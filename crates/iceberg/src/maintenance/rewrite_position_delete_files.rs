@@ -486,6 +486,50 @@ impl RewritePositionDeleteFiles {
     /// Commits NOTHING and returns zero counts when there is no current snapshot, no live parquet
     /// position-delete files, none match the filter, no partition yields a CANDIDATE, or every bin
     /// is declined by the three-clause admission gate.
+    ///
+    /// # ONE commit per admitted BIN
+    ///
+    /// Every admitted bin gets its OWN [`RewriteFiles`](crate::transaction::rewrite_files) — one
+    /// `Replace` snapshot each — so a partition yielding `B` admitted bins produces `B` snapshots.
+    /// Bins replace pairwise DISJOINT sets of position-delete files (the packer partitions each
+    /// partition's candidate list, and the group keys are disjoint by construction), so committing
+    /// them one after another is correct; and a FIXED `starting_snapshot_id` across all `B` bins
+    /// cannot trip conflict validation, because
+    /// [`RewriteFilesAction::validate`](crate::transaction::rewrite_files) early-returns when
+    /// `deleted_data_files` is empty. That set is always empty here: this action passes
+    /// `rewrite_files(Vec::new(), Vec::new())`, so the only file sets it ever populates are
+    /// `deleted_delete_files` (the rewritten inputs) and `added_delete_files` (the compacted
+    /// outputs) — never a DATA-file set on either side.
+    ///
+    /// NOT part of that correctness argument: the loop also advances the base table to each bin's
+    /// committed tip before building the next bin. That is a re-apply-COST optimisation only —
+    /// `Transaction::do_commit` refreshes a stale base and re-applies, so the commits chain and the
+    /// CAS succeeds either way. See the comment above the loop.
+    ///
+    /// # The abort contract
+    ///
+    /// The bin loop is SEQUENTIAL and each iteration commits, so failure is NOT atomic across bins.
+    /// When any bin fails — a read error, a writer error, a commit rejection, or the `DataInvalid`
+    /// raised when a bin's `spec_id` is absent from table metadata — `execute` returns that `Err`
+    /// and:
+    ///
+    /// - every bin committed BEFORE it STANDS. **No rollback is attempted**, and none is possible
+    ///   without a compensating snapshot this action deliberately does not write.
+    /// - the caller receives NO partial [`RewritePositionDeleteFilesResult`] — the counts
+    ///   accumulated so far are dropped along with the `Ok` path.
+    ///
+    /// A table left mid-loop is CONSISTENT, just less compacted than a full run would leave it:
+    /// each committed bin independently replaced its own delete files with an equivalent compacted
+    /// set, so the masked row set is unchanged either way. Re-running the action resumes from there.
+    ///
+    /// This RETAINS the pre-size-gate behaviour and matches the contract the sibling
+    /// [`RewriteDataFiles`](super::rewrite_data_files::RewriteDataFiles) documents; the bin change
+    /// only multiplies the windows in which it can arise, from one per PARTITION to one per BIN.
+    ///
+    /// DIVERGENCE, recorded rather than hidden: Java's non-partial-progress path commits the whole
+    /// plan through ONE `RewritePositionDeletesCommitManager.commitOrClean(Set<group>)`, so the
+    /// fork's snapshot COUNT diverges from Java's — amplified by the bin change from #partitions to
+    /// #bins. Named in `docs/parity/GAP_MATRIX.md` row R136's residue.
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RewritePositionDeleteFilesResult> {
         // Resolve + VALIDATE the size / count thresholds BEFORE any manifest is read, mirroring Java,
         // where `sizeThresholds` runs at planner `init` and therefore before planning.
@@ -854,8 +898,25 @@ impl RewritePositionDeleteFiles {
                 .await?;
         }
 
-        // A group of live pos-delete files always carries rows (a position delete with no rows is
-        // degenerate); if somehow empty, there is nothing to compact — leave the group untouched.
+        // THE PER-BIN ZERO-PAIRS SKIP — DEFENSIVE, and deliberately NOT a parity claim.
+        //
+        // A bin can pass the three-clause gate and then yield NO `(file_path, pos)` pairs, because
+        // the gate reads `file_size_in_bytes` and never a row count. This action's own writer cannot
+        // produce such an input — `ParquetWriter::close` DELETES a zero-row output and returns
+        // `Ok(vec![])`, so it never reaches a manifest — which leaves only an EXTERNALLY-written
+        // zero-row position-delete file. Java cannot reach the state at all
+        // (`RewritePositionDeletesGroup`'s constructor `Preconditions`-checks `!tasks.isEmpty()`),
+        // so this is FORK-DEFENSIVE behaviour, not a ported Java contract.
+        //
+        // The skip is PER BIN and must STAY per bin: returning the table UNCHANGED lets `execute`'s
+        // loop CONTINUE with the remaining bins. This bin contributes zero to all four counts and
+        // commits nothing. Hoisting the check into `execute` as an early return would additionally
+        // drop every LATER bin — silently, since the counts would merely come back smaller.
+        //
+        // DELETING this branch does NOT by itself produce an `Err`: the writer's `Ok(vec![])` is a
+        // NORMAL return. It is `require_non_empty` below that converts the empty `Vec` into
+        // `Err(Unexpected)`, so the mutant reds THROUGH that guard. Without the guard the mutant
+        // would return `Ok`, add nothing, and DROP the bin's live delete files.
         if pairs.is_empty() {
             return Ok(table.clone());
         }

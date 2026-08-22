@@ -34,8 +34,8 @@ use crate::io::LocalFsStorageFactory;
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Literal, ManifestContentType,
-    NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema as IcebergSchema, Struct,
-    Transform, Type,
+    NestedField, Operation, PartitionKey, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
+    SnapshotRef, Struct, Transform, Type,
 };
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::position_delete_writer::{
@@ -3860,5 +3860,660 @@ async fn test_bin_with_pairs_but_no_output_file_is_a_hard_error() {
         passed[0].file_path(),
         file.file_path(),
         "and is returned UNCHANGED"
+    );
+}
+
+// =================================================================================================
+// THE COMMIT LOOP — one `RewriteFiles` per admitted BIN (C-011), the abort contract (C-037), and
+// the per-bin zero-pairs skip (C-040).
+//
+// C-011 and C-037 both run on C-036 RECIPE 7, so the fixture is built once here. Every window the
+// knob derivation makes tautological is RECORDED as true by construction below and its falsifiable
+// content moved onto MEASURED quantities — the bin COMPOSITION is read back off the outputs rather
+// than assumed from the packer's arithmetic.
+// =================================================================================================
+
+/// C-036 RECIPE 7 — TWO ADMITTED BINS in ONE partition.
+///
+/// FOUR position-delete files A, B, C, D in MANIFEST order, each masking a DISJOINT 1000-block of
+/// positions so an output's pairs NAME the bin members that produced it. Sizes are MEASURED, never
+/// predicted, and the knobs are set around them.
+struct Recipe7 {
+    table: Table,
+    /// `S_A .. S_D`, MEASURED, in MANIFEST order.
+    sizes: [u64; 4],
+    /// A, B, C, D's file paths, in MANIFEST order.
+    paths: [String; 4],
+    /// `W` — the `max_file_group_size_bytes` knob, derived from the measured sizes.
+    group_size: u64,
+}
+
+/// `m` — recipe 7's `min_file_size_bytes` knob. FIXED, not derived: every measured `S_i` is asserted
+/// BELOW it, so a size drift that pushed a position-delete file past 100 KB reds on the precondition
+/// instead of silently emptying the candidate set. `m < target` (200_000) closes C-006's (3).
+const RECIPE_7_MIN: u64 = 100_000;
+
+/// Build C-036 recipe 7. `W := max(S_A + S_B, S_C + S_D)`.
+///
+/// RECORDED as TRUE BY CONSTRUCTION and deliberately NOT asserted (C-036: no window assert may be an
+/// algebraic identity in the fixture size): `S_A + S_B <= W` and `S_C + S_D <= W`, both immediate
+/// from `W := max(..)`. The remaining leg, `W < S_A + S_B + S_C`, is FALSIFIABLE — it holds only
+/// while `S_D < S_A + S_B` — and IS asserted. The bin composition the three legs are supposed to
+/// force is then read back off the MEASURED outputs by the pins themselves.
+async fn recipe_7_two_bin_fixture() -> (impl Catalog, TempDir, Recipe7) {
+    let (catalog, temp, table, x_path) = gate_table().await;
+
+    // Disjoint 1000-blocks (block = pos / 1000) with distinct pair counts, so the sizes differ and
+    // each output's pairs identify its bin's members.
+    let pd_a = write_sized_pos_delete(&table, &x_path, 1_000, 1).await;
+    let pd_b = write_sized_pos_delete(&table, &x_path, 2_000, 2).await;
+    let pd_c = write_sized_pos_delete(&table, &x_path, 3_000, 3).await;
+    let pd_d = write_sized_pos_delete(&table, &x_path, 4_000, 4).await;
+    let sizes = [
+        pd_a.file_size_in_bytes,
+        pd_b.file_size_in_bytes,
+        pd_c.file_size_in_bytes,
+        pd_d.file_size_in_bytes,
+    ];
+    let paths = [
+        pd_a.file_path().to_string(),
+        pd_b.file_path().to_string(),
+        pd_c.file_path().to_string(),
+        pd_d.file_path().to_string(),
+    ];
+    let table = add_deletes(&catalog, &table, vec![pd_a, pd_b, pd_c, pd_d]).await;
+
+    assert_eq!(
+        live_pos_delete_paths(&table).await,
+        paths.to_vec(),
+        "fixture: the manifest order must be A, B, C, D — the bin boundaries depend on it"
+    );
+
+    let group_size = (sizes[0] + sizes[1]).max(sizes[2] + sizes[3]);
+    (catalog, temp, Recipe7 {
+        table,
+        sizes,
+        paths,
+        group_size,
+    })
+}
+
+/// Recipe 7's knobs, as a fresh action every call (`execute` consumes `self`).
+fn recipe_7_action(fixture: &Recipe7) -> RewritePositionDeleteFiles {
+    RewritePositionDeleteFiles::new(fixture.table.clone())
+        .min_input_files(2)
+        .min_file_size_bytes(RECIPE_7_MIN)
+        .target_file_size_bytes(200_000)
+        .max_file_size_bytes(400_000)
+        .max_file_group_size_bytes(fixture.group_size)
+}
+
+/// Recipe 7's mandatory PRE-`execute` preconditions, all over MEASURED sizes in MANIFEST order.
+fn assert_recipe_7_preconditions(fixture: &Recipe7, config: &ResolvedConfig) {
+    for size in &fixture.sizes {
+        assert!(
+            *size < config.min_file_size_bytes,
+            "fixture: every file must be SUB-MIN so all four are candidates \
+             (measured {size}, resolved min {})",
+            config.min_file_size_bytes
+        );
+    }
+    assert!(
+        2 >= config.min_input_files,
+        "fixture: a bin of two must clear the count floor (resolved {})",
+        config.min_input_files
+    );
+    assert!(
+        config.max_file_group_size_bytes < fixture.sizes[0] + fixture.sizes[1] + fixture.sizes[2],
+        "fixture: C must NOT fit alongside A and B — this is what forces the split (W {}, \
+         S_A + S_B + S_C {})",
+        config.max_file_group_size_bytes,
+        fixture.sizes[0] + fixture.sizes[1] + fixture.sizes[2]
+    );
+    // RECORDED, not asserted: `S_A + S_B <= W` and `S_C + S_D <= W` are identities in `W := max(..)`.
+    assert!(
+        config.write_max_file_size > fixture.sizes.iter().sum::<u64>(),
+        "fixture: write_max must sit far above BOTH bins, so each bin emits exactly ONE output and \
+         the split arity cannot confound the commit count (write_max {}, total input {})",
+        config.write_max_file_size,
+        fixture.sizes.iter().sum::<u64>()
+    );
+}
+
+/// The 1000-BLOCKS each live position-delete file covers, one sorted+deduped `Vec` per output,
+/// themselves sorted so the comparison does not depend on manifest order.
+async fn output_blocks(table: &Table) -> Vec<Vec<i64>> {
+    let mut all = Vec::new();
+    for file in live_pos_delete_files(table).await {
+        let mut blocks: Vec<i64> = read_pos_delete_pairs(table, &file)
+            .await
+            .iter()
+            .map(|(_, pos)| pos / 1_000)
+            .collect();
+        blocks.sort();
+        blocks.dedup();
+        all.push(blocks);
+    }
+    all.sort();
+    all
+}
+
+/// The snapshots appended to `table`'s history AFTER index `from`, oldest first.
+fn snapshots_after(table: &Table, from: usize) -> Vec<SnapshotRef> {
+    table.metadata().history()[from..]
+        .iter()
+        .map(|log| {
+            table
+                .metadata()
+                .snapshot_by_id(log.snapshot_id)
+                .expect("every history entry resolves to a snapshot")
+                .clone()
+        })
+        .collect()
+}
+
+/// One snapshot's `added-delete-files` / `removed-delete-files` summary counters.
+fn delete_file_counters(snapshot: &Snapshot) -> (Option<String>, Option<String>) {
+    let props = &snapshot.summary().additional_properties;
+    (
+        props.get("added-delete-files").cloned(),
+        props.get("removed-delete-files").cloned(),
+    )
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-011 — exactly ONE `RewriteFiles` (one Replace snapshot) per admitted BIN.
+// ------------------------------------------------------------------------------------------------
+
+/// C-011. `execute` iterates BINS, not partitions, and commits ONE `RewriteFiles` per admitted bin:
+/// a single partition packed into TWO bins produces TWO `Replace` snapshots, chained (each built on
+/// the previous bin's committed tip), each removing exactly its OWN bin's inputs and adding exactly
+/// its own output.
+///
+/// The correctness of committing sequentially against a FIXED `starting_snapshot_id` rests on two
+/// facts verified at source: the bins replace DISJOINT delete-file sets (`pack_bins` partitions the
+/// candidate list; group keys are disjoint), and `RewriteFilesAction::validate` early-returns when
+/// `deleted_data_files` is empty — always true here, because this action passes
+/// `rewrite_files(Vec::new(), Vec::new())` and only `delete_delete_files`.
+///
+/// NON-VACUITY: the two bins' MEMBERSHIP is not assumed from the packer's arithmetic — it is read
+/// back off the outputs' `(file_path, pos)` pairs, each input file masking a disjoint 1000-block. A
+/// commit shape that merged the partition into one bin, or split it differently, would show up in
+/// the block coverage as well as in the snapshot count. The read-identity assertion at the end is a
+/// REGRESSION guard, not the discriminating one: this fixture's inputs mask positions 1000..4004 of
+/// a FIVE-row data file, so no live row is masked and the row set is full either way (the same
+/// disclosure `test_bin_commit_failure_leaves_earlier_bins_committed` carries). `output_blocks` is
+/// what does the work — design call 2's "never read identity alone" is satisfied by it.
+///
+/// RECORDED, NOT PINNED — the base-advance conjunct. C-011's proposition also says "the base table
+/// is advanced after each bin commit". That leg is UNPINNABLE BY OBSERVATION: pointing the loop at
+/// `self.table` instead of the advanced `table` leaves the WHOLE lib suite green, because
+/// `Transaction::do_commit` refreshes a stale base and re-applies, so the two commits chain either
+/// way. The advance is a re-apply-COST optimisation, exactly as the merged comment above the loop
+/// says ("not required for CAS correctness under the retry/refresh loop"). The `parent_snapshot_id`
+/// assertion below therefore pins only what it CAN — that the two commits CHAIN rather than FORK —
+/// and deliberately does not imply the optimisation, the same discipline applied to recipe 7's
+/// `S_A + S_B <= W` window.
+///
+/// MUTATION, APPLIED: replace `plan_bins`'s S5 + S6 block with `admitted.push((key, candidates))`
+/// (one bin per PARTITION, the pre-unit shape). RED — one snapshot instead of two, one added file
+/// instead of two, and the surviving output covers all four blocks.
+#[tokio::test]
+async fn test_one_rewrite_files_commit_per_bin() {
+    let (catalog, _temp, fixture) = recipe_7_two_bin_fixture().await;
+    let config = recipe_7_action(&fixture)
+        .resolve_config()
+        .expect("recipe 7's knobs are legal");
+    assert_recipe_7_preconditions(&fixture, &config);
+
+    let before = scan_y_values(&fixture.table).await;
+    let history_before = fixture.table.metadata().history().len();
+
+    let result = recipe_7_action(&fixture)
+        .execute(&catalog)
+        .await
+        .expect("both bins commit");
+    assert_eq!(
+        result.rewritten_delete_files_count, 4,
+        "all four candidates are rewritten, across TWO bins"
+    );
+    assert_eq!(
+        result.added_delete_files_count, 2,
+        "one compacted output per BIN"
+    );
+
+    let reloaded = catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .expect("reload");
+    let new_snapshots = snapshots_after(&reloaded, history_before);
+    assert_eq!(
+        new_snapshots.len(),
+        2,
+        "TWO admitted bins ⇒ TWO commits, never one batched `RewriteFiles`"
+    );
+    for snapshot in &new_snapshots {
+        assert_eq!(
+            snapshot.summary().operation,
+            Operation::Replace,
+            "every bin commit is a Replace snapshot (Java `newRewrite()`)"
+        );
+        assert_eq!(
+            delete_file_counters(snapshot),
+            (Some("1".to_string()), Some("2".to_string())),
+            "each snapshot replaces exactly ITS OWN bin: 2 position-deletes out, 1 in"
+        );
+    }
+    assert_eq!(
+        new_snapshots[1].parent_snapshot_id(),
+        Some(new_snapshots[0].snapshot_id()),
+        "the two bin commits CHAIN — the second's parent is the first, so the bins do not FORK \
+         from a common base. This does NOT pin the base-advance optimisation; see the rustdoc."
+    );
+
+    // The bins the packer actually formed, MEASURED off the outputs.
+    assert_eq!(
+        output_blocks(&reloaded).await,
+        vec![vec![1, 2], vec![3, 4]],
+        "the two outputs cover {{A, B}} and {{C, D}} — one output per bin, and the bin boundary is \
+         where the group-size knob put it"
+    );
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-037 — the abort contract: earlier bins STAND, no partial result reaches the caller.
+// ------------------------------------------------------------------------------------------------
+
+/// C-037. A bin commit failure aborts `execute` with `Err`; the bins committed BEFORE it STAND and
+/// are NOT rolled back; the caller receives NO partial [`RewritePositionDeleteFilesResult`].
+///
+/// The failure is injected by DELETING bin 2's first input file off disk after the fixture is
+/// committed — deterministic, because within a partition the entry order is manifest order, so the
+/// packer's bins are `{A, B}` then `{C, D}` and `execute` reaches `{C, D}` only after `{A, B}` has
+/// already committed. The sabotage is asserted to have APPLIED before `execute` runs; a fixture in
+/// which the file is not where the manifest says it is HARD-FAILS rather than proving nothing.
+///
+/// This RETAINS the pre-unit behaviour and makes it explicit — the bin change only multiplies the
+/// windows in which the state arises, from one per partition to one per bin. The same contract
+/// covers the `DataInvalid` raised mid-loop when a bin's `spec_id` is absent from table metadata.
+///
+/// MUTATION, APPLIED: swallow the per-bin error in `execute` (`match .. { Ok(t) => table = t, Err(_)
+/// => continue }`). RED — `execute` returns `Ok` with a partial result. A rollback of bin 1 would
+/// red the "bin 1 STANDS" assertions instead.
+#[tokio::test]
+async fn test_bin_commit_failure_leaves_earlier_bins_committed() {
+    let (catalog, _temp, fixture) = recipe_7_two_bin_fixture().await;
+    let config = recipe_7_action(&fixture)
+        .resolve_config()
+        .expect("recipe 7's knobs are legal");
+    assert_recipe_7_preconditions(&fixture, &config);
+
+    let before = scan_y_values(&fixture.table).await;
+    let history_before = fixture.table.metadata().history().len();
+
+    // SABOTAGE — bin 2's first member (C, the third file in manifest order). HARD-FAIL if it cannot
+    // be applied: a sabotage that corrupted nothing has proven nothing.
+    let victim = fixture.paths[2]
+        .strip_prefix("file://")
+        .unwrap_or(&fixture.paths[2])
+        .to_string();
+    assert!(
+        std::path::Path::new(&victim).is_file(),
+        "sabotage precondition: bin 2's input must be on disk at the path the manifest names \
+         ({victim})"
+    );
+    std::fs::remove_file(&victim).expect("remove bin 2's input file");
+    assert!(
+        !std::path::Path::new(&victim).exists(),
+        "sabotage must have APPLIED before execute runs"
+    );
+
+    let error = recipe_7_action(&fixture)
+        .execute(&catalog)
+        .await
+        .expect_err("bin 2 cannot be read, so execute ABORTS");
+    assert_eq!(
+        error.kind(),
+        ErrorKind::DataInvalid,
+        "the abort carries the READ failure's typed kind: {error}"
+    );
+    assert!(
+        error.to_string().contains(&victim),
+        "and it names the file the sabotage removed, so the test cannot pass on some unrelated \
+         failure (victim {victim}, error {error})"
+    );
+
+    let reloaded = catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .expect("reload");
+    let new_snapshots = snapshots_after(&reloaded, history_before);
+    assert_eq!(
+        new_snapshots.len(),
+        1,
+        "bin 1 committed and STANDS; bin 2 never did, and NOTHING was rolled back"
+    );
+    assert_eq!(
+        new_snapshots[0].summary().operation,
+        Operation::Replace,
+        "the surviving commit is bin 1's Replace snapshot"
+    );
+    assert_eq!(
+        delete_file_counters(&new_snapshots[0]),
+        (Some("1".to_string()), Some("2".to_string())),
+        "and it replaced exactly BIN 1: A and B out, one compacted output in"
+    );
+
+    let live = live_pos_delete_paths(&reloaded).await;
+    assert_eq!(
+        live.len(),
+        3,
+        "bin 1's output plus bin 2's two untouched inputs (live: {live:?})"
+    );
+    assert!(
+        !live.contains(&fixture.paths[0]) && !live.contains(&fixture.paths[1]),
+        "bin 1's rewritten files are GONE — its commit was not undone (live: {live:?})"
+    );
+    assert!(
+        live.contains(&fixture.paths[2]) && live.contains(&fixture.paths[3]),
+        "bin 2's inputs are still live — the failed bin changed nothing (live: {live:?})"
+    );
+    let survivor = live
+        .iter()
+        .find(|path| !fixture.paths.contains(path))
+        .expect("bin 1's new file is live");
+    let survivor_file = live_pos_delete_files(&reloaded)
+        .await
+        .into_iter()
+        .find(|f| f.file_path() == survivor)
+        .expect("the new file resolves");
+    let mut blocks: Vec<i64> = read_pos_delete_pairs(&reloaded, &survivor_file)
+        .await
+        .iter()
+        .map(|(_, pos)| pos / 1_000)
+        .collect();
+    blocks.sort();
+    blocks.dedup();
+    assert_eq!(
+        blocks,
+        vec![1, 2],
+        "the live new file is BIN 1's output — it carries A's and B's blocks and nothing else"
+    );
+    assert_eq!(
+        read_pos_delete_pairs(&reloaded, &survivor_file).await.len(),
+        3,
+        "and it carries EVERY pair bin 1's two inputs held — A's 1 plus B's 2 — so bin 1's commit \
+         masks exactly what it replaced"
+    );
+
+    // A post-`execute` read-identity scan is deliberately NOT asserted: the sabotage physically
+    // removed a delete file that is still LIVE in metadata, so any scan of this table now fails on
+    // the missing bytes. `before` is captured pre-sabotage only to document what the fixture masked.
+    assert_eq!(
+        before,
+        HashSet::from([10, 20, 30, 40, 50]),
+        "fixture: the inputs mask positions no row occupies, so the pre-execute row set is full"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-040 — an admitted BIN yielding ZERO pairs is skipped PER BIN.
+// ------------------------------------------------------------------------------------------------
+
+/// Write a genuinely ZERO-ROW parquet position-delete file into `table`'s data directory, in
+/// partition `part_value`, and return the [`DataFile`] that describes it.
+///
+/// It cannot be produced through [`write_position_delete_file`]: `ParquetWriter::close` DELETES a
+/// zero-row output and returns `Ok(vec![])`, which is precisely why this action's own writer can
+/// never put such a file in a manifest. So the parquet bytes are written directly with the parquet
+/// crate's `ArrowWriter` over the position-delete ARROW schema — field ids included, so the
+/// reserved-column lookup still resolves if the reader hands back an empty batch — and the
+/// manifest-side `DataFile` is taken from a real one-pair write (for the content type, format,
+/// partition tuple and spec id) and re-pointed at the empty file with its row count, size and
+/// per-column metrics corrected.
+async fn write_zero_row_pos_delete(table: &Table, part_value: i64, name: &str) -> DataFile {
+    use parquet::arrow::ArrowWriter;
+
+    let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
+    let empty = RecordBatch::new_empty(config.arrow_schema().clone());
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut writer = ArrowWriter::try_new(
+        &mut buffer,
+        config.arrow_schema().clone(),
+        Some(position_delete_writer_properties()),
+    )
+    .expect("open an arrow parquet writer over the position-delete schema");
+    writer.write(&empty).expect("write the empty batch");
+    writer.close().expect("close the zero-row parquet file");
+
+    let path = format!("{}/data/{name}", table.metadata().location());
+    table
+        .file_io()
+        .new_output(&path)
+        .expect("new output for the zero-row file")
+        .write(bytes::Bytes::from(buffer.clone()))
+        .await
+        .expect("write the zero-row parquet bytes");
+
+    let mut file =
+        write_position_delete_file(table, Some(part_value), &[("scaffold.parquet", 0)]).await;
+    file.file_path = path;
+    file.record_count = 0;
+    file.file_size_in_bytes =
+        u64::try_from(buffer.len()).expect("the zero-row file's length fits a u64");
+    file.column_sizes = HashMap::new();
+    file.value_counts = HashMap::new();
+    file.null_value_counts = HashMap::new();
+    file.nan_value_counts = HashMap::new();
+    file.lower_bounds = HashMap::new();
+    file.upper_bounds = HashMap::new();
+    file
+}
+
+/// C-040. An admitted BIN whose files yield ZERO `(file_path, pos)` pairs is SKIPPED **per bin**: it
+/// contributes zero to all four counts, commits nothing, and does not abort the loop over the
+/// remaining bins.
+///
+/// The state is REACHED, not simulated: partition 0 holds EXACTLY five zero-row parquet
+/// position-deletes and nothing else — so they cannot co-bin with non-empty files — and the bin is
+/// admitted by `enough_input_files` at the DEFAULT floor of five. Partition 1 carries a normal
+/// admissible group of five. The admission precondition (all five sub-min, count >= the resolved
+/// floor) is asserted BEFORE `execute`, so a fixture that stopped reaching the branch would red
+/// rather than pass vacuously.
+///
+/// The branch is DEFENSIVE and NOT a parity claim: Java cannot reach this state at all
+/// (`RewritePositionDeletesGroup`'s ctor `Preconditions`-checks `!tasks.isEmpty()`), and the fork's
+/// own writer cannot emit a zero-row position-delete, so only an externally-written file gets here.
+///
+/// WHY THE WHITE-BOX LEG EXISTS — do not "simplify" it away. MEASURED BY THE G4 REVIEW (not by this
+/// author): against the hazard mutant — branch deleted from `compact_group` AND an early
+/// `return Ok(result)` hoisted into `execute` — 10 runs went 6 RED on the end-to-end leg (zero bin
+/// scheduled first) and 4 RED on the white-box leg (normal bin first): 10/10 lethal, the two legs
+/// EXACT COMPLEMENTS. So the end-to-end leg ALONE is ~50% flaky against that mutant, and the
+/// white-box leg is not a weaker substitute for it — it is the half that removes the coin flip. No
+/// end-to-end-only construction can close it: for ANY mix of k zero bins and m normal bins,
+/// `HashMap` iteration order may place every zero bin LAST.
+///
+/// MUTATION, APPLIED: delete the `if pairs.is_empty()` branch. RED — but note the CAUSE: the mutant
+/// does NOT raise the error itself. `ParquetWriter::close` returns `Ok(vec![])` for zero rows and
+/// deletes the empty output, so "no file" is a normal return; it is `require_non_empty` that turns
+/// the empty `Vec` into `Err(Unexpected)`, and the mutant reds THROUGH that guard. Without the guard
+/// the mutant would return `Ok`, add nothing, and drop five live delete files.
+#[tokio::test]
+async fn test_admitted_bin_with_zero_pairs_is_skipped() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let p0 = write_data_file(&table, "p0.parquet", 0, &[(0, 10, 1), (0, 20, 2)]).await;
+    let p1 = write_data_file(&table, "p1.parquet", 1, &[(1, 30, 3), (1, 40, 4)]).await;
+    let p1_path = p1.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![p0, p1]).await;
+
+    // Partition 0: FIVE zero-row position-deletes and NOTHING else.
+    let mut empties = Vec::new();
+    for index in 0..5 {
+        empties.push(write_zero_row_pos_delete(&table, 0, &format!("empty-{index}.parquet")).await);
+    }
+    let empty_paths: Vec<String> = empties.iter().map(|f| f.file_path().to_string()).collect();
+    let empty_sizes: Vec<u64> = empties.iter().map(|f| f.file_size_in_bytes).collect();
+
+    // Partition 1: a normal admissible group of FIVE, masking p1's row at position 1 (y = 40).
+    let mut normals = Vec::new();
+    for _ in 0..5 {
+        normals.push(write_position_delete_file(&table, Some(1), &[(&p1_path, 1)]).await);
+    }
+    let normal_paths: Vec<String> = normals.iter().map(|f| f.file_path().to_string()).collect();
+    let normal_sizes: Vec<u64> = normals.iter().map(|f| f.file_size_in_bytes).collect();
+
+    let mut all = empties;
+    all.extend(normals);
+    let table = add_deletes(&catalog, &table, all).await;
+
+    // ADMISSION PRECONDITIONS at the DEFAULT config — both bins must actually be admitted, or the
+    // zero-pairs branch is never reached and this pin proves nothing.
+    let action = || RewritePositionDeleteFiles::new(table.clone());
+    let config = action().resolve_config().expect("the defaults are legal");
+    for size in empty_sizes.iter().chain(normal_sizes.iter()) {
+        assert!(
+            *size < config.min_file_size_bytes,
+            "fixture: every input must be a SUB-MIN candidate (measured {size}, resolved min {})",
+            config.min_file_size_bytes
+        );
+    }
+    assert_eq!(
+        config.min_input_files, 5,
+        "fixture: the zero-pairs bin must be admitted at Java's DEFAULT floor of FIVE, not a \
+         lowered one — the literal, so a moved constant reds here rather than silently re-shaping \
+         the fixture"
+    );
+    assert!(
+        empty_paths.len() >= config.min_input_files,
+        "fixture: the zero-pairs partition must clear `enough_input_files` on its own \
+         ({} files, floor {})",
+        empty_paths.len(),
+        config.min_input_files
+    );
+    assert!(
+        normal_paths.len() >= config.min_input_files,
+        "fixture: the second partition must be admissible too"
+    );
+
+    // Acceptance item 4's read-identity leg, and SUBSTANTIVE here unlike recipe 7's: partition 1's
+    // deletes genuinely mask a live row (p1's position 1, y = 40), so the pre/post comparison can
+    // actually detect a compaction that changed the masked set. It also proves the production scan
+    // path READS the five surviving zero-row position-deletes without error.
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([10, 20, 30]),
+        "fixture: y = 40 is really masked by partition 1's deletes, so read identity is not \
+         vacuous here"
+    );
+
+    let history_before = table.metadata().history().len();
+    let result = action()
+        .execute(&catalog)
+        .await
+        .expect("the zero-pairs bin is SKIPPED, not an error — and the other bin still commits");
+
+    // All four counts reflect ONLY the second partition.
+    assert_eq!(
+        result.rewritten_delete_files_count, 5,
+        "only the SECOND partition's five files are rewritten"
+    );
+    assert_eq!(result.added_delete_files_count, 1, "one compacted output");
+    assert_eq!(
+        result.rewritten_bytes_count,
+        normal_sizes.iter().sum::<u64>(),
+        "the rewritten BYTES are the second partition's alone — the skipped bin adds none"
+    );
+
+    let reloaded = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload");
+    let new_snapshots = snapshots_after(&reloaded, history_before);
+    assert_eq!(
+        new_snapshots.len(),
+        1,
+        "exactly ONE commit: the skipped bin commits nothing, and the other bin is unaffected"
+    );
+    assert_eq!(new_snapshots[0].summary().operation, Operation::Replace);
+
+    let live = live_pos_delete_paths(&reloaded).await;
+    for path in &empty_paths {
+        assert!(
+            live.contains(path),
+            "every zero-row file is STILL LIVE — the skipped bin was left untouched, not dropped"
+        );
+    }
+    for path in &normal_paths {
+        assert!(
+            !live.contains(path),
+            "the second partition's inputs were replaced"
+        );
+    }
+    assert_eq!(
+        live.len(),
+        empty_paths.len() + 1,
+        "five untouched zero-row files plus the second partition's one output (live: {live:?})"
+    );
+    let added_bytes: u64 = live_pos_delete_files(&reloaded)
+        .await
+        .into_iter()
+        .filter(|f| !empty_paths.contains(&f.file_path().to_string()))
+        .map(|f| f.file_size_in_bytes)
+        .sum();
+    assert_eq!(
+        result.added_bytes_count, added_bytes,
+        "the added BYTES are the one real output's, and nothing from the skipped bin"
+    );
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "read identity — and the scan still reads the five untouched zero-row position-deletes"
+    );
+
+    // WHITE BOX, the leg the end-to-end shape cannot force: `plan_bins` iterates a `HashMap`, so
+    // which of the two bins `execute` reaches FIRST is not fixed. Driving `compact_group` directly
+    // on the zero-pairs bin pins what the loop actually depends on — the skip RETURNS the table
+    // unchanged (so the caller's loop CONTINUES) and leaves the result counters alone, rather than
+    // signalling an abort.
+    let entries: Vec<LiveDeleteEntry> = live_pos_delete_files(&reloaded)
+        .await
+        .into_iter()
+        .filter(|f| empty_paths.contains(&f.file_path().to_string()))
+        .map(|data_file| LiveDeleteEntry {
+            data_file,
+            sequence_number: 1,
+        })
+        .collect();
+    assert_eq!(
+        entries.len(),
+        5,
+        "the five zero-row entries are still there"
+    );
+    let bin: AdmittedBin = ((0, Struct::from_iter([Some(Literal::long(0))])), entries);
+    let starting = reloaded
+        .metadata()
+        .current_snapshot()
+        .expect("a current snapshot")
+        .snapshot_id();
+    let mut counters = RewritePositionDeleteFilesResult::default();
+    let returned = action()
+        .compact_group(&catalog, &reloaded, &bin, &config, starting, &mut counters)
+        .await
+        .expect("the zero-pairs bin returns Ok so the bin loop CONTINUES");
+    assert_eq!(
+        returned.metadata().current_snapshot_id(),
+        reloaded.metadata().current_snapshot_id(),
+        "the skip returns the table UNCHANGED — nothing was committed for this bin"
+    );
+    assert_eq!(
+        counters,
+        RewritePositionDeleteFilesResult::default(),
+        "and it contributed zero to ALL FOUR counts"
     );
 }
