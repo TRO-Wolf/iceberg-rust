@@ -107,7 +107,7 @@ use crate::metadata_columns::{
 };
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, MetricsConfig, PartitionKey, Schema, Snapshot,
-    Struct,
+    Struct, TableProperties,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -125,6 +125,102 @@ use crate::{Catalog, Error, ErrorKind, Result};
 /// The `(spec_id, partition)` group a position-delete file belongs to (Java's
 /// `BinPackRewritePositionDeletePlanner` groups by partition + spec).
 type GroupKey = (i32, Struct);
+
+/// Java `SizeBasedFileRewritePlanner.MIN_FILE_SIZE_DEFAULT_RATIO` — an unset `min_file_size_bytes`
+/// defaults to 75% of the resolved target (bytecode-verified vs `iceberg-core-1.10.0.jar`:
+/// `sizeThresholds` loads `ldc2_w // double 0.75d` and multiplies).
+const MIN_FILE_SIZE_DEFAULT_RATIO: f64 = 0.75;
+
+/// Java `SizeBasedFileRewritePlanner.MAX_FILE_SIZE_DEFAULT_RATIO` — an unset `max_file_size_bytes`
+/// defaults to 180% of the resolved target (bytecode-verified vs `iceberg-core-1.10.0.jar`:
+/// `sizeThresholds` loads `ldc2_w // double 1.8d` and multiplies).
+const MAX_FILE_SIZE_DEFAULT_RATIO: f64 = 1.80;
+
+/// Java `SizeBasedFileRewritePlanner.MIN_INPUT_FILES_DEFAULT` = `5` (bytecode-verified vs
+/// `iceberg-core-1.10.0.jar`). THE parity number this action was missing: Java admits a group of
+/// small position-delete files only from five files up, where this port used to admit two.
+const MIN_INPUT_FILES_DEFAULT: usize = 5;
+
+/// Java `SizeBasedFileRewritePlanner.MAX_FILE_GROUP_SIZE_BYTES_DEFAULT` = `107374182400` (100 GiB,
+/// bytecode-verified vs `iceberg-core-1.10.0.jar`).
+const MAX_FILE_GROUP_SIZE_BYTES_DEFAULT: u64 = 107374182400;
+
+/// [`TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT`] in the `i64` domain the
+/// parse works in (see [`parse_delete_target_file_size`]). The `as` is proven lossless by the
+/// const-evaluated assertion, so the cast can never truncate.
+const DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT_I64: i64 = {
+    let default = TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT;
+    assert!(default <= i64::MAX as u64);
+    default as i64
+};
+
+/// Java's `d2l` on the ratio products in `SizeBasedFileRewritePlanner.sizeThresholds` — the JVM's
+/// `(long) doubleValue`, which SATURATES at `Long.MAX_VALUE` (and at `Long.MIN_VALUE` / `0` for NaN).
+///
+/// Rust's `as u64` on an `f64` also saturates, but at `u64::MAX` — roughly twice Java's ceiling — so
+/// the `.min(i64::MAX as u64)` IS the parity act, not defensive padding: without it a target above
+/// `2^63 / 1.8` resolves a `max_file_size_bytes` Java can never produce. Negative and NaN inputs map
+/// to `0` here where Java gives a negative; that divergence is unreachable in this action (a negative
+/// target is rejected by precondition (1) of [`RewritePositionDeleteFiles::resolve_config`]) and is
+/// stated rather than assumed.
+///
+/// NAMED RESIDUE (RES-9): the sibling [`super::rewrite_data_files`] resolver at its own ratio-default
+/// site is UNCLAMPED and deliberately stays so; this action does not change the template.
+fn d2l(x: f64) -> u64 {
+    (x as u64).min(i64::MAX as u64)
+}
+
+/// Parse the `write.delete.target-file-size-bytes` table property — Java
+/// `BinPackRewritePositionDeletePlanner.defaultTargetFileSize()` via `PropertyUtil.propertyAsLong`,
+/// which is `map.get(key)`, `null -> default`, else `Long.parseLong`.
+///
+/// Parses into **`i64`, not `u64`, on purpose**: `i64::from_str`'s accept/reject domain COINCIDES with
+/// `Long.parseLong`'s (both take an optional leading `+`/`-` then decimal digits only — no
+/// underscores, whitespace or radix prefix — and both reject a magnitude outside the 64-bit signed
+/// range). ONE stated exception, fail-closed: `Long.parseLong` digits through `Character.digit`, so
+/// it also accepts non-ASCII Unicode decimal digits (Arabic-Indic `U+0660`–`U+0669` and the other
+/// decimal-digit ranges) where Rust's parser is ASCII-only. The fork REJECTS what Java would accept
+/// there, so the divergence errors loudly rather than resolving a different threshold, and no real
+/// table carries such a value.
+///
+/// So `"0"` and `"-1"` PARSE here exactly as they parse in Java, and are then rejected
+/// downstream by [`RewritePositionDeleteFiles::resolve_config`]'s `target > 0` precondition carrying
+/// Java's verbatim message. A `u64` parse would reject `"-1"` at the parse with a fork-only message
+/// and would ADMIT values above `i64::MAX` that `Long.parseLong` throws on.
+///
+/// NAMED RESIDUE (RES-10): the sibling `rewrite_data_files::parse_target_file_size` parses `u64` and
+/// stays as-is; that asymmetry is a follow-up, not a change this action makes.
+fn parse_delete_target_file_size(properties: &HashMap<String, String>) -> Result<i64> {
+    match properties.get(TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES) {
+        None => Ok(DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT_I64),
+        Some(value) => value.parse::<i64>().map_err(|error| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid value '{value}' for table property '{}'",
+                    TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES
+                ),
+            )
+            .with_source(error)
+        }),
+    }
+}
+
+/// The rejection for a builder override outside Java's `long` domain — precondition (7) of
+/// [`RewritePositionDeleteFiles::resolve_config`], reusing [`parse_delete_target_file_size`]'s
+/// out-of-range shape. Java's thresholds are `long` fields fed by `Long.parseLong`, so a `u64`
+/// above `i64::MAX` is a config Java cannot express; the fork refuses it rather than silently
+/// accepting a state in which `too_much_content` is unreachable.
+fn reject_size_override_above_i64_max(option: &str, value: u64) -> Error {
+    Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "Invalid value '{value}' for '{option}': it must be <= {} — Java's option is a `long`, \
+             so a larger threshold has no Java analogue",
+            i64::MAX
+        ),
+    )
+}
 
 /// The outcome of a [`RewritePositionDeleteFiles::execute`] run, mirroring Java
 /// `RewritePositionDeleteFiles$Result`'s four counts.
@@ -162,22 +258,117 @@ impl RewritePositionDeleteFilesResult {
     }
 }
 
+/// The resolved size/count thresholds for one [`RewritePositionDeleteFiles::execute`] run — Java
+/// `SizeBasedFileRewritePlanner`'s post-`init` field set, restricted to the five options this action
+/// ports. Produced by [`RewritePositionDeleteFiles::resolve_config`], which is the ONLY place the
+/// defaults and Java's preconditions live.
+///
+/// The fields are consumed by the planner increment (candidate filter, bin packer, group gate).
+/// Keep the `Clone`/`PartialEq`/`Eq` derives — they are what keeps `dead_code` disarmed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedConfig {
+    target_file_size_bytes: u64,
+    min_file_size_bytes: u64,
+    max_file_size_bytes: u64,
+    min_input_files: usize,
+    max_file_group_size_bytes: u64,
+}
+
 /// The `RewritePositionDeleteFiles` maintenance action. Build it with [`Self::new`], optionally restrict
-/// the compacted partitions with [`Self::filter`], and run it with [`Self::execute`].
+/// the compacted partitions with [`Self::filter`], configure the size / count thresholds with the
+/// builder methods, and run it with [`Self::execute`].
+///
+/// # Ported options (five)
+///
+/// [`Self::target_file_size_bytes`], [`Self::min_file_size_bytes`], [`Self::max_file_size_bytes`],
+/// [`Self::min_input_files`] and [`Self::max_file_group_size_bytes`] — Java's
+/// `SizeBasedFileRewritePlanner.validOptions()` minus the deferrals below. Defaults are Java's:
+///
+/// - `target_file_size_bytes` = `write.delete.target-file-size-bytes` (default 64 MiB — the
+///   DELETE-specific property, NOT the 512 MiB `write.target-file-size-bytes` the data-file planner
+///   reads).
+/// - `min_file_size_bytes` = `0.75 * target` (resolved lazily when unset).
+/// - `max_file_size_bytes` = `1.8 * target` (resolved lazily when unset).
+/// - `min_input_files` = 5.
+/// - `max_file_group_size_bytes` = 100 GiB.
+// TODO(doc pass): the `# Deferred (loudly)` block enumerating the six unported options
+// (`rewrite-all` with its inverted-emulation warning, `rewrite-job-order`,
+// `partial-progress.enabled`, `partial-progress.max-commits`, `max-concurrent-file-group-rewrites`
+// and `output-spec-id` with its carry-forward citation) is written in this PR's documentation
+// increment. It is deliberately NOT drafted here — its text is owned by that increment.
 pub struct RewritePositionDeleteFiles {
     table: Table,
     filter: Predicate,
+    /// `Some(t)` once the caller pins a target size; `None` ⇒ resolve from the table property at
+    /// execute (Java `BinPackRewritePositionDeletePlanner.defaultTargetFileSize`).
+    target_file_size_bytes: Option<u64>,
+    /// `Some(min)` once the caller pins it; `None` ⇒ `0.75 * target` at execute.
+    min_file_size_bytes: Option<u64>,
+    /// `Some(max)` once the caller pins it; `None` ⇒ `1.8 * target` at execute.
+    max_file_size_bytes: Option<u64>,
+    min_input_files: usize,
+    max_file_group_size_bytes: u64,
 }
 
 impl RewritePositionDeleteFiles {
-    /// Create a `RewritePositionDeleteFiles` action for `table`. With no [`filter`](Self::filter), every
-    /// `(spec, partition)` group of live parquet position-delete files in the current snapshot is
-    /// compacted.
+    /// Create a `RewritePositionDeleteFiles` action for `table` with Java's defaults (see the struct
+    /// docs). With no [`filter`](Self::filter), every `(spec, partition)` group of live parquet
+    /// position-delete files in the current snapshot is considered. The size thresholds are resolved
+    /// lazily at [`Self::execute`] from the table's `write.delete.target-file-size-bytes` property when
+    /// not overridden.
     pub fn new(table: Table) -> Self {
         Self {
             table,
             filter: Predicate::AlwaysTrue,
+            target_file_size_bytes: None,
+            min_file_size_bytes: None,
+            max_file_size_bytes: None,
+            min_input_files: MIN_INPUT_FILES_DEFAULT,
+            max_file_group_size_bytes: MAX_FILE_GROUP_SIZE_BYTES_DEFAULT,
         }
+    }
+
+    /// Set the target output position-delete file size in bytes (Java `TARGET_FILE_SIZE_BYTES`). When
+    /// unset, the table's `write.delete.target-file-size-bytes` property is used (default 64 MiB).
+    /// Setting this also shifts the default `min`/`max` thresholds (0.75× / 1.8× of the target) unless
+    /// those are independently overridden.
+    ///
+    /// Values above `i64::MAX` are rejected at [`Self::execute`] — Java's option is a `long`.
+    pub fn target_file_size_bytes(mut self, target_file_size_bytes: u64) -> Self {
+        self.target_file_size_bytes = Some(target_file_size_bytes);
+        self
+    }
+
+    /// Position-delete files smaller than this are always candidates for compaction (Java
+    /// `MIN_FILE_SIZE_BYTES`). Defaults to 75% of the target file size.
+    ///
+    /// Values above `i64::MAX` are rejected at [`Self::execute`] — Java's option is a `long`.
+    pub fn min_file_size_bytes(mut self, min_file_size_bytes: u64) -> Self {
+        self.min_file_size_bytes = Some(min_file_size_bytes);
+        self
+    }
+
+    /// Position-delete files larger than this are always candidates for compaction (Java
+    /// `MAX_FILE_SIZE_BYTES`). Defaults to 180% of the target file size.
+    ///
+    /// Values above `i64::MAX` are rejected at [`Self::execute`] — Java's option is a `long`.
+    pub fn max_file_size_bytes(mut self, max_file_size_bytes: u64) -> Self {
+        self.max_file_size_bytes = Some(max_file_size_bytes);
+        self
+    }
+
+    /// A group with at least this many position-delete files is compacted regardless of total size
+    /// (Java `MIN_INPUT_FILES`, default 5). Must be `> 0` — a zero is rejected at [`Self::execute`].
+    pub fn min_input_files(mut self, min_input_files: usize) -> Self {
+        self.min_input_files = min_input_files;
+        self
+    }
+
+    /// The largest total size of input position-delete files compacted in a single group (Java
+    /// `MAX_FILE_GROUP_SIZE_BYTES`, default 100 GiB). Must be `> 0`.
+    pub fn max_file_group_size_bytes(mut self, max_file_group_size_bytes: u64) -> Self {
+        self.max_file_group_size_bytes = max_file_group_size_bytes;
+        self
     }
 
     /// Restrict the compaction to position-delete files whose partition matches `filter` (Java
@@ -199,6 +390,22 @@ impl RewritePositionDeleteFiles {
     /// position-delete files, none match the filter, or no group has more than one file (nothing to
     /// compact).
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RewritePositionDeleteFilesResult> {
+        // Resolve + VALIDATE the size / count thresholds BEFORE any manifest is read, mirroring Java,
+        // where `sizeThresholds` runs at planner `init` and therefore before planning.
+        //
+        // BEHAVIOUR FLIP (4th, for the PR body): `write.delete.target-file-size-bytes` is a standard
+        // Iceberg property that Java writers and users already set, so a PRE-EXISTING table carrying
+        // it with an unparsable value, a value above `i64::MAX`, or a value <= 1 now makes `execute`
+        // return `Err` where it previously returned counts. (At 1 the defaulted max is `d2l(1.8)`
+        // = 1, so the STRICT `target < max` fires; from 2 up every precondition passes.) This is
+        // parity-correct — Java throws on exactly the same inputs — but it IS a flip, and R-9's
+        // PR-body list currently names only three.
+        //
+        // TODO(size gate): bound as `_config` because the admission gate that CONSUMES it lands in
+        // the planner increment of this PR; the `entries.len() < 2` guard below is still the
+        // pre-parity admission rule until then.
+        let _config = self.resolve_config()?;
+
         let metadata = self.table.metadata();
         let Some(snapshot) = metadata.current_snapshot().cloned() else {
             return Ok(RewritePositionDeleteFilesResult::default());
@@ -241,6 +448,158 @@ impl RewritePositionDeleteFiles {
         }
 
         Ok(result)
+    }
+
+    /// Resolve the size / count thresholds and enforce Java's `SizeBasedFileRewritePlanner`
+    /// preconditions. This is the single home for the defaults, the property lookup and the
+    /// rejections — every default pin calls it directly.
+    ///
+    /// # Order (Java's, plus this port's three additions)
+    ///
+    /// Java's `sizeThresholds(Map)` resolves the min/max DEFAULTS first and only then checks, in this
+    /// order: (1) `target > 0`, (2) `min >= 0`, (3) `target > min`, (4) `target < max` — all STRICT,
+    /// each carrying the verbatim message reproduced below. The order is load-bearing: at a negative
+    /// target this port's [`d2l`] saturates BOTH ratio products to `0`, so (3) `target > min` is
+    /// independently false there; hoisting (3) above (1) would report the wrong message.
+    ///
+    /// **(2) `min >= 0` is STRUCTURALLY UNREACHABLE here and is therefore not coded**: this port's
+    /// `min_file_size_bytes` is a `u64` with no table property behind it, only the builder, so no
+    /// caller can express a negative. It is recorded rather than written as a comparison that is
+    /// always true.
+    ///
+    /// Three preconditions live OUTSIDE Java's `sizeThresholds`. Only (7) is fork-authored — (5) and
+    /// (6) ARE Java's, just raised elsewhere, so their message shape is Java's and is not ours to
+    /// reword:
+    ///
+    /// - (5) `min_input_files > 0` and (6) `max_file_group_size_bytes > 0` — Java's own
+    ///   `checkArgument`s on the same two options, raised in `SizeBasedFileRewritePlanner.init(Map)`
+    ///   rather than in `sizeThresholds`. Reproduced here in Java's message shape, checked after (4).
+    /// - (7) every EXPLICIT builder override of the three size knobs is `<= i64::MAX`. THIS one has
+    ///   no Java analogue: Java's thresholds are `long`s fed by `Long.parseLong`, so a larger value
+    ///   is a config Java cannot express, and admitting it would open a state in which
+    ///   `too_much_content` (`input_size > max`) is unreachable.
+    ///
+    ///   **(7) is checked when each override is READ — i.e. before the defaults resolve and before
+    ///   (1)** — and this position is a deliberate, recorded deviation from the ledger's numbering.
+    ///   TWO reasons, both verified by removing the checks rather than argued:
+    ///
+    ///   1. **(7) is what makes the `as i64` cast below lossless.** The target override is narrowed
+    ///      to `i64` before the defaults resolve; with (7)'s target leg removed, a `u64` above
+    ///      `i64::MAX` WRAPS to a negative and (1) then reports
+    ///      `'target-file-size-bytes' is set to -9223372036854775808 but must be > 0` — a value the
+    ///      caller never wrote, leaked into user-facing error text. The cast's soundness rests on
+    ///      (7) running first.
+    ///   2. **Checked last, only ONE of its three legs would be observable.** A `min` override above
+    ///      `i64::MAX` is caught first by (3) (`target > min` fails, wrong message); a `target`
+    ///      override above `i64::MAX` is caught first by (1) via the wrap in point 1. Only the `max`
+    ///      leg would survive to report its own rejection.
+    ///
+    ///   Checking the overrides at read time is therefore the only placement under which each knob
+    ///   reports its own rejection AND the narrowing cast is total, and it leaves the relative order
+    ///   of Java's own (1) → (3) → (4) untouched.
+    fn resolve_config(&self) -> Result<ResolvedConfig> {
+        // (7) at READ time, one leg per knob, in builder-declaration order.
+        if let Some(target) = self.target_file_size_bytes
+            && target > i64::MAX as u64
+        {
+            return Err(reject_size_override_above_i64_max(
+                "target-file-size-bytes",
+                target,
+            ));
+        }
+        if let Some(min) = self.min_file_size_bytes
+            && min > i64::MAX as u64
+        {
+            return Err(reject_size_override_above_i64_max(
+                "min-file-size-bytes",
+                min,
+            ));
+        }
+        if let Some(max) = self.max_file_size_bytes
+            && max > i64::MAX as u64
+        {
+            return Err(reject_size_override_above_i64_max(
+                "max-file-size-bytes",
+                max,
+            ));
+        }
+
+        // The target stays in the `i64` domain until precondition (1) has run, so a negative property
+        // value reaches (1) exactly as it reaches Java's `checkArgument`.
+        let target = match self.target_file_size_bytes {
+            // In range by (7) above, so the widening cast cannot truncate.
+            Some(target) => target as i64,
+            None => parse_delete_target_file_size(self.table.metadata().properties())?,
+        };
+
+        // Java: `defaultMin = d2l(target * 0.75)`, `defaultMax = d2l(target * 1.8)`, resolved BEFORE
+        // the checks. `target as f64` is Java's `l2d` — the same f64 rounding on a large `long`.
+        let default_min = d2l(target as f64 * MIN_FILE_SIZE_DEFAULT_RATIO);
+        let default_max = d2l(target as f64 * MAX_FILE_SIZE_DEFAULT_RATIO);
+        let min_file_size_bytes = self.min_file_size_bytes.unwrap_or(default_min);
+        let max_file_size_bytes = self.max_file_size_bytes.unwrap_or(default_max);
+
+        // (1) target > 0.
+        if target <= 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("'target-file-size-bytes' is set to {target} but must be > 0"),
+            ));
+        }
+        // (2) min >= 0 — structurally unreachable (see the doc comment); not coded.
+
+        // Proven positive by (1), so the narrowing is total; carried as a checked conversion rather
+        // than an `as` so a future edit to (1) cannot silently wrap.
+        let target: u64 = u64::try_from(target).map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "'target-file-size-bytes' passed the > 0 precondition but is not a u64",
+            )
+            .with_source(error)
+        })?;
+
+        // (3) target > min.
+        if target <= min_file_size_bytes {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "'target-file-size-bytes' ({target}) must be > 'min-file-size-bytes' \
+                     ({min_file_size_bytes}), all new files will be smaller than the min threshold"
+                ),
+            ));
+        }
+        // (4) target < max.
+        if target >= max_file_size_bytes {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "'target-file-size-bytes' ({target}) must be < 'max-file-size-bytes' \
+                     ({max_file_size_bytes}), all new files will be larger than the max threshold"
+                ),
+            ));
+        }
+        // (5) min_input_files > 0.
+        if self.min_input_files == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "'min-input-files' is set to 0 but must be > 0",
+            ));
+        }
+        // (6) max_file_group_size_bytes > 0.
+        if self.max_file_group_size_bytes == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "'max-file-group-size-bytes' is set to 0 but must be > 0",
+            ));
+        }
+
+        Ok(ResolvedConfig {
+            target_file_size_bytes: target,
+            min_file_size_bytes,
+            max_file_size_bytes,
+            min_input_files: self.min_input_files,
+            max_file_group_size_bytes: self.max_file_group_size_bytes,
+        })
     }
 
     /// Walk the current snapshot's manifests once and collect the live PARQUET position-delete entries

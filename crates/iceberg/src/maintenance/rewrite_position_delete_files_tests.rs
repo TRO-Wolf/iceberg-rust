@@ -883,3 +883,557 @@ async fn test_unpartitioned_group_compacts() {
     );
     assert_eq!(count_pos(&live_delete_files(&reloaded).await), 1);
 }
+
+// =================================================================================================
+// CONFIG SEAM — the size/count thresholds, their Java defaults, the delete-specific property, the
+// `Long.parseLong`-exact parse, and Java's `sizeThresholds` preconditions.
+//
+// Every default here is asserted WHITE-BOX through `resolve_config()` (private, but reachable — this
+// is a child module), never end to end: observing 50331648 / 120795955 end to end would need ~48 MiB
+// and ~115 MiB fixtures. These pins are therefore named `test_config_*` / `test_resolve_config_*` /
+// `test_parse_delete_target_*` and NEVER `test_admission_*`, so no later change lowers the target to
+// make them end-to-end and thereby unpins the ratio constants.
+// =================================================================================================
+
+/// A minimal unpartitioned table carrying `properties` — the fixture for the white-box config pins.
+/// The config seam reads only `metadata().properties()`, so the table needs no snapshot and no files.
+async fn config_table(properties: &[(&str, &str)]) -> (TempDir, Table) {
+    let (catalog, temp_dir) = local_fs_catalog().await;
+    let schema = three_long_schema();
+    let spec = PartitionSpec::builder(schema.clone())
+        .with_spec_id(0)
+        .build()
+        .expect("build spec");
+    let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
+    catalog
+        .create_namespace(&namespace, std::collections::HashMap::new())
+        .await
+        .expect("create namespace");
+    let creation = TableCreation::builder()
+        .name("t".to_string())
+        .schema(schema)
+        .partition_spec(spec)
+        .format_version(FormatVersion::V2)
+        .properties(
+            properties
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect::<Vec<_>>(),
+        )
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create table");
+    (temp_dir, table)
+}
+
+/// `write.delete.target-file-size-bytes` as a `HashMap`, for the pins that exercise the parse function
+/// alone (no table needed).
+fn delete_target_property(value: &str) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([(
+        TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES.to_string(),
+        value.to_string(),
+    )])
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-035 — the parse: one function whose accept/reject domain is `Long.parseLong`'s, EXACTLY.
+// ------------------------------------------------------------------------------------------------
+
+/// C-035 element 1 (ABSENT). No property ⇒ the 64 MiB delete default.
+#[test]
+fn test_parse_delete_target_absent_is_64_mib() {
+    let properties = std::collections::HashMap::new();
+    assert_eq!(
+        parse_delete_target_file_size(&properties).expect("an absent property takes the default"),
+        67108864
+    );
+}
+
+/// C-035 element 2 (a well-formed decimal in `[2, i64::MAX - 1]`) — the only class that can also
+/// SURVIVE the preconditions. A leading `+` is accepted, matching `Long.parseLong`.
+#[test]
+fn test_parse_delete_target_mid_band_is_accepted() {
+    assert_eq!(
+        parse_delete_target_file_size(&delete_target_property("12345678")).expect("mid band"),
+        12345678
+    );
+    assert_eq!(
+        parse_delete_target_file_size(&delete_target_property("+12345678"))
+            .expect("Long.parseLong accepts a leading '+', and so must this"),
+        12345678
+    );
+}
+
+/// C-035 element 3, upper endpoint. `i64::MAX` PARSES (this is a parse-function assertion only —
+/// whether it then survives the preconditions is `resolve_config`'s business, pinned separately by
+/// `test_resolve_config_rejects_target_at_i64_max_on_the_max_precondition`).
+#[test]
+fn test_parse_delete_target_at_i64_max_is_accepted_by_the_parse() {
+    assert_eq!(
+        parse_delete_target_file_size(&delete_target_property("9223372036854775807"))
+            .expect("Long.parseLong accepts Long.MAX_VALUE"),
+        i64::MAX
+    );
+}
+
+/// C-035 element 3, lower endpoint. `"1"` PARSES (parse-function assertion only).
+#[test]
+fn test_parse_delete_target_at_one_is_accepted_by_the_parse() {
+    assert_eq!(
+        parse_delete_target_file_size(&delete_target_property("1")).expect("'1' parses"),
+        1
+    );
+}
+
+/// C-035 element 6 (unparsable / empty). Every one of these throws `NumberFormatException` in Java,
+/// so every one must be a `DataInvalid` here — including the forms Rust's parser could plausibly have
+/// accepted (`1_000` is a Rust literal, not a `Long.parseLong` input).
+#[test]
+fn test_parse_delete_target_unparsable_is_data_invalid() {
+    for value in ["", "abc", "1_000", " 12", "12 ", "0x10", "1.0", "12,3", "+"] {
+        let error = parse_delete_target_file_size(&delete_target_property(value))
+            .expect_err("an unparsable delete target must be rejected loudly");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid, "value {value:?}");
+        assert_eq!(
+            error.message(),
+            format!(
+                "Invalid value '{value}' for table property 'write.delete.target-file-size-bytes'"
+            ),
+            "value {value:?}"
+        );
+    }
+}
+
+/// C-035 element 6 (magnitude outside the `long` range) — THE anti-`u64` pin. `Long.parseLong` throws
+/// on anything above `Long.MAX_VALUE`, so these must be rejected AT THE PARSE. A `u64` parse would
+/// accept every one of them and hand the action a threshold Java cannot express.
+#[test]
+fn test_parse_delete_target_above_i64_max_is_rejected() {
+    for value in [
+        "9223372036854775808",  // i64::MAX + 1
+        "18446744073709551615", // u64::MAX — accepted by a u64 parse, rejected by Long.parseLong
+        "99999999999999999999999",
+    ] {
+        let error = parse_delete_target_file_size(&delete_target_property(value))
+            .expect_err("a value outside Java's long range must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid, "value {value:?}");
+    }
+    // ... and the boundary directly below it still parses, so the rejection is two-sided.
+    assert_eq!(
+        parse_delete_target_file_size(&delete_target_property("9223372036854775807"))
+            .expect("i64::MAX itself parses"),
+        i64::MAX
+    );
+}
+
+/// C-035 element 4 (`"0"`). It PARSES — and is then rejected downstream by precondition (1) carrying
+/// Java's verbatim `'%s' is set to %s but must be > 0`. A `u64` parse would also parse it, so the
+/// discriminating half is the message.
+#[tokio::test]
+async fn test_parse_delete_target_zero_is_rejected_by_the_target_precondition() {
+    assert_eq!(
+        parse_delete_target_file_size(&delete_target_property("0")).expect("'0' parses"),
+        0
+    );
+
+    let (_temp, table) = config_table(&[("write.delete.target-file-size-bytes", "0")]).await;
+    let error = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect_err("a zero target must be rejected");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "'target-file-size-bytes' is set to 0 but must be > 0"
+    );
+}
+
+/// C-035 element 5 (a NEGATIVE decimal). `"-1"` PARSES as `i64` exactly as `Long.parseLong` parses it
+/// — a `u64` parse would reject it at the parse with a fork-only message — and is then rejected by
+/// precondition (1).
+///
+/// This is also the ORDER pin for C-006: at `target = -1` this port's `d2l` saturates BOTH ratio
+/// products to `0`, so `min = 0` and precondition (3) `target > min` (`-1 > 0`) is INDEPENDENTLY
+/// false. Hoisting (3) above (1) therefore reports the min-threshold message instead, and this
+/// assertion reds.
+#[tokio::test]
+async fn test_parse_delete_target_negative_is_rejected_by_the_target_precondition() {
+    assert_eq!(
+        parse_delete_target_file_size(&delete_target_property("-1"))
+            .expect("'-1' parses as i64, exactly as Long.parseLong parses it"),
+        -1
+    );
+
+    let (_temp, table) = config_table(&[("write.delete.target-file-size-bytes", "-1")]).await;
+    let error = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect_err("a negative target must be rejected");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "'target-file-size-bytes' is set to -1 but must be > 0"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-002 / C-032 — the target resolves from the DELETE property, never from the data-file one.
+// ------------------------------------------------------------------------------------------------
+
+/// C-002. No property ⇒ 64 MiB (Java `defaultTargetFileSize`'s `ldc2_w 67108864L`).
+#[tokio::test]
+async fn test_config_target_file_size_default_is_64_mib() {
+    let (_temp, table) = config_table(&[]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect("the defaults satisfy every precondition");
+    assert_eq!(config.target_file_size_bytes, 67108864);
+}
+
+/// C-002. The DELETE-specific property moves the target.
+#[tokio::test]
+async fn test_config_target_file_size_resolves_delete_property() {
+    let (_temp, table) = config_table(&[("write.delete.target-file-size-bytes", "12345678")]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect("12345678 satisfies every precondition");
+    assert_eq!(config.target_file_size_bytes, 12345678);
+    // The ratios follow the resolved target, not the default.
+    assert_eq!(config.min_file_size_bytes, 9259258);
+    assert_eq!(config.max_file_size_bytes, 22222220);
+}
+
+/// C-002, the NEGATIVE CONTROL. `write.target-file-size-bytes` is the DATA-file target (512 MiB) and
+/// must not move the delete target by so much as a byte — Java's
+/// `BinPackRewritePositionDeletePlanner.defaultTargetFileSize` never reads it. Reds if the port
+/// resolves from `TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES`.
+#[tokio::test]
+async fn test_config_write_target_file_size_does_not_move_delete_target() {
+    let (_temp, table) = config_table(&[("write.target-file-size-bytes", "536870912")]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect("the delete defaults still hold");
+    assert_eq!(
+        config.target_file_size_bytes, 67108864,
+        "the data-file target must not leak into the delete target"
+    );
+    assert_ne!(config.target_file_size_bytes, 536870912);
+}
+
+/// C-001. The builder wins over the property.
+#[tokio::test]
+async fn test_config_target_file_size_builder_overrides_property() {
+    let (_temp, table) = config_table(&[("write.delete.target-file-size-bytes", "12345678")]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .target_file_size_bytes(99_999_999)
+        .resolve_config()
+        .expect("99999999 satisfies every precondition");
+    assert_eq!(config.target_file_size_bytes, 99_999_999);
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-007 — the ratio defaults through the shared `d2l` helper.
+// ------------------------------------------------------------------------------------------------
+
+/// C-007. `min = d2l(target * 0.75)`; at the 64 MiB delete default that is EXACTLY 50331648 (dyadic,
+/// so no rounding is involved). Asserted as a literal so the ratio constant cannot drift.
+#[tokio::test]
+async fn test_config_min_file_size_default_is_three_quarters_target() {
+    let (_temp, table) = config_table(&[]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect("the defaults satisfy every precondition");
+    assert_eq!(config.min_file_size_bytes, 50331648);
+}
+
+/// C-007. `max = d2l(target * 1.8)`; at the 64 MiB delete default `1.8 * 2^26 = 120795955.2`, which
+/// Java's `d2l` TRUNCATES to 120795955. Asserted as a literal, so both the ratio and the truncation
+/// (vs rounding) are pinned.
+#[tokio::test]
+async fn test_config_max_file_size_default_is_one_point_eight_target() {
+    let (_temp, table) = config_table(&[]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect("the defaults satisfy every precondition");
+    assert_eq!(config.max_file_size_bytes, 120795955);
+}
+
+/// C-007, THE CLAMP. Java's `d2l` saturates at `Long.MAX_VALUE`; Rust's `as u64` saturates at
+/// `u64::MAX`, so `.min(i64::MAX as u64)` is the parity act.
+///
+/// The window in which it is OBSERVABLE is `target ∈ (2^63 / 1.8, i64::MAX - 1]`: there the clamped
+/// max IS `i64::MAX` while the unclamped one is larger, and BOTH are above the target, so
+/// `resolve_config` returns `Ok` either way and the equality is the discriminator rather than the
+/// Ok/Err split. `6e18` sits inside it.
+#[tokio::test]
+async fn test_config_max_file_size_clamps_to_java_long_max() {
+    const TARGET: u64 = 6_000_000_000_000_000_000;
+    // Fixture preconditions: inside the observable window, and the unclamped product really does
+    // exceed Java's ceiling (otherwise this test would pass with the clamp deleted).
+    assert!(
+        (TARGET as f64) > (i64::MAX as f64) / 1.8,
+        "fixture: the target must sit above 2^63 / 1.8"
+    );
+    let unclamped = (TARGET as f64 * 1.8) as u64;
+    assert!(
+        unclamped > i64::MAX as u64,
+        "fixture: the UNCLAMPED product must exceed Long.MAX_VALUE, else the clamp is unobservable"
+    );
+
+    let (_temp, table) = config_table(&[]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .target_file_size_bytes(TARGET)
+        .resolve_config()
+        .expect("target < clamped max, so this resolves");
+    assert_eq!(
+        config.max_file_size_bytes,
+        i64::MAX as u64,
+        "d2l must saturate at Long.MAX_VALUE, not at u64::MAX"
+    );
+    assert_ne!(config.max_file_size_bytes, unclamped);
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-001 — the remaining two ported options and their defaults.
+// ------------------------------------------------------------------------------------------------
+
+/// C-001. `min_input_files` defaults to Java's `MIN_INPUT_FILES_DEFAULT = 5`. Asserted with
+/// `assert_eq!` so it reds on a raise AND on a lower.
+///
+/// TODO(tests): the two-sided ADMISSION pin — four files declined, five admitted, at the DEFAULT
+/// config — belongs to the gate, not to this config seam, and is owed by the test increment.
+#[tokio::test]
+async fn test_config_min_input_files_default_is_five() {
+    let (_temp, table) = config_table(&[]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect("the defaults satisfy every precondition");
+    assert_eq!(config.min_input_files, 5);
+}
+
+/// C-001. `max_file_group_size_bytes` defaults to Java's
+/// `MAX_FILE_GROUP_SIZE_BYTES_DEFAULT = 107374182400` (100 GiB).
+#[tokio::test]
+async fn test_config_max_file_group_size_default_is_100_gib() {
+    let (_temp, table) = config_table(&[]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect("the defaults satisfy every precondition");
+    assert_eq!(config.max_file_group_size_bytes, 107374182400);
+    assert_eq!(config.max_file_group_size_bytes, 100 * 1024 * 1024 * 1024);
+}
+
+/// C-001. All five ported builders land on the resolved config — one assertion per option, so a
+/// builder wired to the wrong field reds.
+#[tokio::test]
+async fn test_config_explicit_overrides_are_returned_unchanged() {
+    let (_temp, table) = config_table(&[]).await;
+    let config = RewritePositionDeleteFiles::new(table)
+        .target_file_size_bytes(200_000)
+        .min_file_size_bytes(100_000)
+        .max_file_size_bytes(400_000)
+        .min_input_files(2)
+        .max_file_group_size_bytes(1_000_000)
+        .resolve_config()
+        .expect("a legal knob combination");
+    assert_eq!(config.target_file_size_bytes, 200_000);
+    assert_eq!(config.min_file_size_bytes, 100_000);
+    assert_eq!(config.max_file_size_bytes, 400_000);
+    assert_eq!(config.min_input_files, 2);
+    assert_eq!(config.max_file_group_size_bytes, 1_000_000);
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-006 — Java's `sizeThresholds` preconditions, each with Java's verbatim message.
+// ------------------------------------------------------------------------------------------------
+
+/// C-006 precondition (1), via the builder path.
+#[tokio::test]
+async fn test_resolve_config_rejects_target_zero() {
+    let (_temp, table) = config_table(&[]).await;
+    let error = RewritePositionDeleteFiles::new(table)
+        .target_file_size_bytes(0)
+        .resolve_config()
+        .expect_err("a zero target must be rejected");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "'target-file-size-bytes' is set to 0 but must be > 0"
+    );
+}
+
+/// C-006 precondition (1) at a NEGATIVE target — the ORDER-discriminating pin. See
+/// `test_parse_delete_target_negative_is_rejected_by_the_target_precondition` for why `min` is `0`
+/// here and why that makes precondition (3) independently false.
+#[tokio::test]
+async fn test_resolve_config_rejects_target_negative_with_the_must_be_positive_message() {
+    let (_temp, table) = config_table(&[("write.delete.target-file-size-bytes", "-7")]).await;
+    let error = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect_err("a negative target must be rejected");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "'target-file-size-bytes' is set to -7 but must be > 0",
+        "precondition (1) must report first: at a negative target the saturating d2l makes min = 0, \
+         so (3) `target > min` is independently false and a hoisted (3) would report instead"
+    );
+}
+
+/// C-006 precondition (3), STRICT: `target == min` is rejected, `target == min + 1` is not.
+#[tokio::test]
+async fn test_resolve_config_rejects_target_le_min() {
+    let (_temp, table) = config_table(&[]).await;
+    let error = RewritePositionDeleteFiles::new(table.clone())
+        .target_file_size_bytes(200_000)
+        .min_file_size_bytes(200_000)
+        .max_file_size_bytes(400_000)
+        .resolve_config()
+        .expect_err("target == min must be rejected (STRICT >)");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "'target-file-size-bytes' (200000) must be > 'min-file-size-bytes' (200000), all new files \
+         will be smaller than the min threshold"
+    );
+
+    // Two-sided: one byte above the min is legal, so the pin is not vacuous.
+    RewritePositionDeleteFiles::new(table)
+        .target_file_size_bytes(200_001)
+        .min_file_size_bytes(200_000)
+        .max_file_size_bytes(400_000)
+        .resolve_config()
+        .expect("target == min + 1 is legal");
+}
+
+/// C-006 precondition (4), STRICT: `target == max` is rejected, `target == max - 1` is not.
+#[tokio::test]
+async fn test_resolve_config_rejects_target_ge_max() {
+    let (_temp, table) = config_table(&[]).await;
+    let error = RewritePositionDeleteFiles::new(table.clone())
+        .target_file_size_bytes(400_000)
+        .min_file_size_bytes(100_000)
+        .max_file_size_bytes(400_000)
+        .resolve_config()
+        .expect_err("target == max must be rejected (STRICT <)");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "'target-file-size-bytes' (400000) must be < 'max-file-size-bytes' (400000), all new files \
+         will be larger than the max threshold"
+    );
+
+    // Two-sided: one byte below the max is legal.
+    RewritePositionDeleteFiles::new(table)
+        .target_file_size_bytes(399_999)
+        .min_file_size_bytes(100_000)
+        .max_file_size_bytes(400_000)
+        .resolve_config()
+        .expect("target == max - 1 is legal");
+}
+
+/// C-006 precondition (5).
+#[tokio::test]
+async fn test_resolve_config_rejects_min_input_files_zero() {
+    let (_temp, table) = config_table(&[]).await;
+    let error = RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(0)
+        .resolve_config()
+        .expect_err("min_input_files = 0 must be rejected");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "'min-input-files' is set to 0 but must be > 0"
+    );
+
+    RewritePositionDeleteFiles::new(table)
+        .min_input_files(1)
+        .resolve_config()
+        .expect("min_input_files = 1 is legal");
+}
+
+/// C-006 precondition (6).
+#[tokio::test]
+async fn test_resolve_config_rejects_max_file_group_size_zero() {
+    let (_temp, table) = config_table(&[]).await;
+    let error = RewritePositionDeleteFiles::new(table.clone())
+        .max_file_group_size_bytes(0)
+        .resolve_config()
+        .expect_err("max_file_group_size_bytes = 0 must be rejected");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "'max-file-group-size-bytes' is set to 0 but must be > 0"
+    );
+
+    RewritePositionDeleteFiles::new(table)
+        .max_file_group_size_bytes(1)
+        .resolve_config()
+        .expect("max_file_group_size_bytes = 1 is legal");
+}
+
+/// C-006 precondition (7) — ONE LEG PER KNOB. Java's thresholds are `long`s fed by `Long.parseLong`,
+/// so an override above `i64::MAX` is a config Java cannot express; admitting it would open a state
+/// in which `too_much_content` (`input_size > max`) is unreachable for every possible input.
+///
+/// Each leg sets exactly ONE over-range knob and asserts that knob's own message, which is what
+/// forces (7) to run at override-READ time: checked after (3)/(4) instead, the `min` leg would be
+/// caught by (3) and the `target` leg by (4), both with the wrong message.
+#[tokio::test]
+async fn test_resolve_config_rejects_size_override_above_i64_max() {
+    const ABOVE: u64 = i64::MAX as u64 + 1;
+    let (_temp, table) = config_table(&[]).await;
+
+    for (option, action) in [
+        (
+            "target-file-size-bytes",
+            RewritePositionDeleteFiles::new(table.clone()).target_file_size_bytes(ABOVE),
+        ),
+        (
+            "min-file-size-bytes",
+            RewritePositionDeleteFiles::new(table.clone()).min_file_size_bytes(ABOVE),
+        ),
+        (
+            "max-file-size-bytes",
+            RewritePositionDeleteFiles::new(table.clone()).max_file_size_bytes(ABOVE),
+        ),
+    ] {
+        let error = action
+            .resolve_config()
+            .expect_err("an override above i64::MAX must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid, "option {option}");
+        assert_eq!(
+            error.message(),
+            format!(
+                "Invalid value '{ABOVE}' for '{option}': it must be <= 9223372036854775807 — \
+                 Java's option is a `long`, so a larger threshold has no Java analogue"
+            ),
+            "option {option}"
+        );
+    }
+
+    // Two-sided: `i64::MAX` itself is accepted BY (7) on every knob (the `max` leg then resolves
+    // cleanly; the other two are rejected later, by (3)/(4), which is a different message).
+    RewritePositionDeleteFiles::new(table)
+        .max_file_size_bytes(i64::MAX as u64)
+        .resolve_config()
+        .expect("i64::MAX is inside Java's long domain");
+}
+
+/// C-035 element 3 downstream. `i64::MAX` PARSES, then falls to precondition (4): its defaulted max
+/// CLAMPS to `i64::MAX`, so `target < max` is false. Asserts `Err` + the message, never a resolved
+/// value.
+#[tokio::test]
+async fn test_resolve_config_rejects_target_at_i64_max_on_the_max_precondition() {
+    let (_temp, table) =
+        config_table(&[("write.delete.target-file-size-bytes", "9223372036854775807")]).await;
+    let error = RewritePositionDeleteFiles::new(table)
+        .resolve_config()
+        .expect_err("target == the clamped max must be rejected");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "'target-file-size-bytes' (9223372036854775807) must be < 'max-file-size-bytes' \
+         (9223372036854775807), all new files will be larger than the max threshold"
+    );
+}
