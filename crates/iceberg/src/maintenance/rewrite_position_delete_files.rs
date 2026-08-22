@@ -16,9 +16,13 @@
 // under the License.
 
 //! `RewritePositionDeleteFiles` — the engine-agnostic maintenance action that COMPACTS the live PARQUET
-//! position-delete files in the current snapshot, per `(spec, partition)` group, into FEWER position-delete
-//! files and commits the swap in one `Replace` snapshot per group. The Rust port of Java's
+//! position-delete files in the current snapshot, BIN-PACKED per `(spec, partition)` group, and commits
+//! the swap in one `Replace` snapshot per admitted BIN. The Rust port of Java's
 //! `org.apache.iceberg.actions.RewritePositionDeleteFiles` (api 1.10.0).
+//!
+//! The rewrite runs in BOTH directions, and the mask-identity promise holds in each: the many small files
+//! of a bin fuse into FEWER position-delete files, while a single file above `max_file_size_bytes` — which
+//! `too_much_content` admits ALONE, carrying no `size > 1` guard — SPLITS into two or more.
 //!
 //! # The Java contract this mirrors
 //!
@@ -26,7 +30,11 @@
 //! method `filter(Expression)` plus the inherited `execute() -> Result` (javap-verified against
 //! `iceberg-api` 1.10.0). `RewritePositionDeleteFiles$Result` exposes four counts —
 //! `rewrittenDeleteFilesCount()` / `addedDeleteFilesCount()` (`int`) and `rewrittenBytesCount()` /
-//! `addedBytesCount()` (`long`) — mirrored 1:1 by [`RewritePositionDeleteFilesResult`]. The PLANNING +
+//! `addedBytesCount()` (`long`) — carried by [`RewritePositionDeleteFilesResult`]. NOT 1:1, and
+//! deliberately so: javap of `iceberg-api` 1.10.0 shows `Result` has FIVE members, of which those four
+//! counts are DEFAULT methods derived from the one ABSTRACT member
+//! `rewriteResults() -> List<FileGroupRewriteResult>`. That per-group list is DEFERRED — see the
+//! deferral block on [`RewritePositionDeleteFiles`] and `docs/parity/GAP_MATRIX.md` row R136. The PLANNING +
 //! COMMIT machinery is engine-agnostic iceberg-core (`BinPackRewritePositionDeletePlanner` groups by
 //! partition; `RewritePositionDeletesCommitManager` runs `newRewrite().validateFromSnapshot(J)
 //! .deleteFile(rewritten).addFile(added, J).commit()` where `J` = the group MAX rewritten data-seq); the
@@ -39,17 +47,26 @@
 //! the twelve Java `ActionsProvider` methods (`rewritePositionDeletes(Table)`), so it is wired into the
 //! [`ActionsProvider`](crate::maintenance::ActionsProvider) factory.
 //!
-//! # The compaction (many parquet pos-deletes → fewer)
+//! # The compaction (fuse in one direction, split in the other)
 //!
 //! A position-delete file deletes rows by `(file_path, pos)`. Compaction reads the `(file_path, pos)`
-//! pairs out of EVERY live parquet position-delete file in a `(spec, partition)` group, concatenates and
-//! sorts them, and writes them into FEWER position-delete files that mask EXACTLY the same rows. A
-//! merge-on-read scan therefore returns an identical live row set before and after.
+//! pairs out of every live parquet position-delete file the gate ADMITS in a `(spec, partition)` group,
+//! concatenates and sorts them, and writes them into position-delete files that mask EXACTLY the same
+//! rows. A merge-on-read scan therefore returns an identical live row set before and after.
+//!
+//! The file COUNT moves in BOTH directions, and that mask-identity promise holds either way:
+//!
+//! - **FUSE** — a bin of many small files (the common case, and the only one this action could reach
+//!   before the size gate) is rewritten into FEWER position-delete files.
+//! - **SPLIT** — a bin whose single file exceeds `max_file_size_bytes` is admitted ALONE, because
+//!   `too_much_content` carries no `size > 1` guard, and is rewritten into TWO OR MORE files as the
+//!   rolling writer rolls at `write_max_file_size`.
 //!
 //! This action is a STRICT SUBSET of `ConvertEqualityDeleteFiles`: there is no data-file row matching, no
 //! survival-predicate inversion, and no equality-tuple parsing — the positions are read directly off the
-//! delete files. For each `(spec_id, partition)` group of live parquet position-delete files (optionally
-//! restricted by [`RewritePositionDeleteFiles::filter`], applied to each delete file's partition):
+//! delete files. The live parquet position-delete files (optionally restricted by
+//! [`RewritePositionDeleteFiles::filter`], applied to each delete file's partition) are grouped by
+//! `(spec_id, partition)`, bin-packed, and gated; then for each ADMITTED BIN:
 //!
 //! 1. Read each live parquet position-delete file's two RESERVED columns — `file_path` (reserved field id
 //!    [`RESERVED_FIELD_ID_DELETE_FILE_PATH`] = `2147483546`) and `pos`
@@ -59,22 +76,29 @@
 //! 2. Concatenate every group member's pairs and sort by `(file_path, pos)` (the spec-recommended
 //!    position-delete ordering). Java does NOT dedup within a group — the reader bitmap dedups — so
 //!    duplicates are harmless; we sort and keep them.
-//! 3. Write the sorted pairs into FEWER position-delete files (one per group) under the group's spec +
+//! 3. Write the sorted pairs into the bin's compacted position-delete file(s) under the group's spec +
 //!    partition key, via the [`PositionDeleteFileWriter`](crate::writer::base_writer::position_delete_writer).
-//! 4. Compute the group MAX rewritten data sequence number (staller — see below).
-//! 5. Commit ONE [`RewriteFilesAction`](crate::transaction::rewrite_files) per group that REPLACES the
-//!    rewritten position-delete files with the new ones, STAMPING the new file with the group MAX
-//!    rewritten data-seq (via `add_delete_file_with_sequence_number`, NOT the default-inherit
-//!    `add_delete_file`) and validating from the starting snapshot.
+//!    ONE output for a bin that fits under `write_max_file_size`, SEVERAL for a bin above it — so a bin
+//!    of many small files fuses into fewer, and a lone oversized file splits into more.
+//! 4. Compute THAT BIN's MAX rewritten data sequence number (staller — see below).
+//! 5. Commit ONE [`RewriteFilesAction`](crate::transaction::rewrite_files) per admitted BIN that REPLACES
+//!    that bin's rewritten position-delete files with ALL of its new ones, STAMPING EACH new file with
+//!    that bin's MAX rewritten data-seq (via `add_delete_file_with_sequence_number`, NOT the
+//!    default-inherit `add_delete_file`) and validating from the starting snapshot.
 //!
 //! # The silent-corruption staller (handled EXPLICITLY): SEQ STAMPING
 //!
-//! The added compacted file MUST be stamped with the group MAX rewritten data sequence number — NOT the
-//! inherited (higher) seq, NOT the min. A position delete applies to data with `data_seq < delete_seq`;
-//! stamping the MAX of the rewritten group's data-seqs preserves exactly which data generation the
-//! compacted delete masks. A wrong (higher / inherited) seq makes the compacted pos-delete stop applying
-//! to its older data and RESURRECTS deleted rows; a wrong (lower) seq over-applies. Java's
-//! `RewritePositionDeletesCommitManager` adds the rewritten file with `Long.valueOf(maxRewrittenSeq)`
+//! EVERY file a bin adds MUST be stamped with THAT BIN's MAX rewritten data sequence number — NOT the
+//! inherited (higher) seq, NOT the min, and NOT another bin's max. A position delete applies to data with
+//! `data_seq <= delete_seq`: `delete_file_index.rs`'s `applicable_pos_deletes` keeps a delete whose
+//! `delete_seq >= data_seq` (the STRICT form is `applicable_eq_deletes`' EQUALITY-delete rule, not this
+//! one). Stamping the MAX of the rewritten bin therefore preserves exactly which data generation the
+//! compacted delete masks.
+//!
+//! DIRECTION OF DANGER, read off that same rule: an OVER-HIGH (e.g. inherited) stamp reaches data the
+//! rewritten deletes never masked and OVER-APPLIES — it deletes rows it must not; an UNDER-LOW stamp
+//! stops applying to the bin's own higher-seq data and RESURRECTS rows it must delete. Java's
+//! `RewritePositionDeletesCommitManager` adds EACH rewritten file with `Long.valueOf(maxRewrittenSeq)`
 //! exactly for this reason.
 //!
 //! # Planning — Java's six-stage pipeline
@@ -387,11 +411,58 @@ struct ResolvedConfig {
 /// - `max_file_size_bytes` = `1.8 * target` (resolved lazily when unset).
 /// - `min_input_files` = 5.
 /// - `max_file_group_size_bytes` = 100 GiB.
-// TODO(doc pass): the `# Deferred (loudly)` block enumerating the six unported options
-// (`rewrite-all` with its inverted-emulation warning, `rewrite-job-order`,
-// `partial-progress.enabled`, `partial-progress.max-commits`, `max-concurrent-file-group-rewrites`
-// and `output-spec-id` with its carry-forward citation) is written in this PR's documentation
-// increment. It is deliberately NOT drafted here — its text is owned by that increment.
+///
+/// # Deferred (loudly)
+///
+/// Java's option domain here is ELEVEN keys: `SizeBasedFileRewritePlanner.validOptions()` (six `ldc`
+/// strings) plus `BinPackRewritePositionDeletePlanner`'s ONE addition (`rewrite-job-order`), plus
+/// `output-spec-id`, which the INHERITED `SizeBasedFileRewritePlanner.init(Map)` reads OUTSIDE
+/// `validOptions()`, plus the THREE that the Java ACTION interface `RewritePositionDeleteFiles`
+/// declares and no planner `validOptions()` carries — `partial-progress.enabled`,
+/// `partial-progress.max-commits` and `max-concurrent-file-group-rewrites` (javap of `iceberg-api`
+/// 1.10.0). Five are ported above; the other SIX are deferred, here, by name:
+///
+/// - **`rewrite-all`** — NOT exposed, and NOT emulable through the ported knobs. **The emulation is
+///   INVERTED, so do not attempt it.** `planFileGroups(Iterable)` branches
+///   `rewriteAll ? tasks : filterFiles` at offset 4 and `rewriteAll ? bins : filterFileGroups` at
+///   offset 47, with the `new BinPacking$ListPacker(maxGroupSize, 1, false)` construction BETWEEN
+///   them running UNCONDITIONALLY: `rewriteAll` bypasses BOTH filters while KEEPING the packing.
+///   Reaching for `min_file_size_bytes(0)` + a huge `max_file_size_bytes` + `min_input_files(1)`
+///   instead makes `is_candidate` (Java `outsideDesiredFileSizeRange`) false for EVERY file —
+///   `length < 0` and `length > max` are both false — which empties the CANDIDATE set upstream of
+///   the packer and admits NOTHING. That is the exact INVERSE of `rewriteAll`'s intent. (The
+///   literal `u64::MAX` does not even get that far: precondition (7) rejects it before the
+///   candidate filter runs, so the failure is loud rather than silent; every LEGAL large value
+///   gives the silent-empty outcome.) Template precedent:
+///   [`RewriteDataFiles`](super::rewrite_data_files::RewriteDataFiles) defers it too and has no
+///   `rewrite_all` field either.
+/// - **`rewrite-job-order`** — the subclass's one added option. Bins are planned and committed in
+///   plan order; there is no cost/size ordering of the rewrite jobs.
+/// - **`partial-progress.enabled`** — each admitted bin commits in its OWN `RewriteFiles`
+///   transaction, sequentially. See [`Self::execute`]'s abort contract: a failure mid-loop leaves
+///   the bins already committed standing and returns `Err` with no partial `Result`.
+/// - **`partial-progress.max-commits`** — meaningless without the flag above; there is no
+///   commit batching and no failure tolerance to size.
+/// - **`max-concurrent-file-group-rewrites`** — the bin sweep is SEQUENTIAL; there is no executor
+///   seam and `executeWith(ExecutorService)` is not ported.
+/// - **`output-spec-id`** — not exposed. Each bin's outputs are written under the spec of the group
+///   the bin came from (`GroupKey.0`), which is what Java's pos-delete WRITE path actually does:
+///   `SparkRewritePositionDeleteRunner.doRewrite` / `SparkPositionDeletesRewriteBuilder.specId`
+///   resolve the output spec from the FIRST rewritten delete file's `specId()` and never consult
+///   `outputSpecId()`. **Cited, not re-derived here** — that is the prior closing Critic's firsthand
+///   Spark read, carried forward. Were it false, this action's `GroupKey.0` output-spec selection
+///   would diverge from Java on spec-evolved tables.
+///
+/// Deferred alongside them, and NOT an option key:
+///
+/// - **The per-group `Result` list.** Java's `RewritePositionDeleteFiles$Result` has FIVE members
+///   (javap, `iceberg-api` 1.10.0): the ONE abstract `rewriteResults() -> List<FileGroupRewriteResult>`
+///   plus the four counts, which are DEFAULT methods derived from it.
+///   [`RewritePositionDeleteFilesResult`] carries only the four aggregate counts; the per-group list
+///   is NOT added. This became a real loss of information IN THIS CHANGE and is named as a residue on
+///   `docs/parity/GAP_MATRIX.md` row R136: until the size gate landed, a partition produced exactly
+///   ONE group, so the per-group list was inferable from the aggregates; now that a partition can
+///   yield SEVERAL bins, it is not.
 pub struct RewritePositionDeleteFiles {
     table: Table,
     filter: Predicate,
@@ -534,13 +605,16 @@ impl RewritePositionDeleteFiles {
         // Resolve + VALIDATE the size / count thresholds BEFORE any manifest is read, mirroring Java,
         // where `sizeThresholds` runs at planner `init` and therefore before planning.
         //
-        // BEHAVIOUR FLIP (4th, for the PR body): `write.delete.target-file-size-bytes` is a standard
-        // Iceberg property that Java writers and users already set, so a PRE-EXISTING table carrying
-        // it with an unparsable value, a value above `i64::MAX`, or a value <= 1 now makes `execute`
-        // return `Err` where it previously returned counts. (At 1 the defaulted max is `d2l(1.8)`
-        // = 1, so the STRICT `target < max` fires; from 2 up every precondition passes.) This is
-        // parity-correct — Java throws on exactly the same inputs — but it IS a flip, and R-9's
-        // PR-body list currently names only three.
+        // BEHAVIOUR FLIP (4th, named in the PR body): `write.delete.target-file-size-bytes` is a
+        // standard Iceberg property that Java writers and users already set, so a PRE-EXISTING table
+        // carrying it with a value in {unparsable, > i64::MAX, <= 1, == i64::MAX} now makes `execute`
+        // return `Err` where it previously returned counts. FOUR elements, not three, and they die at
+        // two different mechanisms: unparsable text and a magnitude above `i64::MAX` are rejected at
+        // the `i64` PARSE; `<= 0` at precondition (1); `== 1` at (4), because the defaulted max is
+        // `d2l(1 * 1.8)` = 1 and `target < max` is STRICT; and `== i64::MAX` at (4) as well, because
+        // `target as f64` rounds to 2^63 and `d2l` CLAMPS `2^63 * 1.8` back to `i64::MAX`, so the
+        // defaulted max equals the target. From 2 up to `i64::MAX - 1` every precondition passes.
+        // This is parity-correct — Java throws on exactly the same inputs — but it IS a flip.
         let config = self.resolve_config()?;
 
         let metadata = self.table.metadata();
@@ -616,8 +690,10 @@ impl RewritePositionDeleteFiles {
     /// reword:
     ///
     /// - (5) `min_input_files > 0` and (6) `max_file_group_size_bytes > 0` — Java's own
-    ///   `checkArgument`s on the same two options, raised in `SizeBasedFileRewritePlanner.init(Map)`
-    ///   rather than in `sizeThresholds`. Reproduced here in Java's message shape, checked after (4).
+    ///   `checkArgument`s on the same two options. The opcodes live in the PRIVATE
+    ///   `SizeBasedFileRewritePlanner.minInputFiles(Map)` / `maxGroupSize(Map)`, each called once
+    ///   from `init(Map)` — true of the call path, not of the declaring method — rather than in
+    ///   `sizeThresholds`. Reproduced here in Java's message shape, checked after (4).
     /// - (7) every EXPLICIT builder override of the three size knobs is `<= i64::MAX`. THIS one has
     ///   no Java analogue: Java's thresholds are `long`s fed by `Long.parseLong`, so a larger value
     ///   is a config Java cannot express, and admitting it would open a state in which
@@ -678,7 +754,7 @@ impl RewritePositionDeleteFiles {
         // The target stays in the `i64` domain until precondition (1) has run, so a negative property
         // value reaches (1) exactly as it reaches Java's `checkArgument`.
         let target = match self.target_file_size_bytes {
-            // In range by (7) above, so the widening cast cannot truncate.
+            // In range by (7) above, so the narrowing cast cannot truncate.
             Some(target) => target as i64,
             None => parse_delete_target_file_size(self.table.metadata().properties())?,
         };
@@ -890,7 +966,10 @@ impl RewritePositionDeleteFiles {
     /// with the bin MAX rewritten data-seq and validated from the starting snapshot. Accumulates the
     /// four `Result` counts.
     ///
-    /// The bin may produce MORE THAN ONE output file: the rolling writer rolls at
+    /// The output COUNT moves in BOTH directions and the mask-identity promise holds either way: a bin
+    /// of many small files FUSES into FEWER files than it rewrote, while a bin admitted on
+    /// `too_much_content` alone (one file above `max_file_size_bytes`, no `size > 1` guard) SPLITS into
+    /// more. The bin may therefore produce MORE THAN ONE output file: the rolling writer rolls at
     /// [`ResolvedConfig::write_max_file_size`], so a bin larger than that bound splits. Every output
     /// of THIS bin carries THIS bin's own max — Java's
     /// `RewritePositionDeletesGroup.maxRewrittenDataSequenceNumber` ranges the max over that GROUP's

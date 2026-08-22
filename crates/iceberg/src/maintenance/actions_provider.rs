@@ -315,9 +315,16 @@ impl ActionsProvider for Actions {
     }
 
     /// Returns a [`RewritePositionDeleteFiles`] action for `table` (Java
-    /// `rewritePositionDeletes(Table)`). Configure it with [`RewritePositionDeleteFiles::filter`] and run
-    /// it with [`RewritePositionDeleteFiles::execute`] — it compacts the live PARQUET position-delete
-    /// files per `(spec, partition)` group into fewer files, preserving the masked row set.
+    /// `rewritePositionDeletes(Table)`). Configure it with [`RewritePositionDeleteFiles::filter`] plus
+    /// the five ported size / count options —
+    /// [`target_file_size_bytes`](RewritePositionDeleteFiles::target_file_size_bytes),
+    /// [`min_file_size_bytes`](RewritePositionDeleteFiles::min_file_size_bytes),
+    /// [`max_file_size_bytes`](RewritePositionDeleteFiles::max_file_size_bytes),
+    /// [`min_input_files`](RewritePositionDeleteFiles::min_input_files) and
+    /// [`max_file_group_size_bytes`](RewritePositionDeleteFiles::max_file_group_size_bytes) — and run it
+    /// with [`RewritePositionDeleteFiles::execute`]. It bin-packs the CANDIDATE PARQUET position-delete files
+    /// of each `(spec, partition)` group and rewrites every bin Java's three-clause admission gate
+    /// admits, preserving the masked row set. The file-count floor is `min_input_files`, DEFAULT FIVE.
     /// **This action rewrites delete files.**
     fn rewrite_position_deletes(&self, table: Table) -> Result<RewritePositionDeleteFiles> {
         Ok(RewritePositionDeleteFiles::new(table))

@@ -68,11 +68,17 @@
 //!   Java's javap-confirmed 12-method surface). Returns a [`ConvertEqualityDeleteFilesResult`] mirroring
 //!   Java `Result`'s two `int` counts. **This action rewrites delete files.**
 //! - [`RewritePositionDeleteFiles`] — COMPACT the live PARQUET position-delete files in the current
-//!   snapshot, per `(spec, partition)` group, into FEWER position-delete files and commit the swap in one
-//!   `Replace` snapshot per group (the Rust port of Java 1.10.0 `RewritePositionDeleteFiles`). For each
-//!   group of 2+ live parquet pos-deletes: read every member's `(file_path, pos)` pairs by RESERVED FIELD
-//!   ID, concat + sort, write one compacted file, and commit ONE `RewriteFiles` STAMPING the compacted
-//!   file with the group MAX rewritten data seq (via `add_delete_file_with_sequence_number`, NOT inherit)
+//!   snapshot, BIN-PACKED per `(spec, partition)` group, and commit the swap in one `Replace` snapshot
+//!   per admitted BIN (the Rust port of Java 1.10.0 `RewritePositionDeleteFiles`). Each partition's
+//!   candidate files (Java `filterFiles`: `length` outside `[min_file_size_bytes, max_file_size_bytes]`)
+//!   are bin-packed at `max_file_group_size_bytes`, and a bin is ADMITTED on Java's three-clause gate
+//!   `enough_input_files || enough_content || too_much_content` — so the file-count floor is
+//!   `min_input_files`, DEFAULT FIVE, and a LONE file above `max_file_size_bytes` is admitted anyway
+//!   (`too_much_content` has no `size > 1` guard). For each admitted bin: read every member's
+//!   `(file_path, pos)` pairs by RESERVED FIELD ID, concat + sort, write the compacted file(s) —
+//!   FEWER than the bin rewrote when it fuses, MORE when a lone oversized file splits at
+//!   `writeMaxFileSize` — and commit ONE `RewriteFiles` STAMPING EVERY new file with THAT BIN's MAX
+//!   rewritten data seq (via `add_delete_file_with_sequence_number`, NOT inherit)
 //!   so it masks exactly the same data generation. Puffin V3 DELETION VECTORS are SKIPPED (file-scoped,
 //!   never bin-packed) — V2 PARQUET only (documented divergence, GAP_MATRIX row R136). A STRICT SUBSET of
 //!   `ConvertEqualityDeleteFiles` (no row matching / predicate inversion / tuple parsing). One of the

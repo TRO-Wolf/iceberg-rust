@@ -751,3 +751,31 @@ rather than restate.
 **Known residues that stay open** (14, each homed): the sibling roll bound (RES-1), the
 `(spec_id, partition)` grouping key (RES-2), the fork-only non-Parquet skip (RES-3), per-bin commit
 granularity (RES-4), and ten others enumerated in the ledger.
+
+**Follow-ups FILED by this unit, deliberately NOT fixed in it** (each a pre-existing defect that this
+change does not falsify, so R-10's in-scope test does not reach it):
+
+- **Sequence-direction inversion in `crates/iceberg/src/transaction/rewrite_files.rs`** (R-13, named
+  residue). SEVEN statements about the seq stamped on a rewritten DELETE file, verified at source
+  2026-08-22 — FIVE inverted, TWO direction-less. INVERTED: the module rustdoc's "Added-delete
+  SEQUENCE NUMBER" paragraph, `add_delete_file`'s rustdoc, `add_delete_file_with_sequence_number`'s
+  rustdoc, the in-code comment on the ADDED-DELETE negative-seq guard, and the user-facing
+  `DataInvalid` message that same guard emits — all say a HIGHER (inherited) seq makes the delete
+  stop applying and RESURRECT rows, with `add_delete_file_with_sequence_number` also calling a LOWER
+  seq an over-apply. DIRECTION-LESS: the `added_delete_files` field doc ("stops applying (rows
+  resurrect) or over-applies") and `test_rewrite_add_delete_file_negative_sequence_number_rejected`'s
+  rustdoc ("resurrection/over-deletion"). Seven is the MEASURED set, not a ceiling — re-derive it in
+  the unit rather than trusting this count. Backwards: `delete_file_index.rs`'s
+  `applicable_pos_deletes` keeps a delete whose `delete_seq >= data_seq`, so a HIGHER stamp reaches
+  data it never masked and OVER-APPLIES while a LOWER stamp RESURRECTS. The same paragraphs also give
+  the applicability rule as the STRICT `data_seq < delete_seq`, which is `applicable_eq_deletes`'
+  equality-delete rule, not the position-delete one. `add_delete_file_with_sequence_number` is the
+  very call `RewritePositionDeleteFiles` now fans out from one to N. Wrong before this PR, so outside
+  its manifest; open a bounded doc unit. (The DATA-file paragraphs in the same file — a fresh higher
+  seq on an added DATA file making outstanding equality deletes stop applying — are CORRECT and must
+  not be "fixed" alongside them.)
+- **Stale bare-number matrix citation "GAP_MATRIX row 134"** in `crates/iceberg/tests/map.md` and
+  `dev/java-interop/map.md` (C-038 residue). R134 is `DeleteOrphanFiles`; the intended row is R136.
+  Both files are OUT of this unit's manifest (R-10) and both stay accurate otherwise, so the
+  citation is recorded here rather than drive-by fixed. Bare-number citations are exactly the class
+  `make check-matrix-anchors` was built to retire — fix with the `row R136` anchor form.
