@@ -19,8 +19,9 @@
 //! merge-on-read live row set is asserted IDENTICAL before (many parquet pos-deletes) and after (fewer,
 //! compacted pos-deletes), plus the four `Result` counts. The crown jewel + the seq-stamp test pin the
 //! silent-corruption staller (the compacted file must carry the group MAX rewritten data seq); the
-//! grouping + partition-isolation tests pin the `(spec, partition)` planning; the DV test pins the
-//! V2-parquet-only scope (a Puffin deletion vector is NOT compacted).
+//! grouping + partition-isolation tests pin the `(spec, partition)` planning; the C-008 format
+//! battery pins the V2-parquet-only scope over all four `DataFileFormat` variants (a Puffin
+//! deletion vector, a V2 ORC pos-delete and a V2 Avro pos-delete are all SKIPPED, not compacted).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -34,8 +35,8 @@ use crate::io::LocalFsStorageFactory;
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Literal, ManifestContentType,
-    NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema as IcebergSchema, Struct,
-    Transform, Type,
+    NestedField, Operation, PartitionKey, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
+    SnapshotRef, Struct, Transform, Type,
 };
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::position_delete_writer::{
@@ -771,72 +772,164 @@ async fn test_filter_restricts_compacted_partitions() {
 }
 
 // =================================================================================================
-// V3 DELETION-VECTOR SCOPE — a DV is NOT compacted by this action.
+// C-008 — THE FORMAT SKIP. `file_format() != Parquet` drops EVERY non-Parquet position delete, a
+// FORK DIVERGENCE from Java's format-blind `BinPackRewritePositionDeletePlanner` (zero
+// case-insensitive `FileFormat` / `PUFFIN` matches in its class file; Java's DV avoidance lives one
+// level up, in the Spark action). `DataFileFormat` is a CLOSED four-variant enum
+// (`spec/manifest/data_file.rs:387-396`) and the predicate reads exactly that field, so the four
+// variants exhaust the domain:
+//
+//   Parquet -> KEPT.    Pinned by every admission test below.
+//   Puffin  -> DROPPED. `test_v3_deletion_vectors_are_not_compacted` (immediately below).
+//   Orc     -> DROPPED. `test_non_parquet_position_deletes_skipped_at_collection_orc`.
+//   Avro    -> DROPPED. `test_non_parquet_position_deletes_skipped_at_collection_avro`.
+//
+// Every one of the three DROPPED pins carries the SAME applied mutation — delete the
+// `file_format() != Parquet` skip — and each is armed independently: five same-partition entries at
+// the DEFAULT floor of five, so the mutated build forms one admissible bin.
+//
+// NON-REDUNDANT, MEASURED not argued. Four mutations were APPLIED against the whole lib suite
+// (population 3378) and their failure sets recorded:
+//
+//   delete the skip entirely                       -> 3 RED: puffin + orc + avro, nothing else
+//   exempt Orc    (`Parquet | Orc` in the skip)    -> 1 RED: orc only
+//   exempt Avro   (`Parquet | Avro`)               -> 1 RED: avro only
+//   exempt Puffin (`Parquet | Puffin`)             -> 1 RED: puffin only
+//
+// So each variant of the closed enum has a mutant that ONLY its own pin kills — none of the three
+// is a duplicate of another, and no other test in the suite covers any of them.
+//
+// DISCLOSURE — C-036 NEEDS A THIRTEENTH RECIPE, and by its own rule ("a pin needing a tenth recipe
+// is a finding") that is a finding, filed here rather than silently invented. All three pins below
+// stand on a fixture the enumeration does not describe, and so do two PRE-EXISTING tests:
+//
+//   * RECIPE 13 — the DEFAULT-FLOOR ADMISSIBLE BIN. FIVE SUB-MIN position-delete entries in ONE
+//     partition at the SHIPPED defaults, NO knobs; asserted by every measured size < the resolved
+//     `min_file_size_bytes` and `min_input_files == 5`, so the five are all candidates, pack into
+//     one bin and clear `enough_input_files` on their own.
+//
+// It is NOT recipe 8 (five IN-RANGE files, zero candidates, the candidate filter's existence pin)
+// and not recipe 7 (four files behind four explicit knobs). It is the fixture a pin needs whenever
+// the thing under test must be reached THROUGH admission at the default config rather than around
+// it — which is why `test_admission_min_input_files_default_five_declines_four_admits_five` (G2)
+// and `test_admitted_bin_with_zero_pairs_is_skipped` (G4) already built it before this group did.
+// This extends G3's recipe 10/11/12 finding; the ledger edit is outside this group's fence and is
+// carried as a hand-off.
+//
+// ADJUDICATION, recorded because two clauses name this fixture. C-008's enumeration names the
+// Puffin pin `test_non_parquet_position_deletes_skipped_at_collection_puffin`, while C-014 element 7
+// rules the PRE-EXISTING `test_v3_deletion_vectors_are_not_compacted` "reworked to FIVE Puffin DVs,
+// NO KNOB". Both describe the SAME fixture (five Puffin DVs, one partition, default config) and the
+// SAME pin form (the applied skip mutation), so they are ONE test, not two: a duplicate would share
+// the single mutant and discriminate nothing. The pre-existing NAME is kept, because C-014's
+// disposition table cites it and the V3-DV scope is the older, wider claim; C-008's Puffin element
+// is discharged here and cross-referenced above, so neither scope loses its pin.
 // =================================================================================================
 
-/// V2-PARQUET-ONLY SCOPE. On a V3 table, TWO data files in partition 0 are each masked by a Puffin
-/// DELETION VECTOR. A DV is file-scoped and never bin-packed, so this action must SKIP both — even
-/// though they share `(spec 0, partition 0)` and would otherwise form a compactable 2-file group. The
-/// action is a no-op: both DVs stay live, the read set is unchanged.
+/// V2-PARQUET-ONLY SCOPE, and C-008's Puffin element. On a V3 table, FIVE data files in partition 0
+/// are each masked by a Puffin DELETION VECTOR. A DV is file-scoped and never bin-packed, so this
+/// action must SKIP all five — even though they share `(spec 0, partition 0)` and, at five files,
+/// would form an admissible bin under Java's DEFAULT `min_input_files` of five. The action is a
+/// no-op: all five DVs stay live, the read set is unchanged.
 ///
-/// MUTATION COVERAGE: drop the `file_format() != Parquet` skip and the two DVs would be enumerated as a
-/// 2-file `(spec 0, partition 0)` "position delete" group — passing the `entries.len() < 2` guard — and
-/// the action would try to read each Puffin DV as a parquet file (failing the read, or wrongly handling it).
-/// This test (zero counts, both DVs intact, read identity) fails. The 2-DV group is what makes the skip
-/// load-bearing (a single DV would be dropped by the single-file-group guard regardless).
-/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
-/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is the V2-PARQUET-ONLY scope — not
-/// admission. It therefore sets `.min_input_files(2)` explicitly, which is also acceptance item
-/// 2: the floor is configuration, not a hard-coded constant. Its PIN FORM is the APPLIED
-/// mutation above, NOT knob removal: with the Parquet skip in place both DVs are dropped at S1,
-/// so the action is a no-op with or without the knob, and removing it leaves this test GREEN.
-/// The knob is load-bearing only for the MUTATED build, where the two DVs form an admissible
-/// 2-file bin. The stronger rework — five Puffin DVs at the default config, no knob — is ruled
-/// to the test increment.
+/// NO KNOB, deliberately (C-014 element 7). The previous form was a TWO-DV fixture carrying
+/// `.min_input_files(2)`, and that knob was load-bearing only for the MUTATED build — under the
+/// size gate a two-file group is below the floor, so the mutant that deletes the skip would have
+/// been declined by admission rather than caught by this test. FIVE DVs at the shipped defaults
+/// remove the knob and the dependency on it: the mutated build clears `enough_input_files` on its
+/// own (5 > 1 and 5 >= 5), so this pin now measures the SKIP and nothing else.
+///
+/// MUTATION COVERAGE — APPLIED, not predicted: delete the `file_format() != Parquet` skip in
+/// `collect_position_delete_groups` and the five DVs are enumerated as a five-file
+/// `(spec 0, partition 0)` "position delete" group, admitted by `enough_input_files`, and read as
+/// parquet by `compact_group`. RED.
+///
+/// FIXTURE PRECONDITIONS asserted before `execute` (so a drifted fixture reds instead of passing
+/// vacuously): five DVs in ONE partition, every one sub-min, and the resolved floor is FIVE.
 #[tokio::test]
 async fn test_v3_deletion_vectors_are_not_compacted() {
     let (catalog, _temp) = local_fs_catalog().await;
     let table = create_partitioned_table(&catalog, FormatVersion::V3).await;
 
-    let a = write_data_file(&table, "a.parquet", 0, &[(0, 10, 1), (0, 20, 2)]).await;
-    let b = write_data_file(&table, "b.parquet", 0, &[(0, 30, 3), (0, 40, 4)]).await;
-    let a_path = a.file_path().to_string();
-    let b_path = b.file_path().to_string();
-    let table = append_files(&catalog, &table, vec![a, b]).await;
+    // FIVE data files in partition 0, each holding two rows; the DV below masks the SECOND.
+    let mut data_paths = Vec::new();
+    let mut files = Vec::new();
+    for (index, y) in [10i64, 20, 30, 40, 50].into_iter().enumerate() {
+        let file = write_data_file(&table, &format!("dv-target-{index}.parquet"), 0, &[
+            (0, y, 1),
+            (0, y + 1, 2),
+        ])
+        .await;
+        data_paths.push(file.file_path().to_string());
+        files.push(file);
+    }
+    let table = append_files(&catalog, &table, files).await;
 
-    // Two Puffin DVs in the SAME partition 0: one masks a.y=20 (pos 1), one masks b.y=30 (pos 0).
-    let dva = write_deletion_vector(&table, &a_path, &[1]).await;
-    let table = add_deletes(&catalog, &table, vec![dva]).await;
-    let dvb = write_deletion_vector(&table, &b_path, &[0]).await;
-    let table = add_deletes(&catalog, &table, vec![dvb]).await;
+    // FIVE Puffin DVs in the SAME partition 0 — one per data file, each masking its position 1.
+    let mut table = table;
+    for path in &data_paths {
+        let dv = write_deletion_vector(&table, path, &[1]).await;
+        table = add_deletes(&catalog, &table, vec![dv]).await;
+    }
 
     let before = scan_y_values(&table).await;
     assert_eq!(
         before,
-        HashSet::from([10, 40]),
-        "before: the two DVs mask a.y=20 and b.y=30"
+        HashSet::from([10, 20, 30, 40, 50]),
+        "before: each DV masks its data file's second row (y = 11, 21, 31, 41, 51)"
     );
 
-    let result = RewritePositionDeleteFiles::new(table.clone())
-        .min_input_files(2)
-        .execute(&catalog)
-        .await
-        .unwrap();
+    // FIXTURE PRECONDITIONS at the DEFAULT config — the mutated build must be ADMITTED, or the
+    // skip is not what this test measures.
+    let action = || RewritePositionDeleteFiles::new(table.clone());
+    let config = action().resolve_config().expect("the defaults are legal");
+    let dvs = live_delete_files(&table).await;
+    assert_eq!(dvs.len(), 5, "fixture: FIVE live deletion vectors");
+    assert!(
+        dvs.iter()
+            .all(|f| f.file_format() == DataFileFormat::Puffin),
+        "fixture: every live delete is a Puffin DV"
+    );
+    assert!(
+        dvs.iter()
+            .all(|f| f.content_type() == DataContentType::PositionDeletes),
+        "fixture NON-VACUITY: a DV carries content PositionDeletes, so it clears the CONTENT \
+         filter and reaches the FORMAT skip — this test would prove nothing if it were dropped one \
+         line earlier"
+    );
+    assert!(
+        dvs.iter()
+            .all(|f| f.file_size_in_bytes < config.min_file_size_bytes),
+        "fixture: every DV is SUB-MIN, so the mutated build makes all five candidates"
+    );
+    assert_eq!(
+        config.min_input_files, 5,
+        "fixture: FIVE files clear the DEFAULT floor with no knob — the literal, so a moved \
+         constant reds here rather than silently re-shaping the fixture"
+    );
+
+    let snapshot_before = table.metadata().current_snapshot_id();
+    let result = action().execute(&catalog).await.unwrap();
     assert_eq!(
         result,
         RewritePositionDeleteFilesResult::default(),
-        "DVs are NOT compacted by this action — zero counts, no commit (even a 2-DV same-partition group)"
+        "DVs are NOT compacted by this action — zero counts, no commit, even at five same-partition DVs"
     );
 
     let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "post-execute SHAPE: a skipped group must NOT commit a new snapshot"
+    );
     assert_eq!(
         scan_y_values(&reloaded).await,
         before,
         "read identity: the DVs are untouched, the live set unchanged"
     );
-    // Both Puffin DVs are still live, and none became a parquet pos-delete.
+    // All five Puffin DVs are still live, and none became a parquet pos-delete.
     let deletes = live_delete_files(&reloaded).await;
-    assert_eq!(deletes.len(), 2, "both DVs remain live");
+    assert_eq!(deletes.len(), 5, "all five DVs remain live");
     assert!(
         deletes
             .iter()
@@ -878,8 +971,142 @@ async fn write_deletion_vector(table: &Table, target_path: &str, positions: &[u6
         .expect("one DV delete file")
 }
 
+/// Commit FIVE live position-delete manifest entries in partition 0 whose `file_format` is
+/// `format` — the fixture for C-008's V2 ORC and Avro elements — and return their measured sizes.
+///
+/// WHY FABRICATED, AND WHY THAT IS SOUND. The format skip fires during the manifest walk, BEFORE
+/// any file is opened (`collect_position_delete_groups` reads `file_format()` off the entry and
+/// `continue`s; nothing between the walk and the skip touches the bytes). So the pin needs a
+/// manifest ENTRY that says ORC/Avro, not an ORC/Avro encoder the fork does not have. Each entry is
+/// produced by a real [`write_position_delete_file`] write — i.e. through the writer's own
+/// `DataFileBuilder`, so every required field is populated exactly as a genuine entry's would be —
+/// and only the `file_format` field is re-stamped. The bytes on disk stay PARQUET on purpose: under
+/// the applied mutation (skip deleted) the entries are then read successfully and COMPACTED, so the
+/// mutant reds on this test's own count/shape assertions rather than on an IO error. That is the
+/// stronger red — it proves the SKIP is what drops these files, not a failed read.
+///
+/// The five entries mask the same `(target_path, pos)` pair, which keeps them the same size class
+/// and makes the group's composition the only thing that varies between the Orc and Avro pins.
+async fn add_fabricated_non_parquet_pos_deletes(
+    catalog: &impl Catalog,
+    table: &Table,
+    target_path: &str,
+    format: DataFileFormat,
+) -> (Table, Vec<u64>) {
+    assert_ne!(
+        format,
+        DataFileFormat::Parquet,
+        "helper misuse: this fixture exists to build NON-Parquet entries"
+    );
+    let mut files = Vec::new();
+    for _ in 0..5 {
+        let mut file = write_position_delete_file(table, Some(0), &[(target_path, 1)]).await;
+        file.file_format = format;
+        files.push(file);
+    }
+    let sizes: Vec<u64> = files.iter().map(|f| f.file_size_in_bytes).collect();
+    let table = add_deletes(catalog, table, files).await;
+    (table, sizes)
+}
+
+/// The shared body of C-008's ORC and Avro elements: FIVE live position-delete entries in one
+/// partition whose `file_format` is `format` are dropped at collection, so the action is a no-op.
+///
+/// FIXTURE PRECONDITIONS asserted before `execute`: all five entries live and carrying `format`,
+/// content `PositionDeletes` (so they clear the CONTENT filter and actually REACH the format skip),
+/// every one sub-min, and the resolved floor is FIVE — i.e. the mutated build forms exactly one
+/// ADMISSIBLE bin. Without those the pin could pass because the group was declined on count.
+///
+/// A post-`execute` SCAN is deliberately NOT asserted, and the omission is not a gap: the table's
+/// metadata now claims five ORC/Avro delete files the scan has no reader for, so a read would fail
+/// for a reason that has nothing to do with this action. The post-`execute` signal is SHAPE —
+/// zero counts, no new snapshot, all five entries still live and still carrying `format`.
+///
+/// MUTATION COVERAGE — APPLIED, not predicted: delete the `file_format() != Parquet` skip and the
+/// five entries become one admissible five-file bin, are read (the bytes really are parquet),
+/// compacted into one file and committed. RED on the counts, the snapshot id and the live set.
+async fn assert_non_parquet_pos_deletes_are_skipped(format: DataFileFormat) {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 1), (0, 20, 2)]).await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+
+    let (table, sizes) =
+        add_fabricated_non_parquet_pos_deletes(&catalog, &table, &x_path, format).await;
+
+    let action = || RewritePositionDeleteFiles::new(table.clone());
+    let config = action().resolve_config().expect("the defaults are legal");
+    let live = live_delete_files(&table).await;
+    assert_eq!(live.len(), 5, "fixture: FIVE live delete entries");
+    assert!(
+        live.iter().all(|f| f.file_format() == format),
+        "fixture: every live delete entry carries {format:?}"
+    );
+    assert!(
+        live.iter()
+            .all(|f| f.content_type() == DataContentType::PositionDeletes),
+        "fixture NON-VACUITY: the entries are POSITION DELETES, so they pass the CONTENT filter \
+         and reach the FORMAT skip — dropped one line earlier they would prove nothing"
+    );
+    assert!(
+        sizes.iter().all(|s| *s < config.min_file_size_bytes),
+        "fixture: every entry is SUB-MIN, so the mutated build makes all five candidates"
+    );
+    assert_eq!(
+        config.min_input_files, 5,
+        "fixture: FIVE entries clear the DEFAULT floor with no knob — the mutated build forms ONE \
+         ADMISSIBLE bin, which is what arms this pin"
+    );
+
+    let snapshot_before = table.metadata().current_snapshot_id();
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "{format:?} position deletes are dropped at collection — zero counts, no commit"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "post-execute SHAPE: a skipped group must NOT commit a new snapshot"
+    );
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 5, "all five entries remain live");
+    assert!(
+        after.iter().all(|f| f.file_format() == format),
+        "no {format:?} entry was rewritten into a parquet position delete"
+    );
+}
+
+/// C-008, `Orc` element. A V2 table carrying FIVE live ORC position-delete entries in one partition
+/// is left completely alone: the `file_format() != Parquet` skip drops them at collection.
+///
+/// THIS IS THE DIVERGENCE, not a parity claim. Java's `BinPackRewritePositionDeletePlanner` is
+/// format-blind and WOULD compact these five; the fork cannot, because `compact_group` reads
+/// through the parquet reader and writes through `ParquetWriterBuilder`. Recorded in
+/// `docs/parity/GAP_MATRIX.md` row R136 and at the skip itself.
+#[tokio::test]
+async fn test_non_parquet_position_deletes_skipped_at_collection_orc() {
+    assert_non_parquet_pos_deletes_are_skipped(DataFileFormat::Orc).await;
+}
+
+/// C-008, `Avro` element — the same fixture and the same applied mutation as the ORC pin, over the
+/// last of `DataFileFormat`'s four variants. Both are listed because the skip is a single
+/// inequality against `Parquet`: a future implementation that special-cased ORC (say, by adding an
+/// ORC reader) would keep one pin green and red the other.
+#[tokio::test]
+async fn test_non_parquet_position_deletes_skipped_at_collection_avro() {
+    assert_non_parquet_pos_deletes_are_skipped(DataFileFormat::Avro).await;
+}
+
 // =================================================================================================
-// NO-OP edges.
+// NO-OP edges. The SINGLE-FILE no-op moved into C-021's size-class trio (see
+// `test_admission_sub_min_single_file_is_declined`): a lone position-delete file is a no-op only in
+// size classes 1 and 2 — class 3, above `max_file_size`, is ADMITTED and SPLIT.
 // =================================================================================================
 
 /// No current snapshot → no-op, zero counts, no commit.
@@ -892,41 +1119,6 @@ async fn test_no_current_snapshot_is_a_no_op() {
         .await
         .unwrap();
     assert_eq!(result, RewritePositionDeleteFilesResult::default());
-}
-
-/// A group of ONLY ONE position-delete file → nothing to compact (Java's planner drops single-file
-/// groups). No-op, zero counts, no new snapshot.
-#[tokio::test]
-async fn test_single_file_group_is_a_no_op() {
-    let (catalog, _temp) = local_fs_catalog().await;
-    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
-
-    let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 1), (0, 20, 2)]).await;
-    let x_path = x.file_path().to_string();
-    let table = append_files(&catalog, &table, vec![x]).await;
-
-    let pd = write_position_delete_file(&table, Some(0), &[(&x_path, 1)]).await;
-    let table = add_deletes(&catalog, &table, vec![pd]).await;
-    let snapshot_before = table.metadata().current_snapshot_id();
-
-    let result = RewritePositionDeleteFiles::new(table.clone())
-        .execute(&catalog)
-        .await
-        .unwrap();
-    assert_eq!(
-        result,
-        RewritePositionDeleteFilesResult::default(),
-        "a single-file group is not compacted"
-    );
-
-    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
-    assert_eq!(
-        reloaded.metadata().current_snapshot_id(),
-        snapshot_before,
-        "a no-op must NOT commit a new snapshot"
-    );
-    // Read identity trivially holds (the single delete is unchanged).
-    assert_eq!(scan_y_values(&reloaded).await, HashSet::from([10]));
 }
 
 /// Unpartitioned table: two pos-delete files in the single unpartitioned group compact into one. Read
@@ -1941,6 +2133,200 @@ async fn test_admission_too_much_content_admits_lone_oversized_file() {
         history_before + 1,
         "exactly one Replace snapshot"
     );
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-021 — SINGLE-FILE GROUPS, all three size classes. `is_candidate` and `group_qualifies` read
+// exactly ONE scalar per file (its length) against exactly TWO thresholds, and both comparisons are
+// STRICT, so the real line is TRICHOTOMOUS and both boundary values fall in the middle class:
+//
+//   1. `size < min_file_size`            -> candidate, bin of 1, all three clauses FALSE -> DECLINED
+//   2. `min <= size <= max`              -> NOT a candidate, never reaches packing       -> DECLINED
+//   3. `size > max_file_size`            -> candidate, bin of 1, too_much_content TRUE   -> ADMITTED
+//
+// Element 3 is `test_admission_too_much_content_admits_lone_oversized_file`, directly above (it is
+// also C-003 element 5's pin and acceptance criterion 3's admission leg); elements 1 and 2 follow.
+//
+// WHY EACH CARRIES A WHITE-BOX `is_candidate` LEG. Classes 1 and 2 are INDISTINGUISHABLE BY OUTCOME
+// — both are DECLINED with zero counts and no snapshot — so the end-to-end assertions alone cannot
+// tell which mechanism did the work, and a fixture that drifted from one class into the other would
+// still pass. The measured-size precondition (asserted FIRST, per C-021 and C-036) fixes the class;
+// the `is_candidate` leg then asserts the MECHANISM that class implies. It is the same white-box
+// seam `test_gate_*_white_box` already opens on `group_qualifies`, used here for the same reason:
+// the fact is real, and no black-box fixture can express it.
+//
+// The two BOUNDARY values (`size == min`, `size == max`) are deliberately NOT pinned here: a LONE
+// boundary file cannot discriminate the strictness mutants (both leave the observable DECLINED with
+// zero counts), which is why C-004's pins pair the boundary file with a sub-min COMPANION.
+// ------------------------------------------------------------------------------------------------
+
+/// C-021 element 1 (C-036 recipe 1). A LONE SUB-MIN position-delete file is DECLINED. It IS a
+/// candidate — `outsideDesiredFileSizeRange` is true below `min` — so it forms a bin of one and
+/// REACHES the gate, where all three clauses are false: `enough_input_files` and `enough_content`
+/// are both killed by their `size > 1` conjunct, and `too_much_content` is false because the file is
+/// nowhere near `max`.
+///
+/// KNOBS FROM THE MEASUREMENT (recipe 1): `min := S + 1`, `target := S + 2`, `max := S + 3`. The
+/// gaps are the smallest values that satisfy C-006's STRICT `min < target < max`.
+///
+/// TRUE BY CONSTRUCTION, RECORDED not dressed up (C-036): with `min := S + 1` the precondition
+/// `S < min` is an algebraic identity in `S`. The knobs are derived FROM the measured size, so the
+/// fixture CANNOT drift out of its class and the assert cannot red on drift. It is asserted anyway
+/// because it is not tautological against the SEAM — it still reds if `resolve_config` ever stopped
+/// honouring the explicit overrides — but it is NOT this test's falsifiable content. That content is
+/// the `is_candidate` leg plus the declined outcome, each with an APPLIED killer recorded below.
+///
+/// PROVENANCE — this test REPLACES `test_single_file_group_is_a_no_op`, whose name and doc asserted
+/// a universal the size gate FALSIFIES: "Java's planner drops single-file groups" is false, because
+/// `too_much_content` has no `size > 1` guard, so a lone file above `max` is admitted (element 3
+/// above). The old fixture also lost its mutant — under the deleted `entries.len() < 2` guard it
+/// pinned that guard, and the guard is gone. C-014 element 9 routes it instead to C-003 element 1's
+/// pin; that destination is ALREADY OCCUPIED by
+/// `test_admission_min_input_files_one_still_declines_lone_sub_min_file`, which carries the
+/// `.min_input_files(1)` knob that mutant needs, so following C-014 element 9 literally would have
+/// produced a duplicate sharing a single mutant. C-021's own proposition names THIS destination.
+/// Recorded as a deviation from C-014 element 9, in favour of C-021.
+///
+/// MUTATION COVERAGE, each APPLIED against the whole lib suite: `is_candidate`'s
+/// `length < min_file_size` disjunct deleted (the file stops being a candidate — the white-box leg
+/// reds); and `too_much_content`'s `input_size > max` flipped to `input_size < max` (the lone bin is
+/// admitted — the end-to-end legs red). What this test does NOT kill is recorded next to element 2.
+#[tokio::test]
+async fn test_admission_sub_min_single_file_is_declined() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    let pd = write_sized_pos_delete(&table, &x_path, 1, 1).await;
+    let size = pd.file_size_in_bytes;
+    let entry = LiveDeleteEntry {
+        data_file: pd.clone(),
+        sequence_number: 1,
+    };
+    let table = add_deletes(&catalog, &table, vec![pd]).await;
+
+    let action = || {
+        RewritePositionDeleteFiles::new(table.clone())
+            .min_file_size_bytes(size + 1)
+            .target_file_size_bytes(size + 2)
+            .max_file_size_bytes(size + 3)
+    };
+    let config = action().resolve_config().expect("recipe 1 knobs are legal");
+
+    // PRECONDITION FIRST — the measured size against the RESOLVED thresholds. See the doc: an
+    // identity in `S` given the knob derivation, kept because it still checks the resolve_config
+    // seam, but NOT this test's falsifiable content.
+    assert!(
+        size < config.min_file_size_bytes,
+        "fixture: the lone file must be SUB-MIN (measured {size}, resolved min {})",
+        config.min_file_size_bytes
+    );
+    // MECHANISM — what separates this class from element 2: sub-min means CANDIDATE, so the file
+    // does reach the gate and is declined THERE, not by the candidate filter.
+    assert!(
+        is_candidate(&entry, &config),
+        "class 1 mechanism: a sub-min file IS a candidate and reaches the gate as a bin of one"
+    );
+    assert_eq!(
+        config.min_input_files, 5,
+        "fixture: the DEFAULT floor, no count knob — the decline is the `size > 1` conjunct's"
+    );
+
+    let before = scan_y_values(&table).await;
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "a LONE SUB-MIN file is declined: every clause of the three-way gate is false"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "post-execute SHAPE: a declined bin must NOT commit a new snapshot"
+    );
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 1);
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+/// C-021 element 2 (C-036 recipe 2). A LONE IN-RANGE position-delete file is DECLINED for a
+/// DIFFERENT REASON than element 1: `outsideDesiredFileSizeRange` is false, so it is NOT a candidate
+/// and never reaches packing at all. The gate is not consulted.
+///
+/// KNOBS FROM THE MEASUREMENT (recipe 2): `min := S - 1`, `target := S`, `max := S + 1`, which puts
+/// the measured size strictly inside the band with the smallest legal gaps.
+///
+/// TRUE BY CONSTRUCTION, RECORDED not dressed up (C-036): with knobs derived as `S-1` / `S+1`, the
+/// window `min <= S <= max` is an algebraic identity in `S`. It is asserted anyway because it is NOT
+/// tautological against the SEAM — it still reds if `resolve_config` ever stopped honouring the
+/// explicit overrides in a direction that moved the band off `S` — but it is NOT this test's
+/// falsifiable content. That content is the `is_candidate` leg plus the declined outcome.
+///
+/// MUTATION COVERAGE, APPLIED: `is_candidate` forced to `true` (the candidate filter deleted) reds
+/// the white-box leg. HONESTLY RECORDED, with the arithmetic: the END-TO-END legs of this test
+/// survive that mutant, because a lone in-range file promoted to candidacy forms a bin of ONE and is
+/// then declined by the `size > 1` conjuncts anyway — outcome unchanged. That is exactly why
+/// C-004's existence pin (`test_candidate_filter_drops_in_range_files_before_packing`) uses FIVE
+/// in-range files, and why this element gets a white-box leg instead of pretending the end-to-end
+/// assertions cover the filter.
+#[tokio::test]
+async fn test_admission_in_range_single_file_is_declined() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    let pd = write_sized_pos_delete(&table, &x_path, 1, 1).await;
+    let size = pd.file_size_in_bytes;
+    let entry = LiveDeleteEntry {
+        data_file: pd.clone(),
+        sequence_number: 1,
+    };
+    let table = add_deletes(&catalog, &table, vec![pd]).await;
+
+    let action = || {
+        RewritePositionDeleteFiles::new(table.clone())
+            .min_file_size_bytes(size - 1)
+            .target_file_size_bytes(size)
+            .max_file_size_bytes(size + 1)
+    };
+    let config = action().resolve_config().expect("recipe 2 knobs are legal");
+
+    // PRECONDITION FIRST. See the doc: an identity in `S` given the knob derivation, kept because it
+    // still checks the resolve_config seam, but NOT this test's falsifiable content.
+    assert!(
+        config.min_file_size_bytes <= size && size <= config.max_file_size_bytes,
+        "fixture: the lone file must be IN RANGE (measured {size}, resolved band [{}, {}])",
+        config.min_file_size_bytes,
+        config.max_file_size_bytes
+    );
+    // MECHANISM — what separates this class from element 1: in-range means NOT a candidate, so the
+    // file is dropped BEFORE packing and the gate never sees it.
+    assert!(
+        !is_candidate(&entry, &config),
+        "class 2 mechanism: an in-range file is NOT a candidate and never reaches packing"
+    );
+    assert_eq!(
+        config.min_input_files, 5,
+        "fixture: the DEFAULT floor, no count knob"
+    );
+
+    let before = scan_y_values(&table).await;
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "a LONE IN-RANGE file is declined by the candidate filter, before packing"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "post-execute SHAPE: a declined group must NOT commit a new snapshot"
+    );
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 1);
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
@@ -3860,5 +4246,660 @@ async fn test_bin_with_pairs_but_no_output_file_is_a_hard_error() {
         passed[0].file_path(),
         file.file_path(),
         "and is returned UNCHANGED"
+    );
+}
+
+// =================================================================================================
+// THE COMMIT LOOP — one `RewriteFiles` per admitted BIN (C-011), the abort contract (C-037), and
+// the per-bin zero-pairs skip (C-040).
+//
+// C-011 and C-037 both run on C-036 RECIPE 7, so the fixture is built once here. Every window the
+// knob derivation makes tautological is RECORDED as true by construction below and its falsifiable
+// content moved onto MEASURED quantities — the bin COMPOSITION is read back off the outputs rather
+// than assumed from the packer's arithmetic.
+// =================================================================================================
+
+/// C-036 RECIPE 7 — TWO ADMITTED BINS in ONE partition.
+///
+/// FOUR position-delete files A, B, C, D in MANIFEST order, each masking a DISJOINT 1000-block of
+/// positions so an output's pairs NAME the bin members that produced it. Sizes are MEASURED, never
+/// predicted, and the knobs are set around them.
+struct Recipe7 {
+    table: Table,
+    /// `S_A .. S_D`, MEASURED, in MANIFEST order.
+    sizes: [u64; 4],
+    /// A, B, C, D's file paths, in MANIFEST order.
+    paths: [String; 4],
+    /// `W` — the `max_file_group_size_bytes` knob, derived from the measured sizes.
+    group_size: u64,
+}
+
+/// `m` — recipe 7's `min_file_size_bytes` knob. FIXED, not derived: every measured `S_i` is asserted
+/// BELOW it, so a size drift that pushed a position-delete file past 100 KB reds on the precondition
+/// instead of silently emptying the candidate set. `m < target` (200_000) closes C-006's (3).
+const RECIPE_7_MIN: u64 = 100_000;
+
+/// Build C-036 recipe 7. `W := max(S_A + S_B, S_C + S_D)`.
+///
+/// RECORDED as TRUE BY CONSTRUCTION and deliberately NOT asserted (C-036: no window assert may be an
+/// algebraic identity in the fixture size): `S_A + S_B <= W` and `S_C + S_D <= W`, both immediate
+/// from `W := max(..)`. The remaining leg, `W < S_A + S_B + S_C`, is FALSIFIABLE — it holds only
+/// while `S_D < S_A + S_B` — and IS asserted. The bin composition the three legs are supposed to
+/// force is then read back off the MEASURED outputs by the pins themselves.
+async fn recipe_7_two_bin_fixture() -> (impl Catalog, TempDir, Recipe7) {
+    let (catalog, temp, table, x_path) = gate_table().await;
+
+    // Disjoint 1000-blocks (block = pos / 1000) with distinct pair counts, so the sizes differ and
+    // each output's pairs identify its bin's members.
+    let pd_a = write_sized_pos_delete(&table, &x_path, 1_000, 1).await;
+    let pd_b = write_sized_pos_delete(&table, &x_path, 2_000, 2).await;
+    let pd_c = write_sized_pos_delete(&table, &x_path, 3_000, 3).await;
+    let pd_d = write_sized_pos_delete(&table, &x_path, 4_000, 4).await;
+    let sizes = [
+        pd_a.file_size_in_bytes,
+        pd_b.file_size_in_bytes,
+        pd_c.file_size_in_bytes,
+        pd_d.file_size_in_bytes,
+    ];
+    let paths = [
+        pd_a.file_path().to_string(),
+        pd_b.file_path().to_string(),
+        pd_c.file_path().to_string(),
+        pd_d.file_path().to_string(),
+    ];
+    let table = add_deletes(&catalog, &table, vec![pd_a, pd_b, pd_c, pd_d]).await;
+
+    assert_eq!(
+        live_pos_delete_paths(&table).await,
+        paths.to_vec(),
+        "fixture: the manifest order must be A, B, C, D — the bin boundaries depend on it"
+    );
+
+    let group_size = (sizes[0] + sizes[1]).max(sizes[2] + sizes[3]);
+    (catalog, temp, Recipe7 {
+        table,
+        sizes,
+        paths,
+        group_size,
+    })
+}
+
+/// Recipe 7's knobs, as a fresh action every call (`execute` consumes `self`).
+fn recipe_7_action(fixture: &Recipe7) -> RewritePositionDeleteFiles {
+    RewritePositionDeleteFiles::new(fixture.table.clone())
+        .min_input_files(2)
+        .min_file_size_bytes(RECIPE_7_MIN)
+        .target_file_size_bytes(200_000)
+        .max_file_size_bytes(400_000)
+        .max_file_group_size_bytes(fixture.group_size)
+}
+
+/// Recipe 7's mandatory PRE-`execute` preconditions, all over MEASURED sizes in MANIFEST order.
+fn assert_recipe_7_preconditions(fixture: &Recipe7, config: &ResolvedConfig) {
+    for size in &fixture.sizes {
+        assert!(
+            *size < config.min_file_size_bytes,
+            "fixture: every file must be SUB-MIN so all four are candidates \
+             (measured {size}, resolved min {})",
+            config.min_file_size_bytes
+        );
+    }
+    assert!(
+        2 >= config.min_input_files,
+        "fixture: a bin of two must clear the count floor (resolved {})",
+        config.min_input_files
+    );
+    assert!(
+        config.max_file_group_size_bytes < fixture.sizes[0] + fixture.sizes[1] + fixture.sizes[2],
+        "fixture: C must NOT fit alongside A and B — this is what forces the split (W {}, \
+         S_A + S_B + S_C {})",
+        config.max_file_group_size_bytes,
+        fixture.sizes[0] + fixture.sizes[1] + fixture.sizes[2]
+    );
+    // RECORDED, not asserted: `S_A + S_B <= W` and `S_C + S_D <= W` are identities in `W := max(..)`.
+    assert!(
+        config.write_max_file_size > fixture.sizes.iter().sum::<u64>(),
+        "fixture: write_max must sit far above BOTH bins, so each bin emits exactly ONE output and \
+         the split arity cannot confound the commit count (write_max {}, total input {})",
+        config.write_max_file_size,
+        fixture.sizes.iter().sum::<u64>()
+    );
+}
+
+/// The 1000-BLOCKS each live position-delete file covers, one sorted+deduped `Vec` per output,
+/// themselves sorted so the comparison does not depend on manifest order.
+async fn output_blocks(table: &Table) -> Vec<Vec<i64>> {
+    let mut all = Vec::new();
+    for file in live_pos_delete_files(table).await {
+        let mut blocks: Vec<i64> = read_pos_delete_pairs(table, &file)
+            .await
+            .iter()
+            .map(|(_, pos)| pos / 1_000)
+            .collect();
+        blocks.sort();
+        blocks.dedup();
+        all.push(blocks);
+    }
+    all.sort();
+    all
+}
+
+/// The snapshots appended to `table`'s history AFTER index `from`, oldest first.
+fn snapshots_after(table: &Table, from: usize) -> Vec<SnapshotRef> {
+    table.metadata().history()[from..]
+        .iter()
+        .map(|log| {
+            table
+                .metadata()
+                .snapshot_by_id(log.snapshot_id)
+                .expect("every history entry resolves to a snapshot")
+                .clone()
+        })
+        .collect()
+}
+
+/// One snapshot's `added-delete-files` / `removed-delete-files` summary counters.
+fn delete_file_counters(snapshot: &Snapshot) -> (Option<String>, Option<String>) {
+    let props = &snapshot.summary().additional_properties;
+    (
+        props.get("added-delete-files").cloned(),
+        props.get("removed-delete-files").cloned(),
+    )
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-011 — exactly ONE `RewriteFiles` (one Replace snapshot) per admitted BIN.
+// ------------------------------------------------------------------------------------------------
+
+/// C-011. `execute` iterates BINS, not partitions, and commits ONE `RewriteFiles` per admitted bin:
+/// a single partition packed into TWO bins produces TWO `Replace` snapshots, chained (each built on
+/// the previous bin's committed tip), each removing exactly its OWN bin's inputs and adding exactly
+/// its own output.
+///
+/// The correctness of committing sequentially against a FIXED `starting_snapshot_id` rests on two
+/// facts verified at source: the bins replace DISJOINT delete-file sets (`pack_bins` partitions the
+/// candidate list; group keys are disjoint), and `RewriteFilesAction::validate` early-returns when
+/// `deleted_data_files` is empty — always true here, because this action passes
+/// `rewrite_files(Vec::new(), Vec::new())` and only `delete_delete_files`.
+///
+/// NON-VACUITY: the two bins' MEMBERSHIP is not assumed from the packer's arithmetic — it is read
+/// back off the outputs' `(file_path, pos)` pairs, each input file masking a disjoint 1000-block. A
+/// commit shape that merged the partition into one bin, or split it differently, would show up in
+/// the block coverage as well as in the snapshot count. The read-identity assertion at the end is a
+/// REGRESSION guard, not the discriminating one: this fixture's inputs mask positions 1000..4004 of
+/// a FIVE-row data file, so no live row is masked and the row set is full either way (the same
+/// disclosure `test_bin_commit_failure_leaves_earlier_bins_committed` carries). `output_blocks` is
+/// what does the work — design call 2's "never read identity alone" is satisfied by it.
+///
+/// RECORDED, NOT PINNED — the base-advance conjunct. C-011's proposition also says "the base table
+/// is advanced after each bin commit". That leg is UNPINNABLE BY OBSERVATION: pointing the loop at
+/// `self.table` instead of the advanced `table` leaves the WHOLE lib suite green, because
+/// `Transaction::do_commit` refreshes a stale base and re-applies, so the two commits chain either
+/// way. The advance is a re-apply-COST optimisation, exactly as the merged comment above the loop
+/// says ("not required for CAS correctness under the retry/refresh loop"). The `parent_snapshot_id`
+/// assertion below therefore pins only what it CAN — that the two commits CHAIN rather than FORK —
+/// and deliberately does not imply the optimisation, the same discipline applied to recipe 7's
+/// `S_A + S_B <= W` window.
+///
+/// MUTATION, APPLIED: replace `plan_bins`'s S5 + S6 block with `admitted.push((key, candidates))`
+/// (one bin per PARTITION, the pre-unit shape). RED — one snapshot instead of two, one added file
+/// instead of two, and the surviving output covers all four blocks.
+#[tokio::test]
+async fn test_one_rewrite_files_commit_per_bin() {
+    let (catalog, _temp, fixture) = recipe_7_two_bin_fixture().await;
+    let config = recipe_7_action(&fixture)
+        .resolve_config()
+        .expect("recipe 7's knobs are legal");
+    assert_recipe_7_preconditions(&fixture, &config);
+
+    let before = scan_y_values(&fixture.table).await;
+    let history_before = fixture.table.metadata().history().len();
+
+    let result = recipe_7_action(&fixture)
+        .execute(&catalog)
+        .await
+        .expect("both bins commit");
+    assert_eq!(
+        result.rewritten_delete_files_count, 4,
+        "all four candidates are rewritten, across TWO bins"
+    );
+    assert_eq!(
+        result.added_delete_files_count, 2,
+        "one compacted output per BIN"
+    );
+
+    let reloaded = catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .expect("reload");
+    let new_snapshots = snapshots_after(&reloaded, history_before);
+    assert_eq!(
+        new_snapshots.len(),
+        2,
+        "TWO admitted bins ⇒ TWO commits, never one batched `RewriteFiles`"
+    );
+    for snapshot in &new_snapshots {
+        assert_eq!(
+            snapshot.summary().operation,
+            Operation::Replace,
+            "every bin commit is a Replace snapshot (Java `newRewrite()`)"
+        );
+        assert_eq!(
+            delete_file_counters(snapshot),
+            (Some("1".to_string()), Some("2".to_string())),
+            "each snapshot replaces exactly ITS OWN bin: 2 position-deletes out, 1 in"
+        );
+    }
+    assert_eq!(
+        new_snapshots[1].parent_snapshot_id(),
+        Some(new_snapshots[0].snapshot_id()),
+        "the two bin commits CHAIN — the second's parent is the first, so the bins do not FORK \
+         from a common base. This does NOT pin the base-advance optimisation; see the rustdoc."
+    );
+
+    // The bins the packer actually formed, MEASURED off the outputs.
+    assert_eq!(
+        output_blocks(&reloaded).await,
+        vec![vec![1, 2], vec![3, 4]],
+        "the two outputs cover {{A, B}} and {{C, D}} — one output per bin, and the bin boundary is \
+         where the group-size knob put it"
+    );
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-037 — the abort contract: earlier bins STAND, no partial result reaches the caller.
+// ------------------------------------------------------------------------------------------------
+
+/// C-037. A bin commit failure aborts `execute` with `Err`; the bins committed BEFORE it STAND and
+/// are NOT rolled back; the caller receives NO partial [`RewritePositionDeleteFilesResult`].
+///
+/// The failure is injected by DELETING bin 2's first input file off disk after the fixture is
+/// committed — deterministic, because within a partition the entry order is manifest order, so the
+/// packer's bins are `{A, B}` then `{C, D}` and `execute` reaches `{C, D}` only after `{A, B}` has
+/// already committed. The sabotage is asserted to have APPLIED before `execute` runs; a fixture in
+/// which the file is not where the manifest says it is HARD-FAILS rather than proving nothing.
+///
+/// This RETAINS the pre-unit behaviour and makes it explicit — the bin change only multiplies the
+/// windows in which the state arises, from one per partition to one per bin. The same contract
+/// covers the `DataInvalid` raised mid-loop when a bin's `spec_id` is absent from table metadata.
+///
+/// MUTATION, APPLIED: swallow the per-bin error in `execute` (`match .. { Ok(t) => table = t, Err(_)
+/// => continue }`). RED — `execute` returns `Ok` with a partial result. A rollback of bin 1 would
+/// red the "bin 1 STANDS" assertions instead.
+#[tokio::test]
+async fn test_bin_commit_failure_leaves_earlier_bins_committed() {
+    let (catalog, _temp, fixture) = recipe_7_two_bin_fixture().await;
+    let config = recipe_7_action(&fixture)
+        .resolve_config()
+        .expect("recipe 7's knobs are legal");
+    assert_recipe_7_preconditions(&fixture, &config);
+
+    let before = scan_y_values(&fixture.table).await;
+    let history_before = fixture.table.metadata().history().len();
+
+    // SABOTAGE — bin 2's first member (C, the third file in manifest order). HARD-FAIL if it cannot
+    // be applied: a sabotage that corrupted nothing has proven nothing.
+    let victim = fixture.paths[2]
+        .strip_prefix("file://")
+        .unwrap_or(&fixture.paths[2])
+        .to_string();
+    assert!(
+        std::path::Path::new(&victim).is_file(),
+        "sabotage precondition: bin 2's input must be on disk at the path the manifest names \
+         ({victim})"
+    );
+    std::fs::remove_file(&victim).expect("remove bin 2's input file");
+    assert!(
+        !std::path::Path::new(&victim).exists(),
+        "sabotage must have APPLIED before execute runs"
+    );
+
+    let error = recipe_7_action(&fixture)
+        .execute(&catalog)
+        .await
+        .expect_err("bin 2 cannot be read, so execute ABORTS");
+    assert_eq!(
+        error.kind(),
+        ErrorKind::DataInvalid,
+        "the abort carries the READ failure's typed kind: {error}"
+    );
+    assert!(
+        error.to_string().contains(&victim),
+        "and it names the file the sabotage removed, so the test cannot pass on some unrelated \
+         failure (victim {victim}, error {error})"
+    );
+
+    let reloaded = catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .expect("reload");
+    let new_snapshots = snapshots_after(&reloaded, history_before);
+    assert_eq!(
+        new_snapshots.len(),
+        1,
+        "bin 1 committed and STANDS; bin 2 never did, and NOTHING was rolled back"
+    );
+    assert_eq!(
+        new_snapshots[0].summary().operation,
+        Operation::Replace,
+        "the surviving commit is bin 1's Replace snapshot"
+    );
+    assert_eq!(
+        delete_file_counters(&new_snapshots[0]),
+        (Some("1".to_string()), Some("2".to_string())),
+        "and it replaced exactly BIN 1: A and B out, one compacted output in"
+    );
+
+    let live = live_pos_delete_paths(&reloaded).await;
+    assert_eq!(
+        live.len(),
+        3,
+        "bin 1's output plus bin 2's two untouched inputs (live: {live:?})"
+    );
+    assert!(
+        !live.contains(&fixture.paths[0]) && !live.contains(&fixture.paths[1]),
+        "bin 1's rewritten files are GONE — its commit was not undone (live: {live:?})"
+    );
+    assert!(
+        live.contains(&fixture.paths[2]) && live.contains(&fixture.paths[3]),
+        "bin 2's inputs are still live — the failed bin changed nothing (live: {live:?})"
+    );
+    let survivor = live
+        .iter()
+        .find(|path| !fixture.paths.contains(path))
+        .expect("bin 1's new file is live");
+    let survivor_file = live_pos_delete_files(&reloaded)
+        .await
+        .into_iter()
+        .find(|f| f.file_path() == survivor)
+        .expect("the new file resolves");
+    let mut blocks: Vec<i64> = read_pos_delete_pairs(&reloaded, &survivor_file)
+        .await
+        .iter()
+        .map(|(_, pos)| pos / 1_000)
+        .collect();
+    blocks.sort();
+    blocks.dedup();
+    assert_eq!(
+        blocks,
+        vec![1, 2],
+        "the live new file is BIN 1's output — it carries A's and B's blocks and nothing else"
+    );
+    assert_eq!(
+        read_pos_delete_pairs(&reloaded, &survivor_file).await.len(),
+        3,
+        "and it carries EVERY pair bin 1's two inputs held — A's 1 plus B's 2 — so bin 1's commit \
+         masks exactly what it replaced"
+    );
+
+    // A post-`execute` read-identity scan is deliberately NOT asserted: the sabotage physically
+    // removed a delete file that is still LIVE in metadata, so any scan of this table now fails on
+    // the missing bytes. `before` is captured pre-sabotage only to document what the fixture masked.
+    assert_eq!(
+        before,
+        HashSet::from([10, 20, 30, 40, 50]),
+        "fixture: the inputs mask positions no row occupies, so the pre-execute row set is full"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-040 — an admitted BIN yielding ZERO pairs is skipped PER BIN.
+// ------------------------------------------------------------------------------------------------
+
+/// Write a genuinely ZERO-ROW parquet position-delete file into `table`'s data directory, in
+/// partition `part_value`, and return the [`DataFile`] that describes it.
+///
+/// It cannot be produced through [`write_position_delete_file`]: `ParquetWriter::close` DELETES a
+/// zero-row output and returns `Ok(vec![])`, which is precisely why this action's own writer can
+/// never put such a file in a manifest. So the parquet bytes are written directly with the parquet
+/// crate's `ArrowWriter` over the position-delete ARROW schema — field ids included, so the
+/// reserved-column lookup still resolves if the reader hands back an empty batch — and the
+/// manifest-side `DataFile` is taken from a real one-pair write (for the content type, format,
+/// partition tuple and spec id) and re-pointed at the empty file with its row count, size and
+/// per-column metrics corrected.
+async fn write_zero_row_pos_delete(table: &Table, part_value: i64, name: &str) -> DataFile {
+    use parquet::arrow::ArrowWriter;
+
+    let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
+    let empty = RecordBatch::new_empty(config.arrow_schema().clone());
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut writer = ArrowWriter::try_new(
+        &mut buffer,
+        config.arrow_schema().clone(),
+        Some(position_delete_writer_properties()),
+    )
+    .expect("open an arrow parquet writer over the position-delete schema");
+    writer.write(&empty).expect("write the empty batch");
+    writer.close().expect("close the zero-row parquet file");
+
+    let path = format!("{}/data/{name}", table.metadata().location());
+    table
+        .file_io()
+        .new_output(&path)
+        .expect("new output for the zero-row file")
+        .write(bytes::Bytes::from(buffer.clone()))
+        .await
+        .expect("write the zero-row parquet bytes");
+
+    let mut file =
+        write_position_delete_file(table, Some(part_value), &[("scaffold.parquet", 0)]).await;
+    file.file_path = path;
+    file.record_count = 0;
+    file.file_size_in_bytes =
+        u64::try_from(buffer.len()).expect("the zero-row file's length fits a u64");
+    file.column_sizes = HashMap::new();
+    file.value_counts = HashMap::new();
+    file.null_value_counts = HashMap::new();
+    file.nan_value_counts = HashMap::new();
+    file.lower_bounds = HashMap::new();
+    file.upper_bounds = HashMap::new();
+    file
+}
+
+/// C-040. An admitted BIN whose files yield ZERO `(file_path, pos)` pairs is SKIPPED **per bin**: it
+/// contributes zero to all four counts, commits nothing, and does not abort the loop over the
+/// remaining bins.
+///
+/// The state is REACHED, not simulated: partition 0 holds EXACTLY five zero-row parquet
+/// position-deletes and nothing else — so they cannot co-bin with non-empty files — and the bin is
+/// admitted by `enough_input_files` at the DEFAULT floor of five. Partition 1 carries a normal
+/// admissible group of five. The admission precondition (all five sub-min, count >= the resolved
+/// floor) is asserted BEFORE `execute`, so a fixture that stopped reaching the branch would red
+/// rather than pass vacuously.
+///
+/// The branch is DEFENSIVE and NOT a parity claim: Java cannot reach this state at all
+/// (`RewritePositionDeletesGroup`'s ctor `Preconditions`-checks `!tasks.isEmpty()`), and the fork's
+/// own writer cannot emit a zero-row position-delete, so only an externally-written file gets here.
+///
+/// WHY THE WHITE-BOX LEG EXISTS — do not "simplify" it away. MEASURED BY THE G4 REVIEW (not by this
+/// author): against the hazard mutant — branch deleted from `compact_group` AND an early
+/// `return Ok(result)` hoisted into `execute` — 10 runs went 6 RED on the end-to-end leg (zero bin
+/// scheduled first) and 4 RED on the white-box leg (normal bin first): 10/10 lethal, the two legs
+/// EXACT COMPLEMENTS. So the end-to-end leg ALONE is ~50% flaky against that mutant, and the
+/// white-box leg is not a weaker substitute for it — it is the half that removes the coin flip. No
+/// end-to-end-only construction can close it: for ANY mix of k zero bins and m normal bins,
+/// `HashMap` iteration order may place every zero bin LAST.
+///
+/// MUTATION, APPLIED: delete the `if pairs.is_empty()` branch. RED — but note the CAUSE: the mutant
+/// does NOT raise the error itself. `ParquetWriter::close` returns `Ok(vec![])` for zero rows and
+/// deletes the empty output, so "no file" is a normal return; it is `require_non_empty` that turns
+/// the empty `Vec` into `Err(Unexpected)`, and the mutant reds THROUGH that guard. Without the guard
+/// the mutant would return `Ok`, add nothing, and drop five live delete files.
+#[tokio::test]
+async fn test_admitted_bin_with_zero_pairs_is_skipped() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let p0 = write_data_file(&table, "p0.parquet", 0, &[(0, 10, 1), (0, 20, 2)]).await;
+    let p1 = write_data_file(&table, "p1.parquet", 1, &[(1, 30, 3), (1, 40, 4)]).await;
+    let p1_path = p1.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![p0, p1]).await;
+
+    // Partition 0: FIVE zero-row position-deletes and NOTHING else.
+    let mut empties = Vec::new();
+    for index in 0..5 {
+        empties.push(write_zero_row_pos_delete(&table, 0, &format!("empty-{index}.parquet")).await);
+    }
+    let empty_paths: Vec<String> = empties.iter().map(|f| f.file_path().to_string()).collect();
+    let empty_sizes: Vec<u64> = empties.iter().map(|f| f.file_size_in_bytes).collect();
+
+    // Partition 1: a normal admissible group of FIVE, masking p1's row at position 1 (y = 40).
+    let mut normals = Vec::new();
+    for _ in 0..5 {
+        normals.push(write_position_delete_file(&table, Some(1), &[(&p1_path, 1)]).await);
+    }
+    let normal_paths: Vec<String> = normals.iter().map(|f| f.file_path().to_string()).collect();
+    let normal_sizes: Vec<u64> = normals.iter().map(|f| f.file_size_in_bytes).collect();
+
+    let mut all = empties;
+    all.extend(normals);
+    let table = add_deletes(&catalog, &table, all).await;
+
+    // ADMISSION PRECONDITIONS at the DEFAULT config — both bins must actually be admitted, or the
+    // zero-pairs branch is never reached and this pin proves nothing.
+    let action = || RewritePositionDeleteFiles::new(table.clone());
+    let config = action().resolve_config().expect("the defaults are legal");
+    for size in empty_sizes.iter().chain(normal_sizes.iter()) {
+        assert!(
+            *size < config.min_file_size_bytes,
+            "fixture: every input must be a SUB-MIN candidate (measured {size}, resolved min {})",
+            config.min_file_size_bytes
+        );
+    }
+    assert_eq!(
+        config.min_input_files, 5,
+        "fixture: the zero-pairs bin must be admitted at Java's DEFAULT floor of FIVE, not a \
+         lowered one — the literal, so a moved constant reds here rather than silently re-shaping \
+         the fixture"
+    );
+    assert!(
+        empty_paths.len() >= config.min_input_files,
+        "fixture: the zero-pairs partition must clear `enough_input_files` on its own \
+         ({} files, floor {})",
+        empty_paths.len(),
+        config.min_input_files
+    );
+    assert!(
+        normal_paths.len() >= config.min_input_files,
+        "fixture: the second partition must be admissible too"
+    );
+
+    // Acceptance item 4's read-identity leg, and SUBSTANTIVE here unlike recipe 7's: partition 1's
+    // deletes genuinely mask a live row (p1's position 1, y = 40), so the pre/post comparison can
+    // actually detect a compaction that changed the masked set. It also proves the production scan
+    // path READS the five surviving zero-row position-deletes without error.
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([10, 20, 30]),
+        "fixture: y = 40 is really masked by partition 1's deletes, so read identity is not \
+         vacuous here"
+    );
+
+    let history_before = table.metadata().history().len();
+    let result = action()
+        .execute(&catalog)
+        .await
+        .expect("the zero-pairs bin is SKIPPED, not an error — and the other bin still commits");
+
+    // All four counts reflect ONLY the second partition.
+    assert_eq!(
+        result.rewritten_delete_files_count, 5,
+        "only the SECOND partition's five files are rewritten"
+    );
+    assert_eq!(result.added_delete_files_count, 1, "one compacted output");
+    assert_eq!(
+        result.rewritten_bytes_count,
+        normal_sizes.iter().sum::<u64>(),
+        "the rewritten BYTES are the second partition's alone — the skipped bin adds none"
+    );
+
+    let reloaded = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload");
+    let new_snapshots = snapshots_after(&reloaded, history_before);
+    assert_eq!(
+        new_snapshots.len(),
+        1,
+        "exactly ONE commit: the skipped bin commits nothing, and the other bin is unaffected"
+    );
+    assert_eq!(new_snapshots[0].summary().operation, Operation::Replace);
+
+    let live = live_pos_delete_paths(&reloaded).await;
+    for path in &empty_paths {
+        assert!(
+            live.contains(path),
+            "every zero-row file is STILL LIVE — the skipped bin was left untouched, not dropped"
+        );
+    }
+    for path in &normal_paths {
+        assert!(
+            !live.contains(path),
+            "the second partition's inputs were replaced"
+        );
+    }
+    assert_eq!(
+        live.len(),
+        empty_paths.len() + 1,
+        "five untouched zero-row files plus the second partition's one output (live: {live:?})"
+    );
+    let added_bytes: u64 = live_pos_delete_files(&reloaded)
+        .await
+        .into_iter()
+        .filter(|f| !empty_paths.contains(&f.file_path().to_string()))
+        .map(|f| f.file_size_in_bytes)
+        .sum();
+    assert_eq!(
+        result.added_bytes_count, added_bytes,
+        "the added BYTES are the one real output's, and nothing from the skipped bin"
+    );
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "read identity — and the scan still reads the five untouched zero-row position-deletes"
+    );
+
+    // WHITE BOX, the leg the end-to-end shape cannot force: `plan_bins` iterates a `HashMap`, so
+    // which of the two bins `execute` reaches FIRST is not fixed. Driving `compact_group` directly
+    // on the zero-pairs bin pins what the loop actually depends on — the skip RETURNS the table
+    // unchanged (so the caller's loop CONTINUES) and leaves the result counters alone, rather than
+    // signalling an abort.
+    let entries: Vec<LiveDeleteEntry> = live_pos_delete_files(&reloaded)
+        .await
+        .into_iter()
+        .filter(|f| empty_paths.contains(&f.file_path().to_string()))
+        .map(|data_file| LiveDeleteEntry {
+            data_file,
+            sequence_number: 1,
+        })
+        .collect();
+    assert_eq!(
+        entries.len(),
+        5,
+        "the five zero-row entries are still there"
+    );
+    let bin: AdmittedBin = ((0, Struct::from_iter([Some(Literal::long(0))])), entries);
+    let starting = reloaded
+        .metadata()
+        .current_snapshot()
+        .expect("a current snapshot")
+        .snapshot_id();
+    let mut counters = RewritePositionDeleteFilesResult::default();
+    let returned = action()
+        .compact_group(&catalog, &reloaded, &bin, &config, starting, &mut counters)
+        .await
+        .expect("the zero-pairs bin returns Ok so the bin loop CONTINUES");
+    assert_eq!(
+        returned.metadata().current_snapshot_id(),
+        reloaded.metadata().current_snapshot_id(),
+        "the skip returns the table UNCHANGED — nothing was committed for this bin"
+    );
+    assert_eq!(
+        counters,
+        RewritePositionDeleteFilesResult::default(),
+        "and it contributed zero to ALL FOUR counts"
     );
 }
