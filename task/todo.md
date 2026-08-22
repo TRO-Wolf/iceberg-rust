@@ -717,3 +717,37 @@ sweep (this change): new row R165, R138/R140/R145/R93/R95 notes, and the
 `rewrite_position_delete_files` accepted-finer grouping residue recorded on R165.
 Remaining to flip R165 green: a bidirectional interop round-trip (out of this campaign's
 scope per the charter — `make interop` excluded).
+
+## PLANNED (2026-08-21): `RewritePositionDeleteFiles` size-based admission gate
+
+**Scope is closed and owner-ratified; no production code is written.** This block exists so the
+plan survives outside a session scratchpad. The charter and its five binding addenda are in
+[rpdf-size-gate-2026-08-21-brief.md](rpdf-size-gate-2026-08-21-brief.md); the 45-clause proof
+ledger, the build carving and the fourteen residues are in
+[rpdf-size-gate-2026-08-21-ledger.md](rpdf-size-gate-2026-08-21-ledger.md).
+
+**The defect.** `rewrite_position_delete_files.rs:222` admits any `(spec, partition)` group with
+two or more live position-delete files. Java's `BinPackRewritePositionDeletePlanner` admits a group
+only through `enoughInputFiles || enoughContent || tooMuchContent`, whose file-count floor is
+**five**. Reported by the RePark engine side (MW-2) with live Spark 4.0.1 / Iceberg 1.10.0
+measurements; independently re-verified against `9f85a086`. No wrong answers — the fork compacts
+*more* than Java, so this is a parity fix, not a bug fix.
+
+**Base ref** `9f85a086`. **One PR**, owner squash-merges, title
+`[repark] maintenance: RewritePositionDeleteFiles size-based admission gate (BREAKING default)`.
+The default admission floor moves 2 → 5, so existing two-file callers become no-ops unless they
+set `.min_input_files(2)`; that is the intended breaking flip and is named in the PR body.
+
+**Seven ordered build groups** (45 clauses, clause-complete, each clause in exactly one group):
+G1 CONFIG (7) · G2 PLANNER (8) · G3 WRITER (6) · G4 COMMIT LOOP (3) · G5 TESTS (7) ·
+G6 DOCS + STATUS (7) · G7 GOVERNANCE (7). G4 depends on G3; G5 depends on G1-G4.
+
+**Doc obligations carried in the same change:** R136 currently claims a "1:1 port" while the gate is
+absent — the sentence is corrected, not dropped, and the row keeps `✅` with named residues (R-8).
+A sibling roll-bound divergence is logged against R135 (RES-1). The `rewrite_position_delete_files`
+grouping residue already recorded on R165 by the C16 docs sweep is RES-2 here — one home, cross-link
+rather than restate.
+
+**Known residues that stay open** (14, each homed): the sibling roll bound (RES-1), the
+`(spec_id, partition)` grouping key (RES-2), the fork-only non-Parquet skip (RES-3), per-bin commit
+granularity (RES-4), and ten others enumerated in the ledger.
