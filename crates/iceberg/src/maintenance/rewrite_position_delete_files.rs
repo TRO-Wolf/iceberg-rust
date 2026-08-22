@@ -77,6 +77,52 @@
 //! `RewritePositionDeletesCommitManager` adds the rewritten file with `Long.valueOf(maxRewrittenSeq)`
 //! exactly for this reason.
 //!
+//! # Planning — Java's six-stage pipeline
+//!
+//! Between the manifest walk and the first commit, the live entries pass through exactly six stages,
+//! in Java's order (`BinPackRewritePositionDeletePlanner.planFileGroups` +
+//! `SizeBasedFileRewritePlanner.filterFileGroups`, with the user filter applied at Java's
+//! `planFiles` scan):
+//!
+//! 1. **Collect** the live `PositionDeletes` entries, skipping every non-PARQUET delete file (the
+//!    fork-only V2-parquet scope — see the divergence section below).
+//! 2. **User filter** — [`RewritePositionDeleteFiles::filter`] is applied PER ENTRY *at collection*,
+//!    because Java applies it at the `PositionDeletes` scan, STRICTLY BEFORE grouping. The predicate
+//!    is bound to the table schema ONCE (right after the no-snapshot early return) and the projected
+//!    partition evaluator is cached per `spec_id`, so binding is O(specs), not O(entries).
+//! 3. **Group** by `(spec_id, partition)`.
+//! 4. **Candidate filter** — Java `filterFiles` → `outsideDesiredFileSizeRange`: a file is a
+//!    candidate iff `length < min_file_size_bytes || length > max_file_size_bytes`, both STRICT.
+//!    There is NO delete-count clause here: `tooManyDeletes` is `BinPackRewriteFilePlanner`-only and
+//!    the position-delete planner does not inherit it.
+//! 5. **Bin-pack** each partition's candidates through the shared
+//!    [`pack_bins`](super::rewrite_data_files::pack_bins) — Java
+//!    `BinPacking$ListPacker(maxGroupSize, lookback = 1, largestBinFirst = false)`, inherited
+//!    unchanged by this planner.
+//! 6. **Group filter** — Java `filterFileGroups`, a plain three-way disjunction with no fourth
+//!    clause: `enough_input_files || enough_content || too_much_content`.
+//!
+//! [`RewritePositionDeleteFiles::execute`] then iterates BINS (not partitions), committing one
+//! `Replace` snapshot per admitted bin.
+//!
+//! # Named NON-PORT: Java's `inputSplitSize` / `expectedOutputFiles`
+//!
+//! `SizeBasedFileRewritePlanner.inputSplitSize(long)` and its helper
+//! `SizeBasedFileRewritePlanner.expectedOutputFiles(long)` are DELIBERATELY NOT PORTED. The bytecode
+//! reason: `SparkRewritePositionDeleteRunner.doRewrite` consumes `inputSplitSize` on the **READ**
+//! side, as the scan option `split-size` passed to `DataFrameReader.option`; the **WRITE** bound is a
+//! SEPARATE option (`target-delete-file-size-bytes`), fed from `group.maxOutputFileSize()` =
+//! `writeMaxFileSize()`. Java never chunks a writer feed with it. This action reads the
+//! `(file_path, pos)` pairs directly and has NO split-size-driven scan for either function to
+//! parameterise, so a port would be dead code.
+//!
+//! GUARD ON THE PIN — do not "helpfully" broaden it. The tripwire for this non-port is a repo-wide
+//! grep for the SNAKE_CASE Rust spellings of those two Java names, which must return ZERO hits. It is
+//! snake-case-ONLY **by design**, because the camelCase Java names MUST appear: this very paragraph
+//! names them, and [`super::rewrite_data_files`]'s "Deferred (loudly)" rustdoc cites `inputSplitSize`
+//! correctly and load-bearingly. Re-broadening the pattern to the camelCase spellings would classify
+//! both of those required, correct sentences as violations.
+//!
 //! # Divergence: V2 PARQUET only (V3 deletion vectors are OUT of scope)
 //!
 //! This action compacts V2 PARQUET position-delete files only. V3 Puffin DELETION VECTORS are
@@ -87,27 +133,34 @@
 //! # No-op
 //!
 //! With no current snapshot, no live parquet position-delete files, a [`filter`](RewritePositionDeleteFiles::filter)
-//! that matches none, or a group of only ONE position-delete file (nothing to compact — Java's planner
-//! drops single-file groups), the action commits NOTHING for that group and the result counts stay zero
-//! (Java commits only when there is real compaction work).
+//! that matches none, no CANDIDATE in a partition, or a bin the three-clause admission gate declines,
+//! the action commits NOTHING for that bin and the result counts stay zero (Java commits only when
+//! there is real compaction work). A bin of ONE file is declined by the two `size > 1` guards —
+//! UNLESS that file is larger than `max_file_size_bytes`, which `too_much_content` admits with no
+//! such guard.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use futures::StreamExt;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use super::rewrite_data_files::{
+    MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO, MIN_FILE_SIZE_DEFAULT_RATIO,
+    MIN_INPUT_FILES_DEFAULT, pack_bins,
+};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
 use crate::expr::visitors::inclusive_projection::InclusiveProjection;
-use crate::expr::{Bind, Predicate};
+use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, MetricsConfig, PartitionKey, Schema, Snapshot,
-    Struct, TableProperties,
+    Struct, TableMetadata, TableProperties,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -126,24 +179,15 @@ use crate::{Catalog, Error, ErrorKind, Result};
 /// `BinPackRewritePositionDeletePlanner` groups by partition + spec).
 type GroupKey = (i32, Struct);
 
-/// Java `SizeBasedFileRewritePlanner.MIN_FILE_SIZE_DEFAULT_RATIO` — an unset `min_file_size_bytes`
-/// defaults to 75% of the resolved target (bytecode-verified vs `iceberg-core-1.10.0.jar`:
-/// `sizeThresholds` loads `ldc2_w // double 0.75d` and multiplies).
-const MIN_FILE_SIZE_DEFAULT_RATIO: f64 = 0.75;
-
-/// Java `SizeBasedFileRewritePlanner.MAX_FILE_SIZE_DEFAULT_RATIO` — an unset `max_file_size_bytes`
-/// defaults to 180% of the resolved target (bytecode-verified vs `iceberg-core-1.10.0.jar`:
-/// `sizeThresholds` loads `ldc2_w // double 1.8d` and multiplies).
-const MAX_FILE_SIZE_DEFAULT_RATIO: f64 = 1.80;
-
-/// Java `SizeBasedFileRewritePlanner.MIN_INPUT_FILES_DEFAULT` = `5` (bytecode-verified vs
-/// `iceberg-core-1.10.0.jar`). THE parity number this action was missing: Java admits a group of
-/// small position-delete files only from five files up, where this port used to admit two.
-const MIN_INPUT_FILES_DEFAULT: usize = 5;
-
-/// Java `SizeBasedFileRewritePlanner.MAX_FILE_GROUP_SIZE_BYTES_DEFAULT` = `107374182400` (100 GiB,
-/// bytecode-verified vs `iceberg-core-1.10.0.jar`).
-const MAX_FILE_GROUP_SIZE_BYTES_DEFAULT: u64 = 107374182400;
+// ONE HOME for the four Java planner constants, imported above from the sibling template rather
+// than duplicated here: `MIN_FILE_SIZE_DEFAULT_RATIO` (0.75), `MAX_FILE_SIZE_DEFAULT_RATIO` (1.8),
+// `MIN_INPUT_FILES_DEFAULT` (5) and `MAX_FILE_GROUP_SIZE_BYTES_DEFAULT` (107374182400 = 100 GiB).
+// All four are `SizeBasedFileRewritePlanner`'s and are inherited UNCHANGED by
+// `BinPackRewritePositionDeletePlanner` (bytecode-verified vs `iceberg-core-1.10.0.jar`:
+// `sizeThresholds` loads `ldc2_w // double 0.75d` and `ldc2_w // double 1.8d`), so a single home
+// is what keeps the two ports from drifting apart. `MIN_INPUT_FILES_DEFAULT` = 5 is THE parity
+// number this action was missing: Java admits a group of small position-delete files only from
+// FIVE files up, where this port used to admit two.
 
 /// [`TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT`] in the `i64` domain the
 /// parse works in (see [`parse_delete_target_file_size`]). The `as` is proven lossless by the
@@ -381,14 +425,15 @@ impl RewritePositionDeleteFiles {
         self
     }
 
-    /// Run the compaction: for every `(spec, partition)` group of live (filter-matching) parquet
-    /// position-delete files in the current snapshot, read their `(file_path, pos)` pairs, concat + sort
-    /// them, write FEWER position-delete files, and commit the swap in one `Replace` snapshot per group.
-    /// Returns the [`RewritePositionDeleteFilesResult`] counts.
+    /// Run the compaction: plan the live (filter-matching) parquet position-delete files of the
+    /// current snapshot through Java's six-stage pipeline (see the module docs), then for every
+    /// ADMITTED BIN read its `(file_path, pos)` pairs, concat + sort them, write the compacted
+    /// position-delete file(s), and commit the swap in one `Replace` snapshot per bin. Returns the
+    /// [`RewritePositionDeleteFilesResult`] counts.
     ///
     /// Commits NOTHING and returns zero counts when there is no current snapshot, no live parquet
-    /// position-delete files, none match the filter, or no group has more than one file (nothing to
-    /// compact).
+    /// position-delete files, none match the filter, no partition yields a CANDIDATE, or every bin
+    /// is declined by the three-clause admission gate.
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RewritePositionDeleteFilesResult> {
         // Resolve + VALIDATE the size / count thresholds BEFORE any manifest is read, mirroring Java,
         // where `sizeThresholds` runs at planner `init` and therefore before planning.
@@ -400,11 +445,7 @@ impl RewritePositionDeleteFiles {
         // = 1, so the STRICT `target < max` fires; from 2 up every precondition passes.) This is
         // parity-correct — Java throws on exactly the same inputs — but it IS a flip, and R-9's
         // PR-body list currently names only three.
-        //
-        // TODO(size gate): bound as `_config` because the admission gate that CONSUMES it lands in
-        // the planner increment of this PR; the `entries.len() < 2` guard below is still the
-        // pre-parity admission rule until then.
-        let _config = self.resolve_config()?;
+        let config = self.resolve_config()?;
 
         let metadata = self.table.metadata();
         let Some(snapshot) = metadata.current_snapshot().cloned() else {
@@ -412,35 +453,42 @@ impl RewritePositionDeleteFiles {
         };
         let starting_snapshot_id = snapshot.snapshot_id();
 
-        // (1) Enumerate the live PARQUET position-delete entries, grouped by (spec_id, partition).
-        // Puffin DVs are SKIPPED (file-scoped, never bin-packed) — the documented V2-parquet-only scope.
-        let groups = self.collect_position_delete_groups(&snapshot).await?;
+        // S2, BOUND ONCE — after the no-snapshot early return and BEFORE the manifest walk, mirroring
+        // Java, which binds the filter at the `PositionDeletes` scan.
+        //
+        // BEHAVIOUR FLIP (2nd, for the PR body): an UNBINDABLE filter previously errored only when
+        // some group happened to hold >= 2 files; hoisted to the scan it errors on ANY table with a
+        // current snapshot. That is Java's shape (a filter Java cannot bind fails the scan), and it
+        // fails loudly instead of silently compacting nothing.
+        //
+        // MICRO-RESIDUE, stated not claimed: whether Java also binds on a snapshot-less table is
+        // unverified, so this port keeps its pre-binding early return.
+        let mut partition_filter = self.bind_filter()?;
 
-        // Advance the base table after each group commit so the next group's `Transaction` is
-        // built on the committed tip (mirrors RewriteDataFiles). Without this, groups 2..N still
-        // succeed via `Transaction::do_commit`'s stale-base refresh + re-apply, but each group
-        // pays a full rewrite re-apply against the refreshed tip. Advancing avoids that redundant
-        // re-apply work; it is not required for CAS correctness under the retry/refresh loop.
+        // S1 + S2 + S3 — enumerate the live PARQUET position-delete entries, drop the ones the filter
+        // rejects, and group by (spec_id, partition). Puffin DVs are SKIPPED (file-scoped, never
+        // bin-packed) — the documented V2-parquet-only scope.
+        let groups = self
+            .collect_position_delete_groups(&snapshot, &mut partition_filter)
+            .await?;
+
+        // S4 + S5 + S6 — candidate filter, bin-pack, group filter.
+        let bins = plan_bins(groups, &config);
+
+        // Advance the base table after each bin commit so the next bin's `Transaction` is built on
+        // the committed tip (mirrors RewriteDataFiles). Without this, bins 2..N still succeed via
+        // `Transaction::do_commit`'s stale-base refresh + re-apply, but each bin pays a full rewrite
+        // re-apply against the refreshed tip. Advancing avoids that redundant re-apply work; it is
+        // not required for CAS correctness under the retry/refresh loop.
         let mut table = self.table.clone();
         let mut result = RewritePositionDeleteFilesResult::default();
-        for (key, entries) in groups {
-            // Java's planner drops single-file groups (nothing to compact). A group must have at least
-            // TWO position-delete files for compaction to do real work.
-            if entries.len() < 2 {
-                continue;
-            }
-            // Filter on the group's partition (every entry in a group shares the partition + spec, so the
-            // first entry represents the group).
-            if !self.group_matches_filter(&entries[0])? {
-                continue;
-            }
-
+        for (key, bin) in bins {
             table = self
                 .compact_group(
                     catalog,
                     &table,
                     &key,
-                    &entries,
+                    &bin,
                     starting_snapshot_id,
                     &mut result,
                 )
@@ -602,12 +650,18 @@ impl RewritePositionDeleteFiles {
         })
     }
 
-    /// Walk the current snapshot's manifests once and collect the live PARQUET position-delete entries
-    /// grouped by `(spec_id, partition)`. Puffin deletion vectors (`format == Puffin`) and
-    /// equality/data entries are EXCLUDED. One pass over the manifest list.
+    /// Stages S1 - S3: walk the current snapshot's manifests ONCE, collect the live PARQUET
+    /// position-delete entries that pass the user `filter`, and group them by `(spec_id, partition)`.
+    /// Puffin deletion vectors (`format == Puffin`) and equality/data entries are EXCLUDED.
+    ///
+    /// The filter is applied PER ENTRY here (S2), not per group, because Java applies it at the
+    /// `PositionDeletes` scan — strictly before `groupByPartition`. The selection is identical either
+    /// way (every entry in a group shares the partition and the projected predicate is
+    /// partition-only); what changes is WHEN an unbindable filter errors (see [`Self::execute`]).
     async fn collect_position_delete_groups(
         &self,
         snapshot: &Snapshot,
+        partition_filter: &mut PartitionFilter,
     ) -> Result<HashMap<GroupKey, Vec<LiveDeleteEntry>>> {
         let metadata = self.table.metadata();
         let manifest_list = snapshot
@@ -630,6 +684,10 @@ impl RewritePositionDeleteFiles {
                     // A Puffin DELETION VECTOR — file-scoped, never bin-packed by this action.
                     continue;
                 }
+                // S2 — the user filter, at collection (Java's scan-level `filter`).
+                if !partition_filter.matches(metadata, data_file)? {
+                    continue;
+                }
                 let key = (data_file.partition_spec_id, data_file.partition().clone());
                 groups.entry(key).or_default().push(LiveDeleteEntry {
                     data_file: data_file.clone(),
@@ -643,61 +701,30 @@ impl RewritePositionDeleteFiles {
         Ok(groups)
     }
 
-    /// Whether the position-delete group's partition matches [`Self::filter`]. `AlwaysTrue` (the default)
-    /// matches everything without binding. Otherwise the row-level filter is bound to the table schema,
-    /// inclusively projected onto the delete file's partition spec, and evaluated against the delete
-    /// file's partition struct — the SAME partition-pruning path the table scan uses.
-    fn group_matches_filter(&self, entry: &LiveDeleteEntry) -> Result<bool> {
+    /// Stage S2's ONE bind: bind [`Self::filter`] to the table schema, once, before the manifest
+    /// walk. `AlwaysTrue` (the default) matches everything and is never bound.
+    ///
+    /// This is where an unbindable filter now fails — see [`Self::execute`]'s behaviour-flip note.
+    fn bind_filter(&self) -> Result<PartitionFilter> {
         if matches!(self.filter, Predicate::AlwaysTrue) {
-            return Ok(true);
+            return Ok(PartitionFilter::always_true());
         }
-        let metadata = self.table.metadata();
-        let schema = metadata.current_schema().clone();
-        let bound_row_filter = self
-            .filter
-            .clone()
-            .bind(schema.clone(), true)
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "RewritePositionDeleteFiles filter could not be bound to the table schema",
-                )
-                .with_source(e)
-            })?;
-
-        let spec = metadata
-            .partition_spec_by_id(entry.data_file.partition_spec_id)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Position delete '{}' references unknown partition spec {}",
-                        entry.data_file.file_path(),
-                        entry.data_file.partition_spec_id
-                    ),
-                )
-            })?;
-
-        let partition_type = spec.partition_type(&schema)?;
-        let partition_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(spec.spec_id())
-                .with_fields(partition_type.fields().to_owned())
-                .build()?,
-        );
-        let mut inclusive_projection = InclusiveProjection::new(spec.clone());
-        let partition_filter = inclusive_projection
-            .project(&bound_row_filter)?
-            .rewrite_not()
-            .bind(partition_schema, true)?;
-
-        ExpressionEvaluator::new(partition_filter).eval(&entry.data_file)
+        let schema = self.table.metadata().current_schema().clone();
+        let bound_row_filter = self.filter.clone().bind(schema, true).map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "RewritePositionDeleteFiles filter could not be bound to the table schema",
+            )
+            .with_source(e)
+        })?;
+        Ok(PartitionFilter::bound(bound_row_filter))
     }
 
-    /// Compact ONE `(spec, partition)` group: read every member file's `(file_path, pos)` pairs, concat +
-    /// sort, write FEWER position-delete files, and commit ONE `RewriteFiles` that replaces the rewritten
-    /// files with the new one, stamped with the group MAX rewritten data-seq and validated from the
-    /// starting snapshot. Accumulates the four `Result` counts.
+    /// Compact ONE ADMITTED BIN of a `(spec, partition)` group: read every member file's
+    /// `(file_path, pos)` pairs, concat + sort, write FEWER position-delete files, and commit ONE
+    /// `RewriteFiles` that replaces the rewritten files with the new one, stamped with the bin MAX
+    /// rewritten data-seq and validated from the starting snapshot. Accumulates the four `Result`
+    /// counts.
     ///
     /// Returns the committed [`Table`] so the caller can advance the base for the next group
     /// (mirrors [`crate::maintenance::rewrite_data_files::RewriteDataFiles`]).
@@ -886,6 +913,193 @@ impl RewritePositionDeleteFiles {
             )
         })
     }
+}
+
+/// Stage S2's evaluator: the user `filter`, bound ONCE to the table schema, plus the projected +
+/// bound partition evaluator CACHED PER `spec_id`. Binding is therefore O(specs), not O(entries).
+///
+/// `bound_row_filter == None` is the [`Predicate::AlwaysTrue`] default — it matches everything and
+/// never binds, so a table whose filter is unset does no projection work at all.
+struct PartitionFilter {
+    bound_row_filter: Option<BoundPredicate>,
+    by_spec_id: HashMap<i32, ExpressionEvaluator>,
+}
+
+impl PartitionFilter {
+    /// The unfiltered default: every entry matches, nothing is bound.
+    fn always_true() -> Self {
+        Self {
+            bound_row_filter: None,
+            by_spec_id: HashMap::new(),
+        }
+    }
+
+    /// A real filter, already bound to the table schema by
+    /// [`RewritePositionDeleteFiles::bind_filter`].
+    fn bound(bound_row_filter: BoundPredicate) -> Self {
+        Self {
+            bound_row_filter: Some(bound_row_filter),
+            by_spec_id: HashMap::new(),
+        }
+    }
+
+    /// Whether `data_file`'s PARTITION matches the filter — the SAME partition-pruning path the
+    /// table scan uses (inclusive projection onto the file's spec, then evaluation against the
+    /// file's partition struct). The per-spec evaluator is built at most once.
+    fn matches(&mut self, metadata: &TableMetadata, data_file: &DataFile) -> Result<bool> {
+        // Split the borrow so the cache can be filled while the bound predicate is read.
+        let Self {
+            bound_row_filter,
+            by_spec_id,
+        } = self;
+        let Some(bound_row_filter) = bound_row_filter.as_ref() else {
+            return Ok(true);
+        };
+
+        let spec_id = data_file.partition_spec_id;
+        let evaluator = match by_spec_id.entry(spec_id) {
+            Entry::Occupied(occupied) => occupied.into_mut(),
+            Entry::Vacant(vacant) => vacant.insert(build_partition_evaluator(
+                metadata,
+                bound_row_filter,
+                spec_id,
+                data_file.file_path(),
+            )?),
+        };
+        evaluator.eval(data_file)
+    }
+}
+
+/// Project the bound row filter onto partition spec `spec_id` and bind it to that spec's partition
+/// schema, yielding the evaluator [`PartitionFilter`] caches.
+fn build_partition_evaluator(
+    metadata: &TableMetadata,
+    bound_row_filter: &BoundPredicate,
+    spec_id: i32,
+    file_path: &str,
+) -> Result<ExpressionEvaluator> {
+    let schema = metadata.current_schema().clone();
+    let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("Position delete '{file_path}' references unknown partition spec {spec_id}"),
+        )
+    })?;
+
+    let partition_type = spec.partition_type(&schema)?;
+    let partition_schema = Arc::new(
+        Schema::builder()
+            .with_schema_id(spec.spec_id())
+            .with_fields(partition_type.fields().to_owned())
+            .build()?,
+    );
+    let mut inclusive_projection = InclusiveProjection::new(spec.clone());
+    let partition_filter = inclusive_projection
+        .project(bound_row_filter)?
+        .rewrite_not()
+        .bind(partition_schema, true)?;
+
+    Ok(ExpressionEvaluator::new(partition_filter))
+}
+
+/// Stages S4 - S6 of the planner (Java `BinPackRewritePositionDeletePlanner.planFileGroups`, reached
+/// per partition): candidate-filter each group, bin-pack the survivors, and keep the bins the
+/// three-clause group filter admits. Returns each admitted bin alongside its group key.
+///
+/// Java's order is `filterFiles` → `ListPacker.pack` → `filterFileGroups`, and it is load-bearing:
+/// packing first would let an in-range file consume bin headroom and split the candidates that
+/// belong together.
+fn plan_bins(
+    groups: HashMap<GroupKey, Vec<LiveDeleteEntry>>,
+    config: &ResolvedConfig,
+) -> Vec<(GroupKey, Vec<LiveDeleteEntry>)> {
+    let mut admitted: Vec<(GroupKey, Vec<LiveDeleteEntry>)> = Vec::new();
+
+    for (key, entries) in groups {
+        // S4 — the candidate filter.
+        let candidates: Vec<LiveDeleteEntry> = entries
+            .into_iter()
+            .filter(|entry| is_candidate(entry, config))
+            .collect();
+        // A partition with no candidate contributes no bin. The packer already returns an empty
+        // `Vec` for an empty input, so this is a cheap short-circuit rather than a behaviour: the
+        // branch is deliberately UNKILLABLE by mutation and is not carried as covered anywhere.
+        if candidates.is_empty() {
+            continue;
+        }
+
+        // S5 — bin-pack through the shared packer (Java's inherited `ListPacker`).
+        let bins = pack_bins(
+            candidates,
+            |entry| entry.data_file.file_size_in_bytes,
+            config.max_file_group_size_bytes,
+        );
+
+        // S6 — the three-clause group filter.
+        for bin in bins {
+            if group_qualifies(&bin, config) {
+                admitted.push((key.clone(), bin));
+            }
+        }
+    }
+
+    admitted
+}
+
+/// Java `SizeBasedFileRewritePlanner.filterFiles` → `outsideDesiredFileSizeRange`: a position-delete
+/// file is a CANDIDATE iff it is undersized or oversized, both comparisons STRICT.
+///
+/// There is deliberately NO delete-count clause: `tooManyDeletes` / `tooHighDeleteRatio` live on
+/// `BinPackRewriteFilePlanner` (the DATA-file planner), and `BinPackRewritePositionDeletePlanner`
+/// does not inherit them — its `filterFiles` is `Iterables.filter(tasks, outsideDesiredFileSizeRange)`
+/// and nothing else.
+fn is_candidate(entry: &LiveDeleteEntry, config: &ResolvedConfig) -> bool {
+    let length = entry.data_file.file_size_in_bytes;
+    length < config.min_file_size_bytes || length > config.max_file_size_bytes
+}
+
+/// Java `SizeBasedFileRewritePlanner.filterFileGroups` — a plain three-way disjunction over one bin,
+/// with NO fourth clause (the template's `any_too_many_deletes` disjunct is
+/// `BinPackRewriteFilePlanner`-only and must not appear here):
+///
+/// - `enough_input_files` = `size > 1 && size >= min_input_files`
+/// - `enough_content`     = `size > 1 && input_size > target_file_size_bytes`
+/// - `too_much_content`   = `input_size > max_file_size_bytes` — **no `size > 1` guard**, which is
+///   what admits a LONE oversized position-delete file.
+///
+/// Every size comparison is STRICT; `>=` appears only on `min_input_files`.
+///
+/// TWO leaf sub-expressions here are unreachable END TO END, so no end-to-end fixture can kill their
+/// mutants. (a) `enough_content`'s `size > 1`: a bin of one that reaches this gate is a candidate, so
+/// its length is either below `min` — and `min < target`, so `enough_content` is false either way —
+/// or above `max`, in which case `too_much_content` is already true. (b) `too_much_content`'s
+/// boundary STRICTNESS: a bin at `input_size == max` is either of size 1, whose file then has
+/// `length == max` and is not a candidate at all, or of size >= 2, and then `enough_content` is
+/// already true because `max > target`. Both proofs use only `min < target < max`, which
+/// `resolve_config`'s preconditions (3) and (4) guarantee.
+///
+/// UNREACHABLE IS NOT UNPINNED. Both rest on candidate-filter REACHABILITY, not on the config space,
+/// so both states are constructible through the WHITE-BOX seam the test module already opens on this
+/// function, and both mutants ARE killed there — see
+/// `test_gate_enough_content_size_guard_declines_lone_over_target_file_white_box` and
+/// `test_gate_input_size_exactly_max_is_declined_white_box`. Do not delete either leaf as dead code.
+///
+/// The input-size sum SATURATES (template form) where Java's `mapToLong(..).sum()` WRAPS on `long`
+/// overflow. A wrapped negative sum makes both size clauses false, so Java would DECLINE where this
+/// port ADMITS. Unreachable in practice — it needs more than 8 EiB of live delete files in ONE bin —
+/// and the input is manifest-trusted, so saturating is the safer of the two; the divergence is
+/// recorded rather than assumed.
+fn group_qualifies(bin: &[LiveDeleteEntry], config: &ResolvedConfig) -> bool {
+    let size = bin.len();
+    let input_size: u64 = bin.iter().fold(0u64, |sum, entry| {
+        sum.saturating_add(entry.data_file.file_size_in_bytes)
+    });
+
+    let enough_input_files = size > 1 && size >= config.min_input_files;
+    let enough_content = size > 1 && input_size > config.target_file_size_bytes;
+    let too_much_content = input_size > config.max_file_size_bytes;
+
+    enough_input_files || enough_content || too_much_content
 }
 
 /// Locate the `file_path` (string) and `pos` (int64) columns of a position-delete record batch by their

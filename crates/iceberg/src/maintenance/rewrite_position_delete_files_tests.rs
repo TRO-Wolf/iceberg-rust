@@ -341,6 +341,11 @@ fn count_pos(files: &[DataFile]) -> usize {
 /// MUTATION COVERAGE: grouping — if compaction collected positions from only one of the two files (e.g.
 /// a `break` after the first), one masked row would resurrect and the after-set would differ from
 /// before, failing the read-identity assertion.
+/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
+/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is READ IDENTITY across a compaction — not
+/// admission. It therefore sets `.min_input_files(2)` explicitly, which is also acceptance item
+/// 2: the floor is configuration, not a hard-coded constant. Removing that knob must RED this
+/// test — it asserts post-`execute` SHAPE, never read identity alone.
 #[tokio::test]
 async fn test_crown_jewel_read_identity_data_file_masked_by_two_pos_deletes() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -377,6 +382,7 @@ async fn test_crown_jewel_read_identity_data_file_masked_by_two_pos_deletes() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
@@ -424,6 +430,11 @@ async fn test_crown_jewel_read_identity_data_file_masked_by_two_pos_deletes() {
 /// MUTATION COVERAGE: change `add_delete_file_with_sequence_number(.., max_seq)` to
 /// `add_delete_file(..)` (inherit) and the live compacted pos-delete seq becomes the rewrite snapshot's
 /// seq (4), not 3; the seq assertion fails. Change `.max()` to `.min()` and the stamp becomes 2; fails.
+/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
+/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is the sequence-number STAMP the compacted
+/// file carries — not admission. It therefore sets `.min_input_files(2)` explicitly, which is
+/// also acceptance item 2: the floor is configuration, not a hard-coded constant. Removing that
+/// knob must RED this test — it asserts post-`execute` SHAPE, never read identity alone.
 #[tokio::test]
 async fn test_compacted_file_carries_group_max_rewritten_seq() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -460,6 +471,7 @@ async fn test_compacted_file_carries_group_max_rewritten_seq() {
     assert_eq!(before, HashSet::from([30]), "before: y=10 and y=20 masked");
 
     RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
@@ -492,6 +504,11 @@ async fn test_compacted_file_carries_group_max_rewritten_seq() {
 /// masks X. If the stamp were inherited (seq 5 from the rewrite), it would `> 1` so X stays masked
 /// (looks fine) — but the resurrection failure mode is the INVERSE: an OVER-low stamp. We pin the read
 /// identity across BOTH data files so any wrong stamp that changes the masked set fails.
+/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
+/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is the sequence-number STAMP (resurrection
+/// / over-apply) — not admission. It therefore sets `.min_input_files(2)` explicitly, which is
+/// also acceptance item 2: the floor is configuration, not a hard-coded constant. Removing that
+/// knob must RED this test — it asserts post-`execute` SHAPE, never read identity alone.
 #[tokio::test]
 async fn test_seq_stamp_does_not_resurrect_or_over_apply() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -517,12 +534,43 @@ async fn test_seq_stamp_does_not_resurrect_or_over_apply() {
         "before: X fully masked; W (seq 4 > delete seqs) survives with y=10,20"
     );
 
-    RewritePositionDeleteFiles::new(table.clone())
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
 
+    // SHAPE FIRST (acceptance criterion 4 / design call 2). Read identity ALONE is satisfied by a
+    // DECLINED bin doing nothing, so this test asserts the bin was actually ADMITTED before it
+    // asserts anything about what the admitted run produced. Remove the `.min_input_files(2)` knob
+    // above and these two assertions red.
+    assert_eq!(
+        result.rewritten_delete_files_count, 2,
+        "the two pos-deletes must actually be rewritten — a declined bin rewrites nothing"
+    );
+    assert_eq!(result.added_delete_files_count, 1);
+
     let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    let pos_entries: Vec<(DataFile, Option<i64>)> = live_delete_entries_with_seq(&reloaded)
+        .await
+        .into_iter()
+        .filter(|(f, _)| f.content_type() == DataContentType::PositionDeletes)
+        .collect();
+    assert_eq!(
+        pos_entries.len(),
+        1,
+        "the two pos-deletes compacted into ONE — a declined bin would leave two"
+    );
+    // POWER ON ITS OWN SUBJECT: pin the EXACT stamp, not just the row set. Read identity cannot
+    // separate `max` from `inherit` here (both are > X's seq 1, so X stays masked either way), and
+    // it cannot separate `max` from `min` either (2 and 3 both mask X and both miss W). The stamp
+    // assertion can, and does.
+    assert_eq!(
+        pos_entries[0].1,
+        Some(3),
+        "the compacted pos-delete MUST carry the group MAX rewritten data seq (3): `< 4` so it \
+         never touches W, `> 1` so it still masks X"
+    );
     assert_eq!(
         scan_y_values(&reloaded).await,
         before,
@@ -537,6 +585,11 @@ async fn test_seq_stamp_does_not_resurrect_or_over_apply() {
 /// MULTI-FILE GROUPING across DATA files in one partition. Two data files in partition 0, each masked by
 /// its own pos-delete file. Both pos-deletes share `(spec 0, partition 0)`, so they compact into ONE
 /// file carrying both data files' positions. Read identity must hold.
+/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
+/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is GROUPING across data files in one
+/// partition — not admission. It therefore sets `.min_input_files(2)` explicitly, which is also
+/// acceptance item 2: the floor is configuration, not a hard-coded constant. Removing that knob
+/// must RED this test — it asserts post-`execute` SHAPE, never read identity alone.
 #[tokio::test]
 async fn test_multi_file_grouping_one_partition() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -561,6 +614,7 @@ async fn test_multi_file_grouping_one_partition() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
@@ -588,6 +642,11 @@ async fn test_multi_file_grouping_one_partition() {
 /// MUTATION COVERAGE: collapse the `(spec, partition)` group key to spec-only and both partitions' files
 /// would merge into one group; the compacted file's partition would be wrong and the per-partition read
 /// identity would break (or the writer/commit would error on a partition mismatch).
+/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
+/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is PARTITION ISOLATION and the per-group
+/// commit — not admission. It therefore sets `.min_input_files(2)` explicitly, which is also
+/// acceptance item 2: the floor is configuration, not a hard-coded constant. Removing that knob
+/// must RED this test — it asserts post-`execute` SHAPE, never read identity alone.
 #[tokio::test]
 async fn test_partition_isolation_compacts_each_group_separately() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -616,6 +675,7 @@ async fn test_partition_isolation_compacts_each_group_separately() {
     let history_before = table.metadata().history().len();
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
@@ -649,6 +709,11 @@ async fn test_partition_isolation_compacts_each_group_separately() {
 
 /// FILTER restriction. Two partitions, each with two pos-deletes. `filter(x == 0)` compacts ONLY the
 /// partition-0 group; partition 1's pos-deletes are left untouched. Read identity holds throughout.
+/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
+/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is the user FILTER stage (C-005 S2) — not
+/// admission. It therefore sets `.min_input_files(2)` explicitly, which is also acceptance item
+/// 2: the floor is configuration, not a hard-coded constant. Removing that knob must RED this
+/// test — it asserts post-`execute` SHAPE, never read identity alone.
 #[tokio::test]
 async fn test_filter_restricts_compacted_partitions() {
     use crate::expr::Reference;
@@ -674,6 +739,7 @@ async fn test_filter_restricts_compacted_partitions() {
     assert_eq!(before, HashSet::from([10, 30]));
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .filter(Reference::new("x").equal_to(Datum::long(0)))
         .execute(&catalog)
         .await
@@ -712,6 +778,15 @@ async fn test_filter_restricts_compacted_partitions() {
 /// the action would try to read each Puffin DV as a parquet file (failing the read, or wrongly handling it).
 /// This test (zero counts, both DVs intact, read identity) fails. The 2-DV group is what makes the skip
 /// load-bearing (a single DV would be dropped by the single-file-group guard regardless).
+/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
+/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is the V2-PARQUET-ONLY scope — not
+/// admission. It therefore sets `.min_input_files(2)` explicitly, which is also acceptance item
+/// 2: the floor is configuration, not a hard-coded constant. Its PIN FORM is the APPLIED
+/// mutation above, NOT knob removal: with the Parquet skip in place both DVs are dropped at S1,
+/// so the action is a no-op with or without the knob, and removing it leaves this test GREEN.
+/// The knob is load-bearing only for the MUTATED build, where the two DVs form an admissible
+/// 2-file bin. The stronger rework — five Puffin DVs at the default config, no knob — is ruled
+/// to the test increment.
 #[tokio::test]
 async fn test_v3_deletion_vectors_are_not_compacted() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -737,6 +812,7 @@ async fn test_v3_deletion_vectors_are_not_compacted() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
@@ -849,6 +925,11 @@ async fn test_single_file_group_is_a_no_op() {
 
 /// Unpartitioned table: two pos-delete files in the single unpartitioned group compact into one. Read
 /// identity holds.
+/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
+/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is the UNPARTITIONED group key — not
+/// admission. It therefore sets `.min_input_files(2)` explicitly, which is also acceptance item
+/// 2: the floor is configuration, not a hard-coded constant. Removing that knob must RED this
+/// test — it asserts post-`execute` SHAPE, never read identity alone.
 #[tokio::test]
 async fn test_unpartitioned_group_compacts() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -869,6 +950,7 @@ async fn test_unpartitioned_group_compacts() {
     assert_eq!(before, HashSet::from([10, 40]));
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
@@ -1435,5 +1517,1023 @@ async fn test_resolve_config_rejects_target_at_i64_max_on_the_max_precondition()
         error.message(),
         "'target-file-size-bytes' (9223372036854775807) must be < 'max-file-size-bytes' \
          (9223372036854775807), all new files will be larger than the max threshold"
+    );
+}
+
+// =================================================================================================
+// THE ADMISSION GATE — the candidate filter (C-004), the six-stage pipeline order (C-005), the
+// three-clause group filter (C-003), the shared bin packer (C-027) and the saturating input sum
+// (C-041).
+//
+// FIXTURE DISCIPLINE (C-036), applied without exception below: a size-class fixture is NEVER sized
+// to fixed knobs. The position-delete file is written first, its `file_size_in_bytes` is MEASURED
+// off the returned `DataFile`, and the knobs are then set AROUND that measurement. Every size-class
+// test asserts its measured size against the RESOLVED thresholds BEFORE `execute`, so a fixture that
+// drifts out of its size class fails loudly instead of passing vacuously. Where a knob derivation
+// makes a window assert an algebraic identity in the fixture size, that is RECORDED as true by
+// construction rather than dressed up as a check.
+// =================================================================================================
+
+/// Write a position-delete file masking `count` consecutive positions of `target_path` starting at
+/// `first_pos`, in partition 0. This is the SIZE DIAL for the size-class fixtures: more masked
+/// positions ⇒ a strictly larger file (the `file_path` column dictionary-encodes to one value, so the
+/// growth is the `pos` column). The size is never predicted — it is measured off the return value.
+async fn write_sized_pos_delete(
+    table: &Table,
+    target_path: &str,
+    first_pos: i64,
+    count: i64,
+) -> DataFile {
+    let pairs: Vec<(&str, i64)> = (first_pos..first_pos + count)
+        .map(|pos| (target_path, pos))
+        .collect();
+    write_position_delete_file(table, Some(0), &pairs).await
+}
+
+/// A partitioned table with ONE five-row data file (y = 10,20,30,40,50 at positions 0..5) already
+/// committed — the base every gate fixture below builds its position-delete files on. Returns the
+/// catalog, the temp dir (kept alive), the table and the data file's path.
+async fn gate_table() -> (impl Catalog, TempDir, Table, String) {
+    let (catalog, temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+    let x = write_data_file(&table, "x.parquet", 0, &[
+        (0, 10, 100),
+        (0, 20, 200),
+        (0, 30, 300),
+        (0, 40, 400),
+        (0, 50, 500),
+    ])
+    .await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+    (catalog, temp, table, x_path)
+}
+
+/// The live position-delete files in MANIFEST ORDER — the same order
+/// `collect_position_delete_groups` walks, so a fixture whose packing depends on order can assert
+/// the order it actually gets instead of assuming it.
+async fn live_pos_delete_paths(table: &Table) -> Vec<String> {
+    live_delete_files(table)
+        .await
+        .iter()
+        .filter(|f| f.content_type() == DataContentType::PositionDeletes)
+        .map(|f| f.file_path().to_string())
+        .collect()
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-003 element 1 — `enough_input_files`'s `size > 1` conjunct.
+// ------------------------------------------------------------------------------------------------
+
+/// C-003 element 1. `.min_input_files(1)` with a SINGLE sub-min position-delete file. The file IS a
+/// candidate (sub-min) and forms a bin of one, so the gate is reached; `enough_input_files` is
+/// `size > 1 && size >= min_input_files`, and only the `size > 1` conjunct declines it — `1 >= 1`
+/// holds. `enough_content` is false for the same reason, and the file is far below `max`, so
+/// `too_much_content` is false too.
+///
+/// MUTATION COVERAGE: this is the ONLY killer of `enough_input_files`'s `size > 1` conjunct. Drop it
+/// and the bin is admitted, producing a Replace snapshot and non-zero counts.
+#[tokio::test]
+async fn test_admission_min_input_files_one_still_declines_lone_sub_min_file() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    let pd = write_sized_pos_delete(&table, &x_path, 1, 1).await;
+    let size = pd.file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, vec![pd]).await;
+
+    let action = || RewritePositionDeleteFiles::new(table.clone()).min_input_files(1);
+    let config = action()
+        .resolve_config()
+        .expect("the defaults plus min_input_files(1) are legal");
+
+    // PRECONDITIONS (measured against the RESOLVED thresholds, before execute).
+    assert!(
+        size < config.min_file_size_bytes,
+        "fixture: the lone file must be SUB-MIN so it is a candidate and reaches the gate \
+         (measured {size}, resolved min {})",
+        config.min_file_size_bytes
+    );
+    assert!(
+        size <= config.max_file_size_bytes,
+        "fixture: too_much_content must NOT fire, or the pin would pass for the wrong reason"
+    );
+    assert_eq!(
+        config.min_input_files, 1,
+        "fixture: the floor is lowered to 1"
+    );
+
+    let before = scan_y_values(&table).await;
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "a bin of ONE is declined by `size > 1` even at min_input_files(1)"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "a declined bin must NOT commit"
+    );
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 1);
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-003 element 2 (+ C-001, and the execute-altitude proof that the resolved config is CONSULTED).
+// ------------------------------------------------------------------------------------------------
+
+/// C-003 element 2, TWO-SIDED at the DEFAULT config — the acceptance-criterion-1 pin and THE parity
+/// number this whole change is about. Four small position-delete files in one partition are DECLINED
+/// under Java's `MIN_INPUT_FILES_DEFAULT = 5`; a fifth flips the same partition to ADMITTED.
+///
+/// NON-VACUITY: the fixture asserts that the four/five-file input size is at or below BOTH the
+/// resolved target and the resolved max, so neither `enough_content` nor `too_much_content` can be
+/// the admitter — the fifth file admits through `enough_input_files` and nothing else.
+///
+/// MUTATION COVERAGE, two-sided and both applied: `MIN_INPUT_FILES_DEFAULT` 5 → 4 admits the
+/// four-file case (first half reds); 5 → 6 declines the five-file case (second half reds). It is
+/// also the EXECUTE-ALTITUDE pin that the resolved config is actually consumed by the planner: the
+/// action sets no builder overrides at all, so a planner that ignored `config.min_input_files` (say,
+/// by keeping a hard-coded floor of 2) admits the four-file case and reds here.
+#[tokio::test]
+async fn test_admission_min_input_files_default_five_declines_four_admits_five() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    // FOUR position-delete files, each masking one position of X.
+    let mut sizes: Vec<u64> = Vec::new();
+    let mut table = table;
+    for pos in 0..4i64 {
+        let pd = write_sized_pos_delete(&table, &x_path, pos, 1).await;
+        sizes.push(pd.file_size_in_bytes);
+        table = add_deletes(&catalog, &table, vec![pd]).await;
+    }
+
+    let config = RewritePositionDeleteFiles::new(table.clone())
+        .resolve_config()
+        .expect("the pure defaults are legal");
+    assert_eq!(
+        config.min_input_files, 5,
+        "fixture: this pin runs at Java's DEFAULT floor, with no builder override"
+    );
+    let four_input: u64 = sizes.iter().sum();
+    for size in &sizes {
+        assert!(
+            *size < config.min_file_size_bytes,
+            "fixture: every file must be SUB-MIN so all four are candidates \
+             (measured {size}, resolved min {})",
+            config.min_file_size_bytes
+        );
+    }
+    assert!(
+        four_input <= config.target_file_size_bytes && four_input <= config.max_file_size_bytes,
+        "fixture NON-VACUITY: the four-file input ({four_input}) must clear NEITHER the target nor \
+         the max, so only the COUNT clause can ever admit this partition"
+    );
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([50]),
+        "before: positions 0..4 are masked"
+    );
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    // (a) FOUR files at the default floor of five ⇒ DECLINED.
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "FOUR small position-delete files are BELOW Java's floor of five — not rewritten"
+    );
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "a declined partition must NOT commit"
+    );
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 4);
+
+    // (b) A FIFTH file in the same partition ⇒ ADMITTED.
+    let pd5 = write_sized_pos_delete(&reloaded, &x_path, 4, 1).await;
+    let five_input = four_input + pd5.file_size_in_bytes;
+    assert!(
+        pd5.file_size_in_bytes < config.min_file_size_bytes,
+        "fixture: the fifth file is SUB-MIN too"
+    );
+    assert!(
+        five_input <= config.target_file_size_bytes && five_input <= config.max_file_size_bytes,
+        "fixture NON-VACUITY: the five-file input ({five_input}) still clears neither size clause"
+    );
+    let table = add_deletes(&catalog, &reloaded, vec![pd5]).await;
+    let before_five = scan_y_values(&table).await;
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rewritten_delete_files_count, 5,
+        "FIVE files meet Java's floor — the whole bin is rewritten"
+    );
+    assert_eq!(result.added_delete_files_count, 1);
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        count_pos(&live_delete_files(&reloaded).await),
+        1,
+        "the five position-delete files compact into one"
+    );
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before_five,
+        "read identity across the admitted compaction"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-003 element 4 — `enough_content` and its STRICTNESS at the target.
+// ------------------------------------------------------------------------------------------------
+
+/// C-003 element 4. TWO sub-min position-delete files whose MEASURED sizes sum to just over the
+/// target: below the count floor of five, so only `enough_content` can admit them.
+///
+/// KNOBS FROM THE MEASUREMENTS: `target := S_A + S_B - 1`, with min/max defaulted (0.75x / 1.8x), so
+/// both files are sub-min candidates and the bin's input is one byte over the target.
+///
+/// RECORDED AS TRUE BY CONSTRUCTION, not asserted as if it were falsifiable: `input_size > target`
+/// is an identity under `target := S_A + S_B - 1`. The falsifiable content is on the MEASURED
+/// OUTPUT — one Replace snapshot, two files rewritten, one added — plus the preconditions that make
+/// the OTHER two clauses provably false.
+///
+/// MUTATION COVERAGE: delete the `enough_content` disjunct and the bin is declined (2 < 5, and the
+/// input is far below max) — zero counts, no snapshot.
+#[tokio::test]
+async fn test_admission_enough_content_admits_two_files_over_target() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    let pd_a = write_sized_pos_delete(&table, &x_path, 1, 1).await;
+    let size_a = pd_a.file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, vec![pd_a]).await;
+    let pd_b = write_sized_pos_delete(&table, &x_path, 3, 1).await;
+    let size_b = pd_b.file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, vec![pd_b]).await;
+
+    let target = size_a + size_b - 1;
+    let action = || RewritePositionDeleteFiles::new(table.clone()).target_file_size_bytes(target);
+    let config = action().resolve_config().expect("legal knobs");
+
+    // PRECONDITIONS.
+    assert!(
+        size_a < config.min_file_size_bytes && size_b < config.min_file_size_bytes,
+        "fixture: both files must be SUB-MIN candidates (measured {size_a}/{size_b}, resolved min {})",
+        config.min_file_size_bytes
+    );
+    assert!(
+        2 < config.min_input_files,
+        "fixture NON-VACUITY: two files are BELOW the count floor, so enough_input_files is false"
+    );
+    assert!(
+        size_a + size_b <= config.max_file_size_bytes,
+        "fixture NON-VACUITY: the input must NOT exceed max, so too_much_content is false too"
+    );
+
+    let before = scan_y_values(&table).await;
+    let history_before = table.metadata().history().len();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result.rewritten_delete_files_count, 2,
+        "enough_content admits a two-file bin whose bytes exceed the target"
+    );
+    assert_eq!(result.added_delete_files_count, 1);
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().history().len(),
+        history_before + 1,
+        "exactly one Replace snapshot"
+    );
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 1);
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+/// C-003 element 4, THE BOUNDARY. The same two sub-min files, but `target := S_A + S_B` exactly.
+/// `enough_content` is `input_size > target`, STRICT, so an input EQUAL to the target is declined.
+///
+/// RECORDED AS TRUE BY CONSTRUCTION: `input_size == target` is an identity under the knob choice.
+/// The falsifiable content is the MEASURED OUTCOME — zero counts and no new snapshot — plus the
+/// preconditions that rule out the other two clauses.
+///
+/// MUTATION COVERAGE: relax `input_size > target` to `>=` and this bin is admitted.
+#[tokio::test]
+async fn test_admission_input_size_exactly_target_is_declined() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    let pd_a = write_sized_pos_delete(&table, &x_path, 1, 1).await;
+    let size_a = pd_a.file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, vec![pd_a]).await;
+    let pd_b = write_sized_pos_delete(&table, &x_path, 3, 1).await;
+    let size_b = pd_b.file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, vec![pd_b]).await;
+
+    let target = size_a + size_b;
+    let action = || RewritePositionDeleteFiles::new(table.clone()).target_file_size_bytes(target);
+    let config = action().resolve_config().expect("legal knobs");
+
+    assert!(
+        size_a < config.min_file_size_bytes && size_b < config.min_file_size_bytes,
+        "fixture: both files must be SUB-MIN candidates, so the bin REACHES the gate"
+    );
+    assert!(2 < config.min_input_files, "fixture: below the count floor");
+    assert!(
+        size_a + size_b <= config.max_file_size_bytes,
+        "fixture: too_much_content must be false"
+    );
+
+    let before = scan_y_values(&table).await;
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "an input EXACTLY at the target is declined — the comparison is STRICT"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "a declined bin must NOT commit"
+    );
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 2);
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-003 element 5 — `too_much_content` EXISTS and carries NO `size > 1` guard.
+// ------------------------------------------------------------------------------------------------
+
+/// C-003 element 5, and acceptance criterion 3's ADMISSION leg. A LONE position-delete file above
+/// `max_file_size_bytes` IS admitted: `too_much_content` is `input_size > max_file_size_bytes` with
+/// no `size > 1` guard, unlike the other two clauses.
+///
+/// KNOBS FROM THE MEASUREMENT: `max := S - 1`, `target := S - 2`, `min := S - 3`, so the single file
+/// is oversized (hence a candidate) and forms a bin of one.
+///
+/// This test pins ADMISSION only. What the writer then does with an oversized input — the roll bound
+/// and the fixed point — is the writer increment's subject, not this clause's.
+///
+/// MUTATION COVERAGE: delete the `too_much_content` disjunct and this bin is declined by both
+/// `size > 1` guards — zero counts, no snapshot.
+#[tokio::test]
+async fn test_admission_too_much_content_admits_lone_oversized_file() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    let pd = write_sized_pos_delete(&table, &x_path, 1, 1).await;
+    let size = pd.file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, vec![pd]).await;
+
+    let action = || {
+        RewritePositionDeleteFiles::new(table.clone())
+            .min_file_size_bytes(size - 3)
+            .target_file_size_bytes(size - 2)
+            .max_file_size_bytes(size - 1)
+    };
+    let config = action().resolve_config().expect("legal knobs");
+
+    assert!(
+        size > config.max_file_size_bytes,
+        "fixture: the lone file must be OVERSIZED (measured {size}, resolved max {})",
+        config.max_file_size_bytes
+    );
+    assert!(
+        1 < config.min_input_files,
+        "fixture NON-VACUITY: one file is below the count floor, so enough_input_files is false"
+    );
+
+    let before = scan_y_values(&table).await;
+    let history_before = table.metadata().history().len();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result.rewritten_delete_files_count, 1,
+        "too_much_content admits a LONE oversized file — it has no `size > 1` guard"
+    );
+    assert!(result.added_delete_files_count >= 1);
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().history().len(),
+        history_before + 1,
+        "exactly one Replace snapshot"
+    );
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-004 — the size-only candidate filter, and its two STRICT boundaries.
+// ------------------------------------------------------------------------------------------------
+
+/// C-004 element 1 (C-036 recipe 8), and C-042's OUTCOME pin. FIVE position-delete files in one
+/// partition, every one of them strictly IN RANGE, so `outsideDesiredFileSizeRange` rejects all
+/// five: zero candidates, zero bins, zero commits — even though five files WOULD satisfy
+/// `enough_input_files` had they reached the gate.
+///
+/// KNOBS FROM THE MEASUREMENTS: `min := min_i(S_i)`, `max := max_i(S_i) + 1`, `target := min + 1`
+/// (the five files are written with different masked-position counts so their sizes differ).
+///
+/// MUTATION COVERAGE: delete the candidate filter and all five files reach the packer as one bin,
+/// which `enough_input_files` (5 >= 5) then admits — non-zero counts and a Replace snapshot.
+///
+/// EXPLICITLY NOT A MUTANT-KILLER for C-042's `if candidates.is_empty() { continue; }`
+/// short-circuit: deleting that branch is observationally a no-op, because `pack_bins` on an empty
+/// input returns an empty `Vec` and the per-bin loop then never runs. That line is recorded as
+/// UNKILLABLE, not as covered.
+#[tokio::test]
+async fn test_candidate_filter_drops_in_range_files_before_packing() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    let mut sizes: Vec<u64> = Vec::new();
+    let mut table = table;
+    for count in 1..=5i64 {
+        let pd = write_sized_pos_delete(&table, &x_path, 100, count).await;
+        sizes.push(pd.file_size_in_bytes);
+        table = add_deletes(&catalog, &table, vec![pd]).await;
+    }
+    let smallest = *sizes.iter().min().expect("five files");
+    let largest = *sizes.iter().max().expect("five files");
+    assert!(
+        largest >= smallest + 2,
+        "fixture: the five measured sizes must span at least 2 bytes so `target = min + 1` is \
+         strictly below `max` (measured {smallest}..{largest})"
+    );
+
+    let action = || {
+        RewritePositionDeleteFiles::new(table.clone())
+            .min_file_size_bytes(smallest)
+            .target_file_size_bytes(smallest + 1)
+            .max_file_size_bytes(largest + 1)
+    };
+    let config = action().resolve_config().expect("legal knobs");
+
+    // PRECONDITIONS. The two window legs are true by construction (min := min_i, max := max_i + 1);
+    // they are asserted anyway because they also check that the builders reach the resolved config.
+    for size in &sizes {
+        assert!(
+            *size >= config.min_file_size_bytes && *size <= config.max_file_size_bytes,
+            "fixture: every file must be IN RANGE (measured {size}, resolved [{}, {}])",
+            config.min_file_size_bytes,
+            config.max_file_size_bytes
+        );
+    }
+    assert!(
+        5 >= config.min_input_files,
+        "fixture NON-VACUITY: five files WOULD satisfy enough_input_files if the candidate filter \
+         did not drop them first"
+    );
+
+    let before = scan_y_values(&table).await;
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "a partition of well-sized files yields no candidate, no bin and no commit"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "no candidate ⇒ no snapshot"
+    );
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 5);
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+/// C-004 element 2 (C-036 recipe 4). `length < min_file_size_bytes` is STRICT: a file whose MEASURED
+/// size is EXACTLY the resolved min is NOT a candidate.
+///
+/// A lone boundary file cannot discriminate this (both the mutated and the unmutated planner leave a
+/// declined, zero-count table), so the fixture adds a strictly smaller COMPANION that makes
+/// candidacy outcome-bearing: unmutated, only the companion is a candidate and its bin of one is
+/// declined; mutated to `<=`, the boundary file joins it and the two-file bin clears the target.
+///
+/// MUTATION COVERAGE: `length < min` → `length <= min` admits the bin and reds this test.
+#[tokio::test]
+async fn test_candidate_filter_keeps_file_at_exactly_min_file_size() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    // A is the BOUNDARY file (more masked positions ⇒ strictly larger); B is the sub-min companion.
+    let pd_a = write_sized_pos_delete(&table, &x_path, 100, 5).await;
+    let size_a = pd_a.file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, vec![pd_a]).await;
+    let pd_b = write_sized_pos_delete(&table, &x_path, 1, 1).await;
+    let size_b = pd_b.file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, vec![pd_b]).await;
+
+    let action = || {
+        RewritePositionDeleteFiles::new(table.clone())
+            .min_file_size_bytes(size_a)
+            .target_file_size_bytes(size_a + 1)
+            .max_file_size_bytes(size_a + 2)
+    };
+    let config = action().resolve_config().expect("legal knobs");
+
+    assert_eq!(
+        size_a, config.min_file_size_bytes,
+        "fixture: A sits EXACTLY on the resolved min"
+    );
+    assert!(
+        size_b < config.min_file_size_bytes,
+        "fixture: B is STRICTLY sub-min (measured {size_b}, resolved min {})",
+        config.min_file_size_bytes
+    );
+    assert!(
+        size_a + size_b > config.target_file_size_bytes,
+        "fixture NON-VACUITY: were A wrongly a candidate, the two-file bin WOULD clear the target"
+    );
+    assert!(2 < config.min_input_files, "fixture: below the count floor");
+
+    let before = scan_y_values(&table).await;
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "a file EXACTLY at min is not a candidate, so only B is packed — and a bin of one is declined"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "declined ⇒ no snapshot"
+    );
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 2);
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+/// C-004 element 3 (C-036 recipe 4, mirrored). `length > max_file_size_bytes` is STRICT: a file whose
+/// MEASURED size is EXACTLY the resolved max is NOT a candidate. Same companion construction as the
+/// min boundary, for the same reason.
+///
+/// MUTATION COVERAGE: `length > max` → `length >= max` admits the bin and reds this test.
+#[tokio::test]
+async fn test_candidate_filter_keeps_file_at_exactly_max_file_size() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    let pd_a = write_sized_pos_delete(&table, &x_path, 100, 5).await;
+    let size_a = pd_a.file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, vec![pd_a]).await;
+    let pd_b = write_sized_pos_delete(&table, &x_path, 1, 1).await;
+    let size_b = pd_b.file_size_in_bytes;
+    let table = add_deletes(&catalog, &table, vec![pd_b]).await;
+
+    let action = || {
+        RewritePositionDeleteFiles::new(table.clone())
+            .min_file_size_bytes(size_a - 2)
+            .target_file_size_bytes(size_a - 1)
+            .max_file_size_bytes(size_a)
+    };
+    let config = action().resolve_config().expect("legal knobs");
+
+    assert_eq!(
+        size_a, config.max_file_size_bytes,
+        "fixture: A sits EXACTLY on the resolved max"
+    );
+    assert!(
+        size_b < config.min_file_size_bytes,
+        "fixture: B is STRICTLY sub-min (measured {size_b}, resolved min {})",
+        config.min_file_size_bytes
+    );
+    assert!(
+        size_a + size_b > config.target_file_size_bytes,
+        "fixture NON-VACUITY: were A wrongly a candidate, the two-file bin WOULD clear the target"
+    );
+    assert!(
+        size_b <= config.max_file_size_bytes,
+        "fixture: B's own bin must not clear too_much_content"
+    );
+    assert!(2 < config.min_input_files, "fixture: below the count floor");
+
+    let before = scan_y_values(&table).await;
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "a file EXACTLY at max is not a candidate, so only B is packed — and a bin of one is declined"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "declined ⇒ no snapshot"
+    );
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 2);
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-005 — the pipeline ORDER (S4 strictly before S5) and the filter STAGE.
+// ------------------------------------------------------------------------------------------------
+
+/// C-005's ORDER pin (C-036 recipe 5), discriminating BY BIN COUNT. One partition, THREE files in
+/// manifest order A, X, B: A and B sub-min candidates, X strictly in range. The knobs come from the
+/// measurements — `min := S_X - 1`, `target := S_X`, `max := S_X + 1`, and a group size
+/// `W := S_A + S_B` that A and B exactly fill.
+///
+/// FILTER-THEN-PACK (Java's order, and this port's): X is dropped at S4, so A and B pack into ONE
+/// bin whose input clears the target ⇒ one Replace snapshot, two files rewritten.
+///
+/// PACK-THEN-FILTER (the mutant): X is still present at packing, and since `S_A + S_X > W` and
+/// `S_X + S_B > W`, the greedy lookback-1 packer emits the three SINGLETONS [A], [X], [B]. Dropping X
+/// afterwards leaves two bins of one, both declined by the `size > 1` guards ⇒ ZERO snapshots.
+///
+/// RECORDED AS TRUE BY CONSTRUCTION, not asserted as falsifiable: `min < S_X < max` and
+/// `S_A + S_B <= W` are identities under the knob choice. The falsifiable preconditions are the
+/// ones that make the mutant emit singletons (`S_X > S_A`, `S_X > S_B`), the ones that make A and B
+/// candidates while X is not, the MANIFEST ORDER, and `S_A + S_B > target`.
+#[tokio::test]
+async fn test_candidate_filter_runs_before_packing() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    // ONE commit, so the three entries land in ONE manifest in this order: A, X, B.
+    let pd_a = write_sized_pos_delete(&table, &x_path, 1, 1).await; // masks y=20
+    let pd_x = write_sized_pos_delete(&table, &x_path, 100, 40).await; // masks nothing live
+    let pd_b = write_sized_pos_delete(&table, &x_path, 3, 1).await; // masks y=40
+    let (size_a, size_x, size_b) = (
+        pd_a.file_size_in_bytes,
+        pd_x.file_size_in_bytes,
+        pd_b.file_size_in_bytes,
+    );
+    let (path_a, path_x, path_b) = (
+        pd_a.file_path().to_string(),
+        pd_x.file_path().to_string(),
+        pd_b.file_path().to_string(),
+    );
+    let table = add_deletes(&catalog, &table, vec![pd_a, pd_x, pd_b]).await;
+
+    assert_eq!(
+        live_pos_delete_paths(&table).await,
+        vec![path_a, path_x, path_b],
+        "fixture: the manifest order must be A, X, B — the packing the mutant produces depends on it"
+    );
+
+    let group_size = size_a + size_b;
+    let action = || {
+        RewritePositionDeleteFiles::new(table.clone())
+            .min_file_size_bytes(size_x - 1)
+            .target_file_size_bytes(size_x)
+            .max_file_size_bytes(size_x + 1)
+            .max_file_group_size_bytes(group_size)
+    };
+    let config = action().resolve_config().expect("legal knobs");
+
+    // PRECONDITIONS.
+    assert!(
+        size_a < config.min_file_size_bytes && size_b < config.min_file_size_bytes,
+        "fixture: A and B are SUB-MIN candidates (measured {size_a}/{size_b}, resolved min {})",
+        config.min_file_size_bytes
+    );
+    assert!(
+        size_x >= config.min_file_size_bytes && size_x <= config.max_file_size_bytes,
+        "fixture: X is strictly IN RANGE, so S4 must drop it"
+    );
+    assert!(
+        size_x > size_a && size_x > size_b,
+        "fixture: X must be larger than each of A and B, or the pack-then-filter mutant would NOT \
+         emit singletons and the pin would not discriminate (measured A={size_a}, X={size_x}, B={size_b})"
+    );
+    assert!(
+        size_a + size_b > config.target_file_size_bytes,
+        "fixture: the A+B bin must clear the target so the correct order ADMITS it"
+    );
+    assert!(
+        2 < config.min_input_files,
+        "fixture NON-VACUITY: two files are below the count floor, so enough_content is the only \
+         admitting clause"
+    );
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([10, 30, 50]),
+        "before: A masks y=20, B masks y=40"
+    );
+    let history_before = table.metadata().history().len();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result.rewritten_delete_files_count, 2,
+        "filter-then-pack: A and B form ONE admitted bin; the in-range X never reaches the packer"
+    );
+    assert_eq!(result.added_delete_files_count, 1);
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().history().len(),
+        history_before + 1,
+        "exactly ONE Replace snapshot — the pack-then-filter mutant commits none"
+    );
+    assert_eq!(
+        count_pos(&live_delete_files(&reloaded).await),
+        2,
+        "the compacted A+B file plus the untouched X"
+    );
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+/// C-005's FILTER-STAGE pin for the hoist's NAMED CONSEQUENCE (behaviour flip 2). The user `filter`
+/// is now bound ONCE, right after the no-snapshot early return and BEFORE the manifest walk, exactly
+/// where Java binds it (at the `PositionDeletes` scan). So an UNBINDABLE filter fails on ANY table
+/// with a current snapshot — here one that has no position-delete files at all, and therefore no
+/// group that could ever be admitted.
+///
+/// Under the pre-hoist, per-group binding this same call returned `Ok` with zero counts, because the
+/// bind only ran inside a group that already had two files. The flip is deliberate: a filter the
+/// engine cannot bind is a caller error, and failing loudly beats silently compacting nothing.
+#[tokio::test]
+async fn test_unbindable_filter_errors_even_when_no_group_is_admissible() {
+    use crate::expr::Reference;
+    use crate::spec::Datum;
+
+    let (catalog, _temp, table, _x_path) = gate_table().await;
+    assert!(
+        table.metadata().current_snapshot().is_some(),
+        "fixture: the table HAS a current snapshot (the data-file append)"
+    );
+    assert!(
+        live_delete_files(&table).await.is_empty(),
+        "fixture: and NO delete files, so no group is admissible under any gate"
+    );
+
+    let error = RewritePositionDeleteFiles::new(table.clone())
+        .filter(Reference::new("no_such_column").equal_to(Datum::long(0)))
+        .execute(&catalog)
+        .await
+        .expect_err("an unbindable filter must fail at the bind, not be silently ignored");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert!(
+        error
+            .message()
+            .contains("filter could not be bound to the table schema"),
+        "unexpected message: {}",
+        error.message()
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-027 — the SHARED bin packer, reused through a weight closure.
+// ------------------------------------------------------------------------------------------------
+
+/// C-027 (C-036 recipe 7's fixture shape). `max_file_group_size_bytes` splits ONE partition into TWO
+/// bins, and each admitted bin commits its own Replace snapshot — which is only possible if the
+/// position-delete planner really goes through the shared `pack_bins` with the delete file's size as
+/// its weight.
+///
+/// KNOBS FROM THE MEASUREMENTS: four files A, B, C, D in manifest order, all sub-min (so all four are
+/// candidates), `.min_input_files(2)`, and `W := max(S_A + S_B, S_C + S_D)` with `W < S_A + S_B + S_C`
+/// asserted — under the greedy forward first-fit that yields exactly {A, B} and {C, D}.
+///
+/// MUTATION COVERAGE: pass a constant weight (or `u64::MAX` as the group size) and the four files
+/// pack into ONE bin — one snapshot, one added file, and both assertions red. Reverse the packer's
+/// emission order and the manifest-order precondition reds.
+#[tokio::test]
+async fn test_admission_max_file_group_size_splits_partition_into_bins() {
+    let (catalog, _temp, table, x_path) = gate_table().await;
+
+    // Distinct sizes, so the packing genuinely depends on the weights and on the manifest order.
+    let pd_a = write_sized_pos_delete(&table, &x_path, 100, 1).await;
+    let pd_b = write_sized_pos_delete(&table, &x_path, 200, 2).await;
+    let pd_c = write_sized_pos_delete(&table, &x_path, 300, 3).await;
+    let pd_d = write_sized_pos_delete(&table, &x_path, 400, 4).await;
+    let sizes = [
+        pd_a.file_size_in_bytes,
+        pd_b.file_size_in_bytes,
+        pd_c.file_size_in_bytes,
+        pd_d.file_size_in_bytes,
+    ];
+    let paths: Vec<String> = [&pd_a, &pd_b, &pd_c, &pd_d]
+        .iter()
+        .map(|f| f.file_path().to_string())
+        .collect();
+    let table = add_deletes(&catalog, &table, vec![pd_a, pd_b, pd_c, pd_d]).await;
+
+    assert_eq!(
+        live_pos_delete_paths(&table).await,
+        paths,
+        "fixture: the manifest order must be A, B, C, D — the bin boundaries depend on it"
+    );
+
+    let group_size = (sizes[0] + sizes[1]).max(sizes[2] + sizes[3]);
+    let action = || {
+        RewritePositionDeleteFiles::new(table.clone())
+            .min_input_files(2)
+            .min_file_size_bytes(100_000)
+            .target_file_size_bytes(200_000)
+            .max_file_size_bytes(400_000)
+            .max_file_group_size_bytes(group_size)
+    };
+    let config = action().resolve_config().expect("legal knobs");
+
+    // PRECONDITIONS, all over MEASURED sizes.
+    for size in &sizes {
+        assert!(
+            *size < config.min_file_size_bytes,
+            "fixture: every file must be SUB-MIN so all four are candidates \
+             (measured {size}, resolved min {})",
+            config.min_file_size_bytes
+        );
+    }
+    assert!(
+        2 >= config.min_input_files,
+        "fixture: a bin of two must clear the count floor"
+    );
+    assert!(
+        sizes[0] + sizes[1] <= config.max_file_group_size_bytes,
+        "fixture: A and B must fit ONE bin"
+    );
+    assert!(
+        config.max_file_group_size_bytes < sizes[0] + sizes[1] + sizes[2],
+        "fixture: C must NOT fit alongside A and B — this is what forces the split"
+    );
+    assert!(
+        sizes[2] + sizes[3] <= config.max_file_group_size_bytes,
+        "fixture: C and D must fit ONE bin"
+    );
+
+    let before = scan_y_values(&table).await;
+    let history_before = table.metadata().history().len();
+
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result.rewritten_delete_files_count, 4,
+        "all four candidates are rewritten, but across TWO bins"
+    );
+    assert_eq!(
+        result.added_delete_files_count, 2,
+        "one compacted file per BIN — a single bin would add one"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().history().len(),
+        history_before + 2,
+        "two admitted bins ⇒ two Replace snapshots"
+    );
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 2);
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-041 — the group input-size sum SATURATES where Java's `long` sum wraps.
+// ------------------------------------------------------------------------------------------------
+
+/// C-041. The bin input-size sum is `saturating_add`, so an overflowing bin resolves to `u64::MAX`
+/// and stays ADMITTED. Java's `inputSize` is `stream().mapToLong(..).sum()`, which WRAPS to a small
+/// (or negative) value and would DECLINE — a named, recorded divergence in the safe direction.
+///
+/// WHITE-BOX on `group_qualifies` with two fabricated entries, because an end-to-end fixture would
+/// then try to READ 16 EiB of position deletes. The thresholds are chosen so the two arithmetics
+/// disagree on the OUTCOME: saturating gives `u64::MAX > target`, while wrapping gives
+/// `u64::MAX + 10 = 9`, which clears neither the target nor the max, and the count floor is above
+/// the bin size either way.
+///
+/// MUTATION COVERAGE: change `saturating_add` to `wrapping_add` in `group_qualifies` and the bin is
+/// declined.
+#[tokio::test]
+async fn test_group_input_size_saturates_not_wraps() {
+    let (_catalog, _temp, table, x_path) = gate_table().await;
+
+    let mut huge = write_sized_pos_delete(&table, &x_path, 1, 1).await;
+    huge.file_size_in_bytes = u64::MAX;
+    let mut small = write_sized_pos_delete(&table, &x_path, 3, 1).await;
+    small.file_size_in_bytes = 10;
+
+    let bin = vec![
+        LiveDeleteEntry {
+            data_file: huge,
+            sequence_number: 1,
+        },
+        LiveDeleteEntry {
+            data_file: small,
+            sequence_number: 1,
+        },
+    ];
+    let config = ResolvedConfig {
+        target_file_size_bytes: 100,
+        min_file_size_bytes: 50,
+        max_file_size_bytes: 1_000,
+        // Above the bin size, so `enough_input_files` cannot be the admitter under EITHER arithmetic.
+        min_input_files: 10,
+        max_file_group_size_bytes: 1_000_000,
+    };
+
+    assert!(
+        group_qualifies(&bin, &config),
+        "u64::MAX + 10 must SATURATE to u64::MAX (admitted via enough_content), not WRAP to 9 \
+         (which clears neither the target 100 nor the max 1000, and would be declined)"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// C-003 elements 3 and 5b — the two gate leaves that are unreachable END TO END, pinned WHITE BOX.
+//
+// C-003 recorded both as "UNKILLABLE, never claimed pinned". That scoping is now SUPERSEDED, in the
+// fork's favour: both proofs rest on candidate-filter REACHABILITY (a bin in those states cannot be
+// produced by `plan_bins`, because its member would not have been a candidate), not on the config
+// space, and this module already opens a white-box seam on `group_qualifies`. Through that seam the
+// states ARE constructible and both mutants DO die. The end-to-end unreachability argument stays
+// true and stays recorded on `group_qualifies`; what changes is that neither leaf is now unpinned.
+// ------------------------------------------------------------------------------------------------
+
+/// A [`LiveDeleteEntry`] whose `file_size_in_bytes` is SET to `size` — the same white-box seam
+/// `test_group_input_size_saturates_not_wraps` uses. The underlying file is real but is never read:
+/// `group_qualifies` reads nothing off the entry except its size.
+async fn entry_of_size(table: &Table, target_path: &str, size: u64) -> LiveDeleteEntry {
+    let mut data_file = write_sized_pos_delete(table, target_path, 1, 1).await;
+    data_file.file_size_in_bytes = size;
+    LiveDeleteEntry {
+        data_file,
+        sequence_number: 1,
+    }
+}
+
+/// The thresholds both white-box gate pins run against: `min < target < max` (C-006 preconditions
+/// (3) and (4)), with `min_input_files` well above the bin size so `enough_input_files` cannot be
+/// the admitter under any of the mutants below.
+fn white_box_gate_config() -> ResolvedConfig {
+    ResolvedConfig {
+        target_file_size_bytes: 100,
+        min_file_size_bytes: 50,
+        max_file_size_bytes: 1_000,
+        min_input_files: 10,
+        max_file_group_size_bytes: 1_000_000,
+    }
+}
+
+/// C-003 element 5b — `too_much_content`'s BOUNDARY STRICTNESS. A bin whose input size is EXACTLY
+/// `max_file_size_bytes` is DECLINED, because the comparison is `input_size > max`, strict.
+///
+/// END-TO-END UNREACHABLE, and that is why C-003 recorded it as unkillable: such a bin is either of
+/// size 1 — and then its file's length equals max, so `outsideDesiredFileSizeRange` never made it a
+/// candidate and it never reaches the gate — or of size >= 2, and then `enough_content` is already
+/// true because `max > target`. WHITE BOX the state is trivially constructible, so the mutant dies.
+///
+/// MUTATION COVERAGE: `input_size > max` → `>=` admits this bin.
+#[tokio::test]
+async fn test_gate_input_size_exactly_max_is_declined_white_box() {
+    let (_catalog, _temp, table, x_path) = gate_table().await;
+    let config = white_box_gate_config();
+
+    let bin = vec![entry_of_size(&table, &x_path, config.max_file_size_bytes).await];
+
+    assert!(
+        !group_qualifies(&bin, &config),
+        "an input size EXACTLY at max is declined — too_much_content is `input_size > max`, STRICT"
+    );
+}
+
+/// C-003 element 3 — `enough_content`'s `size > 1` conjunct. A LONE file whose length is above the
+/// target but at or below the max is DECLINED: `enough_content` is `size > 1 && input_size > target`,
+/// and the `size > 1` conjunct is the only thing that declines it.
+///
+/// END-TO-END UNREACHABLE, and that is why C-003 recorded it as unkillable: a bin of one that
+/// reaches the gate must be a candidate, so its length is either below min — and `min < target`, so
+/// `enough_content` is false either way — or above max, in which case `too_much_content` is already
+/// true and carries the admission. WHITE BOX the in-band lone file is constructible, so the mutant
+/// dies.
+///
+/// MUTATION COVERAGE: drop the `size > 1` conjunct from `enough_content` and this bin is admitted.
+#[tokio::test]
+async fn test_gate_enough_content_size_guard_declines_lone_over_target_file_white_box() {
+    let (_catalog, _temp, table, x_path) = gate_table().await;
+    let config = white_box_gate_config();
+
+    let size = 500;
+    assert!(
+        size > config.target_file_size_bytes && size < config.max_file_size_bytes,
+        "fixture: the lone file is strictly BETWEEN target and max, so enough_content's size guard \
+         is the ONLY clause declining it"
+    );
+    let bin = vec![entry_of_size(&table, &x_path, size).await];
+
+    assert!(
+        !group_qualifies(&bin, &config),
+        "a LONE file above the target is declined by enough_content's `size > 1` conjunct"
     );
 }
