@@ -48,7 +48,7 @@ items** and nothing else: the five `RewritePositionDeleteFiles` builder methods
 new `pub` type, no new trait item, no changed `pub` signature, no new error variant — so
 struct-literal construction of `RewritePositionDeleteFilesResult` (four counts, R-6) and of
 `TableProperties` (seven fields, R-7) is unaffected on both all-`pub`, non-`#[non_exhaustive]`
-types. Re-derived mechanically: `git diff <base>..HEAD -- crates/ | grep -E '^\+\s*pub '` returns
+types. Re-derived mechanically: `git diff 51edcc2c..HEAD -- crates/ | grep -E '^\+\s*pub '` returns
 exactly those seven lines, none inside `#[cfg(test)]`. `pack_bins` and four constants widen to
 `pub(super)` only, which cannot escape the crate.
 
@@ -103,10 +103,20 @@ enumeration names as a doc home:
 | `crates/iceberg/tests/interop_rewrite_pos_deletes.rs` | `.min_input_files(2)` — closes a false green (below) |
 | `docs/parity/GAP_MATRIX.md` | rows R136 and R135 |
 | `task/todo.md` | the unit's plan block and the two follow-ups it files |
-| `task/lessons.md` | the unit's lessons |
 | `crates/iceberg/src/maintenance/mod.rs` | the module-head action summary, falsified on all three of its counts |
 
+`task/lessons.md` is inside C-016's manifest but is NOT modified by this PR — the unit's lessons
+entry is written by the final governance group. Listed here for manifest accounting, not as a
+changed file.
+
 `Roadmap.md` is deliberately untouched: the matrix owns status and the glyph does not move.
+
+**SCOPE — read this table as the UNIT, not as this PR's diff.** The unit shipped in stages:
+`51edcc2c` (#207) carried the charter and the `task/todo.md` plan block; `972b932c` (#208) and
+`77ddf5d4` (#209) carried the implementation and tests. Against current `main` **this PR changes
+seven files and adds ZERO `pub` items** — `table_properties.rs`, `rewrite_data_files.rs` and the
+plan block are already merged. A reviewer opening this PR will not find those diffs here, and that
+is expected rather than a discrepancy.
 
 ### `rewrite_data_files.rs` — FOUR edit classes, all behaviour-neutral
 
@@ -215,6 +225,18 @@ the sibling roll bound is on row R135. Two follow-ups are filed to `task/todo.md
 NOT fixed here, because neither is falsified by this change: the sequence-direction inversion in
 `transaction/rewrite_files.rs` (R-13) and the stale bare-number `GAP_MATRIX row 134` citation in
 `crates/iceberg/tests/map.md` and `dev/java-interop/map.md` (R-10, C-038).
+
+## Contingencies (C-029) — none fired
+
+C-029 names four halt paths for this unit. Each is recorded with its outcome, since an unfired
+contingency proves nothing unless it is stated:
+
+| Halt path | Outcome |
+|---|---|
+| Interop suite red, or its Java oracle needing a change | **Did not fire.** `dev/java-interop/run-interop-rewrite-pos-deletes.sh` exits 0 — `[5/5] DONE`, `0 failures`, both sabotage legs failing closed — run twice by the build agent and reproduced independently by the reviewing agent. The Java oracle is unchanged. |
+| A golden or committed fixture moving | **Did not fire.** All ten enumerated constants hold, four measured live against the running suite; the discovery floor stays 53. There is no committed fixture for this suite (GEN-only, gitignored). |
+| A dependency file needing to change | **Did not fire.** `Cargo.toml` and `Cargo.lock` are untouched by every group of this unit. |
+| The fixed point failing — output re-admitted on a second run | **Did not fire.** Pinned by `test_second_run_is_a_no_op_after_split`, and verified by probe rather than inference: re-running at `min_input_files(1)`, where a lone candidate WOULD be admitted, still yields zero counts — so the candidate filter is what closes the loop. |
 
 ## Verification
 
