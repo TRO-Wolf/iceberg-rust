@@ -26,3 +26,8 @@ dist/*
 *.pyc
 *.whl
 *.tar.gz
+
+# Claude Code local session state — the .claude/ directory is tracked for its
+# skills symlink and map.md, but per-machine state must never be committed.
+.claude/settings.local.json
+.claude/worktrees/

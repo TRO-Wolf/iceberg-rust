@@ -27,7 +27,7 @@
 # Invoked weekly (nightly until 2026-07-30 — cadence lives in the workflow's cron) by
 # .github/workflows/nightly_interop.yml via `make interop`.
 #
-# House doctrine encoded here (CLAUDE.md working conventions + the G3 brief):
+# House doctrine encoded here (AGENTS.md working conventions + the G3 brief):
 #   * HARD-FAIL, never SKIP. Missing prerequisites (mvn / the JDK-11 home / cargo) are an error
 #     before anything runs — a skipped suite is a false-green.
 #   * NO SILENT CAPS. There is no per-suite timeout (a hung suite is bounded only by the CI

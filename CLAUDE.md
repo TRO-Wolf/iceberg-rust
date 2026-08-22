@@ -17,315 +17,73 @@
   ~ under the License.
 -->
 
-# CLAUDE.md
+# CLAUDE.md — the Claude adapter (not authoritative)
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+**STOP — the authoritative contract is [AGENTS.md](AGENTS.md). Read it first.** This file adds only
+Claude-specific tool mechanics; it states **no rule the spine does not already own**. Every project fact lives in the
+neutral spine, and this adapter only points at it — so it cannot drift, and deleting it would lose
+no project knowledge.
 
-This is an **owned fork of [Apache Iceberg™ Rust](https://github.com/apache/iceberg-rust)** — the Rust
-implementation of the [Apache Iceberg](https://iceberg.apache.org/) open table format. We maintain it to
-reach **1:1 capability parity with the Java `iceberg-core` / `iceberg-api` library** (the engine-agnostic
-table-format core, **not** the Spark engine surface). Upstream `apache/iceberg-rust` is a **sync baseline
-we cherry-pick from, not a mergeability constraint** — we diverge freely in service of parity. The
-deliverable is a **Rust-native library**; Python / PySpark is deferred (there is no Python layer in this
-repo). **Glue + S3 Tables** are the first-priority catalogs.
+## Where the project rules actually live
 
-The authoritative plan is **[Roadmap.md](Roadmap.md)** (phase plan + sequencing); the living capability
-checklist is **[docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md)**. When this file and the Roadmap
-disagree on direction, the **Roadmap wins**; when the Roadmap and the GAP_MATRIX disagree on a
-capability's *status*, the **GAP_MATRIX** (re-audited against the live base) wins.
+CLAUDE.md is not their home. Follow the pointers:
 
-> **A note on the XML tags in this file.** A few sections are wrapped in semantic tags
-> (`<read_order>`, `<map_md_navigation>`, `<subagent_policy>`). They mark the load-bearing
-> "do this / don't skip this" regions so an agent can locate them unambiguously; they carry no
-> meaning beyond "read this bounded region as a unit." Reference sections (snapshot, architecture,
-> build/test, repo layout) are intentionally left untagged.
+| For… | Read (authoritative) |
+|---|---|
+| The read path + the rules governing any change | [AGENTS.md](AGENTS.md) (start at its `<read_order>`) |
+| The precedence / authority chain | [AGENTS.md](AGENTS.md) `<precedence>` — its single home |
+| Repo intent, the fork's north star, the parity mandate | [AGENTS.md](AGENTS.md) "Parity mandate" |
+| The phase plan and the current phase | [Roadmap.md](Roadmap.md) |
+| Per-capability status (the only home for a status) | [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md) |
+| What is irreversible / hard-blocked | [AGENTS.md](AGENTS.md) "Absolute prohibitions" |
+| Rust rules — errors, concurrency, casts, recursion, tests | [AGENTS.md](AGENTS.md) "Rust conventions — the engineering contract" |
+| Build, test, and gate commands | [AGENTS.md](AGENTS.md) "Build & test commands" |
+| The testing-discipline contract | [docs/testing.md](docs/testing.md) |
+| Directory navigation, and when a `map.md` is owed | [AGENTS.md](AGENTS.md) `<map_md_navigation>` |
+| Lifecycle / process governance | [skills/sepmo/SKILL.md](skills/sepmo/SKILL.md) + [binding-manifest.md](skills/sepmo/binding-manifest.md) |
+| Navigation for a directory you will touch | that directory's `map.md` |
 
-<read_order>
+## Claude read order (every session)
 
-## Read order (every session)
+1. **[AGENTS.md](AGENTS.md) first**, then follow its `<read_order>` (Roadmap → GAP_MATRIX → tier
+   manual → SEPMO → `task/lessons.md` + `task/todo.md` → the touched directories' `map.md`).
+2. **The operating manual for your model tier** in [skills/](skills/map.md) — one model family's
+   view of the same engineering conventions, not a separate source of truth:
+   [Fable.md](skills/Fable.md) (Mythos-class), [Opus.md](skills/Opus.md),
+   [Sonnet.md](skills/Sonnet.md), [Haiku.md](skills/Haiku.md).
+3. The `map.md` of every directory your task will touch (AGENTS.md `<map_md_navigation>`).
 
-1. **This file (CLAUDE.md)** — repository intent, prohibitions, and the navigation contract.
-2. **[Roadmap.md](Roadmap.md)** — the parity phase plan and the current phase; then
-   **[docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md)** for per-capability status.
-3. **The operating manual for your model tier** — [skills/Fable.md](skills/Fable.md) (Mythos-class),
-   [skills/Opus.md](skills/Opus.md), [skills/Sonnet.md](skills/Sonnet.md), or
-   [skills/Haiku.md](skills/Haiku.md) (the portable engineering contract; see
-   [skills/map.md](skills/map.md)); precedence is in `<precedence>` below. For crate code (`crates/`), also
-   read **[AGENTS.md](AGENTS.md)** — the per-crate Rust engineering rules (error chains, etc.).
-4. **The SEPMO control plane** — [skills/sepmo/SKILL.md](skills/sepmo/SKILL.md) (the
-   lifecycle/governance shell: scope audit + 100% gate, Actor–Critic execution, PR-grouping,
-   delivery, retrospective) and [skills/sepmo/binding-manifest.md](skills/sepmo/binding-manifest.md)
-   (how it binds to this repo). SEPMO governs *lifecycle*; the tier manuals and this file win the
-   *engineering contract* and all conflicts (see `<precedence>`).
-5. **[task/lessons.md](task/lessons.md) in full, then [task/todo.md](task/todo.md)** — accumulated
-   lessons and any mid-flight plan to pick up.
-6. **The `map.md` of every directory your task will touch** (where present — see the navigation
-   rule below).
-7. **Upstream docs when you need depth:** [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md),
-   the per-crate `README.md` files, and the [Iceberg Rust site](https://rust.iceberg.apache.org/).
+CLAUDE.md keeps this filename so Claude tooling that auto-loads it still fires and lands you on
+AGENTS.md on turn 1.
 
-</read_order>
+## Claude tool mechanics — skills are invocable here
 
-<precedence>
+`.claude/skills` is a symlink to `../.agents/skills` (git mode `120000`), so every runbook there
+loads natively in a Claude session and can be invoked by name rather than opened by path. The skills
+keep their single home under `.agents/`; that directory adds no second copy and states no rule.
+Roster and reasoning: [.agents/skills/map.md](.agents/skills/map.md).
 
-## Precedence — who wins on conflict
+The SEPMO control plane under [skills/](skills/map.md) is a separate tree and is **not** covered by
+that symlink; it is invoked deliberately, not discovered.
 
-One chain, highest authority first:
+## Claude tool mechanics — capability tiers and sub-agents
 
-1. **CLAUDE.md** (this file) — repo intent, prohibitions, precedence, the navigation contract.
-2. **Roadmap.md** — the plan and the current phase. *(Direction-vs-status nuance: the Roadmap owns
-   direction, the GAP_MATRIX owns capability status — see the intro paragraph above.)*
-3. **docs/parity/GAP_MATRIX.md** — the single source of truth for capability *status*.
-4. **The tier manuals** ([skills/](skills/)) **+ AGENTS.md** — the **engineering contract** (how the
-   code is written).
-5. **SEPMO** ([skills/sepmo/](skills/sepmo/)) — **lifecycle and orchestration only**.
+These are Claude-family orchestration mechanics, **not** project rules. [AGENTS.md](AGENTS.md)
+`<subagent_policy>` is the neutral rule — single agent for the small stuff, a mandatory *independent*
+Critic (separate agent, fresh context) on anything that ships as a PR, both roles defaulting to the
+frontier tier. This is how that maps onto Claude tiers:
 
-SEPMO **cedes the engineering contract** to the manuals and to this file; the manuals and this file
-**cede lifecycle/orchestration** (the scope audit, the gates, the Actor–Critic loop, PR-grouping,
-delivery, retrospective) to SEPMO. When a SEPMO rule conflicts with a higher item, the higher item
-wins and SEPMO is corrected.
+- **`OO AC` = Opus–Opus Actor–Critic is the default pair.** Whenever you spawn an Actor and/or a
+  Critic, both default to Opus (`model: "opus"`) at high reasoning effort — the Claude realization
+  of AGENTS.md's frontier–frontier (FF) pair.
+- **Never turn the Critic below Opus on a correctness-bearing review.** Recorded evidence: on
+  2026-06-25 two Opus Critics caught (and mutation-proved) a NULL-three-valued-logic coverage gap
+  that *every* Sonnet Critic in the same effort — including a dedicated "final" bundle Critic — had
+  missed.
+- You may turn the **Actor** down to Sonnet or Haiku only for genuinely rote sub-work (large
+  mechanical renames, log scraping) — and say so explicitly in the report when you do.
+- `Workflow` fan-out and plan-mode `Explore` / `Plan` helpers stay opt-in.
 
-</precedence>
-
-## Parity mandate
-
-The north star is behavioral 1:1 parity with Java `iceberg-core` / `iceberg-api`. Concretely:
-
-- **The Java repo is the spec-by-example.** Keep a reference checkout of `apache/iceberg` and re-crawl on
-  each Java release. A capability is "done" only when the Rust API matches the Java contract's behavior.
-- **Tests land with the code, in the same change.** Behavior added without tests is a hard block.
-- **Interop is the only true 1:1 evidence.** Where applicable, prove byte-level round-trips: read tables
-  Java wrote, and prove Java reads what we write. A GAP_MATRIX row flips to ✅ only with unit tests **and**
-  an interop test.
-- **Re-audit the GAP_MATRIX after every upstream sync and every phase**, and date-stamp the provenance.
-- **Order by dependency, then value:** metadata correctness underpins writes; writes underpin maintenance.
-
-<map_md_navigation>
-
-## `map.md` navigation — a convention this fork adopts
-
-This fork uses a guiding-agent navigation pattern: a directory may carry a single `map.md`
-documenting what lives there and where to go next. **It is opt-in and incremental** — upstream
-Iceberg Rust does not ship `map.md` files, so coverage grows as you work, not all at once.
-
-Each `map.md` has two parts in one file:
-
-- **The map** (top) — `Purpose`, `Contents`, an `I want to... → go to` intent table, and
-  `Pointers` (Up / Related) to neighboring directories.
-- **`## Debug`** (bottom) — `Known failure modes` table, `First checks`, and `Escalate to` pointers.
-
-**The contract:**
-
-- **Before reading or editing a file in a directory that has a `map.md`,** open the `map.md` first
-  and use it to navigate. The maps are the index; the code is the truth.
-- **If the code and a `map.md` disagree, the code wins** — the `map.md` is stale.
-- **When your change makes a directory's `map.md` inaccurate, update it in the same change**
-  (always in scope, even though §6 of the manuals otherwise forbids touching unplanned files).
-- **When you create a new source directory, add its `map.md` in the same change** — but only if the
-  surrounding tree already uses the convention. Do not litter `map.md` files across pristine
-  upstream directories you are only reading.
-
-</map_md_navigation>
-
-## Project snapshot
-
-Apache Iceberg Rust implements the **Iceberg table format spec** in Rust: reading and writing table
-metadata and data, expression/predicate handling, partition transforms, snapshot and schema
-evolution, and pluggable catalogs and object storage. It is a **library workspace**, not an
-application — most code is library crates consumed by downstream projects. **Rust** edition 2024, MSRV
-**1.94** (see [Cargo.toml](Cargo.toml) `rust-version`). Base synced to upstream **0.9.1**; the
-dependency family was bumped to **datafusion 54.1 / arrow 58.4 / parquet 58.4** on 2026-08-05
-(`orc-rust` 0.8; MSRV 1.92 → 1.94).
-
-## Big-picture architecture
-
-### The workspace crates
-
-| Crate | Path | Role |
-|---|---|---|
-| **iceberg** | [crates/iceberg/](crates/iceberg/) | The core: spec types, catalog trait, table scans, transactions, writers, Arrow/Avro/Parquet IO, expressions, partition transforms, metadata inspection, Puffin, deletion vectors. |
-| **iceberg-datafusion** | [crates/integrations/datafusion/](crates/integrations/datafusion/) | DataFusion integration — `TableProvider` / `CatalogProvider` / physical plans so Iceberg tables are queryable from DataFusion SQL. |
-| **catalog/{rest,hms,glue,s3tables,sql}** | [crates/catalog/](crates/catalog/) | Concrete `Catalog` implementations: REST, Hive Metastore, AWS Glue, S3 Tables, and SQL-backed. **Glue + S3 Tables are the parity priority.** |
-| **catalog/loader** | [crates/catalog/loader/](crates/catalog/loader/) | Config-driven catalog construction (pick a catalog impl at runtime). |
-| **storage/opendal** | [crates/storage/opendal/](crates/storage/opendal/) | OpenDAL-backed FileIO storage (extracted from the core in the 0.8/0.9 cycle). |
-| **integrations/cache-moka** | [crates/integrations/cache-moka/](crates/integrations/cache-moka/) | Moka-backed object/metadata cache. |
-| **integrations/playground** | [crates/integrations/playground/](crates/integrations/playground/) | `iceberg-playground` — scratch crate for experimentation. |
-| **examples, sqllogictest, test_utils, integration_tests** | [crates/](crates/) | Runnable examples, SQL logic tests, shared test helpers, end-to-end integration suites. |
-
-### Inside the `iceberg` crate
-
-```
-crates/iceberg/src/
-├── spec/         table/manifest/schema/snapshot/partition/view metadata types (the on-disk format)
-├── catalog/      the Catalog trait + table/view identifiers + creation/update types
-├── scan/         table scan planning → Arrow record batches
-├── transaction/  atomic metadata updates (append, sort-order, properties, location, statistics,
-│                 upgrade-format-version) + the TransactionAction / ApplyTransactionAction seam
-├── writer/       data + equality-delete writers, file/rolling/partitioning writers
-├── arrow/        Arrow ⇄ Iceberg schema/value conversion + merge-on-read delete application
-├── avro/         Avro encoding for manifests/metadata
-├── io/           object storage abstraction (FileIO; OpenDAL impl in crates/storage/opendal)
-├── expr/         predicate / boolean expression trees + binding + visitors
-├── transform/    partition transforms (identity, bucket, truncate, year/month/day/hour, void)
-├── inspect/      metadata tables (snapshots, manifests — more variants are a parity gap)
-├── puffin/       Puffin file format (stats / deletion vectors)
-├── delete_vector.rs / delete_file_index.rs   merge-on-read delete handling
-└── metadata_columns.rs                        reserved metadata columns (_file, _pos, ...)
-```
-
-Patterns to internalize: **the spec module is the source of truth** for the on-disk format —
-changes there ripple through every reader and writer. **Catalogs are pluggable** behind one trait;
-**FileIO is pluggable** behind OpenDAL. **Arrow is the in-memory currency** — scans produce Arrow,
-writers consume it. **Transactions extend via `TransactionAction`** (`transaction/action.rs`); the
-trait is currently `pub(crate)` — since we own this fork, opening it is the sanctioned path to new
-write actions in Phase 2 (see [Roadmap.md](Roadmap.md)).
-
-## Build & test commands
-
-The canonical entry points are in the [Makefile](Makefile) (run from the repo root):
-
-```bash
-make build         # cargo build --all-targets --all-features --workspace
-make check         # fmt --check + clippy -D warnings + taplo TOML check + cargo-machete (unused deps)
-make unit-test     # doc tests + lib tests only (faster)
-make test          # docker-up + doc tests + cargo test --no-fail-fast --all-targets --all-features --workspace
-make check-msrv    # cargo +<MSRV> check --workspace
-```
-
-Or the underlying cargo commands directly:
-
-```bash
-cargo build --workspace
-cargo test --workspace --no-fail-fast
-cargo clippy --all-targets --workspace -- -D warnings
-cargo fmt --all -- --check
-```
-
-- **Toolchain:** the lint gate runs on a pinned nightly ([rust-toolchain.toml](rust-toolchain.toml),
-  currently `nightly-2026-03-05`, which `rustup` fetches automatically); downstream only needs MSRV
-  **1.94**. The pinned nightly declares the `rustfmt` and `clippy` components.
-- **`protoc` prerequisite:** `crates/sqllogictest` transitively pulls `datafusion-substrait` →
-  `substrait`, whose build needs the Protobuf compiler. If `protoc` is unavailable, the core surface
-  still builds/tests via `cargo test --workspace --exclude iceberg-sqllogictest`. Install
-  `protobuf-compiler` to run the full suite.
-- **`make test` starts Docker** (`docker-up`) for integration suites (REST fixture, MinIO, etc.).
-  AWS/Glue/S3-Tables integration tests need real credentials and are not part of the offline gate.
-- **Formatter:** [rustfmt.toml](rustfmt.toml) (`StdExternalCrate` import grouping, module granularity).
-  **TOML:** `taplo`. **Unused deps:** `cargo machete`.
-
-CI lives in [.github/workflows/](.github/workflows/) — `ci.yml` (Rust), `ci_typos.yml`, `audit.yml`,
-`codeql.yml`, `publish.yml`, plus website jobs. (Python binding CI/release workflows were removed with
-the Python layer.)
-
-## Absolute prohibitions
-
-These are irreversible or hard-block. The operating manuals (Non-Negotiables) reference this section.
-
-- **No destructive or irreversible operations without explicit approval** — no `git push --force`
-  to shared branches, no history rewrite, no mass file deletion, no dropping/truncating data in a
-  live catalog, no resource teardown. There is no rollback.
-- **Never commit or log secrets, credentials, or tokens** — not in code, tests, fixtures, or
-  `tracing` output. Treat AWS keys, catalog tokens, and S3 URIs with embedded creds as radioactive.
-- **Do not break the on-disk format without explicit approval** — a changed spec encoding silently
-  corrupts already-written tables. This is a table-format library; format stability is the product.
-  (The public *Rust* API may evolve in service of parity — this is an owned fork — but call out any
-  breaking surface change so downstream pins can follow.)
-- **Never edit dependency files** — [Cargo.toml](Cargo.toml), `Cargo.lock`, any crate `Cargo.toml` —
-  without explicit approval. (The Phase 0 version-family sync to 0.9.1 was the sanctioned exception and
-  is complete; routine work does not touch these.)
-
-## Rust conventions
-
-The full engineering contract lives in the [skills/](skills/) manuals and — for crate code
-(`crates/`) — in [AGENTS.md](AGENTS.md); this section is the repo-specific house style they point to.
-
-- **Error handling:** library crates define error types with `thiserror` (the `iceberg` crate uses a
-  central `Error` in [crates/iceberg/src/error.rs](crates/iceberg/src/error.rs)); binaries/examples
-  may use `anyhow`. **No bare `.unwrap()` / `.unwrap_err()` in production paths** — carry context.
-  Public APIs return a **typed error enum**, never `Result<_, String>` or `Box<dyn Error>`; when you
-  wrap an inner error, implement `Error::source()` so the chain survives (see [AGENTS.md](AGENTS.md)).
-- **Imports & formatting:** let `cargo fmt` own layout (config in [rustfmt.toml](rustfmt.toml)); do
-  not hand-format imports — the `StdExternalCrate` grouping and module granularity are automatic.
-- **Lints:** code must pass `cargo clippy --all-targets --workspace -- -D warnings`.
-- **House style — section banners + one blank line between top-level items.** For large modules,
-  group related items under a banner: a `///` doc block followed by a `///` + space + a run of `=`
-  characters out to the formatter width, with the closing banner directly above the item (no blank
-  line between). Banners are hand-authored and `cargo fmt`-compatible. (Adopt this only where the
-  surrounding module already uses it.)
-- **Logging:** `tracing` with structured fields (`?error`, ids, durations), never `println!` in
-  library code, and never log secrets.
-- **Numeric casts:** never `as` for conversions that may truncate/overflow — use `try_into()` (with
-  handling) or a clamped cast on a bounded domain; treat every `as` as a review flag.
-- **Concurrency:** document lock-acquisition order (never acquire the same locks in different orders);
-  do not hold a `RwLock`/`Mutex` write guard across `.await` unless the section is unavoidably async
-  and bounded; prefer `compare_exchange` loops for concurrent counters.
-- **Recursion:** user-influenced tree/graph walks carry a depth limit or use an explicit-stack
-  iterative form — malformed input must not overflow the thread stack.
-- **Async & tests:** keep async paths non-blocking (`spawn_blocking` for CPU-heavy work); every test
-  asserts at least once and prefers `.expect("context")` over a bare `.unwrap()`.
-
-<subagent_policy>
-
-## Agent orchestration — current policy
-
-**Single agent for the small stuff; Actor–Critic for anything that ships.** Do searches, reads,
-and trivial mechanical edits inline in the main thread — don't spawn for those. But any change that
-lands as a PR goes through an **Actor–Critic cycle with an *independent* Critic** (a separate
-agent, fresh context — see the cadence memories and SEPMO `references/05-critic.md`). The
-independent Critic per PR is **non-negotiable**; convergence is the Critic's call.
-
-**Default both roles to Opus — "OO" means Opus–Opus.** Whenever you spawn an Actor and/or a Critic,
-**both default to Opus** (`model: "opus"`) at high reasoning effort. This is the project's concrete
-realization of SEPMO's "frontier–frontier (FF)" pair: **`OO AC` = Opus–Opus Actor–Critic, the
-default.** Opus Critics are materially stronger at the part that matters most — non-vacuity and
-coverage refutation: on 2026-06-25 two Opus Critics caught (and mutation-proved) a NULL-three-valued-
-logic coverage gap that *every* Sonnet Critic in the same effort — including a dedicated "final"
-bundle Critic — had missed. Never turn the **Critic** below Opus on a correctness-bearing review.
-You may turn the **Actor** down to Sonnet/Haiku only for genuinely rote sub-work (large mechanical
-renames, log scraping) — and say so explicitly when you do.
-
-(Cost note: OO is the most expensive mode and is nonetheless the default, because correctness on a
-table-format library *is* the product. `Workflow` fan-out and plan-mode `Explore`/`Plan` helpers
-stay opt-in; the heavy parity phases — **Phase 2 (write engine)**, **Phase 4 (formats & V3 types)** —
-are the natural fan-out candidates when the user asks for scale.)
-
-</subagent_policy>
-
-## Working conventions
-
-- **One home per fact (de-triplication rule, 2026-06-10).** A capability's STATUS lives ONLY in
-  [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md) — terse cells (location, 1–2 sentences,
-  flip dates, links). The Roadmap holds the plan and one-line phase statuses; increment narratives
-  live in `task/todo-archive/`, `task/lessons-archive/`, and `docs/parity/archive/` (grep on
-  demand, never required reading). **Never write the same status in two places — link instead.**
-  When a status flips, edit the matrix cell and nothing else.
-- **Chain the verification gate to the commit in ONE `&&` chain** — `typos . && cargo fmt --all --
-  check && git add -A && git commit …` — never put `git commit` on a separate line from the gate: a
-  failed gate on its own line still lets the commit run. (Promoted 2026-06-09 from a twice-repeated
-  lessons entry.)
-- **Run `make check-matrix-anchors` after any GAP_MATRIX edit** — it enforces the 5-pipe row
-  audit (raw pipes inside code spans split cells silently; the de-triplication pass once stranded
-  half a cell as a phantom column), the row anchors below, and citation resolution. It runs in CI
-  and the aggregate `make check`. _Promoted 2026-06-11 from lessons as a manual pipe-count sweep;
-  automated 2026-07-01._
-- **Cite GAP_MATRIX rows by permanent anchor — `row R<id>` — never by file line number.** Line
-  numbers shift when ANY line is inserted above them — the +2 drift that broke ~45 citations
-  between 2026-06-17 and 2026-07-01 (discovered in four separate waves) came from two PROSE lines
-  added above the table, not from row insertions; prose edits are not safe either. Every
-  capability row's first cell carries its anchor (`R<id> ·`); a NEW row takes the next unused ID
-  and may be inserted anywhere; IDs are never reused. Bare-number citations in dated archives are
-  historical epochs — leave them. Enforced by `scripts/check_matrix_anchors.sh`. _Added
-  2026-07-01._
-- **A sabotage step that cannot be applied must HARD-FAIL, never SKIP.** A negative/sabotage test
-  that did not actually corrupt anything has proven nothing — a SKIP branch is a false-green. When
-  the corruption cannot be applied (e.g. the target byte pattern is absent), exit non-zero and abort
-  the chain (restoring any `.bak` first); under `set -euo pipefail`, capture the mutator's exit with
-  `|| rc=$?` so the restore stays reachable. _Promoted 2026-06-13 from a thrice-repeated lessons
-  entry (interop sabotage 6b / 8e / 7b)._
-- **Upstream is a sync baseline, not a constraint.** This is an owned fork for Java `iceberg-core`
-  parity — edit freely; sync up from upstream and cherry-pick wins, but mergeability is not required.
-- **Tests ship with the change**, plus interop tests where applicable (see the Parity mandate and the
-  manuals' §4 Done gate).
-- **Keep `map.md` in lockstep** with the directories that use it (see `<map_md_navigation>`).
-- **Follow the operating manual for your tier** ([skills/](skills/)) — Risk-First, naming, the
-  Rust rules, the debugging protocol, and the verification gate. CLAUDE.md wins on conflict.
+Relax nothing here: an adapter may name tiers, never loosen the rule it implements. If the neutral
+rule needs to change, change it in [AGENTS.md](AGENTS.md) `<subagent_policy>` and note it in
+[task/lessons.md](task/lessons.md).

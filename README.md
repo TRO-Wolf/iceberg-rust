@@ -72,7 +72,8 @@ high-level:
 - **[Roadmap.md](Roadmap.md)** — the phase plan and sequencing toward full parity.
 - **[docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md)** — the single source of truth for each
   capability's status (✅ / 🟡 / ❌), re-audited after every sync and phase.
-- **[CLAUDE.md](CLAUDE.md)** — repository intent, prohibitions, and conventions.
+- **[AGENTS.md](AGENTS.md)** — the authoritative contract: repository intent, prohibitions, and
+  conventions. ([CLAUDE.md](CLAUDE.md) is a thin Claude adapter that points here and states no rule.)
 
 ---
 

@@ -26,7 +26,8 @@
 # breaks its line-number citations, row or prose. Every capability row now
 # carries a PERMANENT anchor in its first cell ('| R<id> · ...') and live docs
 # cite "row R<id>". This gate enforces:
-#   1. the 5-pipe row audit (was a manual CLAUDE.md convention);
+#   1. the 5-pipe row audit (was a manual convention in the repo contract,
+#      now AGENTS.md);
 #   2. every data row anchored exactly once ('| R<id> · ');
 #   3. anchor IDs unique (they are permanent and never reused);
 #   4. every 'row R<n>' citation in the LIVE docs resolves to an anchor.
@@ -103,7 +104,7 @@ fi
 # A renamed/deleted scan target would silently drop out of a bare git-grep
 # pathspec (exit 1, indistinguishable from no-match), so assert each first —
 # this existence list and the git-grep pathspec below MUST stay in lockstep.
-for f in Roadmap.md CLAUDE.md task/todo.md docs crates; do
+for f in Roadmap.md AGENTS.md CLAUDE.md .agents task/todo.md docs crates; do
   if [ ! -e "$f" ]; then
     echo "ERROR: live-doc scan target '$f' does not exist — update this script's scan set" >&2
     exit 1
@@ -115,7 +116,7 @@ CONT='(, ?| ?/ ?| and | ?- ?| ?– ?)'
 # gate's v3 hardening closed; same doctrine here).
 rc=0
 git grep -hoE "(^|[^[:alnum:]])[Rr]ows? R[0-9]+(${CONT}R[0-9]+)*" -- \
-  'Roadmap.md' 'CLAUDE.md' 'task/todo.md' 'docs' 'crates' \
+  'Roadmap.md' 'AGENTS.md' 'CLAUDE.md' '.agents' 'task/todo.md' 'docs' 'crates' \
   ':(exclude)docs/parity/archive' \
   >"$cites_raw" 2>"$err_file" || rc=$?
 if [ "$rc" -ge 2 ]; then

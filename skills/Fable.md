@@ -39,9 +39,9 @@ rule matters most.
 pull against each other, the higher priority wins. "Demand elegance" never overrides "simplicity
 first": elegance here *means* clarity, not cleverness.
 
-**Authority order:** repo-root `CLAUDE.md` (if present) > this manual > portable defaults. Read
-`CLAUDE.md` **before** this manual; it documents repo-specific intent, constraints, and build/test
-commands. `CLAUDE.md` wins on any conflict.
+**Authority order:** repo-root `AGENTS.md` (if present) > this manual > portable defaults. Read
+`AGENTS.md` **before** this manual; it documents repo-specific intent, constraints, and build/test
+commands. `AGENTS.md` wins on any conflict.
 
 **How this manual is organized:** every rule has exactly one canonical home; other sections point
 to it rather than restate it. There are two checklists only — **Pre-Flight** (before you start)
@@ -52,7 +52,7 @@ one home, not missing. Read this manual at the start of every session.
 > `<non_negotiables>`, `<frontier_addendum>`, `<risk_first>`, `<verification_gate>`,
 > `<scope_boundaries>`. They mark the must-not-skip / must-not-violate regions so an agent can
 > locate and obey each as a unit; the tags carry no meaning beyond that and follow the same
-> convention as the tags in [CLAUDE.md](../CLAUDE.md).
+> convention as the tags in [AGENTS.md](../AGENTS.md).
 
 ---
 
@@ -67,14 +67,14 @@ is exactly the failure mode they exist to stop.
 1. **Never run destructive or irreversible operations without explicit approval** — no
    `git push --force` to shared branches, no history rewrite, no mass file deletion, no
    dropping/truncating data in a live catalog, no resource teardown. No rollback exists.
-   (`CLAUDE.md` "Absolute prohibitions")
+   (`AGENTS.md` "Absolute prohibitions")
 2. **Tests ship with the change, same commit/PR.** Behavior added without tests gets reverted, not
    patched. No `#[ignore]`, no commented-out tests, no `// TODO: add test`.
    (§4, [docs/testing.md](../docs/testing.md))
 3. **No bare `.unwrap()` / `.unwrap_err()` in Rust production paths** — every fallible call
    carries debug context. (Rust §)
 4. **Never commit or log secrets, credentials, or tokens** — not in code, tests, fixtures, or log
-   output. (`CLAUDE.md` "Absolute prohibitions")
+   output. (`AGENTS.md` "Absolute prohibitions")
 5. **Modify only files in the current plan.** An unexpected file means STOP and check in
    (interactive) or report it (delegated). (§6)
 6. **Never edit dependency files** — `Cargo.toml`, `Cargo.lock`, `pyproject.toml`,
@@ -128,11 +128,12 @@ fuzzing parsers, reasoning about deserialization exploits in Avro/Parquet reader
 
 ### Sub-agent economics
 
-Follow [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` — single agent for the small stuff, but every
+Follow [AGENTS.md](../AGENTS.md) `<subagent_policy>` — single agent for the small stuff, but every
 change that ships as a PR runs an Actor–Critic cycle with a mandatory independent Critic. Two
 Fable-specific extensions:
 
-- A spawned Actor and the Critic **default to Opus** (`OO` = Opus–Opus, per CLAUDE.md); never run
+- A spawned Actor and the Critic **default to Opus** (`OO` = Opus–Opus, the Claude-tier mapping
+  in [CLAUDE.md](../CLAUDE.md)); never run
   the Critic below Opus on a correctness-bearing review. **Never spawn a Fable/Mythos-tier sub-agent**
   unless the user names the tier explicitly — a fan-out of frontier-*priced* agents above Opus is a
   budget decision only the user can make.
@@ -224,11 +225,11 @@ fails. Concurrency tests the race window directly (`Barrier`, contention loop).
 
 | Surface | Why it bites silently | Rules live in |
 |---|---|---|
-| **Data / format correctness** | Encoding, schema, partition, or serialization bugs survive until data is read back wrong — long after the commit. | [CLAUDE.md](../CLAUDE.md) + the crate's `map.md` |
-| **Destructive / irreversible operations** | Permanent, no rollback. | [CLAUDE.md](../CLAUDE.md) "Absolute prohibitions" |
-| **Public API / compatibility breaks** | A changed trait or on-disk encoding silently breaks downstream crates and already-written data. | [CLAUDE.md](../CLAUDE.md) "Absolute prohibitions" |
+| **Data / format correctness** | Encoding, schema, partition, or serialization bugs survive until data is read back wrong — long after the commit. | [AGENTS.md](../AGENTS.md) + the crate's `map.md` |
+| **Destructive / irreversible operations** | Permanent, no rollback. | [AGENTS.md](../AGENTS.md) "Absolute prohibitions" |
+| **Public API / compatibility breaks** | A changed trait or on-disk encoding silently breaks downstream crates and already-written data. | [AGENTS.md](../AGENTS.md) "Absolute prohibitions" |
 | **Secrets / credentials** | A leaked token is exposed permanently once pushed. | Non-Negotiables |
-| **`map.md` drift from code** | A stale map misdirects every later session. Same-change rule. | [CLAUDE.md](../CLAUDE.md) `<map_md_navigation>` |
+| **`map.md` drift from code** | A stale map misdirects every later session. Same-change rule. | [AGENTS.md](../AGENTS.md) `<map_md_navigation>` |
 
 Risk-First is not "defensive programming." It is *naming* the failure mode before mitigating it,
 then testing the mitigation.
@@ -239,9 +240,10 @@ then testing the mitigation.
 
 ## Workflow Orchestration
 
-> **Sub-agent policy.** Follow [CLAUDE.md](../CLAUDE.md) `<subagent_policy>` — single agent for the
+> **Sub-agent policy.** Follow [AGENTS.md](../AGENTS.md) `<subagent_policy>` — single agent for the
 > small stuff; a PR-shipping Actor–Critic cycle has a mandatory independent Critic, and a spawned
-> Actor + that Critic **default to Opus** (`OO` = Opus–Opus). The Frontier Addendum adds: never spawn
+> Actor + that Critic **default to Opus** (`OO` = Opus–Opus — the Claude-tier mapping in
+> [CLAUDE.md](../CLAUDE.md)). The Frontier Addendum adds: never spawn
 > Fable-tier sub-agents (above Opus) without the user naming the tier.
 
 ### 1. Reason Before You Act — and record the plan
@@ -370,7 +372,7 @@ comment it out** — git remembers. Functions under 100 lines (Function Length &
 
 ## Navigation: `map.md` Convention
 
-The repo's authoritative rule is [CLAUDE.md](../CLAUDE.md) `<map_md_navigation>`; it wins. The
+The repo's authoritative rule is [AGENTS.md](../AGENTS.md) `<map_md_navigation>`; it wins. The
 contract in brief: a directory may carry one `map.md` — the map on top (`Purpose`, `Contents`,
 `I want to... → go to`, `Pointers`) and `## Debug` at the bottom (`Known failure modes`,
 `First checks`, `Escalate to`).
@@ -440,7 +442,7 @@ structured fields (`?error`, ids, durations) — never `println!` in library cod
 in logs; validate PyO3 conversions at the FFI boundary; **house style** — section banners
 (`///` + space + `=`-run to formatter width, closing banner directly above the item) + one blank
 line between top-level items, adopted only where the surrounding module already uses it (full
-spec: [CLAUDE.md](../CLAUDE.md) "Rust conventions"); let `cargo fmt` own layout.
+spec: [AGENTS.md](../AGENTS.md) "Rust conventions"); let `cargo fmt` own layout.
 
 ### Python
 
@@ -471,7 +473,7 @@ stack for deep tree walks.
 
 ## Pre-Flight Checklist — before you start
 
-- [ ] Read `CLAUDE.md` at repo root for repo-specific intent and build/test commands.
+- [ ] Read `AGENTS.md` at repo root for repo-specific intent and build/test commands.
 - [ ] Read this manual, then the active [task/lessons.md](../task/lessons.md) in full (§2; read
       protocol in [skills/compaction.md](compaction.md)).
 - [ ] Read [task/todo.md](../task/todo.md) + any relevant long-form tracker to pick up mid-flight work.

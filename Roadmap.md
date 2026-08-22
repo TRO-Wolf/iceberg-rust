@@ -28,7 +28,7 @@
 >
 > **Authority.** This file is the **plan** (altitude + sequencing). The **living capability checklist**
 > is [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md). Repo conventions + read order live in
-> [CLAUDE.md](CLAUDE.md); the testing contract is [docs/testing.md](docs/testing.md). When this file and
+> [AGENTS.md](AGENTS.md); the testing contract is [docs/testing.md](docs/testing.md). When this file and
 > the GAP_MATRIX disagree on a capability's status, the **GAP_MATRIX** (re-audited against the live base)
 > wins and this file is corrected.
 
@@ -59,7 +59,7 @@ layers are removed in Phase 0.
 
 ## For a new session — start here
 
-1. Read [CLAUDE.md](CLAUDE.md) (intent, prohibitions, conventions, read order) → this `Roadmap.md` →
+1. Read [AGENTS.md](AGENTS.md) (intent, prohibitions, conventions, read order) → this `Roadmap.md` →
    [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md) (per-capability status — the ONLY status
    record) → [docs/testing.md](docs/testing.md) → [task/lessons.md](task/lessons.md) in full →
    [task/todo.md](task/todo.md) (the live plan).
@@ -74,7 +74,7 @@ layers are removed in Phase 0.
    round-trip (see Definition of done).
 
 ### Sub-agent note
-Per [CLAUDE.md](CLAUDE.md) `<subagent_policy>` the default is single-agent. The two heavy phases —
+Per [AGENTS.md](AGENTS.md) `<subagent_policy>` the default is single-agent. The two heavy phases —
 **Phase 2 (write engine)** and **Phase 4 (formats & types)** — are the natural fan-out candidates if the
 policy is lifted; everything else is comfortably single-agent.
 
@@ -249,7 +249,7 @@ bare parenthesized numbers had drifted stale, 10 of 11 resolving to the wrong ro
 - **Order by dependency, then value:** metadata correctness underpins writes; writes underpin
   maintenance actions.
 - Engineering floor (no bare `.unwrap()` in prod paths, `thiserror`/`anyhow`, `tracing`, house style,
-  `map.md` navigation): [CLAUDE.md](CLAUDE.md).
+  `map.md` navigation): [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -452,7 +452,7 @@ format-sensitive work still leads; well-templated breadth follows.
 |---|---|
 | GAP_MATRIX drifts from reality as work lands or Java evolves | One home per fact (statuses ONLY in the matrix); re-audit after every sync and every phase; Phase 7 automates Java-release tracking. |
 | Parity claimed without true 1:1 evidence | Definition of Done requires an interop test (Java↔Rust round-trip) before a row flips to ✅. |
-| Status narratives regrow in this file | The de-triplication rule in [CLAUDE.md](CLAUDE.md): never write a capability's status outside the matrix — link instead. Archived narrative: [task/todo-archive/](task/todo-archive/). |
+| Status narratives regrow in this file | The de-triplication rule in [AGENTS.md](AGENTS.md): never write a capability's status outside the matrix — link instead. Archived narrative: [task/todo-archive/](task/todo-archive/). |
 | Dependency treadmill: the arrow / parquet / datafusion cadence (a fork-and-own cost) | Named policy (2026-07-01): evaluate each upstream FAMILY bump on a schedule — the downstream engine will eventually drag a newer DataFusion (⇒ arrow major) through the core. First exercise of this policy: the DF 54.1 / arrow 58.4 bump, 2026-08-05. Budget one sync-spike per family release; record the take/skip decision per crate in `task/todo.md`. |
 | Upstream `apache/iceberg-rust` divergence compounds (cherry-pick cost grows superlinearly, worst on the write path) | Scheduled upstream-evaluation cadence: on each upstream minor, take io / catalog / reader fixes, skip write-path changes unless load-bearing — and record a DATED take/skip decision per release. Deciding not to sync is also a decision; leaving it implicit is how the option silently expires. |
 
@@ -470,7 +470,8 @@ compatibility with Java in both directions where applicable.
 
 - [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md) — the living capability audit (the checklist this
   roadmap drives).
-- [CLAUDE.md](CLAUDE.md) — repository intent, prohibitions, conventions, read order, sub-agent policy.
+- [AGENTS.md](AGENTS.md) — the authoritative contract: repository intent, prohibitions, conventions,
+  read order, sub-agent policy. ([CLAUDE.md](CLAUDE.md) is the Claude adapter — tool mechanics only.)
 - [docs/testing.md](docs/testing.md) — the testing contract (tests-with-code + interop tests).
 - [docs/ENGINE_CONTRACT.md](docs/ENGINE_CONTRACT.md) — the engine-facing integration contract
   (DRAFT 2026-07-01: isolation-level → validation recipes pending bytecode verification).
