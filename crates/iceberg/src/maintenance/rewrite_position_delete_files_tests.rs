@@ -16,8 +16,11 @@
 // under the License.
 
 //! Tests for [`RewritePositionDeleteFiles`]. Each is a corruption-class READ-IDENTITY proof: the
-//! merge-on-read live row set is asserted IDENTICAL before (many parquet pos-deletes) and after (fewer,
-//! compacted pos-deletes), plus the four `Result` counts. The crown jewel + the seq-stamp test pin the
+//! merge-on-read live row set is asserted IDENTICAL before and after the rewrite, plus the four
+//! `Result` counts. The file count moves in BOTH directions across this file and identity holds in
+//! each: most fixtures FUSE many parquet pos-deletes into fewer compacted ones, while the split
+//! battery (`test_output_splits_into_multiple_files_at_a_small_explicit_config` and its siblings)
+//! rewrites a bin into MORE files than it consumed. The crown jewel + the seq-stamp test pin the
 //! silent-corruption staller (the compacted file must carry the group MAX rewritten data seq); the
 //! grouping + partition-isolation tests pin the `(spec, partition)` planning; the C-008 format
 //! battery pins the V2-parquet-only scope over all four `DataFileFormat` variants (a Puffin
