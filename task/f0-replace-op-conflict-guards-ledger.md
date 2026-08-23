@@ -57,7 +57,8 @@ fork already matches all three — they were **not** touched.
 | `operation_removes_data_files` | `{Overwrite, Delete}` | `{Overwrite, Replace, Delete}` | `VALIDATE_DATA_FILES_EXIST_OPERATIONS` |
 | `operation_removes_data_files_skip_deletes` | `{Overwrite}` | `{Overwrite, Replace}` | `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS` |
 
-**Doc sites corrected — six, not four.** The brief named four; two more restatements of the same
+**Doc sites corrected — six in the first pass, eleven more in the F1 remand pass.** The brief named
+four; two more restatements of the same
 false claim were found in `row_delta.rs` while implementing and are corrected in the same change
 (they became actively false the moment the predicates changed):
 
@@ -74,9 +75,50 @@ false claim were found in `row_delta.rs` while implementing and are corrected in
 6. `row_delta.rs` — the in-body comment at check 3 **and** the files-exist test-region banner, which
    restated the same two op sets.
 
-A repo-wide grep for `unrepresentable` / ``never records a `REPLACE` `` / ``REPLACE` snapshot`` over
-`crates/` and `docs/` (excluding dated archives, per the brief) shows no surviving instance of the
-false claim; every remaining hit is an unrelated use of the word.
+**On the searches actually run, and what they do and do not establish.** The first pass grepped only
+the PROSE forms of the false rationale — `unrepresentable`, ``never records a `REPLACE` ``,
+``REPLACE` snapshot`` — over `crates/` and `docs/` excluding dated archives. That search establishes
+only that no surviving text repeats the *unrepresentability rationale*; it says nothing about sites
+that restate the *op-set membership* as fact, because none of those three terms appears in them. It
+was reported here as if it covered both, which it did not. The Critic (F1) caught that.
+
+A second, member-level sweep was then run — `grep -rn "OVERWRITE, DELETE\|{OVERWRITE}\|{Overwrite}\|{Overwrite, Delete}\|OVERWRITE, REPLACE\|Overwrite, Replace\|VALIDATE_DATA_FILES_EXIST"` plus a
+brace-free `skipDeletes\|skip_deletes` sweep, both over `crates/` and `docs/` excluding
+`docs/parity/archive/` and `snapshot.rs` itself. **Population: 64 hit lines across 9 files**
+(re-derived by re-running both sweeps against `git archive HEAD` and `sort -u`, not from the
+screen-truncated first look, which under-counted at 39). Each was read in context and classified
+against the two predicate bodies at `snapshot.rs` (not against a summary of them):
+
+- **14 hit lines were FALSE** and are corrected in this change. They sit in **11 distinct comment
+  blocks across 5 files** (the table below groups them into 10 rows; the
+  `interop_deletefiles_conflict.rs` row covers two blocks — a doc comment and a body comment).
+- **The other 50 hit lines were already CORRECT and were deliberately left alone** — they state either
+  `VALIDATE_ADDED_DELETE_FILES_OPERATIONS = {OVERWRITE, DELETE}` or
+  `VALIDATE_ADDED_DVS_OPERATIONS = {OVERWRITE, DELETE, REPLACE}` (neither set changed here), or Java's
+  three-member files-exist set which the fork now matches, or they name the constant without
+  enumerating members.
+
+Corrected in the F1 pass:
+
+| Site | Was | Now |
+|---|---|---|
+| `row_delta.rs` field doc on `validate_deleted_files` (2 lines) | `{OVERWRITE}` / `{OVERWRITE, DELETE}` | `{OVERWRITE, REPLACE}` / `{OVERWRITE, REPLACE, DELETE}` |
+| `row_delta.rs` **public rustdoc on `pub fn validate_deleted_files()`** (2 lines) | same | same, plus an explicit note that `REPLACE` is in BOTH sets and this flag toggles only `DELETE` |
+| `row_delta.rs` `commit_concurrent_overwrite_deletion` helper doc | "in BOTH `{OVERWRITE}` and `{OVERWRITE, DELETE}`" | "in BOTH `{OVERWRITE, REPLACE}` and `{OVERWRITE, REPLACE, DELETE}`" |
+| `row_delta.rs` `commit_concurrent_delete_op_deletion` helper doc | "non-skip `{OVERWRITE, DELETE}`" | "non-skip `{OVERWRITE, REPLACE, DELETE}`" |
+| `row_delta.rs` `test_row_delta_files_exist_skip_deletes_default_excludes_delete_op_snapshot` doc (2 lines) | `{OVERWRITE}` / `{OVERWRITE, DELETE}` | `{OVERWRITE, REPLACE}` / `{OVERWRITE, REPLACE, DELETE}`, plus "this test isolates the `DELETE` member alone" |
+| `tests/interop_rowdelta_conflict.rs:38` (module doc) | `{OVERWRITE}` | `{OVERWRITE, REPLACE}` |
+| `tests/interop_rowdelta_conflict.rs` FilesExist history comment | `{OVERWRITE}` | `{OVERWRITE, REPLACE}` |
+| `tests/interop_deletefiles_conflict.rs` `build_scenario_table` doc + body comment (2 lines) | "the `{OVERWRITE}` default op set" — wrong even PRE-fix, since `DeleteFiles` always validates with `skipDeletes = false` | `VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE, REPLACE, DELETE}`, with the `skipDeletes = false` reason stated |
+| `crates/iceberg/tests/map.md:56` (map lockstep) | `{OVERWRITE}` default op set | `{OVERWRITE, REPLACE}` default op set |
+| `docs/ENGINE_CONTRACT.md:211` (normative §5) | "outside the `{OVERWRITE}` op set" | "outside the default `{OVERWRITE, REPLACE}` op set", plus "a concurrent compaction/REPLACE removal is NOT tolerated" |
+
+Inspected and deliberately NOT changed (already true after the fix): `row_delta.rs:54,117,550-556,2510,2549,4397,5118` (added-delete / DV op sets, unchanged by this unit); `row_delta.rs:473`
+("By DEFAULT the check IGNORES concurrent merge-on-read DELETE-op snapshots" — still true);
+`replace_partitions.rs:399-400,410-411,439`; `delete_files.rs:295,583,1236`;
+`interop_deletefiles_conflict.rs:34`; `docs/ENGINE_CONTRACT.md:213`;
+`crates/integrations/datafusion/tests/integration_datafusion_test.rs:6109` ("the files-exist check's
+default op set excludes `Operation::Delete` snapshots" — still true, and it enumerates no members).
 
 `docs/parity/archive/2026-06_matrix-cell-narratives.md` was **not** touched (brief §5 / the dated-archive
 convention).
@@ -143,7 +185,12 @@ test result: FAILED. 3378 passed; 2 failed; 1 ignored; 0 measured; 0 filtered ou
   `Table`. That is the defect in its literal form: a `RowDelta` carrying a position delete over
   `test/f.parquet` committed even though a concurrent `Operation::Replace` compaction had already
   removed `test/f.parquet` from the live set. No error, no retry — the position delete now references
-  a data file that does not exist, and the rows it removed are live again in `test/f-compacted.parquet`.
+  a data file that does not exist. **What was OBSERVED is the metadata state**: the commit returned
+  `Ok`, `test/f.parquet` is absent from the live set, and the committed DELETE manifest references it
+  anyway. **That the deleted rows are consequently live again in `test/f-compacted.parquet` is
+  REASONED from that metadata state, not read back** — the fixture uses synthetic `DataFile` records
+  (`synthetic_data_file` / `synthetic_delete_file`), there is no parquet on disk, and no scan is
+  performed. A read-back proof would need a real-data fixture; see residue 6.
 - **`delete_files`: the commit failed at base, but for the WRONG reason.** The message was
   `Missing required files to delete: test/a.parquet` — the *generic path-resolution* check firing
   later in `commit`, not the `validateDataFilesExist` conflict guard. The conflict guard did not run
@@ -224,6 +271,12 @@ Additional residue found while implementing (new, not in the brief):
 5. **The `deleted_data_files_after` walk still does not thread a conflict filter**, where Java's
    `validateDataFilesExist` accepts one. Pre-existing, documented in the fn's own docs as a
    conservative over-scan (can only over-reject). Untouched by this unit.
+
+6. **No row-level read-back of the resurrection.** The corruption-level test proves the metadata
+   state (commit accepted; DELETE manifest referencing a non-live data file) but never scans the
+   table, because the fixture is synthetic. The row-level consequence is reasoned from the metadata,
+   not measured. A real-parquet fixture that scans post-commit and counts the resurrected rows would
+   close this; not attempted here.
 
 ## 8. Gate
 
