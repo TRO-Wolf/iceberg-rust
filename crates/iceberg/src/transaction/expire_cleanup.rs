@@ -58,7 +58,11 @@
 //!    reads both manifest contents through the typed reader instead, with identical results.
 //!    A deletion-vector entry's `file_path` is its PUFFIN location, so a puffin shared by
 //!    several DVs is naturally deduplicated by the path-set, and one retained DV in the puffin
-//!    protects the whole file.
+//!    protects the whole file. Each surviving path is tagged with its entry's
+//!    [`DataContentType`] so the report can be read per content class — Java's own tagging
+//!    (`BaseSparkAction$ReadManifest.toFileInfo`, 1.10.0 bytecode) uses `ContentFile.content()`
+//!    ALONE and never the file format, so a deletion vector counts as a POSITION delete and
+//!    there is no fourth class (see [`CleanupReport::deleted_position_delete_files`]).
 //! 5. **Statistics files:** `statistics`/`partition-statistics` locations present in `before`
 //!    but absent from `after` (`FileCleanupStrategy.expiredStatisticsFilesLocations`).
 //!
@@ -165,13 +169,13 @@
 //! - `cleanExpiredMetadata` (unreachable spec/schema pruning) — same deferral as B1.
 //! - Java interop evidence for the cleanup (the GAP_MATRIX row stays 🟡).
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use futures::future::BoxFuture;
 
 use crate::error::Result;
 use crate::io::FileIO;
-use crate::spec::{ManifestFile, SnapshotRef, TableMetadata, TableProperties};
+use crate::spec::{DataContentType, ManifestFile, SnapshotRef, TableMetadata, TableProperties};
 use crate::table::Table;
 use crate::transaction::Transaction;
 use crate::transaction::expire_snapshots::parse_property;
@@ -220,12 +224,32 @@ pub struct CleanupFailure {
 
 /// The outcome of one cleanup sweep: every successfully deleted path, per delete funnel
 /// (mirroring Java's four `deleteFiles` calls), plus every collected failure. Vectors are
-/// deterministic: paths sorted within each funnel, funnels in Java's deletion order.
+/// deterministic: paths sorted within each funnel, funnels in Java's deletion order. The
+/// content funnel is additionally readable per content class through the DERIVED typed views
+/// ([`Self::deleted_data_files`] / [`Self::deleted_position_delete_files`] /
+/// [`Self::deleted_equality_delete_files`]) — Spark's three per-content-type
+/// `expire_snapshots` columns.
 #[derive(Debug, Default)]
 pub struct CleanupReport {
     /// Deleted content files: data files, position/equality delete files, deletion-vector
     /// puffins (Java's `"data"` funnel — its `readPaths` walk emits all three classes).
+    ///
+    /// **This is the UNION and it is the authority on membership.** The per-content-type views
+    /// ([`Self::deleted_data_files`], [`Self::deleted_position_delete_files`],
+    /// [`Self::deleted_equality_delete_files`], [`Self::deleted_content_files_of_type`]) are
+    /// DERIVED by filtering this vector, so a typed view can never name a file the union does
+    /// not — including when the fail-closed posture clears the content set (see
+    /// [`Self::clean_expired_files`](ExpireSnapshotsCleanup::clean_expired_files)).
     pub deleted_content_files: Vec<String>,
+    /// The manifest-entry content type of each path in [`Self::deleted_content_files`], keyed by
+    /// path — a TYPE LOOKUP, not a second membership list. Populated from the same walk that
+    /// produced the union (the classification is `ManifestEntry::content_type()`, Java
+    /// `ContentFile.content()`), so its key set equals the union's element set.
+    ///
+    /// Consumers should read it through the typed accessors rather than directly; it is public
+    /// only so the struct stays constructible field-by-field, as it was before this field
+    /// existed.
+    pub deleted_content_file_types: HashMap<String, DataContentType>,
     /// Deleted manifest files (data and delete manifests).
     pub deleted_manifests: Vec<String>,
     /// Deleted manifest-list files.
@@ -244,6 +268,47 @@ impl CleanupReport {
             && self.deleted_manifest_lists.is_empty()
             && self.deleted_statistics_files.is_empty()
             && self.failures.is_empty()
+    }
+
+    /// The deleted content files whose manifest-entry content type is `content_type`, in the
+    /// union's order (sorted by path).
+    ///
+    /// **Derived, never stored** — this filters [`Self::deleted_content_files`], so the union
+    /// remains the single membership authority: concatenating the three
+    /// [`DataContentType`] views reproduces the union exactly, and an empty union (the
+    /// fail-closed clear) empties every view.
+    pub fn deleted_content_files_of_type(&self, content_type: DataContentType) -> Vec<&str> {
+        self.deleted_content_files
+            .iter()
+            .filter(|path| {
+                self.deleted_content_file_types.get(path.as_str()) == Some(&content_type)
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// The deleted DATA files — Spark's `deleted_data_files_count` column
+    /// (`FileContent.DATA`).
+    pub fn deleted_data_files(&self) -> Vec<&str> {
+        self.deleted_content_files_of_type(DataContentType::Data)
+    }
+
+    /// The deleted POSITION-delete files — Spark's `deleted_position_delete_files_count`
+    /// column (`FileContent.POSITION_DELETES`).
+    ///
+    /// **Deletion-vector puffins land HERE.** Java tags a content file by
+    /// `ContentFile.content()` alone (`BaseSparkAction$ReadManifest.toFileInfo`, bytecode
+    /// 1.10.0), never by file format, and a DV is a `DeleteFile` whose content is
+    /// `POSITION_DELETES` — so DVs are counted as position deletes and are NOT separable from
+    /// Parquet position deletes. There is no fourth bucket in Java and there is none here.
+    pub fn deleted_position_delete_files(&self) -> Vec<&str> {
+        self.deleted_content_files_of_type(DataContentType::PositionDeletes)
+    }
+
+    /// The deleted EQUALITY-delete files — Spark's `deleted_equality_delete_files_count`
+    /// column (`FileContent.EQUALITY_DELETES`).
+    pub fn deleted_equality_delete_files(&self) -> Vec<&str> {
+        self.deleted_content_files_of_type(DataContentType::EqualityDeletes)
     }
 }
 
@@ -379,14 +444,20 @@ impl ExpireSnapshotsCleanup {
         //    retained manifest (Java `findFilesToDelete`; "live" = status != DELETED on BOTH
         //    sides). Skipped entirely when no manifest dies (Java's `!manifestsToDelete
         //    .isEmpty()` gate).
-        let mut content_files_to_delete: BTreeSet<String> = BTreeSet::new();
+        //    Keyed by path (the deduplicating set algebra is unchanged) and VALUED by the
+        //    entry's content type (Java `ContentFile.content()` — the only thing Spark's
+        //    `toFileInfo` tags a deleted content file with). Two entries sharing a path share a
+        //    content type in every legal shape (a puffin's DVs are all POSITION_DELETES), so
+        //    the last-write-wins insert is not a classification hazard.
+        let mut content_files_to_delete: BTreeMap<String, DataContentType> = BTreeMap::new();
         if !manifests_to_delete.is_empty() {
             for (path, manifest_file) in &manifests_to_delete {
                 match manifest_file.load_manifest(&self.file_io).await {
                     Ok(manifest) => {
                         for entry in manifest.entries() {
                             if entry.is_alive() {
-                                content_files_to_delete.insert(entry.file_path().to_string());
+                                content_files_to_delete
+                                    .insert(entry.file_path().to_string(), entry.content_type());
                             }
                         }
                     }
@@ -450,13 +521,24 @@ impl ExpireSnapshotsCleanup {
 
         // 6. The sweep, in Java's deletion order: content files → manifests → manifest lists →
         //    statistics. Per-file failures are collected; the sweep never aborts.
+        // The content funnel sweeps the map's KEYS (identical set, identical sorted order to
+        // the previous `BTreeSet`), then records the type of each SUCCESSFULLY deleted path.
+        // Both come from `content_files_to_delete`, so every union member has a type entry by
+        // construction, and a path that failed to delete is in neither.
+        let content_paths: BTreeSet<String> = content_files_to_delete.keys().cloned().collect();
         report.deleted_content_files = self
             .delete_all(
-                content_files_to_delete,
+                content_paths,
                 CleanupFailureKind::DeleteContentFile,
                 &mut report.failures,
             )
             .await;
+        let deleted_content: HashSet<&String> = report.deleted_content_files.iter().collect();
+        report.deleted_content_file_types = content_files_to_delete
+            .iter()
+            .filter(|(path, _)| deleted_content.contains(path))
+            .map(|(path, content_type)| (path.clone(), *content_type))
+            .collect();
         report.deleted_manifests = self
             .delete_all(
                 manifests_to_delete.into_keys().collect(),
@@ -1668,6 +1750,300 @@ mod tests {
         assert_eq!(
             error.message(),
             "Cannot expire snapshots: GC is disabled (deleting files may corrupt other tables)"
+        );
+    }
+
+    /// =======================================================================
+    /// Content-type classification of the deleted content funnel (F-2)
+    /// =======================================================================
+    /// A synthetic PARQUET position-delete file (NOT a deletion vector — no
+    /// `referenced_data_file` / `content_offset`), routed to partition `x = 0`. V2-legal;
+    /// exists so the position-delete bucket can be pinned by a non-puffin file too.
+    fn synthetic_position_delete_file(path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .build()
+            .expect("build synthetic position delete file")
+    }
+
+    /// A synthetic EQUALITY-delete file (equality on field id 1, `x`), partition `x = 0`.
+    fn synthetic_equality_delete_file(path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .equality_ids(Some(vec![1]))
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .build()
+            .expect("build synthetic equality delete file")
+    }
+
+    /// The union must equal the concatenation of the three typed views (Java's `FileContent`
+    /// has exactly three members — `DATA`, `POSITION_DELETES`, `EQUALITY_DELETES`,
+    /// bytecode-verified against `iceberg-api-1.10.0.jar` — so the three views partition the
+    /// funnel with nothing left over). Asserted as SORTED multisets because the views are
+    /// order-preserving filters of a sorted union.
+    fn assert_union_is_concatenation_of_parts(report: &super::CleanupReport) {
+        let mut concatenated: Vec<&str> = report.deleted_data_files();
+        concatenated.extend(report.deleted_position_delete_files());
+        concatenated.extend(report.deleted_equality_delete_files());
+        concatenated.sort_unstable();
+        assert_eq!(
+            concatenated, report.deleted_content_files,
+            "the three typed views must partition the union exactly — no file may be dropped \
+             by, or duplicated across, the classification"
+        );
+    }
+
+    /// Builds a table whose expiry kills exactly one DATA file, one PARQUET position delete and
+    /// one EQUALITY delete, expires it, and returns `(data_path, pos_path, eq_path, report)`.
+    /// Shared by the per-bucket test and the partition-invariant test so the invariant can be
+    /// asserted ALONE (an invariant asserted after exhaustive per-bucket equality would be
+    /// dominated by it and could not be mutation-proven).
+    async fn expire_one_file_of_each_content_type() -> (
+        &'static str,
+        &'static str,
+        &'static str,
+        super::CleanupReport,
+    ) {
+        let catalog = new_memory_catalog().await;
+        let table = make_table(&catalog).await;
+        let data_path = "test/wtB2/f2-a-data.parquet";
+        let pos_path = "test/wtB2/f2-b-pos-delete.parquet";
+        let eq_path = "test/wtB2/f2-c-eq-delete.parquet";
+
+        let data_file = synthetic_data_file(data_path);
+        let table1 = append(&catalog, &table, vec![data_file.clone()]).await;
+
+        let pos_delete = synthetic_position_delete_file(pos_path);
+        let eq_delete = synthetic_equality_delete_file(eq_path);
+        let tx = Transaction::new(&table1);
+        let tx = tx
+            .row_delta()
+            .add_deletes(vec![pos_delete.clone(), eq_delete.clone()])
+            .apply(tx)
+            .expect("apply row delta deletes");
+        let table2 = tx.commit(&catalog).await.expect("commit row delta deletes");
+
+        // Remove all three in ONE commit, so the retained head's manifests hold only
+        // tombstones and every one of the three becomes an expired-only live entry.
+        let tx = Transaction::new(&table2);
+        let tx = tx
+            .row_delta()
+            .remove_data_files(vec![data_file])
+            .remove_deletes_many(vec![pos_delete, eq_delete])
+            .apply(tx)
+            .expect("apply removals");
+        let table3 = tx.commit(&catalog).await.expect("commit removals");
+
+        let cleanup = ExpireSnapshotsCleanup::new(table3.file_io().clone());
+        let (_, report) = expire_and_clean(&catalog, &table3, &cleanup).await;
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        // Pre-flight: the fixture really did kill all three (otherwise every assertion the
+        // callers make could pass vacuously on an empty funnel).
+        assert_eq!(
+            report.deleted_content_files,
+            vec![
+                data_path.to_string(),
+                pos_path.to_string(),
+                eq_path.to_string()
+            ],
+            "fixture must delete exactly the three content files, sorted"
+        );
+        (data_path, pos_path, eq_path, report)
+    }
+
+    /// Risk pinned: the deleted content funnel must be SPLIT by manifest-entry content type, so
+    /// a consumer can fill Spark's `deleted_data_files_count` /
+    /// `deleted_position_delete_files_count` / `deleted_equality_delete_files_count` columns
+    /// separately instead of reporting one lumped number. One expiry kills a DATA file, a
+    /// PARQUET position delete and an EQUALITY delete; each must land in exactly its own view.
+    #[tokio::test]
+    async fn test_deleted_content_files_split_by_content_type() {
+        let (data_path, pos_path, eq_path, report) = expire_one_file_of_each_content_type().await;
+
+        assert_eq!(report.deleted_data_files(), vec![data_path]);
+        assert_eq!(report.deleted_position_delete_files(), vec![pos_path]);
+        assert_eq!(report.deleted_equality_delete_files(), vec![eq_path]);
+    }
+
+    /// Risk pinned: the union is the membership authority and the three typed views PARTITION
+    /// it — no file may be dropped by the classification, and none may be counted twice.
+    /// Asserted ALONE (no per-bucket equality in this test) so a bucket that drops a file
+    /// reddens THIS assertion and not merely a stricter one ahead of it.
+    #[tokio::test]
+    async fn test_typed_views_partition_the_deleted_content_union() {
+        let (_, _, _, report) = expire_one_file_of_each_content_type().await;
+        assert_union_is_concatenation_of_parts(&report);
+    }
+
+    /// Risk pinned — THE deletion-vector question, settled by Java 1.10.0 bytecode: a DV puffin
+    /// is counted as a POSITION delete, not as a fourth class.
+    /// `BaseSparkAction$ReadManifest.toFileInfo(ContentFile)` tags a file with
+    /// `file.content().toString()` ALONE — the file FORMAT is never consulted — and
+    /// `BaseSparkAction$DeleteSummary.deletedFile` dispatches that string against
+    /// `FileContent.POSITION_DELETES.name()`. A DV is a `DeleteFile` whose `content()` is
+    /// `POSITION_DELETES`, so its Puffin format is irrelevant: DVs are NOT separable from
+    /// Parquet position deletes in Spark's counts, and no fourth bucket exists.
+    #[tokio::test]
+    async fn test_deletion_vector_puffin_is_counted_as_a_position_delete_not_a_fourth_bucket() {
+        let catalog = new_memory_catalog().await;
+        let table = crate::transaction::tests::make_v3_minimal_table_in_catalog(&catalog).await;
+        let data_path = "test/wtB2/f2-dv-data.parquet";
+        let table1 = append(&catalog, &table, vec![synthetic_data_file(data_path)]).await;
+
+        let old_puffin = "test/wtB2/f2-old.puffin";
+        let dv = synthetic_dv_file(old_puffin, data_path, 4);
+        let tx = Transaction::new(&table1);
+        let tx = tx
+            .row_delta()
+            .add_deletes(vec![dv.clone()])
+            .apply(tx)
+            .expect("apply row delta dv");
+        let table2 = tx.commit(&catalog).await.expect("commit row delta dv");
+
+        // Replace the DV: the old puffin becomes referenced by no retained live entry and dies.
+        let successor = synthetic_dv_file("test/wtB2/f2-new.puffin", data_path, 4);
+        let tx = Transaction::new(&table2);
+        let tx = tx
+            .row_delta()
+            .remove_deletes(dv)
+            .add_deletes(vec![successor])
+            .apply(tx)
+            .expect("apply dv replacement");
+        let table3 = tx.commit(&catalog).await.expect("commit dv replacement");
+
+        let cleanup = ExpireSnapshotsCleanup::new(table3.file_io().clone());
+        let (_, report) = expire_and_clean(&catalog, &table3, &cleanup).await;
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(
+            report.deleted_content_files,
+            vec![old_puffin.to_string()],
+            "fixture must delete exactly the replaced puffin"
+        );
+        assert_eq!(
+            report.deleted_position_delete_files(),
+            vec![old_puffin],
+            "a deletion vector's PUFFIN must be counted as a POSITION delete — Java tags by \
+             content() alone, never by format"
+        );
+        assert!(
+            report.deleted_data_files().is_empty(),
+            "a DV is not a data file: {:?}",
+            report.deleted_data_files()
+        );
+        assert!(
+            report.deleted_equality_delete_files().is_empty(),
+            "a DV is not an equality delete: {:?}",
+            report.deleted_equality_delete_files()
+        );
+        assert_union_is_concatenation_of_parts(&report);
+    }
+
+    /// Risk pinned: the fail-closed posture covers the TYPED views too. When a retained
+    /// manifest cannot be read, liveness cannot be proven and the whole content set is cleared
+    /// — so every typed view must be empty as well, not just the union. (The typed views are
+    /// derived by filtering the union, which is what makes this structural; a shape that
+    /// stored the classification independently could report deletions the union denies.)
+    #[tokio::test]
+    async fn test_unreadable_retained_manifest_spares_every_typed_content_view() {
+        let catalog = new_memory_catalog().await;
+        let table = make_table(&catalog).await;
+        let data_path = "test/wtB2/f2-failclosed-data.parquet";
+        let pos_path = "test/wtB2/f2-failclosed-pos.parquet";
+        let data_file = synthetic_data_file(data_path);
+        let table1 = append(&catalog, &table, vec![data_file.clone()]).await;
+
+        let pos_delete = synthetic_position_delete_file(pos_path);
+        let tx = Transaction::new(&table1);
+        let tx = tx
+            .row_delta()
+            .add_deletes(vec![pos_delete.clone()])
+            .apply(tx)
+            .expect("apply row delta deletes");
+        let table2 = tx.commit(&catalog).await.expect("commit row delta deletes");
+
+        let tx = Transaction::new(&table2);
+        let tx = tx
+            .row_delta()
+            .remove_data_files(vec![data_file])
+            .remove_deletes(pos_delete)
+            .apply(tx)
+            .expect("apply removals");
+        let table3 = tx.commit(&catalog).await.expect("commit removals");
+        let s3 = table3.metadata().current_snapshot_id().expect("s3");
+        let retained_manifests: Vec<String> = manifests_of(&table3, s3)
+            .await
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            !retained_manifests.is_empty(),
+            "fixture must retain at least one manifest to corrupt"
+        );
+
+        let (before, after) = expire_metadata_only(&catalog, &table3).await;
+        // Corrupt EVERY retained manifest after the commit, before the cleanup, so the
+        // retained-side liveness walk cannot succeed whichever manifest it reads first.
+        for path in &retained_manifests {
+            table3
+                .file_io()
+                .new_output(path)
+                .expect("corrupt output")
+                .write(Bytes::from_static(b"wtB2 corrupted avro"))
+                .await
+                .expect("corrupt retained manifest");
+        }
+
+        let cleanup = ExpireSnapshotsCleanup::new(table3.file_io().clone());
+        let report = cleanup
+            .clean_expired_files(before.metadata(), after.metadata())
+            .await
+            .expect("clean expired files");
+
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.kind == CleanupFailureKind::ReadRetainedManifest),
+            "fixture must actually trip the retained-manifest read failure: {:?}",
+            report.failures
+        );
+        assert!(
+            report.deleted_content_files.is_empty(),
+            "union: {:?}",
+            report.deleted_content_files
+        );
+        assert!(
+            report.deleted_data_files().is_empty(),
+            "the DATA view must be empty when liveness cannot be proven: {:?}",
+            report.deleted_data_files()
+        );
+        assert!(
+            report.deleted_position_delete_files().is_empty(),
+            "the POSITION-delete view must be empty when liveness cannot be proven: {:?}",
+            report.deleted_position_delete_files()
+        );
+        assert!(
+            report.deleted_equality_delete_files().is_empty(),
+            "the EQUALITY-delete view must be empty when liveness cannot be proven: {:?}",
+            report.deleted_equality_delete_files()
+        );
+        assert!(
+            report.deleted_content_file_types.is_empty(),
+            "the classification lookup must be cleared with the union: {:?}",
+            report.deleted_content_file_types
         );
     }
 
