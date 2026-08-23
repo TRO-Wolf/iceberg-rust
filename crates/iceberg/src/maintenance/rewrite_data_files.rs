@@ -114,17 +114,52 @@
 //! - `delete_file_threshold` = disabled (`usize::MAX`, Java `Integer.MAX_VALUE`).
 //! - `max_file_group_size_bytes` = 100 GiB.
 //! - `use_starting_sequence_number` = true.
+//! - `remove_dangling_deletes` = false.
 //! - `filter` = always-true (no row filter).
 //!
 //! Java's `sizeThresholds` preconditions are mirrored at [`Self::execute`]: `target > 0`,
 //! `target > min`, `target < max` (each a `DataInvalid` with Java's verbatim message).
+//!
+//! # The composed `remove-dangling-deletes` sub-action
+//!
+//! Java `RewriteDataFiles.REMOVE_DANGLING_DELETES = "remove-dangling-deletes"` with
+//! `REMOVE_DANGLING_DELETES_DEFAULT = false` (api bytecode). When enabled, Java's
+//! `RewriteDataFilesSparkAction.execute()` (spark-runtime bytecode) composes the standalone
+//! dangling-delete GC pass AFTER the group loop:
+//!
+//! - offsets 9-15: `currentSnapshot() == null` ⇒ `return EMPTY_RESULT`;
+//! - offsets 44-73: `plan.totalGroupCount() == 0` ⇒ `return EMPTY_RESULT`. **Both early returns
+//!   precede the dangling step at offset 113**, so an empty plan runs NO dangling removal at all.
+//! - offsets 113-165: `if (removeDanglingDeletes)` ⇒
+//!   `new RemoveDanglingDeletesSparkAction(spark, this.table).execute()`, then
+//!   `n = Iterables.size(result.removedDeleteFiles())`, then
+//!   `withRemovedDeleteFilesCount(existing + n)`.
+//!
+//! Three consequences are pinned here:
+//!
+//! 1. **It runs whenever the plan was non-empty**, including when the sub-action then removes
+//!    nothing — there is no "removed something" precondition. The sub-action itself commits only
+//!    when its dangling set is non-empty ([`RemoveDanglingDeleteFiles::execute`]), so a run that
+//!    finds nothing adds NO snapshot.
+//! 2. **A failure in the dangling step fails the whole action.** `execute()` carries no exception
+//!    table over offsets 113-165, so the sub-action's throw propagates. This port likewise `?`s it.
+//! 3. **The table handle.** Java passes `this.table` — the action's ORIGINAL handle, not a
+//!    separately reloaded one. That handle is nonetheless CURRENT: every group commit went through
+//!    the same handle (`commitManager(long)` constructs `RewriteDataFilesCommitManager` with
+//!    `this.table`), and `BaseMetastoreTableOperations.commit` calls `requestRefresh()` at
+//!    offset 83 after `doCommit`, so `this.table` observes the post-rewrite metadata. Passing the
+//!    loop's final committed table here is therefore 1:1, not a divergence. (Java's refresh
+//!    re-reads the catalog and would additionally pick up a CONCURRENT third-party commit; this
+//!    port sees exactly the state its own last group commit produced — a narrower window, recorded
+//!    as residue rather than emulated.)
 //!
 //! # Empty plan
 //!
 //! If nothing qualifies (no candidate files, or no group survives the group filter), the action is
 //! a NO-OP: it returns a zero-count [`RewriteDataFilesResult`] and commits NOTHING (Java's empty
 //! `rewriteResults` — `RewriteDataFilesCommitManager` is never asked to commit an empty group set;
-//! there is no throw on an empty plan).
+//! there is no throw on an empty plan). **The `remove-dangling-deletes` sub-action does not run on
+//! an empty plan** — Java returns `EMPTY_RESULT` before reaching it (see above).
 //!
 //! # Deferred (loudly)
 //!
@@ -153,6 +188,7 @@ use std::collections::HashMap;
 use crate::Catalog;
 use crate::error::{Error, ErrorKind, Result};
 use crate::expr::Predicate;
+use crate::maintenance::RemoveDanglingDeleteFiles;
 use crate::scan::FileScanTask;
 use crate::spec::{DataFile, PartitionSpec, Struct, TableProperties};
 use crate::table::Table;
@@ -182,6 +218,7 @@ const DELETE_FILE_THRESHOLD_DEFAULT: usize = usize::MAX;
 /// A no-op plan (nothing qualified) returns this with all counts zero and `file_groups` empty —
 /// no snapshot was committed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RewriteDataFilesResult {
     /// Total number of data files added across all groups (Java `Result.addedDataFilesCount()`).
     pub added_data_files_count: usize,
@@ -190,6 +227,24 @@ pub struct RewriteDataFilesResult {
     pub rewritten_data_files_count: usize,
     /// Total bytes of the rewritten (input) data files (Java `Result.rewrittenBytesCount()`).
     pub rewritten_bytes_count: u64,
+    /// Number of delete files removed by the composed `remove-dangling-deletes` sub-action (Java
+    /// `Result.removedDeleteFilesCount()`). Always `0` unless
+    /// [`RewriteDataFiles::remove_dangling_deletes`] was set — see
+    /// [the sub-action section](self#the-composed-remove-dangling-deletes-sub-action).
+    ///
+    /// **Why this count lives ONLY at the top level.** Java's aggregate accessor is a `default`
+    /// method that SUMS `rewriteResults()`' per-group `removedDeleteFilesCount()` (api bytecode:
+    /// `rewriteResults().stream().mapToInt(...).sum()`), but the per-group accessor is itself a
+    /// `default` whose entire body is `iconst_0; ireturn` — a constant `0` — and neither
+    /// `BaseRewriteDataFiles$FileGroupRewriteResult` (it re-delegates to that same default) nor the
+    /// Immutables-generated `ImmutableRewriteDataFiles$FileGroupRewriteResult` (its
+    /// `removedDeleteFilesCountInitialize` invokes the interface default) supplies a non-zero
+    /// value, and nothing on the `RewriteDataFiles` path ever calls the per-group builder setter.
+    /// The sum is therefore identically `0`, and the only non-zero contribution comes from
+    /// `ImmutableRewriteDataFiles$Result.withRemovedDeleteFilesCount(existing + n)` at the TOP
+    /// level. [`FileGroupRewriteResult`] accordingly carries no such field: adding one would invent
+    /// a shape Java does not populate.
+    pub removed_delete_files_count: usize,
     /// Per-group results, in commit order (Java `Result.rewriteResults()`).
     pub file_groups: Vec<FileGroupRewriteResult>,
 }
@@ -221,6 +276,8 @@ pub struct RewriteDataFiles {
     delete_file_threshold: usize,
     max_file_group_size_bytes: u64,
     use_starting_sequence_number: bool,
+    /// Java `REMOVE_DANGLING_DELETES`, default `false`.
+    remove_dangling_deletes: bool,
     filter: Predicate,
 }
 
@@ -238,6 +295,7 @@ impl RewriteDataFiles {
             delete_file_threshold: DELETE_FILE_THRESHOLD_DEFAULT,
             max_file_group_size_bytes: MAX_FILE_GROUP_SIZE_BYTES_DEFAULT,
             use_starting_sequence_number: true,
+            remove_dangling_deletes: false,
             filter: Predicate::AlwaysTrue,
         }
     }
@@ -292,6 +350,18 @@ impl RewriteDataFiles {
     /// outstanding merge-on-read deletes — see [the sequence-number rule](self#the-sequence-number-rule).
     pub fn use_starting_sequence_number(mut self, use_starting_sequence_number: bool) -> Self {
         self.use_starting_sequence_number = use_starting_sequence_number;
+        self
+    }
+
+    /// Whether to compose the [`RemoveDanglingDeleteFiles`] GC pass after the group loop (Java
+    /// `REMOVE_DANGLING_DELETES`, default `false` — `REMOVE_DANGLING_DELETES_DEFAULT`, api
+    /// bytecode). When `true` AND the plan was non-empty, the sub-action runs against the state the
+    /// rewrite left behind and its removal total is folded into
+    /// [`RewriteDataFilesResult::removed_delete_files_count`]. See
+    /// [the sub-action section](self#the-composed-remove-dangling-deletes-sub-action) for the
+    /// ordering, the empty-plan exemption, and the failure posture.
+    pub fn remove_dangling_deletes(mut self, remove_dangling_deletes: bool) -> Self {
+        self.remove_dangling_deletes = remove_dangling_deletes;
         self
     }
 
@@ -362,6 +432,19 @@ impl RewriteDataFiles {
             result.file_groups.push(group_result.0);
             // The committed table becomes the base for the next group's commit (sequential).
             table = group_result.1;
+        }
+
+        // 7. The composed `remove-dangling-deletes` sub-action (Java
+        //    `RewriteDataFilesSparkAction.execute` offsets 113-165). Reached ONLY on a non-empty
+        //    plan — both of Java's `EMPTY_RESULT` early returns precede it — and only when the
+        //    opt-in flag is set. `table` here is the last group's committed table, which is what
+        //    Java's `this.table` observes (its ops were refreshed by those same commits). A
+        //    failure propagates and fails the whole action (Java has no exception table there).
+        if self.remove_dangling_deletes {
+            let removed = RemoveDanglingDeleteFiles::new(table)
+                .execute(catalog)
+                .await?;
+            result.removed_delete_files_count += removed.removed_delete_files.len();
         }
 
         Ok(result)
@@ -2886,5 +2969,312 @@ mod tests {
         );
         // The empty group is the same shape (nothing to take a tuple from).
         assert!(group_partition_tuple(&[], &spec).is_err());
+    }
+
+    // ============================================================================================
+    // The composed `remove-dangling-deletes` sub-action (F-3). Java
+    // `RewriteDataFilesSparkAction.execute()` offsets 9-15 / 44-73 (the two `EMPTY_RESULT` early
+    // returns) and 113-165 (the opt-in dangling pass + `withRemovedDeleteFilesCount(existing + n)`).
+    // ============================================================================================
+
+    /// The set of live (Added/Existing) DELETE-file paths in the table's current snapshot — the
+    /// direct read-side signal for "was this delete file actually removed from the new snapshot".
+    async fn live_delete_file_paths(table: &Table) -> HashSet<String> {
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+        let mut paths = HashSet::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                if entry.is_alive() && entry.content_type() != DataContentType::Data {
+                    paths.insert(entry.file_path().to_string());
+                }
+            }
+        }
+        paths
+    }
+
+    /// Drop `removed` data files in one `RewriteFiles` commit (no adds), returning the new table.
+    async fn remove_data_files(
+        catalog: &impl Catalog,
+        table: &Table,
+        removed: Vec<DataFile>,
+    ) -> Table {
+        let tx = Transaction::new(table);
+        // `rewrite_files(files_to_delete, files_to_add)` — a delete-only rewrite adds nothing.
+        let action = tx.rewrite_files(removed, Vec::new());
+        let tx = action.apply(tx).unwrap();
+        tx.commit(catalog).await.unwrap()
+    }
+
+    /// A fixture whose lone position delete is GENUINELY dangling after compaction.
+    ///
+    /// Timeline (partition `x = 0` throughout, so the whole table is ONE bin-pack group):
+    /// `seq 1` append 5 small files (one of them two-row) · `seq 2` a position delete on row 0 of
+    /// the two-row file · `seq 3` append a sixth small file. The rewrite's STARTING snapshot is the
+    /// `seq 3` one, so every rewritten file is stamped `data_seq = 3` and the partition minimum
+    /// becomes 3. The delete sits at `seq 2 < 3`, which is exactly Java's position-delete dangling
+    /// clause (STRICT `<`) — see [`crate::maintenance::RemoveDanglingDeleteFiles`].
+    ///
+    /// Returns the table and the position delete's path.
+    async fn dangling_after_compaction_fixture(catalog: &impl Catalog) -> (Table, String) {
+        let table = create_partitioned_table(catalog, crate::spec::FormatVersion::V2).await;
+
+        let mut files = Vec::new();
+        let two_row =
+            write_data_file(&table, "two-row.parquet", 0, &[(0, 11, 110), (0, 22, 220)]).await;
+        let two_row_path = two_row.file_path().to_string();
+        files.push(two_row);
+        for index in 0..4i64 {
+            files.push(
+                write_data_file(&table, &format!("one-{index}.parquet"), 0, &[(
+                    0,
+                    30 + index,
+                    300,
+                )])
+                .await,
+            );
+        }
+        let table = append_files(catalog, &table, files).await;
+
+        let pos_delete = write_position_delete_file(&table, 0, &[(two_row_path, 0)]).await;
+        let pos_delete_path = pos_delete.file_path().to_string();
+        let table = add_deletes(catalog, &table, vec![pos_delete]).await;
+
+        // The sequence-number bump that makes the delete dangle once the data is restamped.
+        let later = write_data_file(&table, "later.parquet", 0, &[(0, 99, 990)]).await;
+        let table = append_files(catalog, &table, vec![later]).await;
+
+        assert_eq!(
+            live_delete_file_paths(&table).await,
+            HashSet::from([pos_delete_path.clone()]),
+            "fixture: exactly one live delete file before compaction"
+        );
+        (table, pos_delete_path)
+    }
+
+    /// DEFAULT-OFF (risk: silently enabling a delete-file GC pass no caller asked for — Java's
+    /// `REMOVE_DANGLING_DELETES_DEFAULT = false`). With the flag UNSET on a fixture whose delete
+    /// file genuinely dangles after compaction, the sub-action must not run: the count is 0, the
+    /// delete file is still live, and exactly ONE snapshot (the single group's commit) is added.
+    #[tokio::test]
+    async fn test_remove_dangling_deletes_defaults_off() {
+        let (catalog, _temp) = local_fs_catalog().await;
+        let (table, pos_delete_path) = dangling_after_compaction_fixture(&catalog).await;
+
+        let rows_before = scan_rows(&table).await;
+        let snapshots_before = table.metadata().snapshots().count();
+
+        let result = RewriteDataFiles::new(table.clone())
+            .target_file_size_bytes(1_000_000)
+            .execute(&catalog)
+            .await
+            .expect("compaction must succeed");
+
+        assert_eq!(
+            result.rewritten_data_files_count, 6,
+            "fixture: all 6 files formed one group and were rewritten"
+        );
+        assert_eq!(
+            result.removed_delete_files_count, 0,
+            "the sub-action did not run, so nothing was removed"
+        );
+
+        let table = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_delete_file_paths(&table).await,
+            HashSet::from([pos_delete_path]),
+            "the dangling delete file survives (population: the table's 1 delete file)"
+        );
+        assert_eq!(
+            table.metadata().snapshots().count(),
+            snapshots_before + 1,
+            "exactly one new snapshot — the lone group's rewrite commit, no GC commit \
+             (population: 1 partition ⇒ 1 group ⇒ 1 commit)"
+        );
+        assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
+    }
+
+    /// FLAG ON, GENUINELY DANGLING (risk: the option is accepted but composes nothing, so an engine
+    /// can only ever report 0). With the flag set, the sub-action runs against the state the rewrite
+    /// left behind: the count is 1, the delete file is GONE from the new snapshot, a second snapshot
+    /// was committed, and the rows still read identically.
+    #[tokio::test]
+    async fn test_remove_dangling_deletes_on_removes_the_dangling_delete() {
+        let (catalog, _temp) = local_fs_catalog().await;
+        let (table, pos_delete_path) = dangling_after_compaction_fixture(&catalog).await;
+
+        let rows_before = scan_rows(&table).await;
+        let snapshots_before = table.metadata().snapshots().count();
+
+        let result = RewriteDataFiles::new(table.clone())
+            .target_file_size_bytes(1_000_000)
+            .remove_dangling_deletes(true)
+            .execute(&catalog)
+            .await
+            .expect("compaction + dangling removal must succeed");
+
+        assert_eq!(
+            result.rewritten_data_files_count, 6,
+            "fixture: all 6 files formed one group and were rewritten"
+        );
+        assert_eq!(
+            result.removed_delete_files_count, 1,
+            "the one dangling delete file was removed (population: the table's 1 delete file)"
+        );
+
+        let table = catalog.load_table(table.identifier()).await.unwrap();
+        assert!(
+            live_delete_file_paths(&table).await.is_empty(),
+            "no delete file is live any more; the removed one was {pos_delete_path}"
+        );
+        assert_eq!(
+            table.metadata().snapshots().count(),
+            snapshots_before + 2,
+            "two new snapshots: the group's rewrite commit, then the GC commit"
+        );
+        assert_eq!(
+            scan_rows(&table).await,
+            rows_before,
+            "row conservation: dangling-delete GC never changes the read result"
+        );
+    }
+
+    /// FLAG ON, NOTHING DANGLING (risk: an unconditional GC commit, i.e. an empty extra snapshot;
+    /// and the inverse risk of removing a delete that Java KEEPS). Same shape as the fixture above
+    /// but WITHOUT the sequence bump: the rewrite's starting snapshot is the delete's own, so the
+    /// rewritten data is restamped to the delete's sequence number and Java's STRICT `<` clause does
+    /// NOT fire (`2 < 2` is false) even though the delete's referenced data file is gone. The
+    /// sub-action runs, finds nothing, commits nothing.
+    #[tokio::test]
+    async fn test_remove_dangling_deletes_on_with_nothing_dangling_commits_no_snapshot() {
+        let (catalog, _temp) = local_fs_catalog().await;
+        let table = create_partitioned_table(&catalog, crate::spec::FormatVersion::V2).await;
+
+        let mut files = Vec::new();
+        let two_row =
+            write_data_file(&table, "two-row.parquet", 0, &[(0, 11, 110), (0, 22, 220)]).await;
+        let two_row_path = two_row.file_path().to_string();
+        files.push(two_row);
+        for index in 0..4i64 {
+            files.push(
+                write_data_file(&table, &format!("one-{index}.parquet"), 0, &[(
+                    0,
+                    30 + index,
+                    300,
+                )])
+                .await,
+            );
+        }
+        let table = append_files(&catalog, &table, files).await;
+        let pos_delete = write_position_delete_file(&table, 0, &[(two_row_path, 0)]).await;
+        let pos_delete_path = pos_delete.file_path().to_string();
+        let table = add_deletes(&catalog, &table, vec![pos_delete]).await;
+
+        let rows_before = scan_rows(&table).await;
+        let snapshots_before = table.metadata().snapshots().count();
+
+        let result = RewriteDataFiles::new(table.clone())
+            .target_file_size_bytes(1_000_000)
+            .remove_dangling_deletes(true)
+            .execute(&catalog)
+            .await
+            .expect("compaction must succeed");
+
+        assert_eq!(
+            result.rewritten_data_files_count, 5,
+            "fixture: all 5 files formed one group and were rewritten"
+        );
+        assert_eq!(
+            result.removed_delete_files_count, 0,
+            "nothing dangled by Java's predicate (population: the table's 1 delete file)"
+        );
+
+        let table = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_delete_file_paths(&table).await,
+            HashSet::from([pos_delete_path]),
+            "the same-sequence delete is KEPT — Java's position clause is STRICT `<`"
+        );
+        assert_eq!(
+            table.metadata().snapshots().count(),
+            snapshots_before + 1,
+            "exactly one new snapshot: the group's rewrite commit. The sub-action ran and found \
+             nothing, and an empty dangling set commits NOTHING (Java commits only when the set is \
+             non-empty) — so there is no empty GC snapshot"
+        );
+        assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
+    }
+
+    /// EMPTY PLAN + FLAG ON (risk: running the GC pass on a no-op rewrite — Java returns
+    /// `EMPTY_RESULT` at offsets 15 and 73, BEFORE the dangling step at offset 113). The table here
+    /// carries a genuinely dangling delete (its partition has no live data at all, Java's
+    /// `min_data_sequence_number IS NULL` clause), so "nothing ran" is observable rather than
+    /// vacuous: with a non-empty plan the very same delete would be removed.
+    #[tokio::test]
+    async fn test_empty_plan_skips_the_dangling_step_entirely() {
+        let (catalog, _temp) = local_fs_catalog().await;
+        let table = create_partitioned_table(&catalog, crate::spec::FormatVersion::V2).await;
+
+        // Partition x=0: one well-sized file that is not a rewrite candidate.
+        let rows: Vec<(i64, i64, i64)> = (0..100).map(|n| (0, n, n)).collect();
+        let well_sized = write_data_file(&table, "ok.parquet", 0, &rows).await;
+        let well_sized_size = well_sized.file_size_in_bytes();
+        // Partition x=1: a small file that will be dropped, orphaning its position delete.
+        let doomed = write_data_file(&table, "doomed.parquet", 1, &[(1, 5, 50), (1, 6, 60)]).await;
+        let doomed_path = doomed.file_path().to_string();
+        let table = append_files(&catalog, &table, vec![well_sized, doomed.clone()]).await;
+
+        let pos_delete = write_position_delete_file(&table, 1, &[(doomed_path, 0)]).await;
+        let pos_delete_path = pos_delete.file_path().to_string();
+        let table = add_deletes(&catalog, &table, vec![pos_delete]).await;
+        let table = remove_data_files(&catalog, &table, vec![doomed]).await;
+
+        assert_eq!(
+            live_delete_file_paths(&table).await,
+            HashSet::from([pos_delete_path.clone()]),
+            "fixture: the delete file is live and its partition now has NO live data"
+        );
+
+        let rows_before = scan_rows(&table).await;
+        let snapshots_before = table.metadata().snapshots().count();
+        let snapshot_id_before = current_snapshot_id(&table);
+
+        let result = RewriteDataFiles::new(table.clone())
+            .target_file_size_bytes(well_sized_size)
+            .min_file_size_bytes(well_sized_size / 2)
+            .max_file_size_bytes(well_sized_size * 2)
+            .remove_dangling_deletes(true)
+            .execute(&catalog)
+            .await
+            .expect("execute must succeed (no-op)");
+
+        assert_eq!(
+            result,
+            RewriteDataFilesResult::default(),
+            "an empty plan returns a zero-count result even with the flag on"
+        );
+
+        let table = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(
+            live_delete_file_paths(&table).await,
+            HashSet::from([pos_delete_path]),
+            "the dangling delete is UNTOUCHED — the sub-action never ran (population: the \
+             table's 1 delete file)"
+        );
+        assert_eq!(
+            table.metadata().snapshots().count(),
+            snapshots_before,
+            "no snapshot at all was committed"
+        );
+        assert_eq!(
+            current_snapshot_id(&table),
+            snapshot_id_before,
+            "the current snapshot is unchanged"
+        );
+        assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
     }
 }
