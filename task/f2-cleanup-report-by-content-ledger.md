@@ -65,6 +65,13 @@ load-bearing column (`202: iconst_1`) and the finding were correct throughout._
 others in that block. Per brief §5 this is **recorded only**; the engine's
 nullable-vs-non-nullable divergence is NOT fixed here and no fork code depends on it.
 
+_Convergent evidence, added 2026-08-23 (orchestrator sweep):_ the engine's own output schema builds
+its columns as `Field::new(<name>, DataType::Int64, true)` — i.e. **nullable**, independently
+agreeing with the bytecode finding above. Recorded as **convergent evidence from a second source,
+not as proof**: two sources agreeing is not the same as either one being verified by the other, and
+the bytecode remains the oracle. It does, however, mean the divergence the brief anticipated may not
+exist on this axis — a question for the repin, not for this unit.
+
 ### 1.3 Item (b) — what "Others" covers, and whether the fork's walk can produce one
 
 The `"Others"` tag is produced in exactly one place. Grepping the *extracted* spark jar for the
@@ -187,12 +194,35 @@ free moment for it._
 
 **The cost, stated rather than glossed:** `#[non_exhaustive]` closes off cross-crate functional
 update syntax (`CleanupReport { x, ..Default::default() }`) and exhaustive destructuring, neither
-of which the bare field addition would have broken. **I cannot verify the engine's actual usage —
-it is not in this workspace and was not compiled against this branch** (§7). If the engine happens
-to build the report with `..Default::default()`, this attribute breaks it where the field addition
-alone would not have, and the fix is the two-line `default()`-plus-assignment spelling above. I am
-taking that risk deliberately, on the handoff's "consumed" wording plus the escape hatch, and
-flagging it here so the repin unit sees it before it compiles rather than after.
+of which the bare field addition would have broken.
+
+**That cost has since been MEASURED against the consumer, and it is zero as the consumer stands
+today.** The first draft of this section took the decision on the handoff's "consumed" wording plus
+the escape hatch, explicitly flagging that I could not check the engine because it is not in this
+workspace. **The orchestrator ran that check on 2026-08-23** against the engine working copies at
+`/home/john/CodeRepos/LocalRepark/repark` and `/home/john/CodeRepos/BigRustSparkRebuild`, and
+reported:
+
+1. `grep -rn "CleanupReport\s*{" … --include=*.rs` over BOTH repos returns **zero hits** — no
+   struct-literal construction anywhere, and therefore no functional-record-update
+   (`..Default::default()`) and no exhaustive destructuring of this type.
+2. Every use is a **read through a shared reference**: `repark-spark/src/call.rs:664`
+   (`report: &CleanupReport`), `repark-sql/src/call.rs:530`
+   (`fn expire_result_dataframe(ctx, report: &CleanupReport)`), plus the imports at
+   `repark-spark/src/call.rs:80` and `repark-sql/src/call.rs:46`.
+3. Field access is `.len()` on the four existing vectors — `deleted_manifests`,
+   `deleted_manifest_lists`, `deleted_statistics_files` — with `deleted_content_files` passed by
+   reference into the engine's own tally.
+
+**Conclusion: `#[non_exhaustive]` breaks nothing in the consumer as it stands today.** The premise
+the attribute was adopted on is verified, not merely reasoned about.
+
+**The precise scope of that claim, which must not be inflated:** this is a **point-in-time
+observation of two working copies on one machine, not a contract**. It says nothing about consumer
+code written later, about other consumers, or about branches of those repos not checked out at the
+time. It is also **not my own check — I did not re-run it**; the two paths and the date are recorded
+above precisely so a later reader can. If future consumer code does want to build a report, the
+supported spelling remains `CleanupReport::default()` plus field assignment.
 
 ### 2.2 The lookup is a `BTreeMap`, not a `HashMap` (Critic F2)
 
@@ -305,6 +335,11 @@ Notes, stated because a mutation table that hides them is worthless:
   makes all six columns nullable). No fork behaviour depends on it and nothing was changed for it.
 - **Java's own `"Others"` / `"Statistics Files"` tagging asymmetry** for statistics files (§1.3) —
   observed, out of scope, not mirrored.
+- **The engine already carries its own classification workaround** alongside the funnel —
+  `repark-spark/src/call.rs:593` reads `ExpireCounts::tally(&report.deleted_content_files,
+  &classified)` (orchestrator sweep, 2026-08-23). Recorded purely as **context for the repin**,
+  which may now be able to retire it in favour of the typed views. It is engine-side and explicitly
+  out of scope: it was NOT analysed, and nothing in this unit was designed against it.
 - Everything else in the handoff queue.
 - **No interop test was added.** The classification is unit-proven only; the R133 interop
   deferral list is unchanged.
@@ -325,8 +360,12 @@ and `CleanupFailureKind` are untouched. The change is purely additive: one new p
    `CleanupReport` no longer compiles — neither the exhaustive form nor
    `..Default::default()` — and neither does exhaustive destructuring. The supported spelling is
    `CleanupReport::default()` followed by field assignment, which is stable against every future
-   field. **Reading the report — the engine's usage per the handoff — is entirely unaffected**, and
-   that is the whole premise the attribute was adopted on.
+   field. **Reading the report is entirely unaffected, and reading is all the engine does:**
+   verified 2026-08-23 by the orchestrator against `/home/john/CodeRepos/LocalRepark/repark` and
+   `/home/john/CodeRepos/BigRustSparkRebuild` — zero struct-literal constructions in either repo,
+   every use a `&CleanupReport` read (§2.1). **This caveat therefore costs the repin nothing as the
+   consumer stands today**; it is recorded because it is a point-in-time observation of two working
+   copies, not a guarantee about consumer code written later.
 2. The new `deleted_content_file_types` field is a **`BTreeMap`**, so both it and the derived
    `Debug` rendering of the whole report are deterministically path-ordered. No previously-existing
    part of the `Debug` output changed shape; the report simply gained one ordered field.
@@ -345,13 +384,15 @@ to code that BUILDS a report; nothing in this workspace does so outside `expire_
   §6 is derived from reading the diff, not from building the consumer.
 - **`ic-core-1.10.0.jar` was not consulted** for this unit; the `ReachableFileCleanup` set-algebra
   claims quoted in the module docs are inherited from the earlier increment and were not re-derived.
-- **The `#[non_exhaustive]` risk is unmeasured.** §2.1 adopts it on the premise that the engine
-  only reads the report. That premise comes from the handoff's wording, NOT from compiling the
-  engine, and `#[non_exhaustive]` breaks a construction spelling (`..Default::default()`) that the
-  bare field addition would have left working. If the premise is wrong, this is the line that
-  breaks the repin. _Superseded 2026-08-23: the first draft's disclosure here — that
-  `deleted_content_file_types`' `HashMap` iteration order was unspecified — no longer applies; the
-  field is a `BTreeMap` (§2.2) and is deterministically ordered._
+- **The `#[non_exhaustive]` premise is now MEASURED — this entry is retained only as history.**
+  _Superseded 2026-08-23 (orchestrator): this bullet previously read "the `#[non_exhaustive]` risk
+  is unmeasured", on the grounds that the engine is not in this workspace. The orchestrator checked
+  the two engine working copies directly (`/home/john/CodeRepos/LocalRepark/repark`,
+  `/home/john/CodeRepos/BigRustSparkRebuild`): zero struct-literal constructions, every use a
+  `&CleanupReport` read. The risk is absent as the consumer stands today — see §2.1 for the
+  evidence and for the limits of that claim (a point-in-time observation, not a contract; and not
+  re-run by me). An earlier supersession on this same bullet — the `HashMap` iteration-order
+  disclosure — was retired by the `BTreeMap` swap in §2.2._
 - **Determinism of the ordered field is not defended by a test.** The `BTreeMap` gives it by
   construction, and the accessors' ordering is covered (they iterate the sorted union), but no test
   asserts the raw field's iteration order or the report's `Debug` shape.
@@ -393,3 +434,27 @@ would have made it false):
   none names the lookup's concrete map type or the construction contract, so `BTreeMap` and
   `#[non_exhaustive]` leave every sentence in them true. Re-read to confirm rather than assumed.
 - The archives and `dev/java-interop/map.md`, per the first commit's report — unchanged.
+
+## 9. Orchestrator verification pass — 2026-08-23
+
+After the §8 polish pass, the orchestrator closed the one unmeasured risk this ledger was carrying.
+The engine is present on this machine — it simply is not in this workspace, which is why I could not
+reach it — and the orchestrator checked it directly at
+`/home/john/CodeRepos/LocalRepark/repark` and `/home/john/CodeRepos/BigRustSparkRebuild`.
+
+| What changed | Where |
+|---|---|
+| `#[non_exhaustive]` risk: **stated → measured and absent** (zero struct-literal constructions; every use a `&CleanupReport` read) | §2.1 (evidence + limits), §6 caveat 1, §7 (old bullet superseded in place, dated) |
+| Convergent nullable evidence from the engine's own `Field::new(…, Int64, true)` schema | §1.2, recorded as convergent evidence, not proof |
+| The engine's existing `ExpireCounts::tally` classification workaround | §5, as repin context only — not analysed, not designed against |
+
+**This pass changed no code**, only this ledger — so the mutation set was **not** re-run, and did
+not need to be: the §4 table and its 6-of-6 result still describe the exact tree at
+`03138e28`, which this commit does not touch. The last shape change (§2.1/§2.2) already had its
+re-run, reported there.
+
+**Provenance, stated plainly so a later reader weighs it correctly:** the engine findings in §2.1,
+§1.2 and §5 are the **orchestrator's executed check, not mine — I did not re-run any of them**. The
+repo paths and the date are recorded above so they can be re-run. Every one of them is a
+point-in-time observation of two working copies on one machine; none is a contract about future
+consumer code.
