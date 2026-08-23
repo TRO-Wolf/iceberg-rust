@@ -209,7 +209,10 @@ reported:
 2. Every use is a **read through a shared reference**: `repark-spark/src/call.rs:664`
    (`report: &CleanupReport`), `repark-sql/src/call.rs:530`
    (`fn expire_result_dataframe(ctx, report: &CleanupReport)`), plus the imports at
-   `repark-spark/src/call.rs:80` and `repark-sql/src/call.rs:46`.
+   `repark-spark/src/call.rs:80` and `repark-sql/src/call.rs:46`. That enumerates the **uses**; the
+   grep also returns two **doc-comment** mentions of the name — `repark-spark/src/call.rs:602` and
+   `repark-spark/src/tests/call.rs:649` — which are prose, not code, and so neither construct nor
+   read. Noted because "every use is a read" would otherwise read as denying they exist.
 3. Field access is `.len()` on the four existing vectors — `deleted_manifests`,
    `deleted_manifest_lists`, `deleted_statistics_files` — with `deleted_content_files` passed by
    reference into the engine's own tally.
@@ -337,9 +340,11 @@ Notes, stated because a mutation table that hides them is worthless:
   observed, out of scope, not mirrored.
 - **The engine already carries its own classification workaround** alongside the funnel —
   `repark-spark/src/call.rs:593` reads `ExpireCounts::tally(&report.deleted_content_files,
-  &classified)` (orchestrator sweep, 2026-08-23). Recorded purely as **context for the repin**,
-  which may now be able to retire it in favour of the typed views. It is engine-side and explicitly
-  out of scope: it was NOT analysed, and nothing in this unit was designed against it.
+  &classified)`, and the doc comment at `repark-spark/src/call.rs:602` is the engine describing the
+  very gap this unit closes (orchestrator sweep, 2026-08-23; Critic-confirmed). Recorded purely as
+  **context for the repin**, which may now be able to retire the workaround AND that comment in
+  favour of the typed views. Both are engine-side and explicitly out of scope: neither was analysed,
+  and nothing in this unit was designed against either.
 - Everything else in the handoff queue.
 - **No interop test was added.** The classification is unit-proven only; the R133 interop
   deferral list is unchanged.
@@ -357,8 +362,9 @@ and `CleanupFailureKind` are untouched. The change is purely additive: one new p
 **The API caveats the repin unit must know, in one place (see §2.1/§2.2 for the reasoning):**
 
 1. The struct now carries **`#[non_exhaustive]`**. Cross-crate **struct-literal construction** of a
-   `CleanupReport` no longer compiles — neither the exhaustive form nor
-   `..Default::default()` — and neither does exhaustive destructuring. The supported spelling is
+   `CleanupReport` no longer compiles — neither the exhaustive form nor any functional update,
+   e.g. `..Default::default()` (the base makes no difference: `..some_owned_report` is closed
+   too) — and neither does exhaustive destructuring. The supported spelling is
    `CleanupReport::default()` followed by field assignment, which is stable against every future
    field. **Reading the report is entirely unaffected, and reading is all the engine does:**
    verified 2026-08-23 by the orchestrator against `/home/john/CodeRepos/LocalRepark/repark` and
@@ -458,3 +464,44 @@ re-run, reported there.
 repo paths and the date are recorded above so they can be re-run. Every one of them is a
 point-in-time observation of two working copies on one machine; none is a contract about future
 consumer code.
+
+## 10. Second Critic pass — 2026-08-23 (REMAND on one finding)
+
+The Critic re-ran all six mutations from scratch against the post-`#[non_exhaustive]`/`BTreeMap`
+shape — **every one compiled and panicked at an assertion, none at the type checker** — with
+reddened-test sets identical to pass 1, and independently re-ran the orchestrator's engine grep
+line for line. It converged on everything except one blocking finding.
+
+| # | Finding | Disposition |
+|---|---|---|
+| F6 (S2, blocking) | a false shell claim in `task/lessons.md`: "`set -euo pipefail` does not help either" | **CORRECTED IN PLACE** — see the route ruling below |
+| F7 (S4) | §6 caveat 1 read "neither the exhaustive form nor `..Default::default()`", which a literal reader could take as leaving `..some_owned_report` open | Fixed: "nor any functional update", with the base explicitly called out as irrelevant |
+| F8 (S4) | §2.1's "every use is a read" enumerates uses but reads as denying the grep's two doc-comment hits | Clause added in §2.1; `call.rs:602` folded into §5 as repin context |
+
+**F6 in full, because it is the interesting one.** The entry's headline claim was false. My two
+sub-clauses were each individually true — pipefail IS off by default, and `set -e` does NOT fire on
+an `&&` operand — but neither supports the headline, because the headline is about what happens when
+you *write* the line, and writing it turns pipefail on. Two bullets later the same entry said "DO
+run `set -o pipefail` explicitly first", so the entry contradicted itself and a reader could not
+resolve it from context. **I verified the correction by execution before writing it** rather than
+transcribing the Critic's counterexample, and ran the negative cases too; the four-row table now in
+the entry is that experiment's actual output. The conclusion ("no pipes in a gate chain") was
+correct throughout and is unchanged — only its justification was unsound.
+
+**Repair route: DIRECT CORRECTION, not an appended supersede note.** `task/lessons.md` is
+append-only precisely so that a rule some session may already have read and acted on is never
+silently rewritten underneath it. That protection does not apply here: these lines were added on
+this branch, the branch is unpushed, and no session has ever read them — there is no history to
+preserve, so the protocol is not engaged. The alternative would permanently install a refuted claim
+plus its correction in a file that CLAUDE.md requires be read **in full every session** and that is
+already ~1080 lines and under compaction pressure, buying nothing. An appended note was the
+available alternative and was rejected for that reason.
+
+**One thing the Critic found that makes the suite stronger than §4 claims:** Mu3, Mu5 and Mu6 redden
+`test_unreadable_retained_manifest_spares_every_typed_content_view` at **three different assertion
+lines**, so three of that test's five assertions are independently reachable. §4 is left as written
+— it is true, merely conservative — and this is recorded here rather than by editing it.
+
+**No mutation re-run and no re-verification was performed for this pass**, and none was needed: F6
+is a prose correction in `task/lessons.md`, F7 and F8 are prose corrections in this ledger, and no
+crate source was touched. The §4 table and its 6-of-6 result still describe the tree at `03138e28`.

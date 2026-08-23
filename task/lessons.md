@@ -1063,8 +1063,25 @@ unpiped was exit 0), but the chain as executed could not have stopped it.
 
 This is a new failure mode of an ALREADY-PROMOTED rule, and it generalizes: the rule's wording
 polices the CONNECTIVE (`&&` vs newline) and is blind to the PIPE, which is the more natural thing
-to reach for and just as fatal. `set -euo pipefail` does not help either — `pipefail` is not on by
-default in a non-interactive `bash -c`, and `set -e` is irrelevant inside an `&&` chain.
+to reach for and just as fatal.
+
+You do not get the protection for free, but the trap is the shell's DEFAULTS, not the shell. All
+four cases below were executed 2026-08-23 as `bash -c '<flags>; true && (echo "3 failed"; exit 101)
+| tail -5 && echo REACHED'`:
+
+| flags | reaches the "commit"? | chain exit |
+|---|---|---|
+| none | **yes** | 0 |
+| `set -e` alone | **yes** | 0 |
+| `set -o pipefail` alone | no | 101 |
+| `set -euo pipefail` | no | 101 |
+
+So `set -e` alone does NOT rescue a piped gate chain — `set -e` does not fire on a command that is
+an operand of `&&` — but **an explicit `set -o pipefail` genuinely does**, and `set -euo pipefail`
+with it. Pipefail is simply OFF by default in a non-interactive `bash -c`, which is why the piped
+chain sailed through. The rule below is therefore "no pipes" rather than "remember pipefail" not
+because pipefail fails to work, but because it makes every future gate chain depend on someone
+remembering to write it.
 
 - **DO NOT put a pipe anywhere inside a gate-to-commit chain** — not `| tail`, not `| grep`, not
   `| head`. Redirect to a file and inspect it after (`cargo test … > /tmp/gate.txt 2>&1`), or accept
