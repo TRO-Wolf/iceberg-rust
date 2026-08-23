@@ -48,8 +48,10 @@
 //! adding M: `N + M - N = M`, no underflow). `replace-partitions=true` is just a summary property.
 //!
 //! **Concurrent-commit conflict validation (serializable isolation):** opt-in, mirroring Java
-//! `BaseReplacePartitions.validate`. Two INDEPENDENT flags, both PARTITION-SET-based over the replaced
-//! `(spec_id, partition)` tuples (unlike OverwriteFiles/RowDelta's per-data-file checks):
+//! `BaseReplacePartitions.validate`. Two INDEPENDENT flags, each evaluated over the scope
+//! [`ConflictScope`] resolves for this commit — normally PARTITION-SET-based over the replaced
+//! `(spec_id, partition)` tuples (unlike OverwriteFiles/RowDelta's per-data-file checks), but the
+//! spec-agnostic `alwaysTrue` scope covering EVERY file when the added files' spec is unpartitioned:
 //! - [`ReplacePartitionsAction::validate_no_conflicting_data`] (Java `validateNoConflictingData`) rejects
 //!   when a concurrent snapshot ADDED DATA to a replaced partition.
 //! - [`ReplacePartitionsAction::validate_no_conflicting_deletes`] (Java `validateNoConflictingDeletes`)
@@ -310,9 +312,14 @@ impl ReplacePartitionsAction {
     ///
     /// `PartitionSpec::is_unpartitioned` is the Rust `PartitionSpec.isUnpartitioned()`: TRUE when the spec
     /// has no fields **or** every field's transform is `Void` (1.10.0 `isPartitioned()` =
-    /// `fields.length > 0 && fields.stream().anyMatch(f -> !f.transform().isVoid())`). The all-VOID case
-    /// matters in practice: dropping the last partition field on a V2/V3 table leaves a VOID field behind
-    /// rather than an empty field list, so an "unpartitioned again" evolved spec reaches this branch.
+    /// `fields.length > 0 && fields.stream().anyMatch(f -> !f.transform().isVoid())`). The all-VOID case is reachable
+    /// but NOT by the route an earlier draft of this comment claimed: `UpdatePartitionSpec` substitutes
+    /// `Void` only on V1 (see `update_partition_spec.rs`'s `format_version < FormatVersion::V2` arm); on
+    /// V2/V3 the field is genuinely REMOVED, the field list empties, and the resulting spec dedups back
+    /// onto an existing id — which is why this module's all-VOID fixture is V1. An all-VOID spec still
+    /// reaches a V2/V3 table two ways: a V1 table upgraded to V2+ carries its voided fields forward in its
+    /// spec history, and externally-written metadata may contain one directly. The predicate itself is
+    /// format-version-independent, so the V1 fixture proves the logic for every version.
     fn conflict_scope(
         &self,
         current: &Table,
@@ -435,7 +442,10 @@ impl TransactionAction for ReplacePartitionsAction {
     }
 
     /// Serializable-isolation conflict validation (Java `BaseReplacePartitions.validate`). Two INDEPENDENT,
-    /// opt-in checks, both PARTITION-SET-based over the replaced `(spec_id, partition)` tuples:
+    /// opt-in checks, each evaluated over the [`ConflictScope`] this commit resolves — PARTITION-SET-based
+    /// over the replaced `(spec_id, partition)` tuples, or the spec-agnostic `alwaysTrue` scope covering
+    /// EVERY file when the added files' spec is unpartitioned (see [`Self::conflict_scope`]). Where the
+    /// bullets below say "a replaced partition", read "within the resolved scope":
     /// - [`Self::validate_no_conflicting_data`] (Java `validateConflictingData` branch →
     ///   `validateAddedDataFiles`): reject if a concurrent snapshot ADDED DATA to a replaced partition.
     /// - [`Self::validate_no_conflicting_deletes`] (Java `validateConflictingDeletes` branch →
@@ -446,7 +456,7 @@ impl TransactionAction for ReplacePartitionsAction {
     /// (snapshot isolation, current behavior unchanged).
     ///
     /// The effective starting snapshot ([`Self::validate_from_snapshot`] if set, else the transaction-captured
-    /// `starting_snapshot_id`) and the replaced-partition set are computed ONCE and shared by all enabled
+    /// `starting_snapshot_id`) and the [`ConflictScope`] are computed ONCE and shared by all enabled
     /// checks. Every rejection is a NON-retryable [`ErrorKind::DataInvalid`] (Java's non-retryable
     /// `ValidationException`), so the commit retry loop stops and the error propagates rather than looping.
     async fn validate(
@@ -698,6 +708,15 @@ impl SnapshotProduceOperation for ReplacePartitionsOperation {
         // outstanding position / equality deletes in the UNREPLACED partitions instead of silently dropping
         // them table-wide and resurrecting deleted rows. The conservative dangling-delete posture (no
         // pruning) is documented on the helper.
+        //
+        // NAMED DIVERGENCE on the FULL-TABLE-REPLACE branch (`is_full_table_replace`): there ARE no
+        // unreplaced partitions there, so the rationale above does not apply and this carry-forward is
+        // where the port diverges from Java most. Java's `deleteByRowFilter` drives BOTH filter managers
+        // (`MergingSnapshotProducer.deleteByRowFilter` offsets 5-18) and `apply` additionally runs
+        // `deleteFilterManager.removeDanglingDeletesFor(...)` (offsets 103-114), so under `alwaysTrue`
+        // Java removes every live DELETE file as well. This port keeps them. It cannot resurrect rows
+        // (every referenced data file is removed and the replacements carry a higher sequence number), but
+        // it leaves a manifest-list difference byte-level interop would show. See row R104's residue.
         snapshot_produce.current_manifests().await
     }
 }
@@ -1590,8 +1609,9 @@ mod tests {
     // Concurrent-commit CONFLICTING-DELETE validation (Java `validateNoConflictingDeletes` /
     // serializable isolation).
     //
-    // INDEPENDENT of `validateNoConflictingData` (above): this is PARTITION-SET-based over the replaced
-    // `(spec_id, partition)` tuples and rejects when, in a replaced partition, a concurrent commit either
+    // INDEPENDENT of `validateNoConflictingData` (above): this is evaluated over the resolved
+    // `ConflictScope` — the replaced `(spec_id, partition)` tuples, or every file under the
+    // spec-agnostic `alwaysTrue` scope — and rejects when, within that scope, a concurrent commit either
     //   (a) DELETED a data file (Java `validateDeletedDataFiles` — you cannot dynamically replace a
     //       partition whose data a concurrent commit removed), or
     //   (b) ADDED a delete file (Java `validateNoNewDeleteFiles` — a concurrent row-delete in a partition

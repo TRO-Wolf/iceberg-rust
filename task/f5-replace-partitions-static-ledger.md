@@ -233,10 +233,27 @@ apply-side mutation too — it is not a scope-only pin.
    filter is bound with `case_sensitive = true` (the `MergingSnapshotProducer` constructor default).
    `alwaysTrue` binds no column names, so the flag is inert here — stated for completeness, not a gap.
 4. **The `apply` branch is reached through `resolve_filter_deletes`, not through a literal port of
-   `ManifestFilterManager.filterManifest`.** The two agree on `alwaysTrue` by construction (the residual
-   is `alwaysTrue`, strict metrics trivially satisfy it, so every live data file resolves and the
-   PARTIAL-match error is unreachable) — but that is a REASONED equivalence over the shared helper, not a
-   separately measured one.
+   `ManifestFilterManager.filterManifest`.** The two agree on `alwaysTrue` **for the DATA half only** (the
+   residual is `alwaysTrue`, strict metrics trivially satisfy it, so every live data file resolves and the
+   PARTIAL-match error is unreachable) — and even that is a REASONED equivalence over the shared helper,
+   not a separately measured one.
+5. **The DELETE half of `deleteByRowFilter` is NOT ported** (found by the independent Critic; residue 4
+   originally overstated the equivalence as total). `MergingSnapshotProducer.deleteByRowFilter` drives BOTH
+   managers — `filterManager` at offset 10 and `deleteFilterManager` at offset 18 — and
+   `MergingSnapshotProducer.apply` runs `deleteFilterManager.removeDanglingDeletesFor(filterManager
+   .filesToBeDeleted())` at offsets 103-114 and `deleteFilterManager.filterManifests(...)` at offset 152.
+   `ManifestFilterManager`'s `isDeleteManifestReader()` branch permits a PARTIAL match rather than
+   erroring, so under `alwaysTrue` Java removes EVERY live delete file. This port's
+   `resolve_filter_deletes` skips non-DATA manifests and `existing_manifest` carries every DELETE manifest
+   forward unchanged, so after a full-table replace the fork keeps a delete-file set Java deletes. NOT a
+   row-resurrection hazard (every referenced data file is removed; replacements carry a higher sequence
+   number) and the same gap pre-exists on the `dropPartition` path, but it IS a manifest-list divergence
+   byte-level interop would surface, and it is a reason R104 stays 🟡.
+6. **New error surface on the full-replace branch** (Critic finding, S4). `resolve_filter_deletes` →
+   `build_residual_evaluator` errors with `unknown partition spec id {spec_id}` when a live data file
+   carries a spec id absent from table metadata; the previous `resolve_partition_deletes` path silently
+   skipped such a file. On malformed or foreign metadata a full replace now hard-errors where it once
+   committed. Judged the better posture (fail-closed) but recorded as a behaviour change, not a silent one.
 
 ## 6. Reasoned rather than observed
 
