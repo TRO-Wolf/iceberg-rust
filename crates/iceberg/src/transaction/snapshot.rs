@@ -1767,15 +1767,22 @@ pub(crate) async fn added_dv_candidate_delete_files_after(
 /// needs to inspect (Java `MergingSnapshotProducer.VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE,
 /// REPLACE, DELETE}`). An `Append` snapshot never removes a live data file, so it is not inspected.
 ///
-/// Java's set has THREE members; the Rust [`Operation`] enum has no `Replace` variant (a `ReplacePartitions`
-/// commit records `Operation::Overwrite`, and a rewrite/compaction is not yet a distinct operation here), so
-/// only `{Overwrite, Delete}` are representable. This is faithful to every operation Rust can currently
-/// produce — Rust never records a `REPLACE` snapshot, so there is nothing of that operation to miss.
+/// All THREE Java members are representable in Rust and all three are matched here
+/// (1.10.0-bytecode-verified: the `MergingSnapshotProducer` `static {}` block builds
+/// `VALIDATE_DATA_FILES_EXIST_OPERATIONS` from `ImmutableSet.of("overwrite", "replace", "delete")`).
+/// `Operation::Replace` IS recorded by the Rust write path — [`crate::transaction::rewrite_files`]
+/// always commits `Operation::Replace`, and `RewriteDataFiles` / `RemoveDanglingDeleteFiles` /
+/// `RewritePositionDeleteFiles` all commit through it — so omitting `Replace` would let a concurrent
+/// COMPACTION snapshot's `Deleted` tombstones escape this walk. Matches the same-file
+/// [`operation_adds_dvs`], which includes `Replace` for the same reason.
 ///
 /// This is the `skipDeletes == false` variant; see [`operation_removes_data_files_skip_deletes`] for the
 /// `skipDeletes == true` variant Java's `RowDelta` uses by default.
 fn operation_removes_data_files(operation: &Operation) -> bool {
-    matches!(operation, Operation::Overwrite | Operation::Delete)
+    matches!(
+        operation,
+        Operation::Overwrite | Operation::Replace | Operation::Delete
+    )
 }
 
 /// The `skipDeletes == true` variant of [`operation_removes_data_files`] — the operations whose snapshots can
@@ -1785,11 +1792,14 @@ fn operation_removes_data_files(operation: &Operation) -> bool {
 /// Java drops `DELETE` from the set so that a concurrent merge-on-read DELETE-op snapshot (which produces
 /// `Deleted` tombstones for the files it removed) does NOT trip the files-exist check — this is what
 /// `BaseRowDelta` uses by DEFAULT (its `validateDeletes` flag is `false` unless `validateDeletedFiles()` is
-/// called, and it passes `skipDeletes = !validateDeletes = true`). With `REPLACE` unrepresentable in the Rust
-/// [`Operation`] enum (a rewrite is not yet a distinct op), only `{Overwrite}` is representable here — faithful
-/// to every operation Rust can produce.
+/// called, and it passes `skipDeletes = !validateDeletes = true`). `REPLACE` is NOT dropped: both Java
+/// members are matched here (1.10.0-bytecode-verified — `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS`
+/// is `ImmutableSet.of("overwrite", "replace")`). This is the op set `RowDelta` uses by DEFAULT, so
+/// dropping `Replace` would be the corruption line: a concurrent compaction (`Operation::Replace`, which
+/// the fork's own [`crate::transaction::rewrite_files`] records) removes the data file a position delete
+/// references, the row delta commits anyway, and the deleted rows are live again in the compacted output.
 fn operation_removes_data_files_skip_deletes(operation: &Operation) -> bool {
-    matches!(operation, Operation::Overwrite)
+    matches!(operation, Operation::Overwrite | Operation::Replace)
 }
 
 /// Enumerate the files of a given manifest `content` that snapshots committed AFTER `starting_snapshot_id`
@@ -2256,16 +2266,16 @@ fn delete_applies_to_data_file(
 ///
 /// The `skip_deletes` flag selects the operation set, mirroring Java's two `validateDataFilesExist` op sets:
 /// - `skip_deletes == false` ⇒ [`operation_removes_data_files`] = Java
-///   `VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE, REPLACE, DELETE}` (`{Overwrite, Delete}` in Rust).
+///   `VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE, REPLACE, DELETE}`.
 ///   `DeleteFiles` uses this (its `validate` always includes DELETE-op snapshots).
 /// - `skip_deletes == true` ⇒ [`operation_removes_data_files_skip_deletes`] = Java
-///   `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS = {OVERWRITE, REPLACE}` (`{Overwrite}` in Rust).
+///   `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS = {OVERWRITE, REPLACE}`.
 ///   `RowDelta` uses this by DEFAULT (Java `BaseRowDelta` passes `skipDeletes = !validateDeletes`, and
 ///   `validateDeletes` is `false` unless `validateDeletedFiles()` was called) so that a concurrent
 ///   merge-on-read DELETE-op snapshot does not trip the referenced-files check.
 ///
-/// In BOTH cases the unrepresentable Java `REPLACE` operation is absent (Rust never records a `REPLACE`
-/// snapshot) — faithful, not a gap.
+/// BOTH sets include `REPLACE` (1.10.0-bytecode-verified), so a concurrent COMPACTION snapshot's
+/// `Deleted` tombstones are inspected on both arms — see [`operation_removes_data_files`].
 ///
 /// A concurrent delete/overwrite writes the file it removes as a `Deleted` tombstone in a manifest IT wrote
 /// (`rewrite_manifest_with_deletes` stamps the committing snapshot id as the manifest's `added_snapshot_id`),
@@ -2394,9 +2404,8 @@ pub(crate) async fn validate_no_conflicting_added_delete_files(
 /// This is the Rust port of Java `MergingSnapshotProducer.validateDeletedDataFiles`
 /// (`core/MergingSnapshotProducer.java` L636-654, the `dataFilter` overload): it enumerates the
 /// concurrently-DELETED DATA files via the shared [`deleted_data_files_after`] walk (with
-/// `skip_deletes = false` ⇒ the op set `{Overwrite, Delete}`, Java
-/// `VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE, REPLACE, DELETE}` minus the unrepresentable Java
-/// `REPLACE` operation — Rust never records a `REPLACE` snapshot, so its absence is faithful, not a gap) and
+/// `skip_deletes = false` ⇒ the op set `{Overwrite, Replace, Delete}`, Java
+/// `VALIDATE_DATA_FILES_EXIST_OPERATIONS`) and
 /// throws a non-retryable `ValidationException` ("Found conflicting deleted files that can contain records
 /// matching %s: %s") on the FIRST removed file whose metrics permit a match. The per-file "could this deleted
 /// file have contained records matching the filter?" test is the SAME [`first_conflicting_file`] (the
@@ -2424,9 +2433,8 @@ pub(crate) async fn validate_no_conflicting_added_delete_files(
 ///
 /// **Conservative posture (documented):** the per-file [`InclusiveMetricsEvaluator`] over-approximates —
 /// it can only over-REJECT (treat a non-matching deletion as a conflict), never under-reject, so it is safe
-/// under serializable isolation. The unrepresentable Java `REPLACE` operation is omitted from the walk's op
-/// set (Rust records no `REPLACE` snapshot), which can only under-scan relative to Java — faithful because
-/// the Rust write path never produces a `REPLACE`, so there is nothing to scan.
+/// under serializable isolation. The walk's op set matches Java member-for-member, `REPLACE` included, so a
+/// concurrent compaction's removals are scanned here too.
 pub(crate) async fn validate_deleted_data_files(
     current: &Table,
     effective_start: Option<i64>,

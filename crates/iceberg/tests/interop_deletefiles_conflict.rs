@@ -265,7 +265,9 @@ async fn append_files(catalog: &impl Catalog, table: &Table, files: Vec<DataFile
 
 /// Build the shared S0→S1 history and return the table at S1:
 /// - S0: append two base files f0 (y[0,5]) + f1 (y[6,9]).
-/// - S1: an OVERWRITE that REMOVES f0 (in the `{OVERWRITE}` default op set) and adds f2.
+/// - S1: an OVERWRITE that REMOVES f0 (in `DeleteFiles`' files-exist op set
+///   `VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE, REPLACE, DELETE}` — `DeleteFiles` always
+///   validates with `skipDeletes = false`) and adds f2.
 ///
 /// Identical to C3's files-exist history; the only difference is the validating action (`DeleteFiles`
 /// here, `RowDelta` there).
@@ -274,7 +276,8 @@ async fn build_scenario_table(catalog: &impl Catalog, table: Table) -> Table {
     let f0 = write_yid_file(&table, vec![1, 2], vec![0, 5]).await;
     let f1 = write_yid_file(&table, vec![3, 4], vec![6, 9]).await;
     let table = append_files(catalog, &table, vec![f0.clone(), f1]).await;
-    // S1: an OVERWRITE that REMOVES f0 (in the `{OVERWRITE}` default op set) and adds f2.
+    // S1: an OVERWRITE that REMOVES f0 (in `{OVERWRITE, REPLACE, DELETE}`, the op set `DeleteFiles`
+    // uses -- it always validates with `skipDeletes = false`) and adds f2.
     let f2 = write_yid_file(&table, vec![5, 6], vec![10, 12]).await;
     let tx = Transaction::new(&table);
     let tx = tx

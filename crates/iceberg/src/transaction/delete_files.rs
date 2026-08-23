@@ -1213,6 +1213,122 @@ mod tests {
         );
     }
 
+    /// Commit a CONCURRENT COMPACTION: rewrite `delete_path` into `add_path` through `rewrite_files`, whose
+    /// snapshot records `Operation::Replace` (Java `BaseRewriteFiles.operation()` = `DataOperations.REPLACE`).
+    /// The rewritten data file gets a `Deleted` tombstone on a DATA manifest the new snapshot itself wrote.
+    async fn commit_concurrent_replace_compaction(
+        catalog: &impl Catalog,
+        table: &Table,
+        delete_path: &str,
+        add_path: &str,
+    ) -> Table {
+        let tx = Transaction::new(table);
+        let action = tx.rewrite_files(vec![data_file(delete_path, 0)], vec![data_file(
+            add_path, 0,
+        )]);
+        let tx = action.apply(tx).expect("rewrite_files action applies");
+        tx.commit(catalog)
+            .await
+            .expect("the concurrent compaction commit must succeed")
+    }
+
+    /// THE `skip_deletes == false` ARM. `DeleteFiles` always validates with `skip_deletes == false`, which
+    /// routes to `operation_removes_data_files` (Java `VALIDATE_DATA_FILES_EXIST_OPERATIONS =
+    /// {overwrite, replace, delete}`, 1.10.0 bytecode) — a DIFFERENT predicate from the one `RowDelta` uses
+    /// by default.
+    ///
+    /// Append S0 ({a, b}). Build `delete_files(a).validate_from_snapshot(S0).validate_files_exist()`. Then a
+    /// concurrent COMPACTION (`rewrite_files`, `Operation::Replace`) rewrites `a` into `a-compacted` (S1).
+    /// The commit must fail with the NON-retryable `validateDataFilesExist` error NAMING `a`.
+    ///
+    /// Risk pinned: drop `Operation::Replace` from `operation_removes_data_files` and the compaction's
+    /// tombstone for `a` is never inspected — the validation passes and the commit fails LATER (or not at
+    /// all) on the generic path-resolution error, which is a different contract. The test asserts BOTH that
+    /// the validation message is present AND that the generic path-resolution message is absent, so the
+    /// no-longer-validated path cannot pass this test by failing for the wrong reason.
+    #[tokio::test]
+    async fn test_delete_files_exist_rejects_concurrent_replace_compaction_of_same_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // S0: {a, b}.
+        let table = append_files(&catalog, &table, vec![
+            data_file("test/a.parquet", 0),
+            data_file("test/b.parquet", 0),
+        ])
+        .await;
+        let s0 = table
+            .metadata()
+            .current_snapshot()
+            .expect("S0 exists")
+            .snapshot_id();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .delete_files()
+            .delete_file("test/a.parquet")
+            .validate_from_snapshot(s0)
+            .validate_files_exist();
+        let tx = action.apply(tx).expect("delete_files action applies");
+
+        // CONCURRENT commit (S1): a compaction that REPLACES the file this delete also requires.
+        let compacted = commit_concurrent_replace_compaction(
+            &catalog,
+            &table,
+            "test/a.parquet",
+            "test/a-compacted.parquet",
+        )
+        .await;
+
+        // Fixture pin: the concurrent snapshot really is a REPLACE, and `a` really is gone.
+        assert_eq!(
+            compacted
+                .metadata()
+                .current_snapshot()
+                .expect("the compaction produced a snapshot")
+                .summary()
+                .operation,
+            Operation::Replace,
+            "the concurrent compaction must record Operation::Replace — otherwise this test would \
+             exercise a different op-set member and prove nothing about REPLACE"
+        );
+        let live = live_file_paths(&compacted).await;
+        assert!(
+            !live.contains("test/a.parquet"),
+            "the compaction removed a, live = {live:?}"
+        );
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "delete must fail: a concurrent REPLACE (compaction) removed the file it requires",
+        );
+
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DataInvalid,
+            "a files-exist conflict is a non-retryable validation failure (DataInvalid)"
+        );
+        assert!(
+            !err.retryable(),
+            "the validation failure must be NON-retryable so the retry loop stops and it propagates"
+        );
+        assert!(
+            err.message().contains("Cannot commit, missing data files"),
+            "the error must be the validateDataFilesExist rejection, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("test/a.parquet"),
+            "the error must NAME the missing file, got: {}",
+            err.message()
+        );
+        assert!(
+            !err.message().contains("Missing required files to delete"),
+            "the rejection must come from validateDataFilesExist, NOT from the later generic \
+             path-resolution check, got: {}",
+            err.message()
+        );
+    }
+
     /// NEGATIVE CONTROL: same setup, but the concurrent deletion removes a DIFFERENT file (b) than the one
     /// this action deletes (a). The `delete_files(a)` files-exist check PASSES and the commit succeeds — a
     /// concurrent removal of an unrelated file is not a conflict.

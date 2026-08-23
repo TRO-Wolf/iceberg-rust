@@ -35,7 +35,8 @@
 //! 3. **`validate_data_files_exist(paths)`** — reject if a concurrent commit REMOVED a data file the
 //!    row-delta's deletes reference (concurrent-removal shape). Java
 //!    `RowDelta.validateDataFilesExist` → `MergingSnapshotProducer.validateDataFilesExist`. The
-//!    concurrent removal is an OVERWRITE (the `skipDeletes = true` DEFAULT op set `{OVERWRITE}`),
+//!    concurrent removal is an OVERWRITE (the `skipDeletes = true` DEFAULT op set
+//!    `{OVERWRITE, REPLACE}`),
 //!    so this rejects WITHOUT `validate_deleted_files()`.
 //!
 //! ## The insight that makes it tractable (same shape as C1/C4)
@@ -431,7 +432,7 @@ async fn build_scenario_table(catalog: &impl Catalog, table: Table, scenario: &S
             let f0 = write_yid_file(&table, vec![1, 2], vec![0, 5]).await;
             let f1 = write_yid_file(&table, vec![3, 4], vec![6, 9]).await;
             let table = append_files(catalog, &table, vec![f0.clone(), f1]).await;
-            // S1: an OVERWRITE that REMOVES f0 (in the {OVERWRITE} default op set) and adds f2.
+            // S1: an OVERWRITE that REMOVES f0 (in the {OVERWRITE, REPLACE} default op set) and adds f2.
             let f2 = write_yid_file(&table, vec![5, 6], vec![10, 12]).await;
             let tx = Transaction::new(&table);
             let tx = tx
