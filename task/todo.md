@@ -718,13 +718,15 @@ sweep (this change): new row R165, R138/R140/R145/R93/R95 notes, and the
 Remaining to flip R165 green: a bidirectional interop round-trip (out of this campaign's
 scope per the charter — `make interop` excluded).
 
-## PLANNED (2026-08-21): `RewritePositionDeleteFiles` size-based admission gate
+## CLOSED (2026-08-22): `RewritePositionDeleteFiles` size-based admission gate
 
-**Scope is closed and owner-ratified; no production code is written.** This block exists so the
-plan survives outside a session scratchpad. The charter and its five binding addenda are in
+**Delivered.** The charter and its five binding addenda are in
 [rpdf-size-gate-2026-08-21-brief.md](rpdf-size-gate-2026-08-21-brief.md); the 45-clause proof
 ledger, the build carving and the fourteen residues are in
-[rpdf-size-gate-2026-08-21-ledger.md](rpdf-size-gate-2026-08-21-ledger.md).
+[rpdf-size-gate-2026-08-21-ledger.md](rpdf-size-gate-2026-08-21-ledger.md), whose dated
+**CLOSE-OUT (2026-08-22)** section carries the per-clause dispositions, the eighteen charter
+defects and the five residues this unit opened (R-G7-1..5). The PR body is
+[rpdf-size-gate-pr-body.md](rpdf-size-gate-pr-body.md).
 
 **The defect.** `rewrite_position_delete_files.rs:222` admits any `(spec, partition)` group with
 two or more live position-delete files. Java's `BinPackRewritePositionDeletePlanner` admits a group
@@ -733,14 +735,33 @@ only through `enoughInputFiles || enoughContent || tooMuchContent`, whose file-c
 measurements; independently re-verified against `9f85a086`. No wrong answers — the fork compacts
 *more* than Java, so this is a parity fix, not a bug fix.
 
-**Base ref** `9f85a086`. **One PR**, owner squash-merges, title
-`[repark] maintenance: RewritePositionDeleteFiles size-based admission gate (BREAKING default)`.
-The default admission floor moves 2 → 5, so existing two-file callers become no-ops unless they
-set `.min_input_files(2)`; that is the intended breaking flip and is named in the PR body.
+**Base ref** `9f85a086`. **The plan said one PR; it shipped as FOUR** — the seven build groups were
+carved across four merges, and the two unrelated PRs that interleaved (#210 the AGENTS.md spine
+move, #211 an h2 bump that edited `Cargo.lock`) belong to other units:
+
+| PR | Squash commit | Carried |
+|---|---|---|
+| #207 | `51edcc2c` | scope charter (brief + ledger + this plan block) |
+| #208 | `972b932c` | G1 CONFIG, G2 PLANNER, G3 WRITER |
+| #209 | `77ddf5d4` | G4 COMMIT LOOP, G5 TESTS |
+| #212 | `a4cdc419` | G6 DOCS + STATUS (re-cut over #210/#211) |
+
+**The BREAKING flip.** The default admission floor moves 2 → 5, so existing two-file callers become
+no-ops unless they set `.min_input_files(2)`. Three further behaviour flips ship with it (an
+unbindable `filter` errors earlier; the output and snapshot shape is per BIN and can be more than
+one file; a pre-existing `write.delete.target-file-size-bytes` in
+`{unparsable, > i64::MAX, <= 1, == i64::MAX}` now makes `execute` return `Err`). All four are named
+in the PR body. Public surface is purely additive — five builder methods plus two `TableProperties`
+consts. Status is on matrix rows R136 (corrected, keeps `✅`) and R135 (sibling roll bound).
+
+Lib suite at `a4cdc419`: 3378 passed / 0 failed / 1 ignored (`cargo test -p iceberg --lib`).
 
 **Seven ordered build groups** (45 clauses, clause-complete, each clause in exactly one group):
 G1 CONFIG (7) · G2 PLANNER (8) · G3 WRITER (6) · G4 COMMIT LOOP (3) · G5 TESTS (7) ·
-G6 DOCS + STATUS (7) · G7 GOVERNANCE (7). G4 depends on G3; G5 depends on G1-G4.
+G6 DOCS + STATUS (7) · G7 GOVERNANCE (7). G4 depended on G3; G5 on G1-G4. Every group ran a
+single Actor with an independent fresh-context Critic. **G1–G6 converged**; G7's convergence is
+G7's Critic's call to record, not the Actor's ([AGENTS.md](../AGENTS.md) `<subagent_policy>`:
+"convergence is the Critic's call"), and G7's first review REMANDED.
 
 **Doc obligations carried in the same change:** R136 currently claims a "1:1 port" while the gate is
 absent — the sentence is corrected, not dropped, and the row keeps `✅` with named residues (R-8).
@@ -779,3 +800,25 @@ change does not falsify, so R-10's in-scope test does not reach it):
   Both files are OUT of this unit's manifest (R-10) and both stay accurate otherwise, so the
   citation is recorded here rather than drive-by fixed. Bare-number citations are exactly the class
   `make check-matrix-anchors` was built to retire — fix with the `row R136` anchor form.
+
+**Residues opened at close-out (G7, 2026-08-22)** — FIVE were opened (R-G7-1..5); the THREE that
+are actionable in this repo are listed here. R-G7-1 (C-017's pin unmet) has nothing to fix
+retroactively and R-G7-5 (R2's six-field mandate vs the claim board's table shape) is homed on
+`PrimarySync/Concurrency-Protocol.md` and its owner. Full text in the ledger's CLOSE-OUT section:
+
+- **The R7 pre-merge gate never ran in full for this unit** (R-G7-2). `make test` begins with
+  `docker-up` and the Docker daemon is unavailable on this host, so the Docker-backed leg was never
+  executed; `make check-msrv` and `cargo deny check advisories` are likewise unevidenced anywhere in
+  this unit's artefacts. Clause C-018 asserted the whole gate runs green before merge, and that
+  assertion was never true here. This is a named instance of the standing Docker-`make test` gap,
+  not a new one — but do not read the PR body's Verification block as an R7 transcript.
+- **`crates/iceberg/src/maintenance/mod.rs` names only Puffin V3 DVs** — the sentence "Puffin V3
+  DELETION VECTORS are SKIPPED (file-scoped, never bin-packed) — V2 PARQUET only", at `:82-83`
+  measured 2026-08-22 (G6-5 cited `:80-81`; already stale when written — find it by its text) —
+  where the action file, the test battery and matrix row R136 also name V2 ORC/Avro. **DEFERRED
+  deliberately:** the existing sentence ("V2 PARQUET only") is TRUE, so this is consistency and not
+  accuracy, and re-editing a true sentence is the over-correction failure mode this unit hit twice.
+  A future unit may widen it; it must verify the sentence is false first.
+- **R3 was violated by #208 and #209** (R-G7-3) — both carry GitHub's auto-generated branch-name
+  titles with no `[repark]` tag, and no merged PR title names the BREAKING flip. Nothing to fix
+  retroactively; recorded so the next unit tags its PRs at open time rather than at merge time.

@@ -562,3 +562,301 @@ A residue without a home is a leak; every one below names where it is recorded.
 ## SEPMO rubric
 
 STANDARD — 2 of 6 LIGHT criteria pass (SKILL.md:447-457, each evaluated individually; the manifest's light_thresholds row binds the size numbers). 1 BLAST RADIUS: FAIL — nine files across maintenance/, spec/, tests/ and docs/, two modules gaining public interface (five builders on the action, two consts on TableProperties) and a behaviour-neutral signature change inside the sibling template. 2 REVERSIBILITY: PASS — one squash commit, no migration, no data rewrite, no on-disk format change; a revert restores the prior gate exactly. 3 SIZE: FAIL by an order of magnitude — the pin battery alone (C-003's five sub-expression pins, C-004's two companion-fixture boundary pins, C-008's four format pins, C-010's three bin-stamp pins, C-021's three size-class pins with preconditions, C-035's six-branch parse battery, C-006's seven-precondition battery, C-025/C-026's measured-output batteries, plus C-037/C-040/C-041/C-044/C-046) is far past 150 lines before the action's own rewrite, and nine files is past the five-file bound. The removed C-043's six branch pins are NOT counted (N-C8). 4 NOVELTY: FAIL — no new dependency and no new external call, but the chunked feed into a rolling writer is a new architectural pattern with no in-repo precedent (grep for '.chunks(' over crates/iceberg/src returns zero, re-verified). N-9's refuted second limb ('first to derive a writer roll bound from a resolved planner config') stays STRUCK: rewrite_data_files.rs:601-607 already does that. 5 SENSITIVITY: FAIL — delete-file rewriting with sequence-number stamping is the silent-corruption class, the unit touches crates/iceberg/src/spec/, and it corrects a GAP_MATRIX row; the manifest's note makes criterion 5 unreachable on any one of those grounds. 6 CLARITY: PASS — RE-EVALUATED per N-C1 now that no clause is OPEN: 45 of 45 PROVEN, zero OPEN, zero REJECTED; every clause carries a proof and a pinning test; the two standing clarifying questions are answered by addendum 4 (R-14 ratifies the three fork-authored literals, R-15 keeps precondition (7) as a DataInvalid) and the list is empty. Consequences UNCHANGED by the criterion-6 flip, because they are triggered by criteria 1/3/4/5: independent Opus Critic (standing hard break), full attestation including the java-parity and format-stability taxonomy extensions, and the R7 readiness audit not self-run.
+
+## CLOSE-OUT (2026-08-22) — build group G7 (governance)
+
+**How to read this section.** The 45 clauses above are a HISTORICAL proof record and are **not**
+rewritten in place. Every correction below is **additive and dated**, the same discipline
+[`task/lessons.md`](lessons.md) states for itself ("supersede an outdated rule with a dated note
+rather than editing the original in place"). Where a clause below is marked
+`DISCHARGED-WITH-CORRECTION`, the clause text above still says what it said on 2026-08-21; this
+section is what supersedes it.
+
+**Every number in this section was re-derived from git, from the file, or from a run — never from
+the prose beside it — and each is stated with its population, WITH FIVE MARKED EXCEPTIONS**: defect
+rows 7 and 11 and acceptance items 2, 4 and 6 rest on another group's measurement, which G7 did not
+re-run. Each says so at its own site. The rule this section preaches applies to the sentence stating
+it: "every" was the wrong quantifier, and the exceptions are named rather than quietly excluded.
+
+### Delivery record
+
+The unit shipped in **FOUR merged PRs**, not the one the charter and
+[`todo.md`](todo.md) planned:
+
+| PR | Squash commit | Carried | Diffstat (files / +ins / -del) |
+|---|---|---|---|
+| #207 | `51edcc2c` | scope charter (brief + ledger + `todo.md` plan block) | 3 / +1151 / -0 |
+| #208 | `972b932c` | G1 CONFIG, G2 PLANNER, G3 WRITER | 4 / +4028 / -164 |
+| #209 | `77ddf5d4` | G4 COMMIT LOOP, G5 TESTS | 3 / +1217 / -77 |
+| #212 | `a4cdc419` | G6 DOCS + STATUS (re-cut over #210/#211) | 7 / +422 / -49 |
+
+Base ref `9f85a086`. Two UNRELATED PRs merged between them — #210 (`10e077d9`, the AGENTS.md
+spine restructure) and #211 (`e7ca4212`, an h2 security bump that edited `Cargo.lock`). Neither
+belongs to this unit; the distinction is load-bearing for C-015 below.
+
+Live suite at `a4cdc419` (main's tip and G6's squash — G7 adds no code, so the branch tip measures
+the same): **3378 passed, 0 failed, 1 ignored** — population is the
+`iceberg` crate's `cargo test -p iceberg --lib` unit tests, run 2026-08-22.
+
+### G7's seven clauses — final disposition
+
+#### C-015 — no `Cargo.toml` / crate `Cargo.toml` / `Cargo.lock` edited — **DISCHARGED**
+
+Proven PER PR, not over the span, because the span is contaminated. Measurement: for each of
+`51edcc2c`, `972b932c`, `77ddf5d4`, `a4cdc419`, `git show --format='' --name-only <c>` filtered by
+`grep -Ei 'Cargo\.(toml|lock)'` returns **0 hits — 0 of the 12 files this unit touched is a
+dependency file**.
+
+THE DISCRIMINATOR, stated explicitly because a naive check reads the other way:
+`git diff --stat 9f85a086..a4cdc419 -- Cargo.lock` DOES report `1 file changed, 2 insertions(+),
+2 deletions(-)`, and `git log --oneline 9f85a086..a4cdc419 -- Cargo.lock` attributes that change to
+**exactly one commit, `e7ca4212` (#211)** — a separate security unit that merged between this
+unit's PRs. A span diff is therefore not evidence about this unit; the per-PR proof is.
+
+#### C-016 — the nine-file manifest — **DISCHARGED-WITH-CORRECTION (the clause is WRONG)**
+
+The manifest is not closed at nine. Re-derived: the union of files touched by #207+#208+#209+#212
+is **12**. Of C-016's enumerated nine, **8 were touched and 1 was not** (`task/lessons.md`, touched
+by ZERO commits of the unit until this close-out). **4 touched files are absent from the
+enumeration.** 8 + 4 = 12, which checks against the union above.
+
+| Enumerated by C-016 | Touched by the unit? |
+|---|---|
+| `crates/iceberg/src/maintenance/rewrite_position_delete_files.rs` | yes (#208, #209, #212) |
+| `crates/iceberg/src/maintenance/rewrite_position_delete_files_tests.rs` | yes (#208, #209, #212) |
+| `crates/iceberg/src/maintenance/rewrite_data_files.rs` | yes (#208) |
+| `crates/iceberg/src/maintenance/actions_provider.rs` | yes (#212) |
+| `crates/iceberg/src/spec/table_properties.rs` | yes (#208) |
+| `docs/parity/GAP_MATRIX.md` | yes (#212) |
+| `task/todo.md` | yes (#207, #212) |
+| `crates/iceberg/tests/interop_rewrite_pos_deletes.rs` | yes (#209) |
+| `task/lessons.md` | **NO** — enumerated but untouched by every commit of the unit |
+
+| Touched but NOT enumerated |
+|---|
+| `crates/iceberg/src/maintenance/mod.rs` (#212) |
+| `task/rpdf-size-gate-2026-08-21-brief.md` (#207) |
+| `task/rpdf-size-gate-2026-08-21-ledger.md` (#207) |
+| `task/rpdf-size-gate-pr-body.md` (#212) |
+
+**L-1's own correction is also wrong.** G6 ruled the manifest "short by one — `maintenance/mod.rs`".
+It is short by FOUR and long by one. The three charter artefacts are not a rounding error.
+
+**The anticipated counter-argument, and the ruling.** One could argue the three charter artefacts
+belong to a "pre-unit" charter PR and so fall outside the manifest's domain. **REJECTED**:
+`task/todo.md` was touched by that same commit `51edcc2c` AND is enumerated in the manifest, so the
+manifest demonstrably reaches into #207. A domain that admits one file of a commit and excludes
+three others of the same commit is not a domain.
+
+**ASF headers — the clause's REASONING is false, its CONCLUSION holds.** C-016 says "it creates no
+new source file, so no new ASF header is required". The unit created **3 new files**
+(`git show --diff-filter=A`, over the four commits): the brief, the ledger and the PR body. No new
+`.rs` file, so the clause is right about *source* files — but `.licenserc.yaml` requires the ASF
+header on **every `.md`**, with only `SKILL.md` frontmatter files and mechanical entries exempted,
+and `task/` carries no `paths-ignore` entry. So three new headers WERE required. **All 3 of the 3
+carry one** (verified by `head -3` on each), so nothing is owed; the inference "no new source file
+⇒ no new header" is what is wrong, and it would have been unsafe if any of the three had shipped
+bare.
+
+#### C-017 — the R2 unit gate as ONE `&&` chain with the interop leg inside — **DISCHARGED-WITH-CORRECTION; the PINNING-TEST leg UNMET**
+
+The false-green C-017 exists to prevent WAS closed, and by the mechanism the clause names: G5
+reproduced the interop break live (`left: 0, right: 4`), applied `.min_input_files(2)`, and the
+suite was then RUN green **twice by the building agent and once independently by the reviewing
+agent** through the `ICEBERG_INTEROP_REWRITE_POS_DELETES_GEN_DIR` path.
+
+Two corrections, recorded rather than smoothed over:
+
+1. **Not every group ran the interop leg.** The chain is specified once for "THIS unit", but the
+   unit shipped as four PRs with different fences. G6 was doc-only (`git diff -- crates/` has zero
+   non-comment changed lines, proven by both its agents) and ran a gate without the interop leg.
+   Running a Java-backed interop suite to gate a comment-only diff is not what the clause is for —
+   but the clause as written says otherwise, and the honest record is that the leg was run by the
+   group that touched interop-bearing surfaces, not by every group.
+2. **C-017's own pinning test is UNMET.** The pin is "the commit command itself, recorded verbatim
+   in the PR body". [`rpdf-size-gate-pr-body.md`](rpdf-size-gate-pr-body.md)'s Verification block
+   records a DECOMPOSED command list (`typos . && cargo fmt --all -- --check &&
+   make check-agent-artifacts && make check-matrix-anchors && cargo clippy ... && cargo test -p
+   iceberg --lib`) with **no `git add`, no `git commit`, and no interop leg in the chain**. It is a
+   transcript of what ran, not the chained commit command the clause pins. RESIDUE R-G7-1.
+
+#### C-018 — the R7 pre-merge gate — **NOT DISCHARGED (recorded as owed, not claimed)**
+
+The clause names six legs: `typos .`, `make check`, `make check-msrv`,
+`cargo build -p iceberg --no-default-features`, `cargo deny check advisories`, `make test`.
+
+**What is evidenced:** `typos .`, the constituents of `make check`
+(fmt / clippy `--all-targets --all-features -D warnings` / taplo / machete / check-agent-artifacts /
+check-matrix-anchors), and `cargo build -p iceberg --no-default-features` — all recorded in the PR
+body and re-run green by G7 (see the gate transcript on this branch's commit).
+
+**What is NOT evidenced anywhere in this unit's artefacts:** `make check-msrv`,
+`cargo deny check advisories`, and `make test`. **`make test` was not runnable**: it begins with
+`docker-up`, and `docker info` on this host reports the daemon unavailable (the binary is present at
+`/usr/local/bin/docker`; the daemon is not). This is not a new gap — it is the standing open
+"Docker `make test` gap" — but C-018 asserted the whole gate "runs green before the PR is offered
+for merge" and that assertion was never true for this unit. **Do not read the PR body's Verification
+block as an R7 transcript; it is an R2 one.** RESIDUE R-G7-2.
+
+#### C-023 — worktree, claim row, PR title, R-20 readiness — **DISCHARGED-WITH-CORRECTION; the title leg FAILED and the six-field pin FAILS (R-G7-5)**
+
+- **Worktree / branch:** discharged. All edits ran in the persistent sibling worktree
+  `iceberg-rust-ws`; the branch `parity/rpdf-size-gate-2026-08-21` is the literal the clause pins,
+  and the later per-group branches (`…-g4`, `…-g6`, `…-g7`) are the four-PR carving, not a rename.
+- **Claim row:** discharged. Appended to `PrimarySync/Concurrency-Protocol.md` before the first
+  edit, and released at this close-out per R2's own "release the claim (strike or mark done) at
+  close-out". The row's own text carried two now-corrected claims — "the closed nine-file manifest"
+  (see C-016) and "one PR, owner squash-merges" — both fixed in the release text.
+
+  **CORRECTION (G7's Critic, F-01): the row carries FIVE of R2's six fields, not six.** R2
+  (`PrimarySync/Concurrency-Protocol.md:39-41`) requires date, workstream, repo, branch name,
+  files/dirs, **and expected duration**. The claim board's table declares six columns at `:84` —
+  `Opened │ Workstream │ Repo │ Branch │ Files/dirs claimed │ Status` — and its sixth is **Status,
+  not duration**. C-023's pinning test is "checked field-by-field against R2's six", so that check
+  **FAILS**. **Ruling: the defect is in the shared protocol, not in this row.** Measured across the
+  whole board **as it stood before this release text was written**, `grep -in duration` returned
+  exactly ONE hit — R2's own prose at `:41` — so **no row on the board has ever carried a
+  duration**. (The command now returns TWO: `:41` and `:199`, the second being this finding's own
+  prose quoting R2. The conclusion is unaffected — neither hit is a duration VALUE in a claim row —
+  but the measurement was falsified by the sentence that records it, so it is quoted with the state
+  it was taken against rather than as a live reproduction.) The table shape cannot express the field R2 mandates.
+  A row cannot be faulted for omitting a column that does not exist, and inventing a seventh column
+  unilaterally would be a protocol edit outside this unit's fence. Recorded as **R-G7-5** for the
+  board's owner: either R2 drops "expected duration" (matching ~80 rows of practice) or the table
+  gains the column and R2's field list and the header are reconciled in one change. Until then,
+  every "all six R2 fields" claim on this board — including C-023's — is unmeetable as written.
+- **R-20 readiness:** discharged. Both preconditions were met before the branch was cut.
+- **PR title — FAILED.** C-023 pins the LITERAL
+  `[repark] maintenance: RewritePositionDeleteFiles size-based admission gate (BREAKING default)`.
+  Measured with `gh pr view <n> --json title`, **0 of the 4 merged PRs carry it**:
+
+  | PR | Actual title |
+  |---|---|
+  | #207 | `[repark] docs(task): RewritePositionDeleteFiles size-gate — scope cha…` (GitHub-truncated) |
+  | #208 | `Parity/rpdf size gate impl` |
+  | #209 | `Parity/rpdf size gate g4` |
+  | #212 | `[repark] maintenance: RPDF size-gate G6 — doc + status pass (no behav…` (GitHub-truncated) |
+
+  The literal survives only as the H1 of `rpdf-size-gate-pr-body.md`. **Ruling on R3's actual
+  requirement** (workstream tag PLUS the highest-severity production change named): #207 and #212
+  carry the `[repark]` tag; **#208 and #209 carry NO tag at all** — they are GitHub's
+  auto-generated branch-name titles — which is a plain R3 violation on the two PRs that carried
+  ALL of the production code. And **no merged PR title names the BREAKING default-behaviour flip**,
+  which is the unit's highest-severity production change (C-034); #212's "(no behav…" is accurate
+  for the doc-only G6 pass but is the opposite of the unit's headline. R3 is NOT met.
+  RESIDUE R-G7-3.
+
+#### C-029 — the four-path contingency — **DISCHARGED**
+
+The clause's only pin is that its text appears in the PR body's contingency section. Verified at
+source: `rpdf-size-gate-pr-body.md` carries a `## Contingencies (C-029) — none fired` section with
+**4 of the 4 halt paths named**, each with its outcome — interop red / a golden moving / a
+dependency file needing to change / the fixed point failing. No path fired, and each is recorded
+with the evidence that it did not, which is what the clause asks for.
+
+#### C-039 — the CLOSED set of six acceptance criteria — **DISCHARGED-WITH-CORRECTION**
+
+Every named pinning test was located BY NAME at source in
+`crates/iceberg/src/maintenance/rewrite_position_delete_files_tests.rs` (population: the 71 test
+functions in that file) unless noted.
+
+| Acceptance | Named pin(s) | Found |
+|---|---|---|
+| 1 — 4 declined / more admitted under defaults | `test_admission_min_input_files_default_five_declines_four_admits_five` (:1864) | YES; "plus a group-of-eight leg" **NOT FOUND** — see below |
+| 2 — `.min_input_files(2)` restores the old behaviour | every migrated test's knob-removal-RED form + the interop knob | YES — G5's Critic removed all SEVEN knobs INDIVIDUALLY, each reddening its own test alone (1 of 3378 × 7); interop knob at `interop_rewrite_pos_deletes.rs` |
+| 3 — admission + fixed point | `test_admission_enough_content_admits_two_files_over_target` (:1979), `test_admission_too_much_content_admits_lone_oversized_file` (:2098), C-009's four roll-bound pins, C-025's two chunk pins (`test_feed_chunk_budget_is_the_ruled_constant` :3437, `test_no_split_output_exceeds_max_file_size` :3545), C-026's `test_second_run_is_a_no_op_after_split` (:3637) | YES for all but **two of C-009's four**, which exist under DIFFERENT names — see below |
+| 4 — read identity never the only post-execute assertion | every new test's shape assertion beside its identity assertion | YES (Critic-checked per group) |
+| 5 — seq stamping, three-element bin-max partition | `test_compacted_file_carries_bin_max_rewritten_seq` (:449), `test_every_split_output_carries_bin_max_rewritten_seq` (:3939), `test_each_bin_output_carries_its_own_bin_max_not_the_partition_max` (:3989), `test_result_counts_added_files_and_bytes_across_split_outputs` (:4095) | YES, 4 of 4 |
+| 6 — interop green through the GEN path | C-019's evidence | YES — `dev/java-interop/run-interop-rewrite-pos-deletes.sh` exits 0, `[5/5] DONE`, both sabotage legs failing closed, reproduced independently |
+
+Two FINDINGS, not rounding errors:
+
+- **Acceptance 1's "group-of-eight leg" does not exist.** No test in the file builds an eight-file
+  group (`grep` for `0..8` / `0..=7` / `for pos in 0..[6-9]` returns zero hits). The delivered
+  admitted leg is at **FIVE**, which is the exact floor and therefore a STRICTLY STRONGER pin than
+  eight would be **against floor-value mutants**: `MIN_INPUT_FILES_DEFAULT` 5→6 declines the
+  five-file case and reds, where an eight-file leg would survive it. It is NOT stronger in general —
+  a mutant capping bin membership at about five would be caught by an eight-file leg and not by this
+  one — so the deviation buys boundary precision, not coverage. The charter's "8" came from the RePark report; the build moved it
+  to the boundary and did not say so. Deviation ACCEPTED, recorded.
+- **Two of C-009's four named pins do not exist under the names the ledger records.**
+  `test_output_rolls_at_java_write_max_file_size` and `test_write_max_file_size_clamps_to_java_long_max`
+  return **zero hits across all of `crates/`**. They shipped as
+  `test_config_write_max_file_size_default_is_java_write_max` (:3090) and
+  `test_config_write_max_file_size_clamps_to_java_long_max` (:3141) — renamed by the ledger's own
+  `test_config_*` naming rule for config-altitude pins (F-12). The pins are REAL and their doc
+  comments identify themselves as "C-009 pin 1" and "C-009 pin 2"; the CITATION is what is stale.
+  Same class as G5-5 and as the standing matrix line-citation trap.
+
+### Charter defects — 18, with the population named
+
+**Population.** Statements in the two charter documents
+([brief](rpdf-size-gate-2026-08-21-brief.md), this ledger) that a build group found FALSE,
+UNSATISFIABLE, INCOMPLETE or MISLABELLED, and whose finding an independent Critic ratified.
+Non-conformances (where the charter was right and the BUILD deviated) are a different population and
+are listed separately below. **The count is 18 and it is re-derived here, not copied:** the 11 in
+the G2–G5 hand-off tables + 2 on C-030 (G6) + L-1 + L-2 + G4's unpinned-leg disclosure + 2 found by
+G7. 11 + 2 + 2 + 1 + 2 = 18, which checks against the 18 rows below.
+
+G6's "thirteen" and the PR body's "eleven, plus two more" are **different populations** counted with
+different boundaries, and neither is this one. G6's thirteen = the 11 hand-off items + L-1 + L-2. The
+PR body's set = the same 11 (`:201`) plus two C-030 items filed to the group report (`:217`), which
+also totals thirteen but is a DIFFERENT thirteen — neither set contains the other. CORRECTION (G7's
+Critic, F-06): the PR body never uses the word — `grep -n thirteen task/rpdf-size-gate-pr-body.md`
+returns ZERO hits, and only G6's hand-off says "thirteen". The hazard is that two distinct
+thirteen-item populations were in play at once, not that both used the word.
+
+| # | Clause | What the clause claims | What is true | How it was found |
+|---|---|---|---|---|
+| 1 | C-020 | "exactly THREE edit classes" in `rewrite_data_files.rs` | UNSATISFIABLE — genericising `pack_bins` breaks the template's own `cfg(test)` call sites, which must compile; a fourth, compelled, assertion-preserving class exists | G2 build; Critic RATIFIED the fourth class as compelled |
+| 2 | C-036 | a nine-recipe fixture enumeration | INCOMPLETE — recipes 10/11/12 needed; by C-036's own rule ("a pin needing a tenth recipe is a finding") this is a finding | G3 build |
+| 3 | C-036 | recipe 3 costs "~3.93 MB" | MEASURED `S = 4_739_051`, 20.5% over. The margin is sound (the window is scale-invariant in `S`); the cost figure was wrong | G3 measurement |
+| 4 | C-011 | disposition "RETAINED :399-406" | STALE — G3 rewrote that block into the `Vec<DataFile>` fan-out. The commit-ARITY proposition survives; the statement does not | G4 build |
+| 5 | C-011 | disposition "DELETED :225-226 (that guard's trailing comment)" | MISLABELS the region — at `51edcc2c` those lines are `group_matches_filter`'s LEADING comment; the guard and its comment were :220-224. Outcome right, label wrong, would double-count | G4 read at the base ref |
+| 6 | C-011 | the added input class names TWO `DataInvalid` mid-loop abort sites | OVER-STATES one — after G2 moved the filter to collection, `build_partition_evaluator` fires BEFORE any bin commits; only `write_compacted_file`'s is a genuine mid-loop abort | G4 build |
+| 7 | C-011 | `Verdict: PROVEN` with a pinning test, for a proposition whose conjuncts include "the base table is advanced after each bin commit" | That conjunct has **NO killing pin** — mutating `&table` → `&self.table` left G4's whole suite GREEN (3375 tests at G4's tip, G4's measurement, not re-run here), because `Transaction::do_commit` refreshes a stale base and re-applies. Now recorded as unpinnable-by-observation and perf-only | G4 mutation; was the G4 S2 blocker. BOUNDARY CASE — G4 filed it as a disclosure, not a "ledger disagreement"; counted here because a PROVEN verdict over an unpinnable conjunct is an over-claim by the charter |
+| 8 | C-040 | the pinning test is "written directly with `ParquetWriterBuilder`" | NOT LITERALLY CONSTRUCTIBLE — `ParquetWriter::close` DELETES a zero-row output and returns `Ok(vec![])`, the very fact the clause relies on elsewhere. A substitute (`ArrowWriter` over the same schema via the same `add_deletes` path) was built and proven genuine by two mutations | G4 build |
+| 9 | C-036 | the enumeration is complete after G3's extension to twelve | A THIRTEENTH recipe is needed — default-floor admissible bin (five sub-min entries, one partition, shipped defaults, no knobs), distinct from recipes 7 and 8; three tests already stand on it | G5 build; Critic verified distinctness |
+| 10 | C-036 | recipes 1 and 2 describe constructions the unit uses | They had **NEVER been built by any group** — `min_file_size_bytes(size ± 1)` was absent at HEAD. The enumeration assumed constructions that did not exist | G5 grep at HEAD |
+| 11 | C-014 | element 9's de-pinning ledger | STALE and in conflict with C-021 — dropping `enough_input_files`' `size > 1` conjunct reds EXACTLY ONE test of the 3378 in the lib suite (G5's measurement), so element 9's destination is occupied and obeying it literally duplicates a single-mutant pin. C-021 wins | G5 mutation |
+| 12 | C-013 / C-024 | the GEN-block citations `:358 … :430` | `+19` post-merge. They were EXACT at HEAD — THIS unit moved them — so "the ledger drifted" is the wrong framing. Same class as the matrix line-citation trap; anchors preferred | G5 read at source |
+| 13 | C-030 | fifteen elements addressed by line number | Addresses go STALE inside the unit's own lifetime. **Re-derived by G7, and the framing corrected:** `:374-377`, `:195` and `:199-200` were EXACT at the base ref `9f85a086` and point at unrelated text by `972b932c` — the unit's own G1–G3 PR moved them. Two spot-checked elements (`:44-46`, `:73-77`) did NOT move and stayed exact until G6 edited them, so "the enumeration carries stale addresses" is true of some elements, not of the enumeration | G6 doc pass; addresses independently re-derived by G7 across all four commits |
+| 14 | C-030 | fifteen elements, closed over its stated domain | SHORT of its own domain — the tests-file module rustdoc `:18` ("fewer, compacted pos-deletes") is in R-19's both-directions family and is not one of the fifteen | G5-8 raised, G6 adjudicated |
+| 15 | C-016 | "The unit's file manifest is CLOSED at nine files" (the MANIFEST half only — the ASF half is row 17, kept distinct so a reader re-deriving from statements gets 18, not 17) | WRONG — see C-016 above: 12 files touched, 8 of the 9 enumerated, 4 unenumerated, 1 enumerated-and-untouched | G6 as L-1 ("short by one" — itself wrong); re-derived and corrected by G7 |
+| 16 | brief §"One PR" / `todo.md` plan block / C-023 | "One PR, owner squash-merges" — one squash commit is the containment | The containment BROKE. Four PRs merged. G3-1's disclosure that the file would hold a CORRECT statement beside an INCORRECT one was ruled "acceptable within a single squash commit"; #208 merged G1–G3 to main WITHOUT G6's correction, so the INVERTED seq statement shipped to main. Verified by G7: the module head still read "A wrong (higher / inherited) seq … RESURRECTS deleted rows" at both `972b932c` and `77ddf5d4`, and was corrected only at `a4cdc419` | G6 as L-2; verified at all four commits by G7 |
+| 17 | C-016 | "it creates no new source file, so no new ASF header is required" | The INFERENCE is unsound — `.licenserc.yaml` requires the header on every `.md`, and the unit created three. Conclusion holds only because all three happen to carry one | G7, `--diff-filter=A` + `head -3` + `.licenserc.yaml` read at source |
+| 18 | C-009 | pins 1 and 2 are `test_output_rolls_at_java_write_max_file_size` and `test_write_max_file_size_clamps_to_java_long_max` | Neither name exists anywhere under `crates/`. The pins shipped as `test_config_write_max_file_size_default_is_java_write_max` and `test_config_write_max_file_size_clamps_to_java_long_max`, renamed by the ledger's own `test_config_*` rule (F-12) | G7, crate-wide grep |
+
+**Build non-conformances (a DIFFERENT population — the charter was right, the build deviated):** 4.
+
+| # | Clause | Deviation |
+|---|---|---|
+| N1 | C-023 | the pinned literal PR title is carried by 0 of the 4 merged PRs; #208/#209 carry no workstream tag at all (R3) |
+| N2 | C-017 | the chained commit command is not recorded verbatim in the PR body; the interop leg was not in every group's chain |
+| N3 | C-018 | the R7 pre-merge gate did not run in full — `make check-msrv`, `cargo deny check advisories` and (Docker-blocked) `make test` are unevidenced |
+| N4 | C-039 el. 1 | no group-of-eight leg; a stronger five-file boundary leg shipped instead, undisclosed until now |
+
+**Deliberately EXCLUDED from the 18, with reasons** — recorded so the boundary is checkable and so
+no future pass "re-finds" them:
+
+- **G3-1 (C-030's `:374-377` element "already discharged").** NOT a charter defect. The element was
+  correct when written; G3's own work discharged it in flight. Re-applying it would have
+  **RE-INVERTED a correct statement** — this is the over-correction failure mode, and it is why the
+  strike was ratified rather than the fix.
+- **G5-6 (C-021 elements 1 and 2 have no exclusive mutant).** A pin-STRENGTH disclosure recorded at
+  full width, not a false charter statement: C-021 never claimed exclusivity, and element 2 is
+  honestly a CLASS-COMPLETENESS pin.
+- **G5-7 (the C-021 catalogue re-run is not mechanically reproducible as reported).** A defect in a
+  GROUP REPORT, not in the charter. Kept as a method note: if that re-run is ever cited as evidence,
+  the extraction rule must be stated with it.
+- **G2-7, G4's `source() == None` observation, H1-3/4/5.** Pre-existing or outside this unit.
+
+### Residues opened by this close-out
+
+| # | Item | Home |
+|---|---|---|
+| R-G7-1 | C-017's pin (the chained commit command recorded verbatim in the PR body) is unmet for this unit | this section; nothing to fix retroactively |
+| R-G7-2 | the R7 pre-merge gate never ran in full — `make test` is Docker-blocked on this host, `make check-msrv` and `cargo deny check advisories` are unevidenced. This is the standing "Docker `make test` gap", now with a named instance | this section + `task/todo.md` |
+| R-G7-3 | R3 was violated by #208 and #209 (no workstream tag), and no merged PR title names the BREAKING flip | this section + `task/todo.md` |
+| R-G7-4 | `crates/iceberg/src/maintenance/mod.rs` — the sentence "Puffin V3 DELETION VECTORS are SKIPPED (file-scoped, never bin-packed) — V2 PARQUET only", at **:82-83** measured 2026-08-22 (G6-5 cited it as `:80-81`; that address was already stale when written — cite the text, not the line, and not a commit an amend can orphan) — names only Puffin V3 DVs where the action file, the test battery and matrix row R136 also name V2 ORC/Avro. **DEFERRED, not fixed:** the existing sentence ("V2 PARQUET only") is TRUE, so this is consistency, not accuracy — and re-editing a true sentence is exactly the over-correction failure this unit kept hitting (see G3-1). A future unit may widen it | `task/todo.md` |
+| R-G7-5 | **R2 vs the claim board's table shape.** R2 mandates six claim fields including "expected duration"; the board's table declares `Opened │ Workstream │ Repo │ Branch │ Files/dirs claimed │ Status`, and `grep -in duration` over the board as it stood BEFORE this unit's release text returned exactly one hit — R2's own prose at `:41`. No row has ever carried the field. (The command now returns two; the added hit is this finding's own prose, not a duration value.) Every "all six R2 fields" claim on this board is unmeetable as written. Reconcile R2's field list with the header in ONE change; a unilateral seventh column from inside a fork unit would be the wrong fix | `PrimarySync/Concurrency-Protocol.md` (its owner); recorded here and in this unit's release text |
