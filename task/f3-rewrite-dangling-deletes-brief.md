@@ -50,9 +50,11 @@ Every citation below is re-decoded first-hand in the ledger.
   RemoveDanglingDeletesSparkAction(spark, this.table).execute().removedDeleteFiles());
   result.withRemovedDeleteFilesCount(result.removedDeleteFilesCount() + n); }`. No exception table
   covers it.
-- `this.table` is the handle the commit manager already committed through, and
-  `BaseMetastoreTableOperations.commit` calls `requestRefresh()` (offset 83) after `doCommit`, so it
-  is CURRENT. Passing the loop's final committed table is 1:1, not a divergence.
+- `this.table` is the handle the commit manager already committed through, and every
+  `TableOperations.commit` implementation leaves it CURRENT — `BaseMetastoreTableOperations.commit`
+  calls `requestRefresh()` (offset 83) after `doCommit`, `HadoopTableOperations.commit` sets
+  `shouldRefresh` (offset 245), and `RESTTableOperations.commit` calls `updateCurrentMetadata`
+  (offset 262), so the conclusion is not metastore-specific. Passing the loop's final committed table is 1:1, not a divergence.
 
 ## The ask (delivered)
 

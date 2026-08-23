@@ -146,8 +146,11 @@
 //! 3. **The table handle.** Java passes `this.table` — the action's ORIGINAL handle, not a
 //!    separately reloaded one. That handle is nonetheless CURRENT: every group commit went through
 //!    the same handle (`commitManager(long)` constructs `RewriteDataFilesCommitManager` with
-//!    `this.table`), and `BaseMetastoreTableOperations.commit` calls `requestRefresh()` at
-//!    offset 83 after `doCommit`, so `this.table` observes the post-rewrite metadata. Passing the
+//!    `this.table`), and every `TableOperations.commit` implementation leaves that handle current:
+//!    `BaseMetastoreTableOperations.commit` calls `requestRefresh()` at offset 83 after `doCommit`,
+//!    `HadoopTableOperations.commit` sets `shouldRefresh` at offset 245 before its return, and
+//!    `RESTTableOperations.commit` calls `updateCurrentMetadata` at offset 262. So `this.table`
+//!    observes the post-rewrite metadata under every catalog family, not just the metastore one. Passing the
 //!    loop's final committed table here is therefore 1:1, not a divergence. (Java's refresh
 //!    re-reads the catalog and would additionally pick up a CONCURRENT third-party commit; this
 //!    port sees exactly the state its own last group commit produced — a narrower window, recorded
@@ -381,7 +384,9 @@ impl RewriteDataFiles {
     ///
     /// Returns a zero-count [`RewriteDataFilesResult`] and commits NOTHING when no file qualifies
     /// (the empty-plan no-op). Returns `Err` when a `sizeThresholds` precondition is violated, when
-    /// planning fails, or when a group's commit fails (no partial-progress tolerance).
+    /// planning fails, when a group's commit fails (no partial-progress tolerance), or when the
+    /// composed `remove-dangling-deletes` sub-action fails (Java propagates it the same way — see
+    /// the module docs).
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RewriteDataFilesResult> {
         let config = self.resolve_config()?;
 

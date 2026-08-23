@@ -127,8 +127,11 @@ Four rulings drop straight out:
 4. **The table handle is CURRENT, so passing the final committed table is 1:1.**
    `RewriteDataFilesSparkAction.commitManager(long)` constructs `RewriteDataFilesCommitManager` with
    `this.table` (offset 5: `getfield #147 table`), i.e. every group commit goes through the SAME
-   handle, and `BaseMetastoreTableOperations.commit` (`RT`) calls `requestRefresh()` at offset 83
-   right after `doCommit`. `RemoveDanglingDeletesSparkAction` itself does no refresh — its ctor only
+   handle, and every `TableOperations.commit` implementation leaves that handle current:
+   `BaseMetastoreTableOperations.commit` (`RT`) calls `requestRefresh()` at offset 83 right after
+   `doCommit`, `HadoopTableOperations.commit` sets `shouldRefresh` at offset 245 before its return,
+   and `RESTTableOperations.commit` calls `updateCurrentMetadata` at offset 262 — so the claim is
+   universal across catalog families, not metastore-only (independently re-decoded by the Critic). `RemoveDanglingDeletesSparkAction` itself does no refresh — its ctor only
    stores the table (offsets 0-10) and `findDanglingDeletes` reads `loadMetadataTable(table, ENTRIES)`
    — it does not need to, because the handle it is given is already post-commit.
 
@@ -286,7 +289,16 @@ panicked at crates/iceberg/src/maintenance/rewrite_data_files.rs:3130:9:
 - **M4** is the delete-corruption edge. It flips Java's STRICT `<` position-delete clause to `<=`,
   which makes the still-applicable same-sequence delete look dangling. The "nothing dangling" test
   catches it, so that test is pinning Java's exact predicate rather than merely observing a zero.
-- **Disclosed domination that remains.** In
+- **Domination that remains — NOT an exhaustive enumeration.** Each of the six mutations above
+  kills a DISTINCT assertion, so every load-bearing behaviour in this unit is pinned in isolation;
+  but many surrounding assertions are reached only after a stricter earlier one passes and are
+  therefore not independently proven. Beyond the two named below, the independent Critic enumerated
+  these: in `..._defaults_off` the `live_delete_file_paths`, `snapshots_before + 1` and `scan_rows`
+  assertions all sit behind the count assertion M1 kills first; in `..._nothing_dangling...` the
+  `live_delete_file_paths` and `scan_rows` assertions sit behind the count assertion M4 kills first;
+  and in `test_empty_plan_skips_the_dangling_step_entirely` all four post-`result == default()`
+  assertions are dominated by the one M3 trips. They are kept as documentation of the Java rule, not
+  claimed as independently proven. In
   `test_remove_dangling_deletes_on_removes_the_dangling_delete` the snapshot-count assertion
   (`snapshots_before + 2`) is reached only when both earlier assertions pass; no mutation in this set
   kills it in isolation. Its twin in
