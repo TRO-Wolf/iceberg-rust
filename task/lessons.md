@@ -983,3 +983,69 @@ both.
 - **DO NOT let a false claim in a comment survive because the code is right.** Several of these had
   correct production code and a lying comment. The comment is what the next maintainer will trust
   when deciding whether a change is safe, so it is load-bearing on its own.
+
+### 2026-08-22 — In a doc or governance pass every NUMBER is a hypothesis: re-derive it from source, never from the prose beside it — and check that the "correction" is not itself an over-correction
+
+- **DO re-derive every count, every line citation and every file list from git, from the file, or
+  from a run — in the same pass that writes it down — and state the POPULATION in the same sentence
+  as the number** ("12 of the 12 files this unit touched", not "twelve files").
+  *Why:* the `RewritePositionDeleteFiles` size-gate unit PRODUCED **four** false counts sharing
+  exactly ONE shape — a COUNT asserted next to a list that did not support it — and every one of
+  them survived Actor review **because the list was correct**. **Two** were caught by a Critic before merge —
+  items (1) and (3), neither of which ever appears at any of the four merge commits — and **two
+  reached main**: item (2) was live at `972b932c:497` (#208), rode #209, and was corrected only at
+  #212; item (4) landed at `51edcc2c` (#207) and is on main still. (This split is itself a corrected
+  count: the first correction said three-and-one, and was wrong. Re-derived per ref with
+  `git show <ref>:<file> | grep -c`.) The eye validates the list and takes
+  the count on trust. The four: (1) the action rustdoc's `# Deferred (loudly)` block put Java's
+  option domain at "8 keys", then said 5 were ported and "the other SIX" deferred — the domain is
+  ELEVEN; (2) the in-code flip set said "from 2 up every precondition passes", false at exactly
+  `target == i64::MAX`; (3) a filed follow-up enumerated FOUR inverted doc homes where the source
+  file has SEVEN; (4) clause C-016's "the manifest is CLOSED at nine files", where the measured union of
+  the four merged PRs is **12** — 8 of the 9 enumerated files touched, 1 enumerated file
+  (`task/lessons.md`) touched by zero commits, and 4 touched files absent from the enumeration.
+- **DO treat a correction to a count as a NEW count that needs its own derivation.**
+  *Why:* case (4)'s correction was also wrong. The doc group ruled C-016 "short by one" and named
+  the one file it had spotted; the manifest is short by FOUR and long by one. A correction inherits
+  none of the original's credibility — and "short by one" is exactly the shape that reads as
+  carefully measured.
+- **DO NOT "fix" a sentence before verifying it is actually false.**
+  *Why:* the same unit had to STRIKE a scheduled correction: two earlier groups had already fixed
+  the sentence the doc pass was told to fix, and re-applying it would have **RE-INVERTED a correct
+  statement** into a wrong one. The paired rules are not in tension — re-derive the number, and
+  re-derive the falsity — and the second is the one a governance pass skips, because "the plan says
+  fix it" feels like authority. It is a hypothesis too.
+- **DO check the count against the table you already wrote, three lines above the claim.**
+  *Why:* every one of these was refutable in seconds from an artifact already on the page.
+
+### 2026-08-22 — `AGENTS.md` is now the authoritative spine and `CLAUDE.md` a thin adapter: this file's three `CLAUDE.md` section citations resolve there
+
+- **DO read section citations of the form "CLAUDE.md §X" in entries dated before 2026-08-22 as
+  citations of the same section in [AGENTS.md](../AGENTS.md).** On 2026-08-22 the repository
+  contract moved: `AGENTS.md` went 88 → 410 lines and became the single authoritative contract
+  (read order, precedence, parity mandate, absolute prohibitions, engineering rules, working
+  conventions), and `CLAUDE.md` went 331 → 89 lines and became a Claude-only adapter that states, in
+  its own narrow wording, "no rule the spine does not already own" — it still carries the Claude
+  tier mapping, which AGENTS.md sanctions as tool mechanics. Both files still exist, so the LINKS
+  below still resolve — the SECTIONS they name no longer live where they point. This file is
+  append-only by its own protocol, so this is a dated supersession note rather than three in-place
+  edits. The three citations this file carried at the
+  time of writing, and their new homes:
+  - **line 90** — `[CLAUDE.md](../CLAUDE.md) *Absolute prohibitions*` → [AGENTS.md](../AGENTS.md)
+    "Absolute prohibitions".
+  - **line 696** — "`CLAUDE.md` §subagent_policy AC·OO" → **split.** The neutral rule (single agent
+    for the small stuff; a mandatory *independent* Critic on anything that ships; both roles at the
+    frontier tier) is [AGENTS.md](../AGENTS.md) `<subagent_policy>`. The concrete Opus–Opus tier
+    MAPPING that "AC·OO" names is still in [CLAUDE.md](../CLAUDE.md), which AGENTS.md explicitly
+    sanctions as tool mechanics. Cite the spine for the rule and the adapter for the tier.
+  - **line 804** — "in a repo where CLAUDE.md says the code wins over docs" →
+    [AGENTS.md](../AGENTS.md) `<map_md_navigation>` ("If the code and a `map.md` disagree, the code
+    wins").
+- **DO NOT accept "the rule moved" on assertion when an authority inversion happens — demand the
+  mechanical old-line accounting plus a scan-set provocation proof.**
+  *Why:* an authority inversion is **not a rename**. When a 331-line contract collapses to 89 lines,
+  the difference between "every rule was rehomed" and "a rule silently vanished" is invisible to
+  reading, and the reader who finds the new file coherent has checked nothing. What made this one
+  safe was that the reviewing agent enumerated **80 normative phrases across every rule family and
+  probed each against the new tree — 80 checked, 0 missing** — rather than reading the new spine and
+  agreeing with it. Apply the same bar to any future contract move, in either direction.
