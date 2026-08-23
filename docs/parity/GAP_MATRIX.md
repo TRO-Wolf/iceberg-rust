@@ -31,7 +31,7 @@
 - ❌ **missing** — not implemented
 
 > **Two ✅ bars — read the count accordingly (clarified 2026-06-16).** Per the parity mandate
-> ([CLAUDE.md](../CLAUDE.md)), a row the FORK actively flips to ✅ requires unit tests **and** a
+> ([AGENTS.md](../../AGENTS.md)), a row the FORK actively flips to ✅ requires unit tests **and** a
 > bidirectional Java interop round-trip. **Base-inherited upstream primitives** (data/eq-delete/partitioning
 > writers, the parquet reader, FileIO, transforms, name-mapping, `upgrade_format_version`, …) carry their ✅
 > on the weaker "implemented + usable" bar and are **exempt from the fork's interop requirement** — they
@@ -74,7 +74,7 @@
   write-engine actions, schema/partition/snapshot evolution, incremental scans, ORC/Avro data files,
   variant/geo/unknown types, catalog view ops, maintenance actions, encryption.
 - **Cell style (de-triplication pass, 2026-06-10):** this matrix is the ONLY status record (the
-  one-home-per-fact rule in [CLAUDE.md](../../CLAUDE.md)). Cells stay TERSE — Rust location, a 1–2
+  one-home-per-fact rule in [AGENTS.md](../../AGENTS.md)). Cells stay TERSE — Rust location, a 1–2
   sentence summary, flip dates, links. The full per-increment narratives the cells used to carry
   moved verbatim to [archive/2026-06_matrix-cell-narratives.md](archive/2026-06_matrix-cell-narratives.md)
   (grep by row Area). When a status flips: update the cell here, link evidence, write the narrative

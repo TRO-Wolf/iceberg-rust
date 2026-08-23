@@ -20,8 +20,8 @@
 # Testing contract
 
 The authoritative testing rules for this fork. The operating manuals ([skills/](../skills/)) and
-[CLAUDE.md](../CLAUDE.md) point here; read this **before any code change**. Where this file and
-[CLAUDE.md](../CLAUDE.md) disagree, CLAUDE.md wins.
+[AGENTS.md](../AGENTS.md) point here; read this **before any code change**. Where this file and
+[AGENTS.md](../AGENTS.md) disagree, AGENTS.md wins.
 
 The north star is **1:1 capability parity with Java `iceberg-core` / `iceberg-api`** (see
 [Roadmap.md](../Roadmap.md)). Tests exist to prove that parity and to keep it from regressing.
@@ -141,7 +141,7 @@ mutations of the production code make it fail.
 
 ## Verification commands (the Done gate)
 
-Run before declaring any change complete (canonical list in [CLAUDE.md](../CLAUDE.md) and the
+Run before declaring any change complete (canonical list in [AGENTS.md](../AGENTS.md) and the
 [skills/](../skills/) manuals):
 
 ```bash

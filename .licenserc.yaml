@@ -34,8 +34,17 @@ header:
     - "target"
     - "Cargo.lock"
     - ".github/PULL_REQUEST_TEMPLATE.md"
-    # Claude Code skill definition: YAML frontmatter must be the first line, so
-    # an ASF header comment cannot precede it. Companion SEPMO docs
-    # (binding-manifest.md, map.md, references/*) carry the header normally.
+    # Agent skill definitions: YAML frontmatter must be the first line, so an
+    # ASF header comment cannot precede it. Companion docs (binding-manifest.md,
+    # every map.md, references/*) carry the header normally.
     - "skills/sepmo/SKILL.md"
+    - ".agents/skills/rust-code-quality/SKILL.md"
+    - ".agents/skills/test-adequacy/SKILL.md"
+    # .claude/skills is a symlink to .agents/skills. This entry is REQUIRED, not
+    # cosmetic: skywalking-eyes' git path os.Stat's tree entries (following the
+    # link) and then os.ReadFile's them, so an un-ignored symlink-to-directory
+    # fails the whole job with EISDIR before any header is examined. Every skill
+    # file is still checked at its canonical .agents/skills/** path. Do not
+    # delete this as redundant.
+    - ".claude/skills"
   comment: on-failure

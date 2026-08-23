@@ -919,7 +919,7 @@ impl Predicate {
     ///
     /// De Morgan's laws push the negation through every `AND`/`OR` level, so the walk is as deep
     /// as the tree. It is written as an **in-place, explicit-stack** rewrite rather than a
-    /// recursion (CLAUDE.md "Recursion" rule, second alternative): `negate` is infallible and
+    /// recursion (AGENTS.md "Crate code — recursion safety", second alternative): `negate` is infallible and
     /// public, so it has no way to report a depth error, and a recursive form would abort the
     /// process on a deep hand-built or deserialized tree.
     pub fn negate(mut self) -> Predicate {

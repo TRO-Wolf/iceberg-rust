@@ -49,7 +49,7 @@ exceptions = [
 unmaintained = "workspace"
 # Known advisories in the pinned lockfile. Originally recorded 2026-07-10 (audit remediation
 # Tier 3); RE-AUDITED 2026-08-22 against the live lockfile and the advisory DB. Dependency bumps
-# are out of policy for routine work (see CLAUDE.md); each entry below is a deliberate, dated
+# are out of policy for routine work (see AGENTS.md); each entry below is a deliberate, dated
 # acceptance — remove it when the affected crate is cleared. New advisories NOT in this list fail
 # the gate.
 #
