@@ -1049,3 +1049,32 @@ both.
   safe was that the reviewing agent enumerated **80 normative phrases across every rule family and
   probed each against the new tree — 80 checked, 0 missing** — rather than reading the new spine and
   agreeing with it. Apply the same bar to any future contract move, in either direction.
+
+### 2026-08-23 — The one-`&&`-chain gate rule is silently defeated by ANY pipe inside the chain: the shell reports the LAST command's status, not the gate's
+
+Context (F-2, `CleanupReport` by content type): the repo rule "chain the verification gate to the
+commit in ONE `&&` chain" was followed to the letter — `typos . && cargo fmt --all -- --check &&
+cargo clippy … && cargo test -p iceberg --lib | tail -5 && make check-matrix-anchors && git add …
+&& git commit …` — and was nonetheless **not a gate**. The `| tail -5`, added purely to keep the
+output readable, made the shell evaluate `tail`'s exit status for that link. `tail` succeeds on any
+input, so a suite with failures would have printed its failures and the chain would have marched on
+to `git commit` regardless. The commit that shipped was not false-green (the identical gate re-run
+unpiped was exit 0), but the chain as executed could not have stopped it.
+
+This is a new failure mode of an ALREADY-PROMOTED rule, and it generalizes: the rule's wording
+polices the CONNECTIVE (`&&` vs newline) and is blind to the PIPE, which is the more natural thing
+to reach for and just as fatal. `set -euo pipefail` does not help either — `pipefail` is not on by
+default in a non-interactive `bash -c`, and `set -e` is irrelevant inside an `&&` chain.
+
+- **DO NOT put a pipe anywhere inside a gate-to-commit chain** — not `| tail`, not `| grep`, not
+  `| head`. Redirect to a file and inspect it after (`cargo test … > /tmp/gate.txt 2>&1`), or accept
+  the full output. The verbosity is the price of the gate being real.
+- **DO run `set -o pipefail` explicitly first** if a pipe is genuinely unavoidable in the chain, and
+  say in the report that you did — a chain containing a pipe without it is not a gate, however many
+  `&&`s it has.
+- **DO prove the chain observed the real status, not just that the artifacts are green.** Capture
+  the gate command's own `$?` (or make the failing leg's status visible) rather than reasoning from
+  the printed "0 failed". "The tree is green" and "the gate would have caught it" are different
+  claims, and only the second is what the rule buys.
+- **DO NOT amend the commit to repair this.** A pipe-weakened chain over a genuinely green tree is a
+  PROCESS defect, not a commit defect; re-verify unpiped, disclose it, and fix the habit.

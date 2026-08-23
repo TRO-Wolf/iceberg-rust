@@ -169,7 +169,7 @@
 //! - `cleanExpiredMetadata` (unreachable spec/schema pruning) — same deferral as B1.
 //! - Java interop evidence for the cleanup (the GAP_MATRIX row stays 🟡).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use futures::future::BoxFuture;
 
@@ -229,7 +229,15 @@ pub struct CleanupFailure {
 /// ([`Self::deleted_data_files`] / [`Self::deleted_position_delete_files`] /
 /// [`Self::deleted_equality_delete_files`]) — Spark's three per-content-type
 /// `expire_snapshots` columns.
+///
+/// **`#[non_exhaustive]`:** this report is produced by the cleanup and READ by callers, never
+/// built by them, and it gains a funnel whenever the cleanup learns to report one. Downstream
+/// crates therefore construct it — in the rare case they need to, e.g. a test double — as
+/// `CleanupReport::default()` followed by field assignment, which keeps compiling as fields are
+/// added; cross-crate struct-literal construction (exhaustive or `..Default::default()`) and
+/// exhaustive destructuring are deliberately closed off so no future funnel breaks a consumer.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct CleanupReport {
     /// Deleted content files: data files, position/equality delete files, deletion-vector
     /// puffins (Java's `"data"` funnel — its `readPaths` walk emits all three classes).
@@ -246,10 +254,10 @@ pub struct CleanupReport {
     /// produced the union (the classification is `ManifestEntry::content_type()`, Java
     /// `ContentFile.content()`), so its key set equals the union's element set.
     ///
-    /// Consumers should read it through the typed accessors rather than directly; it is public
-    /// only so the struct stays constructible field-by-field, as it was before this field
-    /// existed.
-    pub deleted_content_file_types: HashMap<String, DataContentType>,
+    /// Consumers should read it through the typed accessors rather than directly. A
+    /// [`BTreeMap`], not a hash map, so the field — and therefore the derived [`Debug`]
+    /// rendering of the whole report — has a deterministic, path-sorted order.
+    pub deleted_content_file_types: BTreeMap<String, DataContentType>,
     /// Deleted manifest files (data and delete manifests).
     pub deleted_manifests: Vec<String>,
     /// Deleted manifest-list files.

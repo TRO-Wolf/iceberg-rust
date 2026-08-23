@@ -48,8 +48,17 @@ in `ExpireSnapshotsProcedure`'s `static {}` block **every one of the six pushes 
 | 1 | `deleted_position_delete_files_count` | 132–146 | `142: iconst_1` | **true** |
 | 2 | `deleted_equality_delete_files_count` | 152–166 | `162: iconst_1` | **true** |
 | 3 | `deleted_manifest_files_count` | 172–186 | `182: iconst_1` | **true** |
-| 4 | `deleted_manifest_lists_count` | 202 (`ldc_w #299`) –206 | `202: iconst_1` | **true** |
+| 4 | `deleted_manifest_lists_count` | 192–206 | `202: iconst_1` | **true** |
 | 5 | `deleted_statistics_files_count` | 212–226 | `222: iconst_1` | **true** |
+
+Every row's "ctor site" column is `new #280` offset – `invokespecial #290` offset, re-derived
+from the `static {}` disassembly (the six `new #280` sites are at 112 / 132 / 152 / 172 / 192 /
+212 and the six `invokespecial #290` at 126 / 146 / 166 / 186 / 206 / 226). _Corrected 2026-08-23
+(Critic F4): row 4 previously read `202 (ldc_w #299) –206`, which misstated the site start and
+misattributed the string load. Re-derived from the bytecode, not from the wrong number: `new
+#280` is at **192**, `ldc_w #299` at 196, `iconst_1` at 202, `invokespecial #290` at 206 — so the
+site is **192–206**, which is also the only rendering consistent with the other five rows. The
+load-bearing column (`202: iconst_1`) and the finding were correct throughout._
 
 **Finding: all six columns are NULLABLE (`nullable = true`) in Java 1.10.0.** Population is
 6 of 6 — the population is the six `StructField` constructions in `OUTPUT_TYPE`, and there are no
@@ -92,7 +101,15 @@ deleted by this module at all — `cleanExpiredMetadata` is deferred, see §5).
 ### 1.4 Item §2a — the deletion-vector question, pinned
 
 **A DV puffin is counted as a POSITION delete.** Evidence chain, all re-run this session:
-`toFileInfo` tags by `content()` alone and never touches `format()`; `DeleteSummary.deletedFile`
+`toFileInfo` tags by `content()` alone and never touches `format()`;
+
+_Strengthened 2026-08-23 (Critic), and re-derived here independently rather than taken on report:_
+the format is not merely unused — **it is never read off disk.** `ReadManifest.entries` builds its
+projection at offsets 38–53 as `ImmutableList.of(DataFile.FILE_PATH.name(), DataFile.CONTENT.name())`
+— exactly two columns — and pushes it through `ManifestReader.select(Collection)` on BOTH branches
+of the `ManifestContent` switch (`ManifestFiles.read` for DATA at 88, `readDeleteManifest` for
+DELETES at 112). `file_format` is not in the projection, so Java could not classify by format even
+if `toFileInfo` wanted to. This makes the DV ruling stronger than the brief stated it; `DeleteSummary.deletedFile`
 dispatches that string against `FileContent.POSITION_DELETES.name()`; a DV is a `DeleteFile`
 whose `content()` is `POSITION_DELETES`. Therefore **DVs are NOT separable from Parquet position
 deletes in Spark's counts**, and there is no fourth bucket. Pinned by
@@ -142,24 +159,64 @@ permit a silent desync):
 - The union could not be made derived: `deleted_content_files` is a `pub` field an external
   consumer compiles against, so it must remain a field of that name and type.
 
-Why `deleted_content_file_types` is `pub` rather than private: a private field would make
-`CleanupReport { .. }` literal construction (and functional-update syntax) impossible for any
-downstream crate. Keeping it public preserves constructibility. Its doc comment states plainly
-that it is a type lookup, that membership authority is the union, and that consumers should read
-it through the accessors.
+Why `deleted_content_file_types` is `pub` rather than private: a private field would make the
+struct opaque to any downstream reader that wants the raw classification. Its doc comment states
+plainly that it is a type lookup, that membership authority is the union, and that consumers
+should read it through the accessors.
 
-**Known, accepted API consequence (call it out for the repin):** adding *any* field breaks an
-exhaustive struct-literal construction `CleanupReport { a, b, c, d, e }` of this struct. Code that
-only *reads* the report — which is what the engine does — is unaffected. Nothing in this
-workspace constructs it by literal outside `expire_cleanup.rs`.
+### 2.1 `#[non_exhaustive]` — ADOPTED (Critic F1)
+
+_Ruled 2026-08-23. The first draft of this ledger reasoned about `pub` vs private on the new field
+and never evaluated `#[non_exhaustive]` at all; the Critic was right that this commit is the only
+free moment for it._
+
+`CleanupReport` now carries `#[non_exhaustive]`. The reasoning:
+
+- Adding a field already imposes the exhaustive-struct-literal break on downstream code **exactly
+  once, in this commit**. Adopting `#[non_exhaustive]` now folds the "you may not write an
+  exhaustive literal" contract into a break the consumer is taking anyway. Every future funnel or
+  classification the cleanup learns to report is then additive for free. Deferring the attribute
+  means paying a second, avoidable break later.
+- The direction of this type is one-way: the cleanup PRODUCES the report and callers READ it.
+  Nothing in this workspace constructs it outside `expire_cleanup.rs`, and the handoff names it an
+  engine-**consumed** surface. Same-crate construction is entirely unaffected by the attribute.
+- There is a real escape hatch, so "closed off" does not mean "impossible": a downstream crate that
+  genuinely needs to build one (a test double, say) writes `let mut r = CleanupReport::default();
+  r.deleted_content_files = …;`. `Default` is derived, the fields are `pub`, and that spelling
+  keeps compiling as fields are added — which is precisely the property the attribute is buying.
+
+**The cost, stated rather than glossed:** `#[non_exhaustive]` closes off cross-crate functional
+update syntax (`CleanupReport { x, ..Default::default() }`) and exhaustive destructuring, neither
+of which the bare field addition would have broken. **I cannot verify the engine's actual usage —
+it is not in this workspace and was not compiled against this branch** (§7). If the engine happens
+to build the report with `..Default::default()`, this attribute breaks it where the field addition
+alone would not have, and the fix is the two-line `default()`-plus-assignment spelling above. I am
+taking that risk deliberately, on the handoff's "consumed" wording plus the escape hatch, and
+flagging it here so the repin unit sees it before it compiles rather than after.
+
+### 2.2 The lookup is a `BTreeMap`, not a `HashMap` (Critic F2)
+
+_Changed 2026-08-23._ The lookup is built from a `BTreeMap` and only ever `.get()`, so the swap is
+free at the point of use — and a `pub` field's type is free to change now and a breaking change
+forever after. It buys two things:
+
+- **Deterministic iteration**, retiring what §7 of the first draft disclosed as an unfixed wart.
+- **Deterministic `Debug` rendering.** `CleanupReport` derives `Debug`, so a hash-ordered field
+  would have made the whole report's `Debug` output unstable — enough to flake a downstream
+  `Debug`-snapshot assertion. That consequence was undisclosed in the first draft; the Critic
+  caught it. Fixing it beat documenting it.
+
+**Both changes are shape changes, so the full mutation set was RE-RUN against the new shape** (§4)
+rather than inherited: 6 of 6 caught, with reddened-test sets identical to the pre-change run.
 
 ## 3. What changed
 
 | File | Change |
 |---|---|
-| `crates/iceberg/src/transaction/expire_cleanup.rs` | Walk carries `DataContentType`: `content_files_to_delete` is now `BTreeMap<String, DataContentType>` (was `BTreeSet<String>`); the retained-side `.remove(path)` subtraction and the fail-closed `.clear()` are byte-for-byte the same calls on the map. Sweep unchanged (it now takes `map.keys()`, an identical sorted set). New field `deleted_content_file_types` + four derived accessors. Module doc + struct doc updated. Six new/refactored tests. |
+| `crates/iceberg/src/transaction/expire_cleanup.rs` | Walk carries `DataContentType`: `content_files_to_delete` is now `BTreeMap<String, DataContentType>` (was `BTreeSet<String>`); the retained-side `.remove(path)` subtraction and the fail-closed `.clear()` are byte-for-byte the same calls on the map. Sweep unchanged (it now takes `map.keys()`, an identical sorted set). New field `deleted_content_file_types: BTreeMap<String, DataContentType>` + four derived accessors; the struct gains `#[non_exhaustive]`. Module doc + struct doc updated. Six new/refactored tests. |
 | `crates/iceberg/src/transaction/map.md` | `expire_cleanup.rs` row now describes the typed views and the DV-is-a-position-delete rule. |
 | `docs/parity/GAP_MATRIX.md` | R133 status cell: dated 2026-08-23 sentence on the additive split. `make check-matrix-anchors` green (79 rows, 5-pipe audit OK). |
+| `task/lessons.md` | Dated 2026-08-23 entry: the one-`&&`-chain gate rule is silently defeated by any pipe inside the chain (Critic F3 — appended per the file's append-only protocol, superseding nothing). |
 | `task/f2-cleanup-report-by-content-ledger.md` | This file. |
 
 Deliverable A is satisfied at the level the brief specified: classification is threaded from the
@@ -178,14 +235,28 @@ and `test_unreadable_candidate_manifest_skips_its_files_but_still_dies` are unto
 
 ## 4. Mutation table
 
-**M = 5. The population is the five behaviour knobs this change introduces or newly relies on:**
+**M = 6. The population is the six behaviour knobs this change introduces or newly relies on:**
 (1) the classification VALUE recorded at the walk's insert site; (2) the filter that restricts the
 recorded lookup to successfully-deleted paths; (3) the fail-closed `content_files_to_delete
 .clear()`; (4) whether classification may consult the file FORMAT; (5) the derivation DIRECTION
-(views filtered from the union vs. read off the lookup). **Result: 5 of 5 caught.**
+(views filtered from the union vs. read off the lookup); (6) the POINT IN TIME the lookup is
+snapshotted at, relative to the fail-closed clear. **Result: 6 of 6 caught.**
 
-Each mutation was applied **individually** (file restored from a pristine copy between every run)
-and the whole `transaction::expire_cleanup` module — 21 tests — was executed each time.
+**M is author-enumerated, and that is a structural weakness of this convention, not a formality.**
+Because the author picks the denominator, an "N of M" computed this way can never read below 100%:
+it measures the completeness of *my enumeration*, not of the change's behaviour space. So treat
+M as a **hypothesis about coverage**, refutable by anyone who names a knob the list omits — and it
+was refuted here. Knob (6) and its mutation **Mu6 are the independent Critic's**, not mine: the
+first draft shipped M = 5 with knob (6) missing, and the Critic wrote the mutation that exposed it.
+The honest reading of the table below is therefore "6 of 6 against an enumeration that has already
+been shown incomplete once."
+
+Each mutation was applied **individually** (file restored with a plain `cp` from a pristine copy
+between every run — never `cp -p`, per the 2026-08-08 lesson; every run recompiled) and the whole
+`transaction::expire_cleanup` module — 21 tests — was executed each time. The whole set was run
+TWICE: once against the original shape, and again after the `#[non_exhaustive]` + `BTreeMap`
+changes of §2.1/§2.2. **The reddened-test sets were identical across both runs**, so the shape
+change invalidated no invariant proof.
 
 | # | Mutation (one knob) | Tests reddened | Verdict |
 |---|---|---|---|
@@ -194,6 +265,7 @@ and the whole `transaction::expire_cleanup` module — 21 tests — was executed
 | Mu3 | fail-closed `content_files_to_delete.clear()` deleted | `..spares_all_content_files` (pre-existing), `..spares_every_typed_content_view` (2 of 21) | CAUGHT |
 | Mu4 | format-sniff: a `Puffin`-format entry classified `EqualityDeletes` (the forbidden "DVs are their own class" reflex) | `..deletion_vector_puffin_is_counted_as_a_position_delete..` **only** (1 of 21) | CAUGHT |
 | Mu5 | classification stored INDEPENDENTLY: lookup populated from the pre-clear walk, views read off the lookup's keys instead of filtering the union | `..spares_every_typed_content_view` **only** (1 of 21) | CAUGHT |
+| Mu6 **(Critic-authored)** | lookup built from a snapshot taken BEFORE the fail-closed `clear()`; views still correctly derived from the union | `..spares_every_typed_content_view` **only** (1 of 21), failing at the lookup-emptiness assertion specifically | CAUGHT |
 
 Notes, stated because a mutation table that hides them is worthless:
 
@@ -213,6 +285,14 @@ Notes, stated because a mutation table that hides them is worthless:
   leaves the union fail-closed test GREEN and reddens only the typed one, which is exactly the
   defect class ("the parts say files died; the union says none did") the derived shape exists to
   prevent.
+- **Mu6 is the answer to a question the first draft did not ask.** Hunting for an undisclosed
+  dominated assertion, the Critic identified the lookup-emptiness assertion in the typed
+  fail-closed test as the only candidate, then wrote a mutation that isolates it: with the lookup
+  snapshotted pre-`clear()` but the views still derived from the union, all three typed views stay
+  correctly empty and ONLY the lookup-emptiness assertion fires. Reproduced here — one test fails,
+  at `expire_cleanup.rs:2054`, reporting the two leaked classifications. So that assertion is live
+  and independently covered, and the coverage is **broader** than the first draft claimed rather
+  than narrower.
 - Every new test asserts a **pre-flight** on its own fixture (the funnel really contains the
   files, or the retained-manifest read really failed) before asserting the property, so none can
   pass vacuously on an empty report.
@@ -239,9 +319,20 @@ sorted, and still cleared to empty by the fail-closed retained-manifest path. `d
 and `CleanupFailureKind` are untouched. The change is purely additive: one new public field
 (`deleted_content_file_types`) and four new accessor methods.
 
-The one API caveat the repin unit should know (§2): adding a field means an exhaustive
-`CleanupReport { .. }` **struct-literal construction** no longer compiles. Reading the report —
-the engine's usage — is unaffected.
+**The API caveats the repin unit must know, in one place (see §2.1/§2.2 for the reasoning):**
+
+1. The struct now carries **`#[non_exhaustive]`**. Cross-crate **struct-literal construction** of a
+   `CleanupReport` no longer compiles — neither the exhaustive form nor
+   `..Default::default()` — and neither does exhaustive destructuring. The supported spelling is
+   `CleanupReport::default()` followed by field assignment, which is stable against every future
+   field. **Reading the report — the engine's usage per the handoff — is entirely unaffected**, and
+   that is the whole premise the attribute was adopted on.
+2. The new `deleted_content_file_types` field is a **`BTreeMap`**, so both it and the derived
+   `Debug` rendering of the whole report are deterministically path-ordered. No previously-existing
+   part of the `Debug` output changed shape; the report simply gained one ordered field.
+
+Neither caveat touches an existing field. The first is a construction-site change and applies only
+to code that BUILDS a report; nothing in this workspace does so outside `expire_cleanup.rs`.
 
 ## 7. What could NOT be verified
 
@@ -254,6 +345,51 @@ the engine's usage — is unaffected.
   §6 is derived from reading the diff, not from building the consumer.
 - **`ic-core-1.10.0.jar` was not consulted** for this unit; the `ReachableFileCleanup` set-algebra
   claims quoted in the module docs are inherited from the earlier increment and were not re-derived.
-- The `HashMap` iteration order of `deleted_content_file_types` is unspecified; determinism is
-  guaranteed only for the union and the accessors (which iterate the sorted union). Anyone
-  iterating the field directly gets a nondeterministic order — documented, not defended by a test.
+- **The `#[non_exhaustive]` risk is unmeasured.** §2.1 adopts it on the premise that the engine
+  only reads the report. That premise comes from the handoff's wording, NOT from compiling the
+  engine, and `#[non_exhaustive]` breaks a construction spelling (`..Default::default()`) that the
+  bare field addition would have left working. If the premise is wrong, this is the line that
+  breaks the repin. _Superseded 2026-08-23: the first draft's disclosure here — that
+  `deleted_content_file_types`' `HashMap` iteration order was unspecified — no longer applies; the
+  field is a `BTreeMap` (§2.2) and is deterministically ordered._
+- **Determinism of the ordered field is not defended by a test.** The `BTreeMap` gives it by
+  construction, and the accessors' ordering is covered (they iterate the sorted union), but no test
+  asserts the raw field's iteration order or the report's `Debug` shape.
+
+## 8. Critic pass — 2026-08-23
+
+The independent Critic returned **CONVERGED** (no S1, no S2) on the commit `78fa0772`. It
+re-decompiled the oracle from scratch, reproduced all five original mutations with **identical
+reddened-test sets**, could not break the shape invariants, and confirmed all three of §4's
+self-disclosures under execution. It raised five S3/S4 findings; this section records the
+disposition of each, and all five were acted on.
+
+| # | Finding | Disposition |
+|---|---|---|
+| F1 | `#[non_exhaustive]` never evaluated — free only in this commit | **ADOPTED.** Ruling + the unmeasured risk in §2.1; caveat in §6; residual risk in §7 |
+| F2 | make the lookup a `BTreeMap` (kills the §7 nondeterminism AND an undisclosed `Debug`-shape flake) | **SWAPPED.** §2.2; §6 caveat 2; the stale §7 bullet superseded in place with a dated note |
+| F3 | the gate-pipe flaw is a PROCESS defect, not a commit defect — write it to `task/lessons.md` | **APPENDED** dated 2026-08-23, per that file's append-only protocol. No commit redone, no amend |
+| F4 | wrong bytecode offset in §1.2 row 4 | **CORRECTED** to `192–206`, re-derived from the disassembly with the whole six-site derivation now shown; the wrong number was not "adjusted" |
+| F5 | name the M-population convention as a hypothesis; fold in Mu6 | **DONE.** §4 now states M is author-enumerated and was already refuted once, and credits Mu6 to the Critic |
+
+Two of these are corrections to claims the first draft made, and are called out as such rather than
+quietly overwritten: the §1.2 offset (F4) and the §7 `HashMap` disclosure (F2, now superseded with a
+dated note). One is an addition of coverage I did not know I had (Mu6 / F5). The `#[non_exhaustive]`
+adoption (F1) is a new deliberate risk, taken with its premise and its escape hatch both stated.
+
+**Doc sites inspected during this pass and deliberately LEFT ALONE** (each already true; editing
+would have made it false):
+
+- §6's core sentence — "No existing field of `CleanupReport` changed name, type, or population
+  semantics. None." — is **still exactly true** after F1/F2. `deleted_content_file_types` is a NEW
+  field, absent at the pinned rev, so choosing its type is not a change to an existing field, and
+  `#[non_exhaustive]` is a struct attribute that alters construction sites, not any field's name,
+  type, or population. Only the caveat paragraph beneath it needed rewriting.
+- §1.2's finding, table flags, and population statement (all six nullable, 6 of 6) — F4 touched the
+  offset column of one row and nothing else.
+- §4's three original self-disclosures (the dominance refactor, the DV test's dominated invariant
+  call, Mu3's non-uniqueness) — the Critic verified all three by execution; they stand verbatim.
+- `crates/iceberg/src/transaction/map.md`, `docs/parity/GAP_MATRIX.md` R133, and the module docs —
+  none names the lookup's concrete map type or the construction contract, so `BTreeMap` and
+  `#[non_exhaustive]` leave every sentence in them true. Re-read to confirm rather than assumed.
+- The archives and `dev/java-interop/map.md`, per the first commit's report — unchanged.
