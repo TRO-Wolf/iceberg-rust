@@ -259,7 +259,7 @@ pub(crate) fn is_deletion_vector(data_file: &DataFile) -> bool {
 /// as in Java (which compares the raw bound `ByteBuffer`s and decodes with the `file_path` column's
 /// string type). Bound TRUNCATION cannot forge a match: a truncated lower bound is shortened and the
 /// matching upper bound is rounded UP, so the two are equal only when both are the full value.
-pub(crate) fn referenced_data_file_location(delete_file: &DataFile) -> Option<String> {
+pub fn referenced_data_file_location(delete_file: &DataFile) -> Option<String> {
     if delete_file.content_type() == DataContentType::EqualityDeletes {
         return None;
     }
@@ -1510,7 +1510,9 @@ mod tests {
         let spec_id = 1;
         let data_file = build_partitioned_data_file(&partition, spec_id);
 
-        let invalid_dv = DataFileBuilder::default()
+        // `DataFileBuilder` now refuses this shape, so build a valid DV and strip the field. Only the
+        // manifest READ path can produce it — it decodes into a struct literal, not the builder.
+        let mut invalid_dv = DataFileBuilder::default()
             .file_path("orphan-deletes.puffin".to_string())
             .file_format(DataFileFormat::Puffin)
             .content(DataContentType::PositionDeletes)
@@ -1518,8 +1520,12 @@ mod tests {
             .partition(partition.clone())
             .partition_spec_id(spec_id)
             .file_size_in_bytes(100)
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(40))
+            .referenced_data_file(Some("placeholder.parquet".to_string()))
             .build()
             .unwrap();
+        invalid_dv.referenced_data_file = None;
 
         let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(2, &invalid_dv).into(),

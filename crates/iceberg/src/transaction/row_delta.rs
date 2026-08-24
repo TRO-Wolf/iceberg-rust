@@ -148,10 +148,12 @@
 //! **Out of scope (deferred — the NEXT increment):**
 //! - Equality-delete WRITER end-to-end (the writer exists; the RowDelta-with-equality-deletes scan
 //!   application may have gaps — the end-to-end test focuses on POSITION deletes).
-//! - The WRITER-side previous-deletes MERGE for deletion vectors (`BaseDVFileWriter.loadPreviousDeletes`
-//!   reading + unioning the old positions into the new DV) — the apply-side removal here is the commit-path
-//!   half; the writer hook that auto-merges is the next increment. (The DV WRITE path itself — `DVFileWriter`
-//!   → `add_deletes` → commit → scan, plus `remove_deletes` of a superseded DV — is supported now.)
+//! - Merging a legacy PARQUET position delete into a new DV. Java `loadPreviousDeletes` unions
+//!   whatever covers the data file; this port reads DVs only, so a data file still covered by a
+//!   parquet position delete is refused here. GAP_MATRIX row R114 carries the residue.
+//!   (Merging a previous DV is NO LONGER deferred — `delete_vector::load_delete_vector` +
+//!   `DVFileWriter::with_previous_deletes` + `remove_deletes_many` do it, and the DataFusion V3
+//!   merge-on-read path drives them.)
 //!
 //! (Apply-side `removeRows` data-file removal is NO LONGER deferred — it landed here; see the apply-side
 //! removal note above.)
@@ -162,7 +164,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::delete_file_index::is_deletion_vector;
+use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};
 use crate::error::Result;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::{Bind, Predicate};
@@ -756,11 +758,13 @@ impl RowDeltaAction {
                             ErrorKind::DataInvalid,
                             format!(
                                 "Cannot commit deletion vector for {}: the current snapshot already \
-                                 carries a live deletion vector for that data file ({}). Merging \
-                                 previous deletes into the new DV and removing the old delete file \
-                                 (Java BaseDVFileWriter.loadPreviousDeletes + RowDelta.removeDeletes) \
-                                 is deferred in this port; committing would leave two DVs for one data \
-                                 file, which the scan rejects",
+                                 carries a live deletion vector for that data file ({}). Read it \
+                                 back with delete_vector::load_delete_vector, merge it through \
+                                 DVFileWriter::with_previous_deletes, and pass the superseded file \
+                                 to RowDelta::remove_deletes_many in THIS commit (Java \
+                                 BaseDVFileWriter.loadPreviousDeletes + RowDelta.removeDeletes). \
+                                 Committing as-is would leave two DVs for one data file, which the \
+                                 scan rejects",
                                 referenced,
                                 dv_desc(existing)
                             ),
@@ -780,7 +784,13 @@ impl RowDeltaAction {
                         else {
                             continue;
                         };
-                        let scope_matches = match existing.referenced_data_file() {
+                        // The SHARED derivation (Java `ContentFileUtil.referencedDataFile`): a
+                        // delete with equal `file_path` bounds names its data file even with the
+                        // field unset, which is how virtually every Java-written file-granularity
+                        // position delete is recognised. Reading the field alone left that whole
+                        // class treated as partition-scoped, so a bounds-scoped delete stamped
+                        // under another spec passed this door and was superseded by the DV.
+                        let scope_matches = match referenced_data_file_location(existing) {
                             Some(path) => &path == referenced,
                             None => {
                                 existing.partition_spec_id == *data_spec_id
@@ -1219,6 +1229,7 @@ mod tests {
     use crate::delete_vector::DeleteVector;
     use crate::expr::Reference;
     use crate::memory::tests::new_memory_catalog;
+    use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
     use crate::scan::FileScanTaskDeleteFile;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal,
@@ -4710,7 +4721,7 @@ mod tests {
         .await;
 
         // A Puffin delete file with NO referenced_data_file ⇒ malformed DV.
-        let malformed_dv = DataFileBuilder::default()
+        let mut malformed_dv = DataFileBuilder::default()
             .content(DataContentType::PositionDeletes)
             .file_path("test/bad-dv.puffin".to_string())
             .file_format(DataFileFormat::Puffin)
@@ -4720,8 +4731,11 @@ mod tests {
             .partition(Struct::from_iter([Some(Literal::long(0))]))
             .content_offset(Some(4))
             .content_size_in_bytes(Some(40))
+            .referenced_data_file(Some("placeholder.parquet".to_string()))
             .build()
             .unwrap();
+        // The builder refuses this shape now; only a decoded manifest entry can carry it.
+        malformed_dv.referenced_data_file = None;
 
         let tx = Transaction::new(&table);
         let action = tx
@@ -4897,13 +4911,86 @@ mod tests {
     // succeeds`.
     // ============================================================================================
 
+    /// Risk pinned: a BOUNDS-scoped position delete escaping the door. Java's
+    /// `PositionDeleteWriter.close()` never sets `referenced_data_file`; it only leaves equal
+    /// `file_path` bounds, so that is how virtually every Java-written file-granularity delete
+    /// names its data file. Reading the field alone treated the whole class as partition-scoped,
+    /// and a delete stamped under ANOTHER spec then passed the door — Spark's default write
+    /// granularity is FILE, so a mismatched stamp is routine. The DV would supersede it at read
+    /// time and its rows would come back.
+    #[tokio::test]
+    async fn test_row_delta_dv_over_bounds_scoped_position_delete_is_rejected() {
+        use crate::spec::FormatVersion;
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![synthetic_data_file(
+            "test/a.parquet",
+            0,
+        )])
+        .await;
+
+        // A position delete that names test/a.parquet ONLY through equal file_path bounds, and is
+        // stamped under a partition the data file does not share (legal on V2).
+        let bounds_scoped = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("test/a-pos.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(999))]))
+            .lower_bounds(HashMap::from([(
+                RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                Datum::string("test/a.parquet"),
+            )]))
+            .upper_bounds(HashMap::from([(
+                RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                Datum::string("test/a.parquet"),
+            )]))
+            .build()
+            .unwrap();
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![bounds_scoped]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Upgrade to V3 — the parquet position delete stays live.
+        let tx = Transaction::new(&table);
+        let action = tx
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V3);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // A DV for the same data file must be refused: it would silently supersede that delete.
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(vec![synthetic_dv_file(
+            "test/a-dv.puffin",
+            0,
+            "test/a.parquet",
+        )]);
+        let tx = action.apply(tx).unwrap();
+        let err = tx
+            .commit(&catalog)
+            .await
+            .expect_err("a live bounds-scoped position delete still applies to that data file");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("test/a-pos.parquet"),
+            "the door must name the delete file it protected, got: {}",
+            err.message()
+        );
+    }
+
     /// SECOND DV FOR THE SAME FILE REJECTED. DV1 for data file A is committed; a LATER transaction
     /// (started after DV1 — no concurrent window, so `validateAddedDVs` self-passes) adds DV2 for
     /// the same A. The door must reject: without it the commit would leave TWO live DVs for A,
     /// which D1's duplicate-DV load door rejects at SCAN time — fail-late, table unreadable.
-    /// The message must name the referenced file AND the deferral.
+    /// The message must name the referenced file AND the way out — merging the previous DV and
+    /// removing it in the same commit, which is supported now.
     #[tokio::test]
-    async fn test_row_delta_second_dv_for_same_file_rejected_until_merge_lands() {
+    async fn test_row_delta_second_dv_for_same_file_rejected_unless_it_supersedes() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append_files(&catalog, &table, vec![synthetic_data_file(
@@ -4950,8 +5037,8 @@ mod tests {
             err.message()
         );
         assert!(
-            err.message().contains("deferred"),
-            "the door must name the deferral (previous-delete merge not yet supported), got: {}",
+            err.message().contains("remove_deletes_many"),
+            "the door must tell the caller how to merge instead, got: {}",
             err.message()
         );
     }

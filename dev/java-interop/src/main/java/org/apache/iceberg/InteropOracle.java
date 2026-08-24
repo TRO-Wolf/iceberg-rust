@@ -400,6 +400,26 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "verify-interop-dv-sql":
+        // V3 MERGE-ON-READ SQL DML, DIRECTION 2 — "JAVA reads what RUST's SQL DELETE writes"
+        // (F-13 U4). The Rust GEN test (env ICEBERG_INTEROP_DV_SQL_GEN_DIR,
+        // integrations/datafusion/tests/interop_dv_sql.rs) ran THREE DataFusion SQL `DELETE` statements on a
+        // V3 identity(category)-partitioned table, the third re-deleting from a data file that
+        // already carried a DV so the writer had to load, merge and supersede it. Java loads the
+        // Rust-written final.metadata.json, asserts it really is format-version 3, reads the
+        // table with its PRODUCTION scan (IcebergGenerics -> BaseDeleteLoader.readDV), and
+        // asserts the live rows equal expected_rows.json. It ALSO asserts every live delete file
+        // is PUFFIN with a referencedDataFile and that no data file carries two DVs -- the V3
+        // spec forbids new position-delete files and allows at most one DV per data file.
+        // NOTE: `mvn exec:java` does not propagate System.exit -- the run script greps the
+        // "0 failures" sentinel.
+        Path dvSqlVerifyDir = requireFixturesDir("interop.dv_sql.dir");
+        int dvSqlFailures = DvSqlOracle.verify(dvSqlVerifyDir);
+        System.out.println("verify-interop-dv-sql: " + dvSqlFailures + " failures");
+        if (dvSqlFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "verify-interop-dv-table":
         // DELETION-VECTOR TABLE-level, DIRECTION 2 — "JAVA reads what RUST writes" (Increment
         // D4, the headline). The Rust GEN test (env ICEBERG_INTEROP_DV_TABLE_DIR,
@@ -9639,6 +9659,153 @@ public final class InteropOracle {
   //   THIS table, and the Rust test asserts its own views of both. This is the FIRST LIVE comparison
   //   of the `removed-dvs` summary key end to end.
   // =============================================================================================
+
+  // =============================================================================================
+  // DV SQL DML oracle (F-13 U4) — Java reads a table whose deletion vectors were produced by
+  // Rust's DataFusion SQL DELETE path rather than by a hand-driven DVFileWriter chain.
+  // =============================================================================================
+
+  static final class DvSqlOracle {
+    private DvSqlOracle() {}
+
+    /** One expected surviving row parsed from expected_rows.json. */
+    private static final class ExpectedRow {
+      final long id;
+      final String data;
+
+      ExpectedRow(com.fasterxml.jackson.databind.JsonNode node) {
+        this.id = node.get("id").asLong();
+        com.fasterxml.jackson.databind.JsonNode dataNode = node.get("data");
+        this.data = dataNode == null || dataNode.isNull() ? null : dataNode.asText();
+      }
+    }
+
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path finalMetadata =
+          dir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(finalMetadata)) {
+        System.out.println(
+            "FAIL dv-sql: missing " + finalMetadata + " (run the Rust GEN path first)");
+        return 1;
+      }
+
+      List<ExpectedRow> expectedRows = new ArrayList<>();
+      for (com.fasterxml.jackson.databind.JsonNode node :
+          JsonUtil.mapper().readTree(readString(dir.resolve("expected_rows.json")))) {
+        expectedRows.add(new ExpectedRow(node));
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata =
+            TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException parseError) {
+        System.out.println(
+            "FAIL dv-sql: Java could not parse the Rust-written V3 final.metadata.json: "
+                + parseError);
+        return 1;
+      }
+
+      if (metadata.formatVersion() != 3) {
+        System.out.println(
+            "FAIL dv-sql: expected a format-version 3 table, got " + metadata.formatVersion());
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+
+      // (1) The production merge-on-read read: IcebergGenerics loads each DV via
+      // BaseDeleteLoader.readDV and applies it during the scan.
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL dv-sql: Java could not READ the table Rust's SQL DELETE committed: " + readError);
+        return 1;
+      }
+
+      List<Long> liveIds = new ArrayList<>(dataById.keySet());
+      liveIds.sort(Long::compareTo);
+      List<Long> expectedIds = new ArrayList<>();
+      boolean rowsMatch = true;
+      for (ExpectedRow row : expectedRows) {
+        expectedIds.add(row.id);
+        String actual = dataById.get(row.id);
+        if (!dataById.containsKey(row.id)
+            || (row.data == null ? actual != null : !row.data.equals(actual))) {
+          rowsMatch = false;
+        }
+      }
+      if (!liveIds.equals(expectedIds) || !rowsMatch) {
+        System.out.println(
+            "FAIL dv-sql: live (id,data) set mismatch — RESURRECTED, missing or double-deleted "
+                + "rows: java-read="
+                + dataById
+                + " expected ids "
+                + expectedIds);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS dv-sql: Java's production scan applied the SQL-written DVs -> live rows "
+                + dataById);
+      }
+
+      // (2) The V3 shape rules: no new position-delete files, at most one DV per data file.
+      Map<String, String> dvByReferencedFile = new LinkedHashMap<>();
+      Snapshot current = table.currentSnapshot();
+      for (ManifestFile manifest : current.deleteManifests(io)) {
+        try (ManifestReader<DeleteFile> reader =
+            ManifestFiles.readDeleteManifest(manifest, io, metadata.specsById())) {
+          for (DeleteFile deleteFile : reader) {
+            if (deleteFile.format() != FileFormat.PUFFIN) {
+              System.out.println(
+                  "FAIL dv-sql: V3 forbids new position-delete files, but Rust committed a "
+                      + deleteFile.format()
+                      + " delete file at "
+                      + deleteFile.location());
+              failures++;
+              continue;
+            }
+            String referenced = String.valueOf(deleteFile.referencedDataFile());
+            if (deleteFile.referencedDataFile() == null) {
+              System.out.println(
+                  "FAIL dv-sql: a DV must name its data file, but "
+                      + deleteFile.location()
+                      + " has no referencedDataFile");
+              failures++;
+              continue;
+            }
+            String previous = dvByReferencedFile.put(referenced, deleteFile.location());
+            if (previous != null) {
+              System.out.println(
+                  "FAIL dv-sql: data file "
+                      + referenced
+                      + " carries TWO live DVs ("
+                      + previous
+                      + " and "
+                      + deleteFile.location()
+                      + ") — the superseded one was not removed, so its positions double-count");
+              failures++;
+            }
+          }
+        }
+      }
+      if (failures == 0) {
+        System.out.println(
+            "PASS dv-sql: every live delete file is a PUFFIN DV, one per data file ("
+                + dvByReferencedFile.size()
+                + " total)");
+      }
+      return failures;
+    }
+  }
 
   static final class DvReplaceOracle {
     private DvReplaceOracle() {}

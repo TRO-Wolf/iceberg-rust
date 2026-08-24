@@ -75,7 +75,7 @@ REPO_ROOT="$(pwd)"
 # run-interop-ranged-read.sh was added for MIDPOINT row-group selection over a byte-range split —
 # the 52nd was run-interop-file-scoped-deletes.sh, for the path-keyed position-delete routing).
 # RATCHET THIS UP when a suite is added (same change); lower it only with a deliberate removal.
-SUITE_FLOOR_DEFAULT=53
+SUITE_FLOOR_DEFAULT=54
 
 SUITES_DIR_DEFAULT="${REPO_ROOT}/dev/java-interop"
 MVN_DEFAULT="/opt/maven/bin/mvn"

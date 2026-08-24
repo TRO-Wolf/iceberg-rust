@@ -459,7 +459,8 @@ mod tests {
         if format == DataFileFormat::Puffin {
             builder
                 .content_offset(Some(4))
-                .content_size_in_bytes(Some(40));
+                .content_size_in_bytes(Some(40))
+                .referenced_data_file(Some("placeholder.parquet".to_string()));
         }
         builder.build().unwrap()
     }
