@@ -39,6 +39,59 @@ use crate::spec::{
 };
 use crate::{Error, ErrorKind};
 
+/// The canonical Arrow extension-type name for a Parquet/Iceberg variant, and the two field names
+/// its struct carries. Taken from `parquet_variant_compute::VariantType` (`NAME`) and the Arrow
+/// canonical-extension-type spec rather than invented here; re-stated as constants so this module
+/// does not depend on the experimental crate for a string.
+pub(crate) const VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
+/// The extension metadata for a variant is the EMPTY STRING, not an absent key — a reader that
+/// checks only for the name is lenient, one that requires absence is wrong.
+pub(crate) const VARIANT_EXTENSION_METADATA: &str = "";
+pub(crate) const VARIANT_METADATA_FIELD: &str = "metadata";
+pub(crate) const VARIANT_VALUE_FIELD: &str = "value";
+const ARROW_EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
+const ARROW_EXTENSION_METADATA_KEY: &str = "ARROW:extension:metadata";
+
+/// The Arrow `DataType` of a variant: `Struct<metadata: Binary, value: Binary>`.
+///
+/// Both children are NON-NULLABLE. A variant that is absent is a null at the struct level; a
+/// struct whose `metadata` child is null is malformed, because variant metadata is what makes the
+/// value decodable at all.
+pub(crate) fn variant_arrow_data_type() -> DataType {
+    DataType::Struct(Fields::from(vec![
+        Field::new(VARIANT_METADATA_FIELD, DataType::Binary, false),
+        Field::new(VARIANT_VALUE_FIELD, DataType::Binary, false),
+    ]))
+}
+
+/// Whether an Arrow field is a variant — i.e. carries the canonical extension name.
+///
+/// Keyed on the extension NAME alone. The metadata value is not part of the identity check: the
+/// spec fixes it to the empty string, and a writer that omitted the key entirely still produced a
+/// variant. Requiring the metadata key would reject those files.
+pub(crate) fn is_variant_arrow_field(field: &Field) -> bool {
+    field
+        .metadata()
+        .get(ARROW_EXTENSION_NAME_KEY)
+        .map(String::as_str)
+        == Some(VARIANT_EXTENSION_NAME)
+}
+
+/// Stamp the canonical variant extension metadata onto a field's metadata map.
+pub(crate) fn with_variant_extension_metadata(
+    mut meta: HashMap<String, String>,
+) -> HashMap<String, String> {
+    meta.insert(
+        ARROW_EXTENSION_NAME_KEY.to_string(),
+        VARIANT_EXTENSION_NAME.to_string(),
+    );
+    meta.insert(
+        ARROW_EXTENSION_METADATA_KEY.to_string(),
+        VARIANT_EXTENSION_METADATA.to_string(),
+    );
+    meta
+}
+
 /// When iceberg map type convert to Arrow map type, the default map field name is "key_value".
 pub const DEFAULT_MAP_FIELD_NAME: &str = "key_value";
 /// UTC timezone annotation produced for Iceberg `timestamptz` / `timestamptz_ns`
@@ -112,6 +165,19 @@ pub trait ArrowSchemaVisitor {
 
     /// Return type of this visitor on arrow schema.
     type U;
+
+    /// Called for every field BEFORE its data type is descended into. Returning `Some` short-
+    /// circuits the walk for that field and uses the returned value as its result.
+    ///
+    /// This exists for the canonical Arrow VARIANT extension type, which is a `Struct` carrying
+    /// the `arrow.parquet.variant` extension name on the FIELD. Descending into it would be
+    /// wrong twice over: its `metadata` / `value` children are components of one Iceberg field
+    /// rather than Iceberg fields, so they carry no field ids and the walk would fail on the
+    /// missing id — and even if it succeeded it would yield a two-field struct instead of the
+    /// variant type. Mirrors the Avro side's `variant()` visitor arm.
+    fn variant_field(&mut self, _field: &Field) -> Result<Option<Self::T>> {
+        Ok(None)
+    }
 
     /// Called before struct/list/map field.
     fn before_field(&mut self, _field: &Field) -> Result<()> {
@@ -311,7 +377,10 @@ fn visit_struct<V: ArrowSchemaVisitor>(
     let mut results = Vec::with_capacity(fields.len());
     for field in fields {
         visitor.before_field(field)?;
-        let result = visit_type_at_depth(field.data_type(), visitor, depth + 1)?;
+        let result = match visitor.variant_field(field)? {
+            Some(result) => result,
+            None => visit_type_at_depth(field.data_type(), visitor, depth + 1)?,
+        };
         visitor.after_field(field)?;
         results.push(result);
     }
@@ -328,7 +397,10 @@ pub(crate) fn visit_schema<V: ArrowSchemaVisitor>(
     for field in schema.fields() {
         visitor.before_field(field)?;
         // An Arrow schema is an implicit root struct at depth 0, matching Iceberg's schema visitor.
-        let result = visit_type_at_depth(field.data_type(), visitor, 1)?;
+        let result = match visitor.variant_field(field)? {
+            Some(result) => result,
+            None => visit_type_at_depth(field.data_type(), visitor, 1)?,
+        };
         visitor.after_field(field)?;
         results.push(result);
     }
@@ -466,6 +538,13 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             builder = builder.with_reassigned_field_ids(start_from)
         }
         builder.build()
+    }
+
+    /// A field carrying the canonical variant extension name IS the Iceberg variant type — the
+    /// mirror of `SchemaToType.variant` returning `Types.VariantType.get()` on the Avro side
+    /// (1.10.0 bytecode: a bare `VariantType.get()` return).
+    fn variant_field(&mut self, field: &Field) -> Result<Option<Self::T>> {
+        Ok(is_variant_arrow_field(field).then_some(Type::Variant))
     }
 
     fn r#struct(&mut self, fields: &Fields, results: Vec<Self::T>) -> Result<Self::T> {
@@ -661,6 +740,15 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         } else {
             HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), field.id.to_string())])
         };
+        // A variant field carries the canonical Arrow extension metadata ALONGSIDE its field id.
+        // Stamped here rather than in `variant()` because that method returns a `DataType`, and
+        // the extension name lives on the FIELD — a variant is identified by its field metadata,
+        // never by its struct shape (a plain `{metadata, value}` struct is not a variant).
+        let metadata = if matches!(field.field_type.as_ref(), crate::spec::Type::Variant) {
+            with_variant_extension_metadata(metadata)
+        } else {
+            metadata
+        };
         Ok(ArrowSchemaOrFieldOrType::Field(
             Field::new(field.name.clone(), ty, !field.required).with_metadata(metadata),
         ))
@@ -737,24 +825,30 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         )))
     }
 
-    /// Iceberg `variant` has no Arrow representation here — fail loudly, never fall back.
+    /// Iceberg `variant` becomes the CANONICAL Arrow variant extension type: a two-field struct
+    /// `{metadata: Binary, value: Binary}` carrying the `arrow.parquet.variant` extension name.
     ///
-    /// Java parity: `ArrowSchemaUtil`'s converter does not override the visitor default, so Java
-    /// throws `UnsupportedOperationException("Unsupported type: variant")` (the 1.10.0
-    /// `TypeUtil.SchemaVisitor.variant` default) on the same conversion. This override exists
-    /// only to NAME the Rust-side limitation: `arrow-schema` ships no canonical variant extension
-    /// type, and the one `parquet` uses comes from `parquet-variant-compute`, behind its opt-in
-    /// `variant_experimental` feature — so there is nothing this fork could emit without a
-    /// dependency change. This is a feature-gate boundary, not a version floor (see GAP_MATRIX
-    /// row R88); the DF-54 / arrow-58 bump did not move it. A
-    /// silent fallback (e.g. binary or a metadata/value struct) would let a scan or writer treat
-    /// variant bytes as a plain column and corrupt the on-disk contract.
+    /// This DIVERGES FROM JAVA DELIBERATELY, and the divergence is an extension, not a defect.
+    /// Java throws here — `TypeUtil$SchemaVisitor.variant(VariantType)` is a bare
+    /// `throw new UnsupportedOperationException("Unsupported type: variant")` (1.10.0 bytecode,
+    /// offsets 0-6) and `ArrowSchemaUtil`'s converter does not override it — because Java's Arrow
+    /// bridge predates the canonical extension type. Refusing was the right behaviour only while
+    /// the fork had nothing to emit; emitting the CANONICAL type is strictly better than an
+    /// exception, and it is the same type `parquet`'s own variant support reads and writes, so
+    /// the on-disk contract is preserved rather than bypassed.
+    ///
+    /// The shape is fixed by the Arrow spec, not chosen here: `VariantType::NAME` is
+    /// `"arrow.parquet.variant"`, its extension metadata is the EMPTY STRING (not absent), and it
+    /// admits only a struct. Both children are non-nullable `Binary` — a variant with no value is
+    /// represented by a null at the STRUCT level, never by a null child.
+    ///
+    /// # Notes
+    ///
+    /// Field ids are stamped by the caller (`Self::field`), as for every other type. The
+    /// `metadata` / `value` children carry NO field ids: they are components of one Iceberg
+    /// field, not Iceberg fields themselves.
     fn variant(&mut self) -> crate::Result<ArrowSchemaOrFieldOrType> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Unsupported type: variant (Iceberg-to-Arrow conversion: arrow-rs exposes \
-             no variant extension type; file-level variant I/O is deferred)",
-        ))
+        Ok(ArrowSchemaOrFieldOrType::Type(variant_arrow_data_type()))
     }
 
     fn primitive(
@@ -2683,31 +2777,33 @@ mod tests {
         assert_eq!(out.iter().collect::<Vec<_>>(), values);
     }
 
-    // RISK: variant has NO Arrow representation under the pinned arrow-rs — the conversion
-    // must ERROR LOUDLY (Java parity: `ArrowSchemaUtil` inherits the 1.10.0
-    // `TypeUtil.SchemaVisitor.variant` default throw "Unsupported type: variant"), never fall
-    // back to binary/struct. A silent fallback would let scans/writes treat raw variant bytes as
-    // a plain column. This is also the door that makes a variant equality-delete config fail
-    // loudly: `EqualityDeleteWriterConfig::new` converts the full table schema through this path.
-    #[test]
-    fn test_variant_to_arrow_errors_loudly() {
-        // Bare type conversion.
-        let error = type_to_arrow_type(&Type::Variant)
-            .expect_err("variant must not convert to an Arrow type");
-        assert_eq!(error.kind(), crate::ErrorKind::FeatureUnsupported);
-        assert!(
-            error.message().starts_with("Unsupported type: variant"),
-            "message must start with Java's visitor-default text, got: {}",
-            error.message()
-        );
-        assert!(
-            error.message().contains("no variant extension type"),
-            "message must NAME the missing-extension-type limitation, got: {}",
-            error.message()
-        );
+    // Variant converts to the CANONICAL Arrow extension type (`arrow.parquet.variant`) rather
+    // than erroring, as of the `variant_experimental` enablement. This REPLACES
+    // `test_variant_to_arrow_errors_loudly`, which pinned the old refusal — that behaviour is
+    // deliberately gone, and it was the only test in the suite that failed on this change.
+    //
+    // What still must NOT happen is a silent fallback: the type is identified by the FIELD's
+    // extension metadata, never by its struct shape, so a plain `{metadata, value}` struct
+    // carrying no extension name must still convert back to a STRUCT, not a variant. That is the
+    // discriminating cell below, and it is what keeps raw variant bytes from being mistaken for a
+    // plain column (and vice versa).
 
-        // Whole-schema conversion (the scan/write/equality-delete entry point) — a variant
-        // ANYWHERE in the schema fails the conversion.
+    #[test]
+    fn test_variant_converts_to_the_canonical_arrow_extension_type() {
+        let arrow_type =
+            type_to_arrow_type(&Type::Variant).expect("variant now has an Arrow representation");
+        assert_eq!(
+            arrow_type,
+            DataType::Struct(Fields::from(vec![
+                Field::new("metadata", DataType::Binary, false),
+                Field::new("value", DataType::Binary, false),
+            ])),
+            "both children are NON-nullable — an absent variant is a null at the struct level"
+        );
+    }
+
+    #[test]
+    fn test_variant_field_carries_the_extension_name_and_its_field_id() {
         let schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
@@ -2715,12 +2811,84 @@ mod tests {
             ])
             .build()
             .unwrap();
-        let error = schema_to_arrow_schema(&schema)
-            .expect_err("a schema containing variant must not convert to Arrow");
+        let arrow_schema = schema_to_arrow_schema(&schema)
+            .expect("a schema containing variant now converts to Arrow");
+
+        let variant_field = arrow_schema.field_with_name("v").expect("variant field");
+        assert_eq!(
+            variant_field.metadata().get("ARROW:extension:name"),
+            Some(&"arrow.parquet.variant".to_string())
+        );
+        assert_eq!(
+            variant_field.metadata().get("ARROW:extension:metadata"),
+            Some(&String::new()),
+            "the extension metadata is the EMPTY STRING, not an absent key"
+        );
+        assert_eq!(
+            variant_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"2".to_string()),
+            "the Iceberg field id survives alongside the extension metadata"
+        );
+        assert!(is_variant_arrow_field(variant_field));
         assert!(
-            error.message().starts_with("Unsupported type: variant"),
-            "got: {}",
-            error.message()
+            !is_variant_arrow_field(arrow_schema.field_with_name("id").expect("id field")),
+            "a non-variant field must not be mistaken for one"
+        );
+    }
+
+    #[test]
+    fn test_variant_round_trips_back_to_the_iceberg_variant_type() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "v", Type::Variant).into(),
+            ])
+            .build()
+            .unwrap();
+        let arrow_schema = schema_to_arrow_schema(&schema).expect("to arrow");
+        let back = arrow_schema_to_schema(&arrow_schema).expect("back to iceberg");
+        assert_eq!(
+            back.as_struct().fields()[1].field_type.as_ref(),
+            &Type::Variant,
+            "the extension name must be recognised on the way back, not flattened to a struct"
+        );
+        assert_eq!(back.as_struct().fields()[1].id, 2);
+    }
+
+    /// The DISCRIMINATING cell. A struct of the same SHAPE but WITHOUT the extension name is a
+    /// plain struct. If identity were keyed on shape, any `{metadata: Binary, value: Binary}`
+    /// column in a user's table would silently become a variant — the exact
+    /// treat-raw-bytes-as-something-else hazard the old refusal existed to prevent.
+    #[test]
+    fn test_a_shape_alike_struct_without_the_extension_name_is_not_a_variant() {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new(
+                "not_a_variant",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("metadata", DataType::Binary, false).with_metadata(HashMap::from([
+                        (PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string()),
+                    ])),
+                    Field::new("value", DataType::Binary, false).with_metadata(HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        "4".to_string(),
+                    )])),
+                ])),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]);
+
+        let converted = arrow_schema_to_schema(&arrow_schema).expect("plain struct converts");
+        assert!(
+            matches!(
+                converted.as_struct().fields()[0].field_type.as_ref(),
+                Type::Struct(_)
+            ),
+            "shape alone must not make a variant, got {:?}",
+            converted.as_struct().fields()[0].field_type
         );
     }
 
