@@ -5704,6 +5704,8 @@ pub mod tests {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         test_fn(task);
 
@@ -5724,6 +5726,8 @@ pub mod tests {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         test_fn(task);
     }

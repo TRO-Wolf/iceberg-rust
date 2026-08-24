@@ -66,7 +66,9 @@ use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
-use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, is_metadata_field};
+use crate::metadata_columns::{
+    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, is_metadata_field,
+};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{DataFileFormat, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
 use crate::utils::available_parallelism;
@@ -524,7 +526,15 @@ impl ArrowReader {
         // aware ordinal pushdown is STOP-gated (see `task/fk5-pos-projection-ledger.md`): a
         // `RowFilter` does not expose physical ordinals of undelivered rows. Pushdown is unaffected
         // for scans that do not request `_pos`.
-        if task.project_field_ids().contains(&RESERVED_FIELD_ID_POS) {
+        // `_row_id` shares `_pos`'s requirement: Java's `RowIdReader` falls back to
+        // `firstRowId + pos`, so a row id computed for a row whose physical ordinal was lost to
+        // row-skipping is WRONG — and wrong silently, as a plausible id belonging to another row.
+        // The guard is unconditional on projection rather than conditional on the file carrying a
+        // stored `_row_id` column, because whether the fallback arm is needed is only knowable
+        // per NULL row AFTER decoding, by which point the ordinals are already gone.
+        let needs_physical_ordinals = task.project_field_ids().contains(&RESERVED_FIELD_ID_POS)
+            || task.project_field_ids().contains(&RESERVED_FIELD_ID_ROW_ID);
+        if needs_physical_ordinals {
             // Review rider (2026-08-03): this path decodes the WHOLE file in physical order with
             // ordinals from 0 (see `stream_pos_projection_scan_task`); a RANGED split task here
             // would re-emit the full file per split — duplicate rows with wrong `_pos`, which
@@ -536,13 +546,25 @@ impl ArrowReader {
             let whole_file =
                 task.start == 0 && (task.length == 0 || task.length == task.file_size_in_bytes);
             if !whole_file {
+                // Name the column that actually forced this path, so a `_row_id` scan does not
+                // get told to "drop `_pos`" — a projection it never asked for.
+                let projected_columns = if task.project_field_ids().contains(&RESERVED_FIELD_ID_POS)
+                {
+                    if task.project_field_ids().contains(&RESERVED_FIELD_ID_ROW_ID) {
+                        "`_pos` and `_row_id`"
+                    } else {
+                        "`_pos`"
+                    }
+                } else {
+                    "`_row_id`"
+                };
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
                     format!(
-                        "`_pos` projection over a ranged split task is unsupported: task covers \
-                         {}..{} of {} bytes of '{}', but the `_pos` path decodes whole files with \
-                         ordinals from 0 (each split would duplicate every row). Plan without \
-                         splitting, or drop `_pos` from the projection.",
+                        "{projected_columns} projection over a ranged split task is unsupported: \
+                         task covers {}..{} of {} bytes of '{}', but this path decodes whole \
+                         files with ordinals from 0 (each split would duplicate every row). Plan \
+                         without splitting, or drop {projected_columns} from the projection.",
                         task.start,
                         task.start.saturating_add(task.length),
                         task.file_size_in_bytes,
@@ -563,7 +585,8 @@ impl ArrowReader {
         // that come back from the file, such as type promotion, default column insertion,
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
+                .with_row_lineage(task.first_row_id, task.file_sequence_number);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -1003,7 +1026,8 @@ impl ArrowReader {
     /// whole-file tails (schema evolution, reorder, `_file` / identity-partition constants).
     fn build_scan_task_transformer(task: &FileScanTask) -> Result<RecordBatchTransformer> {
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
+                .with_row_lineage(task.first_row_id, task.file_sequence_number);
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
             let file_datum = Datum::string(task.data_file_path.clone());
             record_batch_transformer_builder =
@@ -2907,7 +2931,7 @@ mod tests {
         SetExpression,
     };
     use crate::io::FileIO;
-    use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+    use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, NestedField, PrimitiveLiteral, PrimitiveType,
@@ -3290,6 +3314,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         })])) as FileScanTaskStream;
 
         let result = reader
@@ -3654,6 +3680,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 
@@ -4703,6 +4731,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         // Task 2: read the second and third row groups
@@ -4722,6 +4752,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         let tasks1 = Box::pin(futures::stream::iter(vec![Ok(task1)])) as FileScanTaskStream;
@@ -4854,6 +4886,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4953,6 +4987,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -5072,6 +5108,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 
@@ -5166,6 +5204,45 @@ message schema {
         assert_eq!(
             pairs, expected,
             "physical _pos must be 0..N-1 across batches"
+        );
+    }
+
+    /// `_row_id` reaches the SAME whole-file guard as `_pos`, and for the same reason: Java's
+    /// `RowIdReader` falls back to `firstRowId + pos`, so a row id computed after row-skipping is
+    /// silently wrong — a plausible id belonging to a different row. Pinning this on `_pos` alone
+    /// leaves a `_row_id`-only scan able to take the split path.
+    #[tokio::test]
+    async fn row_id_ranged_split_task_is_rejected_fail_loud() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..20).collect();
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+
+        let mut ranged = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        // `_row_id` ALONE — no `_pos` in the projection, so only the new half of the guard can
+        // reject this.
+        ranged.project_field_ids = Arc::from(vec![1, RESERVED_FIELD_ID_ROW_ID]);
+        ranged.first_row_id = Some(1_000);
+        ranged.start = 1;
+        ranged.length = ranged.file_size_in_bytes;
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let err = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream)
+            .expect("stream construction")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect_err("a ranged task projecting `_row_id` must fail loud, not mint wrong ids");
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            err.to_string()
+                .contains("`_row_id` projection over a ranged split task"),
+            "the error must name `_row_id`, not tell the caller to drop a `_pos` it never \
+             projected, got: {err}"
         );
     }
 
@@ -5550,6 +5627,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         let batches = run_pos_scan(task, Some(2)).await;
         let mut pairs = Vec::new();
@@ -5678,6 +5757,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(2)).await);
         // Survivors keep physical positions: 10@0, 30@2, 50@4
@@ -5781,6 +5862,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(3)).await);
         // residual [2,9) minus pos{1,8} minus eq{4} → 2,3,5,6,7 (pos 1,8 outside residual for 1)
@@ -5849,6 +5932,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         let batches = reader
             .read(Box::pin(futures::stream::iter(vec![Ok(mor_task)])) as FileScanTaskStream)
@@ -6028,6 +6113,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -6266,6 +6353,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -6497,6 +6586,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -6605,6 +6696,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -6707,6 +6800,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -6798,6 +6893,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -6903,6 +7000,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -7037,6 +7136,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -7138,6 +7239,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -7252,6 +7355,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -7347,6 +7452,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_1.parquet"))
@@ -7366,6 +7473,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_2.parquet"))
@@ -7385,6 +7494,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             }),
         ];
 
@@ -7568,6 +7679,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -7985,6 +8098,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -8055,6 +8170,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -8678,6 +8795,8 @@ mod avro_scan_tests {
             name_mapping: None,
             case_sensitive: true,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 
@@ -8850,6 +8969,8 @@ mod avro_scan_tests {
             name_mapping: None,
             case_sensitive: true,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 
@@ -9532,6 +9653,8 @@ mod parquet_eq_keyset_mor_tests {
             name_mapping: None,
             case_sensitive: true,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 

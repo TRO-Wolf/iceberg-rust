@@ -143,6 +143,8 @@ async fn read_window(path: &str, start: u64, length: u64) -> Vec<i64> {
         name_mapping: None,
         case_sensitive: false,
         split_offsets: None,
+        first_row_id: None,
+        file_sequence_number: None,
     };
     let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
     let batches: Vec<RecordBatch> = reader

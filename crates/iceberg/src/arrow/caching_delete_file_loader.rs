@@ -1447,6 +1447,8 @@ mod tests {
             name_mapping: None,
             case_sensitive: true,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         let vector = delete_filter
             .get_delete_vector(&task)
@@ -2072,6 +2074,8 @@ mod tests {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         // Load the deletes - should handle both types without error
@@ -2637,6 +2641,8 @@ mod tests {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 

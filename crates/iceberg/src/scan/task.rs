@@ -403,6 +403,29 @@ pub struct FileScanTask {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split_offsets: Option<Vec<i64>>,
+
+    /// V3 row lineage: the data file's assigned `first_row_id` — the start of the row-id range
+    /// this file owns, inherited at manifest read (Java `ManifestReader.idAssigner`).
+    ///
+    /// **Flagged additive field.** `None` for V1/V2 tables and for any V3 file whose manifest
+    /// carries no assigned range. Projecting `_row_id` on such a task is an error, never a guess:
+    /// defaulting to zero would mint row ids that collide with another file's.
+    ///
+    /// Unlike `split_offsets` this SURVIVES a split — a sub-task still belongs to the same file
+    /// and the same range. Reading `_row_id` under a split is refused elsewhere (it needs whole-
+    /// file physical ordinals), but the field itself must not be dropped, or a later
+    /// non-positional use would silently lose the file's identity.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_row_id: Option<i64>,
+
+    /// V3 row lineage: the data file's sequence number, the fallback for
+    /// `_last_updated_sequence_number` (Java `ValueReaders$LastUpdatedSeqReader`).
+    ///
+    /// **Flagged additive field**, `None` when unknown. Like `first_row_id` it survives a split.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_sequence_number: Option<i64>,
 }
 
 impl FileScanTask {
@@ -673,6 +696,11 @@ impl FileScanTask {
             name_mapping: self.name_mapping.as_ref().map(Arc::clone),
             case_sensitive: self.case_sensitive,
             split_offsets: None,
+            // Row lineage SURVIVES the split: a sub-task is still a window of the SAME data file,
+            // so it owns the same row-id range and the same file sequence number. (Contrast
+            // `split_offsets`, which describes the whole file's row-group grid and is cleared.)
+            first_row_id: self.first_row_id,
+            file_sequence_number: self.file_sequence_number,
         }
     }
 
@@ -939,6 +967,8 @@ mod tests {
             name_mapping: None,
             case_sensitive: true,
             split_offsets,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 

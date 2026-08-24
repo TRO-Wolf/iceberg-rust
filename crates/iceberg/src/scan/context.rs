@@ -248,6 +248,14 @@ impl ManifestEntryContext {
             // transforms (bucket/truncate/...) are read from the file. The spec is resolved
             // once per manifest from its `partition_spec_id`, so a multi-spec scan
             // materializes each file's constants under its own spec.
+            // V3 row lineage, threaded from the manifest entry. `first_row_id` is what
+            // `assign_first_row_ids` resolved for THIS file when its manifest was read; the
+            // sequence number is the entry's own (already inherited by `inherit_data`). Both are
+            // `None` on a V1/V2 table, which makes projecting a row-lineage column an error
+            // rather than a silent zero.
+            first_row_id: self.manifest_entry.data_file.first_row_id(),
+            file_sequence_number: self.manifest_entry.file_sequence_number,
+
             partition: Some(self.manifest_entry.data_file.partition.clone()),
             partition_spec: self.partition_spec.clone(),
             // The table's default name mapping (property `schema.name-mapping.default`), parsed

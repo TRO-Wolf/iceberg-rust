@@ -79,10 +79,12 @@
 //! - Files **without** Avro `field-id` properties (name-mapping fallback,
 //!   `org.apache.iceberg.mapping.NameMapping`) are **not** supported yet: such a file errors loudly
 //!   rather than silently resolving by name (wrong slot).
-//! - V3 **row-lineage** present-field readers — Java `ValueReaders.fileFieldReader` special-cases a
-//!   *present* file field whose id is `ROW_ID` or `LAST_UPDATED_SEQUENCE_NUMBER` with dedicated
-//!   readers. Here those ids, when present in the file, read as plain columns (their default-fill
-//!   path is unaffected). This is niche V3 metadata and is deferred with U2.
+//! - V3 **row-lineage** present-field readers — CLOSED 2026-08-24 (F-13 V2), but NOT in this file.
+//!   Java `ValueReaders.fileFieldReader` special-cases a *present* file field whose id is `ROW_ID`
+//!   or `LAST_UPDATED_SEQUENCE_NUMBER` with dedicated readers; the fork implements the same rules
+//!   one layer later, in `RecordBatchTransformer` (`ColumnSource::RowIdFromFile` /
+//!   `LastUpdatedSeqFromFile`), which every format's scan path funnels through. This reader still
+//!   emits those ids as plain columns — that is now the INPUT to the shared fallback, not a gap.
 //! - The `variant` type read is deferred (the Avro→Iceberg schema converter rejects variant on the
 //!   read path anyway).
 
