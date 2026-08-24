@@ -78,6 +78,16 @@ The predicate was also too WIDE — no `delete_seq >= data_seq` filter — so it
 allows. Both halves are now extracted as named seams and unit-tested per cell, because the
 end-to-end tests could not distinguish them.
 
+Cycle 3 found the seams' domain still open in two cells, and the pattern is worth recording: I had
+pinned the reference axis and the sequence axis INDEPENDENTLY, never crossed. Every sequence
+assertion sat on the partition-scoped leg, so the named leg was free to skip the filter entirely.
+The second was the same shape — the entry seam's test asserted three of the tuple's four fields,
+following the function signature rather than the fields the function computes, and the one it
+skipped was invisible because the only end-to-end test used an UNPARTITIONED table.
+
+Fixture note worth keeping: the commit-door test must go V2-then-upgrade. `RowDelta` refuses a
+Parquet position delete on a V3 table outright, so the hazard cannot be constructed directly at V3.
+
 It also found a regression I introduced: extracting `validate_delete_vector_coordinates` dropped the
 `\` line continuations, so five runtime messages — two of them the SCAN path's, correct before this
 branch — carried runs of 18-22 literal spaces. No test asserted a full message string. One now does.
@@ -103,7 +113,16 @@ resolve to spec 0.
    `DataFiles$Builder.withSortOrder` on every data file it builds; the fork's writers never set
    `sort_order_id` at all. Wider than (1), adjacent to R111, and currently recorded nowhere else.
    Surfaced by the U2 Critic.
-3. **U2's Puffin-DATA arm is a fork-only strengthening.** Java's delete-file builder cannot express a
+3. **`referenced_data_file_location` placement.** It is now `pub` and re-exported from `spec`, but
+   `spec`'s public namespace is otherwise a flat glob of TYPES, and this is a pure function of one
+   `DataFile`. The idiomatic Rust home is an inherent method,
+   `DataFile::referenced_data_file_location(&self)`. Not done here: 20 call sites across 7 files,
+   and churning established code late in a large PR is the wrong trade. Surfaced by the bundle
+   Critic.
+4. **Half a seam is exposed.** `is_deletion_vector` sits in the same module, answers the other half
+   of "does this delete still cover this file", and stays `pub(crate)`. If the export is for
+   downstream engines, the pair should go together. Surfaced by the bundle Critic.
+5. **U2's Puffin-DATA arm is a fork-only strengthening.** Java's delete-file builder cannot express a
    Puffin data file and its data-file builder has no blob-coordinate fields, so requiring the
    coordinates there has no Java oracle. Kept deliberately (it rejects only shapes no writer emits,
    and dropping it would make the validator diverge structurally from Java's format-keyed shape);

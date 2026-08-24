@@ -7087,3 +7087,70 @@ async fn test_delete_mread_v3_after_drop_partition_field_stamps_the_files_own_sp
     assert_eq!(ids, vec![2], "the deleted row must not resurrect");
     Ok(())
 }
+
+/// Risk pinned: the PARTITIONED form of the legacy-position-delete refusal. The unpartitioned twin
+/// cannot see a dropped partition tuple — an empty tuple and the real one are the same value there.
+/// On a partitioned table an empty tuple matches nothing, the pre-IO refusal silently stops firing,
+/// and the commit door catches it only after the Puffin has reached storage.
+#[tokio::test]
+async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_position_deletes()
+-> Result<()> {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+    let (ctx, client) = make_partitioned_mread_ctx("test_del_mread_part_upgrade", "items").await?;
+    ctx.sql(
+        "INSERT INTO catalog.test_del_mread_part_upgrade.items VALUES \
+         (1, 'electronics', 'laptop'), (2, 'electronics', 'phone'), (3, 'books', 'novel')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // V2: writes a Parquet position-delete file, stamped in the electronics partition.
+    delete_count(
+        &ctx,
+        "DELETE FROM catalog.test_del_mread_part_upgrade.items WHERE id = 1",
+    )
+    .await;
+
+    let tbl_id = iceberg::TableIdent::new(
+        NamespaceIdent::new("test_del_mread_part_upgrade".to_string()),
+        "items".to_string(),
+    );
+    let table = client.load_table(&tbl_id).await?;
+    let tx = Transaction::new(&table);
+    let action = tx
+        .upgrade_table_version()
+        .set_format_version(iceberg::spec::FormatVersion::V3);
+    let tx = ApplyTransactionAction::apply(action, tx)?;
+    tx.commit(client.as_ref()).await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "catalog",
+        Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?),
+    );
+
+    // The other electronics row lives in the file that delete still covers.
+    let error = ctx
+        .sql("DELETE FROM catalog.test_del_mread_part_upgrade.items WHERE id = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("the data file is still covered by a Parquet position delete");
+    assert!(
+        error.to_string().contains("Parquet position-delete"),
+        "the refusal must name the cause; got: {error}"
+    );
+
+    let delete_files = live_delete_files(&client, "test_del_mread_part_upgrade", "items").await?;
+    assert_eq!(
+        delete_files.len(),
+        1,
+        "only the original V2 position-delete file is live — no orphaned DV was committed"
+    );
+    Ok(())
+}

@@ -2403,15 +2403,6 @@ mod tests {
         assert_batch_matches_per_row(&col);
     }
 
-    /// MEDIUM-1 (H-ORDER), deterministic seam test: `sort_position_delete_pairs` — the sort applied at
-    /// every MoR position-delete write site (`merge_on_read_delete`, `merge_on_read_update`, and the
-    /// per-partition-group path in `write_position_deletes`) — MUST produce ascending `(file_path,
-    /// pos)` order for ANY input. The default concurrent scan interleaves files unordered, so the
-    /// collected pairs arrive out of order; this pins the spec-required order independent of scan
-    /// interleaving (which an integration test cannot pin deterministically).
-    ///
-    /// MUTATION PROOF: turn `sort_position_delete_pairs` into a no-op (delete the `pairs.sort()`) → this
-    /// test goes RED (the deliberately-unsorted input stays unsorted).
     /// The applicability domain of [`legacy_position_delete_applies`], one test per cell. Java's
     /// own writer never sets `referenced_data_file`, so the BOUNDS leg and the PARTITION leg are
     /// the two that fire in practice, and they disagree: a named delete ignores the partition.
@@ -2453,6 +2444,12 @@ mod tests {
             entry.1, 7,
             "the stamp is carried for the partition-scoped leg"
         );
+        assert_eq!(
+            entry.2,
+            IcebergStruct::from_iter([Some(Literal::long(999))]),
+            "the partition TUPLE is carried too — an empty one matches nothing on a partitioned \
+             table, so the refusal would silently stop firing"
+        );
         assert_eq!(entry.3, Some(3), "the sequence number is carried");
     }
 
@@ -2473,7 +2470,7 @@ mod tests {
                 &data_partition,
                 Some(1)
             ),
-            "a delete that NAMES the file applies whatever partition it is stamped with — Spark's              default write granularity is FILE, so a mismatched stamp is routine"
+            "a delete that NAMES the file applies whatever partition it is stamped with — Spark's default write granularity is FILE, so a mismatched stamp is routine"
         );
         assert!(
             !legacy_position_delete_applies(&delete, "s3://b/other.parquet", 7, &delete.2, Some(1)),
@@ -2518,8 +2515,34 @@ mod tests {
             legacy_position_delete_applies(&delete, "s3://b/x.parquet", 0, &partition, None),
             "an unknown sequence errs toward applying, so the caller refuses rather than corrupts"
         );
+
+        // The sequence rule is the same `>=` on BOTH legs — only the key changes. Asserting it on
+        // the partition leg alone leaves the named leg free to skip it.
+        let named = (
+            Some("s3://b/new.parquet".to_string()),
+            0,
+            partition.clone(),
+            Some(1),
+        );
+        assert!(
+            !legacy_position_delete_applies(&named, "s3://b/new.parquet", 0, &partition, Some(2)),
+            "a NAMED delete that predates its data file cannot cover it either"
+        );
+        assert!(
+            legacy_position_delete_applies(&named, "s3://b/new.parquet", 0, &partition, Some(1)),
+            "and it does apply at an equal sequence number"
+        );
     }
 
+    /// MEDIUM-1 (H-ORDER), deterministic seam test: `sort_position_delete_pairs` — the sort applied at
+    /// every MoR position-delete write site (`merge_on_read_delete`, `merge_on_read_update`, and the
+    /// per-partition-group path in `write_position_deletes`) — MUST produce ascending `(file_path,
+    /// pos)` order for ANY input. The default concurrent scan interleaves files unordered, so the
+    /// collected pairs arrive out of order; this pins the spec-required order independent of scan
+    /// interleaving (which an integration test cannot pin deterministically).
+    ///
+    /// MUTATION PROOF: turn `sort_position_delete_pairs` into a no-op (delete the `pairs.sort()`) → this
+    /// test goes RED (the deliberately-unsorted input stays unsorted).
     #[test]
     fn test_sort_position_delete_pairs_orders_by_path_then_pos() {
         // Deliberately unsorted: files interleaved (b before a), positions descending within a file —
