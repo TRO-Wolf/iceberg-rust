@@ -182,7 +182,7 @@ impl DVWriteResult {
     ///
     /// A DV without a `referenced_data_file` cannot occur — [`DataFileBuilder::build`] rejects a
     /// Puffin file with the field unset (Java `FileMetadata$Builder.build` offset 158) — so no
-    /// entry is silently dropped here; the `flatten` is a total projection, not a filter.
+    /// entry is silently dropped here; the `filter_map` is a total projection, not a filter.
     ///
     /// [`DataFileBuilder::build`]: crate::spec::DataFileBuilder::build
     pub fn referenced_data_files(&self) -> HashSet<String> {
@@ -1507,7 +1507,9 @@ mod tests {
     }
 
     /// ZERO DVs: with nothing recorded, Java's `close` early-returns a result carrying
-    /// `CharSequenceSet.empty()` (offset 79), and `referencesDataFiles()` is then false.
+    /// `CharSequenceSet.empty()` — the set is built at offset 11 and the
+    /// `deletesByPath.isEmpty()` early return runs at offsets 19-45 — and `referencesDataFiles()`
+    /// is then false.
     #[tokio::test]
     async fn dv_result_with_no_deletes_references_nothing() {
         let temp_dir = TempDir::new().expect("temp dir");

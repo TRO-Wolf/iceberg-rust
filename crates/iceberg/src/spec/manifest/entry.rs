@@ -161,7 +161,9 @@ impl ManifestEntry {
 /// Java has two arms, and the absent arm is the surprising one:
 ///
 /// * `manifest_first_row_id` **absent** → every file's `first_row_id` is set to `None`
-///   (`lambda$idAssigner$2`: an unconditional `setFirstRowId(null)` at offset 22). This
+///   (`lambda$idAssigner$2`: `setFirstRowId(null)` at offset 22, reached for every entry — it sits
+///   under the same `instanceof BaseFile` downcast as the present arm (`ifeq 25` at offset 9) and
+///   under NO status or already-assigned guard). This
 ///   **OVERWRITES** any value the file carried on disk rather than preserving it; a manifest with
 ///   no assigned range cannot lend row ids to its files. Delete manifests always take this arm —
 ///   the manifest-list writer never assigns them a `first_row_id`.
@@ -772,18 +774,26 @@ mod first_row_id_tests {
     // Every skip cell is pinned by the id the NEXT assignable file receives — asserting only that
     // the skipped entry is untouched leaves a mutation that advances the counter anyway alive.
 
+    /// The absent arm applies to EVERY entry state. Java's `lambda$idAssigner$2` carries no status
+    /// guard at all — only the `instanceof BaseFile` downcast — so a `Deleted` entry and an entry
+    /// with a stored id are nulled exactly like an `Added` one. Pinning this on `Added` alone lets
+    /// a mutation that adds a `Deleted` skip (or a preserve-if-set skip) survive, which is how the
+    /// first version of this test passed while being wrong.
     #[test]
     fn absent_manifest_row_id_forces_every_file_to_none() {
         let mut entries = vec![
             entry(ManifestStatus::Added, "a.parquet", 10, None),
             entry(ManifestStatus::Added, "b.parquet", 10, Some(4242)),
+            entry(ManifestStatus::Deleted, "c.parquet", 10, Some(77)),
+            entry(ManifestStatus::Existing, "d.parquet", 10, Some(88)),
+            entry(ManifestStatus::Existing, "e.parquet", 10, None),
         ];
         assign_first_row_ids(&mut entries, None).expect("assign");
         assert_eq!(
             assigned(&entries),
-            vec![None, None],
-            "an unassigned manifest lends no ids, and OVERWRITES a stored one — Java \
-             `lambda$idAssigner$2` calls setFirstRowId(null) unconditionally"
+            vec![None; 5],
+            "an unassigned manifest lends no ids, and OVERWRITES a stored one — in EVERY entry \
+             state, since Java's absent arm has no status guard"
         );
     }
 
@@ -847,7 +857,32 @@ mod first_row_id_tests {
         assert_eq!(assigned(&entries), vec![Some(0), Some(10)]);
     }
 
-    /// Fail closed rather than wrap into a negative row id. Java's `long` would wrap here.
+    // Two SEPARATE overflow doors, and they are not interchangeable. The `i64` door is the
+    // REACHABLE one (`i64::MAX` < `u64::MAX`), and it is the one whose wrapping form produces
+    // NEGATIVE row ids — the corruption this divergence from Java's silent `long` wrap exists to
+    // prevent. A test that only reaches the `u64` door leaves `as i64` unpinned.
+
+    /// The `i64` narrowing door: a manifest range already past `i64::MAX` cannot lend any id.
+    #[test]
+    fn a_row_id_beyond_i64_max_is_rejected() {
+        let mut entries = vec![entry(ManifestStatus::Added, "a.parquet", 1, None)];
+        let beyond_i64 = i64::MAX as u64 + 1;
+        let error = assign_first_row_ids(&mut entries, Some(beyond_i64))
+            .expect_err("a range starting past i64::MAX has no representable id");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("exceeds i64::MAX"),
+            "the i64 door must be the one that fires, got: {}",
+            error.message()
+        );
+        assert_eq!(
+            assigned(&entries),
+            vec![None],
+            "nothing is assigned on the failing entry — no wrapped, negative id is left behind"
+        );
+    }
+
+    /// The `u64` addition door: the counter itself cannot wrap.
     #[test]
     fn an_overflowing_counter_is_rejected() {
         let mut entries = vec![
@@ -855,11 +890,11 @@ mod first_row_id_tests {
             entry(ManifestStatus::Added, "b.parquet", 1, None),
         ];
         let error = assign_first_row_ids(&mut entries, Some(1))
-            .expect_err("the second file's id is past i64::MAX");
+            .expect_err("the running total wraps u64 on the first file's record_count");
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
         assert!(
-            error.message().contains("first_row_id assignment"),
-            "got: {}",
+            error.message().contains("overflowed u64"),
+            "the u64 door must be the one that fires, got: {}",
             error.message()
         );
     }

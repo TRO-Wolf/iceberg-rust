@@ -873,7 +873,10 @@ impl ManifestFile {
 
         // V3 row lineage: assign `first_row_id` from this manifest's own range (Java
         // `ManifestReader.idAssigner`). Stateful across entries, so it is a pass over the whole
-        // slice AFTER the per-entry inheritance above, and it must see them in manifest order.
+        // slice rather than a per-entry method, and it must see them in MANIFEST ORDER — that
+        // ordering IS load-bearing (the ids are a running total). Its position relative to
+        // `inherit_data` is not: that loop touches only snapshot/sequence numbers and never
+        // `first_row_id`, so the two passes are independent.
         assign_first_row_ids(&mut entries, self.first_row_id)?;
 
         Ok(Manifest::new(metadata, entries))

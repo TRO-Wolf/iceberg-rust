@@ -38,7 +38,7 @@ production-capability path unless RePark writes those types.
 |---|---|---|
 | Deletion vectors (Puffin `deletion-vector-v1`) | ✅ closed | R114; write, read, merge, commit door, and V3 engine MOR all landed (#219, #221) |
 | V3 delete-file rules (no parquet position deletes at v3) | ✅ closed | `RowDelta` refuses them at v3; the DV writer's pre-IO check refuses a DV over a live bounds-scoped delete |
-| Default values (`initial-default` / `write-default`) | ✅ closed | applied on ALL THREE read paths — `record_batch_transformer.rs:718` (parquet), `avro_reader.rs:430`, `orc_reader.rs:339-346`; `write_default` correctly NOT gated at v2 (`table_metadata_builder.rs:4284-4306`) |
+| Default values (`initial-default` / `write-default`) | ✅ closed **on the data-path formats** | APPLIED on the two data-path readers — `record_batch_transformer.rs:718` (parquet, the one RePark reads) and `avro_reader.rs:430`. ORC is the exception and is NOT an application site: `orc_reader.rs:339-346` REFUSES a field carrying a non-null `initial_default` with `FeatureUnsupported`. That is Java-faithful — Java's ORC reader throws the same way (`ORCSchemaUtil.buildOrcProjection`) — so it is parity, not a gap, but it is a REFUSAL and must not be read as support. `write_default` correctly NOT gated at v2 (`table_metadata_builder.rs:4284-4306`) |
 | Multi-argument transforms | ✅ out of scope | NOT in the oracle: `javap org.apache.iceberg.PartitionField` (1.10.0) has a single `private final int sourceId`. Parity is Java core 1.10.0, so this is not a fork gap |
 | `timestamp_ns` / `timestamptz_ns` | ✅ closed | R90 ✅ (R162 🟡 is a `data_file` metadata-projection residue, not a data-path gap) |
 | **Row lineage — `first_row_id` inheritance** | ❌ **OPEN** | see V1 |
