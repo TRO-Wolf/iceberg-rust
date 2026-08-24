@@ -32,9 +32,11 @@
 //! - `operation()` returns `DataOperations.OVERWRITE` → always [`Operation::Overwrite`].
 //! - the constructor sets `SnapshotSummary.REPLACE_PARTITIONS_PROP = "replace-partitions" = "true"`.
 //! - `addFile(file)` drops `file.partition()` (in `file.specId()`) then adds the file.
-//! - **Unpartitioned table = FULL replace:** every file is in the single empty partition, so adding any
-//!   file drops that one partition → ALL existing files are replaced (Java `apply()` reaches the same end
-//!   via `deleteByRowFilter(alwaysTrue)` when `dataSpec().isUnpartitioned()`).
+//! - **Unpartitioned data spec = FULL replace:** Java `apply()` adds `deleteByRowFilter(alwaysTrue)` when
+//!   `dataSpec().fields().isEmpty()`, removing every live data file **under every spec** — see
+//!   [`ReplacePartitionsAction::is_full_table_replace`]. On a table that only ever had one, unpartitioned
+//!   spec this coincides with dropping the single empty partition; on a table whose spec evolved it does
+//!   NOT, which is why the branch is explicit here rather than emergent.
 //! - **A replaced partition with no existing files is a pure add** (no spurious delete, no error): Java's
 //!   `failMissingDeletePaths` guards only path/file deletes, never partition drops.
 //!
@@ -46,8 +48,10 @@
 //! adding M: `N + M - N = M`, no underflow). `replace-partitions=true` is just a summary property.
 //!
 //! **Concurrent-commit conflict validation (serializable isolation):** opt-in, mirroring Java
-//! `BaseReplacePartitions.validate`. Two INDEPENDENT flags, both PARTITION-SET-based over the replaced
-//! `(spec_id, partition)` tuples (unlike OverwriteFiles/RowDelta's per-data-file checks):
+//! `BaseReplacePartitions.validate`. Two INDEPENDENT flags, each evaluated over the scope
+//! [`ConflictScope`] resolves for this commit — normally PARTITION-SET-based over the replaced
+//! `(spec_id, partition)` tuples (unlike OverwriteFiles/RowDelta's per-data-file checks), but the
+//! spec-agnostic `alwaysTrue` scope covering EVERY file when the added files' spec is unpartitioned:
 //! - [`ReplacePartitionsAction::validate_no_conflicting_data`] (Java `validateNoConflictingData`) rejects
 //!   when a concurrent snapshot ADDED DATA to a replaced partition.
 //! - [`ReplacePartitionsAction::validate_no_conflicting_deletes`] (Java `validateNoConflictingDeletes`)
@@ -71,13 +75,23 @@
 //! `addFile`, `validateAppendOnly`, `validateFromSnapshot`, `validateNoConflictingDeletes`,
 //! `validateNoConflictingData`). `BaseReplacePartitions` inherits the field from `MergingSnapshotProducer`
 //! but never surfaces it, and this action's validate path is PURELY PARTITION-SET-BASED (it compares
-//! `(spec_id, partition)` tuples — see [`file_in_replaced_partition`]) with NO `Expression`/`Predicate`
-//! binding anywhere, so there is no column-name resolution for a case-sensitivity flag to affect. Adding
-//! one would be an inert no-op that diverges from the Java public surface. Deferred deliberately.
+//! `(spec_id, partition)` tuples, or the spec-agnostic `alwaysTrue` scope — see [`ConflictScope`]) with NO
+//! caller-supplied `Expression`/`Predicate`, so there is no column-name resolution for a case-sensitivity
+//! flag to affect (the `alwaysTrue` filter binds no column names). Adding one would be an inert no-op that
+//! diverges from the Java public surface. Deferred deliberately.
 //!
-//! **Out of scope (deferred):**
-//! - static `replaceByRowFilter` / explicit-partition overwrite APIs — need inclusive/strict metrics
-//!   evaluators to select files by row predicate.
+//! **No `replaceByRowFilter` / explicit-partition API — there is none in Java to port.** `javap -p` on
+//! `iceberg-api-1.10.0.jar` lists exactly five methods on `org.apache.iceberg.ReplacePartitions`
+//! (`addFile`, `validateAppendOnly`, `validateFromSnapshot`, `validateNoConflictingDeletes`,
+//! `validateNoConflictingData`) and `BaseReplacePartitions` (`iceberg-core-1.10.0.jar`) adds no public
+//! selector of its own. `overwriteByRowFilter(Expression)` is a method of `OverwriteFiles`, ported at
+//! [`crate::transaction::overwrite_files::OverwriteFilesAction::overwrite_by_row_filter`]. Spark's static
+//! `INSERT OVERWRITE` reaches THAT action, not this one: `SparkWriteBuilder.overwrite(Filter[])` sets
+//! `overwriteByFilter` and `SparkWrite$OverwriteByFilter` calls
+//! `table.newOverwrite().overwriteByRowFilter(expr)`, while only `overwriteDynamicPartitions()` /
+//! `SparkWrite$DynamicOverwrite` calls `table.newReplacePartitions()` (bytecode-verified against
+//! `iceberg-spark-runtime-4.0_2.13-1.10.0.jar`). Adding such a method here would be an ANTI-parity
+//! addition to the Java surface.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -86,6 +100,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::expr::Predicate;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation, Struct};
 use crate::table::Table;
 use crate::transaction::snapshot::{
@@ -261,15 +276,136 @@ impl ReplacePartitionsAction {
             .map(|data_file| (data_file.partition_spec_id, data_file.partition().clone()))
             .collect()
     }
+
+    /// The partition-spec id shared by every added file — the Rust analogue of Java
+    /// `MergingSnapshotProducer.dataSpec()`, which reads the key set of `newDataFilesBySpec`.
+    ///
+    /// **This returns `None` where Java THROWS**, and that difference is a NAMED, deliberate divergence
+    /// rather than an oversight — see the two `Preconditions.checkState` calls in the 1.10.0 bytecode
+    /// (`javap -c -p org.apache.iceberg.MergingSnapshotProducer`, `dataSpec()`):
+    ///
+    /// ```text
+    ///  24: ldc "Cannot determine partition specs: no data files have been added"
+    ///  26: invokestatic Preconditions.checkState:(ZLjava/lang/Object;)V
+    ///  44: ldc "Cannot return a single partition spec: data files with different partition specs have been added"
+    ///  46: invokestatic Preconditions.checkState:(ZLjava/lang/Object;)V
+    /// ```
+    ///
+    /// Porting those two `IllegalStateException`s would make an empty replace and a mixed-spec replace
+    /// hard errors here; both currently commit (the empty case is pinned by
+    /// `test_replace_partitions_with_no_added_files_adds_nothing`). Returning `None` keeps that behavior
+    /// and makes the *scope* decision fall back to the narrower, spec-keyed
+    /// [`ConflictScope::Partitions`] / by-partition delete resolution — never to the wider
+    /// [`ConflictScope::AllFiles`], so `None` can only ever under-fire relative to Java, never over-fire.
+    /// Recorded as residue on GAP_MATRIX row R104.
+    fn data_spec_id(&self) -> Option<i32> {
+        let mut ids = self.added_data_files.iter().map(|f| f.partition_spec_id);
+        let first = ids.next()?;
+        if ids.any(|id| id != first) {
+            return None;
+        }
+        Some(first)
+    }
+
+    /// The scope the conflict checks run at, mirroring the `dataSpec().isUnpartitioned()` branch of
+    /// `BaseReplacePartitions.validate` (see [`ConflictScope`]).
+    ///
+    /// `PartitionSpec::is_unpartitioned` is the Rust `PartitionSpec.isUnpartitioned()`: TRUE when the spec
+    /// has no fields **or** every field's transform is `Void` (1.10.0 `isPartitioned()` =
+    /// `fields.length > 0 && fields.stream().anyMatch(f -> !f.transform().isVoid())`). The all-VOID case is reachable
+    /// but NOT by the route an earlier draft of this comment claimed: `UpdatePartitionSpec` substitutes
+    /// `Void` only on V1 (see `update_partition_spec.rs`'s `format_version < FormatVersion::V2` arm); on
+    /// V2/V3 the field is genuinely REMOVED, the field list empties, and the resulting spec dedups back
+    /// onto an existing id — which is why this module's all-VOID fixture is V1. An all-VOID spec still
+    /// reaches a V2/V3 table two ways: a V1 table upgraded to V2+ carries its voided fields forward in its
+    /// spec history, and externally-written metadata may contain one directly. The predicate itself is
+    /// format-version-independent, so the V1 fixture proves the logic for every version.
+    fn conflict_scope(
+        &self,
+        current: &Table,
+        drop_partitions: HashSet<(i32, Struct)>,
+    ) -> ConflictScope {
+        let unpartitioned = self
+            .data_spec_id()
+            .and_then(|spec_id| current.metadata().partition_spec_by_id(spec_id))
+            .is_some_and(|spec| spec.is_unpartitioned());
+
+        if unpartitioned {
+            ConflictScope::AllFiles
+        } else {
+            ConflictScope::Partitions(drop_partitions)
+        }
+    }
+
+    /// Whether this replace is a FULL-TABLE replace on the apply side — Java
+    /// `BaseReplacePartitions.apply`'s `dataSpec().fields().isEmpty()` branch, which adds
+    /// `deleteByRowFilter(alwaysTrue)` so EVERY live data file is removed regardless of its spec:
+    ///
+    /// ```text
+    ///   1: invokevirtual dataSpec:()Lorg/apache/iceberg/PartitionSpec;
+    ///   4: invokevirtual org/apache/iceberg/PartitionSpec.fields:()Ljava/util/List;
+    ///   7: invokeinterface java/util/List.isEmpty:()Z
+    ///  12: ifeq 22
+    ///  16: invokestatic  org/apache/iceberg/expressions/Expressions.alwaysTrue:()
+    ///  19: invokevirtual deleteByRowFilter:(Lorg/apache/iceberg/expressions/Expression;)V
+    /// ```
+    ///
+    /// **The apply test is STRICTER than the validate test** and the asymmetry is Java's, not ours:
+    /// `apply` uses `fields().isEmpty()`, `validate` uses `isUnpartitioned()` (= empty **or** all-VOID).
+    /// An all-VOID evolved spec therefore takes the WIDE branch in `validate` and the NARROW
+    /// (per-partition) branch in `apply`. Do not "harmonize" these two predicates.
+    fn is_full_table_replace(&self, current: &Table) -> bool {
+        self.data_spec_id()
+            .and_then(|spec_id| current.metadata().partition_spec_by_id(spec_id))
+            .is_some_and(|spec| spec.fields().is_empty())
+    }
 }
 
-/// Whether `file`'s `(partition_spec_id, partition)` is in the replaced-partition set `drop_partitions` —
-/// the single partition-membership predicate ReplacePartitions' conflict checks share (Java
-/// `partitionSet.contains(file.specId(), file.partition())`). Used by BOTH the conflicting-DATA check
-/// ([`ReplacePartitionsAction::validate_no_conflicting_data`]) and the two conflicting-DELETE checks
-/// ([`ReplacePartitionsAction::validate_no_conflicting_deletes`]); there is exactly ONE such predicate.
-fn file_in_replaced_partition(drop_partitions: &HashSet<(i32, Struct)>, file: &DataFile) -> bool {
-    drop_partitions.contains(&(file.partition_spec_id, file.partition().clone()))
+/// The scope a `ReplacePartitions` conflict check tests a concurrently-written file against — the Rust
+/// analogue of the TWO overload families `BaseReplacePartitions.validate` picks between (1.10.0 bytecode,
+/// `javap -c -p org.apache.iceberg.BaseReplacePartitions`):
+///
+/// ```text
+///   0: getfield  validateConflictingData
+///   7: invokevirtual dataSpec:()Lorg/apache/iceberg/PartitionSpec;
+///  11: invokevirtual org/apache/iceberg/PartitionSpec.isUnpartitioned:()Z
+///  14: ifeq 33
+///  23: invokestatic  org/apache/iceberg/expressions/Expressions.alwaysTrue:()   // UNPARTITIONED branch
+///  27: invokevirtual validateAddedDataFiles:(…Ljava/lang/Long;Lorg/…/Expression;…)V
+///  40: getfield      replacedPartitions:Lorg/apache/iceberg/util/PartitionSet;  // PARTITIONED branch
+///  44: invokevirtual validateAddedDataFiles:(…Ljava/lang/Long;Lorg/…/util/PartitionSet;…)V
+/// ```
+///
+/// The same `isUnpartitioned()` branch guards the two `validateConflictingDeletes` calls
+/// (`validateDeletedDataFiles` and `validateNoNewDeleteFiles`) at bytecode offsets 54-118.
+enum ConflictScope {
+    /// Java's PARTITIONED branch: `PartitionSet` membership, keyed by `(specId, StructLike)` — a
+    /// concurrently-written file conflicts only when BOTH its spec id AND its partition tuple are among the
+    /// replaced ones (`org.apache.iceberg.util.PartitionSet.contains(int, StructLike)` looks the spec id up
+    /// in `partitionSetById` FIRST, so a matching tuple under a DIFFERENT spec id does not conflict).
+    Partitions(HashSet<(i32, Struct)>),
+    /// Java's UNPARTITIONED branch: `Expressions.alwaysTrue()` — the conflict-detection expression matches
+    /// EVERY concurrently-written file, in EVERY partition, under EVERY partition spec. This is strictly
+    /// WIDER than `Partitions({(data_spec_id, <empty tuple>)})`: on a table whose spec evolved, live files
+    /// written under an older, PARTITIONED spec are in scope for Java and would not be for the partition-set
+    /// form.
+    AllFiles,
+}
+
+impl ConflictScope {
+    /// Whether a concurrently-written `file` is in scope for this check (Java
+    /// `partitionSet.contains(file.specId(), file.partition())` vs. an `alwaysTrue` conflict-detection
+    /// expression, which every file satisfies). Used by BOTH the conflicting-DATA check
+    /// ([`ReplacePartitionsAction::validate_no_conflicting_data`]) and the two conflicting-DELETE checks
+    /// ([`ReplacePartitionsAction::validate_no_conflicting_deletes`]); there is exactly ONE such predicate.
+    fn contains(&self, file: &DataFile) -> bool {
+        match self {
+            ConflictScope::Partitions(drop_partitions) => {
+                drop_partitions.contains(&(file.partition_spec_id, file.partition().clone()))
+            }
+            ConflictScope::AllFiles => true,
+        }
+    }
 }
 
 #[async_trait]
@@ -297,6 +433,7 @@ impl TransactionAction for ReplacePartitionsAction {
             .commit(
                 ReplacePartitionsOperation {
                     drop_partitions: self.drop_partitions(),
+                    full_table_replace: self.is_full_table_replace(table),
                     validate_append_only: self.validate_append_only,
                 },
                 DefaultManifestProcess,
@@ -305,7 +442,10 @@ impl TransactionAction for ReplacePartitionsAction {
     }
 
     /// Serializable-isolation conflict validation (Java `BaseReplacePartitions.validate`). Two INDEPENDENT,
-    /// opt-in checks, both PARTITION-SET-based over the replaced `(spec_id, partition)` tuples:
+    /// opt-in checks, each evaluated over the [`ConflictScope`] this commit resolves — PARTITION-SET-based
+    /// over the replaced `(spec_id, partition)` tuples, or the spec-agnostic `alwaysTrue` scope covering
+    /// EVERY file when the added files' spec is unpartitioned (see [`Self::conflict_scope`]). Where the
+    /// bullets below say "a replaced partition", read "within the resolved scope":
     /// - [`Self::validate_no_conflicting_data`] (Java `validateConflictingData` branch →
     ///   `validateAddedDataFiles`): reject if a concurrent snapshot ADDED DATA to a replaced partition.
     /// - [`Self::validate_no_conflicting_deletes`] (Java `validateConflictingDeletes` branch →
@@ -316,7 +456,7 @@ impl TransactionAction for ReplacePartitionsAction {
     /// (snapshot isolation, current behavior unchanged).
     ///
     /// The effective starting snapshot ([`Self::validate_from_snapshot`] if set, else the transaction-captured
-    /// `starting_snapshot_id`) and the replaced-partition set are computed ONCE and shared by all enabled
+    /// `starting_snapshot_id`) and the [`ConflictScope`] are computed ONCE and shared by all enabled
     /// checks. Every rejection is a NON-retryable [`ErrorKind::DataInvalid`] (Java's non-retryable
     /// `ValidationException`), so the commit retry loop stops and the error propagates rather than looping.
     async fn validate(
@@ -334,23 +474,29 @@ impl TransactionAction for ReplacePartitionsAction {
         let effective_start = self.validate_from_snapshot.or(starting_snapshot_id);
 
         let drop_partitions = self.drop_partitions();
-        // An empty replace touches no partitions, so nothing can conflict — skip every manifest walk.
+        // An empty replace adds no files, so `data_spec_id()` is `None`, the scope can only be
+        // `Partitions(<empty>)`, and nothing can conflict — skip every manifest walk. (Java instead throws
+        // `IllegalStateException` from `dataSpec()` here; see [`Self::data_spec_id`].)
         if drop_partitions.is_empty() {
             return Ok(());
         }
 
-        // Java `validateConflictingData` branch → `validateAddedDataFiles(partitionSet)`.
+        // Java `BaseReplacePartitions.validate` picks ONE scope for all three checks, from
+        // `dataSpec().isUnpartitioned()`.
+        let scope = self.conflict_scope(current, drop_partitions);
+
+        // Java `validateConflictingData` branch → `validateAddedDataFiles(partitionSet | alwaysTrue)`.
         if self.validate_no_conflicting_data {
-            self.validate_added_data_files(current, effective_start, &drop_partitions)
+            self.validate_added_data_files(current, effective_start, &scope)
                 .await?;
         }
 
-        // Java `validateConflictingDeletes` branch → `validateDeletedDataFiles(partitionSet)` THEN
-        // `validateNoNewDeleteFiles(partitionSet)` (same order as Java).
+        // Java `validateConflictingDeletes` branch → `validateDeletedDataFiles` THEN
+        // `validateNoNewDeleteFiles` (same order as Java), at the same scope.
         if self.validate_no_conflicting_deletes {
-            self.validate_deleted_data_files(current, effective_start, &drop_partitions)
+            self.validate_deleted_data_files(current, effective_start, &scope)
                 .await?;
-            self.validate_no_new_delete_files(current, effective_start, &drop_partitions)
+            self.validate_no_new_delete_files(current, effective_start, &scope)
                 .await?;
         }
 
@@ -363,21 +509,19 @@ impl ReplacePartitionsAction {
     /// base, startingSnapshotId, replacedPartitions, parent)`. Enumerate every DATA file ADDED to the refreshed
     /// base by snapshots committed since `effective_start` (the shared [`added_data_files_after`] = Java
     /// `addedDataFiles`, gated to `VALIDATE_ADDED_FILES_OPERATIONS = {APPEND, OVERWRITE}`) and reject on the
-    /// FIRST whose partition is replaced ([`file_in_replaced_partition`] = Java `partitionSet.contains(...)`).
+    /// FIRST whose partition is replaced ([`ConflictScope::contains`] = Java `partitionSet.contains(...)`, or unconditionally true under the
+    /// `alwaysTrue` scope).
     async fn validate_added_data_files(
         &self,
         current: &Table,
         effective_start: Option<i64>,
-        drop_partitions: &HashSet<(i32, Struct)>,
+        scope: &ConflictScope,
     ) -> Result<()> {
         let added = added_data_files_after(current, effective_start).await?;
 
         // Naming the conflicting partition + file mirrors Java's
         // "Found conflicting files that can contain records matching partitions %s: %s".
-        if let Some(conflict) = added
-            .iter()
-            .find(|file| file_in_replaced_partition(drop_partitions, file))
-        {
+        if let Some(conflict) = added.iter().find(|file| scope.contains(file)) {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -399,13 +543,14 @@ impl ReplacePartitionsAction {
     /// with `skip_deletes == false` = Java `deletedDataFiles` gated to `VALIDATE_DATA_FILES_EXIST_OPERATIONS =
     /// {OVERWRITE, REPLACE, DELETE}`; `skip_deletes == false` keeps concurrent DELETE-op snapshots in scope,
     /// matching Java's op-set which INCLUDES `DELETE`) and reject on the FIRST whose partition is replaced
-    /// ([`file_in_replaced_partition`] = Java `partitionSet.contains(...)`). You cannot dynamically replace a
+    /// ([`ConflictScope::contains`] = Java `partitionSet.contains(...)`, or unconditionally true under the
+    /// `alwaysTrue` scope). You cannot dynamically replace a
     /// partition whose data a concurrent commit removed.
     async fn validate_deleted_data_files(
         &self,
         current: &Table,
         effective_start: Option<i64>,
-        drop_partitions: &HashSet<(i32, Struct)>,
+        scope: &ConflictScope,
     ) -> Result<()> {
         // `skip_deletes == false`: Java's `validateDeletedDataFiles` uses `VALIDATE_DATA_FILES_EXIST_OPERATIONS`
         // (the full `{OVERWRITE, REPLACE, DELETE}` set), NOT the skip-delete subset — so a concurrent DELETE-op
@@ -414,10 +559,7 @@ impl ReplacePartitionsAction {
 
         // Java throws on the first matching entry:
         // "Found conflicting deleted files that can apply to records matching %s: %s".
-        if let Some(conflict) = deleted
-            .iter()
-            .find(|file| file_in_replaced_partition(drop_partitions, file))
-        {
+        if let Some(conflict) = deleted.iter().find(|file| scope.contains(file)) {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -438,22 +580,20 @@ impl ReplacePartitionsAction {
     /// refreshed base by snapshots committed since `effective_start` (the shared [`added_delete_files_after`] =
     /// Java `addedDeleteFiles` gated to `VALIDATE_ADDED_DELETE_FILES_OPERATIONS = {OVERWRITE, DELETE}`,
     /// V2-guarded so a V1 table walks nothing) and reject on the FIRST whose partition is replaced
-    /// ([`file_in_replaced_partition`] = Java `partitionSet.contains(...)`). A concurrent row-delete in a
+    /// ([`ConflictScope::contains`] = Java `partitionSet.contains(...)`, or unconditionally true under the
+    /// `alwaysTrue` scope). A concurrent row-delete in a
     /// partition you are about to replace is a conflict.
     async fn validate_no_new_delete_files(
         &self,
         current: &Table,
         effective_start: Option<i64>,
-        drop_partitions: &HashSet<(i32, Struct)>,
+        scope: &ConflictScope,
     ) -> Result<()> {
         let added_deletes = added_delete_files_after(current, effective_start).await?;
 
         // Java throws on the first matching entry:
         // "Found new conflicting delete files that can apply to records matching %s: %s".
-        if let Some(conflict) = added_deletes
-            .iter()
-            .find(|file| file_in_replaced_partition(drop_partitions, file))
-        {
+        if let Some(conflict) = added_deletes.iter().find(|file| scope.contains(file)) {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -480,6 +620,11 @@ impl ReplacePartitionsAction {
 struct ReplacePartitionsOperation {
     /// The `(partition_spec_id, partition)` tuples to replace, derived from the added files.
     drop_partitions: HashSet<(i32, Struct)>,
+    /// Java `BaseReplacePartitions.apply`'s `dataSpec().fields().isEmpty()` branch: when true the operation
+    /// removes EVERY live data file (`deleteByRowFilter(alwaysTrue)`), not just the ones whose
+    /// `(spec_id, partition)` is in [`Self::drop_partitions`]. Computed by
+    /// [`ReplacePartitionsAction::is_full_table_replace`].
+    full_table_replace: bool,
     /// Java `ManifestFilterManager.failAnyDelete` (set by `ReplacePartitions.validateAppendOnly`): when true,
     /// the resolved deletes must be EMPTY — if this overwrite would remove any live file, the commit fails.
     validate_append_only: bool,
@@ -499,13 +644,31 @@ impl SnapshotProduceOperation for ReplacePartitionsOperation {
     }
 
     async fn delete_files(&self, snapshot_produce: &SnapshotProducer<'_>) -> Result<Vec<DataFile>> {
-        // Resolve the drop-partition set against the current snapshot's live data entries: every live
-        // data file whose `(spec_id, partition)` is in the set is removed (Java
+        // Java `BaseReplacePartitions.apply` FIRST adds `deleteByRowFilter(alwaysTrue)` when the data spec
+        // has no partition fields, and only then delegates to `MergingSnapshotProducer.apply`. That row
+        // filter is spec-AGNOSTIC: it removes every live data file, including files written under an OLDER,
+        // PARTITIONED spec that the `(spec_id, <empty tuple>)` drop-partition key can never reach. Route it
+        // through the shared `resolve_filter_deletes`, which is the port of the same
+        // `ManifestFilterManager` machinery Java's row filter drives (an `alwaysTrue` residual is
+        // trivially strict, so every live data file resolves and no PARTIAL-match error is reachable).
+        //
+        // `case_sensitive = true` is not a choice: `ReplacePartitions` exposes no `caseSensitive(boolean)`
+        // in the 1.10.0 API, so the `MergingSnapshotProducer` constructor default (`true`) always applies —
+        // and `alwaysTrue` binds no column names anyway.
+        //
+        // Otherwise resolve the drop-partition set against the current snapshot's live data entries: every
+        // live data file whose `(spec_id, partition)` is in the set is removed (Java
         // `ManifestFilterManager`'s `dropPartitions.contains(...)`). No missing-target validation —
         // a replaced partition with no existing files is a pure add.
-        let resolved = snapshot_produce
-            .resolve_partition_deletes(&self.drop_partitions)
-            .await?;
+        let resolved = if self.full_table_replace {
+            snapshot_produce
+                .resolve_filter_deletes(&Predicate::AlwaysTrue, true)
+                .await?
+        } else {
+            snapshot_produce
+                .resolve_partition_deletes(&self.drop_partitions)
+                .await?
+        };
 
         // Java `ManifestFilterManager.failAnyDelete` (set by `ReplacePartitions.validateAppendOnly`): if this
         // dynamic overwrite would REMOVE any existing live data file, the operation is not purely additive, so
@@ -545,6 +708,15 @@ impl SnapshotProduceOperation for ReplacePartitionsOperation {
         // outstanding position / equality deletes in the UNREPLACED partitions instead of silently dropping
         // them table-wide and resurrecting deleted rows. The conservative dangling-delete posture (no
         // pruning) is documented on the helper.
+        //
+        // NAMED DIVERGENCE on the FULL-TABLE-REPLACE branch (`is_full_table_replace`): there ARE no
+        // unreplaced partitions there, so the rationale above does not apply and this carry-forward is
+        // where the port diverges from Java most. Java's `deleteByRowFilter` drives BOTH filter managers
+        // (`MergingSnapshotProducer.deleteByRowFilter` offsets 5-18) and `apply` additionally runs
+        // `deleteFilterManager.removeDanglingDeletesFor(...)` (offsets 103-114), so under `alwaysTrue`
+        // Java removes every live DELETE file as well. This port keeps them. It cannot resurrect rows
+        // (every referenced data file is removed and the replacements carry a higher sequence number), but
+        // it leaves a manifest-list difference byte-level interop would show. See row R104's residue.
         snapshot_produce.current_manifests().await
     }
 }
@@ -562,7 +734,7 @@ mod tests {
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, ManifestContentType,
-        ManifestStatus, Operation, Struct, TableMetadata,
+        ManifestStatus, Operation, Struct, TableMetadata, Transform,
     };
     use crate::table::Table;
     use crate::transaction::tests::{
@@ -688,6 +860,14 @@ mod tests {
     /// Create an UNPARTITIONED V3 table in the catalog (same schema as the minimal fixture, but with no
     /// partition spec). Used to pin the full-table-replace behavior of `ReplacePartitions`.
     async fn make_v3_unpartitioned_table_in_catalog(catalog: &impl Catalog) -> Table {
+        make_unpartitioned_table_in_catalog(catalog, crate::spec::FormatVersion::V3).await
+    }
+
+    /// [`make_v3_unpartitioned_table_in_catalog`] at an explicit format version.
+    async fn make_unpartitioned_table_in_catalog(
+        catalog: &impl Catalog,
+        format_version: crate::spec::FormatVersion,
+    ) -> Table {
         let table_ident =
             TableIdent::from_strs([format!("ns1-{}", uuid::Uuid::new_v4()), "test1".to_string()])
                 .unwrap();
@@ -696,10 +876,17 @@ mod tests {
             .await
             .unwrap();
 
+        // The V3 minimal schema carries a non-null `initial-default`, which is illegal before V3 — take
+        // the V2 minimal schema for anything below V3.
+        let template = if format_version >= crate::spec::FormatVersion::V3 {
+            "TableMetadataV3ValidMinimal.json"
+        } else {
+            "TableMetadataV2ValidMinimal.json"
+        };
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
             env!("CARGO_MANIFEST_DIR"),
-            "TableMetadataV3ValidMinimal.json"
+            template
         ))
         .unwrap();
         let reader = BufReader::new(file);
@@ -710,7 +897,7 @@ mod tests {
             .schema((**base_metadata.current_schema()).clone())
             .sort_order((**base_metadata.default_sort_order()).clone())
             .name(table_ident.name().to_string())
-            .format_version(crate::spec::FormatVersion::V3)
+            .format_version(format_version)
             .build();
 
         catalog
@@ -1422,8 +1609,9 @@ mod tests {
     // Concurrent-commit CONFLICTING-DELETE validation (Java `validateNoConflictingDeletes` /
     // serializable isolation).
     //
-    // INDEPENDENT of `validateNoConflictingData` (above): this is PARTITION-SET-based over the replaced
-    // `(spec_id, partition)` tuples and rejects when, in a replaced partition, a concurrent commit either
+    // INDEPENDENT of `validateNoConflictingData` (above): this is evaluated over the resolved
+    // `ConflictScope` — the replaced `(spec_id, partition)` tuples, or every file under the
+    // spec-agnostic `alwaysTrue` scope — and rejects when, within that scope, a concurrent commit either
     //   (a) DELETED a data file (Java `validateDeletedDataFiles` — you cannot dynamically replace a
     //       partition whose data a concurrent commit removed), or
     //   (b) ADDED a delete file (Java `validateNoNewDeleteFiles` — a concurrent row-delete in a partition
@@ -2159,6 +2347,556 @@ mod tests {
             live_file_paths(&reloaded).await,
             HashSet::from(["test/a.parquet".to_string(), "test/b.parquet".to_string()]),
             "the rejected full replace must not have altered the table (A, B kept, C absent)"
+        );
+    }
+    // ============================================================================================
+    // MULTI-SPEC scope: Java's `dataSpec()` branches.
+    //
+    // Every test above builds exactly ONE partition spec, which makes the `(spec_id, partition)` key
+    // indistinguishable from a bare partition key. These tests evolve the spec so the two disagree, and
+    // pin the two places Java branches on the ADDED FILES' spec (`MergingSnapshotProducer.dataSpec()`):
+    //
+    // - `BaseReplacePartitions.apply`  → `dataSpec().fields().isEmpty()`  ⇒ `deleteByRowFilter(alwaysTrue)`
+    // - `BaseReplacePartitions.validate` → `dataSpec().isUnpartitioned()` ⇒ the `alwaysTrue` overloads of
+    //   `validateAddedDataFiles` / `validateDeletedDataFiles` / `validateNoNewDeleteFiles`
+    //
+    // Both branches are SPEC-AGNOSTIC where the partition-set form is spec-keyed, so on a table whose spec
+    // evolved they see strictly more files. The two predicates are deliberately DIFFERENT (`fields()
+    // .isEmpty()` vs `isUnpartitioned()`, the latter also true for an all-VOID spec) — that asymmetry is
+    // Java's and is pinned below.
+    // ============================================================================================
+
+    /// A data file stamped with an explicit `(spec_id, partition)` — the multi-spec tests need to place a
+    /// file under a spec that is no longer the table default.
+    fn data_file_in_spec(path: &str, spec_id: i32, partition: Struct) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(spec_id)
+            .partition(partition)
+            .build()
+            .unwrap()
+    }
+
+    /// A position-delete file stamped with an explicit `(spec_id, partition)`.
+    fn position_delete_file_in_spec(path: &str, spec_id: i32, partition: Struct) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(spec_id)
+            .partition(partition)
+            .build()
+            .unwrap()
+    }
+
+    /// Evolve the table's partition spec by ADDING an identity field on `field`, returning the table and
+    /// its new default spec id.
+    async fn evolve_add_field(catalog: &impl Catalog, table: &Table, field: &str) -> (Table, i32) {
+        let tx = Transaction::new(table);
+        let tx = tx
+            .update_partition_spec()
+            .add_field(field)
+            .apply(tx)
+            .expect("apply update_partition_spec add_field");
+        let table = tx
+            .commit(catalog)
+            .await
+            .expect("commit spec evolution (add)");
+        let spec_id = table.metadata().default_partition_spec_id();
+        (table, spec_id)
+    }
+
+    /// Evolve the table's partition spec by REMOVING `field`, returning the table and its new default spec
+    /// id. On V2/V3 this leaves a VOID field behind rather than an empty field list.
+    async fn evolve_remove_field(
+        catalog: &impl Catalog,
+        table: &Table,
+        field: &str,
+    ) -> (Table, i32) {
+        let tx = Transaction::new(table);
+        let tx = tx
+            .update_partition_spec()
+            .remove_field(field)
+            .apply(tx)
+            .expect("apply update_partition_spec remove_field");
+        let table = tx
+            .commit(catalog)
+            .await
+            .expect("commit spec evolution (remove)");
+        let spec_id = table.metadata().default_partition_spec_id();
+        (table, spec_id)
+    }
+
+    /// THE multi-spec fixture. Build a V3 table that carries live data under TWO specs:
+    ///
+    /// - spec 0: UNPARTITIONED (`fields()` empty — the table is created with no partition spec), holding
+    ///   `test/a.parquet`;
+    /// - spec 1: `identity(x)`, holding `test/b.parquet` in partition `x = 0`.
+    ///
+    /// Returns `(table, spec_1_id)`. Asserts the fixture's own preconditions, because every test below is
+    /// vacuous if the two specs collapse to one or if spec 0 is not field-empty.
+    async fn make_two_spec_table(catalog: &impl Catalog) -> (Table, i32) {
+        make_two_spec_table_of(catalog, crate::spec::FormatVersion::V3).await
+    }
+
+    /// [`make_two_spec_table`] at an explicit format version. V2 is needed by the conflicting-DELETE leg:
+    /// V3 rejects parquet position deletes outright (`validateDeleteFileForVersion`, "Must use DVs for
+    /// position deletes in V3"), which would abort the concurrent commit before the scope is ever tested.
+    async fn make_two_spec_table_of(
+        catalog: &impl Catalog,
+        format_version: crate::spec::FormatVersion,
+    ) -> (Table, i32) {
+        let table = make_unpartitioned_table_in_catalog(catalog, format_version).await;
+        assert!(
+            table
+                .metadata()
+                .partition_spec_by_id(0)
+                .expect("spec 0 exists")
+                .fields()
+                .is_empty(),
+            "fixture precondition: spec 0 must have NO partition fields (Java `dataSpec().fields().isEmpty()`)"
+        );
+
+        let table = append_files(catalog, &table, vec![unpartitioned_data_file(
+            "test/a.parquet",
+        )])
+        .await;
+
+        let (table, spec_1) = evolve_add_field(catalog, &table, "x").await;
+        assert_ne!(
+            spec_1, 0,
+            "fixture precondition: the evolved spec must be a NEW spec id"
+        );
+        assert!(
+            !table
+                .metadata()
+                .partition_spec_by_id(spec_1)
+                .expect("evolved spec exists")
+                .is_unpartitioned(),
+            "fixture precondition: the evolved spec must be genuinely partitioned"
+        );
+
+        let table = append_files(catalog, &table, vec![data_file_in_spec(
+            "test/b.parquet",
+            spec_1,
+            Struct::from_iter([Some(Literal::long(0))]),
+        )])
+        .await;
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/a.parquet".to_string(), "test/b.parquet".to_string()]),
+            "fixture precondition: both specs' files are live"
+        );
+        (table, spec_1)
+    }
+
+    /// **The corruption-class pin for the apply side.** On the two-spec fixture, a `replace_partitions`
+    /// whose added file belongs to the FIELD-EMPTY spec 0 is a FULL-TABLE replace in Java
+    /// (`BaseReplacePartitions.apply` adds `deleteByRowFilter(alwaysTrue)` when
+    /// `dataSpec().fields().isEmpty()`), so `test/b.parquet` — live under the PARTITIONED spec 1 — must be
+    /// removed too. The live set after the commit is exactly `{test/c.parquet}`.
+    ///
+    /// Risk pinned: a by-partition-only resolution keys on `(0, <empty tuple>)`, which `test/b.parquet`
+    /// (spec 1, `x = 0`) can never match, so it survives a replace Java would have removed — a table that
+    /// silently holds MORE rows than the same operation produced in Java, with no error anywhere. This is
+    /// the exact shape `is_full_table_replace` exists for.
+    #[tokio::test]
+    async fn test_replace_partitions_field_empty_data_spec_replaces_files_of_every_spec() {
+        let catalog = new_memory_catalog().await;
+        let (table, _spec_1) = make_two_spec_table(&catalog).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(unpartitioned_data_file("test/c.parquet"));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/c.parquet".to_string()]),
+            "a replace whose data spec has NO partition fields is a full-table replace: the spec-1 file \
+             must be removed too"
+        );
+    }
+
+    /// The OVER-broadening control for the test above: on the same fixture, a replace whose added file
+    /// belongs to the PARTITIONED spec 1 must take the narrow, per-partition branch —
+    /// `dataSpec().fields().isEmpty()` is false, so Java adds no `alwaysTrue` row filter. Only
+    /// `test/b.parquet` (spec 1, `x = 0`) is replaced; `test/a.parquet` under spec 0 survives.
+    ///
+    /// Risk pinned: making the full-replace branch unconditional (or keying it on the TABLE's default spec
+    /// rather than the ADDED FILES' spec) would delete `test/a.parquet` here — unrequested data loss. The
+    /// preceding test cannot see that mutation; this one does.
+    #[tokio::test]
+    async fn test_replace_partitions_partitioned_data_spec_keeps_other_specs_files() {
+        let catalog = new_memory_catalog().await;
+        let (table, spec_1) = make_two_spec_table(&catalog).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx.replace_partitions().add_file(data_file_in_spec(
+            "test/b2.parquet",
+            spec_1,
+            Struct::from_iter([Some(Literal::long(0))]),
+        ));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/a.parquet".to_string(), "test/b2.parquet".to_string()]),
+            "a partitioned data spec takes the narrow per-partition branch: the spec-0 file must survive"
+        );
+    }
+
+    /// The ALL-VOID-spec fixture. Returns `(table, partitioned_spec_id, all_void_spec_id)`.
+    ///
+    /// It is a **V1** table because V1 is where the void field comes from: `UpdatePartitionSpec` replaces a
+    /// removed field with a `Void` transform (preserving its field id) only on V1 — on V2/V3 the field is
+    /// genuinely removed, the field list becomes empty, and the resulting spec is DEDUPLICATED back onto
+    /// the existing spec id, so no distinct all-void spec exists to test. (Java 1.10.0 behaves the same
+    /// way; the V1 field-id-stability rule is what forces the void placeholder.)
+    ///
+    /// Shape: spec 0 = `identity(x)` holding `test/a.parquet` at `x = 0`; spec 1 = `[void(x)]`, holding
+    /// nothing yet. Asserts the shape Java's two predicates disagree on: `fields()` is NOT empty (so
+    /// `apply` stays narrow) while `isUnpartitioned()` IS true (so `validate` goes wide).
+    async fn make_all_void_spec_table(catalog: &impl Catalog) -> (Table, i32, i32) {
+        let table = make_v1_partitioned_table_in_catalog(catalog).await;
+        let partitioned_spec = table.metadata().default_partition_spec_id();
+        let table = append_files(catalog, &table, vec![data_file_in_spec(
+            "test/a.parquet",
+            partitioned_spec,
+            Struct::from_iter([Some(Literal::long(0))]),
+        )])
+        .await;
+
+        let (table, void_spec) = evolve_remove_field(catalog, &table, "x").await;
+        assert_ne!(
+            void_spec, partitioned_spec,
+            "fixture precondition: the void spec must be a NEW spec id"
+        );
+
+        let spec = table
+            .metadata()
+            .partition_spec_by_id(void_spec)
+            .expect("all-void spec exists");
+        assert!(
+            !spec.fields().is_empty(),
+            "fixture precondition: removing the last field on V1 leaves a VOID field, not an empty list \
+             (this is the whole point of the asymmetry pin)"
+        );
+        assert!(
+            spec.fields().iter().all(|f| f.transform == Transform::Void),
+            "fixture precondition: every field of the evolved spec must be VOID"
+        );
+        assert!(
+            spec.is_unpartitioned(),
+            "fixture precondition: an all-VOID spec is `isUnpartitioned()` (Java `isPartitioned()` = \
+             fields non-empty AND some field is non-void)"
+        );
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/a.parquet".to_string()]),
+            "fixture precondition: the partitioned spec's file is live"
+        );
+        (table, partitioned_spec, void_spec)
+    }
+
+    /// A fresh V1 table partitioned by `identity(x)` (same schema as the minimal fixtures). V1 is required
+    /// by [`make_all_void_spec_table`]; see its doc for why.
+    async fn make_v1_partitioned_table_in_catalog(catalog: &impl Catalog) -> Table {
+        let table_ident =
+            TableIdent::from_strs([format!("ns1-{}", uuid::Uuid::new_v4()), "test1".to_string()])
+                .unwrap();
+        catalog
+            .create_namespace(table_ident.namespace(), HashMap::new())
+            .await
+            .unwrap();
+
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV2ValidMinimal.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let base_metadata = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        let table_creation = TableCreation::builder()
+            .schema((**base_metadata.current_schema()).clone())
+            .partition_spec((**base_metadata.default_partition_spec()).clone())
+            .sort_order((**base_metadata.default_sort_order()).clone())
+            .name(table_ident.name().to_string())
+            .format_version(crate::spec::FormatVersion::V1)
+            .build();
+
+        catalog
+            .create_table(table_ident.namespace(), table_creation)
+            .await
+            .unwrap()
+    }
+
+    /// **The `fields().isEmpty()` vs `isUnpartitioned()` ASYMMETRY, apply half.** On an ALL-VOID data spec
+    /// Java's `apply` does NOT add the `alwaysTrue` row filter (its test is the stricter
+    /// `dataSpec().fields().isEmpty()`), so the replace stays per-partition and the other specs' files
+    /// survive.
+    ///
+    /// Risk pinned: "harmonizing" `is_full_table_replace` onto `is_unpartitioned()` — the predicate the
+    /// sibling `conflict_scope` uses, and the obvious-looking simplification — would silently turn this
+    /// into a full-table replace and destroy `test/a.parquet` and `test/b.parquet`.
+    #[tokio::test]
+    async fn test_replace_partitions_all_void_data_spec_does_not_full_replace() {
+        let catalog = new_memory_catalog().await;
+        let (table, _partitioned_spec, void_spec) = make_all_void_spec_table(&catalog).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx.replace_partitions().add_file(data_file_in_spec(
+            "test/v.parquet",
+            void_spec,
+            Struct::from_iter([None]),
+        ));
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from(["test/a.parquet".to_string(), "test/v.parquet".to_string()]),
+            "an all-VOID data spec has NON-empty `fields()`, so Java's apply-side full-replace branch does \
+             NOT fire: nothing pre-existing is removed"
+        );
+    }
+
+    /// **The `alwaysTrue` conflict scope, `validateAddedDataFiles` leg.** With a FIELD-EMPTY data spec,
+    /// `BaseReplacePartitions.validate` calls `validateAddedDataFiles(base, start, Expressions.alwaysTrue(),
+    /// parent)` — spec-agnostic. A concurrent append under the OTHER (partitioned) spec, in a partition the
+    /// replace never names, is therefore a conflict.
+    ///
+    /// Risk pinned: under the partition-set form the concurrent file's key is `(1, {x=1})`, the replaced set
+    /// is `{(0, <empty>)}`, so the commit is ACCEPTED — the fork silently permits a lost write that Java
+    /// rejects, on exactly the operation (`apply` full-replaces every spec) that clobbers it.
+    #[tokio::test]
+    async fn test_replace_partitions_field_empty_data_spec_conflicts_with_other_spec_append() {
+        let catalog = new_memory_catalog().await;
+        let (table, spec_1) = make_two_spec_table(&catalog).await;
+        let from = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        // Build the replace against the current head...
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(unpartitioned_data_file("test/c.parquet"))
+            .validate_from_snapshot(from)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // ...then land a CONCURRENT append under spec 1, partition x = 1 — a partition this replace does
+        // not name, under a spec it does not name.
+        append_files(&catalog, &table, vec![data_file_in_spec(
+            "test/d.parquet",
+            spec_1,
+            Struct::from_iter([Some(Literal::long(1))]),
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "an alwaysTrue conflict scope must reject a concurrent append under ANY spec/partition",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            !err.retryable(),
+            "Java's ValidationException is non-retryable"
+        );
+        assert!(
+            err.message().contains("test/d.parquet"),
+            "the error must name the conflicting file, got: {}",
+            err.message()
+        );
+    }
+
+    /// The OVER-broadening control for the scope: with a PARTITIONED data spec the narrow partition-set
+    /// form applies, so a concurrent append into a DIFFERENT partition of the same spec is accepted.
+    ///
+    /// Risk pinned: widening `conflict_scope` to `AllFiles` unconditionally would reject this commit,
+    /// turning ordinary non-overlapping concurrent appends into hard validation failures. The preceding
+    /// test cannot see that mutation.
+    #[tokio::test]
+    async fn test_replace_partitions_partitioned_data_spec_keeps_narrow_conflict_scope() {
+        let catalog = new_memory_catalog().await;
+        let (table, spec_1) = make_two_spec_table(&catalog).await;
+        let from = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(data_file_in_spec(
+                "test/b2.parquet",
+                spec_1,
+                Struct::from_iter([Some(Literal::long(0))]),
+            ))
+            .validate_from_snapshot(from)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        append_files(&catalog, &table, vec![data_file_in_spec(
+            "test/d.parquet",
+            spec_1,
+            Struct::from_iter([Some(Literal::long(1))]),
+        )])
+        .await;
+
+        let table = tx.commit(&catalog).await.expect(
+            "a narrow partition-set scope must accept an append into an untouched partition",
+        );
+        assert_eq!(
+            live_file_paths(&table).await,
+            HashSet::from([
+                "test/a.parquet".to_string(),
+                "test/b2.parquet".to_string(),
+                "test/d.parquet".to_string(),
+            ]),
+            "the concurrent append survives alongside the replaced partition"
+        );
+    }
+
+    /// **The `alwaysTrue` conflict scope, `validateNoNewDeleteFiles` leg** — the twin of the
+    /// `validateAddedDataFiles` test above. A concurrent snapshot adds a POSITION-DELETE file under the
+    /// other, partitioned spec; with a field-empty data spec Java's scope is `alwaysTrue`, so it conflicts.
+    ///
+    /// Risk pinned: scope is threaded through three separate helpers, and coverage of one is not coverage
+    /// of another (`validate_added_data_files` walks added DATA files, this one walks added DELETE files).
+    #[tokio::test]
+    async fn test_replace_partitions_field_empty_data_spec_conflicts_with_other_spec_delete_file() {
+        let catalog = new_memory_catalog().await;
+        // V2: parquet position deletes are rejected outright on V3 (see `make_two_spec_table_of`).
+        let (table, spec_1) =
+            make_two_spec_table_of(&catalog, crate::spec::FormatVersion::V2).await;
+        let from = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(unpartitioned_data_file("test/c.parquet"))
+            .validate_from_snapshot(from)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // Concurrent row-delete under spec 1, partition x = 1.
+        let concurrent = Transaction::new(&table);
+        let concurrent_action =
+            concurrent
+                .row_delta()
+                .add_deletes(vec![position_delete_file_in_spec(
+                    "test/del-x1.parquet",
+                    spec_1,
+                    Struct::from_iter([Some(Literal::long(1))]),
+                )]);
+        let concurrent = concurrent_action.apply(concurrent).unwrap();
+        concurrent.commit(&catalog).await.unwrap();
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "an alwaysTrue conflict scope must reject a concurrent delete file under ANY spec/partition",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert!(
+            err.message().contains("test/del-x1.parquet"),
+            "the error must name the conflicting delete file, got: {}",
+            err.message()
+        );
+    }
+
+    /// **The `alwaysTrue` conflict scope, `validateDeletedDataFiles` leg** — the third helper the scope is
+    /// threaded through. A concurrent snapshot REMOVES a data file under the other, partitioned spec; with
+    /// a field-empty data spec that is a conflict.
+    ///
+    /// Risk pinned: same twin-coverage risk as the delete-file test — this helper walks DELETED data files
+    /// (`deleted_data_files_after`), which neither sibling touches.
+    #[tokio::test]
+    async fn test_replace_partitions_field_empty_data_spec_conflicts_with_other_spec_data_removal()
+    {
+        let catalog = new_memory_catalog().await;
+        let (table, _spec_1) = make_two_spec_table(&catalog).await;
+        let from = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(unpartitioned_data_file("test/c.parquet"))
+            .validate_from_snapshot(from)
+            .validate_no_conflicting_deletes();
+        let tx = action.apply(tx).unwrap();
+
+        // Concurrent removal of the spec-1 file.
+        let concurrent = Transaction::new(&table);
+        let concurrent_action = concurrent
+            .delete_files()
+            .delete_file("test/b.parquet".to_string());
+        let concurrent = concurrent_action.apply(concurrent).unwrap();
+        concurrent.commit(&catalog).await.unwrap();
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "an alwaysTrue conflict scope must reject a concurrent data removal under ANY spec/partition",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert!(
+            err.message().contains("test/b.parquet"),
+            "the error must name the concurrently-deleted file, got: {}",
+            err.message()
+        );
+    }
+
+    /// **The `fields().isEmpty()` vs `isUnpartitioned()` ASYMMETRY, validate half.** An ALL-VOID data spec
+    /// is `isUnpartitioned()`, so `BaseReplacePartitions.validate` takes the WIDE `alwaysTrue` branch even
+    /// though `apply` stayed narrow for the same spec (pinned by
+    /// `test_replace_partitions_all_void_data_spec_does_not_full_replace`). A concurrent append under the
+    /// partitioned spec therefore conflicts.
+    ///
+    /// Risk pinned: implementing `conflict_scope` with `fields().is_empty()` — the predicate its apply-side
+    /// sibling uses — leaves this commit accepted, dropping a real Java rejection on the floor. The two
+    /// predicates must stay different; this test and the apply-half test fail under opposite mutations.
+    #[tokio::test]
+    async fn test_replace_partitions_all_void_data_spec_uses_always_true_conflict_scope() {
+        let catalog = new_memory_catalog().await;
+        let (table, partitioned_spec, void_spec) = make_all_void_spec_table(&catalog).await;
+        let from = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .replace_partitions()
+            .add_file(data_file_in_spec(
+                "test/v.parquet",
+                void_spec,
+                Struct::from_iter([None]),
+            ))
+            .validate_from_snapshot(from)
+            .validate_no_conflicting_data();
+        let tx = action.apply(tx).unwrap();
+
+        // Concurrent append under the PARTITIONED spec, partition x = 1.
+        append_files(&catalog, &table, vec![data_file_in_spec(
+            "test/d.parquet",
+            partitioned_spec,
+            Struct::from_iter([Some(Literal::long(1))]),
+        )])
+        .await;
+
+        let err = tx.commit(&catalog).await.expect_err(
+            "an all-VOID data spec is `isUnpartitioned()`, so the conflict scope must be alwaysTrue",
+        );
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(!err.retryable());
+        assert!(
+            err.message().contains("test/d.parquet"),
+            "the error must name the conflicting file, got: {}",
+            err.message()
         );
     }
 }
