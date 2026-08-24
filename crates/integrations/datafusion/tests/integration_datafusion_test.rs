@@ -6464,3 +6464,380 @@ async fn test_s5_invalid_overwrite_isolation_only_gates_overwrite()
     );
     Ok(())
 }
+
+/// A V3 `{id int, val string}` table with both row-level modes set to merge-on-read.
+async fn make_v3_mread_ctx(ns: &str, tbl: &str) -> Result<(SessionContext, Arc<MemoryCatalog>)> {
+    make_versioned_mread_ctx(ns, tbl, iceberg::spec::FormatVersion::V3).await
+}
+
+async fn make_versioned_mread_ctx(
+    ns: &str,
+    tbl: &str,
+    format_version: iceberg::spec::FormatVersion,
+) -> Result<(SessionContext, Arc<MemoryCatalog>)> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new(ns.to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "val", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+
+    let creation = TableCreation::builder()
+        .name(tbl.to_string())
+        .location(temp_path())
+        .schema(schema)
+        .format_version(format_version)
+        .properties(HashMap::from([
+            ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+            ("write.update.mode".to_string(), "merge-on-read".to_string()),
+        ]))
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+    Ok((ctx, client))
+}
+
+/// Every live delete file of the table's current snapshot.
+async fn live_delete_files(
+    client: &MemoryCatalog,
+    ns: &str,
+    tbl: &str,
+) -> Result<Vec<iceberg::spec::DataFile>> {
+    let table_ident =
+        iceberg::TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&table_ident).await?;
+    let mut delete_files = Vec::new();
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(delete_files);
+    };
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await?;
+    for manifest_entry in manifest_list.entries() {
+        if manifest_entry.content != iceberg::spec::ManifestContentType::Deletes {
+            continue;
+        }
+        let manifest = manifest_entry.load_manifest(table.file_io()).await?;
+        for entry in manifest.entries() {
+            if entry.is_alive() {
+                delete_files.push(entry.data_file().clone());
+            }
+        }
+    }
+    Ok(delete_files)
+}
+
+async fn delete_count(ctx: &SessionContext, sql: &str) -> u64 {
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0)
+}
+
+async fn surviving_ids(ctx: &SessionContext, sql: &str) -> Vec<i32> {
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut ids = Vec::new();
+    for batch in &batches {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        ids.extend((0..batch.num_rows()).map(|row| column.value(row)));
+    }
+    ids
+}
+
+/// Risk pinned: a V3 merge-on-read DELETE writing a Parquet position-delete file. The V3 spec
+/// FORBIDS new position-delete files, so a table written that way is invalid to a Java reader.
+#[tokio::test]
+async fn test_delete_mread_v3_writes_a_deletion_vector() -> Result<()> {
+    let (ctx, client) = make_v3_mread_ctx("test_del_mread_v3", "items").await?;
+    ctx.sql("INSERT INTO catalog.test_del_mread_v3.items VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let deleted = delete_count(
+        &ctx,
+        "DELETE FROM catalog.test_del_mread_v3.items WHERE id = 2",
+    )
+    .await;
+    assert_eq!(deleted, 1, "exactly one row matches id = 2");
+
+    let ids = surviving_ids(
+        &ctx,
+        "SELECT id FROM catalog.test_del_mread_v3.items ORDER BY id",
+    )
+    .await;
+    assert_eq!(ids, vec![1, 3, 4], "the V3 DV must hide exactly row id = 2");
+
+    let delete_files = live_delete_files(&client, "test_del_mread_v3", "items").await?;
+    assert_eq!(delete_files.len(), 1, "one DV per touched data file");
+    let dv = &delete_files[0];
+    assert_eq!(
+        dv.file_format(),
+        iceberg::spec::DataFileFormat::Puffin,
+        "V3 forbids new position-delete files, so this must be a Puffin DV"
+    );
+    assert!(
+        dv.referenced_data_file().is_some(),
+        "a DV is file-scoped and names the data file it covers"
+    );
+    assert_eq!(dv.record_count(), 1, "the DV carries the one deleted row");
+    Ok(())
+}
+
+/// Risk pinned: a second DELETE on a data file that already has a DV leaving BOTH live. V3 allows
+/// at most one DV per data file, and two live DVs over one file double-count its positions.
+#[tokio::test]
+async fn test_delete_mread_v3_second_delete_supersedes_the_first_dv() -> Result<()> {
+    let (ctx, client) = make_v3_mread_ctx("test_del_mread_v3_merge", "items").await?;
+    ctx.sql(
+        "INSERT INTO catalog.test_del_mread_v3_merge.items VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    delete_count(
+        &ctx,
+        "DELETE FROM catalog.test_del_mread_v3_merge.items WHERE id = 2",
+    )
+    .await;
+    delete_count(
+        &ctx,
+        "DELETE FROM catalog.test_del_mread_v3_merge.items WHERE id = 3",
+    )
+    .await;
+
+    let ids = surviving_ids(
+        &ctx,
+        "SELECT id FROM catalog.test_del_mread_v3_merge.items ORDER BY id",
+    )
+    .await;
+    assert_eq!(ids, vec![1, 4], "both deletes must apply");
+
+    let delete_files = live_delete_files(&client, "test_del_mread_v3_merge", "items").await?;
+    assert_eq!(
+        delete_files.len(),
+        1,
+        "the second DV supersedes the first, so exactly one stays live"
+    );
+    assert_eq!(
+        delete_files[0].record_count(),
+        2,
+        "the surviving DV carries BOTH deleted positions, so the first was merged not dropped"
+    );
+    Ok(())
+}
+
+/// Risk pinned: the UPDATE arm still writing position deletes on V3 after the DELETE arm was
+/// converted. Both arms call the same guard, and both must dispatch.
+#[tokio::test]
+async fn test_update_mread_v3_writes_a_deletion_vector() -> Result<()> {
+    let (ctx, client) = make_v3_mread_ctx("test_upd_mread_v3", "items").await?;
+    ctx.sql("INSERT INTO catalog.test_upd_mread_v3.items VALUES (1,'a'),(2,'b'),(3,'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    ctx.sql("UPDATE catalog.test_upd_mread_v3.items SET val = 'z' WHERE id = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = ctx
+        .sql("SELECT id, val FROM catalog.test_upd_mread_v3.items ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "an UPDATE changes rows, it does not remove them");
+
+    let delete_files = live_delete_files(&client, "test_upd_mread_v3", "items").await?;
+    assert_eq!(delete_files.len(), 1, "the updated row is hidden by one DV");
+    assert_eq!(
+        delete_files[0].file_format(),
+        iceberg::spec::DataFileFormat::Puffin,
+        "the UPDATE arm must dispatch to deletion vectors on V3 too"
+    );
+    Ok(())
+}
+
+/// Risk pinned: the version dispatch admitting V1, which has no delete files of any kind.
+#[tokio::test]
+async fn test_mread_v1_is_still_refused() -> Result<()> {
+    let (ctx, _client) = make_versioned_mread_ctx(
+        "test_del_mread_v1",
+        "items",
+        iceberg::spec::FormatVersion::V1,
+    )
+    .await?;
+    ctx.sql("INSERT INTO catalog.test_del_mread_v1.items VALUES (1,'a'),(2,'b')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let error = ctx
+        .sql("DELETE FROM catalog.test_del_mread_v1.items WHERE id = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("a V1 table has no delete files, so merge-on-read cannot run");
+    assert!(
+        error.to_string().contains("copy-on-write"),
+        "the refusal must name the alternative; got: {error}"
+    );
+    Ok(())
+}
+
+/// A V3 `{id int, category string, val string}` table partitioned by `identity(category)`, both
+/// row-level modes merge-on-read.
+async fn make_v3_partitioned_mread_ctx(
+    ns: &str,
+    tbl: &str,
+) -> Result<(SessionContext, Arc<MemoryCatalog>)> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new(ns.to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "val", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()?;
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name(tbl.to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .format_version(iceberg::spec::FormatVersion::V3)
+        .properties(HashMap::from([
+            ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+            ("write.update.mode".to_string(), "merge-on-read".to_string()),
+        ]))
+        .build();
+
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+    Ok((ctx, client))
+}
+
+/// Risk pinned: a V3 DV written with NO partition context. An unpartitioned table cannot see this
+/// — a missing key and the real key both resolve to spec 0 with an empty tuple. On a partitioned
+/// table the DV would carry an empty partition tuple, which groups it into the wrong per-spec
+/// manifest and can prune it out of the scan that must apply it.
+#[tokio::test]
+async fn test_delete_mread_v3_partitioned_dv_carries_its_data_file_partition() -> Result<()> {
+    let (ctx, client) = make_v3_partitioned_mread_ctx("test_del_mread_v3_part", "items").await?;
+    ctx.sql(
+        "INSERT INTO catalog.test_del_mread_v3_part.items VALUES \
+         (1,'electronics','laptop'),(2,'electronics','phone'),(3,'books','novel')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let deleted = delete_count(
+        &ctx,
+        "DELETE FROM catalog.test_del_mread_v3_part.items WHERE id = 1",
+    )
+    .await;
+    assert_eq!(deleted, 1, "exactly one row matches id = 1");
+
+    let ids = surviving_ids(
+        &ctx,
+        "SELECT id FROM catalog.test_del_mread_v3_part.items ORDER BY id",
+    )
+    .await;
+    assert_eq!(ids, vec![2, 3], "the DV must hide exactly row id = 1");
+
+    let delete_files = live_delete_files(&client, "test_del_mread_v3_part", "items").await?;
+    assert_eq!(delete_files.len(), 1, "one DV covers the one touched file");
+    let dv = &delete_files[0];
+    assert_eq!(
+        dv.file_format(),
+        iceberg::spec::DataFileFormat::Puffin,
+        "V3 forbids new position-delete files"
+    );
+
+    // The DV must carry the SAME (spec_id, partition) as the data file it covers, not an empty
+    // tuple under a fabricated spec.
+    let table_ident = iceberg::TableIdent::new(
+        NamespaceIdent::new("test_del_mread_v3_part".to_string()),
+        "items".to_string(),
+    );
+    let table = client.load_table(&table_ident).await?;
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await?;
+    let referenced = dv.referenced_data_file().expect("a DV names its data file");
+    let mut data_file_partition = None;
+    for manifest_entry in manifest_list.entries() {
+        if manifest_entry.content != iceberg::spec::ManifestContentType::Data {
+            continue;
+        }
+        let manifest = manifest_entry.load_manifest(table.file_io()).await?;
+        for entry in manifest.entries() {
+            if entry.is_alive() && entry.data_file().file_path() == referenced {
+                data_file_partition = Some((
+                    entry.data_file().partition_spec_id(),
+                    entry.data_file().partition().clone(),
+                ));
+            }
+        }
+    }
+    let (spec_id, partition) = data_file_partition.expect("the covered data file is live");
+    assert_eq!(
+        dv.partition_spec_id(),
+        spec_id,
+        "the DV must be stamped with its data file's spec id"
+    );
+    assert_eq!(
+        dv.partition(),
+        &partition,
+        "the DV must carry its data file's partition tuple, not an empty one"
+    );
+    Ok(())
+}
