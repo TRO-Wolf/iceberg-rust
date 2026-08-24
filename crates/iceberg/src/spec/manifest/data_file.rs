@@ -487,6 +487,20 @@ mod test {
     }
 }
 
+/// The validator's input domain is closed and small, and every cell below is pinned by a test.
+///
+/// Coordinate rules — 3 content types x 2 format classes:
+///
+/// | | Puffin (coordinates required) | non-Puffin (coordinates forbidden) |
+/// |---|---|---|
+/// | data | `puffin_rules_apply_to_any_content_type` | `non_puffin_data_with_content_offset_is_rejected` |
+/// | position deletes | `puffin_without_*` (3) | `non_puffin_with_content_*` (2) |
+/// | equality deletes | `puffin_equality_delete_still_needs_its_coordinates` | `non_puffin_equality_delete_with_content_offset_is_rejected` |
+///
+/// Sort-order rule — forbidden for position deletes in EITHER format
+/// (`position_delete_with_sort_order_is_rejected` for Parquet,
+/// `a_deletion_vector_with_a_sort_order_is_rejected` for Puffin), permitted for the other two
+/// content types (`an_equality_delete_may_carry_a_sort_order`, `a_data_file_may_carry_a_sort_order`).
 #[cfg(test)]
 mod validate_tests {
     use super::*;
@@ -584,6 +598,38 @@ mod validate_tests {
         builder
             .build()
             .expect("only position deletes forbid a sort order");
+    }
+
+    /// Risk pinned: a Puffin EQUALITY delete escaping the coordinate rules. Java tests the format
+    /// at offsets 112-119 and completes before the content switch at 215, so the rule is
+    /// content-independent.
+    #[test]
+    fn puffin_equality_delete_still_needs_its_coordinates() {
+        let mut builder = valid(DataContentType::EqualityDeletes, DataFileFormat::Puffin);
+        builder.content_offset(None);
+        assert_eq!(err_of(builder), "Content offset is required for DV");
+    }
+
+    /// Risk pinned: a non-Puffin EQUALITY delete carrying blob coordinates. Offsets 179-212 are the
+    /// same format test's else-arm, equally content-independent.
+    #[test]
+    fn non_puffin_equality_delete_with_content_offset_is_rejected() {
+        let mut builder = valid(DataContentType::EqualityDeletes, DataFileFormat::Parquet);
+        builder.content_offset(Some(4));
+        assert_eq!(err_of(builder), "Content offset can only be set for DV");
+    }
+
+    /// Risk pinned: the sort-order guard exempting a DV. A DV is by definition Puffin + position
+    /// deletes, so this is the exact file class the guard exists to protect. Java reaches offset
+    /// 252 from the switch at 215, which never consults the format.
+    #[test]
+    fn a_deletion_vector_with_a_sort_order_is_rejected() {
+        let mut builder = valid(DataContentType::PositionDeletes, DataFileFormat::Puffin);
+        builder.sort_order_id(0);
+        assert_eq!(
+            err_of(builder),
+            "Position delete file should not have sort order"
+        );
     }
 
     /// Risk pinned: narrowing the sort-order rule's exemption. Java's `DataFiles$Builder` exposes
