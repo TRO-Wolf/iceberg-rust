@@ -7018,3 +7018,72 @@ async fn test_delete_mread_v3_refuses_a_file_still_covered_by_position_deletes()
     );
     Ok(())
 }
+
+/// Risk pinned: the V3 arm stamping every DV with the table's CURRENT default spec instead of the
+/// data file's own. The V2 arm carries this pin already
+/// (`test_delete_mread_after_drop_partition_field_no_resurrection`), added because the same mistake
+/// on the position-delete path was a real shipped bug. Every other V3 test uses a single-spec
+/// table, where the two expressions are the same value.
+#[tokio::test]
+async fn test_delete_mread_v3_after_drop_partition_field_stamps_the_files_own_spec() -> Result<()> {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+    let (ctx, client) = make_v3_partitioned_mread_ctx("test_del_mread_v3_evolved", "items").await?;
+    ctx.sql(
+        "INSERT INTO catalog.test_del_mread_v3_evolved.items VALUES \
+         (1,'electronics','laptop'),(2,'electronics','phone')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let ns = NamespaceIdent::new("test_del_mread_v3_evolved".to_string());
+    let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
+
+    // Drop identity(category): the new default spec is unpartitioned, but the data file stays
+    // under the original partitioned spec.
+    let table = client.load_table(&tbl_id).await?;
+    let original_spec_id = table.metadata().default_partition_spec().spec_id();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_partition_spec()
+        .remove_field("category")
+        .apply(tx)
+        .expect("apply remove_field(category)");
+    let table = tx.commit(client.as_ref()).await.expect("commit evolution");
+    let default_spec_id = table.metadata().default_partition_spec().spec_id();
+    assert_ne!(
+        original_spec_id, default_spec_id,
+        "fixture: the default spec must have moved, or the mutation is unobservable"
+    );
+
+    let ctx2 = SessionContext::new();
+    ctx2.register_catalog(
+        "catalog",
+        Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?),
+    );
+    let deleted = delete_count(
+        &ctx2,
+        "DELETE FROM catalog.test_del_mread_v3_evolved.items WHERE id = 1",
+    )
+    .await;
+    assert_eq!(deleted, 1, "one row matches");
+
+    let delete_files = live_delete_files(&client, "test_del_mread_v3_evolved", "items").await?;
+    assert_eq!(delete_files.len(), 1, "one DV covers the one touched file");
+    assert_eq!(
+        delete_files[0].partition_spec_id(),
+        original_spec_id,
+        "the DV must carry the DATA FILE's spec, not the table's new default"
+    );
+
+    let ids = surviving_ids(
+        &ctx2,
+        "SELECT id FROM catalog.test_del_mread_v3_evolved.items ORDER BY id",
+    )
+    .await;
+    assert_eq!(ids, vec![2], "the deleted row must not resurrect");
+    Ok(())
+}

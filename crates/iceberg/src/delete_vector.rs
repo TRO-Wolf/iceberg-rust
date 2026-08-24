@@ -1562,7 +1562,8 @@ mod loader_tests {
             error
                 .message()
                 .ends_with("content_offset must be a non-negative integer, got Some(-1)"),
-            "the message text is pinned — `cargo fmt` silently reflowed these once. got: {}",
+            "the exact text is pinned: these literals were once hand-wrapped with no `\\` \
+             continuation, so the message carried 22 literal spaces and no test noticed. got: {}",
             error.message()
         );
     }

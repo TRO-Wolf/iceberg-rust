@@ -64,6 +64,20 @@ NOT CONVERGED on first pass, three S2s:
 (1) and (2) are the same class again, on its fourth and fifth occurrence in this unit. (3) is now a
 PRE-IO refusal, restoring the §7a guarantee, and the residue is named on R114.
 
+Cycle 2 then found THREE more, and one of them was a genuine correctness hole rather than a missing
+test: my pre-IO predicate derived the delete's reference from the `referenced_data_file` field
+alone, but Java's `PositionDeleteWriter.close()` never sets that field — it leaves equal `file_path`
+bounds. The repository already had the Java-faithful derivation
+(`delete_file_index::referenced_data_file_location`) and the scan uses it; my predicate did not.
+**The commit door I cited as the backstop had the same bug**, so a bounds-scoped position delete
+stamped under another spec passed both and was silently superseded by the DV. Both now share one
+rule, and the door's fix is pinned by a hand-built fixture (the shape is not producible by the
+fork's own writer, which always stamps the matching partition).
+
+The predicate was also too WIDE — no `delete_seq >= data_seq` filter — so it refused deletes Java
+allows. Both halves are now extracted as named seams and unit-tested per cell, because the
+end-to-end tests could not distinguish them.
+
 It also found a regression I introduced: extracting `validate_delete_vector_coordinates` dropped the
 `\` line continuations, so five runtime messages — two of them the SCAN path's, correct before this
 branch — carried runs of 18-22 literal spaces. No test asserted a full message string. One now does.

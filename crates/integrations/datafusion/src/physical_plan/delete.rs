@@ -117,7 +117,10 @@ use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN, Partition
 use iceberg::delete_vector::load_delete_vector;
 use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
-use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionKey, Struct};
+use iceberg::spec::{
+    DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionKey, Struct,
+    referenced_data_file_location,
+};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -1102,6 +1105,10 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
 
     // Group pairs by (spec_id, partition) — every pair's data file must be live in the snapshot the
     // map was built from.
+    let path_to_partition: HashMap<String, (i32, Struct)> = path_to_partition
+        .into_iter()
+        .map(|(path, (spec_id, partition, _))| (path, (spec_id, partition)))
+        .collect();
     let groups = group_pairs_by_partition(pairs, &path_to_partition)?;
 
     // Write one position-delete file per (spec_id, partition) group.
@@ -1147,9 +1154,11 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
 ///
 /// Both delete write paths stamp from this, so a position-delete file and a deletion vector
 /// covering the same data file cannot disagree about its partition.
-async fn live_data_file_partitions(table: &Table) -> DFResult<HashMap<String, (i32, Struct)>> {
+async fn live_data_file_partitions(
+    table: &Table,
+) -> DFResult<HashMap<String, (i32, Struct, Option<i64>)>> {
     let metadata = table.metadata();
-    let mut path_to_partition: HashMap<String, (i32, Struct)> = HashMap::new();
+    let mut path_to_partition: HashMap<String, (i32, Struct, Option<i64>)> = HashMap::new();
     let Some(snapshot) = metadata.current_snapshot() else {
         return Ok(path_to_partition);
     };
@@ -1174,7 +1183,13 @@ async fn live_data_file_partitions(table: &Table) -> DFResult<HashMap<String, (i
                 let df = entry.data_file();
                 path_to_partition
                     .entry(df.file_path().to_string())
-                    .or_insert_with(|| (df.partition_spec_id(), df.partition().clone()));
+                    .or_insert_with(|| {
+                        (
+                            df.partition_spec_id(),
+                            df.partition().clone(),
+                            entry.sequence_number(),
+                        )
+                    });
             }
         }
     }
@@ -1185,9 +1200,11 @@ async fn live_data_file_partitions(table: &Table) -> DFResult<HashMap<String, (i
 struct LiveDeletes {
     /// Puffin DVs, keyed by the data file each covers.
     dv_by_data_file: HashMap<String, DataFile>,
-    /// Non-Puffin position deletes, as `(referenced_data_file, spec_id, partition)`. A path-scoped
-    /// one names its data file; a partition-scoped one covers every data file in its partition.
-    legacy_position_deletes: Vec<(Option<String>, i32, Struct)>,
+    /// Non-Puffin position deletes, as `(referenced_data_file, spec_id, partition, sequence)`.
+    /// The reference comes from [`referenced_data_file_location`], the same derivation the scan
+    /// uses — a delete with equal `file_path` bounds names its data file even with the field
+    /// unset, which is how virtually every Java-written file-granularity delete is recognised.
+    legacy_position_deletes: Vec<(Option<String>, i32, Struct, Option<i64>)>,
 }
 
 /// Reads the current snapshot's delete manifests once.
@@ -1232,15 +1249,64 @@ async fn live_delete_vectors_by_data_file(table: &Table) -> DFResult<LiveDeletes
                     live.dv_by_data_file.insert(referenced, df.clone());
                 }
             } else {
-                live.legacy_position_deletes.push((
-                    df.referenced_data_file(),
-                    df.partition_spec_id(),
-                    df.partition().clone(),
-                ));
+                live.legacy_position_deletes
+                    .push(legacy_position_delete_entry(df, entry.sequence_number()));
             }
         }
     }
     Ok(live)
+}
+
+/// Reduces a live non-Puffin position delete to what the applicability test needs.
+///
+/// # Notes
+///
+/// The reference is [`referenced_data_file_location`], not the raw `referenced_data_file` field.
+/// Java's `PositionDeleteWriter.close()` never sets that field — it leaves equal `file_path`
+/// bounds — so reading the field alone treats virtually every Java-written file-granularity delete
+/// as partition-scoped.
+fn legacy_position_delete_entry(
+    delete_file: &DataFile,
+    sequence_number: Option<i64>,
+) -> (Option<String>, i32, Struct, Option<i64>) {
+    (
+        referenced_data_file_location(delete_file),
+        delete_file.partition_spec_id(),
+        delete_file.partition().clone(),
+        sequence_number,
+    )
+}
+
+/// Whether a live non-Puffin position delete still applies to a data file.
+///
+/// Args mirror the commit door's own test (`RowDeltaAction::validate_fresh_dvs_only`), so the
+/// pre-IO refusal and the commit-time rejection cannot disagree about what "covers" means.
+///
+/// # Notes
+///
+/// `delete.0` is [`referenced_data_file_location`], not the raw field: a delete with equal
+/// `file_path` bounds names its data file even with the field unset, and that is how virtually
+/// every Java-written file-granularity delete is recognised. A named delete is matched on PATH
+/// alone — the partition it happens to be stamped with is irrelevant, exactly as the scan does.
+/// An unknown sequence number errs toward "applies", so the caller refuses rather than corrupts.
+fn legacy_position_delete_applies(
+    delete: &(Option<String>, i32, Struct, Option<i64>),
+    data_file_path: &str,
+    data_spec_id: i32,
+    data_partition: &Struct,
+    data_seq: Option<i64>,
+) -> bool {
+    let (referenced, delete_spec_id, delete_partition, delete_seq) = delete;
+    let scope_matches = match referenced {
+        Some(referenced) => referenced == data_file_path,
+        // Partition-scoped: covers every data file sharing its (spec_id, partition).
+        None => *delete_spec_id == data_spec_id && delete_partition == data_partition,
+    };
+    scope_matches
+        && match (delete_seq, data_seq) {
+            (Some(delete_seq), Some(data_seq)) => *delete_seq >= data_seq,
+            _ => true,
+        }
 }
 
 /// Writes the deletion vectors for `pairs` — the V3 merge-on-read delete output.
@@ -1268,11 +1334,12 @@ async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFRes
     // Resolve every PartitionKey BEFORE opening the Puffin file, so an unresolvable one cannot
     // leave a fully written, unreferenced Puffin on storage.
     let mut partition_key_by_path: HashMap<&str, PartitionKey> = HashMap::new();
+    let mut resolved: Vec<(&str, i32, Struct, Option<i64>)> = Vec::new();
     for (path, _) in pairs {
         if partition_key_by_path.contains_key(path.as_str()) {
             continue;
         }
-        let (spec_id, partition) = path_to_partition.get(path).cloned().ok_or_else(|| {
+        let (spec_id, partition, data_seq) = path_to_partition.get(path).cloned().ok_or_else(|| {
             DataFusionError::Internal(format!(
                 "deletion-vector: data file `{path}` is not a live file of the current snapshot, so its partition cannot be resolved"
             ))
@@ -1286,9 +1353,10 @@ async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFRes
             })?
             .as_ref()
             .clone();
-        let partition_key =
-            PartitionKey::new(spec, schema.clone(), partition).map_err(to_datafusion_error)?;
+        let partition_key = PartitionKey::new(spec, schema.clone(), partition.clone())
+            .map_err(to_datafusion_error)?;
         partition_key_by_path.insert(path.as_str(), partition_key);
+        resolved.push((path.as_str(), spec_id, partition, data_seq));
     }
 
     // Load the DV each touched data file already has, if any. Java's `loadPreviousDeletes` is
@@ -1299,22 +1367,13 @@ async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFRes
     // Refuse a data file still covered by a Parquet position delete, BEFORE the Puffin is opened.
     // Java's `loadPreviousDeletes` unions those positions into the new DV and rewrites the
     // file-scoped sources; this port reads DVs only, so merging them is not yet possible. The
-    // commit door would reject it anyway — but only after a fully written, unreferenced Puffin
-    // reached storage. Reachable on a V2 table with position deletes upgraded to V3. GAP_MATRIX
-    // row R114 carries the residue.
-    for (path, (spec_id, partition)) in partition_key_by_path
-        .keys()
-        .filter_map(|path| path_to_partition.get(*path).map(|value| (path, value)))
-    {
-        let covered = live.legacy_position_deletes.iter().any(
-            |(referenced, delete_spec_id, delete_partition)| {
-                match referenced {
-                    Some(referenced) => referenced == *path,
-                    // Partition-scoped: covers every data file sharing its (spec_id, partition).
-                    None => delete_spec_id == spec_id && delete_partition == partition,
-                }
-            },
-        );
+    // commit door rejects it too, but only after a fully written, unreferenced Puffin reached
+    // storage. Reachable on a V2 table with position deletes upgraded to V3. GAP_MATRIX row R114
+    // carries the residue.
+    for (path, spec_id, partition, data_seq) in &resolved {
+        let covered = live.legacy_position_deletes.iter().any(|delete| {
+            legacy_position_delete_applies(delete, path, *spec_id, partition, *data_seq)
+        });
         if covered {
             return Err(DataFusionError::NotImplemented(format!(
                 "deletion-vector: data file `{path}` is still covered by a Parquet position-delete \
@@ -2142,10 +2201,12 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_expr::expressions::Column;
+    use iceberg::spec::Literal;
 
     use super::{
         IsolationLevel, apply_assignments, decode_file_path, decode_file_paths_batch,
-        decode_position, group_pairs_by_partition, position_delete_unpartitioned_fast_path,
+        decode_position, group_pairs_by_partition, legacy_position_delete_applies,
+        legacy_position_delete_entry, position_delete_unpartitioned_fast_path,
         sort_position_delete_pairs,
     };
 
@@ -2351,6 +2412,114 @@ mod tests {
     ///
     /// MUTATION PROOF: turn `sort_position_delete_pairs` into a no-op (delete the `pairs.sort()`) → this
     /// test goes RED (the deliberately-unsorted input stays unsorted).
+    /// The applicability domain of [`legacy_position_delete_applies`], one test per cell. Java's
+    /// own writer never sets `referenced_data_file`, so the BOUNDS leg and the PARTITION leg are
+    /// the two that fire in practice, and they disagree: a named delete ignores the partition.
+    /// Risk pinned: reading `referenced_data_file` instead of the shared derivation. Java's writer
+    /// leaves the field unset and only equal `file_path` bounds, so the field-only read would treat
+    /// this delete as partition-scoped and miss the file it actually names.
+    #[test]
+    fn test_legacy_delete_entry_derives_the_name_from_equal_file_path_bounds() {
+        use iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, Datum, Struct as IcebergStruct,
+        };
+
+        let delete_file = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("s3://b/pos-del.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(7)
+            .partition(IcebergStruct::from_iter([Some(Literal::long(999))]))
+            .lower_bounds(std::collections::HashMap::from([(
+                iceberg::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                Datum::string("s3://b/a.parquet"),
+            )]))
+            .upper_bounds(std::collections::HashMap::from([(
+                iceberg::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                Datum::string("s3://b/a.parquet"),
+            )]))
+            .build()
+            .expect("build a bounds-scoped position delete");
+
+        let entry = legacy_position_delete_entry(&delete_file, Some(3));
+        assert_eq!(
+            entry.0.as_deref(),
+            Some("s3://b/a.parquet"),
+            "equal file_path bounds name the data file even with referenced_data_file unset"
+        );
+        assert_eq!(
+            entry.1, 7,
+            "the stamp is carried for the partition-scoped leg"
+        );
+        assert_eq!(entry.3, Some(3), "the sequence number is carried");
+    }
+
+    #[test]
+    fn test_legacy_delete_named_by_path_applies_across_partitions() {
+        let delete = (
+            Some("s3://b/a.parquet".to_string()),
+            7,
+            iceberg::spec::Struct::from_iter([Some(Literal::long(999))]),
+            Some(1),
+        );
+        let data_partition = iceberg::spec::Struct::from_iter([Some(Literal::long(0))]);
+        assert!(
+            legacy_position_delete_applies(
+                &delete,
+                "s3://b/a.parquet",
+                0,
+                &data_partition,
+                Some(1)
+            ),
+            "a delete that NAMES the file applies whatever partition it is stamped with — Spark's              default write granularity is FILE, so a mismatched stamp is routine"
+        );
+        assert!(
+            !legacy_position_delete_applies(&delete, "s3://b/other.parquet", 7, &delete.2, Some(1)),
+            "and it applies to no other file, even one sharing its stamp"
+        );
+    }
+
+    #[test]
+    fn test_legacy_delete_without_a_name_applies_by_partition() {
+        let partition = iceberg::spec::Struct::from_iter([Some(Literal::long(0))]);
+        let delete = (None, 0, partition.clone(), Some(1));
+        assert!(
+            legacy_position_delete_applies(&delete, "s3://b/a.parquet", 0, &partition, Some(1)),
+            "a partition-scoped delete covers every data file in its partition"
+        );
+        let other = iceberg::spec::Struct::from_iter([Some(Literal::long(1))]);
+        assert!(
+            !legacy_position_delete_applies(&delete, "s3://b/a.parquet", 0, &other, Some(1)),
+            "but not one in another partition"
+        );
+        assert!(
+            !legacy_position_delete_applies(&delete, "s3://b/a.parquet", 1, &partition, Some(1)),
+            "nor one under another spec"
+        );
+    }
+
+    /// Risk pinned: refusing a V3 delete because of a position delete that CANNOT apply. A data
+    /// file written after the delete is not covered by it, and Java writes that DV happily.
+    #[test]
+    fn test_legacy_delete_older_than_the_data_file_does_not_apply() {
+        let partition = iceberg::spec::Struct::from_iter([Some(Literal::long(0))]);
+        let delete = (None, 0, partition.clone(), Some(1));
+        assert!(
+            !legacy_position_delete_applies(&delete, "s3://b/new.parquet", 0, &partition, Some(2)),
+            "delete_seq 1 < data_seq 2 — the delete predates the file and cannot cover it"
+        );
+        assert!(
+            legacy_position_delete_applies(&delete, "s3://b/old.parquet", 0, &partition, Some(1)),
+            "an equal sequence number DOES apply (delete_seq >= data_seq)"
+        );
+        assert!(
+            legacy_position_delete_applies(&delete, "s3://b/x.parquet", 0, &partition, None),
+            "an unknown sequence errs toward applying, so the caller refuses rather than corrupts"
+        );
+    }
+
     #[test]
     fn test_sort_position_delete_pairs_orders_by_path_then_pos() {
         // Deliberately unsorted: files interleaved (b before a), positions descending within a file —

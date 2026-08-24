@@ -259,7 +259,7 @@ pub(crate) fn is_deletion_vector(data_file: &DataFile) -> bool {
 /// as in Java (which compares the raw bound `ByteBuffer`s and decodes with the `file_path` column's
 /// string type). Bound TRUNCATION cannot forge a match: a truncated lower bound is shortened and the
 /// matching upper bound is rounded UP, so the two are equal only when both are the full value.
-pub(crate) fn referenced_data_file_location(delete_file: &DataFile) -> Option<String> {
+pub fn referenced_data_file_location(delete_file: &DataFile) -> Option<String> {
     if delete_file.content_type() == DataContentType::EqualityDeletes {
         return None;
     }
