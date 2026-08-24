@@ -274,8 +274,17 @@ partition, …)` — so a Java-written file can never claim a spec the table doe
   (which carries the spec its tuple came from), or configure the spec explicitly with
   `DataFileWriterBuilder::with_partition_spec` /
   `PositionDeleteFileWriterBuilder::with_partition_spec` /
-  `EqualityDeleteFileWriterBuilder::with_partition_spec`. When both are given the **`PartitionKey`
-  wins** — it is authoritative for its own tuple.
+  `EqualityDeleteFileWriterBuilder::with_partition_spec` / `DVFileWriter::with_partition_spec`.
+  When both are given the **`PartitionKey` wins** — it is authoritative for its own tuple.
+- **Deletion vectors take the spec on the writer.** `DVFileWriter` takes its `PartitionKey` per
+  `delete` call, so a partitioned configured spec with no key is rejected at `close()`, not at
+  construction. The rejection fires before any byte reaches storage.
+  **Do not treat a DV as the safe case.** A DV is matched to its data file by referenced-file PATH,
+  so it does not fail the way a wrong-spec position delete does. The verified cost is wrong per-spec
+  manifest grouping (`SnapshotProducer::group_files_by_spec`). Whether a wrong-spec DV's delete
+  manifest can then be pruned by a partition filter during planning is **UNVERIFIED** — delete
+  manifests are on the same pruning path as data manifests. If it can, the DV is silently not
+  applied and rows resurrect. Stamp the spec.
 - For a delete file the spec **MUST** be the spec of the **DATA FILES the deletes apply to** — never
   the table's default/current spec, and never a fabricated constant. After a spec evolution the
   live data files sit under several specs at once; a delete only ever applies to data files carrying
