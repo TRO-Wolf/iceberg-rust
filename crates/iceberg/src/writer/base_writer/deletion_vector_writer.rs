@@ -78,7 +78,10 @@ use crate::delete_vector::DeleteVector;
 use crate::io::OutputFile;
 use crate::metadata_columns::{RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_POS};
 use crate::puffin::{Blob, CompressionCodec, DELETION_VECTOR_V1, PuffinWriter};
-use crate::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, PartitionKey};
+use crate::spec::{
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, PartitionKey, PartitionSpec,
+};
+use crate::writer::base_writer::data_file_writer::resolve_partition_spec_id;
 use crate::{Error, ErrorKind, Result};
 
 /// The largest position a deletion vector may record, mirroring Java
@@ -227,6 +230,10 @@ pub struct DVFileWriter {
     /// `loadPreviousDeletes`). Empty unless [`with_previous_deletes`](Self::with_previous_deletes)
     /// was called.
     previous_deletes_by_path: HashMap<String, PreviousDeletes>,
+    /// The spec to stamp on a DV whose [`delete`](Self::delete) calls carried no [`PartitionKey`].
+    /// `None` falls back to `DEFAULT_PARTITION_SPEC_ID`. See
+    /// [`with_partition_spec`](Self::with_partition_spec).
+    partition_spec: Option<PartitionSpec>,
 }
 
 impl DVFileWriter {
@@ -237,7 +244,23 @@ impl DVFileWriter {
             output_file,
             deletes_by_path: BTreeMap::new(),
             previous_deletes_by_path: HashMap::new(),
+            partition_spec: None,
         }
+    }
+
+    /// Set the spec to stamp on a DV whose [`delete`](Self::delete) calls carried no
+    /// [`PartitionKey`]. Without it such a DV claims `DEFAULT_PARTITION_SPEC_ID` (0), an id no
+    /// table stands behind. Java takes the spec as a required per-call argument
+    /// (`BaseDVFileWriter.delete`). Use the spec of the data files the DV references, which is not
+    /// always the table's current spec. A key wins; see `resolve_partition_spec_id`.
+    ///
+    /// # Notes
+    ///
+    /// A partitioned spec with no key fails at [`close`](Self::close), not here. The writer takes
+    /// its key per `delete` call, so the pairing is unknown until close.
+    pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
+        self.partition_spec = Some(partition_spec);
+        self
     }
 
     /// Supply each referenced data file's PREVIOUS deletes to MERGE into the new deletion vector at
@@ -354,6 +377,22 @@ impl DVFileWriter {
             });
         }
 
+        // Resolve every spec id BEFORE opening the Puffin file. A partitioned configured spec with
+        // no PartitionKey fails here; resolving after the write would leave a fully written,
+        // unreferenced Puffin file on storage. The other three base writers resolve at build time,
+        // before any IO — this pre-pass is the DV writer's equivalent, since it takes its key per
+        // `delete` call.
+        let spec_ids = self
+            .deletes_by_path
+            .values()
+            .map(|deletes| {
+                resolve_partition_spec_id(
+                    self.partition_spec.as_ref(),
+                    deletes.partition_key.as_ref(),
+                )
+            })
+            .collect::<Result<Vec<i32>>>()?;
+
         // One Puffin file for ALL the vectors. The footer is uncompressed; `created-by`
         // identifies this writer (Java sets `IcebergBuild.fullVersion()` — the value differs,
         // which is footer-cosmetic and reader-irrelevant).
@@ -403,8 +442,12 @@ impl DVFileWriter {
             .deletes_by_path
             .iter()
             .zip(blob_coordinates)
+            .zip(spec_ids)
             .map(
-                |((data_file_path, deletes), (content_offset, content_size_in_bytes))| {
+                |(
+                    ((data_file_path, deletes), (content_offset, content_size_in_bytes)),
+                    spec_id,
+                )| {
                     Self::create_dv_metadata(
                         &puffin_path,
                         puffin_file_size,
@@ -412,6 +455,7 @@ impl DVFileWriter {
                         deletes,
                         content_offset,
                         content_size_in_bytes,
+                        spec_id,
                     )
                 },
             )
@@ -434,6 +478,7 @@ impl DVFileWriter {
         deletes: &DeletesForDataFile,
         content_offset: u64,
         content_size_in_bytes: u64,
+        partition_spec_id: i32,
     ) -> Result<DataFile> {
         let to_signed = |value: u64, what: &str| -> Result<i64> {
             i64::try_from(value).map_err(|_| {
@@ -458,10 +503,9 @@ impl DVFileWriter {
                 "content_size_in_bytes",
             )?));
         if let Some(partition_key) = &deletes.partition_key {
-            builder
-                .partition(partition_key.data().clone())
-                .partition_spec_id(partition_key.spec().spec_id());
+            builder.partition(partition_key.data().clone());
         }
+        builder.partition_spec_id(partition_spec_id);
         builder.build().map_err(|error| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -1173,6 +1217,211 @@ mod tests {
         assert!(
             !is_file_scoped(&unequal),
             "unequal _file_path bounds span many data files → NOT file-scoped"
+        );
+    }
+
+    /// Build an unpartitioned spec carrying `spec_id`, and a one-field partitioned spec.
+    fn specs_for_stamping(spec_id: i32) -> (PartitionSpec, PartitionSpec, Arc<Schema>) {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "category", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let unpartitioned = PartitionSpec::builder(schema.clone())
+            .with_spec_id(spec_id)
+            .build()
+            .expect("unpartitioned spec");
+        let partitioned = PartitionSpec::builder(schema.clone())
+            .with_spec_id(spec_id)
+            .add_partition_field("category", "category", crate::spec::Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("partitioned spec");
+        (unpartitioned, partitioned, schema)
+    }
+
+    /// A DV written with no `PartitionKey` claims the CONFIGURED spec id, not the fabricated
+    /// `DEFAULT_PARTITION_SPEC_ID` (0). Java stamps `spec.specId()` unconditionally
+    /// (`FileMetadata.deleteFileBuilder(spec)`), so a keyless DV must not claim spec 0.
+    #[tokio::test]
+    async fn dv_with_partition_spec_stamps_configured_spec_without_a_key() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let (unpartitioned, _, _) = specs_for_stamping(7);
+
+        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"))
+            .with_partition_spec(unpartitioned);
+        writer.delete("p/x.parquet", 1, None).expect("delete");
+        let delete_files = writer.close().await.expect("close");
+
+        assert_eq!(delete_files.len(), 1, "one DV per referenced data file");
+        assert_eq!(
+            delete_files[0].partition_spec_id, 7,
+            "a keyless DV must claim the configured spec, not DEFAULT_PARTITION_SPEC_ID"
+        );
+        assert_eq!(
+            delete_files[0].partition(),
+            &Struct::empty(),
+            "an unpartitioned spec leaves the tuple empty"
+        );
+    }
+
+    /// A `PartitionKey` on the `delete` call wins over a configured spec. The key carries the tuple
+    /// AND the spec that tuple came from, so it is authoritative — a delete file claims the spec of
+    /// the DATA FILES it deletes from, which is not always the table's current spec.
+    #[tokio::test]
+    async fn dv_partition_key_wins_over_configured_partition_spec() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let (configured, _, schema) = specs_for_stamping(7);
+        let keyed_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(9)
+            .add_partition_field("category", "category", crate::spec::Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("keyed spec");
+        let key = PartitionKey::new(
+            keyed_spec,
+            schema,
+            Struct::from_iter([Some(Literal::string("a"))]),
+        )
+        .expect("PartitionKey::new: valid partition tuple");
+
+        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"))
+            .with_partition_spec(configured);
+        writer.delete("p/x.parquet", 1, Some(&key)).expect("delete");
+        let delete_files = writer.close().await.expect("close");
+
+        assert_eq!(
+            delete_files[0].partition_spec_id, 9,
+            "the key's spec wins over the configured spec"
+        );
+        assert_eq!(
+            delete_files[0].partition(),
+            &Struct::from_iter([Some(Literal::string("a"))]),
+            "the key's tuple is stamped"
+        );
+    }
+
+    /// A partitioned configured spec with no `PartitionKey` is rejected at close. The file would
+    /// carry an EMPTY tuple while claiming a spec whose partition type has arity 1, which
+    /// `SnapshotProducer::validate_partition_value` rejects at commit anyway.
+    #[tokio::test]
+    async fn dv_partitioned_spec_without_a_key_is_rejected() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let (_, partitioned, _) = specs_for_stamping(7);
+
+        let puffin_path = temp_dir.path().join("deletes.puffin");
+        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"))
+            .with_partition_spec(partitioned);
+        writer.delete("p/x.parquet", 1, None).expect("delete");
+        let error = writer
+            .close()
+            .await
+            .expect_err("a partitioned spec with no key must not produce a DV");
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("partition field(s)"),
+            "the error names the arity mismatch, got: {}",
+            error.message()
+        );
+        assert!(
+            !puffin_path.exists(),
+            "the rejection must fire before any byte reaches storage: an unreferenced Puffin \
+             file is an orphan no commit will ever clean up"
+        );
+    }
+
+    /// Each DV carries ITS OWN referenced file's spec id. `close_with_result` zips three iterators
+    /// derived from the same `BTreeMap` — the resolved spec ids, the blob coordinates, and the
+    /// entries. A misalignment stamps path A's DV with path B's spec, which is silently wrong; a
+    /// length mismatch truncates the zip and DROPS a delete file, so rows resurrect.
+    #[tokio::test]
+    async fn dv_spec_ids_follow_their_own_referenced_file() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let (configured, _, schema) = specs_for_stamping(7);
+        let keyed_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(9)
+            .add_partition_field("category", "category", crate::spec::Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("keyed spec");
+        let key = PartitionKey::new(
+            keyed_spec,
+            schema,
+            Struct::from_iter([Some(Literal::string("a"))]),
+        )
+        .expect("PartitionKey::new: valid partition tuple");
+
+        // Sorted path order puts "p/a.parquet" first, so the two stampings are distinguishable.
+        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"))
+            .with_partition_spec(configured);
+        writer.delete("p/a.parquet", 1, Some(&key)).expect("delete");
+        writer.delete("p/b.parquet", 2, None).expect("delete");
+        let delete_files = writer.close().await.expect("close");
+
+        assert_eq!(delete_files.len(), 2, "one DV per referenced data file");
+        for delete_file in &delete_files {
+            let referenced = delete_file
+                .referenced_data_file()
+                .expect("a DV always names its referenced data file");
+            let expected = match referenced.as_str() {
+                "p/a.parquet" => 9,
+                "p/b.parquet" => 7,
+                other => panic!("unexpected referenced data file: {other}"),
+            };
+            assert_eq!(
+                delete_file.partition_spec_id, expected,
+                "{referenced} must carry its own spec id, not another entry's"
+            );
+        }
+    }
+
+    /// The rejection keys on partition-field ARITY, not [`PartitionSpec::is_unpartitioned`]. An
+    /// ALL-VOID spec is the discriminator: `is_unpartitioned()` is true for it, yet its partition
+    /// type still has arity 1, so a file under it still needs a tuple of nulls. Keying on
+    /// `is_unpartitioned` would wave this through into a commit-time arity failure instead.
+    #[tokio::test]
+    async fn dv_all_void_spec_without_a_key_is_rejected() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let (_, _, schema) = specs_for_stamping(7);
+        let all_void = PartitionSpec::builder(schema)
+            .with_spec_id(7)
+            .add_partition_field("category", "category", crate::spec::Transform::Void)
+            .expect("void partition field")
+            .build()
+            .expect("all-void spec");
+        assert!(
+            all_void.is_unpartitioned(),
+            "fixture precondition: an all-void spec reports itself unpartitioned"
+        );
+        assert_eq!(
+            all_void.fields().len(),
+            1,
+            "fixture precondition: it nonetheless has one partition field"
+        );
+
+        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"))
+            .with_partition_spec(all_void);
+        writer.delete("p/x.parquet", 1, None).expect("delete");
+        let error = writer
+            .close()
+            .await
+            .expect_err("an all-void spec with no key must be rejected on arity");
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("partition field(s)"),
+            "the error names the arity mismatch, got: {}",
+            error.message()
         );
     }
 }
