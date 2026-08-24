@@ -83,8 +83,11 @@
 //!   Java `ValueReaders.fileFieldReader` special-cases a *present* file field whose id is `ROW_ID`
 //!   or `LAST_UPDATED_SEQUENCE_NUMBER` with dedicated readers; the fork implements the same rules
 //!   one layer later, in `RecordBatchTransformer` (`ColumnSource::RowIdFromFile` /
-//!   `LastUpdatedSeqFromFile`), which every format's scan path funnels through. This reader still
-//!   emits those ids as plain columns — that is now the INPUT to the shared fallback, not a gap.
+//!   `LastUpdatedSeqFromFile`), which every format's scan path funnels through. For that to be
+//!   true of THIS reader, `ArrowReader::build_expected_schema` must also let the two reserved
+//!   row-lineage ids through (it excludes every other metadata column); it does, and the arm is
+//!   covered by `stored_row_id_in_an_avro_file_survives_the_real_reader`. This reader emits those
+//!   ids as plain columns — the INPUT to the shared fallback, not a gap.
 //! - The `variant` type read is deferred (the Avro→Iceberg schema converter rejects variant on the
 //!   read path anyway).
 

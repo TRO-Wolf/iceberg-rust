@@ -30,7 +30,7 @@ oracle jars. Nothing here is inferred from documentation.
 
 ## Verdict
 
-**Four axes are closed. Two are open, both in ROW LINEAGE, and they chain.** Two more (variant
+**As first written: four axes closed, two open (both ROW LINEAGE, chained). BOTH have since been CLOSED — V1 and V2 landed 2026-08-24 on this same branch. The narrative below is preserved as the audit's findings AT THE TIME; the per-unit sections carry an outcome note.** Two more (variant
 shredded-parquet I/O, geospatial types) are v3 type-system features that are NOT on the
 production-capability path unless RePark writes those types.
 
@@ -41,14 +41,18 @@ production-capability path unless RePark writes those types.
 | Default values (`initial-default` / `write-default`) | ✅ closed **on the data-path formats** | APPLIED on the two data-path readers — `record_batch_transformer.rs:718` (parquet, the one RePark reads) and `avro_reader.rs:430`. ORC is the exception and is NOT an application site: `orc_reader.rs:339-346` REFUSES a field carrying a non-null `initial_default` with `FeatureUnsupported`. That is Java-faithful — Java's ORC reader throws the same way (`ORCSchemaUtil.buildOrcProjection`) — so it is parity, not a gap, but it is a REFUSAL and must not be read as support. `write_default` correctly NOT gated at v2 (`table_metadata_builder.rs:4284-4306`) |
 | Multi-argument transforms | ✅ out of scope | NOT in the oracle: `javap org.apache.iceberg.PartitionField` (1.10.0) has a single `private final int sourceId`. Parity is Java core 1.10.0, so this is not a fork gap |
 | `timestamp_ns` / `timestamptz_ns` | ✅ closed | R90 ✅ (R162 🟡 is a `data_file` metadata-projection residue, not a data-path gap) |
-| **Row lineage — `first_row_id` inheritance** | ❌ **OPEN** | see V1 |
-| **Row lineage — `_row_id` / `_last_updated_sequence_number` materialization** | ❌ **OPEN** | see V2 |
+| **Row lineage — `first_row_id` inheritance** | ✅ CLOSED 2026-08-24 (V1) | see V1 |
+| **Row lineage — `_row_id` / `_last_updated_sequence_number` materialization** | ✅ CLOSED 2026-08-24 (V2), 🟡 on ORC + interop | see V2 |
 | `variant` | 🟡 R88 | binary format done both directions. SCOPE CORRECTED below: shredded-PARQUET variant is NOT in the parity scope (Java's is in `iceberg-parquet`, not `iceberg-core`). The `variant_experimental` feature has since been enabled and the canonical Arrow extension type wired both directions; file-level I/O remains owed |
 | `geometry` / `geography` | ❌ R89 | nothing exists |
 
 ---
 
 ## V1 — `DataFile.first_row_id` inheritance on manifest read
+
+> **OUTCOME (2026-08-24): BUILT.** `spec/manifest/entry.rs` `assign_first_row_ids`, wired into
+> `ManifestFile::load_manifest_with_schema_fallback`. See GAP_MATRIX row R166. The gap statement
+> below describes the state BEFORE that change.
 
 **The gap.** Java assigns each data file's `first_row_id` **at manifest-read time**, exactly as it
 inherits sequence numbers. The fork does not: `spec/manifest/_serde.rs:159` passes the stored value
@@ -79,6 +83,12 @@ domain is the three guards crossed with the null/non-null manifest arm; the DELE
 already-assigned cells are the ones a naive running-total gets wrong.
 
 ## V2 — `_row_id` / `_last_updated_sequence_number` materialization at scan
+
+> **OUTCOME (2026-08-24): BUILT** for Parquet and Avro, at the shared `RecordBatchTransformer`.
+> See row R166 for the rules, the two fail-closed divergences, and the residue (ORC has no arm;
+> no interop leg). The evidence sentence below — "`RESERVED_FIELD_ID_ROW_ID` appears in exactly
+> one file" — was true at `d62fe54bd` and is NO LONGER true at tip; it is kept because it is the
+> finding that motivated the unit.
 
 **The gap.** `RESERVED_FIELD_ID_ROW_ID` appears in **exactly one file** in the whole workspace —
 `crates/iceberg/src/metadata_columns.rs`, where it is defined. `grep -rl` over `crates/` returns
@@ -117,8 +127,8 @@ Avro path is the one with a direct core-jar oracle (`ValueReaders`); ORC's Java 
   FORK-ONLY EXTENSION beyond Java core, gated on the `parquet` crate's experimental
   `variant_experimental` feature — not a parity gap with an oracle.
 
-  The related fork refusal is also already correct: `arrow/schema.rs`'s `variant()` arm throws, and
-  so does Java — `TypeUtil$SchemaVisitor.variant(VariantType)` is a bare
+  The related fork refusal WAS also correct at the time of the audit: `arrow/schema.rs`'s
+  `variant()` arm threw, and so does Java — `TypeUtil$SchemaVisitor.variant(VariantType)` is a bare
   `throw new UnsupportedOperationException("Unsupported type: variant")` (bytecode offsets 0-6),
   and `ArrowSchemaUtil`'s converter does not override it.
 

@@ -313,8 +313,9 @@ impl RecordBatchTransformerBuilder {
     ///
     /// Both are `Option` because a file in a V1/V2 table — or a V3 file in a manifest with no
     /// assigned range — has neither. Projecting `_row_id` or `_last_updated_sequence_number`
-    /// without the corresponding value is rejected at transform-build time; it is never silently
-    /// defaulted to zero, which would mint colliding row ids.
+    /// without the corresponding value yields an ALL-NULL column, matching Java exactly
+    /// (`ValueReaders.rowIds(null, …)` and `lastUpdated` with either constant null both return
+    /// `constant(null)`). It is never defaulted to zero, which would mint colliding row ids.
     pub(crate) fn with_row_lineage(
         mut self,
         first_row_id: Option<i64>,
@@ -769,9 +770,8 @@ impl RecordBatchTransformer {
                 // on whether the FILE carries the field: a present field gets a dedicated reader
                 // that falls back per NULL row, an absent one gets the computed/constant value.
                 if *field_id == RESERVED_FIELD_ID_ROW_ID {
-                    // No assigned range => an ALL-NULL column, exactly as Java: `ValueReaders
-                    // .rowIds(null, reader)` returns `constant(null)` (1.10.0 bytecode offsets
-                    // 0-1 branch to 14, `constant` at 15). A V1/V2 file simply has no row
+                    // No assigned range => an ALL-NULL column, exactly as Java's
+                    // `ValueReaders.rowIds(null, reader)`. A V1/V2 file simply has no row
                     // identity, which is a fact about the row, not a failure to read it.
                     let Some(first_row_id) = first_row_id else {
                         return Ok(ColumnSource::Add {
@@ -790,9 +790,8 @@ impl RecordBatchTransformer {
 
                 if *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER {
                     // Java gates this column on BOTH inputs, not just the sequence number:
-                    // `ValueReaders.lastUpdated(Long rowIdConst, Long fileSeq, reader)` returns
-                    // `constant(null)` if EITHER is null (1.10.0 bytecode: `ifnull 21` at offsets
-                    // 1 and 5, with `constant(null)` at 21-25). So a V1/V2 file — which HAS a
+                    // `ValueReaders.lastUpdated(rowIdConst, fileSeq, reader)` is a null constant
+                    // if EITHER is null. So a V1/V2 file — which HAS a
                     // sequence number but no `first_row_id` — reports NULL here, not its sequence
                     // number. Gating on the sequence number alone would fabricate a
                     // last-updated value for every row of every pre-V3 table.

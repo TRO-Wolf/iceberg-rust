@@ -224,11 +224,10 @@ static COMMIT_SNAPSHOT_ID_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
 /// This field represents a unique long assigned for row lineage.
 static ROW_ID_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
     Arc::new(
-        // OPTIONAL, not required — Java `MetadataColumns` static initializer offset 144 calls
-        // `NestedField.optional`. A row read from a V1/V2 file (or from a V3 manifest with no
-        // assigned range) has NO row id, and Java reports that as NULL. Declaring it required
-        // made the Arrow field non-nullable, so the null column Java produces could not even be
-        // built — the error surfaced only once something finally consumed this field.
+        // OPTIONAL, not required — Java `MetadataColumns` declares it so. A row read from a
+        // V1/V2 file (or from a V3 manifest with no assigned range) has NO row id, and Java
+        // reports that as NULL; declaring it required makes the Arrow field non-nullable, so
+        // that null column cannot even be built.
         NestedField::optional(
             RESERVED_FIELD_ID_ROW_ID,
             RESERVED_COL_NAME_ROW_ID,
@@ -242,8 +241,7 @@ static ROW_ID_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
 /// This field represents the sequence number which last updated this row.
 static LAST_UPDATED_SEQUENCE_NUMBER_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
     Arc::new(
-        // OPTIONAL for the same reason as `_row_id` (Java offset 159), and the doc string is
-        // Java's verbatim.
+        // OPTIONAL for the same reason as `_row_id`; the doc string is Java's verbatim.
         NestedField::optional(
             RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
             RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
@@ -391,7 +389,7 @@ pub fn partition_field(partition_fields: Vec<NestedFieldRef>) -> NestedFieldRef 
 /// These are the only reserved metadata columns that can be PHYSICALLY PRESENT in a data file: a
 /// lineage-preserving rewrite carries the original `_row_id` / `_last_updated_sequence_number`
 /// forward into the new file, and Java prefers that stored value over the computed one
-/// (`ValueReaders$RowIdReader.read`, offsets 34-39). Every other reserved column (`_file`, `_pos`,
+/// (`ValueReaders$RowIdReader`). Every other reserved column (`_file`, `_pos`,
 /// `_spec_id`, ...) is synthesized by the reader and never read from the file, which is why
 /// [`is_metadata_field`] alone is the wrong predicate for deciding what to project.
 pub fn is_row_lineage_field(field_id: i32) -> bool {

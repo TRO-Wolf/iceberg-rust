@@ -151,8 +151,8 @@ impl ManifestEntry {
 
 /// Assign each entry's `first_row_id` from the manifest's own `first_row_id` — the V3 row-lineage
 /// counterpart of [`ManifestEntry::inherit_data`], and the Rust mirror of Java
-/// `ManifestReader.idAssigner` (`core/.../ManifestReader.java`; 1.10.0 bytecode decoded from
-/// `ManifestReader.idAssigner` and its anonymous `ManifestReader$1`).
+/// `ManifestReader.idAssigner` (`core/.../ManifestReader.java`) and its anonymous
+/// `ManifestReader$1`. Decoded bytecode: `task/f13-v3-row-lineage-ledger.md`.
 ///
 /// Unlike `inherit_data` this is **stateful across entries** — the assignment is a running total —
 /// so it is a pass over the whole slice rather than a per-entry method, and it must see the entries
@@ -160,20 +160,13 @@ impl ManifestEntry {
 ///
 /// Java has two arms, and the absent arm is the surprising one:
 ///
-/// * `manifest_first_row_id` **absent** → every file's `first_row_id` is set to `None`
-///   (`lambda$idAssigner$2`: `setFirstRowId(null)` at offset 22, reached for every entry — it sits
-///   under the same `instanceof BaseFile` downcast as the present arm (`ifeq 25` at offset 9) and
-///   under NO status or already-assigned guard). This
+/// * `manifest_first_row_id` **absent** -> every file's `first_row_id` is set to `None`. This
 ///   **OVERWRITES** any value the file carried on disk rather than preserving it; a manifest with
-///   no assigned range cannot lend row ids to its files. Delete manifests always take this arm —
-///   the manifest-list writer never assigns them a `first_row_id`.
-/// * `manifest_first_row_id` **present** → a running counter starting at that value
-///   (`ManifestReader$1`), assigning to an entry only when ALL THREE of its guards hold:
-///   the file is a `BaseFile` (offsets 6-9 — a defensive downcast that both data and delete files
-///   satisfy in Java, so it is NOT a content-type filter and has no Rust counterpart),
-///   `status != DELETED` (offsets 12-21), and the file's `first_row_id` is currently `None`
-///   (offsets 34-39). Only then does it `setFirstRowId(nextRowId)` and advance
-///   `nextRowId += recordCount` (offsets 43-63).
+///   no assigned range cannot lend row ids to its files, in ANY entry state. Delete manifests
+///   always take this arm — the manifest-list writer never assigns them a `first_row_id`.
+/// * `manifest_first_row_id` **present** -> a running counter starting at that value, assigning to
+///   an entry only when its status is not `Deleted` AND its `first_row_id` is currently `None`,
+///   then advancing by that file's `record_count`.
 ///
 /// The two skip cells are the ones a naive running total gets wrong: the counter does **not**
 /// advance past a `Deleted` entry, and it does **not** advance past a file that already carries a

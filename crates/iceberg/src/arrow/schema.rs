@@ -313,7 +313,12 @@ fn visit_type_at_depth<V: ArrowSchemaVisitor>(
 
                 let value_result = {
                     visitor.before_map_value(value_field)?;
-                    let ret = visit_type_at_depth(value_field.data_type(), visitor, depth + 1)?;
+                    // A variant map VALUE is short-circuited like a variant field or list
+                    // element. (A variant KEY is not a case: Iceberg map keys are primitives.)
+                    let ret = match visitor.variant_field(value_field)? {
+                        Some(ret) => ret,
+                        None => visit_type_at_depth(value_field.data_type(), visitor, depth + 1)?,
+                    };
                     visitor.after_map_value(value_field)?;
                     ret
                 };
@@ -363,7 +368,12 @@ fn visit_list<V: ArrowSchemaVisitor>(
     depth: usize,
 ) -> Result<V::T> {
     visitor.before_list_element(element_field)?;
-    let value = visit_type_at_depth(element_field.data_type(), visitor, depth + 1)?;
+    // A variant ELEMENT is short-circuited exactly like a variant field: descending would fail on
+    // its id-less `metadata` / `value` children and would yield a struct even if it succeeded.
+    let value = match visitor.variant_field(element_field)? {
+        Some(value) => value,
+        None => visit_type_at_depth(element_field.data_type(), visitor, depth + 1)?,
+    };
     visitor.after_list_element(element_field)?;
     visitor.list(data_type, value)
 }
@@ -542,7 +552,7 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
 
     /// A field carrying the canonical variant extension name IS the Iceberg variant type — the
     /// mirror of `SchemaToType.variant` returning `Types.VariantType.get()` on the Avro side
-    /// (1.10.0 bytecode: a bare `VariantType.get()` return).
+    /// (a bare `VariantType.get()` return).
     fn variant_field(&mut self, field: &Field) -> Result<Option<Self::T>> {
         Ok(is_variant_arrow_field(field).then_some(Type::Variant))
     }
@@ -792,6 +802,19 @@ impl SchemaVisitor for ToArrowSchemaConverter {
                 list.element_field.id.to_string(),
             )])
         };
+        // `self.field` above already stamped the canonical variant extension metadata when the
+        // element is a variant; this rebuild REPLACES the whole metadata map, so re-stamp it or
+        // the element silently degrades to a plain `{metadata, value}` struct — a variant column
+        // treated as an ordinary struct, which is the exact hazard the type's identity rule
+        // exists to prevent.
+        let meta = if matches!(
+            list.element_field.field_type.as_ref(),
+            crate::spec::Type::Variant
+        ) {
+            with_variant_extension_metadata(meta)
+        } else {
+            meta
+        };
         let field = field.with_metadata(meta);
         Ok(ArrowSchemaOrFieldOrType::Type(DataType::List(Arc::new(
             field,
@@ -830,8 +853,8 @@ impl SchemaVisitor for ToArrowSchemaConverter {
     ///
     /// This DIVERGES FROM JAVA DELIBERATELY, and the divergence is an extension, not a defect.
     /// Java throws here — `TypeUtil$SchemaVisitor.variant(VariantType)` is a bare
-    /// `throw new UnsupportedOperationException("Unsupported type: variant")` (1.10.0 bytecode,
-    /// offsets 0-6) and `ArrowSchemaUtil`'s converter does not override it — because Java's Arrow
+    /// `UnsupportedOperationException("Unsupported type: variant")` and `ArrowSchemaUtil`'s
+    /// converter does not override it — because Java's Arrow
     /// bridge predates the canonical extension type. Refusing was the right behaviour only while
     /// the fork had nothing to emit; emitting the CANONICAL type is strictly better than an
     /// exception, and it is the same type `parquet`'s own variant support reads and writes, so
@@ -2853,6 +2876,73 @@ mod tests {
             "the extension name must be recognised on the way back, not flattened to a struct"
         );
         assert_eq!(back.as_struct().fields()[1].id, 2);
+    }
+
+    /// NESTED variant — inside a `list` and inside a `map` value. Both were broken when the
+    /// top-level arm landed (verification-Critic F-4): `list` REBUILDS its element's metadata map
+    /// and so erased the extension name, degrading `list<variant>` to a list of plain
+    /// `{metadata, value}` structs — silently, which is the precise hazard the identity rule
+    /// exists to prevent — and neither `visit_list` nor the map-value descent consulted the
+    /// `variant_field` hook, so neither converted back.
+    #[test]
+    fn test_variant_nested_in_a_list_and_a_map_round_trips() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(
+                    1,
+                    "vs",
+                    Type::List(crate::spec::ListType {
+                        element_field: NestedField::list_element(2, Type::Variant, true).into(),
+                    }),
+                )
+                .into(),
+                NestedField::optional(
+                    3,
+                    "vm",
+                    Type::Map(crate::spec::MapType {
+                        key_field: NestedField::map_key_element(
+                            4,
+                            Type::Primitive(PrimitiveType::String),
+                        )
+                        .into(),
+                        value_field: NestedField::map_value_element(5, Type::Variant, true).into(),
+                    }),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let arrow_schema = schema_to_arrow_schema(&schema).expect("to arrow");
+
+        // The list element keeps the extension name despite `list()` rebuilding its metadata.
+        let DataType::List(element) = arrow_schema.field_with_name("vs").unwrap().data_type()
+        else {
+            panic!("expected a list");
+        };
+        assert!(
+            is_variant_arrow_field(element),
+            "the list ELEMENT must still be identifiable as a variant, got metadata {:?}",
+            element.metadata()
+        );
+
+        let back = arrow_schema_to_schema(&arrow_schema).expect("back to iceberg");
+        let Type::List(list) = back.as_struct().fields()[0].field_type.as_ref() else {
+            panic!("expected a list");
+        };
+        assert_eq!(
+            list.element_field.field_type.as_ref(),
+            &Type::Variant,
+            "a list element must not flatten to a struct on the way back"
+        );
+        let Type::Map(map) = back.as_struct().fields()[1].field_type.as_ref() else {
+            panic!("expected a map");
+        };
+        assert_eq!(
+            map.value_field.field_type.as_ref(),
+            &Type::Variant,
+            "a map value must not flatten to a struct on the way back"
+        );
     }
 
     /// The DISCRIMINATING cell. A struct of the same SHAPE but WITHOUT the extension name is a

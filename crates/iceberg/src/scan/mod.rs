@@ -2411,6 +2411,64 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
+        /// Re-write the current snapshot's manifest list as a **V3** list carrying an assigned
+        /// row-id range, reusing the manifests `setup_manifest_files` already wrote.
+        ///
+        /// `add_manifests` then assigns each data manifest its `first_row_id`, which
+        /// `load_manifest` propagates onto every entry's `DataFile`, which
+        /// `into_file_scan_task` threads onto the `FileScanTask`. That is the whole row-lineage
+        /// read chain, end to end, and it is the only way to make a planned task carry a
+        /// non-`None` `first_row_id`.
+        pub async fn rewrite_manifest_list_as_v3_with_row_range(&mut self, first_row_id: u64) {
+            // The manifest LIST is parsed against the table's format version, so a V3-shaped list
+            // read by a V2 table silently drops `first_row_id`. Upgrade the table first.
+            let metadata = self.table.metadata().clone();
+            let upgraded = metadata
+                .into_builder(Some(
+                    self.table
+                        .metadata_location()
+                        .unwrap_or_default()
+                        .to_string(),
+                ))
+                .upgrade_format_version(crate::spec::FormatVersion::V3)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+            self.table = Table::builder()
+                .metadata(upgraded)
+                .identifier(self.table.identifier().clone())
+                .file_io(self.table.file_io().clone())
+                .metadata_location(
+                    self.table
+                        .metadata_location()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+                .build()
+                .unwrap();
+
+            let snapshot = self.table.metadata().current_snapshot().unwrap().clone();
+            let manifest_list = snapshot
+                .load_manifest_list(self.table.file_io(), self.table.metadata())
+                .await
+                .unwrap();
+            let mut writer = ManifestListWriter::v3(
+                self.table
+                    .file_io()
+                    .new_output(snapshot.manifest_list())
+                    .unwrap(),
+                snapshot.snapshot_id(),
+                snapshot.parent_snapshot_id(),
+                snapshot.sequence_number(),
+                Some(first_row_id),
+            );
+            writer
+                .add_manifests(manifest_list.entries().iter().cloned())
+                .unwrap();
+            writer.close().await.unwrap();
+        }
+
         /// Writes identical Parquet data files (1.parquet, 2.parquet, 3.parquet)
         /// and returns the file size in bytes.
         fn write_parquet_data_files(&self) -> u64 {
@@ -3304,6 +3362,59 @@ pub mod tests {
         let batch_stream = table.scan().build().unwrap().to_arrow().await.unwrap();
         let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
         assert!(batches.is_empty());
+    }
+
+    /// THE MANIFEST -> TASK WIRING PIN (verification-Critic F-2). `into_file_scan_task` is the
+    /// single production seam carrying row lineage from the manifest entry onto the
+    /// `FileScanTask`. Replacing both fields with `None` there passed the ENTIRE suite — every
+    /// real scan would have reported `_row_id` as all-NULL and nothing would have noticed. The
+    /// earlier fix replaced a refusal with a null column, which removed even the crude canary
+    /// that would have errored, so this seam has to be pinned directly.
+    ///
+    /// Both halves are asserted: `first_row_id` (needs a V3 manifest list with an assigned range,
+    /// hence the rewrite) and `file_sequence_number`. Pinning only one leaves a narrower mutation
+    /// alive.
+    #[tokio::test]
+    async fn test_plan_files_threads_row_lineage_onto_the_task() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        fixture
+            .rewrite_manifest_list_as_v3_with_row_range(1_000)
+            .await;
+
+        let table_scan = fixture.table.scan().build().unwrap();
+        let mut tasks: Vec<FileScanTask> = table_scan
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        tasks.sort_by_key(|task| task.data_file_path.to_string());
+        assert_eq!(tasks.len(), 2, "fixture precondition");
+
+        // The manifest's range starts at 1000 and each entry advances it by its record count, so
+        // the two tasks take DIFFERENT ids — an implementation that stamped a constant, or that
+        // dropped the field, fails here.
+        let first_row_ids: Vec<Option<i64>> = tasks.iter().map(|t| t.first_row_id).collect();
+        assert!(
+            first_row_ids.iter().all(Option::is_some),
+            "every planned task must carry the row-id range its manifest assigned, got \
+             {first_row_ids:?}"
+        );
+        assert_ne!(
+            first_row_ids[0], first_row_ids[1],
+            "the two files must NOT share a row-id range"
+        );
+        assert!(
+            first_row_ids.iter().flatten().all(|id| *id >= 1_000),
+            "ids start at the manifest's assigned range, not at 0, got {first_row_ids:?}"
+        );
+
+        assert!(
+            tasks.iter().all(|task| task.file_sequence_number.is_some()),
+            "the file sequence number is threaded from the manifest entry too"
+        );
     }
 
     #[tokio::test]
