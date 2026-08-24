@@ -108,12 +108,26 @@ Avro path is the one with a direct core-jar oracle (`ValueReaders`); ORC's Java 
 
 ## What is NOT on the production path
 
-- **`variant` shredded-parquet I/O (R88).** The binary format is done in both directions. What is
-  missing is file-level shredded I/O, and it is not a scheduling decision the fork owns alone: it
-  needs the `parquet` crate's `variant_experimental` opt-in feature, PLUS an Iceberg→
-  `ShreddedSchemaBuilder` bridge and a `variant()` arm in `arrow/schema.rs`'s visitor, which
-  hard-errors by design today. Re-adjudicated at the DF-54/arrow-58 bump on 2026-08-05: the bump
-  does not unblock it.
+- **`variant` shredded-PARQUET I/O (R88).** CORRECTED 2026-08-24, and the correction changes what
+  the unit is. Parquet variant support does **not exist in the parity scope at all**: `unzip -l`
+  over the 1.10.0 `iceberg-core` jar returns variant classes only under `avro/` and `variants/` —
+  `ValueReaders$VariantReader`, `ValueWriters$Variant{Binary,Metadata,Value,}Writer`,
+  `VariantConversion`, `VariantLogicalType`. Java's parquet variant lives in the **`iceberg-parquet`
+  module, outside `iceberg-core`/`iceberg-api`**. So shredded-parquet variant I/O would be a
+  FORK-ONLY EXTENSION beyond Java core, gated on the `parquet` crate's experimental
+  `variant_experimental` feature — not a parity gap with an oracle.
+
+  The related fork refusal is also already correct: `arrow/schema.rs`'s `variant()` arm throws, and
+  so does Java — `TypeUtil$SchemaVisitor.variant(VariantType)` is a bare
+  `throw new UnsupportedOperationException("Unsupported type: variant")` (bytecode offsets 0-6),
+  and `ArrowSchemaUtil`'s converter does not override it.
+
+- **`variant` over AVRO — the in-scope unit R88 should actually name.** This one HAS an oracle in
+  `iceberg-core` (the five classes above) and needs no dependency change. The fork already has the
+  whole binary format both directions (`variant/` — metadata, value, shredded, visitor, write) and
+  the Avro SCHEMA shape (`avro/schema.rs` `avro_variant_schema`, `is_variant_record_shape`). What
+  is missing is the Avro→Iceberg direction, which refuses at `avro/schema.rs:455`, and the data
+  read/write plumbing behind it.
 - **`geometry` / `geography` (R89).** A whole type family with no fork presence: types, JSON and
   Avro serde, transforms, metrics bounds, and Arrow mapping. This is its own block, not a residue.
 
