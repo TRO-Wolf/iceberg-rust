@@ -4710,7 +4710,7 @@ mod tests {
         .await;
 
         // A Puffin delete file with NO referenced_data_file ⇒ malformed DV.
-        let malformed_dv = DataFileBuilder::default()
+        let mut malformed_dv = DataFileBuilder::default()
             .content(DataContentType::PositionDeletes)
             .file_path("test/bad-dv.puffin".to_string())
             .file_format(DataFileFormat::Puffin)
@@ -4720,8 +4720,11 @@ mod tests {
             .partition(Struct::from_iter([Some(Literal::long(0))]))
             .content_offset(Some(4))
             .content_size_in_bytes(Some(40))
+            .referenced_data_file(Some("placeholder.parquet".to_string()))
             .build()
             .unwrap();
+        // The builder refuses this shape now; only a decoded manifest entry can carry it.
+        malformed_dv.referenced_data_file = None;
 
         let tx = Transaction::new(&table);
         let action = tx

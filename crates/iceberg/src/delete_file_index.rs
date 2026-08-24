@@ -1510,7 +1510,9 @@ mod tests {
         let spec_id = 1;
         let data_file = build_partitioned_data_file(&partition, spec_id);
 
-        let invalid_dv = DataFileBuilder::default()
+        // `DataFileBuilder` now refuses this shape, so build a valid DV and strip the field. Only the
+        // manifest READ path can produce it — it decodes into a struct literal, not the builder.
+        let mut invalid_dv = DataFileBuilder::default()
             .file_path("orphan-deletes.puffin".to_string())
             .file_format(DataFileFormat::Puffin)
             .content(DataContentType::PositionDeletes)
@@ -1518,8 +1520,12 @@ mod tests {
             .partition(partition.clone())
             .partition_spec_id(spec_id)
             .file_size_in_bytes(100)
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(40))
+            .referenced_data_file(Some("placeholder.parquet".to_string()))
             .build()
             .unwrap();
+        invalid_dv.referenced_data_file = None;
 
         let index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
             manifest_entry: build_added_manifest_entry(2, &invalid_dv).into(),

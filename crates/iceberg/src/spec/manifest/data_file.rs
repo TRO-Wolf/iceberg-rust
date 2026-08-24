@@ -33,6 +33,7 @@ use crate::{Error, ErrorKind};
 
 /// Data file carries data file path, partition tuple, metrics, …
 #[derive(Debug, PartialEq, Clone, Eq, Builder)]
+#[builder(build_fn(validate = "DataFileBuilder::validate"))]
 pub struct DataFile {
     /// field id: 134
     ///
@@ -182,6 +183,54 @@ pub struct DataFile {
     /// The length of a referenced content stored in the file; required if `content_offset` is present
     #[builder(default)]
     pub(crate) content_size_in_bytes: Option<i64>,
+}
+
+impl DataFileBuilder {
+    /// Reject the DataFile shapes Java `FileMetadata$Builder.build()` rejects.
+    ///
+    /// Returns:
+    ///     `Ok(())`, or the Java message for the first violated rule.
+    ///
+    /// Notes:
+    ///     Runs before defaults are applied, so an unset optional reads as its `None` default.
+    ///     `file_format` has no default; when it is unset the caller gets derive_builder's own
+    ///     missing-field error instead, so the DV rules are skipped.
+    fn validate(&self) -> std::result::Result<(), String> {
+        let Some(file_format) = self.file_format else {
+            return Ok(());
+        };
+        let content_offset = self.content_offset.flatten();
+        let content_size_in_bytes = self.content_size_in_bytes.flatten();
+        let referenced_data_file = self.referenced_data_file.as_ref().and_then(Option::as_ref);
+
+        // Puffin is the deletion-vector container. Java keys these rules on the FORMAT, not on the
+        // content type, so a Puffin file of any content must carry the blob coordinates.
+        if file_format == DataFileFormat::Puffin {
+            if content_offset.is_none() {
+                return Err("Content offset is required for DV".to_string());
+            }
+            if content_size_in_bytes.is_none() {
+                return Err("Content size is required for DV".to_string());
+            }
+            if referenced_data_file.is_none() {
+                return Err("Referenced data file is required for DV".to_string());
+            }
+        } else {
+            if content_offset.is_some() {
+                return Err("Content offset can only be set for DV".to_string());
+            }
+            if content_size_in_bytes.is_some() {
+                return Err("Content size can only be set for DV".to_string());
+            }
+        }
+
+        if self.content == Some(DataContentType::PositionDeletes)
+            && self.sort_order_id.flatten().is_some()
+        {
+            return Err("Position delete file should not have sort order".to_string());
+        }
+        Ok(())
+    }
 }
 
 impl DataFile {
@@ -434,5 +483,121 @@ mod test {
     #[test]
     fn test_data_content_type_default_value() {
         assert_eq!(DataContentType::default() as i32, 0);
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    /// Build a builder that already has every field `build()` requires.
+    ///
+    /// Args:
+    ///     content: the file content type.
+    ///     file_format: the file format.
+    ///
+    /// Returns:
+    ///     A builder that passes validation until the caller makes it invalid.
+    fn valid(content: DataContentType, file_format: DataFileFormat) -> DataFileBuilder {
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(content)
+            .file_path("s3://b/f".to_string())
+            .file_format(file_format)
+            .record_count(1)
+            .file_size_in_bytes(100);
+        if file_format == DataFileFormat::Puffin {
+            builder
+                .content_offset(Some(4))
+                .content_size_in_bytes(Some(40))
+                .referenced_data_file(Some("s3://b/d.parquet".to_string()));
+        }
+        builder
+    }
+
+    fn err_of(builder: DataFileBuilder) -> String {
+        match builder.build() {
+            Err(DataFileBuilderError::ValidationError(message)) => message,
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn puffin_without_content_offset_is_rejected() {
+        let mut builder = valid(DataContentType::PositionDeletes, DataFileFormat::Puffin);
+        builder.content_offset(None);
+        assert_eq!(err_of(builder), "Content offset is required for DV");
+    }
+
+    #[test]
+    fn puffin_without_content_size_is_rejected() {
+        let mut builder = valid(DataContentType::PositionDeletes, DataFileFormat::Puffin);
+        builder.content_size_in_bytes(None);
+        assert_eq!(err_of(builder), "Content size is required for DV");
+    }
+
+    #[test]
+    fn puffin_without_referenced_data_file_is_rejected() {
+        let mut builder = valid(DataContentType::PositionDeletes, DataFileFormat::Puffin);
+        builder.referenced_data_file(None);
+        assert_eq!(err_of(builder), "Referenced data file is required for DV");
+    }
+
+    #[test]
+    fn non_puffin_with_content_offset_is_rejected() {
+        let mut builder = valid(DataContentType::PositionDeletes, DataFileFormat::Parquet);
+        builder.content_offset(Some(4));
+        assert_eq!(err_of(builder), "Content offset can only be set for DV");
+    }
+
+    #[test]
+    fn non_puffin_with_content_size_is_rejected() {
+        let mut builder = valid(DataContentType::PositionDeletes, DataFileFormat::Parquet);
+        builder.content_size_in_bytes(Some(40));
+        assert_eq!(err_of(builder), "Content size can only be set for DV");
+    }
+
+    #[test]
+    fn position_delete_with_sort_order_is_rejected() {
+        let mut builder = valid(DataContentType::PositionDeletes, DataFileFormat::Parquet);
+        builder.sort_order_id(0);
+        assert_eq!(
+            err_of(builder),
+            "Position delete file should not have sort order"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_dv_builds() {
+        valid(DataContentType::PositionDeletes, DataFileFormat::Puffin)
+            .build()
+            .expect("a Puffin DV with all three coordinates is valid");
+    }
+
+    #[test]
+    fn a_plain_data_file_builds() {
+        valid(DataContentType::Data, DataFileFormat::Parquet)
+            .build()
+            .expect("a Parquet data file sets no DV field");
+    }
+
+    /// The sort-order rule is scoped to POSITION deletes. Java defaults the equality-delete case to
+    /// the unsorted order id instead of rejecting it (`FileMetadata$Builder.build()` switch case 2).
+    #[test]
+    fn an_equality_delete_may_carry_a_sort_order() {
+        let mut builder = valid(DataContentType::EqualityDeletes, DataFileFormat::Parquet);
+        builder.sort_order_id(0);
+        builder
+            .build()
+            .expect("only position deletes forbid a sort order");
+    }
+
+    /// Puffin rules key on the FORMAT, not the content type — a Puffin DATA file needs the
+    /// coordinates too.
+    #[test]
+    fn puffin_rules_apply_to_any_content_type() {
+        let mut builder = valid(DataContentType::Data, DataFileFormat::Puffin);
+        builder.referenced_data_file(None);
+        assert_eq!(err_of(builder), "Referenced data file is required for DV");
     }
 }
