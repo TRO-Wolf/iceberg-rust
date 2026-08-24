@@ -49,6 +49,25 @@ The interop leg's ROW comparison is load-bearing (a one-position DV shift is cau
 checks are belt-and-braces: `RowDelta` refuses both corruptions before they can be written. Measured,
 not assumed — see `crates/integrations/datafusion/tests/interop_dv_sql.rs`.
 
+## Bundle Critic
+
+NOT CONVERGED on first pass, three S2s:
+
+1. The UPDATE arm's `remove_deletes_many` was unpinned — the DELETE arm had a second-delete test,
+   the UPDATE arm did not. Deleting the whole block survived all 305 tests.
+2. The per-path `PartitionKey` was unpinned for a DV write spanning more than one data file. Every
+   test touched one data file per statement, so stamping one arbitrary key was an identity.
+3. A data file still covered by a legacy PARQUET position delete was refused only at commit — AFTER
+   the Puffin was written, leaving an orphan. Reachable by upgrading a V2 table with position
+   deletes to V3.
+
+(1) and (2) are the same class again, on its fourth and fifth occurrence in this unit. (3) is now a
+PRE-IO refusal, restoring the §7a guarantee, and the residue is named on R114.
+
+It also found a regression I introduced: extracting `validate_delete_vector_coordinates` dropped the
+`\` line continuations, so five runtime messages — two of them the SCAN path's, correct before this
+branch — carried runs of 18-22 literal spaces. No test asserted a full message string. One now does.
+
 ## Critic cycles
 
 Two cycles on U2, both NOT CONVERGED on first pass, both for the same class: an exemption pinned on

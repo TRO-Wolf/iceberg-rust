@@ -75,7 +75,7 @@ pub(crate) fn validate_delete_vector_coordinates(
             Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Invalid deletion vector '{file_path}': content_offset must be a non-negative                      integer, got {content_offset:?}"
+                    "Invalid deletion vector '{file_path}': content_offset must be a non-negative integer, got {content_offset:?}"
                 ),
             )
         })?;
@@ -89,7 +89,7 @@ pub(crate) fn validate_delete_vector_coordinates(
             Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Invalid deletion vector '{file_path}': content_size_in_bytes must be between                      0 and {} (2GB), got {content_size_in_bytes:?}",
+                    "Invalid deletion vector '{file_path}': content_size_in_bytes must be between 0 and {} (2GB), got {content_size_in_bytes:?}",
                     i32::MAX
                 ),
             )
@@ -126,7 +126,7 @@ pub async fn load_delete_vector(file_io: &FileIO, delete_file: &DataFile) -> Res
         return Err(Error::new(
             ErrorKind::DataInvalid,
             format!(
-                "Invalid deletion vector '{file_path}': expected a Puffin position-delete file,                  got {:?} / {:?}",
+                "Invalid deletion vector '{file_path}': expected a Puffin position-delete file, got {:?} / {:?}",
                 delete_file.content_type(),
                 delete_file.file_format()
             ),
@@ -167,7 +167,7 @@ pub async fn load_delete_vector(file_io: &FileIO, delete_file: &DataFile) -> Res
         return Err(Error::new(
             ErrorKind::DataInvalid,
             format!(
-                "Invalid deletion vector cardinality for '{file_path}': decoded {} positions,                  manifest record_count expects {}",
+                "Invalid deletion vector cardinality for '{file_path}': decoded {} positions, manifest record_count expects {}",
                 delete_vector.len(),
                 delete_file.record_count()
             ),
@@ -1559,8 +1559,10 @@ mod loader_tests {
             .expect_err("a negative offset is not a readable coordinate");
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
         assert!(
-            error.message().contains("content_offset must be"),
-            "got: {}",
+            error
+                .message()
+                .ends_with("content_offset must be a non-negative integer, got Some(-1)"),
+            "the message text is pinned — `cargo fmt` silently reflowed these once. got: {}",
             error.message()
         );
     }

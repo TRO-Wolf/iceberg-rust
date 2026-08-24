@@ -1181,17 +1181,30 @@ async fn live_data_file_partitions(table: &Table) -> DFResult<HashMap<String, (i
     Ok(path_to_partition)
 }
 
-/// Maps every live deletion vector of the current snapshot to the data file it covers.
+/// The live delete files of the current snapshot, split by whether they are deletion vectors.
+struct LiveDeletes {
+    /// Puffin DVs, keyed by the data file each covers.
+    dv_by_data_file: HashMap<String, DataFile>,
+    /// Non-Puffin position deletes, as `(referenced_data_file, spec_id, partition)`. A path-scoped
+    /// one names its data file; a partition-scoped one covers every data file in its partition.
+    legacy_position_deletes: Vec<(Option<String>, i32, Struct)>,
+}
+
+/// Reads the current snapshot's delete manifests once.
 ///
 /// # Notes
 ///
-/// V3 allows at most one DV per data file, so the map is unambiguous. A second delete on a data
-/// file must merge that DV and supersede it; leaving it live would double-count the positions.
-async fn live_delete_vectors_by_data_file(table: &Table) -> DFResult<HashMap<String, DataFile>> {
+/// V3 allows at most one DV per data file, so `dv_by_data_file` is unambiguous. A second delete on
+/// a data file must merge that DV and supersede it; leaving it live would double-count the
+/// positions.
+async fn live_delete_vectors_by_data_file(table: &Table) -> DFResult<LiveDeletes> {
     let metadata = table.metadata();
-    let mut dv_by_data_file: HashMap<String, DataFile> = HashMap::new();
+    let mut live = LiveDeletes {
+        dv_by_data_file: HashMap::new(),
+        legacy_position_deletes: Vec::new(),
+    };
     let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(dv_by_data_file);
+        return Ok(live);
     };
     let manifest_list = snapshot
         .load_manifest_list(table.file_io(), metadata)
@@ -1211,15 +1224,23 @@ async fn live_delete_vectors_by_data_file(table: &Table) -> DFResult<HashMap<Str
                 continue;
             }
             let df = entry.data_file();
-            if df.file_format() != DataFileFormat::Puffin {
+            if df.content_type() != iceberg::spec::DataContentType::PositionDeletes {
                 continue;
             }
-            if let Some(referenced) = df.referenced_data_file() {
-                dv_by_data_file.insert(referenced, df.clone());
+            if df.file_format() == DataFileFormat::Puffin {
+                if let Some(referenced) = df.referenced_data_file() {
+                    live.dv_by_data_file.insert(referenced, df.clone());
+                }
+            } else {
+                live.legacy_position_deletes.push((
+                    df.referenced_data_file(),
+                    df.partition_spec_id(),
+                    df.partition().clone(),
+                ));
             }
         }
     }
-    Ok(dv_by_data_file)
+    Ok(live)
 }
 
 /// Writes the deletion vectors for `pairs` — the V3 merge-on-read delete output.
@@ -1253,7 +1274,7 @@ async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFRes
         }
         let (spec_id, partition) = path_to_partition.get(path).cloned().ok_or_else(|| {
             DataFusionError::Internal(format!(
-                "deletion-vector: data file `{path}` is not a live file of the current snapshot,                  so its partition cannot be resolved"
+                "deletion-vector: data file `{path}` is not a live file of the current snapshot, so its partition cannot be resolved"
             ))
         })?;
         let spec = metadata
@@ -1273,10 +1294,40 @@ async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFRes
     // Load the DV each touched data file already has, if any. Java's `loadPreviousDeletes` is
     // called per touched path, so a data file with only previous deletes and no new position is
     // never visited and keeps its DV.
-    let live_dvs = live_delete_vectors_by_data_file(table).await?;
+    let live = live_delete_vectors_by_data_file(table).await?;
+
+    // Refuse a data file still covered by a Parquet position delete, BEFORE the Puffin is opened.
+    // Java's `loadPreviousDeletes` unions those positions into the new DV and rewrites the
+    // file-scoped sources; this port reads DVs only, so merging them is not yet possible. The
+    // commit door would reject it anyway — but only after a fully written, unreferenced Puffin
+    // reached storage. Reachable on a V2 table with position deletes upgraded to V3. GAP_MATRIX
+    // row R114 carries the residue.
+    for (path, (spec_id, partition)) in partition_key_by_path
+        .keys()
+        .filter_map(|path| path_to_partition.get(*path).map(|value| (path, value)))
+    {
+        let covered = live.legacy_position_deletes.iter().any(
+            |(referenced, delete_spec_id, delete_partition)| {
+                match referenced {
+                    Some(referenced) => referenced == *path,
+                    // Partition-scoped: covers every data file sharing its (spec_id, partition).
+                    None => delete_spec_id == spec_id && delete_partition == partition,
+                }
+            },
+        );
+        if covered {
+            return Err(DataFusionError::NotImplemented(format!(
+                "deletion-vector: data file `{path}` is still covered by a Parquet position-delete \
+                 file. Merging those positions into a new DV is not yet ported (Java \
+                 BaseDVFileWriter.loadPreviousDeletes does it), and V3 forbids writing another \
+                 position-delete file — rewrite the table's position deletes as DVs first"
+            )));
+        }
+    }
+
     let mut previous_deletes_by_path: HashMap<String, PreviousDeletes> = HashMap::new();
     for path in partition_key_by_path.keys() {
-        let Some(existing) = live_dvs.get(*path) else {
+        let Some(existing) = live.dv_by_data_file.get(*path) else {
             continue;
         };
         let positions = load_delete_vector(table.file_io(), existing)

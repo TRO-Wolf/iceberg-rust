@@ -148,10 +148,12 @@
 //! **Out of scope (deferred — the NEXT increment):**
 //! - Equality-delete WRITER end-to-end (the writer exists; the RowDelta-with-equality-deletes scan
 //!   application may have gaps — the end-to-end test focuses on POSITION deletes).
-//! - The WRITER-side previous-deletes MERGE for deletion vectors (`BaseDVFileWriter.loadPreviousDeletes`
-//!   reading + unioning the old positions into the new DV) — the apply-side removal here is the commit-path
-//!   half; the writer hook that auto-merges is the next increment. (The DV WRITE path itself — `DVFileWriter`
-//!   → `add_deletes` → commit → scan, plus `remove_deletes` of a superseded DV — is supported now.)
+//! - Merging a legacy PARQUET position delete into a new DV. Java `loadPreviousDeletes` unions
+//!   whatever covers the data file; this port reads DVs only, so a data file still covered by a
+//!   parquet position delete is refused here. GAP_MATRIX row R114 carries the residue.
+//!   (Merging a previous DV is NO LONGER deferred — `delete_vector::load_delete_vector` +
+//!   `DVFileWriter::with_previous_deletes` + `remove_deletes_many` do it, and the DataFusion V3
+//!   merge-on-read path drives them.)
 //!
 //! (Apply-side `removeRows` data-file removal is NO LONGER deferred — it landed here; see the apply-side
 //! removal note above.)
@@ -756,11 +758,13 @@ impl RowDeltaAction {
                             ErrorKind::DataInvalid,
                             format!(
                                 "Cannot commit deletion vector for {}: the current snapshot already \
-                                 carries a live deletion vector for that data file ({}). Merging \
-                                 previous deletes into the new DV and removing the old delete file \
-                                 (Java BaseDVFileWriter.loadPreviousDeletes + RowDelta.removeDeletes) \
-                                 is deferred in this port; committing would leave two DVs for one data \
-                                 file, which the scan rejects",
+                                 carries a live deletion vector for that data file ({}). Read it \
+                                 back with delete_vector::load_delete_vector, merge it through \
+                                 DVFileWriter::with_previous_deletes, and pass the superseded file \
+                                 to RowDelta::remove_deletes_many in THIS commit (Java \
+                                 BaseDVFileWriter.loadPreviousDeletes + RowDelta.removeDeletes). \
+                                 Committing as-is would leave two DVs for one data file, which the \
+                                 scan rejects",
                                 referenced,
                                 dv_desc(existing)
                             ),
@@ -4904,9 +4908,10 @@ mod tests {
     /// (started after DV1 — no concurrent window, so `validateAddedDVs` self-passes) adds DV2 for
     /// the same A. The door must reject: without it the commit would leave TWO live DVs for A,
     /// which D1's duplicate-DV load door rejects at SCAN time — fail-late, table unreadable.
-    /// The message must name the referenced file AND the deferral.
+    /// The message must name the referenced file AND the way out — merging the previous DV and
+    /// removing it in the same commit, which is supported now.
     #[tokio::test]
-    async fn test_row_delta_second_dv_for_same_file_rejected_until_merge_lands() {
+    async fn test_row_delta_second_dv_for_same_file_rejected_unless_it_supersedes() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append_files(&catalog, &table, vec![synthetic_data_file(
@@ -4953,8 +4958,8 @@ mod tests {
             err.message()
         );
         assert!(
-            err.message().contains("deferred"),
-            "the door must name the deferral (previous-delete merge not yet supported), got: {}",
+            err.message().contains("remove_deletes_many"),
+            "the door must tell the caller how to merge instead, got: {}",
             err.message()
         );
     }

@@ -139,7 +139,7 @@ The engine-boundary proof (#116): scan `_file`/`_pos` → write position-delete 
 | DELETE | copy-on-write | rewrite affected files' survivors; commit `OverwriteFiles` `.delete_files(affected).add_files(rewritten)` |
 | DELETE | merge-on-read | V2: position-delete files, one per `(spec_id, partition)` group, stamped with the matching `PartitionKey`. V3: deletion vectors, one per DATA FILE (see §7a). Either way, commit `RowDelta` |
 | UPDATE | copy-on-write | rewrite affected files in full (matched rows take SET values); `OverwriteFiles` as above; a partition-key-changing UPDATE re-routes rows via the partition-aware writer |
-| UPDATE / MERGE | merge-on-read | position/equality deletes for matched rows + new data files; ONE `RowDelta` commit (added deletes inherit the commit's sequence number) |
+| UPDATE / MERGE | merge-on-read | deletes for the matched rows (V2: position/equality deletes. V3: deletion vectors, per the DELETE row) + new data files; ONE `RowDelta` commit (added deletes inherit the commit's sequence number) |
 | INSERT OVERWRITE (dynamic) | — | `ReplacePartitions` |
 | compaction commit | — | `RewriteFiles` (the action layer's `RewriteDataFiles` wraps it) |
 

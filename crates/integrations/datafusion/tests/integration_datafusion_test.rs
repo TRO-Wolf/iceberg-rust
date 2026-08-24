@@ -6841,3 +6841,180 @@ async fn test_delete_mread_v3_partitioned_dv_carries_its_data_file_partition() -
     );
     Ok(())
 }
+
+/// Risk pinned: the UPDATE arm never removing a superseded DV. The DELETE arm's removal is pinned
+/// by its own second-delete test; this is the same path on the other arm, and the two are wired
+/// separately.
+///
+/// The second UPDATE must target a row that is still in the ORIGINAL data file. A row that was
+/// already updated has moved to a new file and would need no merge.
+#[tokio::test]
+async fn test_update_mread_v3_second_update_supersedes_the_first_dv() -> Result<()> {
+    let (ctx, client) = make_v3_mread_ctx("test_upd_mread_v3_merge", "items").await?;
+    ctx.sql("INSERT INTO catalog.test_upd_mread_v3_merge.items VALUES (1,'a'),(2,'b'),(3,'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    ctx.sql("UPDATE catalog.test_upd_mread_v3_merge.items SET val = 'y' WHERE id = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    ctx.sql("UPDATE catalog.test_upd_mread_v3_merge.items SET val = 'z' WHERE id = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ids = surviving_ids(
+        &ctx,
+        "SELECT id FROM catalog.test_upd_mread_v3_merge.items ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "an UPDATE must not lose or duplicate rows"
+    );
+
+    let delete_files = live_delete_files(&client, "test_upd_mread_v3_merge", "items").await?;
+    assert_eq!(
+        delete_files.len(),
+        1,
+        "both updates hide rows of the SAME original data file, so the second DV must supersede \
+         the first rather than joining it"
+    );
+    assert_eq!(
+        delete_files[0].record_count(),
+        2,
+        "the surviving DV carries BOTH hidden positions, so the first was merged not dropped"
+    );
+    Ok(())
+}
+
+/// Risk pinned: one `PartitionKey` stamped on every DV of a multi-file delete. A statement matching
+/// rows in two data files writes two DVs in ONE Puffin, and each must carry its OWN data file's
+/// partition. Every other V3 test touches a single data file, where any per-path lookup is an
+/// identity.
+#[tokio::test]
+async fn test_delete_mread_v3_multi_file_dvs_each_carry_their_own_partition() -> Result<()> {
+    let (ctx, client) = make_v3_partitioned_mread_ctx("test_del_mread_v3_multi", "items").await?;
+    ctx.sql(
+        "INSERT INTO catalog.test_del_mread_v3_multi.items VALUES \
+         (1,'electronics','laptop'),(2,'electronics','phone'),\
+         (3,'books','novel'),(4,'books','textbook')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    // One statement, two partitions, two data files.
+    let deleted = delete_count(
+        &ctx,
+        "DELETE FROM catalog.test_del_mread_v3_multi.items WHERE id = 1 OR id = 3",
+    )
+    .await;
+    assert_eq!(deleted, 2, "one row matches in each partition");
+
+    let ids = surviving_ids(
+        &ctx,
+        "SELECT id FROM catalog.test_del_mread_v3_multi.items ORDER BY id",
+    )
+    .await;
+    assert_eq!(ids, vec![2, 4], "exactly one row survives per partition");
+
+    let delete_files = live_delete_files(&client, "test_del_mread_v3_multi", "items").await?;
+    assert_eq!(delete_files.len(), 2, "one DV per touched data file");
+
+    // The two DVs must carry DIFFERENT partition tuples — their own, not a shared one.
+    let mut partitions: Vec<iceberg::spec::Struct> = delete_files
+        .iter()
+        .map(|dv| dv.partition().clone())
+        .collect();
+    partitions.dedup();
+    assert_eq!(
+        partitions.len(),
+        2,
+        "each DV must carry its OWN data file's partition; a shared key collapses them to one"
+    );
+    Ok(())
+}
+
+/// Risk pinned: a V2 table with Parquet position deletes upgraded to V3, then deleted from again.
+/// Java's `loadPreviousDeletes` would union those positions into the new DV; this port reads DVs
+/// only, so it must refuse — and refuse BEFORE the Puffin is written. The commit door catches it
+/// either way, but only after a fully written, unreferenced Puffin has reached storage.
+#[tokio::test]
+async fn test_delete_mread_v3_refuses_a_file_still_covered_by_position_deletes() -> Result<()> {
+    let (ctx, client) = make_versioned_mread_ctx(
+        "test_del_mread_upgrade",
+        "items",
+        iceberg::spec::FormatVersion::V2,
+    )
+    .await?;
+    ctx.sql("INSERT INTO catalog.test_del_mread_upgrade.items VALUES (1,'a'),(2,'b'),(3,'c')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // V2: this writes a Parquet position-delete file.
+    delete_count(
+        &ctx,
+        "DELETE FROM catalog.test_del_mread_upgrade.items WHERE id = 1",
+    )
+    .await;
+
+    let table_ident = iceberg::TableIdent::new(
+        NamespaceIdent::new("test_del_mread_upgrade".to_string()),
+        "items".to_string(),
+    );
+    let table = client.load_table(&table_ident).await?;
+    let tx = iceberg::transaction::Transaction::new(&table);
+    let action = tx
+        .upgrade_table_version()
+        .set_format_version(iceberg::spec::FormatVersion::V3);
+    let tx = iceberg::transaction::ApplyTransactionAction::apply(action, tx)?;
+    tx.commit(client.as_ref()).await?;
+
+    // The provider snapshots the catalog at construction, so rebuild it to see V3.
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "catalog",
+        Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?),
+    );
+
+    let error = ctx
+        .sql("DELETE FROM catalog.test_del_mread_upgrade.items WHERE id = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("the data file is still covered by a Parquet position delete");
+    assert!(
+        error.to_string().contains("Parquet position-delete"),
+        "the refusal must name the cause; got: {error}"
+    );
+
+    // Nothing was written: the refusal runs before the Puffin is opened.
+    let delete_files = live_delete_files(&client, "test_del_mread_upgrade", "items").await?;
+    assert_eq!(
+        delete_files.len(),
+        1,
+        "only the original V2 position-delete file is live — no orphaned DV was committed"
+    );
+    assert_eq!(
+        delete_files[0].file_format(),
+        iceberg::spec::DataFileFormat::Parquet,
+        "the live delete file is still the V2 position delete"
+    );
+    Ok(())
+}

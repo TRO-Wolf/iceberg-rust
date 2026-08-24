@@ -24,7 +24,7 @@
 # -> DVFileWriter -> row_delta with remove_deletes_many -> Java's production scan.
 #
 # Steps:
-#   1. Rust GEN: three SQL `DELETE` statements on a V3 identity(category)-partitioned table. The third
+#   1. Rust GEN: three SQL DELETE statements on a V3 identity(category)-partitioned table. The third
 #      re-deletes from a data file that already carries a DV, so the writer must load, merge and
 #      supersede it.
 #   2. Java verify: parse the Rust-written final.metadata.json, confirm format-version 3, read the
@@ -44,7 +44,7 @@ echo "==> [1/3] Reset the temp dir: ${TMP}"
 rm -rf "${TMP}"
 mkdir -p "${TMP}"
 
-echo "==> [2/3] Rust: three SQL `DELETE` statements on a V3 MoR table -> Puffin DVs + final.metadata.json"
+echo "==> [2/3] Rust: three SQL DELETE statements on a V3 MoR table -> Puffin DVs + final.metadata.json"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_DV_SQL_GEN_DIR="${TMP}" \
