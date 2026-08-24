@@ -22,8 +22,8 @@ description: >-
 Two passes over Rust work in this workspace. The **authoring pass** applies while you write. The
 **review pass** applies to a diff. It records a proven *sequence*; every
 rule it leans on is a pointer into the spine ([AGENTS.md](../../../AGENTS.md) "Rust conventions",
-"Absolute prohibitions", "Parity mandate") or the per-tier manual
-([skills/Opus.md](../../../skills/Opus.md)) — on any conflict, those win. This skill states no
+"Absolute prohibitions", "Parity mandate") or the engineering method
+([../engineering-method/SKILL.md](../engineering-method/SKILL.md)) — on any conflict, those win. This skill states no
 project rule; it decides nothing that AGENTS.md has not already decided. The evidence companion is
 [../test-adequacy/SKILL.md](../test-adequacy/SKILL.md) — this skill asks *is the code right*, that
 one asks *does the test prove it*.
@@ -232,8 +232,9 @@ This axis has no analogue in a non-parity repo, and it is the reason the fork ex
         one word one meaning, plain verbs, no hedging and no narration of the author's reasoning.
   - [ ] The doc comment shape matches the contract, not the effort. A one-line setter takes one
         line. `# Errors` / `# Panics` / `# Notes` appear where they apply.
-  - [ ] No commented-out code and no tombstone ([skills/Opus.md](../../../skills/Opus.md) §9,
-        "Delete dead code; don't comment it out"). Git remembers the old version.
+  - [ ] No commented-out code and no tombstone
+        ([engineering-method](../engineering-method/SKILL.md) §9, "Delete dead code; don't comment
+        it out"). Git remembers the old version.
 
 ## Worked example — the shortest-form rule
 

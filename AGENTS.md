@@ -56,15 +56,15 @@ capability's *status*, the **GAP_MATRIX** (re-audited against the live base) win
    and the navigation contract. Everything below is the contract; read it before touching anything.
 2. **[Roadmap.md](Roadmap.md)** — the parity phase plan and the current phase; then
    **[docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md)** for per-capability status.
-3. **The operating manual for your model tier** — [skills/Fable.md](skills/Fable.md) (Mythos-class),
-   [skills/Opus.md](skills/Opus.md), [skills/Sonnet.md](skills/Sonnet.md), or
-   [skills/Haiku.md](skills/Haiku.md) (the portable engineering contract; see
-   [skills/map.md](skills/map.md)); precedence is in `<precedence>` below.
+3. **The engineering method** —
+   [.agents/skills/engineering-method/SKILL.md](.agents/skills/engineering-method/SKILL.md), the
+   portable agent-agnostic working method (one instruction set for every model tier; it replaced
+   the per-tier manuals 2026-08-24); precedence is in `<precedence>` below.
 4. **The SEPMO control plane** — [skills/sepmo/SKILL.md](skills/sepmo/SKILL.md) (the
    lifecycle/governance shell: scope audit + 100% gate, Actor–Critic execution, PR-grouping,
    delivery, retrospective) and [skills/sepmo/binding-manifest.md](skills/sepmo/binding-manifest.md)
-   (how it binds to this repo). SEPMO governs *lifecycle*; this file and the tier manuals win the
-   *engineering contract* and all conflicts (see `<precedence>`).
+   (how it binds to this repo). SEPMO governs *lifecycle*; this file and the engineering method win
+   the *engineering contract* and all conflicts (see `<precedence>`).
 5. **[task/lessons.md](task/lessons.md) in full, then [task/todo.md](task/todo.md)** — accumulated
    lessons and any mid-flight plan to pick up.
 6. **The `map.md` of every directory your task will touch** (where present — see the navigation
@@ -94,8 +94,9 @@ One chain, highest authority first:
 2. **Roadmap.md** — the plan and the current phase. *(Direction-vs-status nuance: the Roadmap owns
    direction, the GAP_MATRIX owns capability status — see the intro paragraph above.)*
 3. **docs/parity/GAP_MATRIX.md** — the single source of truth for capability *status*.
-4. **The tier manuals** ([skills/](skills/)) — the portable engineering defaults; this file is
-   repo-specific and wins over them.
+4. **The engineering method**
+   ([.agents/skills/engineering-method/](.agents/skills/engineering-method/map.md)) — the portable
+   engineering defaults; this file is repo-specific and wins over it.
 5. **SEPMO** ([skills/sepmo/](skills/sepmo/)) — **lifecycle and orchestration only**.
 
 SEPMO **cedes the engineering contract** to this file and to the manuals; this file and the manuals
@@ -265,8 +266,9 @@ These are irreversible or hard-block. The operating manuals (Non-Negotiables) re
 
 ## Rust conventions — the engineering contract
 
-The tier manuals in [skills/](skills/) carry the portable defaults; the rules below are this
-repository's contract and win over them. Everything under `### Crate code` **applies to all paths
+The engineering method in
+[.agents/skills/engineering-method/SKILL.md](.agents/skills/engineering-method/SKILL.md) carries
+the portable defaults; the rules below are this repository's contract and win over it. Everything under `### Crate code` **applies to all paths
 under `crates/`**; the house-style rules above it apply repo-wide.
 
 - **Imports & formatting:** let `cargo fmt` own layout (config in [rustfmt.toml](rustfmt.toml)); do

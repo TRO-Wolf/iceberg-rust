@@ -47,19 +47,19 @@ taxonomy, and the artifact rule (every gate is a checkable artifact, not a self-
 
 | SEPMO role | Canonical home in this repo | Mode | Relationship |
 |---|---|---|---|
-| Engineering contract | [AGENTS.md](../../AGENTS.md) (the authoritative contract — repo-wide rules and the `crates/` rules) + the [skills/](../) tier manual for the running model (`Fable.md` / `Opus.md` / `Sonnet.md` / `Haiku.md`; index [skills/map.md](../map.md), the portable defaults AGENTS.md wins over) + the tool configs ([rustfmt.toml](../../rustfmt.toml), [rust-toolchain.toml](../../rust-toolchain.toml), the [Makefile](../../Makefile) lint targets) + the **`rust-code-quality` skill** ([.agents/skills/rust-code-quality/SKILL.md](../../.agents/skills/rust-code-quality/SKILL.md)). AGENTS.md read order loads that skill for every Actor and every Critic. It carries the authoring pass for AGENTS.md "Comments and prose" and the review sequence for what the gates cannot catch. Its P3 comment class maps to a `doc-accuracy` finding. | BIND | Actor binds — defers entirely; Critic runs both passes |
-| Risk lens | `Opus.md` *Risk-First Mindset* (risk-surface table, double-execution rule, ToCToU windows) layered under the attack taxonomy ([references/05](references/05-critic.md)) + this manifest's `taxonomy_extensions` | BIND | Critic uses as attack basis |
-| Done gate | tier manual §4 *Verification Before Done* + [docs/testing.md](../../docs/testing.md); the two named green tiers are bound in `green_commands` below | BIND | Delivery invokes; R2/R7 exits |
+| Engineering contract | [AGENTS.md](../../AGENTS.md) (the authoritative contract — repo-wide rules and the `crates/` rules) + the **engineering-method skill** ([.agents/skills/engineering-method/SKILL.md](../../.agents/skills/engineering-method/SKILL.md) — the portable working method, agent-agnostic since 2026-08-24 when it replaced the per-tier manuals; the portable defaults AGENTS.md wins over) + the tool configs ([rustfmt.toml](../../rustfmt.toml), [rust-toolchain.toml](../../rust-toolchain.toml), the [Makefile](../../Makefile) lint targets) + the **`rust-code-quality` skill** ([.agents/skills/rust-code-quality/SKILL.md](../../.agents/skills/rust-code-quality/SKILL.md)). AGENTS.md read order loads that skill for every Actor and every Critic. It carries the authoring pass for AGENTS.md "Comments and prose" and the review sequence for what the gates cannot catch. Its P3 comment class maps to a `doc-accuracy` finding. | BIND | Actor binds — defers entirely; Critic runs both passes |
+| Risk lens | the engineering-method skill's *Risk-First Mindset* (risk-surface table, double-execution rule, ToCToU windows) layered under the attack taxonomy ([references/05](references/05-critic.md)) + this manifest's `taxonomy_extensions` | BIND | Critic uses as attack basis |
+| Done gate | the engineering-method skill's §4 *Verification Before Done* + [docs/testing.md](../../docs/testing.md); the two named green tiers are bound in `green_commands` below | BIND | Delivery invokes; R2/R7 exits |
 | Plan-of-record | [Roadmap.md](../../Roadmap.md) (phase plan + sequencing); the ranked open queue lives in [task/todo.md](../../task/todo.md) §ACTIVE per the "one home for PRIORITY" rule there | BIND | Orchestrator derives the charter |
 | Status SSOT | [docs/parity/GAP_MATRIX.md](../../docs/parity/GAP_MATRIX.md) — capability status lives ONLY there; cite rows by permanent `R<id>` anchor; `make check-matrix-anchors` enforces | BIND | Delivery updates; never restated |
 | PR-unit grouping | [task/todo.md](../../task/todo.md) unit sections under the two user-picked cadence modes (Mode A per-cycle scoped PR / Mode B bundled branch with interim + final Critic checkpoints); historical "Waves" are the same vocabulary | BIND-and-map | Orchestrator maps to it |
-| Active plan tracking | [task/todo.md](../../task/todo.md) — exactly one tracker; archival lifecycle per [skills/compaction.md](../compaction.md) §Todo Archival | BIND | Orchestrator writes the plan here |
-| Memory / lessons | [task/lessons.md](../../task/lessons.md) (active) + `task/lessons-archive/` + the lifecycle in [skills/compaction.md](../compaction.md) | BIND | Retrospective runs the learning pass |
+| Active plan tracking | [task/todo.md](../../task/todo.md) — exactly one tracker; archival lifecycle per the [compaction skill](../../.agents/skills/compaction/SKILL.md) §Todo Archival | BIND | Orchestrator writes the plan here |
+| Memory / lessons | [task/lessons.md](../../task/lessons.md) (active) + `task/lessons-archive/` + the lifecycle in the [compaction skill](../../.agents/skills/compaction/SKILL.md) | BIND | Retrospective runs the learning pass |
 | Navigation | the `map.md` convention — [AGENTS.md](../../AGENTS.md) `<map_md_navigation>`; the mandate extends to SEPMO's files ([map.md](map.md) here) | BIND | Mandate extends to SEPMO's files |
 | Prohibitions | [AGENTS.md](../../AGENTS.md) *Absolute prohibitions* — SEPMO adds none | BIND | All agents obey |
 | Sub-agent / tier policy | [AGENTS.md](../../AGENTS.md) `<subagent_policy>`: the per-PR **independent Critic (separate agent, fresh context) is non-negotiable**, and both roles default to the frontier tier. SEPMO's FF pair realizes as **OO = Opus–Opus** by the Claude-tier mapping in [CLAUDE.md](../../CLAUDE.md) (tool mechanics, not a project rule); the Critic never drops below Opus on correctness review | BIND | Orchestrator's AC mode follows it (see `context_break_mechanics`) |
-| Mode handling | the tier manuals' *Mode Handling* section (interactive vs. delegated) | BIND | Orchestrator + all agents adopt |
-| Debugging protocol | `Opus.md` §8 *Debugging Protocol* + each mapped directory's `map.md` `## Debug` section | BIND | Actor/Critic follow on failure |
+| Mode handling | the engineering-method skill's *Mode Handling* section (interactive vs. delegated) | BIND | Orchestrator + all agents adopt |
+| Debugging protocol | the engineering-method skill's §8 *Debugging Protocol* + each mapped directory's `map.md` `## Debug` section | BIND | Actor/Critic follow on failure |
 
 ## SEPMO binding points (tunables)
 
@@ -150,8 +150,10 @@ landed at the master home.
   wording diff over `references/` is the expected state, and an earlier "stale/missing"
   reading of it was refuted. **Never bulk-import either direction** — overwriting a canon
   home in place is incident #2 in [task/sepmo-metrics.md](../../task/sepmo-metrics.md).
-- Unsure which manual is "the engineering contract" right now → the one matching the
-  running model tier (Mythos-class → `Fable.md`); if unknown, `Opus.md`.
+- Unsure where "the engineering contract" lives right now → [AGENTS.md](../../AGENTS.md) (the
+  rule of record) + the engineering-method skill
+  ([.agents/skills/engineering-method/SKILL.md](../../.agents/skills/engineering-method/SKILL.md))
+  — one method for every model tier since 2026-08-24.
 
 ## Instantiation checklist
 

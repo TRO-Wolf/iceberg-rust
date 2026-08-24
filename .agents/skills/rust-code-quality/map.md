@@ -32,7 +32,8 @@ parity axis (divergence from Java `iceberg-core` 1.10.0) has no mechanical form 
 
 It records *sequences*, not a second contract: every rule it leans on points into
 [../../../AGENTS.md](../../../AGENTS.md), [../../../docs/testing.md](../../../docs/testing.md), or
-the tier manual in [../../../skills/](../../../skills/map.md), and on any conflict those win.
+the engineering method in [../engineering-method/SKILL.md](../engineering-method/SKILL.md), and on
+any conflict those win.
 
 ## Contents
 
@@ -56,8 +57,8 @@ the tier manual in [../../../skills/](../../../skills/map.md), and on any confli
 ## Pointers
 
 - **Up:** [../map.md](../map.md)
-- **Related:** [../../../skills/Opus.md](../../../skills/Opus.md) (the per-tier manual whose Rust
-  sections this skill cites rather than restates); [../../../docs/parity/GAP_MATRIX.md](../../../docs/parity/GAP_MATRIX.md)
+- **Related:** [../engineering-method/SKILL.md](../engineering-method/SKILL.md) (the working
+  method whose Rust sections this skill cites rather than restates); [../../../docs/parity/GAP_MATRIX.md](../../../docs/parity/GAP_MATRIX.md)
   (where a named parity residue is registered, cited by `row R<id>`).
 
 ## Debug
