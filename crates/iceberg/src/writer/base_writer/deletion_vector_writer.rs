@@ -72,7 +72,7 @@
 //! `for (DeleteFile f : result.rewrittenDeleteFiles()) rowDelta.removeDeletes(f)`. The Rust mirror
 //! is `row_delta().add_deletes(result.delete_files).remove_deletes_many(result.rewritten_delete_files)`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::delete_vector::DeleteVector;
 use crate::io::OutputFile;
@@ -151,9 +151,12 @@ impl PreviousDeletes {
 /// rewrittenDeleteFiles)`).
 ///
 /// Java's `DeleteWriteResult` carries a third member, `referencedDataFiles` (a `CharSequenceSet`),
-/// used by conflict validation; it is recoverable from `delete_files` (each carries its
-/// `referenced_data_file`), so it is omitted here rather than duplicated — the two load-bearing
-/// members for the merge-and-replace commit are the DVs and the rewritten (superseded) delete files.
+/// used by conflict validation. It is not stored here: it is fully recoverable from `delete_files`
+/// (each DV carries its `referenced_data_file`), so it is exposed as the DERIVED accessors
+/// [`referenced_data_files`](Self::referenced_data_files) and
+/// [`references_data_files`](Self::references_data_files) rather than duplicated as a field that
+/// could drift out of step with `delete_files`. The two STORED members are the ones a
+/// merge-and-replace commit cannot reconstruct: the DVs and the rewritten (superseded) delete files.
 #[derive(Debug)]
 pub struct DVWriteResult {
     /// One DV `DeleteFile` per referenced data file (Java `DeleteWriteResult.deleteFiles()`); the
@@ -164,6 +167,42 @@ pub struct DVWriteResult {
     /// Non-file-scoped previous deletes (partition-scoped parquet position deletes) are NOT included
     /// — Java leaves them in the table (`BaseDVFileWriter` L121-124).
     pub rewritten_delete_files: Vec<DataFile>,
+}
+
+impl DVWriteResult {
+    /// The set of data file paths the written DVs reference — Java
+    /// `DeleteWriteResult.referencedDataFiles()` (a `CharSequenceSet`), which `RowDelta`'s
+    /// `validateDataFilesExist` consumes to arm conflict detection.
+    ///
+    /// DERIVED from [`delete_files`](Self::delete_files) rather than stored, and exactly equal to
+    /// what Java accumulates: `BaseDVFileWriter.close` adds `deletes.path()` to the set once per
+    /// entry of `deletesByPath` it writes a blob for (1.10.0 bytecode, `close()` offset 205,
+    /// immediately after the `write(PuffinWriter, Deletes)` call at 199), and this writer emits
+    /// exactly one `DataFile` per such entry carrying that same path in `referenced_data_file`.
+    ///
+    /// A DV without a `referenced_data_file` cannot occur — [`DataFileBuilder::build`] rejects a
+    /// Puffin file with the field unset (Java `FileMetadata$Builder.build` offset 158) — so no
+    /// entry is silently dropped here; the `flatten` is a total projection, not a filter.
+    ///
+    /// [`DataFileBuilder::build`]: crate::spec::DataFileBuilder::build
+    pub fn referenced_data_files(&self) -> HashSet<String> {
+        self.delete_files
+            .iter()
+            .filter_map(|delete_file| delete_file.referenced_data_file())
+            .collect()
+    }
+
+    /// Whether any data file is referenced — Java `DeleteWriteResult.referencesDataFiles()`
+    /// (1.10.0 bytecode: `referencedDataFiles != null && !referencedDataFiles.isEmpty()`; the
+    /// null arm cannot arise here because the set is derived, never absent).
+    ///
+    /// Equivalent to a non-empty [`referenced_data_files`](Self::referenced_data_files) but does
+    /// not allocate the set.
+    pub fn references_data_files(&self) -> bool {
+        self.delete_files
+            .iter()
+            .any(|delete_file| delete_file.referenced_data_file().is_some())
+    }
 }
 
 /// Whether a previous delete file is FILE-SCOPED and therefore safe to discard from the table state
@@ -1422,6 +1461,126 @@ mod tests {
             error.message().contains("partition field(s)"),
             "the error names the arity mismatch, got: {}",
             error.message()
+        );
+    }
+
+    // ---- `DVWriteResult::referenced_data_files` / `references_data_files` (F-13 U3b) ------------
+    //
+    // The accessors are DERIVED, so the closed domain to pin is the projection itself, not a set of
+    // examples. Three axes, each crossed with both accessors:
+    //
+    // | Axis | Cells pinned |
+    // |---|---|
+    // | Cardinality | zero DVs (empty result) · one DV · MANY DVs |
+    // | Source member | reads `delete_files`, NOT `rewritten_delete_files` — pinned by a result where BOTH are non-empty and their paths are DISJOINT |
+    // | Field read | reads `referenced_data_file`, not the DV's own `file_path` — the two differ in every fixture below |
+    //
+    // Without the disjoint-source cell a mutation swapping `delete_files` for
+    // `rewritten_delete_files` survives every single-member fixture.
+
+    /// MANY DVs: the derived set is exactly the referenced data files, one per written blob —
+    /// Java `BaseDVFileWriter.close` adds `deletes.path()` once per written entry (offset 205).
+    #[tokio::test]
+    async fn dv_result_referenced_data_files_names_every_referenced_file() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+        writer.delete("mem://data/a.parquet", 0, None).expect("a");
+        writer.delete("mem://data/b.parquet", 4, None).expect("b");
+        writer
+            .delete("mem://data/b.parquet", 9, None)
+            .expect("b again");
+        writer.delete("mem://data/c.parquet", 1, None).expect("c");
+
+        let result = writer.close_with_result().await.expect("close with result");
+        assert_eq!(result.delete_files.len(), 3, "one DV per referenced file");
+        assert_eq!(
+            result.referenced_data_files(),
+            HashSet::from([
+                "mem://data/a.parquet".to_string(),
+                "mem://data/b.parquet".to_string(),
+                "mem://data/c.parquet".to_string(),
+            ]),
+            "every referenced file appears exactly once, regardless of how many positions it had"
+        );
+        assert!(result.references_data_files());
+    }
+
+    /// ZERO DVs: with nothing recorded, Java's `close` early-returns a result carrying
+    /// `CharSequenceSet.empty()` (offset 79), and `referencesDataFiles()` is then false.
+    #[tokio::test]
+    async fn dv_result_with_no_deletes_references_nothing() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+
+        let result = writer.close_with_result().await.expect("close with result");
+        assert!(result.delete_files.is_empty(), "fixture precondition");
+        assert!(
+            result.referenced_data_files().is_empty(),
+            "no DV written means no data file referenced"
+        );
+        assert!(
+            !result.references_data_files(),
+            "`references_data_files` must be false on the empty result, not vacuously true"
+        );
+    }
+
+    /// The SOURCE-MEMBER cell. Both members are non-empty and name DISJOINT data files, so a
+    /// mutation reading `rewritten_delete_files` instead of `delete_files` produces the wrong set
+    /// rather than the same one. `rewritten` is superseded state on the way OUT of the table; it is
+    /// not what the DVs reference, and Java's set is populated only in the write branch.
+    #[tokio::test]
+    async fn dv_result_referenced_data_files_reads_the_dvs_not_the_rewritten_files() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let written = "mem://data/written.parquet";
+        let superseded_target = "mem://data/superseded-target.parquet";
+
+        // A file-scoped previous DV over `written`, whose own `referenced_data_file` names a
+        // DIFFERENT path — so the two members cannot be confused for each other.
+        let previous = PreviousDeletes::new(DeleteVector::new([2u64].into_iter().collect()), vec![
+            synthetic_dv_delete_file("mem://data/old-dv.puffin", superseded_target),
+        ]);
+        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"))
+            .with_previous_deletes(HashMap::from([(written.to_string(), previous)]));
+        writer.delete(written, 7, None).expect("record new delete");
+
+        let result = writer.close_with_result().await.expect("close with result");
+        assert_eq!(
+            result.rewritten_delete_files.len(),
+            1,
+            "fixture precondition: the previous file-scoped DV is superseded"
+        );
+        assert_eq!(
+            result.referenced_data_files(),
+            HashSet::from([written.to_string()]),
+            "the set names what the NEW DVs reference; the superseded file's own target is absent"
+        );
+    }
+
+    /// The FIELD cell: the set is the `referenced_data_file`, never the DV's own `file_path`. The
+    /// Puffin path is shared by every blob, so a mutation reading `file_path` would collapse a
+    /// three-file result to a one-element set — and would be wrong even at cardinality one.
+    #[tokio::test]
+    async fn dv_result_referenced_data_files_is_not_the_puffin_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+        writer
+            .delete("mem://data/only.parquet", 0, None)
+            .expect("d");
+
+        let result = writer.close_with_result().await.expect("close with result");
+        let puffin_path = result.delete_files[0].file_path().to_string();
+        assert!(
+            puffin_path.ends_with("deletes.puffin"),
+            "fixture precondition: the DV lives in the Puffin file, got {puffin_path}"
+        );
+        assert_eq!(
+            result.referenced_data_files(),
+            HashSet::from(["mem://data/only.parquet".to_string()]),
+            "the referenced DATA file, not the Puffin container the DV was written into"
         );
     }
 }

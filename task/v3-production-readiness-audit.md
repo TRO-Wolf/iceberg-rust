@@ -1,0 +1,132 @@
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+
+# V3 production readiness — SEPMO Phase-0 scope audit
+
+**Question asked:** what remains before RePark has full Iceberg **v3 spec production**
+capabilities on this fork?
+
+**Method:** every claim below is either a grep over the live tree at `d62fe54bd` (the negative
+claims name the exact search that came back empty) or a `javap` disassembly of the pinned 1.10.0
+oracle jars. Nothing here is inferred from documentation.
+
+---
+
+## Verdict
+
+**Four axes are closed. Two are open, both in ROW LINEAGE, and they chain.** Two more (variant
+shredded-parquet I/O, geospatial types) are v3 type-system features that are NOT on the
+production-capability path unless RePark writes those types.
+
+| v3 axis | State | Evidence |
+|---|---|---|
+| Deletion vectors (Puffin `deletion-vector-v1`) | ✅ closed | R114; write, read, merge, commit door, and V3 engine MOR all landed (#219, #221) |
+| V3 delete-file rules (no parquet position deletes at v3) | ✅ closed | `RowDelta` refuses them at v3; the DV writer's pre-IO check refuses a DV over a live bounds-scoped delete |
+| Default values (`initial-default` / `write-default`) | ✅ closed | applied on ALL THREE read paths — `record_batch_transformer.rs:718` (parquet), `avro_reader.rs:430`, `orc_reader.rs:339-346`; `write_default` correctly NOT gated at v2 (`table_metadata_builder.rs:4284-4306`) |
+| Multi-argument transforms | ✅ out of scope | NOT in the oracle: `javap org.apache.iceberg.PartitionField` (1.10.0) has a single `private final int sourceId`. Parity is Java core 1.10.0, so this is not a fork gap |
+| `timestamp_ns` / `timestamptz_ns` | ✅ closed | R90 ✅ (R162 🟡 is a `data_file` metadata-projection residue, not a data-path gap) |
+| **Row lineage — `first_row_id` inheritance** | ❌ **OPEN** | see V1 |
+| **Row lineage — `_row_id` / `_last_updated_sequence_number` materialization** | ❌ **OPEN** | see V2 |
+| `variant` | 🟡 R88 | binary format done both directions; shredded-parquet FILE I/O blocked on the `parquet` crate's opt-in `variant_experimental` feature PLUS owed fork-side bridge work |
+| `geometry` / `geography` | ❌ R89 | nothing exists |
+
+---
+
+## V1 — `DataFile.first_row_id` inheritance on manifest read
+
+**The gap.** Java assigns each data file's `first_row_id` **at manifest-read time**, exactly as it
+inherits sequence numbers. The fork does not: `spec/manifest/_serde.rs:159` passes the stored value
+straight through (`first_row_id: value.first_row_id`), and no assigner exists anywhere in the crate.
+
+**The oracle rule** (`javap org.apache.iceberg.ManifestReader` + `ManifestReader$1`, 1.10.0):
+
+`idAssigner(Long firstRowId)` returns one of two functions:
+
+- `firstRowId == null` → a function setting EVERY file's `firstRowId` to **null**
+  (`lambda$idAssigner$2`, `setFirstRowId(null)` at offset 22). Note this OVERWRITES a stored value
+  rather than preserving it.
+- otherwise → a stateful `ManifestReader$1` with `nextRowId = firstRowId`, applying per entry:
+  - **only if** the file is a `BaseFile` **and** `entry.status() != DELETED` **and**
+    `file.firstRowId() == null` (offsets 6-39 — three guards, all `if_acmpeq`/`ifnull` jumps to the
+    no-op exit at 66);
+  - then `setFirstRowId(nextRowId)` and `nextRowId += file.recordCount()` (offsets 43-63).
+  - The counter therefore does **not** advance for a DELETED entry, nor for a file that already
+    carries a `firstRowId`.
+
+**Why it matters for production.** Without it, every data file read back carries
+`first_row_id: None`, so V2 below has nothing to compute `_row_id` from. It is also the axis on
+which a wrong implementation is silently wrong: an off-by-one in the counter mislabels rows
+without failing anything.
+
+**Size:** small — one assigner, applied where the manifest entry stream is built. Its closed test
+domain is the three guards crossed with the null/non-null manifest arm; the DELETED and
+already-assigned cells are the ones a naive running-total gets wrong.
+
+## V2 — `_row_id` / `_last_updated_sequence_number` materialization at scan
+
+**The gap.** `RESERVED_FIELD_ID_ROW_ID` appears in **exactly one file** in the whole workspace —
+`crates/iceberg/src/metadata_columns.rs`, where it is defined. `grep -rl` over `crates/` returns
+that file alone. The constants, the `NestedField`s, and the name↔id maps all exist; nothing
+consumes them. Selecting `_row_id` on a scan yields nothing today. `arrow/avro_reader.rs:82-85`
+already names this as a known deferred gap.
+
+**The oracle rules** (both `javap`-decoded, 1.10.0):
+
+- `ValueReaders$RowIdReader.read` — read the file's `_row_id` column; if non-null return it
+  (offsets 34-39); otherwise return `firstRowId + pos`, where `pos` comes from
+  `ValueReaders.positions()` and `firstRowId` is the **file's** assigned value (V1's output).
+- `ValueReaders$LastUpdatedSeqReader.read` — read the file's column; if non-null return it
+  (offsets 15-20); otherwise return the file's `fileSeqNumber` (offset 21-28).
+- Dispatch is `ValueReaders.fileFieldReader`, which special-cases a **present** file field whose id
+  is `MetadataColumns.ROW_ID` or `LAST_UPDATED_SEQUENCE_NUMBER`; an **absent** field takes the
+  constant path.
+
+**Blocked on:** V1 (hard — `firstRowId` is V1's output, and with V1 missing the fallback arm
+computes from `None`).
+
+**Size:** medium, and it touches all three readers. The parquet path is the one RePark needs; the
+Avro path is the one with a direct core-jar oracle (`ValueReaders`); ORC's Java reader is outside
+`iceberg-core`, so its arm is a fork-side extension of the same rule rather than a port.
+
+---
+
+## What is NOT on the production path
+
+- **`variant` shredded-parquet I/O (R88).** The binary format is done in both directions. What is
+  missing is file-level shredded I/O, and it is not a scheduling decision the fork owns alone: it
+  needs the `parquet` crate's `variant_experimental` opt-in feature, PLUS an Iceberg→
+  `ShreddedSchemaBuilder` bridge and a `variant()` arm in `arrow/schema.rs`'s visitor, which
+  hard-errors by design today. Re-adjudicated at the DF-54/arrow-58 bump on 2026-08-05: the bump
+  does not unblock it.
+- **`geometry` / `geography` (R89).** A whole type family with no fork presence: types, JSON and
+  Avro serde, transforms, metrics bounds, and Arrow mapping. This is its own block, not a residue.
+
+Neither blocks a v3 table that does not use those types. Both are honest gaps in "full v3 type
+system" and neither is reachable by tightening something that already exists.
+
+---
+
+## What I could not determine, and why
+
+1. **Whether RePark actually needs `_row_id` selectable, or only correct `first_row_id` metadata.**
+   V2's cost is dominated by the three reader arms. If RePark only needs lineage to survive
+   rewrites, V1 plus a metadata-level accessor is materially cheaper. Named as a question for the
+   user rather than assumed — the audit does not know RePark's consumer.
+2. **Whether ORC's `_row_id` arm is owed at all.** Java's ORC reader is outside the parity scope
+   (`iceberg-orc`, not `iceberg-core`), so that arm has no oracle. Flagged, not decided.
