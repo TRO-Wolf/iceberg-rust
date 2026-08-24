@@ -21,8 +21,8 @@
 
 ## Purpose
 
-Agent-facing **review procedures**: step-by-step sequences for recurring judgement work, written for
-any tool's agent. Each skill is a directory holding a `SKILL.md` with YAML frontmatter (`name`,
+Agent-facing **skills**: the portable working method plus step-by-step sequences for recurring
+judgement and maintenance work, written for any tool's agent. Each skill is a directory holding a `SKILL.md` with YAML frontmatter (`name`,
 `version`, and a `description` that says when to reach for it **and when not to**) — the same shape
 as [skills/sepmo/SKILL.md](../../skills/sepmo/SKILL.md) — so a skill is discoverable and invocable
 rather than a file an agent has to already know to open.
@@ -45,6 +45,8 @@ here (this file, each skill's `map.md`) carries the ASF header normally.
 
 | Skill | For |
 |---|---|
+| [engineering-method/](engineering-method/map.md) | The portable, agent-agnostic working method for implementation and review sessions: risk-first design, the reason-plan-verify workflow, naming, the Rust defaults, the debugging protocol, the done gate, and the frontier operating notes. Generalized 2026-08-24 from the former per-model-tier manuals (`skills/{Fable,Opus,Sonnet,Haiku}.md`); tier postures moved to the tool adapters. Rule of record stays [AGENTS.md](../../AGENTS.md). |
+| [compaction/](compaction/map.md) | The lessons-compaction procedure for [task/lessons.md](../../task/lessons.md) (and the todo-archival analogue): lifecycle (PROMOTE / KEEP / ARCHIVE), triggers, archive layout, conservation gate. Its own scoped change, interactive-approval-only. Moved 2026-08-24 from `skills/compaction.md`. |
 | [rust-code-quality/](rust-code-quality/map.md) | The Rust review procedure for what the gates cannot catch: on-disk format stability, divergence from Java `iceberg-core`, panics and value-path casts (neither is armed in this workspace), broken error chains, lock discipline, unbounded recursion. Severity ordered for a table-format library — silent corruption of already-written tables outranks everything. Also carries the authoring pass for [AGENTS.md](../../AGENTS.md) "Comments and prose". That pass is why AGENTS.md read order loads this skill for every Actor and every Critic, not for review alone. |
 | [test-adequacy/](test-adequacy/map.md) | The evidence discipline behind a coverage claim: apply the mutation rather than predict it, one knob at a time, and state the population next to every number. Carries the green-vacuity patterns that have each produced a false green here, the sabotage hard-fail rule, and the chained-gate rule. |
 
@@ -52,6 +54,8 @@ here (this file, each skill's `map.md`) carries the ASF header normally.
 
 | I want to... | go to |
 |---|---|
+| Read the working method before writing or reviewing code | [engineering-method/SKILL.md](engineering-method/SKILL.md) |
+| Compact the lessons file / find an archived lesson | [compaction/SKILL.md](compaction/SKILL.md) |
 | Review a Rust PR or commit | [rust-code-quality/SKILL.md](rust-code-quality/SKILL.md) "Quick start" |
 | Know how much to comment, and in what English | the rule is [AGENTS.md](../../AGENTS.md) "Comments and prose"; the sequence is [rust-code-quality/SKILL.md](rust-code-quality/SKILL.md) "Comment discipline — the authoring pass" |
 | Decide where Java bytecode evidence belongs | [AGENTS.md](../../AGENTS.md) "Comments and prose" — the ledger under [task/](../../task/), never a doc comment |
@@ -66,7 +70,7 @@ here (this file, each skill's `map.md`) carries the ASF header normally.
 - **Up:** [../map.md](../map.md)
 - **Related:** [../../AGENTS.md](../../AGENTS.md) (every rule these skills cite),
   [../../docs/testing.md](../../docs/testing.md) (the testing-discipline contract),
-  [../../skills/map.md](../../skills/map.md) (the tier manuals + SEPMO — a separate tree, deliberately
+  [../../skills/map.md](../../skills/map.md) (the SEPMO control plane — a separate tree, deliberately
   **not** covered by the `.claude/skills` symlink).
 
 ## Debug

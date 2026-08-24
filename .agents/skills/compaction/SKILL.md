@@ -1,31 +1,25 @@
-<!--
-  ~ Licensed to the Apache Software Foundation (ASF) under one
-  ~ or more contributor license agreements.  See the NOTICE file
-  ~ distributed with this work for additional information
-  ~ regarding copyright ownership.  The ASF licenses this file
-  ~ to you under the Apache License, Version 2.0 (the
-  ~ "License"); you may not use this file except in compliance
-  ~ with the License.  You may obtain a copy of the License at
-  ~
-  ~   http://www.apache.org/licenses/LICENSE-2.0
-  ~
-  ~ Unless required by applicable law or agreed to in writing,
-  ~ software distributed under the License is distributed on an
-  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  ~ KIND, either express or implied.  See the License for the
-  ~ specific language governing permissions and limitations
-  ~ under the License.
--->
+---
+name: compaction
+version: "1.0"
+description: >-
+  Compact task/lessons.md (and, by the same lifecycle, task/todo.md) when the
+  session-start full read has grown past one sitting: every entry is promoted
+  to its authoritative home, kept, or archived — never deleted. Load it when a
+  compaction trigger fires (read cost, entry count, a visibly stale block), or
+  to find where an old lesson went. A pass is its own scoped change,
+  interactive-approval-only — never run one mid-increment, and never bundle it
+  into another PR.
+---
 
 # Lessons Compaction — keeping `task/lessons.md` readable in one sitting
 
-This document is the canonical procedure for compacting [task/lessons.md](../task/lessons.md). The
-tier manuals' §2 (Self-Improvement Loop) and Workflow Storage tables point here; this file owns
+This document is the canonical procedure for compacting [task/lessons.md](../../../task/lessons.md). The
+engineering-method skill's §2 (Self-Improvement Loop) and Workflow Storage table point here; this file owns
 the rule.
 
 ## The problem this solves
 
-The manuals require reading `lessons.md` **in full at the start of every session**. The file is
+The method ([engineering-method](../engineering-method/SKILL.md) §2) requires reading `lessons.md` **in full at the start of every session**. The file is
 append-only by design, and a single working day of BUILDER/REVIEWER increments appends dozens of
 entries. Left alone, the session-start read cost grows linearly forever — eventually crowding out
 the context the session actually needs (the code, the maps, the plan). An unbounded memory that
@@ -57,23 +51,23 @@ works." Tests for promotability:
 - It names a *class* of mistake, not one instance ("strict `<` on wall-clock millis is flaky" —
   class; "Increment 9's third test was flaky" — instance).
 - It has *recurred*, or its first occurrence was expensive enough that one occurrence suffices.
-- It contradicts or refines a rule already in a manual / `AGENTS.md` / a `map.md` — in which case
+- It contradicts or refines a rule already in the engineering-method skill / `AGENTS.md` / a `map.md` — in which case
   promotion is mandatory, because two sources now disagree and the precedence chain only works if
   the canonical home is correct.
 
 When in doubt, KEEP — a lesson can be promoted on the next pass; an over-eager promotion bloats
-the manuals, which are read even more often than the lessons file.
+the method skill, which is read even more often than the lessons file.
 
 ### Promotion targets — where a durable rule lives
 
 | The lesson is about... | Promote into... |
 |---|---|
-| A repo-wide engineering rule (testing discipline, error handling, style) | The relevant section of the tier manuals ([skills/](.)) — all variants, since the rules are identical across tiers |
-| Repo intent, precedence, prohibitions, build/test behavior | [AGENTS.md](../AGENTS.md) (it wins all conflicts, so it must stay correct) |
+| A repo-wide engineering rule (testing discipline, error handling, style) | The relevant section of the [engineering-method skill](../engineering-method/SKILL.md) |
+| Repo intent, precedence, prohibitions, build/test behavior | [AGENTS.md](../../../AGENTS.md) (it wins all conflicts, so it must stay correct) |
 | A failure mode, first-check, or escalation specific to one directory | That directory's `map.md` **`## Debug`** section — this is the highest-value target; most REVIEWER lessons are really debug knowledge with a home address |
 | A library API correction (§7) | The directory `map.md` of the code that uses it, or `AGENTS.md` if repo-wide |
-| Testing-specific discipline | [docs/testing.md](../docs/testing.md) |
-| A capability-status fact ("X actually works / doesn't") | [docs/parity/GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md), date-stamped per its provenance rule |
+| Testing-specific discipline | [docs/testing.md](../../../docs/testing.md) |
+| A capability-status fact ("X actually works / doesn't") | [docs/parity/GAP_MATRIX.md](../../../docs/parity/GAP_MATRIX.md), date-stamped per its provenance rule |
 
 A promotion is an **edit to the target file in the same compaction change** — not a TODO to edit
 it later. The `map.md` same-change rule applies as usual.
@@ -134,9 +128,9 @@ every session sees:
 ```markdown
 > **Compaction log.** Last pass: 2026-06-09 (Phase 2/3 boundary) →
 > [lessons-archive/2026-06_phase2-phase3.md](lessons-archive/2026-06_phase2-phase3.md).
-> Promoted that pass: 4 rules (2 → skills manuals, 1 → crates/iceberg/src/transaction/map.md#debug,
+> Promoted that pass: 4 rules (2 → the method skill, 1 → crates/iceberg/src/transaction/map.md#debug,
 > 1 → docs/testing.md). Archives are not read by default — see
-> [skills/compaction.md](../skills/compaction.md).
+> [.agents/skills/compaction/SKILL.md](../.agents/skills/compaction/SKILL.md).
 ```
 
 One line per pass, newest first, capped at the last five passes (older log lines move to the
@@ -147,7 +141,7 @@ archive `map.md`).
 A compaction pass edits the agent's own memory and several canonical documents at once. It is
 treated with the same care as a destructive operation, even though nothing is destroyed:
 
-1. **Never bundle.** A pass is its own change — its own plan in [task/todo.md](../task/todo.md),
+1. **Never bundle.** A pass is its own change — its own plan in [task/todo.md](../../../task/todo.md),
    its own commit/PR. Never fold compaction into feature work; a reviewer must be able to see
    *only* memory edits in the diff.
 2. **Plan first (§1).** List the trigger that fired, the proposed archive filename, and the
@@ -183,7 +177,7 @@ treated with the same care as a destructive operation, even though nothing is de
 
 - **Summarize instead of archive.** "Condensed 30 entries into 5 themes" destroys the specific
   reproduction details that made the lessons useful. Promotion distills; archiving preserves.
-- **Promote eagerly to shrink the file.** The manuals and `AGENTS.md` are read more often than
+- **Promote eagerly to shrink the file.** The method skill and `AGENTS.md` are read more often than
   the lessons file — moving noise upstream makes the problem worse everywhere.
 - **Compact mid-increment.** In-flight context is exactly what the recency window protects.
 - **Skip the conservation check because the diff "looks right".** The check exists because a
@@ -196,8 +190,8 @@ treated with the same care as a destructive operation, even though nothing is de
 
 # Todo Archival — keeping `task/todo.md` actionable in one sitting
 
-The todo-file analogue of lessons compaction. [task/todo.md](../task/todo.md) is the in-flight
-plan; the manuals require reading it to pick up mid-flight work. Like `lessons.md` it grows
+The todo-file analogue of lessons compaction. [task/todo.md](../../../task/todo.md) is the in-flight
+plan; the method requires reading it to pick up mid-flight work. Like `lessons.md` it grows
 append-only — every shipped increment leaves its full narrative behind — so without periodic
 archival the "what's next" signal drowns in "what already happened." A todo file a session must
 read to find the open items, but that is 90% completed-increment history, is a todo file that gets

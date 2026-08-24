@@ -20,5 +20,6 @@
 # .agents/claude.md — Claude adapter
 
 Claude sessions: see [../CLAUDE.md](../CLAUDE.md) (the Claude adapter — the skills symlink,
-capability tiers, the sub-agent tier mapping) and the tier manuals in [../skills/](../skills/map.md).
+capability tiers, the sub-agent tier mapping) and the portable working method in
+[skills/engineering-method/SKILL.md](skills/engineering-method/SKILL.md).
 Start from [common.md](common.md) → [../AGENTS.md](../AGENTS.md).

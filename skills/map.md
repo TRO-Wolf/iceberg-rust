@@ -21,48 +21,43 @@
 
 ## Purpose
 
-Per-model-tier operating manuals: the portable engineering contract (reasoning
-and planning, naming, Rust/Python rules, debugging protocol, verification
-gates, the `map.md` convention itself) — plus the lessons-compaction procedure
-the manuals' §2 points to. Read the manual matching the model you are running
-as, **after** root [AGENTS.md](../AGENTS.md). AGENTS.md wins on any conflict
-(it is repo-specific; these are portable defaults).
+Portable, tool-agnostic **agent control planes** installed into this repo. These are operating
+layers an agent runs *under* — they bind to, and defer to, the repo's engineering contract
+([../AGENTS.md](../AGENTS.md)).
 
-This directory also hosts [sepmo/](sepmo/) — the **SEPMO control plane** (the lifecycle/governance
-shell), which drives work through the scope audit, Actor–Critic execution, and delivery while
-*binding* to these manuals for the engineering contract.
+The per-model-tier operating manuals that used to live here (`Fable.md` / `Opus.md` /
+`Sonnet.md` / `Haiku.md`) were generalized on 2026-08-24 into the agent-agnostic
+**engineering-method** skill at
+[../.agents/skills/engineering-method/SKILL.md](../.agents/skills/engineering-method/SKILL.md);
+tier postures and model-specific mechanics (the `OO` mapping, Fable pricing and fallback notes)
+moved to the Claude adapter, [../CLAUDE.md](../CLAUDE.md). The lessons-compaction procedure
+(`compaction.md`) moved to [../.agents/skills/compaction/SKILL.md](../.agents/skills/compaction/SKILL.md)
+the same day. This directory now holds only the SEPMO control plane.
 
 ## Contents
 
-| File | For |
+| Entry | For |
 |---|---|
-| `Fable.md` | Mythos-class sessions (Fable / Mythos — tersest variant; adds the Frontier Addendum: cost discipline, restricted-domain fallback awareness, sub-agent economics, calibration) |
-| `Opus.md` | Opus-tier sessions (fullest prose; richest reasoning guidance) |
-| `Sonnet.md` | Sonnet-tier sessions |
-| `Haiku.md` | Haiku-tier sessions (most explicit + procedural — concrete examples, spelled-out steps) |
-| `compaction.md` | The lessons-compaction procedure for [task/lessons.md](../task/lessons.md): lifecycle (PROMOTE / KEEP / ARCHIVE), triggers, archive layout, conservation gate |
-| `sepmo/` | The SEPMO control plane: lifecycle state machine, scope audit + 100% gate, Actor–Critic protocol, PR-grouping, delivery, retrospective. Governs lifecycle; binds to the manuals for the engineering contract. See [sepmo/map.md](sepmo/map.md). |
-
-The four manuals are variants of the same contract; **the rules are identical** — only the level of detail differs (Haiku = most explicit/procedural, Opus = fullest prose, Fable = tersest, plus its tier-specific Frontier Addendum, which adds operating notes without changing any rule). All four share one skeleton: Identity & Priority Stack → Non-Negotiables → Mode Handling → Risk-First → Workflow Orchestration §1–§9 → Navigation → Naming → Language-Specific Rules → Function Length & Recursion → Pre-Flight → Core Principles (TL;DR). (`Fable.md` inserts the Frontier Addendum between Non-Negotiables and Mode Handling.)
+| `sepmo/` | The **SEPMO** governance-and-orchestration control plane: lifecycle state machine, scope audit + 100% ledger gate, adversarial Actor–Critic protocol, PR-grouping, delivery, retrospective — and its binding manifest (the one file mapping SEPMO's abstract roles to this repo). Governs lifecycle; binds to AGENTS.md + the engineering-method skill for the engineering contract. See [sepmo/map.md](sepmo/map.md). |
 
 ## I want to...
 
 | I want to... | go to |
 |---|---|
-| Read my manual | the file matching my model tier (Mythos-class → `Fable.md`) |
-| Find the `map.md` convention spec | any of the four (Navigation section) — but the repo's authoritative rule is in [AGENTS.md](../AGENTS.md) `<map_md_navigation>` |
-| Find the testing-discipline contract (mandatory before any code change) | [docs/testing.md](../docs/testing.md) (referenced from each manual's verification gate) |
-| Resolve a manual-vs-repo conflict | [AGENTS.md](../AGENTS.md) (it wins) |
-| Know the sub-agent / parallelism policy | [AGENTS.md](../AGENTS.md) `<subagent_policy>` — the neutral rule: single agent for small stuff; a PR-shipping Actor–Critic cycle has a mandatory independent Critic; both roles default to the frontier tier. The **Claude-tier mapping** (`OO` = Opus–Opus, `model: "opus"`) is tool mechanics and lives in the Claude adapter, [CLAUDE.md](../CLAUDE.md). (Each manual's Workflow Orchestration section points here; `Fable.md`'s Frontier Addendum adds: never spawn Fable-tier sub-agents above Opus unless the user names the tier.) |
-| Find the plan / lessons workflow | [task/todo.md](../task/todo.md) + [task/lessons.md](../task/lessons.md) (each manual's Workflow Storage section) |
-| Compact the lessons file / decide what to archive | [compaction.md](compaction.md) — its own scoped change, interactive-approval-only |
-| Find an old archived lesson | [task/lessons-archive/map.md](../task/lessons-archive/map.md) (archives are read on demand, never by default — see [compaction.md](compaction.md)) |
-| Govern a project's lifecycle / audit a brief before coding | [sepmo/SKILL.md](sepmo/SKILL.md) (and [sepmo/binding-manifest.md](sepmo/binding-manifest.md)) |
+| Operate under / understand SEPMO | [sepmo/map.md](sepmo/map.md) → [sepmo/SKILL.md](sepmo/SKILL.md) |
+| See SEPMO's bindings to this repo | [sepmo/binding-manifest.md](sepmo/binding-manifest.md) |
+| Read the portable engineering method (formerly the tier manuals) | [../.agents/skills/engineering-method/SKILL.md](../.agents/skills/engineering-method/SKILL.md) |
+| Compact the lessons file / find an archived lesson | [../.agents/skills/compaction/SKILL.md](../.agents/skills/compaction/SKILL.md) |
+| Know the sub-agent / parallelism policy | [../AGENTS.md](../AGENTS.md) `<subagent_policy>` (neutral rule); the Claude tier mapping is in [../CLAUDE.md](../CLAUDE.md) |
+| Resolve a conflict with the repo contract | [../AGENTS.md](../AGENTS.md) (it wins) |
 
 ## Pointers
 
-- **Up:** repo root [AGENTS.md](../AGENTS.md).
-- **Related:** [docs/testing.md](../docs/testing.md) (the verification gate); [task/](../task/) (plan + lessons + lessons-archive); [.agents/skills/map.md](../.agents/skills/map.md) (a **separate** tree — the agent-facing review procedures, symlinked into `.claude/skills`; these tier manuals are not). AGENTS.md's `<read_order>` sequences these into a session.
+- **Up:** repo root [../AGENTS.md](../AGENTS.md).
+- **Related:** [../.agents/skills/map.md](../.agents/skills/map.md) (the agent-facing runbook
+  skills, symlinked into `.claude/skills`); [../docs/testing.md](../docs/testing.md)
+  (the verification gate); [../task/todo.md](../task/todo.md) +
+  [../task/lessons.md](../task/lessons.md) (plan + lessons + archives).
 
 ## Debug
 
@@ -70,17 +65,14 @@ The four manuals are variants of the same contract; **the rules are identical** 
 
 | Symptom | Likely cause |
 |---|---|
-| Following a manual rule that contradicts the repo | AGENTS.md overrides the manual — re-check AGENTS.md. |
-| Unsure which manual applies | Match the running model tier (Mythos-class → `Fable.md`); if unknown, default to `Opus.md` (fullest). |
-| Session-start lessons read is consuming excessive context | A compaction trigger has likely fired — check [compaction.md](compaction.md) triggers; propose a pass (do not run one mid-increment). |
-| A needed lesson seems to be missing from `task/lessons.md` | It may have been promoted or archived — check the compaction header at the top of [task/lessons.md](../task/lessons.md), then [task/lessons-archive/map.md](../task/lessons-archive/map.md). |
-| A manual link doesn't resolve | The bundle expects to live at the repo root (`AGENTS.md`, `skills/`, `docs/`, `task/` as siblings). Confirm the layout. |
+| A link to `skills/Opus.md` (or another tier manual) doesn't resolve | The manuals were generalized 2026-08-24 into [../.agents/skills/engineering-method/SKILL.md](../.agents/skills/engineering-method/SKILL.md) — retarget the link |
+| A link to `skills/compaction.md` doesn't resolve | Moved the same day to [../.agents/skills/compaction/SKILL.md](../.agents/skills/compaction/SKILL.md) |
+| A SEPMO behavior contradicts the engineering contract | The contract wins — see [sepmo/binding-manifest.md](sepmo/binding-manifest.md) Precedence |
 
 ### First checks
 
-- Did you read root `AGENTS.md` first? It sets precedence and the `map.md` rule.
+- Start at [sepmo/map.md](sepmo/map.md); each subdirectory carries its own `map.md`.
 
 ### Escalate to
 
-- Conflicts / precedence → [AGENTS.md](../AGENTS.md).
-- Unresolved → open an issue.
+- [../AGENTS.md](../AGENTS.md) `<precedence>`; unresolved → open an issue.

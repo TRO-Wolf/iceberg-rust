@@ -40,6 +40,8 @@ header:
     - "skills/sepmo/SKILL.md"
     - ".agents/skills/rust-code-quality/SKILL.md"
     - ".agents/skills/test-adequacy/SKILL.md"
+    - ".agents/skills/engineering-method/SKILL.md"
+    - ".agents/skills/compaction/SKILL.md"
     # .claude/skills is a symlink to .agents/skills. This entry is REQUIRED, not
     # cosmetic: skywalking-eyes' git path os.Stat's tree entries (following the
     # link) and then os.ReadFile's them, so an un-ignored symlink-to-directory

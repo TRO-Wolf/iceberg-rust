@@ -41,7 +41,7 @@ How to use it (see the manuals' §2):
 > 2026-06-12 (pass 3 — 14/47/3) →
 > [lessons-archive/2026-06_wave3-wave4-overnight.md](lessons-archive/2026-06_wave3-wave4-overnight.md);
 > 2026-06-11 (pass 2 — 17/25/6); 2026-06-09 (pass 1 — 31 promoted). Archives are not read by
-> default — see [skills/compaction.md](../skills/compaction.md).
+> default — see [the compaction skill](../.agents/skills/compaction/SKILL.md).
 
 ---
 

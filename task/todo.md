@@ -518,7 +518,7 @@ Spec: [reconciliation-qb-bug001-work-order.md](reconciliation-qb-bug001-work-ord
 > kept live and reconciled in place; 7 buried open items lifted to Carried-forward. Prior passes:
 > 2026-06-13 (pass 5 — Wave-6/7 → the wave6-wave7 file), 2026-06-12 (pass 4 → wave5), 2026-06-12
 > (pass 3 → wave3-wave4), 2026-06-11 (pass 2), 2026-06-09 (pass 1). Procedure:
-> [skills/compaction.md](../skills/compaction.md) §Todo Archival.
+> [the compaction skill](../.agents/skills/compaction/SKILL.md) §Todo Archival.
 
 ## POST-BUNDLE QUEUE (2026-07-26, signed off) — D7 order + D8 toHumanString approval
 
@@ -678,7 +678,7 @@ GAP_MATRIX before starting one. Full context:
 
 ## Archived increment narratives
 
-Completed-increment narratives moved verbatim out of this file (see [skills/compaction.md](../skills/compaction.md)
+Completed-increment narratives moved verbatim out of this file (see [the compaction skill](../.agents/skills/compaction/SKILL.md)
 §Todo Archival). Not session-start reading — grep/open on demand.
 
 - [todo-archive/phase1.md](todo-archive/phase1.md) — Phase 1 spec & metadata completeness (schema /
