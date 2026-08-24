@@ -137,7 +137,7 @@ The engine-boundary proof (#116): scan `_file`/`_pos` → write position-delete 
 |---|---|---|
 | INSERT / append | — | fast append (`Transaction` append) or merge append |
 | DELETE | copy-on-write | rewrite affected files' survivors; commit `OverwriteFiles` `.delete_files(affected).add_files(rewritten)` |
-| DELETE | merge-on-read | write position-delete files (or V3 DVs), one per `(spec_id, partition)` group, stamped with the matching `PartitionKey`; commit `RowDelta` |
+| DELETE | merge-on-read | V2: position-delete files, one per `(spec_id, partition)` group, stamped with the matching `PartitionKey`. V3: deletion vectors, one per DATA FILE (see §7a). Either way, commit `RowDelta` |
 | UPDATE | copy-on-write | rewrite affected files in full (matched rows take SET values); `OverwriteFiles` as above; a partition-key-changing UPDATE re-routes rows via the partition-aware writer |
 | UPDATE / MERGE | merge-on-read | position/equality deletes for matched rows + new data files; ONE `RowDelta` commit (added deletes inherit the commit's sequence number) |
 | INSERT OVERWRITE (dynamic) | — | `ReplacePartitions` |
@@ -276,6 +276,14 @@ partition, …)` — so a Java-written file can never claim a spec the table doe
   `PositionDeleteFileWriterBuilder::with_partition_spec` /
   `EqualityDeleteFileWriterBuilder::with_partition_spec` / `DVFileWriter::with_partition_spec`.
   When both are given the **`PartitionKey` wins** — it is authoritative for its own tuple.
+- **On a V3 table a merge-on-read delete MUST be a deletion vector.** The spec forbids new
+  position-delete files at V3, and `RowDelta` refuses one ("Must use DVs for position deletes in
+  V3"). At most one DV may be live per data file: to delete again from a file that already has
+  one, read it back with `delete_vector::load_delete_vector`, feed it to
+  `DVFileWriter::with_previous_deletes`, and pass `DVWriteResult::rewritten_delete_files` to
+  `RowDelta::remove_deletes_many` in the SAME commit. Leaving the old DV live double-counts its
+  positions. The fork's own DataFusion integration does this (2026-08-24); an engine driving the
+  seam directly owns it.
 - **Deletion vectors take the spec on the writer.** `DVFileWriter` takes its `PartitionKey` per
   `delete` call, so a partitioned configured spec with no key is rejected at `close()`, not at
   construction. The rejection fires before any byte reaches storage.
