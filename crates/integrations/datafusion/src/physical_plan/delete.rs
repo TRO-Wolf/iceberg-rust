@@ -2565,7 +2565,9 @@ mod tests {
                 &data_partition,
                 Some(1)
             ),
-            "a delete that NAMES the file applies whatever partition it is stamped with — Spark's default write granularity is FILE, so a mismatched stamp is routine"
+            "a delete that NAMES the file applies whatever partition it is stamped with; SPARK \
+             defaults write.delete.granularity to FILE (core's default is PARTITION), so a \
+             mismatched stamp is routine"
         );
         assert!(
             !legacy_position_delete_applies(&delete, "s3://b/other.parquet", 7, &delete.2, Some(1)),

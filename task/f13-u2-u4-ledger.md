@@ -117,6 +117,24 @@ The same class then appeared in U4's own tests: dropping the per-file `Partition
 303 tests, because every test used an unpartitioned table where a missing key and the real key both
 resolve to spec 0.
 
+## The commit-door fix protects future commits only
+
+An external logic review confirmed the causal chain at bytecode level and raised one residual the
+ledger did not state. Recording it, because it changes what an operator should do:
+
+The fix is **door-side prevention**. A table that ALREADY carries the bad state — a DV committed
+over a live bounds-scoped position delete before this change — still silently resurrects rows at
+every read. `get_deletes_for_data_file` early-returns on a DV hit and never consults the
+position-delete maps, so the still-live parquet delete's positions are simply dropped. Java's
+`findDV` does the same, so the READ side is parity-faithful; the corrupted metadata is the defect,
+not the reader. Detecting or repairing such a table is not in this unit and is not currently
+possible through any fork surface.
+
+The same review corrected a phrasing risk now fixed in R114 and in the seam test's message:
+`write.delete.granularity` defaults to FILE in **Spark** (`SparkWriteConf.deleteGranularity()`),
+NOT in Iceberg core, whose `TableProperties.DELETE_GRANULARITY_DEFAULT` is PARTITION. The claim was
+correct as written but one word from being wrong.
+
 ## Queue, not this unit
 
 1. **Equality-delete `sort_order_id` defaulting.** Java's `FileMetadata$Builder.build()` switch case
