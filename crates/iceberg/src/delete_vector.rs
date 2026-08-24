@@ -31,7 +31,150 @@ use roaring::bitmap::Iter;
 use roaring::treemap::BitmapIter;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
+use crate::io::FileIO;
+use crate::spec::{DataContentType, DataFile, DataFileFormat};
 use crate::{Error, ErrorKind, Result};
+
+/// The three manifest fields a Puffin `deletion-vector-v1` blob must carry before it can be read,
+/// with the untrusted `i64` ranges checked into `u64`.
+pub(crate) struct DeleteVectorCoordinates {
+    pub(crate) referenced_data_file: String,
+    pub(crate) content_offset: u64,
+    pub(crate) content_size_in_bytes: u64,
+}
+
+/// Validates the DV metadata on a delete file and range-checks the coordinates into `u64`.
+///
+/// Mirrors Java `BaseDeleteLoader.validateDV`, plus the keying prerequisite that
+/// `referenced_data_file` is present: the Puffin spec makes it mandatory for `deletion-vector-v1`,
+/// and the loaded vector is keyed by it.
+///
+/// # Errors
+///
+/// `DataInvalid` when a field is absent, the offset is negative, or the size is outside 0..=2GB.
+///
+/// # Notes
+///
+/// The scan path and the public loader share this so their Java-parity messages cannot drift.
+pub(crate) fn validate_delete_vector_coordinates(
+    file_path: &str,
+    referenced_data_file: Option<String>,
+    content_offset: Option<i64>,
+    content_size_in_bytes: Option<i64>,
+) -> Result<DeleteVectorCoordinates> {
+    let referenced_data_file = referenced_data_file.ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("Invalid deletion vector '{file_path}': missing referenced_data_file"),
+        )
+    })?;
+
+    let checked_offset = content_offset
+        .and_then(|offset| u64::try_from(offset).ok())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid deletion vector '{file_path}': content_offset must be a non-negative                      integer, got {content_offset:?}"
+                ),
+            )
+        })?;
+
+    // Java: "Can't read DV larger than 2GB" (contentSizeInBytes <= Integer.MAX_VALUE); negative
+    // sizes are equally invalid.
+    let checked_size = content_size_in_bytes
+        .filter(|size| (0..=i64::from(i32::MAX)).contains(size))
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid deletion vector '{file_path}': content_size_in_bytes must be between                      0 and {} (2GB), got {content_size_in_bytes:?}",
+                    i32::MAX
+                ),
+            )
+        })?;
+
+    Ok(DeleteVectorCoordinates {
+        referenced_data_file,
+        content_offset: checked_offset,
+        content_size_in_bytes: checked_size,
+    })
+}
+
+/// Read one committed deletion vector back off storage.
+///
+/// The public mirror of Java's `Function<String, PositionDeleteIndex>` previous-deletes source
+/// (`BaseDeleteLoader.readDV`): ONE ranged read at the manifest's blob coordinates, then the
+/// `deletion-vector-v1` decode. A caller that must merge into an existing DV — a second delete on
+/// a data file that already has one — feeds the result to
+/// [`crate::writer::base_writer::deletion_vector_writer::DVFileWriter::with_previous_deletes`].
+///
+/// # Errors
+///
+/// `DataInvalid` when `delete_file` is not a Puffin position-delete file, when its blob coordinates
+/// are missing or out of range, or when the decoded cardinality disagrees with `record_count`.
+///
+/// # Notes
+///
+/// This does not cache. The scan path has its own caching loader; a writer reads each DV once.
+pub async fn load_delete_vector(file_io: &FileIO, delete_file: &DataFile) -> Result<DeleteVector> {
+    let file_path = delete_file.file_path();
+    if delete_file.content_type() != DataContentType::PositionDeletes
+        || delete_file.file_format() != DataFileFormat::Puffin
+    {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Invalid deletion vector '{file_path}': expected a Puffin position-delete file,                  got {:?} / {:?}",
+                delete_file.content_type(),
+                delete_file.file_format()
+            ),
+        ));
+    }
+
+    let coordinates = validate_delete_vector_coordinates(
+        file_path,
+        delete_file.referenced_data_file(),
+        delete_file.content_offset(),
+        delete_file.content_size_in_bytes(),
+    )?;
+    let end = coordinates
+        .content_offset
+        .checked_add(coordinates.content_size_in_bytes)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid deletion vector '{file_path}': offset {} + length {} overflows",
+                    coordinates.content_offset, coordinates.content_size_in_bytes
+                ),
+            )
+        })?;
+
+    let blob = file_io
+        .new_input(file_path)?
+        .reader()
+        .await?
+        .read(coordinates.content_offset..end)
+        .await?;
+    let delete_vector = DeleteVector::deserialize_deletion_vector_v1(&blob)?;
+
+    // Java validates the decoded cardinality against the DeleteFile's recordCount
+    // (`deserializeBitmap`) — a mismatch means the manifest and the blob disagree about how many
+    // rows are deleted.
+    if delete_vector.len() != delete_file.record_count() {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Invalid deletion vector cardinality for '{file_path}': decoded {} positions,                  manifest record_count expects {}",
+                delete_vector.len(),
+                delete_file.record_count()
+            ),
+        ));
+    }
+    Ok(delete_vector)
+}
 
 /// An in-memory set of deleted row positions for a single data file — the Rust analogue of Java's
 /// `PositionDeleteIndex` / `BitmapPositionDeleteIndex`. Backed by a 64-bit roaring treemap so it
@@ -1325,5 +1468,138 @@ pub(crate) mod tests {
         );
         assert_eq!(iter2.next(), Some(KEY_BOUNDARY + 8));
         assert_eq!(iter2.next(), None);
+    }
+}
+
+#[cfg(test)]
+mod loader_tests {
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::writer::base_writer::deletion_vector_writer::DVFileWriter;
+
+    /// Writes one DV over `s3://b/d.parquet` and returns the FileIO to read it back through.
+    async fn written_dv(dir: &TempDir, positions: &[u64]) -> (FileIO, DataFile) {
+        let file_io = FileIO::new_with_fs();
+        let path = dir.path().join("deletes.puffin");
+        let output = file_io
+            .new_output(path.to_str().expect("utf-8 temp path"))
+            .expect("create output file");
+        let mut writer = DVFileWriter::new(output);
+        for position in positions {
+            writer
+                .delete("s3://b/d.parquet", *position, None)
+                .expect("delete");
+        }
+        let mut files = writer.close().await.expect("close");
+        assert_eq!(files.len(), 1, "one DeleteFile per referenced data file");
+        (file_io, files.remove(0))
+    }
+
+    #[tokio::test]
+    async fn round_trips_a_written_dv() {
+        let dir = TempDir::new().expect("temp dir");
+        let (file_io, delete_file) = written_dv(&dir, &[0, 3, (1u64 << 32) + 1]).await;
+
+        let loaded = load_delete_vector(&file_io, &delete_file)
+            .await
+            .expect("a DV this writer just wrote must load back");
+        assert_eq!(loaded.iter().collect::<Vec<_>>(), vec![
+            0,
+            3,
+            (1u64 << 32) + 1
+        ]);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_file_that_is_not_a_dv() {
+        let dir = TempDir::new().expect("temp dir");
+        let (file_io, mut delete_file) = written_dv(&dir, &[1]).await;
+        delete_file.file_format = DataFileFormat::Parquet;
+
+        let error = load_delete_vector(&file_io, &delete_file)
+            .await
+            .expect_err("a Parquet position-delete file is not a DV");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("expected a Puffin position-delete"),
+            "got: {}",
+            error.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_missing_referenced_data_file() {
+        let dir = TempDir::new().expect("temp dir");
+        let (file_io, mut delete_file) = written_dv(&dir, &[1]).await;
+        // Only a decoded manifest entry can carry this shape; `DataFileBuilder` refuses it.
+        delete_file.referenced_data_file = None;
+
+        let error = load_delete_vector(&file_io, &delete_file)
+            .await
+            .expect_err("a DV with no referenced data file cannot be keyed");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("missing referenced_data_file"),
+            "got: {}",
+            error.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_negative_content_offset() {
+        let dir = TempDir::new().expect("temp dir");
+        let (file_io, mut delete_file) = written_dv(&dir, &[1]).await;
+        delete_file.content_offset = Some(-1);
+
+        let error = load_delete_vector(&file_io, &delete_file)
+            .await
+            .expect_err("a negative offset is not a readable coordinate");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("content_offset must be"),
+            "got: {}",
+            error.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_size_over_two_gigabytes() {
+        let dir = TempDir::new().expect("temp dir");
+        let (file_io, mut delete_file) = written_dv(&dir, &[1]).await;
+        delete_file.content_size_in_bytes = Some(i64::from(i32::MAX) + 1);
+
+        let error = load_delete_vector(&file_io, &delete_file)
+            .await
+            .expect_err("Java refuses to read a DV larger than 2GB");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("content_size_in_bytes must be"),
+            "got: {}",
+            error.message()
+        );
+    }
+
+    /// Risk pinned: the manifest and the blob disagreeing about how many rows are deleted. A silent
+    /// accept here resurrects or over-deletes rows.
+    #[tokio::test]
+    async fn rejects_a_cardinality_mismatch() {
+        let dir = TempDir::new().expect("temp dir");
+        let (file_io, mut delete_file) = written_dv(&dir, &[0, 3]).await;
+        delete_file.record_count = 99;
+
+        let error = load_delete_vector(&file_io, &delete_file)
+            .await
+            .expect_err("a record_count that disagrees with the blob must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("Invalid deletion vector cardinality"),
+            "got: {}",
+            error.message()
+        );
     }
 }

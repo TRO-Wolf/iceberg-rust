@@ -28,7 +28,7 @@ use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::null_propagation::propagate_struct_validity;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
-use crate::delete_vector::DeleteVector;
+use crate::delete_vector::{DeleteVector, validate_delete_vector_coordinates};
 use crate::expr::Predicate::AlwaysTrue;
 use crate::expr::{Predicate, Reference};
 use crate::io::FileIO;
@@ -443,57 +443,25 @@ impl CachingDeleteFileLoader {
         }
     }
 
-    /// Validates the deletion-vector metadata on a delete-file task, mirroring Java
-    /// `BaseDeleteLoader.validateDV` (offset non-null, length non-null, length <= 2GB) plus the
-    /// keying prerequisite (`referenced_data_file` present — the Puffin spec makes
-    /// `referenced-data-file` mandatory for `deletion-vector-v1`, and the loaded vector is keyed
-    /// by it). Returns `(referenced_data_file, content_offset, content_size_in_bytes)` with the
-    /// untrusted i64 ranges checked into u64.
+    /// Validates a delete-file task's DV metadata, returning
+    /// `(referenced_data_file, content_offset, content_size_in_bytes)`.
+    ///
+    /// # Notes
+    ///
+    /// The rules live in [`validate_delete_vector_coordinates`] so this path and the public
+    /// writer-side loader cannot drift apart.
     fn validate_deletion_vector_task(task: &FileScanTaskDeleteFile) -> Result<(String, u64, u64)> {
-        let referenced_data_file = task.referenced_data_file.clone().ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Invalid deletion vector '{}': missing referenced_data_file",
-                    task.file_path
-                ),
-            )
-        })?;
-
-        let content_offset = task
-            .content_offset
-            .and_then(|offset| u64::try_from(offset).ok())
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid deletion vector '{}': content_offset must be a non-negative \
-                         integer, got {:?}",
-                        task.file_path, task.content_offset
-                    ),
-                )
-            })?;
-
-        // Java: "Can't read DV larger than 2GB" (contentSizeInBytes <= Integer.MAX_VALUE);
-        // negative sizes are equally invalid.
-        let content_size_in_bytes = task
-            .content_size_in_bytes
-            .filter(|size| (0..=i64::from(i32::MAX)).contains(size))
-            .and_then(|size| u64::try_from(size).ok())
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid deletion vector '{}': content_size_in_bytes must be between 0 \
-                         and {} (2GB), got {:?}",
-                        task.file_path,
-                        i32::MAX,
-                        task.content_size_in_bytes
-                    ),
-                )
-            })?;
-
-        Ok((referenced_data_file, content_offset, content_size_in_bytes))
+        let coordinates = validate_delete_vector_coordinates(
+            &task.file_path,
+            task.referenced_data_file.clone(),
+            task.content_offset,
+            task.content_size_in_bytes,
+        )?;
+        Ok((
+            coordinates.referenced_data_file,
+            coordinates.content_offset,
+            coordinates.content_size_in_bytes,
+        ))
     }
 
     async fn parse_file_content_for_task(

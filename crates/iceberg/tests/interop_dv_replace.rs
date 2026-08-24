@@ -279,27 +279,17 @@ async fn write_dv(
         .expect("one DV")
 }
 
-/// Load a committed DV's positions back through the PRODUCTION DECODER — read the blob bytes off
-/// disk at the recorded coordinates and decode with [`DeleteVector::deserialize_deletion_vector_v1`]
-/// (the SAME `deletion-vector-v1` decoder the scan-side loader uses internally). The engine's
-/// `loadPreviousDeletes` reads the existing DV off disk; this mirrors it without the caching layer.
+/// Load a committed DV's positions back through the PRODUCTION LOADER — the same
+/// [`iceberg::delete_vector::load_delete_vector`] entry point a writer uses to merge into an
+/// existing vector. The engine's `loadPreviousDeletes` reads the existing DV off disk; this is that
+/// mirror, without the scan-side caching layer.
 async fn load_dv_positions(
     table: &Table,
     dv_file: &DataFile,
 ) -> iceberg::delete_vector::DeleteVector {
-    use iceberg::delete_vector::DeleteVector;
-
-    let blob = table
-        .file_io()
-        .new_input(dv_file.file_path())
-        .expect("new input for the DV puffin")
-        .read()
+    iceberg::delete_vector::load_delete_vector(table.file_io(), dv_file)
         .await
-        .expect("read the DV puffin bytes");
-    let offset = usize::try_from(dv_file.content_offset().expect("offset")).expect("usize");
-    let size = usize::try_from(dv_file.content_size_in_bytes().expect("size")).expect("usize");
-    DeleteVector::deserialize_deletion_vector_v1(&blob[offset..offset + size])
-        .expect("decode the committed DV blob via the production decoder")
+        .expect("load the committed DV through the production loader")
 }
 
 /// Write a MERGED DV via the writer hook: union `previous_positions` (sourced from `previous_dv`)
