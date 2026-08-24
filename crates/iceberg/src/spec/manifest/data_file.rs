@@ -186,15 +186,14 @@ pub struct DataFile {
 }
 
 impl DataFileBuilder {
-    /// Reject the DataFile shapes Java `FileMetadata$Builder.build()` rejects.
+    /// Rejects the DataFile shapes Java `FileMetadata$Builder.build()` rejects, carrying the Java
+    /// message for the first violated rule.
     ///
-    /// Returns:
-    ///     `Ok(())`, or the Java message for the first violated rule.
+    /// # Notes
     ///
-    /// Notes:
-    ///     Runs before defaults are applied, so an unset optional reads as its `None` default.
-    ///     `file_format` has no default; when it is unset the caller gets derive_builder's own
-    ///     missing-field error instead, so the DV rules are skipped.
+    /// Runs before defaults are applied, so an unset optional reads as its `None` default. When
+    /// `file_format` is unset every rule is skipped and the caller gets derive_builder's own
+    /// missing-field error instead.
     fn validate(&self) -> std::result::Result<(), String> {
         let Some(file_format) = self.file_format else {
             return Ok(());
@@ -203,8 +202,10 @@ impl DataFileBuilder {
         let content_size_in_bytes = self.content_size_in_bytes.flatten();
         let referenced_data_file = self.referenced_data_file.as_ref().and_then(Option::as_ref);
 
-        // Puffin is the deletion-vector container. Java keys these rules on the FORMAT, not on the
-        // content type, so a Puffin file of any content must carry the blob coordinates.
+        // Puffin is the deletion-vector container, and Java keys these rules on the FORMAT rather
+        // than the content type. Java has no oracle for a Puffin DATA file — `FileMetadata$Builder`
+        // builds delete files only, and `DataFiles$Builder` has no blob-coordinate fields — so
+        // applying the rules to every content type is a fork-only strengthening.
         if file_format == DataFileFormat::Puffin {
             if content_offset.is_none() {
                 return Err("Content offset is required for DV".to_string());
@@ -490,14 +491,7 @@ mod test {
 mod validate_tests {
     use super::*;
 
-    /// Build a builder that already has every field `build()` requires.
-    ///
-    /// Args:
-    ///     content: the file content type.
-    ///     file_format: the file format.
-    ///
-    /// Returns:
-    ///     A builder that passes validation until the caller makes it invalid.
+    /// Builds a builder that passes validation, so each test can break exactly one rule.
     fn valid(content: DataContentType, file_format: DataFileFormat) -> DataFileBuilder {
         let mut builder = DataFileBuilder::default();
         builder
@@ -592,8 +586,27 @@ mod validate_tests {
             .expect("only position deletes forbid a sort order");
     }
 
-    /// Puffin rules key on the FORMAT, not the content type — a Puffin DATA file needs the
-    /// coordinates too.
+    /// Risk pinned: narrowing the sort-order rule's exemption. Java's `DataFiles$Builder` exposes
+    /// `withSortOrder`, so a DATA file may carry one. Only POSITION deletes forbid it.
+    #[test]
+    fn a_data_file_may_carry_a_sort_order() {
+        let mut builder = valid(DataContentType::Data, DataFileFormat::Parquet);
+        builder.sort_order_id(0);
+        builder
+            .build()
+            .expect("only position deletes forbid a sort order");
+    }
+
+    /// Risk pinned: narrowing the forbidden arm to delete files. It keys on the FORMAT, so a
+    /// non-Puffin DATA file may not carry blob coordinates either.
+    #[test]
+    fn non_puffin_data_with_content_offset_is_rejected() {
+        let mut builder = valid(DataContentType::Data, DataFileFormat::Parquet);
+        builder.content_offset(Some(4));
+        assert_eq!(err_of(builder), "Content offset can only be set for DV");
+    }
+
+    /// The required arm keys on the FORMAT too — a Puffin DATA file needs the coordinates.
     #[test]
     fn puffin_rules_apply_to_any_content_type() {
         let mut builder = valid(DataContentType::Data, DataFileFormat::Puffin);
