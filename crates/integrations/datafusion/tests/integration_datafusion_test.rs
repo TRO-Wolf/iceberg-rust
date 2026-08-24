@@ -7088,10 +7088,13 @@ async fn test_delete_mread_v3_after_drop_partition_field_stamps_the_files_own_sp
     Ok(())
 }
 
-/// Risk pinned: the PARTITIONED form of the legacy-position-delete refusal. The unpartitioned twin
-/// cannot see a dropped partition tuple — an empty tuple and the real one are the same value there.
-/// On a partitioned table an empty tuple matches nothing, the pre-IO refusal silently stops firing,
-/// and the commit door catches it only after the Puffin has reached storage.
+/// The PARTITIONED form of the legacy-position-delete refusal.
+///
+/// It does NOT isolate the partition-tuple carry, though an earlier version of this comment claimed
+/// it did. The fork's own V2 position delete satisfies BOTH legs at once — it carries a derivable
+/// name AND its data file's own `(spec_id, partition)` — so killing either leg alone leaves the
+/// other holding this test up; only killing both reddens it. The per-leg pins live in the seam
+/// tests. This one pins that the whole rule still refuses on a partitioned table.
 #[tokio::test]
 async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_position_deletes()
 -> Result<()> {

@@ -1241,20 +1241,48 @@ async fn live_delete_vectors_by_data_file(table: &Table) -> DFResult<LiveDeletes
                 continue;
             }
             let df = entry.data_file();
-            if df.content_type() != iceberg::spec::DataContentType::PositionDeletes {
-                continue;
-            }
-            if df.file_format() == DataFileFormat::Puffin {
-                if let Some(referenced) = df.referenced_data_file() {
-                    live.dv_by_data_file.insert(referenced, df.clone());
+            match classify_live_delete(df) {
+                Some(LiveDeleteKind::DeletionVector) => {
+                    if let Some(referenced) = df.referenced_data_file() {
+                        live.dv_by_data_file.insert(referenced, df.clone());
+                    }
                 }
-            } else {
-                live.legacy_position_deletes
-                    .push(legacy_position_delete_entry(df, entry.sequence_number()));
+                Some(LiveDeleteKind::LegacyPositionDelete) => live
+                    .legacy_position_deletes
+                    .push(legacy_position_delete_entry(df, entry.sequence_number())),
+                None => continue,
             }
         }
     }
     Ok(live)
+}
+
+/// What a live delete file is, for the V3 write path's purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveDeleteKind {
+    /// A Puffin deletion vector: merge it and supersede it.
+    DeletionVector,
+    /// A non-Puffin position delete: refuse, because merging it is not ported.
+    LegacyPositionDelete,
+}
+
+/// Classifies a live delete file, or `None` when the V3 write path must ignore it.
+///
+/// # Notes
+///
+/// EQUALITY deletes are ignored deliberately. They are legal at V3 and are not superseded by a DV,
+/// so treating one as a legacy position delete would refuse a DELETE that is perfectly valid —
+/// `referenced_data_file_location` returns `None` for them, which would then match every data file
+/// in the partition.
+fn classify_live_delete(delete_file: &DataFile) -> Option<LiveDeleteKind> {
+    if delete_file.content_type() != iceberg::spec::DataContentType::PositionDeletes {
+        return None;
+    }
+    if delete_file.file_format() == DataFileFormat::Puffin {
+        Some(LiveDeleteKind::DeletionVector)
+    } else {
+        Some(LiveDeleteKind::LegacyPositionDelete)
+    }
 }
 
 /// Reduces a live non-Puffin position delete to what the applicability test needs.
@@ -2204,10 +2232,10 @@ mod tests {
     use iceberg::spec::Literal;
 
     use super::{
-        IsolationLevel, apply_assignments, decode_file_path, decode_file_paths_batch,
-        decode_position, group_pairs_by_partition, legacy_position_delete_applies,
-        legacy_position_delete_entry, position_delete_unpartitioned_fast_path,
-        sort_position_delete_pairs,
+        IsolationLevel, LiveDeleteKind, apply_assignments, classify_live_delete, decode_file_path,
+        decode_file_paths_batch, decode_position, group_pairs_by_partition,
+        legacy_position_delete_applies, legacy_position_delete_entry,
+        position_delete_unpartitioned_fast_path, sort_position_delete_pairs,
     };
 
     // =============================================================================================
@@ -2406,6 +2434,73 @@ mod tests {
     /// The applicability domain of [`legacy_position_delete_applies`], one test per cell. Java's
     /// own writer never sets `referenced_data_file`, so the BOUNDS leg and the PARTITION leg are
     /// the two that fire in practice, and they disagree: a named delete ignores the partition.
+    /// Risk pinned: an EQUALITY delete being treated as a legacy position delete. Equality deletes
+    /// are legal at V3 and a DV does not supersede them, but `referenced_data_file_location`
+    /// returns `None` for one — so it would take the partition-scoped leg, match every data file in
+    /// its partition, and refuse a valid DELETE.
+    #[test]
+    fn test_classify_live_delete_ignores_equality_deletes() {
+        use iceberg::spec::{DataContentType, DataFileFormat};
+
+        assert_eq!(
+            classify_live_delete(&delete_file_of(
+                DataContentType::EqualityDeletes,
+                DataFileFormat::Parquet
+            )),
+            None,
+            "an equality delete is not a position delete and must not drive a refusal"
+        );
+        assert_eq!(
+            classify_live_delete(&delete_file_of(
+                DataContentType::PositionDeletes,
+                DataFileFormat::Puffin
+            )),
+            Some(LiveDeleteKind::DeletionVector),
+        );
+        assert_eq!(
+            classify_live_delete(&delete_file_of(
+                DataContentType::PositionDeletes,
+                DataFileFormat::Parquet
+            )),
+            Some(LiveDeleteKind::LegacyPositionDelete),
+        );
+        assert_eq!(
+            classify_live_delete(&delete_file_of(
+                DataContentType::Data,
+                DataFileFormat::Parquet
+            )),
+            None,
+            "a data file is not a delete at all"
+        );
+    }
+
+    /// A minimal delete file of the given shape. Puffin needs the blob coordinates to build.
+    fn delete_file_of(
+        content: iceberg::spec::DataContentType,
+        file_format: iceberg::spec::DataFileFormat,
+    ) -> iceberg::spec::DataFile {
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat};
+
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(content)
+            .file_path("s3://b/d".to_string())
+            .file_format(file_format)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0);
+        if content == DataContentType::EqualityDeletes {
+            builder.equality_ids(Some(vec![1]));
+        }
+        if file_format == DataFileFormat::Puffin {
+            builder
+                .content_offset(Some(4))
+                .content_size_in_bytes(Some(40))
+                .referenced_data_file(Some("s3://b/a.parquet".to_string()));
+        }
+        builder.build().expect("build the delete file")
+    }
+
     /// Risk pinned: reading `referenced_data_file` instead of the shared derivation. Java's writer
     /// leaves the field unset and only equal `file_path` bounds, so the field-only read would treat
     /// this delete as partition-scoped and miss the file it actually names.

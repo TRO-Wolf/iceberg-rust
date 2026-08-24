@@ -49,7 +49,21 @@ The interop leg's ROW comparison is load-bearing (a one-position DV shift is cau
 checks are belt-and-braces: `RowDelta` refuses both corruptions before they can be written. Measured,
 not assumed — see `crates/integrations/datafusion/tests/interop_dv_sql.rs`.
 
-## Bundle Critic
+## Bundle Critic — CONVERGED at cycle 4
+
+Four cycles, seven surviving mutations found and closed, no S1 or S2 outstanding. Two corrections
+the Critic made to MY claims, both recorded because they change what the evidence means:
+
+- The partitioned end-to-end refusal test does NOT isolate the partition-tuple carry, as its
+  docstring and my commit message claimed. The fork's own V2 position delete satisfies both legs of
+  the rule at once, so killing either alone leaves the other holding the test up. The per-leg pins
+  are the seam tests; the docstring now says so. (The commit message stays wrong in history —
+  amending a pushed-branch commit is a rewrite; this ledger is the correction of record.)
+- Mutation counts must be read with `--no-fail-fast`. Plain `cargo test` aborts after the first
+  failing target, so a mutation that reddens the lib target hides the integration target's result
+  entirely. Two of the Critic's own intermediate readings were wrong until it re-ran that way.
+
+
 
 NOT CONVERGED on first pass, three S2s:
 
@@ -119,9 +133,12 @@ resolve to spec 0.
    `DataFile::referenced_data_file_location(&self)`. Not done here: 20 call sites across 7 files,
    and churning established code late in a large PR is the wrong trade. Surfaced by the bundle
    Critic.
-4. **Half a seam is exposed.** `is_deletion_vector` sits in the same module, answers the other half
-   of "does this delete still cover this file", and stays `pub(crate)`. If the export is for
-   downstream engines, the pair should go together. Surfaced by the bundle Critic.
+4. **Half a seam is exposed, and deliberately so for now.** `is_deletion_vector` sits in the same
+   module, answers the other half of "does this delete still cover this file", and stays
+   `pub(crate)`. `referenced_data_file_location` went public only because the DataFusion crate
+   needed it across a crate boundary; the PAIR is not yet a supported external contract. If a
+   downstream engine is to drive `RowDelta` directly, export both and say so. Surfaced by the
+   bundle Critic.
 5. **U2's Puffin-DATA arm is a fork-only strengthening.** Java's delete-file builder cannot express a
    Puffin data file and its data-file builder has no blob-coordinate fields, so requiring the
    coordinates there has no Java oracle. Kept deliberately (it rejects only shapes no writer emits,
