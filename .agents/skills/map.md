@@ -45,7 +45,7 @@ here (this file, each skill's `map.md`) carries the ASF header normally.
 
 | Skill | For |
 |---|---|
-| [rust-code-quality/](rust-code-quality/map.md) | The Rust review procedure for what the gates cannot catch: on-disk format stability, divergence from Java `iceberg-core`, panics and value-path casts (neither is armed in this workspace), broken error chains, lock discipline, unbounded recursion. Severity ordered for a table-format library — silent corruption of already-written tables outranks everything. |
+| [rust-code-quality/](rust-code-quality/map.md) | The Rust review procedure for what the gates cannot catch: on-disk format stability, divergence from Java `iceberg-core`, panics and value-path casts (neither is armed in this workspace), broken error chains, lock discipline, unbounded recursion. Severity ordered for a table-format library — silent corruption of already-written tables outranks everything. Also carries the authoring pass for [AGENTS.md](../../AGENTS.md) "Comments and prose". That pass is why AGENTS.md read order loads this skill for every Actor and every Critic, not for review alone. |
 | [test-adequacy/](test-adequacy/map.md) | The evidence discipline behind a coverage claim: apply the mutation rather than predict it, one knob at a time, and state the population next to every number. Carries the green-vacuity patterns that have each produced a false green here, the sabotage hard-fail rule, and the chained-gate rule. |
 
 ## I want to...
@@ -53,6 +53,8 @@ here (this file, each skill's `map.md`) carries the ASF header normally.
 | I want to... | go to |
 |---|---|
 | Review a Rust PR or commit | [rust-code-quality/SKILL.md](rust-code-quality/SKILL.md) "Quick start" |
+| Know how much to comment, and in what English | the rule is [AGENTS.md](../../AGENTS.md) "Comments and prose"; the sequence is [rust-code-quality/SKILL.md](rust-code-quality/SKILL.md) "Comment discipline — the authoring pass" |
+| Decide where Java bytecode evidence belongs | [AGENTS.md](../../AGENTS.md) "Comments and prose" — the ledger under [task/](../../task/), never a doc comment |
 | Refute (not accept) a coverage claim | [test-adequacy/SKILL.md](test-adequacy/SKILL.md) "Apply, never predict" |
 | Know what the gates already enforce | [rust-code-quality/SKILL.md](rust-code-quality/SKILL.md) "What the gates already hold" |
 | Turn a checklist item into a real gate | [rust-code-quality/SKILL.md](rust-code-quality/SKILL.md) "Arming candidates" |

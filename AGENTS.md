@@ -72,6 +72,12 @@ capability's *status*, the **GAP_MATRIX** (re-audited against the live base) win
 7. **Upstream docs when you need depth:** [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md),
    the per-crate `README.md` files, and the [Iceberg Rust site](https://rust.iceberg.apache.org/).
 
+**Before you write or review any Rust, doc comment, or markdown prose**, load
+[.agents/skills/rust-code-quality/SKILL.md](.agents/skills/rust-code-quality/SKILL.md). It carries
+the review sequence for what the armed gates cannot catch, and the comment-discipline pass for
+"Comments and prose" below. Every Actor and every Critic in this repository loads it. Its evidence
+companion is [.agents/skills/test-adequacy/SKILL.md](.agents/skills/test-adequacy/SKILL.md).
+
 Your tool's adapter ([CLAUDE.md](CLAUDE.md), [.agents/](.agents/map.md)) may add tool mechanics on
 top of this order; it never replaces a step.
 
@@ -273,6 +279,78 @@ under `crates/`**; the house-style rules above it apply repo-wide.
   surrounding module already uses it.)
 - **Logging:** `tracing` with structured fields (`?error`, ids, durations), never `println!` in
   library code, and never log secrets.
+
+### Comments and prose
+
+Three rules. They bind on every comment, doc comment, markdown paragraph, PR body, and ledger
+entry. Long comments teach the reader to skim. A reader who skims also skims the one comment that
+carried a real constraint.
+
+**Scope: what the change adds or touches.** The existing tree does not comply, and a sweep is its
+own unit. Do not raise a finding on a line the diff did not touch.
+
+1. **Comment the WHY, never the WHAT.** A clear name and an explicit type document the WHAT. A
+   comment earns its place when it records what the code cannot show. Six things qualify:
+   - a race you prevent
+   - an ordering invariant
+   - a cross-cutting contract
+   - a deliberate loud failure
+   - defensive code that looks dead but is not
+   - the reason you did not do the obvious thing
+
+   Code gets rewritten. The next reader needs the reason it must not be rewritten one wrong way.
+2. **Use the shortest form that carries the reason.** If two lines are enough, do not write ten.
+   Cut the preamble, the restatement, and the second example. Delete what a competent reader
+   derives from the code. Keep what they cannot. Then cut the keeper by half and check it still
+   says the same thing.
+3. **Write in ASD-STE100 Simplified Technical English.** Readers under time pressure parse simple
+   sentences correctly and complex ones incorrectly. So do non-native English speakers, and so does
+   the on-call engineer at 2 a.m.
+
+| Do | Not |
+|---|---|
+| One idea per sentence. Max ~20 words. | Multi-clause sentences joined by em-dashes and semicolons. |
+| Active voice: "the writer commits the batch". | Passive: "the batch is committed". |
+| Present tense: "the retry fails". | "the retry would have failed". |
+| One word, one meaning. Pick a term and reuse it. | Rotating synonyms — row / record / entry for one thing. |
+| Plain verbs: "use", "read", "fail", "retry". | "leverage", "utilize", "surface", "orchestrate". |
+| Say the thing. | Hedging, apology, or narration of your own reasoning. |
+
+Every function carries a doc comment stating what it does, its inputs, and its outputs. Use
+`# Errors` and `# Panics` where they apply, and `# Notes` for invariants the caller needs that fit
+no other section. Shape scales with the contract, not with the effort the change cost. A one-line
+setter takes one line.
+
+**Parity evidence is the main source of over-commenting here, and it is misplaced, not wrong.** The
+Parity mandate makes agents paste bytecode offsets and decode narratives into doc comments. Route it:
+
+| Evidence | Home |
+|---|---|
+| The Java method this mirrors | one line in the doc comment |
+| What a divergence does to the caller | one line in the doc comment — it is contract text |
+| That the divergence exists, and its status | the GAP_MATRIX row only (one home per fact) |
+| Bytecode offsets, `javap` output, decode narrative | the unit ledger in [task/](task/) |
+
+A named divergence splits across two homes. The doc comment says what the caller gets. The matrix
+row says the fork differs from Java and how far. Never write the status in both.
+
+A doc comment states the contract. It does not carry the proof. The review sequence for this
+section is [.agents/skills/rust-code-quality/SKILL.md](.agents/skills/rust-code-quality/SKILL.md).
+
+### Working style
+
+These bind on every agent, in every mode, interactive and delegated.
+
+- **Stop gathering once you can act.** Redundant file reads, repeated commands, and exploration
+  past sufficient context are waste. In a delegated unit they are the main way a context budget
+  is lost.
+- **Write for the eventual reader, not for this conversation.** That reader opens the file months
+  later without the session that produced it. Work out their knowledge, purpose, and likely
+  questions privately. Never put an audience analysis in the artifact.
+- **Be concise.** No sycophantic openers. No closing filler. No narrated status. Say what changed,
+  what it cost, and what is still open.
+- **Answer in the language the requester used.** Source code, comments, identifiers, commit
+  messages, and PR titles and bodies stay English.
 
 ### Crate code — library design
 

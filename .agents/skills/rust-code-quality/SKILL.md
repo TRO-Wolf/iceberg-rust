@@ -1,12 +1,15 @@
 ---
 name: rust-code-quality
-version: "1.0"
+version: "1.1"
 description: >-
-  Run a focused Rust quality review over changed `crates/` code when one is
-  requested, when reviewing a Rust PR or commit, or when another review
-  workflow (a SEPMO Critic, an audit) delegates the Rust-specific checks. Do
-  not auto-load it for every implementation edit, and do not use it to
-  re-check what the armed gates already hold (`make check` — fmt, clippy
+  Load this before you write or review any Rust, doc comment, or markdown
+  prose in this repository: every Actor and every Critic loads it, per
+  AGENTS.md read order. It carries two passes. The authoring pass applies
+  while you write, and enacts AGENTS.md "Comments and prose" — the rules live
+  there, not here. The review pass applies to a changed `crates/` diff, a Rust
+  PR or commit, or when another workflow (a SEPMO Critic, an audit) delegates
+  the Rust checks. Do not use it
+  to re-check what the armed gates already hold (`make check` — fmt, clippy
   `-D warnings`, taplo, cargo-machete, the agent-artifact and matrix-anchor
   scripts — and `typos`, which runs in CI beside it, not inside it). It exists for the findings no linter here can
   reach: on-disk format stability, divergence from Java `iceberg-core`,
@@ -16,7 +19,8 @@ description: >-
 
 # Rust Code Quality Gate
 
-A review procedure for a Rust diff in this workspace. It records a proven review *sequence*; every
+Two passes over Rust work in this workspace. The **authoring pass** applies while you write. The
+**review pass** applies to a diff. It records a proven *sequence*; every
 rule it leans on is a pointer into the spine ([AGENTS.md](../../../AGENTS.md) "Rust conventions",
 "Absolute prohibitions", "Parity mandate") or the per-tier manual
 ([skills/Opus.md](../../../skills/Opus.md)) — on any conflict, those win. This skill states no
@@ -51,6 +55,25 @@ from a workspace with a pedantic-clippy or panic-ban configuration:
 - Nothing bans `println!` / `dbg!` in library code.
 - Nothing checks that a GAP_MATRIX citation uses an anchor rather than a line number (the anchor
   script validates only citations already written in `row R<id>` form).
+
+## Comment discipline — the authoring pass
+
+Apply this while you write, before any review exists. The rules are AGENTS.md "Comments and prose";
+this is how to hold yourself to them at the keyboard.
+
+1. **Ask what the comment records.** A race, an ordering invariant, a cross-cutting contract, a
+   deliberate loud failure, live-but-dead-looking code, or why you avoided the obvious thing. None
+   of those? Delete the comment. Do not shorten it.
+2. **Cut to the reason, then cut again.** Delete the preamble, the restatement, and the second
+   example. Then halve what is left and check it still says the same thing.
+3. **Run the ~20-word test on each sentence.** Over the ceiling means two ideas in one sentence.
+   Split it. Check for passive voice and hedging in the same pass.
+4. **Route the evidence.** Bytecode offsets and `javap` output go to the unit ledger under
+   `task/`. Capability status goes to the GAP_MATRIX cell. The doc comment keeps the contract.
+5. **Match the shape to the contract.** A one-line setter takes one line. `# Errors`, `# Panics`,
+   and `# Notes` appear only where they apply.
+
+The worked example below shows step 2 on a real doc comment in this repo.
 
 ## Quick start
 
@@ -90,6 +113,16 @@ rg -n 'Ordering::Relaxed' <changed-files>
 
 # 8. GAP_MATRIX cited by line number instead of by anchor
 rg -n 'GAP_MATRIX[^)]*[:#]L?[0-9]+|line [0-9]+ of .*GAP_MATRIX' <changed-files>
+
+# 9. Bytecode evidence parked in a doc comment — it belongs in the unit ledger
+rg -n '^\s*(///|//).*(offset [0-9]+|javap|bytecode|invokevirtual|invokestatic)' <changed-files>
+
+# 10. Doc blocks over 6 lines — candidates for the shortest-form rule.
+# `[ \t]` not `\s`: mawk has no `\s` and silently skips every indented block. FNR, not NR.
+awk 'FNR==1 {if(n>6) print f":"s" ("n" lines)"; n=0}
+     /^[ \t]*\/\/[\/!]/ {if(!n) s=FNR; n++; f=FILENAME; next}
+     {if(n>6) print FILENAME":"s" ("n" lines)"; n=0}
+     END {if(n>6) print f":"s" ("n" lines)"}' <changed-files>
 ```
 
 ## Manual review checklist
@@ -185,7 +218,57 @@ This axis has no analogue in a non-parity repo, and it is the reason the fork ex
 - [ ] Touched directories' `map.md` updated in the same change (AGENTS.md `<map_md_navigation>`);
       a new source directory in a tree that already uses the convention gets one.
 - [ ] No capability *status* written anywhere but the GAP_MATRIX cell (AGENTS.md one-home-per-fact).
-- [ ] Comments carry the non-obvious invariant, not narration of the next line.
+- [ ] **Comment discipline** — each item below is AGENTS.md "Comments and prose", which is the
+      rule; this is the pass that finds the breach.
+  - [ ] No comment restates what the code already says. A name and a type carry the WHAT.
+  - [ ] Every comment the diff adds records one of the six things AGENTS.md lists. Delete a
+        comment that records none of them. Do not shorten it.
+  - [ ] No comment takes ten lines for a reason that fits in two. Check every doc block over six
+        lines against scan 10.
+  - [ ] Bytecode offsets, `javap` output, and decode narrative are in the unit ledger under
+        `task/`, not in a doc comment (scan 9). Capability status is in the GAP_MATRIX cell only.
+        A doc comment states the contract; it does not carry the proof.
+  - [ ] Prose follows ASD-STE100: one idea per sentence, ~20 words, active voice, present tense,
+        one word one meaning, plain verbs, no hedging and no narration of the author's reasoning.
+  - [ ] The doc comment shape matches the contract, not the effort. A one-line setter takes one
+        line. `# Errors` / `# Panics` / `# Notes` appear where they apply.
+  - [ ] No commented-out code and no tombstone ([skills/Opus.md](../../../skills/Opus.md) §9,
+        "Delete dead code; don't comment it out"). Git remembers the old version.
+
+## Worked example — the shortest-form rule
+
+Eight lines for one setter, from `transaction/overwrite_files.rs`:
+
+```rust
+/// ENABLE the assertion that every ADDED data file lies entirely inside the [`Self::overwrite_by_row_filter`]
+/// predicate (Java `OverwriteFiles.validateAddedFilesMatchOverwriteFilter`): at validate time each added
+/// data file must have ALL of its rows match the row filter, or the commit is rejected with a non-retryable
+/// `ValidationException` ("Cannot append file with rows that do not match filter"). This guards a
+/// replace-by-predicate from re-introducing rows outside the predicate it just deleted.
+///
+/// Only meaningful together with [`Self::overwrite_by_row_filter`] — with no row filter the predicate is
+/// `alwaysFalse` and no added file could match it. Default (this method NOT called) = no assertion.
+```
+
+The caller loses nothing at six:
+
+```rust
+/// Reject the commit if any added data file has rows outside the
+/// [`Self::overwrite_by_row_filter`] predicate. Java
+/// `OverwriteFiles.validateAddedFilesMatchOverwriteFilter`.
+///
+/// Default off. Without a row filter the predicate is `alwaysFalse`, so any
+/// commit that adds a file fails.
+```
+
+What was cut, and why each cut was safe. The exception class and its message belong to the error
+and to the test that pins it. "At validate time" repeats the method name. The guards-against
+sentence restates the first sentence from the other side.
+
+One phrase resists the cut. "No added file can match" must not become "every commit fails".
+`check_added_files_match_overwrite_filter` returns `Ok(())` when `added_data_files` is empty. A
+deletes-only overwrite still commits. Shortening is where correctness leaks. Re-check every claim
+against the code after you cut.
 
 ## Severity
 
@@ -210,7 +293,8 @@ is not a finding at all.
   value-path `as` cast; a broken `Error::source()` chain; a secret reachable by a log line; a
   blanket `#[allow]`.
 - **P3 (should fix)**: avoidable duplication with a concrete simpler replacement; a stale `map.md`;
-  a local clarity issue with no behavioral risk.
+  a local clarity issue with no behavioral risk; a comment that restates the code, parks bytecode
+  evidence that belongs in a ledger, or takes ten lines for a two-line reason.
 
 ## Output template
 
@@ -226,6 +310,8 @@ is not a finding at all.
 - output-macro candidates inspected: N
 - relaxed-ordering candidates inspected: N
 - line-number-citation candidates inspected: N
+- doc-comment-in-ledger-territory candidates inspected: N
+- doc blocks over 6 lines inspected: N
 
 ### Java references read
 - <class#method or jar bytecode> for <behavior> — matched / diverged (row R<id>)
