@@ -32,7 +32,7 @@ use crate::arrow::value::{create_primitive_array_repeated, create_primitive_arra
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_POS,
-    RESERVED_FIELD_ID_ROW_ID, get_metadata_field,
+    RESERVED_FIELD_ID_ROW_ID, get_metadata_field, is_row_lineage_field,
 };
 use crate::spec::{
     Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
@@ -679,6 +679,18 @@ impl RecordBatchTransformer {
                 return SchemaComparison::Different;
             }
 
+            // A V3 ROW-LINEAGE column is NEVER a pass-through, even when the file's column matches
+            // the target field exactly. Its value is stored-else-fallback PER ROW (Java
+            // `ValueReaders$RowIdReader` / `$LastUpdatedSeqReader`), so a null in the stored column
+            // must be replaced with `first_row_id + pos` / the file sequence number. The fast
+            // paths hand the column back verbatim, nulls included — which is precisely what the
+            // fallback exists to prevent. Force the field-id-based `Modify` path.
+            if Self::field_id_of(source_field).is_some_and(is_row_lineage_field)
+                || Self::field_id_of(target_field).is_some_and(is_row_lineage_field)
+            {
+                return SchemaComparison::Different;
+            }
+
             if source_field.name() != target_field.name() {
                 names_changed = true;
             }
@@ -757,14 +769,16 @@ impl RecordBatchTransformer {
                 // on whether the FILE carries the field: a present field gets a dedicated reader
                 // that falls back per NULL row, an absent one gets the computed/constant value.
                 if *field_id == RESERVED_FIELD_ID_ROW_ID {
-                    let first_row_id = first_row_id.ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::FeatureUnsupported,
-                            "`_row_id` was projected but this data file has no assigned \
-                             `first_row_id`. Row lineage requires a V3 table whose manifest \
-                             carries a row-id range; a V1/V2 file has no row identity to report.",
-                        )
-                    })?;
+                    // No assigned range => an ALL-NULL column, exactly as Java: `ValueReaders
+                    // .rowIds(null, reader)` returns `constant(null)` (1.10.0 bytecode offsets
+                    // 0-1 branch to 14, `constant` at 15). A V1/V2 file simply has no row
+                    // identity, which is a fact about the row, not a failure to read it.
+                    let Some(first_row_id) = first_row_id else {
+                        return Ok(ColumnSource::Add {
+                            target_type: DataType::Int64,
+                            value: None,
+                        });
+                    };
                     return Ok(match field_id_to_source_schema_map.get(field_id) {
                         Some((_, source_index)) => ColumnSource::RowIdFromFile {
                             source_index: *source_index,
@@ -775,13 +789,21 @@ impl RecordBatchTransformer {
                 }
 
                 if *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER {
-                    let file_sequence_number = file_sequence_number.ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::FeatureUnsupported,
-                            "`_last_updated_sequence_number` was projected but this data file has \
-                             no file sequence number.",
-                        )
-                    })?;
+                    // Java gates this column on BOTH inputs, not just the sequence number:
+                    // `ValueReaders.lastUpdated(Long rowIdConst, Long fileSeq, reader)` returns
+                    // `constant(null)` if EITHER is null (1.10.0 bytecode: `ifnull 21` at offsets
+                    // 1 and 5, with `constant(null)` at 21-25). So a V1/V2 file — which HAS a
+                    // sequence number but no `first_row_id` — reports NULL here, not its sequence
+                    // number. Gating on the sequence number alone would fabricate a
+                    // last-updated value for every row of every pre-V3 table.
+                    let (Some(_), Some(file_sequence_number)) =
+                        (first_row_id, file_sequence_number)
+                    else {
+                        return Ok(ColumnSource::Add {
+                            target_type: DataType::Int64,
+                            value: None,
+                        });
+                    };
                     return Ok(match field_id_to_source_schema_map.get(field_id) {
                         Some((_, source_index)) => ColumnSource::LastUpdatedSeqFromFile {
                             source_index: *source_index,
@@ -2621,22 +2643,24 @@ mod test {
         );
     }
 
+    /// Java returns an ALL-NULL column here, NOT an error: `ValueReaders.rowIds(null, reader)`
+    /// is `constant(null)` (1.10.0 bytecode, `ifnull` at offset 1 branching to `constant` at 15).
+    /// A V1/V2 file simply has no row identity — that is a fact about the rows, not a failure to
+    /// read them, and erroring would make `SELECT _row_id` unusable on any mixed-version table.
+    ///
+    /// This REPLACES `projecting_row_id_without_an_assigned_range_is_refused`, which pinned an
+    /// invented refusal (bundle-Critic F-C).
     #[test]
-    fn projecting_row_id_without_an_assigned_range_is_refused() {
+    fn projecting_row_id_without_an_assigned_range_yields_nulls() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];
         let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
             .with_row_lineage(None, Some(7))
             .build();
 
-        let error = transformer
-            .process_record_batch(row_lineage_batch(vec![1], None))
-            .expect_err("no assigned range means no row identity to report");
-        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
-        assert!(
-            error.message().contains("no assigned"),
-            "got: {}",
-            error.message()
-        );
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(vec![1, 2], None))
+            .expect("no assigned range is not an error");
+        assert_eq!(int64_col(&batch, 1), vec![None, None]);
     }
 
     #[test]
@@ -2681,17 +2705,43 @@ mod test {
         );
     }
 
+    /// Java gates `_last_updated_sequence_number` on BOTH inputs:
+    /// `ValueReaders.lastUpdated(Long rowIdConst, Long fileSeq, reader)` returns `constant(null)`
+    /// if EITHER is null (1.10.0 bytecode: `ifnull 21` at offsets 1 and 5). So a V1/V2 file —
+    /// which HAS a sequence number but no `first_row_id` — reports NULL, not its sequence number.
+    ///
+    /// This is the cell that matters most in practice: gating on the sequence number alone
+    /// fabricates a last-updated value for every row of every pre-V3 table, and does it silently.
+    /// (bundle-Critic F-B.)
     #[test]
-    fn projecting_last_updated_sequence_number_without_one_is_refused() {
+    fn last_updated_sequence_number_is_null_without_a_first_row_id() {
+        let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(None, Some(5))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(vec![1, 2], None))
+            .expect("a missing first_row_id is not an error");
+        assert_eq!(
+            int64_col(&batch, 1),
+            vec![None, None],
+            "NULL, not the file's sequence number — Java gates on BOTH inputs"
+        );
+    }
+
+    /// The other half of the same gate: no file sequence number is also NULL.
+    #[test]
+    fn last_updated_sequence_number_is_null_without_a_file_sequence_number() {
         let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
         let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
             .with_row_lineage(Some(100), None)
             .build();
 
-        let error = transformer
+        let batch = transformer
             .process_record_batch(row_lineage_batch(vec![1], None))
-            .expect_err("no file sequence number means no fallback");
-        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+            .expect("a missing file sequence number is not an error");
+        assert_eq!(int64_col(&batch, 1), vec![None]);
     }
 
     /// The boundary the overflow check must NOT reject: a batch whose LAST id is exactly

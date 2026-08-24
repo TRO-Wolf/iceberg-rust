@@ -597,10 +597,16 @@ impl FileScanTask {
         // Java has no such case: `_pos` is a Spark-side metadata column there, and its readers
         // carry the row-group start ordinal into a split, so a Java split can serve absolute
         // positions. Cost here: whole-file tasks — parallelism, never rows.
-        if self
-            .project_field_ids
-            .contains(&crate::metadata_columns::RESERVED_FIELD_ID_POS)
-        {
+        //
+        // `_row_id` is on this guard for the same reason: its fallback arm is
+        // `first_row_id + PHYSICAL ORDINAL` (Java `ValueReaders$RowIdReader`), so it needs the
+        // same whole-file in-order decode. Leaving it off is not a wrong-value bug but a TOTAL
+        // OUTAGE — the reader refuses every ranged sub-task, so a file that would have yielded
+        // its rows yields none and N errors instead.
+        if self.project_field_ids.iter().any(|&id| {
+            id == crate::metadata_columns::RESERVED_FIELD_ID_POS
+                || id == crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID
+        }) {
             return Ok(vec![self.clone()]);
         }
 
@@ -1789,6 +1795,91 @@ mod tests {
     }
 
     // ---- serde: the flagged-additive split_offsets field ----
+
+    /// Row lineage SURVIVES a split, unlike `split_offsets` which is cleared. A sub-task is a
+    /// byte window of the SAME data file, so it owns the same row-id range and the same file
+    /// sequence number; dropping them would lose the file's identity on every sub-task.
+    ///
+    /// (bundle-Critic F-E/M9: this design claim was asserted in the commit message and pinned by
+    /// nothing — setting both to `None` in `sub_task` passed the whole suite.)
+    #[test]
+    fn row_lineage_survives_a_split_while_split_offsets_is_cleared() {
+        let mut whole = task(1000, DataFileFormat::Parquet, Some(vec![0, 400, 800]));
+        whole.start = 0;
+        whole.first_row_id = Some(4_242);
+        whole.file_sequence_number = Some(9);
+
+        let parts = whole.split(400).expect("split");
+        assert!(parts.len() > 1, "fixture precondition: the task must split");
+        for part in &parts {
+            assert_eq!(
+                part.first_row_id,
+                Some(4_242),
+                "every sub-task keeps the file's row-id range"
+            );
+            assert_eq!(
+                part.file_sequence_number,
+                Some(9),
+                "every sub-task keeps the file's sequence number"
+            );
+            assert_eq!(
+                part.split_offsets, None,
+                "control: split_offsets IS cleared — the two fields behave differently on purpose"
+            );
+        }
+    }
+
+    /// Both new fields are PUBLIC on an engine-serialized struct, so their wire contract is part
+    /// of the API: present when set, ABSENT when `None` so a pre-field serialization still
+    /// round-trips. (bundle-Critic F-E/M10: `#[serde(skip)]` on `first_row_id` survived.)
+    #[test]
+    fn row_lineage_fields_round_trip_and_are_absent_when_none() {
+        let mut with_lineage = task(1000, DataFileFormat::Parquet, None);
+        with_lineage.start = 0;
+        with_lineage.first_row_id = Some(4_242);
+        with_lineage.file_sequence_number = Some(9);
+        let json = serde_json::to_string(&with_lineage).expect("serialize");
+        assert!(json.contains("first_row_id"), "must serialize when present");
+        assert!(json.contains("file_sequence_number"));
+        let back: FileScanTask = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.first_row_id, Some(4_242));
+        assert_eq!(back.file_sequence_number, Some(9));
+
+        let without = task(1000, DataFileFormat::Parquet, None);
+        let json_none = serde_json::to_string(&without).expect("serialize none");
+        assert!(
+            !json_none.contains("first_row_id"),
+            "absent from the JSON when None, so a task predating the field round-trips"
+        );
+        assert!(!json_none.contains("file_sequence_number"));
+        let back_none: FileScanTask = serde_json::from_str(&json_none).expect("deserialize none");
+        assert_eq!(back_none.first_row_id, None);
+        assert_eq!(back_none.file_sequence_number, None);
+    }
+
+    /// `_row_id` suppresses splitting exactly as `_pos` does (branch 1c). Without this the planner
+    /// hands the reader ranged sub-tasks that it then REFUSES one by one — a total outage, not a
+    /// wrong value. (bundle-Critic F-D.)
+    #[test]
+    fn projecting_row_id_suppresses_splitting() {
+        let mut whole = task(1000, DataFileFormat::Parquet, Some(vec![0, 400, 800]));
+        whole.start = 0;
+        whole.project_field_ids =
+            Arc::from(vec![1, crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID]);
+
+        let parts = whole.split(400).expect("split");
+        assert_eq!(
+            parts.len(),
+            1,
+            "a `_row_id` projection must yield ONE whole-file task, not ranged sub-tasks"
+        );
+
+        // Control: the same task WITHOUT `_row_id` really does split, so the assertion above is
+        // discriminating rather than vacuous.
+        let mut splittable = task(1000, DataFileFormat::Parquet, Some(vec![0, 400, 800]));
+        splittable.start = 0;
+        assert!(splittable.split(400).expect("split").len() > 1);
+    }
 
     #[test]
     fn split_offsets_round_trips_and_is_absent_when_none() {

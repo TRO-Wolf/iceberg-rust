@@ -992,11 +992,16 @@ impl TableScan {
         // `task.start == 0` clause does — a local statement of the precondition this path relies on
         // — and because it reads the SCAN's projection, which is the authority here even if a
         // task's own `project_field_ids` were ever to drift from it.
+        // `_row_id` suppresses splitting exactly as `_pos` does — both need whole-file physical
+        // ordinals (see `FileScanTask::split` branch 1c).
         let projects_pos = {
-            use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+            use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
             self.plan_context
                 .as_ref()
-                .map(|ctx| ctx.field_ids.contains(&RESERVED_FIELD_ID_POS))
+                .map(|ctx| {
+                    ctx.field_ids.contains(&RESERVED_FIELD_ID_POS)
+                        || ctx.field_ids.contains(&RESERVED_FIELD_ID_ROW_ID)
+                })
                 .unwrap_or(false)
         };
 
@@ -1061,14 +1066,18 @@ impl TableScan {
         &self,
         tasks: FileScanTaskStream,
     ) -> Result<FileScanTaskStream> {
-        use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+        use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
 
         let enabled = self.within_file_read_parallelism
             && self.concurrency_limit_data_files > 1
             && !self
                 .plan_context
                 .as_ref()
-                .map(|ctx| ctx.field_ids.contains(&RESERVED_FIELD_ID_POS))
+                .map(|ctx| {
+                    // `_row_id` needs whole-file ordinals like `_pos` — see `split` branch 1c.
+                    ctx.field_ids.contains(&RESERVED_FIELD_ID_POS)
+                        || ctx.field_ids.contains(&RESERVED_FIELD_ID_ROW_ID)
+                })
                 .unwrap_or(false);
 
         if !enabled {

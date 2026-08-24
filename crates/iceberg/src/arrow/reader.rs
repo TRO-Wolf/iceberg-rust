@@ -67,7 +67,8 @@ use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
-    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, is_metadata_field,
+    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, get_metadata_field,
+    is_metadata_field, is_row_lineage_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{DataFileFormat, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
@@ -492,11 +493,21 @@ impl ArrowReader {
         let mut record_batch_stream_builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
-        // Filter out metadata fields for Parquet projection (they don't exist in files)
+        // Filter out metadata fields for Parquet projection (they don't exist in files).
+        //
+        // The V3 ROW-LINEAGE pair is the exception and must NOT be filtered: unlike `_file` or
+        // `_pos`, `_row_id` / `_last_updated_sequence_number` CAN be physically present in a data
+        // file — a lineage-preserving rewrite carries the original ids forward — and Java reads
+        // the stored value in preference to the computed one (`ValueReaders$RowIdReader.read`
+        // offsets 34-39). Filtering them here would leave the stored column undecoded, so the
+        // transformer would silently fall back to `first_row_id + pos` and report plausible but
+        // WRONG identities for exactly the rows whose identity was being preserved.
+        // Requesting an id the file does not carry is harmless: the mask builder drops unmatched
+        // ids and the transformer then takes its computed/constant arm.
         let project_field_ids_without_metadata: Vec<i32> = task
             .project_field_ids
             .iter()
-            .filter(|&&id| !is_metadata_field(id))
+            .filter(|&&id| !is_metadata_field(id) || is_row_lineage_field(id))
             .copied()
             .collect();
 
@@ -1546,9 +1557,19 @@ impl ArrowReader {
             // Parquet's columnar format requires leaf-level (not top-level struct/list/map) projection
             let mut leaf_field_ids = vec![];
             for field_id in field_ids {
-                let field = iceberg_schema_of_task.field_by_id(*field_id);
+                // Reserved ROW-LINEAGE ids are not in the table schema (they are reserved
+                // metadata columns) but CAN be physically present in the file, so resolve them
+                // from the reserved-column registry. Without this they are silently dropped
+                // here — the leaf never reaches the projection, the stored column is never
+                // decoded, and the transformer falls back to a COMPUTED row id: plausible,
+                // wrong, and silent. They are scalars, so `include_leaf_field_id` on the
+                // reserved field yields exactly the id itself.
+                let field = iceberg_schema_of_task
+                    .field_by_id(*field_id)
+                    .cloned()
+                    .or_else(|| get_metadata_field(*field_id).ok().cloned());
                 if let Some(field) = field {
-                    Self::include_leaf_field_id(field, &mut leaf_field_ids);
+                    Self::include_leaf_field_id(&field, &mut leaf_field_ids);
                 }
             }
 
@@ -1596,19 +1617,24 @@ impl ArrowReader {
                 return false;
             };
 
-            let iceberg_field = iceberg_schema_of_task.field_by_id(field_id);
+            // Reserved row-lineage columns are not in the TABLE schema — they are reserved
+            // metadata fields — but they can be present in the FILE, so resolve their declared
+            // type from the reserved-column registry instead of failing the lookup.
+            let iceberg_field = iceberg_schema_of_task
+                .field_by_id(field_id)
+                .cloned()
+                .or_else(|| get_metadata_field(field_id).ok().cloned());
             let parquet_iceberg_field = iceberg_schema.field_by_id(field_id);
 
-            if iceberg_field.is_none() || parquet_iceberg_field.is_none() {
+            let (Some(iceberg_field), Some(parquet_iceberg_field)) =
+                (iceberg_field, parquet_iceberg_field)
+            else {
                 return false;
-            }
+            };
 
             if !type_promotion_is_valid(
-                parquet_iceberg_field
-                    .unwrap()
-                    .field_type
-                    .as_primitive_type(),
-                iceberg_field.unwrap().field_type.as_primitive_type(),
+                parquet_iceberg_field.field_type.as_primitive_type(),
+                iceberg_field.field_type.as_primitive_type(),
             ) {
                 return false;
             }
@@ -5204,6 +5230,144 @@ message schema {
         assert_eq!(
             pairs, expected,
             "physical _pos must be 0..N-1 across batches"
+        );
+    }
+
+    /// Write a Parquet file carrying `id` PLUS a physically-stored `_row_id` column, the shape a
+    /// lineage-preserving rewrite produces.
+    fn write_parquet_with_stored_row_id(path: &str, ids: &[i32], row_ids: &[Option<i64>]) {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("_row_id", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_ROW_ID.to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(arrow_array::Int32Array::from(ids.to_vec())) as ArrayRef,
+            Arc::new(arrow_array::Int64Array::from(row_ids.to_vec())) as ArrayRef,
+        ])
+        .expect("batch");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(path).expect("create data");
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    /// THE S1 REGRESSION PIN (bundle Critic F-A). `_row_id` and
+    /// `_last_updated_sequence_number` are the only reserved metadata columns that can be
+    /// PHYSICALLY PRESENT in a data file. The reader used to strip every `is_metadata_field` id
+    /// from the Parquet projection, so the stored column was never decoded, the transformer's
+    /// `RowIdFromFile` arm could not execute in production, and every row got a computed
+    /// `first_row_id + pos` instead — plausible, wrong, and silent, for exactly the rows whose
+    /// identity a rewrite had preserved.
+    ///
+    /// This test reads through the REAL `ArrowReader`, not a hand-built transformer fixture; the
+    /// transformer-level tests cannot see this bug because they are handed a batch that already
+    /// contains the column.
+    #[tokio::test]
+    async fn stored_row_id_in_the_data_file_survives_the_real_reader() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("lineage.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_with_stored_row_id(&data_path, &[1, 2, 3], &[Some(777), None, Some(999)]);
+
+        let mut task = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        task.project_field_ids = Arc::from(vec![1, RESERVED_FIELD_ID_ROW_ID]);
+        task.first_row_id = Some(1_000);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let batches: Vec<RecordBatch> = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .expect("stream")
+            .try_collect()
+            .await
+            .expect("read");
+
+        let row_ids: Vec<Option<i64>> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("_row_id")
+                    .expect("_row_id projected")
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("Int64")
+                    .clone();
+                use arrow_array::Array as _;
+                (0..column.len())
+                    .map(|row| {
+                        if arrow_array::Array::is_null(&column, row) {
+                            None
+                        } else {
+                            Some(column.value(row))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            row_ids,
+            vec![Some(777), Some(1_001), Some(999)],
+            "the STORED ids must win (777, 999); only the NULL row falls back to \
+             first_row_id + its own position (1000 + 1). Getting [1000, 1001, 1002] here means \
+             the stored column was never decoded."
+        );
+    }
+
+    /// `_last_updated_sequence_number` does NOT need physical ordinals, so it takes the ordinary
+    /// Parquet path — a different transformer construction site than the `_row_id` test above.
+    /// Both sites must be fed the task's row lineage; deleting either `with_row_lineage` call
+    /// passed the entire suite before this test existed (bundle-Critic F-E/M3+M4).
+    #[tokio::test]
+    async fn last_updated_sequence_number_is_materialized_on_the_ordinary_parquet_path() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp.path().join("seq.parquet").to_string_lossy().to_string();
+        write_id_parquet_for_pos(&data_path, &[1, 2, 3], 1000);
+
+        let mut task = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        task.project_field_ids = Arc::from(vec![
+            1,
+            crate::metadata_columns::RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        ]);
+        task.first_row_id = Some(1_000);
+        task.file_sequence_number = Some(42);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let batches: Vec<RecordBatch> = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .expect("stream")
+            .try_collect()
+            .await
+            .expect("read");
+
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("_last_updated_sequence_number")
+                    .expect("projected")
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("Int64")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![42, 42, 42],
+            "the FILE's sequence number, threaded from the task — not 0, and not the row position"
         );
     }
 

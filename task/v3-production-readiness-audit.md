@@ -43,7 +43,7 @@ production-capability path unless RePark writes those types.
 | `timestamp_ns` / `timestamptz_ns` | ✅ closed | R90 ✅ (R162 🟡 is a `data_file` metadata-projection residue, not a data-path gap) |
 | **Row lineage — `first_row_id` inheritance** | ❌ **OPEN** | see V1 |
 | **Row lineage — `_row_id` / `_last_updated_sequence_number` materialization** | ❌ **OPEN** | see V2 |
-| `variant` | 🟡 R88 | binary format done both directions; shredded-parquet FILE I/O blocked on the `parquet` crate's opt-in `variant_experimental` feature PLUS owed fork-side bridge work |
+| `variant` | 🟡 R88 | binary format done both directions. SCOPE CORRECTED below: shredded-PARQUET variant is NOT in the parity scope (Java's is in `iceberg-parquet`, not `iceberg-core`). The `variant_experimental` feature has since been enabled and the canonical Arrow extension type wired both directions; file-level I/O remains owed |
 | `geometry` / `geography` | ❌ R89 | nothing exists |
 
 ---
