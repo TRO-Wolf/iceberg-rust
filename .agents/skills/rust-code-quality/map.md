@@ -21,26 +21,31 @@
 
 ## Purpose
 
-The **Rust review procedure**: what to check in a Rust diff that the armed gates (`make check` —
+The **Rust authoring and review procedure**. The authoring pass enacts
+[../../../AGENTS.md](../../../AGENTS.md) "Comments and prose" while you write, before any diff
+exists. That is why AGENTS.md read order loads this skill for every Actor, not for review alone.
+The review pass is what to check in a Rust diff that the armed gates (`make check` —
 fmt, clippy `-D warnings`, taplo, cargo-machete, the agent-artifact and matrix-anchor scripts — plus
 `typos`) cannot catch. In this workspace that residue is unusually large: there is no `clippy.toml`
 and no `[workspace.lints]`, so panics and truncating `as` casts are held by **review only**, and the
 parity axis (divergence from Java `iceberg-core` 1.10.0) has no mechanical form at all.
 
-It is a review *sequence*, not a second contract: every rule it leans on points into
+It records *sequences*, not a second contract: every rule it leans on points into
 [../../../AGENTS.md](../../../AGENTS.md), [../../../docs/testing.md](../../../docs/testing.md), or
 the tier manual in [../../../skills/](../../../skills/map.md), and on any conflict those win.
 
 ## Contents
 
-- [SKILL.md](SKILL.md) — the gate inventory (what never to re-review, and what is deliberately
-  *not* gated here), the candidate scans, the manual checklist, the severity scale, the report
-  template, and the arming candidates.
+- [SKILL.md](SKILL.md) — the comment-discipline authoring pass, the gate inventory (what never to
+  re-review, and what is deliberately *not* gated here), the candidate scans, the review checklist,
+  the shortest-form worked example, the severity scale, the report template, and the arming
+  candidates.
 
 ## I want to...
 
 | I want to... | go to |
 |---|---|
+| Comment discipline while writing | [SKILL.md](SKILL.md) "Comment discipline — the authoring pass"; the rule is [../../../AGENTS.md](../../../AGENTS.md) "Comments and prose" |
 | Review a Rust PR or commit | [SKILL.md](SKILL.md) "Quick start" |
 | Know what the gates already enforce | [SKILL.md](SKILL.md) "What the gates already hold" |
 | Rank a finding | [SKILL.md](SKILL.md) "Severity" — silent format/data corruption outranks everything |
