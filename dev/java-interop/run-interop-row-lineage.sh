@@ -27,11 +27,14 @@
 #   Java emits the lineage view its own ManifestReader.idAssigner resolved; Rust builds the same
 #   view through ManifestFile::load_manifest and diffs.
 #
-#   The UPGRADED fixture is a second table in the same run: V2, two files, an upgrade to V3, then a
+#   The UPGRADED fixture is a second table in the same run: V2, TWO appends, an upgrade to V3, then a
 #   rewrite as the FIRST V3 commit. It is the only shape either implementation can build in which a
 #   live EXISTING entry reaches the reader with NO stored first_row_id — the rewrite reads the V2
 #   manifest, whose range is absent, so every entry is nulled before the survivor is written
-#   forward. Both directions plus a cross-check, like the main fixture.
+#   forward. It takes TWO appends, not one, so two carried-forward data manifests reach the V3
+#   commit still needing a range and each still holding live rows; their relative order then decides
+#   which takes which. The four record counts are distinct (f=3, g=2, i=4, h=1) so a swap survives
+#   the name stripping the assignment cross-check does. Both directions plus a cross-check.
 #
 #   D2 ("JAVA reads what RUST writes"): the Rust GEN test commits the equivalent V3 table through
 #   the production path; Java reads it with the SAME view builder, diffs, and separately asserts no
@@ -52,14 +55,20 @@
 #   * write-side range advances by 0             -> cross-check RED (c gets 0, next_row_id 0)
 #   * every row in a file shares one _row_id     -> materialization RED (was GREEN before the
 #     materialization tests existed: the manifest view alone cannot see a per-row defect)
-#   * skip guard `== Added` instead of `!= Deleted` -> RED on the UPGRADED legs (3 red out of 10):
+#   * skip guard `== Added` instead of `!= Deleted` -> RED on the UPGRADED legs (4 red out of 10):
 #     the surviving file reads back with a null first_row_id and null _row_id for every row.
 #     MEASURED LIMIT (2026-08-25): the four-snapshot fixture above has EXISTING entries and still
 #     leaves this mutation GREEN, because a rewrite reads its source through the assigning reader,
 #     so every survivor it writes forward already carries a stored id and the `is_some()` clause
 #     short-circuits the status test. Only the V2-to-V3 upgrade reaches the branch.
-#   * manifest-list order: added manifests AFTER the existing ones -> cross-check RED (file d takes
-#     15 where Java gives it 12), the divergence this suite found on 2026-08-25.
+#   * manifest-list order, conjunct (a): added data manifests AFTER the existing ones -> 2 red out
+#     of 10 (file d takes 15 where Java gives it 12), the divergence this suite found 2026-08-25.
+#   * manifest-list order, conjunct (b): the existing data manifests reversed -> 1 red out of 10,
+#     on the UPGRADED cross-check (files g and i swap their ranges). Also 1 red out of 3477 lib
+#     tests, in snapshot::manifest_list_order_tests.
+#   * manifest-list order, conjunct (c): the data group must precede the delete group. NO interop
+#     leg can see it — neither fixture carries a delete manifest — so it is pinned in lib only, by
+#     snapshot::manifest_list_order_tests (1 red out of 3477).
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -26202,6 +26202,11 @@ public final class InteropOracle {
      * before the survivor is written forward; the V3 manifest list then gives the rewritten
      * manifest a range. Without it the reader's DELETED-vs-ADDED skip test cannot be observed from
      * either direction.
+     *
+     * <p>It takes TWO V2 appends, not one, so that two carried-forward data manifests reach the V3
+     * commit still needing a range and each still holding live rows. Their relative order then
+     * decides which of them takes which range. The four record counts are distinct so a swap
+     * survives the name-stripping the assignment cross-check does.
      */
     private static void generateUpgraded(Path dir, Schema schema, PartitionSpec spec)
         throws IOException {
@@ -26241,21 +26246,33 @@ public final class InteropOracle {
               new long[] {240L, 250L},
               new String[] {"t", "u"});
       table.newAppend().appendFile(f).appendFile(g).commit();
+
+      // A SECOND V2 append, so the V3 commit below carries TWO unassigned data manifests forward.
+      DataFile i =
+          writeDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data-i.parquet").getAbsolutePath(),
+              new long[] {260L, 270L, 280L, 290L},
+              new String[] {"v", "w", "x", "y"});
+      table.newAppend().appendFile(i).commit();
       table.refresh();
 
       ops.commit(ops.current(), TableMetadata.buildFrom(ops.current()).upgradeFormatVersion(3).build());
       table.refresh();
 
-      // The FIRST V3 commit must be the rewrite: the source manifest is still the V2 one, so its
-      // entries reach the writer with no id.
+      // The FIRST V3 commit must be the rewrite: the source manifests are still the V2 ones, so
+      // their entries reach the writer with no id. It replaces f, which leaves g live in the
+      // rewritten manifest and i live in the manifest carried forward beside it.
       DataFile h =
           writeDataFile(
               table,
               schema,
               spec,
               new File(dataDir, "00000-data-h.parquet").getAbsolutePath(),
-              new long[] {260L, 270L},
-              new String[] {"v", "w"});
+              new long[] {300L},
+              new String[] {"z"});
       table
           .newRewrite()
           .rewriteFiles(

@@ -1180,10 +1180,6 @@ impl<'a> SnapshotProducer<'a> {
             .into_iter()
             .partition(|manifest| manifest.content == ManifestContentType::Data);
 
-        // ORDER IS LOAD-BEARING. Java `MergingSnapshotProducer.apply` concatenates the NEW data
-        // manifests before the filtered existing ones, then does the same for deletes. On V3 the
-        // manifest-list writer assigns each unassigned DATA manifest its `first_row_id` range in list
-        // order, so any other order gives a newly added file a row id Java does not give it.
         let mut manifest_files =
             Vec::with_capacity(existing_data_manifests.len() + existing_delete_manifests.len() + 2);
 
@@ -1194,6 +1190,12 @@ impl<'a> SnapshotProducer<'a> {
             let added_manifests = self.write_added_manifests().await?;
             manifest_files.extend(added_manifests);
         }
+        // DATA ORDER IS LOAD-BEARING, in both halves of this line (Java
+        // `MergingSnapshotProducer.apply`: `concat(prepareNewDataManifests(), filteredExistingData)`).
+        // The V3 manifest-list writer gives each unassigned DATA manifest its `first_row_id` range in
+        // list order. Put the added group second and a new file takes a row id Java does not give it;
+        // reorder the existing group and two carried-forward manifests that still need ranges swap
+        // theirs.
         manifest_files.extend(existing_data_manifests);
 
         // Process added DELETE entries — ONE DELETE manifest per partition-spec group (Java
@@ -1202,6 +1204,11 @@ impl<'a> SnapshotProducer<'a> {
             let added_delete_manifests = self.write_added_delete_manifests().await?;
             manifest_files.extend(added_delete_manifests);
         }
+        // The data-before-deletes split is `MergingSnapshotProducer.apply`'s shape ALONE. Java
+        // `FastAppend.apply` and `BaseRewriteManifests.apply` append the prior list un-split. The
+        // difference is unreachable: only a merging producer can introduce a delete manifest, and it
+        // appends its delete group last, so every list either engine writes is already data-then-
+        // deletes and the split is a no-op there.
         manifest_files.extend(existing_delete_manifests);
 
         let manifest_files = manifest_process
@@ -3714,6 +3721,228 @@ mod first_row_id_suppression_tests {
             stored.get("test/other.parquet").copied(),
             Some(Some(3)),
             "the survivor keeps the id it inherited behind the 3-row seed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod manifest_list_order_tests {
+    //! The three conjuncts of the manifest-list order [`SnapshotProducer::manifest_file`] emits.
+    //!
+    //! The added-data-first conjunct is pinned cross-engine by the row-lineage interop suite. These
+    //! two cover the other two, which that suite cannot see: the existing DATA manifests keep their
+    //! source-list order, and every DATA manifest precedes every DELETE manifest.
+
+    use crate::memory::tests::new_memory_catalog;
+    use crate::spec::{
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, ManifestContentType,
+        ManifestStatus, Struct,
+    };
+    use crate::table::Table;
+    use crate::transaction::tests::make_v2_minimal_table_in_catalog;
+    use crate::transaction::{ApplyTransactionAction, Transaction};
+
+    /// A data file under the fixture's spec 0 (`identity(x)`), partition `(x = 0)`.
+    fn data_file(path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .build()
+            .expect("build the fixture data file")
+    }
+
+    /// A parquet position-delete file under the same spec, so the commit writes a DELETE manifest.
+    fn position_delete_file(path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .build()
+            .expect("build the fixture delete file")
+    }
+
+    /// The committed manifest list's `content` sequence.
+    async fn manifest_contents(table: &Table) -> Vec<ManifestContentType> {
+        manifest_list(table)
+            .await
+            .into_iter()
+            .map(|(content, _)| content)
+            .collect()
+    }
+
+    /// Each manifest in list order, as its content plus the paths of its live entries.
+    async fn manifest_list(table: &Table) -> Vec<(ManifestContentType, Vec<String>)> {
+        let metadata = table.metadata();
+        let snapshot = metadata
+            .current_snapshot()
+            .expect("the committed table has a current snapshot");
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), metadata)
+            .await
+            .expect("load the manifest list");
+
+        let mut described = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .expect("load the manifest");
+            let mut live: Vec<String> = manifest
+                .entries()
+                .iter()
+                .filter(|entry| entry.status() != ManifestStatus::Deleted)
+                .map(|entry| entry.file_path().to_string())
+                .collect();
+            live.sort();
+            described.push((manifest_file.content, live));
+        }
+        described
+    }
+
+    /// Conjunct (b): the carried-forward DATA manifests keep the order they had in the source list.
+    ///
+    /// Risk pinned: two carried-forward manifests that both still need a `first_row_id` range take
+    /// each other's range when the order moves, which is the same cross-engine row-identity
+    /// divergence the added-data conjunct removes. Reached here without V3, by identifying each
+    /// manifest by the files it holds.
+    #[tokio::test]
+    async fn carried_forward_data_manifests_keep_their_source_order() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+
+        let transaction = Transaction::new(&table);
+        let transaction = transaction
+            .fast_append()
+            .add_data_files(vec![
+                data_file("test/a1.parquet"),
+                data_file("test/a2.parquet"),
+            ])
+            .apply(transaction)
+            .expect("apply the first append");
+        let table = transaction
+            .commit(&catalog)
+            .await
+            .expect("commit the first append");
+
+        let transaction = Transaction::new(&table);
+        let transaction = transaction
+            .fast_append()
+            .add_data_files(vec![data_file("test/b.parquet")])
+            .apply(transaction)
+            .expect("apply the second append");
+        let table = transaction
+            .commit(&catalog)
+            .await
+            .expect("commit the second append");
+
+        let before: Vec<Vec<String>> = manifest_list(&table)
+            .await
+            .into_iter()
+            .map(|(_, live)| live)
+            .collect();
+        assert_eq!(
+            before,
+            vec![vec!["test/b.parquet".to_string()], vec![
+                "test/a1.parquet".to_string(),
+                "test/a2.parquet".to_string()
+            ]],
+            "fixture precondition: two data manifests, newest first"
+        );
+
+        // Delete a1. Its manifest is rewritten; the other is carried forward untouched. Neither is
+        // emptied, so both still hold live rows.
+        let transaction = Transaction::new(&table);
+        let transaction = transaction
+            .delete_files()
+            .delete_file("test/a1.parquet".to_string())
+            .apply(transaction)
+            .expect("apply the delete");
+        let table = transaction
+            .commit(&catalog)
+            .await
+            .expect("commit the delete");
+
+        let after: Vec<Vec<String>> = manifest_list(&table)
+            .await
+            .into_iter()
+            .map(|(_, live)| live)
+            .collect();
+        assert_eq!(
+            after,
+            vec![vec!["test/b.parquet".to_string()], vec![
+                "test/a2.parquet".to_string()
+            ]],
+            "the carried-forward manifest and the rewritten one kept their source-list order"
+        );
+    }
+
+    /// Conjunct (c): every DATA manifest precedes every DELETE manifest.
+    ///
+    /// Risk pinned: an interleaved list diverges from Java `MergingSnapshotProducer.apply`, which
+    /// builds the data group and the delete group separately and concatenates them in that order.
+    #[tokio::test]
+    async fn every_data_manifest_precedes_every_delete_manifest() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+
+        let transaction = Transaction::new(&table);
+        let transaction = transaction
+            .fast_append()
+            .add_data_files(vec![data_file("test/d1.parquet")])
+            .apply(transaction)
+            .expect("apply the append");
+        let table = transaction
+            .commit(&catalog)
+            .await
+            .expect("commit the append");
+
+        let transaction = Transaction::new(&table);
+        let transaction = transaction
+            .row_delta()
+            .add_deletes(vec![position_delete_file("test/d1-pos-del.parquet")])
+            .apply(transaction)
+            .expect("apply the row delta");
+        let table = transaction
+            .commit(&catalog)
+            .await
+            .expect("commit the row delta");
+        assert_eq!(
+            manifest_contents(&table).await,
+            vec![ManifestContentType::Data, ManifestContentType::Deletes],
+            "fixture precondition: the table now carries a DELETE manifest"
+        );
+
+        // A commit that adds a data manifest while a delete manifest is carried forward is the only
+        // shape in which the two groups can interleave.
+        let transaction = Transaction::new(&table);
+        let transaction = transaction
+            .fast_append()
+            .add_data_files(vec![data_file("test/d2.parquet")])
+            .apply(transaction)
+            .expect("apply the second append");
+        let table = transaction
+            .commit(&catalog)
+            .await
+            .expect("commit the second append");
+
+        let contents = manifest_contents(&table).await;
+        assert_eq!(
+            contents,
+            vec![
+                ManifestContentType::Data,
+                ManifestContentType::Data,
+                ManifestContentType::Deletes
+            ],
+            "the manifest list is all DATA then all DELETES"
         );
     }
 }

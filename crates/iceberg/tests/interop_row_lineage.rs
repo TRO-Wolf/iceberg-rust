@@ -369,8 +369,11 @@ async fn row_lineage_write_gen() {
 
 /// D2 GEN UPGRADED — the fork's own V2-upgraded-to-V3 table, for Java to read back.
 ///
-/// Mirrors the Java `upgraded` fixture: two files at V2, an upgrade, then a rewrite as the FIRST V3
-/// commit so the survivor is written forward with no stored `first_row_id`.
+/// Mirrors the Java `upgraded` fixture: two V2 appends, an upgrade, then a rewrite as the FIRST V3
+/// commit so the survivor is written forward with no stored `first_row_id`. Two appends, not one, so
+/// two carried-forward data manifests reach the V3 commit still needing a range and each still
+/// holding live rows — their relative order is what decides which takes which. The four record
+/// counts are distinct so a swap survives the cross-check's name stripping.
 #[tokio::test]
 async fn row_lineage_upgraded_write_gen() {
     let Some(dir) = fixture_dir(D2_ENV) else {
@@ -416,8 +419,24 @@ async fn row_lineage_upgraded_write_gen() {
         .fast_append()
         .add_data_files(vec![file_f.clone(), file_g])
         .apply(tx)
-        .expect("apply the V2 append");
-    let table = tx.commit(&catalog).await.expect("commit the V2 append");
+        .expect("apply the first V2 append");
+    let table = tx
+        .commit(&catalog)
+        .await
+        .expect("commit the first V2 append");
+
+    // A SECOND V2 append, so the V3 commit below carries TWO unassigned data manifests forward.
+    let file_i = write_data_file(&table, vec![260, 270, 280, 290], vec!["v", "w", "x", "y"]).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_i])
+        .apply(tx)
+        .expect("apply the second V2 append");
+    let table = tx
+        .commit(&catalog)
+        .await
+        .expect("commit the second V2 append");
 
     let tx = Transaction::new(&table);
     let tx = tx
@@ -427,7 +446,9 @@ async fn row_lineage_upgraded_write_gen() {
         .expect("apply the upgrade");
     let table = tx.commit(&catalog).await.expect("commit the upgrade");
 
-    let file_h = write_data_file(&table, vec![260, 270], vec!["v", "w"]).await;
+    // The rewrite replaces f, leaving g live in the rewritten manifest and i live in the manifest
+    // carried forward beside it.
+    let file_h = write_data_file(&table, vec![300], vec!["z"]).await;
     let tx = Transaction::new(&table);
     let tx = tx
         .rewrite_files(vec![file_f], vec![file_h])
@@ -448,9 +469,12 @@ async fn row_lineage_upgraded_write_gen() {
     println!("interop_row_lineage UPGRADED GEN OK — {table_location}\n  rust view: {view}");
 }
 
-/// Erase every file NAME from a lineage view, leaving only the lineage numbers.
+/// Erase every file NAME from a lineage view, then RE-SORT the file list.
 ///
 /// The name is the one field that legitimately differs: Java names by ordinal, the fork by uuid.
+/// Both sides sort their file list by the rendered string, so the name they are about to lose is
+/// what ordered it. Comparing the stripped lists in place would therefore rest on the fork's uuids
+/// happening to sort in creation order; re-sorting compares the lineage numbers as a multiset.
 fn strip_names(view: &str) -> String {
     let mut out = String::with_capacity(view.len());
     let mut rest = view;
@@ -461,7 +485,28 @@ fn strip_names(view: &str) -> String {
         rest = &rest[end..];
     }
     out.push_str(rest);
-    out
+    resort_file_list(&out)
+}
+
+/// Sort the elements of the view's `files` array. Only valid once the names are erased.
+fn resort_file_list(view: &str) -> String {
+    const OPEN: &str = "\"files\":[";
+    let start = view.find(OPEN).expect("the view carries a files array") + OPEN.len();
+    let end = view[start..].find(']').expect("the files array is closed") + start;
+    if start == end {
+        return view.to_string();
+    }
+    let inner = view[start..end]
+        .trim_start_matches('{')
+        .trim_end_matches('}');
+    let mut elements: Vec<&str> = inner.split("},{").collect();
+    elements.sort();
+    format!(
+        "{}{{{}}}{}",
+        &view[..start],
+        elements.join("},{"),
+        &view[end..]
+    )
 }
 
 /// The cross-check that closes D2's circularity.

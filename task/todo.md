@@ -914,7 +914,10 @@ Stage 2 found a REAL divergence and it is fixed in the same change: the fork emi
 carried-forward manifests before the newly written ones, where Java emits new first, and the V3
 manifest-list writer assigns row-id ranges in list order — so a newly added file took a row id
 Java does not give it (15 against Java's 12 on the rewrite fixture). Both facts are recorded in
-row R166. Stage 2's named mutation now goes RED, but only through a V2-to-V3 upgrade fixture: a
+row R166. The order has three conjuncts and each is now mutation-pinned separately; the
+data-before-deletes one is `MergingSnapshotProducer.apply`'s shape alone, and is unreachable
+because no producer on either side emits a delete manifest ahead of a data manifest.
+Stage 2's named mutation now goes RED, but only through a V2-to-V3 upgrade fixture: a
 rewrite reads its source through the assigning reader on both sides, so an ordinary rewrite's
 survivor already carries a stored id. NOT built and escalated: Java's `add(ManifestFile)`
 `first_row_id` precondition has no fork surface to land on (see the R166 residue).
