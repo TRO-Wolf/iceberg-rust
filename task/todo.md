@@ -35,7 +35,15 @@ How to use it (see the manuals' §1):
 
 Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next.
 
-- [ ] **R166 interop leg — a CITATION-AND-PIN job, not a build.** The leg already exists on the
+- [x] **R166 interop leg — DONE 2026-08-25, and it was a BUILD, not a citation.** The engine's
+      V3-0 lineage evidence turned out to be an UN-PINNED measurement — its own §5 says the CI pins
+      deliberately avoid the Spark fixture, and the lineage numbers "stay a measurement in this
+      ledger until V3-1 lands a fixture CI can read" — so citing it could not carry the row under
+      the fork's definition of done. Built instead on the fork's OWN Java oracle, which already
+      writes and reads V3 tables: `run-interop-row-lineage.sh`, both directions plus a cross-check
+      that closes D2's circularity. R166 🟡→✅; residues (1) and (2) stay open and named on the row.
+      The original brief follows, kept for its reasoning.
+- [ ] ~~**R166 interop leg — a CITATION-AND-PIN job, not a build.**~~ The leg already exists on the
       engine side: unit V3-0 (RePark #199) appended rows with lineage through the fork and
       round-tripped through Spark→Java with the read verified Spark-exact. **Read
       `/home/john/CodeRepos/LocalRepark/repark/task/ledgers/staging/v3-0-charter-ledger.md` and

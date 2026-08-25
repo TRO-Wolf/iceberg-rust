@@ -322,10 +322,11 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   **V3 row lineage materializes at scan (row R166, 2026-08-24/25):** `_row_id` and
   `_last_updated_sequence_number` resolve stored-value-else-fallback per row, in the SHARED
   `RecordBatchTransformer` rather than per format, so Parquet and Avro get one rule. `_row_id`
-  inherits `_pos`'s whole-file in-order decode requirement and its split suppression. Three named residues remain. A citation-and-pin unit can close only one of them — the missing interop
-  leg. The ORC stored-column arm has no oracle, because Java's ORC reader sits outside
-  `iceberg-core`, so it flips under the legend's named-unproven-slice allowance rather than by
-  test.
+  inherits `_pos`'s whole-file in-order decode requirement and its split suppression. The interop leg landed
+  2026-08-25, in both directions plus an assignment cross-check, so the row is closed. Two residues
+  stay open and named on it: the ORC stored-column arm has no oracle, because Java's ORC reader
+  sits outside `iceberg-core`, and the ranged-split refusal is still reachable through the public
+  `PartitionWork` seam.
   Remaining: CDC-merge (row-level) + strict-evaluator completion (per-row status: GAP_MATRIX).
   *(Corrected 2026-07-01: the stale "split planning (row 146)" entry removed — it landed ✅
   2026-06-17, as headline item 4 below already records.)*
@@ -347,7 +348,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   | Column default values | R92 | `write_default` is set but consumed nowhere under `writer/` |
   | `timestamp_ns` / `timestamptz_ns` | R90 | nothing on the type itself |
   | `unknown` | R91 | data-file always-null I/O, deferred-loud |
-  | Row lineage | R166 | no interop leg; ORC stored arm has no oracle; ranged-split refusal via `PartitionWork` |
+  | Row lineage | R166 | ORC stored arm has no oracle; ranged-split refusal via `PartitionWork` |
   | `variant` | R88 | shredded-parquet I/O — outside the parity envelope, see below |
   | `timestamptz` metadata projection / Arrow tz annotation | R162, R163 | named residues on each row |
   | `geometry` / `geography` + geospatial predicates | R89 | no type entry, no predicates, no format gate — see the row |
