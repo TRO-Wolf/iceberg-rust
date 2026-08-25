@@ -75,7 +75,20 @@ Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next
         the `DataFile` carrying the stamp. Any ruling that makes the arm an error MUST migrate that
         call site in the same change. Options: make the arm an error, or require an explicit
         `unpartitioned()` opt-in. Needs an owner ruling — it is a BREAKING change to a public
-        writer's default construction, with one in-tree migration, not zero.
+        writer's default construction, with one in-tree migration plus one public pass-through to
+        audit: `writer/partitioning/unpartitioned_writer.rs` calls `build(None)` UNCONDITIONALLY, so
+        whether the arm fires is decided by its caller. Both in-tree `TaskWriter` constructions
+        chain `with_partition_spec`, so nothing fires today — but the arm sits behind a public API,
+        and an external consumer reaches it without ever writing `build(None)`.
+        **Recommendation: the opt-in, not the error.** Making the arm an error breaks
+        `DataFileWriterBuilder`'s default construction and makes the LEGITIMATE case inexpressible —
+        an unpartitioned table under spec 0 genuinely wants spec 0. An explicit `unpartitioned()`
+        keeps that case expressible and turns every silent path into a compile error at the call
+        site rather than a runtime error in a consumer's job.
+        **File a RED-first test with it:** drive a PARTITION-scoped position delete through the
+        `(None, None)` arm and assert the deletes are lost. R113's `spec_stamp_e2e_test` pins the
+        CONSEQUENCE of a wrong spec; nothing pins this arm as a SOURCE of one, so without that test
+        the fix can regress silently.
 
 ---
 
