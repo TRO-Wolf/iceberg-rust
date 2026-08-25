@@ -408,7 +408,8 @@ pub struct FileScanTask {
     /// this file owns, inherited at manifest read (Java `ManifestReader.idAssigner`).
     ///
     /// **Flagged additive field.** `None` for V1/V2 tables and for any V3 file whose manifest
-    /// carries no assigned range. Projecting `_row_id` on such a task is an error, never a guess:
+    /// carries no assigned range. Projecting `_row_id` on such a task yields an ALL-NULL column
+    /// — Java's answer (`ValueReaders.rowIds(null, …)` is a null constant) — never a guess:
     /// defaulting to zero would mint row ids that collide with another file's.
     ///
     /// Unlike `split_offsets` this SURVIVES a split — a sub-task still belongs to the same file

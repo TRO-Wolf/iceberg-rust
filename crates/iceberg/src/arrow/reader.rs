@@ -394,22 +394,53 @@ impl ArrowReader {
     /// [`Type::Variant`].
     fn reject_variant_projection(task: &FileScanTask) -> Result<()> {
         for &field_id in task.project_field_ids() {
-            if let Some(field) = task.schema.field_by_id(field_id)
-                && matches!(field.field_type.as_ref(), Type::Variant)
-            {
+            let Some(field) = task.schema.field_by_id(field_id) else {
+                continue;
+            };
+            if let Some(path) = Self::variant_within(&field.name, field.field_type.as_ref()) {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
                     format!(
-                        "Scanning the variant column '{}' (field id {field_id}) is not supported \
-                         yet: file-level variant I/O is unimplemented (GAP_MATRIX row R88). The \
-                         Iceberg→Arrow conversion of `variant` now succeeds, so this is a \
-                         deliberate reader-side bound, not a schema failure.",
-                        field.name
+                        "Scanning the variant column '{path}' (under projected field id \
+                         {field_id}) is not supported yet: file-level variant I/O is \
+                         unimplemented (GAP_MATRIX row R88). The Iceberg→Arrow conversion of \
+                         `variant` now succeeds, so this is a deliberate reader-side bound, not a \
+                         schema failure."
                     ),
                 ));
             }
         }
         Ok(())
+    }
+
+    /// The dotted path to the first `variant` at or beneath `ty`, or `None`.
+    ///
+    /// The projection names a TOP-LEVEL field id, but a variant can sit anywhere beneath it — in
+    /// a struct field, a list element, or a map value. Checking only the projected field's own
+    /// type lets `struct<v: variant>` through, and the reader then hands back a column it has
+    /// just declared it cannot decode. The three descent sites mirror exactly the ones the
+    /// `variant_field` hook covers in `arrow::schema`.
+    ///
+    /// A map KEY cannot be a variant (Iceberg map keys are primitives), so it is not descended.
+    fn variant_within(name: &str, ty: &Type) -> Option<String> {
+        match ty {
+            Type::Variant => Some(name.to_string()),
+            Type::Struct(struct_type) => struct_type.fields().iter().find_map(|nested| {
+                Self::variant_within(
+                    &format!("{name}.{}", nested.name),
+                    nested.field_type.as_ref(),
+                )
+            }),
+            Type::List(list) => Self::variant_within(
+                &format!("{name}.element"),
+                list.element_field.field_type.as_ref(),
+            ),
+            Type::Map(map) => Self::variant_within(
+                &format!("{name}.value"),
+                map.value_field.field_type.as_ref(),
+            ),
+            Type::Primitive(_) => None,
+        }
     }
 
     async fn process_parquet_file_scan_task(
@@ -5550,6 +5581,86 @@ message schema {
         );
     }
 
+    /// A variant NESTED inside a struct, a list element or a map value must be refused too
+    /// (round-4 Critic S2-1). The projection names a top-level field id, so a guard that checks
+    /// only that field's own type lets `struct<v: variant>` straight through and the reader hands
+    /// back a column it has just said it cannot decode. Each of the three descent sites is a
+    /// separate cell — pinning one leaves the others open, which is how the top-level-only
+    /// version passed review.
+    #[tokio::test]
+    async fn scanning_a_variant_nested_in_any_container_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("nested.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_id_parquet_for_pos(&data_path, &[1, 2], 1000);
+
+        let cases: Vec<(&str, Type, &str)> = vec![
+            (
+                "struct",
+                Type::Struct(crate::spec::StructType::new(vec![
+                    NestedField::optional(3, "v", Type::Variant).into(),
+                ])),
+                "s.v",
+            ),
+            (
+                "list",
+                Type::List(crate::spec::ListType {
+                    element_field: NestedField::list_element(3, Type::Variant, true).into(),
+                }),
+                "s.element",
+            ),
+            (
+                "map value",
+                Type::Map(crate::spec::MapType {
+                    key_field: NestedField::map_key_element(
+                        3,
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    value_field: NestedField::map_value_element(4, Type::Variant, true).into(),
+                }),
+                "s.value",
+            ),
+        ];
+
+        for (label, container, expected_path) in cases {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_schema_id(1)
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(2, "s", container).into(),
+                    ])
+                    .build()
+                    .expect("schema"),
+            );
+            let mut task = pos_scan_task(&data_path, schema, vec![], None);
+            task.project_field_ids = Arc::from(vec![1, 2]);
+
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let err = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                ErrorKind::FeatureUnsupported,
+                "a variant nested in a {label} must be REFUSED, and with the typed refusal — not \
+                 an opaque decode failure later on"
+            );
+            assert!(
+                err.to_string().contains(expected_path),
+                "the error must name the PATH to the variant ({expected_path}) so the caller can \
+                 find it in a wide schema, got: {err}"
+            );
+        }
+    }
+
     /// Control: a table that HAS a variant column can still be scanned when that column is not
     /// projected. The refusal is scoped to the projection, not to the table — otherwise adding a
     /// variant column would make an entire table unreadable.
@@ -9149,7 +9260,7 @@ mod avro_scan_tests {
     /// row-lineage pair from the projection strip on ONE line, on the Parquet path only;
     /// `build_expected_schema` — the sole schema the Avro and ORC readers see — still excluded
     /// them, so those two formats kept silently discarding a stored `_row_id` and reporting a
-    /// computed one. Java's oracle for this rule (`avro/ValueReaders$RowIdReader`, offsets 34-39)
+    /// computed one. Java's oracle for this rule (`avro/ValueReaders$RowIdReader`)
     /// is the AVRO path, which makes Avro the arm least excusable to leave broken.
     #[tokio::test]
     async fn stored_row_id_in_an_avro_file_survives_the_real_reader() {

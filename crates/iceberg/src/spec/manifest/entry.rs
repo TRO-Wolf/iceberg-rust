@@ -753,8 +753,8 @@ mod first_row_id_tests {
         entries.iter().map(|e| e.data_file.first_row_id).collect()
     }
 
-    // The closed domain of `assign_first_row_ids`, from the 1.10.0 bytecode of
-    // `ManifestReader.idAssigner` / `ManifestReader$1`:
+    // The closed domain of `assign_first_row_ids`, from `ManifestReader.idAssigner` /
+    // `ManifestReader$1` (decoded bytecode: `task/f13-v3-row-lineage-ledger.md`):
     //
     // | Manifest `first_row_id` | Entry state | Java behaviour |
     // |---|---|---|

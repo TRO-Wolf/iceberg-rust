@@ -2643,7 +2643,7 @@ mod test {
     }
 
     /// Java returns an ALL-NULL column here, NOT an error: `ValueReaders.rowIds(null, reader)`
-    /// is `constant(null)` (1.10.0 bytecode, `ifnull` at offset 1 branching to `constant` at 15).
+    /// is a null constant (see `task/f13-v3-row-lineage-ledger.md`).
     /// A V1/V2 file simply has no row identity — that is a fact about the rows, not a failure to
     /// read them, and erroring would make `SELECT _row_id` unusable on any mixed-version table.
     ///
@@ -2706,7 +2706,7 @@ mod test {
 
     /// Java gates `_last_updated_sequence_number` on BOTH inputs:
     /// `ValueReaders.lastUpdated(Long rowIdConst, Long fileSeq, reader)` returns `constant(null)`
-    /// if EITHER is null (1.10.0 bytecode: `ifnull 21` at offsets 1 and 5). So a V1/V2 file —
+    /// if EITHER is null. So a V1/V2 file —
     /// which HAS a sequence number but no `first_row_id` — reports NULL, not its sequence number.
     ///
     /// This is the cell that matters most in practice: gating on the sequence number alone

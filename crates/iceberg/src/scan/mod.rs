@@ -993,7 +993,10 @@ impl TableScan {
         // — and because it reads the SCAN's projection, which is the authority here even if a
         // task's own `project_field_ids` were ever to drift from it.
         // `_row_id` suppresses splitting exactly as `_pos` does — both need whole-file physical
-        // ordinals (see `FileScanTask::split` branch 1c).
+        // ordinals. This is a DEFENSIVE RESTATEMENT, not the load-bearing guard: `split` branch
+        // 1c already returns the whole-file task for either projection, so removing this leaves
+        // the suite green. It is kept so the intent is visible where the split is requested, the
+        // same pattern this file uses for its other conjuncts.
         let projects_pos = {
             use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
             self.plan_context
@@ -1074,7 +1077,8 @@ impl TableScan {
                 .plan_context
                 .as_ref()
                 .map(|ctx| {
-                    // `_row_id` needs whole-file ordinals like `_pos` — see `split` branch 1c.
+                    // `_row_id` needs whole-file ordinals like `_pos`. Defensive restatement of
+                    // `split` branch 1c, as above — removing it leaves the suite green.
                     ctx.field_ids.contains(&RESERVED_FIELD_ID_POS)
                         || ctx.field_ids.contains(&RESERVED_FIELD_ID_ROW_ID)
                 })

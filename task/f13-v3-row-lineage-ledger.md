@@ -25,8 +25,10 @@ table: doc comments name the mirrored Java method and the caller-visible diverge
 
 Oracle: `javap -p -c -constants -cp
 /home/john/.m2/repository/org/apache/iceberg/iceberg-core/1.10.0/iceberg-core-1.10.0.jar <class>`
-(api jar alongside). Every offset below was decoded from those pinned jars and independently
-re-derived by two Critics.
+(api jar alongside). Offsets are BYTECODE offsets from that disassembly — never Java source line
+numbers. (The first version of this file confused the two for `fileFieldReader`; a round-4 Critic
+caught it. An offset here must be checkable by running the command above and reading the left-hand
+column.)
 
 ---
 
@@ -67,7 +69,7 @@ live rows. The `i64` door is the reachable one (`i64::MAX` < `u64::MAX`).
 | `ValueReaders$LastUpdatedSeqReader.read` | stored value returned at 15-20; else `fileSeqNumber` at 21-28 | `_last_updated_sequence_number` = stored value, else the file's sequence number |
 | `ValueReaders.rowIds(Long, reader)` | `ifnull` at 1 → `constant(null)` at 14-18 | absent `first_row_id` ⇒ an ALL-NULL column, not an error |
 | `ValueReaders.lastUpdated(Long rowIdConst, Long fileSeq, reader)` | `ifnull 21` at BOTH offsets 1 and 5; `constant(null)` at 21-25 | null if EITHER input is null — a V1/V2 file reports NULL, not its sequence number |
-| `ValueReaders.fileFieldReader` | special-cases a PRESENT file field whose id is `ROW_ID` (317, 340) or `LAST_UPDATED_SEQUENCE_NUMBER` (334) | dispatch on whether the FILE carries the column |
+| `ValueReaders.fileFieldReader` | `ROW_ID` compare at 0-13 then `rowIds` at 32; `LAST_UPDATED_SEQUENCE_NUMBER` compare at 39-52 then `lastUpdated` at 93 | special-cases a PRESENT file field with either reserved id; dispatch on whether the FILE carries the column |
 | `MetadataColumns.<clinit>` | `NestedField.optional` at 144 (`_row_id`, id 2147483540) and 159 (`_last_updated_sequence_number`, id 2147483539) | both reserved fields are **optional** |
 
 The fork implements these once, in the shared `RecordBatchTransformer`, rather than per format.
@@ -108,3 +110,13 @@ hand it back verbatim — nulls included — which is precisely what the fallbac
 bare `throw new UnsupportedOperationException("Unsupported type: variant")`, offsets 0-9 (`athrow`
 at 9). The fork's canonical-extension-type emission is therefore a deliberate EXTENSION beyond
 Java, recorded on R88.
+
+## F-13 U3b — `DeleteWriteResult` (→ `DVWriteResult::referenced_data_files`)
+
+| Java | Bytecode | Rule |
+|---|---|---|
+| `BaseDVFileWriter.close` | `write(PuffinWriter, Deletes)` at 199, then `CharSequenceSet.add(deletes.path())` at 205, once per iterated `Deletes` | the referenced set has exactly one entry per written blob, so it is DERIVABLE from `delete_files` |
+| `BaseDVFileWriter.close` empty arm | `CharSequenceSet.empty()` built at 11; `deletesByPath.isEmpty()` early return at 19-45 | no deletes ⇒ empty set, `referencesDataFiles()` false |
+| `DeleteWriteResult.referencesDataFiles` | `!= null && !isEmpty()` | non-empty test |
+| `FileMetadata$Builder.build` | "Referenced data file is required for DV" at 158 | a Puffin file without `referenced_data_file` is rejected, so the derivation's `filter_map` is total |
+

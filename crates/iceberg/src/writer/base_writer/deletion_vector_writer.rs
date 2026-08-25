@@ -176,12 +176,12 @@ impl DVWriteResult {
     ///
     /// DERIVED from [`delete_files`](Self::delete_files) rather than stored, and exactly equal to
     /// what Java accumulates: `BaseDVFileWriter.close` adds `deletes.path()` to the set once per
-    /// entry of `deletesByPath` it writes a blob for (1.10.0 bytecode, `close()` offset 205,
-    /// immediately after the `write(PuffinWriter, Deletes)` call at 199), and this writer emits
-    /// exactly one `DataFile` per such entry carrying that same path in `referenced_data_file`.
+    /// entry of `deletesByPath` it writes a blob for, and this writer emits exactly one
+    /// `DataFile` per such entry carrying that same path in `referenced_data_file`. Decoded
+    /// bytecode: `task/f13-v3-row-lineage-ledger.md`.
     ///
     /// A DV without a `referenced_data_file` cannot occur — [`DataFileBuilder::build`] rejects a
-    /// Puffin file with the field unset (Java `FileMetadata$Builder.build` offset 158) — so no
+    /// Puffin file with the field unset (Java `FileMetadata$Builder.build`) — so no
     /// entry is silently dropped here; the `filter_map` is a total projection, not a filter.
     ///
     /// [`DataFileBuilder::build`]: crate::spec::DataFileBuilder::build
@@ -1479,7 +1479,7 @@ mod tests {
     // `rewritten_delete_files` survives every single-member fixture.
 
     /// MANY DVs: the derived set is exactly the referenced data files, one per written blob —
-    /// Java `BaseDVFileWriter.close` adds `deletes.path()` once per written entry (offset 205).
+    /// Java `BaseDVFileWriter.close` adds `deletes.path()` once per written entry.
     #[tokio::test]
     async fn dv_result_referenced_data_files_names_every_referenced_file() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -1507,9 +1507,8 @@ mod tests {
     }
 
     /// ZERO DVs: with nothing recorded, Java's `close` early-returns a result carrying
-    /// `CharSequenceSet.empty()` — the set is built at offset 11 and the
-    /// `deletesByPath.isEmpty()` early return runs at offsets 19-45 — and `referencesDataFiles()`
-    /// is then false.
+    /// `CharSequenceSet.empty()` from its `deletesByPath.isEmpty()` early return, and
+    /// `referencesDataFiles()` is then false.
     #[tokio::test]
     async fn dv_result_with_no_deletes_references_nothing() {
         let temp_dir = TempDir::new().expect("temp dir");
