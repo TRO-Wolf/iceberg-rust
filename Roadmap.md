@@ -322,8 +322,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   **V3 row lineage materializes at scan (row R166, 2026-08-24/25):** `_row_id` and
   `_last_updated_sequence_number` resolve stored-value-else-fallback per row, in the SHARED
   `RecordBatchTransformer` rather than per format, so Parquet and Avro get one rule. `_row_id`
-  inherits `_pos`'s whole-file in-order decode requirement and its split suppression. Held at 🟡 by
-  three named residues. A citation-and-pin unit can close only one of them — the missing interop
+  inherits `_pos`'s whole-file in-order decode requirement and its split suppression. Three named residues remain. A citation-and-pin unit can close only one of them — the missing interop
   leg. The ORC stored-column arm has no oracle, because Java's ORC reader sits outside
   `iceberg-core`, so it flips under the legend's named-unproven-slice allowance rather than by
   test.
@@ -344,18 +343,18 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 
   | V3 axis | Row | What is left |
   |---|---|---|
-  | Deletion vectors (write, read, commit door, engine MOR) | R114 | nothing — F-13 closed 2026-08-24 |
+  | Deletion vectors (write, read, commit door, engine MOR) | R114 | F-13 closed 2026-08-24; three engine-facing bounds on the row |
   | Column default values | R92 | `write_default` is set but consumed nowhere under `writer/` |
   | `timestamp_ns` / `timestamptz_ns` | R90 | nothing on the type itself |
   | `unknown` | R91 | data-file always-null I/O, deferred-loud |
   | Row lineage | R166 | no interop leg; ORC stored arm has no oracle; ranged-split refusal via `PartitionWork` |
   | `variant` | R88 | shredded-parquet I/O — outside the parity envelope, see below |
   | `timestamptz` metadata projection / Arrow tz annotation | R162, R163 | named residues on each row |
-  | `geometry` / `geography` + geospatial predicates | R89 | everything — nothing exists |
+  | `geometry` / `geography` + geospatial predicates | R89 | no type entry, no predicates, no format gate — see the row |
 
   Read that as: the V3 type front is **partly landed under existing row ids**, not unstarted. Of the
-  eight axes, two carry no remaining work (R114, R90), five carry named residue, and one is a dated
-  DECLARED "not yet" (R89). ORC and Avro **data** file read/write is NOT a V3 axis — it is format
+  eight axes, one is a dated DECLARED "not yet" (R89) and the other seven each point at their row
+  for what is left. ORC and Avro **data** file read/write is NOT a V3 axis — it is format
   breadth, tracked separately in this phase's deliverables.
 
   Shredded-parquet variant I/O sits behind parquet's opt-in `variant_experimental` feature, and it
