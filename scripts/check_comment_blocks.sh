@@ -44,6 +44,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+err_file="$(mktemp)"
+trap 'rm -f "$err_file"' EXIT
 MAX_LINES="${MAX_LINES:-6}"
 BASE_REF="${BASE_REF:-origin/main}"
 diff_pathspec='crates/*.rs'
@@ -68,7 +70,7 @@ detect() {
         sub(/^\/\/[\/!]?[ \t]*/, "", text)
         if (text != "" && text !~ /^# (Errors|Panics|Notes|Examples|Safety)$/) n++
         if (body ~ /\|/ || body ~ /====/ || body ~ /----/) exempt = 1
-      if (body ~ /Licensed to the Apache Software Foundation/) exempt = 1
+      if (n == 1 && body ~ /Licensed to the Apache Software Foundation/) exempt = 1
         next
       }
       flush(); next
@@ -146,11 +148,24 @@ tracked_hits="$(git diff -U0 "$merge_base" -- "$diff_pathspec" | detect || true)
 
 # Untracked candidates: /dev/null as the left side renders every line as added.
 untracked_hits=""
-while IFS= read -r candidate; do
+while IFS= read -r -d '' candidate; do
   [ -n "$candidate" ] || continue
-  found="$(git diff --no-index -U0 /dev/null "$candidate" 2>/dev/null | detect || true)"
-  [ -n "$found" ] && untracked_hits="${untracked_hits}${found}"$'\n'
-done < <(git ls-files --others --exclude-standard -- "$diff_pathspec")
+  # `|| rc=$?` keeps this set -e safe: --no-index exits 1 for "differs", which is the NORMAL
+  # case here and would otherwise abort the script before rc is ever read.
+  rc=0
+  raw="$(git diff --no-index -U0 /dev/null "$candidate" 2>"$err_file")" || rc=$?
+  # --no-index exits 0 (identical) or 1 (differs); anything else means it could not read the file,
+  # and a scan that cannot see a candidate must not report OK.
+  if [ "$rc" -gt 1 ]; then
+    echo "ERROR: could not diff untracked candidate '$candidate' (exit $rc):" >&2
+    cat "$err_file" >&2
+    exit 1
+  fi
+  found="$(printf '%s' "$raw" | detect || true)"
+  if [ -n "$found" ]; then
+    untracked_hits="${untracked_hits}${found}"$'\n'
+  fi
+done < <(git ls-files -z --others --exclude-standard -- "$diff_pathspec")
 
 hits="$(printf '%s\n%s' "$tracked_hits" "$untracked_hits" | sed '/^$/d')"
 

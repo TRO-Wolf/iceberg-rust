@@ -442,14 +442,14 @@ async fn java_materializes_rust_row_ids() {
         eprintln!("{D2_ENV} unset — skipping");
         return;
     };
+    // Once the env var is set the fixture MUST exist: a missing artifact is a failure, not a skip.
     let java_path = dir.join("java_row_ids_of_rust_table.json");
-    let Ok(java_rows) = fs::read_to_string(&java_path) else {
-        eprintln!(
-            "{} absent — run the oracle's verify first",
+    let java_rows = fs::read_to_string(&java_path).unwrap_or_else(|error| {
+        panic!(
+            "read {} ({error}) — run the oracle's verify first",
             java_path.display()
-        );
-        return;
-    };
+        )
+    });
     let table = load_table(
         &dir.join("rust_table/metadata/final.metadata.json"),
         "rust_row_lineage",
