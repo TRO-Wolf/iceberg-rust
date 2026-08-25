@@ -26066,6 +26066,33 @@ public final class InteropOracle {
       return sb.toString();
     }
 
+    /**
+     * Per-row materialized lineage from a REAL scan, sorted by id. This is the half the manifest
+     * view cannot reach: `first_row_id` inheritance is metadata, but `_row_id` is resolved PER ROW
+     * by the reader (Java `ValueReaders$RowIdReader`: the stored value, else firstRowId + pos).
+     */
+    private static String rowIdsJson(BaseTable table) throws IOException {
+      Schema lineage = MetadataColumns.schemaWithRowLineage(table.schema());
+      List<String> rows = new ArrayList<>();
+      try (CloseableIterable<Record> records =
+          IcebergGenerics.read(table).project(lineage).build()) {
+        for (Record record : records) {
+          Object rowId = record.getField("_row_id");
+          Object seq = record.getField("_last_updated_sequence_number");
+          rows.add(
+              "{\"id\":"
+                  + record.getField("id")
+                  + ",\"row_id\":"
+                  + (rowId == null ? "null" : rowId)
+                  + ",\"last_updated_seq\":"
+                  + (seq == null ? "null" : seq)
+                  + "}");
+        }
+      }
+      Collections.sort(rows);
+      return "[" + String.join(",", rows) + "]";
+    }
+
     static void generate(Path dir) throws IOException {
       Files.createDirectories(dir);
       File tableDir = new File(dir.toFile(), "table");
@@ -26131,6 +26158,7 @@ public final class InteropOracle {
       TableMetadataParser.write(ops.current(), finalOut);
 
       writeJson(dir.resolve("java_row_lineage.json"), lineageJson(table));
+      writeJson(dir.resolve("java_row_ids.json"), rowIdsJson(table));
       System.out.println("generate-interop-row-lineage: wrote " + dir);
     }
 
@@ -26172,6 +26200,11 @@ public final class InteropOracle {
           failures++;
         }
       }
+
+      // MATERIALIZATION: Java's per-row read of the RUST table. The Rust side diffs its own scan
+      // against this, which is what pins `_row_id` VALUES rather than only the manifest metadata.
+      String javaRows = rowIdsJson(table);
+      writeJson(dir.resolve("java_row_ids_of_rust_table.json"), javaRows);
 
       // The headline assertion of residue (3): every data file Rust assigned carries an id Java
       // resolves, and no file comes back with a null id on a V3 table.

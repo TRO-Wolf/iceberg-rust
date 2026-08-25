@@ -15,36 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! V3 ROW LINEAGE interop (GAP_MATRIX row R166) — the leg the row names as its ✅-gating residue:
-//! "no interop leg yet proves Java reads fork-assigned row ids".
-//!
-//! ONE canonical view, compared in both directions. Both sides render the same string — format
-//! version, the metadata row-id counter, the current snapshot's range, each DATA manifest's
-//! assigned range, and every data file's INHERITED `first_row_id` — so a disagreement is a diff of
-//! one artifact rather than two ad-hoc reads.
-//!
-//! D1 "Rust reads what JAVA writes": the oracle's `generate-interop-row-lineage` builds a V3 table
-//! over TWO snapshots, so the counter must advance both WITHIN a manifest (files a=0 then b=5, by
-//! a's record count) and ACROSS snapshots (manifest 2 starts at 8). Java emits the view its own
-//! `ManifestReader.idAssigner` resolved; this test builds the same view through
-//! `ManifestFile::load_manifest` — the fork's `assign_first_row_ids` seam — and asserts equality.
-//!
-//! D2 "JAVA reads what RUST writes" lives in `row_lineage_write_gen`, which commits an equivalent
-//! V3 table and emits the Rust view for the oracle's `verify-interop-row-lineage` to diff.
-//!
-//! THE ENV GATE. Both tests are gated on their env var (empty treated as unset) and are a clean
-//! runtime NO-OP when it is absent, so the offline `cargo test` gate stays green with no
-//! Java/Maven. `dev/java-interop/run-interop-row-lineage.sh` runs the real comparison.
+//! V3 row-lineage interop for GAP_MATRIX row R166: `first_row_id` assignment and inheritance,
+//! compared with Java in both directions over one canonical view. D2 renders a single table
+//! twice, so only the cross-check against Java's INDEPENDENT assignment can fail on a
+//! wrong-but-consistent writer. Fixture, mutations and what stays unpinned:
+//! `dev/java-interop/run-interop-row-lineage.sh`. Each test no-ops with its env var unset.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int64Type;
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::{FileIO, LocalFsStorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+use iceberg::metadata_columns::{
+    RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
+};
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestStatus, NestedField,
     PrimitiveType, Schema, SortOrder, TableMetadata, Type,
@@ -114,7 +104,7 @@ pub async fn lineage_view(table: &Table) -> String {
         manifests.push(format!(
             "{{\"first_row_id\":{},\"added_files\":{}}}",
             opt(manifest_file.first_row_id),
-            manifest_file.added_files_count.unwrap_or_default()
+            opt(manifest_file.added_files_count.map(u64::from))
         ));
         let manifest = manifest_file
             .load_manifest(file_io)
@@ -142,6 +132,8 @@ pub async fn lineage_view(table: &Table) -> String {
             ));
         }
     }
+    // Java sorts the same rendered strings with `Collections.sort`. UTF-16 code-unit order and
+    // UTF-8 byte order agree on ASCII, which is all these strings carry.
     manifests.sort();
     files.sort();
 
@@ -356,6 +348,9 @@ async fn rust_assigns_the_same_row_ids_java_does() {
     let java = fs::read_to_string(d1.join("java_row_lineage.json")).expect("read the Java view");
     let rust =
         fs::read_to_string(d2.join("rust_row_lineage_expected.json")).expect("read the Rust view");
+    // Strip BEFORE any ordering matters: the lists arrive sorted by the file name, which this
+    // erases, so comparing them as-is would rest on the fork's uuid names happening to sort in
+    // creation order.
     let java_numbers = strip_names(java.trim());
     let rust_numbers = strip_names(rust.trim());
 
@@ -363,5 +358,108 @@ async fn rust_assigns_the_same_row_ids_java_does() {
         rust_numbers, java_numbers,
         "the fork ASSIGNED different row ids than Java did for the same logical chain.\n \
          rust: {rust_numbers}\n java: {java_numbers}"
+    );
+}
+
+// ---- MATERIALIZATION: the per-row half of R166 ------------------------------------------------
+
+/// Per-row `(id, _row_id, _last_updated_sequence_number)` from a REAL scan, rendered like the
+/// oracle's `rowIdsJson` and sorted the same way.
+///
+/// The manifest view cannot reach this: inheritance is metadata, but `_row_id` is resolved PER ROW
+/// by the reader — the stored value, else `first_row_id + pos`.
+async fn row_ids_view(table: &Table) -> String {
+    use futures::TryStreamExt;
+
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .select([
+            "id",
+            RESERVED_COL_NAME_ROW_ID,
+            RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+        ])
+        .build()
+        .expect("build the row-lineage scan")
+        .to_arrow()
+        .await
+        .expect("scan to arrow")
+        .try_collect()
+        .await
+        .expect("collect batches");
+
+    let mut rows: Vec<String> = Vec::new();
+    for batch in &batches {
+        let ids = batch.column(0).as_primitive::<Int64Type>();
+        let row_ids = batch.column(1).as_primitive::<Int64Type>();
+        let seqs = batch.column(2).as_primitive::<Int64Type>();
+        for row in 0..batch.num_rows() {
+            let render = |array: &arrow_array::PrimitiveArray<Int64Type>| {
+                if array.is_null(row) {
+                    "null".to_string()
+                } else {
+                    array.value(row).to_string()
+                }
+            };
+            rows.push(format!(
+                "{{\"id\":{},\"row_id\":{},\"last_updated_seq\":{}}}",
+                ids.value(row),
+                render(row_ids),
+                render(seqs)
+            ));
+        }
+    }
+    rows.sort();
+    format!("[{}]", rows.join(","))
+}
+
+/// D1 materialization — the fork's per-row `_row_id` over a JAVA-written table must equal Java's.
+#[tokio::test]
+async fn rust_materializes_java_row_ids() {
+    let Some(dir) = fixture_dir(D1_ENV) else {
+        eprintln!("{D1_ENV} unset — skipping");
+        return;
+    };
+    let table = load_table(
+        &dir.join("table/metadata/final.metadata.json"),
+        "row_lineage",
+    );
+    let rust_rows = row_ids_view(&table).await;
+    let java_rows = fs::read_to_string(dir.join("java_row_ids.json"))
+        .expect("read java_row_ids.json")
+        .trim()
+        .to_string();
+    assert_eq!(
+        rust_rows, java_rows,
+        "the fork's per-row _row_id over a JAVA table differs from Java's own read.\n \
+         rust: {rust_rows}\n java: {java_rows}"
+    );
+}
+
+/// D2 materialization — Java's per-row read of the RUST table must equal the fork's own.
+#[tokio::test]
+async fn java_materializes_rust_row_ids() {
+    let Some(dir) = fixture_dir(D2_ENV) else {
+        eprintln!("{D2_ENV} unset — skipping");
+        return;
+    };
+    let java_path = dir.join("java_row_ids_of_rust_table.json");
+    let Ok(java_rows) = fs::read_to_string(&java_path) else {
+        eprintln!(
+            "{} absent — run the oracle's verify first",
+            java_path.display()
+        );
+        return;
+    };
+    let table = load_table(
+        &dir.join("rust_table/metadata/final.metadata.json"),
+        "rust_row_lineage",
+    );
+    let rust_rows = row_ids_view(&table).await;
+    assert_eq!(
+        rust_rows,
+        java_rows.trim(),
+        "Java's per-row read of the RUST-written table differs from the fork's own.\n \
+         rust: {rust_rows}\n java: {}",
+        java_rows.trim()
     );
 }
