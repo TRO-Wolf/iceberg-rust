@@ -1105,16 +1105,17 @@ remembering to write it.
   prompt carried a one-line resolver and the Actor's did not, which is why the two roles had
   different reach into the same contract.
 - **DO make the delegated agent confirm the read, not merely be bound to it.** AGENTS.md and the
-  binding manifest both bind every Actor to `rust-code-quality`; nothing required the Actor to say it
-  had read anything, so a dangling pointer produced silence instead of a signal. D1/D2 halt on an
+  binding manifest both bind every Actor to `rust-code-quality`; nothing required the Actor to say
+  it had read anything, so a dangling pointer produced silence instead of a signal. D1/D2 halt on an
   unverified precondition only if the agent reaches the missing document — a reference that never
   resolves to a path is never reached. Two PRs shipped across the break with no escalation.
-- **DO NOT forward a review's finding ids into the Actor's brief.** `04-actor.md`'s blindness design note forbids
-  telling the Actor it will be reviewed, and predicts the exact failure: "writing to the test —
-  shaping the code to anticipate and pre-empt the reviewer." 48 lines across 15 `crates/` files carried
-  `Critic-octo C1-Q-004`-style identifiers into production comments. The over-long doc blocks that
-  followed were an audit trail addressed to the reviewer, not documentation for the next maintainer.
-  Restate defects as plain requirements; the review's own record belongs in the unit ledger.
+- **DO NOT forward a review's finding ids into the Actor's brief.** `04-actor.md`'s blindness design
+  note forbids telling the Actor it will be reviewed, and predicts the exact failure: "writing to
+  the test — shaping the code to anticipate and pre-empt the reviewer." 48 lines across 15 `crates/`
+  files carried `Critic-octo C1-Q-004`-style identifiers into production comments. The over-long doc
+  blocks that followed were an audit trail addressed to the reviewer, not documentation for the next
+  maintainer. Restate defects as plain requirements; the review's own record belongs in the unit
+  ledger.
 - **DO arm a rule mechanically instead of writing it a second time.** #218 made comment discipline a
   contract on 2026-08-24; the three PRs after it all violated it, because a contract's only enforcer
   was intention that resets each session. The fix that has worked here before is a gate:
@@ -1125,11 +1126,15 @@ remembering to write it.
   `Critic` is residue in `crates/` and correct usage in `task/`, `docs/` and the SEPMO tree, so the
   scan is pathspec-scoped rather than tree-wide. Word-bounding, not case-sensitivity, is what keeps
   "Critical" and "Critically" out: case-sensitivity buys nothing there and missed nine lowercase
-  `critic-octo` lines, so the needles are case-INSENSITIVE with an anti-probe pinning the exclusion. A gate that cannot catch its own probe is vacuous —
-  and one that fires on correct text gets disabled.
+  `critic-octo` lines, so the needles are case-INSENSITIVE with an anti-probe pinning the exclusion.
+  A gate that cannot catch its own probe is vacuous — and one that fires on correct text gets
+  disabled.
 - **DO make a gate's self-test assert its WIRING, not only its detector.** An independent review
   sabotaged both new gates: every mutation inside the detector was caught, and five outside it
   survived green — repointing the scan pathspec at a directory that does not exist, blanking the
   variable that holds the scan's output, and replacing the failure assignment with a no-op so hits
   printed and the script still exited 0. Pin the pathspec and the needle-family size in the
   self-test, and decide failure by COUNTING hits rather than by a flag a mutation can neutralize.
+  Pin each grep FLAG whose loss is silent: dropping `-w` reds the tree loudly and so protects
+  itself, but dropping `-i` just re-greens the gate over lowercase residue, so a lowercase sample
+  must fail the self-test when it goes.

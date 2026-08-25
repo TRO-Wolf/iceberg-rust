@@ -43,13 +43,19 @@
 #
 # v4 (2026-08-25): a second needle family — REVIEW-PROCESS RESIDUE. Actor /
 # Critic / Falsifier identifiers and finding ids were reaching production
-# comments (32 lines across 13 files, entering with #181 and #183). AGENTS.md
+# comments (48 lines across 15 files, entering with #181 and #183). AGENTS.md
 # "Comments and prose" routes review evidence to the unit ledger in task/, so
 # this family is scoped to crates/ ONLY: task/, docs/ and the SEPMO tree are its
 # correct homes and must never trip. Matching is word-bounded (-w) and
 # case-INSENSITIVE: lowercase "critic-octo" is the same residue, and -w already
 # excludes "Critical" and "Critically" in either case. An anti-probe proves that
-# exclusion, so a future edit cannot drop -w and quietly red the whole tree.
+# exclusion.
+#
+# The self-test reaches the needles, the family size and the pathspec VARIABLE.
+# It does not reach the grep call: a pathspec or a hit count substituted in place
+# still passes. Those are single visible edits to the shipped scan. Dropping -i
+# was the one SILENT regression — it re-greens the tree over lowercase residue —
+# so a lowercase sample pins it.
 #
 # Referencing these tags IN PROSE without tripping the gate: never write a
 # needle verbatim — omit the leading '<' (as task/todo.md does), or assemble
@@ -80,6 +86,8 @@ patterns=(
 # Review-process residue. Assembled by concatenation so this script never
 # matches itself.
 C='C'
+c='c'
+residue_grep_flags='-nIEwi'
 # -w (whole word) does the bounding: git grep -E is POSIX ERE, where \b is a
 # literal 'b', not a word boundary. Each needle carries a matching SAMPLE, since
 # a probe holding the pattern itself proves nothing for a needle with metachars.
@@ -91,7 +99,7 @@ residue_patterns=(
   "SEPMO"
 )
 residue_samples=(
-  "the ${C}ritic asked for this fixture"
+  "the ${c}ritic-octo probe found it"
   "Falsifier F9 found the gap"
   "SEPMO cycle 2 remediation"
 )
@@ -165,7 +173,7 @@ self_test() {
       echo "ERROR: self-test could not stage its residue probe file" >&2
       return 1
     fi
-    if ! GIT_INDEX_FILE="$tmp_index" git grep -nIEwi -e "$p" -- "$residue_probe" >/dev/null 2>&1; then
+    if ! GIT_INDEX_FILE="$tmp_index" git grep $residue_grep_flags -e "$p" -- "$residue_probe" >/dev/null 2>&1; then
       echo "ERROR: self-test FAILED — residue needle '$p' was not detected; the gate is vacuous" >&2
       return 1
     fi
@@ -178,7 +186,7 @@ self_test() {
       return 1
     fi
     for q in "${residue_patterns[@]}"; do
-      if GIT_INDEX_FILE="$tmp_index" git grep -nIEwi -e "$q" -- "$residue_probe" >/dev/null 2>&1; then
+      if GIT_INDEX_FILE="$tmp_index" git grep $residue_grep_flags -e "$q" -- "$residue_probe" >/dev/null 2>&1; then
         echo "ERROR: self-test FAILED — needle '$q' matched legitimate text '$p'" >&2
         return 1
       fi
@@ -220,7 +228,7 @@ fi
 residue_hits=0
 for p in "${residue_patterns[@]}"; do
   rc=0
-  git grep -nIEwi -e "$p" -- "$residue_pathspec" >"$hits_file" 2>"$err_file" || rc=$?
+  git grep $residue_grep_flags -e "$p" -- "$residue_pathspec" >"$hits_file" 2>"$err_file" || rc=$?
   if [ "$rc" -eq 0 ]; then
     echo "ERROR: review-process residue '$p' found in $residue_pathspec:" >&2
     cat "$hits_file" >&2
