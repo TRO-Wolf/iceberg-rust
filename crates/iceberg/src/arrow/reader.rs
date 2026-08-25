@@ -423,9 +423,9 @@ impl ArrowReader {
     /// The dotted path to the first `variant` at or beneath `ty`, or `None`.
     ///
     /// The projection names a TOP-LEVEL field id, but a variant can sit anywhere beneath it — in
-    /// a struct field, a list element, or a map value. Checking only the projected field's own
-    /// type lets `struct<v: variant>` through, and the reader then hands back a column it has
-    /// just declared it cannot decode. The three descent sites mirror exactly the ones the
+    /// a struct field, a list element, a map KEY or a map value. Checking only the projected
+    /// field's own type lets `struct<v: variant>` through, and the reader then hands back a column
+    /// it has just declared it cannot decode. All four descent positions mirror the ones the
     /// `variant_field` hook covers in `arrow::schema`.
     ///
     /// Map KEYS are descended too. An earlier version skipped them on the stated grounds that
@@ -436,11 +436,13 @@ impl ArrowReader {
     ///
     /// # Notes
     ///
-    /// Bounded by [`Self::MAX_VARIANT_SCAN_DEPTH`]: the schema comes from a metadata file that may be
-    /// partner- or attacker-influenced, and this walk runs FIRST on the read path, ahead of every
-    /// other bounded walk. Exceeding the bound reports "no variant found" rather than erroring —
-    /// the walk is a guard, and a type nested past 128 levels fails later in the schema visitor
-    /// that owns that rule.
+    /// Bounded by [`Self::MAX_VARIANT_SCAN_DEPTH`]: the schema comes from a metadata file that may
+    /// be partner- or attacker-influenced, and this walk runs FIRST on the read path, ahead of
+    /// every other bounded walk. Exceeding the bound reports "no variant found" rather than
+    /// erroring — the walk is a guard, and a type nested that deep is rejected EARLIER, by
+    /// `Schema::builder().build()`, which owns that rule and refuses at 128 composite edges. The
+    /// bound is therefore strictly looser than any constructible schema and changes behaviour for
+    /// none of them; it exists so this walk cannot be the thing that overflows the stack.
     fn variant_within(name: &str, ty: &Type) -> Option<String> {
         Self::variant_within_at_depth(name, ty, 0)
     }
@@ -9333,100 +9335,114 @@ mod avro_scan_tests {
         std::fs::write(path, bytes).expect("write avro file");
     }
 
-    /// THE AVRO/ORC HALF OF THE S1 (verification-Critic F-1). The Parquet fix exempted the
-    /// row-lineage pair from the projection strip on ONE line, on the Parquet path only;
-    /// `build_expected_schema` — the sole schema the Avro and ORC readers see — still excluded
-    /// them, so those two formats kept silently discarding a stored `_row_id` and reporting a
-    /// computed one. Java's oracle for this rule (`avro/ValueReaders$RowIdReader`)
-    /// is the AVRO path, which makes Avro the arm least excusable to leave broken.
+    /// THE AVRO/ORC HALF OF THE S1 (verification-Critic F-1), for BOTH reserved columns.
+    ///
+    /// The Parquet fix exempted the row-lineage pair from the projection strip on one line, on the
+    /// Parquet path only; `build_expected_schema` — the sole schema the Avro and ORC readers see —
+    /// still excluded them, so those formats silently discarded a stored value and reported a
+    /// computed one. Java's oracle for `_row_id` (`avro/ValueReaders$RowIdReader`) is the AVRO
+    /// path, which makes Avro the arm least excusable to leave broken.
+    ///
+    /// Parameterised over WHICH column because pinning `_row_id` alone left the
+    /// `_last_updated_sequence_number` half of the exemption free to be narrowed — the identical
+    /// asymmetry this branch had already fixed once on Parquet, reproduced on the Avro leg added
+    /// afterwards (round-6 Critic S2-1).
     #[tokio::test]
-    async fn stored_row_id_in_an_avro_file_survives_the_real_reader() {
-        let tmp = TempDir::new().expect("temp dir");
-        let path = tmp
-            .path()
-            .join("lineage.avro")
-            .to_string_lossy()
-            .to_string();
+    async fn stored_row_lineage_in_an_avro_file_survives_the_real_reader() {
+        for (column_name, field_id, stored, expected) in [
+            (
+                "_row_id",
+                crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID,
+                vec![Some(777i64), None, Some(999)],
+                // The NULL row falls back to `first_row_id + its own position` (1000 + 1).
+                vec![Some(777i64), Some(1_001), Some(999)],
+            ),
+            (
+                "_last_updated_sequence_number",
+                crate::metadata_columns::RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                vec![Some(31i64), None, Some(33)],
+                // The NULL row falls back to the FILE's sequence number.
+                vec![Some(31i64), Some(42), Some(33)],
+            ),
+        ] {
+            let tmp = TempDir::new().expect("temp dir");
+            let path = tmp
+                .path()
+                .join(format!("lineage{field_id}.avro"))
+                .to_string_lossy()
+                .to_string();
 
-        // A file schema of `id` PLUS the reserved `_row_id` column, the shape a
-        // lineage-preserving rewrite writes.
-        let row_id_field = crate::metadata_columns::get_metadata_field(
-            crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID,
-        )
-        .expect("reserved field")
-        .clone();
-        let file_schema = Schema::builder()
-            .with_schema_id(1)
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-                row_id_field,
-            ])
-            .build()
-            .expect("file schema");
-
-        let avro_schema = schema_to_avro_schema("data", &file_schema).expect("iceberg→avro");
-        let mut writer = AvroWriter::new(&avro_schema, Vec::new());
-        for (id, row_id) in [(1i64, Some(777i64)), (2, None), (3, Some(999))] {
-            let row_id_value = match row_id {
-                Some(v) => AvroWriteValue::Union(1, Box::new(AvroWriteValue::Long(v))),
-                None => AvroWriteValue::Union(0, Box::new(AvroWriteValue::Null)),
-            };
-            writer
-                .append_value_ref(&AvroWriteValue::Record(vec![
-                    ("id".to_string(), AvroWriteValue::Long(id)),
-                    ("_row_id".to_string(), row_id_value),
-                ]))
-                .expect("append row");
-        }
-        std::fs::write(&path, writer.into_inner().expect("finalize")).expect("write avro");
-
-        // The TABLE schema carries only `id`; `_row_id` is a reserved metadata column.
-        let table_schema = Arc::new(
-            Schema::builder()
+            let reserved = crate::metadata_columns::get_metadata_field(field_id)
+                .expect("reserved field")
+                .clone();
+            let file_schema = Schema::builder()
                 .with_schema_id(1)
                 .with_fields(vec![
                     NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    reserved,
                 ])
                 .build()
-                .expect("table schema"),
-        );
-        let mut task = avro_task(
-            &path,
-            table_schema,
-            vec![1, crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID],
-            vec![],
-        );
-        task.first_row_id = Some(1_000);
+                .expect("file schema");
 
-        let batches = run_scan(FileIO::new_with_fs(), task).await;
-        let row_ids: Vec<Option<i64>> = batches
-            .iter()
-            .flat_map(|batch| {
-                let column = batch
-                    .column_by_name("_row_id")
-                    .expect("_row_id projected")
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-                    .expect("Int64")
-                    .clone();
-                (0..column.len())
-                    .map(|row| {
-                        if arrow_array::Array::is_null(&column, row) {
-                            None
-                        } else {
-                            Some(column.value(row))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+            let avro_schema = schema_to_avro_schema("data", &file_schema).expect("iceberg→avro");
+            let mut writer = AvroWriter::new(&avro_schema, Vec::new());
+            for (row, value) in stored.iter().enumerate() {
+                let stored_value = match value {
+                    Some(v) => AvroWriteValue::Union(1, Box::new(AvroWriteValue::Long(*v))),
+                    None => AvroWriteValue::Union(0, Box::new(AvroWriteValue::Null)),
+                };
+                writer
+                    .append_value_ref(&AvroWriteValue::Record(vec![
+                        ("id".to_string(), AvroWriteValue::Long(row as i64 + 1)),
+                        (column_name.to_string(), stored_value),
+                    ]))
+                    .expect("append row");
+            }
+            std::fs::write(&path, writer.into_inner().expect("finalize")).expect("write avro");
 
-        assert_eq!(
-            row_ids,
-            vec![Some(777), Some(1_001), Some(999)],
-            "the STORED ids must win on the AVRO path too; [1000, 1001, 1002] means the column \
-             never reached the transformer"
-        );
+            // The TABLE schema carries only `id`; both are reserved metadata columns.
+            let table_schema = Arc::new(
+                Schema::builder()
+                    .with_schema_id(1)
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    ])
+                    .build()
+                    .expect("table schema"),
+            );
+            let mut task = avro_task(&path, table_schema, vec![1, field_id], vec![]);
+            task.first_row_id = Some(1_000);
+            task.file_sequence_number = Some(42);
+
+            let batches = run_scan(FileIO::new_with_fs(), task).await;
+            let values: Vec<Option<i64>> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch
+                        .column_by_name(column_name)
+                        .expect("projected")
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .expect("Int64")
+                        .clone();
+                    (0..column.len())
+                        .map(|row| {
+                            if arrow_array::Array::is_null(&column, row) {
+                                None
+                            } else {
+                                Some(column.value(row))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+
+            assert_eq!(
+                values, expected,
+                "the STORED {column_name} values must win on the AVRO path; a fully-computed \
+                 column means the stored one never reached the transformer"
+            );
+        }
     }
 
     /// Build a whole-file [`FileScanTask`] for an Avro data file at `path` projecting

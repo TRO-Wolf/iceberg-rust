@@ -93,9 +93,15 @@ PRESENT in a data file. Both readers therefore need an exemption, and they are s
 * Avro / ORC — `build_expected_schema`.
 
 Exempting only one leaves the other silently substituting a computed id for a stored one. Both
-arms are pinned by real-reader tests (`stored_row_id_in_the_data_file_survives_the_real_reader`,
-`stored_row_id_in_an_avro_file_survives_the_real_reader`,
-`stored_last_updated_sequence_number_survives_the_real_reader`).
+arms are pinned by real-reader tests, and each is parameterised over BOTH reserved columns:
+`stored_row_id_in_the_data_file_survives_the_real_reader` +
+`stored_last_updated_sequence_number_survives_the_real_reader` (Parquet), and
+`stored_row_lineage_in_an_avro_file_survives_the_real_reader` (Avro, both columns).
+
+Pinning ONE column per format is not enough. Each exemption is a single predicate
+(`is_row_lineage_field`), so a mutation narrowing it to `_row_id` alone survives every
+`_row_id`-only test — which is exactly what happened twice: once on Parquet, and again on the Avro
+leg added to fix the Parquet omission.
 
 `compare_schemas` must also force the `Modify` path for these columns: once the reserved fields
 are correctly OPTIONAL, a file column matches the target exactly and the pass-through fast paths

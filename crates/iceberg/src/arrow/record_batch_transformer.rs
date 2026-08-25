@@ -2704,6 +2704,64 @@ mod test {
         );
     }
 
+    /// The DISCRIMINATING cell for the absent-range arm. Java's `ValueReaders.rowIds(null, …)` is
+    /// a null constant, which means the stored column is **ignored**, not preferred — the arm is
+    /// chosen before the file is ever consulted. The sibling test feeds a batch with NO stored
+    /// column, so it cannot tell "discard the stored value" from "there was nothing to discard":
+    /// reordering the match to prefer a stored column whenever one exists passed the whole suite.
+    ///
+    /// Reachable in practice — a V3 file carrying `_row_id` read under a manifest with no
+    /// assigned range, which is every DELETE manifest.
+    #[test]
+    fn a_stored_row_id_is_discarded_when_there_is_no_assigned_range() {
+        let projected = [1, RESERVED_FIELD_ID_ROW_ID];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(None, Some(7))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(
+                vec![1, 2, 3],
+                Some((RESERVED_FIELD_ID_ROW_ID, "_row_id", vec![
+                    Some(900),
+                    Some(901),
+                    Some(902),
+                ])),
+            ))
+            .expect("no assigned range is not an error");
+        assert_eq!(
+            int64_col(&batch, 1),
+            vec![None, None, None],
+            "no assigned range means NO row identity — the stored column is discarded, not \
+             preferred. Java reaches `constant(null)` without consulting the file at all."
+        );
+    }
+
+    /// The same cell for the sequence column: a stored value is discarded when the gate fails.
+    #[test]
+    fn a_stored_last_updated_sequence_number_is_discarded_without_a_first_row_id() {
+        let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(None, Some(5))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(
+                vec![1, 2],
+                Some((
+                    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                    "_last_updated_sequence_number",
+                    vec![Some(31), Some(33)],
+                )),
+            ))
+            .expect("a missing first_row_id is not an error");
+        assert_eq!(
+            int64_col(&batch, 1),
+            vec![None, None],
+            "Java gates on BOTH inputs BEFORE reading the column, so a stored value is discarded"
+        );
+    }
+
     /// Java gates `_last_updated_sequence_number` on BOTH inputs:
     /// `ValueReaders.lastUpdated(Long rowIdConst, Long fileSeq, reader)` returns `constant(null)`
     /// if EITHER is null. So a V1/V2 file —

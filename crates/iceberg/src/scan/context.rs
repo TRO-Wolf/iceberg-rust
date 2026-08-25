@@ -256,7 +256,6 @@ impl ManifestEntryContext {
             // `constant(null)`), not an error and not a silent zero.
             first_row_id: self.manifest_entry.data_file.first_row_id(),
             file_sequence_number: self.manifest_entry.file_sequence_number,
-
             partition: Some(self.manifest_entry.data_file.partition.clone()),
             partition_spec: self.partition_spec.clone(),
             // The table's default name mapping (property `schema.name-mapping.default`), parsed
