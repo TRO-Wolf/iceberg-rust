@@ -63,15 +63,16 @@ straight through (`first_row_id: value.first_row_id`), and no assigner exists an
 `idAssigner(Long firstRowId)` returns one of two functions:
 
 - `firstRowId == null` → a function setting EVERY file's `firstRowId` to **null**
-  (`lambda$idAssigner$2`, `setFirstRowId(null)` at offset 22). Note this OVERWRITES a stored value
-  rather than preserving it.
+  (`lambda$idAssigner$2`). Note this OVERWRITES a stored value rather than preserving it.
 - otherwise → a stateful `ManifestReader$1` with `nextRowId = firstRowId`, applying per entry:
   - **only if** the file is a `BaseFile` **and** `entry.status() != DELETED` **and**
-    `file.firstRowId() == null` (offsets 6-39 — three guards, all `if_acmpeq`/`ifnull` jumps to the
-    no-op exit at 66);
-  - then `setFirstRowId(nextRowId)` and `nextRowId += file.recordCount()` (offsets 43-63).
+    `file.firstRowId() == null` — three guards, each jumping to a no-op exit;
+  - then `setFirstRowId(nextRowId)` and `nextRowId += file.recordCount()`.
   - The counter therefore does **not** advance for a DELETED entry, nor for a file that already
     carries a `firstRowId`.
+
+Exact offsets and opcodes: [task/f13-v3-row-lineage-ledger.md](f13-v3-row-lineage-ledger.md), which
+is their single home per AGENTS.md's evidence-routing table.
 
 **Why it matters for production.** Without it, every data file read back carries
 `first_row_id: None`, so V2 below has nothing to compute `_row_id` from. It is also the axis on
@@ -98,11 +99,9 @@ already names this as a known deferred gap.
 
 **The oracle rules** (both `javap`-decoded, 1.10.0):
 
-- `ValueReaders$RowIdReader.read` — read the file's `_row_id` column; if non-null return it
-  (offsets 34-39); otherwise return `firstRowId + pos`, where `pos` comes from
+- `ValueReaders$RowIdReader.read` — read the file's `_row_id` column; if non-null return it; otherwise return `firstRowId + pos`, where `pos` comes from
   `ValueReaders.positions()` and `firstRowId` is the **file's** assigned value (V1's output).
-- `ValueReaders$LastUpdatedSeqReader.read` — read the file's column; if non-null return it
-  (offsets 15-20); otherwise return the file's `fileSeqNumber` (offset 21-28).
+- `ValueReaders$LastUpdatedSeqReader.read` — read the file's column; if non-null return it; otherwise return the file's `fileSeqNumber`.
 - Dispatch is `ValueReaders.fileFieldReader`, which special-cases a **present** file field whose id
   is `MetadataColumns.ROW_ID` or `LAST_UPDATED_SEQUENCE_NUMBER`; an **absent** field takes the
   constant path.
@@ -129,7 +128,7 @@ Avro path is the one with a direct core-jar oracle (`ValueReaders`); ORC's Java 
 
   The related fork refusal WAS also correct at the time of the audit: `arrow/schema.rs`'s
   `variant()` arm threw, and so does Java — `TypeUtil$SchemaVisitor.variant(VariantType)` is a bare
-  `throw new UnsupportedOperationException("Unsupported type: variant")` (bytecode offsets 0-9, the `athrow` at 9),
+  `throw new UnsupportedOperationException("Unsupported type: variant")` (see the ledger for offsets),
   and `ArrowSchemaUtil`'s converter does not override it.
 
 - **`variant` over AVRO — the in-scope unit R88 should actually name.** This one HAS an oracle in

@@ -306,15 +306,21 @@ fn visit_type_at_depth<V: ArrowSchemaVisitor>(
 
                 let key_result = {
                     visitor.before_map_key(key_field)?;
-                    let ret = visit_type_at_depth(key_field.data_type(), visitor, depth + 1)?;
+                    // A variant map KEY is short-circuited like every other position. Java places
+                    // no type constraint on a map key (`Types$MapType.ofOptional` null-checks only
+                    // the VALUE), so `map<variant, _>` is constructible and must round-trip.
+                    let ret = match visitor.variant_field(key_field)? {
+                        Some(ret) => ret,
+                        None => visit_type_at_depth(key_field.data_type(), visitor, depth + 1)?,
+                    };
                     visitor.after_map_key(key_field)?;
                     ret
                 };
 
                 let value_result = {
                     visitor.before_map_value(value_field)?;
-                    // A variant map VALUE is short-circuited like a variant field or list
-                    // element. (A variant KEY is not a case: Iceberg map keys are primitives.)
+                    // A variant map VALUE is short-circuited like a variant field, list element
+                    // or map key.
                     let ret = match visitor.variant_field(value_field)? {
                         Some(ret) => ret,
                         None => visit_type_at_depth(value_field.data_type(), visitor, depth + 1)?,
@@ -2909,6 +2915,23 @@ mod tests {
                     }),
                 )
                 .into(),
+                // A variant map KEY. Java constrains only the VALUE type
+                // (`Types$MapType.ofOptional` null-checks it and nothing else), so this is a legal
+                // Iceberg type and must round-trip like every other position.
+                NestedField::optional(
+                    6,
+                    "vk",
+                    Type::Map(crate::spec::MapType {
+                        key_field: NestedField::map_key_element(7, Type::Variant).into(),
+                        value_field: NestedField::map_value_element(
+                            8,
+                            Type::Primitive(PrimitiveType::String),
+                            true,
+                        )
+                        .into(),
+                    }),
+                )
+                .into(),
             ])
             .build()
             .unwrap();
@@ -2942,6 +2965,14 @@ mod tests {
             map.value_field.field_type.as_ref(),
             &Type::Variant,
             "a map value must not flatten to a struct on the way back"
+        );
+        let Type::Map(key_map) = back.as_struct().fields()[2].field_type.as_ref() else {
+            panic!("expected a map");
+        };
+        assert_eq!(
+            key_map.key_field.field_type.as_ref(),
+            &Type::Variant,
+            "a map KEY must round-trip too — the position skipped on a false premise"
         );
     }
 

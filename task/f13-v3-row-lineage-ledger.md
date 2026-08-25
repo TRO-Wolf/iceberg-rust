@@ -118,5 +118,5 @@ Java, recorded on R88.
 | `BaseDVFileWriter.close` | `write(PuffinWriter, Deletes)` at 199, then `CharSequenceSet.add(deletes.path())` at 205, once per iterated `Deletes` | the referenced set has exactly one entry per written blob, so it is DERIVABLE from `delete_files` |
 | `BaseDVFileWriter.close` empty arm | `CharSequenceSet.empty()` built at 11; `deletesByPath.isEmpty()` early return at 19-45 | no deletes ⇒ empty set, `referencesDataFiles()` false |
 | `DeleteWriteResult.referencesDataFiles` | `!= null && !isEmpty()` | non-empty test |
-| `FileMetadata$Builder.build` | "Referenced data file is required for DV" at 158 | a Puffin file without `referenced_data_file` is rejected, so the derivation's `filter_map` is total |
+| `FileMetadata$Builder.build` | the DV `referencedDataFile` precondition at 158-173 (its `ldc_w` for "Referenced data file is required for DV" at 170) | a Puffin file without `referenced_data_file` is rejected, so the derivation's `filter_map` is total |
 

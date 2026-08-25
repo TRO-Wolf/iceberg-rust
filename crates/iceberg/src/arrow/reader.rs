@@ -413,6 +413,13 @@ impl ArrowReader {
         Ok(())
     }
 
+    /// Depth bound for [`Self::variant_within`], mirroring
+    /// [`crate::spec::schema::visitor`]'s `MAX_SCHEMA_NESTING_DEPTH` — the repo already
+    /// adjudicated this hazard for the same tree: a metadata file can be partner-influenced, and
+    /// an unbounded recursive walk over it overflows the thread stack (an abort, not a typed
+    /// error).
+    const MAX_VARIANT_SCAN_DEPTH: usize = 128;
+
     /// The dotted path to the first `variant` at or beneath `ty`, or `None`.
     ///
     /// The projection names a TOP-LEVEL field id, but a variant can sit anywhere beneath it — in
@@ -421,24 +428,54 @@ impl ArrowReader {
     /// just declared it cannot decode. The three descent sites mirror exactly the ones the
     /// `variant_field` hook covers in `arrow::schema`.
     ///
-    /// A map KEY cannot be a variant (Iceberg map keys are primitives), so it is not descended.
+    /// Map KEYS are descended too. An earlier version skipped them on the stated grounds that
+    /// "Iceberg map keys are primitives" — that is FALSE: Java's `Types$MapType.ofOptional` /
+    /// `ofRequired` constrain only the VALUE (a null check on it and nothing on the key), and this
+    /// fork's own `spec/schema/visitor.rs` descends `map.key_field`. A `map<variant, _>` is
+    /// therefore constructible, and skipping the key left it unguarded.
+    ///
+    /// # Notes
+    ///
+    /// Bounded by [`Self::MAX_VARIANT_SCAN_DEPTH`]: the schema comes from a metadata file that may be
+    /// partner- or attacker-influenced, and this walk runs FIRST on the read path, ahead of every
+    /// other bounded walk. Exceeding the bound reports "no variant found" rather than erroring —
+    /// the walk is a guard, and a type nested past 128 levels fails later in the schema visitor
+    /// that owns that rule.
     fn variant_within(name: &str, ty: &Type) -> Option<String> {
+        Self::variant_within_at_depth(name, ty, 0)
+    }
+
+    fn variant_within_at_depth(name: &str, ty: &Type, depth: usize) -> Option<String> {
+        if depth > Self::MAX_VARIANT_SCAN_DEPTH {
+            return None;
+        }
+        let next = depth + 1;
         match ty {
             Type::Variant => Some(name.to_string()),
             Type::Struct(struct_type) => struct_type.fields().iter().find_map(|nested| {
-                Self::variant_within(
+                Self::variant_within_at_depth(
                     &format!("{name}.{}", nested.name),
                     nested.field_type.as_ref(),
+                    next,
                 )
             }),
-            Type::List(list) => Self::variant_within(
+            Type::List(list) => Self::variant_within_at_depth(
                 &format!("{name}.element"),
                 list.element_field.field_type.as_ref(),
+                next,
             ),
-            Type::Map(map) => Self::variant_within(
-                &format!("{name}.value"),
-                map.value_field.field_type.as_ref(),
-            ),
+            Type::Map(map) => Self::variant_within_at_depth(
+                &format!("{name}.key"),
+                map.key_field.field_type.as_ref(),
+                next,
+            )
+            .or_else(|| {
+                Self::variant_within_at_depth(
+                    &format!("{name}.value"),
+                    map.value_field.field_type.as_ref(),
+                    next,
+                )
+            }),
             Type::Primitive(_) => None,
         }
     }
@@ -5624,6 +5661,37 @@ message schema {
                 }),
                 "s.value",
             ),
+            // The fourth container position. Skipped in the first version of this guard on the
+            // stated grounds that map keys are primitives — FALSE: Java's `Types$MapType`
+            // factories constrain only the VALUE type, so `map<variant, _>` is constructible.
+            (
+                "map key",
+                Type::Map(crate::spec::MapType {
+                    key_field: NestedField::map_key_element(3, Type::Variant).into(),
+                    value_field: NestedField::map_value_element(
+                        4,
+                        Type::Primitive(PrimitiveType::String),
+                        true,
+                    )
+                    .into(),
+                }),
+                "s.key",
+            ),
+            // Nested TWO deep, so a one-level descent is not enough.
+            (
+                "struct in a list",
+                Type::List(crate::spec::ListType {
+                    element_field: NestedField::list_element(
+                        3,
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::optional(4, "v", Type::Variant).into(),
+                        ])),
+                        true,
+                    )
+                    .into(),
+                }),
+                "s.element.v",
+            ),
         ];
 
         for (label, container, expected_path) in cases {
@@ -5708,28 +5776,37 @@ message schema {
         let ids: Vec<i32> = (0..20).collect();
         write_id_parquet_for_pos(&data_path, &ids, 1000);
 
-        let mut ranged = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
-        // `_row_id` ALONE — no `_pos` in the projection, so only the new half of the guard can
-        // reject this.
-        ranged.project_field_ids = Arc::from(vec![1, RESERVED_FIELD_ID_ROW_ID]);
-        ranged.first_row_id = Some(1_000);
-        ranged.start = 1;
-        ranged.length = ranged.file_size_in_bytes;
+        // All THREE message arms: `_row_id` alone, `_pos` alone, and BOTH. Pinning only the
+        // `_row_id` arm leaves the combined arm free to collapse to "`_pos`" — a message telling
+        // the caller to drop a projection that is not the whole reason the path was taken.
+        for (projected, expected) in [
+            (vec![1, RESERVED_FIELD_ID_ROW_ID], "`_row_id` projection"),
+            (vec![1, RESERVED_FIELD_ID_POS], "`_pos` projection"),
+            (
+                vec![1, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID],
+                "`_pos` and `_row_id` projection",
+            ),
+        ] {
+            let mut ranged = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+            ranged.project_field_ids = Arc::from(projected);
+            ranged.first_row_id = Some(1_000);
+            ranged.start = 1;
+            ranged.length = ranged.file_size_in_bytes;
 
-        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
-        let err = reader
-            .read(Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream)
-            .expect("stream construction")
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .expect_err("a ranged task projecting `_row_id` must fail loud, not mint wrong ids");
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-        assert!(
-            err.to_string()
-                .contains("`_row_id` projection over a ranged split task"),
-            "the error must name `_row_id`, not tell the caller to drop a `_pos` it never \
-             projected, got: {err}"
-        );
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let err = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect_err("a ranged task must fail loud, not mint wrong ids");
+            assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+            assert!(
+                err.to_string().contains(expected),
+                "the error must name exactly the columns that forced the whole-file path \
+                 ({expected}), got: {err}"
+            );
+        }
     }
 
     /// Review rider (2026-08-03): a RANGED split task must NOT take the `_pos` streaming path —

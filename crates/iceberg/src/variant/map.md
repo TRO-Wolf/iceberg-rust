@@ -33,10 +33,16 @@ unshredded backing with the `SerializedObject.sliceValue` verbatim-copy contract
 The `variant` SCHEMA-type entry landed 2026-06-11 (F1) and lives OUTSIDE this module:
 `Type::Variant` + serde in `spec/datatypes.rs`, the V3 gate in `spec/schema/mod.rs`, Avro/Arrow
 conversion in `avro/schema.rs` / `arrow/schema.rs`. Shredded-parquet FILE I/O + file-level
-interop are deferred behind the `parquet` crate's opt-in `variant_experimental` feature (which
-pulls `parquet-variant{,-json,-compute}`), NOT behind a version floor — the feature is present
-and identical in both parquet 57.3.1 and 58.4.0, and this workspace does not enable it. The
-DF-54/arrow-58 bump therefore does not move this. The Java→Rust mapping and every
+interop are still deferred, but the FEATURE GATE is gone: as of 2026-08-24 this workspace ENABLES
+`parquet`'s `variant_experimental` (pulling `parquet-variant{,-json,-compute}` at 58.4.0), and
+`arrow/schema.rs` now converts Iceberg `variant` to the canonical Arrow extension type
+(`arrow.parquet.variant`) in BOTH directions, at every position — top level, struct field, list
+element, map key and map value. What remains deferred is file-level I/O: `arrow/avro_reader.rs`'s
+variant arm refuses, there is no Iceberg→`ShreddedSchemaBuilder` bridge, and
+`ArrowReader::reject_variant_projection` refuses any scan that projects a variant at any depth.
+SCOPE NOTE: shredded-parquet variant is NOT a parity gap — Java's is in `iceberg-parquet`, outside
+the `iceberg-core`/`iceberg-api` parity scope; the core jar's variant classes are Avro-only. See
+GAP_MATRIX row R88. The Java→Rust mapping and every
 deliberate divergence are documented in [mod.rs](mod.rs)'s module doc (read-side list),
 [write.rs](write.rs)'s module doc (write-side list), [shredded.rs](shredded.rs)'s module doc
 (overlay list incl. the two probe-verified 1.10.0 bugs this port does not mirror), and
