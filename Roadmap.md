@@ -319,6 +319,13 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   interop-proven both directions; residual evaluation wired into planning; incremental append +
   changelog scans interop-proven both directions (✅ 2026-06-17, rows R122/R123; row-level CDC is named
   residue); `BatchScan` ✅ (row R124, interop-proven 2026-06-17); metrics model + opt-in emission landed.
+  **V3 row lineage materializes at scan (row R166, 2026-08-24/25):** `_row_id` and
+  `_last_updated_sequence_number` resolve stored-value-else-fallback per row, in the SHARED
+  `RecordBatchTransformer` rather than per format, so Parquet and Avro get one rule. `_row_id`
+  inherits `_pos`'s whole-file in-order decode requirement and its split suppression. Three named residues remain. A citation-and-pin unit can close only one of them — the missing interop
+  leg. The ORC stored-column arm has no oracle, because Java's ORC reader sits outside
+  `iceberg-core`, so it flips under the legend's named-unproven-slice allowance rather than by
+  test.
   Remaining: CDC-merge (row-level) + strict-evaluator completion (per-row status: GAP_MATRIX).
   *(Corrected 2026-07-01: the stale "split planning (row 146)" entry removed — it landed ✅
   2026-06-17, as headline item 4 below already records.)*
@@ -330,13 +337,31 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 - **Gates on:** Phase 1 (types in spec).
 - **Key deliverables:** ORC + Avro **data** file read/write; remaining V3 types end-to-end — variant
   (incl. shredding), geometry/geography + geospatial predicates, `unknown`.
-- **Where it stands:** `timestamp_ns` ✅ and column default values ✅ landed in the 0.9.1 base;
-  `variant` is 🟡 (binary format read+write byte-exact BOTH sides — shredded-parquet FILE I/O is
-  gated behind parquet's opt-in `variant_experimental` feature — not a version floor; see row R88). `unknown` is ✅ at the
-  metadata level (schema-type entry + V3 gate + metadata-only schema round-trip interop; data-file
-  always-null I/O deferred-loud — a no-physical-column type's contract is the metadata round-trip).
-  Genuinely ❌: `geometry`/`geography` + geospatial predicates, ORC + Avro DATA files. Per-row status:
-  GAP_MATRIX (the only status record).
+- **Where it stands — the V3 slate, one axis per row.** Status is the GAP_MATRIX's and is NOT
+  restated here; this table is a router, because the phase narrative and the engine queue kept
+  disagreeing about which axes existed at all.
+
+  | V3 axis | Row | What is left |
+  |---|---|---|
+  | Deletion vectors (write, read, commit door, engine MOR) | R114 | F-13 closed 2026-08-24; three engine-facing bounds on the row |
+  | Column default values | R92 | `write_default` is set but consumed nowhere under `writer/` |
+  | `timestamp_ns` / `timestamptz_ns` | R90 | nothing on the type itself |
+  | `unknown` | R91 | data-file always-null I/O, deferred-loud |
+  | Row lineage | R166 | no interop leg; ORC stored arm has no oracle; ranged-split refusal via `PartitionWork` |
+  | `variant` | R88 | shredded-parquet I/O — outside the parity envelope, see below |
+  | `timestamptz` metadata projection / Arrow tz annotation | R162, R163 | named residues on each row |
+  | `geometry` / `geography` + geospatial predicates | R89 | no type entry, no predicates, no format gate — see the row |
+
+  Read that as: the V3 type front is **partly landed under existing row ids**, not unstarted. Of the
+  eight axes, one is a dated DECLARED "not yet" (R89) and the other seven each point at their row
+  for what is left. ORC and Avro **data** file read/write is NOT a V3 axis — it is format
+  breadth, tracked separately in this phase's deliverables.
+
+  Shredded-parquet variant I/O sits behind parquet's opt-in `variant_experimental` feature, and it
+  is outside the `iceberg-core` parity envelope, because Java's shredding lives in
+  `iceberg-parquet`. Whether it is inside a CONSUMER's v1.0 gate is a separate owner ruling. See
+  row R88.
+
 - **Exit criteria:** read/write parity for ORC + Avro data; V3 types round-trip and interop with Java.
 
 ### Phase 5 — Catalog & views  ·  **Status: 🟡**

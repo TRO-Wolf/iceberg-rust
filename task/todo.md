@@ -31,6 +31,67 @@ How to use it (see the manuals' §1):
 
 ---
 
+## QUEUED (2026-08-25): engine-agreed order — R166 interop, then F-13-or-F-7
+
+Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next.
+
+- [ ] **R166 interop leg — a CITATION-AND-PIN job, not a build.** The leg already exists on the
+      engine side: unit V3-0 (RePark #199) appended rows with lineage through the fork and
+      round-tripped through Spark→Java with the read verified Spark-exact. **Read
+      `/home/john/CodeRepos/LocalRepark/repark/task/ledgers/staging/v3-0-charter-ledger.md` and
+      `/home/john/CodeRepos/LocalRepark/repark/task/ledgers/archive/2026-08/2026-08-24-v3e-1-2-cow-oracle-ledger.md`
+      BEFORE writing anything.** The named v3 oracle — PySpark 4.1.2 +
+      `iceberg-spark-runtime-4.1_2.13:1.11.0` — is live on this machine with the V3E-3 fixtures
+      (partitioned DV + equality-delete). A fork-local pin that REUSES that oracle is fine; a
+      separate harness is not. Closes residue (3). It does NOT by itself close the row: residue
+      (1), the untested ORC stored-`_row_id` arm, has no oracle either, so the flip needs the
+      legend's named-unproven-slice allowance applied deliberately, not silently.
+- [ ] **Then F-7, not F-13.** F-13 is CLOSED (see row R114's engine answer, 2026-08-25), so the
+      unblocked item is F-7: lineage through `RewriteFiles`/`OverwriteFiles`, DV-aware
+      `RewritePositionDeleteFiles`, dangling-DV removal. Unlocks engine units V3-4 + V3-5.
+- [ ] R166's other two residues stay open and named: the ORC stored-column arm has no oracle
+      (Java's ORC reader is outside `iceberg-core`), and the ranged-split refusal is unreachable
+      through `plan_tasks` but reachable through the public `PartitionWork` seam.
+- [ ] **Fork units the engine answer surfaced (not queued, no owner) — THREE, not one.** All are
+      external-engine-only; the in-tree DataFusion arm reaches none of them. See row R114's bounds.
+      - (a) The applicability rule is unreachable: `delete_file_index` is `pub(crate)`, so
+        `referenced_data_file_location` / `is_deletion_vector` need promoting to public core.
+      - (a2) Previous-DV DISCOVERY has no public core equivalent, and promoting (a) does NOT close
+        it: `load_delete_vector` and `PreviousDeletes::new` both need a full `DataFile`, while the
+        public scan surface hands out `FileScanTaskDeleteFile`, a projection. The only public route
+        left is `Manifest::parse_avro`, which R166 records as the seam that BYPASSES `first_row_id`
+        inheritance. Scope this separately from (a).
+      - (c) **A CODE candidate, not a docs one, and the widest of the three.**
+        `resolve_partition_spec_id`'s `(None, None)` arm stamps spec 0 with an empty partition
+        SILENTLY. The helper is shared by ALL FOUR base writers, so this is not a DV property. On a
+        table whose metadata holds a zero-field spec 0 it COMMITS, carrying a `partition_spec_id`
+        that misdescribes the covered data file. On a DV the damage is metadata only — path-keyed
+        lookup, and a zero-field spec projects to `AlwaysTrue` so it escapes pruning. On a
+        PARTITION-scoped position delete it LOSES DELETES: that index is `(spec_id, partition)`-keyed,
+        so the delete silently never applies. R113 documents that failure and pins it with
+        `spec_stamp_e2e_test`, while claiming the id is stamped ALWAYS — the claim this unit
+        corrected. **One in-tree call site reaches the arm**, `maintenance/rewrite_table_path.rs`,
+        and it is harmless there only because that path takes the written file's PATH and discards
+        the `DataFile` carrying the stamp. Any ruling that makes the arm an error MUST migrate that
+        call site in the same change. Options: make the arm an error, or require an explicit
+        `unpartitioned()` opt-in. Needs an owner ruling — it is a BREAKING change to a public
+        writer's default construction, with one in-tree migration plus one public pass-through to
+        audit: `writer/partitioning/unpartitioned_writer.rs` calls `build(None)` UNCONDITIONALLY, so
+        whether the arm fires is decided by its caller. Both in-tree `TaskWriter` constructions
+        chain `with_partition_spec`, so nothing fires today — but the arm sits behind a public API,
+        and an external consumer reaches it without ever writing `build(None)`.
+        **Recommendation: the opt-in, not the error.** Making the arm an error breaks
+        `DataFileWriterBuilder`'s default construction and makes the LEGITIMATE case inexpressible —
+        an unpartitioned table under spec 0 genuinely wants spec 0. An explicit `unpartitioned()`
+        keeps that case expressible and turns every silent path into a compile error at the call
+        site rather than a runtime error in a consumer's job.
+        **File a RED-first test with it:** drive a PARTITION-scoped position delete through the
+        `(None, None)` arm and assert the deletes are lost. R113's `spec_stamp_e2e_test` pins the
+        CONSEQUENCE of a wrong spec; nothing pins this arm as a SOURCE of one, so without that test
+        the fix can regress silently.
+
+---
+
 ## ACTIVE (2026-08-16): PT increment C — files/entries project the unified type
 
 Branch: `grok/c16-files-entries-unified` off `16abae8b` (#204). Projected-type
