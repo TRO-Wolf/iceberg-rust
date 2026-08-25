@@ -3866,8 +3866,7 @@ message schema {
     /// "EOF: file size of 0 is less than footer". (1b) is therefore pinned at the unit level only, by
     /// `scan::task::tests::split_whole_file_sentinel_on_an_empty_file_is_one_task_not_zero`. What
     /// this test still pins end-to-end is the observable that matters: a sentinel-spelled task
-    /// survives `split` as one task and reads every row. (Independent review of the reviewer rider,
-    /// 2026-08-08 / Falsifier 5b.)
+    /// survives `split` as one task and reads every row.
     #[tokio::test]
     async fn test_whole_file_length_sentinel_survives_split_and_reads_every_row() {
         let tmp = TempDir::new().unwrap();
@@ -4028,7 +4027,6 @@ message schema {
         // so dropping `self.start != 0` leaves it green — measured. This second parent keeps
         // `length == file_size_in_bytes` and moves only the left edge, the one shape the
         // `length != file_size` disjunct cannot see, so it is `start != 0` alone that must answer.
-        // (Independent review of the reviewer rider, 2026-08-08 / Falsifier 5a.)
         let relocated = midpoint_scan_task(&path, schema.clone(), start, file_size);
         let sub_tasks = relocated.split(target).expect("relocated split");
         assert_eq!(
@@ -5932,7 +5930,7 @@ message schema {
         );
     }
 
-    /// Critic-octo C1: residual drops the entire first batch; later batches must still carry
+    /// Residual drops the entire first batch; later batches must still carry
     /// physical `_pos` (not renumbered from 0).
     #[tokio::test]
     async fn fk5_pos_residual_empties_first_batch_preserves_physical_pos() {
@@ -5959,7 +5957,7 @@ message schema {
         );
     }
 
-    /// Critic-octo C1: every row position-deleted → empty result (no panic / bogus _pos).
+    /// Every row position-deleted → empty result (no panic / bogus _pos).
     #[tokio::test]
     async fn fk5_pos_all_rows_position_deleted() {
         let tmp = TempDir::new().unwrap();
@@ -5985,7 +5983,7 @@ message schema {
         );
     }
 
-    /// Critic-octo C1: single-batch vs multi-batch streaming must yield identical (id,_pos) sets
+    /// Single-batch vs multi-batch streaming must yield identical (id,_pos) sets
     /// under dense pos-deletes + residual (unpruned baseline identity).
     #[tokio::test]
     async fn fk5_pos_single_vs_multi_batch_identity() {
@@ -6037,7 +6035,7 @@ message schema {
         assert_eq!(single, expected);
     }
 
-    /// Critic-octo C2: `_file` + `_pos` together under multi-batch streaming (constants + ordinals).
+    /// `_file` + `_pos` together under multi-batch streaming (constants + ordinals).
     #[tokio::test]
     async fn fk5_pos_with_file_metadata_column() {
         use arrow_array::{Int32Array, Int64Array};
@@ -6104,7 +6102,7 @@ message schema {
         );
     }
 
-    /// Critic-octo C2: equality-delete + `_pos` streaming path (survival_mask eq branch).
+    /// Equality-delete + `_pos` streaming path (survival_mask eq branch).
     #[tokio::test]
     async fn fk5_pos_with_equality_deletes() {
         // Two-column schema so eq-delete on `id` is well-formed; project id + _pos.
@@ -6216,7 +6214,7 @@ message schema {
         );
     }
 
-    /// Critic-octo C5: residual ∩ pos-delete ∩ eq-delete under streaming `_pos`.
+    /// Residual ∩ pos-delete ∩ eq-delete under streaming `_pos`.
     #[tokio::test]
     async fn fk5_pos_residual_and_pos_and_eq_deletes() {
         use crate::expr::{Bind, Reference};
@@ -9826,7 +9824,7 @@ mod avro_scan_tests {
     ///
     /// `reject_ranged_whole_file_task` is invoked from BOTH `process_avro_file_scan_task` and
     /// `process_orc_file_scan_task`, but only the AVRO call site was pinned: deleting the ORC line
-    /// left the whole suite green (U3 cycle 5, the Critic's S2 / the Falsifier's F9). Since
+    /// left the whole suite green. Since
     /// `process_orc_file_scan_task` never reads `task.start` / `task.length`, an unguarded ranged
     /// ORC task re-emits every row of the file — N copies per N-way split, with no error.
     #[tokio::test]
@@ -10439,7 +10437,7 @@ mod parquet_eq_keyset_mor_tests {
         assert_eq!(keep.len(), 3);
     }
 
-    /// Critic-octo C1-Q-001: when keys are projected (keyset post-decode path), the scan residual
+    /// When keys are projected (keyset post-decode path), the scan residual
     /// must still be applied via RowFilter. Survivors = residual ∩ ¬eq-deleted.
     #[tokio::test]
     async fn parquet_eq_keyset_with_scan_residual() {
@@ -10486,7 +10484,7 @@ mod parquet_eq_keyset_mor_tests {
         );
     }
 
-    /// Critic-octo C1-Q-002: nullable key column with a NULL cell forces predicate fallback
+    /// Nullable key column with a NULL cell forces predicate fallback
     /// under the keyset-eligible path. A value-delete must NOT drop the NULL-key row
     /// (Java nulls-first / unit A2).
     #[tokio::test]
@@ -10569,7 +10567,7 @@ mod parquet_eq_keyset_mor_tests {
         );
     }
 
-    /// Critic-octo C2-Q-001: composite equality key (id + data) on the Parquet keyset path.
+    /// Composite equality key (id + data) on the Parquet keyset path.
     /// Pins multi-column tuple membership — a sabotage that only matches the first key column
     /// would over-delete.
     #[tokio::test]
@@ -10663,7 +10661,7 @@ mod parquet_eq_keyset_mor_tests {
         );
     }
 
-    /// Critic-octo C2-Q-002: positional RowSelection + eq keyset post-decode on one Parquet task.
+    /// Positional RowSelection + eq keyset post-decode on one Parquet task.
     #[tokio::test]
     async fn parquet_eq_keyset_with_positional_deletes() {
         let tmp = TempDir::new().expect("tempdir");
@@ -10738,7 +10736,7 @@ mod parquet_eq_keyset_mor_tests {
         );
     }
 
-    /// Critic-octo C3-Q-001: keyset path when the projection is *only* the key column (no
+    /// Keyset path when the projection is *only* the key column (no
     /// non-key data columns). Gate is keys ⊆ projection, not projection == full schema.
     #[tokio::test]
     async fn parquet_eq_keyset_project_key_only() {
@@ -10770,7 +10768,7 @@ mod parquet_eq_keyset_mor_tests {
         );
     }
 
-    /// Critic-octo C3-Q-002: two eq-delete files OR-combined under the keyset path
+    /// Two eq-delete files OR-combined under the keyset path
     /// (a row matching EITHER file is deleted).
     #[tokio::test]
     async fn parquet_eq_keyset_two_delete_files_or() {
@@ -10799,7 +10797,7 @@ mod parquet_eq_keyset_mor_tests {
         );
     }
 
-    /// Critic-octo C4-Q-002: keyset path that deletes every row yields empty (or no-row) output —
+    /// Keyset path that deletes every row yields empty (or no-row) output —
     /// must not error and must not resurrect rows.
     #[tokio::test]
     async fn parquet_eq_keyset_deletes_all_rows() {

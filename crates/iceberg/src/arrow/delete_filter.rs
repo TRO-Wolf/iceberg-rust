@@ -2536,7 +2536,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Critic-octo FK1 cycle 1+2: I64 store drops null delete cells. Null-only Long delete files
+    /// I64 store drops null delete cells. Null-only Long delete files
     /// must (a) not report `is_empty()` (apply seam must not skip them), and (b) `delete_mask`
     /// null-bail so the predicate's `col IS NULL` leaf still applies.
     ///
@@ -2584,7 +2584,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Critic-octo FK1 cycle 2: simulate the apply-seam keep-mask loop (reader
+    /// Simulate the apply-seam keep-mask loop (reader
     /// `eq_delete_keep_mask`) over a null-only I64 set. Skipping `is_empty` sets without calling
     /// `delete_mask` would yield keep-all; the production loop must call `delete_mask` and fall
     /// back when it returns `None`.

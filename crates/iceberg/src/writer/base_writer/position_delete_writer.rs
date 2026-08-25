@@ -1038,7 +1038,7 @@ mod spec_stamp_e2e_test {
     /// `SnapshotProducer::validate_partition_value` ACCEPTS it. The read side then never pairs it
     /// with the data, so every "deleted" row survives. Nothing anywhere fails.
     ///
-    /// ATTRIBUTION (be precise — 2026-07-25 Critic): the unstamped delete here differs from the data
+    /// ATTRIBUTION: the unstamped delete here differs from the data
     /// on BOTH halves of the read-side `(spec_id, partition)` key — its tuple is `Struct::empty()`
     /// while the data's is `{"eng"}` — so the miss happens at the partition-bucket lookup
     /// (`pos_deletes_by_partition.get(data_file.partition())`) and never reaches the
@@ -1226,7 +1226,7 @@ mod spec_stamp_e2e_test {
         assert_eq!(delete_spec_id, cur_spec_id);
     }
 
-    /// SILENT UNDER-DELETE, ISOLATED ON THE SPEC ID ALONE (2026-07-25, Critic-supplied fixture).
+    /// SILENT UNDER-DELETE, ISOLATED ON THE SPEC ID ALONE.
     ///
     /// The engine-reachable twin above cannot attribute the miss to the spec id, because its
     /// unkeyed delete also differs in the partition TUPLE. Here the tuple is held CONSTANT and only

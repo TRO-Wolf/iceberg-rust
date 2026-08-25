@@ -1485,7 +1485,7 @@ mod tests {
     /// field `payload` is a list but the same-named source field is a struct. Java's
     /// `ReassignIds.list` runs `Preconditions.checkArgument(sourceType.isListType(), "Not a list:
     /// %s", sourceType)` and throws `IllegalArgumentException` — it does NOT silently reassign or
-    /// fall through to fresh ids. Risk (the Critic's MEDIUM #2): the previous `(other, _)` arm
+    /// fall through to fresh ids. Risk: the previous `(other, _)` arm
     /// routed this to `assign_fresh_or_fail`, which for `reassign_or_refresh_ids` SILENTLY assigned
     /// fresh ids (Java throws) and for `reassign_ids` errored with the WRONG "not found" message.
     #[test]

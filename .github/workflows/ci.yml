@@ -55,6 +55,9 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
+          # check-comment-blocks diffs against the merge base, which a shallow
+          # clone cannot resolve.
+          fetch-depth: 0
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
@@ -70,6 +73,9 @@ jobs:
 
       - name: Check GAP_MATRIX anchors
         run: make check-matrix-anchors
+
+      - name: Check comment block length
+        run: make check-comment-blocks
 
       - name: Install protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3

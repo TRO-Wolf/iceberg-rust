@@ -1272,7 +1272,6 @@ mod tests {
     /// `[RESERVED_FIELD_ID_POS]` (`scan/mod.rs`, the `is_metadata_column_name` arms). Under the
     /// narrowed guard such a task is SPLIT and `arrow::reader`'s `_pos` guard then rejects every
     /// sub-task with a typed `FeatureUnsupported` — the total-outage class (1c) exists to prevent.
-    /// (Independent review of the reviewer rider, 2026-08-08 / Falsifier 1.)
     #[test]
     fn split_of_a_pos_only_projection_is_a_passthrough() {
         // Non-vacuity: the same geometry with a lone DATA column really does split.
@@ -1309,7 +1308,7 @@ mod tests {
     /// relocation-corruption class it was added for stayed reachable (measured under that mutant:
     /// THREE sub-tasks over `[0, 1000)` from a parent that owned `[600, 1600)`). The shape is
     /// self-inconsistent — the window runs past EOF — which is precisely why only the passthrough
-    /// can answer it safely. (Reviewer rider, 2026-08-08 / Falsifier F2.)
+    /// can answer it safely.
     #[test]
     fn split_of_a_relocated_parent_is_a_passthrough_even_when_length_spans_the_file() {
         for offsets in [None, Some(vec![0i64, 300, 700])] {
@@ -1347,7 +1346,7 @@ mod tests {
     /// `file_size_in_bytes = 1000`) now returns at (1a) and never reaches (1b), so corrupting the
     /// sentinel condition left the suite green while the fixed-size walk still emitted ZERO
     /// sub-tasks for this shape — `plan_files` returns the file, `plan_tasks` reads no rows from it,
-    /// nothing errors. (Reviewer rider, 2026-08-08 / Falsifier F1.)
+    /// nothing errors.
     #[test]
     fn split_whole_file_sentinel_on_an_empty_file_is_one_task_not_zero() {
         // Non-vacuity: `split` really does split when there are bytes to split.
@@ -1373,12 +1372,12 @@ mod tests {
     /// A parent whose length OVERRUNS the file (`length > file_size_in_bytes`) is ranged in the
     /// same sense as a truncated one, and (1a)'s `!=` — not a `<` — is what covers it. Without this
     /// pin the inequality could be narrowed to `<` and the fixed-size walk would happily emit
-    /// windows past EOF. (Reviewer rider, 2026-08-08 / Falsifier F3b.)
+    /// windows past EOF.
     #[test]
     fn split_of_an_overlong_parent_is_a_passthrough() {
         // Non-vacuity: without it, a `split` that declined EVERYTHING would satisfy the assertions
         // below. (Measured: under a `target.min(remaining)` → `remaining` mutant this test alone of
-        // the rider's four stayed green.) Independent review of the rider, 2026-08-08 / Falsifier 4.
+        // the rider's four stayed green.)
         let sized = task(1000, DataFileFormat::Parquet, None);
         assert!(
             sized.split(200).expect("sized split ok").len() > 1,
@@ -1409,8 +1408,6 @@ mod tests {
     /// references outside `metadata_columns`, and `_deleted` only in `arrow::avro_reader`, a format
     /// branch (1) declines to split), so "splitting is safe for them" is not a fact this test
     /// establishes. Without this pin, widening the guard to "any metadata field" is invisible.
-    /// (Reviewer rider, 2026-08-08 / Falsifier F3a; justification corrected by the independent
-    /// review of that rider, 2026-08-08 / Critic 2 + Falsifier 8.)
     #[test]
     fn split_declines_pos_specifically_not_every_metadata_column() {
         let mut file_col = task(1000, DataFileFormat::Parquet, None);
@@ -1523,8 +1520,7 @@ mod tests {
     /// `checked_add`, so the consequence is a spurious error, not row loss).
     ///
     /// Strict ascent guarantees `end > start` for every EARLIER window, so this last offset is the
-    /// guard's only reachable shape. (Independent review of the reviewer rider, 2026-08-08 /
-    /// Falsifier 3.)
+    /// guard's only reachable shape.
     #[test]
     fn split_offsets_running_past_eof_yield_an_empty_trailing_window_not_an_underflow() {
         let t = task(1000, DataFileFormat::Parquet, Some(vec![0, 300, 2000]));
@@ -1552,7 +1548,6 @@ mod tests {
     /// `split_offsets` is an `Option<Vec<i64>>` decoded from an Avro array, and an empty Avro array
     /// decodes to `Some(vec![])` — the in-tree manifest-read fixture in `spec::manifest` decodes a
     /// sibling list field to `Some(Vec::new())`, proving empty lists survive this decoder as `Some`.
-    /// (Independent review of the reviewer rider, 2026-08-08 / Critic 1 + Falsifier 2.)
     #[test]
     fn split_empty_offsets_fall_back_to_fixed_size_and_never_drop_the_file() {
         let t = task(1000, DataFileFormat::Parquet, Some(vec![]));
