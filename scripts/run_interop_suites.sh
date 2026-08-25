@@ -74,8 +74,9 @@ REPO_ROOT="$(pwd)"
 # The discovery floor: the number of run-interop-*.sh suites (53 as of 2026-08-07, when
 # run-interop-ranged-read.sh was added for MIDPOINT row-group selection over a byte-range split —
 # the 52nd was run-interop-file-scoped-deletes.sh, for the path-keyed position-delete routing).
+# The 55th is run-interop-row-lineage.sh, added 2026-08-25 for V3 row lineage (row R166).
 # RATCHET THIS UP when a suite is added (same change); lower it only with a deliberate removal.
-SUITE_FLOOR_DEFAULT=54
+SUITE_FLOOR_DEFAULT=55
 
 SUITES_DIR_DEFAULT="${REPO_ROOT}/dev/java-interop"
 MVN_DEFAULT="/opt/maven/bin/mvn"

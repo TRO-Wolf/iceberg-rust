@@ -43,6 +43,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -366,6 +367,21 @@ public final class InteropOracle {
         if (nonidentityFailures > 0) {
           System.exit(1);
         }
+        break;
+      case "generate-interop-row-lineage":
+        // V3 ROW LINEAGE, DIRECTION 1 — "Rust reads what JAVA writes" (row R166 residue 3).
+        // Java writes a V3 table over TWO snapshots so the row-id counter advances both within a
+        // manifest (files A + B in one commit) and across snapshots (file C), then emits the
+        // lineage view its OWN ManifestReader.idAssigner resolved. The dir is via
+        // -Dinterop.row_lineage.dir.
+        RowLineageOracle.generate(requireFixturesDir("interop.row_lineage.dir"));
+        break;
+      case "verify-interop-row-lineage":
+        // V3 ROW LINEAGE, DIRECTION 2 — "JAVA reads what RUST writes". The Rust GEN test wrote a
+        // V3 table under <dir>/rust_table with its own assigned ranges plus the expectation file;
+        // Java reads it with the SAME view builder and diffs. This is the leg R166 named as its
+        // ✅-gating residue.
+        RowLineageOracle.verify(requireFixturesDir("interop.row_lineage.dir"));
         break;
       case "generate-interop-dv":
         // DELETION-VECTOR merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes" (Increment
@@ -25974,6 +25990,266 @@ public final class InteropOracle {
               .build()) {
         appender.addAll(rows);
       }
+    }
+  }
+
+
+  /**
+   * V3 ROW LINEAGE (GAP_MATRIX row R166) — the interop leg named as residue (3): "no interop leg
+   * yet proves Java reads fork-assigned row ids".
+   *
+   * <p>Two directions, one fixture shape each.
+   *
+   * <p>D1 "Rust reads what JAVA writes": a V3 table built by Java's OWN write path, with TWO
+   * snapshots so the row-id counter has to advance across manifests rather than only within one.
+   * Snapshot 1 appends files A (5 rows) + B (3 rows) in ONE commit; snapshot 2 appends file C
+   * (4 rows). Java then reads back what its own {@code ManifestReader.idAssigner} inherited onto
+   * each entry and emits it, so the Rust side compares against Java's resolution rather than
+   * against a hand-computed expectation.
+   *
+   * <p>D2 "JAVA reads what RUST writes": the Rust GEN test commits an equivalent V3 table; this
+   * side loads it and reports the SAME view. A disagreement in either direction is a real
+   * write-incompatibility finding, not a test bug.
+   */
+  static final class RowLineageOracle {
+    private RowLineageOracle() {}
+
+    /** One data file's inherited lineage, as Java resolved it. */
+    private static String fileEntryJson(DataFile file) {
+      String name = new File(file.location()).getName();
+      return "{\"file\":\""
+          + name
+          + "\",\"first_row_id\":"
+          + (file.firstRowId() == null ? "null" : file.firstRowId())
+          + ",\"record_count\":"
+          + file.recordCount()
+          + "}";
+    }
+
+    /**
+     * The canonical lineage view of a table: the metadata counter, each manifest's assigned range,
+     * and every data file's INHERITED first_row_id in manifest order. Both directions emit this
+     * same shape, so the comparison is a byte-level diff of one view rather than two ad-hoc reads.
+     */
+    private static String lineageJson(BaseTable table) throws IOException {
+      StringBuilder sb = new StringBuilder();
+      sb.append("{\"format_version\":").append(table.operations().current().formatVersion());
+      sb.append(",\"next_row_id\":").append(table.operations().current().nextRowId());
+      Snapshot snapshot = table.currentSnapshot();
+      sb.append(",\"snapshot_first_row_id\":")
+          .append(snapshot.firstRowId() == null ? "null" : snapshot.firstRowId());
+      sb.append(",\"snapshot_added_rows\":")
+          .append(snapshot.addedRows() == null ? "null" : snapshot.addedRows());
+
+      List<String> manifests = new ArrayList<>();
+      List<String> entries = new ArrayList<>();
+      for (ManifestFile manifest : snapshot.dataManifests(table.io())) {
+        manifests.add(
+            "{\"first_row_id\":"
+                + (manifest.firstRowId() == null ? "null" : manifest.firstRowId())
+                + ",\"added_files\":"
+                + manifest.addedFilesCount()
+                + "}");
+        try (CloseableIterable<DataFile> files = ManifestFiles.read(manifest, table.io())) {
+          for (DataFile file : files) {
+            entries.add(fileEntryJson(file));
+          }
+        }
+      }
+      // SORTED, both sides: manifest iteration order is newest-first and is not part of the
+      // contract under test. The assigned ids themselves encode the assignment order, so sorting
+      // compares content without pinning an incidental traversal.
+      Collections.sort(manifests);
+      Collections.sort(entries);
+      sb.append(",\"manifests\":[").append(String.join(",", manifests)).append("]");
+      sb.append(",\"files\":[").append(String.join(",", entries)).append("]}");
+      return sb.toString();
+    }
+
+    /**
+     * Per-row materialized lineage from a REAL scan, sorted by id. This is the half the manifest
+     * view cannot reach: `first_row_id` inheritance is metadata, but `_row_id` is resolved PER ROW
+     * by the reader (Java `ValueReaders$RowIdReader`: the stored value, else firstRowId + pos).
+     */
+    private static String rowIdsJson(BaseTable table) throws IOException {
+      Schema lineage = MetadataColumns.schemaWithRowLineage(table.schema());
+      List<String> rows = new ArrayList<>();
+      try (CloseableIterable<Record> records =
+          IcebergGenerics.read(table).project(lineage).build()) {
+        for (Record record : records) {
+          Object rowId = record.getField("_row_id");
+          Object seq = record.getField("_last_updated_sequence_number");
+          rows.add(
+              "{\"id\":"
+                  + record.getField("id")
+                  + ",\"row_id\":"
+                  + (rowId == null ? "null" : rowId)
+                  + ",\"last_updated_seq\":"
+                  + (seq == null ? "null" : seq)
+                  + "}");
+        }
+      }
+      Collections.sort(rows);
+      return "[" + String.join(",", rows) + "]";
+    }
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = new File(dir.toFile(), "table");
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.mkdirs() && !metadataDir.isDirectory()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.mkdirs() && !dataDir.isDirectory()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.LongType.get()),
+              Types.NestedField.optional(2, "data", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+
+      // FORMAT VERSION 3 — row lineage does not exist below it.
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "3");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_row_lineage");
+
+      DataFile a =
+          writeDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data-a.parquet").getAbsolutePath(),
+              new long[] {10L, 20L, 30L, 40L, 50L},
+              new String[] {"a", "b", "c", "d", "e"});
+      DataFile b =
+          writeDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data-b.parquet").getAbsolutePath(),
+              new long[] {60L, 70L, 80L},
+              new String[] {"f", "g", "h"});
+      // TWO files in ONE commit: the counter must advance by A's record count before B is assigned.
+      table.newAppend().appendFile(a).appendFile(b).commit();
+
+      DataFile c =
+          writeDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data-c.parquet").getAbsolutePath(),
+              new long[] {90L, 100L, 110L, 120L},
+              new String[] {"i", "j", "k", "l"});
+      // A SECOND commit: the range continues across snapshots, not just within a manifest.
+      table.newAppend().appendFile(c).commit();
+      table.refresh();
+
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      writeJson(dir.resolve("java_row_lineage.json"), lineageJson(table));
+      writeJson(dir.resolve("java_row_ids.json"), rowIdsJson(table));
+      System.out.println("generate-interop-row-lineage: wrote " + dir);
+    }
+
+    static void verify(Path dir) throws IOException {
+      Path rustTable = dir.resolve("rust_table");
+      Path rustMetadata = rustTable.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(rustMetadata)) {
+        System.out.println("FAIL row-lineage: no Rust metadata at " + rustMetadata);
+        System.out.println("verify-interop-row-lineage: 1 failures");
+        return;
+      }
+
+      int failures = 0;
+      TableMetadata metadata =
+          TableMetadataParser.read(new LocalFileIO(), rustMetadata.toAbsolutePath().toString());
+      if (metadata.formatVersion() != 3) {
+        System.out.println(
+            "FAIL row-lineage: expected format-version 3, got " + metadata.formatVersion());
+        failures++;
+      }
+      LocalTableOperations ops =
+          new LocalTableOperations(rustTable.toFile(), rustTable.resolve("metadata").toFile());
+      ops.commit(null, metadata);
+      BaseTable table = new BaseTable(ops, "rust_row_lineage");
+
+      String javaView = lineageJson(table);
+      writeJson(dir.resolve("java_view_of_rust_row_lineage.json"), javaView);
+
+      Path expectedPath = dir.resolve("rust_row_lineage_expected.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println("FAIL row-lineage: no Rust expectation at " + expectedPath);
+        failures++;
+      } else {
+        String expected = readString(expectedPath).trim();
+        if (!expected.equals(javaView)) {
+          System.out.println("FAIL row-lineage: Java's view of the RUST table differs.");
+          System.out.println("  rust  : " + expected);
+          System.out.println("  java  : " + javaView);
+          failures++;
+        }
+      }
+
+      // MATERIALIZATION: Java's per-row read of the RUST table. The Rust side diffs its own scan
+      // against this, which is what pins `_row_id` VALUES rather than only the manifest metadata.
+      String javaRows = rowIdsJson(table);
+      writeJson(dir.resolve("java_row_ids_of_rust_table.json"), javaRows);
+
+      // The headline assertion of residue (3): every data file Rust assigned carries an id Java
+      // resolves, and no file comes back with a null id on a V3 table.
+      for (ManifestFile manifest : table.currentSnapshot().dataManifests(table.io())) {
+        try (CloseableIterable<DataFile> files = ManifestFiles.read(manifest, table.io())) {
+          for (DataFile file : files) {
+            if (file.firstRowId() == null) {
+              System.out.println(
+                  "FAIL row-lineage: Java read a NULL first_row_id for " + file.location());
+              failures++;
+            }
+          }
+        }
+      }
+
+      System.out.println("verify-interop-row-lineage: " + failures + " failures");
+    }
+
+    private static DataFile writeDataFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        String path,
+        long[] ids,
+        String[] values)
+        throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("data", values[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
     }
   }
 

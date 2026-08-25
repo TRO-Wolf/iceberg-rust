@@ -1831,6 +1831,66 @@ mod test {
         temp_dir.close().unwrap();
     }
 
+    /// A manifest's assigned range must advance by EXISTING rows as well as added ones.
+    ///
+    /// Dropping the `existing_rows_count` term left both the interop suite and the whole lib
+    /// suite green (2026-08-25): every fixture appends, so no manifest carried an existing entry.
+    /// A rewrite or merge-append does, and the next manifest would then be handed an OVERLAPPING
+    /// range — duplicate row identities across live files.
+    #[tokio::test]
+    async fn assigned_range_advances_by_existing_rows_not_only_added() {
+        fn data_manifest(path: &str, existing_rows: u64, added_rows: u64) -> ManifestFile {
+            ManifestFile {
+                manifest_path: path.to_string(),
+                manifest_length: 1,
+                partition_spec_id: 0,
+                content: ManifestContentType::Data,
+                sequence_number: 0,
+                min_sequence_number: 0,
+                added_snapshot_id: 1,
+                added_files_count: Some(1),
+                existing_files_count: Some(1),
+                deleted_files_count: Some(0),
+                added_rows_count: Some(added_rows),
+                existing_rows_count: Some(existing_rows),
+                deleted_rows_count: Some(0),
+                partitions: None,
+                key_metadata: None,
+                first_row_id: None,
+            }
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("manifest_list_existing_rows.avro");
+        let io = FileIO::new_with_fs();
+        let output_file = io.new_output(path.to_str().unwrap()).unwrap();
+
+        // 7 EXISTING + 3 added in the first manifest: the second must start at 100 + 10, not 100 + 3.
+        let mut writer = ManifestListWriter::v3(output_file, 1, Some(0), 1, Some(100));
+        writer
+            .add_manifests(
+                vec![
+                    data_manifest("first.avro", 7, 3),
+                    data_manifest("second.avro", 0, 2),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let bytes = fs::read(path).unwrap();
+        let manifest_list =
+            ManifestList::parse_with_version(&bytes, crate::spec::FormatVersion::V3).unwrap();
+        assert_eq!(manifest_list.entries[0].first_row_id, Some(100));
+        assert_eq!(
+            manifest_list.entries[1].first_row_id,
+            Some(110),
+            "the second manifest must start after BOTH the existing and the added rows of the first"
+        );
+
+        temp_dir.close().unwrap();
+    }
+
     #[tokio::test]
     async fn test_manifest_list_writer_v1_as_v2() {
         let expected_manifest_list = ManifestList {
