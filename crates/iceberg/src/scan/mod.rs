@@ -5000,7 +5000,7 @@ pub mod tests {
                 "a filter fully implied by the partition must reduce to AlwaysTrue"
             );
         }
-        // FK2.1 critic-octo: residual memo Arc-clones onto co-partition tasks (same partition
+        // Residual memo Arc-clones onto co-partition tasks (same partition
         // x==1 ⇒ same Arc identity; deep clone would allocate distinct AlwaysTrue Arcs).
         assert!(
             Arc::ptr_eq(

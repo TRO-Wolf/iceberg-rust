@@ -1109,9 +1109,9 @@ remembering to write it.
   had read anything, so a dangling pointer produced silence instead of a signal. D1/D2 halt on an
   unverified precondition only if the agent reaches the missing document — a reference that never
   resolves to a path is never reached. Two PRs shipped across the break with no escalation.
-- **DO NOT forward a review's finding ids into the Actor's brief.** `04-actor.md:36` forbids telling
-  the Actor it will be reviewed, and predicts the exact failure: "writing to the test — shaping the
-  code to anticipate and pre-empt the reviewer." 32 lines across 13 `crates/` files carried
+- **DO NOT forward a review's finding ids into the Actor's brief.** `04-actor.md`'s blindness design note forbids
+  telling the Actor it will be reviewed, and predicts the exact failure: "writing to the test —
+  shaping the code to anticipate and pre-empt the reviewer." 48 lines across 15 `crates/` files carried
   `Critic-octo C1-Q-004`-style identifiers into production comments. The over-long doc blocks that
   followed were an audit trail addressed to the reviewer, not documentation for the next maintainer.
   Restate defects as plain requirements; the review's own record belongs in the unit ledger.
@@ -1123,7 +1123,13 @@ remembering to write it.
   GAP_MATRIX anchor drift, which recurred four times until `check_matrix_anchors.sh` was armed.
 - **DO scope a residue needle to the surface that must be clean, and prove the exclusions.**
   `Critic` is residue in `crates/` and correct usage in `task/`, `docs/` and the SEPMO tree, so the
-  scan is pathspec-scoped rather than tree-wide. It is word-bounded and case-sensitive because
-  "Critical" and "Critically" are legitimate; an anti-probe in the self-test hard-fails if a future
-  edit broadens a needle enough to match them. A gate that cannot catch its own probe is vacuous —
+  scan is pathspec-scoped rather than tree-wide. Word-bounding, not case-sensitivity, is what keeps
+  "Critical" and "Critically" out: case-sensitivity buys nothing there and missed nine lowercase
+  `critic-octo` lines, so the needles are case-INSENSITIVE with an anti-probe pinning the exclusion. A gate that cannot catch its own probe is vacuous —
   and one that fires on correct text gets disabled.
+- **DO make a gate's self-test assert its WIRING, not only its detector.** An independent review
+  sabotaged both new gates: every mutation inside the detector was caught, and five outside it
+  survived green — repointing the scan pathspec at a directory that does not exist, blanking the
+  variable that holds the scan's output, and replacing the failure assignment with a no-op so hits
+  printed and the script still exited 0. Pin the pathspec and the needle-family size in the
+  self-test, and decide failure by COUNTING hits rather than by a flag a mutation can neutralize.

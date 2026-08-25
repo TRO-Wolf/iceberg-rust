@@ -4152,7 +4152,8 @@ async fn test_split_outputs_have_disjoint_ascending_ranges() {
     //
     // This replaces an earlier guard that asserted `input_pairs.len() == 24_000` while
     // `input_pairs` was built four lines above as `(1..=24_000).map(..)` — an unconditional
-    // identity in the fixture's own construction that could never red. Reverting only the two stride arguments and touching no assertion left the suite green
+    // identity in the fixture's own construction that could never red. Reverting only the two
+    // stride arguments and touching no assertion left the suite green
     // under the sort mutation. Same over-claim class R-16 corrected on the config-time assert.
     //
     // The witness form is deliberate: ONE descending adjacent pair is logically equivalent to "not

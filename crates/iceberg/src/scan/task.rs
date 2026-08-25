@@ -1377,7 +1377,7 @@ mod tests {
     fn split_of_an_overlong_parent_is_a_passthrough() {
         // Non-vacuity: without it, a `split` that declined EVERYTHING would satisfy the assertions
         // below. (Measured: under a `target.min(remaining)` → `remaining` mutant this test alone of
-        // the rider's four stayed green.)
+        // the four passthrough tests stayed green.)
         let sized = task(1000, DataFileFormat::Parquet, None);
         assert!(
             sized.split(200).expect("sized split ok").len() > 1,
@@ -1708,7 +1708,7 @@ mod tests {
         ));
     }
 
-    /// FK2.1 critic-octo: offsets-aware split must Arc-share the same way as fixed-size.
+    /// Offsets-aware split must Arc-share the same way as fixed-size.
     #[test]
     fn split_offsets_aware_sub_tasks_arc_share_innards() {
         let mut t = task(1000, DataFileFormat::Parquet, Some(vec![0, 300, 700]));
@@ -1926,7 +1926,7 @@ mod tests {
         assert_eq!(back.predicate.as_deref(), t.predicate.as_deref());
     }
 
-    /// FK2.1 critic-octo STOP bar: frozen golden JSON (pre-Arc field shapes) must match
+    /// STOP bar: frozen golden JSON (pre-Arc field shapes) must match
     /// exactly for a representative task — not just Value-level type checks.
     #[test]
     fn arc_fields_json_matches_pre_arc_golden_bytes() {

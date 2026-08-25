@@ -27,8 +27,8 @@ bar-raising and are independent of ratification.
 
 ## The defect (evidence)
 
-`references/04-actor.md:86` is the **copy-paste role prompt — "hand this to the Actor"**. It is the
-one artifact that reaches a fresh-context Actor. Line 98 reads:
+`references/04-actor.md` §*Role prompt (copy-paste ready)* is the one artifact that reaches a
+fresh-context Actor. It reads:
 
 > Build to the engineering contract in **your tier manual** — that is the canonical home for what
 > "outstanding engineering" means, and **it is not restated here.** Read it there and build to it.
@@ -43,8 +43,8 @@ The obligation was never in doubt. AGENTS.md `<read_order>` states "Every Actor 
 this repository loads it", and the manifest row says "Actor binds — defers entirely". What failed is
 **transmission**, at the one hop that carries it.
 
-The Critic prompt does not share the defect. `references/05-critic.md:72-75`, inside its own
-copy-paste block, carries a resolver: "The binding manifest (`../binding-manifest.md`, row 'Risk
+The Critic prompt does not share the defect. `references/05-critic.md`, inside its own copy-paste
+block, carries a resolver: "The binding manifest (`../binding-manifest.md`, row 'Risk
 lens') resolves 'your tier manual' to the concrete canonical home for the running tier." The Actor
 prompt has no such sentence. The placeholder is resolvable for one role and dangling for the other.
 
@@ -105,11 +105,12 @@ sentence of operational constraint in the brief is the ceiling.
 ## Not an amendment — Actor blindness
 
 Forwarding Critic finding ids into an Actor brief violates rules that **already exist**:
-`04-actor.md:36` ("The Actor is never told that a Critic will audit its work… Writing to the test —
-shaping the code to anticipate and pre-empt the reviewer") and `04-actor.md:242` ("The Actor is never
-told where the defects came from; from its perspective they are simply requirements").
+`04-actor.md` §*Design note — the Actor is blind to the Critic* ("The Actor is never told that a
+Critic will audit its work… Writing to the test — shaping the code to anticipate and pre-empt the
+reviewer") and §*Defect-fix slices* ("The Actor is never told where the defects came from; from its
+perspective they are simply requirements").
 
-32 lines across 13 `crates/` files carried Critic, Falsifier and review-round identifiers into
+48 lines across 15 `crates/` files carried Critic, Falsifier and review-round identifiers into
 production comments, entering with #181 (2026-07-30) and #183 (2026-08-03). Git dates the residue and
 its context but not its author, so this is filed as an **execution failure with a mechanical check**,
 not as new canon. Adding canon to cover an unfollowed rule is how a contract grows until readers
@@ -120,10 +121,12 @@ skim it — which is the same mechanism as the over-long comment.
 Both are bar-raising and repo-local; neither touches canon.
 
 - **`scripts/check_agent_artifacts.sh` v4** — a second needle family for review-process residue
-  (`Critic`, `Falsifier`, `SEPMO`, `Actor-Critic`), scoped to `crates/` because `task/`, `docs/` and
-  the SEPMO tree are its correct homes. Case-sensitive and word-bounded, with an anti-probe that
-  hard-fails if a future edit broadens a needle enough to match "Critical" or "Critically". The 32
-  residue lines are swept in the same change, since the gate cannot go green beside them.
+  (`Critic`, `Falsifier`, `SEPMO`), scoped to `crates/` because `task/`, `docs/` and the SEPMO tree
+  are its correct homes. Word-bounded, with an anti-probe that
+  hard-fails if a needle is ever unbounded enough to match "Critical" or "Critically". Matching is
+  case-insensitive: lowercase `critic-octo` is the same residue, and `-w` alone excludes
+  "Critical" in either case. The 48 residue lines are swept in the same change, since the gate
+  cannot go green beside them.
 - **`scripts/check_comment_blocks.sh`** — the `rust-code-quality` scan 10 armed, in `make check` and
   CI. Diff-scoped, per AGENTS.md "Comments and prose" *Scope*. Rustdoc scaffolding (a bare `///`, a
   `# Errors` / `# Panics` / `# Notes` heading) does not count toward the cap: AGENTS.md requires

@@ -4517,7 +4517,8 @@ async fn test_update_cow_null_predicate_three_valued_logic() -> Result<()> {
 // H7-S2 — NON-VACUOUS 3VL for the COPY-ON-WRITE paths.
 //
 // The two `=`-only COW tests above cannot falsify the `is_valid` guard: for `=`, Arrow yields
-// (valid=false, value=false) on a NULL operand, so `is_valid` is redundant there. Deleting the guard from `match_mask` left both of them GREEN, and only a
+// (valid=false, value=false) on a NULL operand, so `is_valid` is redundant there. Deleting the
+// guard from `match_mask` left both of them GREEN, and only a
 // merge-on-read UPDATE test went red. H7-S2 routed COW DELETE's formerly-inline guard through the
 // shared `match_mask`, so ONE line now governs three of the four DML paths; these two `<>` tests make
 // it load-bearing on both COW paths. MUTATION PROOF (executed): dropping `is_valid` from `match_mask`

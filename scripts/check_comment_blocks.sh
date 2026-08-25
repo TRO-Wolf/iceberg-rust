@@ -18,36 +18,29 @@
 #
 
 # check_comment_blocks.sh — fail if the change under review ADDS a comment block
-# longer than MAX_LINES.
+# longer than MAX_LINES. This is scan 10 of .agents/skills/rust-code-quality,
+# armed: AGENTS.md "Comments and prose" rule 2 had no check, and three PRs
+# shipped 10-to-30-line doc blocks duplicating the unit ledger.
 #
-# Motivation (2026-08-25): AGENTS.md "Comments and prose" rule 2 — the shortest
-# form that carries the reason — had no armed check, and three consecutive PRs
-# shipped 10-to-30-line doc blocks that duplicated the unit ledger. The manual
-# form of this scan lives in .agents/skills/rust-code-quality/SKILL.md (scan 10);
-# nothing invoked it. This is that scan, armed.
+# DIFF-SCOPED because AGENTS.md scopes the rule to what the change touches, and
+# a tree-wide gate could not go green without the sweep it calls its own unit.
+# It counts ADDED runs only, so an edit inside an existing long block passes.
 #
-# DIFF-SCOPED, deliberately: AGENTS.md scopes the rule to "what the change adds
-# or touches" and states that a sweep of the existing tree is its own unit. A
-# tree-wide gate could not go green without that sweep, so it would have to be
-# advisory — and an advisory gate is one nobody fixes.
+# An unresolvable base ref is a HARD ERROR: a gate that passes when it cannot
+# see the diff is a false green. On a push to main the merge base is HEAD, so
+# the scan is empty by construction — this guards PRs.
 #
-# The base ref is BASE_REF, else origin/main. An unresolvable base is a HARD
-# ERROR, never a skip: a gate that silently passes when it cannot see the diff
-# is the false green the vacuity doctrine forbids.
-#
-# Exempt runs: a markdown table (any '|'), a section banner ('====' / '----').
-# A table is a closed domain in its shortest form; prose restating it is longer.
-#
-# Rustdoc scaffolding — a bare '///' separator and a '# Errors' / '# Panics' /
-# '# Notes' / '# Examples' heading — does not count toward the total. AGENTS.md
-# REQUIRES those sections, so counting them would cap the prose at four lines and
-# pay for a heading by deleting an error contract. The cap is on prose.
+# Exempt: a markdown table (any '|') and a section banner, which are shorter
+# than the prose restating them. Rustdoc scaffolding (a bare '///', a
+# '# Errors' / '# Panics' / '# Notes' heading) does not count toward the cap,
+# since AGENTS.md requires those sections.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MAX_LINES="${MAX_LINES:-6}"
 BASE_REF="${BASE_REF:-origin/main}"
+diff_pathspec='crates/*.rs'
 
 # The detector reads `git diff -U0` on stdin so the self-test can feed it a
 # synthetic diff. Only ADDED lines count: a run broken by context or a removal
@@ -81,6 +74,12 @@ detect() {
 # --- self-test: the detector must flag what it claims to, and only that -------
 self_test() {
   local out
+  # Wiring, not detection: a self-test that only exercises the detector passes
+  # while the shipped scan points at a path that matches nothing.
+  if [ "$diff_pathspec" != 'crates/*.rs' ]; then
+    echo "ERROR: scan pathspec is '$diff_pathspec' — it would miss the product surface" >&2
+    return 1
+  fi
   # Rustdoc scaffolding is free: 6 prose lines + separators + a heading passes
   out="$(printf '+++ b/a.rs\n@@\n+/// 1\n+/// 2\n+/// 3\n+///\n+/// # Errors\n+///\n+/// 4\n+/// 5\n+/// 6\n' | detect)"
   if [ -n "$out" ]; then
@@ -130,7 +129,7 @@ if ! merge_base="$(git merge-base "$base_sha" HEAD)"; then
   exit 1
 fi
 
-hits="$(git diff -U0 "$merge_base" -- 'crates/*.rs' | detect || true)"
+hits="$(git diff -U0 "$merge_base" -- "$diff_pathspec" | detect || true)"
 
 if [ -n "$hits" ]; then
   echo "ERROR: comment blocks over $MAX_LINES added lines:" >&2

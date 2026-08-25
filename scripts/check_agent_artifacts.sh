@@ -46,10 +46,10 @@
 # comments (32 lines across 13 files, entering with #181 and #183). AGENTS.md
 # "Comments and prose" routes review evidence to the unit ledger in task/, so
 # this family is scoped to crates/ ONLY: task/, docs/ and the SEPMO tree are its
-# correct homes and must never trip. It matches case-SENSITIVE ERE with word
-# boundaries, because "Critical" and "Critically" are legitimate and a
-# case-insensitive substring needle false-positives on both. An anti-probe
-# hard-fails if a future edit broadens a needle enough to match them.
+# correct homes and must never trip. Matching is word-bounded (-w) and
+# case-INSENSITIVE: lowercase "critic-octo" is the same residue, and -w already
+# excludes "Critical" and "Critically" in either case. An anti-probe proves that
+# exclusion, so a future edit cannot drop -w and quietly red the whole tree.
 #
 # Referencing these tags IN PROSE without tripping the gate: never write a
 # needle verbatim — omit the leading '<' (as task/todo.md does), or assemble
@@ -83,18 +83,19 @@ C='C'
 # -w (whole word) does the bounding: git grep -E is POSIX ERE, where \b is a
 # literal 'b', not a word boundary. Each needle carries a matching SAMPLE, since
 # a probe holding the pattern itself proves nothing for a needle with metachars.
+# "Actor-Critic" needs no needle of its own: -w treats the hyphen as a boundary,
+# so the Critic needle already matches it.
 residue_patterns=(
   "${C}ritic"
   "Falsifier"
   "SEPMO"
-  "Actor[-–]${C}ritic"
 )
 residue_samples=(
   "the ${C}ritic asked for this fixture"
   "Falsifier F9 found the gap"
   "SEPMO cycle 2 remediation"
-  "an Actor-${C}ritic cycle produced this"
 )
+residue_pathspec='crates/'
 
 # Strings that must NOT match: proof the needles stay word-bounded.
 residue_anti_patterns=(
@@ -137,10 +138,18 @@ self_test() {
   done
   rm -f "$probe"
 
-  # The probe proves the needles fire; this proves the real scan's pathspec
-  # would reach a file in the probe's position.
+  # Wiring, not detection: a self-test that only exercises the needles passes
+  # while the shipped scan points at nothing.
+  if [ "${#residue_patterns[@]}" -ne 3 ]; then
+    echo "ERROR: residue needle family changed size — update the count in the OK line" >&2
+    return 1
+  fi
+  if [ "$residue_pathspec" != "crates/" ]; then
+    echo "ERROR: residue pathspec is '$residue_pathspec', not 'crates/' — the scan would miss the product surface" >&2
+    return 1
+  fi
   case "$residue_probe" in
-    crates/*) ;;
+    "$residue_pathspec"*) ;;
     *) echo "ERROR: residue probe is outside the scanned pathspec — self-test is vacuous" >&2
        return 1 ;;
   esac
@@ -156,7 +165,7 @@ self_test() {
       echo "ERROR: self-test could not stage its residue probe file" >&2
       return 1
     fi
-    if ! GIT_INDEX_FILE="$tmp_index" git grep -nIEw -e "$p" -- "$residue_probe" >/dev/null 2>&1; then
+    if ! GIT_INDEX_FILE="$tmp_index" git grep -nIEwi -e "$p" -- "$residue_probe" >/dev/null 2>&1; then
       echo "ERROR: self-test FAILED — residue needle '$p' was not detected; the gate is vacuous" >&2
       return 1
     fi
@@ -169,7 +178,7 @@ self_test() {
       return 1
     fi
     for q in "${residue_patterns[@]}"; do
-      if GIT_INDEX_FILE="$tmp_index" git grep -nIEw -e "$q" -- "$residue_probe" >/dev/null 2>&1; then
+      if GIT_INDEX_FILE="$tmp_index" git grep -nIEwi -e "$q" -- "$residue_probe" >/dev/null 2>&1; then
         echo "ERROR: self-test FAILED — needle '$q' matched legitimate text '$p'" >&2
         return 1
       fi
@@ -208,13 +217,14 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
+residue_hits=0
 for p in "${residue_patterns[@]}"; do
   rc=0
-  git grep -nIEw -e "$p" -- 'crates/' >"$hits_file" 2>"$err_file" || rc=$?
+  git grep -nIEwi -e "$p" -- "$residue_pathspec" >"$hits_file" 2>"$err_file" || rc=$?
   if [ "$rc" -eq 0 ]; then
-    echo "ERROR: review-process residue '$p' found in crates/:" >&2
+    echo "ERROR: review-process residue '$p' found in $residue_pathspec:" >&2
     cat "$hits_file" >&2
-    fail=1
+    residue_hits=$(( residue_hits + $(wc -l <"$hits_file") ))
   elif [ "$rc" -ge 2 ]; then
     echo "ERROR: git grep failed (exit $rc) while scanning for '$p' — cannot certify the tree:" >&2
     cat "$err_file" >&2
@@ -222,7 +232,7 @@ for p in "${residue_patterns[@]}"; do
   fi
 done
 
-if [ "$fail" -ne 0 ]; then
+if [ "$residue_hits" -ne 0 ]; then
   echo >&2
   echo "Review evidence belongs in the unit ledger under task/, per AGENTS.md" >&2
   echo "'Comments and prose'. State the constraint the code keeps; never name the" >&2
@@ -230,4 +240,4 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "OK: no agent-session artifacts or review residue in tracked files (11 + 4 needles, self-tested)."
+echo "OK: no agent-session artifacts or review residue in tracked files (11 + 3 needles, self-tested)."
