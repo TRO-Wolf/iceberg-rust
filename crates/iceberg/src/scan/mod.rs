@@ -2416,13 +2416,8 @@ pub mod tests {
         }
 
         /// Re-write the current snapshot's manifest list as a **V3** list carrying an assigned
-        /// row-id range, reusing the manifests `setup_manifest_files` already wrote.
-        ///
-        /// `add_manifests` then assigns each data manifest its `first_row_id`, which
-        /// `load_manifest` propagates onto every entry's `DataFile`, which
-        /// `into_file_scan_task` threads onto the `FileScanTask`. That is the whole row-lineage
-        /// read chain, end to end, and it is the only way to make a planned task carry a
-        /// non-`None` `first_row_id`.
+        /// row-id range, reusing the manifests `setup_manifest_files` already wrote. This is the
+        /// only way to make a planned task carry a non-`None` `first_row_id`.
         pub async fn rewrite_manifest_list_as_v3_with_row_range(&mut self, first_row_id: u64) {
             // The manifest LIST is parsed against the table's format version, so a V3-shaped list
             // read by a V2 table silently drops `first_row_id`. Upgrade the table first.
@@ -3368,16 +3363,10 @@ pub mod tests {
         assert!(batches.is_empty());
     }
 
-    /// THE MANIFEST -> TASK WIRING PIN (verification-Critic F-2). `into_file_scan_task` is the
-    /// single production seam carrying row lineage from the manifest entry onto the
-    /// `FileScanTask`. Replacing both fields with `None` there passed the ENTIRE suite — every
-    /// real scan would have reported `_row_id` as all-NULL and nothing would have noticed. The
-    /// earlier fix replaced a refusal with a null column, which removed even the crude canary
-    /// that would have errored, so this seam has to be pinned directly.
-    ///
-    /// Both halves are asserted: `first_row_id` (needs a V3 manifest list with an assigned range,
-    /// hence the rewrite) and `file_sequence_number`. Pinning only one leaves a narrower mutation
-    /// alive.
+    /// The manifest -> task wiring pin. `into_file_scan_task` is the single production seam
+    /// carrying row lineage onto the `FileScanTask`, and `None`-ing both fields there passed the
+    /// entire suite — every real scan would have reported `_row_id` as all-NULL, silently. Both
+    /// halves are asserted; pinning one leaves a narrower mutation alive.
     #[tokio::test]
     async fn test_plan_files_threads_row_lineage_onto_the_task() {
         let mut fixture = TableTestFixture::new();

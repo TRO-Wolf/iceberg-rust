@@ -308,14 +308,12 @@ impl RecordBatchTransformerBuilder {
         self
     }
 
-    /// Supply the V3 row-lineage inputs for this data file: its assigned `first_row_id` (the
-    /// output of `assign_first_row_ids` at manifest read) and its file sequence number.
+    /// Supply the V3 row-lineage inputs for this data file: its assigned `first_row_id` and its
+    /// file sequence number.
     ///
-    /// Both are `Option` because a file in a V1/V2 table — or a V3 file in a manifest with no
-    /// assigned range — has neither. Projecting `_row_id` or `_last_updated_sequence_number`
-    /// without the corresponding value yields an ALL-NULL column, matching Java exactly
-    /// (`ValueReaders.rowIds(null, …)` and `lastUpdated` with either constant null both return
-    /// `constant(null)`). It is never defaulted to zero, which would mint colliding row ids.
+    /// Both are `Option` — a V1/V2 file, or a V3 file under a manifest with no assigned range, has
+    /// neither. Projecting without the corresponding input yields an all-NULL column, as Java
+    /// does; it is never defaulted to zero, which would mint colliding row ids.
     pub(crate) fn with_row_lineage(
         mut self,
         first_row_id: Option<i64>,
@@ -680,19 +678,12 @@ impl RecordBatchTransformer {
                 return SchemaComparison::Different;
             }
 
-            // A V3 ROW-LINEAGE column is NEVER a pass-through, even when the file's column matches
-            // the target field exactly. Its value is stored-else-fallback PER ROW (Java
-            // `ValueReaders$RowIdReader` / `$LastUpdatedSeqReader`), so a null in the stored column
-            // must be replaced with `first_row_id + pos` / the file sequence number. The fast
-            // paths hand the column back verbatim, nulls included — which is precisely what the
-            // fallback exists to prevent. Force the field-id-based `Modify` path.
+            // A V3 row-lineage column is never a pass-through: its value is stored-else-fallback
+            // PER ROW, so a null in the stored column must be replaced rather than handed back
+            // verbatim. Force the field-id-based `Modify` path.
             //
-            // The SOURCE half is defensive, not dead-but-reachable: the target schema always
-            // carries its field id and the preceding check already returns `Different` on an id
-            // mismatch, so the target half alone decides every case reachable today. Dropping
-            // either half individually leaves the suite green; dropping both does not. Kept so the
-            // guard still holds if a source field ever arrives without an embedded id (the
-            // name-mapping fallback shape).
+            // The source half is defensive — the target half alone decides every case reachable
+            // today — and is kept in case a source field ever arrives without an embedded id.
             if Self::field_id_of(source_field).is_some_and(is_row_lineage_field)
                 || Self::field_id_of(target_field).is_some_and(is_row_lineage_field)
             {
@@ -796,12 +787,9 @@ impl RecordBatchTransformer {
                 }
 
                 if *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER {
-                    // Java gates this column on BOTH inputs, not just the sequence number:
-                    // `ValueReaders.lastUpdated(rowIdConst, fileSeq, reader)` is a null constant
-                    // if EITHER is null. So a V1/V2 file — which HAS a
-                    // sequence number but no `first_row_id` — reports NULL here, not its sequence
-                    // number. Gating on the sequence number alone would fabricate a
-                    // last-updated value for every row of every pre-V3 table.
+                    // Java gates this column on BOTH inputs, not just the sequence number, so a
+                    // V1/V2 file reports NULL here. Gating on the sequence number alone would
+                    // fabricate a last-updated value for every row of every pre-V3 table.
                     let (Some(_), Some(file_sequence_number)) =
                         (first_row_id, file_sequence_number)
                     else {
@@ -936,9 +924,8 @@ impl RecordBatchTransformer {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::DataInvalid`] if any row's id would overflow `i64`. Java's `long`
-    /// addition wraps here; the fork fails closed, because a wrapped row id aliases another live
-    /// row's identity instead of surfacing as a read failure.
+    /// [`ErrorKind::DataInvalid`] if any row's id would overflow `i64`. Java's `long` addition
+    /// wraps; the fork fails closed, since a wrapped id aliases another live row's identity.
     fn row_ids_from_positions(
         first_row_id: i64,
         start_row_position: u64,
@@ -2516,18 +2503,16 @@ mod test {
 
     // ---- V3 row lineage: `_row_id` / `_last_updated_sequence_number` (F-13 V2) ----------------
     //
-    // Java `ValueReaders.fileFieldReader` dispatches on whether the FILE carries the reserved
-    // field, and each of the two dedicated readers then dispatches per ROW on whether the stored
-    // value is null. That is a 2x2 domain per column, and both axes are pinned below:
+    // Java dispatches on whether the FILE carries the reserved field, then per ROW on whether the
+    // stored value is null — a 2x2 domain per column, both axes pinned below:
     //
     // | | file lacks the column | file has it, no nulls | file has it, some nulls |
     // |---|---|---|---|
     // | `_row_id` | `first_row_id + pos` for every row | stored value verbatim | stored wins per row; NULL -> `first_row_id + pos` |
     // | `_last_updated_sequence_number` | the file's sequence number, constant | stored value verbatim | stored wins per row; NULL -> file sequence number |
     //
-    // Plus the two refusal cells (projected without the corresponding input) and the overflow
-    // door. The mixed-null cells are the discriminating ones: an implementation that ignores the
-    // stored column, and one that ignores the fallback, both pass the two pure cells.
+    // Plus the two absent-input cells and the overflow door. The mixed-null cells discriminate:
+    // both a stored-ignoring and a fallback-ignoring implementation pass the pure cells.
 
     fn row_lineage_schema() -> Arc<Schema> {
         Arc::new(
@@ -2649,13 +2634,9 @@ mod test {
         );
     }
 
-    /// Java returns an ALL-NULL column here, NOT an error: `ValueReaders.rowIds(null, reader)`
-    /// is a null constant (see `task/f13-v3-row-lineage-ledger.md`).
-    /// A V1/V2 file simply has no row identity — that is a fact about the rows, not a failure to
-    /// read them, and erroring would make `SELECT _row_id` unusable on any mixed-version table.
-    ///
-    /// This REPLACES `projecting_row_id_without_an_assigned_range_is_refused`, which pinned an
-    /// invented refusal (bundle-Critic F-C).
+    /// Java returns an all-NULL column here, not an error: a V1/V2 file has no row identity, which
+    /// is a fact about the rows rather than a failure to read them. Erroring would make
+    /// `SELECT _row_id` unusable on any mixed-version table.
     #[test]
     fn projecting_row_id_without_an_assigned_range_yields_nulls() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];
@@ -2711,14 +2692,9 @@ mod test {
         );
     }
 
-    /// The DISCRIMINATING cell for the absent-range arm. Java's `ValueReaders.rowIds(null, …)` is
-    /// a null constant, which means the stored column is **ignored**, not preferred — the arm is
-    /// chosen before the file is ever consulted. The sibling test feeds a batch with NO stored
-    /// column, so it cannot tell "discard the stored value" from "there was nothing to discard":
-    /// reordering the match to prefer a stored column whenever one exists passed the whole suite.
-    ///
-    /// Reachable in practice — a V3 file carrying `_row_id` read under a manifest with no
-    /// assigned range, which is every DELETE manifest.
+    /// The discriminating cell for the absent-range arm: the stored column is IGNORED, not
+    /// preferred, because the arm is chosen before the file is consulted. The sibling test feeds a
+    /// batch with no stored column and so cannot tell that apart from having nothing to discard.
     #[test]
     fn a_stored_row_id_is_discarded_when_there_is_no_assigned_range() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];
@@ -2769,14 +2745,9 @@ mod test {
         );
     }
 
-    /// Java gates `_last_updated_sequence_number` on BOTH inputs:
-    /// `ValueReaders.lastUpdated(Long rowIdConst, Long fileSeq, reader)` returns `constant(null)`
-    /// if EITHER is null. So a V1/V2 file —
-    /// which HAS a sequence number but no `first_row_id` — reports NULL, not its sequence number.
-    ///
-    /// This is the cell that matters most in practice: gating on the sequence number alone
-    /// fabricates a last-updated value for every row of every pre-V3 table, and does it silently.
-    /// (bundle-Critic F-B.)
+    /// Java gates `_last_updated_sequence_number` on BOTH inputs, so a V1/V2 file — which has a
+    /// sequence number but no `first_row_id` — reports NULL. Gating on the sequence number alone
+    /// silently fabricates a last-updated value for every row of every pre-V3 table.
     #[test]
     fn last_updated_sequence_number_is_null_without_a_first_row_id() {
         let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];

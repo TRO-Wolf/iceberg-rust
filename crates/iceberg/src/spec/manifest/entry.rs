@@ -149,36 +149,18 @@ impl ManifestEntry {
     }
 }
 
-/// Assign each entry's `first_row_id` from the manifest's own `first_row_id` — the V3 row-lineage
-/// counterpart of [`ManifestEntry::inherit_data`], and the Rust mirror of Java
-/// `ManifestReader.idAssigner` (`core/.../ManifestReader.java`) and its anonymous
-/// `ManifestReader$1`. Decoded bytecode: `task/f13-v3-row-lineage-ledger.md`.
+/// Assign each entry's `first_row_id` from the manifest's own range — the V3 row-lineage
+/// counterpart of [`ManifestEntry::inherit_data`], mirroring Java `ManifestReader.idAssigner`.
+/// Stateful across entries, so it takes the whole slice in manifest order.
 ///
-/// Unlike `inherit_data` this is **stateful across entries** — the assignment is a running total —
-/// so it is a pass over the whole slice rather than a per-entry method, and it must see the entries
-/// in the order they appear in the manifest.
-///
-/// Java has two arms, and the absent arm is the surprising one:
-///
-/// * `manifest_first_row_id` **absent** -> every file's `first_row_id` is set to `None`. This
-///   **OVERWRITES** any value the file carried on disk rather than preserving it; a manifest with
-///   no assigned range cannot lend row ids to its files, in ANY entry state. Delete manifests
-///   always take this arm — the manifest-list writer never assigns them a `first_row_id`.
-/// * `manifest_first_row_id` **present** -> a running counter starting at that value, assigning to
-///   an entry only when its status is not `Deleted` AND its `first_row_id` is currently `None`,
-///   then advancing by that file's `record_count`.
-///
-/// The two skip cells are the ones a naive running total gets wrong: the counter does **not**
-/// advance past a `Deleted` entry, and it does **not** advance past a file that already carries a
-/// `first_row_id`. Both leave the counter where it was, so the next assignable file takes the id
-/// the skipped entry did not consume.
+/// An absent `manifest_first_row_id` forces every file to `None`, OVERWRITING any stored value. A
+/// present one is a running counter that skips `Deleted` entries and entries that already carry an
+/// id, without advancing past either. Decoded bytecode: `task/f13-v3-row-lineage-ledger.md`.
 ///
 /// # Errors
 ///
-/// Returns [`ErrorKind::DataInvalid`] if the running counter would overflow `u64`. Java lets the
-/// `long` wrap silently here; the fork fails closed instead, because a wrapped row id aliases live
-/// rows rather than surfacing as a read failure. Unreachable for any real table — it needs the
-/// assigned ids to reach `u64::MAX`.
+/// [`ErrorKind::DataInvalid`] if the counter would overflow. Java wraps silently; the fork fails
+/// closed, since a wrapped id aliases live rows instead of surfacing as a read failure.
 pub(crate) fn assign_first_row_ids(
     entries: &mut [ManifestEntry],
     manifest_first_row_id: Option<u64>,
@@ -195,9 +177,8 @@ pub(crate) fn assign_first_row_ids(
         if entry.status == ManifestStatus::Deleted || entry.data_file.first_row_id.is_some() {
             continue;
         }
-        // The counter is `u64` (the width of `ManifestFile::first_row_id` and `record_count`), but
-        // `DataFile::first_row_id` is `i64` — Java's `Long`. Convert at the assignment, failing
-        // closed on the narrowing rather than wrapping into a negative row id.
+        // The counter is `u64`; `DataFile::first_row_id` is `i64` (Java's `Long`). Fail closed on
+        // the narrowing rather than wrap into a negative row id.
         entry.data_file.first_row_id = Some(
             i64::try_from(next_row_id)
                 .map_err(|_| overflow_error(manifest_first_row_id, entry, "exceeds i64::MAX"))?,
@@ -722,8 +703,8 @@ mod first_row_id_tests {
     use super::*;
     use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
 
-    /// A minimal data-file entry. `record_count` is the only field the assigner reads besides
-    /// `first_row_id`, so every fixture varies it to keep the counter's steps distinguishable.
+    /// A minimal data-file entry; fixtures vary `record_count` to keep the counter's steps
+    /// distinguishable.
     fn entry(
         status: ManifestStatus,
         path: &str,
@@ -753,8 +734,8 @@ mod first_row_id_tests {
         entries.iter().map(|e| e.data_file.first_row_id).collect()
     }
 
-    // The closed domain of `assign_first_row_ids`, from `ManifestReader.idAssigner` /
-    // `ManifestReader$1` (decoded bytecode: `task/f13-v3-row-lineage-ledger.md`):
+    // The closed domain of `assign_first_row_ids` (decoded bytecode:
+    // `task/f13-v3-row-lineage-ledger.md`):
     //
     // | Manifest `first_row_id` | Entry state | Java behaviour |
     // |---|---|---|
@@ -764,14 +745,10 @@ mod first_row_id_tests {
     // | present | `Added`, no id | assign; counter += `record_count` |
     // | present | `Existing`, no id | assign; counter += `record_count` (the guard is `!= Deleted`, NOT `== Added`) |
     //
-    // Every skip cell is pinned by the id the NEXT assignable file receives — asserting only that
-    // the skipped entry is untouched leaves a mutation that advances the counter anyway alive.
+    // Every skip cell is pinned by the id the NEXT assignable file receives.
 
-    /// The absent arm applies to EVERY entry state. Java's `lambda$idAssigner$2` carries no status
-    /// guard at all — only the `instanceof BaseFile` downcast — so a `Deleted` entry and an entry
-    /// with a stored id are nulled exactly like an `Added` one. Pinning this on `Added` alone lets
-    /// a mutation that adds a `Deleted` skip (or a preserve-if-set skip) survive, which is how the
-    /// first version of this test passed while being wrong.
+    /// The absent arm applies to EVERY entry state — Java's carries no status guard — so pinning
+    /// it on `Added` alone would let a skip-mutation survive.
     #[test]
     fn absent_manifest_row_id_forces_every_file_to_none() {
         let mut entries = vec![
@@ -837,9 +814,8 @@ mod first_row_id_tests {
         );
     }
 
-    /// The guard is `status != Deleted`, not `status == Added`. An `Existing` entry with no id must
-    /// still be assigned — reusing `inherit_data`'s `== Added` shape here would leave every
-    /// carried-forward file without a row id.
+    /// The guard is `status != Deleted`, not `status == Added`: reusing `inherit_data`'s shape
+    /// would leave every carried-forward file without a row id.
     #[test]
     fn an_existing_entry_without_an_id_is_still_assigned() {
         let mut entries = vec![
@@ -850,10 +826,9 @@ mod first_row_id_tests {
         assert_eq!(assigned(&entries), vec![Some(0), Some(10)]);
     }
 
-    // Two SEPARATE overflow doors, and they are not interchangeable. The `i64` door is the
-    // REACHABLE one (`i64::MAX` < `u64::MAX`), and it is the one whose wrapping form produces
-    // NEGATIVE row ids — the corruption this divergence from Java's silent `long` wrap exists to
-    // prevent. A test that only reaches the `u64` door leaves `as i64` unpinned.
+    // Two separate, non-interchangeable overflow doors: a test that only reaches the `u64` one
+    // leaves the `i64` narrowing — the reachable door, and the one that yields negative ids —
+    // unpinned.
 
     /// The `i64` narrowing door: a manifest range already past `i64::MAX` cannot lend any id.
     #[test]

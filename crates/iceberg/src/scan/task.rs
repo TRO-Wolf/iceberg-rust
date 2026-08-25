@@ -404,26 +404,17 @@ pub struct FileScanTask {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split_offsets: Option<Vec<i64>>,
 
-    /// V3 row lineage: the data file's assigned `first_row_id` — the start of the row-id range
-    /// this file owns, inherited at manifest read (Java `ManifestReader.idAssigner`).
-    ///
-    /// **Flagged additive field.** `None` for V1/V2 tables and for any V3 file whose manifest
-    /// carries no assigned range. Projecting `_row_id` on such a task yields an ALL-NULL column
-    /// — Java's answer (`ValueReaders.rowIds(null, …)` is a null constant) — never a guess:
-    /// defaulting to zero would mint row ids that collide with another file's.
-    ///
-    /// Unlike `split_offsets` this SURVIVES a split — a sub-task still belongs to the same file
-    /// and the same range. Reading `_row_id` under a split is refused elsewhere (it needs whole-
-    /// file physical ordinals), but the field itself must not be dropped, or a later
-    /// non-positional use would silently lose the file's identity.
+    /// V3 row lineage: start of the row-id range this data file owns, inherited at manifest read
+    /// (Java `ManifestReader.idAssigner`). Flagged additive field. `None` for V1/V2 and for any V3
+    /// file with no assigned range, which projects `_row_id` as all-NULL rather than guessing.
+    /// Survives a split — a sub-task belongs to the same file and range.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_row_id: Option<i64>,
 
     /// V3 row lineage: the data file's sequence number, the fallback for
-    /// `_last_updated_sequence_number` (Java `ValueReaders$LastUpdatedSeqReader`).
-    ///
-    /// **Flagged additive field**, `None` when unknown. Like `first_row_id` it survives a split.
+    /// `_last_updated_sequence_number` (Java `ValueReaders$LastUpdatedSeqReader`). Flagged
+    /// additive field, `None` when unknown. Like `first_row_id` it survives a split.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_sequence_number: Option<i64>,
@@ -598,12 +589,8 @@ impl FileScanTask {
         // Java has no such case: `_pos` is a Spark-side metadata column there, and its readers
         // carry the row-group start ordinal into a split, so a Java split can serve absolute
         // positions. Cost here: whole-file tasks — parallelism, never rows.
-        //
-        // `_row_id` is on this guard for the same reason: its fallback arm is
-        // `first_row_id + PHYSICAL ORDINAL` (Java `ValueReaders$RowIdReader`), so it needs the
-        // same whole-file in-order decode. Leaving it off is not a wrong-value bug but a TOTAL
-        // OUTAGE — the reader refuses every ranged sub-task, so a file that would have yielded
-        // its rows yields none and N errors instead.
+        // `_row_id` joins the guard for the same reason: its fallback arm is
+        // `first_row_id + physical ordinal`, so it needs the same whole-file in-order decode.
         if self.project_field_ids.iter().any(|&id| {
             id == crate::metadata_columns::RESERVED_FIELD_ID_POS
                 || id == crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID
@@ -703,9 +690,8 @@ impl FileScanTask {
             name_mapping: self.name_mapping.as_ref().map(Arc::clone),
             case_sensitive: self.case_sensitive,
             split_offsets: None,
-            // Row lineage SURVIVES the split: a sub-task is still a window of the SAME data file,
-            // so it owns the same row-id range and the same file sequence number. (Contrast
-            // `split_offsets`, which describes the whole file's row-group grid and is cleared.)
+            // Row lineage survives the split: a sub-task is a window of the same data file, so
+            // it keeps that file's row-id range and sequence number.
             first_row_id: self.first_row_id,
             file_sequence_number: self.file_sequence_number,
         }
@@ -1797,12 +1783,7 @@ mod tests {
 
     // ---- serde: the flagged-additive split_offsets field ----
 
-    /// Row lineage SURVIVES a split, unlike `split_offsets` which is cleared. A sub-task is a
-    /// byte window of the SAME data file, so it owns the same row-id range and the same file
-    /// sequence number; dropping them would lose the file's identity on every sub-task.
-    ///
-    /// (bundle-Critic F-E/M9: this design claim was asserted in the commit message and pinned by
-    /// nothing — setting both to `None` in `sub_task` passed the whole suite.)
+    /// Row lineage survives a split, unlike `split_offsets`, which is cleared.
     #[test]
     fn row_lineage_survives_a_split_while_split_offsets_is_cleared() {
         let mut whole = task(1000, DataFileFormat::Parquet, Some(vec![0, 400, 800]));
@@ -1830,9 +1811,8 @@ mod tests {
         }
     }
 
-    /// Both new fields are PUBLIC on an engine-serialized struct, so their wire contract is part
-    /// of the API: present when set, ABSENT when `None` so a pre-field serialization still
-    /// round-trips. (bundle-Critic F-E/M10: `#[serde(skip)]` on `first_row_id` survived.)
+    /// Both fields are public on an engine-serialized struct: present when set, absent when
+    /// `None` so a serialization predating them still round-trips.
     #[test]
     fn row_lineage_fields_round_trip_and_are_absent_when_none() {
         let mut with_lineage = task(1000, DataFileFormat::Parquet, None);
@@ -1858,9 +1838,8 @@ mod tests {
         assert_eq!(back_none.file_sequence_number, None);
     }
 
-    /// `_row_id` suppresses splitting exactly as `_pos` does (branch 1c). Without this the planner
-    /// hands the reader ranged sub-tasks that it then REFUSES one by one — a total outage, not a
-    /// wrong value. (bundle-Critic F-D.)
+    /// `_row_id` suppresses splitting exactly as `_pos` does (branch 1c); without it the planner
+    /// hands the reader ranged sub-tasks it then refuses one by one.
     #[test]
     fn projecting_row_id_suppresses_splitting() {
         let mut whole = task(1000, DataFileFormat::Parquet, Some(vec![0, 400, 800]));

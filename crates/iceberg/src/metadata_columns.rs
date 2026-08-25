@@ -384,14 +384,12 @@ pub fn partition_field(partition_fields: Vec<NestedFieldRef>) -> NestedFieldRef 
     )
 }
 
-/// Whether `field_id` is one of the two V3 ROW-LINEAGE reserved columns.
+/// Whether `field_id` is one of the two V3 row-lineage reserved columns.
 ///
-/// These are the only reserved metadata columns that can be PHYSICALLY PRESENT in a data file: a
-/// lineage-preserving rewrite carries the original `_row_id` / `_last_updated_sequence_number`
-/// forward into the new file, and Java prefers that stored value over the computed one
-/// (`ValueReaders$RowIdReader`). Every other reserved column (`_file`, `_pos`,
-/// `_spec_id`, ...) is synthesized by the reader and never read from the file, which is why
-/// [`is_metadata_field`] alone is the wrong predicate for deciding what to project.
+/// These are the only reserved metadata columns that can be physically present in a data file — a
+/// lineage-preserving rewrite carries them forward, and the stored value wins over the computed
+/// one. Every other reserved column is synthesized, which is why [`is_metadata_field`] alone is
+/// the wrong predicate for deciding what to project.
 pub fn is_row_lineage_field(field_id: i32) -> bool {
     matches!(
         field_id,

@@ -151,12 +151,11 @@ impl PreviousDeletes {
 /// rewrittenDeleteFiles)`).
 ///
 /// Java's `DeleteWriteResult` carries a third member, `referencedDataFiles` (a `CharSequenceSet`),
-/// used by conflict validation. It is not stored here: it is fully recoverable from `delete_files`
-/// (each DV carries its `referenced_data_file`), so it is exposed as the DERIVED accessors
+/// used by conflict validation. It is recoverable from `delete_files` (each DV carries its
+/// `referenced_data_file`), so it is exposed as the derived accessors
 /// [`referenced_data_files`](Self::referenced_data_files) and
-/// [`references_data_files`](Self::references_data_files) rather than duplicated as a field that
-/// could drift out of step with `delete_files`. The two STORED members are the ones a
-/// merge-and-replace commit cannot reconstruct: the DVs and the rewritten (superseded) delete files.
+/// [`references_data_files`](Self::references_data_files) rather than stored as a field that could
+/// drift out of step.
 #[derive(Debug)]
 pub struct DVWriteResult {
     /// One DV `DeleteFile` per referenced data file (Java `DeleteWriteResult.deleteFiles()`); the
@@ -171,20 +170,12 @@ pub struct DVWriteResult {
 
 impl DVWriteResult {
     /// The set of data file paths the written DVs reference — Java
-    /// `DeleteWriteResult.referencedDataFiles()` (a `CharSequenceSet`), which `RowDelta`'s
-    /// `validateDataFilesExist` consumes to arm conflict detection.
+    /// `DeleteWriteResult.referencedDataFiles()`, which `RowDelta.validateDataFilesExist` consumes
+    /// to arm conflict detection.
     ///
-    /// DERIVED from [`delete_files`](Self::delete_files) rather than stored, and exactly equal to
-    /// what Java accumulates: `BaseDVFileWriter.close` adds `deletes.path()` to the set once per
-    /// entry of `deletesByPath` it writes a blob for, and this writer emits exactly one
-    /// `DataFile` per such entry carrying that same path in `referenced_data_file`. Decoded
-    /// bytecode: `task/f13-v3-row-lineage-ledger.md`.
-    ///
-    /// A DV without a `referenced_data_file` cannot occur — [`DataFileBuilder::build`] rejects a
-    /// Puffin file with the field unset (Java `FileMetadata$Builder.build`) — so no
-    /// entry is silently dropped here; the `filter_map` is a total projection, not a filter.
-    ///
-    /// [`DataFileBuilder::build`]: crate::spec::DataFileBuilder::build
+    /// Derived from [`delete_files`](Self::delete_files), one path per written blob. A DV with no
+    /// `referenced_data_file` cannot occur (`DataFileBuilder::build` rejects it), so the
+    /// `filter_map` is a total projection, not a filter.
     pub fn referenced_data_files(&self) -> HashSet<String> {
         self.delete_files
             .iter()
@@ -192,12 +183,9 @@ impl DVWriteResult {
             .collect()
     }
 
-    /// Whether any data file is referenced — Java `DeleteWriteResult.referencesDataFiles()`
-    /// (1.10.0 bytecode: `referencedDataFiles != null && !referencedDataFiles.isEmpty()`; the
-    /// null arm cannot arise here because the set is derived, never absent).
-    ///
-    /// Equivalent to a non-empty [`referenced_data_files`](Self::referenced_data_files) but does
-    /// not allocate the set.
+    /// Whether any data file is referenced — Java `DeleteWriteResult.referencesDataFiles()`.
+    /// Equivalent to a non-empty [`referenced_data_files`](Self::referenced_data_files) without
+    /// allocating the set.
     pub fn references_data_files(&self) -> bool {
         self.delete_files
             .iter()
@@ -1466,20 +1454,12 @@ mod tests {
 
     // ---- `DVWriteResult::referenced_data_files` / `references_data_files` (F-13 U3b) ------------
     //
-    // The accessors are DERIVED, so the closed domain to pin is the projection itself, not a set of
-    // examples. Three axes, each crossed with both accessors:
-    //
-    // | Axis | Cells pinned |
-    // |---|---|
-    // | Cardinality | zero DVs (empty result) · one DV · MANY DVs |
-    // | Source member | reads `delete_files`, NOT `rewritten_delete_files` — pinned by a result where BOTH are non-empty and their paths are DISJOINT |
-    // | Field read | reads `referenced_data_file`, not the DV's own `file_path` — the two differ in every fixture below |
-    //
-    // Without the disjoint-source cell a mutation swapping `delete_files` for
-    // `rewritten_delete_files` survives every single-member fixture.
+    // The accessors are derived, so what must be pinned is the projection: cardinality (zero, one,
+    // many), that it reads `delete_files` and not `rewritten_delete_files`, and that it reads
+    // `referenced_data_file` and not the DV's own path. Without a fixture where both members are
+    // non-empty with DISJOINT paths, a source-swapping mutation survives.
 
-    /// MANY DVs: the derived set is exactly the referenced data files, one per written blob —
-    /// Java `BaseDVFileWriter.close` adds `deletes.path()` once per written entry.
+    /// Many DVs: the derived set is exactly the referenced data files, one per written blob.
     #[tokio::test]
     async fn dv_result_referenced_data_files_names_every_referenced_file() {
         let temp_dir = TempDir::new().expect("temp dir");

@@ -872,22 +872,12 @@ impl ManifestFile {
         }
 
         // V3 row lineage: assign `first_row_id` from this manifest's own range (Java
-        // `ManifestReader.idAssigner`). Stateful across entries, so it is a pass over the whole
-        // slice rather than a per-entry method, and it must see them in MANIFEST ORDER — that
-        // ordering IS load-bearing (the ids are a running total). Its position relative to
-        // `inherit_data` is not: that loop touches only snapshot/sequence numbers and never
-        // `first_row_id`, so the two passes are independent.
+        // `ManifestReader.idAssigner`). The ids are a running total, so the entries must arrive in
+        // MANIFEST ORDER; the pass is independent of `inherit_data`, which never touches the field.
         //
-        // A DELETE manifest never lends row ids. Java reaches the same outcome structurally
-        // rather than by validation: `ManifestFiles.readDeleteManifest` builds its reader through
-        // the 5-arg `ManifestReader` constructor, which hardcodes a null `firstRowId`, so the
-        // range simply never arrives. (Java's 6-arg constructor does carry a
-        // "First row ID is not valid for delete manifests" precondition, but no call site can
-        // trip it — all three that pass a range also pass `DATA_FILES`.) So Java READS such a
-        // manifest happily and ignores the range; REFUSING it here would make the fork reject a
-        // table Java scans fine. Passing `None` reproduces Java's behaviour exactly, and matches
-        // this file's own writer, which likewise forces `first_row_id = None` for delete
-        // manifests rather than erroring.
+        // A delete manifest never lends row ids, and Java IGNORES a range on one rather than
+        // refusing it (`ManifestFiles.readDeleteManifest` hardcodes a null `firstRowId`), so
+        // passing `None` here matches — erroring would reject a table Java scans fine.
         let manifest_range = match self.content {
             ManifestContentType::Deletes => None,
             ManifestContentType::Data => self.first_row_id,
@@ -2166,10 +2156,9 @@ mod test {
 
     // ---- V3 row lineage: `first_row_id` inheritance through `load_manifest` -------------------
     //
-    // The unit-level rules live in `spec::manifest::entry::first_row_id_tests`. These two pin the
-    // WIRING — that `load_manifest` runs the assigner and feeds it THIS manifest's own
-    // `first_row_id`. Both arms are needed: with only the assigning arm, dropping the call site
-    // still yields `None` everywhere, which the absent arm also produces.
+    // The unit-level rules live in `spec::manifest::entry::first_row_id_tests`; these two pin the
+    // WIRING. Both arms are needed — with only the assigning arm, dropping the call site yields
+    // `None` everywhere, which the absent arm also produces.
 
     /// Write a real V3 data manifest holding `record_counts.len()` added entries, and return the
     /// `ManifestFile` describing it with `first_row_id` forced to the given value.
@@ -2248,15 +2237,9 @@ mod test {
         );
     }
 
-    /// A DELETE manifest carrying a row-id range is READ successfully and its range IGNORED —
-    /// Java's behaviour, reached structurally: `ManifestFiles.readDeleteManifest` uses the 5-arg
-    /// `ManifestReader` constructor, which hardcodes a null `firstRowId`.
-    ///
-    /// This test previously asserted a REFUSAL, on the strength of the 6-arg constructor's
-    /// `checkArgument`. That precondition is unreachable in 1.10.0 — every call site passing a
-    /// range also passes `DATA_FILES` — so refusing made the fork reject a table Java scans fine:
-    /// a fail-closed where Java is fail-open. What must NOT happen is assigning row ids to delete
-    /// files, which is what the ignored range prevents.
+    /// A delete manifest carrying a row-id range is READ and its range IGNORED, as Java does.
+    /// Refusing it instead would be a fail-closed where Java is fail-open; what must not happen is
+    /// assigning row ids to delete files.
     #[tokio::test]
     async fn test_a_row_range_on_a_delete_manifest_is_ignored_not_assigned() {
         let temp_dir = TempDir::new().expect("temp dir");

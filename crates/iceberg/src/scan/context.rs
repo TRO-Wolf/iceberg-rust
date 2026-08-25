@@ -248,12 +248,10 @@ impl ManifestEntryContext {
             // transforms (bucket/truncate/...) are read from the file. The spec is resolved
             // once per manifest from its `partition_spec_id`, so a multi-spec scan
             // materializes each file's constants under its own spec.
-            // V3 row lineage, threaded from the manifest entry. `first_row_id` is what
-            // `assign_first_row_ids` resolved for THIS file when its manifest was read; the
-            // sequence number is the entry's own (already inherited by `inherit_data`). Both are
-            // `None` on a V1/V2 table, which makes a projected row-lineage column read as an
-            // ALL-NULL column — Java's answer (`ValueReaders.rowIds(null, …)` is
-            // `constant(null)`), not an error and not a silent zero.
+            // V3 row lineage, threaded from the manifest entry: `first_row_id` as
+            // `assign_first_row_ids` resolved it at manifest read, and the entry's own sequence
+            // number. Both are `None` on a V1/V2 table, which reads as an all-NULL column — Java's
+            // answer, not an error and not a silent zero.
             first_row_id: self.manifest_entry.data_file.first_row_id(),
             file_sequence_number: self.manifest_entry.file_sequence_number,
             partition: Some(self.manifest_entry.data_file.partition.clone()),

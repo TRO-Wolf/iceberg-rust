@@ -102,16 +102,10 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
-        // Refuse a variant-bearing schema HERE, before any bytes are written.
-        //
-        // Until `variant_experimental` was enabled, this was enforced incidentally: the
-        // Iceberg→Arrow conversion on the next line threw on `variant`, so `build` failed and
-        // nothing reached storage. That conversion now succeeds (it emits the canonical extension
-        // type, GAP_MATRIX row R88), which moved the refusal all the way to `close` — after the
-        // Parquet bytes had been flushed, leaving an ORPHAN file behind. No committable
-        // `DataFile` was ever produced, so this was never an on-disk-format hazard, but a writer
-        // that fails should fail before it writes. This is the write-path twin of
-        // `ArrowReader::reject_variant_projection`.
+        // Refuse a variant-bearing schema HERE, before any bytes are written. This used to fall
+        // out of the Iceberg→Arrow conversion below throwing on `variant`; that conversion now
+        // succeeds (row R88), which moved the refusal to `close` — after the bytes were flushed,
+        // leaving an orphan file. The write-path twin of `ArrowReader::reject_variant_projection`.
         reject_variant_write(self.schema.as_ref())?;
 
         // Detect once at build time: only run the NaN visitor when the schema has float/double
@@ -133,10 +127,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     }
 }
 
-/// Refuse writing a schema that contains a `variant` at ANY depth.
-///
-/// File-level variant I/O is unimplemented (row R88). The Iceberg→Arrow conversion of `variant`
-/// now succeeds, so this refusal is explicit rather than a side effect of that conversion failing.
+/// Refuse writing a schema that contains a `variant` at any depth (row R88).
 ///
 /// # Errors
 ///
@@ -3447,13 +3438,9 @@ mod variant_write_refusal_tests {
     use crate::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
     use crate::writer::file_writer::FileWriterBuilder;
 
-    /// A variant-bearing schema is refused BEFORE any bytes are written, at every depth.
-    ///
-    /// Enabling `variant_experimental` made the Iceberg→Arrow conversion succeed, which moved this
-    /// refusal from `build()` all the way to `close()` — after the Parquet bytes had been flushed,
-    /// leaving an orphan file. The read path got an explicit replacement guard in the same change;
-    /// the write path did not (closing-Critic finding). All four container positions are covered,
-    /// because the write walk is a second copy of the reader's and could drift from it.
+    /// A variant-bearing schema is refused BEFORE any bytes are written, at every depth — without
+    /// the guard the refusal lands in `close()`, after the Parquet bytes are flushed, leaving an
+    /// orphan file. All four container positions are covered.
     #[tokio::test]
     async fn a_variant_schema_is_refused_before_any_bytes_are_written() {
         for (label, variant_field) in [

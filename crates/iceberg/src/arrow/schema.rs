@@ -64,30 +64,20 @@ pub(crate) fn variant_arrow_data_type() -> DataType {
     ]))
 }
 
-/// Depth bound for [`variant_path_within`].
-///
-/// Mirrors `spec::schema::visitor`'s `MAX_SCHEMA_NESTING_DEPTH`: the repo already adjudicated this
-/// hazard for the same tree — a metadata file can be partner-influenced, and an unbounded
-/// recursive walk over it overflows the thread stack (an abort, not a typed error). It is strictly
-/// looser than any constructible schema, since `Schema::builder().build()` refuses at 128
-/// composite edges, so it changes behaviour for no legitimate schema.
+/// Depth bound for [`variant_path_within`], mirroring `spec::schema::visitor`'s
+/// `MAX_SCHEMA_NESTING_DEPTH`: an unbounded recursive walk over a partner-supplied metadata file
+/// overflows the stack. No constructible schema reaches it — the builder refuses first.
 pub(crate) const MAX_VARIANT_NESTING_DEPTH: usize = 128;
 
 /// The dotted path to the first `variant` at or beneath `ty`, or `None`.
 ///
 /// ONE walk, shared by the read guard (`ArrowReader::reject_variant_projection`) and the write
-/// guard (`ParquetWriterBuilder::build`). It was briefly two copies; the copies drifted in
-/// coverage within a single commit, which is why they are one function now.
+/// guard (`ParquetWriterBuilder::build`); as two copies they drifted in coverage.
 ///
-/// All FOUR container positions are descended — struct field, list element, map KEY and map value.
-/// The key is not a special case to skip: Java's `Types$MapType` factories constrain only the
-/// VALUE type, so `map<variant, _>` is a legal Iceberg type.
-///
-/// # Notes
-///
-/// Bounded by [`MAX_VARIANT_NESTING_DEPTH`]. Exceeding the bound reports "no variant found" rather
-/// than erroring — this is a guard, and a type nested that deep is rejected earlier by the schema
-/// builder that owns that rule.
+/// All four container positions are descended — struct field, list element, map KEY and map value.
+/// The key is not skippable: Java constrains only a map's VALUE type, so `map<variant, _>` is
+/// legal. Bounded by [`MAX_VARIANT_NESTING_DEPTH`], past which it reports "no variant" rather than
+/// erroring — a type nested that deep is rejected by the schema builder that owns that rule.
 pub(crate) fn variant_path_within(name: &str, ty: &Type) -> Option<String> {
     fn walk(name: &str, ty: &Type, depth: usize) -> Option<String> {
         if depth > MAX_VARIANT_NESTING_DEPTH {
@@ -228,15 +218,12 @@ pub trait ArrowSchemaVisitor {
     /// Return type of this visitor on arrow schema.
     type U;
 
-    /// Called for every field BEFORE its data type is descended into. Returning `Some` short-
-    /// circuits the walk for that field and uses the returned value as its result.
+    /// Called for every field BEFORE its data type is descended into; returning `Some` short-
+    /// circuits the walk for that field.
     ///
-    /// This exists for the canonical Arrow VARIANT extension type, which is a `Struct` carrying
-    /// the `arrow.parquet.variant` extension name on the FIELD. Descending into it would be
-    /// wrong twice over: its `metadata` / `value` children are components of one Iceberg field
-    /// rather than Iceberg fields, so they carry no field ids and the walk would fail on the
-    /// missing id — and even if it succeeded it would yield a two-field struct instead of the
-    /// variant type. Mirrors the Avro side's `variant()` visitor arm.
+    /// This exists for the canonical Arrow variant extension type, a `Struct` carrying the
+    /// `arrow.parquet.variant` name on the FIELD. Its `metadata` / `value` children are components
+    /// of one Iceberg field, not Iceberg fields, so descending would fail on their missing ids.
     fn variant_field(&mut self, _field: &Field) -> Result<Option<Self::T>> {
         Ok(None)
     }
@@ -916,22 +903,16 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         )))
     }
 
-    /// Iceberg `variant` becomes the CANONICAL Arrow variant extension type: a two-field struct
+    /// Iceberg `variant` becomes the canonical Arrow variant extension type: a two-field struct
     /// `{metadata: Binary, value: Binary}` carrying the `arrow.parquet.variant` extension name.
     ///
-    /// This DIVERGES FROM JAVA DELIBERATELY, and the divergence is an extension, not a defect.
-    /// Java throws here — `TypeUtil$SchemaVisitor.variant(VariantType)` is a bare
-    /// `UnsupportedOperationException("Unsupported type: variant")` and `ArrowSchemaUtil`'s
-    /// converter does not override it — because Java's Arrow
-    /// bridge predates the canonical extension type. Refusing was the right behaviour only while
-    /// the fork had nothing to emit; emitting the CANONICAL type is strictly better than an
-    /// exception, and it is the same type `parquet`'s own variant support reads and writes, so
-    /// the on-disk contract is preserved rather than bypassed.
+    /// A DELIBERATE divergence from Java, which throws here because its Arrow bridge predates the
+    /// canonical type. Emitting it is the same type `parquet`'s own variant support reads and
+    /// writes, so the on-disk contract is preserved rather than bypassed.
     ///
-    /// The shape is fixed by the Arrow spec, not chosen here: `VariantType::NAME` is
-    /// `"arrow.parquet.variant"`, its extension metadata is the EMPTY STRING (not absent), and it
-    /// admits only a struct. Both children are non-nullable `Binary` — a variant with no value is
-    /// represented by a null at the STRUCT level, never by a null child.
+    /// The shape is fixed by the Arrow spec: the extension metadata is the empty string (not
+    /// absent), and both children are non-nullable — a variant with no value is a null at the
+    /// STRUCT level, never a null child.
     ///
     /// # Notes
     ///
@@ -2868,16 +2849,11 @@ mod tests {
         assert_eq!(out.iter().collect::<Vec<_>>(), values);
     }
 
-    // Variant converts to the CANONICAL Arrow extension type (`arrow.parquet.variant`) rather
-    // than erroring, as of the `variant_experimental` enablement. This REPLACES
-    // `test_variant_to_arrow_errors_loudly`, which pinned the old refusal — that behaviour is
-    // deliberately gone, and it was the only test in the suite that failed on this change.
-    //
-    // What still must NOT happen is a silent fallback: the type is identified by the FIELD's
-    // extension metadata, never by its struct shape, so a plain `{metadata, value}` struct
-    // carrying no extension name must still convert back to a STRUCT, not a variant. That is the
-    // discriminating cell below, and it is what keeps raw variant bytes from being mistaken for a
-    // plain column (and vice versa).
+    // Variant converts to the canonical Arrow extension type rather than erroring, replacing
+    // `test_variant_to_arrow_errors_loudly`. What must NOT happen is a silent fallback: the type
+    // is identified by the FIELD's extension metadata, never by its struct shape, so a plain
+    // `{metadata, value}` struct with no extension name still converts back to a STRUCT. That is
+    // the discriminating cell below.
 
     #[test]
     fn test_variant_converts_to_the_canonical_arrow_extension_type() {
@@ -2946,12 +2922,9 @@ mod tests {
         assert_eq!(back.as_struct().fields()[1].id, 2);
     }
 
-    /// NESTED variant — inside a `list` and inside a `map` value. Both were broken when the
-    /// top-level arm landed (verification-Critic F-4): `list` REBUILDS its element's metadata map
-    /// and so erased the extension name, degrading `list<variant>` to a list of plain
-    /// `{metadata, value}` structs — silently, which is the precise hazard the identity rule
-    /// exists to prevent — and neither `visit_list` nor the map-value descent consulted the
-    /// `variant_field` hook, so neither converted back.
+    /// NESTED variant — inside a `list` and inside a `map` value. `list` rebuilds its element's
+    /// metadata map, silently erasing the extension name and degrading `list<variant>` to a list
+    /// of plain structs; neither descent consulted the `variant_field` hook on the way back.
     #[test]
     fn test_variant_nested_in_a_list_and_a_map_round_trips() {
         let schema = Schema::builder()
@@ -3038,12 +3011,9 @@ mod tests {
         );
     }
 
-    /// The FIFTH descent position: a variant inside a STRUCT, on the Arrow→Iceberg side. The
-    /// reader-side struct walk was pinned; this one was not, so removing `visit_struct`'s
-    /// `variant_field` hook survived the suite (symmetry sweep F-8). Without it the round trip
-    /// fails loudly ("Field id not found in metadata") rather than corrupting — the struct's
-    /// `metadata` / `value` children carry no field ids — but a loud failure on a legal type is
-    /// still a defect.
+    /// The fifth descent position: a variant inside a STRUCT, on the Arrow→Iceberg side. Removing
+    /// `visit_struct`'s `variant_field` hook survived the suite. It fails loudly rather than
+    /// corrupting, but a loud failure on a legal type is still a defect.
     #[test]
     fn test_variant_nested_in_a_struct_round_trips() {
         let schema = Schema::builder()
