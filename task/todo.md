@@ -38,17 +38,25 @@ Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next
 - [ ] **R166 interop leg — a CITATION-AND-PIN job, not a build.** The leg already exists on the
       engine side: unit V3-0 (RePark #199) appended rows with lineage through the fork and
       round-tripped through Spark→Java with the read verified Spark-exact. **Read
-      `/home/john/CodeRepos/LocalRepark/repark/task/ledgers/staging/v3-0-charter-ledger.md` and the
-      V3E-1/2 transcript BEFORE writing anything.** The named v3 oracle — PySpark 4.1.2 +
+      `/home/john/CodeRepos/LocalRepark/repark/task/ledgers/staging/v3-0-charter-ledger.md` and
+      `/home/john/CodeRepos/LocalRepark/repark/task/ledgers/archive/2026-08/2026-08-24-v3e-1-2-cow-oracle-ledger.md`
+      BEFORE writing anything.** The named v3 oracle — PySpark 4.1.2 +
       `iceberg-spark-runtime-4.1_2.13:1.11.0` — is live on this machine with the V3E-3 fixtures
       (partitioned DV + equality-delete). A fork-local pin that REUSES that oracle is fine; a
-      separate harness is not. Flips R166 🟡→✅ and closes residue (3).
+      separate harness is not. Closes residue (3). It does NOT by itself flip R166 🟡→✅: residue
+      (1), the untested ORC stored-`_row_id` arm, has no oracle either, so the flip needs the
+      legend's named-unproven-slice allowance applied deliberately, not silently.
 - [ ] **Then F-7, not F-13.** F-13 is CLOSED (see row R114's engine answer, 2026-08-25), so the
       unblocked item is F-7: lineage through `RewriteFiles`/`OverwriteFiles`, DV-aware
       `RewritePositionDeleteFiles`, dangling-DV removal. Unlocks engine units V3-4 + V3-5.
 - [ ] R166's other two residues stay open and named: the ORC stored-column arm has no oracle
       (Java's ORC reader is outside `iceberg-core`), and the ranged-split refusal is unreachable
       through `plan_tasks` but reachable through the public `PartitionWork` seam.
+- [ ] **Fork unit the engine answer surfaced (not queued, no owner):** the DV pre-IO safety check is
+      private to `iceberg-datafusion`. An external engine driving `DVFileWriter` directly gets no
+      pre-IO guard and orphans a Puffin when the commit door refuses it. Promoting
+      `referenced_data_file_location` / `is_deletion_vector` to the public core surface would close
+      it. See row R114.
 
 ---
 

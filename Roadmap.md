@@ -323,8 +323,10 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
   `_last_updated_sequence_number` resolve stored-value-else-fallback per row, in the SHARED
   `RecordBatchTransformer` rather than per format, so Parquet and Avro get one rule. `_row_id`
   inherits `_pos`'s whole-file in-order decode requirement and its split suppression. Held at 🟡 by
-  three named residues, of which one gates ✅: no interop leg yet proves Java reads fork-assigned
-  row ids.
+  three named residues. A citation-and-pin unit can close only one of them — the missing interop
+  leg. The ORC stored-column arm has no oracle, because Java's ORC reader sits outside
+  `iceberg-core`, so it flips under the legend's named-unproven-slice allowance rather than by
+  test.
   Remaining: CDC-merge (row-level) + strict-evaluator completion (per-row status: GAP_MATRIX).
   *(Corrected 2026-07-01: the stale "split planning (row 146)" entry removed — it landed ✅
   2026-06-17, as headline item 4 below already records.)*
@@ -336,26 +338,31 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 - **Gates on:** Phase 1 (types in spec).
 - **Key deliverables:** ORC + Avro **data** file read/write; remaining V3 types end-to-end — variant
   (incl. shredding), geometry/geography + geospatial predicates, `unknown`.
-- **Where it stands — the V3 slate, one row per axis** (status is the GAP_MATRIX's, not this table's;
-  reproduced here because the phase narrative and the engine queue kept disagreeing):
+- **Where it stands — the V3 slate, one axis per row.** Status is the GAP_MATRIX's and is NOT
+  restated here; this table is a router, because the phase narrative and the engine queue kept
+  disagreeing about which axes existed at all.
 
-  | V3 axis | Row | State |
+  | V3 axis | Row | What is left |
   |---|---|---|
-  | Deletion vectors (write + read + commit door + engine MOR) | R114 | ✅ — F-13 fully closed 2026-08-24 |
-  | Column default values (`initial-default` / `write-default`) | R92 | ✅ — applied on the data-path readers |
-  | `timestamp_ns` / `timestamptz_ns` | R90 | ✅ |
-  | `unknown` | R91 | ✅ at the metadata level; data-file always-null I/O deferred-loud |
-  | Row lineage (`first_row_id` inheritance + `_row_id` materialization) | R166 | 🟡 — built both halves; no interop leg yet |
-  | `variant` | R88 | 🟡 — binary format byte-exact both sides; canonical Arrow extension type landed 2026-08-25 |
-  | `timestamptz` residues (metadata projection, Arrow tz annotation) | R162, R163 | 🟡 |
-  | `geometry` / `geography` + geospatial predicates | R89 | ❌ — DECLARED "not yet" for v1.0 |
-  | ORC + Avro **data** file read/write | see GAP_MATRIX | ❌ for write; read is partial |
+  | Deletion vectors (write, read, commit door, engine MOR) | R114 | nothing — F-13 closed 2026-08-24 |
+  | Column default values | R92 | `write_default` is set but consumed nowhere under `writer/` |
+  | `timestamp_ns` / `timestamptz_ns` | R90 | nothing on the type itself |
+  | `unknown` | R91 | data-file always-null I/O, deferred-loud |
+  | Row lineage | R166 | no interop leg; ORC stored arm has no oracle; ranged-split refusal via `PartitionWork` |
+  | `variant` | R88 | shredded-parquet I/O — outside the parity envelope, see below |
+  | `timestamptz` metadata projection / Arrow tz annotation | R162, R163 | named residues on each row |
+  | `geometry` / `geography` + geospatial predicates | R89 | everything — nothing exists |
 
-  So the V3 type front is **partly landed under existing row ids, not unstarted**: six axes closed,
-  three 🟡 with named residue, one ❌ declared. Shredded-parquet variant I/O is gated behind
-  parquet's opt-in `variant_experimental` feature — not a version floor — and sits OUTSIDE the
-  `iceberg-core` parity envelope (Java's shredding lives in `iceberg-parquet`); whether it is inside
-  a CONSUMER's v1.0 gate is a separate owner ruling. See row R88.
+  Read that as: the V3 type front is **partly landed under existing row ids**, not unstarted. Of the
+  eight axes, two carry no remaining work (R114, R90), five carry named residue, and one is a dated
+  DECLARED "not yet" (R89). ORC and Avro **data** file read/write is NOT a V3 axis — it is format
+  breadth, tracked separately in this phase's deliverables.
+
+  Shredded-parquet variant I/O sits behind parquet's opt-in `variant_experimental` feature, and it
+  is outside the `iceberg-core` parity envelope, because Java's shredding lives in
+  `iceberg-parquet`. Whether it is inside a CONSUMER's v1.0 gate is a separate owner ruling. See
+  row R88.
+
 - **Exit criteria:** read/write parity for ORC + Avro data; V3 types round-trip and interop with Java.
 
 ### Phase 5 — Catalog & views  ·  **Status: 🟡**
