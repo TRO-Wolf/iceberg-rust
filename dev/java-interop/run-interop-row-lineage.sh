@@ -33,8 +33,11 @@
 #   manifest, whose range is absent, so every entry is nulled before the survivor is written
 #   forward. It takes TWO appends, not one, so two carried-forward data manifests reach the V3
 #   commit still needing a range and each still holding live rows; their relative order then decides
-#   which takes which. The four record counts are distinct (f=3, g=2, i=4, h=1) so a swap survives
-#   the name stripping the assignment cross-check does. Both directions plus a cross-check.
+#   which takes which. What catches a swap is the `manifests` array's `added_files` asymmetry (0 on
+#   the rewritten manifest, 1 on the carried-forward one), which name stripping never touches; the
+#   four distinct record counts are defence in depth for the `files` half, not the operative guard.
+#   `h` is 1 row because Java REFUSES a `replace` adding more records than it deletes — a
+#   precondition the fork does not carry (row R107). Both directions plus a cross-check.
 #
 #   D2 ("JAVA reads what RUST writes"): the Rust GEN test commits the equivalent V3 table through
 #   the production path; Java reads it with the SAME view builder, diffs, and separately asserts no
