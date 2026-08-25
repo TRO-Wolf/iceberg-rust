@@ -871,6 +871,22 @@ impl ManifestFile {
             entry.inherit_data(self);
         }
 
+        // Java `ManifestReader`'s constructor precondition: a row-id range is meaningful only for
+        // a DATA manifest. The fork's WRITER already forces `first_row_id = None` on delete
+        // manifests, but a manifest list written by someone else can carry one, and silently
+        // assigning row ids to DELETE files would invent lineage for rows that do not exist.
+        // Java throws here; so does this.
+        if let Some(first_row_id) = self.first_row_id
+            && self.content == ManifestContentType::Deletes
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "First row ID is not valid for delete manifests",
+            )
+            .with_context("manifest_path", self.manifest_path.clone())
+            .with_context("first_row_id", first_row_id.to_string()));
+        }
+
         // V3 row lineage: assign `first_row_id` from this manifest's own range (Java
         // `ManifestReader.idAssigner`). Stateful across entries, so it is a pass over the whole
         // slice rather than a per-entry method, and it must see them in MANIFEST ORDER — that
@@ -2228,8 +2244,40 @@ mod test {
         assert_eq!(
             ids,
             vec![Some(1_000), Some(1_010), Some(1_013)],
-            "ids start at the MANIFEST's own first_row_id and advance by record_count — not at 0,              and not all at the same value"
+            "ids start at the MANIFEST's own first_row_id and advance by record_count — not at \
+             0, and not all at the same value"
         );
+    }
+
+    /// Java `ManifestReader`'s constructor precondition, ported to the read path: a row-id range
+    /// on a DELETE manifest is invalid and throws. The fork's writer never emits one, but a
+    /// manifest list written by anyone else can, and silently assigning row ids to delete files
+    /// would invent lineage for rows that do not exist. (Closing-Critic residue.)
+    #[tokio::test]
+    async fn test_load_manifest_rejects_a_row_range_on_a_delete_manifest() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let mut manifest_file = v3_manifest_with(&temp_dir, &file_io, &[10], Some(1_000)).await;
+        // Same manifest, relabelled as a DELETE manifest carrying a range.
+        manifest_file.content = ManifestContentType::Deletes;
+
+        let error = manifest_file
+            .load_manifest(&file_io)
+            .await
+            .expect_err("a delete manifest must not carry a row-id range");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert!(
+            error
+                .message()
+                .contains("First row ID is not valid for delete manifests"),
+            "the message is Java's verbatim, got: {}",
+            error.message()
+        );
+
+        // Control: the SAME manifest as DATA content loads fine, so the rejection keys on the
+        // content type and not on something incidental to the fixture.
+        let data_manifest = v3_manifest_with(&temp_dir, &file_io, &[10], Some(1_000)).await;
+        assert!(data_manifest.load_manifest(&file_io).await.is_ok());
     }
 
     #[tokio::test]

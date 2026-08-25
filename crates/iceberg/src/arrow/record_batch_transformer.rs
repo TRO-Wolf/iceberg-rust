@@ -686,6 +686,13 @@ impl RecordBatchTransformer {
             // must be replaced with `first_row_id + pos` / the file sequence number. The fast
             // paths hand the column back verbatim, nulls included — which is precisely what the
             // fallback exists to prevent. Force the field-id-based `Modify` path.
+            //
+            // The SOURCE half is defensive, not dead-but-reachable: the target schema always
+            // carries its field id and the preceding check already returns `Different` on an id
+            // mismatch, so the target half alone decides every case reachable today. Dropping
+            // either half individually leaves the suite green; dropping both does not. Kept so the
+            // guard still holds if a source field ever arrives without an embedded id (the
+            // name-mapping fallback shape).
             if Self::field_id_of(source_field).is_some_and(is_row_lineage_field)
                 || Self::field_id_of(target_field).is_some_and(is_row_lineage_field)
             {

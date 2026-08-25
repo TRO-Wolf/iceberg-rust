@@ -102,6 +102,18 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
+        // Refuse a variant-bearing schema HERE, before any bytes are written.
+        //
+        // Until `variant_experimental` was enabled, this was enforced incidentally: the
+        // Iceberg→Arrow conversion on the next line threw on `variant`, so `build` failed and
+        // nothing reached storage. That conversion now succeeds (it emits the canonical extension
+        // type, GAP_MATRIX row R88), which moved the refusal all the way to `close` — after the
+        // Parquet bytes had been flushed, leaving an ORPHAN file behind. No committable
+        // `DataFile` was ever produced, so this was never an on-disk-format hazard, but a writer
+        // that fails should fail before it writes. This is the write-path twin of
+        // `ArrowReader::reject_variant_projection`.
+        reject_variant_write(self.schema.as_ref())?;
+
         // Detect once at build time: only run the NaN visitor when the schema has float/double
         // leaves under a counts-collecting metrics mode. Int/string/timestamp-only tables skip
         // the full schema walk on every batch.
@@ -120,6 +132,75 @@ impl FileWriterBuilder for ParquetWriterBuilder {
         })
     }
 }
+
+/// Refuse writing a schema that contains a `variant` at ANY depth.
+///
+/// File-level variant I/O is unimplemented (row R88). The Iceberg→Arrow conversion of `variant`
+/// now succeeds, so this refusal is explicit rather than a side effect of that conversion failing.
+///
+/// # Errors
+///
+/// [`ErrorKind::FeatureUnsupported`] naming the dotted path to the first variant found.
+fn reject_variant_write(schema: &Schema) -> Result<()> {
+    for field in schema.as_struct().fields() {
+        if let Some(path) = variant_path_within(&field.name, field.field_type.as_ref()) {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "Writing the variant column '{path}' is not supported yet: file-level variant \
+                     I/O is unimplemented (GAP_MATRIX row R88). Refused before any bytes are \
+                     written, so no orphan file is left behind."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The dotted path to the first `variant` at or beneath `ty`, or `None`. Mirrors
+/// `ArrowReader::variant_within`, including its four descent positions (struct field, list
+/// element, map KEY and map value — Java constrains only a map's VALUE type, so a variant key is
+/// a legal Iceberg type) and its depth bound.
+fn variant_path_within(name: &str, ty: &Type) -> Option<String> {
+    fn walk(name: &str, ty: &Type, depth: usize) -> Option<String> {
+        if depth > MAX_VARIANT_WRITE_DEPTH {
+            return None;
+        }
+        let next = depth + 1;
+        match ty {
+            Type::Variant => Some(name.to_string()),
+            Type::Struct(struct_type) => struct_type.fields().iter().find_map(|nested| {
+                walk(
+                    &format!("{name}.{}", nested.name),
+                    nested.field_type.as_ref(),
+                    next,
+                )
+            }),
+            Type::List(list) => walk(
+                &format!("{name}.element"),
+                list.element_field.field_type.as_ref(),
+                next,
+            ),
+            Type::Map(map) => walk(
+                &format!("{name}.key"),
+                map.key_field.field_type.as_ref(),
+                next,
+            )
+            .or_else(|| {
+                walk(
+                    &format!("{name}.value"),
+                    map.value_field.field_type.as_ref(),
+                    next,
+                )
+            }),
+            Type::Primitive(_) => None,
+        }
+    }
+    walk(name, ty, 0)
+}
+
+/// Depth bound for [`variant_path_within`], matching the reader's.
+const MAX_VARIANT_WRITE_DEPTH: usize = 128;
 
 /// A mapping from Parquet column path names to internal field id
 struct IndexByParquetPathName {
@@ -3393,5 +3474,110 @@ mod tests {
             "expected a loud incompatible-type rejection exposing the un-normalized nested \
              \"UTC\" vs \"+00:00\" timestamp mismatch, got: {rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod variant_write_refusal_tests {
+    use std::sync::Arc;
+
+    use parquet::file::properties::WriterProperties;
+    use tempfile::TempDir;
+
+    use super::ParquetWriterBuilder;
+    use crate::ErrorKind;
+    use crate::io::FileIO;
+    use crate::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
+    use crate::writer::file_writer::FileWriterBuilder;
+
+    /// A variant-bearing schema is refused BEFORE any bytes are written, at every depth.
+    ///
+    /// Enabling `variant_experimental` made the Iceberg→Arrow conversion succeed, which moved this
+    /// refusal from `build()` all the way to `close()` — after the Parquet bytes had been flushed,
+    /// leaving an orphan file. The read path got an explicit replacement guard in the same change;
+    /// the write path did not (closing-Critic finding). All four container positions are covered,
+    /// because the write walk is a second copy of the reader's and could drift from it.
+    #[tokio::test]
+    async fn a_variant_schema_is_refused_before_any_bytes_are_written() {
+        for (label, variant_field) in [
+            ("top level", NestedField::optional(2, "v", Type::Variant)),
+            (
+                "in a struct",
+                NestedField::optional(
+                    2,
+                    "v",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "inner", Type::Variant).into(),
+                    ])),
+                ),
+            ),
+            (
+                "in a list",
+                NestedField::optional(
+                    2,
+                    "v",
+                    Type::List(ListType {
+                        element_field: NestedField::list_element(3, Type::Variant, true).into(),
+                    }),
+                ),
+            ),
+            (
+                "as a map key",
+                NestedField::optional(
+                    2,
+                    "v",
+                    Type::Map(MapType {
+                        key_field: NestedField::map_key_element(3, Type::Variant).into(),
+                        value_field: NestedField::map_value_element(
+                            4,
+                            Type::Primitive(PrimitiveType::String),
+                            true,
+                        )
+                        .into(),
+                    }),
+                ),
+            ),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                        variant_field.into(),
+                    ])
+                    .build()
+                    .expect("schema"),
+            );
+
+            let temp_dir = TempDir::new().expect("temp dir");
+            let file_io = FileIO::new_with_fs();
+            let path = temp_dir
+                .path()
+                .join("out.parquet")
+                .to_string_lossy()
+                .to_string();
+            let output = file_io.new_output(&path).expect("output file");
+
+            let error = match ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+                .build(output)
+                .await
+            {
+                Ok(_) => panic!("a variant schema must be refused at BUILD time ({label})"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                ErrorKind::FeatureUnsupported,
+                "variant {label} must be refused"
+            );
+            assert!(
+                error.message().contains("Writing the variant column"),
+                "the error must name the write refusal for {label}, got: {}",
+                error.message()
+            );
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "refusing at build time must leave NO file behind for {label}"
+            );
+        }
     }
 }

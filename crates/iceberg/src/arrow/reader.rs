@@ -995,10 +995,11 @@ impl ArrowReader {
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
 
-        // The projected Iceberg schema the Avro reader resolves against: the scan schema restricted
-        // to the projected field ids that are NOT reserved metadata columns (those don't exist in
-        // the data file — the Parquet path strips them from its projection mask the same way; the
-        // transformer re-adds `_file` / partition constants afterwards).
+        // The projected Iceberg schema the Avro reader resolves against: the scan schema
+        // restricted to the projected field ids present in the file, PLUS the two V3 row-lineage
+        // reserved columns, which CAN be physically present and whose stored value wins (the
+        // Parquet path exempts the same pair from its projection mask). Every other reserved
+        // column is excluded; the transformer re-adds `_file` / partition constants afterwards.
         let expected = Self::build_expected_schema(&task)?;
 
         // Avro decode is whole-block; the U1 reader requires a positive batch size. Fall back to the
@@ -1037,8 +1038,9 @@ impl ArrowReader {
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
 
-        // The projected Iceberg schema the ORC reader resolves against: the scan schema restricted to
-        // the projected file-present (non-reserved-metadata) field ids — identical to the Avro path.
+        // The projected Iceberg schema the ORC reader resolves against: the file-present projected
+        // field ids plus the two V3 row-lineage reserved columns — identical to the Avro path,
+        // which shares `build_expected_schema` with it.
         let expected = Self::build_expected_schema(&task)?;
 
         // ORC decode is whole-file; the U1 reader requires a positive batch size. Fall back to the
@@ -1262,10 +1264,20 @@ impl ArrowReader {
     }
 
     /// The projected Iceberg [`Schema`] a whole-file (Avro / ORC) data reader resolves the file
-    /// against: `task.schema` restricted to the projected field ids that exist in the data file
-    /// (reserved metadata columns like `_file` / `_pos` are excluded — they are supplied as constants
-    /// by the transformer / the positional-delete path, never read from the file). Field order
-    /// follows the projection order. Format-agnostic: both the Avro and ORC paths share it.
+    /// against: `task.schema` restricted to the projected field ids that exist in the data file,
+    /// PLUS the two V3 row-lineage reserved columns.
+    ///
+    /// Most reserved metadata columns (`_file`, `_pos`, ...) are excluded — they are supplied as
+    /// constants by the transformer / the positional-delete path and never read from the file.
+    /// `_row_id` and `_last_updated_sequence_number` are the exception and ARE read: a
+    /// lineage-preserving rewrite writes them into the data file, and the stored value must win
+    /// over the computed one. They are not in `task.schema` (they are reserved), so their
+    /// definition comes from the reserved-column registry. A file that does not carry the column
+    /// is unaffected — the reader simply finds nothing and the transformer takes its
+    /// computed/constant arm.
+    ///
+    /// Field order follows the projection order. Format-agnostic: both the Avro and ORC paths
+    /// share it.
     fn build_expected_schema(task: &FileScanTask) -> Result<Arc<Schema>> {
         let mut fields = Vec::new();
         for &field_id in task.project_field_ids() {

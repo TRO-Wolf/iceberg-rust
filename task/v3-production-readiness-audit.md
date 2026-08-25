@@ -41,8 +41,8 @@ production-capability path unless RePark writes those types.
 | Default values (`initial-default` / `write-default`) | ✅ closed **on the data-path formats** | APPLIED on the two data-path readers — `record_batch_transformer.rs`'s `generate_transform_operations` (parquet, the one RePark reads) and `avro_reader.rs`'s `initial_default` fill. ORC is the exception and is NOT an application site: `orc_reader.rs`'s `missing_column_source` REFUSES a field carrying a non-null `initial_default` with `FeatureUnsupported`. That is Java-faithful — Java's ORC reader throws the same way (`ORCSchemaUtil.buildOrcProjection`) — so it is parity, not a gap, but it is a REFUSAL and must not be read as support. `write_default` correctly NOT gated at v2 (`table_metadata_builder.rs:4284-4306`) |
 | Multi-argument transforms | ✅ out of scope | NOT in the oracle: `javap org.apache.iceberg.PartitionField` (1.10.0) has a single `private final int sourceId`. Parity is Java core 1.10.0, so this is not a fork gap |
 | `timestamp_ns` / `timestamptz_ns` | ✅ closed | R90 ✅ (R162 🟡 is a `data_file` metadata-projection residue, not a data-path gap) |
-| **Row lineage — `first_row_id` inheritance** | ✅ CLOSED 2026-08-24 (V1) | see V1 |
-| **Row lineage — `_row_id` / `_last_updated_sequence_number` materialization** | ✅ CLOSED 2026-08-24 (V2), 🟡 on ORC + interop | see V2 |
+| **Row lineage — `first_row_id` inheritance** | ❌ OPEN *(as audited; BUILT since — status lives on row R166)* | see V1 |
+| **Row lineage — `_row_id` / `_last_updated_sequence_number` materialization** | ❌ OPEN *(as audited; BUILT since — status lives on row R166)* | see V2 |
 | `variant` | 🟡 R88 | binary format done both directions. SCOPE CORRECTED below: shredded-PARQUET variant is NOT in the parity scope (Java's is in `iceberg-parquet`, not `iceberg-core`). The `variant_experimental` feature has since been enabled and the canonical Arrow extension type wired both directions; file-level I/O remains owed |
 | `geometry` / `geography` | ❌ R89 | nothing exists |
 
@@ -85,9 +85,12 @@ already-assigned cells are the ones a naive running-total gets wrong.
 
 ## V2 — `_row_id` / `_last_updated_sequence_number` materialization at scan
 
-> **OUTCOME (2026-08-24): BUILT** for Parquet and Avro, at the shared `RecordBatchTransformer`.
-> See row R166 for the rules, the two fail-closed divergences, and the residue (ORC has no arm;
-> no interop leg). The evidence sentence below — "`RESERVED_FIELD_ID_ROW_ID` appears in exactly
+> **OUTCOME (2026-08-24): BUILT** for Parquet, Avro AND ORC, at the shared
+> `RecordBatchTransformer` — ORC shares `build_expected_schema` with Avro, so it gets the arm too;
+> what is unverified there is the STORED-column half, because no in-repo ORC writer stamps
+> `iceberg.id`. **GAP_MATRIX row R166 is the single home for the status and the residue** — read it
+> there rather than here; this file records the audit's findings at the time, not the outcome's
+> status. The evidence sentence below — "`RESERVED_FIELD_ID_ROW_ID` appears in exactly
 > one file" — was true at `d62fe54bd` and is NO LONGER true at tip; it is kept because it is the
 > finding that motivated the unit.
 
