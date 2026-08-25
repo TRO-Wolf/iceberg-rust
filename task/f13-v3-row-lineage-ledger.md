@@ -126,6 +126,28 @@ Java, recorded on R88.
 | `DeleteWriteResult.referencesDataFiles` | `!= null && !isEmpty()` | non-empty test |
 | `FileMetadata$Builder.build` | the DV `referencedDataFile` precondition at 158-173 (its `ldc_w` for "Referenced data file is required for DV" at 170) | a Puffin file without `referenced_data_file` is rejected, so the derivation's `filter_map` is total |
 
+## Delete manifests and `first_row_id` — why the fork passes `None` rather than refusing
+
+`ManifestReader`'s 6-arg constructor carries
+`checkArgument(firstRowId == null || fileType == DATA_FILES, "First row ID is not valid for delete
+manifests")` at offsets 55-75 (`ldc` of the message at 73). Read alone, that looks like a
+precondition to port.
+
+It is unreachable. `javap` over every `ManifestReader.<init>` call site in `org/apache/iceberg/`
+finds four; the three that pass a `Long firstRowId` all pass `FileType.DATA_FILES`
+(`ManifestFiles.read`, `copyAppendManifest`, `copyRewriteManifest`), and the ONLY `DELETE_FILES`
+construction — `ManifestFiles.readDeleteManifest`, offset 52 — uses the **5-arg** constructor,
+which forwards `aconst_null` (offset 6) as the range.
+
+So Java's observable behaviour on a delete manifest whose manifest-list entry carries a
+`first_row_id` is: read it successfully and IGNORE the range (`idAssigner(null)` takes the absent
+arm). Refusing it makes the fork reject a table Java scans fine — a fail-closed where Java is
+fail-open. `load_manifest` therefore passes `None` for `Deletes` content, which reproduces the
+5-arg constructor exactly and matches this repo's own writer, which forces `first_row_id = None`
+on delete manifests rather than erroring.
+
+**A `checkArgument` is not a contract until a call site can reach it.**
+
 ## The recurring defect, and the sweep that closed it
 
 Seven instances of ONE defect were found across six review rounds and a final targeted sweep:

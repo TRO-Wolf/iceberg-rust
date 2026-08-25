@@ -871,29 +871,28 @@ impl ManifestFile {
             entry.inherit_data(self);
         }
 
-        // Java `ManifestReader`'s constructor precondition: a row-id range is meaningful only for
-        // a DATA manifest. The fork's WRITER already forces `first_row_id = None` on delete
-        // manifests, but a manifest list written by someone else can carry one, and silently
-        // assigning row ids to DELETE files would invent lineage for rows that do not exist.
-        // Java throws here; so does this.
-        if let Some(first_row_id) = self.first_row_id
-            && self.content == ManifestContentType::Deletes
-        {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "First row ID is not valid for delete manifests",
-            )
-            .with_context("manifest_path", self.manifest_path.clone())
-            .with_context("first_row_id", first_row_id.to_string()));
-        }
-
         // V3 row lineage: assign `first_row_id` from this manifest's own range (Java
         // `ManifestReader.idAssigner`). Stateful across entries, so it is a pass over the whole
         // slice rather than a per-entry method, and it must see them in MANIFEST ORDER — that
         // ordering IS load-bearing (the ids are a running total). Its position relative to
         // `inherit_data` is not: that loop touches only snapshot/sequence numbers and never
         // `first_row_id`, so the two passes are independent.
-        assign_first_row_ids(&mut entries, self.first_row_id)?;
+        //
+        // A DELETE manifest never lends row ids. Java reaches the same outcome structurally
+        // rather than by validation: `ManifestFiles.readDeleteManifest` builds its reader through
+        // the 5-arg `ManifestReader` constructor, which hardcodes a null `firstRowId`, so the
+        // range simply never arrives. (Java's 6-arg constructor does carry a
+        // "First row ID is not valid for delete manifests" precondition, but no call site can
+        // trip it — all three that pass a range also pass `DATA_FILES`.) So Java READS such a
+        // manifest happily and ignores the range; REFUSING it here would make the fork reject a
+        // table Java scans fine. Passing `None` reproduces Java's behaviour exactly, and matches
+        // this file's own writer, which likewise forces `first_row_id = None` for delete
+        // manifests rather than erroring.
+        let manifest_range = match self.content {
+            ManifestContentType::Deletes => None,
+            ManifestContentType::Data => self.first_row_id,
+        };
+        assign_first_row_ids(&mut entries, manifest_range)?;
 
         Ok(Manifest::new(metadata, entries))
     }
@@ -2249,35 +2248,51 @@ mod test {
         );
     }
 
-    /// Java `ManifestReader`'s constructor precondition, ported to the read path: a row-id range
-    /// on a DELETE manifest is invalid and throws. The fork's writer never emits one, but a
-    /// manifest list written by anyone else can, and silently assigning row ids to delete files
-    /// would invent lineage for rows that do not exist. (Closing-Critic residue.)
+    /// A DELETE manifest carrying a row-id range is READ successfully and its range IGNORED —
+    /// Java's behaviour, reached structurally: `ManifestFiles.readDeleteManifest` uses the 5-arg
+    /// `ManifestReader` constructor, which hardcodes a null `firstRowId`.
+    ///
+    /// This test previously asserted a REFUSAL, on the strength of the 6-arg constructor's
+    /// `checkArgument`. That precondition is unreachable in 1.10.0 — every call site passing a
+    /// range also passes `DATA_FILES` — so refusing made the fork reject a table Java scans fine:
+    /// a fail-closed where Java is fail-open. What must NOT happen is assigning row ids to delete
+    /// files, which is what the ignored range prevents.
     #[tokio::test]
-    async fn test_load_manifest_rejects_a_row_range_on_a_delete_manifest() {
+    async fn test_a_row_range_on_a_delete_manifest_is_ignored_not_assigned() {
         let temp_dir = TempDir::new().expect("temp dir");
         let file_io = FileIO::new_with_fs();
-        let mut manifest_file = v3_manifest_with(&temp_dir, &file_io, &[10], Some(1_000)).await;
+        let mut manifest_file = v3_manifest_with(&temp_dir, &file_io, &[10, 5], Some(1_000)).await;
         // Same manifest, relabelled as a DELETE manifest carrying a range.
         manifest_file.content = ManifestContentType::Deletes;
 
-        let error = manifest_file
+        let manifest = manifest_file
             .load_manifest(&file_io)
             .await
-            .expect_err("a delete manifest must not carry a row-id range");
-        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+            .expect("Java reads this fine — refusing it would reject a scannable table");
         assert!(
-            error
-                .message()
-                .contains("First row ID is not valid for delete manifests"),
-            "the message is Java's verbatim, got: {}",
-            error.message()
+            manifest
+                .entries()
+                .iter()
+                .all(|entry| entry.data_file.first_row_id.is_none()),
+            "a delete manifest lends NO row ids — inventing lineage for delete files is the \
+             failure this ignores the range to prevent"
         );
 
-        // Control: the SAME manifest as DATA content loads fine, so the rejection keys on the
+        // Control: the SAME manifest as DATA content DOES assign, so the ignoring keys on the
         // content type and not on something incidental to the fixture.
-        let data_manifest = v3_manifest_with(&temp_dir, &file_io, &[10], Some(1_000)).await;
-        assert!(data_manifest.load_manifest(&file_io).await.is_ok());
+        let data_manifest = v3_manifest_with(&temp_dir, &file_io, &[10, 5], Some(1_000)).await;
+        let assigned = data_manifest
+            .load_manifest(&file_io)
+            .await
+            .expect("data manifest loads");
+        assert_eq!(
+            assigned
+                .entries()
+                .iter()
+                .map(|entry| entry.data_file.first_row_id)
+                .collect::<Vec<_>>(),
+            vec![Some(1_000), Some(1_010)]
+        );
     }
 
     #[tokio::test]

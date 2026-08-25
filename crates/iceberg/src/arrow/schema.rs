@@ -64,6 +64,68 @@ pub(crate) fn variant_arrow_data_type() -> DataType {
     ]))
 }
 
+/// Depth bound for [`variant_path_within`].
+///
+/// Mirrors `spec::schema::visitor`'s `MAX_SCHEMA_NESTING_DEPTH`: the repo already adjudicated this
+/// hazard for the same tree — a metadata file can be partner-influenced, and an unbounded
+/// recursive walk over it overflows the thread stack (an abort, not a typed error). It is strictly
+/// looser than any constructible schema, since `Schema::builder().build()` refuses at 128
+/// composite edges, so it changes behaviour for no legitimate schema.
+pub(crate) const MAX_VARIANT_NESTING_DEPTH: usize = 128;
+
+/// The dotted path to the first `variant` at or beneath `ty`, or `None`.
+///
+/// ONE walk, shared by the read guard (`ArrowReader::reject_variant_projection`) and the write
+/// guard (`ParquetWriterBuilder::build`). It was briefly two copies; the copies drifted in
+/// coverage within a single commit, which is why they are one function now.
+///
+/// All FOUR container positions are descended — struct field, list element, map KEY and map value.
+/// The key is not a special case to skip: Java's `Types$MapType` factories constrain only the
+/// VALUE type, so `map<variant, _>` is a legal Iceberg type.
+///
+/// # Notes
+///
+/// Bounded by [`MAX_VARIANT_NESTING_DEPTH`]. Exceeding the bound reports "no variant found" rather
+/// than erroring — this is a guard, and a type nested that deep is rejected earlier by the schema
+/// builder that owns that rule.
+pub(crate) fn variant_path_within(name: &str, ty: &Type) -> Option<String> {
+    fn walk(name: &str, ty: &Type, depth: usize) -> Option<String> {
+        if depth > MAX_VARIANT_NESTING_DEPTH {
+            return None;
+        }
+        let next = depth + 1;
+        match ty {
+            Type::Variant => Some(name.to_string()),
+            Type::Struct(struct_type) => struct_type.fields().iter().find_map(|nested| {
+                walk(
+                    &format!("{name}.{}", nested.name),
+                    nested.field_type.as_ref(),
+                    next,
+                )
+            }),
+            Type::List(list) => walk(
+                &format!("{name}.element"),
+                list.element_field.field_type.as_ref(),
+                next,
+            ),
+            Type::Map(map) => walk(
+                &format!("{name}.key"),
+                map.key_field.field_type.as_ref(),
+                next,
+            )
+            .or_else(|| {
+                walk(
+                    &format!("{name}.value"),
+                    map.value_field.field_type.as_ref(),
+                    next,
+                )
+            }),
+            Type::Primitive(_) => None,
+        }
+    }
+    walk(name, ty, 0)
+}
+
 /// Whether an Arrow field is a variant — i.e. carries the canonical extension name.
 ///
 /// Keyed on the extension NAME alone. The metadata value is not part of the identity check: the

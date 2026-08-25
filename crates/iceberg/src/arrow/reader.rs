@@ -397,7 +397,9 @@ impl ArrowReader {
             let Some(field) = task.schema.field_by_id(field_id) else {
                 continue;
             };
-            if let Some(path) = Self::variant_within(&field.name, field.field_type.as_ref()) {
+            if let Some(path) =
+                crate::arrow::variant_path_within(&field.name, field.field_type.as_ref())
+            {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
                     format!(
@@ -411,75 +413,6 @@ impl ArrowReader {
             }
         }
         Ok(())
-    }
-
-    /// Depth bound for [`Self::variant_within`], mirroring
-    /// [`crate::spec::schema::visitor`]'s `MAX_SCHEMA_NESTING_DEPTH` — the repo already
-    /// adjudicated this hazard for the same tree: a metadata file can be partner-influenced, and
-    /// an unbounded recursive walk over it overflows the thread stack (an abort, not a typed
-    /// error).
-    const MAX_VARIANT_SCAN_DEPTH: usize = 128;
-
-    /// The dotted path to the first `variant` at or beneath `ty`, or `None`.
-    ///
-    /// The projection names a TOP-LEVEL field id, but a variant can sit anywhere beneath it — in
-    /// a struct field, a list element, a map KEY or a map value. Checking only the projected
-    /// field's own type lets `struct<v: variant>` through, and the reader then hands back a column
-    /// it has just declared it cannot decode. All four descent positions mirror the ones the
-    /// `variant_field` hook covers in `arrow::schema`.
-    ///
-    /// Map KEYS are descended too. An earlier version skipped them on the stated grounds that
-    /// "Iceberg map keys are primitives" — that is FALSE: Java's `Types$MapType.ofOptional` /
-    /// `ofRequired` constrain only the VALUE (a null check on it and nothing on the key), and this
-    /// fork's own `spec/schema/visitor.rs` descends `map.key_field`. A `map<variant, _>` is
-    /// therefore constructible, and skipping the key left it unguarded.
-    ///
-    /// # Notes
-    ///
-    /// Bounded by [`Self::MAX_VARIANT_SCAN_DEPTH`]: the schema comes from a metadata file that may
-    /// be partner- or attacker-influenced, and this walk runs FIRST on the read path, ahead of
-    /// every other bounded walk. Exceeding the bound reports "no variant found" rather than
-    /// erroring — the walk is a guard, and a type nested that deep is rejected EARLIER, by
-    /// `Schema::builder().build()`, which owns that rule and refuses at 128 composite edges. The
-    /// bound is therefore strictly looser than any constructible schema and changes behaviour for
-    /// none of them; it exists so this walk cannot be the thing that overflows the stack.
-    fn variant_within(name: &str, ty: &Type) -> Option<String> {
-        Self::variant_within_at_depth(name, ty, 0)
-    }
-
-    fn variant_within_at_depth(name: &str, ty: &Type, depth: usize) -> Option<String> {
-        if depth > Self::MAX_VARIANT_SCAN_DEPTH {
-            return None;
-        }
-        let next = depth + 1;
-        match ty {
-            Type::Variant => Some(name.to_string()),
-            Type::Struct(struct_type) => struct_type.fields().iter().find_map(|nested| {
-                Self::variant_within_at_depth(
-                    &format!("{name}.{}", nested.name),
-                    nested.field_type.as_ref(),
-                    next,
-                )
-            }),
-            Type::List(list) => Self::variant_within_at_depth(
-                &format!("{name}.element"),
-                list.element_field.field_type.as_ref(),
-                next,
-            ),
-            Type::Map(map) => Self::variant_within_at_depth(
-                &format!("{name}.key"),
-                map.key_field.field_type.as_ref(),
-                next,
-            )
-            .or_else(|| {
-                Self::variant_within_at_depth(
-                    &format!("{name}.value"),
-                    map.value_field.field_type.as_ref(),
-                    next,
-                )
-            }),
-            Type::Primitive(_) => None,
-        }
     }
 
     async fn process_parquet_file_scan_task(

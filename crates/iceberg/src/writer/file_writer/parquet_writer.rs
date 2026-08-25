@@ -143,7 +143,9 @@ impl FileWriterBuilder for ParquetWriterBuilder {
 /// [`ErrorKind::FeatureUnsupported`] naming the dotted path to the first variant found.
 fn reject_variant_write(schema: &Schema) -> Result<()> {
     for field in schema.as_struct().fields() {
-        if let Some(path) = variant_path_within(&field.name, field.field_type.as_ref()) {
+        if let Some(path) =
+            crate::arrow::variant_path_within(&field.name, field.field_type.as_ref())
+        {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 format!(
@@ -156,51 +158,6 @@ fn reject_variant_write(schema: &Schema) -> Result<()> {
     }
     Ok(())
 }
-
-/// The dotted path to the first `variant` at or beneath `ty`, or `None`. Mirrors
-/// `ArrowReader::variant_within`, including its four descent positions (struct field, list
-/// element, map KEY and map value — Java constrains only a map's VALUE type, so a variant key is
-/// a legal Iceberg type) and its depth bound.
-fn variant_path_within(name: &str, ty: &Type) -> Option<String> {
-    fn walk(name: &str, ty: &Type, depth: usize) -> Option<String> {
-        if depth > MAX_VARIANT_WRITE_DEPTH {
-            return None;
-        }
-        let next = depth + 1;
-        match ty {
-            Type::Variant => Some(name.to_string()),
-            Type::Struct(struct_type) => struct_type.fields().iter().find_map(|nested| {
-                walk(
-                    &format!("{name}.{}", nested.name),
-                    nested.field_type.as_ref(),
-                    next,
-                )
-            }),
-            Type::List(list) => walk(
-                &format!("{name}.element"),
-                list.element_field.field_type.as_ref(),
-                next,
-            ),
-            Type::Map(map) => walk(
-                &format!("{name}.key"),
-                map.key_field.field_type.as_ref(),
-                next,
-            )
-            .or_else(|| {
-                walk(
-                    &format!("{name}.value"),
-                    map.value_field.field_type.as_ref(),
-                    next,
-                )
-            }),
-            Type::Primitive(_) => None,
-        }
-    }
-    walk(name, ty, 0)
-}
-
-/// Depth bound for [`variant_path_within`], matching the reader's.
-const MAX_VARIANT_WRITE_DEPTH: usize = 128;
 
 /// A mapping from Parquet column path names to internal field id
 struct IndexByParquetPathName {
@@ -3534,6 +3491,24 @@ mod variant_write_refusal_tests {
                             true,
                         )
                         .into(),
+                    }),
+                ),
+            ),
+            // The FOURTH container position, and the most realistic of them. Omitted at first
+            // while the map KEY — the exotic one — was covered, because an earlier round had
+            // trained me to remember the key. Dropping the map-VALUE descent was green.
+            (
+                "as a map value",
+                NestedField::optional(
+                    2,
+                    "v",
+                    Type::Map(MapType {
+                        key_field: NestedField::map_key_element(
+                            3,
+                            Type::Primitive(PrimitiveType::String),
+                        )
+                        .into(),
+                        value_field: NestedField::map_value_element(4, Type::Variant, true).into(),
                     }),
                 ),
             ),

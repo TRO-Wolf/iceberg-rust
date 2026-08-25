@@ -38,8 +38,10 @@ interop are still deferred, but the FEATURE GATE is gone: as of 2026-08-24 this 
 `arrow/schema.rs` now converts Iceberg `variant` to the canonical Arrow extension type
 (`arrow.parquet.variant`) in BOTH directions, at every position — top level, struct field, list
 element, map key and map value. What remains deferred is file-level I/O: `arrow/avro_reader.rs`'s
-variant arm refuses, there is no Iceberg→`ShreddedSchemaBuilder` bridge, and
-`ArrowReader::reject_variant_projection` refuses any scan that projects a variant at any depth.
+variant arm refuses, there is no Iceberg→`ShreddedSchemaBuilder` bridge, and BOTH directions are refused at their seam: `ArrowReader::reject_variant_projection` refuses any scan
+that projects a variant, and `ParquetWriterBuilder::build` refuses any write of a variant-bearing schema BEFORE
+any bytes reach storage. Both walk the same `arrow::schema::variant_path_within`, so they cannot disagree
+about what counts as a variant at depth.
 SCOPE NOTE: shredded-parquet variant is NOT a parity gap — Java's is in `iceberg-parquet`, outside
 the `iceberg-core`/`iceberg-api` parity scope; the core jar's variant classes are Avro-only. See
 GAP_MATRIX row R88. The Java→Rust mapping and every
