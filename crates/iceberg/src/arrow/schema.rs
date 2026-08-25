@@ -2976,6 +2976,91 @@ mod tests {
         );
     }
 
+    /// The FIFTH descent position: a variant inside a STRUCT, on the Arrow→Iceberg side. The
+    /// reader-side struct walk was pinned; this one was not, so removing `visit_struct`'s
+    /// `variant_field` hook survived the suite (symmetry sweep F-8). Without it the round trip
+    /// fails loudly ("Field id not found in metadata") rather than corrupting — the struct's
+    /// `metadata` / `value` children carry no field ids — but a loud failure on a legal type is
+    /// still a defect.
+    #[test]
+    fn test_variant_nested_in_a_struct_round_trips() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(
+                    1,
+                    "s",
+                    Type::Struct(crate::spec::StructType::new(vec![
+                        NestedField::optional(2, "v", Type::Variant).into(),
+                        NestedField::required(3, "n", Type::Primitive(PrimitiveType::Long)).into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let arrow_schema = schema_to_arrow_schema(&schema).expect("to arrow");
+        let DataType::Struct(children) = arrow_schema.field_with_name("s").unwrap().data_type()
+        else {
+            panic!("expected a struct");
+        };
+        assert!(
+            is_variant_arrow_field(&children[0]),
+            "the struct's variant CHILD must carry the extension name, got {:?}",
+            children[0].metadata()
+        );
+
+        let back = arrow_schema_to_schema(&arrow_schema).expect("back to iceberg");
+        let Type::Struct(struct_type) = back.as_struct().fields()[0].field_type.as_ref() else {
+            panic!("expected a struct");
+        };
+        assert_eq!(
+            struct_type.fields()[0].field_type.as_ref(),
+            &Type::Variant,
+            "a variant inside a struct must not flatten on the way back"
+        );
+        assert_eq!(
+            struct_type.fields()[1].field_type.as_ref(),
+            &Type::Primitive(PrimitiveType::Long),
+            "its non-variant sibling is unaffected"
+        );
+    }
+
+    /// The LENIENCY clause of `is_variant_arrow_field`, which its own doc states: identity is the
+    /// extension NAME alone, because a writer that omitted the metadata key still produced a
+    /// variant. Every other fixture stamps both keys, so requiring the metadata key survived the
+    /// suite — an unpinned documented clause (symmetry sweep F-9).
+    #[test]
+    fn test_a_variant_field_without_the_extension_metadata_key_is_still_a_variant() {
+        let name_only =
+            Field::new("v", variant_arrow_data_type(), true).with_metadata(HashMap::from([
+                (
+                    "ARROW:extension:name".to_string(),
+                    VARIANT_EXTENSION_NAME.to_string(),
+                ),
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string()),
+            ]));
+        assert!(
+            name_only
+                .metadata()
+                .get("ARROW:extension:metadata")
+                .is_none(),
+            "fixture precondition: the metadata key is ABSENT"
+        );
+        assert!(
+            is_variant_arrow_field(&name_only),
+            "the extension NAME alone identifies a variant — requiring the metadata key would \
+             reject files written without it"
+        );
+
+        let converted =
+            arrow_schema_to_schema(&ArrowSchema::new(vec![name_only])).expect("converts");
+        assert_eq!(
+            converted.as_struct().fields()[0].field_type.as_ref(),
+            &Type::Variant
+        );
+    }
+
     /// The DISCRIMINATING cell. A struct of the same SHAPE but WITHOUT the extension name is a
     /// plain struct. If identity were keyed on shape, any `{metadata: Binary, value: Binary}`
     /// column in a user's table would silently become a variant — the exact

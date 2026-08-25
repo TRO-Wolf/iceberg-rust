@@ -5603,21 +5603,36 @@ message schema {
                 .build()
                 .expect("schema"),
         );
-        let mut task = pos_scan_task(&data_path, schema, vec![], None);
-        task.project_field_ids = Arc::from(vec![1, 2]);
+        // EVERY data-file format. The guard sits ahead of the format dispatch precisely so it is
+        // format-independent, but pinning it through a Parquet-only task helper left it free to
+        // be gated on Parquet — and Avro/ORC would then decode a variant column silently. The
+        // refusal fires before any I/O, so the format field alone drives the case.
+        for format in [
+            DataFileFormat::Parquet,
+            DataFileFormat::Avro,
+            DataFileFormat::Orc,
+        ] {
+            let mut task = pos_scan_task(&data_path, schema.clone(), vec![], None);
+            task.project_field_ids = Arc::from(vec![1, 2]);
+            task.data_file_format = format;
 
-        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
-        let err = reader
-            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
-            .expect("stream construction")
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .expect_err("a variant projection must be refused, not silently decoded wrong");
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-        assert!(
-            err.to_string().contains("variant column 'v'"),
-            "the error must name the column, got: {err}"
-        );
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let err = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect_err("a variant projection must be refused on EVERY format");
+            assert_eq!(
+                err.kind(),
+                ErrorKind::FeatureUnsupported,
+                "format {format:?} must refuse, not decode a variant column"
+            );
+            assert!(
+                err.to_string().contains("variant column 'v'"),
+                "the error must name the column on {format:?}, got: {err}"
+            );
+        }
     }
 
     /// A variant NESTED inside a struct, a list element or a map value must be refused too
@@ -5709,6 +5724,8 @@ message schema {
             );
             let mut task = pos_scan_task(&data_path, schema, vec![], None);
             task.project_field_ids = Arc::from(vec![1, 2]);
+            // Off Parquet, so the nested walk is exercised on another format too.
+            task.data_file_format = DataFileFormat::Avro;
 
             let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
             let err = reader

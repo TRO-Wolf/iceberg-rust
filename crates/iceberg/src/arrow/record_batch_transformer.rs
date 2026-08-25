@@ -2801,6 +2801,30 @@ mod test {
         assert_eq!(int64_col(&batch, 1), vec![None]);
     }
 
+    /// The `num_rows == 0` guard in `row_ids_from_positions` is LOAD-BEARING and had zero
+    /// coverage (symmetry sweep F-10): without it, `num_rows - 1` underflows — a debug panic, and
+    /// in release a wrap to `usize::MAX` that reports a spurious overflow error on an empty batch.
+    /// Empty batches are ordinary (an all-filtered row group, a zero-row file).
+    #[test]
+    fn an_empty_batch_yields_an_empty_row_id_column() {
+        let projected = [1, RESERVED_FIELD_ID_ROW_ID];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(Some(100), Some(7))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(Vec::new(), None))
+            .expect("an empty batch is not an error");
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(int64_col(&batch, 1), Vec::<Option<i64>>::new());
+
+        // And the counter is unmoved, so the NEXT batch still starts at the range's first id.
+        let next = transformer
+            .process_record_batch(row_lineage_batch(vec![1, 2], None))
+            .expect("second batch");
+        assert_eq!(int64_col(&next, 1), vec![Some(100), Some(101)]);
+    }
+
     /// The boundary the overflow check must NOT reject: a batch whose LAST id is exactly
     /// `i64::MAX` is representable and must succeed. Checking `start + num_rows` (one PAST the
     /// last row) instead of `start + num_rows - 1` passes every other test in this module and

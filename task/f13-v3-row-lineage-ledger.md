@@ -126,3 +126,31 @@ Java, recorded on R88.
 | `DeleteWriteResult.referencesDataFiles` | `!= null && !isEmpty()` | non-empty test |
 | `FileMetadata$Builder.build` | the DV `referencedDataFile` precondition at 158-173 (its `ldc_w` for "Referenced data file is required for DV" at 170) | a Puffin file without `referenced_data_file` is rejected, so the derivation's `filter_map` is total |
 
+## The recurring defect, and the sweep that closed it
+
+Seven instances of ONE defect were found across six review rounds and a final targeted sweep:
+
+| # | Construct | Variants | Pinned |
+|---|---|---|---|
+| 1 | DV `DataFileBuilder` guard | Puffin / Parquet | Puffin only |
+| 2 | `assign_first_row_ids` absent arm | Added / Deleted / already-assigned | Added only |
+| 3 | overflow doors | `i64` narrowing / `u64` add | `u64` only |
+| 4 | Parquet reader exemption | `_row_id` / `_last_updated_sequence_number` | `_row_id` only |
+| 5 | nested-variant guard | struct / list / map value / map KEY | first three only |
+| 6 | Avro reader exemption (same predicate as 4) | both reserved columns | `_row_id` only |
+| 7 | `reject_variant_projection` | Parquet / Avro / ORC | Parquet only |
+
+The generator is always the same: ONE predicate covers N variants, and the tests exercise one.
+`is_row_lineage_field` is a single predicate over two columns; `reject_variant_projection` sits
+ahead of the format dispatch precisely so it is format-independent — in both cases any test that
+uses only one variant leaves the rest free by construction.
+
+Instance-by-instance fixing did not converge: #6 reproduced #4 on the format the fix for #4 added,
+and #7 is the same per-format axis again. What converged was a SWEEP — enumerate every
+multi-variant construct in the diff (`matches!`, `||`, `any`, every predicate constant, every
+per-format / per-column / per-arm / per-position rule, both directions of every round trip) and
+mutate each variant independently. That sweep found #7 plus three unpinned clauses in one pass,
+including a load-bearing `num_rows == 0` guard with zero coverage whose removal panics.
+
+**When adding a rule here, mutate every variant of every predicate it introduces — not one.**
+
