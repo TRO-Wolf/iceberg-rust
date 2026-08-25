@@ -51,11 +51,12 @@
 # excludes "Critical" and "Critically" in either case. An anti-probe proves that
 # exclusion.
 #
-# The self-test reaches the needles, the family size and the pathspec VARIABLE.
-# It does not reach the grep call: a pathspec or a hit count substituted in place
-# still passes. Those are single visible edits to the shipped scan. Dropping -i
-# was the one SILENT regression — it re-greens the tree over lowercase residue —
-# so a lowercase sample pins it.
+# The self-test reaches the needles, the family size, and the flag and pathspec
+# VARIABLES. It does not reach the grep call: a flag, a pathspec or a hit count
+# substituted in place still passes. Those are single visible edits to the
+# shipped scan. Everything config-shaped is pinned, because that is where a
+# silent regression looks like a tightening — dropping -i re-greens the tree over
+# lowercase residue, and -q or --max-depth 0 green it over everything.
 #
 # Referencing these tags IN PROSE without tripping the gate: never write a
 # needle verbatim — omit the leading '<' (as task/todo.md does), or assemble
@@ -83,8 +84,10 @@ patterns=(
   "${LT}parameter name="
 )
 
-# Review-process residue. Assembled by concatenation so this script never
-# matches itself.
+# Review-process residue. What keeps this file out of its own scan is the
+# ASSERTED residue_pathspec, not the concatenation below: `Falsifier` and
+# `SEPMO` appear verbatim here, and the header prose matches all three needles.
+# The ${C} / ${c} split hides the Critic literal alone.
 C='C'
 c='c'
 residue_grep_flags='-nIEwi'
@@ -150,6 +153,10 @@ self_test() {
   # while the shipped scan points at nothing.
   if [ "${#residue_patterns[@]}" -ne 3 ]; then
     echo "ERROR: residue needle family changed size — update the count in the OK line" >&2
+    return 1
+  fi
+  if [ "$residue_grep_flags" != "-nIEwi" ]; then
+    echo "ERROR: residue grep flags are '$residue_grep_flags', not '-nIEwi' — matching semantics are pinned" >&2
     return 1
   fi
   if [ "$residue_pathspec" != "crates/" ]; then
