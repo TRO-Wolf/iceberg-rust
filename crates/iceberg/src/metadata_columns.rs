@@ -224,10 +224,8 @@ static COMMIT_SNAPSHOT_ID_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
 /// This field represents a unique long assigned for row lineage.
 static ROW_ID_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
     Arc::new(
-        // OPTIONAL, not required — Java `MetadataColumns` declares it so. A row read from a
-        // V1/V2 file (or from a V3 manifest with no assigned range) has NO row id, and Java
-        // reports that as NULL; declaring it required makes the Arrow field non-nullable, so
-        // that null column cannot even be built.
+        // OPTIONAL, not required — Java `MetadataColumns` declares it so. A row with no assigned
+        // range has no row id, and a required field cannot hold that NULL.
         NestedField::optional(
             RESERVED_FIELD_ID_ROW_ID,
             RESERVED_COL_NAME_ROW_ID,
@@ -386,10 +384,8 @@ pub fn partition_field(partition_fields: Vec<NestedFieldRef>) -> NestedFieldRef 
 
 /// Whether `field_id` is one of the two V3 row-lineage reserved columns.
 ///
-/// These are the only reserved metadata columns that can be physically present in a data file — a
-/// lineage-preserving rewrite carries them forward, and the stored value wins over the computed
-/// one. Every other reserved column is synthesized, which is why [`is_metadata_field`] alone is
-/// the wrong predicate for deciding what to project.
+/// These are the only reserved columns that can be physically present in a data file, and the
+/// stored value wins. So [`is_metadata_field`] alone is the wrong predicate for projection.
 pub fn is_row_lineage_field(field_id: i32) -> bool {
     matches!(
         field_id,

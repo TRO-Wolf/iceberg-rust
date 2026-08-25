@@ -151,11 +151,8 @@ impl PreviousDeletes {
 /// rewrittenDeleteFiles)`).
 ///
 /// Java's `DeleteWriteResult` carries a third member, `referencedDataFiles` (a `CharSequenceSet`),
-/// used by conflict validation. It is recoverable from `delete_files` (each DV carries its
-/// `referenced_data_file`), so it is exposed as the derived accessors
-/// [`referenced_data_files`](Self::referenced_data_files) and
-/// [`references_data_files`](Self::references_data_files) rather than stored as a field that could
-/// drift out of step.
+/// used by conflict validation. It is recoverable from `delete_files`, so it is exposed as the
+/// derived accessors rather than stored as a field that could drift.
 #[derive(Debug)]
 pub struct DVWriteResult {
     /// One DV `DeleteFile` per referenced data file (Java `DeleteWriteResult.deleteFiles()`); the
@@ -170,12 +167,9 @@ pub struct DVWriteResult {
 
 impl DVWriteResult {
     /// The set of data file paths the written DVs reference — Java
-    /// `DeleteWriteResult.referencedDataFiles()`, which `RowDelta.validateDataFilesExist` consumes
-    /// to arm conflict detection.
-    ///
-    /// Derived from [`delete_files`](Self::delete_files), one path per written blob. A DV with no
-    /// `referenced_data_file` cannot occur (`DataFileBuilder::build` rejects it), so the
-    /// `filter_map` is a total projection, not a filter.
+    /// `DeleteWriteResult.referencedDataFiles()`, which `RowDelta.validateDataFilesExist` consumes.
+    /// Derived from [`delete_files`](Self::delete_files); `DataFileBuilder::build` rejects a DV
+    /// with no `referenced_data_file`, so the `filter_map` is total.
     pub fn referenced_data_files(&self) -> HashSet<String> {
         self.delete_files
             .iter()
@@ -183,8 +177,7 @@ impl DVWriteResult {
             .collect()
     }
 
-    /// Whether any data file is referenced — Java `DeleteWriteResult.referencesDataFiles()`.
-    /// Equivalent to a non-empty [`referenced_data_files`](Self::referenced_data_files) without
+    /// Whether any data file is referenced — Java `DeleteWriteResult.referencesDataFiles()`. Avoids
     /// allocating the set.
     pub fn references_data_files(&self) -> bool {
         self.delete_files
@@ -1454,10 +1447,8 @@ mod tests {
 
     // ---- `DVWriteResult::referenced_data_files` / `references_data_files` (F-13 U3b) ------------
     //
-    // The accessors are derived, so what must be pinned is the projection: cardinality (zero, one,
-    // many), that it reads `delete_files` and not `rewritten_delete_files`, and that it reads
-    // `referenced_data_file` and not the DV's own path. Without a fixture where both members are
-    // non-empty with DISJOINT paths, a source-swapping mutation survives.
+    // The accessors are derived, so what is pinned is the projection: cardinality, that it reads
+    // `delete_files` not `rewritten_delete_files`, and `referenced_data_file` not the DV's own path.
 
     /// Many DVs: the derived set is exactly the referenced data files, one per written blob.
     #[tokio::test]
@@ -1486,9 +1477,8 @@ mod tests {
         assert!(result.references_data_files());
     }
 
-    /// ZERO DVs: with nothing recorded, Java's `close` early-returns a result carrying
-    /// `CharSequenceSet.empty()` from its `deletesByPath.isEmpty()` early return, and
-    /// `referencesDataFiles()` is then false.
+    /// ZERO DVs: Java's `close` early-returns `CharSequenceSet.empty()`, so `referencesDataFiles()`
+    /// is false.
     #[tokio::test]
     async fn dv_result_with_no_deletes_references_nothing() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -1507,10 +1497,8 @@ mod tests {
         );
     }
 
-    /// The SOURCE-MEMBER cell. Both members are non-empty and name DISJOINT data files, so a
-    /// mutation reading `rewritten_delete_files` instead of `delete_files` produces the wrong set
-    /// rather than the same one. `rewritten` is superseded state on the way OUT of the table; it is
-    /// not what the DVs reference, and Java's set is populated only in the write branch.
+    /// The SOURCE-MEMBER cell. Both members are non-empty and name DISJOINT data files, so reading
+    /// `rewritten_delete_files` produces the wrong set rather than the same one.
     #[tokio::test]
     async fn dv_result_referenced_data_files_reads_the_dvs_not_the_rewritten_files() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -1541,8 +1529,7 @@ mod tests {
     }
 
     /// The FIELD cell: the set is the `referenced_data_file`, never the DV's own `file_path`. The
-    /// Puffin path is shared by every blob, so a mutation reading `file_path` would collapse a
-    /// three-file result to a one-element set — and would be wrong even at cardinality one.
+    /// Puffin path is shared by every blob, so reading `file_path` collapses the set.
     #[tokio::test]
     async fn dv_result_referenced_data_files_is_not_the_puffin_path() {
         let temp_dir = TempDir::new().expect("temp dir");

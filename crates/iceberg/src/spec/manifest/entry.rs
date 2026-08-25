@@ -149,18 +149,15 @@ impl ManifestEntry {
     }
 }
 
-/// Assign each entry's `first_row_id` from the manifest's own range — the V3 row-lineage
-/// counterpart of [`ManifestEntry::inherit_data`], mirroring Java `ManifestReader.idAssigner`.
-/// Stateful across entries, so it takes the whole slice in manifest order.
+/// Assign each entry's `first_row_id` from the manifest's own range, mirroring Java
+/// `ManifestReader.idAssigner`. Stateful, so it takes the whole slice in manifest order.
 ///
-/// An absent `manifest_first_row_id` forces every file to `None`, OVERWRITING any stored value. A
-/// present one is a running counter that skips `Deleted` entries and entries that already carry an
-/// id, without advancing past either. Decoded bytecode: `task/f13-v3-row-lineage-ledger.md`.
+/// An absent `manifest_first_row_id` forces every file to `None`. A present one is a running
+/// counter that skips `Deleted` and already-assigned entries without advancing.
 ///
 /// # Errors
 ///
-/// [`ErrorKind::DataInvalid`] if the counter would overflow. Java wraps silently; the fork fails
-/// closed, since a wrapped id aliases live rows instead of surfacing as a read failure.
+/// [`ErrorKind::DataInvalid`] on counter overflow. Java wraps; a wrapped id aliases live rows.
 pub(crate) fn assign_first_row_ids(
     entries: &mut [ManifestEntry],
     manifest_first_row_id: Option<u64>,
@@ -734,8 +731,8 @@ mod first_row_id_tests {
         entries.iter().map(|e| e.data_file.first_row_id).collect()
     }
 
-    // The closed domain of `assign_first_row_ids` (decoded bytecode:
-    // `task/f13-v3-row-lineage-ledger.md`):
+    // The closed domain of `assign_first_row_ids`. Every skip cell is pinned by the id the next
+    // assignable file receives.
     //
     // | Manifest `first_row_id` | Entry state | Java behaviour |
     // |---|---|---|
@@ -743,9 +740,7 @@ mod first_row_id_tests {
     // | present | `Deleted` | skip; counter does NOT advance |
     // | present | already has an id | skip; counter does NOT advance |
     // | present | `Added`, no id | assign; counter += `record_count` |
-    // | present | `Existing`, no id | assign; counter += `record_count` (the guard is `!= Deleted`, NOT `== Added`) |
-    //
-    // Every skip cell is pinned by the id the NEXT assignable file receives.
+    // | present | `Existing`, no id | assign; counter += `record_count` (the guard is `!= Deleted`) |
 
     /// The absent arm applies to EVERY entry state — Java's carries no status guard — so pinning
     /// it on `Added` alone would let a skip-mutation survive.
@@ -826,9 +821,8 @@ mod first_row_id_tests {
         assert_eq!(assigned(&entries), vec![Some(0), Some(10)]);
     }
 
-    // Two separate, non-interchangeable overflow doors: a test that only reaches the `u64` one
-    // leaves the `i64` narrowing — the reachable door, and the one that yields negative ids —
-    // unpinned.
+    // Two non-interchangeable overflow doors: a test reaching only the `u64` one leaves the `i64`
+    // narrowing — the reachable door — unpinned.
 
     /// The `i64` narrowing door: a manifest range already past `i64::MAX` cannot lend any id.
     #[test]

@@ -102,10 +102,8 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
-        // Refuse a variant-bearing schema HERE, before any bytes are written. This used to fall
-        // out of the Iceberg→Arrow conversion below throwing on `variant`; that conversion now
-        // succeeds (row R88), which moved the refusal to `close` — after the bytes were flushed,
-        // leaving an orphan file. The write-path twin of `ArrowReader::reject_variant_projection`.
+        // Refuse a variant-bearing schema HERE, before any bytes are written. The conversion below
+        // no longer throws (row R88), which had moved the refusal to `close` — after the flush.
         reject_variant_write(self.schema.as_ref())?;
 
         // Detect once at build time: only run the NaN visitor when the schema has float/double
@@ -3438,9 +3436,8 @@ mod variant_write_refusal_tests {
     use crate::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
     use crate::writer::file_writer::FileWriterBuilder;
 
-    /// A variant-bearing schema is refused BEFORE any bytes are written, at every depth — without
-    /// the guard the refusal lands in `close()`, after the Parquet bytes are flushed, leaving an
-    /// orphan file. All four container positions are covered.
+    /// A variant-bearing schema is refused BEFORE any bytes are written, at every depth. Without
+    /// the guard the refusal lands in `close()`, leaving an orphan file.
     #[tokio::test]
     async fn a_variant_schema_is_refused_before_any_bytes_are_written() {
         for (label, variant_field) in [
@@ -3481,9 +3478,8 @@ mod variant_write_refusal_tests {
                     }),
                 ),
             ),
-            // The FOURTH container position, and the most realistic of them. Omitted at first
-            // while the map KEY — the exotic one — was covered, because an earlier round had
-            // trained me to remember the key. Dropping the map-VALUE descent was green.
+            // The fourth container position, and the most realistic. Dropping the map-VALUE descent
+            // was green.
             (
                 "as a map value",
                 NestedField::optional(

@@ -992,11 +992,8 @@ impl TableScan {
         // `task.start == 0` clause does — a local statement of the precondition this path relies on
         // — and because it reads the SCAN's projection, which is the authority here even if a
         // task's own `project_field_ids` were ever to drift from it.
-        // `_row_id` suppresses splitting exactly as `_pos` does — both need whole-file physical
-        // ordinals. This is a DEFENSIVE RESTATEMENT, not the load-bearing guard: `split` branch
-        // 1c already returns the whole-file task for either projection, so removing this leaves
-        // the suite green. It is kept so the intent is visible where the split is requested, the
-        // same pattern this file uses for its other conjuncts.
+        // `_row_id` suppresses splitting exactly as `_pos` does; both need whole-file ordinals. A
+        // defensive restatement — `split` branch 1c already returns the whole-file task.
         let projects_pos = {
             use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
             self.plan_context
@@ -2415,9 +2412,8 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
-        /// Re-write the current snapshot's manifest list as a **V3** list carrying an assigned
-        /// row-id range, reusing the manifests `setup_manifest_files` already wrote. This is the
-        /// only way to make a planned task carry a non-`None` `first_row_id`.
+        /// Re-write the current snapshot's manifest list as a V3 list carrying an assigned row-id
+        /// range. The only way to make a planned task carry a non-`None` `first_row_id`.
         pub async fn rewrite_manifest_list_as_v3_with_row_range(&mut self, first_row_id: u64) {
             // The manifest LIST is parsed against the table's format version, so a V3-shaped list
             // read by a V2 table silently drops `first_row_id`. Upgrade the table first.
@@ -3363,10 +3359,8 @@ pub mod tests {
         assert!(batches.is_empty());
     }
 
-    /// The manifest -> task wiring pin. `into_file_scan_task` is the single production seam
-    /// carrying row lineage onto the `FileScanTask`, and `None`-ing both fields there passed the
-    /// entire suite — every real scan would have reported `_row_id` as all-NULL, silently. Both
-    /// halves are asserted; pinning one leaves a narrower mutation alive.
+    /// The manifest -> task wiring pin. `into_file_scan_task` is the single seam carrying row
+    /// lineage onto the `FileScanTask`, and `None`-ing both fields there passed the entire suite.
     #[tokio::test]
     async fn test_plan_files_threads_row_lineage_onto_the_task() {
         let mut fixture = TableTestFixture::new();
@@ -3386,9 +3380,8 @@ pub mod tests {
         tasks.sort_by_key(|task| task.data_file_path.to_string());
         assert_eq!(tasks.len(), 2, "fixture precondition");
 
-        // The manifest's range starts at 1000 and each entry advances it by its record count, so
-        // the two tasks take DIFFERENT ids — an implementation that stamped a constant, or that
-        // dropped the field, fails here.
+        // The manifest range starts at 1000 and each entry advances it by its record count, so the
+        // two tasks take DIFFERENT ids.
         let first_row_ids: Vec<Option<i64>> = tasks.iter().map(|t| t.first_row_id).collect();
         assert!(
             first_row_ids.iter().all(Option::is_some),

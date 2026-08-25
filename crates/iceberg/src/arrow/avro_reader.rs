@@ -80,10 +80,8 @@
 //!   `org.apache.iceberg.mapping.NameMapping`) are **not** supported yet: such a file errors loudly
 //!   rather than silently resolving by name (wrong slot).
 //! - V3 **row-lineage** present-field readers — CLOSED 2026-08-24 (F-13 V2), but NOT in this file.
-//!   Java special-cases a present `_row_id` / `_last_updated_sequence_number` field with dedicated
-//!   readers; the fork applies the same rules one layer later, in `RecordBatchTransformer`, which
-//!   every format funnels through. This reader emits those ids as plain columns — the input to
-//!   that shared fallback, not a gap.
+//!   Java uses dedicated readers when the field is present. The fork applies the same rules in
+//!   `RecordBatchTransformer`, which every format funnels through.
 //! - The `variant` type read is deferred (the Avro→Iceberg schema converter rejects variant on the
 //!   read path anyway).
 

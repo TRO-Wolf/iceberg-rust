@@ -871,13 +871,10 @@ impl ManifestFile {
             entry.inherit_data(self);
         }
 
-        // V3 row lineage: assign `first_row_id` from this manifest's own range (Java
-        // `ManifestReader.idAssigner`). The ids are a running total, so the entries must arrive in
-        // MANIFEST ORDER; the pass is independent of `inherit_data`, which never touches the field.
-        //
-        // A delete manifest never lends row ids, and Java IGNORES a range on one rather than
-        // refusing it (`ManifestFiles.readDeleteManifest` hardcodes a null `firstRowId`), so
-        // passing `None` here matches — erroring would reject a table Java scans fine.
+        // V3 row lineage: assign `first_row_id` from this manifest's range (Java
+        // `ManifestReader.idAssigner`). The ids are a running total, so entries must arrive in
+        // manifest order. A delete manifest never lends row ids and Java ignores a range on one, so
+        // `None` here matches; erroring would reject a table Java scans fine.
         let manifest_range = match self.content {
             ManifestContentType::Deletes => None,
             ManifestContentType::Data => self.first_row_id,
@@ -2156,9 +2153,8 @@ mod test {
 
     // ---- V3 row lineage: `first_row_id` inheritance through `load_manifest` -------------------
     //
-    // The unit-level rules live in `spec::manifest::entry::first_row_id_tests`; these two pin the
-    // WIRING. Both arms are needed — with only the assigning arm, dropping the call site yields
-    // `None` everywhere, which the absent arm also produces.
+    // The unit rules live in `spec::manifest::entry::first_row_id_tests`; these pin the WIRING. Both
+    // arms are needed: with only the assigning arm, dropping the call site yields `None` everywhere.
 
     /// Write a real V3 data manifest holding `record_counts.len()` added entries, and return the
     /// `ManifestFile` describing it with `first_row_id` forced to the given value.
@@ -2237,9 +2233,8 @@ mod test {
         );
     }
 
-    /// A delete manifest carrying a row-id range is READ and its range IGNORED, as Java does.
-    /// Refusing it instead would be a fail-closed where Java is fail-open; what must not happen is
-    /// assigning row ids to delete files.
+    /// A delete manifest carrying a row-id range is READ and its range IGNORED, as Java does. What
+    /// must not happen is assigning row ids to delete files.
     #[tokio::test]
     async fn test_a_row_range_on_a_delete_manifest_is_ignored_not_assigned() {
         let temp_dir = TempDir::new().expect("temp dir");

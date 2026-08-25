@@ -405,16 +405,14 @@ pub struct FileScanTask {
     pub split_offsets: Option<Vec<i64>>,
 
     /// V3 row lineage: start of the row-id range this data file owns, inherited at manifest read
-    /// (Java `ManifestReader.idAssigner`). Flagged additive field. `None` for V1/V2 and for any V3
-    /// file with no assigned range, which projects `_row_id` as all-NULL rather than guessing.
-    /// Survives a split — a sub-task belongs to the same file and range.
+    /// (Java `ManifestReader.idAssigner`). `None` for V1/V2 and for a V3 file with no assigned
+    /// range, which projects `_row_id` as all-NULL. Survives a split.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_row_id: Option<i64>,
 
     /// V3 row lineage: the data file's sequence number, the fallback for
-    /// `_last_updated_sequence_number` (Java `ValueReaders$LastUpdatedSeqReader`). Flagged
-    /// additive field, `None` when unknown. Like `first_row_id` it survives a split.
+    /// `_last_updated_sequence_number`. `None` when unknown. Survives a split.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_sequence_number: Option<i64>,

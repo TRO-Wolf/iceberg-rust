@@ -198,27 +198,22 @@ pub(crate) enum ColumnSource {
     // for the positions to be correct — enforced by the callers that project `_pos`.
     RowPosition,
 
-    // The reserved `_row_id` metadata column when the data file does NOT carry one: each row's
-    // row id is `first_row_id + physical ordinal` (Java `ValueReaders$RowIdReader`, whose null
-    // arm returns `firstRowId + pos`). `first_row_id` is the data file's assigned range start,
-    // inherited at manifest read by `assign_first_row_ids`. Carries the same in-order, no-skip
-    // decode requirement as `RowPosition`, since it is computed FROM the physical ordinal.
+    // The reserved `_row_id` column when the file does NOT carry one: `first_row_id + physical
+    // ordinal` (Java `ValueReaders$RowIdReader`). Shares `RowPosition`'s in-order, no-skip decode
+    // requirement, since it is computed from the ordinal.
     RowId {
         first_row_id: i64,
     },
 
-    // The reserved `_row_id` column when the data file DOES carry one: pass the stored value
-    // through, filling NULLs with `first_row_id + physical ordinal` (Java
-    // `ValueReaders$RowIdReader.read`: `idReader` first, `firstRowId + pos` only when it is null).
+    // The reserved `_row_id` column when the file DOES carry one: stored value, NULLs filled with
+    // `first_row_id + physical ordinal` (Java `ValueReaders$RowIdReader.read`).
     RowIdFromFile {
         source_index: usize,
         first_row_id: i64,
     },
 
-    // The reserved `_last_updated_sequence_number` column when the data file carries one: pass the
-    // stored value through, filling NULLs with the file's own sequence number (Java
-    // `ValueReaders$LastUpdatedSeqReader.read`). When the file does NOT carry the column the value
-    // is a plain constant and takes the `Add` path instead.
+    // The reserved `_last_updated_sequence_number` column when the file carries one: stored value,
+    // NULLs filled with the file's own sequence number (Java `ValueReaders$LastUpdatedSeqReader`).
     LastUpdatedSeqFromFile {
         source_index: usize,
         file_sequence_number: i64,
@@ -276,9 +271,8 @@ pub(crate) struct RecordBatchTransformerBuilder {
     snapshot_schema: Arc<IcebergSchema>,
     projected_iceberg_field_ids: Vec<i32>,
     constant_fields: HashMap<i32, Datum>,
-    /// V3 row lineage: the data file's assigned `first_row_id` and its file sequence number,
-    /// threaded from the manifest entry. `None` when the table is not V3 or the file has no
-    /// assigned range — projecting a row-lineage column is then an error rather than a guess.
+    /// V3 row lineage: the data file's assigned `first_row_id` and its file sequence number. `None`
+    /// when the table is not V3 or the file has no assigned range.
     first_row_id: Option<i64>,
     file_sequence_number: Option<i64>,
 }
@@ -308,12 +302,10 @@ impl RecordBatchTransformerBuilder {
         self
     }
 
-    /// Supply the V3 row-lineage inputs for this data file: its assigned `first_row_id` and its
-    /// file sequence number.
+    /// Supply the V3 row-lineage inputs for this data file.
     ///
-    /// Both are `Option` — a V1/V2 file, or a V3 file under a manifest with no assigned range, has
-    /// neither. Projecting without the corresponding input yields an all-NULL column, as Java
-    /// does; it is never defaulted to zero, which would mint colliding row ids.
+    /// Both are `Option`; without them a projected row-lineage column is all-NULL, as in Java.
+    /// Never defaulted to zero, which would mint colliding row ids.
     pub(crate) fn with_row_lineage(
         mut self,
         first_row_id: Option<i64>,
@@ -552,9 +544,9 @@ impl RecordBatchTransformer {
                 } else if *field_id == RESERVED_FIELD_ID_ROW_ID
                     || *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
                 {
-                    // V3 row-lineage reserved columns: absent from the table schema like `_pos`,
-                    // so their Arrow field comes from the reserved-column definition (Iceberg
-                    // `long` => Arrow Int64). Values are synthesized or null-filled below.
+                    // V3 row-lineage columns are absent from the table schema, like `_pos`, so
+                    // their Arrow field comes from the reserved-column definition (Iceberg `long`
+                    // => Arrow Int64).
                     let meta = get_metadata_field(*field_id)?;
                     Ok(Arc::new(
                         Field::new(&meta.name, DataType::Int64, !meta.required).with_metadata(
@@ -679,11 +671,8 @@ impl RecordBatchTransformer {
             }
 
             // A V3 row-lineage column is never a pass-through: its value is stored-else-fallback
-            // PER ROW, so a null in the stored column must be replaced rather than handed back
-            // verbatim. Force the field-id-based `Modify` path.
-            //
-            // The source half is defensive — the target half alone decides every case reachable
-            // today — and is kept in case a source field ever arrives without an embedded id.
+            // PER ROW, so force the field-id-based `Modify` path. The source half is defensive; the
+            // target half alone decides every case reachable today.
             if Self::field_id_of(source_field).is_some_and(is_row_lineage_field)
                 || Self::field_id_of(target_field).is_some_and(is_row_lineage_field)
             {
@@ -764,13 +753,12 @@ impl RecordBatchTransformer {
                     });
                 }
 
-                // V3 row-lineage reserved columns. Java `ValueReaders.fileFieldReader` dispatches
-                // on whether the FILE carries the field: a present field gets a dedicated reader
-                // that falls back per NULL row, an absent one gets the computed/constant value.
+                // Java `ValueReaders.fileFieldReader` dispatches on whether the FILE carries the
+                // field: present gets a per-row fallback reader, absent gets the computed or
+                // constant value.
                 if *field_id == RESERVED_FIELD_ID_ROW_ID {
-                    // No assigned range => an ALL-NULL column, exactly as Java's
-                    // `ValueReaders.rowIds(null, reader)`. A V1/V2 file simply has no row
-                    // identity, which is a fact about the row, not a failure to read it.
+                    // No assigned range => an all-NULL column, as in Java's
+                    // `ValueReaders.rowIds(null, reader)`. A V1/V2 file has no row identity.
                     let Some(first_row_id) = first_row_id else {
                         return Ok(ColumnSource::Add {
                             target_type: DataType::Int64,
@@ -787,9 +775,9 @@ impl RecordBatchTransformer {
                 }
 
                 if *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER {
-                    // Java gates this column on BOTH inputs, not just the sequence number, so a
-                    // V1/V2 file reports NULL here. Gating on the sequence number alone would
-                    // fabricate a last-updated value for every row of every pre-V3 table.
+                    // Java gates this column on BOTH inputs, so a V1/V2 file reports NULL. Gating
+                    // on the sequence number alone fabricates a value for every row of every pre-V3
+                    // table.
                     let (Some(_), Some(file_sequence_number)) =
                         (first_row_id, file_sequence_number)
                     else {
@@ -919,13 +907,9 @@ impl RecordBatchTransformer {
         Ok(field_id_to_source_schema)
     }
 
-    /// `first_row_id + physical ordinal` for each of `num_rows` rows starting at
-    /// `start_row_position` — the fallback arm of Java `ValueReaders$RowIdReader`.
-    ///
-    /// # Errors
-    ///
-    /// [`ErrorKind::DataInvalid`] if any row's id would overflow `i64`. Java's `long` addition
-    /// wraps; the fork fails closed, since a wrapped id aliases another live row's identity.
+    /// `first_row_id + physical ordinal` for `num_rows` rows from `start_row_position` — the
+    /// fallback arm of Java `ValueReaders$RowIdReader`. Fails on `i64` overflow; Java wraps, but a
+    /// wrapped id aliases another live row's identity.
     fn row_ids_from_positions(
         first_row_id: i64,
         start_row_position: u64,
@@ -936,9 +920,8 @@ impl RecordBatchTransformer {
         }
         let overflow = || row_id_overflow(first_row_id, start_row_position, num_rows);
 
-        // Ids are monotonic in position, so checking the LAST row covers the batch. Its offset is
-        // `start + num_rows - 1`, NOT `start + num_rows` — the latter is one PAST the last row and
-        // would reject a batch whose final id is exactly `i64::MAX`.
+        // Ids are monotonic in position, so the LAST row covers the batch. Its offset is `start +
+        // num_rows - 1`; `start + num_rows` would reject a batch ending exactly at `i64::MAX`.
         let first = first_row_id
             .checked_add(i64::try_from(start_row_position).map_err(|_| overflow())?)
             .ok_or_else(overflow)?;
@@ -983,8 +966,7 @@ impl RecordBatchTransformer {
 
                     ColumnSource::RowId { first_row_id } => {
                         // Java `ValueReaders$RowIdReader` with no stored column: every row is
-                        // `firstRowId + pos`. Computed over the PHYSICAL ordinal, so this shares
-                        // `RowPosition`'s in-order, no-skip decode requirement.
+                        // `firstRowId + pos`, computed over the physical ordinal.
                         Arc::new(Self::row_ids_from_positions(
                             *first_row_id,
                             start_row_position,
@@ -2503,16 +2485,13 @@ mod test {
 
     // ---- V3 row lineage: `_row_id` / `_last_updated_sequence_number` (F-13 V2) ----------------
     //
-    // Java dispatches on whether the FILE carries the reserved field, then per ROW on whether the
-    // stored value is null — a 2x2 domain per column, both axes pinned below:
+    // Java dispatches on whether the FILE carries the field, then per ROW on whether the stored
+    // value is null. Both axes are pinned below; the mixed-null cells discriminate.
     //
     // | | file lacks the column | file has it, no nulls | file has it, some nulls |
     // |---|---|---|---|
     // | `_row_id` | `first_row_id + pos` for every row | stored value verbatim | stored wins per row; NULL -> `first_row_id + pos` |
     // | `_last_updated_sequence_number` | the file's sequence number, constant | stored value verbatim | stored wins per row; NULL -> file sequence number |
-    //
-    // Plus the two absent-input cells and the overflow door. The mixed-null cells discriminate:
-    // both a stored-ignoring and a fallback-ignoring implementation pass the pure cells.
 
     fn row_lineage_schema() -> Arc<Schema> {
         Arc::new(
@@ -2634,9 +2613,8 @@ mod test {
         );
     }
 
-    /// Java returns an all-NULL column here, not an error: a V1/V2 file has no row identity, which
-    /// is a fact about the rows rather than a failure to read them. Erroring would make
-    /// `SELECT _row_id` unusable on any mixed-version table.
+    /// Java returns an all-NULL column here, not an error. Erroring would make `SELECT _row_id`
+    /// unusable on any mixed-version table.
     #[test]
     fn projecting_row_id_without_an_assigned_range_yields_nulls() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];
@@ -2693,8 +2671,7 @@ mod test {
     }
 
     /// The discriminating cell for the absent-range arm: the stored column is IGNORED, not
-    /// preferred, because the arm is chosen before the file is consulted. The sibling test feeds a
-    /// batch with no stored column and so cannot tell that apart from having nothing to discard.
+    /// preferred, because the arm is chosen before the file is consulted.
     #[test]
     fn a_stored_row_id_is_discarded_when_there_is_no_assigned_range() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];
@@ -2745,9 +2722,8 @@ mod test {
         );
     }
 
-    /// Java gates `_last_updated_sequence_number` on BOTH inputs, so a V1/V2 file — which has a
-    /// sequence number but no `first_row_id` — reports NULL. Gating on the sequence number alone
-    /// silently fabricates a last-updated value for every row of every pre-V3 table.
+    /// Java gates `_last_updated_sequence_number` on BOTH inputs, so a V1/V2 file reports NULL.
+    /// Gating on the sequence number alone fabricates a value for every pre-V3 row.
     #[test]
     fn last_updated_sequence_number_is_null_without_a_first_row_id() {
         let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
@@ -2779,10 +2755,8 @@ mod test {
         assert_eq!(int64_col(&batch, 1), vec![None]);
     }
 
-    /// The `num_rows == 0` guard in `row_ids_from_positions` is LOAD-BEARING and had zero
-    /// coverage (symmetry sweep F-10): without it, `num_rows - 1` underflows — a debug panic, and
-    /// in release a wrap to `usize::MAX` that reports a spurious overflow error on an empty batch.
-    /// Empty batches are ordinary (an all-filtered row group, a zero-row file).
+    /// The `num_rows == 0` guard in `row_ids_from_positions` is load-bearing: without it
+    /// `num_rows - 1` underflows on an ordinary empty batch. It had no coverage.
     #[test]
     fn an_empty_batch_yields_an_empty_row_id_column() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];
@@ -2803,10 +2777,8 @@ mod test {
         assert_eq!(int64_col(&next, 1), vec![Some(100), Some(101)]);
     }
 
-    /// The boundary the overflow check must NOT reject: a batch whose LAST id is exactly
-    /// `i64::MAX` is representable and must succeed. Checking `start + num_rows` (one PAST the
-    /// last row) instead of `start + num_rows - 1` passes every other test in this module and
-    /// fails only here.
+    /// The boundary the overflow check must NOT reject: a batch whose last id is exactly
+    /// `i64::MAX`. Checking `start + num_rows` instead of `start + num_rows - 1` fails only here.
     #[test]
     fn a_row_id_of_exactly_i64_max_is_allowed() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];
