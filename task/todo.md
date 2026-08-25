@@ -31,6 +31,27 @@ How to use it (see the manuals' §1):
 
 ---
 
+## QUEUED (2026-08-25): engine-agreed order — R166 interop, then F-13-or-F-7
+
+Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next.
+
+- [ ] **R166 interop leg — a CITATION-AND-PIN job, not a build.** The leg already exists on the
+      engine side: unit V3-0 (RePark #199) appended rows with lineage through the fork and
+      round-tripped through Spark→Java with the read verified Spark-exact. **Read
+      `/home/john/CodeRepos/LocalRepark/repark/task/ledgers/staging/v3-0-charter-ledger.md` and the
+      V3E-1/2 transcript BEFORE writing anything.** The named v3 oracle — PySpark 4.1.2 +
+      `iceberg-spark-runtime-4.1_2.13:1.11.0` — is live on this machine with the V3E-3 fixtures
+      (partitioned DV + equality-delete). A fork-local pin that REUSES that oracle is fine; a
+      separate harness is not. Flips R166 🟡→✅ and closes residue (3).
+- [ ] **Then F-7, not F-13.** F-13 is CLOSED (see row R114's engine answer, 2026-08-25), so the
+      unblocked item is F-7: lineage through `RewriteFiles`/`OverwriteFiles`, DV-aware
+      `RewritePositionDeleteFiles`, dangling-DV removal. Unlocks engine units V3-4 + V3-5.
+- [ ] R166's other two residues stay open and named: the ORC stored-column arm has no oracle
+      (Java's ORC reader is outside `iceberg-core`), and the ranged-split refusal is unreachable
+      through `plan_tasks` but reachable through the public `PartitionWork` seam.
+
+---
+
 ## ACTIVE (2026-08-16): PT increment C — files/entries project the unified type
 
 Branch: `grok/c16-files-entries-unified` off `16abae8b` (#204). Projected-type
