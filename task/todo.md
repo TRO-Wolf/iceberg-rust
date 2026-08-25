@@ -61,9 +61,19 @@ Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next
         public scan surface hands out `FileScanTaskDeleteFile`, a projection. The only public route
         left is `Manifest::parse_avro`, which R166 records as the seam that BYPASSES `first_row_id`
         inheritance. Scope this separately from (a).
-      - (c) `resolve_partition_spec_id`'s `(None, None)` arm stamps spec 0 with an empty partition
-        SILENTLY, and on a table whose spec 0 is unpartitioned that COMMITS with a
-        `partition_spec_id` that misdescribes the covered data file.
+      - (c) **A CODE candidate, not a docs one, and the widest of the three.**
+        `resolve_partition_spec_id`'s `(None, None)` arm stamps spec 0 with an empty partition
+        SILENTLY. The helper is shared by ALL FOUR base writers, so this is not a DV property. On a
+        table whose metadata holds a zero-field spec 0 it COMMITS, carrying a `partition_spec_id`
+        that misdescribes the covered data file. On a DV the damage is metadata only — path-keyed
+        lookup, and a zero-field spec projects to `AlwaysTrue` so it escapes pruning. On a
+        PARTITION-scoped position delete it LOSES DELETES: that index is `(spec_id, partition)`-keyed,
+        so the delete silently never applies. R113 documents that failure and pins it with
+        `spec_stamp_e2e_test`, while claiming the id is stamped ALWAYS — the claim this unit
+        corrected. In-tree callers always supply a spec or a key, so nothing in the fork reaches it;
+        an external engine can. Options: make the arm an error, or require an explicit
+        `unpartitioned()` opt-in. Needs an owner ruling — it is a BREAKING change to a public
+        writer's default construction.
 
 ---
 
