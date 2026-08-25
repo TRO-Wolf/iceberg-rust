@@ -28,6 +28,7 @@ use serde_derive::{Deserialize, Serialize};
 
 use self::_const_schema::{MANIFEST_LIST_AVRO_SCHEMA_V1, MANIFEST_LIST_AVRO_SCHEMA_V2};
 use self::_serde::{ManifestFileV1, ManifestFileV2};
+use super::manifest::assign_first_row_ids;
 use super::{FormatVersion, Manifest};
 use crate::error::Result;
 use crate::io::{FileIO, OutputFile};
@@ -870,6 +871,16 @@ impl ManifestFile {
             entry.inherit_data(self);
         }
 
+        // V3 row lineage: assign `first_row_id` from this manifest's range (Java
+        // `ManifestReader.idAssigner`). The ids are a running total, so entries must arrive in
+        // manifest order. A delete manifest never lends row ids and Java ignores a range on one, so
+        // `None` here matches; erroring would reject a table Java scans fine.
+        let manifest_range = match self.content {
+            ManifestContentType::Deletes => None,
+            ManifestContentType::Data => self.first_row_id,
+        };
+        assign_first_row_ids(&mut entries, manifest_range)?;
+
         Ok(Manifest::new(metadata, entries))
     }
 }
@@ -1383,7 +1394,9 @@ mod test {
     use crate::io::FileIO;
     use crate::spec::manifest_list::_serde::{ManifestListV1, ManifestListV3};
     use crate::spec::{
-        Datum, FieldSummary, ManifestContentType, ManifestFile, ManifestList, ManifestListWriter,
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, FieldSummary, ManifestContentType,
+        ManifestEntry, ManifestFile, ManifestList, ManifestListWriter, ManifestStatus,
+        ManifestWriterBuilder, NestedField, PrimitiveType, Struct, Type,
         UNASSIGNED_SEQUENCE_NUMBER,
     };
 
@@ -2136,5 +2149,147 @@ mod test {
         assert_eq!(v2_manifest.deleted_rows_count, Some(0));
         assert_eq!(v2_manifest.partitions, None);
         assert_eq!(v2_manifest.key_metadata, None);
+    }
+
+    // ---- V3 row lineage: `first_row_id` inheritance through `load_manifest` -------------------
+    //
+    // The unit rules live in `spec::manifest::entry::first_row_id_tests`; these pin the WIRING. Both
+    // arms are needed: with only the assigning arm, dropping the call site yields `None` everywhere.
+
+    /// Write a real V3 data manifest holding `record_counts.len()` added entries, and return the
+    /// `ManifestFile` describing it with `first_row_id` forced to the given value.
+    async fn v3_manifest_with(
+        temp_dir: &TempDir,
+        file_io: &FileIO,
+        record_counts: &[u64],
+        first_row_id: Option<u64>,
+    ) -> ManifestFile {
+        let schema = std::sync::Arc::new(
+            crate::spec::Schema::builder()
+                .with_fields(vec![std::sync::Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .expect("schema"),
+        );
+        let partition_spec = crate::spec::PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .expect("unpartitioned spec");
+        let path = temp_dir.path().join("manifest.avro");
+        let output = file_io
+            .new_output(path.to_str().expect("utf-8 path"))
+            .expect("output");
+        let mut writer = ManifestWriterBuilder::new(output, Some(1), None, schema, partition_spec)
+            .build_v3_data();
+        for (index, record_count) in record_counts.iter().enumerate() {
+            let data_file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("mem://data/{index}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::empty())
+                .record_count(*record_count)
+                .file_size_in_bytes(100)
+                .build()
+                .expect("data file");
+            writer
+                .add_entry(ManifestEntry {
+                    status: ManifestStatus::Added,
+                    snapshot_id: None,
+                    sequence_number: None,
+                    file_sequence_number: None,
+                    data_file,
+                })
+                .expect("add entry");
+        }
+        let mut manifest_file = writer.write_manifest_file().await.expect("write manifest");
+        manifest_file.first_row_id = first_row_id;
+        manifest_file
+    }
+
+    #[tokio::test]
+    async fn test_load_manifest_assigns_first_row_ids_from_the_manifests_range() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let manifest_file = v3_manifest_with(&temp_dir, &file_io, &[10, 3, 7], Some(1_000)).await;
+
+        let manifest = manifest_file
+            .load_manifest(&file_io)
+            .await
+            .expect("load manifest");
+
+        let ids: Vec<Option<i64>> = manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.data_file.first_row_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some(1_000), Some(1_010), Some(1_013)],
+            "ids start at the MANIFEST's own first_row_id and advance by record_count — not at \
+             0, and not all at the same value"
+        );
+    }
+
+    /// A delete manifest carrying a row-id range is READ and its range IGNORED, as Java does. What
+    /// must not happen is assigning row ids to delete files.
+    #[tokio::test]
+    async fn test_a_row_range_on_a_delete_manifest_is_ignored_not_assigned() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let mut manifest_file = v3_manifest_with(&temp_dir, &file_io, &[10, 5], Some(1_000)).await;
+        // Same manifest, relabelled as a DELETE manifest carrying a range.
+        manifest_file.content = ManifestContentType::Deletes;
+
+        let manifest = manifest_file
+            .load_manifest(&file_io)
+            .await
+            .expect("Java reads this fine — refusing it would reject a scannable table");
+        assert!(
+            manifest
+                .entries()
+                .iter()
+                .all(|entry| entry.data_file.first_row_id.is_none()),
+            "a delete manifest lends NO row ids — inventing lineage for delete files is the \
+             failure this ignores the range to prevent"
+        );
+
+        // Control: the SAME manifest as DATA content DOES assign, so the ignoring keys on the
+        // content type and not on something incidental to the fixture.
+        let data_manifest = v3_manifest_with(&temp_dir, &file_io, &[10, 5], Some(1_000)).await;
+        let assigned = data_manifest
+            .load_manifest(&file_io)
+            .await
+            .expect("data manifest loads");
+        assert_eq!(
+            assigned
+                .entries()
+                .iter()
+                .map(|entry| entry.data_file.first_row_id)
+                .collect::<Vec<_>>(),
+            vec![Some(1_000), Some(1_010)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_manifest_leaves_row_ids_unassigned_without_a_range() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let manifest_file = v3_manifest_with(&temp_dir, &file_io, &[10, 3], None).await;
+
+        let manifest = manifest_file
+            .load_manifest(&file_io)
+            .await
+            .expect("load manifest");
+
+        assert!(
+            manifest
+                .entries()
+                .iter()
+                .all(|entry| entry.data_file.first_row_id.is_none()),
+            "a manifest with no assigned range lends no row ids"
+        );
     }
 }

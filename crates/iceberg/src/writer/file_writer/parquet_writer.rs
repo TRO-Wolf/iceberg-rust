@@ -102,6 +102,10 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
+        // Refuse a variant-bearing schema HERE, before any bytes are written. The conversion below
+        // no longer throws (row R88), which had moved the refusal to `close` — after the flush.
+        reject_variant_write(self.schema.as_ref())?;
+
         // Detect once at build time: only run the NaN visitor when the schema has float/double
         // leaves under a counts-collecting metrics mode. Int/string/timestamp-only tables skip
         // the full schema walk on every batch.
@@ -119,6 +123,29 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             metrics_config: self.metrics_config.clone(),
         })
     }
+}
+
+/// Refuse writing a schema that contains a `variant` at any depth (row R88).
+///
+/// # Errors
+///
+/// [`ErrorKind::FeatureUnsupported`] naming the dotted path to the first variant found.
+fn reject_variant_write(schema: &Schema) -> Result<()> {
+    for field in schema.as_struct().fields() {
+        if let Some(path) =
+            crate::arrow::variant_path_within(&field.name, field.field_type.as_ref())
+        {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "Writing the variant column '{path}' is not supported yet: file-level variant \
+                     I/O is unimplemented (GAP_MATRIX row R88). Refused before any bytes are \
+                     written, so no orphan file is left behind."
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A mapping from Parquet column path names to internal field id
@@ -3393,5 +3420,122 @@ mod tests {
             "expected a loud incompatible-type rejection exposing the un-normalized nested \
              \"UTC\" vs \"+00:00\" timestamp mismatch, got: {rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod variant_write_refusal_tests {
+    use std::sync::Arc;
+
+    use parquet::file::properties::WriterProperties;
+    use tempfile::TempDir;
+
+    use super::ParquetWriterBuilder;
+    use crate::ErrorKind;
+    use crate::io::FileIO;
+    use crate::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
+    use crate::writer::file_writer::FileWriterBuilder;
+
+    /// A variant-bearing schema is refused BEFORE any bytes are written, at every depth. Without
+    /// the guard the refusal lands in `close()`, leaving an orphan file.
+    #[tokio::test]
+    async fn a_variant_schema_is_refused_before_any_bytes_are_written() {
+        for (label, variant_field) in [
+            ("top level", NestedField::optional(2, "v", Type::Variant)),
+            (
+                "in a struct",
+                NestedField::optional(
+                    2,
+                    "v",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "inner", Type::Variant).into(),
+                    ])),
+                ),
+            ),
+            (
+                "in a list",
+                NestedField::optional(
+                    2,
+                    "v",
+                    Type::List(ListType {
+                        element_field: NestedField::list_element(3, Type::Variant, true).into(),
+                    }),
+                ),
+            ),
+            (
+                "as a map key",
+                NestedField::optional(
+                    2,
+                    "v",
+                    Type::Map(MapType {
+                        key_field: NestedField::map_key_element(3, Type::Variant).into(),
+                        value_field: NestedField::map_value_element(
+                            4,
+                            Type::Primitive(PrimitiveType::String),
+                            true,
+                        )
+                        .into(),
+                    }),
+                ),
+            ),
+            // The fourth container position, and the most realistic. Dropping the map-VALUE descent
+            // was green.
+            (
+                "as a map value",
+                NestedField::optional(
+                    2,
+                    "v",
+                    Type::Map(MapType {
+                        key_field: NestedField::map_key_element(
+                            3,
+                            Type::Primitive(PrimitiveType::String),
+                        )
+                        .into(),
+                        value_field: NestedField::map_value_element(4, Type::Variant, true).into(),
+                    }),
+                ),
+            ),
+        ] {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                        variant_field.into(),
+                    ])
+                    .build()
+                    .expect("schema"),
+            );
+
+            let temp_dir = TempDir::new().expect("temp dir");
+            let file_io = FileIO::new_with_fs();
+            let path = temp_dir
+                .path()
+                .join("out.parquet")
+                .to_string_lossy()
+                .to_string();
+            let output = file_io.new_output(&path).expect("output file");
+
+            let error = match ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+                .build(output)
+                .await
+            {
+                Ok(_) => panic!("a variant schema must be refused at BUILD time ({label})"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                ErrorKind::FeatureUnsupported,
+                "variant {label} must be refused"
+            );
+            assert!(
+                error.message().contains("Writing the variant column"),
+                "the error must name the write refusal for {label}, got: {}",
+                error.message()
+            );
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "refusing at build time must leave NO file behind for {label}"
+            );
+        }
     }
 }

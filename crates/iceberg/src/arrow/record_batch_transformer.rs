@@ -30,7 +30,10 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
-use crate::metadata_columns::{RESERVED_FIELD_ID_POS, get_metadata_field};
+use crate::metadata_columns::{
+    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_POS,
+    RESERVED_FIELD_ID_ROW_ID, get_metadata_field, is_row_lineage_field,
+};
 use crate::spec::{
     Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
 };
@@ -194,6 +197,27 @@ pub(crate) enum ColumnSource {
     // batches in file order with no rows skipped (no Parquet `RowSelection` / row-group pruning)
     // for the positions to be correct — enforced by the callers that project `_pos`.
     RowPosition,
+
+    // The reserved `_row_id` column when the file does NOT carry one: `first_row_id + physical
+    // ordinal` (Java `ValueReaders$RowIdReader`). Shares `RowPosition`'s in-order, no-skip decode
+    // requirement, since it is computed from the ordinal.
+    RowId {
+        first_row_id: i64,
+    },
+
+    // The reserved `_row_id` column when the file DOES carry one: stored value, NULLs filled with
+    // `first_row_id + physical ordinal` (Java `ValueReaders$RowIdReader.read`).
+    RowIdFromFile {
+        source_index: usize,
+        first_row_id: i64,
+    },
+
+    // The reserved `_last_updated_sequence_number` column when the file carries one: stored value,
+    // NULLs filled with the file's own sequence number (Java `ValueReaders$LastUpdatedSeqReader`).
+    LastUpdatedSeqFromFile {
+        source_index: usize,
+        file_sequence_number: i64,
+    },
     // The iceberg spec refers to other permissible schema evolution actions
     // (see https://iceberg.apache.org/spec/#schema-evolution):
     // renaming fields, deleting fields and reordering fields.
@@ -247,6 +271,10 @@ pub(crate) struct RecordBatchTransformerBuilder {
     snapshot_schema: Arc<IcebergSchema>,
     projected_iceberg_field_ids: Vec<i32>,
     constant_fields: HashMap<i32, Datum>,
+    /// V3 row lineage: the data file's assigned `first_row_id` and its file sequence number. `None`
+    /// when the table is not V3 or the file has no assigned range.
+    first_row_id: Option<i64>,
+    file_sequence_number: Option<i64>,
 }
 
 impl RecordBatchTransformerBuilder {
@@ -258,6 +286,8 @@ impl RecordBatchTransformerBuilder {
             snapshot_schema,
             projected_iceberg_field_ids: projected_iceberg_field_ids.to_vec(),
             constant_fields: HashMap::new(),
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 
@@ -269,6 +299,20 @@ impl RecordBatchTransformerBuilder {
     /// * `datum` - The constant value (with type) for this field
     pub(crate) fn with_constant(mut self, field_id: i32, datum: Datum) -> Self {
         self.constant_fields.insert(field_id, datum);
+        self
+    }
+
+    /// Supply the V3 row-lineage inputs for this data file.
+    ///
+    /// Both are `Option`; without them a projected row-lineage column is all-NULL, as in Java.
+    /// Never defaulted to zero, which would mint colliding row ids.
+    pub(crate) fn with_row_lineage(
+        mut self,
+        first_row_id: Option<i64>,
+        file_sequence_number: Option<i64>,
+    ) -> Self {
+        self.first_row_id = first_row_id;
+        self.file_sequence_number = file_sequence_number;
         self
     }
 
@@ -299,6 +343,8 @@ impl RecordBatchTransformerBuilder {
             snapshot_schema: self.snapshot_schema,
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
+            first_row_id: self.first_row_id,
+            file_sequence_number: self.file_sequence_number,
             batch_transform: None,
             next_row_position: 0,
         }
@@ -344,6 +390,11 @@ pub(crate) struct RecordBatchTransformer {
     // Datum holds both the Iceberg type and the value
     constant_fields: HashMap<i32, Datum>,
 
+    // V3 row lineage inputs for the data file being read (see
+    // `RecordBatchTransformerBuilder::with_row_lineage`).
+    first_row_id: Option<i64>,
+    file_sequence_number: Option<i64>,
+
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
     batch_transform: Option<BatchTransform>,
@@ -352,6 +403,17 @@ pub(crate) struct RecordBatchTransformer {
     // batch's row count. Sourced into the reserved `_pos` column (`ColumnSource::RowPosition`)
     // when projected. Correct only under an in-order, no-skip decode — see that variant.
     next_row_position: u64,
+}
+
+/// The shared overflow error for the `_row_id` computation.
+fn row_id_overflow(first_row_id: i64, start_row_position: u64, num_rows: usize) -> Error {
+    Error::new(
+        ErrorKind::DataInvalid,
+        "row-lineage `_row_id` computation overflowed i64",
+    )
+    .with_context("first_row_id", first_row_id.to_string())
+    .with_context("start_row_position", start_row_position.to_string())
+    .with_context("num_rows", num_rows.to_string())
 }
 
 impl RecordBatchTransformer {
@@ -366,6 +428,8 @@ impl RecordBatchTransformer {
                 self.snapshot_schema.as_ref(),
                 &self.projected_iceberg_field_ids,
                 &self.constant_fields,
+                self.first_row_id,
+                self.file_sequence_number,
             )?;
             self.batch_transform = Some(transform);
         }
@@ -430,6 +494,8 @@ impl RecordBatchTransformer {
         snapshot_schema: &IcebergSchema,
         projected_iceberg_field_ids: &[i32],
         constant_fields: &HashMap<i32, Datum>,
+        first_row_id: Option<i64>,
+        file_sequence_number: Option<i64>,
     ) -> Result<BatchTransform> {
         let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
         let field_id_to_mapped_schema_map =
@@ -475,6 +541,21 @@ impl RecordBatchTransformer {
                             .0
                             .clone())
                     }
+                } else if *field_id == RESERVED_FIELD_ID_ROW_ID
+                    || *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+                {
+                    // V3 row-lineage columns are absent from the table schema, like `_pos`, so
+                    // their Arrow field comes from the reserved-column definition (Iceberg `long`
+                    // => Arrow Int64).
+                    let meta = get_metadata_field(*field_id)?;
+                    Ok(Arc::new(
+                        Field::new(&meta.name, DataType::Int64, !meta.required).with_metadata(
+                            HashMap::from([(
+                                PARQUET_FIELD_ID_META_KEY.to_string(),
+                                meta.id.to_string(),
+                            )]),
+                        ),
+                    ))
                 } else if *field_id == RESERVED_FIELD_ID_POS {
                     // `_pos` reserved metadata column: not a value constant and absent from the
                     // table schema (so the regular lookup below would fail). Build its Arrow field
@@ -532,6 +613,8 @@ impl RecordBatchTransformer {
                     projected_iceberg_field_ids,
                     field_id_to_mapped_schema_map,
                     constant_fields,
+                    first_row_id,
+                    file_sequence_number,
                 )?,
                 target_schema,
             }),
@@ -587,6 +670,15 @@ impl RecordBatchTransformer {
                 return SchemaComparison::Different;
             }
 
+            // A V3 row-lineage column is never a pass-through: its value is stored-else-fallback
+            // PER ROW, so force the field-id-based `Modify` path. The source half is defensive; the
+            // target half alone decides every case reachable today.
+            if Self::field_id_of(source_field).is_some_and(is_row_lineage_field)
+                || Self::field_id_of(target_field).is_some_and(is_row_lineage_field)
+            {
+                return SchemaComparison::Different;
+            }
+
             if source_field.name() != target_field.name() {
                 names_changed = true;
             }
@@ -605,6 +697,8 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids: &[i32],
         field_id_to_mapped_schema_map: HashMap<i32, (FieldRef, usize)>,
         constant_fields: &HashMap<i32, Datum>,
+        first_row_id: Option<i64>,
+        file_sequence_number: Option<i64>,
     ) -> Result<Vec<ColumnSource>> {
         let field_id_to_source_schema_map =
             Self::build_field_id_to_arrow_schema_map(source_schema)?;
@@ -656,6 +750,52 @@ impl RecordBatchTransformer {
                             source_index: *source_index,
                         },
                         None => ColumnSource::RowPosition,
+                    });
+                }
+
+                // Java `ValueReaders.fileFieldReader` dispatches on whether the FILE carries the
+                // field: present gets a per-row fallback reader, absent gets the computed or
+                // constant value.
+                if *field_id == RESERVED_FIELD_ID_ROW_ID {
+                    // No assigned range => an all-NULL column, as in Java's
+                    // `ValueReaders.rowIds(null, reader)`. A V1/V2 file has no row identity.
+                    let Some(first_row_id) = first_row_id else {
+                        return Ok(ColumnSource::Add {
+                            target_type: DataType::Int64,
+                            value: None,
+                        });
+                    };
+                    return Ok(match field_id_to_source_schema_map.get(field_id) {
+                        Some((_, source_index)) => ColumnSource::RowIdFromFile {
+                            source_index: *source_index,
+                            first_row_id,
+                        },
+                        None => ColumnSource::RowId { first_row_id },
+                    });
+                }
+
+                if *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER {
+                    // Java gates this column on BOTH inputs, so a V1/V2 file reports NULL. Gating
+                    // on the sequence number alone fabricates a value for every row of every pre-V3
+                    // table.
+                    let (Some(_), Some(file_sequence_number)) =
+                        (first_row_id, file_sequence_number)
+                    else {
+                        return Ok(ColumnSource::Add {
+                            target_type: DataType::Int64,
+                            value: None,
+                        });
+                    };
+                    return Ok(match field_id_to_source_schema_map.get(field_id) {
+                        Some((_, source_index)) => ColumnSource::LastUpdatedSeqFromFile {
+                            source_index: *source_index,
+                            file_sequence_number,
+                        },
+                        // Absent from the file: a plain per-file constant.
+                        None => ColumnSource::Add {
+                            target_type: DataType::Int64,
+                            value: Some(PrimitiveLiteral::Long(file_sequence_number)),
+                        },
                     });
                 }
 
@@ -767,6 +907,34 @@ impl RecordBatchTransformer {
         Ok(field_id_to_source_schema)
     }
 
+    /// `first_row_id + physical ordinal` for `num_rows` rows from `start_row_position` — the
+    /// fallback arm of Java `ValueReaders$RowIdReader`. Fails on `i64` overflow; Java wraps, but a
+    /// wrapped id aliases another live row's identity.
+    fn row_ids_from_positions(
+        first_row_id: i64,
+        start_row_position: u64,
+        num_rows: usize,
+    ) -> Result<Int64Array> {
+        if num_rows == 0 {
+            return Ok(Int64Array::from_iter_values(std::iter::empty()));
+        }
+        let overflow = || row_id_overflow(first_row_id, start_row_position, num_rows);
+
+        // Ids are monotonic in position, so the LAST row covers the batch. Its offset is `start +
+        // num_rows - 1`; `start + num_rows` would reject a batch ending exactly at `i64::MAX`.
+        let first = first_row_id
+            .checked_add(i64::try_from(start_row_position).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
+        let last_offset = i64::try_from(num_rows - 1).map_err(|_| overflow())?;
+        first.checked_add(last_offset).ok_or_else(overflow)?;
+
+        // Every id in `[first, first + num_rows - 1]` is now proven representable, so the
+        // per-row addition below cannot overflow.
+        Ok(Int64Array::from_iter_values(
+            (0..last_offset + 1).map(|offset| first + offset),
+        ))
+    }
+
     fn transform_columns(
         columns: &[Arc<dyn ArrowArray>],
         operations: &[ColumnSource],
@@ -794,6 +962,78 @@ impl RecordBatchTransformer {
                         Arc::new(Int64Array::from_iter_values(
                             (start_row_position..end).map(|p| p as i64),
                         ))
+                    }
+
+                    ColumnSource::RowId { first_row_id } => {
+                        // Java `ValueReaders$RowIdReader` with no stored column: every row is
+                        // `firstRowId + pos`, computed over the physical ordinal.
+                        Arc::new(Self::row_ids_from_positions(
+                            *first_row_id,
+                            start_row_position,
+                            num_rows,
+                        )?)
+                    }
+
+                    ColumnSource::RowIdFromFile {
+                        source_index,
+                        first_row_id,
+                    } => {
+                        // Java `ValueReaders$RowIdReader.read`: the stored id wins; only a NULL
+                        // falls back to `firstRowId + pos`.
+                        let stored = columns[*source_index].as_ref();
+                        let stored =
+                            stored
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .ok_or_else(|| {
+                                    Error::new(
+                                        ErrorKind::DataInvalid,
+                                        "the data file's `_row_id` column is not an Int64 array",
+                                    )
+                                })?;
+                        if stored.null_count() == 0 {
+                            columns[*source_index].clone()
+                        } else {
+                            let computed = Self::row_ids_from_positions(
+                                *first_row_id,
+                                start_row_position,
+                                num_rows,
+                            )?;
+                            Arc::new(Int64Array::from_iter_values((0..num_rows).map(|row| {
+                                if stored.is_null(row) {
+                                    computed.value(row)
+                                } else {
+                                    stored.value(row)
+                                }
+                            })))
+                        }
+                    }
+
+                    ColumnSource::LastUpdatedSeqFromFile {
+                        source_index,
+                        file_sequence_number,
+                    } => {
+                        // Java `ValueReaders$LastUpdatedSeqReader.read`: the stored value wins;
+                        // only a NULL falls back to the file's own sequence number.
+                        let stored = columns[*source_index].as_ref();
+                        let stored = stored.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                "the data file's `_last_updated_sequence_number` column is not an \
+                                 Int64 array",
+                            )
+                        })?;
+                        if stored.null_count() == 0 {
+                            columns[*source_index].clone()
+                        } else {
+                            Arc::new(Int64Array::from_iter_values((0..num_rows).map(|row| {
+                                if stored.is_null(row) {
+                                    *file_sequence_number
+                                } else {
+                                    stored.value(row)
+                                }
+                            })))
+                        }
                     }
                 })
             })
@@ -850,8 +1090,12 @@ mod test {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+    use crate::ErrorKind;
     use crate::arrow::record_batch_transformer::{
         RecordBatchTransformer, RecordBatchTransformerBuilder, constants_map,
+    };
+    use crate::metadata_columns::{
+        RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
     };
     use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Type};
 
@@ -2237,5 +2481,336 @@ mod test {
             .unwrap();
         assert_eq!(id.value(0), 10);
         assert_eq!(id.value(1), 11);
+    }
+
+    // ---- V3 row lineage: `_row_id` / `_last_updated_sequence_number` (F-13 V2) ----------------
+    //
+    // Java dispatches on whether the FILE carries the field, then per ROW on whether the stored
+    // value is null. Both axes are pinned below; the mixed-null cells discriminate.
+    //
+    // | | file lacks the column | file has it, no nulls | file has it, some nulls |
+    // |---|---|---|---|
+    // | `_row_id` | `first_row_id + pos` for every row | stored value verbatim | stored wins per row; NULL -> `first_row_id + pos` |
+    // | `_last_updated_sequence_number` | the file's sequence number, constant | stored value verbatim | stored wins per row; NULL -> file sequence number |
+
+    fn row_lineage_schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// A file batch of `id` values, optionally carrying a reserved row-lineage column.
+    fn row_lineage_batch(
+        ids: Vec<i64>,
+        extra: Option<(i32, &str, Vec<Option<i64>>)>,
+    ) -> RecordBatch {
+        let mut fields = vec![simple_field("id", DataType::Int64, false, "1")];
+        let mut columns: Vec<arrow_array::ArrayRef> = vec![Arc::new(Int64Array::from(ids))];
+        if let Some((field_id, name, values)) = extra {
+            fields.push(simple_field(
+                name,
+                DataType::Int64,
+                true,
+                &field_id.to_string(),
+            ));
+            columns.push(Arc::new(Int64Array::from(values)));
+        }
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap()
+    }
+
+    fn int64_col(batch: &RecordBatch, index: usize) -> Vec<Option<i64>> {
+        let array = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 column");
+        (0..array.len())
+            .map(|row| {
+                if array.is_null(row) {
+                    None
+                } else {
+                    Some(array.value(row))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn row_id_is_computed_from_first_row_id_and_position_when_absent_from_the_file() {
+        let projected = [1, RESERVED_FIELD_ID_ROW_ID];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(Some(100), Some(7))
+            .build();
+
+        let first = transformer
+            .process_record_batch(row_lineage_batch(vec![1, 2, 3], None))
+            .unwrap();
+        assert_eq!(int64_col(&first, 1), vec![Some(100), Some(101), Some(102)]);
+
+        // The position counter CONTINUES across batches — it does not restart, or every batch
+        // after the first would repeat the same row ids.
+        let second = transformer
+            .process_record_batch(row_lineage_batch(vec![4, 5], None))
+            .unwrap();
+        assert_eq!(int64_col(&second, 1), vec![Some(103), Some(104)]);
+    }
+
+    #[test]
+    fn row_id_stored_in_the_file_wins_over_the_computed_value() {
+        let projected = [1, RESERVED_FIELD_ID_ROW_ID];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(Some(100), Some(7))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(
+                vec![1, 2, 3],
+                Some((RESERVED_FIELD_ID_ROW_ID, "_row_id", vec![
+                    Some(900),
+                    Some(901),
+                    Some(902),
+                ])),
+            ))
+            .unwrap();
+        assert_eq!(
+            int64_col(&batch, 1),
+            vec![Some(900), Some(901), Some(902)],
+            "a file that carries row ids keeps them — they are the rows' durable identity, and \
+             recomputing would renumber rows that were carried through a rewrite"
+        );
+    }
+
+    /// The discriminating cell: stored and computed values INTERLEAVE within one batch.
+    #[test]
+    fn a_null_row_id_in_the_file_falls_back_to_first_row_id_plus_position() {
+        let projected = [1, RESERVED_FIELD_ID_ROW_ID];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(Some(100), Some(7))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(
+                vec![1, 2, 3, 4],
+                Some((RESERVED_FIELD_ID_ROW_ID, "_row_id", vec![
+                    Some(900),
+                    None,
+                    Some(902),
+                    None,
+                ])),
+            ))
+            .unwrap();
+        assert_eq!(
+            int64_col(&batch, 1),
+            vec![Some(900), Some(101), Some(902), Some(103)],
+            "each NULL takes `first_row_id + ITS OWN position` (101 at row 1, 103 at row 3) — not \
+             a running count of the nulls, and not the whole column recomputed"
+        );
+    }
+
+    /// Java returns an all-NULL column here, not an error. Erroring would make `SELECT _row_id`
+    /// unusable on any mixed-version table.
+    #[test]
+    fn projecting_row_id_without_an_assigned_range_yields_nulls() {
+        let projected = [1, RESERVED_FIELD_ID_ROW_ID];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(None, Some(7))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(vec![1, 2], None))
+            .expect("no assigned range is not an error");
+        assert_eq!(int64_col(&batch, 1), vec![None, None]);
+    }
+
+    #[test]
+    fn last_updated_sequence_number_is_the_files_own_when_absent_from_the_file() {
+        let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(Some(100), Some(7))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(vec![1, 2], None))
+            .unwrap();
+        assert_eq!(
+            int64_col(&batch, 1),
+            vec![Some(7), Some(7)],
+            "a constant per file — the file's own sequence number, NOT the row position"
+        );
+    }
+
+    /// The discriminating cell for the sequence column.
+    #[test]
+    fn a_null_last_updated_sequence_number_falls_back_to_the_files_own() {
+        let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(Some(100), Some(7))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(
+                vec![1, 2, 3],
+                Some((
+                    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                    "_last_updated_sequence_number",
+                    vec![Some(3), None, Some(5)],
+                )),
+            ))
+            .unwrap();
+        assert_eq!(
+            int64_col(&batch, 1),
+            vec![Some(3), Some(7), Some(5)],
+            "the stored per-row value wins; only the NULL takes the file's sequence number"
+        );
+    }
+
+    /// The discriminating cell for the absent-range arm: the stored column is IGNORED, not
+    /// preferred, because the arm is chosen before the file is consulted.
+    #[test]
+    fn a_stored_row_id_is_discarded_when_there_is_no_assigned_range() {
+        let projected = [1, RESERVED_FIELD_ID_ROW_ID];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(None, Some(7))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(
+                vec![1, 2, 3],
+                Some((RESERVED_FIELD_ID_ROW_ID, "_row_id", vec![
+                    Some(900),
+                    Some(901),
+                    Some(902),
+                ])),
+            ))
+            .expect("no assigned range is not an error");
+        assert_eq!(
+            int64_col(&batch, 1),
+            vec![None, None, None],
+            "no assigned range means NO row identity — the stored column is discarded, not \
+             preferred. Java reaches `constant(null)` without consulting the file at all."
+        );
+    }
+
+    /// The same cell for the sequence column: a stored value is discarded when the gate fails.
+    #[test]
+    fn a_stored_last_updated_sequence_number_is_discarded_without_a_first_row_id() {
+        let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(None, Some(5))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(
+                vec![1, 2],
+                Some((
+                    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                    "_last_updated_sequence_number",
+                    vec![Some(31), Some(33)],
+                )),
+            ))
+            .expect("a missing first_row_id is not an error");
+        assert_eq!(
+            int64_col(&batch, 1),
+            vec![None, None],
+            "Java gates on BOTH inputs BEFORE reading the column, so a stored value is discarded"
+        );
+    }
+
+    /// Java gates `_last_updated_sequence_number` on BOTH inputs, so a V1/V2 file reports NULL.
+    /// Gating on the sequence number alone fabricates a value for every pre-V3 row.
+    #[test]
+    fn last_updated_sequence_number_is_null_without_a_first_row_id() {
+        let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(None, Some(5))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(vec![1, 2], None))
+            .expect("a missing first_row_id is not an error");
+        assert_eq!(
+            int64_col(&batch, 1),
+            vec![None, None],
+            "NULL, not the file's sequence number — Java gates on BOTH inputs"
+        );
+    }
+
+    /// The other half of the same gate: no file sequence number is also NULL.
+    #[test]
+    fn last_updated_sequence_number_is_null_without_a_file_sequence_number() {
+        let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(Some(100), None)
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(vec![1], None))
+            .expect("a missing file sequence number is not an error");
+        assert_eq!(int64_col(&batch, 1), vec![None]);
+    }
+
+    /// The `num_rows == 0` guard in `row_ids_from_positions` is load-bearing: without it
+    /// `num_rows - 1` underflows on an ordinary empty batch. It had no coverage.
+    #[test]
+    fn an_empty_batch_yields_an_empty_row_id_column() {
+        let projected = [1, RESERVED_FIELD_ID_ROW_ID];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(Some(100), Some(7))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(Vec::new(), None))
+            .expect("an empty batch is not an error");
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(int64_col(&batch, 1), Vec::<Option<i64>>::new());
+
+        // And the counter is unmoved, so the NEXT batch still starts at the range's first id.
+        let next = transformer
+            .process_record_batch(row_lineage_batch(vec![1, 2], None))
+            .expect("second batch");
+        assert_eq!(int64_col(&next, 1), vec![Some(100), Some(101)]);
+    }
+
+    /// The boundary the overflow check must NOT reject: a batch whose last id is exactly
+    /// `i64::MAX`. Checking `start + num_rows` instead of `start + num_rows - 1` fails only here.
+    #[test]
+    fn a_row_id_of_exactly_i64_max_is_allowed() {
+        let projected = [1, RESERVED_FIELD_ID_ROW_ID];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(Some(i64::MAX - 1), Some(7))
+            .build();
+
+        let batch = transformer
+            .process_record_batch(row_lineage_batch(vec![1, 2], None))
+            .expect("the last id is exactly i64::MAX, which is representable");
+        assert_eq!(int64_col(&batch, 1), vec![
+            Some(i64::MAX - 1),
+            Some(i64::MAX)
+        ]);
+    }
+
+    /// Fail closed instead of wrapping into a negative row id (Java's `long` addition wraps).
+    #[test]
+    fn a_row_id_computation_that_overflows_i64_is_refused() {
+        let projected = [1, RESERVED_FIELD_ID_ROW_ID];
+        let mut transformer = RecordBatchTransformerBuilder::new(row_lineage_schema(), &projected)
+            .with_row_lineage(Some(i64::MAX), Some(7))
+            .build();
+
+        let error = transformer
+            .process_record_batch(row_lineage_batch(vec![1, 2], None))
+            .expect_err("i64::MAX + 2 has no representable row id");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("overflowed i64"),
+            "got: {}",
+            error.message()
+        );
     }
 }

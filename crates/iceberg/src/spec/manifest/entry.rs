@@ -149,6 +149,44 @@ impl ManifestEntry {
     }
 }
 
+/// Assign each entry's `first_row_id` from the manifest's own range, mirroring Java
+/// `ManifestReader.idAssigner`. Stateful, so it takes the whole slice in manifest order.
+///
+/// An absent `manifest_first_row_id` forces every file to `None`. A present one is a running
+/// counter that skips `Deleted` and already-assigned entries without advancing.
+///
+/// # Errors
+///
+/// [`ErrorKind::DataInvalid`] on counter overflow. Java wraps; a wrapped id aliases live rows.
+pub(crate) fn assign_first_row_ids(
+    entries: &mut [ManifestEntry],
+    manifest_first_row_id: Option<u64>,
+) -> Result<()> {
+    let Some(manifest_first_row_id) = manifest_first_row_id else {
+        for entry in entries.iter_mut() {
+            entry.data_file.first_row_id = None;
+        }
+        return Ok(());
+    };
+
+    let mut next_row_id = manifest_first_row_id;
+    for entry in entries.iter_mut() {
+        if entry.status == ManifestStatus::Deleted || entry.data_file.first_row_id.is_some() {
+            continue;
+        }
+        // The counter is `u64`; `DataFile::first_row_id` is `i64` (Java's `Long`). Fail closed on
+        // the narrowing rather than wrap into a negative row id.
+        entry.data_file.first_row_id = Some(
+            i64::try_from(next_row_id)
+                .map_err(|_| overflow_error(manifest_first_row_id, entry, "exceeds i64::MAX"))?,
+        );
+        next_row_id = next_row_id
+            .checked_add(entry.data_file.record_count)
+            .ok_or_else(|| overflow_error(manifest_first_row_id, entry, "overflowed u64"))?;
+    }
+    Ok(())
+}
+
 /// Used to track additions and deletions in ManifestEntry.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ManifestStatus {
@@ -642,4 +680,192 @@ pub(super) fn manifest_schema_v1(partition_type: &StructType) -> Result<AvroSche
     ];
     let schema = Schema::builder().with_fields(fields).build()?;
     schema_to_avro_schema("manifest_entry", &schema)
+}
+
+/// The shared error for both overflow doors of [`assign_first_row_ids`]. The `i64` door is the
+/// reachable one (`i64::MAX` < `u64::MAX`); the `u64` door exists so the addition itself can never
+/// wrap silently.
+fn overflow_error(manifest_first_row_id: u64, entry: &ManifestEntry, what: &str) -> Error {
+    Error::new(
+        ErrorKind::DataInvalid,
+        format!("row-lineage first_row_id assignment {what}"),
+    )
+    .with_context("manifest_first_row_id", manifest_first_row_id.to_string())
+    .with_context("file_path", entry.data_file.file_path.clone())
+    .with_context("record_count", entry.data_file.record_count.to_string())
+}
+
+#[cfg(test)]
+mod first_row_id_tests {
+    use super::*;
+    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+
+    /// A minimal data-file entry; fixtures vary `record_count` to keep the counter's steps
+    /// distinguishable.
+    fn entry(
+        status: ManifestStatus,
+        path: &str,
+        record_count: u64,
+        first_row_id: Option<i64>,
+    ) -> ManifestEntry {
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .record_count(record_count)
+            .file_size_in_bytes(100);
+        let mut data_file = builder.build().expect("build data file");
+        data_file.first_row_id = first_row_id;
+        ManifestEntry {
+            status,
+            snapshot_id: None,
+            sequence_number: None,
+            file_sequence_number: None,
+            data_file,
+        }
+    }
+
+    fn assigned(entries: &[ManifestEntry]) -> Vec<Option<i64>> {
+        entries.iter().map(|e| e.data_file.first_row_id).collect()
+    }
+
+    // The closed domain of `assign_first_row_ids`. Every skip cell is pinned by the id the next
+    // assignable file receives.
+    //
+    // | Manifest `first_row_id` | Entry state | Java behaviour |
+    // |---|---|---|
+    // | absent | any | force `None` (OVERWRITING a stored value) |
+    // | present | `Deleted` | skip; counter does NOT advance |
+    // | present | already has an id | skip; counter does NOT advance |
+    // | present | `Added`, no id | assign; counter += `record_count` |
+    // | present | `Existing`, no id | assign; counter += `record_count` (the guard is `!= Deleted`) |
+
+    /// The absent arm applies to EVERY entry state — Java's carries no status guard — so pinning
+    /// it on `Added` alone would let a skip-mutation survive.
+    #[test]
+    fn absent_manifest_row_id_forces_every_file_to_none() {
+        let mut entries = vec![
+            entry(ManifestStatus::Added, "a.parquet", 10, None),
+            entry(ManifestStatus::Added, "b.parquet", 10, Some(4242)),
+            entry(ManifestStatus::Deleted, "c.parquet", 10, Some(77)),
+            entry(ManifestStatus::Existing, "d.parquet", 10, Some(88)),
+            entry(ManifestStatus::Existing, "e.parquet", 10, None),
+        ];
+        assign_first_row_ids(&mut entries, None).expect("assign");
+        assert_eq!(
+            assigned(&entries),
+            vec![None; 5],
+            "an unassigned manifest lends no ids, and OVERWRITES a stored one — in EVERY entry \
+             state, since Java's absent arm has no status guard"
+        );
+    }
+
+    #[test]
+    fn present_manifest_row_id_assigns_a_running_total() {
+        let mut entries = vec![
+            entry(ManifestStatus::Added, "a.parquet", 10, None),
+            entry(ManifestStatus::Added, "b.parquet", 3, None),
+            entry(ManifestStatus::Added, "c.parquet", 7, None),
+        ];
+        assign_first_row_ids(&mut entries, Some(100)).expect("assign");
+        assert_eq!(
+            assigned(&entries),
+            vec![Some(100), Some(110), Some(113)],
+            "each file starts where the previous one's rows ended"
+        );
+    }
+
+    #[test]
+    fn a_deleted_entry_is_skipped_and_does_not_consume_ids() {
+        let mut entries = vec![
+            entry(ManifestStatus::Added, "a.parquet", 10, None),
+            entry(ManifestStatus::Deleted, "gone.parquet", 999, None),
+            entry(ManifestStatus::Added, "c.parquet", 7, None),
+        ];
+        assign_first_row_ids(&mut entries, Some(100)).expect("assign");
+        assert_eq!(
+            assigned(&entries),
+            vec![Some(100), None, Some(110)],
+            "the deleted entry gets no id AND does not advance the counter — `c` takes 110, not \
+             1109, which is the discriminator between skipping and merely not-assigning"
+        );
+    }
+
+    #[test]
+    fn an_already_assigned_entry_is_skipped_and_does_not_consume_ids() {
+        let mut entries = vec![
+            entry(ManifestStatus::Added, "a.parquet", 10, None),
+            entry(ManifestStatus::Existing, "kept.parquet", 999, Some(50)),
+            entry(ManifestStatus::Added, "c.parquet", 7, None),
+        ];
+        assign_first_row_ids(&mut entries, Some(100)).expect("assign");
+        assert_eq!(
+            assigned(&entries),
+            vec![Some(100), Some(50), Some(110)],
+            "the stored id is PRESERVED (unlike the absent-manifest arm) and its record_count does \
+             not advance the counter"
+        );
+    }
+
+    /// The guard is `status != Deleted`, not `status == Added`: reusing `inherit_data`'s shape
+    /// would leave every carried-forward file without a row id.
+    #[test]
+    fn an_existing_entry_without_an_id_is_still_assigned() {
+        let mut entries = vec![
+            entry(ManifestStatus::Existing, "a.parquet", 10, None),
+            entry(ManifestStatus::Existing, "b.parquet", 5, None),
+        ];
+        assign_first_row_ids(&mut entries, Some(0)).expect("assign");
+        assert_eq!(assigned(&entries), vec![Some(0), Some(10)]);
+    }
+
+    // Two non-interchangeable overflow doors: a test reaching only the `u64` one leaves the `i64`
+    // narrowing — the reachable door — unpinned.
+
+    /// The `i64` narrowing door: a manifest range already past `i64::MAX` cannot lend any id.
+    #[test]
+    fn a_row_id_beyond_i64_max_is_rejected() {
+        let mut entries = vec![entry(ManifestStatus::Added, "a.parquet", 1, None)];
+        let beyond_i64 = i64::MAX as u64 + 1;
+        let error = assign_first_row_ids(&mut entries, Some(beyond_i64))
+            .expect_err("a range starting past i64::MAX has no representable id");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("exceeds i64::MAX"),
+            "the i64 door must be the one that fires, got: {}",
+            error.message()
+        );
+        assert_eq!(
+            assigned(&entries),
+            vec![None],
+            "nothing is assigned on the failing entry — no wrapped, negative id is left behind"
+        );
+    }
+
+    /// The `u64` addition door: the counter itself cannot wrap.
+    #[test]
+    fn an_overflowing_counter_is_rejected() {
+        let mut entries = vec![
+            entry(ManifestStatus::Added, "a.parquet", u64::MAX, None),
+            entry(ManifestStatus::Added, "b.parquet", 1, None),
+        ];
+        let error = assign_first_row_ids(&mut entries, Some(1))
+            .expect_err("the running total wraps u64 on the first file's record_count");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("overflowed u64"),
+            "the u64 door must be the one that fires, got: {}",
+            error.message()
+        );
+    }
+
+    /// An empty manifest is not an error in either arm.
+    #[test]
+    fn no_entries_is_a_no_op_in_both_arms() {
+        let mut entries: Vec<ManifestEntry> = Vec::new();
+        assign_first_row_ids(&mut entries, None).expect("absent arm");
+        assign_first_row_ids(&mut entries, Some(7)).expect("present arm");
+    }
 }

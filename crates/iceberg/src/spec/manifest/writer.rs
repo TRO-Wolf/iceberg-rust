@@ -116,7 +116,7 @@ impl ManifestWriterBuilder {
         )
     }
 
-    /// Build a [`ManifestWriter`] for format version 2, data content.
+    /// Build a [`ManifestWriter`] for format version 3, data content.
     pub fn build_v3_data(self) -> ManifestWriter {
         let metadata = ManifestMetadata::builder()
             .schema_id(self.schema.schema_id())

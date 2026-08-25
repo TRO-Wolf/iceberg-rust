@@ -66,7 +66,10 @@ use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
-use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, is_metadata_field};
+use crate::metadata_columns::{
+    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, get_metadata_field,
+    is_metadata_field, is_row_lineage_field,
+};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{DataFileFormat, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
 use crate::utils::available_parallelism;
@@ -340,6 +343,7 @@ impl ArrowReader {
         row_selection_enabled: bool,
         parquet_read_options: ParquetReadOptions,
     ) -> Result<ArrowRecordBatchStream> {
+        Self::reject_variant_projection(&task)?;
         match task.data_file_format {
             DataFileFormat::Parquet => {
                 Self::process_parquet_file_scan_task(
@@ -370,6 +374,33 @@ impl ArrowReader {
                 ),
             )),
         }
+    }
+
+    /// Refuse a scan that projects a variant column, in any data-file format.
+    ///
+    /// File-level variant I/O is unimplemented (row R88). The guard sits ahead of the format
+    /// dispatch, since the Iceberg→Arrow conversion no longer throws on `variant`.
+    fn reject_variant_projection(task: &FileScanTask) -> Result<()> {
+        for &field_id in task.project_field_ids() {
+            let Some(field) = task.schema.field_by_id(field_id) else {
+                continue;
+            };
+            if let Some(path) =
+                crate::arrow::variant_path_within(&field.name, field.field_type.as_ref())
+            {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "Scanning the variant column '{path}' (under projected field id \
+                         {field_id}) is not supported yet: file-level variant I/O is \
+                         unimplemented (GAP_MATRIX row R88). The Iceberg→Arrow conversion of \
+                         `variant` now succeeds, so this is a deliberate reader-side bound, not a \
+                         schema failure."
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn process_parquet_file_scan_task(
@@ -490,11 +521,13 @@ impl ArrowReader {
         let mut record_batch_stream_builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
-        // Filter out metadata fields for Parquet projection (they don't exist in files)
+        // Filter out metadata fields for Parquet projection (they don't exist in files). The V3
+        // row-lineage pair is the exception: it can be stored, and Java prefers the stored value
+        // over the computed one.
         let project_field_ids_without_metadata: Vec<i32> = task
             .project_field_ids
             .iter()
-            .filter(|&&id| !is_metadata_field(id))
+            .filter(|&&id| !is_metadata_field(id) || is_row_lineage_field(id))
             .copied()
             .collect();
 
@@ -524,7 +557,11 @@ impl ArrowReader {
         // aware ordinal pushdown is STOP-gated (see `task/fk5-pos-projection-ledger.md`): a
         // `RowFilter` does not expose physical ordinals of undelivered rows. Pushdown is unaffected
         // for scans that do not request `_pos`.
-        if task.project_field_ids().contains(&RESERVED_FIELD_ID_POS) {
+        // `_row_id` shares `_pos`'s requirement: its fallback is `first_row_id + pos`, so an
+        // ordinal lost to row-skipping yields a plausible id belonging to another row.
+        let needs_physical_ordinals = task.project_field_ids().contains(&RESERVED_FIELD_ID_POS)
+            || task.project_field_ids().contains(&RESERVED_FIELD_ID_ROW_ID);
+        if needs_physical_ordinals {
             // Review rider (2026-08-03): this path decodes the WHOLE file in physical order with
             // ordinals from 0 (see `stream_pos_projection_scan_task`); a RANGED split task here
             // would re-emit the full file per split — duplicate rows with wrong `_pos`, which
@@ -536,13 +573,25 @@ impl ArrowReader {
             let whole_file =
                 task.start == 0 && (task.length == 0 || task.length == task.file_size_in_bytes);
             if !whole_file {
+                // Name the column that actually forced this path, so a `_row_id` scan does not
+                // get told to "drop `_pos`" — a projection it never asked for.
+                let projected_columns = if task.project_field_ids().contains(&RESERVED_FIELD_ID_POS)
+                {
+                    if task.project_field_ids().contains(&RESERVED_FIELD_ID_ROW_ID) {
+                        "`_pos` and `_row_id`"
+                    } else {
+                        "`_pos`"
+                    }
+                } else {
+                    "`_row_id`"
+                };
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
                     format!(
-                        "`_pos` projection over a ranged split task is unsupported: task covers \
-                         {}..{} of {} bytes of '{}', but the `_pos` path decodes whole files with \
-                         ordinals from 0 (each split would duplicate every row). Plan without \
-                         splitting, or drop `_pos` from the projection.",
+                        "{projected_columns} projection over a ranged split task is unsupported: \
+                         task covers {}..{} of {} bytes of '{}', but this path decodes whole \
+                         files with ordinals from 0 (each split would duplicate every row). Plan \
+                         without splitting, or drop {projected_columns} from the projection.",
                         task.start,
                         task.start.saturating_add(task.length),
                         task.file_size_in_bytes,
@@ -563,7 +612,8 @@ impl ArrowReader {
         // that come back from the file, such as type promotion, default column insertion,
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
+                .with_row_lineage(task.first_row_id, task.file_sequence_number);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -854,10 +904,8 @@ impl ArrowReader {
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
 
-        // The projected Iceberg schema the Avro reader resolves against: the scan schema restricted
-        // to the projected field ids that are NOT reserved metadata columns (those don't exist in
-        // the data file — the Parquet path strips them from its projection mask the same way; the
-        // transformer re-adds `_file` / partition constants afterwards).
+        // The scan schema restricted to projected field ids present in the file, plus the two V3
+        // row-lineage columns, whose stored value wins. The transformer re-adds the rest.
         let expected = Self::build_expected_schema(&task)?;
 
         // Avro decode is whole-block; the U1 reader requires a positive batch size. Fall back to the
@@ -896,8 +944,7 @@ impl ArrowReader {
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
 
-        // The projected Iceberg schema the ORC reader resolves against: the scan schema restricted to
-        // the projected file-present (non-reserved-metadata) field ids — identical to the Avro path.
+        // Identical to the Avro path, which shares `build_expected_schema`.
         let expected = Self::build_expected_schema(&task)?;
 
         // ORC decode is whole-file; the U1 reader requires a positive batch size. Fall back to the
@@ -1003,7 +1050,8 @@ impl ArrowReader {
     /// whole-file tails (schema evolution, reorder, `_file` / identity-partition constants).
     fn build_scan_task_transformer(task: &FileScanTask) -> Result<RecordBatchTransformer> {
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
+                .with_row_lineage(task.first_row_id, task.file_sequence_number);
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
             let file_datum = Datum::string(task.data_file_path.clone());
             record_batch_transformer_builder =
@@ -1120,27 +1168,35 @@ impl ArrowReader {
     }
 
     /// The projected Iceberg [`Schema`] a whole-file (Avro / ORC) data reader resolves the file
-    /// against: `task.schema` restricted to the projected field ids that exist in the data file
-    /// (reserved metadata columns like `_file` / `_pos` are excluded — they are supplied as constants
-    /// by the transformer / the positional-delete path, never read from the file). Field order
-    /// follows the projection order. Format-agnostic: both the Avro and ORC paths share it.
+    /// `task.schema` restricted to the projected field ids present in the data file, plus the two
+    /// V3 row-lineage columns, whose stored value must win. Other reserved columns are synthesized,
+    /// never read. Field order follows the projection. Shared by the Avro and ORC paths.
     fn build_expected_schema(task: &FileScanTask) -> Result<Arc<Schema>> {
         let mut fields = Vec::new();
         for &field_id in task.project_field_ids() {
-            if is_metadata_field(field_id) {
+            // The row-lineage pair is the one exception to the metadata exclusion: it can be
+            // stored, and the stored value wins. Its definition comes from the reserved-column
+            // registry.
+            let field = if is_row_lineage_field(field_id) {
+                get_metadata_field(field_id)?.clone()
+            } else if is_metadata_field(field_id) {
                 continue;
-            }
-            let field = task.schema.field_by_id(field_id).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Projected field id {field_id} is not present in the scan schema for data \
-                         file '{}'",
-                        task.data_file_path
-                    ),
-                )
-            })?;
-            fields.push(field.clone());
+            } else {
+                task.schema
+                    .field_by_id(field_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Projected field id {field_id} is not present in the scan schema \
+                                 for data file '{}'",
+                                task.data_file_path
+                            ),
+                        )
+                    })?
+                    .clone()
+            };
+            fields.push(field);
         }
         let schema = Schema::builder()
             .with_schema_id(task.schema.schema_id())
@@ -1457,9 +1513,8 @@ impl ArrowReader {
                 field_ids.push(field.id);
             }
             // A variant column is a leaf in the schema tree (its nested ids, if any, belong to
-            // the F2+ shredding overlay). Reading variant DATA is deferred: a scan projecting a
-            // variant column fails loudly earlier, in the Iceberg→Arrow schema conversion
-            // (`ToArrowSchemaConverter::variant`), before this projection mask is consulted.
+            // the F2+ shredding overlay). Reading variant DATA is still deferred, but the door is
+            // now `reject_variant_projection`, not this conversion, which succeeds (row R88).
             Type::Variant => {
                 field_ids.push(field.id);
             }
@@ -1522,9 +1577,15 @@ impl ArrowReader {
             // Parquet's columnar format requires leaf-level (not top-level struct/list/map) projection
             let mut leaf_field_ids = vec![];
             for field_id in field_ids {
-                let field = iceberg_schema_of_task.field_by_id(*field_id);
+                // Reserved row-lineage ids are not in the table schema but can be present in the
+                // file, so resolve them from the reserved-column registry. They are scalars, so the
+                // leaf id is the id.
+                let field = iceberg_schema_of_task
+                    .field_by_id(*field_id)
+                    .cloned()
+                    .or_else(|| get_metadata_field(*field_id).ok().cloned());
                 if let Some(field) = field {
-                    Self::include_leaf_field_id(field, &mut leaf_field_ids);
+                    Self::include_leaf_field_id(&field, &mut leaf_field_ids);
                 }
             }
 
@@ -1572,19 +1633,24 @@ impl ArrowReader {
                 return false;
             };
 
-            let iceberg_field = iceberg_schema_of_task.field_by_id(field_id);
+            // Reserved row-lineage columns are not in the TABLE schema but can be in the FILE, so
+            // take their declared type from the reserved-column registry instead of failing the
+            // lookup.
+            let iceberg_field = iceberg_schema_of_task
+                .field_by_id(field_id)
+                .cloned()
+                .or_else(|| get_metadata_field(field_id).ok().cloned());
             let parquet_iceberg_field = iceberg_schema.field_by_id(field_id);
 
-            if iceberg_field.is_none() || parquet_iceberg_field.is_none() {
+            let (Some(iceberg_field), Some(parquet_iceberg_field)) =
+                (iceberg_field, parquet_iceberg_field)
+            else {
                 return false;
-            }
+            };
 
             if !type_promotion_is_valid(
-                parquet_iceberg_field
-                    .unwrap()
-                    .field_type
-                    .as_primitive_type(),
-                iceberg_field.unwrap().field_type.as_primitive_type(),
+                parquet_iceberg_field.field_type.as_primitive_type(),
+                iceberg_field.field_type.as_primitive_type(),
             ) {
                 return false;
             }
@@ -2907,7 +2973,7 @@ mod tests {
         SetExpression,
     };
     use crate::io::FileIO;
-    use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+    use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, NestedField, PrimitiveLiteral, PrimitiveType,
@@ -3290,6 +3356,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         })])) as FileScanTaskStream;
 
         let result = reader
@@ -3654,6 +3722,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 
@@ -4703,6 +4773,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         // Task 2: read the second and third row groups
@@ -4722,6 +4794,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         let tasks1 = Box::pin(futures::stream::iter(vec![Ok(task1)])) as FileScanTaskStream;
@@ -4854,6 +4928,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -4953,6 +5029,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -5072,6 +5150,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 
@@ -5167,6 +5247,450 @@ message schema {
             pairs, expected,
             "physical _pos must be 0..N-1 across batches"
         );
+    }
+
+    /// Write a Parquet file carrying `id` PLUS a physically-stored `_row_id` column, the shape a
+    /// lineage-preserving rewrite produces.
+    fn write_parquet_with_stored_row_id(path: &str, ids: &[i32], row_ids: &[Option<i64>]) {
+        write_parquet_with_stored_reserved_column(
+            path,
+            ids,
+            row_ids,
+            "_row_id",
+            RESERVED_FIELD_ID_ROW_ID,
+        )
+    }
+
+    /// Write a Parquet file carrying `id` plus a physically-stored RESERVED column, the shape a
+    /// lineage-preserving rewrite produces. Parameterised over which column, so both halves of the
+    /// projection fix are pinned.
+    fn write_parquet_with_stored_reserved_column(
+        path: &str,
+        ids: &[i32],
+        values: &[Option<i64>],
+        column_name: &str,
+        column_field_id: i32,
+    ) {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new(column_name, DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                column_field_id.to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(arrow_array::Int32Array::from(ids.to_vec())) as ArrayRef,
+            Arc::new(arrow_array::Int64Array::from(values.to_vec())) as ArrayRef,
+        ])
+        .expect("batch");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(path).expect("create data");
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    /// Stripping every `is_metadata_field` id from the Parquet projection left a stored `_row_id`
+    /// undecoded, so every row got a computed `first_row_id + pos`. Reads through the real
+    /// `ArrowReader`; a transformer fixture cannot see this.
+    #[tokio::test]
+    async fn stored_row_id_in_the_data_file_survives_the_real_reader() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("lineage.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_with_stored_row_id(&data_path, &[1, 2, 3], &[Some(777), None, Some(999)]);
+
+        let mut task = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        task.project_field_ids = Arc::from(vec![1, RESERVED_FIELD_ID_ROW_ID]);
+        task.first_row_id = Some(1_000);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let batches: Vec<RecordBatch> = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .expect("stream")
+            .try_collect()
+            .await
+            .expect("read");
+
+        let row_ids: Vec<Option<i64>> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("_row_id")
+                    .expect("_row_id projected")
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("Int64")
+                    .clone();
+                use arrow_array::Array as _;
+                (0..column.len())
+                    .map(|row| {
+                        if arrow_array::Array::is_null(&column, row) {
+                            None
+                        } else {
+                            Some(column.value(row))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            row_ids,
+            vec![Some(777), Some(1_001), Some(999)],
+            "the STORED ids must win (777, 999); only the NULL row falls back to \
+             first_row_id + its own position (1000 + 1). Getting [1000, 1001, 1002] here means \
+             the stored column was never decoded."
+        );
+    }
+
+    /// The other half of the projection fix: a stored `_last_updated_sequence_number` must win over
+    /// the file's own sequence number. Narrowing the exemption to `_row_id` alone passed the suite.
+    #[tokio::test]
+    async fn stored_last_updated_sequence_number_survives_the_real_reader() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("stored_seq.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_parquet_with_stored_reserved_column(
+            &data_path,
+            &[1, 2, 3],
+            &[Some(31), None, Some(33)],
+            "_last_updated_sequence_number",
+            crate::metadata_columns::RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        );
+
+        let mut task = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        task.project_field_ids = Arc::from(vec![
+            1,
+            crate::metadata_columns::RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        ]);
+        task.first_row_id = Some(1_000);
+        task.file_sequence_number = Some(42);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let batches: Vec<RecordBatch> = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .expect("stream")
+            .try_collect()
+            .await
+            .expect("read");
+
+        let values: Vec<Option<i64>> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("_last_updated_sequence_number")
+                    .expect("projected")
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("Int64")
+                    .clone();
+                (0..column.len())
+                    .map(|row| {
+                        if arrow_array::Array::is_null(&column, row) {
+                            None
+                        } else {
+                            Some(column.value(row))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            values,
+            vec![Some(31), Some(42), Some(33)],
+            "STORED values win (31, 33); only the NULL row falls back to the file's own sequence \
+             number (42). All-42 means the stored column was never decoded."
+        );
+    }
+
+    /// `_last_updated_sequence_number` needs no physical ordinals, so it takes a different
+    /// transformer construction site than the `_row_id` test above. Deleting either
+    /// `with_row_lineage` call passed the whole suite.
+    #[tokio::test]
+    async fn last_updated_sequence_number_is_materialized_on_the_ordinary_parquet_path() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp.path().join("seq.parquet").to_string_lossy().to_string();
+        write_id_parquet_for_pos(&data_path, &[1, 2, 3], 1000);
+
+        let mut task = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+        task.project_field_ids = Arc::from(vec![
+            1,
+            crate::metadata_columns::RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        ]);
+        task.first_row_id = Some(1_000);
+        task.file_sequence_number = Some(42);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let batches: Vec<RecordBatch> = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .expect("stream")
+            .try_collect()
+            .await
+            .expect("read");
+
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("_last_updated_sequence_number")
+                    .expect("projected")
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("Int64")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![42, 42, 42],
+            "the FILE's sequence number, threaded from the task — not 0, and not the row position"
+        );
+    }
+
+    /// The canonical variant Arrow type removed the door that used to stop a scan reading variant
+    /// DATA. Without the explicit reader-side refusal, that path opens silently.
+    #[tokio::test]
+    async fn scanning_a_variant_column_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp.path().join("v.parquet").to_string_lossy().to_string();
+        write_id_parquet_for_pos(&data_path, &[1, 2], 1000);
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "v", Type::Variant).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        // EVERY data-file format. Pinning the guard through a Parquet-only helper leaves it free to
+        // be gated on Parquet, and Avro/ORC would then decode a variant column silently.
+        for format in [
+            DataFileFormat::Parquet,
+            DataFileFormat::Avro,
+            DataFileFormat::Orc,
+        ] {
+            let mut task = pos_scan_task(&data_path, schema.clone(), vec![], None);
+            task.project_field_ids = Arc::from(vec![1, 2]);
+            task.data_file_format = format;
+
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let err = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect_err("a variant projection must be refused on EVERY format");
+            assert_eq!(
+                err.kind(),
+                ErrorKind::FeatureUnsupported,
+                "format {format:?} must refuse, not decode a variant column"
+            );
+            assert!(
+                err.to_string().contains("variant column 'v'"),
+                "the error must name the column on {format:?}, got: {err}"
+            );
+        }
+    }
+
+    /// A variant nested in a struct, list element or map value must be refused too: a guard
+    /// checking only the projected field's own type lets `struct<v: variant>` through.
+    #[tokio::test]
+    async fn scanning_a_variant_nested_in_any_container_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("nested.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_id_parquet_for_pos(&data_path, &[1, 2], 1000);
+
+        let cases: Vec<(&str, Type, &str)> = vec![
+            (
+                "struct",
+                Type::Struct(crate::spec::StructType::new(vec![
+                    NestedField::optional(3, "v", Type::Variant).into(),
+                ])),
+                "s.v",
+            ),
+            (
+                "list",
+                Type::List(crate::spec::ListType {
+                    element_field: NestedField::list_element(3, Type::Variant, true).into(),
+                }),
+                "s.element",
+            ),
+            (
+                "map value",
+                Type::Map(crate::spec::MapType {
+                    key_field: NestedField::map_key_element(
+                        3,
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    value_field: NestedField::map_value_element(4, Type::Variant, true).into(),
+                }),
+                "s.value",
+            ),
+            // The fourth container position. Java's `Types$MapType` factories constrain only the
+            // VALUE type, so `map<variant, _>` is constructible.
+            (
+                "map key",
+                Type::Map(crate::spec::MapType {
+                    key_field: NestedField::map_key_element(3, Type::Variant).into(),
+                    value_field: NestedField::map_value_element(
+                        4,
+                        Type::Primitive(PrimitiveType::String),
+                        true,
+                    )
+                    .into(),
+                }),
+                "s.key",
+            ),
+            // Nested TWO deep, so a one-level descent is not enough.
+            (
+                "struct in a list",
+                Type::List(crate::spec::ListType {
+                    element_field: NestedField::list_element(
+                        3,
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::optional(4, "v", Type::Variant).into(),
+                        ])),
+                        true,
+                    )
+                    .into(),
+                }),
+                "s.element.v",
+            ),
+        ];
+
+        for (label, container, expected_path) in cases {
+            let schema = Arc::new(
+                Schema::builder()
+                    .with_schema_id(1)
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(2, "s", container).into(),
+                    ])
+                    .build()
+                    .expect("schema"),
+            );
+            let mut task = pos_scan_task(&data_path, schema, vec![], None);
+            task.project_field_ids = Arc::from(vec![1, 2]);
+            // Off Parquet, so the nested walk is exercised on another format too.
+            task.data_file_format = DataFileFormat::Avro;
+
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let err = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                ErrorKind::FeatureUnsupported,
+                "a variant nested in a {label} must be REFUSED, and with the typed refusal — not \
+                 an opaque decode failure later on"
+            );
+            assert!(
+                err.to_string().contains(expected_path),
+                "the error must name the PATH to the variant ({expected_path}) so the caller can \
+                 find it in a wide schema, got: {err}"
+            );
+        }
+    }
+
+    /// A table that HAS a variant column still scans when that column is not projected. The refusal
+    /// is scoped to the projection, not the table.
+    #[tokio::test]
+    async fn a_variant_column_that_is_not_projected_does_not_block_the_scan() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp.path().join("v2.parquet").to_string_lossy().to_string();
+        write_id_parquet_for_pos(&data_path, &[1, 2], 1000);
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "v", Type::Variant).into(),
+                ])
+                .build()
+                .expect("schema"),
+        );
+        let mut task = pos_scan_task(&data_path, schema, vec![], None);
+        task.project_field_ids = Arc::from(vec![1]);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let batches: Vec<RecordBatch> = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .expect("stream")
+            .try_collect()
+            .await
+            .expect("a non-projected variant column must not block the scan");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    }
+
+    /// `_row_id` reaches the same whole-file guard as `_pos`: Java's `RowIdReader` falls back to
+    /// `firstRowId + pos`, so an id computed after row-skipping belongs to a different row.
+    #[tokio::test]
+    async fn row_id_ranged_split_task_is_rejected_fail_loud() {
+        let tmp = TempDir::new().unwrap();
+        let data_path = tmp
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+        let ids: Vec<i32> = (0..20).collect();
+        write_id_parquet_for_pos(&data_path, &ids, 1000);
+
+        // All three message arms: `_row_id` alone, `_pos` alone, and both. Pinning one arm leaves
+        // the combined arm free to name only `_pos`.
+        for (projected, expected) in [
+            (vec![1, RESERVED_FIELD_ID_ROW_ID], "`_row_id` projection"),
+            (vec![1, RESERVED_FIELD_ID_POS], "`_pos` projection"),
+            (
+                vec![1, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID],
+                "`_pos` and `_row_id` projection",
+            ),
+        ] {
+            let mut ranged = pos_scan_task(&data_path, id_schema_for_pos(), vec![], None);
+            ranged.project_field_ids = Arc::from(projected);
+            ranged.first_row_id = Some(1_000);
+            ranged.start = 1;
+            ranged.length = ranged.file_size_in_bytes;
+
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+            let err = reader
+                .read(Box::pin(futures::stream::iter(vec![Ok(ranged)])) as FileScanTaskStream)
+                .expect("stream construction")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect_err("a ranged task must fail loud, not mint wrong ids");
+            assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+            assert!(
+                err.to_string().contains(expected),
+                "the error must name exactly the columns that forced the whole-file path \
+                 ({expected}), got: {err}"
+            );
+        }
     }
 
     /// Review rider (2026-08-03): a RANGED split task must NOT take the `_pos` streaming path —
@@ -5550,6 +6074,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         let batches = run_pos_scan(task, Some(2)).await;
         let mut pairs = Vec::new();
@@ -5678,6 +6204,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(2)).await);
         // Survivors keep physical positions: 10@0, 30@2, 50@4
@@ -5781,6 +6309,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         let pairs = collect_id_pos_pairs(&run_pos_scan(task, Some(3)).await);
         // residual [2,9) minus pos{1,8} minus eq{4} → 2,3,5,6,7 (pos 1,8 outside residual for 1)
@@ -5849,6 +6379,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
         let batches = reader
             .read(Box::pin(futures::stream::iter(vec![Ok(mor_task)])) as FileScanTaskStream)
@@ -6028,6 +6560,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -6266,6 +6800,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -6497,6 +7033,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -6605,6 +7143,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -6707,6 +7247,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -6798,6 +7340,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -6903,6 +7447,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -7037,6 +7583,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -7138,6 +7686,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -7252,6 +7802,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -7347,6 +7899,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_1.parquet"))
@@ -7366,6 +7920,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             }),
             Ok(FileScanTask {
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_2.parquet"))
@@ -7385,6 +7941,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             }),
         ];
 
@@ -7568,6 +8126,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -7985,6 +8545,8 @@ message schema {
                 name_mapping: None,
                 case_sensitive: false,
                 split_offsets: None,
+                first_row_id: None,
+                file_sequence_number: None,
             })]
             .into_iter(),
         )) as FileScanTaskStream;
@@ -8055,6 +8617,8 @@ message schema {
             name_mapping: None,
             case_sensitive: false,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         };
 
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
@@ -8653,6 +9217,106 @@ mod avro_scan_tests {
         std::fs::write(path, bytes).expect("write avro file");
     }
 
+    /// The Avro/ORC half of the same defect: `build_expected_schema` is the only schema those
+    /// readers see, and it excluded the pair. Parameterised over which column.
+    #[tokio::test]
+    async fn stored_row_lineage_in_an_avro_file_survives_the_real_reader() {
+        for (column_name, field_id, stored, expected) in [
+            (
+                "_row_id",
+                crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID,
+                vec![Some(777i64), None, Some(999)],
+                // The NULL row falls back to `first_row_id + its own position` (1000 + 1).
+                vec![Some(777i64), Some(1_001), Some(999)],
+            ),
+            (
+                "_last_updated_sequence_number",
+                crate::metadata_columns::RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                vec![Some(31i64), None, Some(33)],
+                // The NULL row falls back to the FILE's sequence number.
+                vec![Some(31i64), Some(42), Some(33)],
+            ),
+        ] {
+            let tmp = TempDir::new().expect("temp dir");
+            let path = tmp
+                .path()
+                .join(format!("lineage{field_id}.avro"))
+                .to_string_lossy()
+                .to_string();
+
+            let reserved = crate::metadata_columns::get_metadata_field(field_id)
+                .expect("reserved field")
+                .clone();
+            let file_schema = Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    reserved,
+                ])
+                .build()
+                .expect("file schema");
+
+            let avro_schema = schema_to_avro_schema("data", &file_schema).expect("iceberg→avro");
+            let mut writer = AvroWriter::new(&avro_schema, Vec::new());
+            for (row, value) in stored.iter().enumerate() {
+                let stored_value = match value {
+                    Some(v) => AvroWriteValue::Union(1, Box::new(AvroWriteValue::Long(*v))),
+                    None => AvroWriteValue::Union(0, Box::new(AvroWriteValue::Null)),
+                };
+                writer
+                    .append_value_ref(&AvroWriteValue::Record(vec![
+                        ("id".to_string(), AvroWriteValue::Long(row as i64 + 1)),
+                        (column_name.to_string(), stored_value),
+                    ]))
+                    .expect("append row");
+            }
+            std::fs::write(&path, writer.into_inner().expect("finalize")).expect("write avro");
+
+            // The TABLE schema carries only `id`; both are reserved metadata columns.
+            let table_schema = Arc::new(
+                Schema::builder()
+                    .with_schema_id(1)
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    ])
+                    .build()
+                    .expect("table schema"),
+            );
+            let mut task = avro_task(&path, table_schema, vec![1, field_id], vec![]);
+            task.first_row_id = Some(1_000);
+            task.file_sequence_number = Some(42);
+
+            let batches = run_scan(FileIO::new_with_fs(), task).await;
+            let values: Vec<Option<i64>> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch
+                        .column_by_name(column_name)
+                        .expect("projected")
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .expect("Int64")
+                        .clone();
+                    (0..column.len())
+                        .map(|row| {
+                            if arrow_array::Array::is_null(&column, row) {
+                                None
+                            } else {
+                                Some(column.value(row))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+
+            assert_eq!(
+                values, expected,
+                "the STORED {column_name} values must win on the AVRO path; a fully-computed \
+                 column means the stored one never reached the transformer"
+            );
+        }
+    }
+
     /// Build a whole-file [`FileScanTask`] for an Avro data file at `path` projecting
     /// `project_field_ids`, with the given delete attachments.
     fn avro_task(
@@ -8678,6 +9342,8 @@ mod avro_scan_tests {
             name_mapping: None,
             case_sensitive: true,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 
@@ -8850,6 +9516,8 @@ mod avro_scan_tests {
             name_mapping: None,
             case_sensitive: true,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 
@@ -9532,6 +10200,8 @@ mod parquet_eq_keyset_mor_tests {
             name_mapping: None,
             case_sensitive: true,
             split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
         }
     }
 

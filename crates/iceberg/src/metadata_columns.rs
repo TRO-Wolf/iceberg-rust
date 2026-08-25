@@ -224,12 +224,14 @@ static COMMIT_SNAPSHOT_ID_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
 /// This field represents a unique long assigned for row lineage.
 static ROW_ID_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
     Arc::new(
-        NestedField::required(
+        // OPTIONAL, not required — Java `MetadataColumns` declares it so. A row with no assigned
+        // range has no row id, and a required field cannot hold that NULL.
+        NestedField::optional(
             RESERVED_FIELD_ID_ROW_ID,
             RESERVED_COL_NAME_ROW_ID,
             Type::Primitive(PrimitiveType::Long),
         )
-        .with_doc("A unique long assigned for row lineage"),
+        .with_doc("Implicit row ID that is automatically assigned"),
     )
 });
 
@@ -237,12 +239,13 @@ static ROW_ID_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
 /// This field represents the sequence number which last updated this row.
 static LAST_UPDATED_SEQUENCE_NUMBER_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
     Arc::new(
-        NestedField::required(
+        // OPTIONAL for the same reason as `_row_id`; the doc string is Java's verbatim.
+        NestedField::optional(
             RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
             RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
             Type::Primitive(PrimitiveType::Long),
         )
-        .with_doc("The sequence number which last updated this row"),
+        .with_doc("Sequence number when the row was last updated"),
     )
 });
 
@@ -376,6 +379,17 @@ pub fn partition_field(partition_fields: Vec<NestedFieldRef>) -> NestedFieldRef 
             Type::Struct(StructType::new(partition_fields)),
         )
         .with_doc("Partition to which a row belongs"),
+    )
+}
+
+/// Whether `field_id` is one of the two V3 row-lineage reserved columns.
+///
+/// These are the only reserved columns that can be physically present in a data file, and the
+/// stored value wins. So [`is_metadata_field`] alone is the wrong predicate for projection.
+pub fn is_row_lineage_field(field_id: i32) -> bool {
+    matches!(
+        field_id,
+        RESERVED_FIELD_ID_ROW_ID | RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
     )
 }
 
