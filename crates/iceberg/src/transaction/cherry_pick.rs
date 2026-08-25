@@ -114,7 +114,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
@@ -509,6 +509,7 @@ impl TransactionAction for CherryPickAction {
                     self.key_metadata.clone(),
                     snapshot_properties,
                     added_data_files,
+                    FirstRowIdPolicy::Suppress,
                 );
                 // Validate the replayed adds like fast append (data content type, partition-spec match,
                 // partition-value compatibility). The replayed removes are resolved by-path inside the
@@ -894,6 +895,81 @@ mod tests {
     // ============================================================================================
     // Happy-path APPEND cherry-pick.
     // ============================================================================================
+
+    /// A REPLAYED data file must not carry the row-id range it held under the staged snapshot.
+    ///
+    /// Java `CherryPickOperation` extends `MergingSnapshotProducer`, so its `add(DataFile)`
+    /// suppresses. The replayed file arrives with an id: it is read back through the assigning
+    /// manifest reader. Keeping that id would republish a range the new manifest does not own.
+    #[tokio::test]
+    async fn test_cherrypick_replay_suppresses_the_staged_first_row_id() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let (table, staged_id, _s0) =
+            stage_append_for_replay(&catalog, &table, "test/staged.parquet", 0, "wap-row-id").await;
+
+        let staged_file_had_an_id = {
+            let staged = table
+                .metadata()
+                .snapshot_by_id(staged_id)
+                .expect("the staged snapshot is in metadata");
+            let manifest_list = staged
+                .load_manifest_list(table.file_io(), table.metadata())
+                .await
+                .expect("load the staged manifest list");
+            let mut found = None;
+            for manifest_file in manifest_list.entries() {
+                let manifest = manifest_file
+                    .load_manifest(table.file_io())
+                    .await
+                    .expect("load the staged manifest");
+                for entry in manifest.entries() {
+                    if entry.file_path() == "test/staged.parquet" {
+                        found = entry.data_file().first_row_id();
+                    }
+                }
+            }
+            found
+        };
+        assert!(
+            staged_file_had_an_id.is_some(),
+            "fixture precondition: the replayed file arrives carrying an inherited id"
+        );
+
+        let table = cherry_pick(&catalog, &table, staged_id).await;
+
+        // Read the Avro directly: `load_manifest` re-runs inheritance and would hide the stored value.
+        let published = table
+            .metadata()
+            .current_snapshot()
+            .expect("the publish produced a snapshot");
+        let manifest_list = published
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .expect("load the published manifest list");
+        let mut stored = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            let bytes = table
+                .file_io()
+                .new_input(&manifest_file.manifest_path)
+                .expect("open the manifest")
+                .read()
+                .await
+                .expect("read the manifest bytes");
+            let manifest =
+                crate::spec::Manifest::parse_avro(&bytes).expect("parse the manifest avro");
+            for entry in manifest.entries() {
+                if entry.file_path() == "test/staged.parquet" {
+                    stored.push(entry.data_file().first_row_id());
+                }
+            }
+        }
+        assert_eq!(
+            stored,
+            vec![None],
+            "the replayed file must be stored with no first_row_id"
+        );
+    }
 
     /// HAPPY APPEND. A staged append snapshot (wap.id) whose parent is NOT the head is REPLAYED: a NEW
     /// snapshot lands on `main` carrying the replayed file, with BOTH summary props

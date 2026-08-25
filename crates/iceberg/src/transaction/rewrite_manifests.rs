@@ -85,7 +85,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
@@ -295,6 +295,8 @@ impl TransactionAction for RewriteManifestsAction {
             self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             vec![],
+            // Java `BaseRewriteManifests` extends `SnapshotProducer` and adds no data file.
+            FirstRowIdPolicy::Preserve,
         );
 
         // Load the FULL manifest list — DATA and DELETE (Java `allManifests`, L171); `current_data_manifests`

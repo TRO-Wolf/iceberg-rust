@@ -19,10 +19,19 @@
 #
 # V3 ROW LINEAGE interop, BOTH DIRECTIONS (GAP_MATRIX row R166).
 #
-#   D1 ("Rust reads what JAVA writes"): the oracle writes a V3 table over TWO snapshots — files
-#   a(5 rows) + b(3) in one commit, then c(4) — so the row-id counter has to advance BOTH within a
-#   manifest and across snapshots. Java emits the lineage view its own ManifestReader.idAssigner
-#   resolved; Rust builds the same view through ManifestFile::load_manifest and diffs.
+#   D1 ("Rust reads what JAVA writes"): the oracle writes a V3 table over FOUR snapshots — files
+#   a(5 rows) + b(3) in one commit, then c(4), then a RewriteFiles replacing a with d(2), then an
+#   OverwriteFiles replacing c with e(2). The first two commits make the row-id counter advance BOTH
+#   within a manifest and across snapshots; the last two make file b survive as an EXISTING entry
+#   across two rewrites, which pins that a survivor keeps its first_row_id and its per-row _row_id.
+#   Java emits the lineage view its own ManifestReader.idAssigner resolved; Rust builds the same
+#   view through ManifestFile::load_manifest and diffs.
+#
+#   The UPGRADED fixture is a second table in the same run: V2, two files, an upgrade to V3, then a
+#   rewrite as the FIRST V3 commit. It is the only shape either implementation can build in which a
+#   live EXISTING entry reaches the reader with NO stored first_row_id — the rewrite reads the V2
+#   manifest, whose range is absent, so every entry is nulled before the survivor is written
+#   forward. Both directions plus a cross-check, like the main fixture.
 #
 #   D2 ("JAVA reads what RUST writes"): the Rust GEN test commits the equivalent V3 table through
 #   the production path; Java reads it with the SAME view builder, diffs, and separately asserts no
@@ -43,11 +52,14 @@
 #   * write-side range advances by 0             -> cross-check RED (c gets 0, next_row_id 0)
 #   * every row in a file shares one _row_id     -> materialization RED (was GREEN before the
 #     materialization tests existed: the manifest view alone cannot see a per-row defect)
-#   * skip guard `== Added` instead of `!= Deleted` -> GREEN. NAMED LIMIT: this fixture has only
-#     `Added` entries, so the guard stays pinned by the unit domain table in
-#     spec::manifest::entry::first_row_id_tests, not by this leg. The write-side
-#     `existing_rows_count` arm is likewise append-only here and is pinned by the unit test
-#     `assigned_range_advances_by_existing_rows_not_only_added`.
+#   * skip guard `== Added` instead of `!= Deleted` -> RED on the UPGRADED legs (3 red out of 10):
+#     the surviving file reads back with a null first_row_id and null _row_id for every row.
+#     MEASURED LIMIT (2026-08-25): the four-snapshot fixture above has EXISTING entries and still
+#     leaves this mutation GREEN, because a rewrite reads its source through the assigning reader,
+#     so every survivor it writes forward already carries a stored id and the `is_some()` clause
+#     short-circuits the status test. Only the V2-to-V3 upgrade reaches the branch.
+#   * manifest-list order: added manifests AFTER the existing ones -> cross-check RED (file d takes
+#     15 where Java gives it 12), the divergence this suite found on 2026-08-25.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,7 +73,7 @@ echo "==> [1/5] Reset the temp dirs: ${D1} + ${D2}"
 rm -rf "${D1}" "${D2}"
 mkdir -p "${D1}" "${D2}"
 
-echo "==> [2/5] (D1) Java oracle: write a V3 table over two snapshots + emit java_row_lineage.json"
+echo "==> [2/5] (D1) Java oracle: write both V3 fixtures + emit their lineage and row-id views"
 (
   cd "${SCRIPT_DIR}"
   JAVA_HOME="${JAVA_HOME_DIR}" PATH="${JAVA_HOME_DIR}/bin:$PATH" \
@@ -70,23 +82,25 @@ echo "==> [2/5] (D1) Java oracle: write a V3 table over two snapshots + emit jav
     -Dinterop.row_lineage.dir="${D1}"
 )
 
-echo "==> [3/5] (D1) Rust: lineage view + per-row _row_id of the JAVA table, both diffed"
+echo "==> [3/5] (D1) Rust: lineage view + per-row _row_id of the JAVA tables, both diffed"
 (
   cd "${REPO_ROOT}"
-  ICEBERG_INTEROP_ROW_LINEAGE_DIR="${D1}" \
-    cargo test -p iceberg --test interop_row_lineage \
-    rust_reads_java_assigned_row_lineage -- --exact --nocapture
-  ICEBERG_INTEROP_ROW_LINEAGE_DIR="${D1}" \
-    cargo test -p iceberg --test interop_row_lineage \
-    rust_materializes_java_row_ids -- --exact --nocapture
+  for test_name in rust_reads_java_assigned_row_lineage rust_materializes_java_row_ids \
+    rust_reads_java_upgraded_row_lineage rust_materializes_java_upgraded_row_ids; do
+    ICEBERG_INTEROP_ROW_LINEAGE_DIR="${D1}" \
+      cargo test -p iceberg --test interop_row_lineage \
+      "${test_name}" -- --exact --nocapture
+  done
 )
 
-echo "==> [4/5] (D2) Rust: commit the equivalent V3 table + emit rust_row_lineage_expected.json"
+echo "==> [4/5] (D2) Rust: commit the equivalent V3 tables + emit the two expectation files"
 (
   cd "${REPO_ROOT}"
-  ICEBERG_INTEROP_ROW_LINEAGE_WRITE_DIR="${D2}" \
-    cargo test -p iceberg --test interop_row_lineage \
-    row_lineage_write_gen -- --exact --nocapture
+  for test_name in row_lineage_write_gen row_lineage_upgraded_write_gen; do
+    ICEBERG_INTEROP_ROW_LINEAGE_WRITE_DIR="${D2}" \
+      cargo test -p iceberg --test interop_row_lineage \
+      "${test_name}" -- --exact --nocapture
+  done
 )
 
 echo "==> [5/5] (D2) Java: read the RUST-written V3 table + the assignment cross-check"
@@ -105,12 +119,17 @@ if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
 fi
 (
   cd "${REPO_ROOT}"
-  ICEBERG_INTEROP_ROW_LINEAGE_DIR="${D1}" ICEBERG_INTEROP_ROW_LINEAGE_WRITE_DIR="${D2}" \
-    cargo test -p iceberg --test interop_row_lineage \
-    rust_assigns_the_same_row_ids_java_does -- --exact --nocapture
-  ICEBERG_INTEROP_ROW_LINEAGE_WRITE_DIR="${D2}" \
-    cargo test -p iceberg --test interop_row_lineage \
-    java_materializes_rust_row_ids -- --exact --nocapture
+  for test_name in rust_assigns_the_same_row_ids_java_does \
+    rust_assigns_the_same_upgraded_row_ids_java_does; do
+    ICEBERG_INTEROP_ROW_LINEAGE_DIR="${D1}" ICEBERG_INTEROP_ROW_LINEAGE_WRITE_DIR="${D2}" \
+      cargo test -p iceberg --test interop_row_lineage \
+      "${test_name}" -- --exact --nocapture
+  done
+  for test_name in java_materializes_rust_row_ids java_materializes_rust_upgraded_row_ids; do
+    ICEBERG_INTEROP_ROW_LINEAGE_WRITE_DIR="${D2}" \
+      cargo test -p iceberg --test interop_row_lineage \
+      "${test_name}" -- --exact --nocapture
+  done
 )
 
 echo "==> OK — V3 row lineage round-trips in BOTH directions and the fork assigns Java's ids."

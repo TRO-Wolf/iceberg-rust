@@ -891,3 +891,30 @@ retroactively and R-G7-5 (R2's six-field mandate vs the claim board's table shap
 - **R3 was violated by #208 and #209** (R-G7-3) — both carry GitHub's auto-generated branch-name
   titles with no `[repark]` tag, and no merged PR title names the BREAKING flip. Nothing to fix
   retroactively; recorded so the next unit tags its PRs at open time rather than at merge time.
+
+## F-7 U1 — `first_row_id` suppression at the merging-producer add seam (2026-08-25)
+
+Branch `parity/f7-u1-suppress-first-row-id`, base `249a9556b`. Two stages, one branch.
+
+- [x] Stage 1 — port Java `MergingSnapshotProducer.add(DataFile)` → `Delegates.suppressFirstRowId`.
+      Seam: a REQUIRED `FirstRowIdPolicy` argument on `SnapshotProducer::new`, so every call site
+      states its policy and a new producer cannot inherit one by omission. `FastAppend` +
+      `RewriteManifests` pass `Preserve` (both extend Java `SnapshotProducer`); the six merging
+      producers plus `CherryPickOperation` pass `Suppress`.
+- [x] Stage 1 evidence — domain table over the seven producers of the charter's partition, plus a
+      per-rule mutation run with its arithmetic.
+- [x] Stage 2 — extend the row-lineage interop fixture with a `RewriteFiles` and an
+      `OverwriteFiles` commit so `Existing` entries exist, and pin that a survivor keeps its
+      `first_row_id` and its per-row `_row_id`, both directions.
+- [x] Stage 2 evidence — measure the `== Added` vs `!= Deleted` mutation named in row R166.
+- [x] Matrix cells + full done gate.
+
+Outcome: Stage 1 landed as a required `FirstRowIdPolicy` argument on `SnapshotProducer::new`.
+Stage 2 found a REAL divergence and it is fixed in the same change: the fork emitted the
+carried-forward manifests before the newly written ones, where Java emits new first, and the V3
+manifest-list writer assigns row-id ranges in list order — so a newly added file took a row id
+Java does not give it (15 against Java's 12 on the rewrite fixture). Both facts are recorded in
+row R166. Stage 2's named mutation now goes RED, but only through a V2-to-V3 upgrade fixture: a
+rewrite reads its source through the assigning reader on both sides, so an ordinary rewrite's
+survivor already carries a stored id. NOT built and escalated: Java's `add(ManifestFile)`
+`first_row_id` precondition has no fork surface to land on (see the R166 residue).

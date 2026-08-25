@@ -25,7 +25,7 @@ use crate::error::Result;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
@@ -109,6 +109,8 @@ impl TransactionAction for FastAppendAction {
             self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
+            // Java `FastAppend` extends `SnapshotProducer` and never suppresses.
+            FirstRowIdPolicy::Preserve,
         )
         .with_stage_only(self.stage_only);
 
