@@ -70,10 +70,12 @@ Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next
         PARTITION-scoped position delete it LOSES DELETES: that index is `(spec_id, partition)`-keyed,
         so the delete silently never applies. R113 documents that failure and pins it with
         `spec_stamp_e2e_test`, while claiming the id is stamped ALWAYS — the claim this unit
-        corrected. In-tree callers always supply a spec or a key, so nothing in the fork reaches it;
-        an external engine can. Options: make the arm an error, or require an explicit
+        corrected. **One in-tree call site reaches the arm**, `maintenance/rewrite_table_path.rs`,
+        and it is harmless there only because that path takes the written file's PATH and discards
+        the `DataFile` carrying the stamp. Any ruling that makes the arm an error MUST migrate that
+        call site in the same change. Options: make the arm an error, or require an explicit
         `unpartitioned()` opt-in. Needs an owner ruling — it is a BREAKING change to a public
-        writer's default construction.
+        writer's default construction, with one in-tree migration, not zero.
 
 ---
 
