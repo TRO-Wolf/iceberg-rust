@@ -1095,3 +1095,46 @@ remembering to write it.
   claims, and only the second is what the rule buys.
 - **DO NOT amend the commit to repair this.** A pipe-weakened chain over a genuinely green tree is a
   PROCESS defect, not a commit defect; re-verify unpiped, disclose it, and fix the habit.
+
+### 2026-08-25 — A rule reaches a delegated agent through its dispatch prompt, not through the document that owns it
+
+- **DO NOT leave a placeholder document name inside a copy-paste role prompt.** `04-actor.md`'s
+  prompt said "build to the engineering contract in your tier manual" — a document #220 deleted the
+  day before. Prose *about* the contract may use a placeholder, because the Orchestrator holds the
+  binding manifest that resolves it. A copy-paste block's reader holds only the block. The Critic's
+  prompt carried a one-line resolver and the Actor's did not, which is why the two roles had
+  different reach into the same contract.
+- **DO make the delegated agent confirm the read, not merely be bound to it.** AGENTS.md and the
+  binding manifest both bind every Actor to `rust-code-quality`; nothing required the Actor to say
+  it had read anything, so a dangling pointer produced silence instead of a signal. D1/D2 halt on an
+  unverified precondition only if the agent reaches the missing document — a reference that never
+  resolves to a path is never reached. Two PRs shipped across the break with no escalation.
+- **DO NOT forward a review's finding ids into the Actor's brief.** `04-actor.md`'s blindness design
+  note forbids telling the Actor it will be reviewed, and predicts the exact failure: "writing to
+  the test — shaping the code to anticipate and pre-empt the reviewer." 48 lines across 15 `crates/`
+  files carried `Critic-octo C1-Q-004`-style identifiers into production comments. The over-long doc
+  blocks that followed were an audit trail addressed to the reviewer, not documentation for the next
+  maintainer. Restate defects as plain requirements; the review's own record belongs in the unit
+  ledger.
+- **DO arm a rule mechanically instead of writing it a second time.** #218 made comment discipline a
+  contract on 2026-08-24; the three PRs after it all violated it, because a contract's only enforcer
+  was intention that resets each session. The fix that has worked here before is a gate:
+  `check_comment_blocks.sh` (diff-scoped, flags 26 blocks in #222's pre-trim state and passes its
+  merged state) and `check_agent_artifacts.sh` v4 (review-residue needles). Same shape as the
+  GAP_MATRIX anchor drift, which recurred four times until `check_matrix_anchors.sh` was armed.
+- **DO scope a residue needle to the surface that must be clean, and prove the exclusions.**
+  `Critic` is residue in `crates/` and correct usage in `task/`, `docs/` and the SEPMO tree, so the
+  scan is pathspec-scoped rather than tree-wide. Word-bounding, not case-sensitivity, is what keeps
+  "Critical" and "Critically" out: case-sensitivity buys nothing there and missed nine lowercase
+  `critic-octo` lines, so the needles are case-INSENSITIVE with an anti-probe pinning the exclusion.
+  A gate that cannot catch its own probe is vacuous — and one that fires on correct text gets
+  disabled.
+- **DO make a gate's self-test assert its WIRING, not only its detector.** An independent review
+  sabotaged both new gates: every mutation inside the detector was caught, and five outside it
+  survived green — repointing the scan pathspec at a directory that does not exist, blanking the
+  variable that holds the scan's output, and replacing the failure assignment with a no-op so hits
+  printed and the script still exited 0. Pin the pathspec and the needle-family size in the
+  self-test, and decide failure by COUNTING hits rather than by a flag a mutation can neutralize.
+  Pin each grep FLAG whose loss is silent: dropping `-w` reds the tree loudly and so protects
+  itself, but dropping `-i` just re-greens the gate over lowercase residue, so a lowercase sample
+  must fail the self-test when it goes.

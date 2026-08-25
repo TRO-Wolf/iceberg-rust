@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 8);
     }
 
-    /// Critic-octo C4-Q-001: pos-delete projection with only ONE reserved field id present
+    /// Pos-delete projection with only ONE reserved field id present
     /// still falls back to name-based selection of `file_path` + `pos` (not a partial mask).
     #[tokio::test]
     async fn test_positional_delete_projection_partial_field_ids_name_fallback() {
@@ -621,7 +621,7 @@ mod tests {
         );
     }
 
-    /// Critic-octo C1-Q-003: incomplete field-id match must refuse the mask (→ full read),
+    /// Incomplete field-id match must refuse the mask (→ full read),
     /// never return a partial ProjectionMask that could drop a requested leaf silently.
     #[test]
     fn test_try_build_delete_projection_mask_incomplete_field_ids_returns_none() {

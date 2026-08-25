@@ -668,7 +668,7 @@ fn test_nested_map_string_keys() {
 /// MUTATION BAIT (nested by-field-id projection): the file inner struct is `[id10=int, id11=string]`
 /// but we project only the inner `id11=string`. A positional read would grab writer position 0
 /// (the int) and either error or read the wrong child. By-field-id must resolve id11 → writer
-/// position 1 → "the-string". This is the critic's exact reproduction.
+/// position 1 → "the-string". This is the exact reported shape.
 #[test]
 fn test_nested_struct_projects_inner_subset_by_id() {
     // FILE: outer {1: id long, 2: s {10: x int, 11: y string}}

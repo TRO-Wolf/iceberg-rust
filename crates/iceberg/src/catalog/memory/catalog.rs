@@ -434,7 +434,7 @@ impl Catalog for MemoryCatalog {
             root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
         }
         // Seed only after the pointer is claimed — a failed insert must not leave a cache entry
-        // for a location the catalog does not own (FK4.1 critic-octo c4).
+        // for a location the catalog does not own.
         self.cache_put(&metadata_location, &metadata);
 
         Table::builder()

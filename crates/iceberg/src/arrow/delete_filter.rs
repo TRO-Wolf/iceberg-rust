@@ -2339,7 +2339,7 @@ pub(crate) mod tests {
     }
 
     /// Uuid key — pins LE `UInt128` encode on the Datum side against Arrow FixedSizeBinary(16)
-    /// via `Uuid::from_bytes`/`as_u128` on the probe side (critic-octo FK1 cycle 3 coverage).
+    /// via `Uuid::from_bytes`/`as_u128` on the probe side.
     #[test]
     fn test_h6_set_uuid_matches_oracle() {
         use arrow_array::FixedSizeBinaryArray;
@@ -2503,7 +2503,7 @@ pub(crate) mod tests {
     ///
     /// **MUTATION (FK1 P0):** delete the `column.null_count() > 0 { return Ok(None) }` bail in
     /// `EqDeleteKeySet::delete_mask` → this test must go RED (returns `Some(...)` instead of
-    /// `None`). Re-run at tip during critic-octo; a mutation that was RED three commits ago is
+    /// `None`). Re-run at tip; a mutation that was RED three commits ago is
     /// not RED.
     #[test]
     fn test_h6_set_returns_none_when_key_column_has_null() {
@@ -2536,7 +2536,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Critic-octo FK1 cycle 1+2: I64 store drops null delete cells. Null-only Long delete files
+    /// I64 store drops null delete cells. Null-only Long delete files
     /// must (a) not report `is_empty()` (apply seam must not skip them), and (b) `delete_mask`
     /// null-bail so the predicate's `col IS NULL` leaf still applies.
     ///
@@ -2584,7 +2584,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Critic-octo FK1 cycle 2: simulate the apply-seam keep-mask loop (reader
+    /// Simulate the apply-seam keep-mask loop (reader
     /// `eq_delete_keep_mask`) over a null-only I64 set. Skipping `is_empty` sets without calling
     /// `delete_mask` would yield keep-all; the production loop must call `delete_mask` and fall
     /// back when it returns `None`.

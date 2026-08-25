@@ -1401,7 +1401,7 @@ mod tests {
         }
     }
 
-    /// Critic-octo C1-Q-004: production `load_deletes` path projects path+pos (Wave B) and must
+    /// Production `load_deletes` path projects path+pos (Wave B) and must
     /// still install correct positions when the on-disk file carries the optional third `row`
     /// column. Pins the CachingDeleteFileLoader → projection → parse seam (not just in-memory parse).
     #[tokio::test]

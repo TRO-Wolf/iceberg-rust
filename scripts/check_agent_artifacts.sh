@@ -41,6 +41,23 @@
 # which a function-local RETURN trap does not); the probe name is unique per
 # process (concurrent runs in one worktree cannot delete each other's probe).
 #
+# v4 (2026-08-25): a second needle family — REVIEW-PROCESS RESIDUE. Actor /
+# Critic / Falsifier identifiers and finding ids were reaching production
+# comments (48 lines across 15 files, entering with #181 and #183). AGENTS.md
+# "Comments and prose" routes review evidence to the unit ledger in task/, so
+# this family is scoped to crates/ ONLY: task/, docs/ and the SEPMO tree are its
+# correct homes and must never trip. Matching is word-bounded (-w) and
+# case-INSENSITIVE: lowercase "critic-octo" is the same residue, and -w already
+# excludes "Critical" and "Critically" in either case. An anti-probe proves that
+# exclusion.
+#
+# The self-test reaches the needles, the family size, and the flag and pathspec
+# VARIABLES. It does not reach the grep call: a flag, a pathspec or a hit count
+# substituted in place still passes. Those are single visible edits to the
+# shipped scan. Everything config-shaped is pinned, because that is where a
+# silent regression looks like a tightening — dropping -i re-greens the tree over
+# lowercase residue, and -q or --max-depth 0 green it over everything.
+#
 # Referencing these tags IN PROSE without tripping the gate: never write a
 # needle verbatim — omit the leading '<' (as task/todo.md does), or assemble
 # it by concatenation (as this script does). If a doc must one day quote a
@@ -67,14 +84,48 @@ patterns=(
   "${LT}parameter name="
 )
 
+# Review-process residue. What keeps this file out of its own scan is the
+# ASSERTED residue_pathspec, not the concatenation below: `Falsifier` and
+# `SEPMO` appear verbatim here, and the header prose matches all three needles.
+# The ${C} / ${c} split hides the Critic literal alone.
+C='C'
+c='c'
+residue_grep_flags='-nIEwi'
+# -w (whole word) does the bounding: git grep -E is POSIX ERE, where \b is a
+# literal 'b', not a word boundary. Each needle carries a matching SAMPLE, since
+# a probe holding the pattern itself proves nothing for a needle with metachars.
+# "Actor-Critic" needs no needle of its own: -w treats the hyphen as a boundary,
+# so the Critic needle already matches it.
+residue_patterns=(
+  "${C}ritic"
+  "Falsifier"
+  "SEPMO"
+)
+residue_samples=(
+  "the ${c}ritic-octo probe found it"
+  "Falsifier F9 found the gap"
+  "SEPMO cycle 2 remediation"
+)
+residue_pathspec='crates/'
+
+# Strings that must NOT match: proof the needles stay word-bounded.
+residue_anti_patterns=(
+  "Critically this pins the snapshot id"
+  "BUG-001 Critical / BUG-004"
+  "the load-bearing Critical pin"
+)
+
 # One EXIT trap owns ALL cleanup, installed before anything is created:
 # it fires on normal exit, errexit aborts, and SIGINT — a function-local
 # RETURN trap covers none of the abort paths.
 probe=".agent_artifact_selftest_probe.$$.tmp"
+# Under crates/ so the self-test proves the residue pathspec REACHES the probe,
+# not merely that the needle matches somewhere.
+residue_probe="crates/.review_residue_selftest_probe.$$.tmp"
 tmp_index=""
 hits_file=""
 err_file=""
-trap 'rm -f "$probe" "$tmp_index" "$hits_file" "$err_file"' EXIT
+trap 'rm -f "$probe" "$residue_probe" "$tmp_index" "$hits_file" "$err_file"' EXIT
 
 # --- self-test: every needle must be detectable, or the gate is vacuous -----
 self_test() {
@@ -97,6 +148,58 @@ self_test() {
     fi
   done
   rm -f "$probe"
+
+  # Wiring, not detection: a self-test that only exercises the needles passes
+  # while the shipped scan points at nothing.
+  if [ "${#residue_patterns[@]}" -ne 3 ]; then
+    echo "ERROR: residue needle family changed size — update the count in the OK line" >&2
+    return 1
+  fi
+  if [ "$residue_grep_flags" != "-nIEwi" ]; then
+    echo "ERROR: residue grep flags are '$residue_grep_flags', not '-nIEwi' — matching semantics are pinned" >&2
+    return 1
+  fi
+  if [ "$residue_pathspec" != "crates/" ]; then
+    echo "ERROR: residue pathspec is '$residue_pathspec', not 'crates/' — the scan would miss the product surface" >&2
+    return 1
+  fi
+  case "$residue_probe" in
+    "$residue_pathspec"*) ;;
+    *) echo "ERROR: residue probe is outside the scanned pathspec — self-test is vacuous" >&2
+       return 1 ;;
+  esac
+  if [ -e "$residue_probe" ]; then
+    echo "ERROR: self-test probe path '$residue_probe' already exists — refusing to overwrite" >&2
+    return 1
+  fi
+  local i
+  for i in "${!residue_patterns[@]}"; do
+    p="${residue_patterns[$i]}"
+    printf '%s\n' "${residue_samples[$i]}" >"$residue_probe"
+    if ! GIT_INDEX_FILE="$tmp_index" git add -f -- "$residue_probe" 2>/dev/null; then
+      echo "ERROR: self-test could not stage its residue probe file" >&2
+      return 1
+    fi
+    if ! GIT_INDEX_FILE="$tmp_index" git grep $residue_grep_flags -e "$p" -- "$residue_probe" >/dev/null 2>&1; then
+      echo "ERROR: self-test FAILED — residue needle '$p' was not detected; the gate is vacuous" >&2
+      return 1
+    fi
+  done
+
+  for p in "${residue_anti_patterns[@]}"; do
+    printf '%s\n' "$p" >"$residue_probe"
+    if ! GIT_INDEX_FILE="$tmp_index" git add -f -- "$residue_probe" 2>/dev/null; then
+      echo "ERROR: self-test could not stage its anti-probe file" >&2
+      return 1
+    fi
+    for q in "${residue_patterns[@]}"; do
+      if GIT_INDEX_FILE="$tmp_index" git grep $residue_grep_flags -e "$q" -- "$residue_probe" >/dev/null 2>&1; then
+        echo "ERROR: self-test FAILED — needle '$q' matched legitimate text '$p'" >&2
+        return 1
+      fi
+    done
+  done
+  rm -f "$residue_probe"
 }
 self_test
 
@@ -129,4 +232,27 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "OK: no agent-session artifacts in tracked files (11 needles, self-tested)."
+residue_hits=0
+for p in "${residue_patterns[@]}"; do
+  rc=0
+  git grep $residue_grep_flags -e "$p" -- "$residue_pathspec" >"$hits_file" 2>"$err_file" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "ERROR: review-process residue '$p' found in $residue_pathspec:" >&2
+    cat "$hits_file" >&2
+    residue_hits=$(( residue_hits + $(wc -l <"$hits_file") ))
+  elif [ "$rc" -ge 2 ]; then
+    echo "ERROR: git grep failed (exit $rc) while scanning for '$p' — cannot certify the tree:" >&2
+    cat "$err_file" >&2
+    exit 1
+  fi
+done
+
+if [ "$residue_hits" -ne 0 ]; then
+  echo >&2
+  echo "Review evidence belongs in the unit ledger under task/, per AGENTS.md" >&2
+  echo "'Comments and prose'. State the constraint the code keeps; never name the" >&2
+  echo "review, its round, or its finding id." >&2
+  exit 1
+fi
+
+echo "OK: no agent-session artifacts or review residue in tracked files (11 + 3 needles, self-tested)."

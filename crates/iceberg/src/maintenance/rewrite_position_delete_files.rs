@@ -449,8 +449,8 @@ struct ResolvedConfig {
 ///   the bin came from (`GroupKey.0`), which is what Java's pos-delete WRITE path actually does:
 ///   `SparkRewritePositionDeleteRunner.doRewrite` / `SparkPositionDeletesRewriteBuilder.specId`
 ///   resolve the output spec from the FIRST rewritten delete file's `specId()` and never consult
-///   `outputSpecId()`. **Cited, not re-derived here** — that is the prior closing Critic's firsthand
-///   Spark read, carried forward. Were it false, this action's `GroupKey.0` output-spec selection
+///   `outputSpecId()`. **Cited, not re-derived here**, from a firsthand Spark read. Were it
+///   false, this action's `GroupKey.0` output-spec selection
 ///   would diverge from Java on spec-evolved tables.
 ///
 /// Deferred alongside them, and NOT an option key:

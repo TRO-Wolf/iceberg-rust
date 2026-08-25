@@ -778,7 +778,7 @@ async fn test_wap_data_d2_rust_reads_java_cherrypick_table() {
     // PROJECTED from the manifest partition stamp, NOT read from the parquet `category` column. A
     // writer that places wrong-category rows in a partition (column="b", partition stamp="a") reads
     // back as "a" here — the projection masks it, so this pin canNOT catch a wrong-partition DATA
-    // move (proven by the critic's parse-clean probe). It DOES catch a wrong partition STAMP in the
+    // move (proven by a parse-clean probe). It DOES catch a wrong partition STAMP in the
     // manifest. The data-VALUE move is caught by the anti-circular ground-truth pin above; the
     // wrong-stored-category-vs-stamp case is an inherent Iceberg "garbage in" gap (neither Java nor
     // Rust validates column==stamp) and is named residue, not a fixable assertion here.

@@ -1704,7 +1704,7 @@ mod tests {
         );
     }
 
-    /// Risk pinned (audit SAF-007, Critic probe P1b): the populate future can be dropped BEFORE IT
+    /// Risk pinned (audit SAF-007): the populate future can be dropped BEFORE IT
     /// IS EVER POLLED — a runtime torn down between `spawn` and the first poll. A future dropped
     /// unpolled runs no local destructors, so a guard constructed *inside* the `async move` block
     /// would never exist and the state would strand at `Populating`. The guard is therefore
@@ -1746,7 +1746,7 @@ mod tests {
         );
     }
 
-    /// Risk pinned (audit SAF-007, Critic probe P2): a populate task that UNWINDS must leave the
+    /// Risk pinned (audit SAF-007): a populate task that UNWINDS must leave the
     /// index in the terminal `Failed` state, not stranded at `Populating`.
     ///
     /// The panic is raised in a task holding a [`PopulateGuard`] over the real index's state

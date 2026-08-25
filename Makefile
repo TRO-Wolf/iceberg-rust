@@ -50,6 +50,9 @@ check-toml: install-taplo-cli
 check-agent-artifacts:
 	./scripts/check_agent_artifacts.sh
 
+check-comment-blocks:
+	./scripts/check_comment_blocks.sh
+
 check-matrix-anchors:
 	./scripts/check_matrix_anchors.sh
 
@@ -69,7 +72,7 @@ MSRV_VERSION    := $(shell awk -F'"' '/^rust-version/ {print $$2}' Cargo.toml)
 check-msrv:
 	cargo +$(MSRV_VERSION) check --workspace
 
-check: check-fmt check-clippy check-toml cargo-machete check-agent-artifacts check-matrix-anchors
+check: check-fmt check-clippy check-toml cargo-machete check-agent-artifacts check-matrix-anchors check-comment-blocks
 
 doc-test:
 	cargo test --no-fail-fast --doc --all-features --workspace
