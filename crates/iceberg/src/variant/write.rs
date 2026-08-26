@@ -16,82 +16,27 @@
 // under the License.
 
 //! Variant value and metadata serialization — the WRITE side. A port of the Java 1.10.0
-//! construction/serialization surface (all bytecode-verified against `iceberg-core-1.10.0.jar`
-//! / `iceberg-api-1.10.0.jar`; the MAIN-branch sources matched 1.10.0 for the entire write
-//! surface at port time):
+//! construction and serialization surface. Each item below carries the rule it pins.
 //!
-//! - `Variants.metadata(Collection)` → [`VariantMetadata::from_field_names`]: the dictionary
-//!   keeps the INSERTION order (no dedup, no re-sort); the sorted flag is set only when the
-//!   input is already STRICTLY ascending in Java `String.compareTo` (UTF-16 code unit) order
-//!   (`last.compareTo(name) >= 0` clears it, so duplicates also clear it); the offset size is
-//!   `VariantUtil.sizeOf(dataSize)` over the total UTF-8 byte length of all names.
-//! - `PrimitiveWrapper.sizeInBytes`/`writeTo` → the primitive arms of
-//!   [`VariantValue::size_in_bytes`]/[`VariantValue::write_to`]: a string is written as a
-//!   SHORT string when its UTF-8 byte length is at most 63 (`MAX_SHORT_STRING_LENGTH`,
-//!   decided at write time) and spills to the long `STRING` form above that; decimals write
-//!   the raw scale byte then the little-endian two's-complement unscaled value (Java reverses
-//!   `BigInteger.toByteArray()` and sign-pads to 16 bytes for decimal16 — identical to
-//!   `i128::to_le_bytes`).
-//! - `ValueArray` → [`VariantArray::push`](crate::variant::VariantArray::push) + the array
-//!   arm here: `isLarge = numElements > 0xFF` (4-byte count, header bit 4),
-//!   `offsetSize = sizeOf(dataSize)`.
-//! - `ShreddedObject` (its plain object-writing core; see the module doc for what is left
-//!   out) → [`VariantObjectBuilder`] + the object arm here: fields are written sorted by name
-//!   in Java `String.compareTo` (UTF-16) order; `fieldIdSize = sizeOf(metadata.
-//!   dictionarySize())` — the dictionary SIZE, not the largest id used, so a 256-entry
-//!   dictionary forces 2-byte field ids even though the largest id (255) would fit one byte;
-//!   `isLarge = numElements > 0xFF` (4-byte count, header bit 6); field ids are re-resolved
-//!   from the metadata BY NAME at write time exactly like Java's
-//!   `ShreddedObject.SerializationState.writeTo` (`metadata.id(field)` +
-//!   `checkState(id >= 0, "Invalid metadata, missing: %s")`).
-//! - `Variants.of(...)` → the `VariantValue::of_*` constructors, including the
-//!   `of(BigDecimal)` precision rule: decimal4 for precision 1..=9, decimal8 for 10..=18,
-//!   decimal16 for <=38, `UnsupportedOperationException` ("Unsupported decimal precision:
-//!   %s") above that. The Rust decimal input form is `(unscaled: i128, scale: u8)` — the
-//!   unscaled two's-complement integer and the number of fractional digits, matching how
-//!   [`VariantPrimitive`] (and `spec::values::PrimitiveLiteral::Int128`) represent decimals
-//!   where Java uses `BigDecimal`; precision is the decimal digit count of `|unscaled|`
-//!   (`BigDecimal.precision()`, which reports 1 for zero).
-//! - `VariantMetadata.writeTo` / `Variant` emission → [`VariantMetadata::to_bytes`] and
-//!   [`Variant::to_bytes`] (metadata bytes immediately followed by value bytes — the layout
-//!   [`Variant::from_bytes`] parses).
+//! | Java | Rust |
+//! |---|---|
+//! | `Variants.metadata(Collection)` | [`VariantMetadata::from_field_names`] |
+//! | `PrimitiveWrapper.sizeInBytes`/`writeTo` | [`VariantValue::size_in_bytes`] / [`VariantValue::write_to`] |
+//! | `ValueArray` | [`VariantArray::push`](crate::variant::VariantArray::push) |
+//! | `ShreddedObject`, plain object core | [`VariantObjectBuilder`] |
+//! | `Variants.of(...)` | the `VariantValue::of_*` constructors |
+//! | `VariantMetadata.writeTo` / `Variant` emission | [`VariantMetadata::to_bytes`] / [`Variant::to_bytes`] |
 //!
-//! # Differences from Java (write side)
+//! # Differences from Java on the write side
 //!
-//! - **Re-serializing a PARSED value canonicalizes.** Java's `SerializedValue.writeTo` /
-//!   `SerializedMetadata.writeTo` copy the original backing buffer verbatim (non-minimal
-//!   offset widths and all); the eager representation has no backing buffer, so this writer
-//!   re-encodes with the canonical Java-WRITER widths (`sizeOf`-minimal) and, for objects,
-//!   re-resolves field ids by name through the writer's path. For anything Java's own writer
-//!   produced the output is byte-identical (pinned against 1.10.0 fixtures); only
-//!   non-canonical third-party input re-encodes differently (same decoded value).
-//! - **Width overflow is an error, not a silent mask.** `VariantUtil.
-//!   writeLittleEndianUnsigned` masks the value to the requested width, so Java silently
-//!   corrupts the one reachable pathology — a dictionary of >255 names whose total UTF-8
-//!   data size still fits one byte (only possible with empty/duplicated empty names):
-//!   1.10.0 truncates the count byte and emits a metadata that has LOST every name
-//!   (probe-verified: 256 empty names serialize to `01 00 00`). This port rejects it loudly
-//!   ([`DataInvalid`](crate::ErrorKind::DataInvalid)).
-//! - **Java's `int` domain is enforced.** Every size, length, and count is doored at
-//!   `i32::MAX` (Java buffers and `sizeInBytes()` are `int`-addressed), so a value Java
-//!   could never serialize is rejected instead of silently emitted.
-//! - **Serialization recursion is depth-guarded** by [`MAX_NESTING_DEPTH`], mirroring the
-//!   parse side: values deeper than the parser would accept cannot be constructed by parsing,
-//!   but they CAN be constructed manually (each nesting level is an explicit `push`/`put`
-//!   call), and an unbounded write recursion over such a value would overflow the stack.
-//!   Java has no limit (its writer recursion equals the constructed depth).
-//! - **The canonicalization above is BOUNDED by the shredding overlay** (`shredded.rs`,
-//!   Wave-4 F2): `ShreddedObject`'s partial-shred surface (the `unshredded` backing,
-//!   `SerializedObject.sliceValue` verbatim buffer reuse, `remove()`/`removedFields`, the
-//!   `Variants.object(metadata, object)` re-wrap) is ported there, and an overlay over a
-//!   serialized backing preserves untouched fields' original bytes VERBATIM — exactly the
-//!   place Java's verbatim-copy behavior is load-bearing. [`VariantObjectBuilder`] remains
-//!   the plain writer (`Variants.object(metadata)` + `put`) producing a nestable
-//!   [`VariantObject`](crate::variant::VariantObject) value.
-//! - **ISO-string convenience factories are not ported** (`Variants.ofIsoDate` /
-//!   `ofIsoTimestamptz` / ... are `DateTimeUtil` parsing conveniences, not format surface);
-//!   the numeric `of_date`/`of_timestamptz`/... constructors are the byte-format-bearing
-//!   equivalents.
+//! | Difference | Effect |
+//! |---|---|
+//! | Re-serializing a PARSED value canonicalizes | Java copies the backing buffer verbatim. The eager form has no buffer, so widths become `sizeOf`-minimal and object field ids are re-resolved by name. Output stays byte-identical for anything Java's own writer produced. |
+//! | Width overflow errors instead of masking | Java masks the value to the width. For more than 255 names whose UTF-8 data still fits one byte, it truncates the count and LOSES every name. This port returns [`DataInvalid`](crate::ErrorKind::DataInvalid). |
+//! | Java's `int` domain is enforced | Every size, length and count is doored at `i32::MAX`, so a value Java could never serialize is rejected, not silently emitted. |
+//! | Write recursion is depth-guarded | [`MAX_NESTING_DEPTH`] bounds it and Java has none. Parsing cannot build a value that deep, but manual `push` and `put` can, and unbounded recursion would overflow the stack. |
+//! | Canonicalization stops at the shredding overlay | `shredded.rs` keeps an untouched field's original bytes VERBATIM over a serialized backing, where Java's verbatim copy is load-bearing. [`VariantObjectBuilder`] stays the plain writer. |
+//! | ISO-string factories are not ported | They are `DateTimeUtil` parsing helpers, not format surface. The numeric `of_date` and `of_timestamptz` constructors carry the format. |
 
 use std::collections::HashMap;
 
@@ -109,13 +54,13 @@ use crate::variant::value::{
 use crate::{Error, ErrorKind, Result};
 
 /// The longest string written in the SHORT-STRING form, in UTF-8 bytes (Java
-/// `PrimitiveWrapper.MAX_SHORT_STRING_LENGTH` = 63; the spill decision is made at write
-/// time from `buffer.remaining()`, i.e. the UTF-8 byte length, not the char count).
+/// `PrimitiveWrapper.MAX_SHORT_STRING_LENGTH` = 63). The spill decision uses the UTF-8 byte length,
+/// not the char count, and is made at write time.
 const MAX_SHORT_STRING_LENGTH: usize = 63;
 
-/// Java's `int` ceiling: every serialized size, length, count, and offset must fit a signed
-/// 32-bit integer (Java buffers and `sizeInBytes()` are `int`-addressed). Values beyond it
-/// are unrepresentable in Java and are rejected here by name.
+/// Java's `int` ceiling: every serialized size, length, count and offset must fit a signed 32-bit
+/// integer, because Java buffers and `sizeInBytes()` are `int`-addressed. A larger value is
+/// unrepresentable in Java and is rejected here by name.
 pub(super) const JAVA_INT_MAX: usize = i32::MAX as usize;
 
 /// The basic-type tag of an object header (Java `VariantUtil.BASIC_TYPE_OBJECT`, the low two
@@ -126,9 +71,8 @@ const BASIC_TYPE_ARRAY: u8 = 0b11;
 /// The basic-type tag of a short-string header (Java `VariantUtil.BASIC_TYPE_SHORT_STRING`).
 const BASIC_TYPE_SHORT_STRING: u8 = 0b01;
 
-/// Width selection — the number of bytes needed to store `max_value` unsigned: the exact
-/// Java `VariantUtil.sizeOf` thresholds (1 for <= 0xFF, 2 for <= 0xFFFF, 3 for <= 0xFFFFFF,
-/// else 4). Callers door their inputs at [`JAVA_INT_MAX`] first.
+/// Bytes needed to store `max_value` unsigned: the Java `VariantUtil.sizeOf` thresholds (1 for
+/// <= 0xFF, 2 for <= 0xFFFF, 3 for <= 0xFFFFFF, else 4). Callers door inputs at [`JAVA_INT_MAX`].
 pub(super) fn size_of_unsigned(max_value: usize) -> usize {
     if max_value <= 0xFF {
         1
@@ -174,12 +118,9 @@ pub(super) fn write_bytes(buffer: &mut [u8], offset: usize, data: &[u8]) -> Resu
 }
 
 /// Writes a `size`-byte (1..=4) little-endian unsigned integer (Java
-/// `VariantUtil.writeLittleEndianUnsigned`).
-///
-/// Java MASKS the value to the requested width (`(byte) (value & 0xFF)` etc.), silently
-/// corrupting anything too large; here an oversized value is a named error (see the module
-/// doc — by construction every internal caller selects the width with [`size_of_unsigned`],
-/// so this door only fires on the count-wider-than-data pathology).
+/// `VariantUtil.writeLittleEndianUnsigned`). Java MASKS an oversized value to the width and
+/// silently corrupts it; here it is a named error. Every internal caller picks the width with
+/// [`size_of_unsigned`], so this door fires only on the count-wider-than-data pathology.
 pub(super) fn write_le_unsigned(
     buffer: &mut [u8],
     value: usize,
@@ -200,9 +141,8 @@ pub(super) fn write_le_unsigned(
     write_bytes(buffer, offset, &value.to_le_bytes()[..size])
 }
 
-/// Doors a container write up front: `offset + total_size` must fit the buffer (checked
-/// math, so a hostile offset cannot wrap). After this door every interior offset is bounded
-/// by `buffer.len() <= isize::MAX` and plain offset arithmetic cannot overflow.
+/// Doors a container write up front: `offset + total_size` must fit the buffer, with checked math
+/// so a hostile offset cannot wrap. Afterwards interior offset arithmetic cannot overflow.
 pub(super) fn door_value_span(
     buffer: &[u8],
     offset: usize,
@@ -222,8 +162,7 @@ pub(super) fn door_value_span(
     Ok(())
 }
 
-/// Converts a width (1..=4) to its header bit field value, `width - 1` (shared by the
-/// metadata, object, and array header builders).
+/// Converts a width (1..=4) to its header bit field value, `width - 1`.
 fn width_bits(width: usize) -> u8 {
     debug_assert!(
         (1..=4).contains(&width),
@@ -282,14 +221,14 @@ struct MetadataLayout {
     total_size: usize,
 }
 
-/// Computes the serialized layout for a dictionary, mirroring `Variants.metadata` (1.10.0):
-/// `dataSize` = total UTF-8 bytes of all names, `offsetSize = VariantUtil.sizeOf(dataSize)`,
+/// Computes the serialized layout for a dictionary (`Variants.metadata`): `dataSize` = total UTF-8
+/// bytes of all names, `offsetSize = sizeOf(dataSize)`, and
 /// `totalSize = 1 + offsetSize + (1 + numElements) * offsetSize + dataSize`.
 ///
 /// # Errors
 ///
-/// [`crate::ErrorKind::DataInvalid`] when a size escapes Java's `int` domain, or when the
-/// name COUNT does not fit `offsetSize` — the pathology Java silently truncates (module doc).
+/// [`crate::ErrorKind::DataInvalid`] when a size escapes Java's `int` domain, or when the name
+/// COUNT does not fit `offsetSize`, the pathology Java silently truncates.
 fn metadata_layout(names: &[String]) -> Result<MetadataLayout> {
     let mut data_size = 0usize;
     for name in names {
@@ -336,22 +275,19 @@ fn metadata_layout(names: &[String]) -> Result<MetadataLayout> {
 }
 
 // ===== metadata building and serialization ==================================================
-// The write-side surface of `VariantMetadata` (`Variants.metadata(Collection)` and
-// `VariantMetadata.writeTo`, 1.10.0).
+// The write-side surface of `VariantMetadata` (`Variants.metadata`, `VariantMetadata.writeTo`).
 
 impl VariantMetadata {
-    /// Builds metadata from field names exactly as Java `Variants.metadata(Collection)`
-    /// (1.10.0, bytecode-verified): the dictionary keeps the INSERTION order (no dedup, no
-    /// re-sort), and the sorted flag is set only when the input is already STRICTLY ascending
-    /// in Java `String.compareTo` (UTF-16 code unit) order — `last.compareTo(name) >= 0`
-    /// clears it, so duplicate names also clear it. An empty input is the empty-v1 metadata
-    /// (`01 00 00`, sorted flag NOT set — Java's `EMPTY_V1_METADATA`).
+    /// Builds metadata from field names, exactly as Java `Variants.metadata(Collection)`. The
+    /// dictionary keeps the INSERTION order, with no dedup and no re-sort. The sorted flag is set
+    /// only when the input is already STRICTLY ascending in Java `String.compareTo` (UTF-16 code
+    /// unit) order, so a duplicate name clears it. An empty input gives the empty-v1 metadata
+    /// `01 00 00`, with the sorted flag NOT set.
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorKind::DataInvalid`] when the dictionary cannot be serialized in Java's
-    /// `int` domain, or on the count-truncation pathology (see [`Self::to_bytes`]'s door and
-    /// the module doc).
+    /// [`crate::ErrorKind::DataInvalid`] when the dictionary escapes Java's `int` domain, or on the
+    /// count-truncation pathology (see the module doc).
     pub fn from_field_names<I, S>(field_names: I) -> Result<VariantMetadata>
     where
         I: IntoIterator<Item = S>,
@@ -374,17 +310,14 @@ impl VariantMetadata {
         ))
     }
 
-    /// Serializes this metadata to the on-disk layout (header byte, dictionary size,
-    /// `dictionarySize + 1` offsets, concatenated UTF-8 strings — `Variants.metadata`'s
-    /// buffer construction, 1.10.0).
+    /// Serializes this metadata to the on-disk layout: header byte, dictionary size,
+    /// `dictionarySize + 1` offsets, then the concatenated UTF-8 strings.
     ///
-    /// For metadata built by [`Self::from_field_names`] (and for anything Java's own writer
-    /// produced) the output is byte-identical to Java's. A PARSED metadata re-encodes with
-    /// the canonical writer widths — Java's `SerializedMetadata.writeTo` copies its original
-    /// buffer verbatim instead, so a non-canonical third-party encoding (e.g. an oversized
-    /// offset width) canonicalizes here; the sorted flag is preserved as parsed. In that case
-    /// the output length can differ from [`Self::size_in_bytes`] (which reports the PARSED
-    /// size).
+    /// Output is byte-identical to Java's for metadata built by [`Self::from_field_names`] and for
+    /// anything Java's own writer produced. A PARSED metadata re-encodes with the canonical writer
+    /// widths, because Java's `SerializedMetadata.writeTo` copies its original buffer verbatim. The
+    /// sorted flag is preserved as parsed, and the output length can then differ from
+    /// [`Self::size_in_bytes`], which reports the PARSED size.
     ///
     /// # Errors
     ///
@@ -435,9 +368,8 @@ impl VariantValue {
         VariantValue::Primitive(VariantPrimitive::Null)
     }
 
-    /// A boolean (Java `Variants.of(boolean)`; the physical type — `BOOLEAN_TRUE` or
-    /// `BOOLEAN_FALSE` — is derived from the value, as `PrimitiveWrapper`'s constructor
-    /// normalizes it).
+    /// A boolean (Java `Variants.of(boolean)`). The physical type, `BOOLEAN_TRUE` or
+    /// `BOOLEAN_FALSE`, is derived from the value.
     pub fn of_boolean(value: bool) -> VariantValue {
         VariantValue::Primitive(VariantPrimitive::Boolean(value))
     }
@@ -511,9 +443,8 @@ impl VariantValue {
         VariantValue::Primitive(VariantPrimitive::Binary(data))
     }
 
-    /// A UTF-8 string (Java `Variants.of(String)`); whether it serializes as a SHORT string
-    /// or the long `STRING` form is decided at write time by its UTF-8 byte length, exactly
-    /// like Java (`PrimitiveWrapper.writeTo`, `MAX_SHORT_STRING_LENGTH` = 63).
+    /// A UTF-8 string (Java `Variants.of(String)`). The SHORT form or the long `STRING` form is
+    /// decided at write time by the UTF-8 byte length, exactly like Java.
     pub fn of_string(value: impl Into<String>) -> VariantValue {
         VariantValue::Primitive(VariantPrimitive::String(value.into()))
     }
@@ -524,19 +455,17 @@ impl VariantValue {
         VariantValue::Primitive(VariantPrimitive::Uuid(big_endian_bytes))
     }
 
-    /// A decimal from its two's-complement unscaled value and scale, picking the SMALLEST
-    /// physical decimal type by PRECISION exactly like Java `Variants.of(BigDecimal)`
-    /// (1.10.0, bytecode-verified): precision 1..=9 → decimal4, 10..=18 → decimal8,
-    /// <=38 → decimal16. Precision is the decimal digit count of `|unscaled|`
-    /// (`BigDecimal.precision()`; zero has precision 1).
+    /// A decimal from its two's-complement unscaled value and scale. Picks the smallest physical
+    /// decimal type by PRECISION, like Java `Variants.of(BigDecimal)`: 1..=9 gives decimal4, 10..=18
+    /// gives decimal8, and up to 38 gives decimal16. Precision is the digit count of `|unscaled|`,
+    /// and zero has precision 1.
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorKind::FeatureUnsupported`] for precision above 38 (Java throws
-    /// `UnsupportedOperationException("Unsupported decimal precision: %s")`). A 39-digit
-    /// `i128` (e.g. `i128::MIN`) is therefore not constructible here, exactly as it is not
-    /// via `Variants.of(BigDecimal)`; [`VariantPrimitive::Decimal16`] can still represent it
-    /// directly (mirroring Java's width-explicit `Variants.of(PhysicalType, value)`).
+    /// [`crate::ErrorKind::FeatureUnsupported`] above precision 38, like Java's
+    /// `UnsupportedOperationException`. A 39-digit `i128` such as `i128::MIN` is therefore not
+    /// constructible here, exactly as it is not through `Variants.of(BigDecimal)`.
+    /// [`VariantPrimitive::Decimal16`] can still represent it directly.
     pub fn of_decimal(unscaled: i128, scale: u8) -> Result<VariantValue> {
         let precision = decimal_precision(unscaled);
         let primitive = if precision <= 9 {
@@ -576,41 +505,36 @@ fn decimal_precision(unscaled: i128) -> u32 {
 }
 
 // ===== value serialization ==================================================================
-// The write-side surface of `VariantValue` (`VariantValue.sizeInBytes()`/`writeTo`,
-// implemented by `PrimitiveWrapper`/`ValueArray`/`ShreddedObject` in 1.10.0).
+// The write-side surface of `VariantValue` (`sizeInBytes()` and `writeTo`).
 
 impl VariantValue {
-    /// Returns the serialized size in bytes of this value (Java `sizeInBytes()`). Objects
-    /// need the `metadata` because their field-id width is `sizeOf(metadata.
-    /// dictionarySize())` (`ShreddedObject.SerializationState`, 1.10.0).
+    /// Returns the serialized size in bytes of this value (Java `sizeInBytes()`). An object needs
+    /// `metadata`, because its field-id width is `sizeOf(metadata.dictionarySize())`.
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorKind::DataInvalid`] when the value cannot be serialized in Java's `int`
-    /// domain or exceeds [`MAX_NESTING_DEPTH`].
+    /// [`crate::ErrorKind::DataInvalid`] when the value escapes Java's `int` domain or exceeds
+    /// [`MAX_NESTING_DEPTH`].
     pub fn size_in_bytes(&self, metadata: &VariantMetadata) -> Result<usize> {
         value_size(self, metadata, 0)
     }
 
-    /// Writes this value into `buffer` at `offset` and returns the number of bytes written —
-    /// the port of Java `VariantValue.writeTo(ByteBuffer, int)` (absolute offsets; the
-    /// buffer's little-endian order is implicit here).
+    /// Writes this value into `buffer` at `offset` and returns the bytes written. The port of Java
+    /// `VariantValue.writeTo(ByteBuffer, int)`, with absolute offsets.
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorKind::DataInvalid`] when the buffer is too small, a field name is
-    /// missing from `metadata` (Java `checkState`: "Invalid metadata, missing: %s"), the
-    /// value escapes Java's `int` domain, or nesting exceeds [`MAX_NESTING_DEPTH`].
+    /// [`crate::ErrorKind::DataInvalid`] when the buffer is too small, a field name is missing from
+    /// `metadata` (Java `checkState`: "Invalid metadata, missing: %s"), the value escapes Java's
+    /// `int` domain, or nesting exceeds [`MAX_NESTING_DEPTH`].
     pub fn write_to(
         &self,
         metadata: &VariantMetadata,
         buffer: &mut [u8],
         offset: usize,
     ) -> Result<usize> {
-        // Door the caller-supplied offset before any offset arithmetic: slices are bounded
-        // by isize::MAX, so once offset <= buffer.len() (and each container doors
-        // offset + total_size against the buffer below), interior offset math cannot
-        // overflow.
+        // Door the caller-supplied offset before any offset arithmetic. A slice is bounded by
+        // isize::MAX, so once offset <= buffer.len() the interior offset math cannot overflow.
         if offset > buffer.len() {
             return Err(util::invalid(format!(
                 "Invalid variant write: offset {offset} is out of bounds for {} bytes",
@@ -620,13 +544,12 @@ impl VariantValue {
         write_value(self, metadata, buffer, offset, 0)
     }
 
-    /// Serializes this value to its on-disk bytes (an exact-size buffer filled by
-    /// [`Self::write_to`] — the `ByteBuffer.allocate(sizeInBytes())` + `writeTo(buffer, 0)`
-    /// pattern every Java caller uses).
+    /// Serializes this value to its on-disk bytes: an exact-size buffer filled by
+    /// [`Self::write_to`], the pattern every Java caller uses.
     ///
     /// # Errors
     ///
-    /// Any [`Self::size_in_bytes`] / [`Self::write_to`] error.
+    /// Any [`Self::size_in_bytes`] or [`Self::write_to`] error.
     pub fn to_bytes(&self, metadata: &VariantMetadata) -> Result<Vec<u8>> {
         let size = self.size_in_bytes(metadata)?;
         let mut buffer = vec![0u8; size];
@@ -639,13 +562,12 @@ impl VariantValue {
 // ===== whole-variant emission ===============================================================
 
 impl Variant {
-    /// Serializes the variant as metadata bytes immediately followed by value bytes — the
-    /// single-buffer layout [`Variant::from_bytes`] (Java `Variant.from(ByteBuffer)`)
-    /// parses.
+    /// Serializes the variant as metadata bytes immediately followed by value bytes, the
+    /// single-buffer layout [`Variant::from_bytes`] parses.
     ///
     /// # Errors
     ///
-    /// Any [`VariantMetadata::to_bytes`] / [`VariantValue::to_bytes`] error.
+    /// Any [`VariantMetadata::to_bytes`] or [`VariantValue::to_bytes`] error.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut bytes = self.metadata().to_bytes()?;
         let value_bytes = self.value().to_bytes(self.metadata())?;
@@ -654,10 +576,8 @@ impl Variant {
     }
 }
 
-/// Recursive size computation (Java: `PrimitiveWrapper.sizeInBytes` /
-/// `ValueArray.SerializationState` / `ShreddedObject.SerializationState`). Depth-bounded by
-/// [`MAX_NESTING_DEPTH`] — the format is genuinely recursive and the bound is checked before
-/// any child walk, so stack usage is provably capped (see the module doc).
+/// Recursive size computation. Depth-bounded by [`MAX_NESTING_DEPTH`]: the format is genuinely
+/// recursive, and the bound is checked before any child walk, so stack usage stays capped.
 pub(super) fn value_size(
     value: &VariantValue,
     metadata: &VariantMetadata,
@@ -841,11 +761,10 @@ pub(super) fn write_value(
     }
 }
 
-/// Writes a primitive (the exact `PrimitiveWrapper.writeTo` payload layouts, 1.10.0): header
-/// byte, then the little-endian payload (decimals: raw scale byte + LE unscaled value — for
-/// decimal16 Java reverses `BigInteger.toByteArray()` into little-endian and sign-pads to 16
-/// bytes, which is exactly `i128::to_le_bytes`; UUID: the 16 big-endian bytes as stored;
-/// strings: the short form when the UTF-8 length is at most 63, else the long form).
+/// Writes a primitive (the `PrimitiveWrapper.writeTo` payload layouts): header byte, then the
+/// little-endian payload. A decimal writes the raw scale byte then the LE unscaled value, which is
+/// `i128::to_le_bytes` for decimal16. A UUID writes its 16 big-endian bytes as stored. A string
+/// uses the short form when its UTF-8 length is at most 63, else the long form.
 fn write_primitive(
     primitive: &VariantPrimitive,
     buffer: &mut [u8],
@@ -944,12 +863,10 @@ fn write_primitive(
     }
 }
 
-/// Writes an object (`ShreddedObject.SerializationState.writeTo`, 1.10.0): header, count,
-/// field-id list, offset list (one extra entry holding the data length), then the field
-/// values. Fields are emitted in their STORED order — [`VariantObjectBuilder::build`]
-/// guarantees Java's name-sorted (UTF-16) order, and a PARSED spec-conforming object is
-/// already name-sorted; each field id is re-resolved from the metadata BY NAME exactly like
-/// Java (`metadata.id(field)` + `checkState`).
+/// Writes an object (`ShreddedObject.SerializationState.writeTo`): header, count, field-id list,
+/// offset list with one extra entry holding the data length, then the field values. Fields are
+/// emitted in STORED order, which [`VariantObjectBuilder::build`] and a parsed spec-conforming
+/// object both keep name-sorted (UTF-16). Each field id is re-resolved from the metadata BY NAME.
 fn write_object(
     object: &VariantObject,
     metadata: &VariantMetadata,
@@ -958,8 +875,7 @@ fn write_object(
     depth: usize,
 ) -> Result<usize> {
     let layout = object_layout(object, metadata, depth)?;
-    // Door the whole span up front (checked): afterwards every interior offset is bounded
-    // by buffer.len() <= isize::MAX, so the plain offset arithmetic below cannot overflow.
+    // Door the whole span up front, so the interior offset arithmetic below cannot overflow.
     door_value_span(buffer, offset, layout.total_size, "object")?;
     let num_elements = object.num_fields();
     let count_size = if layout.is_large { 4 } else { 1 };
@@ -976,8 +892,7 @@ fn write_object(
 
     let mut next_value_offset = 0usize;
     for (index, field) in object.fields().iter().enumerate() {
-        // Java: int id = metadata.id(field); checkState(id >= 0, "Invalid metadata,
-        // missing: %s", field);
+        // Java: checkState(metadata.id(field) >= 0, "Invalid metadata, missing: %s").
         let id = metadata
             .id(&field.name)
             .ok_or_else(|| util::invalid(format!("Invalid metadata, missing: {}", field.name)))?;
@@ -1064,16 +979,12 @@ fn write_array(
     Ok((data_offset - offset) + layout.data_size)
 }
 
-/// A plain variant-object writer — the object-writing core of Java's `ShreddedObject`
-/// (`Variants.object(metadata)` + `put(field, value)`), WITHOUT the shredding overlay (see
-/// the module doc for the exact left-out surface).
+/// A plain variant-object writer, the object-writing core of Java's `ShreddedObject`
+/// (`Variants.object(metadata)` + `put`), WITHOUT the shredding overlay.
 ///
-/// `put` validates the field name against the metadata dictionary up front (Java's
-/// `Preconditions.checkArgument(metadata.id(field) >= 0, "Cannot find field name in
-/// metadata: %s")`) and replaces any previous value for the same name (Java's `HashMap`
-/// semantics). [`Self::build`] produces a [`VariantObject`] whose fields are sorted by name
-/// in Java `String.compareTo` (UTF-16 code unit) order — the on-disk field order Java's
-/// writer emits (`SortedMerge` of name-sorted streams in `ShreddedObject.writeTo`).
+/// `put` validates the field name against the metadata dictionary up front and replaces any
+/// previous value for the same name. [`Self::build`] sorts fields by name in Java
+/// `String.compareTo` (UTF-16 code unit) order, the on-disk field order Java's writer emits.
 #[derive(Debug)]
 pub struct VariantObjectBuilder<'a> {
     metadata: &'a VariantMetadata,
@@ -1081,8 +992,7 @@ pub struct VariantObjectBuilder<'a> {
 }
 
 impl<'a> VariantObjectBuilder<'a> {
-    /// Starts an object against the given metadata dictionary (Java
-    /// `Variants.object(metadata)`).
+    /// Starts an object against the given metadata dictionary (Java `Variants.object(metadata)`).
     pub fn new(metadata: &'a VariantMetadata) -> VariantObjectBuilder<'a> {
         VariantObjectBuilder {
             metadata,
@@ -1090,13 +1000,12 @@ impl<'a> VariantObjectBuilder<'a> {
         }
     }
 
-    /// Sets a field, replacing any previous value for the same name (Java
-    /// `ShreddedObject.put`).
+    /// Sets a field, replacing any previous value for the same name (Java `ShreddedObject.put`).
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorKind::DataInvalid`] when the name is not in the metadata dictionary
-    /// (Java throws `IllegalArgumentException("Cannot find field name in metadata: %s")`).
+    /// [`crate::ErrorKind::DataInvalid`] when the name is not in the metadata dictionary (Java
+    /// throws `IllegalArgumentException("Cannot find field name in metadata: %s")`).
     pub fn put(&mut self, name: impl Into<String>, value: VariantValue) -> Result<()> {
         let name = name.into();
         if self.metadata.id(&name).is_none() {
@@ -1108,9 +1017,8 @@ impl<'a> VariantObjectBuilder<'a> {
         Ok(())
     }
 
-    /// Finishes the object: fields are sorted by name in Java `String.compareTo` (UTF-16)
-    /// order with their dictionary ids resolved — the exact on-disk order and ids
-    /// `ShreddedObject.writeTo` emits.
+    /// Finishes the object: fields are sorted by name in Java `String.compareTo` (UTF-16) order
+    /// with their dictionary ids resolved, the exact on-disk order `ShreddedObject.writeTo` emits.
     pub fn build(self) -> VariantObject {
         let VariantObjectBuilder { metadata, fields } = self;
         let mut named: Vec<(String, VariantValue)> = fields.into_iter().collect();
@@ -1137,9 +1045,8 @@ impl<'a> VariantObjectBuilder<'a> {
 mod tests {
     use super::*;
 
-    /// Risk pinned: the width-selection thresholds are Java's UNSIGNED `sizeOf` boundaries
-    /// (0xFF/0xFFFF/0xFFFFFF) — an off-by-one here flips every offset/count width at the
-    /// boundary and corrupts the whole container layout.
+    /// Risk pinned: the width thresholds are Java's UNSIGNED `sizeOf` boundaries. An off-by-one
+    /// flips every offset and count width at the boundary and corrupts the container layout.
     #[test]
     fn test_size_of_unsigned_matches_java_thresholds() {
         assert_eq!(size_of_unsigned(0), 1);
@@ -1169,9 +1076,8 @@ mod tests {
         assert_eq!(&buffer[..3], &[0x01, 0x02, 0x03]);
     }
 
-    /// Risk pinned: `BigDecimal.precision()` semantics — zero reports 1 (decimal4), the
-    /// 9/10 and 18/19 digit boundaries flip the physical width, and 39 digits must error
-    /// with Java's message (so `i128::MIN` is not constructible, exactly like Java).
+    /// Risk pinned: `BigDecimal.precision()` semantics. Zero reports 1 (decimal4), the 9/10 and
+    /// 18/19 boundaries flip the physical width, and 39 digits must error with Java's message.
     #[test]
     fn test_decimal_precision_boundaries_match_java_bigdecimal() {
         assert_eq!(decimal_precision(0), 1);

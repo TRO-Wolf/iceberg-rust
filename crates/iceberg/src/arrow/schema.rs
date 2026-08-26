@@ -131,23 +131,17 @@ pub(crate) fn with_variant_extension_metadata(
 
 /// When iceberg map type convert to Arrow map type, the default map field name is "key_value".
 pub const DEFAULT_MAP_FIELD_NAME: &str = "key_value";
-/// UTC timezone annotation produced for Iceberg `timestamptz` / `timestamptz_ns`
-/// Arrow fields. Matches Spark `toArrow` (`timestamp[us, tz=UTC]`).
-///
-/// The historical offset spelling `"+00:00"` is still **accepted** on the
-/// Arrow→Iceberg inverse (see [`is_utc_time_zone`]); it is never produced.
+/// UTC timezone annotation produced for Iceberg `timestamptz` Arrow fields, matching Spark
+/// `toArrow`. The historical spelling `"+00:00"` is still accepted on the inverse; see
+/// [`is_utc_time_zone`].
 pub const UTC_TIME_ZONE: &str = "UTC";
 
-/// Historical offset-form UTC alias this crate used to emit on Iceberg→Arrow.
-///
-/// Still accepted as Iceberg `timestamptz` so files and batches tagged under
-/// the old annotation continue to resolve. Never produced.
+/// Historical offset-form UTC alias. Still accepted as Iceberg `timestamptz`, never produced,
+/// so batches tagged under the old annotation keep resolving.
 pub const UTC_OFFSET_TIME_ZONE: &str = "+00:00";
 
-/// True if `zone` is an accepted UTC alias for Iceberg `timestamptz`.
-///
-/// The produced annotation is [`UTC_TIME_ZONE`]. [`UTC_OFFSET_TIME_ZONE`] remains
-/// accepted so the inverse mapping is never narrowed.
+/// True if `zone` is an accepted UTC alias for Iceberg `timestamptz`. [`UTC_OFFSET_TIME_ZONE`]
+/// stays accepted, so the inverse mapping never narrows.
 #[inline]
 pub fn is_utc_time_zone(zone: &str) -> bool {
     zone == UTC_TIME_ZONE || zone == UTC_OFFSET_TIME_ZONE
@@ -155,9 +149,8 @@ pub fn is_utc_time_zone(zone: &str) -> bool {
 
 /// Maximum Arrow schema-type nesting depth the visitor will descend.
 ///
-/// Arrow schemas can be constructed directly by callers and may therefore contain attacker-
-/// influenced nesting. Keep this aligned with the Iceberg schema visitor's 128-level policy: a
-/// type root is at depth `0`, while fields of a schema's implicit root struct are at depth `1`.
+/// A caller builds the Arrow schema, so the nesting can be attacker-influenced. Keep this
+/// aligned with the Iceberg schema visitor. A type root sits at depth `0`.
 const MAX_ARROW_SCHEMA_NESTING_DEPTH: usize = 128;
 
 fn decimal128_precision_and_scale(precision: u32, scale: u32, context: &str) -> Result<(u8, i8)> {
@@ -203,9 +196,8 @@ pub trait ArrowSchemaVisitor {
     /// Return type of this visitor on arrow schema.
     type U;
 
-    /// Called for every field BEFORE its data type is descended into; `Some` short-circuits that
-    /// field. Exists for the canonical Arrow variant type, whose `metadata` / `value` children are
-    /// components of one Iceberg field and carry no ids.
+    /// Called for every field before its data type is descended, where `Some` short-circuits.
+    /// The variant type needs it: its children are parts of one Iceberg field and carry no ids.
     fn variant_field(&mut self, _field: &Field) -> Result<Option<Self::T>> {
         Ok(None)
     }
@@ -370,9 +362,8 @@ fn visit_type_at_depth<V: ArrowSchemaVisitor>(
         DataType::Dictionary(_key_type, value_type) => {
             visit_type_at_depth(value_type, visitor, depth + 1)
         }
-        // These Arrow types contain recursively formatted child types in their Display
-        // implementations. Keep their diagnostics static: formatting an attacker-controlled,
-        // deeply nested child here can overflow the stack before the typed error is returned.
+        // These types format their children recursively in `Display`. Keep the diagnostic
+        // static: formatting a deeply nested child overflows the stack before the error returns.
         DataType::ListView(_) => Err(Error::new(
             ErrorKind::DataInvalid,
             "Cannot visit Arrow data type: ListView",
@@ -455,9 +446,7 @@ pub(crate) fn visit_schema<V: ArrowSchemaVisitor>(
 
 /// Convert Arrow schema to Iceberg schema.
 ///
-/// Iceberg schema fields require a unique field id, and this function assumes that each field
-/// in the provided Arrow schema contains a field id in its metadata. If the metadata is missing
-/// or the field id is not set, the conversion will fail
+/// Every Arrow field must carry a field id in its metadata, or the conversion fails.
 pub fn arrow_schema_to_schema(schema: &ArrowSchema) -> Result<Schema> {
     let mut visitor = ArrowSchemaConverter::new();
     visit_schema(schema, &mut visitor)
@@ -465,12 +454,8 @@ pub fn arrow_schema_to_schema(schema: &ArrowSchema) -> Result<Schema> {
 
 /// Convert Arrow schema to Iceberg schema with automatically assigned field IDs.
 ///
-/// Unlike [`arrow_schema_to_schema`], this function does not require field IDs in the Arrow
-/// schema metadata. Instead, it automatically assigns unique field IDs starting from 1,
-/// following Iceberg's field ID assignment rules.
-///
-/// This is useful when converting Arrow schemas that don't originate from Iceberg tables,
-/// such as schemas from DataFusion or other Arrow-based systems.
+/// Unlike [`arrow_schema_to_schema`], this assigns field ids from 1 by Iceberg's rules, so it
+/// accepts a schema that did not come from an Iceberg table.
 pub fn arrow_schema_to_schema_auto_assign_ids(schema: &ArrowSchema) -> Result<Schema> {
     let mut visitor = ArrowSchemaConverter::new_with_field_ids_from(FIRST_FIELD_ID);
     visit_schema(schema, &mut visitor)
@@ -512,9 +497,8 @@ struct ArrowSchemaConverter {
     /// When set, the schema builder will reassign field IDs starting from this value
     /// using level-order traversal (breadth-first).
     reassign_field_ids_from: Option<i32>,
-    /// Generates unique placeholder IDs for fields before reassignment.
-    /// Required because `ReassignFieldIds` builds an old-to-new ID mapping
-    /// that expects unique input IDs.
+    /// Placeholder ids issued before reassignment, because `ReassignFieldIds` needs its input
+    /// ids to be unique.
     next_field_id: i32,
 }
 
@@ -535,9 +519,7 @@ impl ArrowSchemaConverter {
 
     fn get_field_id(&mut self, field: &Field) -> Result<i32> {
         if self.reassign_field_ids_from.is_some() {
-            // Field IDs will be reassigned by the schema builder.
-            // We need unique temporary IDs because ReassignFieldIds builds an
-            // old->new ID mapping that requires unique input IDs.
+            // The schema builder reassigns these, so only uniqueness matters here.
             let temp_id = self.next_field_id;
             self.next_field_id += 1;
             Ok(temp_id)
@@ -835,9 +817,8 @@ impl SchemaVisitor for ToArrowSchemaConverter {
                 list.element_field.id.to_string(),
             )])
         };
-        // This rebuild REPLACES the whole metadata map, so re-stamp the variant extension name that
-        // `self.field` applied. Without it the element degrades to a plain `{metadata, value}`
-        // struct.
+        // This rebuild replaces the whole metadata map, so re-stamp the variant extension
+        // name. Without it the element degrades to a plain `{metadata, value}` struct.
         let meta = if matches!(
             list.element_field.field_type.as_ref(),
             crate::spec::Type::Variant
@@ -882,8 +863,8 @@ impl SchemaVisitor for ToArrowSchemaConverter {
     /// Iceberg `variant` becomes the canonical Arrow variant extension type: `{metadata: Binary,
     /// value: Binary}` carrying the `arrow.parquet.variant` name.
     ///
-    /// A deliberate divergence from Java, which throws because its Arrow bridge predates the
-    /// canonical type. This is the type `parquet`'s own variant support reads and writes.
+    /// Java throws here, because its Arrow bridge predates the canonical type. The fork emits
+    /// the type that `parquet` variant support reads and writes.
     ///
     /// # Notes
     ///
@@ -951,11 +932,9 @@ impl SchemaVisitor for ToArrowSchemaConverter {
             crate::spec::PrimitiveType::Binary => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::LargeBinary))
             }
-            // `unknown` is an always-null column with no physical storage; Arrow's `Null` type is
-            // its natural in-memory shape (Java `TypeToMessageType` returns null — no parquet
-            // column). This lets a metadata schema carrying `unknown` participate in Arrow schema
-            // conversion; the file-level always-null write/read I/O is deferred (the parquet
-            // writer and Arrow value path fail loudly on `unknown`).
+            // `unknown` is always null and has no physical storage, so Arrow `Null` is its
+            // shape. Java `TypeToMessageType` emits no parquet column either. The parquet
+            // writer and the Arrow value path still fail loudly on `unknown`.
             crate::spec::PrimitiveType::Unknown => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Null))
             }
@@ -1023,18 +1002,10 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
                 .with_timezone(UTC_TIME_ZONE),
         ))),
         (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(value)) => {
-            // `precision`/`scale` can arrive here through bypass paths such as `Datum::new` or
-            // `Datum::try_from_bytes`, so a corrupt/hostile catalog or manifest can carry a
-            // precision/scale far outside Arrow's Decimal128 range. Reject in three stages,
-            // each as a typed error (AGENTS.md: no bare unwrap AND no truncating `as` in production
-            // paths):
-            //   1. `u8::try_from` / `i8::try_from` — Arrow takes a `u8` precision + `i8` scale, so a
-            //      plain `as` cast would WRAP (e.g. precision 294 → 38, scale 256 → 0) and SILENTLY
-            //      ACCEPT an invalid value; `try_from` rejects anything outside the numeric range.
-            //   2. `validate_decimal_precision_and_scale` — enforces Arrow's own rules
-            //      (precision ≤ 38, and scale ≤ precision) on the now in-range values.
-            //   3. `validate_decimal_literal` — rejects a scalar whose unscaled value needs more
-            //      digits than the declared precision, which Arrow does not check for us here.
+            // `Datum::new` and `Datum::try_from_bytes` bypass validation, so a hostile manifest
+            // can carry a precision or scale outside Arrow's Decimal128 range. A plain `as` cast
+            // to Arrow's `u8`/`i8` would wrap and silently accept it, so each stage below returns
+            // a typed error instead.
             datum.validate_decimal()?;
             let (arrow_precision, arrow_scale) =
                 decimal128_precision_and_scale(*precision, *scale, "Decimal literal type convert")?;
@@ -1061,13 +1032,9 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
             Ok(Arc::new(Time64MicrosecondArray::new_scalar(*value)))
         }
         (PrimitiveType::Fixed(_), PrimitiveLiteral::Binary(value)) => {
-            // A 1-element `FixedSizeBinaryArray` whose width is `value.len()` — the data column for a
-            // `Fixed(n)` field is `FixedSizeBinary(n)`, and Arrow's `eq` kernel compares the scalar's
-            // byte buffer against each row's fixed-width bytes. `try_from_iter` derives the width from
-            // the single element, so a width mismatch with the column is surfaced by the kernel, not
-            // here. Unlike the `Uuid` arm (whose `[u8; 16]` width is statically known and cannot fail),
-            // this width is data-derived, so the `Result` is mapped to a typed error rather than
-            // `.unwrap()`ed (AGENTS.md: no bare unwrap in production paths).
+            // `try_from_iter` derives the width from the single element, so the Arrow kernel,
+            // not this code, reports a width mismatch with the column. The width is data-derived
+            // here, unlike the statically sized `Uuid` arm, so the error is mapped, not unwrapped.
             let array =
                 FixedSizeBinaryArray::try_from_iter([value.clone()].into_iter()).map_err(|e| {
                     Error::new(
@@ -1394,19 +1361,12 @@ impl TryFrom<&crate::spec::Schema> for ArrowSchema {
     }
 }
 
-/// Converts a Datum (Iceberg type + primitive literal) to its corresponding Arrow DataType
-/// with Run-End Encoding (REE).
+/// Converts a [`Datum`] to its Arrow `DataType`, wrapped in Run-End Encoding.
 ///
-/// This function is used for constant fields in record batches, where all values are the same.
-/// Run-End Encoding provides efficient storage for such constant columns.
+/// Constant record-batch fields use this, because REE stores a constant column cheaply.
 ///
-/// # Arguments
-/// * `datum` - The Datum to convert, which contains both type and value information
+/// # Examples
 ///
-/// # Returns
-/// Arrow DataType with Run-End Encoding applied
-///
-/// # Example
 /// ```
 /// use iceberg::arrow::datum_to_arrow_type_with_ree;
 /// use iceberg::spec::Datum;
@@ -1418,16 +1378,13 @@ impl TryFrom<&crate::spec::Schema> for ArrowSchema {
 pub fn datum_to_arrow_type_with_ree(datum: &Datum) -> Result<DataType> {
     datum.validate_decimal()?;
 
-    // Helper to create REE type with the given values type.
-    // Note: values field is nullable as Arrow expects this when building the
-    // final Arrow schema with `RunArray::try_new`.
+    // The values field must be nullable, because `RunArray::try_new` expects that.
     let make_ree = |values_type: DataType| -> DataType {
         let run_ends_field = Arc::new(Field::new("run_ends", DataType::Int32, false));
         let values_field = Arc::new(Field::new("values", values_type, true));
         DataType::RunEndEncoded(run_ends_field, values_field)
     };
 
-    // Match on the PrimitiveType from the Datum to determine the Arrow type
     match datum.data_type() {
         PrimitiveType::Boolean => Ok(make_ree(DataType::Boolean)),
         PrimitiveType::Int => Ok(make_ree(DataType::Int32)),
@@ -1449,18 +1406,16 @@ pub fn datum_to_arrow_type_with_ree(datum: &Datum) -> Result<DataType> {
             *scale,
             "Run-end-encoded decimal datum type convert",
         )?)),
-        // `unknown` carries no `PrimitiveLiteral`, so a `Datum` of this type is unconstructable —
-        // this arm is unreachable in practice. Keep it consistent with `type_to_arrow_type`
-        // (`unknown` -> Arrow `Null`) rather than panicking.
+        // `unknown` carries no `PrimitiveLiteral`, so this arm is unreachable. Keep it aligned
+        // with `type_to_arrow_type` rather than panicking.
         PrimitiveType::Unknown => Ok(make_ree(DataType::Null)),
     }
 }
 
 /// A visitor that strips metadata from an Arrow schema.
 ///
-/// This visitor recursively removes all metadata from fields at every level of the schema,
-/// including nested struct, list, and map fields. This is useful for schema comparison
-/// where metadata differences should be ignored.
+/// Removes metadata from every field at every level, so schemas compare equal when only their
+/// metadata differs.
 struct MetadataStripVisitor {
     /// Stack to track field information during traversal
     field_stack: Vec<Field>,
@@ -1605,20 +1560,15 @@ impl ArrowSchemaVisitor for MetadataStripVisitor {
     }
 }
 
-/// Strips all metadata from an Arrow schema and its nested fields.
+/// Strips metadata from an Arrow schema and every nested field, so two schemas compare equal
+/// when only their metadata differs.
 ///
-/// This function recursively removes metadata from all fields at every level of the schema,
-/// including nested struct, list, and map fields. This is useful for schema comparison
-/// where metadata differences should be ignored.
+/// # Errors
 ///
-/// # Arguments
-/// * `schema` - The Arrow schema to strip metadata from
+/// Fails when the schema structure is invalid.
 ///
-/// # Returns
-/// A new Arrow schema with all metadata removed, or an error if the schema structure
-/// is invalid.
+/// # Examples
 ///
-/// # Example
 /// ```
 /// use std::collections::HashMap;
 ///
@@ -1708,9 +1658,8 @@ mod tests {
         data_type
     }
 
-    /// Build a malicious Arrow map chain through the key slot. Iceberg map keys cannot be nested,
-    /// but a caller can manually construct this Arrow type, so that recursion edge still needs the
-    /// same pre-conversion bound as the valid map-value path.
+    /// Build a deep Arrow map chain through the key slot. Iceberg forbids a nested map key, but
+    /// a caller can build the Arrow type, so that edge needs the same bound.
     fn nested_map_key_type(nesting: usize) -> DataType {
         let mut data_type = DataType::Int32;
         let mut next_field_id = 1;
@@ -2040,9 +1989,8 @@ mod tests {
         assert_eq!(type_error.kind(), ErrorKind::DataInvalid);
         assert!(type_error.to_string().contains(&expected_message));
 
-        // A schema field starts one level below its implicit root, so 128 composite edges are one
-        // beyond the schema boundary. The Arrow-specific diagnostic proves these public converters
-        // fail at this visitor, rather than only at the downstream Iceberg schema builder.
+        // A schema field starts one level below the implicit root, so 128 edges pass the
+        // boundary. The Arrow diagnostic proves the visitor fails first, not the schema builder.
         let overdeep_schema = ArrowSchema::new(vec![simple_field(
             "root",
             nested_composite_type(MAX_ARROW_SCHEMA_NESTING_DEPTH),
@@ -2072,9 +2020,8 @@ mod tests {
         );
         let overdeep = MAX_ARROW_SCHEMA_NESTING_DEPTH + 1;
 
-        // The mixed boundary tests cover struct fields, ordinary lists, and map values. Exercise
-        // manually constructible map-key, LargeList, FixedSizeList, and dictionary chains too, so
-        // no recursive Arrow edge can bypass the shared depth check.
+        // The boundary tests above cover structs, lists and map values. Cover the manually
+        // constructible edges too, so none bypasses the shared depth check.
         for (name, data_type) in [
             ("map key", nested_map_key_type(overdeep)),
             (
@@ -2096,11 +2043,9 @@ mod tests {
 
     #[test]
     fn malicious_arrow_dictionary_depth_errors_and_drops_iteratively() {
-        // Arrow permits callers to manually build far deeper trees than its normal producers emit.
-        // The visitor must stop after 128 edges, independent of the input's total depth. Tear down
-        // the synthetic 10,000-node Box chain iteratively after the call: recursively dropping the
-        // hostile fixture could itself overflow the test thread's stack and would test Arrow's Drop
-        // behavior rather than this borrowed visitor.
+        // A caller can build a far deeper tree than Arrow's own producers emit, so the visitor
+        // must stop after 128 edges. Tear the fixture down iteratively: a recursive drop would
+        // overflow this thread's stack and test Arrow's `Drop`, not the visitor.
         let hostile = nested_dictionary_type(10_000);
         let result = arrow_type_to_type(&hostile);
         drop_dictionary_type_iteratively(hostile);
@@ -2697,9 +2642,8 @@ mod tests {
         assert_eq!(converted_arrow_schema, arrow_schema);
     }
 
-    /// RISK: Iceberg `timestamptz` / `timestamptz_ns` must emit Spark's `tz=UTC`
-    /// annotation, not the historical `+00:00`. Values are unchanged — this pins
-    /// the schema metadata only.
+    /// `timestamptz` must emit Spark's `tz=UTC` annotation, not `+00:00`. Pins the schema
+    /// metadata only; the values do not change.
     #[test]
     fn schema_to_arrow_schema_annotates_timestamptz_as_utc() {
         let schema = Schema::builder()
@@ -2722,9 +2666,8 @@ mod tests {
         assert_eq!(UTC_TIME_ZONE, "UTC");
     }
 
-    /// RISK: narrowing the inverse to only `"UTC"` would refuse parquet/Arrow
-    /// written under the old `+00:00` annotation. Both aliases, both units,
-    /// both public converters must still resolve to Iceberg `timestamptz`.
+    /// Narrowing the inverse to `"UTC"` alone would refuse files written under `+00:00`. Both
+    /// aliases, both units and both converters must resolve to `timestamptz`.
     #[test]
     fn arrow_schema_to_schema_accepts_utc_and_offset_aliases() {
         for (zone, unit, expected) in [
@@ -2796,11 +2739,9 @@ mod tests {
         );
     }
 
-    /// RISK: files written under the old `+00:00` annotation reach the scan
-    /// transformer as `Timestamp(_, "+00:00")` against a `UTC` target. The
-    /// Promote path (`arrow_cast::cast`) must succeed and keep the i64 instants
-    /// bit-identical — otherwise every previously-written timestamptz file
-    /// becomes unreadable.
+    /// Files written under the old `+00:00` annotation reach the scan transformer against a
+    /// `UTC` target. The promote cast must keep the i64 instants bit-identical, or every
+    /// previously-written timestamptz file becomes unreadable.
     #[test]
     fn arrow_cast_from_offset_alias_to_utc_is_bit_identical() {
         use arrow_array::TimestampMicrosecondArray;
@@ -2819,9 +2760,8 @@ mod tests {
         assert_eq!(out.iter().collect::<Vec<_>>(), values);
     }
 
-    // Variant converts to the canonical Arrow extension type rather than erroring. What must NOT
-    // happen is a silent fallback: identity is the FIELD's extension metadata, never the struct
-    // shape, so a plain `{metadata, value}` struct still converts back to a STRUCT.
+    // Variant identity is the field's extension metadata, never the struct shape, so a plain
+    // `{metadata, value}` struct still converts back to a struct.
 
     #[test]
     fn test_variant_converts_to_the_canonical_arrow_extension_type() {
@@ -3056,9 +2996,8 @@ mod tests {
         );
     }
 
-    /// The DISCRIMINATING cell: a struct of the same SHAPE but without the extension name is a
-    /// plain struct. Keying identity on shape would turn any `{metadata, value}` column into a
-    /// variant.
+    /// A struct of the same shape without the extension name stays a plain struct. Keying
+    /// identity on shape would turn any `{metadata, value}` column into a variant.
     #[test]
     fn test_a_shape_alike_struct_without_the_extension_name_is_not_a_variant() {
         let arrow_schema = ArrowSchema::new(vec![
@@ -3092,11 +3031,8 @@ mod tests {
         );
     }
 
-    // RISK: `unknown` is an always-null column with no physical storage (Java `TypeToMessageType`
-    // returns null — no parquet column). Its natural Arrow shape is `DataType::Null`, which lets a
-    // metadata schema carrying `unknown` participate in Arrow schema conversion (the metadata-only
-    // round-trip contract). A wrong mapping (e.g. a real physical type) would invent storage Java
-    // never emits.
+    // `unknown` has no physical storage, and Java `TypeToMessageType` emits no parquet column.
+    // A mapping to a real physical type would invent storage Java never writes.
     #[test]
     fn test_unknown_to_arrow_is_null_type() {
         let arrow_type = type_to_arrow_type(&Type::Primitive(PrimitiveType::Unknown))
@@ -3506,12 +3442,9 @@ mod tests {
         }
     }
 
-    /// A `Datum` can carry a decimal `precision > 38` through bypass paths such as
-    /// [`Datum::new`] or [`Datum::try_from_bytes`], so a corrupt or hostile catalog/manifest can
-    /// hand the predicate path such a datum. Arrow's Decimal128 tops out at precision 38, so
-    /// `with_precision_and_scale` rejects it. `get_arrow_datum` must surface that as a typed
-    /// [`ErrorKind::DataInvalid`], never a panic (a predicate pushdown that panics takes down the
-    /// scan/worker instead of failing the one bad query).
+    /// [`Datum::new`] and [`Datum::try_from_bytes`] bypass validation, so a hostile manifest can
+    /// hand the predicate path a decimal with `precision > 38`. `get_arrow_datum` must return
+    /// [`ErrorKind::DataInvalid`]: a panic in pushdown takes down the worker, not one query.
     #[test]
     fn get_arrow_datum_rejects_over_max_decimal_precision_without_panicking() {
         // precision 50 > Arrow's Decimal128 max of 38; built via the pub(crate) constructor to
@@ -3546,12 +3479,9 @@ mod tests {
         }
     }
 
-    /// The precision/scale rejection must be COMPLETE, not just "large values". Arrow takes a `u8`
-    /// precision + `i8` scale, so casting the `u32` fields with `as` would WRAP an out-of-range value
-    /// INTO Arrow's valid range and SILENTLY accept it — `decimal(294,0)` wraps to precision 38,
-    /// `scale=256` wraps to i8 0, both of which Arrow's `with_precision_and_scale` then ACCEPTS.
-    /// `get_arrow_datum` uses `try_from` (not `as`) so these are rejected as typed
-    /// [`ErrorKind::DataInvalid`]. (Without the `try_from`, this test FAILS — the wrapped values pass.)
+    /// An `as` cast to Arrow's `u8` precision and `i8` scale wraps an out-of-range value back
+    /// into the valid range, which Arrow then accepts: `decimal(294,0)` becomes precision 38.
+    /// Discriminates the mutation that replaces `try_from` with `as`.
     #[test]
     fn get_arrow_datum_rejects_wrapping_decimal_precision_scale() {
         // precision 294 wraps to 38 under `as u8` (294 - 256) — a VALID Arrow precision.
@@ -3582,9 +3512,8 @@ mod tests {
         }
     }
 
-    /// A decimal value whose unscaled magnitude needs more digits than the declared precision is
-    /// not representable by Arrow Decimal128 at that precision. `get_arrow_datum` must reject it
-    /// instead of accepting a value whose type metadata lies about its precision.
+    /// Arrow Decimal128 cannot hold an unscaled value that needs more digits than the declared
+    /// precision. Accepting it would ship type metadata that lies about the value.
     #[test]
     fn get_arrow_datum_rejects_decimal_values_outside_declared_precision_and_accepts_boundaries() {
         for (precision, value, context) in [
@@ -3691,10 +3620,8 @@ mod tests {
 
         let schema = arrow_schema_to_schema_auto_assign_ids(&arrow_schema).unwrap();
 
-        // Build expected schema with exact field IDs following level-order assignment:
-        // Level 0: id=1, name=2, price=3, created_at=4, tags=5, address=6, attributes=7, orders=8
-        // Level 1: tags.element=9, address.{street=10,city=11,zip=12}, attributes.{key=13,value=14}, orders.element=15
-        // Level 2: orders.element.{order_id=16,amount=17}
+        // Expected ids follow level-order assignment: level 0 is 1-8, level 1 is 9-15, and
+        // level 2 is 16-17.
         let expected = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),

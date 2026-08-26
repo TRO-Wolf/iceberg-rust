@@ -15,122 +15,64 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The [`RemoveDanglingDeleteFiles`] maintenance action — the Rust port of Java's
-//! `RemoveDanglingDeletesSparkAction` (spark module, MAIN-only) behind the
-//! `org.apache.iceberg.actions.RemoveDanglingDeleteFiles` api interface (1.10.0 bytecode-confirmed
-//! shape: `Result.removedDeleteFiles()` returning the removed delete files).
+//! The [`RemoveDanglingDeleteFiles`] maintenance action. It ports Java's
+//! `RemoveDanglingDeletesSparkAction`.
 //!
-//! A delete file is **dangling** when its deletes can no longer apply to ANY live data file. Removing
-//! it is pure garbage collection — the read result is unchanged. The corruption hazard is the inverse:
-//! removing a delete file that STILL applies resurrects the rows it was masking (the classic
-//! GC-of-deletes corruption). Every dangling test below therefore pins BOTH directions — the
-//! still-applicable delete is KEPT, the genuinely-dangling one is REMOVED.
+//! A delete file is dangling when its deletes can no longer apply to any live data file. Removing it
+//! is garbage collection, and the read result does not change. The inverse is corruption: removing a
+//! delete file that still applies resurrects the rows it masks. Every test below pins both
+//! directions.
 //!
-//! # The dangling predicate (derived verbatim from Java's `findDanglingDeletes` SQL)
+//! # The dangling predicate
 //!
-//! Over the **current snapshot only** (Java loads the `ENTRIES` / `DATA_FILES` / `DELETE_FILES`
-//! metadata tables, which materialize the current snapshot):
+//! Group the current snapshot's live DATA entries by `(spec_id, partition)`. Take the minimum data
+//! sequence number per group. Left-join each live DELETE entry on the same key. The spec id is part
+//! of the key, so two files in one partition tuple under different specs do not share a minimum.
 //!
-//! 1. Group LIVE DATA entries (content == DATA, `status < DELETED`) by `(partition, spec_id)` and take
-//!    the MINIMUM data sequence number in each group (Java: `groupBy("partition", "spec_id").agg(min
-//!    (sequence_number))`).
-//! 2. Left-outer-join each LIVE DELETE entry (content != DATA, `status < DELETED`) to that grouping on
-//!    `(spec_id, partition)`.
-//! 3. A delete file is dangling when (Java `filterOnDanglingDeletes`, lines 152-165):
-//!    - `min_data_sequence_number IS NULL` — there is NO live data file in the delete's partition+spec,
-//!      so it applies to nothing (ANY content type), OR
-//!    - it is a **position** delete (content == 1) AND `sequence_number < min_data_sequence_number`
-//!      (STRICT `<`), OR
-//!    - it is an **equality** delete (content == 2) AND `sequence_number <= min_data_sequence_number`
-//!      (NON-strict `<=`).
-//! 4. A **deletion vector** (PUFFIN-format position delete) whose `referenced_data_file` is not a live
-//!    data-file path is dangling (Java `findDanglingDvs`: left-outer-join DVs to DATA_FILES on
-//!    `referenced_data_file == file_path`, keep the unmatched).
+//! | Delete kind | Dangles when |
+//! |---|---|
+//! | any content type | the group holds no live data file (`min IS NULL`) |
+//! | position (content 1) | `delete_seq < min_data_seq`, strict |
+//! | equality (content 2) | `delete_seq <= min_data_seq`, non-strict |
+//! | deletion vector | `referenced_data_file` is not a live data-file path |
 //!
-//! **THE OFF-BY-ONE (the corruption edge): position deletes use `<`, equality deletes use `<=`.** This
-//! is the exact complement of the read-path applicability rules in [`crate::delete_file_index`]: a
-//! position delete APPLIES to a data file when `delete_seq >= data_seq`
-//! (`PopulatedDeleteFileIndex::get_deletes_for_data_file`, the `>=` position branch), so it applies to
-//! the partition's minimum-seq data file iff `delete_seq >= min` — i.e. it dangles iff `delete_seq <
-//! min`. An equality delete APPLIES STRICTLY when `delete_seq > data_seq` (the `>` equality branch), so
-//! it applies to the minimum-seq data file iff `delete_seq > min` — i.e. it dangles iff `delete_seq <=
-//! min`. Position deletes apply to same-seq data (`>=`), equality deletes do not (`>`); the dangling
-//! conditions therefore differ by one between the two content types. Flipping `<` to `<=` (or vice
-//! versa) is exactly the mutation that either resurrects same-seq rows or leaves a genuinely-dangling
-//! delete behind.
+//! The off-by-one is the corruption edge. It complements the read path in
+//! [`crate::delete_file_index`]. A position delete applies when `delete_seq >= data_seq`. An equality
+//! delete applies only when `delete_seq > data_seq`. Flipping either comparison resurrects same-sequence
+//! rows or strands a dangling delete.
 //!
-//! # Grouping is per `(partition, spec_id)`
+//! # Commit vehicle
 //!
-//! Java groups the data minimum AND joins the deletes on BOTH the partition tuple AND the spec id. Two
-//! files in the same partition tuple but DIFFERENT specs do not share a minimum — a delete is compared
-//! only against data files written under its own spec's partitioning. This action mirrors that exactly:
-//! the grouping key is `(spec_id, partition_struct)`.
+//! Java runs `table.newRewrite()` and `deleteFile(...)` per dangling file, and records the operation as
+//! `Replace`. This action drives the same vehicle through
+//! [`RewriteFilesAction`](crate::transaction::rewrite_files). It commits only when the dangling set is
+//! non-empty. A plain `RewriteFilesAction` carries every delete manifest forward unchanged, so it never
+//! prunes a now-dangling parquet position delete. This action is the dedicated cleaner.
 //!
-//! # The commit vehicle: `RewriteFiles.deleteFile(DeleteFile)`
+//! Java returns early on a table with one spec that is unpartitioned, because `ManifestFilterManager`
+//! already drops such deletes on each commit. This action mirrors that.
 //!
-//! Java commits via `table.newRewrite()` then `rewriteFiles.deleteFile(deleteFile)` per dangling delete,
-//! committing only if the dangling set is non-empty. The recorded operation is `Replace` (Java
-//! `BaseRewriteFiles.operation()` returns `"replace"` unconditionally, even for a delete-only rewrite —
-//! 1.10.0 bytecode). This action drives the SAME vehicle: the deferred delete-file-removal surface on
-//! [`RewriteFilesAction`](crate::transaction::rewrite_files) (landed in this increment) —
-//! `tx.rewrite_files(vec![], vec![]).delete_delete_files(dangling)`. The producer resolves each path
-//! against the current DELETE manifests, tombstones it, and bumps `removed-position-delete-files` /
-//! `removed-equality-delete-files` / `removed-dvs`.
+//! Removal is metadata-only. The commit tombstones the delete entry in the rewritten DELETE manifest
+//! and leaves the bytes on disk, so time travel to an older snapshot still applies the delete.
+//! `ExpireSnapshots` and `DeleteOrphanFiles` reclaim the bytes.
 //!
-//! # Relationship to plain `RewriteFiles` (the carry-posture)
+//! # A known Java-faithful resurrection race
 //!
-//! A plain [`RewriteFilesAction`](crate::transaction::rewrite_files) that rewrites the data file a
-//! position-delete REFERENCES does NOT prune the now-dangling parquet position delete — it carries every
-//! delete manifest forward unchanged (the conservative carry-unchanged posture documented on
-//! `SnapshotProducer::current_manifests`; empirically confirmed against Java 1.10.0, which on a
-//! `RewriteFiles` prunes only dangling *DVs*, never a dangling parquet position delete). THIS action is
-//! the thing that cleans those up — it is the dedicated dangling-delete GC pass the commit path
-//! deliberately does not do inline.
+//! The commit runs no concurrent-conflict validation. A delete-file-only `RewriteFiles` has an empty
+//! replaced-data set, and both Java's `BaseRewriteFiles.validate` and `RewriteFilesAction::validate`
+//! skip the check in that case. A concurrent sequence-preserving compaction can land a data file at a
+//! lower sequence number between the plan and the commit. The delete becomes applicable again, and its
+//! removal then resurrects the rows. Java has the identical race, so a guard here would diverge. Run
+//! this action when sequence-preserving compaction is not in flight.
 //!
-//! # The unpartitioned single-spec early return
+//! # Global equality deletes under a multi-spec table
 //!
-//! Java short-circuits to an empty result when the table has exactly one spec AND it is unpartitioned:
-//! "ManifestFilterManager already performs this table-wide delete on each commit." This action mirrors
-//! that — on such a table there is nothing for it to do, and no snapshot is committed.
-//!
-//! # Removal is METADATA-ONLY — time travel is preserved
-//!
-//! Removing a dangling delete commits a NEW `Replace` snapshot that TOMBSTONES the delete entry in the
-//! rewritten DELETE manifest (`process_deletes` → `add_delete_entry`); it does NOT physically delete the
-//! delete file's bytes. Older snapshots' manifests still reference the removed delete file, and the bytes
-//! stay on disk, so time-travel reads of a prior snapshot are unaffected. Physical reclamation is the job
-//! of `ExpireSnapshots` / `DeleteOrphanFiles`, never this action (Java-identical — `RewriteFiles` is a
-//! metadata commit).
-//!
-//! # Concurrency: a KNOWN Java-faithful resurrection race (NOT validated)
-//!
-//! The dangling determination is computed against the snapshot in hand and the removal commits with NO
-//! concurrent-conflict validation: a delete-file-only `RewriteFiles` has an EMPTY replaced-DATA set, and
-//! both Java's `BaseRewriteFiles.validate` (it runs `validateNoNewDeletesForDataFiles` only
-//! `if (!replacedDataFiles.isEmpty())`, 1.10.0 bytecode) and the `RewriteFilesAction::validate` it drives
-//! skip the check in that case. Java's `RemoveDanglingDeletesSparkAction` adds no `validateFromSnapshot`
-//! either. So if a
-//! CONCURRENT seq-preserving compaction (Java `RewriteDataFiles` with `use-starting-sequence-number`, the
-//! Rust [`RewriteDataFiles`](crate::maintenance::RewriteDataFiles)) lands a data file at an OLD (lower)
-//! data sequence number in a dangling delete's partition between the plan and the commit, that delete can
-//! become APPLICABLE again at commit time and its removal then RESURRECTS the rows it masked. This race
-//! exists IDENTICALLY in Java (no conflict detection on the delete-only rewrite); the Rust action is pinned
-//! to Java's behavior, so it is documented here rather than guarded (a guard would diverge from Java).
-//! Operationally, run dangling-delete GC when concurrent seq-preserving compaction is not in flight.
-//! (Reviewer-confirmed 2026-06-11: a probe staged exactly this interleaving and observed the resurrection.)
-//!
-//! # Global (unpartitioned-spec) equality deletes under a multi-spec table
-//!
-//! A global equality delete is written under an UNPARTITIONED spec (empty partition struct). The read path
-//! ([`crate::delete_file_index`], `global_equality_deletes`, and Java `DeleteFileIndex.findGlobalDeletes`)
-//! applies it TABLE-WIDE — to data under ANY spec/partition when `delete_seq > data_seq`. This action keys
-//! it by its own `(spec_id, empty-partition)` group, so on a table whose only live data is under a
-//! DIFFERENT (partitioned) spec, the global eq delete's group has no live data (`min IS NULL`) and the
-//! action flags it DANGLING even though the reader still honors it cross-spec. This is faithful to Java:
-//! `findDanglingDeletes` joins on `spec_id AND partition`, so the same global eq delete misses the
-//! partitioned-spec data and is flagged dangling there too — the action↔reader inconsistency is inherited
-//! 1:1 from Java, not introduced here. Reachable only after an unpartitioned→partitioned spec evolution
-//! that leaves a global eq delete live with no unpartitioned-spec data.
+//! A global equality delete carries an unpartitioned spec and an empty partition struct. The read path
+//! applies it table-wide when `delete_seq > data_seq`. This action keys it by its own
+//! `(spec_id, empty-partition)` group. A table whose live data sits under a different spec therefore
+//! flags it dangling even though the reader still honors it. Java joins on `spec_id AND partition`
+//! too, so the inconsistency comes from Java. It needs an unpartitioned-to-partitioned spec evolution
+//! that leaves a global equality delete live.
 
 use std::collections::{HashMap, HashSet};
 
@@ -141,19 +83,19 @@ use crate::spec::{DataContentType, DataFile, DataFileFormat, Struct};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 
-/// The outcome of a [`RemoveDanglingDeleteFiles::execute`] run: the delete files that were removed
-/// (Java `RemoveDanglingDeleteFiles.Result.removedDeleteFiles()`), plus per-content-type counts for
-/// convenient assertion. A no-op run (nothing dangled, or the unpartitioned single-spec early return)
-/// returns this empty and commits no snapshot.
+/// The outcome of a [`RemoveDanglingDeleteFiles::execute`] run, with per-content-type counts.
+///
+/// # Notes
+///
+/// A no-op run returns this empty and commits no snapshot.
 #[derive(Debug, Default, Clone)]
 pub struct RemoveDanglingDeleteFilesResult {
-    /// Every dangling delete file that was removed (Java `Result.removedDeleteFiles()`), in the order
-    /// they were discovered. Each is the on-disk [`DataFile`] of the removed delete entry.
+    /// Every removed dangling delete file, in discovery order.
     pub removed_delete_files: Vec<DataFile>,
 }
 
 impl RemoveDanglingDeleteFilesResult {
-    /// Number of removed position-delete files that are NOT deletion vectors (parquet position deletes).
+    /// Number of removed parquet position-delete files, excluding deletion vectors.
     pub fn removed_position_delete_files_count(&self) -> usize {
         self.removed_delete_files
             .iter()
@@ -172,7 +114,7 @@ impl RemoveDanglingDeleteFilesResult {
             .count()
     }
 
-    /// Number of removed deletion vectors (PUFFIN-format position deletes).
+    /// Number of removed deletion vectors, which are Puffin-format position deletes.
     pub fn removed_dvs_count(&self) -> usize {
         self.removed_delete_files
             .iter()
@@ -184,10 +126,9 @@ impl RemoveDanglingDeleteFilesResult {
     }
 }
 
-/// The `RemoveDanglingDeleteFiles` maintenance action. Build it with [`Self::new`] and run it with
-/// [`Self::execute`]. It removes, in ONE `Replace` snapshot, every delete file in the current snapshot
-/// that can no longer apply to any live data file (see the module docs for the exact dangling predicate
-/// per content type and the commit vehicle).
+/// The `RemoveDanglingDeleteFiles` maintenance action. It removes, in one `Replace` snapshot, every
+/// delete file in the current snapshot that can no longer apply to any live data file. The module docs
+/// carry the dangling predicate.
 pub struct RemoveDanglingDeleteFiles {
     table: Table,
 }
@@ -198,17 +139,19 @@ impl RemoveDanglingDeleteFiles {
         RemoveDanglingDeleteFiles { table }
     }
 
-    /// Find the dangling delete files in the current snapshot and remove them in one `Replace` snapshot
-    /// committed through the [`RewriteFilesAction`](crate::transaction::rewrite_files) delete-file-removal
-    /// surface (Java `RemoveDanglingDeletesSparkAction.doExecute`).
+    /// Find the dangling delete files in the current snapshot and remove them in one `Replace` snapshot.
     ///
-    /// Returns an empty [`RemoveDanglingDeleteFilesResult`] and commits NOTHING when nothing dangles, when
-    /// the table has no current snapshot, or when the table is unpartitioned with a single spec (Java's
-    /// early return — `ManifestFilterManager` already prunes table-wide on each commit). Returns `Err` only
-    /// when reading the manifests fails or the commit fails.
+    /// # Notes
+    ///
+    /// The run commits nothing and returns an empty result when nothing dangles, when the table has no
+    /// current snapshot, or when the table has one unpartitioned spec.
+    ///
+    /// # Errors
+    ///
+    /// Fails when reading the manifests fails, or when the commit fails.
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RemoveDanglingDeleteFilesResult> {
-        // Java early return: an unpartitioned, single-spec table has nothing to do — every commit's
-        // ManifestFilterManager already drops table-wide-applicable deletes.
+        // An unpartitioned single-spec table has nothing to do. Every commit's ManifestFilterManager
+        // already drops table-wide-applicable deletes.
         let metadata = self.table.metadata();
         if metadata.partition_specs_iter().count() == 1
             && metadata.default_partition_spec().is_unpartitioned()
@@ -216,7 +159,7 @@ impl RemoveDanglingDeleteFiles {
             return Ok(RemoveDanglingDeleteFilesResult::default());
         }
 
-        // The action scopes to the CURRENT snapshot only (Java's metadata-table loads).
+        // The action scopes to the current snapshot only.
         let Some(snapshot) = metadata.current_snapshot().cloned() else {
             return Ok(RemoveDanglingDeleteFilesResult::default());
         };
@@ -225,12 +168,11 @@ impl RemoveDanglingDeleteFiles {
         let dangling = find_dangling_deletes(&live);
 
         if dangling.is_empty() {
-            // Empty plan — no-op, NO commit (Java commits only when `!danglingDeletes.isEmpty()`).
+            // An empty plan commits nothing. Java also commits only on a non-empty dangling set.
             return Ok(RemoveDanglingDeleteFilesResult::default());
         }
 
-        // Commit ONE RewriteFiles delete-file removal (Java `table.newRewrite()` +
-        // `deleteFile(deleteFile)` per dangling file). Operation = Replace.
+        // One RewriteFiles delete-file removal. The recorded operation is Replace.
         let transaction = Transaction::new(&self.table);
         let action = transaction
             .rewrite_files(Vec::new(), Vec::new())
@@ -243,9 +185,8 @@ impl RemoveDanglingDeleteFiles {
         })
     }
 
-    /// Walk the current snapshot's manifests once and collect every LIVE entry's relevant fields into a
-    /// [`LiveEntries`] view (live data sequence numbers grouped by `(spec_id, partition)`, the set of live
-    /// data-file paths, and the live delete entries' [`DataFile`]s). One pass over the manifest list.
+    /// Walk the current snapshot's manifests once and collect every live entry into a [`LiveEntries`]
+    /// view.
     async fn collect_live_entries(&self, snapshot: &crate::spec::Snapshot) -> Result<LiveEntries> {
         let metadata = self.table.metadata();
         let manifest_list = snapshot
@@ -287,34 +228,32 @@ impl RemoveDanglingDeleteFiles {
     }
 }
 
-/// The per-spec partition tuple a data/delete file belongs to (Java groups + joins on BOTH).
+/// The grouping key. Java groups and joins on the spec id and the partition tuple together.
 type GroupKey = (i32, Struct);
 
-/// A live DELETE entry: its [`DataFile`] (for the partition / spec / content / referenced-file fields and
-/// to feed the removal set) and its post-inheritance data sequence number.
+/// A live delete entry and its post-inheritance data sequence number.
 struct LiveDeleteEntry {
     data_file: DataFile,
     sequence_number: Option<i64>,
 }
 
-/// The live-entry view the dangling predicate runs over: the minimum live data sequence number per
-/// `(spec_id, partition)` group, the set of live data-file paths (for DV reference matching), and the
-/// live delete entries.
+/// The live-entry view the dangling predicate runs over.
 #[derive(Default)]
 struct LiveEntries {
-    /// `(spec_id, partition) -> min(data_sequence_number over live data files)` (Java `groupBy(...).agg
-    /// (min(sequence_number))`). A group ABSENT from this map means "no live data file in that
-    /// partition+spec" — the `min IS NULL` dangling case.
+    /// `(spec_id, partition) -> min(data_sequence_number)` over live data files. An absent group means
+    /// the partition and spec hold no live data file. That is the `min IS NULL` dangling case.
     min_data_seq_by_group: HashMap<GroupKey, Option<i64>>,
-    /// Every live data file's path (Java's `DATA_FILES.file_path` column), for the DV reference check.
+    /// Every live data file's path. The deletion-vector reference check matches against this set.
     live_data_file_paths: HashSet<String>,
     /// The live delete entries (position / equality / DV).
     live_delete_entries: Vec<LiveDeleteEntry>,
 }
 
-/// Take the minimum of two `Option<i64>` sequence numbers, treating `None` as "unknown / not yet set":
-/// `min(None, x) = x`. Both are populated for real on-disk entries (post-inheritance), so this only
-/// matters for the first insert.
+/// Take the minimum of two sequence numbers, where `None` means "not yet set": `min(None, x) = x`.
+///
+/// # Notes
+///
+/// Real on-disk entries always carry a sequence number, so `None` only occurs on the first insert.
 fn min_option(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     match (left, right) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -323,58 +262,54 @@ fn min_option(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     }
 }
 
-/// Compute the dangling delete files over a [`LiveEntries`] view — the pure core of the action (Java
-/// `findDanglingDeletes` + `findDanglingDvs`). Returns the [`DataFile`]s of every delete entry that can no
-/// longer apply to any live data file. Pure (no IO) so the dangling predicate — the off-by-one corruption
-/// edge — is unit-testable directly.
+/// Return every delete file that can no longer apply to any live data file.
+///
+/// # Notes
+///
+/// This is the pure core of the action. It does no IO, so the off-by-one corruption edge is
+/// unit-testable directly. Java splits it across `findDanglingDeletes` and `findDanglingDvs`.
 fn find_dangling_deletes(live: &LiveEntries) -> Vec<DataFile> {
     let mut dangling = Vec::new();
 
     for entry in &live.live_delete_entries {
         let data_file = &entry.data_file;
 
-        // A FILE-SCOPED delete — a DV, or any position delete whose referenced data file the READ
-        // path can derive (`referenced_data_file_location`: the explicit field, else equal
-        // `file_path`-column bounds) — dangles when that referenced path is not a live data-file
-        // path (Java `findDanglingDvs`). This is checked FIRST and independently of the
-        // sequence-number rule, because such a delete is routed BY PATH in
-        // [`crate::delete_file_index`] (Java `DeleteFileIndex.findPathDeletes` / `findDV`): the
-        // lookup consults neither the spec id nor the partition tuple, so the per-partition min-seq
-        // comparison says nothing about whether it still applies. Judging one by that rule would
-        // remove a delete file the reader still honors and resurrect the rows it masks —
-        // irreversibly, since the removal is a committed metadata change.
+        // A file-scoped delete dangles when its referenced path is not a live data-file path. The read
+        // path routes such a delete BY PATH in `crate::delete_file_index`, and that lookup consults
+        // neither the spec id nor the partition tuple. The per-partition min-seq rule therefore says
+        // nothing about whether it still applies. This check must come first. Judging a file-scoped
+        // delete by the min-seq rule removes a delete the reader still honors, and the masked rows
+        // resurrect permanently, because the removal is a committed metadata change.
         if let Some(referenced) = referenced_data_file_location(data_file) {
             if !live.live_data_file_paths.contains(&referenced) {
                 dangling.push(data_file.clone());
             }
             continue;
         }
-        // A DV with no `referenced_data_file` is malformed; treat it as dangling-by-absence (its
-        // reference can never match a live path), matching the leftouter-join-then-null semantics.
+        // A deletion vector with no `referenced_data_file` is malformed. Its reference can never match a
+        // live path, so it dangles by absence. This matches the left-outer-join-then-null semantics.
         if is_deletion_vector(data_file) {
             dangling.push(data_file.clone());
             continue;
         }
 
-        // Parquet position / equality delete: compare against its partition+spec group's minimum live
-        // data sequence number.
+        // A parquet position or equality delete compares against its group's minimum live data sequence
+        // number.
         let key = (data_file.partition_spec_id, data_file.partition().clone());
         match live.min_data_seq_by_group.get(&key) {
-            // `min_data_sequence_number IS NULL` — no live data file in this partition+spec. The delete
-            // applies to nothing, so it dangles regardless of content type or sequence number.
+            // The group holds no live data file, so the delete applies to nothing. It dangles whatever
+            // its content type and sequence number are.
             None | Some(None) => dangling.push(data_file.clone()),
             Some(Some(min_data_seq)) => {
                 let delete_seq = entry.sequence_number;
                 let is_dangling = match data_file.content_type() {
-                    // Position delete: dangling when `sequence_number < min_data_sequence_number` (STRICT
-                    // `<`). A position delete at the EXACT minimum still applies (read-path `delete_seq >=
-                    // data_seq`), so it is NOT dangling.
+                    // Strict `<`. A position delete at the exact minimum still applies, because the read
+                    // path uses `delete_seq >= data_seq`.
                     DataContentType::PositionDeletes => {
                         delete_seq.is_some_and(|seq| seq < *min_data_seq)
                     }
-                    // Equality delete: dangling when `sequence_number <= min_data_sequence_number`
-                    // (NON-strict `<=`). An equality delete applies STRICTLY to lower-seq data
-                    // (`delete_seq > data_seq`), so one at the exact minimum does NOT apply — it dangles.
+                    // Non-strict `<=`. An equality delete applies only to strictly lower-sequence data,
+                    // so one at the exact minimum does not apply, and it dangles.
                     DataContentType::EqualityDeletes => {
                         delete_seq.is_some_and(|seq| seq <= *min_data_seq)
                     }
@@ -390,9 +325,11 @@ fn find_dangling_deletes(live: &LiveEntries) -> Vec<DataFile> {
     dangling
 }
 
-/// Whether a delete file is a deletion vector (Java `ContentFileUtil.isDV`: format == PUFFIN). A PUFFIN
-/// position delete is file-scoped (keyed by its `referenced_data_file`), so it follows the DV dangling
-/// rule, not the per-partition min-seq rule.
+/// Report whether a delete file is a deletion vector, which means a Puffin-format position delete.
+///
+/// # Notes
+///
+/// A deletion vector is file-scoped, so it follows the reference rule, not the min-seq rule.
 fn is_deletion_vector(data_file: &DataFile) -> bool {
     data_file.content_type() == DataContentType::PositionDeletes
         && data_file.file_format() == DataFileFormat::Puffin
@@ -485,15 +422,18 @@ mod tests {
         live
     }
 
-    /// THE OFF-BY-ONE PIN (pos `<` vs eq `<=`). With a partition minimum data seq of 5:
-    /// - a position delete at seq 5 is NOT dangling (5 < 5 is false — same-seq pos applies);
-    /// - a position delete at seq 4 IS dangling (4 < 5);
-    /// - an equality delete at seq 5 IS dangling (5 <= 5 — same-seq eq does NOT apply);
-    /// - an equality delete at seq 6 is NOT dangling (6 <= 5 is false — it still applies).
+    /// The off-by-one pin. With a partition minimum data sequence of 5:
     ///
-    /// MUTATION: flip the position `<` to `<=` ⇒ the same-seq position delete is wrongly removed
-    /// (resurrection); flip the equality `<=` to `<` ⇒ the same-seq equality delete is wrongly kept
-    /// (dead-code dangling test). Both directions fail this test.
+    /// | Delete | Seq | Dangling |
+    /// |---|---|---|
+    /// | position | 5 | no |
+    /// | position | 4 | yes |
+    /// | equality | 5 | yes |
+    /// | equality | 6 | no |
+    ///
+    /// Mutation: flip the position `<` to `<=` and the same-sequence position delete is wrongly
+    /// removed, which resurrects rows. Flip the equality `<=` to `<` and the same-sequence equality
+    /// delete is wrongly kept. Both directions fail this test.
     #[test]
     fn test_dangling_predicate_off_by_one_between_position_and_equality() {
         let deletes = vec![
@@ -555,8 +495,8 @@ mod tests {
         );
     }
 
-    /// A delete in a partition+spec with NO live data file dangles regardless of content type or seq
-    /// (Java `min_data_sequence_number IS NULL`). Pins the join-miss branch.
+    /// A delete whose group holds no live data file dangles whatever its content type and sequence
+    /// number. This pins the join-miss branch.
     #[test]
     fn test_dangling_when_no_live_data_in_partition() {
         let deletes = vec![
@@ -598,9 +538,8 @@ mod tests {
         );
     }
 
-    /// CROSS-SPEC ISOLATION (pure-fn). The SAME partition tuple under a DIFFERENT spec id does not share
-    /// a minimum: a delete under spec 1 partition 0 is compared only against spec-1 data, not spec-0
-    /// data. With live data only under spec 0, a spec-1 delete dangles (no spec-1 data ⇒ min IS NULL).
+    /// Cross-spec isolation. One partition tuple under two spec ids does not share a minimum. A delete
+    /// under spec 1 compares only against spec-1 data, so it dangles when only spec-0 data is live.
     #[test]
     fn test_cross_spec_grouping_does_not_share_minimum() {
         let deletes = vec![LiveDeleteEntry {
@@ -627,20 +566,15 @@ mod tests {
         );
     }
 
-    /// THE IRREVERSIBLE-DELETE PIN (WG4b). A FILE-SCOPED position delete — one whose referenced data
-    /// file the read path can derive, either from the `referenced_data_file` field or from equal
-    /// `file_path`-column bounds — is routed BY PATH in
-    /// [`crate::delete_file_index`] (Java `DeleteFileIndex.findPathDeletes`), with no spec and no
-    /// partition condition. Classifying it dangling because its OWN partition+spec group holds no
-    /// live data file would delete a delete file the reader still honors, and the rows it masks would
-    /// resurrect — permanently, since the removal is a committed metadata change.
+    /// The irreversible-delete pin. The read path routes a file-scoped position delete BY PATH, with no
+    /// spec and no partition condition. Calling it dangling because its own group holds no live data
+    /// file removes a delete the reader still honors, and the masked rows resurrect permanently.
     ///
-    /// Both legs are pinned here alongside a non-file-scoped delete in the SAME empty group, which
-    /// must still dangle: the fix is "route by reference", not "stop collecting".
+    /// A non-file-scoped delete in the same empty group must still dangle. The rule is "route by
+    /// reference", not "stop collecting".
     ///
-    /// MUTATION: dropping the file-scoped leg (partition min-seq rule for every parquet delete) puts
-    /// both file-scoped deletes in the dangling set (RED); dropping the `contains` check (never
-    /// dangling once file-scoped) leaves `pos-file-scoped-gone.parquet` uncollected (RED).
+    /// Mutation: drop the file-scoped leg and both file-scoped deletes enter the dangling set. Drop the
+    /// `contains` check and `pos-file-scoped-gone.parquet` is never collected. Both turn this test red.
     #[test]
     fn test_file_scoped_position_delete_referencing_live_data_is_not_dangling() {
         let referenced_field = {
@@ -728,21 +662,16 @@ mod tests {
         );
     }
 
-    /// An EQUALITY delete is never file-scoped, whatever bounds it carries — Java's
-    /// `ContentFileUtil.referencedDataFile` returns null for `EQUALITY_DELETES` before it inspects
-    /// the field or the bounds. It must therefore keep being judged by the partition min-seq rule
-    /// here, not by whether some path it happens to bound is still live. Both directions:
+    /// An equality delete is never file-scoped, whatever bounds it carries. Java's
+    /// `ContentFileUtil.referencedDataFile` returns null for equality deletes before it reads the
+    /// bounds. The min-seq rule must judge it. Both directions:
     ///
-    /// - an equality delete in a partition with NO live data dangles (min IS NULL), even though its
-    ///   bounds name a live data file — otherwise it is kept forever (a GC miss);
-    /// - an equality delete that still applies (`seq > min`) does NOT dangle, even though its bounds
-    ///   name a file that is gone — removing it would RESURRECT the rows it masks in the live data
-    ///   files of its partition, and the removal is irreversible.
+    /// - it dangles when its partition holds no live data, even though its bounds name a live file;
+    /// - it does not dangle while it still applies, even though its bounds name a file that is gone.
+    ///   Removing it would resurrect the rows it masks, and the removal is irreversible.
     ///
-    /// MUTATION: dropping the equality early-return from `referenced_data_file_location` flips both
-    /// (the first is spared by reference, the second is collected by reference) — the second is the
-    /// corruption direction, and no read-path test catches it because the index routes by content
-    /// type before it ever consults the helper.
+    /// Mutation: drop the equality early return in `referenced_data_file_location` and both flip. No
+    /// read-path test catches the second case, because the index routes by content type first.
     #[test]
     fn test_equality_delete_with_path_bounds_is_judged_by_min_seq_not_by_reference() {
         let path_bounds = |path: &str| {
@@ -803,8 +732,8 @@ mod tests {
         );
     }
 
-    /// A DV whose referenced data file is not a live data-file path dangles; one whose reference IS live
-    /// does not (Java `findDanglingDvs`). Pins the DV branch both directions.
+    /// A deletion vector dangles when its reference is not a live data-file path, and does not dangle
+    /// when the reference is live. This pins both directions of the reference branch.
     #[test]
     fn test_dv_dangles_when_referenced_data_file_gone() {
         let live_dv = {
@@ -853,10 +782,7 @@ mod tests {
     }
 
     // =========================================================================================
-    // End-to-end tests — real parquet + real delete writers + real scans + real commits
-    //
-    // Harness mirrors maintenance/rewrite_data_files.rs: a local-fs memory catalog (REAL parquet
-    // on disk) + a table partitioned by identity(x) with three long columns x/y/z.
+    // End-to-end tests. Real parquet, real delete writers, real scans, real commits.
     // =========================================================================================
 
     async fn local_fs_catalog() -> (impl Catalog, TempDir) {
@@ -1067,14 +993,13 @@ mod tests {
         writer.close().await.unwrap().into_iter().next().unwrap()
     }
 
-    /// A REAL parquet position delete written with [`MetricsConfig::for_position_delete`] — the
-    /// config that forces the reserved `file_path` column to FULL metrics, so the produced delete
-    /// file carries EQUAL `file_path` lower/upper bounds and is FILE-SCOPED exactly as a
-    /// Java-written one is (Java's `PositionDeleteWriter.close()` never sets
-    /// `referenced_data_file`; it preserves those bounds instead).
+    /// Write a real parquet position delete with [`MetricsConfig::for_position_delete`]. That config
+    /// forces the reserved `file_path` column to full metrics, so the file carries equal `file_path`
+    /// bounds and is file-scoped, as a Java-written one is. Java's `PositionDeleteWriter` never sets
+    /// `referenced_data_file`; it preserves those bounds instead.
     ///
-    /// `part_value` is the partition tuple the delete is STAMPED with, which the caller deliberately
-    /// picks to differ from the referenced data file's.
+    /// `part_value` is the partition tuple the delete is stamped with. Callers pick one that differs
+    /// from the referenced data file's partition.
     async fn write_file_scoped_position_delete_file(
         table: &Table,
         part_value: i64,
@@ -1089,9 +1014,8 @@ mod tests {
             Some(uuid::Uuid::now_v7().to_string()),
             DataFileFormat::Parquet,
         );
-        // Production path: position_delete_writer_properties() disables the 64-byte parquet stats
-        // truncate so file_path bounds stay exact (QB / R113); MetricsConfig::for_position_delete
-        // keeps Full mode. See position_delete_writer module docs.
+        // position_delete_writer_properties() disables the 64-byte parquet stats truncate, so the
+        // file_path bounds stay exact. MetricsConfig::for_position_delete keeps Full mode.
         let parquet_builder =
             ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
                 .with_metrics_config(MetricsConfig::for_position_delete());
@@ -1137,8 +1061,8 @@ mod tests {
         tx.commit(catalog).await.unwrap()
     }
 
-    /// Write a REAL Puffin deletion vector referencing `data_file_path`, deleting the given positions
-    /// (mirrors `transaction::row_delta::tests::write_real_dv_file`). V3-only (DVs require V3).
+    /// Write a real Puffin deletion vector referencing `data_file_path` at the given positions.
+    /// Deletion vectors require format version 3.
     async fn write_real_dv_file(
         table: &Table,
         file_name: &str,
@@ -1166,8 +1090,7 @@ mod tests {
         dv_writer.close().await.unwrap().into_iter().next().unwrap()
     }
 
-    /// Scan the table and collect the `y` column values (merge-on-read deletes applied) — the real
-    /// read-side signal.
+    /// Scan the table and collect the `y` column values with merge-on-read deletes applied.
     async fn scan_y_values(table: &Table) -> HashSet<i64> {
         let stream = table
             .scan()
@@ -1227,16 +1150,12 @@ mod tests {
             .cloned()
     }
 
-    /// THE CROWN JEWEL (the resurrection door). A STILL-APPLICABLE equality delete (a live data file
-    /// with `data_seq < delete_seq`) must NOT be removed, and the scan must stay correct after the
-    /// action. Append X (seq 1, rows y=10/20/30 in partition 0), then an equality delete at seq 2
-    /// removing y=20. The delete applies (`1 < 2`), so it is NOT dangling. The action removes nothing,
-    /// and the scan still drops y=20.
+    /// The resurrection door. A still-applicable equality delete must survive the action, and the scan
+    /// must stay correct afterwards. Append X at sequence 1, then an equality delete at sequence 2
+    /// removing y=20. The delete applies, so the action removes nothing and the scan still drops y=20.
     ///
-    /// MUTATION: flip the equality `<=` to `<` in `find_dangling_deletes` ⇒ STILL leaves this delete
-    /// kept (1 < 2 either way); flip BOTH the comparison direction (`seq <= min` to `seq >= min` /
-    /// removing the strictness) is the real resurrection lever — captured by the off-by-one pure-fn
-    /// test. This e2e pins that the applicable delete survives a real action run + scan.
+    /// Mutation: flipping `<=` to `<` still keeps this delete. Reversing the comparison to `seq >= min`
+    /// is the real resurrection lever, and the off-by-one pure-function test catches that.
     #[tokio::test]
     async fn test_crown_jewel_still_applicable_equality_delete_not_removed() {
         let (catalog, _temp) = local_fs_catalog().await;
@@ -1282,13 +1201,10 @@ mod tests {
         );
     }
 
-    /// POSITION-DELETE EXACT-SEQ BOUNDARY (both directions, e2e). A position delete at the SAME data
-    /// sequence number as the only live data file is NOT dangling (same-seq pos applies). Append X
-    /// (seq 1), then a position delete at seq 2 deleting (X, pos 1). Compact X→X' PRESERVING seq 1
-    /// (so X' is seq 1). The position delete (seq 2) references the OLD X path which is now gone, but
-    /// it is partition-scoped (parquet), so it is compared against the partition minimum (1): seq 2 is
-    /// NOT < 1, so it is NOT dangling — and it no longer matches any live row (X is gone). The action
-    /// keeps it. This pins that a position delete at/above the partition min survives.
+    /// The position-delete exact-sequence boundary, end to end. Append X at sequence 1, then a position
+    /// delete at sequence 2. Compact X to X' preserving sequence 1. The position delete is
+    /// partition-scoped, so it compares against the partition minimum of 1. Sequence 2 is not below 1,
+    /// so the action keeps it. This pins that a position delete at or above the minimum survives.
     #[tokio::test]
     async fn test_position_delete_at_or_above_partition_min_is_not_dangling() {
         let (catalog, _temp) = local_fs_catalog().await;
@@ -1335,12 +1251,10 @@ mod tests {
         );
     }
 
-    /// A GENUINELY DANGLING equality delete (all referencing-era data rewritten to a HIGHER seq) IS
-    /// removed; the post-action scan is unchanged; the summary counter is correct. Append X (seq 1,
-    /// rows y=10/20/30), equality-delete y=20 (seq 2). Then compact X→X' with a FRESH (higher) seq via
-    /// a normal RewriteFiles (no seq preservation): the partition minimum jumps to X''s seq (3), so the
-    /// equality delete (seq 2) now dangles (`2 <= 3`). The action removes it. The scan is unchanged
-    /// because the fresh-seq rewrite already stopped the delete from applying (y=20 was already back).
+    /// A genuinely dangling equality delete is removed, the scan is unchanged, and the counter is
+    /// correct. Append X at sequence 1 and delete y=20 at sequence 2. Compact X to X' with a fresh
+    /// higher sequence, so the partition minimum jumps to 3 and the delete dangles. The scan does not
+    /// change, because the fresh-sequence rewrite already stopped the delete from applying.
     #[tokio::test]
     async fn test_genuinely_dangling_equality_delete_is_removed_with_counter() {
         let (catalog, _temp) = local_fs_catalog().await;
@@ -1414,11 +1328,9 @@ mod tests {
         );
     }
 
-    /// A DANGLING POSITION-DELETE PARQUET (its referenced data file rewritten away to a higher seq) IS
-    /// removed. This converges with the 1.10.0 carry-posture trace: a plain RewriteFiles KEEPS the
-    /// now-dangling parquet position delete (carry-unchanged posture); THIS action is the cleaner.
-    /// Append X (seq 1), position-delete (X, 1) at seq 2, then compact X→X' FRESH-seq (X' seq 3): the
-    /// partition minimum jumps to 3, so the position delete (seq 2) dangles (`2 < 3`). Removed.
+    /// A dangling parquet position delete is removed. A plain RewriteFiles keeps it, so this action is
+    /// the cleaner. Append X at sequence 1 and a position delete at sequence 2. Compact X to X' with a
+    /// fresh sequence 3, so the partition minimum jumps to 3 and the position delete dangles.
     #[tokio::test]
     async fn test_dangling_position_delete_parquet_removed_after_data_rewritten_away() {
         let (catalog, _temp) = local_fs_catalog().await;
@@ -1486,10 +1398,9 @@ mod tests {
         );
     }
 
-    /// PARTITION ISOLATION (e2e). A delete dangling in partition A but applicable in partition B: the
-    /// applicable one is KEPT, the dangling one is removed. Partition 0 has X (seq 1) + an applicable
-    /// eq delete (seq 2, applies `1 < 2`). Partition 1's data is rewritten to a fresh higher seq, so its
-    /// eq delete dangles. The action removes ONLY the partition-1 delete.
+    /// Partition isolation, end to end. Partition 0 holds X at sequence 1 and an applicable equality
+    /// delete at sequence 2. Partition 1's data is rewritten to a fresh higher sequence, so its equality
+    /// delete dangles. The action removes only the partition-1 delete.
     #[tokio::test]
     async fn test_partition_isolation_dangling_in_one_applicable_in_other() {
         let (catalog, _temp) = local_fs_catalog().await;
@@ -1548,8 +1459,8 @@ mod tests {
         );
     }
 
-    /// EMPTY PLAN NO-OP (no commit). A table with deletes that all still apply commits NOTHING — the
-    /// snapshot id is unchanged. Pins that the action does not mint an empty Replace snapshot.
+    /// A table whose deletes all still apply commits nothing, and the snapshot id does not change. This
+    /// pins that the action never mints an empty Replace snapshot.
     #[tokio::test]
     async fn test_empty_plan_is_a_no_op_no_commit() {
         let (catalog, _temp) = local_fs_catalog().await;
@@ -1592,11 +1503,10 @@ mod tests {
         assert!(result.removed_delete_files.is_empty());
     }
 
-    /// PRODUCER-ROUTING MUTATION PIN: the removed delete file must actually be TOMBSTONED in the
-    /// rewritten DELETE manifest (not just reported in the result). After removing a dangling equality
-    /// delete, the rewritten DELETE manifest must carry it as a Deleted tombstone — the read path stops
-    /// applying it. Mutation (sever the RewriteFiles producer routing — make `with_removed_delete_files`
-    /// inert) ⇒ this test fails (the delete stays live).
+    /// The removed delete file must be tombstoned in the rewritten DELETE manifest, not only reported in
+    /// the result. Only then does the read path stop applying it.
+    ///
+    /// Mutation: make `with_removed_delete_files` inert and the delete stays live, which fails here.
     #[tokio::test]
     async fn test_removed_delete_is_tombstoned_in_rewritten_manifest() {
         use crate::spec::ManifestContentType;
@@ -1650,22 +1560,18 @@ mod tests {
         );
     }
 
-    /// THE IRREVERSIBLE-DELETE PIN, end to end through REAL parquet metrics (WG4b).
+    /// The irreversible-delete pin, end to end through real parquet metrics.
     ///
-    /// A position delete written with [`MetricsConfig::for_position_delete`] carries EQUAL
-    /// `file_path` bounds and is therefore FILE-SCOPED — Java routes it by the referenced data
-    /// file's path with no spec and no partition condition. Here it is deliberately STAMPED with
-    /// partition `x=2`, which holds no live data file, while the file it references lives in `x=1`.
+    /// A position delete written with [`MetricsConfig::for_position_delete`] carries equal `file_path`
+    /// bounds, so it is file-scoped and routes by path. This one is stamped with partition `x=2`, which
+    /// holds no live data file, while the file it references lives in `x=1`.
     ///
-    /// Two things must hold together, and each protects the other: the READ path must apply it
-    /// (else the masked row resurrects on every scan), and the maintenance action must NOT collect
-    /// it (else the delete file is tombstoned by a committed metadata change and the row resurrects
-    /// permanently). Before the path-keyed routing landed, the read path dropped it (`x=1` never
-    /// consults the `x=2` bucket) and the action removed it as dangling.
+    /// Two things must hold together. The read path must apply the delete, or the masked row returns on
+    /// every scan. The action must not collect it, or a committed metadata change resurrects the row
+    /// permanently.
     ///
-    /// MUTATION: reverting the maintenance file-scoped leg removes the delete and fails the
-    /// `removed_delete_files.is_empty()` assertion; reverting the index's path map fails the first
-    /// `scan_y_values` assertion with `{10, 20, 30}`.
+    /// Mutation: revert the file-scoped leg and `removed_delete_files.is_empty()` fails. Revert the
+    /// index's path map and the first `scan_y_values` assertion fails with `{10, 20, 30}`.
     #[tokio::test]
     async fn test_file_scoped_position_delete_in_a_foreign_partition_applies_and_survives() {
         let (catalog, _temp) = local_fs_catalog().await;
@@ -1681,10 +1587,8 @@ mod tests {
         let a_path = a.file_path().to_string();
         let table = append_files(&catalog, &table, vec![a]).await;
 
-        // A FILE-SCOPED position delete for A's position 1 (y=20), stamped partition x=2 — a
-        // partition holding NO live data file. This is the shape a writer that stamps the delete
-        // with the table's default/current partitioning instead of the deleted-from data file's
-        // produces, and the shape Java routes purely by path.
+        // A file-scoped position delete for A's position 1, stamped with partition x=2, which holds no
+        // live data file. A writer that stamps the table's default partitioning produces this shape.
         let delete =
             write_file_scoped_position_delete_file(&table, 2, &[(a_path.clone(), 1)]).await;
         let delete_path = delete.file_path().to_string();
@@ -1717,9 +1621,8 @@ mod tests {
             "the file-scoped delete drops y=20 despite the partition mismatch"
         );
 
-        // MAINTENANCE PATH: partition x=2 holds no live data file, so the partition min-seq rule
-        // would call this delete dangling and REMOVE it — an irreversible metadata change that
-        // would resurrect y=20. It must be kept.
+        // Partition x=2 holds no live data file, so the min-seq rule would call this delete dangling.
+        // Removing it is an irreversible metadata change that resurrects y=20. It must be kept.
         let result = RemoveDanglingDeleteFiles::new(table.clone())
             .execute(&catalog)
             .await
@@ -1746,9 +1649,8 @@ mod tests {
         );
     }
 
-    /// The counterpart of the test above: once the referenced data file is gone, the SAME
-    /// file-scoped delete is genuinely dangling and IS collected — the leg is "route by reference",
-    /// not "never collect".
+    /// The counterpart of the test above. Once the referenced data file is gone, the same file-scoped
+    /// delete is genuinely dangling and is collected.
     #[tokio::test]
     async fn test_file_scoped_position_delete_is_collected_once_its_referenced_file_is_gone() {
         let (catalog, _temp) = local_fs_catalog().await;
@@ -1816,19 +1718,14 @@ mod tests {
         );
     }
 
-    /// DELETION-VECTOR E2E (the builder's flagged gap, added by the reviewer). A real Puffin DV
-    /// referencing data file A is carried forward (Rust carry-posture) when A is rewritten to A' via a
-    /// plain RewriteFiles; the DV now references a GONE data file, so it dangles. This action removes it.
-    /// The scan is correct before AND after — A' carries no DV, so the masked row is already back after
-    /// the rewrite, and removing the dangling DV does not change the read result.
+    /// Deletion vectors, end to end. A plain RewriteFiles of data file A carries a real Puffin deletion
+    /// vector forward. The vector now references a gone file, so it dangles, and this action removes it.
+    /// The scan is correct before and after: A' carries no vector, so the masked row is already back.
     ///
-    /// Posture surfaced (module doc): 1.10.0 AUTO-prunes dangling DVs at RewriteFiles time
-    /// (`isDanglingDV` gated on PUFFIN), so Java rarely needs the action for DVs; Rust's RewriteFiles
-    /// carries the dangling DV forward and RELIES on this action to clean it. Pinned `removed-dvs: 1`.
+    /// Java prunes a dangling deletion vector during RewriteFiles, so it rarely needs this action for
+    /// them. The fork's RewriteFiles carries it forward and relies on this action instead.
     ///
-    /// Risk pinned: the DV branch never firing e2e (the builder pinned it pure-fn only); a real DV whose
-    /// referenced file is gone must be removed AND the read result must be unchanged (no resurrection,
-    /// no over-clean).
+    /// The risk pinned is a reference branch that never fires end to end.
     #[tokio::test]
     async fn test_dangling_deletion_vector_removed_after_referenced_data_rewritten_away() {
         use crate::spec::ManifestContentType;
@@ -1860,8 +1757,8 @@ mod tests {
             "the DV drops y=20 before the rewrite"
         );
 
-        // Plain RewriteFiles A->A' (fresh seq). A' has a NEW path, so the DV (keyed by A's path) no
-        // longer applies; y=20 comes back. The carry-posture KEEPS the now-dangling DV.
+        // A plain RewriteFiles gives A' a new path, so the vector no longer applies and y=20 comes back.
+        // The carry posture keeps the now-dangling vector.
         let a_prime = write_data_file(&table, "a-prime.parquet", 0, &[
             (0, 10, 100),
             (0, 20, 200),

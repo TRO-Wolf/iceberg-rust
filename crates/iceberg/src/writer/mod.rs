@@ -17,28 +17,14 @@
 
 //! Iceberg writer module.
 //!
-//! This module contains the generic writer trait and specific writer implementation. We categorize the writer into two types:
-//! 1. FileWriter: writer for physical file format (Such as parquet, orc).
-//! 2. IcebergWriter: writer for logical format provided by iceberg table (Such as data file, equality delete file, position delete file)
-//!    or other function (Such as partition writer, delta writer).
+//! Two writer layers compose. A `FileWriter` writes a physical file, such as Parquet or ORC. An
+//! `IcebergWriter` writes a logical Iceberg file, such as a data file or a delete file, and uses a
+//! `FileWriter` inside. Partitioning writers wrap an `IcebergWriter`.
 //!
-//! The IcebergWriter will use the inner FileWriter to write physical files.
+//! Each layer has a builder trait beside it: `FileWriterBuilder` and `IcebergWriterBuilder`.
+//! Build a writer by nesting the builders. Implement `IcebergWriter` to add your own layer.
 //!
-//! The writer interface is designed to be extensible and flexible. Writers can be independently configured
-//! and composed to support complex write logic. E.g. By combining `FanoutPartitionWriter`, `DataFileWriter`, and `ParquetWriter`,
-//! you can build a writer that automatically partitions the data and writes it in the Parquet format.
-//!
-//! For this purpose, there are four trait corresponding to these writer:
-//! - IcebergWriterBuilder
-//! - IcebergWriter
-//! - FileWriterBuilder
-//! - FileWriter
-//!
-//! Users can create specific writer builders, combine them, and build the final writer.
-//! They can also define custom writers by implementing the `Writer` trait,
-//! allowing seamless integration with existing writers. (See the example below.)
-//!
-//! # Simple example for the data file writer used parquet physical format:
+//! # Data file writer over Parquet
 //! ```rust, no_run
 //! use std::collections::HashMap;
 //! use std::sync::Arc;
@@ -58,7 +44,6 @@
 //! use parquet::file::properties::WriterProperties;
 //! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> Result<()> {
-//!     // Connect to a catalog.
 //!     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 //!     use iceberg::writer::file_writer::rolling_writer::{
 //!         RollingFileWriter, RollingFileWriterBuilder,
@@ -72,9 +57,7 @@
 //!             )]),
 //!         )
 //!         .await?;
-//!     // Add customized code to create a table first.
 //!
-//!     // Load table from catalog.
 //!     let table = catalog
 //!         .load_table(&TableIdent::from_strs(["hello", "world"])?)
 //!         .await?;
@@ -85,13 +68,11 @@
 //!         iceberg::spec::DataFileFormat::Parquet,
 //!     );
 //!
-//!     // Create a parquet file writer builder. The parameter can get from table.
 //!     let parquet_writer_builder = ParquetWriterBuilder::new(
 //!         WriterProperties::default(),
 //!         table.metadata().current_schema().clone(),
 //!     );
 //!
-//!     // Create a rolling file writer using parquet file writer builder.
 //!     let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
 //!         parquet_writer_builder,
 //!         table.file_io().clone(),
@@ -99,49 +80,33 @@
 //!         file_name_generator.clone(),
 //!     );
 //!
-//!     // Create a data file writer using parquet file writer builder.
 //!     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
-//!     // Build the data file writer
 //!     let mut data_file_writer = data_file_writer_builder.build(None).await?;
 //!
 //!     // Write the data using data_file_writer...
 //!
-//!     // Close the write and it will return data files back
+//!     // `close` returns the data files to commit.
 //!     let data_files = data_file_writer.close().await.unwrap();
 //!
 //!     Ok(())
 //! }
 //! ```
 //!
-//! # Custom writer to record latency
+//! # Custom writer layer
+//!
+//! Implement both traits to wrap any writer. This one records latency.
+//!
 //! ```rust, no_run
-//! use std::collections::HashMap;
 //! use std::time::Instant;
 //!
 //! use arrow_array::RecordBatch;
-//! use iceberg::io::FileIOBuilder;
-//! use iceberg::memory::MemoryCatalogBuilder;
+//! use iceberg::Result;
 //! use iceberg::spec::{DataFile, PartitionKey};
-//! use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-//! use iceberg::writer::file_writer::ParquetWriterBuilder;
-//! use iceberg::writer::file_writer::location_generator::{
-//!     DefaultFileNameGenerator, DefaultLocationGenerator,
-//! };
 //! use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-//! use iceberg::{Catalog, CatalogBuilder, MemoryCatalog, Result, TableIdent};
-//! use parquet::file::properties::WriterProperties;
 //!
 //! #[derive(Clone)]
 //! struct LatencyRecordWriterBuilder<B> {
 //!     inner_writer_builder: B,
-//! }
-//!
-//! impl<B: IcebergWriterBuilder> LatencyRecordWriterBuilder<B> {
-//!     pub fn new(inner_writer_builder: B) -> Self {
-//!         Self {
-//!             inner_writer_builder,
-//!         }
-//!     }
 //! }
 //!
 //! #[async_trait::async_trait]
@@ -154,6 +119,7 @@
 //!         })
 //!     }
 //! }
+//!
 //! struct LatencyRecordWriter<W> {
 //!     inner_writer: W,
 //! }
@@ -164,7 +130,6 @@
 //!         let start = Instant::now();
 //!         self.inner_writer.write(input).await?;
 //!         let _latency = start.elapsed();
-//!         // record latency...
 //!         Ok(())
 //!     }
 //!
@@ -172,87 +137,18 @@
 //!         let start = Instant::now();
 //!         let res = self.inner_writer.close().await?;
 //!         let _latency = start.elapsed();
-//!         // record latency...
 //!         Ok(res)
 //!     }
 //! }
-//!
-//! #[tokio::main(flavor = "current_thread")]
-//! async fn main() -> Result<()> {
-//!     // Connect to a catalog.
-//!     use iceberg::memory::MEMORY_CATALOG_WAREHOUSE;
-//!     use iceberg::spec::{Literal, PartitionKey, Struct};
-//!     use iceberg::writer::file_writer::rolling_writer::{
-//!         RollingFileWriter, RollingFileWriterBuilder,
-//!     };
-//!
-//!     let catalog = MemoryCatalogBuilder::default()
-//!         .load(
-//!             "memory",
-//!             HashMap::from([(
-//!                 MEMORY_CATALOG_WAREHOUSE.to_string(),
-//!                 "file:///path/to/warehouse".to_string(),
-//!             )]),
-//!         )
-//!         .await?;
-//!
-//!     // Add customized code to create a table first.
-//!
-//!     // Load table from catalog.
-//!     let table = catalog
-//!         .load_table(&TableIdent::from_strs(["hello", "world"])?)
-//!         .await?;
-//!     let partition_key = PartitionKey::new(
-//!         table.metadata().default_partition_spec().as_ref().clone(),
-//!         table.metadata().current_schema().clone(),
-//!         Struct::from_iter(vec![Some(Literal::string("Seattle"))]),
-//!     )?;
-//!     let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-//!     let file_name_generator = DefaultFileNameGenerator::new(
-//!         "test".to_string(),
-//!         None,
-//!         iceberg::spec::DataFileFormat::Parquet,
-//!     );
-//!
-//!     // Create a parquet file writer builder. The parameter can get from table.
-//!     let parquet_writer_builder = ParquetWriterBuilder::new(
-//!         WriterProperties::default(),
-//!         table.metadata().current_schema().clone(),
-//!     );
-//!
-//!     // Create a rolling file writer
-//!     let rolling_file_writer_builder = RollingFileWriterBuilder::new(
-//!         parquet_writer_builder,
-//!         512 * 1024 * 1024,
-//!         table.file_io().clone(),
-//!         location_generator.clone(),
-//!         file_name_generator.clone(),
-//!     );
-//!
-//!     // Create a data file writer builder using rolling file writer.
-//!     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
-//!     // Create latency record writer using data file writer builder.
-//!     let latency_record_builder = LatencyRecordWriterBuilder::new(data_file_writer_builder);
-//!     // Build the final writer
-//!     let mut latency_record_data_file_writer = latency_record_builder
-//!         .build(Some(partition_key))
-//!         .await
-//!         .unwrap();
-//!
-//!     Ok(())
-//! }
 //! ```
 //!
-//! # Adding Partitioning to Data File Writers
+//! # Partitioning writers
 //!
-//! You can wrap a `DataFileWriter` with partitioning writers to handle partitioned tables.
-//! Iceberg provides two partitioning strategies:
+//! A partitioning writer wraps a `DataFileWriter` to write a partitioned table.
 //!
 //! ## FanoutWriter - For Unsorted Data
 //!
-//! Wraps the data file writer to handle unsorted data by maintaining multiple active writers.
-//! Use this when your data is not pre-sorted by partition key. Writes to different partitions
-//! can happen in any order, even interleaved.
+//! `FanoutWriter` keeps one writer open per partition, so writes may arrive in any order.
 //!
 //! ```rust, no_run
 //! # // Same setup as the simple example above...
@@ -315,8 +211,8 @@
 //!
 //! ## ClusteredWriter - For Sorted Data
 //!
-//! Wraps the data file writer for pre-sorted data. More memory efficient as it maintains
-//! only one active writer at a time, but requires input sorted by partition key.
+//! `ClusteredWriter` keeps one writer open in total, so it uses less memory. It needs input
+//! already sorted by partition key. A write that returns to a closed partition fails.
 //!
 //! ```rust, no_run
 //! # // Same setup as the simple example above...
@@ -410,15 +306,16 @@ pub trait IcebergWriterBuilder<I = DefaultInput, O = DefaultOutput>: Send + Sync
 pub trait IcebergWriter<I = DefaultInput, O = DefaultOutput>: Send + 'static {
     /// Write data to iceberg table.
     async fn write(&mut self, input: I) -> Result<()>;
-    /// Close the writer and return the written data files.
-    /// If close failed, the data written before maybe be lost. User may need to recreate the writer and rewrite the data again.
-    /// # NOTE
-    /// After close, regardless of success or failure, the writer should never be used again, otherwise the writer will panic.
+    /// Close the writer and return the written data files. A failed close may lose the
+    /// data already written. Build a new writer and write it again.
+    ///
+    /// # Panics
+    ///
+    /// Any call after `close` panics, whether the close succeeded or failed.
     async fn close(&mut self) -> Result<O>;
 }
 
-/// The current file status of the Iceberg writer.
-/// This is implemented for writers that write a single file at a time.
+/// The current file status. Only a writer that holds one file at a time implements this.
 pub trait CurrentFileStatus {
     /// Get the current file path.
     fn current_file_path(&self) -> String;
@@ -439,7 +336,7 @@ mod tests {
     use crate::io::FileIO;
     use crate::spec::{DataFile, DataFileFormat};
 
-    // This function is used to guarantee the trait can be used as an object safe trait.
+    // Compile-time proof that the trait stays object safe. Never called.
     async fn _guarantee_object_safe(mut w: Box<dyn IcebergWriter>) {
         let _ = w
             .write(RecordBatch::new_empty(Schema::empty().into()))
@@ -447,9 +344,8 @@ mod tests {
         let _ = w.close().await;
     }
 
-    // This function check:
-    // The data of the written parquet file is correct.
-    // The metadata of the data file is consistent with the written parquet file.
+    // Assert the Parquet file reads back as the batch written, and that the DataFile
+    // metadata matches it.
     pub(crate) async fn check_parquet_data_file(
         file_io: &FileIO,
         data_file: &DataFile,
@@ -458,12 +354,10 @@ mod tests {
         assert_eq!(data_file.file_format, DataFileFormat::Parquet);
 
         let input_file = file_io.new_input(data_file.file_path.clone()).unwrap();
-        // read the written file
         let input_content = input_file.read().await.unwrap();
         let reader_builder =
             ParquetRecordBatchReaderBuilder::try_new(input_content.clone()).unwrap();
 
-        // check data
         let reader = reader_builder.build().unwrap();
         let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
         let res = concat_batches(&batch.schema(), &batches).unwrap();

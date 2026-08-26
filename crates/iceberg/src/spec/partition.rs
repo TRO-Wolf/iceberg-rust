@@ -155,26 +155,16 @@ impl PartitionSpec {
         true
     }
 
-    /// Returns partition path string containing partition type and partition
-    /// value as key-value pairs.
+    /// Returns the partition path: `name=value` pairs joined by `/`. Both sides of each pair are
+    /// URL-escaped like Java (see [`escape_partition_path_component`]), so a `/`, `=` or space in a
+    /// name or a value cannot forge path structure. A NULL value renders `name=null`.
     ///
-    /// Both sides of every `name=value` pair are URL-escaped exactly as Java escapes them (see
-    /// [`escape_partition_path_component`]), so a `/`, `=` or space inside a partition-field name
-    /// or value can never forge path structure. The `=` inside a pair and the `/` between pairs are
-    /// structure and stay raw.
+    /// # Notes
     ///
-    /// TOTAL: a `(spec, schema, data)` triple that is not self-consistent renders `null` for the
-    /// offending field (and emits a `tracing::warn!`) rather than aborting. That mirrors Java's
-    /// leniency for the one case it tolerates — `PartitionData.get(pos)` returns `null` past the
-    /// end of the tuple and `Transform.toHumanString(type, null)` renders the literal `"null"`
-    /// (1.10.0 bytecode) — and extends it to the cases Java rejects with an exception, because this
-    /// signature cannot report failure and the callers on the write path (the infallible
-    /// [`LocationGenerator`](crate::writer::file_writer::location_generator::LocationGenerator)
-    /// trait) and the commit path (`SnapshotProducer::summary`) must not abort a long-running
-    /// engine. Use [`PartitionSpec::try_partition_to_path`] to surface those cases as typed errors:
-    /// it returns exactly this string whenever it returns `Ok`.
-    ///
-    /// A NULL partition value is NOT an anomaly — it renders `name=null` on both paths.
+    /// The call is TOTAL. An inconsistent `(spec, schema, data)` triple renders `null` for the
+    /// offending field and warns. This is wider than Java, which throws for all but a short tuple.
+    /// The write and commit callers cannot report failure and must not abort a long-running engine.
+    /// [`PartitionSpec::try_partition_to_path`] returns this same string on `Ok`, with typed errors.
     pub fn partition_to_path(&self, data: &Struct, schema: SchemaRef) -> String {
         let field_types = self.lenient_partition_field_types(&schema);
 
@@ -205,18 +195,15 @@ impl PartitionSpec {
             .join("/")
     }
 
-    /// The fallible sibling of [`PartitionSpec::partition_to_path`]: returns the SAME string on
-    /// `Ok` (escaping included), and a typed error when the `(spec, schema, data)` triple is not
-    /// self-consistent — the
-    /// partition type cannot be derived under `schema`, the tuple is shorter than the spec, a value
-    /// is not a primitive literal, or a value's literal kind is not compatible with its partition
-    /// field's type (`PrimitiveType::compatible`, the same predicate the commit path's
-    /// `validate_partition_value` uses).
+    /// The fallible sibling of [`PartitionSpec::partition_to_path`]. Returns the SAME string on
+    /// `Ok`, escaping included.
     ///
-    /// Two shapes are deliberately NOT errors, on either path: a NULL value (a first-class Iceberg
-    /// partition value), and a missing value for a [`Transform::Void`] field (its value is always
-    /// null, and an all-`void` spec reports [`PartitionSpec::is_unpartitioned`] — callers that
-    /// branch on that legitimately pair it with an empty tuple).
+    /// # Errors
+    ///
+    /// Returns an error when the `(spec, schema, data)` triple is not self-consistent: the
+    /// partition type is not derivable under `schema`, the tuple is shorter than the spec, a value
+    /// is not a primitive literal, or a value's literal kind fails `PrimitiveType::compatible`.
+    /// A NULL value, and a missing value for a [`Transform::Void`] field, are NOT errors.
     pub fn try_partition_to_path(&self, data: &Struct, schema: SchemaRef) -> Result<String> {
         let partition_type = self.partition_type(&schema)?;
         let mut rendered = Vec::with_capacity(self.fields.len());
@@ -233,12 +220,9 @@ impl PartitionSpec {
         Ok(rendered.join("/"))
     }
 
-    /// Validates that `(self, schema, data)` is a self-consistent partition triple without
-    /// building a path string. Same acceptance rules as [`Self::try_partition_to_path`].
-    ///
-    /// Used by [`PartitionKey::new`] so key construction does not pay for human-string rendering
-    /// and escaping on every write-path construction. Crate-private: not part of the public
-    /// breaking surface of Unit 3.
+    /// Validates that `(self, schema, data)` is self-consistent, and builds no path string. Same
+    /// rules as [`Self::try_partition_to_path`]. [`PartitionKey::new`] uses it, so key construction
+    /// does not pay for human-string rendering and escaping.
     pub(crate) fn validate_partition_data(&self, data: &Struct, schema: &Schema) -> Result<()> {
         let partition_type = self.partition_type(schema)?;
         for (index, (field, field_type)) in
@@ -249,11 +233,9 @@ impl PartitionSpec {
         Ok(())
     }
 
-    /// Per-field partition types for the TOTAL path: the same computation
-    /// [`PartitionSpec::partition_type`] performs, but per field and lenient — a field whose source
-    /// column is absent from `schema` (or whose transform rejects that column's type) yields `None`
-    /// instead of failing the whole call. Java's `PartitionSpec.partitionType()` is lenient the same
-    /// way, substituting `Types.UnknownType` for an absent source column (1.10.0 bytecode).
+    /// Per-field partition types for the TOTAL path. Lenient: a field whose source column is absent
+    /// from `schema`, or whose transform rejects that column's type, yields `None` instead of
+    /// failing the call. Java's `PartitionSpec.partitionType()` substitutes `UnknownType`.
     fn lenient_partition_field_types(&self, schema: &Schema) -> Vec<Option<Type>> {
         self.fields
             .iter()
@@ -276,8 +258,7 @@ impl PartitionSpec {
     ) -> Result<Option<(&'a Type, &'a super::Literal)>> {
         let Some(slot) = data.fields().get(index) else {
             // Past the end of the tuple. A `void` field's value is always null, so a missing slot
-            // for one carries no information — not an anomaly (this is the pair an all-`void`
-            // spec's `is_unpartitioned()` callers legitimately produce).
+            // carries no information. An all-`void` spec's `is_unpartitioned()` callers produce it.
             if field.transform == Transform::Void {
                 return Ok(None);
             }
@@ -340,13 +321,12 @@ impl PartitionSpec {
         Ok(Some((field_type, literal)))
     }
 
-    /// Render one escaped `name=value` pair, or describe why it cannot be rendered. `field_type` is
-    /// `None` when the field's partition type could not be derived under the schema in use.
+    /// Render one escaped `name=value` pair, or describe why it cannot render. `field_type` is
+    /// `None` when the field's partition type is not derivable under the schema in use.
     ///
-    /// Every `Ok` return is a pair that renders without aborting: the value is either absent/NULL
-    /// (rendered `null`) or a primitive literal whose kind `PrimitiveType::compatible` accepts for
-    /// the field's primitive partition type — a strict subset of the pairs `Display for Datum` can
-    /// format, which is what [`Transform::to_human_string`] ultimately calls.
+    /// Every `Ok` return renders without aborting: the value is absent or NULL, or a primitive
+    /// literal whose kind `PrimitiveType::compatible` accepts. That set is a subset of what
+    /// `Display for Datum` can format.
     fn render_partition_field(
         field: &PartitionField,
         field_type: Option<&Type>,
@@ -368,20 +348,10 @@ const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 /// Escape one side of a partition path's `name=value` pair exactly as Java escapes it.
 ///
-/// Java 1.10.0: `PartitionSpec.escape(String)` is a one-liner —
-/// `java.net.URLEncoder.encode(s, "UTF-8")` — and `partitionToPath` is its only caller, passing
-/// BOTH the partition-field name and the transform's human string through it. `URLEncoder` is
-/// `application/x-www-form-urlencoded`, **not** RFC-3986 percent-encoding:
-///
-/// * `A-Z`, `a-z`, `0-9`, `-`, `_`, `.` and `*` pass through unchanged;
-/// * a space becomes `+` (so `"a b"` and `"a+b"` stay distinct: the latter becomes `a%2Bb`);
-/// * every other character becomes one `%XX` group per UTF-8 byte, with UPPERCASE hex digits.
-///
-/// Iterating BYTES is equivalent to Java's UTF-16 `char` loop: every pass-through character is
-/// single-byte ASCII and every byte of a multi-byte UTF-8 sequence is `>= 0x80`, so no lead or
-/// continuation byte can be mistaken for a safe character. Java's one remaining case — an unpaired
-/// surrogate, which it encodes as `?` — is unreachable here, because a Rust `str` is always
-/// well-formed UTF-8.
+/// Java `PartitionSpec.escape` is `java.net.URLEncoder.encode(s, "UTF-8")`. That is
+/// `application/x-www-form-urlencoded`, NOT RFC-3986: `A-Z a-z 0-9 - _ . *` pass through, a space
+/// becomes `+`, and every other character becomes one UPPERCASE `%XX` group per UTF-8 byte. A byte
+/// loop matches Java's `char` loop, and Java's unpaired-surrogate case cannot occur on a Rust `str`.
 fn escape_partition_path_component(component: &str) -> String {
     let mut escaped = String::with_capacity(component.len());
     for &byte in component.as_bytes() {
@@ -400,15 +370,12 @@ fn escape_partition_path_component(component: &str) -> String {
     escaped
 }
 
-/// Render one escaped `name=value` pair — the body of Java's `partitionToPath` loop. Both sides go
-/// through [`escape_partition_path_component`]; the `=` between them (and the `/` the callers join
-/// pairs with) is path STRUCTURE and stays raw. Every pair the partition path emits is built here,
-/// so the escaping cannot be missed on one branch.
+/// Render one escaped `name=value` pair, the body of Java's `partitionToPath` loop. The `=` and the
+/// joining `/` are path STRUCTURE and stay raw. Every pair the partition path emits is built here,
+/// so no branch can miss the escaping.
 ///
-/// There are FOUR call sites — the rendered-value branch and the three `name=null` branches (the
-/// lenient fallback in [`PartitionSpec::partition_to_path`], the `void`-past-end-of-tuple branch,
-/// and the NULL-literal branch) — and each is pinned INDIVIDUALLY: unescaping any one of them
-/// alone reds a distinct test in `partition_path_escaping_tests`.
+/// Four call sites reach it: the rendered-value branch and three `name=null` branches. Each one is
+/// pinned individually in `partition_path_escaping_tests`.
 fn escaped_partition_pair(name: &str, value: &str) -> String {
     format!(
         "{}={}",
@@ -432,26 +399,21 @@ pub struct PartitionKey {
 impl PartitionKey {
     /// Creates a new partition key with the given spec, schema, and data.
     ///
-    /// Validates that `(spec, schema, data)` is self-consistent using the same rules as
-    /// [`PartitionSpec::try_partition_to_path`] (via an internal validate-only path that does not
-    /// allocate a rendered path string): the partition type must be derivable under `schema`, the
-    /// tuple must cover every non-`void` field, each present value must be a primitive literal, and
-    /// each value's literal kind must be compatible with its partition field's type. A NULL slot is
-    /// legal. An all-`void` (or unpartitioned) spec may pair with an empty tuple.
+    /// # Errors
     ///
-    /// Returns [`ErrorKind::DataInvalid`] or [`ErrorKind::Unexpected`] when validation fails —
-    /// an invalid partition tuple is unrepresentable as a [`PartitionKey`] (Java-parity posture:
-    /// `StructTransform` sizes the tuple from the spec and rejects a missing source accessor).
+    /// Returns [`ErrorKind::DataInvalid`] or [`ErrorKind::Unexpected`] when `(spec, schema, data)`
+    /// is not self-consistent, under the same rules as
+    /// [`PartitionSpec::try_partition_to_path`]. An invalid partition tuple is unrepresentable as a
+    /// [`PartitionKey`], matching Java's `StructTransform`. A NULL slot is legal, and an all-`void`
+    /// spec may pair with an empty tuple.
     pub fn new(spec: PartitionSpec, schema: SchemaRef, data: Struct) -> Result<Self> {
-        // Validate without building a path string so write-path construction does not pay for
-        // human-string rendering + escaping on every key. Same rules as try_partition_to_path.
+        // Validate without building a path string, so the write path does not pay for rendering.
         spec.validate_partition_data(&data, schema.as_ref())?;
         Ok(Self { spec, schema, data })
     }
 
-    /// Creates a new partition key from another partition key, with a new data field.
-    ///
-    /// Validates the new data against this key's spec and schema (same rules as [`Self::new`]).
+    /// Creates a new partition key from another key, with new data. Validates the new data against
+    /// this key's spec and schema, like [`Self::new`].
     pub fn copy_with_data(&self, data: Struct) -> Result<Self> {
         Self::new(self.spec.clone(), self.schema.clone(), data)
     }
@@ -632,10 +594,9 @@ impl UnboundPartitionSpecBuilder {
     }
 
     fn add_partition_field_internal(mut self, field: UnboundPartitionField) -> Result<Self> {
-        // Java parity: an invalid transform parameter (bucket[0], truncate[0], counts above the
-        // Java int maximum) cannot exist in Java — `Bucket.get`/`Truncate.get` reject it at
-        // construction — so the builder is the earliest Rust door for programmatically built
-        // `Transform` values (the enum payload itself is public and cannot be guarded).
+        // Java parity: `Bucket.get` and `Truncate.get` reject an invalid parameter at construction,
+        // so Java can never hold one. The builder is the earliest Rust door, because the `Transform`
+        // enum payload is public and cannot be guarded.
         field.transform.validate()?;
         self.check_name_set_and_unique(&field.name)?;
         self.check_for_redundant_partitions(field.source_id, &field.transform)?;
@@ -689,11 +650,9 @@ impl PartitionSpecBuilder {
         Ok(builder)
     }
 
-    /// Set the last assigned field id for the partition spec.
-    ///
-    /// Set this field when a new partition spec is created for an existing TableMetaData.
-    /// As `field_id` must be unique in V2 metadata, this should be set to
-    /// the highest field id used previously.
+    /// Set the last assigned field id. Set it when a new spec is created for existing
+    /// `TableMetadata`. A `field_id` must be unique in V2 metadata, so pass the highest id used
+    /// before.
     pub fn with_last_assigned_field_id(mut self, last_assigned_field_id: i32) -> Self {
         self.last_assigned_field_id = last_assigned_field_id;
         self
@@ -735,10 +694,8 @@ impl PartitionSpecBuilder {
         self.add_unbound_field(field)
     }
 
-    /// Add a new partition field to the partition spec.
-    ///
-    /// If partition field id is set, it is used as the field id.
-    /// Otherwise, a new `field_id` is assigned.
+    /// Add a new partition field to the partition spec. Uses the partition field id when it is set,
+    /// otherwise assigns a new one.
     pub fn add_unbound_field(mut self, field: UnboundPartitionField) -> Result<Self> {
         // Java parity: see `UnboundPartitionSpecBuilder::add_partition_field_internal` — an
         // invalid bucket/truncate parameter is rejected before any other spec check.
@@ -782,8 +739,7 @@ impl PartitionSpecBuilder {
         last_assigned_field_id: i32,
     ) -> Result<Vec<PartitionField>> {
         let mut last_assigned_field_id = last_assigned_field_id;
-        // Already assigned partition ids. If we see one of these during iteration,
-        // we skip it.
+        // Already assigned partition ids. Skip one of these when we see it during iteration.
         let assigned_ids = fields
             .iter()
             .filter_map(|f| f.field_id)
@@ -830,8 +786,7 @@ impl PartitionSpecBuilder {
                 .field_by_id(partition_field.source_id)
                 .ok_or_else(|| {
                     Error::new(
-                        // This should never occur as check_transform_compatibility
-                        // already ensures that the source field exists in the schema
+                        // Unreachable: check_transform_compatibility proved the source field exists.
                         ErrorKind::Unexpected,
                         format!(
                             "No column with source column id {} in schema {:?}",
@@ -848,18 +803,12 @@ impl PartitionSpecBuilder {
         Ok(StructType::new(struct_fields))
     }
 
-    /// Ensure that the partition name is unique among columns in the schema.
-    /// Duplicate names are allowed if:
-    /// 1. The partition is sourced from the schema column with that same name (source-id match), AND
-    /// 2. the transform is identity OR void.
+    /// Ensure the partition name is unique among schema column names. A duplicate is allowed only
+    /// when the partition is sourced from that same column and the transform is identity or void.
     ///
-    /// The `void` exception mirrors Java's bind path: when a V1 partition field is removed it is
-    /// re-added as `void(name)` under the SAME name (preserving its field id), sourced from its own
-    /// column — Java's `PartitionSpec.Builder.checkAndAddPartitionName(name, sourceId)` permits it
-    /// because the name↔source-id correspondence holds and the transform is not restricted to identity.
-    /// Without the void exception the `UpdatePartitionSpec` V1 void replacement is rejected when its
-    /// emitted spec is bound (surfaced by the interop suite). Non-identity, non-void transforms named
-    /// after a schema column remain rejected (matching Java's strict public builder path).
+    /// The `void` exception mirrors Java's `checkAndAddPartitionName(name, sourceId)`, where the
+    /// rule is the name to source-id correspondence. A V1 removed field is re-added as `void(name)`
+    /// under the same name and id; without the exception that replacement fails at bind time.
     fn check_name_does_not_collide_with_schema(
         field: &UnboundPartitionField,
         schema: &Schema,
@@ -1052,12 +1001,10 @@ mod tests {
         assert_eq!(Transform::Truncate(4), partition_spec.fields[2].transform);
     }
 
-    // RISK (crown jewel, the realistic bytes-on-disk entry): a table-metadata JSON whose
-    // partition spec carries bucket[0] previously DESERIALIZED FINE and the process only crashed
-    // later — a divide/modulo-by-zero abort at partition-value computation, triggerable by any
-    // hostile or corrupt metadata file. It must fail AT DESERIALIZATION with DataInvalid,
-    // matching Java where TableMetadataParser -> Transforms.fromString -> Bucket.get throws
-    // (1.10.0 Bucket.java:41-42 / Truncate.java:42).
+    // RISK (crown jewel): table-metadata JSON carrying bucket[0] used to deserialize fine and abort
+    // later with a divide-by-zero at partition-value computation. Any hostile or corrupt metadata
+    // file triggers it. It must fail AT DESERIALIZATION with DataInvalid, like Java's
+    // `TableMetadataParser` -> `Transforms.fromString` -> `Bucket.get`.
     #[test]
     fn test_table_metadata_with_invalid_transform_parameter_fails_deserialization() {
         fn metadata_json(transform: &str) -> String {
@@ -1117,9 +1064,8 @@ mod tests {
             )
         }
 
-        // CONTROL first (docs/testing.md sabotage discipline): the identical metadata with a
-        // legal transform parses — proving the sabotaged variants below fail on the transform
-        // bound, not on an unrelated fixture defect.
+        // CONTROL first (docs/testing.md sabotage discipline): the same metadata with a legal
+        // transform parses, so the sabotaged variants below fail on the transform bound.
         let control =
             serde_json::from_str::<crate::spec::TableMetadata>(&metadata_json("bucket[16]"))
                 .expect("control metadata with bucket[16] must deserialize");
@@ -1138,10 +1084,8 @@ mod tests {
             assert_eq!(error.kind(), ErrorKind::DataInvalid, "{sabotaged}");
         }
 
-        // The Java precondition text is swallowed one level up by the untagged
-        // TableMetadataEnum (serde reports only "data did not match any variant of untagged
-        // enum"), so pin the message at the partition-spec JSON door — the identical
-        // bytes-on-disk shape the metadata carries.
+        // The untagged TableMetadataEnum swallows the Java precondition text, so pin the message at
+        // the partition-spec JSON door — the same bytes-on-disk shape the metadata carries.
         let serde_error = serde_json::from_str::<PartitionSpec>(
             r#"{
                 "spec-id": 0,
@@ -1164,9 +1108,8 @@ mod tests {
         );
     }
 
-    // RISK: the bound builder is the programmatic route into a PartitionSpec — Java can never
-    // hold a Bucket(0)/Truncate(0) instance (rejected at construction), so admitting one here
-    // builds a spec that later aborts the process at apply time.
+    // RISK: the bound builder is the programmatic route into a PartitionSpec. Java can never hold a
+    // Bucket(0) or Truncate(0), so admitting one builds a spec that aborts the process at apply time.
     #[test]
     fn test_partition_spec_builder_rejects_zero_parameter_transforms() {
         let schema = Schema::builder()
@@ -1201,7 +1144,7 @@ mod tests {
             .expect("legal spec must build");
     }
 
-    // RISK: the unbound builder feeds catalog create-table requests — same
+    // RISK: the unbound builder feeds catalog create-table requests, under the same
     // reject-at-construction contract as the bound builder.
     #[test]
     fn test_unbound_partition_spec_builder_rejects_zero_parameter_transforms() {
@@ -1583,11 +1526,10 @@ mod tests {
             .unwrap()
     }
 
-    // RISK: a variant column must NOT be a partition source for ANY value-producing transform —
-    // Java 1.10.0 `PartitionSpec.checkCompatibility` rejects it at the non-primitive door
-    // ("Cannot partition by non-primitive source field: %s", firing BEFORE canTransform), and
-    // `Identity.UNSUPPORTED_TYPES` explicitly lists VARIANT. Partitioning by variant would write
-    // partition tuples with no single-value representation — silent layout corruption.
+    // RISK: a variant column must NOT be a partition source for any value-producing transform. Java
+    // `PartitionSpec.checkCompatibility` rejects it at the non-primitive door, before canTransform,
+    // and `Identity.UNSUPPORTED_TYPES` lists VARIANT. Partitioning by variant writes tuples with no
+    // single-value representation, which is silent layout corruption.
     #[test]
     fn test_variant_rejected_as_partition_source_for_identity_and_bucket() {
         for transform in [
@@ -1619,9 +1561,8 @@ mod tests {
         }
     }
 
-    // RISK: the VOID transform must still ACCEPT a variant source — Java's checkCompatibility
-    // skips `alwaysNull()` fields entirely (it is how V1 drops a partition field in place).
-    // Over-firing here would break partition-field removal on a schema that contains variant.
+    // RISK: the VOID transform must still ACCEPT a variant source. Java's checkCompatibility skips
+    // `alwaysNull()` fields, and over-firing breaks partition-field removal on a variant schema.
     #[test]
     fn test_variant_accepted_as_void_partition_source() {
         let spec = PartitionSpec::builder(schema_with_variant_column())
@@ -1841,11 +1782,10 @@ mod tests {
             .unwrap_err();
     }
 
-    // RISK (Java-parity, surfaced by the UpdatePartitionSpec interop suite): a `void` partition named
-    // after its OWN source column must be accepted (the V1 removed-field replacement), but a `void`
-    // named after a DIFFERENT schema column must still be rejected. Mirrors Java's bind-path
-    // `checkAndAddPartitionName(name, sourceId)` — the name↔source-id correspondence, not the transform,
-    // is the rule. The earlier identity-only guard rejected the legitimate void replacement.
+    // RISK (Java parity): a `void` partition named after its OWN source column must be accepted (the
+    // V1 removed-field replacement), while a `void` named after a DIFFERENT column stays rejected.
+    // Java's `checkAndAddPartitionName(name, sourceId)` rules on the name to source-id
+    // correspondence, not on the transform.
     #[test]
     fn test_builder_collision_is_ok_for_void_named_after_its_own_source() {
         let schema = Schema::builder()
@@ -2399,9 +2339,9 @@ mod tests {
 
 #[cfg(test)]
 mod partition_path_totalisation_tests {
-    //! WG3-L2 pins: [`PartitionSpec::partition_to_path`] is TOTAL — a `(spec, schema, tuple)` triple
-    //! that is not self-consistent renders `name=null` for the offending field and warns, never
-    //! aborts. Four abort vectors were reachable before this change:
+    //! WG3-L2 pins: [`PartitionSpec::partition_to_path`] is TOTAL. An inconsistent
+    //! `(spec, schema, tuple)` triple renders `name=null` for the offending field and warns, and it
+    //! never aborts. Four abort vectors were reachable before this change:
     //!
     //! | # | input | pre-change abort |
     //! |---|---|---|
@@ -2410,12 +2350,9 @@ mod partition_path_totalisation_tests {
     //! | V3 | non-primitive partition-field type + a primitive value | `as_primitive_type().unwrap()` |
     //! | V4 | value literal kind incompatible with the field type | `Display for Datum`'s `unreachable!()` |
     //!
-    //! Java posture (1.10.0 bytecode, `org.apache.iceberg.PartitionSpec.partitionToPath` +
-    //! `org.apache.iceberg.PartitionData.get`): `PartitionData.get(pos)` returns `null` when
-    //! `pos >= data.length` and `Transform.toHumanString(type, null)` renders the literal string
-    //! `"null"` — V1 is LENIENT in Java. The other three throw (`IllegalArgumentException` /
-    //! `NullPointerException`), never abort. [`PartitionSpec::try_partition_to_path`] is the fallible
-    //! sibling that surfaces all four as typed errors for callers that can handle them.
+    //! Java is LENIENT for V1: `PartitionData.get(pos)` returns `null` past the end of the tuple and
+    //! `Transform.toHumanString(type, null)` renders `"null"`. Java throws for the other three.
+    //! [`PartitionSpec::try_partition_to_path`] surfaces all four as typed errors.
 
     use std::sync::Arc;
 
@@ -2444,13 +2381,11 @@ mod partition_path_totalisation_tests {
     }
 
     // ============================================================================================
-    // NULL partition values stay legal (written BEFORE any tightening — a NULL tuple slot is a
-    // first-class Iceberg value, not an anomaly).
+    // NULL partition values stay legal: a NULL tuple slot is a first-class Iceberg value.
     // ============================================================================================
 
-    /// A `PartitionKey` carrying a NULL value renders `name=null` and is NOT an anomaly: neither the
-    /// total nor the fallible path may reject it. Java renders a null partition value as the literal
-    /// `"null"` (`Transform.toHumanString(type, null)`).
+    /// A `PartitionKey` carrying a NULL value renders `name=null` on both paths. Java renders a
+    /// null partition value as the literal `"null"` (`Transform.toHumanString(type, null)`).
     #[test]
     fn partition_key_new_accepts_null_value() {
         let (schema, spec) = two_field_spec();
@@ -2466,8 +2401,7 @@ mod partition_path_totalisation_tests {
         );
     }
 
-    /// Unit 3: `PartitionKey::new` rejects an invalid triple (short non-void tuple) with a typed
-    /// error — an invalid partition key is unrepresentable.
+    /// `PartitionKey::new` rejects an invalid triple (a short non-void tuple) with a typed error.
     #[test]
     fn partition_key_new_rejects_short_non_void_tuple() {
         let (schema, spec) = two_field_spec();
@@ -2522,8 +2456,7 @@ mod partition_path_totalisation_tests {
         assert_eq!(spec.partition_to_path(&data, schema), "x=5/y=null");
     }
 
-    /// V1, fallible sibling: the same short tuple is a typed `DataInvalid` for callers that can
-    /// handle it — the total path's leniency must not be the only signal.
+    /// The same short tuple is a typed `DataInvalid` on the fallible path.
     #[test]
     fn test_try_partition_to_path_short_tuple_errors() {
         let (schema, spec) = two_field_spec();
@@ -2544,10 +2477,8 @@ mod partition_path_totalisation_tests {
     // V2 — source column absent from the schema (the spec-evolved commit-path shape).
     // ============================================================================================
 
-    /// V2: rendering a spec against a schema that no longer carries one of its source columns
-    /// renders THAT field as `null` and still renders the others — per-field leniency, mirroring
-    /// Java's `partitionType()` `UnknownType` substitution. Before this change the whole call
-    /// aborted on `partition_type(..).unwrap()`.
+    /// Rendering a spec against a schema that dropped one of its source columns renders THAT field
+    /// as `null` and still renders the others. Java's `partitionType()` substitutes `UnknownType`.
     #[test]
     fn test_partition_to_path_missing_source_column_renders_null_per_field() {
         let (_schema, spec) = two_field_spec();
@@ -2577,9 +2508,8 @@ mod partition_path_totalisation_tests {
     // V3 — non-primitive partition-field type (a legal `void` over a non-primitive source).
     // ============================================================================================
 
-    /// V3: `void` over a STRUCT source is a legal partition field (Java's `checkCompatibility`
-    /// skips `alwaysNull()` fields), so the partition type can be non-primitive. A primitive value
-    /// in that slot used to abort on `as_primitive_type().unwrap()`; it now renders `null`.
+    /// `void` over a STRUCT source is a legal partition field, so the partition type can be
+    /// non-primitive. A primitive value in that slot renders `null` instead of aborting.
     #[test]
     fn test_partition_to_path_non_primitive_field_type_renders_null() {
         let schema: SchemaRef = Arc::new(
@@ -2616,9 +2546,8 @@ mod partition_path_totalisation_tests {
     // V4 — value literal kind incompatible with the partition-field type.
     // ============================================================================================
 
-    /// V4: an `Int` literal in a `Long`-typed partition slot used to hit `Display for Datum`'s
-    /// `unreachable!()`. It now renders `null`. `PrimitiveType::compatible` — the SAME predicate the
-    /// commit-path `validate_partition_value` uses — decides.
+    /// An `Int` literal in a `Long`-typed partition slot renders `null`. `PrimitiveType::compatible`
+    /// decides, the same predicate the commit-path `validate_partition_value` uses.
     #[test]
     fn test_partition_to_path_incompatible_literal_renders_null() {
         let (schema, spec) = two_field_spec();
@@ -2661,14 +2590,12 @@ mod partition_path_totalisation_tests {
     // Struct::empty())` is a LEGITIMATE pair that a naive arity rule would reject.
     // ============================================================================================
 
-    /// TRAP: an all-`void` spec reports `is_unpartitioned() == true`, and callers that branch on it
-    /// legitimately hand it an EMPTY tuple. A missing value for a `void` field carries no
-    /// information (its value is always null), so it is NOT an anomaly on either path.
+    /// TRAP: an all-`void` spec reports `is_unpartitioned() == true`, and callers legitimately hand
+    /// it an EMPTY tuple. A missing value for a `void` field carries no information, so neither path
+    /// treats it as an anomaly.
     ///
-    /// MUTATION (drop the `void` carve-out from the missing-value branch): this test and
-    /// `test_partition_to_path_mixed_void_short_tuple_is_not_an_anomaly` go RED while
-    /// `test_try_partition_to_path_short_tuple_errors` stays GREEN — proving the arity rule and the
-    /// void case are independent.
+    /// MUTATION (drop the `void` carve-out): this test and the mixed-void test go RED while
+    /// `test_try_partition_to_path_short_tuple_errors` stays GREEN.
     #[test]
     fn test_all_void_spec_with_empty_tuple_is_not_an_anomaly() {
         let schema: SchemaRef = Arc::new(
@@ -2699,8 +2626,7 @@ mod partition_path_totalisation_tests {
     }
 
     /// The MIXED shape (`identity(x)` + `void(y)`) with a tuple covering only `x`: the identity
-    /// field renders its value, the past-the-end `void` field renders `null`, and neither path
-    /// reports an anomaly.
+    /// field renders its value, the past-the-end `void` field renders `null`, and neither path errors.
     #[test]
     fn test_partition_to_path_mixed_void_short_tuple_is_not_an_anomaly() {
         let schema: SchemaRef = Arc::new(
@@ -2760,10 +2686,9 @@ mod partition_path_totalisation_tests {
     // ============================================================================================
 
     /// The anomaly guard admits exactly the pairs `PrimitiveType::compatible` accepts, and every
-    /// admitted pair must survive `Datum`'s `Display` (whose `(_, _)` arm is an `unreachable!()`).
-    /// This test executes the whole accepted matrix: if `Display for Datum` ever drops an arm the
-    /// guard still admits, this test PANICS — the drift alarm. (The converse direction is safe:
-    /// `compatible` is the narrower predicate, so a rejected pair merely renders `null`.)
+    /// admitted pair must survive `Datum`'s `Display`, whose `(_, _)` arm is `unreachable!()`. This
+    /// test runs the whole accepted matrix, so a dropped `Display` arm PANICS here. The converse is
+    /// safe: `compatible` is narrower, so a rejected pair renders `null`.
     #[test]
     fn test_every_compatible_type_literal_pair_renders() {
         let types = [
@@ -2822,18 +2747,10 @@ mod partition_path_totalisation_tests {
 mod partition_path_escaping_tests {
     //! R161 pins: BOTH sides of every `name=value` pair are escaped, exactly as Java does.
     //!
-    //! Java ground truth (1.10.0 bytecode): `PartitionSpec.partitionToPath` appends
-    //! `escape(field.name())`, `"="`, `escape(transform.toHumanString(type, value))` per field and
-    //! joins the pairs with a raw `"/"` — the two separators are STRUCTURE and are never escaped.
-    //! `PartitionSpec.escape` is a one-liner: `java.net.URLEncoder.encode(s, "UTF-8")` (it is the
-    //! ONLY caller of `escape`, both call sites inside `partitionToPath`).
-    //!
-    //! `URLEncoder` is `application/x-www-form-urlencoded`, NOT RFC-3986 percent-encoding:
-    //! `A-Z a-z 0-9 - _ . *` pass through, a space becomes `+`, and every other character is
-    //! encoded as `%XX` (UPPERCASE hex) per UTF-8 byte.
-    //!
-    //! Every expectation below is a verbatim jar-execution oracle result (2026-07-25, run against
-    //! `iceberg-api-1.10.0.jar` on JDK 11; the live leg is `dev/java-interop/run-interop-partition-path.sh`).
+    //! Java `partitionToPath` appends `escape(name)`, `"="`, `escape(humanString)` per field and
+    //! joins the pairs with a raw `"/"`; those two separators are STRUCTURE and stay raw. `escape`
+    //! is `java.net.URLEncoder.encode(s, "UTF-8")`. Every expectation below is a verbatim jar-oracle
+    //! result against `iceberg-api-1.10.0` (`dev/java-interop/run-interop-partition-path.sh`).
 
     use std::sync::Arc;
 
@@ -2896,9 +2813,8 @@ mod partition_path_escaping_tests {
     const JAVA_SAFE_ASCII: &str =
         "*-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
 
-    /// Every printable-ASCII partition value renders exactly as Java's `URLEncoder` renders it:
-    /// the 66 safe characters pass through, a space becomes `+`, and the remaining 28 become
-    /// `%XX` with UPPERCASE hex.
+    /// Every printable-ASCII partition value renders exactly as Java's `URLEncoder` renders it: the
+    /// 66 safe characters pass through, a space becomes `+`, and the remaining 28 become `%XX`.
     #[test]
     fn printable_ascii_sweep_matches_java_url_encoder() {
         let mut passed_through = 0usize;
@@ -2969,9 +2885,8 @@ mod partition_path_escaping_tests {
         ("null", "s=null"),
     ];
 
-    /// Every value in the jar-oracle table renders byte-identically to Java, including the
-    /// multi-byte UTF-8 cases (2-byte `é`, 3-byte CJK, 4-byte emoji — one `%XX` per UTF-8 byte,
-    /// never per `char`).
+    /// Every value in the jar-oracle table renders byte-identically to Java, including multi-byte
+    /// UTF-8: one `%XX` group per UTF-8 byte, never per `char`.
     #[test]
     fn identity_string_values_match_java() {
         for (value, expected) in JAVA_IDENTITY_STRING_PATHS {
@@ -3022,9 +2937,8 @@ mod partition_path_escaping_tests {
         );
     }
 
-    /// A NULL partition value stays the literal `null` (R-anchor: the WG3-L2 leniency pin), and the
-    /// NAME is still escaped on that branch — the `name=null` fallbacks are a separate code path
-    /// from the rendered-value one, so they need their own pin.
+    /// A NULL partition value stays the literal `null`, and the NAME is still escaped on that
+    /// branch. The `name=null` fallbacks are a separate code path and need their own pin.
     #[test]
     fn null_values_keep_rendering_null_with_an_escaped_name() {
         const JAVA_FIELD_NAME_NULL_PATHS: &[(&str, &str)] = &[
@@ -3044,21 +2958,17 @@ mod partition_path_escaping_tests {
         assert_eq!(render("s", Some("null")), render("s", None));
     }
 
-    /// `name=null` is emitted from THREE distinct sites, and each needs its own pin — a mutation
-    /// of one is invisible to the others (Java authority for all three: `Transform.toHumanString`
-    /// returns the literal `"null"` unconditionally, before it switches on the type — 1.10.0
-    /// bytecode offsets 0-6, `aload_2; ifnonnull; ldc "null"; areturn`).
+    /// `name=null` is emitted from THREE sites, and each needs its own pin: a mutation of one is
+    /// invisible to the others. Java `Transform.toHumanString` returns the literal `"null"` before
+    /// it switches on the type.
     ///
-    /// This is site 1: `partition_to_path`'s LENIENT fallback (WG3/G3), taken when the
-    /// `(spec, schema, tuple)` triple is not self-consistent. It is not hypothetical — the commit
-    /// path pairs a file's older spec with the table's current schema
-    /// (`SnapshotProducer::summary` → `snapshot_summary.rs`), so an unescaped name here puts a raw
-    /// `/` straight into a `partitions.` summary key, the exact defect R161 removes.
+    /// Site 1 is the lenient fallback in `partition_to_path`. The commit path pairs a file's older
+    /// spec with the current schema, so an unescaped name puts a raw `/` into a `partitions.` key.
     #[test]
     fn the_lenient_fallback_null_still_escapes_the_field_name() {
         let spec = string_spec("a/b");
-        // A schema that no longer carries source id 1: the field's partition type cannot be
-        // derived, so the total path falls back to `null` for it.
+        // A schema without source id 1: the field's partition type is not derivable, so the total
+        // path falls back to `null` for it.
         let evolved: SchemaRef = Arc::new(
             Schema::builder()
                 .with_fields(vec![
@@ -3088,9 +2998,8 @@ mod partition_path_escaping_tests {
         assert_eq!(err.kind(), crate::ErrorKind::Unexpected);
     }
 
-    /// Site 2 of three: the `void`-past-the-end-of-tuple branch inside `render_partition_field`.
-    /// An all-`void` spec reports `is_unpartitioned()`, so callers legitimately pair it with an
-    /// empty tuple — a shape that reaches `name=null` without ever touching site 1 or site 3.
+    /// Site 2 of three: the `void`-past-the-end-of-tuple branch in `render_partition_field`. An
+    /// all-`void` spec reports `is_unpartitioned()`, so an empty tuple reaches `name=null` here.
     #[test]
     fn the_void_past_end_null_still_escapes_the_field_name() {
         let schema: SchemaRef = Arc::new(
@@ -3198,10 +3107,9 @@ mod partition_path_escaping_tests {
     // The no-churn invariant — the overwhelmingly common case must be BYTE-IDENTICAL to pre-R161.
     // ============================================================================================
 
-    /// Every partition value made only of the URLEncoder safe set renders EXACTLY as it did before
-    /// R161 — no `%XX`, no `+`. This is the regression that keeps the layout of ordinary tables
-    /// unchanged; it also fails loudly under an over-eager escaper (RFC-3986 `NON_ALPHANUMERIC`
-    /// would mangle `-`, `_`, `.` and `*`).
+    /// Every partition value inside the URLEncoder safe set renders EXACTLY as it did before R161:
+    /// no `%XX`, no `+`. This keeps ordinary table layouts unchanged, and it fails loudly under an
+    /// over-eager escaper such as RFC-3986 `NON_ALPHANUMERIC`, which mangles `-`, `_`, `.` and `*`.
     #[test]
     fn safe_partition_values_are_byte_identical_to_the_unescaped_rendering() {
         const COMMON: &[(&str, &str)] = &[
@@ -3262,22 +3170,12 @@ mod partition_path_escaping_tests {
         );
     }
 
-    /// The other half of the format-stability attestation: which value CLASSES move. FIVE
-    /// fork-supported column types render a human string containing `:` (and, for four of them, a
-    /// space too), so their path changes for EVERY value, not only for odd strings — pinned here so
-    /// the approved blast radius (D6) is executable, not derivable. `date` is the byte-stable
-    /// control in the same tuple.
+    /// Which value CLASSES move under R161. FIVE fork-supported column types render a human string
+    /// containing `:`, four of them a space too, so their path changes for EVERY value, the V3
+    /// nanosecond pair included. `date` is the byte-stable control in the same tuple.
     ///
-    /// The V3 nanosecond pair (`timestamp_ns` / `timestamptz_ns`) is NOT a corner case bolted on:
-    /// it renders through the same `Display for Datum` path as the microsecond pair and therefore
-    /// moves for every value too — it was simply missed by the first (three-type) sweep.
-    ///
-    /// Java ground truth re-derived 2026-07-25 by executing
-    /// `Transforms.identity().toHumanString(type, value)` against `iceberg-api-1.10.0` on JDK 11
-    /// and passing the result through `java.net.URLEncoder.encode(s, "UTF-8")` (the whole body of
-    /// `PartitionSpec.escape`). The four `assert_ne!`s are the ALARM for the named human-string
-    /// residue on row R161 — when any becomes equal, that residue has been closed and the row must
-    /// be updated in the same change.
+    /// The four `assert_ne!`s ALARM on the named human-string residue: when one becomes equal, that
+    /// residue is closed and row R161 must change in the same commit.
     #[test]
     fn the_five_always_moving_temporal_types_move_for_every_value() {
         let schema: SchemaRef = Arc::new(
@@ -3339,8 +3237,7 @@ mod partition_path_escaping_tests {
              `date` does not"
         );
 
-        // `time` MATCHES Java post-R161 — a divergence this change CLOSES (pre-R161 the fork
-        // emitted the raw `22:31:08` where Java emits the escaped form).
+        // `time` MATCHES Java post-R161: this change closes that divergence.
         assert_eq!(
             pairs[2], "tm=22%3A31%3A08",
             "Java: `22:31:08` escapes to `22%3A31%3A08`"
@@ -3350,9 +3247,8 @@ mod partition_path_escaping_tests {
             pairs[5], "dt=2022-01-08",
             "Java: `2022-01-08`, untouched by the escaper"
         );
-        // The four remaining divergences, pinned as an alarm (Java's own forms, escaped —
-        // measured on the JVM, so none of these is a dead comparison against a string Java
-        // never produces).
+        // The four remaining divergences, pinned as an alarm. Each expected form is Java's own,
+        // measured on the JVM, so none is a dead comparison.
         assert_ne!(
             pairs[0], "ts=2017-11-16T22%3A31%3A08",
             "residue R161: Java renders ISO `T`, the fork renders a space (escaped `+`)"
@@ -3395,28 +3291,12 @@ mod partition_path_escaping_tests {
         spec.partition_to_path(&Struct::from_iter([Some(value)]), schema)
     }
 
-    /// Byte-stability is a property of the OUTPUT type, never of the transform name.
-    /// `Transform::result_type` returns `input_type.clone()` for `Truncate`, so
-    /// `truncate(string, N)` renders a STRING and is exactly as escaper-sensitive as
-    /// `identity(string)` — `truncate` over a high-cardinality string column is the single most
-    /// likely shape to move on a real table, and an ordinary space in the truncated prefix is
-    /// enough. `truncate` over int / long / decimal / binary stays inside the safe set; the binary
-    /// leg is deliberate — its SOURCE bytes contain `0x2F` (`/`) yet the human string is hex, so
-    /// the raw byte never reaches the path.
-    ///
-    /// Java ground truth (jar oracle, 2026-07-25, `iceberg-api-1.10.0` on JDK 11):
-    /// `Transforms.truncate(4).toHumanString(StringType, "a/b c")` → `a/b c` → `URLEncoder.encode`
-    /// → `a%2Fb+c`, and `truncate(5)` on `east 1x` → `east+1x`. The first case is also
-    /// `truncate_string` in the LIVE interop battery, where Java's own `partitionToPath` emits
-    /// `s_trunc=a%2Fb+c` — the same bytes this pin asserts.
-    ///
-    /// Binary/fixed human strings use Java's standard Base64 (`TransformUtil.base64encode` =
-    /// `java.util.Base64.getEncoder()`), closed 2026-07-31 as QC on row R161. `Truncate` declares
-    /// NO override on either side, so `truncate(binary, 2)`, `identity(binary)`, and
-    /// `identity(fixed[3])` over the bytes `61 2F 62` all emit `YS9i` (JVM-measured 2026-07-25,
-    /// `iceberg-api-1.10.0` on JDK 11). Base64 alphabet characters outside the URLEncoder safe set
-    /// (`+`, `/`, `=`) are then escaped by `escape_partition_path_component` — the same as any other
-    /// human-string character; `YS9i` itself is fully inside the safe set.
+    /// Byte-stability is a property of the OUTPUT type, not of the transform name.
+    /// `Transform::result_type` returns the input type for `Truncate`, so `truncate(string, N)`
+    /// renders a STRING and is as escaper-sensitive as `identity(string)`. Over int, long, decimal
+    /// and binary it stays in the safe set: binary and fixed render as Java's standard Base64
+    /// (`TransformUtil.base64encode`, no `Truncate` override), so a source byte such as `0x2F` never
+    /// reaches the path. Base64's `+`, `/` and `=` are then escaped like any other character.
     #[test]
     fn truncate_is_byte_stable_except_over_string() {
         let moving = [
@@ -3518,9 +3398,8 @@ mod partition_path_escaping_tests {
         }
     }
 
-    /// QC pin: `identity(binary)` and `identity(fixed[N])` use the same Base64 human string as
-    /// Java (not UPPERCASE hex). Display for `Datum` still renders hex — only the human-string /
-    /// partition-path seam is base64.
+    /// `identity(binary)` and `identity(fixed[N])` use the same Base64 human string as Java, not
+    /// UPPERCASE hex. `Display for Datum` still renders hex; only the partition-path seam is base64.
     #[test]
     fn identity_binary_and_fixed_render_java_base64() {
         let bytes = vec![0x61, 0x2F, 0x62]; // ASCII "a/b" → base64 "YS9i"
@@ -3547,9 +3426,8 @@ mod partition_path_escaping_tests {
             "identity(fixed[3]) must match Java TransformUtil.base64encode"
         );
 
-        // Standard Base64 (NOT URL-safe): bytes that produce `+`/`/`/`=` must then be URL-escaped
-        // by the partition-path escaper (Java URLEncoder).
-        // 0xFB 0xFF → base64 "+/8=" → escaped "%2B%2F8%3D"
+        // Standard Base64, NOT URL-safe: bytes that produce `+`, `/` or `=` are then URL-escaped.
+        // 0xFB 0xFF -> base64 "+/8=" -> escaped "%2B%2F8%3D".
         assert_eq!(
             render_one(
                 "bn",
@@ -3601,16 +3479,12 @@ mod partition_path_escaping_tests {
         );
     }
 
-    /// R161 restores INJECTIVITY of partition tuple → directory, which is the data-trust half of
-    /// the defect (the layout half — a forged extra directory level — is
-    /// `a_slash_in_a_value_cannot_forge_a_directory_level`).
+    /// R161 restores INJECTIVITY of partition tuple to directory, the data-trust half of the defect.
     ///
-    /// Pre-R161 the pair was `format!("{name}={value}")` with BOTH sides raw, so a `/` and an `=`
-    /// inside a VALUE could make two DISTINCT tuples render the SAME path: every case below
-    /// collapsed onto `a=1/b=2/b=3` (same spec) or `a=1/b=2` (across two specs of one table).
-    /// Colliding paths mean two partitions' data files land in one directory AND their
-    /// `partitions.<path>` summary entries merge into one key, so the per-partition record counts
-    /// are silently summed. Escaping separates every case.
+    /// Before R161 the pair was `format!("{name}={value}")` with both sides raw, so a `/` or an `=`
+    /// inside a VALUE made two DISTINCT tuples render the SAME path. Colliding paths put two
+    /// partitions' data files in one directory and merge their `partitions.<path>` summary entries,
+    /// so the per-partition record counts are silently summed.
     #[test]
     fn two_distinct_tuples_can_no_longer_collide_on_one_directory() {
         let schema: SchemaRef = Arc::new(

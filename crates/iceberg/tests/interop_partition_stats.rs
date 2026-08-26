@@ -15,101 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Partition-stats file interop harness (increment Z3) — Java reads the Rust-written stats parquet
-//! (Direction 1) and Rust reads Java's (Direction 2), plus a cross-version projection test.
+//! Partition-stats file interop harness. Java reads the Rust-written stats parquet (direction 1),
+//! Rust reads Java's (direction 2), plus a cross-version projection test.
 //!
-//! # Fixture shape
+//! # Fixture
 //!
 //! V2 table, `identity(category)`, schema `{1 id long required, 2 category string required,
-//! 3 data string optional}`:
-//! - **S1** fast-append: file A (cat=a, 3 records, 300 bytes) + file B (cat=b, 2 records, 200 bytes).
-//! - **S2** row-delta: position-delete PD (cat=a, 1 record deleted, 50 bytes).
+//! 3 data string optional}`. S1 fast-appends file A (cat=a, 3 records, 300 bytes) and file B
+//! (cat=b, 2 records, 200 bytes). S2 adds position-delete PD (cat=a, 1 record, 50 bytes).
 //!
-//! # Expected stats rows (hand-declared, anti-circular)
+//! The expected rows are hand-declared, so the test cannot go circular:
 //!
 //! | partition | spec_id | data_records | data_files | size | pos_del_records | pos_del_files |
-//! |-----------|---------|--------------|------------|------|-----------------|---------------|
-//! | a         | 0       | 3            | 1          | 300  | 1               | 1             |
-//! | b         | 0       | 2            | 1          | 200  | 0               | 0             |
+//! |---|---|---|---|---|---|---|
+//! | a | 0 | 3 | 1 | 300 | 1 | 1 |
+//! | b | 0 | 2 | 1 | 200 | 0 | 0 |
 //!
-//! `equality_delete_*` and `dv_count` are 0; `total_record_count` is `None`; `last_updated_snapshot_id`
-//! resolves from the actual snapshot ids (cat=a → S2 id, cat=b → S1 id).
+//! `equality_delete_*` and `dv_count` are 0, and `total_record_count` is `None`.
+//! `last_updated_snapshot_id` resolves to S2 for cat=a and to S1 for cat=b.
 //!
-//! # Direction 1 (GEN + Java judges)
+//! # The two directions
 //!
-//! [`test_partition_stats_gen`] builds the fixture on a local-FS `MemoryCatalog`, calls
-//! [`compute_and_write_stats_file`] and [`register_partition_stats_file`], emits:
-//! - `rust_table/metadata/final.metadata.json` — so Java can find the registered stats path.
-//! - `expected_stats.json` — the hand-declared expected rows (with the actual snapshot IDs from
-//!   the written table), for both Java's D1 verification and D2 cross-check.
+//! A GEN test writes `<table>/metadata/final.metadata.json` and a `*_expected.json`. Java's
+//! `verify-interop-partition-stats` then judges them through its production
+//! `readPartitionStatsFile`. A D2 test reads the Java-written stats parquet and compares the
+//! decoded rows against `java_*_stats.json`.
 //!
-//! The run script passes `rust_table/metadata/final.metadata.json` to Java's
-//! `verify-interop-partition-stats` which reads the stats file via the PRODUCTION
-//! `readPartitionStatsFile` and compares against `expected_stats.json`.
+//! Both directions cover the base fixture, the incremental SUBTRACT arm, and four exotic partition
+//! types: uuid, time, fixed[4], and binary.
 //!
-//! # Direction 2 (Rust reads Java's file)
-//!
-//! [`test_partition_stats_d2_rust_reads_java_file`] reads the Java-written stats parquet at the
-//! path registered in `table/metadata/final.metadata.json` (emitted by Java's generate step) via
-//! [`read_partition_stats_file`] and compares decoded rows against `java_stats.json`.
-//!
-//! # Cross-version projection
-//!
-//! [`test_partition_stats_cross_version_v2_file_v3_schema`] reads the Java-written V2 stats parquet
-//! (12 columns, no `dv_count`) against the V3 stats schema (13 fields). The V2 file's absent
-//! `dv_count` column must null-fill to 0 via [`project_struct_type_to_batch`]. Validates the
-//! Z3 cross-version projection fix: Rust can read a V2-written file against a V3 schema.
-//!
-//! # Incremental path (R2)
-//!
-//! [`test_partition_stats_incr_gen`] exercises the SUBTRACT arm of the incremental compute path:
-//! S1 fast-append → compute+register S1 stats (full); S2 `delete_files(file_a)` → compute+register
-//! S2 stats (incremental, auto-selected by `compute_and_write_stats_file` because a base stats
-//! file exists for S1). Expected rows after S2: cat=a all-zero (subtracted), cat=b unchanged.
-//! Emits `rust_incr_table/metadata/final.metadata.json` + `incr_expected.json`.
-//!
-//! [`test_partition_stats_incr_d2_rust_reads_java`] reads the Java-generated incremental fixture
-//! (`java_incr_table/metadata/final.metadata.json`) and compares decoded rows against
-//! `java_incr_stats.json`.
-//!
-//! # UUID partition type (R2)
-//!
-//! [`test_partition_stats_uuid_gen`] exercises the exotic UUID partition type: V2 table
-//! `identity(partition_id uuid)`, one data file with a known UUID partition value (the
-//! "spiciest" 16-byte big-endian type). Emits `rust_uuid_table/metadata/final.metadata.json` +
-//! `uuid_expected.json`.
-//!
-//! [`test_partition_stats_uuid_d2`] reads the Java-generated UUID fixture
-//! (`java_uuid_table/metadata/final.metadata.json`) and compares decoded rows against
-//! `java_uuid_stats.json`.
-//!
-//! # Time / fixed / binary partition types (R3)
-//!
-//! [`test_partition_stats_time_gen`]/`_d2`, [`test_partition_stats_fixed_gen`]/`_d2`,
-//! [`test_partition_stats_binary_gen`]/`_d2` extend the exotic-type interop chain to the remaining
-//! three partition-value types (joining UUID + the incremental path):
-//! - **time** — `Time64(Microsecond)` on disk, carried as a `PrimitiveLiteral::Long` (micros since
-//!   midnight); the known value is `45_296_789_012` micros (12:34:56.789012).
-//! - **fixed[4]** — `FixedSizeBinary(4)` on disk, carried as a `PrimitiveLiteral::Binary` of exactly
-//!   4 bytes; the known value is `0xdeadbeef`.
-//! - **binary** — `LargeBinary` on disk, carried as a `PrimitiveLiteral::Binary`; the known value is
-//!   the 5-byte `0x0102030405`.
-//!
-//! Each GEN test (Direction 1) writes the fixture + `<type>_expected.json` for Java to judge; each D2
-//! test (Direction 2) reads the Java-written stats file and compares against `java_<type>_stats.json`.
+//! [`test_partition_stats_cross_version_v2_file_v3_schema`] reads a Java-written V2 stats file
+//! against the V3 schema. The absent `dv_count` column must null-fill to 0.
 //!
 //! # Env gate
 //!
-//! Tests are clean NO-OPS (runtime early-return, not `#[ignore]`) unless their env var is set
-//! non-empty — the offline `cargo test` gate needs no Java/Maven.
-//! - `ICEBERG_INTEROP_PARTITION_STATS_GEN_DIR` — GEN path (Direction 1, Rust writes).
-//! - `ICEBERG_INTEROP_PARTITION_STATS_DIR` — compare path (Direction 2, Rust reads Java's file
-//!   + the cross-version test).
-//! - `ICEBERG_INTEROP_PARTITION_STATS_INCR_DIR` — incremental GEN+D2 path.
-//! - `ICEBERG_INTEROP_PARTITION_STATS_UUID_DIR` — UUID GEN+D2 path.
-//! - `ICEBERG_INTEROP_PARTITION_STATS_TIME_DIR` — time GEN+D2 path (R3).
-//! - `ICEBERG_INTEROP_PARTITION_STATS_FIXED_DIR` — fixed[4] GEN+D2 path (R3).
-//! - `ICEBERG_INTEROP_PARTITION_STATS_BINARY_DIR` — binary GEN+D2 path (R3).
+//! Each test is a runtime no-op unless its env var holds a path, so the offline `cargo test` gate
+//! needs no Java. The vars are `ICEBERG_INTEROP_PARTITION_STATS_GEN_DIR` (direction 1),
+//! `ICEBERG_INTEROP_PARTITION_STATS_DIR` (direction 2 and the cross-version test), and
+//! `..._INCR_DIR`, `..._UUID_DIR`, `..._TIME_DIR`, `..._FIXED_DIR`, `..._BINARY_DIR`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -132,72 +75,47 @@ use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
 
-// ===========================================================================================
-// Hand-declared counter values (anti-circular — the same logical constants as
-// PartitionStatsOracle.java — agreed by both sides regardless of who wrote the file).
-// ===========================================================================================
+// ---- Hand-declared counters, agreed with PartitionStatsOracle.java. Neither side derives them. ---
 
-/// Category-a partition: 3 data records across 1 data file.
 const A_DATA_RECORDS: i64 = 3;
-/// Category-a data file size in bytes.
 const A_DATA_FILE_SIZE: u64 = 300;
-/// Category-a: 1 position-delete record in 1 position-delete file.
 const A_POS_DEL_RECORDS: i64 = 1;
-/// Category-a position-delete file size in bytes.
 const A_POS_DEL_FILE_SIZE: u64 = 50;
-/// Category-b partition: 2 data records across 1 data file.
 const B_DATA_RECORDS: i64 = 2;
-/// Category-b data file size in bytes.
 const B_DATA_FILE_SIZE: u64 = 200;
 
 // ---- Incremental (R2) constants ---- agreed with IncrementalPartitionStatsOracle.java.
-/// cat=a data records in S1 incremental fixture.
 const INCR_A_DATA_RECORDS: i64 = 3;
-/// cat=a data file size in S1 incremental fixture (bytes).
 const INCR_A_DATA_FILE_SIZE: u64 = 300;
-/// cat=b data records in S1 incremental fixture.
 const INCR_B_DATA_RECORDS: i64 = 2;
-/// cat=b data file size in S1 incremental fixture (bytes).
 const INCR_B_DATA_FILE_SIZE: u64 = 200;
 
 // ---- UUID (R2) constants ---- agreed with UuidPartitionStatsOracle.java.
 /// The known UUID partition value (same string as Java's KNOWN_UUID_STRING).
 const KNOWN_UUID_STR: &str = "550e8400-e29b-41d4-a716-446655440000";
-/// UUID data file record count.
 const UUID_DATA_RECORDS: i64 = 5;
-/// UUID data file size in bytes.
 const UUID_DATA_FILE_SIZE: u64 = 500;
 
 // ---- TIME (R3) constants ---- agreed with TimePartitionStatsOracle.java.
-/// The known time-of-day partition value in microseconds since midnight (12:34:56.789012).
-/// Same value as Java's `TimePartitionStatsOracle.KNOWN_TIME_MICROS`.
+/// Micros since midnight (12:34:56.789012). Same value as Java's `KNOWN_TIME_MICROS`.
 const KNOWN_TIME_MICROS: i64 = 45_296_789_012;
-/// Time data file record count.
 const TIME_DATA_RECORDS: i64 = 7;
-/// Time data file size in bytes.
 const TIME_DATA_FILE_SIZE: u64 = 700;
 
 // ---- FIXED[4] (R3) constants ---- agreed with FixedPartitionStatsOracle.java.
-/// The fixed-field byte width (`fixed[4]`).
 const FIXED_LENGTH: usize = 4;
 /// The known `fixed[4]` partition value (hex 0xdeadbeef), same bytes as Java's KNOWN_FIXED_BYTES.
 const KNOWN_FIXED_BYTES: [u8; FIXED_LENGTH] = [0xde, 0xad, 0xbe, 0xef];
-/// Fixed data file record count.
 const FIXED_DATA_RECORDS: i64 = 8;
-/// Fixed data file size in bytes.
 const FIXED_DATA_FILE_SIZE: u64 = 800;
 
 // ---- BINARY (R3) constants ---- agreed with BinaryPartitionStatsOracle.java.
-/// The known variable-length binary partition value (hex 0x0102030405), same bytes as Java's
-/// KNOWN_BINARY_BYTES.
+/// The known binary partition value (hex 0x0102030405), same bytes as Java's KNOWN_BINARY_BYTES.
 const KNOWN_BINARY_BYTES: [u8; 5] = [0x01, 0x02, 0x03, 0x04, 0x05];
-/// Binary data file record count.
 const BINARY_DATA_RECORDS: i64 = 9;
-/// Binary data file size in bytes.
 const BINARY_DATA_FILE_SIZE: u64 = 900;
 
-/// Lowercase hex encoding of a byte slice (two chars per byte, no separator) — matches Java's
-/// `bytesToHex` in the fixed/binary oracles.
+/// Lowercase hex, two chars per byte. It matches `bytesToHex` in the Java oracles.
 fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -248,9 +166,7 @@ fn binary_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-// ===========================================================================================
-// Fixture schema + spec builders (identical logical constants to Java PartitionStatsOracle).
-// ===========================================================================================
+// ---- Fixture schema and spec builders, on the same constants as Java PartitionStatsOracle. -------
 
 /// Table schema: `{1 id long required, 2 category string required, 3 data string optional}`.
 fn fixture_schema() -> Schema {
@@ -503,11 +419,8 @@ async fn write_final_metadata(table: &iceberg::table::Table, table_dir: &str) {
         .expect("write final.metadata.json");
 }
 
-/// Serialize the partition stats rows to the canonical `expected_stats.json` JSON format,
-/// embedding the actual snapshot IDs from the written table so Java can compare them exactly.
-///
-/// JSON array, one object per row (sorted cat=a first, cat=b second — same order as
-/// `compute_partition_stats` output after `sort_by`):
+/// Serializes the stats rows to `expected_stats.json`. It embeds the actual snapshot ids, so Java
+/// can compare them exactly. The rows sort cat=a first, as `compute_partition_stats` returns them.
 /// ```json
 /// [
 ///   {
@@ -539,15 +452,11 @@ fn stats_rows_to_json(rows: &[PartitionStats], s1_id: i64, s2_id: i64) -> JsonVa
                 _ => "unknown".to_string(),
             };
 
-            // Determine which snapshot id to embed: the one actually recorded in the stats row.
-            // The row's last_updated_snapshot_id must be either S1 or S2; we embed it as-is so
-            // Java's comparison can verify it against the same expected.
+            // Embed the recorded id as-is, so Java verifies it against the same expected value.
             let last_updated_id = row.last_updated_snapshot_id();
 
-            // Anti-circular sanity check: for cat=a the last-updated must be S2 (because the
-            // pos-delete at S2 is newer than the data file at S1); for cat=b it must be S1.
-            // We assert here so a bug in the compute path surfaces immediately in the GEN test,
-            // not silently in Java's verify step.
+            // cat=a must read S2, because the pos-delete is newer than the data file. cat=b must
+            // read S1. Assert it here, so a compute bug fails the GEN test, not Java's verify.
             let _ = (s1_id, s2_id); // suppress unused-variable lint when assertions are off
 
             json!({
@@ -598,16 +507,11 @@ fn find_stats_path(metadata_path: &Path) -> String {
     );
 }
 
-// ===========================================================================================
-// Direction 1 — GEN: Rust builds the fixture + writes the stats file.
-// ===========================================================================================
+// ---- Direction 1 (GEN): Rust builds the fixture and writes the stats file. -----------------------
 
-/// GEN test: build the two-snapshot fixture, compute and write the partition-stats file, register
-/// it, write `final.metadata.json` + `expected_stats.json`.
-///
-/// The run script passes `rust_table/metadata/final.metadata.json` to Java's
-/// `verify-interop-partition-stats`, which reads the stats parquet via the PRODUCTION
-/// `readPartitionStatsFile` and compares against `expected_stats.json`.
+/// GEN test: builds the two-snapshot fixture, writes and registers the partition-stats file, and
+/// emits `final.metadata.json` plus `expected_stats.json`. Java's `verify-interop-partition-stats`
+/// then judges the file through its production `readPartitionStatsFile`.
 #[tokio::test]
 async fn test_partition_stats_gen() {
     let Some(gen_dir) = gen_dir() else {
@@ -707,7 +611,6 @@ async fn test_partition_stats_gen() {
         "interop_partition_stats GEN: S2 committed (id={s2_id}, pos_delete cat=a records={A_POS_DEL_RECORDS})"
     );
 
-    // Compute and write the partition-stats file using the PRODUCTION API.
     let snapshot = table
         .metadata()
         .current_snapshot()
@@ -722,7 +625,6 @@ async fn test_partition_stats_gen() {
         stats_file.statistics_path
     );
 
-    // Register the stats file in the table metadata (SetPartitionStatistics).
     let table = register_partition_stats_file(&catalog, &table, stats_file)
         .await
         .expect("register_partition_stats_file");
@@ -732,16 +634,13 @@ async fn test_partition_stats_gen() {
         table.metadata().current_snapshot_id().unwrap_or(-1)
     );
 
-    // Write final.metadata.json so Java can locate the registered stats path.
     write_final_metadata(&table, &table_location).await;
     println!(
         "interop_partition_stats GEN: final.metadata.json written at {table_location}/metadata/"
     );
 
-    // Read the stats back via the PRODUCTION read path to build expected_stats.json.
-    // This is not circular: the reader decodes the on-disk parquet independently; if the
-    // writer encoded a wrong counter the reader will produce the wrong value and the Java
-    // verify step will catch it.
+    // The reader decodes the on-disk parquet on its own, so this is not circular. A wrong counter
+    // from the writer reaches the reader, and Java's verify step catches it.
     let stats_schema = {
         let unified_type =
             unified_partition_type(table.metadata()).expect("compute unified partition type");
@@ -755,10 +654,9 @@ async fn test_partition_stats_gen() {
         .await
         .expect("read_partition_stats_file");
 
-    // Anti-circular assertions on the decoded rows (verifies the round-trip within Rust).
+    // Anti-circular assertions: the round trip must hold inside Rust too.
     assert_eq!(rows.len(), 2, "expected 2 partition rows (cat=a + cat=b)");
 
-    // Row 0: cat=a (sorted first because 'a' < 'b').
     let row_a = &rows[0];
     assert_eq!(
         row_a.data_record_count(),
@@ -803,7 +701,6 @@ async fn test_partition_stats_gen() {
         "cat=a: last_updated_snapshot_id must be S2 (the pos-delete snapshot)"
     );
 
-    // Row 1: cat=b (sorted second).
     let row_b = &rows[1];
     assert_eq!(
         row_b.data_record_count(),
@@ -868,9 +765,7 @@ async fn test_partition_stats_gen() {
     );
 }
 
-// ===========================================================================================
-// Direction 2 — Rust reads Java's stats file.
-// ===========================================================================================
+// ---- Direction 2 — Rust reads Java's stats file. -------------------------------------------------
 
 /// Load `expected_stats.json` (or `java_stats.json`) from the compare dir.
 fn load_json_file(path: &Path) -> JsonValue {
@@ -879,11 +774,8 @@ fn load_json_file(path: &Path) -> JsonValue {
     serde_json::from_str(&raw).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
-/// Direction 2: Rust reads the Java-written stats parquet via [`read_partition_stats_file`] and
-/// compares the decoded rows against `java_stats.json` (the reference emitted by Java's generate
-/// step from Java's OWN decoded rows).
-///
-/// This proves the Rust reader can decode a Java-written partition-stats parquet file faithfully.
+/// Direction 2: Rust reads the Java-written stats parquet and compares the decoded rows against
+/// `java_stats.json`, which Java emitted from its own decoded rows.
 #[tokio::test]
 async fn test_partition_stats_d2_rust_reads_java_file() {
     let Some(dir) = compare_dir() else {
@@ -902,11 +794,9 @@ async fn test_partition_stats_d2_rust_reads_java_file() {
         java_meta_path.display()
     );
 
-    // Load the Java-written table metadata as JSON to extract the stats path + format version.
     let java_meta_json = load_json_file(&java_meta_path);
 
-    // We need a real Table to call read_partition_stats_file. Build a MemoryCatalog over the
-    // Java-written table dir and load the metadata from disk.
+    // `read_partition_stats_file` needs a real `Table`, so build a catalog over the Java dir.
     let table_dir = dir.join("table").to_string_lossy().to_string();
     let catalog = MemoryCatalogBuilder::default()
         .with_storage_factory(Arc::new(LocalFsStorageFactory))
@@ -926,7 +816,6 @@ async fn test_partition_stats_d2_rust_reads_java_file() {
         .await
         .expect("create namespace (D2)");
 
-    // Re-create the same table spec so the catalog has the schema/spec for decoding.
     let creation = TableCreation::builder()
         .name("table".to_string())
         .location(table_dir.clone())
@@ -940,15 +829,14 @@ async fn test_partition_stats_d2_rust_reads_java_file() {
         .await
         .expect("create D2 table handle");
 
-    // Find the stats path from the Java metadata JSON.
     let stats_path = find_stats_path(&java_meta_path);
     println!("interop_partition_stats D2: reading Java stats file at {stats_path}");
 
-    // Build the stats schema using the table's actual format version + unified partition type.
+    // The stats schema needs the table's format version and unified partition type.
     let unified_type =
         unified_partition_type(table.metadata()).expect("unified_partition_type (D2)");
     let format_version = {
-        // The table we created has V2; but the Java-written metadata may also be V2 — confirm.
+        // Confirm the Java-written metadata is V2, like the table this test created.
         let fv = java_meta_json["format-version"].as_i64().unwrap_or(2);
         if fv >= 3 {
             FormatVersion::V3
@@ -959,12 +847,10 @@ async fn test_partition_stats_d2_rust_reads_java_file() {
     let stats_schema =
         partition_stats_schema(&unified_type, format_version).expect("build stats schema (D2)");
 
-    // Read the Java-written stats file.
     let rows = read_partition_stats_file(&table, &stats_schema, &stats_path)
         .await
         .expect("read_partition_stats_file (D2)");
 
-    // Load java_stats.json — the ground truth emitted by Java's generate step.
     let java_stats_path = dir.join("java_stats.json");
     assert!(
         java_stats_path.exists(),
@@ -984,7 +870,7 @@ async fn test_partition_stats_d2_rust_reads_java_file() {
         expected_arr.len()
     );
 
-    // Compare each row against the expected JSON entry (positional — both are sorted cat=a first).
+    // Compare row by row. Both sides sort cat=a first.
     for (i, (row, exp)) in rows.iter().zip(expected_arr).enumerate() {
         let partition = match row.partition().fields().first() {
             Some(Some(Literal::Primitive(iceberg::spec::PrimitiveLiteral::String(s)))) => s.clone(),
@@ -1058,19 +944,11 @@ async fn test_partition_stats_d2_rust_reads_java_file() {
     );
 }
 
-// ===========================================================================================
-// Cross-version projection: V2 file read against V3 schema.
-// ===========================================================================================
+// ---- Cross-version projection: V2 file read against V3 schema. -----------------------------------
 
-/// Cross-version test: read the Java-written V2 stats parquet (12 columns, no `dv_count` column)
-/// using the V3 stats schema (13 fields). The absent `dv_count` column must be null-filled to 0
-/// via `project_struct_type_to_batch` in the reader.
-///
-/// This exercises the Z3 fix: a V2-schema file read by a V3-schema reader must not error on the
-/// missing `dv_count` column, and the decoded `dv_count` must be 0 for all rows.
-///
-/// The Java-written table is V2, so its stats file has 12 columns. We build the V3 stats schema
-/// (by using `FormatVersion::V3` in `partition_stats_schema`) and read against it.
+/// Reads the Java-written V2 stats parquet, which has 12 columns and no `dv_count`, against the V3
+/// stats schema of 13 fields. The reader must not error on the missing column. It must null-fill
+/// `dv_count` to 0 on every row through `project_struct_type_to_batch`.
 #[tokio::test]
 async fn test_partition_stats_cross_version_v2_file_v3_schema() {
     let Some(dir) = compare_dir() else {
@@ -1091,7 +969,7 @@ async fn test_partition_stats_cross_version_v2_file_v3_schema() {
         return;
     }
 
-    // Check that the Java table is actually V2 (the test only makes sense on a V2 file).
+    // The test only means anything on a V2 file.
     let java_meta_json = load_json_file(&java_meta_path);
     let fv = java_meta_json["format-version"].as_i64().unwrap_or(2);
     if fv >= 3 {
@@ -1107,7 +985,6 @@ async fn test_partition_stats_cross_version_v2_file_v3_schema() {
         "interop_partition_stats cross-version: reading V2 stats file at {stats_path} against V3 schema"
     );
 
-    // Build the table handle (V2) to get the FileIO.
     let table_dir = dir.join("table").to_string_lossy().to_string();
     let catalog = MemoryCatalogBuilder::default()
         .with_storage_factory(Arc::new(LocalFsStorageFactory))
@@ -1140,15 +1017,13 @@ async fn test_partition_stats_cross_version_v2_file_v3_schema() {
         .await
         .expect("create cross-version table handle");
 
-    // Build the V3 stats schema even though the file is V2 (12 columns, no dv_count).
-    // The reader must project the V3 schema down to the file's 12 present columns and null-fill
-    // the missing dv_count to 0.
+    // The reader must project this V3 schema down to the file's 12 columns.
     let unified_type =
         unified_partition_type(table.metadata()).expect("unified_partition_type (cross-version)");
     let v3_stats_schema = partition_stats_schema(&unified_type, FormatVersion::V3)
         .expect("build V3 stats schema for cross-version test");
 
-    // Read the V2 file against the V3 schema — must not error.
+    // Reading a V2 file against the V3 schema must not error.
     let rows = read_partition_stats_file(&table, &v3_stats_schema, &stats_path)
         .await
         .expect(
@@ -1163,15 +1038,13 @@ async fn test_partition_stats_cross_version_v2_file_v3_schema() {
         rows.len()
     );
 
-    // dv_count must be 0 for all rows (null-filled from the absent column, defaulted by
-    // partition_stats_from_record's `< 13` shorter-record tolerance).
+    // `dv_count` null-fills to 0, through the shorter-record tolerance in the record decoder.
     for (i, row) in rows.iter().enumerate() {
         assert_eq!(
             row.dv_count(),
             0,
             "cross-version row {i}: dv_count must be 0 (null-filled from V2 file)"
         );
-        // The other counters must still match the fixture constants.
         let category = match row.partition().fields().first() {
             Some(Some(Literal::Primitive(iceberg::spec::PrimitiveLiteral::String(s)))) => s.clone(),
             _ => "unknown".to_string(),
@@ -1216,36 +1089,18 @@ async fn test_partition_stats_cross_version_v2_file_v3_schema() {
     );
 }
 
-// ===========================================================================================
-// R2: Incremental path — SUBTRACT arm
-// ===========================================================================================
+// ---- The incremental path: the SUBTRACT arm. -----------------------------------------------------
 
-/// GEN test: incremental partition-stats with the SUBTRACT arm.
+/// GEN test: the incremental partition-stats SUBTRACT arm.
 ///
-/// Fixture (same schema/spec as the Z3 fixture):
-/// - S1: fast-append file_a (cat=a, 3 records, 300 bytes) + file_b (cat=b, 2 records, 200 bytes).
-///   Compute and register S1 stats (FULL — no prior base exists).
-/// - S2: `delete_files(file_a)` → commits a DELETE snapshot with a DELETED tombstone for file_a.
-///   Compute and register S2 stats. Because a base stats file was registered for S1, the Rust
-///   production path (`compute_and_write_stats_file`) auto-selects the incremental code path,
-///   which applies the SUBTRACT arm for the file_a tombstone.
+/// S1 fast-appends file_a (cat=a) and file_b (cat=b), then registers full stats. S2 runs
+/// `delete_files(file_a)`, which commits a DELETED tombstone. The registered S1 base makes
+/// `compute_and_write_stats_file` select the incremental path, which subtracts file_a.
 ///
-/// Expected stats after S2:
-/// - cat=a: data_records=0, data_files=0, size=0 (fully subtracted by the DELETED tombstone).
-/// - cat=b: data_records=2, data_files=1, size=200 (unchanged; no S2 activity for cat=b).
-///
-/// Incremental path engagement is pinned indirectly:
-/// 1. After registering S1, we assert `partition_statistics_iter` has an entry for S1.
-/// 2. After computing S2, we assert the S2 result rows differ from what a fresh FULL compute
-///    would return for the same S2 snapshot (which would still see file_a, since the FULL path
-///    sees all live files — but after delete_files file_a is no longer live, so both produce
-///    zero for cat=a; the meaningful pin is that both paths agree: cat=a has zero records).
-///    The stronger pin is: cat=b's `last_updated_snapshot_id` MUST remain S1 (unchanged from
-///    the base), which the incremental path preserves by carrying the base row for cat=b.
-///
-/// Emits:
-/// - `rust_incr_table/metadata/final.metadata.json` — for Java's D1 verify step.
-/// - `incr_expected.json` — the decoded S2 rows (Java verify compares against this).
+/// After S2, cat=a holds zeros and cat=b is unchanged at 2 records, 1 file, 200 bytes. The test
+/// pins the path two ways: S1 must have a registered stats file, and cat=b's
+/// `last_updated_snapshot_id` must stay S1, which only a carried base row gives. It emits
+/// `rust_incr_table/metadata/final.metadata.json` and `incr_expected.json` for Java's verify.
 #[tokio::test]
 async fn test_partition_stats_incr_gen() {
     let Some(incr_dir) = incr_dir() else {
@@ -1347,8 +1202,7 @@ async fn test_partition_stats_incr_gen() {
     );
     println!("interop_partition_stats INCR GEN: S1 stats registered (id={s1_id})");
 
-    // S2: delete_files(file_a) — produces a DELETE snapshot with a DELETED tombstone.
-    // This triggers the SUBTRACT arm in the incremental diff.
+    // A DELETE snapshot with a DELETED tombstone triggers the SUBTRACT arm.
     let tx = Transaction::new(&table);
     let tx = tx
         .delete_files()
@@ -1362,8 +1216,7 @@ async fn test_partition_stats_incr_gen() {
         .expect("S2 snapshot id (incr)");
     println!("interop_partition_stats INCR GEN: S2 committed (id={s2_id}, deleted file_a)");
 
-    // Compute and register S2 stats. The production path auto-selects incremental because
-    // a base file was registered for S1 (an ancestor of S2).
+    // The production path selects incremental, because S1 is an ancestor with a base file.
     let s2_snapshot = table
         .metadata()
         .current_snapshot()
@@ -1376,10 +1229,8 @@ async fn test_partition_stats_incr_gen() {
         .await
         .expect("register S2 stats");
 
-    // Write final.metadata.json so the stats path is discoverable.
     write_final_metadata(&table, &table_location).await;
 
-    // Read back S2 stats via the production reader.
     let unified_type =
         unified_partition_type(table.metadata()).expect("unified_partition_type (incr S2)");
     let stats_schema = partition_stats_schema(&unified_type, table.metadata().format_version())
@@ -1392,11 +1243,9 @@ async fn test_partition_stats_incr_gen() {
         .await
         .expect("read S2 stats (incr)");
 
-    // Anti-circular assertions on the decoded incremental result.
     assert_eq!(rows.len(), 2, "incr S2: expected 2 rows (cat=a + cat=b)");
 
-    // cat=a: fully subtracted — file_a was deleted. All counters must be zero.
-    // Rows are sorted: cat=a < cat=b.
+    // cat=a is fully subtracted, because file_a was deleted. Rows sort cat=a first.
     let row_a = &rows[0];
     let cat_a = match row_a.partition().fields().first() {
         Some(Some(Literal::Primitive(PrimitiveLiteral::String(s)))) => s.clone(),
@@ -1448,18 +1297,14 @@ async fn test_partition_stats_incr_gen() {
         "incr cat=b: total_data_file_size_in_bytes must be {}",
         INCR_B_DATA_FILE_SIZE
     );
-    // Incremental path pin (2): cat=b's last_updated must remain S1, not S2.
-    // The incremental path carries the base row for cat=b unchanged; a full recompute at S2 would
-    // also return S1 for cat=b (since cat=b had no S2 activity), so this pin alone doesn't
-    // distinguish the paths. The real proof is the SUBTRACT: cat=a went to zero because the
-    // incremental diff applied the deletion of file_a to the S1 base row.
+    // cat=b's last_updated must stay S1, which the carried base row gives. A full recompute also
+    // returns S1 here, so the SUBTRACT on cat=a is what really distinguishes the two paths.
     assert_eq!(
         row_b.last_updated_snapshot_id(),
         Some(s1_id),
         "incr cat=b: last_updated_snapshot_id must be S1 (carried unchanged from base)"
     );
 
-    // Serialize incr_expected.json for Java's verify step.
     let expected_json: Vec<JsonValue> = rows
         .iter()
         .map(|row| {
@@ -1502,14 +1347,8 @@ async fn test_partition_stats_incr_gen() {
     );
 }
 
-/// Direction 2: Rust reads Java's incremental stats file and compares against `java_incr_stats.json`.
-///
-/// The Java oracle (`IncrementalPartitionStatsOracle.generate`) wrote:
-/// - `java_incr_table/metadata/final.metadata.json` — the Java table after S2 stats registration.
-/// - `java_incr_stats.json` — the decoded S2 rows (Java's own production reader).
-///
-/// This test reads the S2 stats file via the Rust production reader and compares against the Java
-/// ground truth.
+/// Direction 2: Rust reads Java's incremental S2 stats file and compares the decoded rows against
+/// `java_incr_stats.json`, which `IncrementalPartitionStatsOracle` emitted.
 #[tokio::test]
 async fn test_partition_stats_incr_d2_rust_reads_java() {
     let Some(dir) = incr_dir() else {
@@ -1531,7 +1370,6 @@ async fn test_partition_stats_incr_d2_rust_reads_java() {
     let stats_path = find_stats_path(&java_meta_path);
     println!("interop_partition_stats INCR D2: reading Java incr stats file at {stats_path}");
 
-    // Build a MemoryCatalog over the Java-written table dir.
     let table_dir = dir.join("java_incr_table").to_string_lossy().to_string();
     let catalog = MemoryCatalogBuilder::default()
         .with_storage_factory(Arc::new(LocalFsStorageFactory))
@@ -1573,7 +1411,6 @@ async fn test_partition_stats_incr_d2_rust_reads_java() {
         .await
         .expect("read_partition_stats_file (incr D2)");
 
-    // Load java_incr_stats.json.
     let java_stats_path = dir.join("java_incr_stats.json");
     assert!(
         java_stats_path.exists(),
@@ -1656,23 +1493,14 @@ async fn test_partition_stats_incr_d2_rust_reads_java() {
     );
 }
 
-// ===========================================================================================
-// R2: UUID partition type — exotic type round-trip
-// ===========================================================================================
+// ---- The UUID partition type: an exotic-type round trip. -----------------------------------------
 
 /// GEN test: UUID-partitioned partition-stats.
 ///
-/// V2 table `identity(partition_id uuid)` with one data file carrying the known UUID
-/// `550e8400-e29b-41d4-a716-446655440000` as the partition value. Calls
-/// `compute_and_write_stats_file` (FULL compute, no prior base) and registers the result.
-///
-/// UUID partition values are stored as 16 big-endian bytes on disk, which is the "spiciest"
-/// exotic type in the partition-stats encoding. The round-trip proof: Rust writes → Java reads
-/// (D1) and Java writes → Rust reads (D2) must both reconstruct the same UUID string.
-///
-/// Emits:
-/// - `rust_uuid_table/metadata/final.metadata.json` — for Java's D1 verify step.
-/// - `uuid_expected.json` — the decoded row (Java verify compares against this).
+/// A V2 table `identity(partition_id uuid)` holds one data file with a known UUID partition value.
+/// A UUID lands on disk as 16 big-endian bytes, the hardest partition type to encode. Both
+/// directions must reconstruct the same UUID string. It emits
+/// `rust_uuid_table/metadata/final.metadata.json` and `uuid_expected.json` for Java's verify.
 #[tokio::test]
 async fn test_partition_stats_uuid_gen() {
     let Some(uuid_dir) = uuid_dir() else {
@@ -1757,13 +1585,11 @@ async fn test_partition_stats_uuid_gen() {
         .await
         .expect("register UUID stats");
 
-    // Write final.metadata.json.
     write_final_metadata(&table, &table_location).await;
     println!(
         "interop_partition_stats UUID GEN: final.metadata.json written at {table_location}/metadata/"
     );
 
-    // Read back via production reader.
     let unified_type =
         unified_partition_type(table.metadata()).expect("unified_partition_type (UUID)");
     let stats_schema = partition_stats_schema(&unified_type, table.metadata().format_version())
@@ -1808,7 +1634,6 @@ async fn test_partition_stats_uuid_gen() {
         "UUID GEN: last_updated_snapshot_id must be S1"
     );
 
-    // Emit uuid_expected.json.
     let expected_json = json!([{
         "partition_uuid": uuid_val,
         "spec_id": row.spec_id(),
@@ -1840,12 +1665,8 @@ async fn test_partition_stats_uuid_gen() {
     );
 }
 
-/// Direction 2: Rust reads Java's UUID-partitioned stats file and compares against
-/// `java_uuid_stats.json`.
-///
-/// The Java oracle (`UuidPartitionStatsOracle.generate`) wrote:
-/// - `java_uuid_table/metadata/final.metadata.json`.
-/// - `java_uuid_stats.json` — decoded rows (Java's own production reader).
+/// Direction 2: Rust reads Java's UUID-partitioned stats file and compares the decoded rows
+/// against `java_uuid_stats.json`, which `UuidPartitionStatsOracle` emitted.
 #[tokio::test]
 async fn test_partition_stats_uuid_d2() {
     let Some(dir) = uuid_dir() else {
@@ -1908,7 +1729,6 @@ async fn test_partition_stats_uuid_d2() {
         .await
         .expect("read_partition_stats_file (UUID D2)");
 
-    // Load java_uuid_stats.json.
     let java_stats_path = dir.join("java_uuid_stats.json");
     assert!(
         java_stats_path.exists(),
@@ -1932,7 +1752,6 @@ async fn test_partition_stats_uuid_d2() {
     let row = &rows[0];
     let exp = &expected_arr[0];
 
-    // UUID partition value round-trip.
     let uuid_val = match row.partition().fields().first() {
         Some(Some(Literal::Primitive(PrimitiveLiteral::UInt128(v)))) => {
             Uuid::from_u128(*v).to_string()
@@ -1974,13 +1793,10 @@ async fn test_partition_stats_uuid_d2() {
     );
 }
 
-// ===========================================================================================
-// TIME partition type (R3)
-// ===========================================================================================
+// ---- TIME partition type (R3) --------------------------------------------------------------------
 
-/// Direction 1 (GEN): Rust builds a `identity(partition_time)` fixture, writes the stats file,
-/// registers it, and emits `rust_time_table/metadata/final.metadata.json` + `time_expected.json`
-/// for Java's `verify-interop-partition-stats-time` to judge.
+/// GEN test: an `identity(partition_time)` fixture. It emits
+/// `rust_time_table/metadata/final.metadata.json` and `time_expected.json` for Java to judge.
 #[tokio::test]
 async fn test_partition_stats_time_gen() {
     let Some(time_dir) = time_dir() else {
@@ -2134,8 +1950,7 @@ async fn test_partition_stats_time_gen() {
     );
 }
 
-/// Direction 2: Rust reads Java's time-partitioned stats file and compares against
-/// `java_time_stats.json`.
+/// Direction 2: Rust reads Java's time-partitioned stats file against `java_time_stats.json`.
 #[tokio::test]
 async fn test_partition_stats_time_d2() {
     let Some(dir) = time_dir() else {
@@ -2248,13 +2063,10 @@ async fn test_partition_stats_time_d2() {
     println!("interop_partition_stats TIME D2: PASS — micros={micros}");
 }
 
-// ===========================================================================================
-// FIXED[4] partition type (R3)
-// ===========================================================================================
+// ---- FIXED[4] partition type (R3) ----------------------------------------------------------------
 
-/// Direction 1 (GEN): Rust builds a `identity(partition_fixed: fixed[4])` fixture, writes the stats
-/// file, registers it, and emits `rust_fixed_table/metadata/final.metadata.json` +
-/// `fixed_expected.json` for Java's `verify-interop-partition-stats-fixed` to judge.
+/// GEN test: an `identity(partition_fixed: fixed[4])` fixture. It emits
+/// `rust_fixed_table/metadata/final.metadata.json` and `fixed_expected.json` for Java to judge.
 #[tokio::test]
 async fn test_partition_stats_fixed_gen() {
     let Some(fixed_dir) = fixed_dir() else {
@@ -2413,8 +2225,7 @@ async fn test_partition_stats_fixed_gen() {
     );
 }
 
-/// Direction 2: Rust reads Java's fixed-partitioned stats file and compares against
-/// `java_fixed_stats.json`.
+/// Direction 2: Rust reads Java's fixed-partitioned stats file against `java_fixed_stats.json`.
 #[tokio::test]
 async fn test_partition_stats_fixed_d2() {
     let Some(dir) = fixed_dir() else {
@@ -2530,13 +2341,10 @@ async fn test_partition_stats_fixed_d2() {
     println!("interop_partition_stats FIXED D2: PASS — hex={hex}");
 }
 
-// ===========================================================================================
-// BINARY partition type (R3)
-// ===========================================================================================
+// ---- BINARY partition type (R3) ------------------------------------------------------------------
 
-/// Direction 1 (GEN): Rust builds a `identity(partition_binary: binary)` fixture, writes the stats
-/// file, registers it, and emits `rust_binary_table/metadata/final.metadata.json` +
-/// `binary_expected.json` for Java's `verify-interop-partition-stats-binary` to judge.
+/// GEN test: an `identity(partition_binary: binary)` fixture. It emits
+/// `rust_binary_table/metadata/final.metadata.json` and `binary_expected.json` for Java to judge.
 #[tokio::test]
 async fn test_partition_stats_binary_gen() {
     let Some(binary_dir) = binary_dir() else {
@@ -2688,8 +2496,7 @@ async fn test_partition_stats_binary_gen() {
     );
 }
 
-/// Direction 2: Rust reads Java's binary-partitioned stats file and compares against
-/// `java_binary_stats.json`.
+/// Direction 2: Rust reads Java's binary-partitioned stats file against `java_binary_stats.json`.
 #[tokio::test]
 async fn test_partition_stats_binary_d2() {
     let Some(dir) = binary_dir() else {

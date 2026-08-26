@@ -17,14 +17,12 @@
 
 //! This module provides the [`PositionDeleteFileWriter`].
 //!
-//! A position-delete file marks rows as deleted by `(file_path, pos)` — the full URI of the target
-//! data file and the ordinal position (starting at 0) of the deleted row within it. This is the
-//! merge-on-read counterpart to the [`EqualityDeleteFileWriter`](super::equality_delete_writer); the
-//! read side that consumes these files lives in [`crate::arrow::delete_filter`].
+//! A position-delete file marks rows as deleted by `(file_path, pos)`. The read side is
+//! [`crate::arrow::delete_filter`].
 //!
 //! # Schema
 //!
-//! The file's schema is exactly the Iceberg position-delete schema (spec
+//! The schema is the Iceberg position-delete schema (spec
 //! [§position-delete-files](https://iceberg.apache.org/spec/#position-delete-files)):
 //!
 //! | field id     | name        | type     |
@@ -32,22 +30,13 @@
 //! | `2147483546` | `file_path` | `string` |
 //! | `2147483545` | `pos`       | `long`   |
 //!
-//! These reserved field ids must match Java (`MetadataColumns.DELETE_FILE_PATH` /
-//! `DELETE_FILE_POS`) for interop — a delete file with the wrong ids cannot be read by Java. They are
-//! defined once in [`crate::metadata_columns`] and reused here.
-//!
-//! The optional `row` column (field id `2147483544`, "position deletes with row data") is **out of
-//! scope** for this writer.
+//! Java cannot read a delete file with any other field ids. The ids live once in
+//! [`crate::metadata_columns`]. The optional `row` column is out of scope for this writer.
 //!
 //! # Sorting
 //!
-//! The Iceberg spec recommends that rows in a position-delete file be sorted by `file_path` then
-//! `pos` so that readers can binary-search. Mirroring Java's basic
-//! [`PositionDeleteWriter`](https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/deletes/PositionDeleteWriter.java),
-//! **this writer writes records in the order given and never reorders them** — producing the sorted
-//! ordering is the caller's responsibility (Java delegates it to `SortingPositionOnlyDeleteWriter`).
-//! Feeding unsorted positions yields a valid, readable delete file that is merely sub-optimal for
-//! scan-time filtering.
+//! This writer keeps the order it is given, like Java `PositionDeleteWriter`. The caller sorts by
+//! `file_path` then `pos` if it wants reader binary search. Unsorted input still reads back.
 
 use std::sync::Arc;
 
@@ -65,11 +54,8 @@ use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileW
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
-/// Build the canonical Iceberg position-delete schema: `file_path: string` (field id `2147483546`)
-/// followed by `pos: long` (field id `2147483545`), both required.
-///
-/// The fields (and their reserved ids) come from [`crate::metadata_columns`], so they match the Java
-/// `MetadataColumns.DELETE_FILE_PATH` / `DELETE_FILE_POS` definitions for interop.
+/// Builds the Iceberg position-delete schema: required `file_path: string` then `pos: long`.
+/// The reserved ids come from [`crate::metadata_columns`], so they match Java.
 pub fn pos_delete_schema() -> Result<Schema> {
     Schema::builder()
         .with_fields(vec![
@@ -81,16 +67,10 @@ pub fn pos_delete_schema() -> Result<Schema> {
 
 /// Parquet [`WriterProperties`] for position-delete files.
 ///
-/// Disables parquet-rs's default 64-byte statistics truncation
-/// (`WriterPropertiesBuilder::set_statistics_truncate_length(None)`) so footer min/max for the
-/// reserved `file_path` column stay exact. Combined with [`crate::spec::MetricsConfig::for_position_delete`]
-/// (Full mode on `file_path`/`pos`), this makes Iceberg DataFile lower/upper bounds equal to the
-/// full path — the load-bearing leg of [`crate::delete_file_index::referenced_data_file_location`]'s
-/// equal-bounds routing (Java `PositionDeleteWriter` never sets `referenced_data_file` on v2 parquet
-/// deletes; path identity rides the bounds alone).
-///
-/// Without this, realistic S3 URIs longer than 64 bytes yield non-exact footer stats; the exactness
-/// guard in the metrics aggregator drops the bounds, and equal-bounds routing silently misses.
+/// Turns off the default 64-byte statistics truncation, so the `file_path` bounds stay exact.
+/// Path identity rides those bounds alone: v2 parquet deletes carry no `referenced_data_file`, and
+/// [`crate::delete_file_index::referenced_data_file_location`] routes on equal lower and upper
+/// bounds. A truncated S3 URI drops the bounds, and the routing silently misses.
 pub fn position_delete_writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_statistics_truncate_length(None)
@@ -150,16 +130,13 @@ where
 {
     /// Create a new `PositionDeleteFileWriterBuilder` using a `RollingFileWriterBuilder`.
     ///
-    /// The inner [`RollingFileWriterBuilder`] must be configured with a parquet (or other) file
-    /// writer whose schema is the position-delete schema (see [`pos_delete_schema`] /
-    /// [`PositionDeleteWriterConfig::schema`]).
+    /// The inner [`RollingFileWriterBuilder`] must carry the position-delete schema.
     ///
-    /// Prefer chaining [`with_partition_spec`](Self::with_partition_spec): without it, a writer built
-    /// with no [`PartitionKey`] falls back to stamping `DEFAULT_PARTITION_SPEC_ID` (0) — and a
-    /// POSITION delete is paired to data on `(spec_id, partition)`
-    /// (`DeleteFileIndex::get_deletes_for_data_file`), so one that claims spec 0 is never applied to
-    /// data files under any other spec: the rows it was written to delete come back. See
-    /// `resolve_partition_spec_id` and `docs/ENGINE_CONTRACT.md` §7a.
+    /// # Notes
+    ///
+    /// Chain [`with_partition_spec`](Self::with_partition_spec). Without it, a writer that also has
+    /// no [`PartitionKey`] stamps spec id 0. The read side pairs deletes to data on
+    /// `(spec_id, partition)`, so the delete never applies and the rows come back.
     pub fn new(
         inner: RollingFileWriterBuilder<B, L, F>,
         config: PositionDeleteWriterConfig,
@@ -173,16 +150,13 @@ where
 
     /// Set the [`PartitionSpec`] the produced delete files are written under.
     ///
-    /// This is the Rust counterpart of Java's REQUIRED `PositionDeleteWriter(…, PartitionSpec spec,
-    /// …)` argument (`core/.../deletes/PositionDeleteWriter.java`, which feeds
-    /// `FileMetadata.deleteFileBuilder(spec)`). The spec MUST be the spec of the DATA FILES the
-    /// deletes reference, not the table's current spec — a delete file only ever applies to data
-    /// files carrying the same `(spec_id, partition)`. It is used only when the writer is built
-    /// WITHOUT a [`PartitionKey`]; a key always wins. See `resolve_partition_spec_id`.
+    /// Java `PositionDeleteWriter` takes the same spec as a required argument.
     ///
-    /// **This writer OWNS `partition_spec_id` on every [`DataFile`] it emits** — `close()` sets the
-    /// field unconditionally, overriding anything a custom
-    /// [`FileWriter`](crate::writer::file_writer::FileWriter) put on the returned `DataFileBuilder`.
+    /// # Notes
+    ///
+    /// Pass the spec of the DATA FILES the deletes reference, not the table's current spec. A
+    /// [`PartitionKey`] always wins over it. `close()` stamps `partition_spec_id` unconditionally,
+    /// overriding whatever a custom file writer put on the `DataFileBuilder`.
     pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
         self.partition_spec = Some(partition_spec);
         self
@@ -237,9 +211,8 @@ where
     F: FileNameGenerator,
 {
     async fn write(&mut self, batch: RecordBatch) -> Result<()> {
-        // Validate the incoming batch against the position-delete schema. A delete file whose
-        // columns/ids/types do not match the reserved (file_path, pos) schema would silently fail to
-        // delete rows (or be unreadable by Java), so reject it here rather than write it.
+        // Reject a mismatched batch here. A delete file with the wrong columns, ids, or types
+        // silently deletes nothing, or Java cannot read it.
         if batch.schema().as_ref() != self.arrow_schema.as_ref() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -253,8 +226,7 @@ where
         }
 
         if let Some(writer) = self.inner.as_mut() {
-            // Write records in the order given — sorting by (file_path, pos) is the caller's
-            // responsibility (see the module docs).
+            // The caller sorts by (file_path, pos). See the module docs.
             writer.write(&self.partition_key, &batch).await
         } else {
             Err(Error::new(
@@ -272,10 +244,8 @@ where
                 .into_iter()
                 .map(|mut res| {
                     res.content(DataContentType::PositionDeletes);
-                    // ALWAYS stamp the spec id (Java `FileMetadata.Builder(spec)` does), never only
-                    // when a partition key happens to be present — a delete file stamped with the
-                    // wrong spec commits and then silently never applies. See
-                    // `resolve_partition_spec_id`.
+                    // Stamp the spec id always, not only when a partition key is present. A delete
+                    // file with the wrong spec commits and then silently never applies.
                     res.partition_spec_id(self.partition_spec_id);
                     if let Some(pk) = self.partition_key.as_ref() {
                         res.partition(pk.data().clone());
@@ -366,8 +336,8 @@ mod test {
         PositionDeleteFileWriterBuilder::new(rolling_writer_builder, config)
     }
 
-    /// QB / R113: a realistic (>64-byte) S3-shaped path must survive as equal lower/upper bounds
-    /// so equal-bounds routing can recover `referenced_data_file_location` without the DV field.
+    /// A realistic S3 path over 64 bytes must survive as equal lower and upper bounds, so
+    /// equal-bounds routing recovers `referenced_data_file_location` without the DV field.
     #[tokio::test]
     async fn test_position_delete_long_file_path_bounds_are_full_and_equal()
     -> Result<(), anyhow::Error> {
@@ -611,8 +581,7 @@ mod test {
 
         // No write() calls — close immediately.
         let data_files = writer.close().await?;
-        // The rolling writer produces no file when nothing was written (matches the data /
-        // equality-delete writers' behavior for an empty writer).
+        // The rolling writer produces no file when nothing was written.
         assert!(
             data_files.is_empty(),
             "expected no delete files for empty input, got {}",
@@ -700,12 +669,10 @@ mod test {
 /// End-to-end partition-spec-id stamping
 /// ======================================
 ///
-/// Writer → commit → scan, over a table whose partition spec EVOLVED. These are the observable
-/// consequences of the fabricated `DEFAULT_PARTITION_SPEC_ID` stamp; they are stated normatively in
-/// `docs/ENGINE_CONTRACT.md` §7a (WG4c). The equality-delete legs live here too (rather than in
-/// `equality_delete_writer.rs`) because the catalog/commit/scan machinery below is shared: they pin
-/// the read-side ASYMMETRY §7a has to state — a keyless equality delete carries an EMPTY tuple and
-/// is therefore GLOBAL, not inert.
+/// Writer, commit, then scan, over a table whose partition spec evolved. These pin the observable
+/// consequences of a fabricated `DEFAULT_PARTITION_SPEC_ID` stamp, which
+/// `docs/ENGINE_CONTRACT.md` §7a states normatively. The equality-delete legs live here because
+/// they share the catalog, commit, and scan machinery below.
 #[cfg(test)]
 mod spec_stamp_e2e_test {
     use std::collections::HashMap;
@@ -769,9 +736,9 @@ mod spec_stamp_e2e_test {
 
     /// A `truncate[5](dept)` spec under `spec_id`, partition field named `dept_trunc`.
     ///
-    /// Its partition TYPE is the same shape as [`identity_dept_spec`]'s — one required-source string
-    /// field — and for any `dept` value of five characters or fewer the two transforms produce the
-    /// SAME tuple. That is what lets a fixture vary the spec id while holding the tuple constant.
+    /// Its partition type has the same shape as [`identity_dept_spec`]'s. For a `dept` of five
+    /// characters or fewer both transforms produce the same tuple. A fixture can then vary the
+    /// spec id and hold the tuple constant.
     fn truncate5_dept_spec(spec_id: i32) -> PartitionSpec {
         PartitionSpec::builder(test_schema())
             .with_spec_id(spec_id)
@@ -1030,24 +997,15 @@ mod spec_stamp_e2e_test {
     // The two consequences.
     // -------------------------------------------------------------------------------------------
 
-    /// SILENT UNDER-DELETE, ENGINE-REACHABLE SHAPE (the probe that sized this unit; 2026-07-25).
+    /// Silent under-delete, in the shape an engine reaches.
     ///
-    /// Table: spec 0 UNPARTITIONED, evolved to a partitioned spec 1. Data lands under spec 1. A
-    /// position delete built with neither a `PartitionKey` nor a configured spec claims spec 0 — and
-    /// spec 0's partition type is EMPTY, exactly the tuple the file carries, so
-    /// `SnapshotProducer::validate_partition_value` ACCEPTS it. The read side then never pairs it
-    /// with the data, so every "deleted" row survives. Nothing anywhere fails.
+    /// Spec 0 is unpartitioned and the table evolved to a partitioned spec 1. Data lands under
+    /// spec 1. A delete with no key and no configured spec claims spec 0, whose partition type is
+    /// empty, so the commit accepts it. The read side never pairs it with the data.
     ///
-    /// ATTRIBUTION: the unstamped delete here differs from the data
-    /// on BOTH halves of the read-side `(spec_id, partition)` key — its tuple is `Struct::empty()`
-    /// while the data's is `{"eng"}` — so the miss happens at the partition-bucket lookup
-    /// (`pos_deletes_by_partition.get(data_file.partition())`) and never reaches the
-    /// `partition_spec_id` comparison. This test pins the SHAPE an engine actually produces (a
-    /// writer given no key at all); the spec id is isolated as the sole discriminator by its twin,
-    /// [`test_e2e_same_tuple_wrong_spec_id_alone_silently_under_deletes`].
-    ///
-    /// The second half is the fix: the same call with the spec configured is REJECTED at build time
-    /// instead of producing the silent artifact.
+    /// This delete differs from the data on BOTH halves of the `(spec_id, partition)` key. The twin
+    /// [`test_e2e_same_tuple_wrong_spec_id_alone_silently_under_deletes`] isolates the spec id.
+    /// The second half proves the fix rejects the call at build time.
     #[tokio::test]
     async fn test_e2e_unstamped_delete_under_evolved_spec_commits_and_never_applies() {
         let catalog = new_memory_catalog().await;
@@ -1111,12 +1069,9 @@ mod spec_stamp_e2e_test {
             "the wrong-spec delete silently never applies — rows resurrect"
         );
 
-        // POSITIVE CONTROL, same table / same data file / same positions: a delete carrying the
-        // data file's OWN PartitionKey removes exactly those rows. Without this leg the survival
-        // above would be attributable to "deletes never work in this fixture"; with it, the
-        // difference is exactly "the delete was given its data files' key" vs "it was given
-        // nothing". (Which HALF of the `(spec_id, partition)` key does the excluding is isolated by
-        // the twin test, not here — see this test's doc comment.)
+        // Positive control on the same table, file, and positions. A delete that carries the data
+        // file's own PartitionKey removes the rows. Without it, the survival above could mean
+        // "deletes never work in this fixture".
         let correct_key = PartitionKey::new(
             table.metadata().default_partition_spec().as_ref().clone(),
             table.metadata().current_schema().clone(),
@@ -1153,15 +1108,12 @@ mod spec_stamp_e2e_test {
         );
     }
 
-    /// UNWRITABLE TABLE (the other half of the same defect).
+    /// Unwritable table, the other half of the same defect.
     ///
-    /// Table: spec 0 = `identity(dept)`, evolved by removing its only field — on V2 the field is
-    /// OMITTED, so the current spec is UNPARTITIONED with a NON-ZERO id. Without a configured spec
-    /// the writers stamp 0, and spec 0 is partitioned, so the commit rejects the empty tuple: the
-    /// table cannot be written at all (control leg below, the exact pre-fix failure).
-    ///
-    /// With the spec configured, the whole round-trip works: data commits, the delete carries the
-    /// same spec id, and the read side applies it.
+    /// Spec 0 is `identity(dept)`. Removing its only field leaves an unpartitioned current spec
+    /// with a non-zero id. Writers with no configured spec stamp 0, which is partitioned, so the
+    /// commit rejects the empty tuple and nothing can be written. With the spec configured the
+    /// round trip works and the read side applies the delete.
     #[tokio::test]
     async fn test_e2e_unpartitioned_nonzero_spec_round_trips_with_configured_spec() {
         let catalog = new_memory_catalog().await;
@@ -1205,10 +1157,8 @@ mod spec_stamp_e2e_test {
             .expect("commit data under the configured spec");
         assert_eq!(scan_ids(&table).await, vec![1, 2, 3]);
 
-        // The delete carries the same spec id — and is APPLIED. The ROW-LEVEL outcome is asserted
-        // first: it is what discriminates this test from the wrong-spec twin above (identical
-        // machinery, the ONLY difference being whether the two spec ids agree), and asserting the
-        // stamp first would mask it — every wrong-stamp mutation would red on the stamp instead.
+        // Assert the ROW-LEVEL outcome first. It discriminates this test from the wrong-spec twin.
+        // Asserting the stamp first makes every wrong-stamp mutation red on the stamp instead.
         let delete = write_pos_delete(&table, Some(cur_spec), None, &[
             (data_path.as_str(), 0),
             (data_path.as_str(), 2),
@@ -1221,25 +1171,18 @@ mod spec_stamp_e2e_test {
             vec![2],
             "positions 0 and 2 must be deleted — the delete and the data agree on the spec id"
         );
-        // Corroborating guard (not the discriminating assertion): the delete really did claim the
-        // current spec rather than reaching the data by some other route.
+        // Corroborating guard: the delete claimed the current spec, not some other route.
         assert_eq!(delete_spec_id, cur_spec_id);
     }
 
-    /// SILENT UNDER-DELETE, ISOLATED ON THE SPEC ID ALONE.
+    /// Silent under-delete, isolated on the spec id alone.
     ///
-    /// The engine-reachable twin above cannot attribute the miss to the spec id, because its
-    /// unkeyed delete also differs in the partition TUPLE. Here the tuple is held CONSTANT and only
-    /// the spec id varies: spec 0 is `truncate[5](dept)` and the current spec is `identity(dept)`,
-    /// and for `"eng"` both transforms yield the byte-identical tuple `{"eng"}`. The delete is built
-    /// from a `PartitionKey` on the OLD spec, so it carries the data file's exact partition value
-    /// while claiming a different `partition_spec_id`.
+    /// The twin above cannot attribute the miss to the spec id, because its delete also differs in
+    /// the tuple. Here the tuple is constant: `truncate[5](dept)` and `identity(dept)` both yield
+    /// `{"eng"}`. The delete claims the old spec id while carrying the data file's exact value.
     ///
-    /// The commit ACCEPTS it (`validate_partition_value` checks the tuple against the spec the file
-    /// CLAIMS — arity 1, type string — never *which* spec the file belongs to) and the read side
-    /// then drops it at the `data_file.partition_spec_id == delete.partition_spec_id` condition in
-    /// `DeleteFileIndex::get_deletes_for_data_file`. This is the fixture that makes that condition
-    /// load-bearing: deleting it turns this test red.
+    /// The commit accepts it, because `validate_partition_value` checks only the tuple shape. The
+    /// read side then drops it. Deleting the spec-id condition in the read side turns this red.
     #[tokio::test]
     async fn test_e2e_same_tuple_wrong_spec_id_alone_silently_under_deletes() {
         let catalog = new_memory_catalog().await;
@@ -1332,17 +1275,14 @@ mod spec_stamp_e2e_test {
         assert_eq!(correct_spec_id, cur_spec_id);
     }
 
-    /// EQUALITY DELETES ARE THE OTHER DIRECTION: a keyless one is GLOBAL, not inert.
+    /// A keyless equality delete is GLOBAL, not inert.
     ///
-    /// The Iceberg spec says "equality delete files stored with an unpartitioned spec are applied as
-    /// global deletes", and both engines implement it — Rust routes on the file's EMPTY TUPLE
-    /// (`PopulatedDeleteFileIndex::new` → `global_equality_deletes`), Java on the SPEC being
-    /// unpartitioned (`DeleteFileIndex.java` `add(...)`, 1.10.0). The global bucket is consulted with
-    /// NO spec-id and NO partition condition, only the sequence-number filter.
+    /// The spec applies an equality delete stored with an unpartitioned spec as a global delete.
+    /// Rust routes on the file's empty tuple, Java on the spec being unpartitioned. The global
+    /// bucket applies with no spec-id and no partition condition, only the sequence-number filter.
     ///
-    /// So the hazard of a missing `PartitionKey` INVERTS between the two delete kinds: for a
-    /// position delete it under-deletes (rows resurrect); for an equality delete it OVER-deletes,
-    /// table-wide. `docs/ENGINE_CONTRACT.md` §7a must say so, and this test is its pin.
+    /// So a missing `PartitionKey` inverts between the two delete kinds. A position delete
+    /// under-deletes. An equality delete over-deletes table-wide. This pins §7a.
     #[tokio::test]
     async fn test_e2e_keyless_equality_delete_is_global_not_inert() {
         let catalog = new_memory_catalog().await;
@@ -1409,12 +1349,10 @@ mod spec_stamp_e2e_test {
         );
     }
 
-    /// The contrast leg: an equality delete with a NON-EMPTY tuple IS partition-scoped, and is the
-    /// case §7a's `(spec_id, partition)` pairing rule actually covers.
+    /// Contrast leg: an equality delete with a non-empty tuple is partition-scoped.
     ///
-    /// Same fixture as the global twin; the only change is that the delete is built from the `eng`
-    /// `PartitionKey`. It must remove `id = 1` from `eng` ONLY — leaving `ops`'s `id = 1` alive,
-    /// which is exactly what distinguishes `[1, 2, 3]` here from `[2, 3]` there.
+    /// Same fixture as the global twin, but the delete carries the `eng` `PartitionKey`. It removes
+    /// `id = 1` from `eng` only, so `ops` keeps its `id = 1`. That is `[1, 2, 3]` against `[2, 3]`.
     #[tokio::test]
     async fn test_e2e_keyed_equality_delete_is_partition_scoped() {
         let catalog = new_memory_catalog().await;

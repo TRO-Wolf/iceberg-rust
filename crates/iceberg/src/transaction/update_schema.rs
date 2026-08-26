@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Schema-evolution transaction action — the Rust mirror of Java `org.apache.iceberg.SchemaUpdate`.
+//! Schema-evolution transaction action. Java `org.apache.iceberg.SchemaUpdate`.
 //!
-//! Builder methods record pending schema operations (add/rename/update/delete/move columns, identifier
-//! fields, union-by-name); [`TransactionAction::commit`] replays them in order against the table's
-//! current schema, rebuilds the resulting [`Schema`] with fresh field-id assignment for new columns, and
-//! emits a [`TableUpdate::AddSchema`] followed by a [`TableUpdate::SetCurrentSchema`] with the
-//! `LAST_ADDED` sentinel. Optimistic-concurrency guards on the last-assigned field id and the current
-//! schema id are attached as requirements, matching Java's `UpdateRequirements` visitor.
+//! Builder methods record pending operations. [`TransactionAction::commit`] replays them in order
+//! against the current schema and assigns fresh field ids to new columns. It then emits
+//! [`TableUpdate::AddSchema`] and [`TableUpdate::SetCurrentSchema`] with the `LAST_ADDED` sentinel.
+//! Requirements guard the last-assigned field id and the current schema id.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -51,11 +49,8 @@ fn data_invalid(message: String) -> Error {
     Error::new(ErrorKind::DataInvalid, message)
 }
 
-/// A pending schema-evolution operation. Builder methods record these in order; `commit` replays them
-/// against the table's current schema (mirroring `transaction/update_partition_spec.rs`, which defers
-/// all validation until a `Table` is available). The ordering matters: Java's `SchemaUpdate` mutates
-/// shared state on each call so later calls observe earlier ones (e.g. the delete-then-conflict checks,
-/// move-after-add, identifier-field-after-add).
+/// A pending schema-evolution operation. `commit` replays these in order against the current schema.
+/// Order matters: Java's `SchemaUpdate` mutates shared state, so a later call observes an earlier one.
 #[derive(Debug, Clone)]
 enum SchemaOp {
     /// Add an optional (`required == false`) or required column under `parent` (None = top level).
@@ -97,12 +92,11 @@ enum SchemaOp {
     UnionByName { other: Box<Schema> },
 }
 
-/// Transaction action for schema evolution — the Rust mirror of Java's `SchemaUpdate`.
+/// Transaction action for schema evolution. Java `SchemaUpdate`.
 ///
-/// Builder methods record pending ops; [`TransactionAction::commit`] resolves them against the table's
-/// current schema and emits a [`TableUpdate::AddSchema`] for the rebuilt schema, followed by a
-/// [`TableUpdate::SetCurrentSchema`] with the `LAST_ADDED` (`-1`) sentinel. Optimistic-concurrency
-/// guards on the last-assigned field id and the current schema id are attached as requirements.
+/// [`TransactionAction::commit`] resolves the recorded ops against the current schema. It emits
+/// [`TableUpdate::AddSchema`] and [`TableUpdate::SetCurrentSchema`] with the `LAST_ADDED` (`-1`)
+/// sentinel, guarded by last-assigned-field-id and current-schema-id requirements.
 pub struct UpdateSchemaAction {
     case_sensitive: bool,
     allow_incompatible_changes: bool,
@@ -179,10 +173,9 @@ impl UpdateSchemaAction {
         self.add_column_internal(None, name, field_type, true, None, None, true)
     }
 
-    /// Add a new required top-level column with an initial/write default (Java
-    /// `addRequiredColumn(name, type, Literal)`). A required add WITH a default is allowed even without
-    /// [`allow_incompatible_changes`](Self::allow_incompatible_changes), because the default backfills
-    /// the existing rows.
+    /// Add a new required top-level column with an initial and write default. Java
+    /// `addRequiredColumn(name, type, Literal)`. The default backfills existing rows, so
+    /// [`allow_incompatible_changes`](Self::allow_incompatible_changes) is not needed.
     pub fn add_required_column_with_default(
         self,
         name: &str,
@@ -506,20 +499,13 @@ impl<'a> SchemaEvolution<'a> {
         Ok(next)
     }
 
-    /// Recursively assign fresh ids to a newly added type — the Rust mirror of Java
-    /// `TypeUtil.assignFreshIds(type, this::assignNewColumnId)`, which runs as a `CustomOrderSchemaVisitor`
-    /// (pre-order / **level-order**). A primitive is returned as-is.
+    /// Assign fresh ids to a newly added type. Java `TypeUtil.assignFreshIds`.
     ///
-    /// The ordering is observable and pinned by Java's `TestSchemaUpdate.testAddNestedMapOfStructs`: a
-    /// struct assigns ids for ALL of its immediate fields BEFORE descending into any field's type, and a
-    /// map assigns its key id and then its value id BEFORE descending into either. A naive depth-first
-    /// walk (assign this field's id, then immediately recurse its type) yields different ids whenever a
-    /// nested field has a following sibling, which breaks Java interop and round-trip parity.
+    /// The traversal is level-order, and the order is observable. A struct assigns ids for all of
+    /// its immediate fields before it descends into any field's type. A map assigns the key id then
+    /// the value id before it descends. A depth-first walk gives different ids and breaks interop.
     fn assign_fresh_ids(&mut self, field_type: Type) -> Result<Type> {
-        // Delegate to the engine-agnostic `TypeUtil.assignFreshIds(Type, NextID)` port, supplying
-        // `assignNewColumnId` as the `NextID` source. The shared function owns the observable
-        // level-order traversal (a struct assigns ALL immediate field ids before descending; a map
-        // assigns key then value before recursing), pinned by Java `TestSchemaUpdate`.
+        // The shared port owns the observable level-order traversal.
         let last_column_id = &mut self.last_column_id;
         let mut next_id = move || -> Result<i32> {
             let next = last_column_id.checked_add(1).ok_or_else(|| {
@@ -882,10 +868,9 @@ impl<'a> SchemaEvolution<'a> {
         self.identifier_field_names = names.iter().cloned().collect();
     }
 
-    /// Build the resulting schema — the Rust mirror of Java `applyChanges`. First validate that no
-    /// existing identifier field (or its ancestor) is being deleted, then recursively rebuild the
-    /// struct applying deletes/updates/adds/moves, then validate the fresh identifier-field set and let
-    /// `Schema::builder` enforce the spec's identifier-field rules.
+    /// Build the resulting schema. Java `applyChanges`. Rejects a delete of an existing identifier
+    /// field or its ancestor, rebuilds the struct, then lets `Schema::builder` enforce the spec's
+    /// identifier-field rules.
     fn apply(self) -> Result<Schema> {
         // 1. Existing identifier fields (and their ancestors) must not be deleted.
         for name in &self.identifier_field_names {
@@ -944,9 +929,8 @@ impl<'a> SchemaEvolution<'a> {
             .build()
     }
 
-    /// Recursively rebuild a struct, applying field-level deletes/updates and parent-scoped adds/moves.
-    /// `parent_id` is the field id of the struct's owner (TABLE_ROOT_ID at the top level), used to look
-    /// up the adds and moves scoped to this struct.
+    /// Rebuild a struct, applying field-level deletes and updates plus parent-scoped adds and moves.
+    /// `parent_id` is the id of the struct's owner (TABLE_ROOT_ID at the top level).
     fn rebuild_struct(&self, struct_type: &StructType, parent_id: i32) -> Result<StructType> {
         let mut fields: Vec<NestedFieldRef> = Vec::with_capacity(struct_type.fields().len());
         for field in struct_type.fields() {
@@ -994,8 +978,7 @@ impl<'a> SchemaEvolution<'a> {
     fn rebuild_type(&self, owner_id: i32, field_type: &Type) -> Result<Type> {
         match field_type {
             Type::Primitive(primitive) => Ok(Type::Primitive(primitive.clone())),
-            // Leaf, like a primitive — Java 1.10.0 `SchemaUpdate$ApplyChanges.variant` returns
-            // the type unchanged (bytecode: `aload_1; areturn`).
+            // Leaf like a primitive. Java `ApplyChanges.variant` returns the type unchanged.
             Type::Variant => Ok(Type::Variant),
             Type::Struct(struct_type) => {
                 Ok(Type::Struct(self.rebuild_struct(struct_type, owner_id)?))
@@ -1054,23 +1037,12 @@ enum MoveKind<'a> {
     After(&'a str),
 }
 
-/// Build a field-id → parent-field-id map for a struct tree, the local equivalent of the schema
-/// module's (crate-private) `index_parents`. A field's parent is the id of the nearest enclosing
-/// struct/list/map field; top-level fields have no entry.
+/// Build a field-id to parent-field-id map for a struct tree. A top-level field has no entry.
 ///
-/// The traversal uses an explicit stack rather than recursion. **This is defence in depth, not the
-/// fix for a reachable hazard, and it should not be cited as one.** `index_parents` has exactly one
-/// caller — [`SchemaEvolution::new`], which passes `schema.as_struct()` — and a [`Schema`] value can
-/// only be produced by `SchemaBuilder::build`, which runs `index_by_id` → `visit_struct` → the
-/// depth-checked `visit_type_at_depth` and so refuses any type nested deeper than
-/// `spec::schema::visitor`'s `MAX_SCHEMA_NESTING_DEPTH` (`128`) before a `Schema` exists at all.
-/// This function therefore cannot receive an unbounded struct tree today.
-///
-/// The genuinely unbounded input on this file's public surface is the caller-supplied `Type` of
-/// [`UpdateSchemaAction::add_column`], which no builder validates and which flows into
-/// [`SchemaEvolution::assign_fresh_ids`]; that door is closed by `spec::schema::id_reassigner`'s
-/// `MAX_ASSIGN_IDS_NESTING_DEPTH`. The explicit stack is kept here so this walk stays correct
-/// independently of that bound and of any future change to what `SchemaBuilder::build` validates.
+/// The walk uses an explicit stack as defence in depth, not to close a reachable hazard. The one
+/// caller passes a built [`Schema`], and `SchemaBuilder::build` already caps nesting at
+/// `MAX_SCHEMA_NESTING_DEPTH`. The unbounded input on this file's surface is the caller-supplied
+/// `Type` of [`UpdateSchemaAction::add_column`], which `MAX_ASSIGN_IDS_NESTING_DEPTH` bounds.
 fn index_parents(struct_type: &StructType, parent_id: Option<i32>, out: &mut HashMap<i32, i32>) {
     enum Pending<'a> {
         Field {
@@ -1287,13 +1259,12 @@ impl SchemaEvolution<'_> {
         }
     }
 
-    /// Replay `unionByNameWith` (Java `UnionByNameVisitor`): accumulate the changes that evolve the
-    /// current schema into the union of itself and `other`. For every field in `other`, add it if it is
-    /// new (by canonical name), or — when it already exists — relax required→optional, apply any legal
-    /// type promotion, update its doc, and recurse through structs / list elements / map key+values so
-    /// nested additions and changes are merged too. Illegal type changes (e.g. an incompatible primitive
-    /// change, or a complex column whose incoming type is a primitive) are routed through
-    /// [`Self::update_column`], which raises the same "Cannot change column type" error Java does.
+    /// Replay `unionByNameWith`. Java `UnionByNameVisitor`.
+    ///
+    /// For each field in `other`: add it when the canonical name is new. Otherwise relax
+    /// required to optional, apply a legal promotion, update the doc, and recurse through structs,
+    /// list elements and map key and value. An illegal type change goes through
+    /// [`Self::update_column`], which raises the Java "Cannot change column type" error.
     fn union_by_name(&mut self, other: &Schema) -> Result<()> {
         let parent_path: Vec<String> = vec![];
         self.union_struct(other.as_struct(), &parent_path)
@@ -1334,9 +1305,8 @@ impl SchemaEvolution<'_> {
         Ok(())
     }
 
-    /// Apply Java `UnionByNameVisitor.updateColumn` to an existing field: relax required→optional, apply
-    /// a non-ignorable type change (routed through [`Self::update_column`], which errors on an illegal
-    /// one), and update the doc. `incoming` is the matching field in the union schema.
+    /// Apply Java `UnionByNameVisitor.updateColumn` to an existing field: relax required to
+    /// optional, route a non-ignorable type change through [`Self::update_column`], update the doc.
     fn union_update_existing(
         &mut self,
         full_name: &str,
@@ -1348,16 +1318,13 @@ impl SchemaEvolution<'_> {
             self.update_column_requirement(full_name, true)?;
         }
 
-        // Type change (Java `needsTypeUpdate = !isIgnorableTypeUpdate`). An ignorable change is skipped;
-        // a non-ignorable one is routed through `update_column`, which both applies a legal promotion and
-        // raises "Cannot change column type" for an illegal one (incompatible primitive, or a complex
-        // existing type whose incoming type is a primitive). `update_column` only accepts a primitive
-        // target, matching Java's `field.type().asPrimitiveType()`.
+        // A non-ignorable change goes through `update_column`. It applies a legal promotion and
+        // rejects an illegal one. It accepts only a primitive target, like Java's
+        // `field.type().asPrimitiveType()`.
         if !is_ignorable_type_update(&existing.field_type, &incoming.field_type) {
             let Type::Primitive(incoming_primitive) = incoming.field_type.as_ref() else {
-                // Java calls `field.type().asPrimitiveType()` here, which throws for a complex incoming
-                // type. The only way to reach this with a non-ignorable change is an existing primitive
-                // whose incoming type is complex — reject it with the same shaped message.
+                // Java `asPrimitiveType()` throws for a complex incoming type. Reject it with the
+                // same shaped message.
                 return Err(data_invalid(format!(
                     "Cannot change column type: {full_name}: {} -> {}",
                     existing.field_type, incoming.field_type
@@ -1373,10 +1340,8 @@ impl SchemaEvolution<'_> {
         Ok(())
     }
 
-    /// Descend into an existing field's nested type, matching Java's partner traversal through structs,
-    /// list elements, and map key+values, so additions and changes nested under a list/map/struct merge.
-    /// The element / value partner is reached with the dotted accessor names Iceberg uses
-    /// (`<path>.element`, `<path>.key`, `<path>.value`).
+    /// Descend into an existing field's nested type: struct, list element, and map key and value.
+    /// The partner names are the dotted Iceberg accessors `<path>.element`, `.key` and `.value`.
     fn union_recurse_into(&mut self, full_name: &str, incoming: &NestedField) -> Result<()> {
         match incoming.field_type.as_ref() {
             Type::Struct(nested) => {
@@ -1398,16 +1363,14 @@ impl SchemaEvolution<'_> {
                 self.union_nested_member(full_name, value)?;
             }
             Type::Primitive(_) => {}
-            // Leaf, like a primitive — variant has no nested fields to merge into (Java 1.10.0
-            // `UnionByNameVisitor.variant` only partner-compares; it never recurses).
+            // Leaf like a primitive. Java `UnionByNameVisitor.variant` never recurses.
             Type::Variant => {}
         }
         Ok(())
     }
 
-    /// Apply the column-level update + recursion for a single synthetic nested member (a list element or
-    /// a map key/value) of the field at `parent_full_name`. The member is matched to the existing field
-    /// by its Iceberg member name (`element` / `key` / `value`) under the parent's dotted path.
+    /// Apply the column update and the recursion for one synthetic nested member (`element`, `key`
+    /// or `value`) of the field at `parent_full_name`.
     fn union_nested_member(
         &mut self,
         parent_full_name: &str,
@@ -1424,14 +1387,11 @@ impl SchemaEvolution<'_> {
     }
 }
 
-/// Validate that `default` is a legal default value for a column of type `field_type`, mirroring Java's
-/// `Types.NestedField` `castDefault`: a non-null default for a nested type is rejected, and a default for
-/// a primitive must be convertible to that type.
+/// Validate `default` for a column of type `field_type`. Java `Types.NestedField.castDefault`.
 ///
-/// The Rust `NestedField::with_initial_default` / `with_write_default` setters do not validate, but the
-/// serde path (`Literal::try_into_json`) does — and panics if the value is incompatible. We therefore run
-/// `try_into_json` here as the canonical compatibility check: passing it guarantees the written field can
-/// be serialized without a later panic, and matches the set of `(literal, type)` pairings Java accepts.
+/// A non-null default on a nested type is rejected. A primitive default must convert to the type.
+/// The check runs `Literal::try_into_json`, because the serde path panics on an incompatible value.
+/// Passing here guarantees the written field serializes later.
 fn validate_default(default: &Literal, field_type: &Type) -> Result<()> {
     // Java rejects a non-null default on a nested type (`type.isNestedType()`); everything that is not a
     // primitive (struct/list/map) is nested.
@@ -1451,17 +1411,12 @@ fn validate_default(default: &Literal, field_type: &Type) -> Result<()> {
         .map(|_| ())
 }
 
-/// Java `UnionByNameVisitor.isIgnorableTypeUpdate`: decide whether the change from `existing_type` to
-/// `incoming_type` can be skipped during a union merge. A change is ignorable when:
+/// Decide whether a union merge can skip the change from `existing_type` to `incoming_type`.
+/// Java `UnionByNameVisitor.isIgnorableTypeUpdate`.
 ///
-/// - `existing` is primitive and `incoming` is a primitive that is a *narrowing* of `existing` (Java
-///   reuses `isPromotionAllowed(incoming, existing)` in reverse: `true` means incoming is narrower, so the
-///   wider existing type is kept and the change ignored); or
-/// - `existing` is complex (struct/list/map) and `incoming` is also complex (the recursion handles any
-///   inner change).
-///
-/// A widening primitive change, or any mismatch between a primitive and a complex shape, is NOT ignorable
-/// — the caller then routes it through `update_column`, which applies a legal promotion or errors.
+/// The change is ignorable when incoming narrows an existing primitive, so the wider existing type
+/// wins, or when both types are complex and the recursion handles the inner change. A widening
+/// change, or a primitive-complex mismatch, is not ignorable and goes to `update_column`.
 fn is_ignorable_type_update(existing_type: &Type, incoming_type: &Type) -> bool {
     match existing_type {
         Type::Primitive(existing_primitive) => match incoming_type {
@@ -1493,15 +1448,11 @@ mod tests {
 
     const MALICIOUS_SCHEMA_DEPTH: i32 = 4096;
 
-    /// Run parent indexing on a deliberately small stack, returning the input so its recursive drop
-    /// happens safely on the test harness's normal-sized stack.
+    /// Run parent indexing on a small stack. Returns the input, so its recursive drop happens on the
+    /// harness stack.
     ///
-    /// The four tests below are IMPLEMENTATION pins on `index_parents`'s explicit-stack form, not
-    /// evidence about reachable input: `index_parents` only ever sees a `Schema`'s struct, and
-    /// `SchemaBuilder::build` caps nesting at `MAX_SCHEMA_NESTING_DEPTH` (128) long before one
-    /// exists, so no caller can hand it a 4096-deep tree (see the function's own doc). They stay
-    /// because reverting the explicit stack to recursion overflows this 64 KiB stack, which keeps
-    /// the defence-in-depth property from silently rotting away.
+    /// The four tests below pin the explicit-stack form of `index_parents`, not reachable input.
+    /// Reverting to recursion overflows this 64 KiB stack, so the defence in depth cannot rot away.
     fn index_parents_on_small_stack(struct_type: StructType) -> (StructType, HashMap<i32, i32>) {
         thread::Builder::new()
             .name("index-parents-small-stack".to_string())
@@ -1558,10 +1509,9 @@ mod tests {
         StructType::new(vec![NestedField::optional(1, "root", field_type).into()])
     }
 
-    // RISK (defence in depth, NOT a reachable input): the explicit-stack parent walk must survive a
-    // struct chain far deeper than any `Schema` this crate can build, and still retain the exact
-    // nearest-parent relationship at the deepest node. Reverting the explicit stack to recursion
-    // overflows the 64 KiB stack; a wrong parent link corrupts nested add/move resolution.
+    // RISK (defence in depth, not reachable input): the explicit-stack walk must survive a struct
+    // chain deeper than any buildable `Schema` and keep the nearest-parent link at the deepest node.
+    // Recursion overflows the 64 KiB stack. A wrong parent link corrupts nested add and move.
     #[test]
     fn deeply_nested_struct_parent_indexing_uses_bounded_call_stack() {
         let (struct_type, parents) =
@@ -1578,9 +1528,8 @@ mod tests {
         drop(struct_type);
     }
 
-    // RISK (defence in depth, NOT a reachable input): list-element traversal is a separate arm of
-    // the walk and must stay iterative — and must keep the element's owner relationship — under the
-    // same deeper-than-buildable chain.
+    // RISK (defence in depth, not reachable input): list-element traversal is a separate arm. It
+    // must stay iterative and keep the element's owner link under the same deep chain.
     #[test]
     fn deeply_nested_list_parent_indexing_uses_bounded_call_stack() {
         let (struct_type, parents) =
@@ -1616,9 +1565,8 @@ mod tests {
         drop(struct_type);
     }
 
-    // RISK (defence in depth, NOT a reachable input): map-value traversal is an arm independent of
-    // map-key traversal and must stay iterative while preserving both deepest member links to the
-    // enclosing value field.
+    // RISK (defence in depth, not reachable input): map-value traversal is an arm independent of
+    // map-key traversal. It must stay iterative and keep both deepest member links.
     #[test]
     fn deeply_nested_map_value_parent_indexing_uses_bounded_call_stack() {
         let (struct_type, parents) =
@@ -1648,17 +1596,11 @@ mod tests {
         field_type
     }
 
-    // RISK (the reachable hazard, and the one C-003 actually has to close): `add_column` takes a
-    // caller-supplied `Type` that NO builder has validated and drives it into the recursive
-    // fresh-id assignment in `spec::schema::id_reassigner`. Unbounded,
-    // `Transaction::update_schema().add_column("deep", hostile)` overflows the thread stack on
-    // commit. Java's `SchemaUpdate` does exactly that — `TypeUtil.assignFreshIds` has no depth
-    // counter, and a 4096-deep chain raises `StackOverflowError` on a 512 KiB JVM thread — so the
-    // typed error asserted here is a deliberate divergence in the SAFE direction, not a parity
-    // break. Runs on a thread with a KNOWN 3 MiB stack: the bounded walk unwinds after 129 levels
-    // (≈1.25 MiB, measured by bisection in the dev profile) while the unbounded walk over 4096
-    // levels needs ≈40 MiB, so deleting the depth guard turns this test into a hard stack-overflow
-    // abort rather than a soft failure.
+    // RISK (the reachable hazard): `add_column` takes an unvalidated caller `Type` and drives it
+    // into recursive fresh-id assignment. Unbounded, commit overflows the thread stack. Java has no
+    // depth counter and raises `StackOverflowError`, so the typed error here diverges in the safe
+    // direction. The thread has a known 3 MiB stack: the bounded walk unwinds after 129 levels
+    // (~1.25 MiB), while 4096 unbounded levels need ~40 MiB. Deleting the guard aborts the test.
     #[test]
     fn deeply_nested_added_column_type_is_rejected_not_overflowed() {
         let action = Arc::new(
@@ -1699,10 +1641,8 @@ mod tests {
         crate::transaction::tests::make_v2_table()
     }
 
-    /// A from-scratch **V3** table with the same `x`/`y`/`z` (long, required) shape as `v2_table`
-    /// (last_column_id 3). Built at format version 3 so column INITIAL defaults are legal — Java's
-    /// `Schema.checkCompatibility` (mirrored by `Schema::check_compatibility`, enforced in
-    /// `TableMetadataBuilder::add_schema`) rejects a non-null initial default on a v1/v2 table.
+    /// A from-scratch V3 table with the same `x`/`y`/`z` (long, required) shape as `v2_table`.
+    /// V3 makes a column initial default legal; `Schema::check_compatibility` rejects it on v1/v2.
     fn v3_table() -> Table {
         let schema = Schema::builder()
             .with_schema_id(0)
@@ -1759,12 +1699,10 @@ mod tests {
         commit.take_updates()
     }
 
-    /// A nested fixture built from scratch (so no stale sort order / partition spec / identifier set
-    /// from the v2 fixture interferes): top-level `id` (long, required), `data` (string, optional),
-    /// `location` (required struct of `lat`/`long` floats), `tags` (optional list<string>), `props`
-    /// (optional map<string,string>). `TableMetadataBuilder::new` reassigns ids top-down in document
-    /// order, which lands exactly on id=1..10 (last_column_id 10) as hand-assigned below. No identifier
-    /// fields, unpartitioned, unsorted.
+    /// A nested fixture built from scratch, so no stale sort order, spec or identifier set
+    /// interferes: `id` (long, required), `data` (string, optional), `location` (required struct of
+    /// `lat`/`long`), `tags` (optional list<string>), `props` (optional map<string,string>).
+    /// `TableMetadataBuilder::new` reassigns ids in document order, landing on 1..10.
     fn nested_table() -> Table {
         let schema = Schema::builder()
             .with_schema_id(0)
@@ -1828,8 +1766,7 @@ mod tests {
 
     // ----- Baseline / no-op -----
 
-    // RISK: an empty update must still rebuild a schema structurally equal to the current one — a
-    // spurious add/drop here would corrupt every column.
+    // RISK: an empty update must rebuild a schema structurally equal to the current one.
     #[tokio::test]
     async fn test_no_op_rebuilds_equal_schema() {
         let table = v2_table();
@@ -1843,8 +1780,8 @@ mod tests {
 
     // ----- addColumn: top-level -----
 
-    // RISK: a top-level add must append an OPTIONAL column with the next field id (last_column_id+1) —
-    // a wrong id or wrong nullability silently breaks readers of older data.
+    // RISK: a top-level add must append an OPTIONAL column with id last_column_id+1. A wrong id or
+    // nullability silently breaks readers of older data.
     #[tokio::test]
     async fn test_add_optional_top_level_column_gets_next_id() {
         let table = v2_table(); // x,y,z long; last_column_id 3
@@ -1863,8 +1800,7 @@ mod tests {
         );
     }
 
-    // RISK: the `.`-rejecting top-level add must reject an ambiguous name — letting it through would
-    // create a column whose name collides with path syntax.
+    // RISK: the top-level add must reject a dotted name, which collides with path syntax.
     #[tokio::test]
     async fn test_add_top_level_dotted_name_rejected() {
         let table = v2_table();
@@ -1890,8 +1826,7 @@ mod tests {
 
     // ----- addColumn: nested + field-id reassignment -----
 
-    // RISK: adding a column into a nested struct must place it inside that struct with a fresh id; a
-    // top-level placement or id collision corrupts the struct.
+    // RISK: a nested add must land inside that struct with a fresh id.
     #[tokio::test]
     async fn test_add_column_into_nested_struct() {
         let table = nested_table(); // last_column_id 10
@@ -1913,8 +1848,8 @@ mod tests {
         assert_eq!(altitude.doc.as_deref(), Some("meters above sea level"));
     }
 
-    // RISK: adding a NESTED-TYPE column must REASSIGN the inner field ids from last_column_id+1 — the
-    // passed-in type's ids must be ignored, or two columns could share a field id.
+    // RISK: a nested-type add must reassign inner ids from last_column_id+1 and ignore the
+    // passed-in ids, or two columns share a field id.
     #[tokio::test]
     async fn test_add_nested_struct_reassigns_inner_ids() {
         let table = v2_table(); // last_column_id 3
@@ -1940,8 +1875,7 @@ mod tests {
         assert_eq!(b.id, 6);
     }
 
-    // RISK: adding a map-of-struct column must reassign EVERY inner id (key, value, value-struct
-    // fields) sequentially — a missed reassignment collides with existing ids.
+    // RISK: a map-of-struct add must reassign every inner id in sequence.
     #[tokio::test]
     async fn test_add_map_of_struct_reassigns_all_ids() {
         let table = v2_table(); // last_column_id 3
@@ -1968,8 +1902,8 @@ mod tests {
 
     // ----- addRequiredColumn + allow_incompatible_changes gating -----
 
-    // RISK: adding a REQUIRED column without a default and WITHOUT the flag must be rejected — letting
-    // it through would break reads of pre-existing rows that lack the column.
+    // RISK: a required add without a default and without the flag must be rejected, or reads of
+    // pre-existing rows break.
     #[tokio::test]
     async fn test_add_required_column_without_flag_rejected() {
         let table = v2_table();
@@ -1984,8 +1918,7 @@ mod tests {
         );
     }
 
-    // RISK: with allow_incompatible_changes the required add must succeed and produce a REQUIRED field —
-    // the gate must actually open, not just suppress the error.
+    // RISK: with the flag the required add must succeed and produce a REQUIRED field.
     #[tokio::test]
     async fn test_add_required_column_with_flag_succeeds() {
         let table = v2_table();
@@ -2034,8 +1967,7 @@ mod tests {
 
     // ----- updateColumn: type promotion accept + reject -----
 
-    // RISK: a legal widening (int->long here uses long->long no-op; use a real widening on a fresh int
-    // column) must succeed. We add an int column then promote it to long in the same transaction.
+    // RISK: a legal widening must succeed. Add an int column, then promote it to long.
     #[tokio::test]
     async fn test_update_column_promotes_int_to_long() {
         let table = v2_table();
@@ -2054,8 +1986,8 @@ mod tests {
         );
     }
 
-    // RISK (the headline promotion risk): a FORBIDDEN type change (long->int narrowing) must be
-    // rejected — even though allow_incompatible_changes is set, since promotion is never relaxed.
+    // RISK: a forbidden narrowing (long to int) must be rejected even with the flag set, because
+    // allow_incompatible_changes never relaxes promotion.
     #[tokio::test]
     async fn test_update_column_rejects_narrowing_even_with_flag() {
         let table = v2_table(); // x is long
@@ -2112,9 +2044,8 @@ mod tests {
 
     // ----- makeColumnOptional / requireColumn -----
 
-    // RISK: making a required column optional must always be allowed and must flip the flag. Uses the
-    // nested fixture (no identifier fields) so the change is not blocked by the spec's required-identifier
-    // rule — that interaction is covered separately by the identifier-field tests.
+    // RISK: making a required column optional must always be allowed and must flip the flag. Uses
+    // the nested fixture, so the spec's required-identifier rule does not block the change.
     #[tokio::test]
     async fn test_make_column_optional() {
         let table = nested_table(); // id required, not an identifier field
@@ -2136,8 +2067,7 @@ mod tests {
         );
     }
 
-    // RISK: requireColumn on an ALREADY-required field must be a no-op that succeeds WITHOUT the flag —
-    // forgetting this no-op path wrongly rejects a legal operation.
+    // RISK: requireColumn on an already-required field must succeed without the flag.
     #[tokio::test]
     async fn test_require_already_required_column_is_noop() {
         let table = v2_table(); // x required
@@ -2198,8 +2128,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // RISK: delete-then-add of the same name must succeed and give the re-added column a FRESH id (not
-    // the deleted one) — reusing the old id would alias old data to the new column.
+    // RISK: delete-then-add of a name must give the re-added column a FRESH id. The old id would
+    // alias old data to the new column.
     #[tokio::test]
     async fn test_delete_then_add_same_name_gets_fresh_id() {
         let table = v2_table(); // last_column_id 3
@@ -2291,8 +2221,8 @@ mod tests {
         assert_eq!(schema.as_struct().fields()[0].name, "z", "z must be first");
     }
 
-    // RISK: moveBefore/moveAfter must position the column relative to the reference; MULTIPLE moves must
-    // apply in call order (not sorted) — the wrong order produces a different layout.
+    // RISK: moveBefore and moveAfter must position relative to the reference, and multiple moves
+    // must apply in call order.
     #[tokio::test]
     async fn test_move_before_and_after_in_call_order() {
         let table = v2_table(); // x,y,z
@@ -2333,8 +2263,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // RISK: moving a top-level field to reference a field in a DIFFERENT struct must be rejected — moves
-    // are struct-local.
+    // RISK: a move is struct-local; a reference in a different struct must be rejected.
     #[tokio::test]
     async fn test_move_across_struct_boundary_rejected() {
         let table = nested_table();
@@ -2418,8 +2347,7 @@ mod tests {
         assert!(result.is_err(), "float identifier field must be rejected");
     }
 
-    // RISK: setting an identifier field on a column ADDED in the same transaction must work (order: add
-    // then set). The added column must be required.
+    // RISK: setIdentifierFields must accept a required column added in the same transaction.
     #[tokio::test]
     async fn test_set_identifier_field_on_added_column() {
         let table = v2_table();
@@ -2441,8 +2369,7 @@ mod tests {
         );
     }
 
-    // RISK: clearing the identifier set must allow deleting a former identifier field — the
-    // delete-identifier guard must observe the NEW (empty) identifier set, not the base one.
+    // RISK: the delete-identifier guard must observe the NEW identifier set, not the base one.
     #[tokio::test]
     async fn test_clear_identifier_then_delete_former_identifier_field() {
         // v2 table identifier ids are [1,2] = x,y. Clear them, then delete y.
@@ -2462,8 +2389,7 @@ mod tests {
         assert_eq!(schema.identifier_field_ids().count(), 0);
     }
 
-    // RISK: deleting a current identifier field WITHOUT clearing it must be rejected — silently
-    // dropping an identifier corrupts row-identity semantics.
+    // RISK: deleting a current identifier field without clearing it must be rejected.
     #[tokio::test]
     async fn test_delete_identifier_field_without_clearing_rejected() {
         let table = v2_table(); // identifier ids [1,2] = x,y
@@ -2478,13 +2404,12 @@ mod tests {
 
     // ----- unionByName -----
 
-    // RISK: union must ADD a new field from the incoming schema and PROMOTE an existing field's type
-    // when the incoming type widens it, while leaving non-widening fields untouched.
+    // RISK: union must add a new incoming field, and promote an existing field when the incoming
+    // type widens it.
     #[tokio::test]
     async fn test_union_adds_new_and_promotes_existing() {
         let table = v2_table(); // x,y,z long
-        // incoming schema: x stays long, plus a new optional "w" string. (long has no widening, so use a
-        // fresh int column to prove promotion separately below.)
+        // incoming schema: x stays long, plus a new optional `w` string.
         let incoming = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -2506,8 +2431,7 @@ mod tests {
         assert!(schema.field_by_name("x").is_some(), "x preserved");
     }
 
-    // RISK: union must promote int->long (widening), and must NOT downgrade when the incoming type is
-    // narrower than the existing one (long stays long).
+    // RISK: union must promote int to long, and must NOT narrow long to int.
     #[tokio::test]
     async fn test_union_promotes_widening_keeps_wider_on_narrowing() {
         let table = v2_table(); // x is long
@@ -2549,12 +2473,12 @@ mod tests {
 
     // ----- case sensitivity -----
 
-    // RISK: case-sensitive (default) resolution must REJECT a differently-cased name; case-insensitive
-    // must resolve it. A leak here would let "X" silently match "x" by accident.
+    // RISK: case-sensitive resolution must reject a differently-cased name, and case-insensitive
+    // must resolve it.
     #[tokio::test]
     async fn test_case_sensitivity_resolution() {
-        // Use the nested fixture (no identifier fields) and a non-identifier column so the test isolates
-        // case-folded NAME RESOLUTION from the identifier-field-by-name interaction.
+        // Use a non-identifier column, so the test isolates name resolution from the
+        // identifier-field-by-name interaction.
         let table = nested_table();
         // default case-sensitive: "DATA" is not a column.
         let strict = Arc::new(UpdateSchemaAction::new().rename_column("DATA", "data2"))
@@ -2582,9 +2506,8 @@ mod tests {
 
     // ----- emitted updates/requirements shape + end-to-end -----
 
-    // RISK: the emitted updates must be exactly AddSchema + SetCurrentSchema{-1}, and the requirements
-    // exactly LastAssignedFieldIdMatch(base last column id) + CurrentSchemaIdMatch(base current schema
-    // id) — the optimistic-concurrency contract Java's UpdateRequirements attaches.
+    // RISK: the emitted updates must be exactly AddSchema + SetCurrentSchema{-1}, with requirements
+    // LastAssignedFieldIdMatch + CurrentSchemaIdMatch. That is the concurrency contract.
     #[tokio::test]
     async fn test_emitted_updates_and_requirements_shape() {
         let table = v2_table(); // last_column_id 3, current_schema_id 1
@@ -2612,9 +2535,8 @@ mod tests {
         )));
     }
 
-    // RISK (end-to-end): the emitted updates must drive through TableMetadataBuilder to make the rebuilt
-    // schema the current schema with the right last_column_id — a mismatch between what the action emits
-    // and what the metadata layer does would silently leave the old schema current.
+    // RISK (end-to-end): the emitted updates must drive through TableMetadataBuilder and make the
+    // rebuilt schema current with the right last_column_id.
     #[tokio::test]
     async fn test_commit_updates_round_trip_to_new_current_schema() {
         let table = v2_table(); // last_column_id 3
@@ -2646,11 +2568,10 @@ mod tests {
         assert_eq!(error.message(), expected, "error message must match Java");
     }
 
-    // RISK (the blocker): nested ids must be assigned LEVEL-ORDER like Java's AssignFreshIds, not
-    // depth-first. For map<struct,struct>, the value id must come immediately after the key id (before
-    // descending into the key struct). This is Java's testAddNestedMapOfStructs: with last_column_id 1,
-    // locations=2, key=3, value=4, key-struct address=5..zip=8, value-struct lat=9, long=10. A
-    // depth-first walk would give value=8 (after the whole key subtree) — divergent ids break interop.
+    // RISK (the blocker): nested ids must be assigned level-order like Java's AssignFreshIds. For
+    // map<struct,struct> the value id follows the key id, before the key struct is walked. Java's
+    // testAddNestedMapOfStructs: locations=2, key=3, value=4, key struct 5..8, value struct 9..10.
+    // Depth-first gives value=8, and divergent ids break interop.
     #[tokio::test]
     async fn test_add_nested_map_of_structs_assigns_level_order_ids() {
         // Fresh single-column table (id=1) so ids start exactly where Java's test does.
@@ -2725,10 +2646,9 @@ mod tests {
         );
     }
 
-    // RISK: a struct whose FIRST field is itself a struct followed by a sibling primitive must assign the
-    // sibling's id BEFORE descending into the first struct's children (level-order). Depth-first would
-    // give the sibling a later id. Adds nested = struct{ inner: struct{a}, b: int } onto last_column_id 3:
-    // nested=4, then immediate fields inner=5, b=6, then inner's child a=7.
+    // RISK: a struct whose first field is a struct followed by a sibling primitive must assign the
+    // sibling id BEFORE descending into the first struct. On last_column_id 3: nested=4, inner=5,
+    // b=6, then inner's child a=7.
     #[tokio::test]
     async fn test_add_struct_with_leading_struct_sibling_is_level_order() {
         let table = v2_table(); // last_column_id 3
@@ -2760,8 +2680,7 @@ mod tests {
         );
     }
 
-    // RISK: list<struct> must assign the element id before descending into the element struct
-    // (Java testAddNestedListOfStructs). On last_column_id 3: locations=4, element=5, lat=6, long=7.
+    // RISK: list<struct> must assign the element id before descending into the element struct.
     #[tokio::test]
     async fn test_add_nested_list_of_structs_level_order() {
         let table = v2_table(); // last_column_id 3
@@ -2786,8 +2705,7 @@ mod tests {
 
     // ----- identifier-field id STABILITY across rename / move -----
 
-    // RISK: renaming an identifier field must preserve its identifier id (Java testRenameIdentifierFields)
-    // — the by-name rewrite must keep the SAME field id in the identifier set, resolving to the new name.
+    // RISK: renaming an identifier field must keep the same field id in the identifier set.
     #[tokio::test]
     async fn test_rename_identifier_field_preserves_identifier_id() {
         let table = v2_table(); // identifier ids [1,2] = x,y
@@ -2831,8 +2749,7 @@ mod tests {
 
     // ----- moves: nested struct + delete/re-add/move -----
 
-    // RISK: a field inside a list-element struct must be movable within that struct (Java
-    // testMoveListElementField analogue). Uses a list<struct{a,b}> and moves b before a.
+    // RISK: a field inside a list-element struct must be movable within that struct.
     #[tokio::test]
     async fn test_move_field_inside_list_element_struct() {
         let base = Schema::builder()
@@ -2900,9 +2817,8 @@ mod tests {
         }
     }
 
-    // RISK: delete + re-add + move of the same name must land the FRESH-id re-added field at the moved
-    // position (Java testMoveTopDeletedColumnAfterAnotherColumn). z is deleted, re-added (fresh id 4),
-    // then moved first.
+    // RISK: delete, re-add and move of one name must land the FRESH-id field at the moved
+    // position.
     #[tokio::test]
     async fn test_delete_readd_then_move_places_fresh_field() {
         let table = v2_table(); // x,y,z; last_column_id 3
@@ -2929,8 +2845,7 @@ mod tests {
 
     // ----- union_by_name: nested + relax + errors + no-op -----
 
-    // RISK: union must add a NEW field into an existing struct by name (Java testAddTopLevelDataframe-
-    // style nested add). Incoming adds location.altitude — it must appear inside the location struct.
+    // RISK: union must add a new field into an existing struct by name (location.altitude).
     #[tokio::test]
     async fn test_union_adds_field_into_existing_struct() {
         let table = nested_table(); // location struct{lat,long}
@@ -2969,9 +2884,8 @@ mod tests {
         );
     }
 
-    // RISK: union must add a new field nested inside an existing list<struct> (Java
-    // testAppendNestedLists / testAddPrimitiveToNestedStruct) — the recursion must descend through the
-    // list element struct, which the struct-only recursion previously skipped.
+    // RISK: union must add a new field nested inside an existing list<struct>. The recursion must
+    // descend through the list element struct.
     #[tokio::test]
     async fn test_union_adds_field_inside_list_element_struct() {
         let base = Schema::builder()
@@ -3049,8 +2963,7 @@ mod tests {
         );
     }
 
-    // RISK: union must relax an existing REQUIRED column to optional when the incoming schema marks it
-    // optional (Java needsOptionalUpdate). data is required in base, optional in incoming.
+    // RISK: union must relax an existing required column to optional when incoming marks it so.
     #[tokio::test]
     async fn test_union_relaxes_required_to_optional() {
         // Build a table where "code" is required.
@@ -3096,8 +3009,8 @@ mod tests {
         );
     }
 
-    // RISK: union must REJECT an incompatible primitive type change (string -> long) with the Java-shaped
-    // "Cannot change column type" message — the previous merge silently dropped it.
+    // RISK: union must reject an incompatible primitive change (string to long) with the Java
+    // "Cannot change column type" message.
     #[tokio::test]
     async fn test_union_rejects_incompatible_primitive_change() {
         let table = nested_table(); // data is string
@@ -3116,8 +3029,7 @@ mod tests {
         assert_data_invalid(&error, "Cannot change column type: data: string -> long");
     }
 
-    // RISK: union must REJECT replacing a list column with a primitive (Java testReplaceListWithPrimitive)
-    // with the "Cannot change column type" message instead of silently keeping the list.
+    // RISK: union must reject replacing a list column with a primitive, not keep the list.
     #[tokio::test]
     async fn test_union_rejects_replacing_list_with_primitive() {
         let table = nested_table(); // tags is list<string>
@@ -3147,9 +3059,8 @@ mod tests {
         );
     }
 
-    // RISK: union with a MIRRORED schema (identical to the current one) must be a no-op — it must not
-    // fabricate adds or spurious updates (Java testMirroredSchemas). The rebuilt struct must equal the
-    // current one.
+    // RISK: union with a mirrored schema must be a no-op. It must not fabricate an add or an
+    // update.
     #[tokio::test]
     async fn test_union_mirrored_schema_is_noop() {
         let table = nested_table();
@@ -3163,8 +3074,7 @@ mod tests {
         );
     }
 
-    // RISK: union must apply a doc-only change to an existing field (Java testUpdateColumnDoc) without
-    // touching its type or nullability.
+    // RISK: union must apply a doc-only change without touching type or nullability.
     #[tokio::test]
     async fn test_union_applies_doc_only_update() {
         let table = nested_table();
@@ -3195,8 +3105,7 @@ mod tests {
 
     // ----- test rigor: exact error kind + message on high-value negatives -----
 
-    // RISK: the ambiguous-name reject must carry the exact Java-shaped message and DataInvalid kind, not
-    // just any error — a duplicate-name reject masquerading as this would hide a precondition bug.
+    // RISK: the ambiguous-name reject must carry the exact Java message and the DataInvalid kind.
     #[tokio::test]
     async fn test_add_dotted_name_error_message_exact() {
         let table = v2_table();
@@ -3243,9 +3152,8 @@ mod tests {
 
     // ----- column defaults (Java addColumn(..,Literal) / updateColumnDefault / addRequiredColumn(..,default)) -----
 
-    // RISK: an OPTIONAL add WITH a default must set BOTH the initial default (backfills existing rows) and
-    // the write default (default for future writes) — Java sets both; setting neither/one silently loses
-    // the backfill or the write default.
+    // RISK: an OPTIONAL add WITH a default must set BOTH the initial default, which backfills
+    // existing rows, and the write default.
     #[tokio::test]
     async fn test_add_optional_column_with_default_sets_both_defaults() {
         let table = v2_table(); // last_column_id 3
@@ -3266,12 +3174,9 @@ mod tests {
     }
 
     // RISK (the headline default rule): a REQUIRED add WITH a default must succeed WITHOUT
-    // allow_incompatible_changes — the default backfills existing rows, so Java treats it as compatible.
-    // The added field must be required and carry the defaults. Driven on a **V3** base (and applied
-    // through the metadata builder), because the column initial default is only legal at v3+ — Java's
-    // `Schema.checkCompatibility`, mirrored by `Schema::check_compatibility` in
-    // `TableMetadataBuilder::add_schema`, rejects it on v1/v2. The V2 rejection is pinned by
-    // `test_add_required_column_with_default_rejected_on_v2` below.
+    // allow_incompatible_changes, because the default backfills existing rows. Driven on a V3 base
+    // and applied through the metadata builder, because a column initial default is legal only at
+    // v3+. `test_add_required_column_with_default_rejected_on_v2` pins the V2 rejection.
     #[tokio::test]
     async fn test_add_required_column_with_default_succeeds_without_flag_on_v3() {
         let table = v3_table();
@@ -3294,12 +3199,10 @@ mod tests {
         assert_eq!(field.write_default, Some(Literal::long(42)));
     }
 
-    // RISK (the V3-only initial-default guard fires): the SAME required-with-default add, applied to a
-    // **V2** table, must be REJECTED when the emitted schema reaches `TableMetadataBuilder::add_schema`
-    // — mirroring Java `Schema.checkCompatibility` ("non-null default ... is not supported until v3").
-    // A guard that only allowed V3 but silently let V2 through would emit Java-unreadable metadata. The
-    // rejection must surface at apply time (the action's `commit` only emits the `AddSchema` update; the
-    // builder enforces the guard).
+    // RISK (the V3-only initial-default guard fires): the same required-with-default add on a V2
+    // table must be REJECTED when the emitted schema reaches `TableMetadataBuilder::add_schema`.
+    // A guard that let V2 through would emit Java-unreadable metadata. The rejection surfaces at
+    // apply time, because `commit` only emits the `AddSchema` update.
     #[tokio::test]
     async fn test_add_required_column_with_default_rejected_on_v2() {
         let table = v2_table();
@@ -3345,8 +3248,7 @@ mod tests {
         );
     }
 
-    // RISK: a required add WITHOUT a default and WITHOUT the flag must STILL be rejected — the default is
-    // what relaxes the gate, not a behavioral regression that now lets all required adds through.
+    // RISK: the default is what relaxes the gate, so a required add WITHOUT one must still fail.
     #[tokio::test]
     async fn test_add_required_column_without_default_still_rejected() {
         let table = v2_table();
@@ -3364,8 +3266,8 @@ mod tests {
         );
     }
 
-    // RISK: a default whose type does not match the column type must be rejected — a string default on a
-    // long column would otherwise panic later in the serde path. Java rejects it at add time.
+    // RISK: a default whose type mismatches the column must be rejected at add time, or the serde
+    // path panics later.
     #[tokio::test]
     async fn test_add_column_with_type_mismatched_default_rejected() {
         let table = v2_table();
@@ -3391,8 +3293,7 @@ mod tests {
         );
     }
 
-    // RISK: a default on a NESTED (non-primitive) column type must be rejected (Java "must be null"). A
-    // struct/list/map default is meaningless and would panic on serialize.
+    // RISK: a default on a NESTED column type must be rejected (Java "must be null").
     #[tokio::test]
     async fn test_add_column_with_default_on_nested_type_rejected() {
         let table = v2_table();
@@ -3418,8 +3319,7 @@ mod tests {
         );
     }
 
-    // RISK: a NESTED (struct child) add WITH a default must place the field inside the struct and set both
-    // defaults on it — the default must follow the field down into the nested struct.
+    // RISK: a nested add WITH a default must place the field in the struct and set both defaults.
     #[tokio::test]
     async fn test_add_nested_struct_child_with_default() {
         let table = nested_table(); // location struct{lat,long}; last_column_id 10
@@ -3443,9 +3343,8 @@ mod tests {
         assert_eq!(altitude.write_default, Some(Literal::float(0.0)));
     }
 
-    // RISK: updateColumnDefault must set ONLY the write default on an existing field, leaving the initial
-    // default unchanged (Java's comment: "write default is always set and initial default is only set if
-    // the field requires one"). It must not touch type/nullability/id.
+    // RISK: updateColumnDefault must set ONLY the write default and leave the initial default,
+    // type, nullability and id unchanged.
     #[tokio::test]
     async fn test_update_column_default_sets_only_write_default() {
         let table = v2_table(); // y is required long, id 2, no defaults
@@ -3464,8 +3363,7 @@ mod tests {
         );
     }
 
-    // RISK: updateColumnDefault with a type-mismatched value must be rejected (Java's `newDefault.to(type)`
-    // would be null -> the builder throws).
+    // RISK: updateColumnDefault with a type-mismatched value must be rejected.
     #[tokio::test]
     async fn test_update_column_default_type_mismatch_rejected() {
         let table = v2_table(); // y is long
@@ -3479,11 +3377,10 @@ mod tests {
         assert!(error.message().starts_with("Cannot cast default value to"));
     }
 
-    // RISK (the `is_defaulted_add` relaxation, Java testAddColumnWithDefaultToRequiredColumn): an OPTIONAL
-    // add WITH a default, then require_column, must succeed WITHOUT allow_incompatible_changes — the
-    // initial default backfills existing rows, so making it required is compatible. The resulting field
-    // must be required and keep both defaults. This pins the `is_added && initial_default.is_some()` branch
-    // in update_column_requirement; a mutation dropping that branch would reject this legal case.
+    // RISK (the `is_defaulted_add` relaxation): an OPTIONAL add WITH a default, then
+    // require_column, must succeed WITHOUT allow_incompatible_changes, because the initial default
+    // backfills existing rows. A mutation dropping the `is_added && initial_default.is_some()`
+    // branch rejects this legal case.
     #[tokio::test]
     async fn test_add_optional_column_with_default_then_require_succeeds_without_flag() {
         let table = v2_table();
@@ -3508,12 +3405,10 @@ mod tests {
         assert_eq!(field.write_default, Some(Literal::long(7)));
     }
 
-    // RISK (Java testAddColumnWithUpdateColumnDefaultToRequiredColumn): an add WITHOUT a default, then
-    // update_column_default (which sets ONLY the write default, NOT the initial default), then
-    // require_column, must STILL be rejected — there is no initial default to backfill existing rows, so
-    // `is_defaulted_add` must be false. This is the exact distinction between updateColumnDefault (write
-    // only) and a defaulted add (both); a mutation checking write_default instead of initial_default in
-    // `is_defaulted_add` would wrongly let this through.
+    // RISK: an add WITHOUT a default, then update_column_default, which sets only the write
+    // default, then require_column, must STILL be rejected. Nothing backfills existing rows, so
+    // `is_defaulted_add` is false. A mutation reading write_default instead of initial_default
+    // wrongly lets this through.
     #[tokio::test]
     async fn test_add_column_then_update_default_then_require_is_rejected() {
         let table = v2_table();
@@ -3533,10 +3428,8 @@ mod tests {
         );
     }
 
-    // RISK (end-to-end): the emitted schema must actually carry the defaults through to a rebuilt
-    // current schema via TableMetadataBuilder — a default dropped between the action and the metadata
-    // layer would silently lose the backfill. Uses a **V3** base because applying an initial default
-    // through the builder is only legal at v3+ (the `Schema::check_compatibility` guard).
+    // RISK (end-to-end): the emitted schema must carry the defaults through to the rebuilt current
+    // schema. Uses a V3 base, because an initial default is legal only at v3+.
     #[tokio::test]
     async fn test_emitted_schema_round_trips_defaults() {
         let table = v3_table();
@@ -3557,9 +3450,8 @@ mod tests {
         assert_eq!(field.write_default, Some(Literal::long(5)));
     }
 
-    /// A from-scratch **V3** table with `id` (long, required), `v` (variant, required), and `vo`
-    /// (variant, optional) — the exact schema the reviewer's live-Java probe drove through 1.10.0
-    /// `SchemaUpdate` to pin the variant evolution behaviors below.
+    /// A from-scratch V3 table with `id` (long, required), `v` (variant, required) and `vo`
+    /// (variant, optional). A live-Java probe drove this schema through 1.10.0 `SchemaUpdate`.
     fn v3_variant_table() -> Table {
         let schema = Schema::builder()
             .with_schema_id(0)
@@ -3587,11 +3479,9 @@ mod tests {
         v2_table().with_metadata(Arc::new(metadata))
     }
 
-    // RISK (the compile-forced `ApplyChanges`/`rebuild_type` variant arms, live-Java-probed):
-    // rename / make-optional / require / doc-update / move / delete on a VARIANT column must each
-    // behave exactly like 1.10.0 `SchemaUpdate` (probed: every op succeeds, the column keeps
-    // `variant` and its id). A wrong rebuild arm would corrupt the type or drop the column during
-    // any unrelated evolution of a variant-bearing schema.
+    // RISK (the `ApplyChanges` and `rebuild_type` variant arms, live-Java-probed): rename,
+    // make-optional, require, doc-update, move and delete on a VARIANT column must each behave like
+    // 1.10.0 `SchemaUpdate`. A wrong rebuild arm corrupts the type or drops the column.
     #[tokio::test]
     async fn test_variant_column_evolution_ops_mirror_java() {
         let table = v3_variant_table();
@@ -3661,10 +3551,9 @@ mod tests {
         assert_eq!(schema.field_by_name("vo").expect("vo").id, 3);
     }
 
-    // RISK (the `assign_fresh_ids` variant arm, live-Java-probed): adding a variant column — and
-    // a struct that NESTS one — must assign fresh ids level-order exactly like 1.10.0
-    // `SchemaUpdate.addColumn` (probed: top-level add gets id 4; a struct add gets 4 with its
-    // inner variant at 5), with the variant type passing through unchanged.
+    // RISK (the `assign_fresh_ids` variant arm, live-Java-probed): adding a variant column, and a
+    // struct that nests one, must assign fresh ids level-order like 1.10.0 `SchemaUpdate.addColumn`,
+    // with the variant type unchanged.
     #[tokio::test]
     async fn test_add_variant_column_assigns_fresh_ids_like_java() {
         let table = v3_variant_table();
@@ -3701,10 +3590,9 @@ mod tests {
         assert_eq!(inner.field_type.as_ref(), &Type::Variant);
     }
 
-    // RISK (no type change away from variant, live-Java-probed): 1.10.0
-    // `SchemaUpdate.updateColumn(v, string)` throws "Cannot change column type: v: variant ->
-    // string" — `update_column` only accepts primitive→primitive promotions, and variant is not a
-    // primitive. Allowing it would silently re-type every existing data file's column.
+    // RISK (no type change away from variant, live-Java-probed): 1.10.0 `updateColumn(v, string)`
+    // throws "Cannot change column type". Variant is not a primitive, and `update_column` accepts
+    // only primitive promotions. Allowing it would re-type every existing data file's column.
     #[tokio::test]
     async fn test_update_variant_column_type_rejected() {
         let table = v3_variant_table();

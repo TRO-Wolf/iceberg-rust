@@ -15,52 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `ComputeTableStats` — per-column NDV (number of distinct values) statistics via Apache
-//! DataSketches theta sketches, written as one `apache-datasketches-theta-v1` Puffin blob per column
-//! into a single statistics file and registered into the table metadata.
+//! `ComputeTableStats` — per-column NDV statistics, written as one
+//! `apache-datasketches-theta-v1` Puffin blob per column. Rust port of Java
+//! `org.apache.iceberg.actions.ComputeTableStats` and `NDVSketchUtil`.
 //!
-//! The Rust port of Java 1.10.0 `org.apache.iceberg.actions.ComputeTableStats` (the engine-agnostic
-//! contract) + the `ComputeTableStatsSparkAction` / `NDVSketchUtil` compute behavior, minus the Spark
-//! distribution layer (the scan runs through the in-process Iceberg [`TableScan`](crate::scan)).
+//! # Notes
 //!
-//! # The cross-engine byte contract
+//! Three contracts keep the blobs and estimates equal to Spark, Trino, and Flink. One wrong byte
+//! makes every NDV estimate disagree silently.
 //!
-//! Each non-null column value is fed to the sketch as its **Iceberg single-value serialization** form
-//! — the exact bytes Java's `Conversions.toByteBuffer` produces (verified against the
-//! `iceberg-api-1.10.0` bytecode): a `long`/`time`/`timestamp` as 8 little-endian bytes, an
-//! `int`/`date` as 4 little-endian bytes, a `string` as unprefixed UTF-8, a `decimal` as the
-//! big-endian two's-complement minimal encoding of the unscaled value, etc. That form is exactly what
-//! [`Datum::to_bytes`](crate::spec::Datum::to_bytes) yields, so the feed is
-//! `sketch.update_bytes(&datum.to_bytes()?)`. A single divergent byte would make every NDV estimate
-//! silently disagree with Spark/Trino/Flink — hence the per-type byte-form pins in the tests.
-//!
-//! The puffin blob payload is the DataSketches theta `CompactSketch` serialized format produced by the
-//! [`iceberg_sketches`] crate (byte-pinned against Java DataSketches).
-//!
-//! # The sketch update family is `Alpha` (Y3 — closes the Y2 family gap)
-//!
-//! **Java's NDV pipeline builds an `Alpha`-family update sketch, not `QuickSelect`.** Three independent
-//! sources agree: the puffin spec (`format/puffin-spec.md`: "constructing **Alpha family sketch** with
-//! default seed"), the Spark `ThetaSketchAgg.createAggregationBuffer` source
-//! (`UpdateSketch.builder.setFamily(Family.ALPHA).build()`, identical across spark v3.5/v4.0/v4.1), and
-//! the `datasketches-java-3.3.0` bytecode (`UpdateSketchBuilder`'s default family is `QUICKSELECT`, so
-//! the explicit `.setFamily(ALPHA)` is load-bearing). This action therefore builds an
-//! [`AlphaSketch`](iceberg_sketches::AlphaSketch) (the Rust port of `HeapAlphaSketch`) at the
-//! Iceberg-default lgK 12 / seed 9001. In **exact mode** (`theta == Long.MAX_VALUE`) Alpha and
-//! QuickSelect are byte-identical; in **estimation mode** they diverge (n=1M → Alpha `ndv` 1 004 032 vs
-//! QuickSelect 1 002 714), and Alpha is what every other engine writes — so on high-cardinality columns
-//! this action now produces cross-engine-matching bytes + `ndv`.
-//!
-//! # The `ndv` property reads the COMPACT sketch, not the update sketch
-//!
-//! The blob's `ndv` property is `String.valueOf((long) sketch.getEstimate())`, but **`sketch` is the
-//! COMPACT sketch** Java reads back from the serialized bytes, not the live Alpha update sketch. Java
-//! `NDVSketchUtil.toBlob` does `Sketch sketch = CompactSketch.wrap(Memory.wrap(bytes))` then reads
-//! `getEstimate()` off that — the family-COMPACT *standard* estimator `compactRetained * (2^63/theta)`
-//! (truncated toward zero to an `i64`, decimal digits, no leading/trailing spaces — puffin spec). This
-//! differs from the Alpha update sketch's own *sampling* estimator (`nominal * 2^63/theta`): for n=1M
-//! the update sketch estimates 1 002 319 but the compact sketch (and thus the `ndv`) is 1 004 032. So
-//! this action feeds `ndv` from `sketch.compact().estimate()`, never from the update form's estimate.
+//! | Contract | Rule |
+//! |---|---|
+//! | Feed bytes | the Iceberg single-value form, [`Datum::to_bytes`](crate::spec::Datum::to_bytes). Java `Conversions.toByteBuffer`. The tests pin it per type. |
+//! | Sketch family | `Alpha`, not the builder default `QuickSelect`. Java sets `Family.ALPHA` explicitly, at lgK 12 and seed 9001. |
+//! | `ndv` source | the COMPACT sketch estimate, never the update sketch estimate. The two diverge in estimation mode. |
 
 use std::collections::HashMap;
 
@@ -86,19 +54,12 @@ const WRITE_METADATA_PATH_PROPERTY: &str = "write.metadata.path";
 const STATS_FILE_EXTENSION: &str = "stats";
 
 /// Computes per-column NDV statistics over a table snapshot and writes them to a Puffin statistics
-/// file — the Rust port of Java's `ComputeTableStats` action.
+/// file. Rust port of Java `ComputeTableStats`.
 ///
-/// Builder semantics mirror Java's `ComputeTableStats` interface:
+/// # Notes
 ///
-/// - [`ComputeTableStats::columns`] — the set of columns to collect stats for. **Default: all
-///   top-level primitive columns** (Java `schema.columns().filter(type.isPrimitiveType())`); nested
-///   struct/list/map columns are excluded and rejected if named explicitly.
-/// - [`ComputeTableStats::snapshot_id`] — the snapshot to compute over. **Default: the current
-///   snapshot.**
-/// - [`ComputeTableStats::execute`] — runs the scan (merge-on-read deletes APPLIED), feeds each
-///   selected column's non-null values into a per-column theta sketch, writes one Puffin file with one
-///   `apache-datasketches-theta-v1` blob per column, and registers the resulting [`StatisticsFile`]
-///   through the existing [`UpdateStatisticsAction`](crate::transaction::Transaction::update_statistics).
+/// By default the action reads every top-level primitive column of the current snapshot. A named
+/// nested column is rejected. [`Self::execute`] applies merge-on-read deletes.
 pub struct ComputeTableStats {
     table: Table,
     columns: Option<Vec<String>>,
@@ -149,12 +110,10 @@ impl ComputeTableStats {
         Ok(snapshot.as_ref().clone())
     }
 
-    /// Resolves the columns to collect stats for — the configured set (validated to exist and be
-    /// top-level primitive), else all top-level primitive columns (Java
-    /// `ComputeTableStatsSparkAction.statsColumns` / `validateColumns`).
+    /// Resolves the columns to collect. Uses the configured set, else every top-level primitive
+    /// column (Java `ComputeTableStatsSparkAction.statsColumns` and `validateColumns`).
     ///
-    /// Returns each column's `(name, field_id, primitive_type)` so the feed loop can build a
-    /// [`Datum`] per value without re-resolving the schema.
+    /// Returns `(name, field_id, primitive_type)` per column, so the feed loop skips a schema lookup.
     fn resolve_columns(&self) -> Result<Vec<StatsColumn>> {
         let schema = self.table.metadata().current_schema();
         match &self.columns {
@@ -318,11 +277,9 @@ fn feed_column(
     Ok(())
 }
 
-/// Builds the stats-file path — the Rust port of Java `String.format("%s-%s.stats", snapshotId,
-/// UUID.randomUUID())` + `TableOperations.metadataFileLocation`.
-///
-/// Location: if `write.metadata.path` is set → `<stripTrailingSlash(write.metadata.path)>/<name>`,
-/// else `<location()>/metadata/<name>`.
+/// Builds the stats-file path (Java `String.format("%s-%s.stats", snapshotId, UUID.randomUUID())`
+/// and `TableOperations.metadataFileLocation`). Uses `write.metadata.path` when set, else
+/// `<location>/metadata/`.
 fn stats_file_path(metadata: &TableMetadata, snapshot_id: i64) -> String {
     let uuid = Uuid::new_v4();
     let name = format!("{snapshot_id}-{uuid}.{STATS_FILE_EXTENSION}");
@@ -338,11 +295,9 @@ fn stats_file_path(metadata: &TableMetadata, snapshot_id: i64) -> String {
 /// Writes one Puffin file with one `apache-datasketches-theta-v1` blob per column and returns the
 /// [`StatisticsFile`] describing it.
 ///
-/// Each blob carries `fields = [field_id]`, the snapshot id + sequence number of the computed
-/// snapshot, the compact-sketch payload, and the `ndv` property = `(estimate as i64)` decimal string
-/// (Java `NDVSketchUtil`). The returned [`StatisticsFile`]'s `file_size_in_bytes` /
-/// `file_footer_size_in_bytes` are the writer's total / footer sizes (Java
-/// `PuffinWriter.fileSize()` / `footerSize()`).
+/// Each blob carries `fields = [field_id]`, the snapshot id and sequence number, the compact-sketch
+/// payload, and the `ndv` property (Java `NDVSketchUtil`). The sizes are the writer's total and
+/// footer sizes (Java `PuffinWriter.fileSize()` and `footerSize()`).
 async fn write_stats_file(
     file_io: &FileIO,
     path: &str,
@@ -365,10 +320,8 @@ async fn write_stats_file(
             )
             .with_source(error)
         })?;
-        // The `ndv` reads the COMPACT sketch's estimate (Java `NDVSketchUtil.toBlob`:
-        // `CompactSketch.wrap(bytes).getEstimate()`), NOT the Alpha update sketch's sampling estimate —
-        // the two diverge in estimation mode (n=1M → compact 1004032 vs update 1002319). Parse the
-        // freshly-serialized payload through the same reader Java uses (`CompactSketch.wrap`).
+        // `ndv` must read the COMPACT sketch (Java `NDVSketchUtil.toBlob`), never the Alpha update
+        // sketch. The two estimates diverge in estimation mode.
         let ndv_estimate = CompactThetaSketch::deserialize(&payload)
             .map_err(|error| {
                 Error::new(
@@ -746,11 +699,8 @@ mod tests {
         let statistics_file = &result.statistics_file;
         assert_eq!(statistics_file.snapshot_id, snapshot_id);
         assert_eq!(statistics_file.blob_metadata.len(), 5);
-        // StatisticsFile size invariant (Java fileSize()/footerSize()): 0 < footer STRICTLY < total.
-        // RISK: a footer_size that returned the TOTAL (or anything >= total) corrupts every reader —
-        // Java locates the blob region as fileSize - footerSize, so footer must exclude the leading
-        // MAGIC + the blob payloads. With 5 non-empty blobs the footer is always strictly smaller.
-        // The `<=` form let a footer_size==total mutation survive (Y2-reviewer); `<` kills it.
+        // Java locates the blob region at fileSize - footerSize, so the footer must be STRICTLY
+        // smaller than the file. A `<=` form let a footer_size == total mutation survive.
         assert!(statistics_file.file_footer_size_in_bytes > 0);
         assert!(
             statistics_file.file_footer_size_in_bytes < statistics_file.file_size_in_bytes,
@@ -787,21 +737,16 @@ mod tests {
     }
 
     // ============================================================================================
-    // End-to-end estimation-mode ndv pin — drives the PRODUCTION `write_stats_file` so the blob's
-    // `ndv` property is computed by the real code path (NOT reconstructed inline). RISK: the crown
-    // jewel only feeds exact-mode (≤6 distinct) data, where the Alpha update estimate and the COMPACT
-    // estimate coincide, so it cannot see which object `write_stats_file` reads. This test feeds a
-    // high-cardinality (1M distinct) Alpha sketch where the two estimators DIVERGE (compact 1004032 vs
-    // update sampling 1002319) and asserts the on-disk blob carries the COMPACT value — so a mutation
-    // in `write_stats_file` that reads the update sketch's `estimate()` fails here with 1002319.
+    // Estimation-mode `ndv` pin, driven through the production `write_stats_file`. The crown jewel
+    // feeds only exact-mode data, where the Alpha update estimate and the COMPACT estimate agree, so
+    // it cannot see which object the writer reads. A 1M-distinct sketch makes them diverge. A
+    // mutation that reads the update sketch's `estimate()` fails here with 1002319.
     // ============================================================================================
 
     #[tokio::test]
     async fn test_write_stats_file_ndv_property_reads_compact_estimate_in_estimation_mode() {
-        // 1M distinct longs ⇒ Alpha is in estimation mode (theta < MAX, sampling phase). Cross-checked
-        // against datasketches-java-3.3.0 (lgK 12 / seed 9001): COMPACT getEstimate 1004032.297 → ndv
-        // 1004032; the live Alpha UPDATE sampling estimate is the DIFFERENT 1002319. NDVSketchUtil reads
-        // the compact one — the on-disk `ndv` property MUST be 1004032.
+        // 1M distinct longs put Alpha in estimation mode. datasketches-java-3.3.0 at lgK 12 and
+        // seed 9001 gives COMPACT ndv 1004032, against the update sketch's 1002319.
         const DISTINCT: u64 = 1_000_000;
         const JAVA_ALPHA_COMPACT_NDV: i64 = 1_004_032;
         const ALPHA_UPDATE_SAMPLING_NDV: i64 = 1_002_319; // the WRONG value an update-estimate read emits
@@ -911,12 +856,10 @@ mod tests {
 
     #[test]
     fn test_byte_form_decimal_negative_and_zero_match_java_biginteger() {
-        // EDGE: the 4 hand pins skip negative + zero unscaled values. Java emits
-        // BigInteger.unscaledValue().toByteArray() — big-endian two's-complement MINIMAL — for these.
-        // Expected bytes derived from a Java probe (BigInteger.valueOf(v).toByteArray()):
-        //   -1 → ff ; 0 → 00 ; -300 → fe d4 ; -10^18 (scale-0) → f2 1f 49 4c 58 9c 00 00.
-        // A wrong sign-extension or a non-minimal/padded encoding would hash a different byte string
-        // and diverge every negative-decimal column's NDV from Java/Spark/Trino.
+        // The four hand pins skip negative and zero unscaled values. Java emits
+        // `BigInteger.toByteArray()`: big-endian two's complement, minimal length.
+        // A Java probe gives -1 → ff, 0 → 00, -300 → fe d4, -10^18 → f2 1f 49 4c 58 9c 00 00.
+        // A wrong sign extension or a padded encoding diverges every negative-decimal NDV.
         let make = |unscaled: i128, precision: u32, scale: u32| {
             Datum::new(
                 PrimitiveType::Decimal { precision, scale },

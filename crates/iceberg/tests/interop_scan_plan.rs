@@ -15,79 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java interop for the SCAN-PLAN layer (`plan_tasks`) — GAP_MATRIX row R148.
+//! Java interop for the SCAN-PLAN layer (`plan_tasks`).
 //!
-//! Proves Rust `TableScan::plan_tasks` produces the SAME bin-packed `CombinedScanTask` GROUPS as Java's
-//! REAL `table.newScan().option(SPLIT_SIZE/LOOKBACK/OPEN_FILE_COST, ...).planTasks()`, in BOTH directions,
-//! with the target/lookback/open-file-cost HAND-DECLARED IDENTICALLY on both sides (anti-circular — the
-//! constants below mirror `InteropOracle.ScanPlanOracle` EXACTLY; neither side derives its knobs from the
-//! other).
+//! It proves Rust `TableScan::plan_tasks` produces the same bin-packed `CombinedScanTask` groups as
+//! Java `planTasks()`, in both directions. The knobs are hand-declared on both sides, mirroring
+//! `InteropOracle.ScanPlanOracle`, so neither side derives them from the other.
 //!
-//! THE FIXTURE (V2, UNPARTITIONED, schema `{1 id long required, 2 data string optional}`), built identically
-//! by BOTH the Java oracle and the Rust GEN path: several REAL parquet data files of VARYING size + a MoR
-//! position delete, so split + bin-pack are non-trivial:
+//! The fixture is a V2 unpartitioned table, schema `{1 id long required, 2 data string optional}`,
+//! built identically by the Java oracle and by the Rust GEN path:
 //!
-//! * `big.parquet` — many rows written with a TINY parquet row-group size, so it has MULTIPLE row groups
-//!   ⇒ non-null strictly-ascending split offsets ⇒ the OFFSETS-AWARE split fires.
-//! * `mid.parquet` — a medium single-row-group file ⇒ FIXED-SIZE split under the small target.
-//! * `small1/small2` — two small files that PACK together.
-//! * `big-deletes` — a position delete over `big.parquet` so big's sub-tasks carry deletes and the
-//!   bin-pack WEIGHT includes the delete bytes.
-//! * `merge.parquet` — the ADJACENT-SPLIT MERGE fixture (2 row groups, whole file comfortably UNDER
-//!   the split target) — see below.
-//! * `gap.parquet` — the ADJACENCY-IS-RESPECTED fixture (3 row groups, the MIDDLE one alone heavier
-//!   than the target) — see below.
+//! | File | Shape | Exercises |
+//! |---|---|---|
+//! | `big.parquet` | many rows, tiny row groups | the offsets-aware split |
+//! | `mid.parquet` | one medium row group | the fixed-size split |
+//! | `small1` / `small2` | small | packing two files into one bin |
+//! | `big-deletes` | a position delete over `big.parquet` | delete bytes in the pack weight |
+//! | `merge.parquet` | 2 row groups, whole file under [`TARGET`] | the adjacent-split merge |
+//! | `gap.parquet` | 3 row groups, the middle one over [`TARGET`] | that adjacency is respected |
 //!
-//! THE MERGE FIXTURES + THEIR ISOLATING FILTERS. `CombinedScanTask::new` ports Java's
-//! `BaseCombinedScanTask(List)` constructor, whose bytecode calls `TableScanUtil.mergeTasks`: within ONE
-//! bin, a run of LIST-ADJACENT splits of the SAME file that are exactly CONTIGUOUS collapses into one
-//! spanning member. The `big/mid/small` fixture above never deterministically puts two adjacent splits of
-//! one file in one bin, so it exercises the merge only by accident (that accident — a delete-file path
-//! length nudging the pack weights across the 4096 knife edge — is exactly what made the original failure
-//! runner-only). Two dedicated files close that coverage hole, each planned under a HAND-DECLARED,
-//! metrics-prunable row filter so its splits meet an EMPTY bin-packer and the outcome cannot depend on
-//! how the other files happened to pack (the fixture files occupy DISJOINT `id` ranges), and over the
-//! delete-free APPEND snapshot (see [`append_snapshot_id`] — the position delete attaches to every file
-//! of an unpartitioned table and its size tracks the checkout path length, which is precisely the
-//! environment sensitivity these fixtures exist to remove):
+//! `CombinedScanTask::new` ports Java `BaseCombinedScanTask(List)`, whose `TableScanUtil.mergeTasks`
+//! collapses a run of list-adjacent, contiguous splits of one file into one spanning member. The
+//! big/mid/small files hit that path by accident only, which made the original failure runner-only.
+//! So `merge.parquet` and `gap.parquet` each plan under a metrics-prunable filter over a disjoint
+//! `id` range, and over the delete-free APPEND snapshot; [`append_snapshot_id`] says why.
 //!
-//! * `merge.parquet` (ids from [`MERGE_ID_BASE`], filter [`merge_filter`]) — 2 row groups and a TOTAL
-//!   LENGTH comfortably below [`TARGET`], so BOTH its splits necessarily share the first bin on any
-//!   parquet build and merge into the single spanning member
-//!   `(merge.parquet, firstOffset, fileLength - firstOffset)` (`firstOffset` is 4 — parquet's "PAR1"
-//!   magic). Note the merged key is INDEPENDENT of the internal row-group grid — merging removes the
-//!   environment sensitivity rather than adding it. The sizing is ASSERTED
-//!   (`fileLength < TARGET`), so a future fixture edit that pushes it over fails loudly instead of
-//!   silently reverting the pin to vacuity. What proves the merge FIRED is the exact
-//!   [`assert_eq`](assert_merge_fixture_pins) on the plan SHAPE — ONE group holding ONE member spanning
-//!   the whole file — read against the offsets-aware-split invariant: the splitter emits exactly one
-//!   sub-task PER SPLIT OFFSET, target-independent (Java `OffsetsAwareSplitScanTaskIterator`, Rust
-//!   `FileScanTask::split_at_offsets`), so `>= 2` offsets means `>= 2` splits and a single spanning
-//!   member is only producible by the merge.
-//! * `gap.parquet` (ids from [`GAP_ID_BASE`], filter [`gap_filter`]) — 3 row groups whose MIDDLE one
-//!   carries [`WIDE_ROWS`] high-entropy [`WIDE_CHARS`]-char strings so its span ALONE exceeds
-//!   [`TARGET`] (asserted), while the outer two are null-`data` row groups whose spans SUM to under
-//!   [`TARGET`] (asserted). First-fit packing therefore puts split 0 in bin 0, split 1 in its own bin
-//!   (it fits nowhere), and split 2 back in bin 0 — a CO-BINNED, SAME-FILE, NON-CONTIGUOUS pair that
-//!   must NOT merge. Java's `mergeTasks` is a single-pass adjacent-run collapse, not a group-by-file;
-//!   this pins that cross-engine instead of only in the offline unit test.
+//! The compared plan is the MULTISET of per-group member-key sets plus the group count. A key is
+//! `(basename,start,length)`, keyed on the basename because the engines write at different roots.
+//! Group emission order is a bin-packer detail and is not compared.
 //!
-//! THE COMPARISON. Each emitted group is a SORTED set of member keys `(basename,start,length)` (basename =
-//! the file's tail — the cross-engine key, since the two engines write at different roots). The plan is the
-//! MULTISET of per-group member-key sets + the group count. Rust and Java BOTH plan the SAME on-disk table
-//! within a direction, so split offsets (hence start/length) are byte-identical; the set-of-sets + count
-//! must match exactly. Group emission ORDER is NOT compared (an internal bin-packer detail).
-//!
-//! THE TWO DIRECTIONS (driven by `dev/java-interop/run-interop-scan-plan.sh`):
-//!
-//! * D1 (`ICEBERG_INTEROP_SCAN_PLAN_DIR`): Java writes the table + emits `java_scan_plan.json`; Rust loads
-//!   the SAME table, runs `plan_tasks` with the hand-declared knobs, asserts its plan == Java's.
-//! * GEN/D2 (`ICEBERG_INTEROP_SCAN_PLAN_GEN_DIR`): Rust WRITES the same logical table to `<dir>/rust_table`
-//!   and emits `rust_scan_plan.json`; the Java oracle's `verify-interop-scan-plan` runs the REAL Java
-//!   planTasks over the RUST-written table and asserts the SAME plan.
-//!
-//! THE ENV GATE. Both tests are clean NO-OPs when their env var is unset (a runtime early-return, NOT
-//! `#[ignore]`), so the offline `cargo test` gate stays green with no Java/Maven.
+//! `dev/java-interop/run-interop-scan-plan.sh` drives two directions: in D1 Java writes the table and
+//! its plan and Rust matches it, and in GEN/D2 Rust writes both and Java judges them. Each test
+//! returns early when its env var is unset, so the offline gate stays green without Java.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -118,9 +76,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use serde::Deserialize;
 
-// ===========================================================================================
-// HAND-DECLARED knobs (anti-circular — mirror InteropOracle.ScanPlanOracle EXACTLY).
-// ===========================================================================================
+// ===== HAND-DECLARED knobs, mirroring InteropOracle.ScanPlanOracle =====
 
 /// The bin-pack target in bytes (Java `ScanPlanOracle.TARGET`).
 const TARGET: u64 = 4096;
@@ -129,48 +85,36 @@ const LOOKBACK: usize = 5;
 /// The per-open file cost in bytes (Java `ScanPlanOracle.OPEN_FILE_COST`).
 const OPEN_FILE_COST: u64 = 0;
 
-// ===========================================================================================
-// HAND-DECLARED merge-fixture shape (anti-circular — mirrors InteropOracle.ScanPlanOracle EXACTLY).
+// ===== HAND-DECLARED merge-fixture shape, mirroring InteropOracle.ScanPlanOracle =====
 //
-// Both engines flush a row group every ROW_GROUP_ROWS rows: Rust sets the parquet writer's
-// max-row-group ROW count directly; parquet-mr flushes at its 100-row memory-check FLOOR because the
-// table's `write.parquet.row-group-size-bytes` is a deliberately tiny 64 bytes (the same trick the
-// `big.parquet` grid already relies on — see InteropOracle.buildTableWithFiles). So a 120-row file is
-// 100 + 20 and a 210-row file is 100 + 100 + 10 on BOTH sides.
-// ===========================================================================================
+// Both flush every ROW_GROUP_ROWS rows: Rust by row count, parquet-mr at its 100-row floor, which
+// the table's 64-byte row-group size reaches at once.
 
-/// Rows per parquet row group for the merge fixtures — parquet-mr's memory-check floor, mirrored as
-/// the Rust writer's max-row-group row count so both engines produce the SAME row-group grid.
+/// Rows per row group for the merge fixtures, so both engines produce the SAME grid.
 const ROW_GROUP_ROWS: usize = 100;
 /// `merge.parquet` row count ⇒ 2 row groups (100 + 20) with a total length under [`TARGET`].
 const MERGE_ROWS: usize = 120;
-/// The `id` value of `merge.parquet`'s first row; its whole range is `[MERGE_ID_BASE, GAP_ID_BASE)`.
+/// `merge.parquet`'s first row id; its range is `[MERGE_ID_BASE, GAP_ID_BASE)`.
 const MERGE_ID_BASE: i64 = 1_000_000;
 /// `gap.parquet` row count ⇒ 3 row groups (100 + 100 + 10).
 const GAP_ROWS: usize = 210;
-/// The `id` value of `gap.parquet`'s first row; its range is `[GAP_ID_BASE, ..)`.
+/// `gap.parquet`'s first row id; its range is `[GAP_ID_BASE, ..)`.
 const GAP_ID_BASE: i64 = 2_000_000;
-/// `gap.parquet`'s WIDE row window `[WIDE_FROM, WIDE_FROM + WIDE_ROWS)` — exactly its MIDDLE row
-/// group, so that group's span alone exceeds [`TARGET`].
+/// The start of `gap.parquet`'s wide window: its MIDDLE row group, whose span alone exceeds [`TARGET`].
 const WIDE_FROM: usize = 100;
 /// How many rows carry the wide `data` value (one full row group).
 const WIDE_ROWS: usize = 100;
-/// Characters per wide `data` value. `WIDE_ROWS * WIDE_CHARS` = 25,600 bytes of HIGH-ENTROPY text,
-/// so the middle row group clears the 4,096-byte target by ~6x even after compression, while the
-/// per-row-group min/max bounds it puts in the parquet FOOTER (which land in the LAST row group's
-/// span) stay small enough that the two outer spans still sum to well under the target.
+/// Characters per wide value. The middle row group then clears the target by about 6x.
 const WIDE_CHARS: usize = 256;
 
 /// The `data` column shape of a fixture file.
 #[derive(Clone, Copy)]
 enum DataShape {
-    /// Every row carries the narrow `row-{i:06}` string (the original big/mid/small fixture files).
+    /// Every row carries the narrow `row-{i:06}` string.
     Narrow,
-    /// Every row carries NULL — the smallest possible file for a given row count, which is how
-    /// `merge.parquet` stays under the split target on both engines.
+    /// Every row carries NULL, so `merge.parquet` stays under the split target.
     NullData,
-    /// Rows in `[WIDE_FROM, WIDE_FROM + WIDE_ROWS)` carry a wide high-entropy string; every other
-    /// row carries NULL (keeping `gap.parquet`'s outer row groups small).
+    /// The wide window carries a high-entropy string, and every other row NULL.
     SparseWide,
 }
 
@@ -179,28 +123,23 @@ enum DataShape {
 struct FixtureShape {
     /// How many rows to write.
     rows: usize,
-    /// Max rows per parquet row group; `None` ⇒ the writer default (⇒ ONE row group here).
+    /// `None` takes the writer default, which gives one row group here.
     max_row_group_rows: Option<usize>,
-    /// The `id` of the first row — fixture files occupy DISJOINT id ranges so a metrics-pruned
-    /// filtered scan can isolate exactly one of them.
+    /// Fixture files occupy DISJOINT id ranges, so a metrics-pruned filter isolates one file.
     id_base: i64,
     /// The `data` column shape.
     data: DataShape,
 }
 
-/// A deterministic HIGH-ENTROPY [`WIDE_CHARS`]-character string for `row` (mirrored EXACTLY by
-/// `InteropOracle.ScanPlanOracle.wideValue` — a 32-bit LCG over a 62-character alphabet).
+/// A deterministic high-entropy [`WIDE_CHARS`]-character string for `row`, mirroring
+/// `InteropOracle.ScanPlanOracle.wideValue`.
 ///
-/// Entropy is LOAD-BEARING, not decoration: the two engines write parquet with different default
-/// codecs (the Rust fixture writer uncompressed, Iceberg's Java default zstd), so a low-entropy filler
-/// (zero-padded digits, a repeated character) would compress away on the Java side and collapse
-/// `gap.parquet`'s middle row group BELOW the split target — silently reverting the M-4 adjacency pin
-/// to vacuity. The span is asserted anyway; the entropy keeps that assertion from being the thing that
-/// fails.
+/// The entropy is LOAD-BEARING. The engines use different default codecs, so a low-entropy filler
+/// compresses away on the Java side and the middle row group falls below the split target.
 fn wide_value(row: usize) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-    // `row` is a small fixture index; the cast is on a bounded domain (< GAP_ROWS).
+    // `row` is a fixture index below GAP_ROWS, so the cast is on a bounded domain.
     let mut seed = u32::try_from(row).unwrap_or(0).wrapping_mul(0x9E37_79B1);
     let mut out = String::with_capacity(WIDE_CHARS);
     for _ in 0..WIDE_CHARS {
@@ -223,31 +162,27 @@ fn fixture_data_value(shape: DataShape, row: usize) -> Option<String> {
     }
 }
 
-/// The metrics-prunable row filter that isolates `merge.parquet` (hand-declared; mirrors
-/// `InteropOracle.ScanPlanOracle.mergeFilter`). Both bounds are needed so `gap.parquet`'s higher ids
-/// are excluded too.
+/// The row filter isolating `merge.parquet` (`ScanPlanOracle.mergeFilter`); its upper bound
+/// excludes `gap.parquet`.
 fn merge_filter() -> Predicate {
     Reference::new("id")
         .greater_than_or_equal_to(Datum::long(MERGE_ID_BASE))
         .and(Reference::new("id").less_than(Datum::long(GAP_ID_BASE)))
 }
 
-/// The metrics-prunable row filter that isolates `gap.parquet` (hand-declared; mirrors
-/// `InteropOracle.ScanPlanOracle.gapFilter`).
+/// The row filter that isolates `gap.parquet`, mirroring `ScanPlanOracle.gapFilter`.
 fn gap_filter() -> Predicate {
     Reference::new("id").greater_than_or_equal_to(Datum::long(GAP_ID_BASE))
 }
 
-// ===========================================================================================
-// Env gates + the Java plan model.
-// ===========================================================================================
+// ===== Env gates + the Java plan model =====
 
-/// The dir the Java oracle wrote its table + `java_scan_plan.json` into (Direction 1).
+/// The dir holding the Java oracle's table and `java_scan_plan.json` (Direction 1).
 fn d1_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_SCAN_PLAN_DIR").map(PathBuf::from)
 }
 
-/// The dir into which the Direction-2 GEN path writes the Rust-authored table for Java to judge.
+/// The dir the GEN path writes the Rust-authored table into, for Java to judge.
 fn gen_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_SCAN_PLAN_GEN_DIR").map(PathBuf::from)
 }
@@ -265,13 +200,10 @@ fn basename(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
-/// The MULTISET of per-group member-key sets, as a sorted `Vec` of sorted member `Vec`s. Using a sorted
-/// `Vec`-of-`Vec`s (NOT a `Set`-of-`Set`s) preserves DUPLICATE groups — two distinct bins that happen to
-/// hold the same member set must both count — which is the faithful multiset contract.
+/// The MULTISET of per-group member-key sets. A `Set` would drop two bins with equal members.
 type PlanMultiset = Vec<Vec<String>>;
 
-/// Normalize a set of groups (each a member-key set) into the canonical comparison form: each group sorted,
-/// then the list of groups sorted. Order-insensitive across groups, duplicate-preserving.
+/// Normalize groups into the comparison form: each group sorted, then the list of groups sorted.
 fn normalize(groups: Vec<BTreeSet<String>>) -> PlanMultiset {
     let mut out: PlanMultiset = groups
         .into_iter()
@@ -281,7 +213,7 @@ fn normalize(groups: Vec<BTreeSet<String>>) -> PlanMultiset {
     out
 }
 
-/// The member key for one file-scan task: `(basename,start,length)` — identical to Java's `memberKey`.
+/// The member key for one file-scan task, identical to Java's `memberKey`.
 fn member_key(task: &iceberg::scan::FileScanTask) -> String {
     format!(
         "({},{},{})",
@@ -300,8 +232,7 @@ fn groups_to_multiset(groups: &[CombinedScanTask]) -> PlanMultiset {
     normalize(group_sets)
 }
 
-/// Run `plan_tasks` and collect the canonical plan multiset for the table scan built with the hand-declared
-/// knobs (target / lookback / open-file-cost set via the builder).
+/// Run `plan_tasks` with the hand-declared knobs and collect the canonical plan multiset.
 async fn rust_plan_multiset(
     table: &Table,
     target: u64,
@@ -325,18 +256,10 @@ async fn rust_plan_multiset(
     groups_to_multiset(&groups)
 }
 
-/// The APPEND snapshot — the parent of the current one, i.e. the fixture state BEFORE the MoR position
-/// delete was committed. The merge legs plan THIS snapshot, and that choice is LOAD-BEARING.
-///
-/// The table is UNPARTITIONED, so a position delete attaches to EVERY data file in the (single, empty)
-/// partition — measured on the Java fixture: `merge.parquet`'s whole-file task comes back with one
-/// delete of 1,545 bytes. Those delete bytes enter the bin-pack weight of EVERY sub-task
-/// ([`FileScanTask::weight`] / Java `ScanTaskUtil.contentSizeInBytes`), and the delete file's size is
-/// dominated by the ABSOLUTE data-file path it embeds — so it varies with the checkout directory.
-/// Charging it to each split would put the merge fixture's co-binning back on exactly the
-/// environment-sensitive knife edge that made the original failure runner-only (2 x 1,545 is already
-/// 75% of the 4,096 target). Planning the delete-free append snapshot makes each split's weight equal
-/// its LENGTH — a property of the fixture, not of the filesystem it was written on.
+/// The APPEND snapshot: the fixture state before the MoR position delete. The merge legs plan it,
+/// and that choice is LOAD-BEARING. The table is unpartitioned, so a position delete attaches to
+/// EVERY data file and its bytes enter every sub-task's weight. Its size tracks the absolute path
+/// it embeds, so the co-binning would follow the checkout directory.
 fn append_snapshot_id(table: &Table) -> i64 {
     table
         .metadata()
@@ -346,11 +269,8 @@ fn append_snapshot_id(table: &Table) -> i64 {
         .expect("the scan-plan fixture must have an APPEND snapshot before the row-delta")
 }
 
-/// Run `plan_tasks` under a ROW FILTER and collect the canonical plan multiset, with the same
-/// hand-declared knobs. Used by the merge fixtures: the filter is metrics-prunable (each fixture file
-/// owns a disjoint `id` range), so the filtered scan plans exactly ONE data file and its splits meet an
-/// EMPTY bin-packer — making the co-binning deterministic instead of a function of how the rest of the
-/// fixture happened to pack.
+/// Run `plan_tasks` under a ROW FILTER. It prunes to ONE data file, so the splits meet an EMPTY
+/// bin-packer and the co-binning no longer depends on the other files.
 async fn rust_filtered_plan_multiset(table: &Table, filter: Predicate) -> PlanMultiset {
     let scan = table
         .scan()
@@ -371,9 +291,8 @@ async fn rust_filtered_plan_multiset(table: &Table, filter: Predicate) -> PlanMu
     groups_to_multiset(&groups)
 }
 
-/// Run the typed [`BatchScan`] `plan_tasks` (row R124) and collect the canonical plan multiset, with the
-/// SAME hand-declared knobs set via the BatchScan builder. The BatchScan adapter delegates to the same
-/// pipeline as [`rust_plan_multiset`], so the two multisets MUST be equal — the tests assert exactly that.
+/// Run the typed [`BatchScan`] `plan_tasks`. It delegates to the same pipeline as
+/// [`rust_plan_multiset`], so the tests assert the two multisets are equal.
 async fn rust_batch_plan_multiset(
     table: &Table,
     target: u64,
@@ -422,20 +341,13 @@ fn read_java_plan_file(dir: &Path, file_name: &str) -> JavaScanPlan {
     serde_json::from_str(&json).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
-// ===========================================================================================
-// D1 mismatch diagnostics.
+// ===== D1 mismatch diagnostics =====
 //
-// The scan-plan D1 leg is the parity net's most environment-sensitive fixture: the split member keys
-// `(basename,start,length)` ARE `big.parquet`'s row-group offsets, and those offsets come from parquet-mr's
-// (version-sensitive) row-group flush. When D1 fails in CI, the raw failure carries only the two plans;
-// this block dumps the UPSTREAM facts — the manifest field-132 `split_offsets` Rust actually plans from, plus
-// the PHYSICAL parquet-footer row-group offsets and `created_by` (the parquet-mr build that wrote the file) —
-// so a single CI `tail -40` localizes the fault instead of requiring another round trip. Kept best-effort:
-// this code runs ONLY on the failure path, so it must never itself panic (it degrades to `<unavailable: …>`).
-// ===========================================================================================
+// The D1 member keys ARE `big.parquet`'s row-group offsets, from a version-sensitive parquet-mr
+// flush, so this block dumps the upstream facts. It runs on the failure path only and must never
+// panic itself.
 
-/// The manifest field-132 `split_offsets` Rust reads for every data file in the current snapshot — the exact
-/// input to the offsets-aware split. Returned as `(basename, offsets)` rows (empty vec ⇒ field absent).
+/// The field-132 `split_offsets` of every data file; an empty vec means absent.
 async fn manifest_split_offsets(table: &Table) -> Result<Vec<(String, Vec<i64>)>, String> {
     Ok(manifest_data_files(table)
         .await?
@@ -444,9 +356,7 @@ async fn manifest_split_offsets(table: &Table) -> Result<Vec<(String, Vec<i64>)>
         .collect())
 }
 
-/// Every file in the current snapshot's manifests as `(basename, split_offsets, file_size_in_bytes)`
-/// — the manifest facts the split layer plans from. Backs both the D1 diagnostics above and the
-/// merge-fixture non-vacuity pins ([`assert_merge_fixture_pins`]).
+/// The manifest facts the split layer plans from, as `(basename, split_offsets, file_size_in_bytes)`.
 async fn manifest_data_files(table: &Table) -> Result<Vec<(String, Vec<i64>, u64)>, String> {
     let snapshot = table
         .metadata()
@@ -477,11 +387,10 @@ async fn manifest_data_files(table: &Table) -> Result<Vec<(String, Vec<i64>, u64
     Ok(rows)
 }
 
-/// `big.parquet`'s PHYSICAL row-group layout, read straight from the parquet footer (bypassing the manifest):
-/// `(created_by, row_group_start_offsets, file_len)`. A row group's start is its first column chunk's
-/// dictionary-page offset when present, else its first data-page offset — exactly Java `BlockMetaData
-/// .getStartingPos()`, i.e. what iceberg records as field-132. Comparing this to [`manifest_split_offsets`]
-/// reveals a write that recorded offsets inconsistent with the physical grid.
+/// `big.parquet`'s physical row-group layout, read from the parquet footer, not the manifest. A row
+/// group starts at its first dictionary page, else its first data page, as Java
+/// `BlockMetaData.getStartingPos()` does. A diff against [`manifest_split_offsets`] shows a write
+/// whose offsets the physical grid does not support.
 fn big_parquet_footer(path: &Path) -> Result<(String, Vec<i64>, u64), String> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
@@ -506,7 +415,7 @@ fn big_parquet_footer(path: &Path) -> Result<(String, Vec<i64>, u64), String> {
     Ok((created_by, offsets, file_len))
 }
 
-/// Build the human-readable D1 mismatch report (see the section banner above). Never panics.
+/// Build the human-readable D1 mismatch report. It never panics.
 async fn d1_mismatch_report(table: &Table, dir: &Path) -> String {
     let mut out =
         String::from("\n--- D1 DIAGNOSTICS (upstream facts behind the plan mismatch) ---\n");
@@ -549,39 +458,16 @@ async fn d1_mismatch_report(table: &Table, dir: &Path) -> String {
     out
 }
 
-// ===========================================================================================
-// The adjacent-split MERGE pins (M-1 / M-3 / M-4).
+// ===== The adjacent-split MERGE pins =====
 //
-// These assertions are what keep the merge legs from being vacuous. The cross-engine equality of the
-// filtered plans (asserted by the callers) proves the two engines AGREE; the assertions here prove the
-// thing they agree on is actually the merge.
-//
-// WHAT DOES THE PROVING — read this before trusting any single assert below. The load-bearing
-// assertions are the two exact `assert_eq`s on the plan SHAPE, interpreted through the
-// OFFSETS-AWARE-SPLIT INVARIANT: the splitter emits exactly ONE sub-task PER SPLIT OFFSET and IGNORES
-// the target in that branch (Java `OffsetsAwareSplitScanTaskIterator`; Rust
-// `FileScanTask::split_at_offsets`). Therefore:
-//
-//   * `merge.parquet` has `>= 2` split offsets (asserted) ⇒ the splitter MUST emit `>= 2` sub-tasks ⇒
-//     a plan of ONE group holding ONE member that spans the whole file is producible ONLY by the merge
-//     collapsing them. That equality is the proof.
-//   * `gap.parquet` is asserted to plan as EXACTLY two groups with the outer pair intact — two separate
-//     same-file members in ONE group. A group-by-file coalesce would emit one member there, so the
-//     equality pins the adjacent-run semantics.
-//
-// The surrounding numeric asserts are FIXTURE guards, not the proof: the SIZING trio (merge total <
-// target; gap middle span > target; gap outer spans sum <= target) pins the packing preconditions, and
-// the "member length exceeds the largest single row-group span" / "the co-binned pair is
-// non-contiguous" checks are degenerate-fixture guards — they catch a file that collapsed to a single
-// row group or offsets that stopped ascending. Both are arithmetically implied once the offset counts
-// and ascending-offset invariant hold, so neither is doing the discriminating work; do not read them
-// as the non-vacuity mechanism. The EXECUTABLE proof that all of this is load-bearing is stage [7] of
-// `dev/java-interop/run-interop-scan-plan.sh`, which removes the merge (and, separately, its
-// contiguity clause) from production source and requires these assertions to go RED.
-// ===========================================================================================
+// The callers assert the two engines agree. These assertions prove they agree on the merge. The
+// splitter emits one sub-task per split offset and ignores the target, so `merge.parquet`, with
+// `>= 2` offsets, reaches one whole-file member only through the merge. `gap.parquet` must plan two
+// groups with the outer pair intact, where a group-by-file coalesce emits one member. The other
+// asserts are fixture guards. Stage [7] of `dev/java-interop/run-interop-scan-plan.sh` deletes the
+// merge, then its contiguity clause, and requires these assertions to go RED.
 
-/// The `length` field of an EMITTED member key `(basename,start,length)` — so a guard can read the
-/// plan's own observable instead of recomputing it from the manifest facts.
+/// The `length` of an emitted member key, so a guard reads the plan's own observable.
 fn member_length(member: &str) -> u64 {
     member
         .trim_end_matches(')')
@@ -591,8 +477,7 @@ fn member_length(member: &str) -> u64 {
         .unwrap_or_else(|| panic!("member key {member} must end in a numeric length"))
 }
 
-/// The per-row-group byte spans of a data file: `offsets[i+1] - offsets[i]`, the last running to the
-/// file's end — exactly the sub-task lengths the offsets-aware split emits.
+/// The per-row-group byte spans of a data file: the sub-task lengths the offsets-aware split emits.
 fn row_group_spans(offsets: &[u64], file_size: u64) -> Vec<u64> {
     offsets
         .iter()
@@ -626,19 +511,16 @@ async fn fixture_file_facts(table: &Table, name: &str) -> (Vec<u64>, u64) {
     (offsets, file_size)
 }
 
-/// Assert the merge pins over `table`'s two dedicated fixture files, given the plans produced under
-/// [`merge_filter`] / [`gap_filter`]. `label` names the direction for the failure message.
+/// Assert the merge pins over the two dedicated fixture files. `label` names the direction.
 async fn assert_merge_fixture_pins(
     table: &Table,
     merge_plan: &PlanMultiset,
     gap_plan: &PlanMultiset,
     label: &str,
 ) {
-    // -- merge.parquet: M-1/M-3, the single spanning member + the fixture guards. --
+    // -- merge.parquet: the single spanning member, plus the fixture guards. --
     let (merge_offsets, merge_len) = fixture_file_facts(table, "merge.parquet").await;
-    // The PREMISE of the M-1 proof: with >= 2 split offsets the offsets-aware splitter necessarily
-    // emits >= 2 sub-tasks (one per offset, target-ignored), so the single-member plan asserted below
-    // can only be the merge's doing.
+    // With >= 2 offsets the splitter emits >= 2 sub-tasks, so only the merge reaches one member.
     assert!(
         merge_offsets.len() >= 2,
         "{label}: merge.parquet must have >= 2 row groups to have anything to merge, got offsets \
@@ -652,8 +534,7 @@ async fn assert_merge_fixture_pins(
     );
     let merge_spans = row_group_spans(&merge_offsets, merge_len);
     let largest_merge_span = merge_spans.iter().copied().max().unwrap_or(0);
-    // The merged span starts at the FIRST split offset (4 for parquet — after the "PAR1" magic), not
-    // at 0, and runs to the end of the file. It is INDEPENDENT of the internal row-group grid.
+    // The merged span runs from the FIRST split offset, 4 for parquet, to the end of the file.
     let merge_start = merge_offsets[0];
     let merge_span_length = merge_len - merge_start;
 
@@ -669,11 +550,7 @@ async fn assert_merge_fixture_pins(
         merge_offsets.len()
     );
 
-    // DEGENERATE-FIXTURE guard (NOT the non-vacuity proof — see the section banner): the length of the
-    // member the plan ACTUALLY emitted must exceed the largest single row-group span, i.e. the file did
-    // not collapse to one row group. Read out of the emitted plan rather than recomputed, so it
-    // describes the observable; given the `>= 2` ascending offsets above it is arithmetically implied,
-    // which is exactly why the SHAPE equality above — not this — is what discriminates.
+    // Degenerate-fixture guard: the file did not collapse to one row group.
     let emitted_merge_length = merge_plan
         .iter()
         .flat_map(|group| group.iter())
@@ -688,7 +565,7 @@ async fn assert_merge_fixture_pins(
          to merge"
     );
 
-    // -- gap.parquet: M-4 (adjacency, not group-by-file) + its sizing guards. --
+    // -- gap.parquet: adjacency, not group-by-file, plus its sizing guards. --
     let (gap_offsets, gap_len) = fixture_file_facts(table, "gap.parquet").await;
     assert_eq!(
         gap_offsets.len(),
@@ -724,10 +601,7 @@ async fn assert_merge_fixture_pins(
          spans {gap_spans:?})"
     );
 
-    // DEGENERATE-FIXTURE guard, not the M-4 proof (see the section banner): the co-binned pair must be
-    // non-contiguous. Given ascending offsets and a middle span that is asserted `> TARGET` this is
-    // arithmetically implied — the discriminating assertion is the two-group SHAPE equality above,
-    // whose RED under a group-by-file mutation is proven by stage [7] of the run script.
+    // Degenerate-fixture guard, not the proof: the co-binned pair must be non-contiguous.
     assert_ne!(
         gap_offsets[0] + gap_spans[0],
         gap_offsets[2],
@@ -743,9 +617,7 @@ async fn assert_merge_fixture_pins(
     );
 }
 
-// ===========================================================================================
-// Table construction (shared by GEN + the load path).
-// ===========================================================================================
+// ===== Table construction, shared by GEN and the load path =====
 
 fn gen_schema() -> Schema {
     Schema::builder()
@@ -775,10 +647,8 @@ fn load_table(dir: &Path) -> Table {
         .expect("build table from Java-written final.metadata.json")
 }
 
-/// Write a REAL parquet data file at `<table>/data/<basename>` with the row-group + content shape
-/// `shape`. `max_row_group_rows` drives the parquet writer's max row-group size so a many-row file gets
-/// MULTIPLE row groups (hence non-null strictly-ascending split offsets, exercising the offsets-aware
-/// split); `id_base` + `data` place the file in its own id range with its own column width.
+/// Write a REAL parquet data file at `<table>/data/<basename>`. A small `max_row_group_rows` gives
+/// multiple row groups, which exercises the offsets-aware split.
 async fn write_data_file(table: &Table, basename: &str, shape: FixtureShape) -> DataFile {
     use iceberg::arrow::schema_to_arrow_schema;
 
@@ -893,9 +763,7 @@ async fn create_rust_table(catalog: &impl Catalog, table_location: &str) -> Tabl
         .expect("create rust_table")
 }
 
-// ===========================================================================================
-// Direction 1 — Rust plans the JAVA-written table.
-// ===========================================================================================
+// ===== Direction 1: Rust plans the JAVA-written table =====
 
 #[tokio::test]
 async fn test_scan_plan_d1_rust_plans_java_table() {
@@ -911,9 +779,7 @@ async fn test_scan_plan_d1_rust_plans_java_table() {
     let rust = rust_plan_multiset(&table, TARGET, LOOKBACK, OPEN_FILE_COST).await;
     let java = java_plan_multiset(&read_java_plan(&dir));
 
-    // A plain `assert_eq!` here would report only the two plans; on the D1 leg the interesting evidence is
-    // UPSTREAM (the manifest offsets + the physical row-group grid), so on mismatch we panic with that dumped
-    // (see `d1_mismatch_report`). Same failure semantics, far richer CI `tail -40`.
+    // A plain `assert_eq!` reports only the two plans, and the D1 evidence is upstream.
     if rust != java {
         let report = d1_mismatch_report(&table, &dir).await;
         panic!(
@@ -922,9 +788,8 @@ async fn test_scan_plan_d1_rust_plans_java_table() {
         );
     }
 
-    // BatchScan leg (row R124): Rust `BatchScan::plan_tasks` over the SAME Java table must equal
-    //   (a) Java's `newBatchScan().planTasks()` plan (java_batch_scan_plan.json), AND
-    //   (b) the plain scan plan (proving the Rust adapter delegates to the same pipeline).
+    // It must equal Java's `newBatchScan().planTasks()` plan and the plain scan plan, so the
+    // adapter delegates to the same pipeline.
     let rust_batch = rust_batch_plan_multiset(&table, TARGET, LOOKBACK, OPEN_FILE_COST).await;
     let java_batch = java_plan_multiset(&read_java_plan_file(&dir, "java_batch_scan_plan.json"));
     if rust_batch != java_batch {
@@ -939,8 +804,7 @@ async fn test_scan_plan_d1_rust_plans_java_table() {
         "Rust BatchScan::plan_tasks must equal Rust TableScan::plan_tasks (adapter delegation)"
     );
 
-    // MERGE legs (M-1 / M-3 / M-4): the two isolating filtered plans must ALSO equal Java's, and the
-    // merge pins must hold over the Java-written table.
+    // The two isolating filtered plans must also equal Java's, with the merge pins holding.
     let rust_merge = rust_filtered_plan_multiset(&table, merge_filter()).await;
     let java_merge = java_plan_multiset(&read_java_plan_file(&dir, "java_merge_scan_plan.json"));
     assert_eq!(
@@ -966,9 +830,7 @@ async fn test_scan_plan_d1_rust_plans_java_table() {
     );
 }
 
-// ===========================================================================================
-// Direction 2 GEN — Rust writes a Java-judgeable table + emits its own plan.
-// ===========================================================================================
+// ===== Direction 2 GEN: Rust writes a Java-judgeable table and emits its own plan =====
 
 #[tokio::test]
 async fn test_scan_plan_gen_rust_writes_java_judgeable_table() {
@@ -996,9 +858,7 @@ async fn test_scan_plan_gen_rust_writes_java_judgeable_table() {
 
     let table = create_rust_table(&catalog, &table_location).await;
 
-    // The same varying-size fixture the Java oracle builds: big (multi-row-group), mid, small1, small2,
-    // plus the two dedicated merge fixtures (merge = contiguous co-binned pair, gap = non-contiguous
-    // co-binned pair). See the module header for their shapes.
+    // The varying-size fixture the Java oracle builds; the module header gives the shapes.
     let narrow = |rows: usize, max_row_group_rows: Option<usize>| FixtureShape {
         rows,
         max_row_group_rows,
@@ -1033,7 +893,6 @@ async fn test_scan_plan_gen_rust_writes_java_judgeable_table() {
         .expect("apply fast append");
     let table = tx.commit(&catalog).await.expect("commit fast append");
 
-    // A MoR position delete over big.parquet (position 0).
     let delete_file = write_position_delete(&table, &big_path).await;
     assert_eq!(delete_file.content_type(), DataContentType::PositionDeletes);
     let tx = Transaction::new(&table);
@@ -1046,16 +905,14 @@ async fn test_scan_plan_gen_rust_writes_java_judgeable_table() {
 
     // Compute OUR OWN plan and emit it for Java to verify.
     let rust = rust_plan_multiset(&table, TARGET, LOOKBACK, OPEN_FILE_COST).await;
-    // The typed BatchScan plan over the SAME Rust table must equal the scan plan (adapter delegation),
-    // and is emitted for the Java verify's BatchScan leg.
+    // The typed BatchScan plan must equal the scan plan, proving the adapter delegates.
     let rust_batch = rust_batch_plan_multiset(&table, TARGET, LOOKBACK, OPEN_FILE_COST).await;
     assert_eq!(
         rust_batch, rust,
         "GEN: Rust BatchScan::plan_tasks must equal Rust TableScan::plan_tasks (adapter delegation)"
     );
 
-    // SANITY: the big file MUST have split into more than one sub-task (multi-row-group ⇒ offsets-aware
-    // split), otherwise the offsets-aware branch is not actually exercised by the GEN fixture.
+    // With one sub-task for the big file, the GEN fixture never exercises the split.
     let big_sub_tasks: usize = rust
         .iter()
         .flat_map(|group| group.iter())
@@ -1084,8 +941,7 @@ async fn test_scan_plan_gen_rust_writes_java_judgeable_table() {
     let batch_plan_path = format!("{table_location}/rust_batch_scan_plan.json");
     fs::write(&batch_plan_path, batch_plan_json).expect("write rust_batch_scan_plan.json");
 
-    // MERGE legs (M-2 / M-3 / M-4): plan the two isolating filtered scans, assert the merge pins hold
-    // over the RUST-written table, and emit both plans for the Java verify to judge.
+    // Assert the merge pins over the RUST-written table, then emit both plans for Java to judge.
     let rust_merge = rust_filtered_plan_multiset(&table, merge_filter()).await;
     let rust_gap = rust_filtered_plan_multiset(&table, gap_filter()).await;
     assert_merge_fixture_pins(&table, &rust_merge, &rust_gap, "GEN").await;
@@ -1110,8 +966,7 @@ async fn test_scan_plan_gen_rust_writes_java_judgeable_table() {
     );
 }
 
-/// Serialize the Rust plan multiset as `{groupCount, groups:[[memberKey,...],...]}` for the Java verify
-/// (the SAME JSON shape Java's `planToJson` emits — each group sorted, the group list sorted).
+/// Serialize the Rust plan multiset in the JSON shape Java's `planToJson` emits.
 fn rust_plan_to_json(plan: &PlanMultiset) -> String {
     // `plan` is already normalized (each group sorted, list sorted).
     let groups: Vec<serde_json::Value> = plan
@@ -1125,11 +980,10 @@ fn rust_plan_to_json(plan: &PlanMultiset) -> String {
     .to_string()
 }
 
-// ===========================================================================================
-// Offline self-test — the env-gated tests are no-ops without Java; this one runs ALWAYS and exercises
-// the comparison plumbing (normalize / multiset equality) so the gate has live coverage of the oracle's
-// own model independent of Java.
-// ===========================================================================================
+// ===== Offline self-test =====
+//
+// The env-gated tests are no-ops without Java. This one always runs and exercises the comparison
+// plumbing, so the gate covers the oracle's own model.
 
 #[test]
 fn normalize_is_order_insensitive_across_groups_and_duplicate_preserving() {
@@ -1144,14 +998,14 @@ fn normalize_is_order_insensitive_across_groups_and_duplicate_preserving() {
     ]);
     assert_eq!(a, b, "group order must not matter");
 
-    // A duplicate group (same member set) is PRESERVED — the multiset, not the set, is the contract.
+    // A duplicate group is PRESERVED: the contract is the multiset, not the set.
     let with_dup = normalize(vec![
         BTreeSet::from(["(a.parquet,0,10)".to_string()]),
         BTreeSet::from(["(a.parquet,0,10)".to_string()]),
     ]);
     assert_eq!(with_dup.len(), 2, "duplicate groups must both count");
 
-    // A genuinely different plan does NOT compare equal (the off-by-one start that the sabotage exploits).
+    // A different plan must not compare equal: the off-by-one start the sabotage exploits.
     let shifted = normalize(vec![BTreeSet::from(["(a.parquet,1,10)".to_string()])]);
     let original = normalize(vec![BTreeSet::from(["(a.parquet,0,10)".to_string()])]);
     assert_ne!(shifted, original, "a shifted start must diverge");

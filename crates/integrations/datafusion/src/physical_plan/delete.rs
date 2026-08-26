@@ -16,84 +16,46 @@
 // under the License.
 
 //! Physical plans for `DELETE FROM` and `UPDATE` — the [`TableProvider::delete_from`] and
-//! [`TableProvider::update`] hooks.
+//! [`TableProvider::update`] hooks. The plan emits one `UInt64` `count` row, per DataFusion's DML
+//! contract. The table property `write.delete.mode` / `write.update.mode` picks the mode:
 //!
-//! The mode is chosen by the table's `write.delete.mode` / `write.update.mode` property (Iceberg
-//! standard). For DELETE:
-//!   * **`merge-on-read`** — find the matching rows' reserved `_file`/`_pos` identity, write a
-//!     position-delete file, and commit a `RowDelta`. Data files are untouched; the next scan applies
-//!     the deletes. This is the engine-facing seam the core was built for.
-//!   * **`copy-on-write`** (the Iceberg default when unset) — file-level rewrite: only the data files
-//!     that contain at least one deleted row are rewritten; unaffected files are left in place. Survivors
-//!     from affected files are routed through the partition-aware `TaskWriter`, so both partitioned and
-//!     unpartitioned tables are supported. The commit is a `OverwriteFiles` that deletes the affected
-//!     paths and adds the rewritten files.
+//! | Mode | Writes | Commit |
+//! |---|---|---|
+//! | `merge-on-read` | position deletes or deletion vectors, plus new rows for UPDATE | `RowDelta` |
+//! | `copy-on-write` (default) | a rewrite of only the files holding a matched row | `OverwriteFiles` |
 //!
-//! **Correctness — why we evaluate the filter ourselves.** The matching rows are identified by
-//! evaluating the *original* DataFusion `WHERE` filters (as a [`PhysicalExpr`]) against the scanned
-//! rows. We deliberately do **not** delete by Iceberg predicate pushdown: `convert_filters_to_predicate`
-//! is *inexact* — it loosens an `AND` whose branch it cannot convert (returning the convertible side
-//! alone) — which is harmless for a SELECT (DataFusion re-filters) but would **over-delete** here. The
-//! exact filter is the contract; pushdown is only ever a (future) pruning optimization layered under it.
+//! **The exact filter is the contract.** These paths evaluate the original DataFusion `WHERE`
+//! [`PhysicalExpr`] over the scanned rows. They never delete by Iceberg pushdown:
+//! `convert_filters_to_predicate` is inexact and loosens an `AND` branch it cannot convert. That is
+//! harmless for a SELECT, which re-filters, but it OVER-DELETES here. Pushdown may only prune under
+//! the exact filter.
 //!
-//! **Memory.** The **merge-on-read** DELETE/UPDATE paths STREAM the live scan batch-by-batch (H7-S1):
-//! they never hold the whole live row set. MoR DELETE buffers only the matched `(path, pos)` pairs
-//! (two small fields per deleted row); MoR UPDATE additionally streams the new data rows straight into
-//! the writer. The floor is O(matched rows), not O(1) — `write_position_deletes` must group + sort the
-//! whole pair set before writing (the default scan interleaves files unordered).
+//! **Memory.** Every path streams its scan, and none is O(1). Merge-on-read buffers the matched
+//! `(path, pos)` pairs, because position deletes must be grouped and sorted before they are written.
+//! Copy-on-write is two-pass by nature: a file becomes affected on its last row as easily as its
+//! first, so the affected set must be complete before the first survivor is emitted. Pass 1 keeps
+//! only the affected paths; pass 2 re-scans and streams rows into the writer, at the price of a
+//! second full read. Pass 2 is skipped when no row matched, and for a predicate-less `DELETE FROM`.
 //!
-//! The **copy-on-write** paths STREAM both of their passes (H7-S2). COW is inherently two-pass — a
-//! source file is "affected" the moment *any* of its rows matches, possibly the last row of the last
-//! batch, so the affected set must be COMPLETE before the first survivor may be emitted — but neither
-//! pass buffers rows. Pass 1 streams the scan and retains only `affected: HashSet<String>` (one entry
-//! per affected FILE) plus a row counter; pass 2 RE-SCANS the same snapshot and feeds each batch's
-//! rewrite rows straight into [`StreamingDataFileWriter`]. The DML path's own contribution to peak is
-//! O(#affected files) + one batch + the writer's own buffers — but that is NOT the total: the scan
-//! underneath holds up to `concurrency_limit_data_files` (default `num_cpus`) in-flight Parquet row
-//! groups plus per-file task state, and on a many-core host that term DOMINATES the absolute peak. It
-//! is bounded by concurrency, not by row count, which is why it cancels out of the marginal assertion
-//! in `tests/cow_memory_bound.rs`. **The named cost is a second full read of the live data** — the accepted
-//! price of bounded memory, and one extra `ScanReport` per statement for catalogs with a metrics
-//! reporter installed. (Two shapes skip pass 2 outright: a zero-match DML, and a predicate-less
-//! `DELETE FROM t`, whose pass 2 is provably empty because every row is deleted.)
-//! Restricting pass 2 to the affected files is not possible through the
-//! public scan API today (`_file` is a reserved metadata column, not a pushdown-able predicate term);
-//! that is a follow-up. Both passes are snapshot-consistent by construction: `Table` is a frozen
-//! handle (`metadata` is a plain `TableMetadataRef` with no interior mutability, and the only mutator
-//! takes `mut self` by value), and an unpinned `TableScanBuilder::build()` resolves from that frozen
-//! metadata, never a fresh catalog read — so two `table.scan()` calls on one handle resolve the
-//! IDENTICAL snapshot regardless of concurrent commits. Both scans additionally pin the snapshot id
-//! explicitly; that is documentation of the invariant, NOT a fix for a live bug.
+//! Both passes read ONE snapshot by construction: `Table` is a frozen handle, and an unpinned
+//! `build()` resolves from that frozen metadata, never a fresh catalog read. The explicit
+//! `snapshot_id` pin documents that invariant; it fixes no live bug.
 //!
-//! **Concurrency — the ENGINE_CONTRACT §5 recipes are ARMED (2026-07-18).** Every DELETE/UPDATE commit
-//! enables the per-operation isolation validations with **Java's per-operation defaults as the oracle**
-//! (`SparkRowLevelOperationBuilder.isolationLevel`, 1.10.0 L96-115: table property
-//! `write.delete.isolation-level` / `write.update.isolation-level`, default **serializable**;
-//! `IsolationLevel.fromName` parse semantics). Copy-on-write commits validate from the scanned snapshot
-//! with an `AlwaysTrue` conflict-detection filter (this path pushes NO filters into the scan, so the
-//! AND-of-pushed-filters Java computes — `SparkWrite.conflictDetectionFilter()` L417-428 — is exactly
-//! `alwaysTrue`), reject concurrent conflicting deletes at BOTH levels, and reject concurrent
-//! conflicting data (inserts) under serializable (`SparkWrite.java` L448-456, L467-509). The removed
-//! files are supplied with FULL metadata (`delete_data_files`) so the conflicting-deletes check is live
-//! — a bare path carries no partition/metrics and would make it inert. Merge-on-read commits always
-//! validate that the data files their position deletes reference still exist
-//! (`SparkPositionDeltaWrite.commit` L243), UPDATE additionally arms `validate_deleted_files` +
-//! `validate_no_conflicting_delete_files` (L251-254 — UPDATE/MERGE only, NOT DELETE), and serializable
-//! adds `validate_no_conflicting_data_files` (L256-258). A zero-match DML commits NOTHING (stronger
-//! than Java's scan==null no-validation arm, L446-447). A validation failure is a NON-retryable
-//! `DataInvalid` surfaced to the caller — see `docs/ENGINE_CONTRACT.md` §5.
+//! **Concurrency.** Each commit arms the ENGINE_CONTRACT §5 validations. Java
+//! `SparkRowLevelOperationBuilder.isolationLevel` is the oracle: property
+//! `write.<op>.isolation-level`, default serializable. The conflict filter is `AlwaysTrue`, because
+//! these paths push no filter into the scan. Removed files carry FULL metadata; a bare path has no
+//! partition or metrics and makes the conflicting-deletes check inert. A zero-match DML commits
+//! nothing. A validation failure is a non-retryable `DataInvalid`. See `docs/ENGINE_CONTRACT.md` §5.
 //!
-//! **Scope / limitations (out of scope here, named honestly):**
-//!   * **Partition evolution / multi-spec tables** — copy-on-write rewrites survivors under the table's
-//!     *current* partition spec (as Java does) and merge-on-read stamps each position-delete file with
-//!     its target data file's *own* `(spec_id, partition)`; both are exercised on single-spec tables but
-//!     a table whose specs have evolved is not yet covered by a test.
-//!   * **Streaming** — both merge-on-read and copy-on-write stream their scans (see *Memory* above).
-//!     Neither is O(1): MoR holds one `(path, pos)` pair per matched row, COW holds one path per
-//!     affected file. Writer-side buffering (a fanout `TaskWriter` holds one open writer per
-//!     partition) is a separate, still-unbounded axis — see the QB writer-bounds unit.
+//! | Path | Always validates | Serializable adds |
+//! |---|---|---|
+//! | copy-on-write DELETE and UPDATE | no conflicting deletes | no conflicting data |
+//! | merge-on-read DELETE | referenced data files exist | no conflicting data files |
+//! | merge-on-read UPDATE | files exist, deleted files, no conflicting delete files | no conflicting data files |
 //!
-//! The plan emits a single `UInt64` `count` row (rows affected), per DataFusion's DML contract.
+//! **Out of scope.** No test covers a table whose partition specs evolved. Writer-side buffering
+//! stays unbounded: a fanout `TaskWriter` holds one open writer per partition.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
@@ -140,7 +102,6 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::task_writer::TaskWriter;
 use crate::to_datafusion_error;
 
-/// The Iceberg row-level write-mode properties and the `merge-on-read` value.
 pub(crate) const WRITE_DELETE_MODE: &str = "write.delete.mode";
 pub(crate) const WRITE_UPDATE_MODE: &str = "write.update.mode";
 const MODE_MERGE_ON_READ: &str = "merge-on-read";
@@ -155,8 +116,7 @@ pub(crate) enum WriteMode {
 }
 
 impl WriteMode {
-    /// Resolve from a table property (`write.delete.mode` / `write.update.mode`); Iceberg's default is
-    /// copy-on-write when the property is absent or unrecognized.
+    /// Resolves the mode from a table property. Iceberg defaults to copy-on-write.
     pub(crate) fn from_property(table: &Table, property: &str) -> Self {
         match table
             .metadata()
@@ -170,28 +130,21 @@ impl WriteMode {
     }
 }
 
-/// The Iceberg row-level isolation-level table properties (Java `TableProperties.DELETE_ISOLATION_LEVEL`
-/// / `UPDATE_ISOLATION_LEVEL`, 1.10.0 `TableProperties.java` L361/L369; shared default `"serializable"`,
-/// L362/L370).
+/// The Iceberg row-level isolation-level table properties. Both default to `"serializable"`.
 pub(crate) const WRITE_DELETE_ISOLATION_LEVEL: &str = "write.delete.isolation-level";
 pub(crate) const WRITE_UPDATE_ISOLATION_LEVEL: &str = "write.update.isolation-level";
 
-/// The isolation level of a row-level write (Java `org.apache.iceberg.IsolationLevel`) — the
-/// engine-owned policy that selects which ENGINE_CONTRACT §5 conflict validations the DML commit
-/// enables.
+/// The isolation level of a row-level write. It picks the §5 validations the commit arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IsolationLevel {
-    /// Reject concurrent conflicting DATA (inserts matching the condition) AND concurrent conflicting
-    /// DELETES.
+    /// Reject concurrent conflicting DATA and concurrent conflicting DELETES.
     Serializable,
     /// Reject only concurrent conflicting DELETES; concurrent inserts are tolerated.
     Snapshot,
 }
 
 impl IsolationLevel {
-    /// Parse an isolation-level name CASE-INSENSITIVELY (Java `IsolationLevel.fromName` =
-    /// `valueOf(levelName.toUpperCase(Locale.ENGLISH))`). An unknown name fails LOUD with Java's
-    /// message shape (`"Invalid isolation level: %s"`) — never silently defaulted.
+    /// Parses a level name case-insensitively. An unknown name fails LOUD, never defaulted.
     pub(crate) fn parse(name: &str) -> DFResult<Self> {
         match name.to_ascii_lowercase().as_str() {
             "serializable" => Ok(IsolationLevel::Serializable),
@@ -202,12 +155,8 @@ impl IsolationLevel {
         }
     }
 
-    /// Resolve the isolation level for a row-level DELETE/UPDATE from its table property, defaulting
-    /// to SERIALIZABLE — Java's per-operation default (`SparkRowLevelOperationBuilder.isolationLevel`,
-    /// 1.10.0 L96-115: `properties.getOrDefault(<op>_ISOLATION_LEVEL, <op>_ISOLATION_LEVEL_DEFAULT)`
-    /// with both defaults `"serializable"`, then `IsolationLevel.fromName`). Like Java, this resolves
-    /// at PLAN time (Java: the row-level-operation-builder constructor), so an invalid property value
-    /// fails the statement before any scan or write happens.
+    /// Resolves the isolation level from the table property, defaulting to serializable as Java
+    /// does. Resolution happens at PLAN time, so an invalid value fails before any scan or write.
     pub(crate) fn for_row_level_op(table: &Table, property: &str) -> DFResult<Self> {
         match table.metadata().properties().get(property) {
             Some(name) => Self::parse(name),
@@ -216,20 +165,16 @@ impl IsolationLevel {
     }
 }
 
-/// `DELETE FROM` execution plan. Finds the matching rows, writes the delete artifacts, commits, and
-/// emits the deleted-row count.
+/// `DELETE FROM` plan. It finds the matching rows, writes the deletes, commits, and counts.
 pub(crate) struct IcebergDeleteExec {
     table: Table,
     catalog: Arc<dyn Catalog>,
-    /// The EXACT row filter (the `WHERE` clause as a `PhysicalExpr` over the table schema), or `None`
-    /// to delete every row (`DELETE FROM t`).
+    /// The EXACT row filter, or `None` to delete every row (`DELETE FROM t`).
     predicate: Option<Arc<dyn PhysicalExpr>>,
     mode: WriteMode,
-    /// The §5 isolation level (resolved at plan time from `write.delete.isolation-level`, default
-    /// serializable — Java's per-operation default).
+    /// The §5 isolation level, resolved at plan time from `write.delete.isolation-level`.
     isolation: IsolationLevel,
-    /// The table's Arrow schema — the projection base for the scan and the schema the `predicate` is
-    /// bound to.
+    /// The scan's projection base, and the schema the `predicate` is bound to.
     table_schema: SchemaRef,
     count_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
@@ -389,16 +334,12 @@ enum MergeOnReadDeleteKind {
     DeletionVectors,
 }
 
-/// Resolves which delete-file kind this table takes.
+/// Resolves which delete-file kind this table takes. Call it BEFORE any I/O: a format rejection at
+/// commit time would orphan an already written delete or data file.
 ///
 /// # Errors
 ///
 /// `NotImplemented` for a V1 table, which has no delete files of any kind.
-///
-/// # Notes
-///
-/// Call this BEFORE any I/O. A format rejection raised at commit time would orphan an already
-/// written delete or data file.
 fn merge_on_read_delete_kind(table: &Table) -> DFResult<MergeOnReadDeleteKind> {
     match table.metadata().format_version() {
         FormatVersion::V2 => Ok(MergeOnReadDeleteKind::PositionDeletes),
@@ -410,15 +351,9 @@ fn merge_on_read_delete_kind(table: &Table) -> DFResult<MergeOnReadDeleteKind> {
     }
 }
 
-/// Writes the merge-on-read delete files for `pairs` in the kind this table takes.
-///
-/// Returns `(files to add, files the commit must remove)`. The removal half is only ever non-empty
-/// on the V3 path, where a merged DV supersedes the file-scoped one it absorbed.
-///
-/// # Notes
-///
-/// `pairs` must already be sorted by `(path, pos)`; the V2 writer needs that order, and the caller
-/// sorts once for both paths.
+/// Writes the merge-on-read delete files for `pairs`, which the caller already sorted by
+/// `(path, pos)` for the V2 writer. Returns `(files to add, files the commit must remove)`. The
+/// removal half is non-empty only on the V3 path, where a merged DV supersedes the one it absorbed.
 async fn write_merge_on_read_deletes(
     table: &Table,
     kind: MergeOnReadDeleteKind,
@@ -435,26 +370,18 @@ async fn write_merge_on_read_deletes(
     }
 }
 
-/// Sort position-delete `(file_path, pos)` pairs into the ascending `(file_path, pos)` order the
-/// Iceberg spec requires for every position-delete file (Java `PositionDeleteWriter`). The default
-/// concurrent scan interleaves files unordered, so the collected pairs are NOT sorted at scan time —
-/// this restores the spec order before the pairs are written. Extracted as a named seam so the
-/// ordering guarantee can be pinned by a deterministic unit test independent of scan interleaving.
+/// Sorts position-delete pairs into the ascending order the Iceberg spec requires. The concurrent
+/// scan interleaves files, so the pairs arrive unordered. A named seam, so a test can pin it.
 fn sort_position_delete_pairs(pairs: &mut [(String, i64)]) {
     pairs.sort();
 }
 
-/// Merge-on-read DELETE: identify the matching rows' `_file`/`_pos`, write a position-delete file, and
-/// commit a `RowDelta`. Returns the number of rows deleted.
+/// Merge-on-read DELETE: finds the matching rows' `_file`/`_pos`, writes the delete files, and
+/// commits a `RowDelta`. Returns the number of rows deleted.
 ///
-/// **Streaming.** The live-row scan is consumed batch-by-batch (never the whole live row set is held in
-/// RAM). For each batch we evaluate the exact `PhysicalExpr` and accumulate ONLY the matched
-/// `(path, pos)` pairs — two small fields per deleted row — into `pairs`. This drops the previous
-/// full-column `Vec<RecordBatch>` buffer. The memory floor is O(matched rows), NOT O(1): the position
-/// deletes must be grouped by `(spec_id, partition)` and sorted `(path, pos)` before writing (the
-/// default scan interleaves files unordered), so `write_position_deletes` still consumes the whole
-/// `pairs` vector — see `task/h7-dml-streaming-scope.md` MEDIUM-1. For a whole-table DELETE this
-/// degenerates to O(table rows × 2 fields), still far below the full-column buffer.
+/// The scan is consumed batch by batch. Only the matched `(path, pos)` pairs accumulate, so the
+/// floor is O(matched rows), not O(1): `write_position_deletes` must group and sort the whole pair
+/// set before it writes.
 async fn merge_on_read_delete(
     table: &Table,
     catalog: &dyn Catalog,
@@ -463,14 +390,11 @@ async fn merge_on_read_delete(
     isolation: IsolationLevel,
 ) -> DFResult<u64> {
     let delete_kind = merge_on_read_delete_kind(table)?;
-    // The snapshot this DML's scan reads — the §5 `validate_from_snapshot` anchor. Java sets it only
-    // when the scan captured a snapshot (`SparkPositionDeltaWrite.java` L245-249; a table that was
-    // empty at read time has none). The commit below is only reached when rows matched, which implies
-    // a snapshot existed, but the guard keeps the Java shape.
+    // The §5 `validate_from_snapshot` anchor. Java sets it only when the scan captured a snapshot.
+    // The commit below is reached only when rows matched, which implies one existed.
     let scan_snapshot_id = table.metadata().current_snapshot_id();
-    // 1. Scan EVERY live row, projecting the table columns (so the exact filter can be evaluated) plus
-    //    the reserved `_file`/`_pos` row identity. We do not push the filter into the scan — see the
-    //    module-level note on why Iceberg pushdown is inexact and unsafe for DELETE.
+    // Scan every live row: the table columns for the exact filter, plus the `_file`/`_pos` row
+    // identity. The filter is NOT pushed into the scan — Iceberg pushdown is inexact.
     let mut projection: Vec<String> = table_schema
         .fields()
         .iter()
@@ -479,8 +403,7 @@ async fn merge_on_read_delete(
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
-    // Stream the scan batch-by-batch. Awaiting `stream.try_next()` polls the scan only as we consume
-    // batches, so the scan is naturally back-pressured — no unbounded producer.
+    // Awaiting `try_next()` polls the scan only as batches are consumed, so it is back-pressured.
     let mut stream = table
         .scan()
         .select(projection)
@@ -492,8 +415,7 @@ async fn merge_on_read_delete(
 
     let mut pairs: Vec<(String, i64)> = Vec::new();
     while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
-        // Build the table-column-only sub-batch (matching the schema the predicate is bound to) by
-        // resolving each table field BY NAME — robust to the scan's output column ordering.
+        // Resolve the predicate's columns BY NAME. The scan's output column order is not fixed.
         let keep_mask = match &predicate {
             None => None, // `DELETE FROM t` — every row matches.
             Some(physical_expr) => {
@@ -541,8 +463,7 @@ async fn merge_on_read_delete(
             .ok_or_else(|| DataFusionError::Internal("_pos column is not Int64".to_string()))?;
 
         for row in 0..batch.num_rows() {
-            // A row is deleted iff the WHERE predicate is TRUE for it (a NULL result, under SQL
-            // three-valued logic, does NOT match), or there is no predicate (`DELETE FROM t`).
+            // A NULL predicate result does NOT match, per SQL three-valued logic.
             let delete_row = match &keep_mask {
                 None => true,
                 Some(mask) => mask.is_valid(row) && mask.value(row),
@@ -565,21 +486,16 @@ async fn merge_on_read_delete(
     sort_position_delete_pairs(&mut pairs);
     let deleted = pairs.len() as u64;
 
-    // The DATA files the position deletes reference — the §5 `validate_data_files_exist` set. Java
-    // enables this check UNCONDITIONALLY for every command, DELETE included
-    // (`SparkPositionDeltaWrite.commit` L243): a referenced file compacted or rewritten away by a
-    // concurrent commit would silently lose these deletes.
+    // The §5 `validate_data_files_exist` set. Java arms this for every command, DELETE included: a
+    // referenced file rewritten away by a concurrent commit would silently lose these deletes.
     let referenced_files: HashSet<String> = pairs.iter().map(|(path, _)| path.clone()).collect();
 
-    // Write ALL delete files the writer produced and commit EVERY one of them.
     let (delete_files, superseded_delete_files) =
         write_merge_on_read_deletes(table, delete_kind, &pairs).await?;
 
-    // ENGINE_CONTRACT §5 row-delta recipe, MoR DELETE row. The conflict-detection filter is the AND of
-    // the scan's PUSHED filters (`SparkPositionDeltaWrite.conflictDetectionFilter` L284-292); this path
-    // pushes NOTHING into the scan (exact-filter design, module docs), so `AlwaysTrue` is the
-    // Java-exact value. DELETE does NOT arm `validate_deleted_files`/`validate_no_conflicting_delete_files`
-    // (UPDATE/MERGE only — Java L251-254); serializable adds the conflicting-data check (L256-258).
+    // §5 row-delta recipe, MoR DELETE. `AlwaysTrue` is Java-exact because this path pushes no filter
+    // into the scan. DELETE does not arm the deleted-files checks; Java arms those for UPDATE and
+    // MERGE only.
     let tx = Transaction::new(table);
     let mut action = tx
         .row_delta()
@@ -607,18 +523,10 @@ async fn merge_on_read_delete(
     Ok(deleted)
 }
 
-/// Open ONE copy-on-write scan stream: every live row, projecting the table columns PLUS the reserved
-/// `_file` path (not `_pos` — COW does not need positions).
-///
-/// We do NOT push the filter into the scan — Iceberg pushdown is inexact (see the module note); the
-/// exact `PhysicalExpr` evaluation in the caller is the correctness contract.
-///
-/// **On the explicit snapshot pin.** `scan_snapshot_id` is the caller's `current_snapshot_id()`, which
-/// is exactly what an UNPINNED `build()` would resolve from the same frozen `Table` handle
-/// (`scan/mod.rs`: `metadata().current_snapshot()`, never a fresh catalog read). Passing it is
-/// therefore a **no-op today**, not a bug fix: it documents at the call site that the two COW passes
-/// read one snapshot, and keeps that true if `Table` ever gains a refresh path. `None` (a snapshotless
-/// table) is left unpinned, which yields the same empty scan.
+/// Opens ONE copy-on-write scan stream: every live row, the table columns plus the reserved `_file`
+/// path. The filter is not pushed into the scan; the caller's exact `PhysicalExpr` is the contract.
+/// The `scan_snapshot_id` pin is a no-op today, because an unpinned `build()` resolves the same
+/// snapshot from the same frozen `Table`. It documents that both passes read one snapshot.
 async fn cow_scan_stream(
     table: &Table,
     table_schema: &SchemaRef,
@@ -635,8 +543,7 @@ async fn cow_scan_stream(
     if let Some(snapshot_id) = scan_snapshot_id {
         builder = builder.snapshot_id(snapshot_id);
     }
-    // Awaiting `try_next()` on the returned stream polls the scan only as batches are consumed, so
-    // the scan is naturally back-pressured — no unbounded producer.
+    // Awaiting `try_next()` polls the scan only as batches are consumed, so it is back-pressured.
     builder
         .build()
         .map_err(to_datafusion_error)?
@@ -645,22 +552,10 @@ async fn cow_scan_stream(
         .map_err(to_datafusion_error)
 }
 
-/// Copy-on-write DELETE: **file-level** rewrite — scan every live row projecting the table columns
-/// PLUS the reserved `_file` path, identify which source data files contain at least one deleted row
-/// (the "affected" set), rewrite only those files' surviving rows through the partition-aware
-/// [`TaskWriter`], and commit a `OverwriteFiles` that deletes the affected source paths and adds the
-/// rewritten files. Unaffected data files are left completely untouched.
-///
-/// Works for BOTH partitioned and unpartitioned tables. A single Iceberg data file is always
-/// single-partition, but the survivor set spans every affected file and therefore many partitions,
-/// and a scan batch may interleave rows from several files — so the rewrite routes through a
-/// `TaskWriter` with `fanout_enabled = true`, which sends each row to its correct partition writer
-/// without requiring the survivors to be pre-sorted by partition.
-///
-/// **Streaming (H7-S2).** Neither pass buffers rows. Pass 1 streams the scan and retains only the
-/// affected-file path set and the deleted-row count; pass 2 RE-SCANS the same snapshot and streams
-/// each batch's survivors straight into [`StreamingDataFileWriter`]. The cost is a second full read
-/// of the live data — see the module-level *Memory* note.
+/// Copy-on-write DELETE: a file-level rewrite. It finds the data files holding at least one deleted
+/// row, rewrites only those files' survivors, and commits an `OverwriteFiles`. Unaffected files stay
+/// untouched. The survivors span many partitions and one batch may interleave files, so the
+/// [`TaskWriter`] runs with `fanout_enabled = true` and routes each row without pre-sorting.
 async fn copy_on_write_delete(
     table: &Table,
     catalog: &dyn Catalog,
@@ -668,15 +563,11 @@ async fn copy_on_write_delete(
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
 ) -> DFResult<u64> {
-    // The snapshot this DML's scan reads — the §5 `validate_from_snapshot` anchor (Java sets it only
-    // when the scan captured one: `SparkWrite.java` L470-472 / L493-495). Both passes below pin this
-    // same snapshot, so they read the identical row set.
+    // The §5 `validate_from_snapshot` anchor. Both passes pin it, so they read the identical rows.
     let scan_snapshot_id = table.metadata().current_snapshot_id();
 
-    // 1. Pass 1 — affected-file detection, STREAMED. A source file is AFFECTED iff at least one of its
-    //    rows matches the predicate (or the predicate is None → all rows deleted → all files affected).
-    //    Also counts total deleted rows for the return value. The ONLY state retained across the pass
-    //    is `affected` (one path per affected FILE) and the counter — no rows are buffered.
+    // Pass 1 — affected-file detection. A file is affected when any of its rows matches. Only the
+    // affected paths and the counter survive the pass; no rows are buffered.
     let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
     let mut deleted: u64 = 0;
     let mut affected: HashSet<String> = HashSet::new();
@@ -687,10 +578,8 @@ async fn copy_on_write_delete(
             .ok_or_else(|| {
                 DataFusionError::Internal("delete scan missing _file column".to_string())
             })?;
-        // Table-column-only sub-batch for predicate evaluation (by name, robust to scan ordering).
         let table_batch = table_column_batch(&batch, table_schema)?;
-        // `match_mask` already collapses NULL → false (SQL three-valued logic: a NULL predicate
-        // result does NOT delete the row) and returns all-true for `DELETE FROM t` (no predicate).
+        // `match_mask` collapses NULL → false (3VL) and is all-true when there is no predicate.
         let mask = match_mask(&predicate, &table_batch)?;
 
         let paths = decode_file_paths_batch(file_col)?;
@@ -704,41 +593,26 @@ async fn copy_on_write_delete(
         }
     }
 
-    // Pass 1's stream is EXHAUSTED but its scan state (plan context, task state, channels) would live
-    // to the end of the function body if it were merely shadowed by pass 2's binding — Rust drops a
-    // shadowed value at scope end, not at the shadowing point. Release it explicitly so the peak really
-    // is "one scan + one batch", as the module note claims.
+    // Rust drops a shadowed value at scope end, not at the shadowing point. Release pass 1's scan
+    // state explicitly, so the peak really is one scan plus one batch.
     drop(stream);
 
-    // 2. No deleted rows → no-op (avoid a pointless snapshot). This now also skips the SECOND scan
-    //    entirely — a zero-match DELETE reads the table exactly once.
+    // No deleted rows → no-op. This also skips the second scan: a zero-match DELETE reads once.
     if deleted == 0 {
         return Ok(0);
     }
 
-    // 3. Pass 2 — RE-SCAN the same snapshot and stream the survivors of AFFECTED files straight into
-    //    the writer. Rows from unaffected files are left in place (their source files are unchanged).
-    //    Per batch, a row is kept iff it is (a) NOT deleted AND (b) from an affected file — those are
-    //    exactly the rows that need a new home. Nothing is accumulated: each filtered batch is handed
-    //    to the writer and dropped.
+    // Pass 2 — re-scan the same snapshot and stream the survivors of affected files into the writer.
+    // A row is kept when it is not deleted AND comes from an affected file. Nothing accumulates.
     //
-    //    The affected set is complete before any survivor is emitted, which is why COW needs two
-    //    passes at all (a file becomes affected on its LAST row just as easily as its first).
-    //
-    //    `DELETE FROM t` (no predicate) is short-circuited: every row is deleted, so pass 2's keep-mask
-    //    is all-false for every batch and the whole table would be re-read to produce nothing. The
-    //    result is EXACT, not an approximation — with `predicate == None`, `match_mask` is all-true by
-    //    construction, so `!deleted && affected.contains(..)` cannot be true for any row.
+    // `DELETE FROM t` (no predicate) is short-circuited. `match_mask` is then all-true by
+    // construction, so no row can be kept: pass 2 is provably empty, not approximated.
     let new_files = if predicate.is_none() {
         Vec::new()
     } else {
         let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
-        // The writer is built on the FIRST batch that actually has survivors, not up front. That keeps
-        // this path byte-identical to the pre-H7-S2 form, where `write_partitioned_data_files` returned
-        // early on an empty survivor slice and never ran `DefaultLocationGenerator::new` /
-        // `PartitionValueCalculator::try_new` — so a DELETE that fully empties every affected file
-        // still cannot fail in a constructor it never needed. (COW UPDATE has no such case: an affected
-        // file always yields rewrite rows, so its writer was always constructed.)
+        // Build the writer on the first batch that HAS survivors. A DELETE that empties every
+        // affected file must not fail inside a constructor it never needed.
         let mut data_writer: Option<StreamingDataFileWriter> = None;
 
         while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
@@ -749,8 +623,7 @@ async fn copy_on_write_delete(
                     DataFusionError::Internal("delete scan missing _file column".to_string())
                 })?;
             let table_batch = table_column_batch(&batch, table_schema)?;
-            // Re-evaluated (not cached from pass 1): pass 2 is a fresh scan, so no per-batch state from
-            // pass 1 could be aligned to it. Same row-wise function, same rows ⇒ same mask.
+            // Pass 2 is an independent scan, so no per-batch state from pass 1 aligns with it.
             let delete_mask = match_mask(&predicate, &table_batch)?;
 
             let paths = decode_file_paths_batch(file_col)?;
@@ -758,7 +631,6 @@ async fn copy_on_write_delete(
                 .map(|row| !delete_mask.value(row) && affected.contains(paths[row]))
                 .collect();
             if keep.true_count() == 0 {
-                // Nothing to rewrite from this batch — leave the writer uncreated.
                 continue;
             }
 
@@ -775,23 +647,16 @@ async fn copy_on_write_delete(
             writer.write_batch(surviving).await?;
         }
 
-        // 4. Close the writer. When there were no survivors to rewrite (e.g. every affected file was
-        //    fully deleted) no writer was ever built and this yields an empty Vec — no empty data file
-        //    is committed, matching the previous buffering form's `batches.is_empty()` contract.
+        // No survivors ⇒ no writer was built ⇒ an empty Vec, so no empty data file is committed.
         match data_writer {
             Some(writer) => writer.finish().await?,
             None => Vec::new(),
         }
     };
 
-    // 5. Commit: delete the affected source files, add the rewritten files. The removals carry FULL
-    //    `DataFile` metadata (`delete_data_files`, resolved from the scanned snapshot's manifests) so
-    //    the §5 conflicting-deletes validation is LIVE — it tests concurrently-added delete files
-    //    against the removed files' partition + metrics, which a bare path cannot carry (Java validates
-    //    the scan tasks' `DataFile` objects, `SparkWrite.commit` L434-437). §5 CoW recipe per
-    //    `SparkWrite.java`: deletes-conflict at BOTH levels (L477/L499), data-conflict under
-    //    serializable only (L476), `AlwaysTrue` conflict filter (= Java's AND of pushed filters when
-    //    nothing is pushed, L417-428).
+    // Commit: remove the affected source files, add the rewritten ones. The removals carry FULL
+    // `DataFile` metadata, so the §5 conflicting-deletes check is LIVE. It tests concurrent delete
+    // files against partition and metrics, which a bare path cannot carry.
     let removed_data_files = resolve_affected_data_files(table, &affected).await?;
     let tx = Transaction::new(table);
     let mut action = tx
@@ -816,13 +681,10 @@ async fn copy_on_write_delete(
     Ok(deleted)
 }
 
-/// Resolve affected file PATHS (collected from the scan's reserved `_file` column) to their full live
-/// [`DataFile`] entries in the scanned snapshot's DATA manifests. The full metadata (partition +
-/// metrics) is what makes the §5 `validate_no_conflicting_deletes` check live on the copy-on-write
-/// commit — the fork validates only `delete_data_files` entries, never bare paths.
-///
-/// Every affected path MUST resolve: the scan just read these files from this same immutable table
-/// handle, so a missing path is an internal invariant breach, not a user error.
+/// Resolves affected file paths to their live [`DataFile`] entries in the scanned snapshot. The full
+/// metadata makes the §5 `validate_no_conflicting_deletes` check live; bare paths are never
+/// validated. Every path MUST resolve: the scan just read these files from this same immutable
+/// handle, so a miss is an internal invariant breach, not a user error.
 async fn resolve_affected_data_files(
     table: &Table,
     affected: &HashSet<String>,
@@ -872,23 +734,11 @@ async fn resolve_affected_data_files(
     Ok(resolved)
 }
 
-/// A streaming, partition-correct data-file writer. Each call to [`Self::write_batch`] feeds one
-/// table-column batch through the production `TaskWriter` without buffering it — so a caller can drain
-/// a scan stream into it batch-by-batch and never hold the whole row set in memory.
-///
-/// Works for BOTH partitioned and unpartitioned tables. Each batch must contain only table-schema
-/// columns (no `_file` or other reserved columns). For partitioned tables the internal
-/// `PartitionValueCalculator` computes and injects the `_partition` struct column that `TaskWriter`'s
-/// splitter reads. `fanout_enabled = true` because successive batches may carry rows from different
-/// partitions (and a single scan batch may interleave them); the `FanoutWriter` routes each row to its
-/// correct partition writer without requiring pre-sorting.
-///
-/// The underlying `TaskWriter` is created lazily on the FIRST batch, so a writer that is finished
-/// without ever receiving a batch produces zero files (matching the previous "empty input → empty Vec"
-/// contract) — no empty data file is committed.
-/// The concrete data-file writer builder the DML paths use: a `DataFileWriter` over a rolling Parquet
-/// writer with the default location / file-name generators. Aliased so the `StreamingDataFileWriter`
-/// field types stay readable.
+/// A streaming, partition-correct data-file writer over the production `TaskWriter`. It buffers no
+/// batch, and each batch must hold only table-schema columns. For a partitioned table a
+/// `PartitionValueCalculator` injects the `_partition` column the splitter reads, and
+/// `fanout_enabled = true` routes rows of any partition without pre-sorting. The `TaskWriter` is
+/// created on the FIRST batch, so a writer that never receives one writes no file.
 type DmlDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
@@ -903,8 +753,7 @@ struct StreamingDataFileWriter {
 }
 
 impl StreamingDataFileWriter {
-    /// Prepare a streaming writer for `table`. No `TaskWriter` (and therefore no output file) is
-    /// created until the first [`Self::write_batch`] call.
+    /// Prepares a streaming writer. No `TaskWriter`, and so no file, exists until the first batch.
     fn try_new(table: &Table) -> DFResult<Self> {
         let schema = table.metadata().current_schema().clone();
         let partition_spec = table.metadata().default_partition_spec().clone();
@@ -927,9 +776,8 @@ impl StreamingDataFileWriter {
             location_gen,
             file_name_gen,
         );
-        // Always configure the default partition spec so an unpartitioned build(None) stamps the
-        // real default_spec_id (post–DROP PARTITION FIELD may be non-zero empty), never fabricated 0
-        // (C5-L-001 / C6-L-001 DATA dual of BUG-001). PartitionKey still wins when present.
+        // Always configure the default spec. `build(None)` would otherwise stamp a fabricated spec
+        // id 0, but a post-DROP-PARTITION-FIELD empty spec may carry a non-zero id (C5-L-001).
         let builder = DataFileWriterBuilder::new(rolling)
             .with_partition_spec(partition_spec.as_ref().clone());
 
@@ -951,7 +799,6 @@ impl StreamingDataFileWriter {
         })
     }
 
-    /// Lazily construct the underlying `TaskWriter` on first use.
     fn ensure_writer(&mut self) -> DFResult<&mut TaskWriter<DmlDataFileWriterBuilder>> {
         if self.writer.is_none() {
             let builder = self.builder.take().ok_or_else(|| {
@@ -975,18 +822,15 @@ impl StreamingDataFileWriter {
         })
     }
 
-    /// Feed ONE table-column batch to the writer, injecting the `_partition` struct column for
-    /// partitioned tables. Awaiting the inner `write` naturally back-pressures the upstream scan.
+    /// Feeds ONE batch to the writer. Awaiting the inner `write` back-pressures the scan.
     async fn write_batch(&mut self, batch: RecordBatch) -> DFResult<()> {
         if self.partition_spec.is_unpartitioned() {
-            // Unpartitioned: TaskWriter writes directly; no partition column needed.
             self.ensure_writer()?
                 .write(batch)
                 .await
                 .map_err(to_datafusion_error)
         } else {
-            // Partitioned: compute the `_partition` struct column and append it so the TaskWriter's
-            // partition splitter can route rows to the correct partition writer.
+            // The TaskWriter's splitter routes rows by this injected `_partition` column.
             let calculator = self.calculator.as_ref().ok_or_else(|| {
                 DataFusionError::Internal(
                     "StreamingDataFileWriter partition calculator missing".to_string(),
@@ -994,7 +838,6 @@ impl StreamingDataFileWriter {
             })?;
             let partition_array = calculator.calculate(&batch).map_err(to_datafusion_error)?;
 
-            // Extend the batch's schema with the `_partition` struct field.
             let partition_field = datafusion::arrow::datatypes::Field::new(
                 PROJECTED_PARTITION_VALUE_COLUMN,
                 partition_array.data_type().clone(),
@@ -1031,42 +874,19 @@ impl StreamingDataFileWriter {
     }
 }
 
-/// Write REAL parquet position-delete file(s) from sorted `(data_file_path, position)` pairs via the
-/// production `PositionDeleteFileWriter`. Returns EVERY file the (rolling) writer produced — a large
-/// DELETE may roll into more than one file, and ALL of them must be committed or the deletes in the
-/// dropped files would be silently lost (rows resurrected on the next scan).
+/// Writes Parquet position-delete files from sorted `(path, pos)` pairs and returns EVERY file the
+/// rolling writer produced; dropping one silently resurrects its rows. Each file is stamped with the
+/// `(spec_id, partition)` of the DATA file it deletes from, which the partitioned path reads from
+/// the snapshot's manifests. The commit validates that stamp against the spec.
 ///
-/// **Partition-aware.** Position-delete files are associated with the `(spec_id, partition)` of the
-/// DATA file they delete from — the Iceberg commit validates that the delete file's partition matches the
-/// registered spec for `partition_spec_id`.
+/// This predicate decides which table shape may skip that walk (BUG-001, C1-L-002):
 ///
-/// **Fast path (never-evolved empty-spec tables only).** When the table has exactly one partition
-/// spec AND that spec has **zero fields**, every data file carries an empty partition tuple and we
-/// write a single delete file stamped via `with_partition_spec(default)` (so the real spec id is
-/// kept — never a hard-coded 0). This is **not** the same as "the default spec is unpartitioned":
-/// after `DROP PARTITION FIELD` / `updateSpec().removeField(...)` the default becomes unpartitioned
-/// while older data files still carry their original `(spec_id, partition)`. Stamping those deletes
-/// with fabricated `None`/spec-0 makes the read-side attach miss and resurrects rows (BUG-001).
-/// All-Void single-spec tables also skip the fast path (need null-tuple arity). Multi-spec and
-/// partitioned shapes always walk manifests and stamp each group with
-/// `PartitionKey::new(data_file_spec, schema, partition)`.
-///
-/// For (still-)partitioned default specs:
-///
-/// 1. The current snapshot manifests are scanned once to build a `path → (spec_id, Struct)` map.
-/// 2. The `(path, pos)` pairs are grouped by their data file's `(spec_id, Struct)`.
-/// 3. One position-delete file is written per group, stamped with that group's `PartitionKey`.
-///
-/// This mirrors Java `PositionDeleteWriter` which always carries a per-data-file `PartitionKey` and
-/// `RewritePositionDeleteFiles` which groups delete files by `(spec_id, partition)`.
-/// Whether position deletes may take the empty-partition fast path.
-///
-/// Option A (BUG-001), refined for all-Void arity (C1-L-002): only when the table has **exactly
-/// one** partition spec AND that spec has **zero fields** (truly unpartitioned).  
-/// - Multi-spec tables whose *default* is unpartitioned after evolution still have partitioned
-///   data under older specs → manifest walk.  
-/// - Single-spec all-Void (`is_unpartitioned()` true but non-empty fields) needs a null-tuple
-///   `PartitionKey` matching the void arity, not `None`/empty → also takes the walk.
+/// | Table shape | Path |
+/// |---|---|
+/// | one spec, zero fields | fast path: one file, stamped through `with_partition_spec` so the real spec id survives |
+/// | multi-spec, empty default (after `DROP PARTITION FIELD`) | walk: old data files keep their own partition, and a fabricated `None`/spec-0 stamp misses on read and resurrects rows |
+/// | one all-Void spec (unpartitioned, non-empty fields) | walk: it needs a null tuple of matching arity |
+/// | partitioned | walk |
 pub(crate) fn position_delete_unpartitioned_fast_path(
     spec_count: usize,
     default_field_count: usize,
@@ -1080,15 +900,12 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
     let default_spec = metadata.default_partition_spec();
     let schema = metadata.current_schema();
 
-    // Never-evolved empty-spec tables only: one delete file under that sole empty spec.
-    // Multi-spec / all-Void / partitioned → manifest walk + per-group PartitionKey (C1-L-001).
+    // Only a never-evolved empty spec skips the manifest walk — see the fast-path table above.
     if position_delete_unpartitioned_fast_path(
         metadata.partition_specs_iter().len(),
         default_spec.fields().len(),
     ) {
-        // Stamp the real default spec id (not a hard-coded 0): build with_partition_spec so
-        // resolve_partition_spec_id does not fabricate DEFAULT_PARTITION_SPEC_ID when the sole
-        // empty spec happens to carry a non-zero id.
+        // `with_partition_spec` keeps the sole spec's real id; `None` would fabricate spec id 0.
         return write_position_deletes_for_partition(
             table,
             &config,
@@ -1099,19 +916,14 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         .await;
     }
 
-    // Partitioned: stamp each delete file with the SAME spec + partition as the data file it
-    // deletes.
     let path_to_partition = live_data_file_partitions(table).await?;
 
-    // Group pairs by (spec_id, partition) — every pair's data file must be live in the snapshot the
-    // map was built from.
     let path_to_partition: HashMap<String, (i32, Struct)> = path_to_partition
         .into_iter()
         .map(|(path, (spec_id, partition, _))| (path, (spec_id, partition)))
         .collect();
     let groups = group_pairs_by_partition(pairs, &path_to_partition)?;
 
-    // Write one position-delete file per (spec_id, partition) group.
     let mut all_delete_files: Vec<DataFile> = Vec::new();
     for ((spec_id, partition), mut group_pairs) in groups {
         // Maintain the per-file (path, pos) sort order within each group.
@@ -1126,9 +938,8 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
             })?
             .as_ref()
             .clone();
-        // Always carry the data file's own (spec, partition) — including empty/unpartitioned and
-        // all-Void null tuples. `partition_key = None` without with_partition_spec would fabricate
-        // spec_id 0 and under-attach or fail commit after DROP PARTITION FIELD (C1-L-001).
+        // Carry the data file's own (spec, partition), including empty and all-Void null tuples. A
+        // `None` key would fabricate spec id 0 and under-attach after DROP PARTITION FIELD.
         let partition_key =
             PartitionKey::new(spec, schema.clone(), partition).map_err(to_datafusion_error)?;
 
@@ -1143,17 +954,12 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         all_delete_files.extend(files);
     }
 
-    // Each group above is non-empty and `write_position_deletes_for_partition` guarantees it
-    // produced at least one file, so `all_delete_files` is non-empty whenever `pairs` was.
     Ok(all_delete_files)
 }
 
-/// Maps every live data file of the current snapshot to its `(spec_id, partition)`.
-///
-/// # Notes
-///
-/// Both delete write paths stamp from this, so a position-delete file and a deletion vector
-/// covering the same data file cannot disagree about its partition.
+/// Maps every live data file of the current snapshot to its `(spec_id, partition)`. Both delete
+/// write paths stamp from this, so a position delete and a deletion vector covering one data file
+/// cannot disagree about its partition.
 async fn live_data_file_partitions(
     table: &Table,
 ) -> DFResult<HashMap<String, (i32, Struct, Option<i64>)>> {
@@ -1168,7 +974,6 @@ async fn live_data_file_partitions(
         .map_err(to_datafusion_error)?;
 
     for manifest_entry in manifest_list.entries() {
-        // Skip delete-file manifests — we only need data file partitions.
         if manifest_entry.content != iceberg::spec::ManifestContentType::Data {
             continue;
         }
@@ -1200,20 +1005,14 @@ async fn live_data_file_partitions(
 struct LiveDeletes {
     /// Puffin DVs, keyed by the data file each covers.
     dv_by_data_file: HashMap<String, DataFile>,
-    /// Non-Puffin position deletes, as `(referenced_data_file, spec_id, partition, sequence)`.
-    /// The reference comes from [`referenced_data_file_location`], the same derivation the scan
-    /// uses — a delete with equal `file_path` bounds names its data file even with the field
-    /// unset, which is how virtually every Java-written file-granularity delete is recognised.
+    /// Non-Puffin position deletes as `(referenced_data_file, spec_id, partition, sequence)`. The
+    /// reference is [`referenced_data_file_location`], the same derivation the scan uses.
     legacy_position_deletes: Vec<(Option<String>, i32, Struct, Option<i64>)>,
 }
 
-/// Reads the current snapshot's delete manifests once.
-///
-/// # Notes
-///
-/// V3 allows at most one DV per data file, so `dv_by_data_file` is unambiguous. A second delete on
-/// a data file must merge that DV and supersede it; leaving it live would double-count the
-/// positions.
+/// Reads the current snapshot's delete manifests once. V3 allows at most one DV per data file, so
+/// `dv_by_data_file` is unambiguous. A second delete on a data file must merge that DV and supersede
+/// it, or the positions are counted twice.
 async fn live_delete_vectors_by_data_file(table: &Table) -> DFResult<LiveDeletes> {
     let metadata = table.metadata();
     let mut live = LiveDeletes {
@@ -1266,14 +1065,10 @@ enum LiveDeleteKind {
     LegacyPositionDelete,
 }
 
-/// Classifies a live delete file, or `None` when the V3 write path must ignore it.
-///
-/// # Notes
-///
-/// EQUALITY deletes are ignored deliberately. They are legal at V3 and are not superseded by a DV,
-/// so treating one as a legacy position delete would refuse a DELETE that is perfectly valid —
-/// `referenced_data_file_location` returns `None` for them, which would then match every data file
-/// in the partition.
+/// Classifies a live delete file, or `None` when the V3 write path must ignore it. Equality deletes
+/// are ignored deliberately: they are legal at V3, no DV supersedes them, and
+/// `referenced_data_file_location` returns `None` for one. Treating one as a legacy position delete
+/// would match every data file in the partition and refuse a valid DELETE.
 fn classify_live_delete(delete_file: &DataFile) -> Option<LiveDeleteKind> {
     if delete_file.content_type() != iceberg::spec::DataContentType::PositionDeletes {
         return None;
@@ -1285,14 +1080,10 @@ fn classify_live_delete(delete_file: &DataFile) -> Option<LiveDeleteKind> {
     }
 }
 
-/// Reduces a live non-Puffin position delete to what the applicability test needs.
-///
-/// # Notes
-///
-/// The reference is [`referenced_data_file_location`], not the raw `referenced_data_file` field.
-/// Java's `PositionDeleteWriter.close()` never sets that field — it leaves equal `file_path`
-/// bounds — so reading the field alone treats virtually every Java-written file-granularity delete
-/// as partition-scoped.
+/// Reduces a live non-Puffin position delete to what the applicability test needs. The reference is
+/// [`referenced_data_file_location`], not the raw field: Java's `PositionDeleteWriter.close()`
+/// leaves that field unset and only equal `file_path` bounds, so a field-only read treats nearly
+/// every Java-written file-granularity delete as partition-scoped.
 fn legacy_position_delete_entry(
     delete_file: &DataFile,
     sequence_number: Option<i64>,
@@ -1305,18 +1096,12 @@ fn legacy_position_delete_entry(
     )
 }
 
-/// Whether a live non-Puffin position delete still applies to a data file.
-///
-/// Args mirror the commit door's own test (`RowDeltaAction::validate_fresh_dvs_only`), so the
-/// pre-IO refusal and the commit-time rejection cannot disagree about what "covers" means.
-///
-/// # Notes
-///
-/// `delete.0` is [`referenced_data_file_location`], not the raw field: a delete with equal
-/// `file_path` bounds names its data file even with the field unset, and that is how virtually
-/// every Java-written file-granularity delete is recognised. A named delete is matched on PATH
-/// alone — the partition it happens to be stamped with is irrelevant, exactly as the scan does.
-/// An unknown sequence number errs toward "applies", so the caller refuses rather than corrupts.
+/// Whether a live non-Puffin position delete still applies to a data file. The args mirror the
+/// commit door's own test (`RowDeltaAction::validate_fresh_dvs_only`), so the pre-IO refusal and the
+/// commit-time rejection cannot disagree about what "covers" means. A NAMED delete matches on PATH
+/// alone, whatever partition it carries, and `delete.0` is [`referenced_data_file_location`], so
+/// equal `file_path` bounds name the file with the raw field unset. An unknown sequence errs toward
+/// "applies": the caller refuses, not corrupts.
 fn legacy_position_delete_applies(
     delete: &(Option<String>, i32, Struct, Option<i64>),
     data_file_path: &str,
@@ -1337,23 +1122,14 @@ fn legacy_position_delete_applies(
         }
 }
 
-/// Writes the deletion vectors for `pairs` — the V3 merge-on-read delete output.
-///
-/// One Puffin file carries one `deletion-vector-v1` blob per data file touched, so unlike the V2
-/// path there is no per-partition grouping: the writer splits by referenced data file itself. Each
-/// position still carries its data file's own `PartitionKey`, so a DV is stamped with the spec and
-/// partition of the file it covers.
+/// Writes the deletion vectors for `pairs` — the V3 merge-on-read delete output. One Puffin file
+/// carries one blob per data file touched, so the writer splits by referenced data file instead of
+/// grouping by partition. Each DV carries its data file's own `PartitionKey`. An existing DV is
+/// loaded, merged, and returned in `rewritten_delete_files`: V3 allows only one DV per data file.
 ///
 /// # Errors
 ///
-/// Fails when a pair's data file is not live in the current snapshot, when its spec is unknown, or
-/// when an existing DV cannot be read back.
-///
-/// # Notes
-///
-/// A data file that already has a DV has it loaded and merged, and the superseded DV comes back in
-/// `rewritten_delete_files` for the commit to remove. V3 allows only one DV per data file, so
-/// skipping that merge would leave two live DVs covering one file.
+/// Fails when a pair's data file is not live, its spec is unknown, or an existing DV is unreadable.
 async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFResult<DVWriteResult> {
     let metadata = table.metadata();
     let schema = metadata.current_schema();
@@ -1387,17 +1163,13 @@ async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFRes
         resolved.push((path.as_str(), spec_id, partition, data_seq));
     }
 
-    // Load the DV each touched data file already has, if any. Java's `loadPreviousDeletes` is
-    // called per touched path, so a data file with only previous deletes and no new position is
-    // never visited and keeps its DV.
+    // Java's `loadPreviousDeletes` runs per touched path, so a data file with only previous deletes
+    // and no new position is never visited and keeps its DV.
     let live = live_delete_vectors_by_data_file(table).await?;
 
-    // Refuse a data file still covered by a Parquet position delete, BEFORE the Puffin is opened.
-    // Java's `loadPreviousDeletes` unions those positions into the new DV and rewrites the
-    // file-scoped sources; this port reads DVs only, so merging them is not yet possible. The
-    // commit door rejects it too, but only after a fully written, unreferenced Puffin reached
-    // storage. Reachable on a V2 table with position deletes upgraded to V3. GAP_MATRIX row R114
-    // carries the residue.
+    // Refuse a data file still covered by a Parquet position delete BEFORE the Puffin is opened.
+    // Java unions those positions into the new DV; this port reads DVs only. The commit door also
+    // rejects it, but only after an unreferenced Puffin reached storage.
     for (path, spec_id, partition, data_seq) in &resolved {
         let covered = live.legacy_position_deletes.iter().any(|delete| {
             legacy_position_delete_applies(delete, path, *spec_id, partition, *data_seq)
@@ -1461,19 +1233,11 @@ async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFRes
 /// of the data files they delete from.
 type PositionDeleteGroups = HashMap<(i32, Struct), Vec<(String, i64)>>;
 
-/// Group `(path, pos)` pairs by the `(spec_id, partition)` of the data file each one deletes from,
-/// so every position-delete file can be stamped with the SAME spec and partition as its target
-/// (Java `PositionDeleteWriter` always carries a per-data-file `PartitionKey`).
-///
-/// A pair whose data file is absent from `path_to_partition` is a hard error. The map is built from
-/// the current snapshot's DATA manifests, so a miss means the pair references a file that is not
-/// live — the pairs come from a scan of that same snapshot, so it cannot happen without a bug.
-/// Fabricating `(default_spec, Struct::empty())` for it (the previous fallback) pairs a PARTITIONED
-/// spec with an EMPTY tuple: that used to ABORT in `PartitionKey::to_path` before any validation
-/// could see it, and with the path walk totalised it would instead write a delete file under a
-/// `field=null` path carrying a tuple no reader can match.
-///
-/// Only reached on the PARTITIONED path — the unpartitioned table returns before this.
+/// Groups `(path, pos)` pairs by the `(spec_id, partition)` of the data file each deletes from, so
+/// every output file is stamped like its target. Only the partitioned path reaches this. A pair
+/// whose data file is absent from `path_to_partition` is a hard error: the pairs come from a scan of
+/// the same snapshot that built the map. The old fallback fabricated an EMPTY tuple under a
+/// PARTITIONED spec, writing a delete file under a `field=null` path that no reader can match.
 fn group_pairs_by_partition(
     pairs: &[(String, i64)],
     path_to_partition: &HashMap<String, (i32, Struct)>,
@@ -1492,12 +1256,9 @@ fn group_pairs_by_partition(
     Ok(groups)
 }
 
-/// Write one position-delete file for a SINGLE `(spec_id, partition)` group.
-///
-/// Prefer `Some(partition_key)` carrying the data file's own spec (always, on the multi-path).
-/// When `partition_key` is `None`, `configured_spec` MUST be `Some` so the writer stamps that
-/// spec's id via `with_partition_spec` instead of fabricating `DEFAULT_PARTITION_SPEC_ID` (0).
-/// The caller must have pre-sorted `pairs` by `(path, pos)`.
+/// Writes one position-delete file for a SINGLE `(spec_id, partition)` group. `pairs` must already
+/// be sorted by `(path, pos)`. With `partition_key = None`, `configured_spec` MUST be `Some`, or the
+/// writer fabricates `DEFAULT_PARTITION_SPEC_ID` (0) instead of the real spec id.
 async fn write_position_deletes_for_partition(
     table: &Table,
     config: &PositionDeleteWriterConfig,
@@ -1512,10 +1273,8 @@ async fn write_position_deletes_for_partition(
         Some(uuid::Uuid::now_v7().to_string()),
         DataFileFormat::Parquet,
     );
-    // Keep the position-delete `file_path` / `pos` bounds FULL and EXACT:
-    // - MetricsConfig::for_position_delete → Full mode (Java MetricsConfig.forPositionDelete)
-    // - position_delete_writer_properties → no 64-byte parquet stats truncate (so min_is_exact /
-    //   max_is_exact stay true and equal-bounds path routing works for long S3 URIs)
+    // Keep the `file_path` and `pos` bounds FULL and EXACT: no parquet stats truncation, so
+    // min_is_exact/max_is_exact stay true and equal-bounds path routing works for long S3 URIs.
     let parquet_builder =
         ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
             .with_metrics_config(MetricsConfig::for_position_delete());
@@ -1555,9 +1314,7 @@ async fn write_position_deletes_for_partition(
     })?;
     writer.write(batch).await.map_err(to_datafusion_error)?;
     let files = writer.close().await.map_err(to_datafusion_error)?;
-    // A non-empty group of pairs MUST produce at least one delete file — otherwise the deletes
-    // would be silently lost (rows resurrected on re-scan). Guard both the unpartitioned fast-path
-    // and every partitioned group here so the check can never be skipped.
+    // A non-empty group MUST produce a file, or the deletes vanish and the rows come back.
     if files.is_empty() {
         return Err(DataFusionError::Internal(
             "position-delete writer produced no file for a non-empty pair group".to_string(),
@@ -1566,13 +1323,9 @@ async fn write_position_deletes_for_partition(
     Ok(files)
 }
 
-/// Decode the reserved `_file` column at `row`. The scan emits `_file` as a per-file constant, which the
-/// transformer materializes as a Run-End-Encoded `Utf8` column; tolerate both REE and plain `Utf8`.
-///
-/// A NULL slot is a hard error rather than a decoded value: arrow's `value()` returns `""` for a
-/// null string, and an empty path silently becomes a position delete against a file that does not
-/// exist. `_file` is a reserved metadata column the scan always materializes, so a NULL means the
-/// batch did not come from where this code believes it did.
+/// Decodes the reserved `_file` column at `row`, tolerating run-end-encoded and plain `Utf8`. A NULL
+/// slot is an error, not a value: arrow's `value()` returns `""` there, and an empty path becomes a
+/// position delete against a file that does not exist.
 fn decode_file_path(col: &ArrayRef, row: usize) -> DFResult<String> {
     use datafusion::arrow::array::RunArray;
     use datafusion::arrow::datatypes::Int32Type;
@@ -1611,10 +1364,8 @@ fn null_file_path_error(row: usize) -> DataFusionError {
     ))
 }
 
-/// Decode the reserved `_pos` column at `row`.
-///
-/// A NULL slot is a hard error for the same reason as [`decode_file_path`]: arrow's `value()`
-/// returns `0` for a null `i64`, which would silently position-delete row 0 of a real data file.
+/// Decodes the reserved `_pos` column at `row`. A NULL slot is an error for the same reason as
+/// [`decode_file_path`]: arrow returns `0`, which would position-delete row 0 of a real data file.
 fn decode_position(col: &Int64Array, row: usize) -> DFResult<i64> {
     if col.is_null(row) {
         return Err(DataFusionError::Internal(format!(
@@ -1625,15 +1376,9 @@ fn decode_position(col: &Int64Array, row: usize) -> DFResult<i64> {
     Ok(col.value(row))
 }
 
-/// Decode the `_file` column for an ENTIRE batch in one pass, returning one borrowed path per row
-/// (row `i` → `out[i]`).
-///
-/// Equivalent to calling [`decode_file_path`] for every row, but it allocates NO per-row `String`:
-/// for a run-end-encoded column (`_file` is REE with only F ≪ R distinct values) each run's value is
-/// resolved once and reused across the run; for a plain `StringArray` each row's `&str` is returned
-/// directly. The returned strings are byte-identical, in the same order, to what `decode_file_path`
-/// would produce per row — callers that need owned paths intern via the affected/path set instead of
-/// allocating one `String` per row.
+/// Decodes the `_file` column for a whole batch in one pass (row `i` → `out[i]`). Equivalent to
+/// [`decode_file_path`] per row, but it allocates no `String`: each run's value of a run-end-encoded
+/// column is resolved once and reused. The strings are byte-identical, and in the same order.
 fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
     use datafusion::arrow::array::RunArray;
     use datafusion::arrow::datatypes::Int32Type;
@@ -1658,11 +1403,8 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
             })?;
         let mut out = Vec::with_capacity(run.len());
         if run.offset() == 0 {
-            // Fast path (the only shape the COW scan produces — whole, unsliced REE batches): walk
-            // the run-ends ONCE, emitting each run's value across its whole logical span. For an
-            // unsliced array the logical index equals the physical run-end offset, so this yields
-            // exactly the same `&str` per row as `run.get_physical_index(row)` — the row-wise form
-            // below — without the per-row binary search.
+            // Unsliced REE, the only shape the COW scan produces: the logical index equals the
+            // physical run-end offset, so one walk gives the same `&str` per row as the form below.
             let run_ends = run.run_ends().values();
             let mut start = 0usize;
             for (physical, &end) in run_ends.iter().enumerate() {
@@ -1679,9 +1421,8 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
                 start = end;
             }
         } else {
-            // Sliced REE array: the logical→physical mapping is offset-relative, so defer to
-            // `get_physical_index` per row (still allocation-free). Behaviorally identical to the
-            // fast path; kept separate because a sliced run-ends walk is easy to get subtly wrong.
+            // Sliced REE: the logical-to-physical map is offset-relative, so defer per row. A
+            // sliced run-ends walk is easy to get subtly wrong.
             for row in 0..run.len() {
                 let physical = run.get_physical_index(row);
                 if values.is_null(physical) {
@@ -1702,8 +1443,7 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
 // UPDATE
 // =================================================================================================
 
-/// `UPDATE … SET … WHERE` execution plan. Applies the `SET` assignments to the rows matching `WHERE`,
-/// commits, and emits the updated-row count.
+/// `UPDATE … SET … WHERE` plan. It applies the assignments, commits, and counts the rows.
 pub(crate) struct IcebergUpdateExec {
     table: Table,
     catalog: Arc<dyn Catalog>,
@@ -1712,8 +1452,7 @@ pub(crate) struct IcebergUpdateExec {
     /// The `SET` assignments: `(table-schema column index, new-value PhysicalExpr)`.
     assignments: Vec<(usize, Arc<dyn PhysicalExpr>)>,
     mode: WriteMode,
-    /// The §5 isolation level (resolved at plan time from `write.update.isolation-level`, default
-    /// serializable — Java's per-operation default).
+    /// The §5 isolation level, resolved at plan time from `write.update.isolation-level`.
     isolation: IsolationLevel,
     table_schema: SchemaRef,
     count_schema: SchemaRef,
@@ -1867,8 +1606,8 @@ fn match_mask(
     }
 }
 
-/// Rebuild a batch holding exactly the table columns (resolved BY NAME, in table-schema order) — the
-/// schema the predicate/assignment `PhysicalExpr`s are bound to and the writer matches against.
+/// Rebuilds a batch of exactly the table columns, resolved BY NAME, in table-schema order. That is
+/// the schema the `PhysicalExpr`s are bound to and the writer matches against.
 fn table_column_batch(batch: &RecordBatch, table_schema: &SchemaRef) -> DFResult<RecordBatch> {
     let columns: Vec<ArrayRef> = table_schema
         .fields()
@@ -1886,10 +1625,9 @@ fn table_column_batch(batch: &RecordBatch, table_schema: &SchemaRef) -> DFResult
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-/// Apply the `SET` assignments to `table_batch`, replacing each assigned column. When `mask` is `Some`,
-/// only the masked-`true` rows take the new value (the rest keep the old) — used by copy-on-write where
-/// the batch holds matching AND non-matching rows. When `None`, every row is updated (merge-on-read,
-/// where the batch is already filtered to matching rows).
+/// Applies the `SET` assignments to `table_batch`. With `Some(mask)` only masked-true rows take the
+/// new value: copy-on-write, whose batch holds matching and non-matching rows. With `None` every row
+/// is updated, because merge-on-read already filtered the batch.
 fn apply_assignments(
     table_batch: &RecordBatch,
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
@@ -1905,12 +1643,9 @@ fn apply_assignments(
             Some(mask) => zip(mask, &new_values, &columns[*col_idx])
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
         };
-        // An assignment must not introduce NULLs into a REQUIRED (non-nullable) column — Parquet would
-        // write the null and silently violate the Iceberg schema contract.
-        //
-        // `logical_null_count`, not `null_count`: the latter is the PHYSICAL count, which is 0 for a
-        // dictionary- or run-end-encoded array whose *values* carry the NULL. `RecordBatch::try_new`'s
-        // own nullability check is physical too, so such a NULL would clear both gates and be written.
+        // An assignment must not put a NULL into a REQUIRED column. Use `logical_null_count`: the
+        // physical count is 0 for a dictionary- or REE-encoded array whose VALUES carry the NULL,
+        // and `RecordBatch::try_new`'s own check is physical too, so the NULL clears both gates.
         let field = table_schema.field(*col_idx);
         if !field.is_nullable() && assigned.logical_null_count() > 0 {
             return Err(DataFusionError::Plan(format!(
@@ -1924,12 +1659,10 @@ fn apply_assignments(
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-/// Merge-on-read UPDATE: position-delete the OLD matching rows and insert NEW rows carrying the updated
-/// values, in one `RowDelta`. Returns the number of rows updated. Works for both partitioned and
-/// unpartitioned tables: the NEW rows are routed through the partition-aware
-/// [`StreamingDataFileWriter`], which computes partition values from the POST-assignment column values.
-/// Position deletes are keyed by (data-file path, position) and are partition-agnostic, so the delete
-/// side is unchanged.
+/// Merge-on-read UPDATE: position-delete the OLD matching rows and insert NEW rows with the updated
+/// values, in one `RowDelta`. Returns the number of rows updated. The new rows go through
+/// [`StreamingDataFileWriter`], which reads partition values from the POST-assignment columns.
+/// Position deletes are keyed by `(path, pos)` and are partition-agnostic.
 async fn merge_on_read_update(
     table: &Table,
     catalog: &dyn Catalog,
@@ -1940,8 +1673,7 @@ async fn merge_on_read_update(
 ) -> DFResult<u64> {
     let delete_kind = merge_on_read_delete_kind(table)?;
 
-    // The snapshot this DML's scan reads — the §5 `validate_from_snapshot` anchor
-    // (`SparkPositionDeltaWrite.java` L245-249).
+    // The §5 `validate_from_snapshot` anchor.
     let scan_snapshot_id = table.metadata().current_snapshot_id();
 
     let mut projection: Vec<String> = table_schema
@@ -1952,8 +1684,7 @@ async fn merge_on_read_update(
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
-    // Stream the scan batch-by-batch. Awaiting `try_next` / the data writer's `write` back-pressures
-    // the scan (single-threaded poll) — no unbounded producer.
+    // Awaiting `try_next` and the writer's `write` back-pressures the scan: no unbounded producer.
     let mut stream = table
         .scan()
         .select(projection)
@@ -1963,10 +1694,8 @@ async fn merge_on_read_update(
         .await
         .map_err(to_datafusion_error)?;
 
-    // The delete side still buffers the matched `(path, pos)` pairs (two small fields per updated row),
-    // because `write_position_deletes` must group by `(spec_id, partition)` and sort `(path, pos)` and
-    // the default scan interleaves files unordered — see MEDIUM-1. The NEW-row (data-file) side, by
-    // contrast, streams straight into the writer per batch — its rows are never buffered.
+    // The delete side buffers the matched pairs, because `write_position_deletes` must group and
+    // sort them. The new-row side streams into the writer per batch.
     let mut pairs: Vec<(String, i64)> = Vec::new();
     let mut data_writer = StreamingDataFileWriter::try_new(table)?;
     while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
@@ -1976,7 +1705,6 @@ async fn merge_on_read_update(
             continue;
         }
 
-        // Record the (path, pos) of every OLD matching row to position-delete.
         let file_col = batch
             .column_by_name(RESERVED_COL_NAME_FILE)
             .ok_or_else(|| {
@@ -1999,8 +1727,7 @@ async fn merge_on_read_update(
             }
         }
 
-        // The matching rows, with the assignments applied (all of them match → no per-row mask).
-        // Stream them straight into the data-file writer rather than buffering `new_rows`.
+        // All rows here match, so the assignments need no per-row mask.
         let matching = filter_record_batch(&table_batch, &mask)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         let new_rows_batch = apply_assignments(&matching, assignments, table_schema, None)?;
@@ -2009,32 +1736,25 @@ async fn merge_on_read_update(
 
     let updated = pairs.len() as u64;
     if updated == 0 {
-        // No rows matched: no position deletes and no new data. The data writer was never fed a batch
-        // (every batch had `true_count() == 0`), so `finish` produces no file — nothing to commit.
+        // No batch ever reached the writer, so `finish` produces no file. Nothing to commit.
         let empty = data_writer.finish().await?;
         debug_assert!(empty.is_empty());
         return Ok(0);
     }
 
-    // The DATA files the position deletes reference — the §5 `validate_data_files_exist` set
-    // (`SparkPositionDeltaWrite.commit` L243, unconditional).
+    // The §5 `validate_data_files_exist` set, which Java arms unconditionally.
     let referenced_files: HashSet<String> = pairs.iter().map(|(path, _)| path.clone()).collect();
 
-    // Position deletes MUST be grouped + sorted (path, pos) before writing — the whole `pairs` set is
-    // required up front (MEDIUM-1). The data files, in contrast, were already streamed above; `finish`
-    // just closes the writer. Both complete BEFORE the single commit below (commit-once atomicity).
+    // Grouping and sorting need the whole pair set up front. Both sides complete BEFORE the single
+    // commit below.
     sort_position_delete_pairs(&mut pairs);
     let (delete_files, superseded_delete_files) =
         write_merge_on_read_deletes(table, delete_kind, &pairs).await?;
     let data_files = data_writer.finish().await?;
 
-    // ENGINE_CONTRACT §5 row-delta recipe, MoR UPDATE row. Beyond the base (conflict filter +
-    // files-exist + from-snapshot), UPDATE arms `validate_deleted_files` +
-    // `validate_no_conflicting_delete_files` at BOTH isolation levels — the op READ rows to produce
-    // its output, so a concurrent delete of those rows conflicts (Java `command == UPDATE || MERGE`,
-    // `SparkPositionDeltaWrite.commit` L251-254 — deliberately NOT armed for DELETE). Serializable
-    // adds the conflicting-data check (L256-258). `AlwaysTrue` = Java's AND of pushed filters when
-    // nothing is pushed (L284-292).
+    // §5 row-delta recipe, MoR UPDATE. UPDATE arms the deleted-files checks at BOTH levels, because
+    // the op READ the rows it rewrote: a concurrent delete of them conflicts. Java arms these for
+    // UPDATE and MERGE only, never DELETE.
     let tx = Transaction::new(table);
     let mut action = tx
         .row_delta()
@@ -2064,20 +1784,10 @@ async fn merge_on_read_update(
     Ok(updated)
 }
 
-/// Copy-on-write UPDATE: **file-level** rewrite — scan every live row projecting the table columns
-/// PLUS the reserved `_file` path, identify which source data files contain at least one updated row
-/// (the "affected" set), rewrite only those files in full (matched rows take the new values; rows of
-/// the same file that did NOT match are carried unchanged), and commit a `OverwriteFiles` that deletes
-/// the affected source paths and adds the rewritten files. Unaffected data files are left completely
-/// untouched.
-///
-/// Works for BOTH partitioned and unpartitioned tables. When the SET expression changes a
-/// partition-key column, the rewritten row is routed to its NEW partition automatically because
-/// [`StreamingDataFileWriter`] computes partition values from the post-assignment column values.
-///
-/// **Streaming (H7-S2).** Same two-pass streaming shape as [`copy_on_write_delete`]: pass 1 retains
-/// only the affected-file set and the counter, pass 2 re-scans and streams each rewritten batch into
-/// the writer. The cost is a second full read — see the module-level *Memory* note.
+/// Copy-on-write UPDATE: a file-level rewrite. It finds the data files holding at least one updated
+/// row and rewrites those files in full: matched rows take the new values, the rest are carried
+/// unchanged. It then commits an `OverwriteFiles`. A SET on a partition-key column moves the row to
+/// its new partition, because [`StreamingDataFileWriter`] reads the post-assignment columns.
 async fn copy_on_write_update(
     table: &Table,
     catalog: &dyn Catalog,
@@ -2086,14 +1796,11 @@ async fn copy_on_write_update(
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
 ) -> DFResult<u64> {
-    // The snapshot this DML's scan reads — the §5 `validate_from_snapshot` anchor (`SparkWrite.java`
-    // L470-472 / L493-495). Both passes below pin this same snapshot.
+    // The §5 `validate_from_snapshot` anchor. Both passes pin it, so they read the identical rows.
     let scan_snapshot_id = table.metadata().current_snapshot_id();
 
-    // 1. Pass 1 — affected-file detection, STREAMED. A source file is AFFECTED iff at least one of its
-    //    rows matches the predicate (or the predicate is None → all rows match → all files affected).
-    //    Also counts total updated rows for the return value. Only `affected` (one path per affected
-    //    FILE) and the counter survive the pass — no rows and no per-batch masks are retained.
+    // Pass 1 — affected-file detection. A file is affected when any of its rows matches. Only the
+    // affected paths and the counter survive the pass; no rows and no masks are retained.
     let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
     let mut updated: u64 = 0;
     let mut affected: HashSet<String> = HashSet::new();
@@ -2119,27 +1826,19 @@ async fn copy_on_write_update(
         }
     }
 
-    // Release pass 1's exhausted scan explicitly — a shadowed binding would otherwise keep its state
-    // alive for all of pass 2 (see the same note in `copy_on_write_delete`).
+    // Release pass 1's exhausted scan: a shadowed binding keeps its state alive for all of pass 2.
     drop(stream);
 
-    // 2. No updated rows → no-op (avoid a pointless rewrite of unchanged data). Also skips the second
-    //    scan entirely.
+    // No updated rows → no-op, and the second scan is skipped.
     if updated == 0 {
         return Ok(0);
     }
 
-    // 3. Pass 2 — RE-SCAN the same snapshot and stream the rewrite content for affected files only.
-    //    For each batch: filter down to rows whose source file is in the affected set, then apply
-    //    the assignments with the per-row match mask so that:
-    //      * matched rows (WHERE = TRUE) take the new SET values
-    //      * other rows of the SAME affected file keep their original values (carried unchanged)
-    //    Rows from unaffected files are NOT included — their source files are untouched. Each rewritten
-    //    batch goes straight to the writer and is dropped; nothing accumulates.
+    // Pass 2 — re-scan and rewrite affected files only. Matched rows take the new SET values; other
+    // rows of the SAME affected file keep their original values. Nothing accumulates.
     let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
-    // Eager construction is behaviour-preserving here (unlike the DELETE path): `updated > 0` means at
-    // least one file is affected, and every row of an affected file is rewritten, so pass 2 always
-    // feeds the writer at least one batch — the pre-H7-S2 form always constructed it too.
+    // Eager construction is safe here, unlike the DELETE path: `updated > 0` means at least one file
+    // is affected, and every row of an affected file is rewritten.
     let mut data_writer = StreamingDataFileWriter::try_new(table)?;
 
     while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
@@ -2150,10 +1849,8 @@ async fn copy_on_write_update(
                 DataFusionError::Internal("update scan missing _file column".to_string())
             })?;
 
-        // Build table-column sub-batch (rows from the FULL batch including unaffected-file rows).
         let table_batch = table_column_batch(&batch, table_schema)?;
 
-        // Keep-mask: only rows whose source file is in the affected set.
         let paths = decode_file_paths_batch(file_col)?;
         let keep_affected: BooleanArray = (0..num_rows)
             .map(|row| affected.contains(paths[row]))
@@ -2162,20 +1859,14 @@ async fn copy_on_write_update(
             continue;
         }
 
-        // Filter down to affected-file rows (table columns only, no _file).
         let affected_batch = filter_record_batch(&table_batch, &keep_affected)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
-        // The per-row WHERE match mask WITHIN the affected rows, evaluated directly over
-        // `affected_batch`. The previous form (M7) instead cached pass 1's per-batch mask and filtered
-        // it by `keep_affected`; the two are equal because `match_mask` is a row-wise pure function and
-        // arrow `filter` preserves row order. The cache is GONE because it was indexed by batch
-        // POSITION, and pass 2 is now an independent scan whose batch boundaries and arrival order are
-        // not guaranteed to match pass 1's — indexing across them would silently apply one batch's mask
-        // to another batch's rows. The traded cost is one extra predicate evaluation per batch.
+        // Evaluate the mask over `affected_batch` instead of caching pass 1's. The old cache was
+        // indexed by batch POSITION, and pass 2 is an independent scan whose batch boundaries need
+        // not match, so it could apply one batch's mask to another batch's rows.
         let affected_match_mask = match_mask(&predicate, &affected_batch)?;
 
-        // Apply assignments: matched rows take new values; non-matched rows keep old values.
         let rewritten = apply_assignments(
             &affected_batch,
             assignments,
@@ -2185,16 +1876,13 @@ async fn copy_on_write_update(
         data_writer.write_batch(rewritten).await?;
     }
 
-    // 4. Close the writer. Routes each row to its correct partition by the POST-assignment column
-    //    values — a partition-key-changing UPDATE automatically moves the row to the new partition
-    //    file. A writer never fed a batch produces no file.
+    // The writer routes each row by its POST-assignment values, so a partition-key-changing UPDATE
+    // moves the row to the new partition.
     let new_files = data_writer.finish().await?;
 
-    // 5. Commit: delete the affected source files, add the rewritten files. Full-metadata removals
-    //    (`delete_data_files`, NOT `overwrite_by_row_filter` — unaffected files stay in place, and NOT
-    //    bare paths — the §5 conflicting-deletes check needs partition + metrics). Same §5 CoW recipe
-    //    as DELETE: Java's isolation `switch` does not branch on the command (`SparkWrite.java`
-    //    L448-456) — deletes-conflict at BOTH levels, data-conflict under serializable.
+    // Commit: remove the affected source files, add the rewritten ones. The removals carry FULL
+    // metadata, not bare paths, because the §5 conflicting-deletes check needs partition and metrics.
+    // Java's isolation switch does not branch on the command, so this matches the DELETE recipe.
     let removed_data_files = resolve_affected_data_files(table, &affected).await?;
     let tx = Transaction::new(table);
     let mut action = tx
@@ -2238,12 +1926,9 @@ mod tests {
         position_delete_unpartitioned_fast_path, sort_position_delete_pairs,
     };
 
-    // =============================================================================================
-    // WG5 (c) — an assignment must never smuggle a NULL into a REQUIRED column. `null_count()` is
-    // the PHYSICAL count: a dictionary (or run-end) array whose *values* hold a NULL reports 0
-    // while `logical_null_count()` reports the real answer, and `RecordBatch::try_new`'s own
-    // nullability check is physical too — so the NULL passes both gates and is written.
-    // =============================================================================================
+    // An assignment must never smuggle a NULL into a REQUIRED column. A dictionary or REE array
+    // whose VALUES hold a NULL reports `null_count() == 0`, and `RecordBatch::try_new`'s own check
+    // is physical too, so the NULL passes both gates and is written.
 
     /// A single-column table schema for `d`, `nullable` as given, dictionary-encoded Utf8.
     fn dict_column_schema(nullable: bool) -> SchemaRef {
@@ -2254,8 +1939,7 @@ mod tests {
         )]))
     }
 
-    /// Dictionary array with a NULL hiding in the VALUES: physically null-free keys, logically a
-    /// NULL at row 1.
+    /// Dictionary array with a NULL in the VALUES: null-free keys, logically NULL at row 1.
     fn dict_with_null_value() -> ArrayRef {
         let values = StringArray::from(vec![Some("x"), None]);
         let keys = Int32Array::from(vec![0, 1]);
@@ -2319,12 +2003,9 @@ mod tests {
         assert_eq!(out.column(0).logical_null_count(), 0);
     }
 
-    // =============================================================================================
-    // WG5 (d) — the reserved `_file` / `_pos` decode read `.value(i)` with no validity check.
-    // Arrow's `value()` on a NULL slot returns a well-formed lie: `""` for a string, `0` for an
-    // i64. Both feed straight into a position-delete tuple, so a NULL `_file` deletes against an
-    // empty path and a NULL `_pos` deletes ROW 0 of a real data file.
-    // =============================================================================================
+    // Arrow's `value()` on a NULL slot returns a well-formed lie: `""` for a string, `0` for an i64.
+    // Both feed a position-delete tuple, so a NULL `_file` deletes against an empty path and a NULL
+    // `_pos` deletes ROW 0 of a real data file.
 
     #[test]
     fn test_decode_file_path_rejects_a_null_path() {
@@ -2369,12 +2050,9 @@ mod tests {
         assert!(err.to_string().contains("_pos"), "unexpected error: {err}");
     }
 
-    /// `decode_file_paths_batch` must produce, for every row, EXACTLY the string
-    /// `decode_file_path` would — for a plain `StringArray`, for a run-end-encoded `_file` column
-    /// (the shape the COW scan produces, with F ≪ R distinct values and duplicate runs), and for a
-    /// SLICED REE array (the offset≠0 fallback path). This pins the H8 per-run decode optimization
-    /// to byte-identical per-row results — the correctness contract for COW DELETE/UPDATE
-    /// affected-file detection and keep-masks.
+    /// `decode_file_paths_batch` must produce, for every row, EXACTLY the string `decode_file_path`
+    /// would: plain, run-end-encoded, and sliced REE. Byte-identical per-row results are the
+    /// correctness contract for COW affected-file detection and keep-masks.
     fn assert_batch_matches_per_row(col: &ArrayRef) {
         let batch = decode_file_paths_batch(col).expect("batch decode");
         assert_eq!(batch.len(), col.len(), "one decoded path per row");
@@ -2399,12 +2077,10 @@ mod tests {
 
     #[test]
     fn test_decode_file_paths_batch_ree_with_runs() {
-        // run-end-encoded: values [a, b, a] over logical rows with runs of length 3, 1, 2.
         let run_ends = Int32Array::from(vec![3, 4, 6]);
         let values = StringArray::from(vec!["f/a.parquet", "f/b.parquet", "f/a.parquet"]);
         let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
         let col: ArrayRef = Arc::new(ree);
-        // Sanity: distinct runs, duplicate value across non-adjacent runs.
         assert_eq!(col.len(), 6);
         assert_batch_matches_per_row(&col);
     }
@@ -2420,24 +2096,18 @@ mod tests {
 
     #[test]
     fn test_decode_file_paths_batch_sliced_ree_offset_fallback() {
-        // Slice a REE array so offset != 0 exercises the get_physical_index fallback branch.
+        // offset != 0 exercises the `get_physical_index` fallback branch.
         let run_ends = Int32Array::from(vec![3, 4, 7]);
         let values = StringArray::from(vec!["f/a.parquet", "f/b.parquet", "f/c.parquet"]);
         let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
-        // Logical rows: a a a b c c c — take rows [2,5) → a b c c.
         let sliced = ree.slice(2, 3);
         let col: ArrayRef = Arc::new(sliced);
         assert_eq!(col.len(), 3);
         assert_batch_matches_per_row(&col);
     }
 
-    /// The applicability domain of [`legacy_position_delete_applies`], one test per cell. Java's
-    /// own writer never sets `referenced_data_file`, so the BOUNDS leg and the PARTITION leg are
-    /// the two that fire in practice, and they disagree: a named delete ignores the partition.
-    /// Risk pinned: an EQUALITY delete being treated as a legacy position delete. Equality deletes
-    /// are legal at V3 and a DV does not supersede them, but `referenced_data_file_location`
-    /// returns `None` for one — so it would take the partition-scoped leg, match every data file in
-    /// its partition, and refuse a valid DELETE.
+    /// Risk pinned: an EQUALITY delete treated as a legacy position delete. It would take the
+    /// partition-scoped leg, match every data file in its partition, and refuse a valid DELETE.
     #[test]
     fn test_classify_live_delete_ignores_equality_deletes() {
         use iceberg::spec::{DataContentType, DataFileFormat};
@@ -2501,9 +2171,8 @@ mod tests {
         builder.build().expect("build the delete file")
     }
 
-    /// Risk pinned: reading `referenced_data_file` instead of the shared derivation. Java's writer
-    /// leaves the field unset and only equal `file_path` bounds, so the field-only read would treat
-    /// this delete as partition-scoped and miss the file it actually names.
+    /// Risk pinned: reading `referenced_data_file` instead of the shared derivation. Java leaves
+    /// that field unset, so a field-only read misses the file this delete actually names.
     #[test]
     fn test_legacy_delete_entry_derives_the_name_from_equal_file_path_bounds() {
         use iceberg::spec::{
@@ -2594,8 +2263,8 @@ mod tests {
         );
     }
 
-    /// Risk pinned: refusing a V3 delete because of a position delete that CANNOT apply. A data
-    /// file written after the delete is not covered by it, and Java writes that DV happily.
+    /// Risk pinned: refusing a V3 delete over a position delete that CANNOT apply. A data file
+    /// written after the delete is not covered by it, and Java writes that DV happily.
     #[test]
     fn test_legacy_delete_older_than_the_data_file_does_not_apply() {
         let partition = iceberg::spec::Struct::from_iter([Some(Literal::long(0))]);
@@ -2613,8 +2282,8 @@ mod tests {
             "an unknown sequence errs toward applying, so the caller refuses rather than corrupts"
         );
 
-        // The sequence rule is the same `>=` on BOTH legs — only the key changes. Asserting it on
-        // the partition leg alone leaves the named leg free to skip it.
+        // The sequence rule is the same `>=` on BOTH legs. Asserting it on the partition leg alone
+        // leaves the named leg free to skip it.
         let named = (
             Some("s3://b/new.parquet".to_string()),
             0,
@@ -2631,19 +2300,15 @@ mod tests {
         );
     }
 
-    /// MEDIUM-1 (H-ORDER), deterministic seam test: `sort_position_delete_pairs` — the sort applied at
-    /// every MoR position-delete write site (`merge_on_read_delete`, `merge_on_read_update`, and the
-    /// per-partition-group path in `write_position_deletes`) — MUST produce ascending `(file_path,
-    /// pos)` order for ANY input. The default concurrent scan interleaves files unordered, so the
-    /// collected pairs arrive out of order; this pins the spec-required order independent of scan
-    /// interleaving (which an integration test cannot pin deterministically).
+    /// `sort_position_delete_pairs` MUST produce ascending `(file_path, pos)` order for ANY input.
+    /// The concurrent scan interleaves files, so an integration test cannot pin the spec order
+    /// deterministically.
     ///
-    /// MUTATION PROOF: turn `sort_position_delete_pairs` into a no-op (delete the `pairs.sort()`) → this
-    /// test goes RED (the deliberately-unsorted input stays unsorted).
+    /// MUTATION PROOF: make `sort_position_delete_pairs` a no-op (delete the `pairs.sort()`) and this
+    /// test goes RED, because the deliberately-unsorted input stays unsorted.
     #[test]
     fn test_sort_position_delete_pairs_orders_by_path_then_pos() {
-        // Deliberately unsorted: files interleaved (b before a), positions descending within a file —
-        // exactly the shape a concurrent, cross-file scan produces before the sort restores order.
+        // Files interleaved, positions descending within a file: the shape a concurrent scan gives.
         let mut pairs: Vec<(String, i64)> = vec![
             ("s3://b/file_b.parquet".to_string(), 5),
             ("s3://b/file_a.parquet".to_string(), 2),
@@ -2663,8 +2328,7 @@ mod tests {
             pairs, expected,
             "position-delete pairs must be sorted ascending by (file_path, pos) — spec order"
         );
-        // Independent, form-agnostic check that it is globally non-decreasing (catches any sort that
-        // is not a true (path, pos) ascending order).
+        // Form-agnostic: catch any sort that is not a true ascending `(path, pos)` order.
         for window in pairs.windows(2) {
             assert!(
                 window[0] <= window[1],
@@ -2675,13 +2339,12 @@ mod tests {
         }
     }
 
-    /// §5 isolation-level parse parity with Java `IsolationLevel.fromName` (1.10.0
-    /// `core/IsolationLevel.java`): case-INSENSITIVE accept (`valueOf(levelName.toUpperCase(ENGLISH))`)
-    /// and a LOUD `"Invalid isolation level: <name>"` error on an unknown name — never a silent
-    /// default. (Ledger P14a; MUTATION M7: make the parse default instead of erroring → RED.)
+    /// Parse parity with Java `IsolationLevel.fromName`: case-insensitive accept, and a LOUD
+    /// `"Invalid isolation level: <name>"` on an unknown name, never a silent default.
+    ///
+    /// MUTATION: make the parse default instead of erroring and this test goes RED.
     #[test]
     fn test_isolation_level_parse_java_parity() {
-        // Case-insensitive accepts, both levels (Java upper-cases before valueOf).
         for accepted in ["serializable", "SERIALIZABLE", "Serializable"] {
             assert_eq!(
                 IsolationLevel::parse(accepted).expect("parse serializable spelling"),
@@ -2697,7 +2360,7 @@ mod tests {
             );
         }
 
-        // Unknown name → loud error carrying Java's message shape and the offending name.
+        // An unknown name fails loud, carrying Java's message shape and the offending name.
         let err = IsolationLevel::parse("read-committed")
             .expect_err("an unknown isolation level must fail loud, not default");
         assert!(
@@ -2705,25 +2368,22 @@ mod tests {
                 .contains("Invalid isolation level: read-committed"),
             "error must carry Java's message + the offending name, got: {err}"
         );
-        // 'none' is NOT a row-level isolation level (Java has no way to disable row-level
-        // validation; absence-of-option exists only on the INSERT OVERWRITE write path).
+        // Java cannot disable row-level validation, so 'none' is not a row-level isolation level.
         assert!(
             IsolationLevel::parse("none").is_err(),
             "'none' must be rejected for row-level operations"
         );
     }
 
-    // ============================================================================================
-    // BUG-001 Option A — unpartitioned fast-path predicate (mutation-proven).
-    // ============================================================================================
+    // BUG-001 — the unpartitioned fast-path predicate (mutation-proven).
 
     #[test]
     fn test_pos_delete_fast_path_only_for_single_empty_spec() {
-        // Never-evolved empty partition type (field_count == 0).
+        // A never-evolved empty partition type.
         assert!(position_delete_unpartitioned_fast_path(1, 0));
-        // Partitioned or all-Void (non-zero fields): always walk manifests.
+        // Partitioned or all-Void: always walk the manifests.
         assert!(!position_delete_unpartitioned_fast_path(1, 1));
-        // Evolved: multi-spec + empty default (DROP PARTITION FIELD) — MUST NOT fast-path.
+        // Evolved: multi-spec with an empty default MUST NOT fast-path.
         assert!(
             !position_delete_unpartitioned_fast_path(2, 0),
             "BUG-001: multi-spec with empty default must take the manifest walk"
@@ -2733,8 +2393,7 @@ mod tests {
         assert!(!position_delete_unpartitioned_fast_path(0, 0));
     }
 
-    /// Mutation twin: weakening to "default is empty" alone (forgetting multi-spec) would make
-    /// this assert fail — keeps Option A load-bearing.
+    /// Mutation twin: weakening the rule to "the default is empty" alone fails this assert.
     #[test]
     fn test_pos_delete_fast_path_mutation_field_count_only_is_wrong() {
         let evolved_empty_default = position_delete_unpartitioned_fast_path(2, 0);
@@ -2744,20 +2403,17 @@ mod tests {
         );
     }
 
-    /// C1-L-002: all-Void is_unpartitioned but has fields — must NOT fast-path.
+    /// C1-L-002: an all-Void spec is unpartitioned but has fields, so it must NOT fast-path.
     #[test]
     fn test_pos_delete_fast_path_rejects_all_void_single_spec() {
-        // One void field ⇒ field_count 1.
+        // One void field.
         assert!(
             !position_delete_unpartitioned_fast_path(1, 1),
             "all-Void needs a null-tuple PartitionKey, not the empty fast path"
         );
     }
 
-    // ============================================================================================
-    // WG3-L3: the position-delete grouping resolves every pair's real partition instead of
-    // fabricating `(default_spec, Struct::empty())` for an unmatched data file.
-    // ============================================================================================
+    // The grouping resolves every pair's real partition, instead of fabricating an empty tuple.
 
     /// `path → (spec_id, partition)` for two files of a one-field partitioned spec.
     fn partition_map() -> std::collections::HashMap<String, (i32, iceberg::spec::Struct)> {
@@ -2805,14 +2461,12 @@ mod tests {
         );
     }
 
-    /// A pair whose data file is not live in the snapshot the map was built from must FAIL — the
-    /// previous fallback fabricated `(default_spec, Struct::empty())`, pairing a partitioned spec
-    /// with an empty tuple. That aborted in `PartitionKey::to_path` before any validation ran, and
-    /// with the path walk totalised it would write a delete file under a `field=null` path that no
-    /// reader can ever match (a silent under-delete: the rows come back).
+    /// A pair whose data file is not live in the map's snapshot must FAIL. The old fallback paired
+    /// a partitioned spec with an empty tuple, writing a delete file under a `field=null` path that
+    /// no reader matches — a silent under-delete, so the rows come back.
     ///
-    /// MUTATION (restore the `unwrap_or_else(|| (default_spec.spec_id(), Struct::empty()))`
-    /// fallback): this test goes RED.
+    /// MUTATION: restore the `unwrap_or_else(|| (default_spec.spec_id(), Struct::empty()))` fallback
+    /// and this test goes RED.
     #[test]
     fn test_group_pairs_by_partition_rejects_an_unmatched_data_file() {
         let map = partition_map();

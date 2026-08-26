@@ -24,156 +24,82 @@ use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result};
 
 use crate::schema::IcebergSchemaProvider;
 
-/// The separator that renders a multi-level Iceberg [`NamespaceIdent`] as the single
-/// DataFusion schema-name string — ASCII **unit separator** `U+001F`.
+/// Joins the levels of a multi-level [`NamespaceIdent`] into one DataFusion schema name.
 ///
-/// # Why a rendering is needed at all
+/// DataFusion maps exactly one `&str` to one [`SchemaProvider`], so the level list must flatten.
+/// [`NamespaceIdent::to_url_string`] already uses `U+001F`, so the fork keeps one flattening.
 ///
-/// An Iceberg namespace is an ordered list of levels (`["a", "b"]`), while DataFusion's
-/// [`CatalogProvider`] maps exactly ONE `&str` to one [`SchemaProvider`]. A multi-level namespace
-/// therefore has to be flattened into one string.
-///
-/// # Why `U+001F`
-///
-/// This is not a new convention: it is the one this repository already commits to in
-/// [`NamespaceIdent::to_url_string`], which the REST catalog uses for every
-/// `/v1/namespaces/{ns}` path segment and the S3 Tables catalog uses for every `namespace(..)`
-/// request. Matching it keeps one flattening in the fork rather than two.
-///
-/// # The inverse (a reader MUST be able to recover the exact namespace)
-///
-/// `schema_name.split(NAMESPACE_SEPARATOR)` reproduces the original level list EXACTLY, and
-/// `NamespaceIdent::from_strs(schema_name.split('\u{1f}'))` reconstructs the identifier itself.
-/// That is total, not best-effort, because [`validate_namespace_renderable`] REJECTS at
-/// construction any namespace whose level text contains the separator — so the join is provably
-/// injective over everything this provider will ever hold.
+/// A split on the separator recovers the exact level list. The recovery is total because
+/// [`validate_namespace_renderable`] rejects any level that contains the separator.
 const NAMESPACE_SEPARATOR: char = '\u{1f}';
 
-/// The separator of the *ergonomic, non-canonical* schema-name alias: a plain dot.
+/// The separator of the ergonomic, non-canonical schema-name alias: a plain dot.
 ///
-/// `U+001F` cannot be typed in SQL, so a nested namespace addressed only by its canonical name
-/// would be reachable programmatically and unreachable from a query. Each multi-level namespace
-/// therefore also gets a dot-joined alias (`["a", "b"]` → `a.b`), which is what Java renders a
-/// namespace as (`org.apache.iceberg.catalog.Namespace.toString` joins its levels with a Guava
-/// DOT `Joiner`; decoded from `iceberg-api` 1.10.0 bytecode).
+/// A query cannot type `U+001F`, so each multi-level namespace also gets a dot-joined alias.
+/// Java `Namespace.toString` renders a namespace the same way.
 ///
-/// A dot may legally occur INSIDE a level — Java's `Namespace.of` rejects only the null byte — so
-/// the alias is NOT injective and never becomes an identity. See [`IcebergCatalogProvider`] for
-/// the precedence rules that keep an alias from ever shadowing a different namespace.
+/// A level may itself contain a dot, so the alias is not injective. See
+/// [`IcebergCatalogProvider`] for the precedence rules that stop an alias from shadowing.
 const NAMESPACE_ALIAS_SEPARATOR: &str = ".";
 
 /// Maximum number of levels a discovered namespace may have.
 ///
-/// Namespace discovery walks a tree the *catalog server* controls, so it is untrusted input in
-/// exactly the sense AGENTS.md "Recursion Safety" means: the walk is an explicit-queue BFS (no
-/// stack recursion), but without a bound an adversarial catalog that answers every child listing
-/// with a STRICTLY DEEPER namespace would keep producing never-before-seen identifiers and issue
-/// round-trips forever.
+/// The catalog server controls the tree, so it is untrusted input. Without this cap a server
+/// that answers each listing with a deeper namespace lists forever. The cap does not stop a
+/// cycle, because a cycle never gains depth. The `seen` set in [`discover_namespaces`] does.
 ///
-/// That is the only failure mode this cap addresses. It does NOT terminate a cycle, nor a catalog
-/// that re-answers with an already-visited namespace: neither increases depth, so the cap is never
-/// reached. Those are terminated by the `seen` visited-set in [`discover_namespaces`] — see that
-/// function for the two independent guarantees and their tests.
-///
-/// 64 is this crate's existing nesting bound (`physical_plan::project`'s
-/// `MAX_WRITE_COMPATIBILITY_DEPTH`), and is far above anything real: Glue, HMS and S3 Tables
-/// return no children at all, and the deepest namespaces seen on REST catalogs are 2–3 levels.
-///
-/// Exceeding it is a LOUD typed error naming the offending namespace, never a truncation — a
-/// silently truncated tree would make namespaces disappear from the catalog, which is the very
-/// defect this module was fixed for.
+/// 64 matches `MAX_WRITE_COMPATIBILITY_DEPTH`. A deeper namespace fails loud, never truncates.
 const MAX_NAMESPACE_DEPTH: usize = 64;
 
 /// Maximum number of catalog listing round-trips in flight at once during discovery.
 ///
-/// Recursive discovery is N+1 over the namespace tree, so the fan-out has to be bounded rather
-/// than issued as one unbounded `try_join_all` over an unknown tree. 16 matches the fork's other
-/// listing-concurrency default (`DEFAULT_LIST_STAT_CONCURRENCY` in `iceberg-storage-opendal`).
+/// Discovery is N+1 over an unknown tree, so the fan-out needs a bound. 16 matches
+/// `DEFAULT_LIST_STAT_CONCURRENCY` in `iceberg-storage-opendal`.
 const NAMESPACE_DISCOVERY_CONCURRENCY: usize = 16;
 
-/// Provides an interface to manage and access multiple schemas
-/// within an Iceberg [`Catalog`].
+/// Serves every namespace of an Iceberg [`Catalog`] as a DataFusion [`SchemaProvider`].
 ///
-/// Acts as a centralized catalog provider that aggregates
-/// multiple [`SchemaProvider`], each associated with distinct namespaces.
+/// Each namespace registers under its canonical [`NAMESPACE_SEPARATOR`]-joined name, which is
+/// what [`Self::schema_names`] reports. A multi-level namespace also resolves through its
+/// dot-joined alias. An alias is never listed and never takes precedence.
 ///
-/// # Namespace naming
+/// # Notes
 ///
-/// Every namespace in the catalog — at every nesting level — is registered under its **canonical**
-/// schema name, its levels joined with [`NAMESPACE_SEPARATOR`] (identical to
-/// [`NamespaceIdent::to_url_string`]). Canonical names are what [`Self::schema_names`] reports,
-/// and they round-trip back to the exact [`NamespaceIdent`] by splitting on the same separator.
-///
-/// Multi-level namespaces are ADDITIONALLY reachable through a dot-joined alias
-/// ([`NAMESPACE_ALIAS_SEPARATOR`]) so they can be named in SQL. Aliases are resolution-only: they
-/// are not reported by [`Self::schema_names`], and they never take precedence.
-///
-/// # Collisions
-///
-/// Two rules keep one namespace from ever being served in place of another:
-///
-/// 1. **Canonical names cannot collide.** A namespace whose level text contains
-///    [`NAMESPACE_SEPARATOR`] is rejected at construction ([`Self::try_new`] /
-///    [`Self::try_new_with_namespace_scope`]) with a typed [`ErrorKind::DataInvalid`] error, which
-///    makes the canonical join injective. (`["a\u{1f}b"]` and `["a", "b"]` would otherwise both
-///    render `a\u{1f}b`.)
-/// 2. **An ambiguous alias is dropped, never resolved.** `["a", "b"]` and `["a.b"]` both alias to
-///    `a.b`. An alias is registered only when it is unclaimed: if it equals ANY namespace's
-///    canonical name, the canonical binding wins and the alias is not registered; if two distinct
-///    namespaces produce the same alias, neither gets it. A dropped alias resolves to `None` —
-///    the query fails to find a schema instead of silently reading the wrong one.
+/// Construction rejects a level that contains [`NAMESPACE_SEPARATOR`], so the canonical join
+/// stays injective. An alias registers only when unclaimed, and a dropped alias gives `None`.
 #[derive(Debug)]
 pub struct IcebergCatalogProvider {
-    /// Canonical schema name ([`NAMESPACE_SEPARATOR`]-joined) → provider. Authoritative; this is
-    /// what [`CatalogProvider::schema_names`] reports.
+    /// Canonical schema name to provider. This is what [`CatalogProvider::schema_names`] reports.
     schemas: HashMap<String, Arc<dyn SchemaProvider>>,
-    /// Unambiguous dot-joined aliases → provider. Resolution-only, never listed, never shadowing
-    /// a canonical name.
+    /// Unambiguous dot-joined alias to provider. Resolution only, never listed.
     aliases: HashMap<String, Arc<dyn SchemaProvider>>,
 }
 
 impl IcebergCatalogProvider {
-    /// Asynchronously tries to construct a new [`IcebergCatalogProvider`]
-    /// using the given client to fetch and initialize schema providers for
-    /// every namespace in the Iceberg [`Catalog`], at every nesting level.
+    /// Builds a schema provider for every namespace of the catalog, at every nesting level.
     ///
-    /// Discovery is a breadth-first walk: `list_namespaces(None)` for the roots, then
-    /// `list_namespaces(Some(parent))` for each namespace found, until no new namespaces appear.
-    /// The walk is bounded by [`MAX_NAMESPACE_DEPTH`] and issues at most
-    /// [`NAMESPACE_DISCOVERY_CONCURRENCY`] listings concurrently.
+    /// Discovery is a breadth-first walk from `list_namespaces(None)`. To snapshot only some
+    /// namespaces, use [`Self::try_new_with_namespace_scope`].
     ///
-    /// This signature is unchanged. To snapshot only some namespaces — and avoid a catalog-wide
-    /// `list_namespaces(None)` — use [`Self::try_new_with_namespace_scope`].
+    /// # Errors
     ///
-    /// # Failure policy — loud, never partial
+    /// A namespace that cannot be listed fails this call and is named in the error. It is never
+    /// dropped: this crate has no `tracing` dependency, so a skip would be silent.
     ///
-    /// A namespace that cannot be listed FAILS this call with a typed error that names the
-    /// namespace; it is never dropped from the catalog. Per-namespace `list_tables` is *not*
-    /// issued here (it runs on first schema access).
-    /// The alternative the charter allows — skipping it with a `tracing` warning — is not
-    /// available here: `iceberg-datafusion` does not depend on `tracing` (adding a dependency is
-    /// out of scope), so a skip would be *silent*, and a namespace that silently vanishes is
-    /// indistinguishable from one that does not exist. Failing loudly also preserves the
-    /// pre-existing behaviour of this constructor, so no caller regresses.
+    /// # Notes
     ///
-    /// Note this is a per-*namespace-walk* policy and does not weaken the lazy, failure-tolerant
-    /// per-*table* contract documented in `docs/ENGINE_CONTRACT.md` §1: table *names* are listed
-    /// on first schema access and table metadata is still never read here, so an unreadable
-    /// table still cannot brick construction.
+    /// This call issues no `list_tables`, so an unreadable table cannot break construction.
     pub async fn try_new(client: Arc<dyn Catalog>) -> Result<Self> {
         Self::try_new_with_scope(client, NamespaceWalkScope::Unscoped).await
     }
 
-    /// Like [`Self::try_new`], but snapshots only `namespaces` and each of their descendants.
+    /// Like [`Self::try_new`], but snapshots only `namespaces` and their descendants.
     ///
-    /// The filter enters at discovery, not on the [`CatalogProvider`] trait: the named identifiers
-    /// seed the same #191 nested BFS (U+001F canonical names, depth cap, visited-set, loud
-    /// failure) and **`list_namespaces(None)` is never issued**. A sibling of a named root is
-    /// neither listed nor registered.
+    /// The named identifiers seed the same walk. This call never issues
+    /// `list_namespaces(None)`, so a sibling of a named root is neither listed nor registered.
     ///
-    /// An empty iterator walks nothing — no namespace listing, no table listing — and returns an
-    /// empty provider. That is distinct from [`Self::try_new`], which is the unset / full-catalog
-    /// walk and stays byte-compatible with historical construction.
+    /// An empty iterator walks nothing and returns an empty provider. [`Self::try_new`] is the
+    /// unset case and still walks the whole catalog.
     pub async fn try_new_with_namespace_scope(
         client: Arc<dyn Catalog>,
         namespaces: impl IntoIterator<Item = NamespaceIdent>,
@@ -195,17 +121,16 @@ impl IcebergCatalogProvider {
         let namespaces = discover_namespaces(&client, scope).await?;
         let providers = build_schema_providers(&client, &namespaces).await?;
 
-        // Canonical bindings. `discover_namespaces` de-duplicates the identifiers and rejects any
-        // level containing the separator, so this join is injective and no insert can overwrite
-        // a different namespace's provider.
+        // `discover_namespaces` de-duplicates and rejects a level holding the separator, so
+        // this join is injective and no insert overwrites another namespace's provider.
         let mut schemas: HashMap<String, Arc<dyn SchemaProvider>> =
             HashMap::with_capacity(namespaces.len());
         for (namespace, provider) in namespaces.iter().zip(providers.iter()) {
             schemas.insert(canonical_schema_name(namespace), provider.clone());
         }
 
-        // Alias bindings. Count first, so an alias claimed by two namespaces is dropped for BOTH
-        // rather than won by whichever is inserted last.
+        // Count first, so an alias two namespaces claim is dropped for both, not won by the
+        // last insert.
         let mut alias_claims: HashMap<String, usize> = HashMap::new();
         for namespace in namespaces.iter().filter(|ns| ns.len() > 1) {
             *alias_claims
@@ -215,7 +140,7 @@ impl IcebergCatalogProvider {
 
         let mut aliases: HashMap<String, Arc<dyn SchemaProvider>> = HashMap::new();
         for (namespace, provider) in namespaces.iter().zip(providers.iter()) {
-            // A single-level namespace's alias IS its canonical name; nothing to add.
+            // A single-level namespace's alias is its canonical name.
             if namespace.len() <= 1 {
                 continue;
             }
@@ -233,8 +158,8 @@ impl IcebergCatalogProvider {
 
 impl CatalogProvider for IcebergCatalogProvider {
     fn schema_names(&self) -> Vec<String> {
-        // Canonical names only — the aliases are alternative spellings of schemas already listed
-        // here, and reporting both would double every nested namespace in `information_schema`.
+        // Canonical names only. Listing the aliases too doubles every nested namespace in
+        // `information_schema`.
         self.schemas.keys().cloned().collect()
     }
 
@@ -246,23 +171,20 @@ impl CatalogProvider for IcebergCatalogProvider {
     }
 }
 
-/// The identity-preserving schema name for `namespace`. See [`NAMESPACE_SEPARATOR`] for the
-/// inverse.
+/// The identity-preserving schema name for `namespace`. [`NAMESPACE_SEPARATOR`] has the inverse.
 fn canonical_schema_name(namespace: &NamespaceIdent) -> String {
     namespace.to_url_string()
 }
 
-/// The ergonomic, non-canonical, SQL-typeable alias for `namespace`. Not injective — see
-/// [`NAMESPACE_ALIAS_SEPARATOR`].
+/// The SQL-typeable alias for `namespace`. Not injective, see [`NAMESPACE_ALIAS_SEPARATOR`].
 fn alias_schema_name(namespace: &NamespaceIdent) -> String {
     namespace.as_ref().join(NAMESPACE_ALIAS_SEPARATOR)
 }
 
-/// Rejects a namespace that cannot be rendered as an identity-preserving schema name.
+/// Rejects a namespace that cannot render as an identity-preserving schema name.
 ///
-/// Both arms are hard, typed [`ErrorKind::DataInvalid`] failures rather than skips: dropping the
-/// namespace would make it silently absent, and accepting a level that contains the separator
-/// would let two different namespaces render to the same canonical name.
+/// Both arms fail loud rather than skip. A dropped namespace is silently absent. An accepted
+/// separator inside a level lets two namespaces render to one canonical name.
 fn validate_namespace_renderable(namespace: &NamespaceIdent) -> Result<()> {
     if namespace.len() > MAX_NAMESPACE_DEPTH {
         return Err(Error::new(
@@ -296,9 +218,8 @@ fn validate_namespace_renderable(namespace: &NamespaceIdent) -> Result<()> {
 
 /// Where the namespace filter enters without changing [`CatalogProvider`].
 ///
-/// [`NamespaceWalkScope::Unscoped`] is today's full BFS (`list_namespaces(None)` then descendants).
-/// [`NamespaceWalkScope::Scoped`] seeds that same BFS at the named identifiers and never lists the
-/// catalog root. An empty scoped list walks nothing.
+/// `Unscoped` is the full walk. `Scoped` seeds the same walk at the named identifiers and never
+/// lists the catalog root. An empty scoped list walks nothing.
 enum NamespaceWalkScope {
     Unscoped,
     Scoped(Vec<NamespaceIdent>),
@@ -306,24 +227,12 @@ enum NamespaceWalkScope {
 
 /// Breadth-first walk of the namespace tree, optionally seeded at a named scope.
 ///
-/// Termination rests on two guarantees that are NOT interchangeable — each covers a shape the
-/// other cannot:
+/// Two guarantees terminate the walk, and neither replaces the other. `seen` expands a
+/// namespace at most once, the only defence against a cycle and against a server that ignores
+/// the parent filter. Neither shape gains depth, so the depth cap never fires on them.
+/// [`MAX_NAMESPACE_DEPTH`] fails loud on a server that answers with deeper, unseen namespaces.
 ///
-/// 1. **`seen`** — a namespace is expanded at most once, so the walk finishes on any catalog that
-///    answers a child listing with an already-visited namespace. That covers a genuine cycle
-///    (`a → b → a`) and a server that ignores the parent filter and re-answers with the root list,
-///    which is what a REST catalog does when it drops an unrecognised `?parent=` query parameter.
-///    Neither shape ever increases depth, so [`MAX_NAMESPACE_DEPTH`] is never reached and `seen`
-///    is the SOLE defence; without it the constructor hangs and floods the catalog with
-///    round-trips. Pinned by `a_catalog_that_ignores_the_parent_filter_still_terminates` and
-///    `a_cyclic_catalog_still_terminates`.
-/// 2. **[`MAX_NAMESPACE_DEPTH`]** — fails loudly on a catalog that keeps answering with strictly
-///    deeper, never-before-seen namespaces, which `seen` alone would follow forever.
-///
-/// A [`NamespaceWalkScope::Scoped`] walk uses the same loop and the same two guarantees. It differs
-/// in the initial frontier (caller-supplied identifiers, never `list_namespaces(None)`) and in a
-/// descendant filter: a listing that ignores the parent argument (a REST server that drops
-/// `?parent=`) must not pull a sibling into the snapshot.
+/// A scoped walk adds a descendant filter, so an ignored parent cannot pull in a sibling.
 async fn discover_namespaces(
     client: &Arc<dyn Catalog>,
     scope: NamespaceWalkScope,
@@ -375,11 +284,10 @@ fn namespace_is_or_under(seed: &NamespaceIdent, candidate: &NamespaceIdent) -> b
             .all(|(left, right)| left == right)
 }
 
-/// Lists the direct children of every namespace in `parents`, at most
-/// [`NAMESPACE_DISCOVERY_CONCURRENCY`] listings in flight.
+/// Lists the direct children of every namespace in `parents`.
 ///
-/// A failing listing aborts the whole walk with a typed error naming the parent — see
-/// [`IcebergCatalogProvider::try_new`] for why the failure is loud rather than skipped.
+/// A failing listing aborts the whole walk and names the parent. See
+/// [`IcebergCatalogProvider::try_new`] for why the failure is loud.
 async fn list_child_namespaces(
     client: &Arc<dyn Catalog>,
     parents: &[NamespaceIdent],
@@ -403,12 +311,10 @@ async fn list_child_namespaces(
     Ok(nested.into_iter().flatten().collect())
 }
 
-/// Builds one [`IcebergSchemaProvider`] per discovered namespace, in the same order, at most
-/// [`NAMESPACE_DISCOVERY_CONCURRENCY`] in flight.
+/// Builds one [`IcebergSchemaProvider`] per discovered namespace, in the same order.
 ///
-/// `buffered` (ordered) rather than `buffer_unordered`: the result is zipped back against
-/// `namespaces`, so order is load-bearing — an unordered buffer would bind providers to the wrong
-/// schema names.
+/// The caller zips the result against `namespaces`, so order is load-bearing. This uses ordered
+/// `buffered`. An unordered buffer binds providers to the wrong schema names.
 async fn build_schema_providers(
     client: &Arc<dyn Catalog>,
     namespaces: &[NamespaceIdent],
@@ -527,8 +433,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to create table {name}: {e}"));
     }
 
-    /// The table names a schema provider reports, excluding the `table$metadata` variants that
-    /// [`IcebergSchemaProvider::table_names`] also emits.
+    /// The table names a schema provider reports, without the `table$metadata` variants.
     fn base_table_names(provider: &Arc<dyn SchemaProvider>) -> Vec<String> {
         let mut names: Vec<String> = provider
             .table_names()
@@ -547,34 +452,29 @@ mod tests {
 
     /// The listing budget the non-delegating [`ParentScript`] arms enforce.
     ///
-    /// A catalog that never terminates the BFS would otherwise HANG the test binary rather than
-    /// fail it, and a hung test reports nothing. Refusing further listings past this budget turns
-    /// the non-termination into a typed `Err` that the assertions can observe. Every scripted tree
-    /// here is 1–2 namespaces, so a correct walk spends 3 listings; 64 leaves two orders of
-    /// magnitude of headroom before the budget can produce a false RED.
+    /// A walk that never terminates hangs the test binary, and a hung test reports nothing. This
+    /// budget turns the hang into a typed `Err` the assertions can observe. A correct walk here
+    /// spends 3 listings, so 64 cannot produce a false RED.
     const MAX_SCRIPTED_LISTINGS: usize = 64;
 
     /// How [`ScriptedCatalog`] answers `list_namespaces`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ParentScript {
-        /// Pass the parent through to the in-memory catalog — a well-behaved server.
+        /// Pass the parent through to the in-memory catalog. A well-behaved server.
         Delegate,
-        /// Answer EVERY child listing with the root list, ignoring the parent. This is what a REST
-        /// catalog server does when it drops an unrecognised `?parent=` query parameter.
+        /// Answer every child listing with the root list. A REST server does this when it drops
+        /// an unrecognised `?parent=`.
         IgnoreParent,
-        /// Answer with the next root in a ring: `ns1 → ns2 → ns1 → …`. A genuine cycle, in which
-        /// the reported depth never increases.
+        /// Answer with the next root in a ring. A genuine cycle, whose depth never increases.
         Cycle,
     }
 
-    /// A catalog that delegates everything to an in-memory catalog but scripts ONE listing:
-    /// either it fails, or it is delayed, or the namespace tree it reports does not terminate.
+    /// Delegates everything to an in-memory catalog but scripts one listing to fail, to delay,
+    /// or to report a tree that does not terminate.
     ///
-    /// The failing arms prove the failure policy (a namespace whose children or tables cannot be
-    /// listed fails construction loudly instead of vanishing). The delay arm makes provider
-    /// construction complete OUT of request order, which is what makes the ordered-`buffered`
-    /// requirement observable. The [`ParentScript`] arms prove the `seen` visited-set is what
-    /// terminates a walk whose depth never grows.
+    /// The failing arms pin the loud failure policy. The delay arm completes provider
+    /// construction out of request order, which makes the ordered `buffered` observable. The
+    /// [`ParentScript`] arms pin `seen` as what terminates a walk whose depth never grows.
     #[derive(Debug)]
     struct ScriptedCatalog {
         inner: Arc<MemoryCatalog>,
@@ -586,11 +486,10 @@ mod tests {
         fail_tables_fired: AtomicUsize,
         delay_tables_of: Option<NamespaceIdent>,
         parent_script: ParentScript,
-        /// Every `list_namespaces` call, so a test can pin the N+1 listing shape and the budget
-        /// can stop a non-terminating walk.
+        /// Every `list_namespaces` call. Pins the N+1 shape and feeds the listing budget.
         listing_calls: AtomicUsize,
-        /// Parent argument of each `list_namespaces` call, in issuance order. `None` is the
-        /// catalog-root listing that a scoped walk must never issue.
+        /// Parent of each `list_namespaces` call, in order. `None` is the catalog-root listing
+        /// that a scoped walk must never issue.
         listing_parents: Mutex<Vec<Option<NamespaceIdent>>>,
         /// Namespace of each `list_tables` call, in issuance order.
         table_listings: Mutex<Vec<NamespaceIdent>>,
@@ -714,10 +613,9 @@ mod tests {
                     }
                 }
             };
-            // Sorted so the REQUEST order of provider construction is deterministic. Without this
-            // the memory catalog yields namespaces in hash order, and
-            // `providers_stay_bound_to_their_own_namespace_when_listings_finish_out_of_order`
-            // would only sometimes be able to distinguish `buffered` from `buffer_unordered`.
+            // Sorted so the request order of provider construction is deterministic. The memory
+            // catalog otherwise yields hash order, and the out-of-order test then only sometimes
+            // tells `buffered` from `buffer_unordered`.
             namespaces.sort();
             Ok(namespaces)
         }
@@ -807,8 +705,7 @@ mod tests {
         }
     }
 
-    /// The single-level shape that existed before nested discovery: unchanged behaviour, one
-    /// schema per namespace, named exactly as before.
+    /// The single-level shape: one schema per namespace, named as before nested discovery.
     #[tokio::test]
     async fn single_level_namespaces_are_unchanged() {
         let (catalog, _dir) = memory_catalog().await;
@@ -831,13 +728,11 @@ mod tests {
         assert_eq!(base_table_names(&ns2_provider), vec!["t2".to_string()]);
     }
 
-    /// OTH-001 (a): the multi-level namespace `["a", "b"]` must survive as ONE schema carrying its
-    /// own tables — not as two bare schemas `a` and `b`.
+    /// The multi-level namespace `["a", "b"]` survives as one schema with its own tables, not
+    /// as two bare schemas `a` and `b`.
     ///
-    /// Mutation this catches: restoring the original
-    /// `.flat_map(|ns| ns.as_ref().clone())` + `NamespaceIdent::new(name)` explosion — the bare
-    /// `"b"` assertion goes RED (a non-existent schema appears) and the canonical `a\u{1f}b`
-    /// lookup goes RED (the real namespace is gone).
+    /// Mutation: restore the `.flat_map(|ns| ns.as_ref().clone())` explosion. The bare `"b"`
+    /// assertion and the canonical lookup both go RED.
     #[tokio::test]
     async fn multi_level_namespace_keeps_its_identity_and_tables() {
         let (catalog, _dir) = memory_catalog().await;
@@ -867,18 +762,17 @@ mod tests {
             "t_in_a".to_string()
         ]);
 
-        // The exploded component must NOT exist as a schema of its own.
+        // The exploded component must not exist as a schema of its own.
         assert!(
             provider.schema("b").is_none(),
             "the bare level \"b\" was registered as a schema; the namespace was flattened"
         );
     }
 
-    /// OTH-001 (b): discovery recurses, and it recurses past two levels.
+    /// Discovery recurses, and it recurses past two levels.
     ///
-    /// Mutation this catches: deleting the `frontier = list_child_namespaces(..)` line (or the
-    /// whole BFS loop body) so only `list_namespaces(None)` is walked — the three-level canonical
-    /// lookup goes RED.
+    /// Mutation: delete the `frontier = list_child_namespaces(..)` line, so only the root list
+    /// is walked. The three-level canonical lookup goes RED.
     #[tokio::test]
     async fn namespaces_nested_three_levels_deep_are_discovered() {
         let (catalog, _dir) = memory_catalog().await;
@@ -904,11 +798,10 @@ mod tests {
         ]);
     }
 
-    /// The canonical name round-trips back to the exact namespace, which is the property the
-    /// separator choice is documented on.
+    /// The canonical name round-trips back to the exact namespace.
     ///
-    /// Mutation this catches: changing `canonical_schema_name` to join with `.` — the recovered
-    /// identifier for `["a.b", "c"]` becomes `["a", "b", "c"]` and the assertion goes RED.
+    /// Mutation: join `canonical_schema_name` with `.`. The recovered identifier for
+    /// `["a.b", "c"]` becomes `["a", "b", "c"]` and the assertion goes RED.
     #[tokio::test]
     async fn canonical_schema_names_invert_to_the_exact_namespace() {
         let (catalog, _dir) = memory_catalog().await;
@@ -938,11 +831,10 @@ mod tests {
         ]);
     }
 
-    /// The SQL-typeable alias resolves a nested namespace to the same provider as its canonical
-    /// name.
+    /// The alias resolves a nested namespace to the same provider as its canonical name.
     ///
-    /// Mutation this catches: deleting the `aliases` lookup arm from
-    /// `CatalogProvider::schema` — `schema("x.y")` becomes `None` and the test goes RED.
+    /// Mutation: delete the `aliases` lookup arm from `CatalogProvider::schema`. `schema("x.y")`
+    /// becomes `None` and the test goes RED.
     #[tokio::test]
     async fn dot_alias_resolves_a_nested_namespace() {
         let (catalog, _dir) = memory_catalog().await;
@@ -959,22 +851,18 @@ mod tests {
             .expect("the dot alias did not resolve");
         assert_eq!(base_table_names(&via_alias), vec!["aliased".to_string()]);
 
-        // The alias is resolution-only: it must not appear in the listed schema names.
+        // The alias resolves only. It must not appear in the listed schema names.
         assert!(
             !provider.schema_names().contains(&"x.y".to_string()),
             "the alias leaked into schema_names()"
         );
     }
 
-    /// COLLISION 1 — `["a", "b"]`'s alias `a.b` is also `["a.b"]`'s CANONICAL name. The canonical
-    /// binding must win, and the aliased namespace must stay reachable under its own canonical
-    /// name. Neither may be served in place of the other.
+    /// Collision 1: the alias of `["a", "b"]` is also the canonical name of `["a.b"]`. The
+    /// canonical binding wins, and both namespaces stay reachable under their canonical names.
     ///
-    /// Mutation this catches: dropping the `schemas.contains_key(&alias)` guard so the alias is
-    /// inserted anyway. The alias map is consulted only after the canonical map, so the wrong
-    /// provider would not be returned by `schema("a.b")` — instead the guard's absence is caught
-    /// by the assertion that the alias map has no entry that shadows a canonical name, which the
-    /// two table-name assertions below pin end to end.
+    /// Mutation: drop the `schemas.contains_key(&alias)` guard so the alias inserts anyway. The
+    /// two table-name assertions below then go RED.
     #[tokio::test]
     async fn alias_never_shadows_a_canonical_schema_name() {
         let (catalog, _dir) = memory_catalog().await;
@@ -995,7 +883,7 @@ mod tests {
             "a.b".to_string(),
         ]);
 
-        // `a.b` is the single-level namespace's own name — it must serve that namespace's table.
+        // `a.b` is the single-level namespace's own name, so it serves that namespace's table.
         let dotted_provider = provider
             .schema("a.b")
             .expect("the dotted schema is missing");
@@ -1017,12 +905,11 @@ mod tests {
         );
     }
 
-    /// COLLISION 2 — two DIFFERENT nested namespaces claim the same alias `a.b.c`. Neither may
-    /// win: the alias must resolve to nothing so a query fails loudly rather than reading the
-    /// wrong namespace's tables.
+    /// Collision 2: two different nested namespaces claim the alias `a.b.c`. Neither wins, so a
+    /// query fails loud instead of reading the wrong namespace.
     ///
-    /// Mutation this catches: removing the `alias_claims.get(&alias) > 1` guard — the alias then
-    /// resolves to whichever namespace was inserted last and `schema("a.b.c").is_none()` goes RED.
+    /// Mutation: remove the `alias_claims.get(&alias) > 1` guard. The alias resolves to the last
+    /// insert and `schema("a.b.c").is_none()` goes RED.
     #[tokio::test]
     async fn an_alias_claimed_by_two_namespaces_is_dropped() {
         let (catalog, _dir) = memory_catalog().await;
@@ -1046,18 +933,16 @@ mod tests {
             "the ambiguous alias a.b.c resolved instead of being dropped"
         );
 
-        // Both namespaces remain reachable under their unambiguous canonical names.
+        // Both namespaces stay reachable under their canonical names.
         assert!(provider.schema(&canonical(&["a", "b", "c"])).is_some());
         assert!(provider.schema(&canonical(&["a", "b.c"])).is_some());
     }
 
-    /// COLLISION 3 — a namespace level containing the canonical separator would make the join
-    /// non-injective (`["a\u{1f}b"]` vs `["a", "b"]`). Construction must fail with a typed error
-    /// naming the namespace, not silently keep one of them.
+    /// Collision 3: a level that contains the canonical separator makes the join non-injective.
+    /// Construction fails with a typed error and names the namespace.
     ///
-    /// Mutation this catches: deleting the `level.contains(NAMESPACE_SEPARATOR)` arm of
-    /// `validate_namespace_renderable` — `try_new` then returns `Ok` with one namespace silently
-    /// overwriting the other, and `is_err()` goes RED.
+    /// Mutation: delete the `level.contains(NAMESPACE_SEPARATOR)` arm of
+    /// `validate_namespace_renderable`. One namespace overwrites the other and `is_err()` is RED.
     #[tokio::test]
     async fn a_separator_inside_a_namespace_level_is_a_typed_error() {
         let (catalog, _dir) = memory_catalog().await;
@@ -1081,8 +966,8 @@ mod tests {
 
     /// The depth cap is a loud failure, not a truncation.
     ///
-    /// Mutation this catches: changing the guard to `namespace.len() > MAX_NAMESPACE_DEPTH + 1`
-    /// (or deleting it) — the over-deep namespace is accepted and `expect_err` goes RED.
+    /// Mutation: relax the guard to `namespace.len() > MAX_NAMESPACE_DEPTH + 1`. The over-deep
+    /// namespace is accepted and `expect_err` goes RED.
     #[tokio::test]
     async fn a_namespace_deeper_than_the_cap_fails_loudly() {
         let (catalog, _dir) = memory_catalog().await;
@@ -1105,10 +990,9 @@ mod tests {
         );
     }
 
-    /// Builds a two-root catalog whose child listings are scripted by `parent_script`, then runs
-    /// discovery under a wall-clock timeout so a non-terminating walk FAILS instead of wedging the
-    /// test binary. Returns the provider, the scripted catalog (so the caller can pin how many
-    /// listings the walk cost) and the warehouse dir, which must outlive both.
+    /// Builds a two-root catalog whose child listings follow `parent_script`, then discovers
+    /// under a wall-clock timeout so a non-terminating walk fails instead of wedging the binary.
+    /// The returned warehouse dir must outlive the provider and the catalog.
     async fn discover_under_script(
         parent_script: ParentScript,
     ) -> (IcebergCatalogProvider, Arc<ScriptedCatalog>, TempDir) {
@@ -1136,19 +1020,12 @@ mod tests {
         (provider, scripted, warehouse)
     }
 
-    /// TERMINATION 1 — a server that ignores the parent filter and answers every child listing
-    /// with the ROOT list. This is exactly what a REST catalog does when it drops an unrecognised
-    /// `?parent=` query parameter, and the namespaces it re-reports are already visited, so the
-    /// walk's depth NEVER grows and [`MAX_NAMESPACE_DEPTH`] is never reached. The `seen`
-    /// visited-set is the only thing that stops it.
+    /// Termination 1: a server answers every child listing with the root list, which a REST
+    /// catalog does when it drops an unrecognised `?parent=`. Depth never grows, so `seen` is
+    /// the only thing that stops the walk.
     ///
-    /// Mutation this catches: replacing
-    /// `if seen.insert(namespace.clone()) { discovered.push(..); fresh.push(..); }` in
-    /// [`discover_namespaces`] with the unconditional `discovered.push(..); fresh.push(..);`
-    /// (equivalently: deleting `seen`). The frontier then never empties, the walk re-lists the same
-    /// two namespaces forever, [`MAX_SCRIPTED_LISTINGS`] trips, and construction returns `Err` —
-    /// RED. Against a real network catalog the same mutant is an unbounded request flood at
-    /// session construction.
+    /// Mutation: delete the `seen.insert` guard in [`discover_namespaces`]. The walk re-lists
+    /// the same two namespaces forever, the listing budget trips, and construction gives RED.
     #[tokio::test]
     async fn a_catalog_that_ignores_the_parent_filter_still_terminates() {
         let (provider, scripted, _warehouse) =
@@ -1158,7 +1035,7 @@ mod tests {
             "ns1".to_string(),
             "ns2".to_string()
         ]);
-        // One root listing plus one child listing per namespace — the N+1 shape, walked ONCE.
+        // One root listing plus one child listing per namespace. The N+1 shape, walked once.
         assert_eq!(
             scripted.listings_issued(),
             3,
@@ -1166,21 +1043,12 @@ mod tests {
         );
     }
 
-    /// TERMINATION 2 — a genuine cycle: the catalog reports `ns1`'s child as `ns2` and `ns2`'s
-    /// child as `ns1`. Depth never increases here either, so again only `seen` terminates the walk,
-    /// and both namespaces must still be discovered exactly once.
+    /// Termination 2: a genuine cycle, where the catalog reports `ns1`'s child as `ns2` and
+    /// `ns2`'s child as `ns1`. Depth never grows, so only `seen` terminates the walk.
     ///
-    /// Mutation this catches: the same `seen.insert` removal as
-    /// `a_catalog_that_ignores_the_parent_filter_still_terminates` — the ring is walked forever,
-    /// the listing budget trips and construction returns `Err`.
-    ///
-    /// Second mutation, applied and confirmed RED: moving `let mut seen = HashSet::new()` INSIDE
-    /// the `while` loop, so de-duplication is per-round rather than global. The frontier here is
-    /// one namespace wide at every round and never repeats WITHIN a round, so termination depends
-    /// on the visited-set surviving ACROSS rounds — which is the property the declaration site
-    /// carries. (That mutant is RED for the parent-ignoring shape too; the two tests are not
-    /// distinguished by it, they are distinguished by frontier width and by whether the repeat is
-    /// intra- or inter-round.)
+    /// Mutation: delete the `seen.insert` guard. The ring walks forever and gives RED.
+    /// Second mutation: move `let mut seen = HashSet::new()` inside the `while` loop. The
+    /// frontier is one namespace wide here, so termination needs `seen` to survive across rounds.
     #[tokio::test]
     async fn a_cyclic_catalog_still_terminates() {
         let (provider, scripted, _warehouse) = discover_under_script(ParentScript::Cycle).await;
@@ -1197,11 +1065,10 @@ mod tests {
         );
     }
 
-    /// A namespace whose CHILD listing fails must fail construction and name itself, never be
-    /// dropped from the catalog.
+    /// A namespace whose child listing fails must fail construction and name itself.
     ///
-    /// Mutation this catches: swallowing the error in `list_child_namespaces` (e.g.
-    /// `.unwrap_or_default()`) — `expect_err` goes RED.
+    /// Mutation: swallow the error in `list_child_namespaces` with `.unwrap_or_default()`.
+    /// `expect_err` goes RED.
     #[tokio::test]
     async fn a_child_listing_failure_fails_construction_and_names_the_namespace() {
         let (inner, _dir) = memory_catalog().await;
@@ -1222,13 +1089,11 @@ mod tests {
         );
     }
 
-    /// A namespace whose TABLE listing fails must NOT fail construction (list_tables is lazy).
-    /// `table_names` / `table_exist` return empty/false without caching the failure; `table()`
-    /// surfaces the listing error loud.
+    /// A namespace whose table listing fails must not fail construction. `table_names` and
+    /// `table_exist` return empty without caching the failure. `table()` fails loud.
     ///
-    /// Mutation this catches: re-introducing eager `list_tables` in
-    /// [`IcebergSchemaProvider::try_new`] — construction then `expect`s an error and this test
-    /// goes RED.
+    /// Mutation: make `list_tables` eager in [`IcebergSchemaProvider::try_new`]. Construction
+    /// then errors and this test goes RED.
     #[tokio::test]
     async fn a_table_listing_failure_is_deferred_to_first_result_bearing_access() {
         let (inner, _dir) = memory_catalog().await;
@@ -1275,16 +1140,14 @@ mod tests {
         );
     }
 
-    /// Providers must stay aligned with the namespaces they are zipped against even when the
-    /// catalog answers out of request order — otherwise a query on one schema silently reads
-    /// another namespace's tables.
+    /// Providers must stay aligned with the namespaces they zip against even when the catalog
+    /// answers out of request order. Otherwise a query reads another namespace's tables.
     ///
-    /// [`ScriptedCatalog`] lists namespaces sorted, so `a_delayed` is requested FIRST; its table
-    /// listing then sleeps, so it completes LAST. Completion order is therefore the reverse of
-    /// request order — deterministically, not by luck.
+    /// [`ScriptedCatalog`] lists namespaces sorted, so `a_delayed` is requested first and its
+    /// sleeping table listing completes last. The reversal is deterministic, not luck.
     ///
-    /// Mutation this catches: `buffered` → `buffer_unordered` in `build_schema_providers` — the
-    /// completion-ordered results zip onto the wrong names and both table assertions go RED.
+    /// Mutation: `buffered` becomes `buffer_unordered` in `build_schema_providers`, and both
+    /// table assertions go RED.
     #[tokio::test]
     async fn providers_stay_bound_to_their_own_namespace_when_listings_finish_out_of_order() {
         let (inner, _dir) = memory_catalog().await;
@@ -1329,9 +1192,8 @@ mod tests {
         assert!(provider.schema(&canonical(&["a", "z"])).is_none());
     }
 
-    /// Builds the F-1 fixture: two sibling roots (`keep`, `other`). `keep` is three levels deep
-    /// so a "descendants" pin cannot be satisfied by a one-level child-only walk. Each listed
-    /// namespace has a table; the scoped-walk pins assert the mock never lists `other`.
+    /// Two sibling roots, `keep` and `other`. `keep` is three levels deep, so a one-level walk
+    /// cannot satisfy a descendants pin. Each listed namespace has a table.
     async fn scoped_walk_fixture() -> (
         Arc<ScriptedCatalog>,
         NamespaceIdent,
@@ -1363,11 +1225,10 @@ mod tests {
         )
     }
 
-    /// Unscoped `try_new` is the historical walk: it lists the catalog root and every namespace's
-    /// children and tables, including siblings the scoped constructor must not touch.
+    /// Unscoped `try_new` lists the catalog root and every namespace, siblings included.
     ///
-    /// Mutation this catches: changing `try_new` to seed an empty scope (so the full walk
-    /// disappears) — the root-listing assertion and the `other` schema assertion both go RED.
+    /// Mutation: seed `try_new` with an empty scope. The root-listing and `other` schema
+    /// assertions both go RED.
     #[tokio::test]
     async fn unscoped_try_new_still_walks_the_whole_catalog() {
         let (scripted, keep, keep_child, keep_grand, other, other_child, _warehouse) =
@@ -1417,13 +1278,11 @@ mod tests {
         }
     }
 
-    /// A named scope walks that namespace and its descendants only — never the catalog root, never
-    /// a sibling tree. Nested names stay #191-canonical (U+001F) and the dot alias still resolves.
+    /// A named scope walks that namespace and its descendants only. Nested names stay canonical
+    /// and the dot alias still resolves.
     ///
-    /// Mutation this catches: implementing scope as a post-filter on a full walk (still calling
-    /// `list_namespaces(None)` / listing `other`) — the root-listing and `other` table-listing
-    /// assertions go RED. Deleting the BFS under the seed (descendants dropped) reds the child
-    /// schema / table assertions.
+    /// Mutation: implement scope as a post-filter on a full walk. The root-listing and `other`
+    /// assertions go RED. Deleting the walk under the seed reds the child assertions.
     #[tokio::test]
     async fn scoped_walk_touches_only_the_named_namespace_and_descendants() {
         let (scripted, keep, keep_child, keep_grand, other, other_child, _warehouse) =
@@ -1507,8 +1366,7 @@ mod tests {
         );
     }
 
-    /// Scoping to a nested namespace does not pull in its parent, and still does not list a
-    /// sibling tree.
+    /// Scoping to a nested namespace pulls in neither its parent nor a sibling tree.
     #[tokio::test]
     async fn scoped_walk_of_a_nested_namespace_excludes_its_parent() {
         let (scripted, keep, keep_child, keep_grand, other, _other_child, _warehouse) =
@@ -1558,11 +1416,10 @@ mod tests {
         );
     }
 
-    /// An empty scope is walk-nothing, not "fall back to the full catalog". Distinct from unset
-    /// [`IcebergCatalogProvider::try_new`].
+    /// An empty scope walks nothing. It does not fall back to the full catalog.
     ///
-    /// Mutation this catches: treating an empty iterator as `Unscoped` — the provider then
-    /// registers `keep`/`other` and `schema_names` is non-empty.
+    /// Mutation: treat an empty iterator as `Unscoped`. The provider registers `keep` and
+    /// `other`, and `schema_names` is non-empty.
     #[tokio::test]
     async fn empty_scope_walks_nothing() {
         let (scripted, _keep, _keep_child, _keep_grand, _other, _other_child, _warehouse) =
@@ -1621,12 +1478,11 @@ mod tests {
         );
     }
 
-    /// A server that ignores `?parent=` and re-answers with the root list must still not register
-    /// a sibling of the named scope. Without the descendant filter, the first child listing would
-    /// ingest `ns2` and the scoped walk would become a full catalog snapshot.
+    /// A server that ignores `?parent=` must still not register a sibling of the named scope.
+    /// Without the descendant filter the scoped walk becomes a full catalog snapshot.
     ///
-    /// Mutation this catches: deleting the `namespace_is_or_under` guard — `ns2` appears in
-    /// `schema_names` and `list_tables(ns2)` is issued.
+    /// Mutation: delete the `namespace_is_or_under` guard. `ns2` appears in `schema_names` and
+    /// `list_tables(ns2)` is issued.
     #[tokio::test]
     async fn scoped_walk_rejects_siblings_when_the_catalog_ignores_the_parent_filter() {
         let (inner, _warehouse) = memory_catalog().await;
@@ -1666,11 +1522,10 @@ mod tests {
         );
     }
 
-    /// A sibling whose children cannot be listed must not be observed when it is outside the
-    /// scope — that is the point of not calling `list_namespaces(None)`.
+    /// A sibling outside the scope is never listed, so its failing children never surface.
     ///
-    /// Mutation this catches: scoping implemented as "full walk then filter" — construction then
-    /// fails on `blocked` the same way unscoped `try_new` does.
+    /// Mutation: implement scope as a full walk then a filter. Construction then fails on
+    /// `blocked` the way unscoped `try_new` does.
     #[tokio::test]
     async fn scoped_walk_does_not_observe_a_sibling_listing_failure() {
         let (inner, _dir) = memory_catalog().await;
@@ -1691,8 +1546,8 @@ mod tests {
         assert_eq!(sorted_schema_names(&provider), vec!["good".to_string()]);
     }
 
-    /// Construction of a populated catalog issues zero `list_tables`. The first successful
-    /// `table_names` issues exactly one; a later `table_names` issues none.
+    /// Construction issues zero `list_tables`. The first `table_names` issues one, a later
+    /// `table_names` issues none.
     #[tokio::test]
     async fn list_tables_is_lazy_per_namespace_and_cached_on_success() {
         let (scripted, keep, _keep_child, _keep_grand, _other, _other_child, _warehouse) =
@@ -1734,7 +1589,7 @@ mod tests {
         );
     }
 
-    /// A failed `list_tables` is not cached: the next access retries and can succeed.
+    /// A failed `list_tables` is not cached. The next access retries and can succeed.
     #[tokio::test]
     async fn a_failed_list_tables_is_retried_on_the_next_access() {
         let (inner, _dir) = memory_catalog().await;

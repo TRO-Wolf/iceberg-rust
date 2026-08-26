@@ -41,22 +41,16 @@ use crate::spec::MAX_DECIMAL_PRECISION;
 use crate::spec::datatypes::{PrimitiveType, Type, ensure_java_decimal_precision};
 use crate::{Error, ErrorKind, ensure_data_valid};
 
-/// Maximum value for [`PrimitiveType::Time`] type in microseconds, e.g. 23 hours 59 minutes 59 seconds 999999 microseconds.
+/// Maximum [`PrimitiveType::Time`] value in microseconds: one microsecond before 24 hours.
 pub(crate) const MAX_TIME_VALUE: i64 = 24 * 60 * 60 * 1_000_000i64 - 1;
 
 pub(crate) const INT_MAX: i32 = 2147483647;
 pub(crate) const INT_MIN: i32 = -2147483648;
 
-/// Metadata gate for the decimal **encode** paths.
-///
-/// Requires `1 <= precision <= 38`. The upper bound is Java's own
-/// (`Types$DecimalType.<init>`); the lower bound is a fork addition, because every encoder below
-/// needs [`Type::decimal_required_bytes`] to pick a byte width and precision `0` has none.
-///
-/// It deliberately does NOT require `scale <= precision`: Java has no such rule anywhere
-/// (`DecimalType.of(1,2)` and `of(10,11)` both construct against iceberg-api-1.10.0), so imposing
-/// it on a value path would reject data Java writes and reads. Arrow's `Decimal128` rule is
-/// enforced at the Arrow boundary instead (`crate::arrow::schema`).
+/// Metadata gate for the decimal encode paths. Requires `1 <= precision <= 38`. Java sets the
+/// upper bound; the lower one is a fork addition, because [`Type::decimal_required_bytes`] has no
+/// byte width for `0`. `scale <= precision` is NOT required: Java allows it, so would reject data
+/// Java writes.
 fn validate_decimal_type(r#type: &PrimitiveType) -> Result<()> {
     if let PrimitiveType::Decimal { precision, .. } = r#type {
         ensure_data_valid!(
@@ -67,29 +61,12 @@ fn validate_decimal_type(r#type: &PrimitiveType) -> Result<()> {
     Ok(())
 }
 
-/// Validate a decimal's metadata and unscaled value against Iceberg's declared precision.
+/// Validate a decimal's metadata and unscaled value against its declared precision.
 ///
-/// **Encode/construction path only.** Java never checks a decimal's magnitude against its
-/// declared precision — `Conversions.internalFromByteBuffer` decodes any `BigInteger` and
-/// `Conversions.toByteBuffer` re-emits `unscaledValue().toByteArray()` unchecked (live probe:
-/// `fromByteBuffer(DecimalType.of(2,0), 0x0F423F)` returns `999999`). The fork needs the check
-/// only where the encoder would otherwise silently TRUNCATE the two's-complement buffer to
-/// `decimal_required_bytes(precision)`.
-///
-/// **It is NOT true that read paths never reach this.** `Datum::to_bytes` calls
-/// `validate_decimal_literal`, and `to_bytes` is reached from two pure READ paths —
-/// [`crate::inspect`]'s `readable_metrics` and `data_file` metadata tables — as well as from the
-/// manifest re-write path (`spec/manifest/_serde.rs::to_bytes_entry`). So a decimal bound whose
-/// unscaled magnitude exceeds its declared precision now SCANS fine (Java-exact, per the relaxation
-/// above) but makes those inspect tables and any manifest-copying maintenance return
-/// `DataInvalid`. That asymmetry is deliberate and fail-closed for now: at the merge base the same
-/// value was silently truncated instead (999999 at `decimal(2,0)` became 15 — a wrong bound written
-/// into metadata), so erroring is strictly safer than what it replaced. Closing it properly means
-/// giving the inspect/manifest-copy encoders a non-validating re-emit that mirrors Java's unchecked
-/// `unscaledValue().toByteArray()`; see the bundle ledger's residue section.
-///
-/// The absolute value is converted through `unsigned_abs`, which is defined for
-/// `i128::MIN` and therefore cannot overflow while checking the 38-digit boundary.
+/// Encode path only. Java never checks the magnitude; the fork must, because the encoder
+/// otherwise truncates the two's-complement buffer to `decimal_required_bytes`. [`crate::inspect`]
+/// and manifest re-writes reach it too, so an over-wide bound scans fine but fails those with
+/// `DataInvalid`. That is deliberate: the alternative is a silently truncated, wrong bound.
 pub(crate) fn validate_decimal_value(r#type: &PrimitiveType, value: i128) -> Result<()> {
     let PrimitiveType::Decimal { precision, .. } = r#type else {
         return Err(Error::new(
@@ -123,11 +100,9 @@ pub(crate) fn validate_decimal_literal(
     }
 }
 
-/// Literal associated with its type. The value and type pair is checked when construction, so the type and value is
-/// guaranteed to be correct when used.
-///
-/// By default, we decouple the type and value of a literal, so we can use avoid the cost of storing extra type info
-/// for each literal. But associate type with literal can be useful in some cases, for example, in unbound expression.
+/// A literal with its type. Construction checks the pair, so the type always matches the value.
+/// A plain [`PrimitiveLiteral`] omits the type to save space; carry the type where a consumer
+/// needs it, as an unbound expression does.
 #[derive(Clone, Debug, PartialEq, Hash, Eq)]
 pub struct Datum {
     r#type: PrimitiveType,
@@ -139,11 +114,8 @@ impl Serialize for Datum {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        // No decimal value gate here. A `Datum` built from a Java-written bound may legitimately
-        // carry an unscaled value wider than its declared precision (Java never checks), and this
-        // impl is one half of a lossless round trip with `Deserialize` — rejecting here would make
-        // such a scan task unserializable. The `precision <= 38` invariant still applies, via the
-        // `PrimitiveType` field below (`serialize_decimal`).
+        // No decimal value gate here: a Java-written bound can exceed its declared precision, and
+        // a gate would make that scan task unserializable. `serialize_decimal` holds `<= 38`.
         let mut struct_ser = serializer
             .serialize_struct("Datum", 2)
             .map_err(serde::ser::Error::custom)?;
@@ -257,7 +229,6 @@ fn iceberg_float_cmp_f64(a: OrderedFloat<f64>, b: OrderedFloat<f64>) -> Option<O
 impl PartialOrd for Datum {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         match (&self.literal, &other.literal, &self.r#type, &other.r#type) {
-            // generate the arm with same type and same literal
             (
                 PrimitiveLiteral::Boolean(val),
                 PrimitiveLiteral::Boolean(other_val),
@@ -381,9 +352,7 @@ impl Display for Datum {
                 Some(date) => write!(f, "{date}"),
                 None => write!(f, "<invalid date: {val}>"),
             },
-            // The temporal converters return `None` for an out-of-range stored value (which can
-            // arrive from corrupt/hostile on-disk bytes). Formatting must never panic, so render a
-            // clearly-marked placeholder instead of unwrapping; valid values format unchanged.
+            // Formatting must never panic on out-of-range on-disk bytes, so render a placeholder.
             (PrimitiveType::Time, PrimitiveLiteral::Long(val)) => {
                 match time::microseconds_to_time(*val) {
                     Some(time) => write!(f, "{time}"),
@@ -457,14 +426,11 @@ impl Datum {
         validate_decimal_literal(&self.r#type, &self.literal)
     }
 
-    /// Creates a `Datum` from a `PrimitiveType` and a `PrimitiveLiteral`
     pub(crate) fn new(r#type: PrimitiveType, literal: PrimitiveLiteral) -> Self {
         Datum { r#type, literal }
     }
 
-    /// Create iceberg value from bytes.
-    ///
-    /// See [this spec](https://iceberg.apache.org/spec/#binary-single-value-serialization) for reference.
+    /// Create an iceberg value from its [single-value binary encoding](https://iceberg.apache.org/spec/#binary-single-value-serialization).
     pub fn try_from_bytes(bytes: &[u8], data_type: PrimitiveType) -> Result<Self> {
         let literal = match data_type {
             PrimitiveType::Boolean => {
@@ -519,24 +485,9 @@ impl Datum {
             PrimitiveType::Fixed(_) => PrimitiveLiteral::Binary(Vec::from(bytes)),
             PrimitiveType::Binary => PrimitiveLiteral::Binary(Vec::from(bytes)),
             PrimitiveType::Decimal { precision, .. } => {
-                // Java parity — `Conversions.internalFromByteBuffer`, iceberg-api 1.10.0, DECIMAL
-                // arm at bytecode offsets 254-294: `new BigInteger(new byte[buf.remaining()])`
-                // then `new BigDecimal(bigint, scale)`. There is NO length check and NO minimality
-                // check, and the omission is deliberate — the LONG (152-177) and DOUBLE (186-211)
-                // arms in the same switch DO branch on `remaining()`. Live probe against the
-                // 1.10.0 jars:
-                //   fromByteBuffer(decimal(9,2), 00 00 04 D2) -> 12.34   (zero-padded)
-                //   fromByteBuffer(decimal(9,2), FF FF FB 2E) -> -12.34  (sign-extended)
-                //   fromByteBuffer(decimal(2,0), 0F 42 3F)    -> 999999  (exceeds precision)
-                // Rejecting any of these would make a single padded bound abort every scan of the
-                // table, because `manifest::_serde::parse_bytes_entry` propagates the error with
-                // `?` and one unparsable bound fails the whole manifest.
-                //
-                // Two things Java DOES reject, which we keep rejecting:
-                //   * an EMPTY buffer — `new BigInteger(new byte[0])` throws
-                //     `NumberFormatException: Zero length BigInteger` (verified live);
-                //   * `precision > 38` — unreachable in Java at all, since `DecimalType.<init>`
-                //     refuses to build the type.
+                // Java's DECIMAL arm has no length check and no minimality check, so padded,
+                // sign-extended, and over-precision buffers all decode. One rejected bound aborts
+                // every scan. Java does reject an empty buffer and `precision > 38`, so these do.
                 ensure_java_decimal_precision(precision)?;
                 ensure_data_valid!(
                     !bytes.is_empty(),
@@ -550,8 +501,7 @@ impl Datum {
                 })?;
                 PrimitiveLiteral::Int128(value)
             }
-            // `unknown` has no `PrimitiveLiteral` form — its values are always null, so there is no
-            // single-value byte encoding to decode (Java keeps no value class for `UnknownType`).
+            // `unknown` values are always null, so there is no byte encoding to decode.
             PrimitiveType::Unknown => {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -562,12 +512,9 @@ impl Datum {
         Ok(Datum::new(data_type, literal))
     }
 
-    /// Convert the value to bytes
-    ///
-    /// See [this spec](https://iceberg.apache.org/spec/#binary-single-value-serialization) for reference.
+    /// Convert the value to its [single-value binary encoding](https://iceberg.apache.org/spec/#binary-single-value-serialization).
     pub fn to_bytes(&self) -> Result<ByteBuf> {
-        // Preserve the diagnostic emitted by the original decimal byte encoder for invalid
-        // precision. Other metadata and value validation continues through the shared helper.
+        // Keep the original decimal encoder's message for an invalid precision.
         if matches!(&self.literal, PrimitiveLiteral::Int128(_))
             && let PrimitiveType::Decimal { precision, .. } = &self.r#type
             && (*precision == 0 || *precision > MAX_DECIMAL_PRECISION)
@@ -605,14 +552,11 @@ impl Datum {
                     ));
                 };
 
-                // It's required by iceberg spec that we must keep the minimum
-                // number of bytes for the value
+                // The spec requires the minimum number of bytes for the value.
                 let required_bytes = Type::decimal_required_bytes(precision)?;
 
-                // The primitive literal is unscaled value.
-                // Convert into two's-complement byte representation in big-endian byte order.
+                // The literal is the unscaled value. Emit two's complement, big-endian.
                 let mut bytes = i128_to_be_bytes_min(*val);
-                // Truncate with required bytes to make sure.
                 bytes.truncate(required_bytes.try_into()?);
 
                 ByteBuf::from(bytes)
@@ -629,8 +573,6 @@ impl Datum {
     }
 
     /// Creates a boolean value.
-    ///
-    /// Example:
     /// ```rust
     /// use iceberg::spec::{Datum, Literal, PrimitiveLiteral};
     /// let t = Datum::bool(true);
@@ -648,10 +590,7 @@ impl Datum {
         }
     }
 
-    /// Creates a boolean value from string.
-    /// See [Parse bool from str](https://doc.rust-lang.org/stable/std/primitive.bool.html#impl-FromStr-for-bool) for reference.
-    ///
-    /// Example:
+    /// Creates a boolean value from a string, via `bool`'s `FromStr`.
     /// ```rust
     /// use iceberg::spec::{Datum, Literal, PrimitiveLiteral};
     /// let t = Datum::bool_from_str("false").unwrap();
@@ -670,8 +609,6 @@ impl Datum {
     }
 
     /// Creates an 32bit integer.
-    ///
-    /// Example:
     /// ```rust
     /// use iceberg::spec::{Datum, Literal, PrimitiveLiteral};
     /// let t = Datum::int(23i8);
@@ -687,8 +624,6 @@ impl Datum {
     }
 
     /// Creates an 64bit integer.
-    ///
-    /// Example:
     /// ```rust
     /// use iceberg::spec::{Datum, Literal, PrimitiveLiteral};
     /// let t = Datum::long(24i8);
@@ -704,8 +639,6 @@ impl Datum {
     }
 
     /// Creates an 32bit floating point number.
-    ///
-    /// Example:
     /// ```rust
     /// use iceberg::spec::{Datum, Literal, PrimitiveLiteral};
     /// use ordered_float::OrderedFloat;
@@ -725,8 +658,6 @@ impl Datum {
     }
 
     /// Creates an 64bit floating point number.
-    ///
-    /// Example:
     /// ```rust
     /// use iceberg::spec::{Datum, Literal, PrimitiveLiteral};
     /// use ordered_float::OrderedFloat;
@@ -746,8 +677,6 @@ impl Datum {
     }
 
     /// Creates date literal from number of days from unix epoch directly.
-    ///
-    /// Example:
     /// ```rust
     /// use iceberg::spec::{Datum, Literal, PrimitiveLiteral};
     /// // 2 days after 1970-01-01
@@ -763,11 +692,7 @@ impl Datum {
         }
     }
 
-    /// Creates date literal in `%Y-%m-%d` format, assume in utc timezone.
-    ///
-    /// See [`NaiveDate::from_str`].
-    ///
-    /// Example
+    /// Creates a date literal in `%Y-%m-%d` format, in UTC. See [`NaiveDate::from_str`].
     /// ```rust
     /// use iceberg::spec::{Datum, Literal};
     /// let t = Datum::date_from_str("1970-01-05").unwrap();
@@ -787,12 +712,7 @@ impl Datum {
         Ok(Self::date(date::date_from_naive_date(t)))
     }
 
-    /// Create date literal from calendar date (year, month and day).
-    ///
-    /// See [`NaiveDate::from_ymd_opt`].
-    ///
-    /// Example:
-    ///
+    /// Creates a date literal from a calendar date. See [`NaiveDate::from_ymd_opt`].
     ///```rust
     /// use iceberg::spec::{Datum, Literal};
     /// let t = Datum::date_from_ymd(1970, 1, 5).unwrap();
@@ -811,12 +731,7 @@ impl Datum {
         Ok(Self::date(date::date_from_naive_date(t)))
     }
 
-    /// Creates time literal in microseconds directly.
-    ///
-    /// It will return error when it's negative or too large to fit in 24 hours.
-    ///
-    /// Example:
-    ///
+    /// Creates a time literal from microseconds. Fails if the value is negative or past 24 hours.
     /// ```rust
     /// use iceberg::spec::{Datum, Literal};
     /// let micro_secs = {
@@ -853,7 +768,7 @@ impl Datum {
     /// Creates time literal from [`chrono::NaiveTime`].
     fn time_from_naive_time(t: NaiveTime) -> Self {
         let duration = t - date::unix_epoch().time();
-        // It's safe to unwrap here since less than 24 hours will never overflow.
+        // A span under 24 hours always fits in microseconds, so this cannot overflow.
         let micro_secs = duration.num_microseconds().unwrap();
 
         Self {
@@ -862,11 +777,7 @@ impl Datum {
         }
     }
 
-    /// Creates time literal in microseconds in `%H:%M:%S:.f` format.
-    ///
-    /// See [`NaiveTime::from_str`] for details.
-    ///
-    /// Example:
+    /// Creates a time literal from a `%H:%M:%S%.f` string. See [`NaiveTime::from_str`].
     /// ```rust
     /// use iceberg::spec::{Datum, Literal};
     /// let t = Datum::time_from_str("01:02:01.888999777").unwrap();
@@ -885,11 +796,7 @@ impl Datum {
         Ok(Self::time_from_naive_time(t))
     }
 
-    /// Creates time literal from hour, minute, second, and microseconds.
-    ///
-    /// See [`NaiveTime::from_hms_micro_opt`].
-    ///
-    /// Example:
+    /// Creates a time literal from hour, minute, second, and microsecond.
     /// ```rust
     /// use iceberg::spec::{Datum, Literal};
     /// let t = Datum::time_from_hms_micro(22, 15, 33, 111).unwrap();
@@ -906,9 +813,6 @@ impl Datum {
     }
 
     /// Creates a timestamp from unix epoch in microseconds.
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::Datum;
     /// let t = Datum::timestamp_micros(1000);
@@ -923,9 +827,6 @@ impl Datum {
     }
 
     /// Creates a timestamp from unix epoch in nanoseconds.
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::Datum;
     /// let t = Datum::timestamp_nanos(1000);
@@ -940,9 +841,6 @@ impl Datum {
     }
 
     /// Creates a timestamp from [`DateTime`].
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
     /// use iceberg::spec::Datum;
@@ -959,12 +857,7 @@ impl Datum {
         Self::timestamp_micros(dt.and_utc().timestamp_micros())
     }
 
-    /// Parse a timestamp in [`%Y-%m-%dT%H:%M:%S%.f`] format.
-    ///
-    /// See [`NaiveDateTime::from_str`].
-    ///
-    /// Example:
-    ///
+    /// Parse a timestamp in `%Y-%m-%dT%H:%M:%S%.f` format. See [`NaiveDateTime::from_str`].
     /// ```rust
     /// use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
     /// use iceberg::spec::{Datum, Literal};
@@ -981,9 +874,6 @@ impl Datum {
     }
 
     /// Creates a timestamp with timezone from unix epoch in microseconds.
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::Datum;
     /// let t = Datum::timestamptz_micros(1000);
@@ -998,9 +888,6 @@ impl Datum {
     }
 
     /// Creates a timestamp with timezone from unix epoch in nanoseconds.
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::Datum;
     /// let t = Datum::timestamptz_nanos(1000);
@@ -1015,8 +902,6 @@ impl Datum {
     }
 
     /// Creates a timestamp with timezone from [`DateTime`].
-    /// Example:
-    ///
     /// ```rust
     /// use chrono::{TimeZone, Utc};
     /// use iceberg::spec::Datum;
@@ -1028,12 +913,7 @@ impl Datum {
         Self::timestamptz_micros(dt.with_timezone(&Utc).timestamp_micros())
     }
 
-    /// Parse timestamp with timezone in RFC3339 format.
-    ///
-    /// See [`DateTime::from_str`].
-    ///
-    /// Example:
-    ///
+    /// Parse a timestamp with timezone in RFC3339 format. See [`DateTime::from_str`].
     /// ```rust
     /// use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
     /// use iceberg::spec::{Datum, Literal};
@@ -1050,9 +930,6 @@ impl Datum {
     }
 
     /// Creates a string literal.
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::Datum;
     /// let t = Datum::string("ss");
@@ -1067,9 +944,6 @@ impl Datum {
     }
 
     /// Creates uuid literal.
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::Datum;
     /// use uuid::uuid;
@@ -1085,9 +959,6 @@ impl Datum {
     }
 
     /// Creates uuid from str. See [`uuid::Uuid::parse_str`].
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::Datum;
     /// let t = Datum::uuid_from_str("a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8").unwrap();
@@ -1106,9 +977,6 @@ impl Datum {
     }
 
     /// Creates a fixed literal from bytes.
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::{Datum, Literal, PrimitiveLiteral};
     /// let t = Datum::fixed(vec![1u8, 2u8]);
@@ -1124,9 +992,6 @@ impl Datum {
     }
 
     /// Creates a binary literal from bytes.
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::Datum;
     /// let t = Datum::binary(vec![1u8, 100u8]);
@@ -1141,9 +1006,6 @@ impl Datum {
     }
 
     /// Creates decimal literal from string.
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::Datum;
     /// let t = Datum::decimal_from_str("123.45").unwrap();
@@ -1157,9 +1019,6 @@ impl Datum {
     }
 
     /// Try to create a decimal literal from [`Decimal`].
-    ///
-    /// Example:
-    ///
     /// ```rust
     /// use iceberg::spec::Datum;
     ///
@@ -1181,17 +1040,12 @@ impl Datum {
         }
     }
 
-    /// Try to create a decimal literal from [`Decimal`] with precision.
-    ///
-    /// This method allows specifying a custom precision for the decimal type,
-    /// which is useful when you need to control the storage requirements.
-    /// Use [`Datum::decimal`] if you want to use the maximum precision (38).
+    /// Try to create a decimal literal from [`Decimal`]. [`Datum::decimal`] uses precision 38.
     pub fn decimal_with_precision(value: Decimal, precision: u32) -> Result<Self> {
         let scale = decimal_scale(&value);
         let mantissa = decimal_mantissa(&value);
 
-        // Validate the metadata before checking the value. In particular, a scale greater than
-        // the precision must not be accepted just because the value happens to fit in one byte.
+        // Metadata before value: `scale > precision` must fail even when the value fits a byte.
         validate_decimal_value(&PrimitiveType::Decimal { precision, scale }, mantissa)?;
 
         let available_bytes = usize::try_from(Type::decimal_required_bytes(precision)?)?;
@@ -1242,20 +1096,8 @@ impl Datum {
                         Ok(Datum::timestamptz_micros(*val))
                     }
 
-                    // NB: Java `DecimalLiteral.to` has ONLY `case DECIMAL: return this` —
-                    // `default: return null` rejects everything else, INCLUDING LONG. A
-                    // `PrimitiveLiteral::Int128` is exclusively the unscaled-mantissa storage of a
-                    // decimal literal, so there is deliberately NO `Int128 → Long` arm: a Decimal→Long
-                    // request falls through to the catch-all `Err`, matching Java exactly. (The old
-                    // arm also returned a wrong value for any non-zero scale by long-casting the
-                    // raw mantissa.)
-
-                    // NB: Java `StringLiteral.to` has NO case for BOOLEAN / INTEGER / LONG — those
-                    // fall through to `default: return null`, i.e. a reject. We deliberately do NOT
-                    // provide `string → {boolean,int,long}` arms so that a parse fall-through hits
-                    // the catch-all `Err` below, matching the Java contract exactly. (The accepted
-                    // string targets — TIMESTAMP/TIMESTAMP_TZ/DATE/TIME/UUID — are the arms here and
-                    // just below.)
+                    // Java `DecimalLiteral.to` accepts DECIMAL only, and `StringLiteral.to`
+                    // rejects BOOLEAN, INTEGER, and LONG. Those must reach the catch-all `Err`.
                     (PrimitiveLiteral::String(val), _, PrimitiveType::Timestamp) => {
                         Datum::timestamp_from_str(val)
                     }
@@ -1263,14 +1105,9 @@ impl Datum {
                         Datum::timestamptz_from_str(val)
                     }
 
-                    // ===== Additive numeric / temporal / identity promotions =====
-                    // 1:1 port of the Java `Literals.*Literal.to(Type)` accept-set
-                    // (`api/.../expressions/Literals.java`). Deferred as NAMED residue (GAP_MATRIX
-                    // row R154): every value-level `→ decimal` conversion (rust_decimal's 96-bit /
-                    // scale-28 bound vs Java `BigDecimal`'s unbounded `setScale(_, HALF_UP)`),
-                    // `timestamp[tz] → date` and `long → time` (Java does not range-check; Rust's
-                    // constructors do), all `timestamp_nano` arms (kept parked per the upstream
-                    // note above), and `string → {fixed,binary}` hex decode.
+                    // The arms below port the Java `Literals.*Literal.to(Type)` accept-set. Still
+                    // unported: `-> decimal`, `timestamp[tz] -> date`, `long -> time`, every
+                    // `timestamp_nano` arm, and `string -> {fixed,binary}`.
 
                     // IntegerLiteral.to: FLOAT / DOUBLE
                     (PrimitiveLiteral::Int(val), _, PrimitiveType::Float) => {
@@ -1280,8 +1117,7 @@ impl Datum {
                         Ok(Datum::double(*val))
                     }
 
-                    // LongLiteral.to: FLOAT / DOUBLE / DATE (DATE bounds-checked to int range, like
-                    // Java's `aboveMax()`/`belowMin()` sentinels)
+                    // LongLiteral.to: FLOAT / DOUBLE / DATE. DATE sentinels outside int range.
                     (PrimitiveLiteral::Long(val), _, PrimitiveType::Float) => {
                         Ok(Datum::float(*val as f32))
                     }
@@ -1314,16 +1150,14 @@ impl Datum {
                         })
                     }
 
-                    // DecimalLiteral.to: DECIMAL — Java returns `this`; the stored scale is
-                    // unchanged regardless of the target decimal's scale/precision.
+                    // DecimalLiteral.to: DECIMAL. Java returns `this`, ignoring the target scale.
                     (
                         PrimitiveLiteral::Int128(_),
                         PrimitiveType::Decimal { .. },
                         PrimitiveType::Decimal { .. },
                     ) => Ok(self),
 
-                    // FixedLiteral.to: BINARY  /  BinaryLiteral.to: FIXED (length-checked; a
-                    // mismatch is Java's `null`, i.e. a reject)
+                    // FixedLiteral.to: BINARY / BinaryLiteral.to: FIXED. A length mismatch rejects.
                     (
                         PrimitiveLiteral::Binary(val),
                         PrimitiveType::Fixed(_),
@@ -1347,8 +1181,7 @@ impl Datum {
                         }
                     }
 
-                    // StringLiteral.to: UUID / DATE / TIME (a parse failure is `DataInvalid`,
-                    // mirroring Java returning `null`)
+                    // StringLiteral.to: UUID / DATE / TIME. A parse failure mirrors Java's `null`.
                     (PrimitiveLiteral::String(val), _, PrimitiveType::Uuid) => {
                         Datum::uuid_from_str(val)
                     }
@@ -1390,8 +1223,7 @@ impl Datum {
         &self.r#type
     }
 
-    /// Returns true if the Literal represents a primitive type
-    /// that can be a NaN, and that it's value is NaN
+    /// Returns true if the literal is a float or double whose value is NaN.
     pub fn is_nan(&self) -> bool {
         match self.literal {
             PrimitiveLiteral::Double(val) => val.is_nan(),
@@ -1400,15 +1232,9 @@ impl Datum {
         }
     }
 
-    /// Returns a human-readable string representation of this literal.
-    ///
-    /// Matches Java `Transform.toHumanString(Type, T)` (iceberg-api 1.10.0):
-    ///
-    /// * **String** — the raw string value without quotes.
-    /// * **Binary / Fixed** — standard Base64 (`java.util.Base64.getEncoder()` via
-    ///   `TransformUtil.base64encode`), NOT uppercase hex. [`Display`] for these types still
-    ///   renders hex; only the human-string / partition-path seam uses base64.
-    /// * **Everything else** — falls back to [`to_string()`] (chrono / Rust `Display` forms).
+    /// Returns a human-readable string, as Java `Transform.toHumanString` does: String raw and
+    /// unquoted, Binary and Fixed as standard Base64 (NOT the hex [`Display`] renders), the rest
+    /// through [`to_string()`].
     pub fn to_human_string(&self) -> String {
         match self.literal() {
             PrimitiveLiteral::String(s) => s.to_string(),
@@ -1427,38 +1253,31 @@ impl Datum {
 mod tests {
     use super::*;
 
-    // Regression for SEC-02: a temporal `Datum` carrying an out-of-range stored value (which can
-    // arrive from corrupt/hostile on-disk bytes — min/max stats, partition values, manifest
-    // entries) must format via a placeholder rather than panicking in `Display`/`to_string`.
-    // `Datum::new` bypasses the range-checked constructors, mirroring how a corrupt value bypasses
-    // validation when read straight off disk.
+    // A temporal `Datum` can hold an out-of-range value read from corrupt on-disk bytes, and
+    // `Display` must render a placeholder rather than panic. `Datum::new` bypasses the checks.
 
     #[test]
     fn test_display_time_out_of_range_does_not_panic() {
-        // Negative microseconds-of-day previously wrapped via `as u32` and unwrapped a `None`.
+        // A negative microsecond-of-day wrapped through `as u32` and unwrapped a `None`.
         let negative = Datum::new(PrimitiveType::Time, PrimitiveLiteral::Long(-1));
         assert_eq!(negative.to_string(), "<invalid time: -1>");
 
-        // 86_400_000_001us is one microsecond past 24h (the largest valid value is < 86_400_000_000).
+        // One microsecond past 24 hours.
         let past_midnight = Datum::new(PrimitiveType::Time, PrimitiveLiteral::Long(86_400_000_001));
         assert_eq!(past_midnight.to_string(), "<invalid time: 86400000001>");
     }
 
     #[test]
     fn test_display_valid_time_unchanged() {
-        // One second after midnight; valid values must still render normally.
+        // A valid value must still render normally.
         let valid = Datum::new(PrimitiveType::Time, PrimitiveLiteral::Long(1_000_000));
         assert_eq!(valid.to_string(), "00:00:01");
     }
 
-    // SAF-003: a `Date` `Datum` with an out-of-range days-since-epoch value (corrupt/hostile
-    // on-disk bytes) must format via a placeholder rather than panicking. The former
-    // `days_to_date` returned a bare `NaiveDate` and overflowed chrono's `DateTime + TimeDelta`
-    // for extreme `i32` values (the `Add` panicked, not the `try_days` unwrap).
-    //
-    // MUTATION (restore `days_to_date -> NaiveDate` built with
-    // `(UNIX_EPOCH + TimeDelta::try_days(days as i64).unwrap()).naive_utc().date()` and the bare
-    // `write!(f, "{}", date::days_to_date(*val))`): `to_string()` panics here.
+    // An out-of-range days-since-epoch `Date` must render a placeholder, not panic. The mutation
+    // this discriminates: make `days_to_date` return a bare `NaiveDate` from
+    // `UNIX_EPOCH + TimeDelta::try_days(d).unwrap()` and format it with a bare `write!`. The
+    // chrono `Add` then panics here on an extreme `i32`.
     #[test]
     fn test_display_date_out_of_range_does_not_panic() {
         let max = Datum::new(PrimitiveType::Date, PrimitiveLiteral::Int(i32::MAX));
@@ -1470,14 +1289,14 @@ mod tests {
 
     #[test]
     fn test_display_valid_date_unchanged() {
-        // 2024-01-01 is 19_723 days since epoch; valid values must still render normally.
+        // 19_723 days is 2024-01-01. A valid value must still render normally.
         let valid = Datum::new(PrimitiveType::Date, PrimitiveLiteral::Int(19_723));
         assert_eq!(valid.to_string(), "2024-01-01");
     }
 
     #[test]
     fn test_display_timestamp_out_of_range_does_not_panic() {
-        // i64::MAX microseconds is far past chrono's representable range.
+        // i64::MAX microseconds is past chrono's range.
         let datum = Datum::new(PrimitiveType::Timestamp, PrimitiveLiteral::Long(i64::MAX));
         let rendered = datum.to_string();
         assert_eq!(rendered, format!("<invalid timestamp: {}>", i64::MAX));
@@ -1485,8 +1304,7 @@ mod tests {
 
     #[test]
     fn test_display_timestamptz_out_of_range_does_not_panic() {
-        // i64::MIN microseconds: previously the negative sub-second remainder wrapped via `as u32`
-        // into a giant nanosecond count and the unwrap panicked.
+        // The negative sub-second remainder wrapped through `as u32` and the unwrap panicked.
         let datum = Datum::new(PrimitiveType::Timestamptz, PrimitiveLiteral::Long(i64::MIN));
         let rendered = datum.to_string();
         assert_eq!(rendered, format!("<invalid timestamptz: {}>", i64::MIN));
@@ -1494,11 +1312,9 @@ mod tests {
 
     #[test]
     fn test_display_timestamptz_ns_negative_remainder_does_not_panic() {
-        // A small negative nanosecond value previously wrapped the negative sub-second remainder
-        // via `as u32` into a >1e9 nanos count, which made `from_timestamp` return `None` and the
-        // unwrap panic. The euclidean split now produces a valid sub-second instant. Every i64
-        // nanosecond value is within chrono's range (≈ years 1677..2262), so this renders normally
-        // rather than as a placeholder; the regression is simply that it does not panic.
+        // A small negative nanosecond value wrapped the sub-second remainder through `as u32`,
+        // so `from_timestamp` gave `None` and the unwrap panicked. Every i64 nanosecond value is
+        // inside chrono's range, so this renders normally and only proves the absence.
         let datum = Datum::new(PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(-1));
         assert_eq!(datum.to_string(), "1969-12-31 23:59:59.999999999 UTC");
     }

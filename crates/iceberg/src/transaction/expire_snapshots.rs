@@ -15,68 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! ExpireSnapshots — the METADATA retention semantics of Java's `ExpireSnapshots` /
-//! `RemoveSnapshots` (the `cleanExpiredFiles(false)` posture).
+//! `ExpireSnapshots` — the metadata retention semantics of Java `RemoveSnapshots` under
+//! `cleanExpiredFiles(false)`.
 //!
-//! **THIS ACTION NEVER DELETES FILES.** It computes exactly which snapshots and snapshot
-//! references fall out of the table's retention policy and emits the corresponding
-//! [`TableUpdate::RemoveSnapshots`] / [`TableUpdate::RemoveSnapshotRef`] metadata updates —
-//! nothing else. Physical cleanup of the manifests, manifest lists, data files, delete files,
-//! and statistics files that become unreachable (Java's `cleanExpiredFiles(true)` default,
-//! `ReachableFileCleanup`, `deleteWith`) lives in the sibling module
-//! [`expire_cleanup`](super::expire_cleanup) (Increment B2) as an EXPLICIT post-commit step —
-//! [`ExpireSnapshotsCleanup`](crate::transaction::ExpireSnapshotsCleanup) — never run by this
-//! action: committing this action only shrinks the metadata; the files stay on storage until
-//! the caller invokes the cleanup (preferably via `ExpireSnapshotsCleanup::commit_and_clean`).
+//! This action never deletes files. It emits the [`TableUpdate::RemoveSnapshots`] and
+//! [`TableUpdate::RemoveSnapshotRef`] updates for the snapshots and refs that fall out of the
+//! retention policy. Physical cleanup lives in
+//! [`ExpireSnapshotsCleanup`](crate::transaction::ExpireSnapshotsCleanup), and the caller must
+//! run it. A commit here shrinks the metadata only, and the files stay on storage.
 //!
-//! The retention computation is a 1:1 port of Java 1.10.0 `RemoveSnapshots.internalApply`
-//! (every branch bytecode-verified against `iceberg-core-1.10.0.jar`):
+//! The retention computation ports Java 1.10.0 `RemoveSnapshots.internalApply`.
 //!
-//! 1. **Retained refs** (`computeRetainedRefs`): `main` is always retained (never ref-expired);
-//!    any other branch or tag is retained iff `now − snapshot.timestamp_ms <= maxRefAgeMs`
-//!    (the ref's own `max_ref_age_ms`, falling back to `history.expire.max-ref-age-ms`, default
-//!    forever); a ref whose snapshot no longer exists is dropped with a warning.
-//! 2. **Explicit-id guard:** an id passed to [`ExpireSnapshotsAction::expire_snapshot_id`] that a
-//!    RETAINED ref still points at fails with Java's exact message
-//!    (`Cannot expire %s. Still referenced by refs: %s`). Ids pointed at only by refs that expire
-//!    in the same pass are allowed.
-//! 3. **Per-branch retention** (`computeBranchSnapshotsToRetain`): for every retained branch, walk
-//!    its ancestry from the head and keep each ancestor while
-//!    `kept < minSnapshotsToKeep || ancestor.timestamp_ms >= expireOlderThan`, STOPPING at the
-//!    first ancestor that fails both (the retained set is a contiguous prefix of the chain). The
-//!    cutoff is `now − ref.max_snapshot_age_ms` when the branch sets one, else the default below;
-//!    the floor is `ref.min_snapshots_to_keep`, else `history.expire.min-snapshots-to-keep`
-//!    (default 1).
-//! 4. **Unreferenced retention** (`unreferencedSnapshotsToRetain`): snapshots reachable from no
-//!    retained ref (branch ancestries + tag targets) are retained iff
-//!    `timestamp_ms >= defaultExpireOlderThan`.
-//! 5. Everything not retained — plus the explicit ids, which override age/ancestry retention for
-//!    non-ref-head snapshots exactly as in Java (the `idsToRemove` seed set) — is removed.
+//! | Step | Rule |
+//! |---|---|
+//! | retained refs | `main` is always retained. Another ref is retained while `now - snapshot.timestamp_ms <= max_ref_age_ms`. A ref whose snapshot is gone is dropped with a warning. |
+//! | explicit-id guard | An id from [`ExpireSnapshotsAction::expire_snapshot_id`] that a retained ref still points at fails. An id held only by refs that expire in the same pass is allowed. |
+//! | per-branch retention | Walk each retained branch from its head. Keep an ancestor while `kept < min_snapshots_to_keep` or `timestamp_ms >= expire_older_than`. Stop at the first ancestor that fails both, so the retained set is a contiguous prefix. |
+//! | unreferenced retention | A snapshot that no retained ref reaches is retained while `timestamp_ms >= default_expire_older_than`. |
+//! | removal | Everything not retained, plus the explicit ids. An explicit id overrides age and ancestry retention for a snapshot that heads no ref. |
 //!
-//! The default cutoff (`defaultExpireOlderThan`) is `expire_older_than(ts)` when called, else
-//! `now − history.expire.max-snapshot-age-ms` (default 5 days).
+//! The default cutoff is the `expire_older_than` timestamp when the caller sets one, else
+//! `now - history.expire.max-snapshot-age-ms`, which defaults to 5 days.
 //!
-//! **Documented divergences from Java (timing only, same outcomes):**
-//! - Java validates `retainLast` and the `gc.enabled` gate eagerly (builder call / constructor);
-//!   this action is built without a table (the fork's stateless-retry pattern), so both checks run
-//!   at commit time against the refreshed table, with Java's exact messages.
-//! - Java pins the `history.expire.*` defaults from the properties at action construction and the
-//!   wall clock at construction; this action reads the properties at commit time (strictly
-//!   fresher; observable only under a concurrent property change) and pins `now` at construction.
-//! - A malformed `history.expire.*` / `gc.enabled` property value fails the commit loudly
-//!   (`DataInvalid`), mirroring Java's `NumberFormatException` from `PropertyUtil` in
-//!   fail-loud effect.
-//! - Optimistic-concurrency posture: Java's primary path commits through a full-metadata CAS
-//!   (`ops.commit(base, updated)`), while its REST `UpdateRequirements` derives no requirement at
-//!   all for snapshot removal. This action emits a [`TableRequirement::RefSnapshotIdMatch`] for
-//!   EVERY ref consulted by the computation — narrower than Java's full CAS, strictly safer than
-//!   the REST shape: a concurrent rollback (the case where applying a stale removal would destroy
-//!   the new head) is rejected and recomputed on retry.
+//! # Divergences from Java
 //!
-//! **Deferred (loudly):** the `IncrementalFileCleanup` strategy (see the deferral note in
-//! [`expire_cleanup`](super::expire_cleanup) — B2 ports the general-correct
-//! `ReachableFileCleanup` only); `cleanExpiredMetadata(true)` (unreachable spec/schema removal —
-//! needs manifest IO to compute reachable spec ids); Java interop evidence.
+//! | Divergence | Effect |
+//! |---|---|
+//! | Java validates `retainLast` and the `gc.enabled` gate at build time. This action holds no table, so both checks run at commit time against the refreshed table, with Java's messages. | timing only |
+//! | Java pins the `history.expire.*` defaults and the wall clock at construction. This action reads the properties at commit time and pins `now` at construction. | timing only |
+//! | A malformed `history.expire.*` or `gc.enabled` value fails the commit loudly with `DataInvalid`. | Java throws likewise |
+//! | Java commits through a full-metadata CAS, and its REST shape derives no requirement. This action emits a [`TableRequirement::RefSnapshotIdMatch`] for every ref the computation reads. | narrower than the CAS, safer than REST: it rejects a concurrent rollback that would destroy the new head, and recomputes on retry |
+//!
+//! Deferred: the `IncrementalFileCleanup` strategy, and `cleanExpiredMetadata(true)`, which needs
+//! manifest IO to compute the reachable spec ids.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -120,29 +91,25 @@ impl ExpireSnapshotsAction {
         }
     }
 
-    /// Expire snapshots with a timestamp STRICTLY older than `timestamp_ms` (a snapshot whose
-    /// timestamp equals `timestamp_ms` is kept — Java retains on
-    /// `timestampMillis() >= expireOlderThan`). Overrides the table's
-    /// `history.expire.max-snapshot-age-ms` default; the last call wins (Java
-    /// `expireOlderThan` overwrites `defaultExpireOlderThan`).
+    /// Expire snapshots strictly older than `timestamp_ms`. A snapshot whose timestamp equals
+    /// `timestamp_ms` is kept, as in Java. This overrides the table's
+    /// `history.expire.max-snapshot-age-ms`. The last call wins.
     pub fn expire_older_than(mut self, timestamp_ms: i64) -> Self {
         self.expire_older_than_ms = Some(timestamp_ms);
         self
     }
 
-    /// Retain at least `num_snapshots` snapshots on each branch regardless of age, unless the
-    /// branch carries its own `min_snapshots_to_keep`. Must be `>= 1`; rejected at commit with
-    /// Java's exact message (Java validates eagerly in `retainLast` — same message, deferred
-    /// timing per this fork's stateless-action pattern). The last call wins.
+    /// Retain at least `num_snapshots` snapshots on each branch, whatever their age, unless the
+    /// branch sets its own `min_snapshots_to_keep`. A value below 1 fails the commit with Java's
+    /// message. The last call wins.
     pub fn retain_last(mut self, num_snapshots: i32) -> Self {
         self.retain_last = Some(num_snapshots);
         self
     }
 
-    /// Explicitly expire the snapshot with the given id; repeatable. Mirrors Java
-    /// `expireSnapshotId`: the id is removed even when age/ancestry retention would keep it, an id
-    /// still pointed at by a RETAINED ref fails the commit, and an id not present in the table
-    /// metadata is silently ignored.
+    /// Expire the snapshot with this id. Mirrors Java `expireSnapshotId`. The id is removed even
+    /// when age or ancestry retention would keep it. An id a retained ref still points at fails
+    /// the commit. An id absent from the metadata is ignored. Repeatable.
     pub fn expire_snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.ids_to_expire.push(snapshot_id);
         self
@@ -167,10 +134,9 @@ fn data_invalid(message: String) -> Error {
     Error::new(ErrorKind::DataInvalid, message)
 }
 
-/// Parse a table property, failing loudly on a malformed value (a silently-defaulted retention
-/// setting could over-expire; Java's `PropertyUtil` throws `NumberFormatException` likewise).
-/// `pub(super)` so the B2 cleanup sibling ([`super::expire_cleanup`]) re-honors the
-/// `gc.enabled` gate with identical parsing.
+/// Parse a table property, and fail loudly on a malformed value. A silently defaulted retention
+/// setting can over-expire. `pub(super)` so [`super::expire_cleanup`] parses the `gc.enabled`
+/// gate the same way.
 pub(super) fn parse_property<T: std::str::FromStr>(
     properties: &HashMap<String, String>,
     key: &str,
@@ -195,10 +161,9 @@ fn max_ref_age_ms(reference: &SnapshotReference) -> Option<i64> {
     }
 }
 
-/// The ancestor chain of `head_id`, head first and inclusive, following `parent_snapshot_id`
-/// until the root or the first missing parent (Java `SnapshotUtil.ancestorsOf`: the lookup
-/// returning null ends the walk silently, but a missing HEAD is an error — Java's
-/// `Preconditions.checkArgument(start != null, "Cannot find snapshot: %s", snapshotId)`).
+/// The ancestor chain of `head_id`, head first and inclusive. Mirrors Java
+/// `SnapshotUtil.ancestorsOf`. A missing parent ends the walk silently. A missing head is an
+/// error.
 fn ancestors_of(metadata: &TableMetadata, head_id: i64) -> Result<Vec<&Arc<Snapshot>>> {
     let head = metadata
         .snapshot_by_id(head_id)
@@ -217,11 +182,9 @@ fn ancestors_of(metadata: &TableMetadata, head_id: i64) -> Result<Vec<&Arc<Snaps
     Ok(chain)
 }
 
-/// The contiguous prefix of a branch's ancestry to retain (Java
-/// `computeBranchSnapshotsToRetain`): keep each ancestor (head first) while
-/// `kept < min_snapshots_to_keep || timestamp_ms >= expire_older_than_ms`, and STOP at the first
-/// ancestor failing both — an out-of-order older-but-recent ancestor behind the stop point is NOT
-/// retained, exactly as Java's early `return`.
+/// The contiguous prefix of a branch's ancestry to retain. Mirrors Java
+/// `computeBranchSnapshotsToRetain`. The walk stops at the first ancestor that fails both tests,
+/// so a recent ancestor behind the stop point is not retained.
 fn branch_snapshots_to_retain(
     metadata: &TableMetadata,
     branch_head_id: i64,
@@ -241,10 +204,9 @@ fn branch_snapshots_to_retain(
     Ok(retained)
 }
 
-/// Snapshots referenced by NO retained ref (branch ancestries + tag targets) that are still young
-/// enough to keep: `timestamp_ms >= default_expire_older_than_ms` retains (Java
-/// `unreferencedSnapshotsToRetain` — note the default cutoff applies here even when a branch
-/// carries its own `max_snapshot_age_ms`).
+/// The snapshots that no retained ref reaches and that are young enough to keep. Mirrors Java
+/// `unreferencedSnapshotsToRetain`. The default cutoff applies here even when a branch sets its
+/// own `max_snapshot_age_ms`.
 fn unreferenced_snapshots_to_retain(
     metadata: &TableMetadata,
     retained_refs: &HashMap<&String, &SnapshotReference>,
@@ -343,11 +305,9 @@ impl TransactionAction for ExpireSnapshotsAction {
                 retained_refs.insert(name, reference);
                 continue;
             }
-            // A ref whose snapshot no longer exists falls through and is dropped. Java logs
-            // `Removing invalid ref {}: snapshot {} does not exist` at WARN; the `iceberg` crate
-            // has no logging-facade dependency (adding one needs approval — see the metrics
-            // module), so the drop is silent here; the emitted `RemoveSnapshotRef` update still
-            // records the removal.
+            // A ref whose snapshot no longer exists falls through and is dropped. Java logs it
+            // at WARN. The crate has no logging facade, so the drop is silent. The emitted
+            // `RemoveSnapshotRef` update still records it.
             if let Some(snapshot) = metadata.snapshot_by_id(reference.snapshot_id) {
                 let max_age_ms = max_ref_age_ms(reference).unwrap_or(default_max_ref_age_ms);
                 // Saturating: `timestamp_ms` comes from on-disk metadata and must not be able
@@ -414,10 +374,9 @@ impl TransactionAction for ExpireSnapshotsAction {
             default_expire_older_than_ms,
         )?);
 
-        // 5. Everything not retained is removed; the explicit ids are the seed set and override
-        //    age/ancestry retention (Java applies `idsToRemove` unconditionally after the ref-head
-        //    guard above). Ids absent from metadata are dropped: Java's builder only records
-        //    actually-removed snapshots. BTreeSet ⇒ deterministic (sorted) update output.
+        // Everything not retained is removed. The explicit ids seed the set and override age and
+        // ancestry retention. An id absent from the metadata is dropped, because Java records
+        // only snapshots it actually removed. The BTreeSet keeps the update output sorted.
         let mut ids_to_remove: BTreeSet<i64> = explicit_ids
             .into_iter()
             .filter(|id| metadata.snapshot_by_id(*id).is_some())
@@ -456,11 +415,10 @@ impl TransactionAction for ExpireSnapshotsAction {
             });
         }
 
-        // Optimistic-concurrency guards: every ref consulted by the computation must still point
-        // where we observed it, or the commit conflicts and the retry loop recomputes against the
-        // refreshed base. This is the action-level analogue of Java's full-metadata CAS
-        // (`ops.commit(base, updated)`) narrowed to the ref surface; it is what rejects the
-        // concurrent-rollback case where applying a stale removal would destroy the new head.
+        // Every ref the computation read must still point where it did, or the commit conflicts
+        // and the retry loop recomputes against the refreshed base. This narrows Java's
+        // full-metadata CAS to the ref surface. It rejects the concurrent rollback where a stale
+        // removal would destroy the new head.
         let mut guarded_ref_names: Vec<&String> = metadata.refs.keys().collect();
         guarded_ref_names.sort_unstable();
         let requirements: Vec<TableRequirement> = guarded_ref_names
@@ -507,10 +465,9 @@ mod tests {
         crate::transaction::tests::make_v2_table()
     }
 
-    /// Append a parent-linked chain of `(snapshot_id, timestamp_ms)` snapshots to `branch`,
-    /// starting from `parent`. One metadata build per snapshot, so each main-branch commit gets
-    /// its own snapshot-log entry (a single-pass chain would be collapsed by the
-    /// intermediate-snapshot suppression in `build()`).
+    /// Append a parent-linked chain of `(snapshot_id, timestamp_ms)` snapshots to `branch`, from
+    /// `parent`. Use one metadata build per snapshot. A single pass collapses the snapshot log,
+    /// because `build()` suppresses intermediate snapshots.
     fn append_chain(table: Table, branch: &str, parent: i64, chain: &[(i64, i64)]) -> Table {
         let mut table = table;
         let mut parent_id = parent;
@@ -852,11 +809,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned: a branch's own `max_snapshot_age_ms` beats even an EXPLICIT
-    /// `expire_older_than` call. Java's `expireOlderThan` merely overwrites
-    /// `defaultExpireOlderThan`; `computeAllBranchSnapshotsToRetain` still prefers the ref's own
-    /// age (bytecode-verified). A refactor letting the explicit cutoff trump per-branch settings
-    /// would over-expire protected branch history and must fail here.
+    /// Risk pinned: a branch's own `max_snapshot_age_ms` beats an explicit `expire_older_than`
+    /// call, because Java's `computeAllBranchSnapshotsToRetain` prefers the ref's own age. A
+    /// refactor that lets the explicit cutoff win over-expires protected branch history.
     #[tokio::test]
     async fn test_branch_max_snapshot_age_beats_explicit_expire_older_than() {
         const D1: i64 = 211;
@@ -882,15 +837,10 @@ mod tests {
         assert_eq!(removed, vec![S1, S2, ROOT, CURRENT]);
     }
 
-    /// Risk pinned: CLOCK SKEW vs the EARLY STOP. The branch walk keeps ancestors while
-    /// `kept < min || ts >= cutoff` and STOPS at the first ancestor failing both — Java 1.10.0
-    /// `computeBranchSnapshotsToRetain`'s early `return` (bytecode-verified `areturn` inside the
-    /// loop). With out-of-order timestamps (clock skew / backfilled commits within the 60s
-    /// `add_snapshot` tolerance), an ancestor NEWER than the cutoff sitting BEHIND an
-    /// older-than-cutoff ancestor is still EXPIRED: the retained set is a contiguous prefix, never
-    /// a timestamp filter. Counterintuitive but the Java semantic — a future "fix" dropping the
-    /// early stop (walking the full ancestry and keeping every recent ancestor) would silently
-    /// diverge from Java and must fail here.
+    /// Risk pinned: clock skew against the early stop. Java's `computeBranchSnapshotsToRetain`
+    /// returns at the first ancestor that fails both tests. Under out-of-order timestamps, an
+    /// ancestor newer than the cutoff behind an older one still expires. The retained set is a
+    /// contiguous prefix, not a timestamp filter. A walk of the full ancestry diverges from Java.
     #[tokio::test]
     async fn test_clock_skew_recent_ancestor_behind_early_stop_is_expired() {
         const A1: i64 = 401; // ts AFTER the cutoff, but behind the stop point
@@ -935,10 +885,9 @@ mod tests {
     // ref (tag/branch) age expiry
     // =======================================================================
 
-    /// Risk pinned: the ref-age boundary EXACTLY ON the limit. Java retains on
-    /// `now − ts <= maxRefAgeMs` (bytecode `lcmp ifgt` — strictly-greater expires), so a ref whose
-    /// age EQUALS its `max_ref_age_ms` is KEPT; one millisecond older goes. A `<=`→`<` flip
-    /// (expiring at the boundary — the over-expiry direction) must fail here.
+    /// Risk pinned: the ref-age boundary. Java retains on `now - ts <= max_ref_age_ms`, so a ref
+    /// whose age equals its limit is kept, and one millisecond older goes. A `<=` to `<` flip
+    /// over-expires and must fail here.
     #[tokio::test]
     async fn test_ref_age_equal_to_max_ref_age_is_retained() {
         const X: i64 = 321;
@@ -1056,12 +1005,10 @@ mod tests {
         assert!(!error.retryable());
     }
 
-    /// Risk: the explicit seed set being filtered by retention. Java applies `idsToRemove`
-    /// unconditionally (only ref HEADS are guarded), so an explicitly-expired mid-chain ancestor
-    /// is removed even though age retention (cutoff 0) would keep everything — punching a hole in
-    /// main's ancestry. Applying the hole must then trigger the snapshot log's
-    /// clear-history-before-invalid-entry rule (Java `updateSnapshotLog`): everything at/before
-    /// the hole is cleared, only the still-contiguous tail survives.
+    /// Risk: retention filtering the explicit seed set. Java applies `idsToRemove` whatever
+    /// retention says, and guards only ref heads, so an explicit mid-chain expiry punches a hole
+    /// in main's ancestry. The apply must then clear the snapshot log at and before the hole, and
+    /// keep the contiguous tail. That is Java's `updateSnapshotLog` rule.
     #[tokio::test]
     async fn test_expire_snapshot_id_removes_ancestor_even_when_age_would_retain_it() {
         let table = chain_table();

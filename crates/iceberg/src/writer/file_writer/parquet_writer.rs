@@ -64,11 +64,9 @@ impl ParquetWriterBuilder {
     /// Create a new `ParquetWriterBuilder`
     /// To construct the write result, the schema should contain the `PARQUET_FIELD_ID_META_KEY` metadata for each field.
     ///
-    /// The column metrics use the default [`MetricsConfig`] (`truncate(16)`), matching Java
-    /// `MetricsConfig.getDefault()` — so string/binary lower/upper bounds are truncated to 16
-    /// code points / bytes. Use [`ParquetWriterBuilder::with_metrics_config`] to override
-    /// (e.g. [`MetricsConfig::for_position_delete`] for delete files, which keeps `file_path`
-    /// bounds full).
+    /// The column metrics use the default [`MetricsConfig`], `truncate(16)`, as Java does. String
+    /// and binary bounds are truncated. [`ParquetWriterBuilder::with_metrics_config`] overrides
+    /// it.
     pub fn new(props: WriterProperties, schema: SchemaRef) -> Self {
         Self::new_with_match_mode(props, schema, FieldMatchMode::Id)
     }
@@ -87,11 +85,9 @@ impl ParquetWriterBuilder {
         }
     }
 
-    /// Set the [`MetricsConfig`] governing which column statistics (counts, truncated/full bounds)
-    /// are persisted in the resulting data file, overriding the default `truncate(16)`.
-    ///
-    /// Chains onto either constructor, e.g. for a position-delete writer that must keep `file_path`
-    /// bounds full: `ParquetWriterBuilder::new(props, schema).with_metrics_config(MetricsConfig::for_position_delete())`.
+    /// Set the [`MetricsConfig`] that decides which column statistics the data file keeps. It
+    /// overrides the default `truncate(16)`. A position-delete writer needs
+    /// [`MetricsConfig::for_position_delete`], which keeps `file_path` bounds full.
     pub fn with_metrics_config(mut self, metrics_config: MetricsConfig) -> Self {
         self.metrics_config = metrics_config;
         self
@@ -125,7 +121,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     }
 }
 
-/// Refuse writing a schema that contains a `variant` at any depth (row R88).
+/// Refuse writing a schema that contains a `variant` at any depth.
 ///
 /// # Errors
 ///
@@ -438,12 +434,11 @@ impl ParquetWriter {
         Ok(data_files)
     }
 
-    /// `ParquetMetadata` to data file builder
+    /// Build a data file from `ParquetMetadata`.
     ///
-    /// `metrics_config` governs, per column, which statistics are persisted (Java
-    /// `ParquetMetrics`): [`MetricsMode::None`] columns are skipped entirely (no sizes, counts, or
-    /// bounds), [`MetricsMode::Counts`] keeps counts but drops bounds, and `Truncate`/`Full` keep
-    /// counts plus (truncated/full) bounds.
+    /// `metrics_config` decides per column which statistics persist. [`MetricsMode::None`] skips
+    /// the column. [`MetricsMode::Counts`] keeps counts and drops bounds. `Truncate` and `Full`
+    /// keep counts and bounds.
     pub(crate) fn parquet_to_data_file_builder(
         schema: SchemaRef,
         metadata: Arc<ParquetMetaData>,
@@ -597,12 +592,9 @@ impl FileWriter for ParquetWriter {
                 .compute(self.schema.clone(), batch)?;
         }
 
-        // Normalize UTC-alias timestamp timezones to the writer schema (metadata-only). The
-        // writer schema tags Iceberg `timestamptz` `Timestamp(_, "UTC")` (UTC_TIME_ZONE);
-        // historical `"+00:00"` batches (and any remaining Spark alias spelling) still need
-        // a metadata-only relabel because the Parquet writer's schema check is timezone-
-        // sensitive. The relabel reuses the values buffer (bit-identical instants);
-        // genuinely different timezones and nested mismatches are left to fail loudly below.
+        // Relabel a UTC-alias timezone to the writer schema. The Parquet schema check is
+        // timezone-sensitive, so a historical `"+00:00"` batch needs it. The relabel reuses the
+        // values buffer. A genuine timezone difference still fails loudly below.
         let normalized = normalize_utc_alias_timestamps(batch, &self.writer_arrow_schema)?;
         let batch = normalized.as_ref().unwrap_or(batch);
 
@@ -673,21 +665,18 @@ impl FileWriter for ParquetWriter {
 }
 
 // ==============================================================================================
-// UTC-alias timestamp normalization at the write funnel (F-A2-3)
+// UTC-alias timestamp normalization at the write funnel
 //
-// Iceberg→Arrow now canonicalizes `timestamptz` to `Timestamp(_, "UTC")` (UTC_TIME_ZONE),
-// matching Spark `toArrow`. Arrow→Iceberg still accepts both `"UTC"` and the historical
-// `"+00:00"` alias. A batch tagged with the *other* UTC alias is therefore a schema-check
-// mismatch even though both denote UTC and carry identical instants. Java Iceberg coerces
-// write batches to the file schema; this normalizes the (closed) UTC-alias case metadata-only
-// at the single write funnel, leaving every genuine mismatch to fail loud.
+// Iceberg-to-Arrow canonicalizes `timestamptz` to `Timestamp(_, "UTC")`. Arrow-to-Iceberg still
+// accepts the historical `"+00:00"` alias. A batch tagged with the other alias fails the schema
+// check although both denote UTC and hold identical instants. Java coerces write batches to the
+// file schema. This normalizes that closed alias case here, and lets every other mismatch fail.
 // ==============================================================================================
 
 /// Relabel a timestamp array's timezone metadata to `tz`, reusing the values buffer.
 ///
-/// `PrimitiveArray::with_timezone` rewrites only the `DataType` (`with_timezone_opt` rebuilds the
-/// array `..self`, keeping the same values buffer), so the microsecond / nanosecond integers are
-/// bit-identical. The caller guarantees the source and target units match, so no precision changes.
+/// `PrimitiveArray::with_timezone` rewrites the `DataType` and keeps the values buffer, so the
+/// integers stay bit-identical. The caller guarantees the units match, so precision cannot change.
 fn relabel_timestamp_timezone(col: &ArrayRef, unit: TimeUnit, tz: &str) -> Result<ArrayRef> {
     fn downcast<T: 'static>(col: &ArrayRef) -> Result<&T> {
         col.as_any().downcast_ref::<T>().ok_or_else(|| {
@@ -721,10 +710,9 @@ fn relabel_timestamp_timezone(col: &ArrayRef, unit: TimeUnit, tz: &str) -> Resul
     })
 }
 
-/// If `batch_dt` and `writer_dt` are both `Timestamp` of the SAME unit but differ by a UTC-alias
-/// timezone string, return `col` relabeled to the writer's timezone (metadata-only). Otherwise
-/// `None` — the column is passed through unchanged so any genuine mismatch (different timezone,
-/// naive-vs-tz, nested timestamp, differing type) is rejected loudly by the Parquet writer.
+/// Relabel `col` to the writer's timezone when `batch_dt` and `writer_dt` are timestamps of the
+/// same unit that differ by a UTC alias alone. Otherwise return `None`, so the Parquet writer
+/// rejects the genuine mismatch loudly.
 fn utc_alias_relabel(
     col: &ArrayRef,
     batch_dt: &DataType,
@@ -748,16 +736,15 @@ fn utc_alias_relabel(
     Ok(None)
 }
 
-/// Normalize a record batch whose schema differs from `writer_schema` ONLY by UTC-alias timezone
-/// strings on TOP-LEVEL timestamp columns, via a metadata-only timezone relabel to the writer's
-/// timezone. Returns `Some(batch)` when at least one column was relabeled, else `None` (the caller
-/// writes the original batch unchanged — the common, zero-copy path taken by already-canonical
-/// `"UTC"` batches, naive timestamps, and non-timestamp schemas).
+/// Relabel the timezone of a top-level timestamp column that differs from `writer_schema` by a
+/// UTC alias alone. Returns `Some(batch)` when a column is relabeled, else `None`, and the caller
+/// then writes the original batch.
 ///
-/// TOP-LEVEL only, by design: the Parquet writer applies its strict `types_compatible` check
-/// positionally per (writer field, column) pair and recurses into nested types itself, so a
-/// nested UTC-alias timestamp inside a struct/list is left unchanged here and still fails loud
-/// (no silent partial normalization). Widening this to nested is a deliberate fork follow-up.
+/// # Notes
+///
+/// Top-level only, by design. The Parquet writer checks each (writer field, column) pair
+/// positionally and recurses itself, so a nested UTC-alias timestamp still fails loudly here.
+/// That avoids a silent partial normalization.
 fn normalize_utc_alias_timestamps(
     batch: &RecordBatch,
     writer_schema: &ArrowSchema,
@@ -836,11 +823,7 @@ impl CurrentFileStatus for ParquetWriter {
     }
 }
 
-/// AsyncFileWriter is a wrapper of FileWrite to make it compatible with tokio::io::AsyncWrite.
-///
-/// # NOTES
-///
-/// We keep this wrapper been used inside only.
+/// Adapts a [`FileWrite`] to `tokio::io::AsyncWrite`. Crate-internal only.
 struct AsyncFileWriter(Box<dyn FileWrite>);
 
 impl AsyncFileWriter {
@@ -2173,74 +2156,8 @@ mod tests {
             Some(Datum::decimal(decimal_min).unwrap()).as_ref()
         );
 
-        // test max and min for scale 38
-        // # TODO
-        // Readd this case after resolve https://github.com/apache/iceberg-rust/issues/669
-        // let schema = Arc::new(
-        //     Schema::builder()
-        //         .with_fields(vec![NestedField::optional(
-        //             0,
-        //             "decimal",
-        //             Type::Primitive(PrimitiveType::Decimal {
-        //                 precision: 38,
-        //                 scale: 0,
-        //             }),
-        //         )
-        //         .into()])
-        //         .build()
-        //         .unwrap(),
-        // );
-        // let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
-        // let mut pw = ParquetWriterBuilder::new(
-        //     WriterProperties::builder().build(),
-        //     schema,
-        //     file_io.clone(),
-        //     loccation_gen,
-        //     file_name_gen,
-        // )
-        // .build()
-        // .await?;
-        // let col0 = Arc::new(
-        //     Decimal128Array::from(vec![
-        //         Some(99999999999999999999999999999999999999_i128),
-        //         Some(-99999999999999999999999999999999999999_i128),
-        //     ])
-        //     .with_data_type(DataType::Decimal128(38, 0)),
-        // ) as ArrayRef;
-        // let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![col0]).unwrap();
-        // pw.write(&to_write).await?;
-        // let res = pw.close().await?;
-        // assert_eq!(res.len(), 1);
-        // let data_file = res
-        //     .into_iter()
-        //     .next()
-        //     .unwrap()
-        //     .content(crate::spec::DataContentType::Data)
-        //     .partition(Struct::empty())
-        //     .build()
-        //     .unwrap();
-        // assert_eq!(
-        //     data_file.upper_bounds().get(&0),
-        //     Some(Datum::new(
-        //         PrimitiveType::Decimal {
-        //             precision: 38,
-        //             scale: 0
-        //         },
-        //         PrimitiveLiteral::Int128(99999999999999999999999999999999999999_i128)
-        //     ))
-        //     .as_ref()
-        // );
-        // assert_eq!(
-        //     data_file.lower_bounds().get(&0),
-        //     Some(Datum::new(
-        //         PrimitiveType::Decimal {
-        //             precision: 38,
-        //             scale: 0
-        //         },
-        //         PrimitiveLiteral::Int128(-99999999999999999999999999999999999999_i128)
-        //     ))
-        //     .as_ref()
-        // );
+        // TODO: min/max for scale 38, blocked on
+        // https://github.com/apache/iceberg-rust/issues/669
 
         Ok(())
     }
@@ -3065,12 +2982,11 @@ mod tests {
     }
 
     // ==========================================================================================
-    // F-A2-3: timestamptz UTC-alias normalization at the parquet writer.
+    // timestamptz UTC-alias normalization at the parquet writer
     //
-    // Iceberg→Arrow now emits `Timestamp(_, "UTC")` (UTC_TIME_ZONE). Historical `"+00:00"`
-    // batches (and any remaining Spark alias spelling) still differ from the writer schema
-    // string-wise; the Parquet `ArrowWriter`'s `types_compatible` check is timezone-sensitive.
-    // The write funnel `ParquetWriter::write` normalizes UTC-alias mismatches metadata-only.
+    // Iceberg-to-Arrow emits `Timestamp(_, "UTC")`. A historical `"+00:00"` batch differs from
+    // the writer schema by that string, and the `ArrowWriter` check is timezone-sensitive.
+    // `ParquetWriter::write` relabels the alias and touches no values.
     // ==========================================================================================
 
     /// Read the single parquet data file back into one concatenated `RecordBatch`.
@@ -3132,10 +3048,9 @@ mod tests {
             .unwrap()
     }
 
-    /// Entry pin (F-A2-3): a `Timestamp(µs, "UTC")` batch written against a
-    /// `timestamptz`-derived (`"UTC"`) writer schema is already canonical (zero-copy)
-    /// and round-trips with BIT-IDENTICAL microsecond integers (compared as `i64`,
-    /// value AND null mask — never display).
+    /// Entry pin: a canonical `Timestamp(us, "UTC")` batch round-trips with bit-identical
+    /// microsecond integers. The test compares the `i64` values and the null mask, never the
+    /// display form.
     #[tokio::test]
     async fn test_write_utc_alias_timestamptz_normalizes_bit_identical() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();

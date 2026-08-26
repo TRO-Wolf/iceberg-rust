@@ -35,16 +35,10 @@ pub(crate) const FIRST_FIELD_ID: i32 = 1;
 
 /// Manipulating table metadata.
 ///
-/// For this builder the order of called functions matters. Functions are applied in-order.
-/// All operations applied to the `TableMetadata` are tracked in `changes` as  a chronologically
-/// ordered vec of `TableUpdate`.
-/// If an operation does not lead to a change of the `TableMetadata`, the corresponding update
-/// is omitted from `changes`.
-///
-/// Unlike a typical builder pattern, the order of function calls matters.
-/// Some basic rules:
-/// - `add_schema` must be called before `set_current_schema`.
-/// - If a new partition spec and schema are added, the schema should be added first.
+/// Unlike a typical builder, the call order matters. The builder applies each function in order
+/// and appends the resulting `TableUpdate` to `changes`. A call that changes nothing appends
+/// nothing. Call `add_schema` before `set_current_schema`. Add a schema before a spec that
+/// binds to it.
 #[derive(Debug, Clone)]
 pub struct TableMetadataBuilder {
     metadata: TableMetadata,
@@ -52,7 +46,6 @@ pub struct TableMetadataBuilder {
     last_added_schema_id: Option<i32>,
     last_added_spec_id: Option<i32>,
     last_added_order_id: Option<i64>,
-    // None if this is a new table (from_metadata) method not used
     previous_history_entry: Option<MetadataLog>,
     last_updated_ms: Option<i64>,
 }
@@ -74,8 +67,8 @@ impl TableMetadataBuilder {
 
     /// Create a `TableMetadata` object from scratch.
     ///
-    /// This method re-assign ids of fields in the schema, schema.id, sort_order.id and
-    /// spec.id. It should only be used to create new table metadata from scratch.
+    /// This re-assigns the schema field ids, `schema.id`, `sort_order.id` and `spec.id`. Use it
+    /// only for a brand-new table.
     pub fn new(
         schema: Schema,
         spec: impl Into<UnboundPartitionSpec>,
@@ -84,7 +77,6 @@ impl TableMetadataBuilder {
         format_version: FormatVersion,
         properties: HashMap<String, String>,
     ) -> Result<Self> {
-        // Re-assign field_ids, schema.id, sort_order.id and spec.id for a new table.
         let (fresh_schema, fresh_spec, fresh_sort_order) =
             Self::reassign_ids(schema, spec.into(), sort_order)?;
         let schema_id = fresh_schema.schema_id();
@@ -101,11 +93,9 @@ impl TableMetadataBuilder {
                 schemas: HashMap::new(),
                 partition_specs: HashMap::new(),
                 default_spec: Arc::new(
-                    // The spec id (-1) is just a proxy value and can be any negative number.
-                    // 0 would lead to wrong changes in the builder if the provided spec by the user is
-                    // also unpartitioned.
-                    // The `default_spec` value is always replaced at the end of this method by he `add_default_partition_spec`
-                    // method.
+                    // -1 is a proxy id. It must stay negative: 0 would collide with a
+                    // user-supplied unpartitioned spec and record a wrong change.
+                    // `add_default_partition_spec` replaces this value below.
                     PartitionSpec::unpartition_spec().with_spec_id(-1),
                 ), // Overwritten immediately by add_default_partition_spec
                 default_partition_type: StructType::new(vec![]),
@@ -139,11 +129,10 @@ impl TableMetadataBuilder {
             .set_properties(properties)
     }
 
-    /// Creates a new table metadata builder from the given metadata to modify it.
-    /// `current_file_location` is the location where the current version
-    /// of the metadata file is stored. This is used to update the metadata log.
-    /// If `current_file_location` is `None`, the metadata log will not be updated.
-    /// This should only be used to stage-create tables.
+    /// Creates a builder from existing metadata.
+    ///
+    /// `current_file_location` is where the current metadata file lives. The builder appends it
+    /// to the metadata log. `None` skips the log update, which suits stage-create only.
     #[must_use]
     pub fn new_from_metadata(
         previous: TableMetadata,
@@ -206,10 +195,7 @@ impl TableMetadataBuilder {
         self
     }
 
-    /// Upgrade `FormatVersion`. Downgrades are not allowed.
-    ///
-    /// # Errors
-    /// - Cannot downgrade to older format versions.
+    /// Upgrade `FormatVersion`. A downgrade fails.
     pub fn upgrade_format_version(mut self, format_version: FormatVersion) -> Result<Self> {
         if format_version < self.metadata.format_version {
             return Err(Error::new(
@@ -223,9 +209,7 @@ impl TableMetadataBuilder {
 
         if format_version != self.metadata.format_version {
             match format_version {
-                FormatVersion::V1 => {
-                    // No changes needed for V1
-                }
+                FormatVersion::V1 => {}
                 FormatVersion::V2 => {
                     self.metadata.format_version = format_version;
                     self.changes
@@ -244,16 +228,14 @@ impl TableMetadataBuilder {
         Ok(self)
     }
 
-    /// Set properties. If a property already exists, it will be overwritten.
+    /// Set properties. An existing key is overwritten.
     ///
-    /// If a reserved property is set, the corresponding action is performed and the property is not persisted.
-    /// Currently the following reserved properties are supported:
-    /// * format-version: Set the format version of the table.
+    /// A reserved property performs its action and is not persisted. `format-version` is the
+    /// only reserved property today.
     ///
     /// # Errors
     /// - If properties contains a reserved property
     pub fn set_properties(mut self, properties: HashMap<String, String>) -> Result<Self> {
-        // List of specified properties that are RESERVED and should not be persisted.
         let reserved_properties = properties
             .keys()
             .filter(|key| TableProperties::RESERVED_PROPERTIES.contains(&key.as_str()))
@@ -282,16 +264,13 @@ impl TableMetadataBuilder {
         Ok(self)
     }
 
-    /// Remove properties from the table metadata.
-    /// Does nothing if the key is not present.
+    /// Remove properties from the table metadata. An absent key is ignored.
     ///
     /// # Errors
     /// - If properties to remove contains a reserved property
     pub fn remove_properties(mut self, properties: &[String]) -> Result<Self> {
-        // remove duplicates
         let properties = properties.iter().cloned().collect::<HashSet<_>>();
 
-        // disallow removal of reserved properties
         let reserved_properties = properties
             .iter()
             .filter(|key| TableProperties::RESERVED_PROPERTIES.contains(&key.as_str()))
@@ -369,8 +348,8 @@ impl TableMetadataBuilder {
         }
 
         if let Some(last) = self.metadata.snapshot_log.last() {
-            // commits can happen concurrently from different machines.
-            // A tolerance helps us avoid failure for small clock skew
+            // Concurrent commits come from different machines. The tolerance absorbs small
+            // clock skew.
             if snapshot.timestamp_ms() - last.timestamp_ms < -ONE_MINUTE_MS {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -449,11 +428,8 @@ impl TableMetadataBuilder {
         Ok(self)
     }
 
-    /// Append a snapshot to the specified branch.
-    /// Retention settings from the `branch` are re-used.
-    ///
-    /// # Errors
-    /// - Any of the preconditions of `self.add_snapshot` are not met.
+    /// Append a snapshot to the branch, re-using its retention settings. Fails on any
+    /// [`Self::add_snapshot`] precondition.
     pub fn set_branch_snapshot(self, snapshot: Snapshot, branch: &str) -> Result<Self> {
         let reference = self.metadata.refs.get(branch).cloned();
 
@@ -481,19 +457,12 @@ impl TableMetadataBuilder {
         self.add_snapshot(snapshot)?.set_ref(branch, reference)
     }
 
-    /// Remove snapshots by its ids from the table metadata.
-    /// Does nothing if a snapshot id is not present.
-    /// Keeps as changes only the snapshots that were actually removed.
+    /// Remove snapshots by id. An absent id is ignored. Only real removals record a change.
     ///
-    /// Mirrors Java `TableMetadata.Builder.removeSnapshots` (1.10.0
-    /// `rewriteSnapshotsInternal`, bytecode-verified): each removed snapshot also drops its
-    /// statistics and partition-statistics entries (via [`Self::remove_statistics`] /
-    /// [`Self::remove_partition_statistics`], which record their own changes), and any ref left
-    /// pointing at a removed snapshot is removed through [`Self::remove_ref`] — recording a
-    /// `RemoveSnapshotRef` change and, for `main`, clearing `current_snapshot_id` so the
-    /// snapshot-log consistency check in [`Self::build`] is skipped exactly as in Java (where
-    /// `removeRef(MAIN_BRANCH)` sets `currentSnapshotId = -1`). The snapshot log itself is pruned
-    /// at build time by `update_snapshot_log`.
+    /// Mirrors Java `TableMetadata.Builder.removeSnapshots`. Each removed snapshot also drops
+    /// its statistics and partition-statistics entries. A ref left dangling goes through
+    /// [`Self::remove_ref`], which clears `current_snapshot_id` for `main`. That skips the
+    /// snapshot-log check in [`Self::build`], as Java does. `update_snapshot_log` prunes the log.
     pub fn remove_snapshots(mut self, snapshot_ids: &[i64]) -> Self {
         let mut removed_snapshots = Vec::with_capacity(snapshot_ids.len());
 
@@ -512,15 +481,15 @@ impl TableMetadataBuilder {
             });
         }
 
-        // A removed snapshot's statistics files are no longer addressable: drop their metadata
-        // entries (Java records a RemoveStatistics / RemovePartitionStatistics change per hit).
+        // A removed snapshot's statistics files are no longer addressable, so drop their
+        // metadata entries. Java records one change per hit.
         for snapshot_id in &removed_snapshots {
             self = self.remove_statistics(*snapshot_id);
             self = self.remove_partition_statistics(*snapshot_id);
         }
 
-        // Remove refs that are no longer valid, through remove_ref so the change is recorded and
-        // a dangling `main` clears `current_snapshot_id` (Java: `danglingRefs.forEach(this::removeRef)`).
+        // Go through remove_ref so the change is recorded and a dangling `main` clears
+        // `current_snapshot_id`.
         let dangling_refs: Vec<String> = self
             .metadata
             .refs
@@ -535,10 +504,7 @@ impl TableMetadataBuilder {
         self
     }
 
-    /// Set a reference to a snapshot.
-    ///
-    /// # Errors
-    /// - The snapshot id is unknown.
+    /// Set a reference to a snapshot. Fails if the snapshot id is unknown.
     pub fn set_ref(mut self, ref_name: &str, reference: SnapshotReference) -> Result<Self> {
         if self
             .metadata
@@ -559,7 +525,7 @@ impl TableMetadataBuilder {
             ));
         };
 
-        // Update last_updated_ms to the exact timestamp of the snapshot if it was added in this commit
+        // A snapshot added in this commit sets last_updated_ms to its own timestamp.
         let is_added_snapshot = self.changes.iter().any(|update| {
             matches!(update, TableUpdate::AddSnapshot { snapshot: snap } if snap.snapshot_id() == snapshot.snapshot_id())
         });
@@ -593,9 +559,7 @@ impl TableMetadataBuilder {
         Ok(self)
     }
 
-    /// Remove a reference
-    ///
-    /// If `ref_name='main'` the current snapshot id is set to -1.
+    /// Remove a reference. Removing `main` sets the current snapshot id to -1.
     pub fn remove_ref(mut self, ref_name: &str) -> Self {
         if ref_name == MAIN_BRANCH {
             self.metadata.current_snapshot_id = None;
@@ -656,21 +620,16 @@ impl TableMetadataBuilder {
         self
     }
 
-    /// Add a schema to the table metadata.
+    /// Add a schema to the table metadata. The builder may ignore `schema.schema_id`.
     ///
-    /// The provided `schema.schema_id` may not be used.
-    ///
-    /// Important: Use this method with caution. The builder does not check
-    /// if the added schema is compatible with the current schema.
+    /// The builder does not check that the new schema is compatible with the current one.
     pub fn add_schema(mut self, schema: Schema) -> Result<Self> {
-        // Validate that new schema fields don't conflict with existing partition field names
         self.validate_schema_field_names(&schema)?;
 
-        // Reject schema features not yet allowed at this table's format version: a non-null column
-        // initial default requires v3+, and a V3-only field type (`timestamp_ns` / `timestamptz_ns`)
-        // requires v3+. Mirrors Java `TableMetadata$Builder.addSchemaInternal`'s
-        // `Schema.checkCompatibility(schema, formatVersion)` call — placed here so every add-schema
-        // path (UpdateSchema commits, CTAS, catalog commits) is covered by the single choke point.
+        // Reject schema features above this table's format version. A non-null initial default
+        // and the V3-only field types both need v3. Mirrors Java
+        // `Schema.checkCompatibility`. This is the single choke point every add-schema path
+        // reaches, so the guard belongs here.
         schema.check_compatibility(self.metadata.format_version)?;
 
         let new_schema_id = self.reuse_or_create_new_schema_id(&schema);
@@ -687,12 +646,10 @@ impl TableMetadataBuilder {
             return Ok(self);
         }
 
-        // New schemas might contain only old columns. In this case last_column_id should not be
-        // reduced.
+        // A new schema can hold only old columns. last_column_id must not go down.
         self.metadata.last_column_id =
             std::cmp::max(self.metadata.last_column_id, schema.highest_field_id());
 
-        // Set schema-id
         let schema = match new_schema_id == schema.schema_id() {
             true => schema,
             false => schema.with_schema_id(new_schema_id),
@@ -738,10 +695,9 @@ impl TableMetadataBuilder {
             )
         })?;
 
-        // Old partition specs and sort-orders should be preserved even if they are not compatible with the new schema,
-        // so that older metadata can still be interpreted.
-        // Default partition spec and sort order are checked in the build() method
-        // which allows other default partition specs and sort orders to be set before the build.
+        // Keep old partition specs and sort orders even when the new schema breaks them. Older
+        // metadata must stay readable. `build()` checks only the default spec and sort order, so
+        // a caller can still replace those before the build.
 
         self.metadata.current_schema_id = schema_id;
 
@@ -763,14 +719,10 @@ impl TableMetadataBuilder {
             .set_current_schema(Self::LAST_ADDED)
     }
 
-    /// Validate schema field names against partition field names across all historical schemas.
+    /// Validate schema field names against partition field names, over all historical schemas.
     ///
-    /// Due to Iceberg's multi-version property, this check ignores existing schema fields
-    /// that match partition names (schema evolution allows re-adding previously removed fields).
-    /// Only NEW field names that conflict with partition names are rejected.
-    ///
-    /// # Errors
-    /// - Schema field name conflicts with partition field name but doesn't exist in any historical schema.
+    /// A name already present in some historical schema is allowed, because evolution can
+    /// re-add a removed field. Only a NEW name that collides with a partition name is rejected.
     fn validate_schema_field_names(&self, schema: &Schema) -> Result<()> {
         if self.metadata.schemas.is_empty() {
             return Ok(());
@@ -794,21 +746,12 @@ impl TableMetadataBuilder {
         Ok(())
     }
 
-    /// Validate partition field names against schema field names across all historical schemas.
+    /// Validate partition field names against schema field names, over all historical schemas.
     ///
-    /// Due to Iceberg's multi-version property, a partition field may share a name with a schema field
-    /// only when it is an `identity` OR `void` transform sourced FROM that same schema field (the
-    /// colliding schema field's id equals the partition field's source id). The `void` case is the V1
-    /// removed-field replacement (`void(name)` re-added under the same name, sourced from its own
-    /// column); it mirrors Java's bind-path `PartitionSpec.Builder.checkAndAddPartitionName(name,
-    /// sourceId)`, which permits a non-identity transform as long as the name↔source-id correspondence
-    /// holds. The earlier identity-only rule wrongly rejected this V1 replacement — surfaced by the
-    /// UpdatePartitionSpec interop suite. This validation runs across all historical schema versions and
-    /// stays in lockstep with `PartitionSpecBuilder::check_name_does_not_collide_with_schema`.
-    ///
-    /// # Errors
-    /// - Partition field name conflicts with a schema field and is not an identity / void transform.
-    /// - Partition field is identity / void but references a DIFFERENT source field id than the collision.
+    /// A partition field may share a name with a schema field only when its transform is
+    /// `identity` or `void` AND its source id equals that schema field's id. `void` covers the V1
+    /// removed-field replacement. Mirrors Java `PartitionSpec.Builder.checkAndAddPartitionName`.
+    /// Keep this in lockstep with `PartitionSpecBuilder::check_name_does_not_collide_with_schema`.
     fn validate_partition_field_names(&self, unbound_spec: &UnboundPartitionSpec) -> Result<()> {
         if self.metadata.schemas.is_empty() {
             return Ok(());
@@ -820,12 +763,10 @@ impl TableMetadataBuilder {
                 .metadata
                 .name_exists_in_any_schema(&partition_field.name);
 
-            // Skip if partition field name doesn't conflict with any schema field
             if !exists_in_any_schema {
                 continue;
             }
 
-            // If name exists in schemas, validate against current schema rules
             if let Some(schema_field) = current_schema.field_by_name(&partition_field.name) {
                 let transform = partition_field.transform;
                 let is_identity_or_void = transform == crate::spec::Transform::Identity
@@ -858,12 +799,8 @@ impl TableMetadataBuilder {
         Ok(())
     }
 
-    /// Add a partition spec to the table metadata.
-    ///
-    /// The spec is bound eagerly to the current schema.
-    /// If a schema is added in the same set of changes, the schema should be added first.
-    ///
-    /// Even if `unbound_spec.spec_id` is provided as `Some`, it may not be used.
+    /// Add a partition spec, bound eagerly to the current schema. Add the schema first when the
+    /// same set of changes adds one. The builder may ignore `unbound_spec.spec_id`.
     ///
     /// # Errors
     /// - The partition spec cannot be bound to the current schema.
@@ -871,10 +808,8 @@ impl TableMetadataBuilder {
     pub fn add_partition_spec(mut self, unbound_spec: UnboundPartitionSpec) -> Result<Self> {
         let schema = self.get_current_schema()?.clone();
 
-        // Check if partition field names conflict with schema field names across all schemas
         self.validate_partition_field_names(&unbound_spec)?;
 
-        // Reuse field IDs for equivalent fields from existing partition specs
         let unbound_spec = self.reuse_partition_field_ids(unbound_spec)?;
 
         let spec = PartitionSpecBuilder::new_from_unbound(unbound_spec.clone(), schema)?
@@ -919,15 +854,14 @@ impl TableMetadataBuilder {
         Ok(self)
     }
 
-    /// Reuse partition field IDs for equivalent fields from existing partition specs.
+    /// Reuse partition field ids from existing specs.
     ///
-    /// According to the Iceberg spec, partition field IDs must be reused if an existing
-    /// partition spec contains an equivalent field (same source_id and transform).
+    /// The spec requires reuse when an existing spec holds a field with the same source id and
+    /// transform.
     fn reuse_partition_field_ids(
         &self,
         unbound_spec: UnboundPartitionSpec,
     ) -> Result<UnboundPartitionSpec> {
-        // Build a map of (source_id, transform) -> field_id from existing specs
         let equivalent_field_ids: HashMap<_, _> = self
             .metadata
             .partition_specs
@@ -936,7 +870,6 @@ impl TableMetadataBuilder {
             .map(|field| ((field.source_id, &field.transform), field.field_id))
             .collect();
 
-        // Create new fields with reused field IDs where possible
         let fields = unbound_spec
             .fields
             .into_iter()
@@ -1018,12 +951,7 @@ impl TableMetadataBuilder {
             .set_default_partition_spec(Self::LAST_ADDED)
     }
 
-    /// Remove partition specs by their ids from the table metadata.
-    /// Does nothing if a spec id is not present. Active partition specs
-    /// should not be removed.
-    ///
-    /// # Errors
-    /// - Cannot remove the default partition spec.
+    /// Remove partition specs by id. An absent id is ignored. Removing the default spec fails.
     pub fn remove_partition_specs(mut self, spec_ids: &[i32]) -> Result<Self> {
         if spec_ids.contains(&self.metadata.default_spec.spec_id()) {
             return Err(Error::new(
@@ -1048,12 +976,8 @@ impl TableMetadataBuilder {
         Ok(self)
     }
 
-    /// Add a sort order to the table metadata.
-    ///
-    /// The spec is bound eagerly to the current schema and must be valid for it.
-    /// If a schema is added in the same set of changes, the schema should be added first.
-    ///
-    /// Even if `sort_order.order_id` is provided, it may not be used.
+    /// Add a sort order, bound eagerly to the current schema. Add the schema first when the same
+    /// set of changes adds one. The builder may ignore `sort_order.order_id`.
     ///
     /// # Errors
     /// - Sort order id to add already exists.
@@ -1147,7 +1071,6 @@ impl TableMetadataBuilder {
     pub fn add_encryption_key(mut self, key: EncryptedKey) -> Self {
         let key_id = key.key_id().to_string();
         if self.metadata.encryption_keys.contains_key(&key_id) {
-            // already exists
             return self;
         }
 
@@ -1174,9 +1097,8 @@ impl TableMetadataBuilder {
             .last_updated_ms
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
-        // Check compatibility of the current schema to the default partition spec and sort order.
-        // We use the `get_xxx` methods from the builder to avoid using the panicking
-        // `TableMetadata.default_partition_spec` etc. methods.
+        // Check the current schema against the default partition spec and sort order. Use the
+        // builder `get_*` methods: the `TableMetadata` accessors panic.
         let schema = self.get_current_schema()?.clone();
         let sort_order = Arc::unwrap_or_clone(self.get_default_sort_order()?);
 
@@ -1244,11 +1166,9 @@ impl TableMetadataBuilder {
                     new_snapshot_log.push(log_entry.clone());
                 }
             } else if has_removed_snapshots {
-                // any invalid entry causes the history before it to be removed. otherwise, there could be
-                // history gaps that cause time-travel queries to produce incorrect results. for example,
-                // if history is [(t1, s1), (t2, s2), (t3, s3)] and s2 is removed, the history cannot be
-                // [(t1, s1), (t3, s3)] because it appears that s3 was current during the time between t2
-                // and t3 when in fact s2 was the current snapshot.
+                // An invalid entry drops all history before it. A gap would make time travel
+                // return wrong results: dropping s2 from [(t1,s1),(t2,s2),(t3,s3)] makes s3 look
+                // current between t2 and t3.
                 new_snapshot_log.clear();
             }
         }
@@ -1267,15 +1187,11 @@ impl TableMetadataBuilder {
         Ok(())
     }
 
-    /// Finds intermediate snapshots that have not been committed as the current snapshot.
+    /// Finds intermediate snapshots, which were added but never became the current snapshot.
     ///
-    /// Transactions can create snapshots that are never the current snapshot because several
-    /// changes are combined by the transaction into one table metadata update. when each
-    /// intermediate snapshot is added to table metadata, it is added to the snapshot log, assuming
-    /// that it will be the current snapshot. when there are multiple snapshot updates, the log must
-    /// be corrected by suppressing the intermediate snapshot entries.
-    ///     
-    /// A snapshot is an intermediate snapshot if it was added but is not the current snapshot.
+    /// A transaction combines several changes into one metadata update. Each added snapshot
+    /// enters the snapshot log as if it will be current. The log must then suppress the
+    /// intermediate entries.
     fn get_intermediate_snapshots(&self) -> HashSet<i64> {
         let added_snapshot_ids = self
             .changes
@@ -1316,7 +1232,6 @@ impl TableMetadataBuilder {
         spec: UnboundPartitionSpec,
         sort_order: SortOrder,
     ) -> Result<(Schema, PartitionSpec, SortOrder)> {
-        // Re-assign field ids and schema ids for a new table.
         let previous_id_to_name = schema.field_id_to_name_map().clone();
         let fresh_schema = schema
             .into_builder()
@@ -1324,7 +1239,6 @@ impl TableMetadataBuilder {
             .with_reassigned_field_ids(FIRST_FIELD_ID)
             .build()?;
 
-        // Re-build partition spec with new ids
         let mut fresh_spec = PartitionSpecBuilder::new(fresh_schema.clone());
         for field in spec.fields() {
             let source_field_name = previous_id_to_name.get(&field.source_id).ok_or_else(|| {
@@ -1341,7 +1255,6 @@ impl TableMetadataBuilder {
         }
         let fresh_spec = fresh_spec.build()?;
 
-        // Re-build sort order with new ids
         let mut fresh_order = SortOrder::builder();
         for mut field in sort_order.fields {
             let source_field_name = previous_id_to_name.get(&field.source_id).ok_or_else(|| {
@@ -1459,8 +1372,7 @@ impl TableMetadataBuilder {
         self.metadata.sort_orders.keys().max().copied()
     }
 
-    /// Remove schemas by their ids from the table metadata.
-    /// Does nothing if a schema id is not present. Active schemas should not be removed.
+    /// Remove schemas by id. An absent id is ignored. Do not remove an active schema.
     pub fn remove_schemas(mut self, schema_id_to_remove: &[i32]) -> Result<Self> {
         if schema_id_to_remove.contains(&self.metadata.current_schema_id) {
             return Err(Error::new(
@@ -1597,10 +1509,8 @@ mod tests {
         assert_eq!(metadata.last_sequence_number, 0);
         assert_eq!(metadata.last_column_id, LAST_ASSIGNED_COLUMN_ID);
 
-        // Test can serialize v1
         let _ = serde_json::to_string(&metadata).unwrap();
 
-        // Test can serialize v2
         let metadata = metadata
             .into_builder(Some(
                 "s3://bucket/test/location/metadata/metadata1.json".to_string(),
@@ -1774,8 +1684,6 @@ mod tests {
             TableUpdate::AddSchema { schema: schema() },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
             TableUpdate::AddSpec {
-                // Because this is a new tables, field-ids are assigned
-                // partition_spec() has None set for field-id
                 spec: PartitionSpec::builder(schema())
                     .with_spec_id(0)
                     .add_unbound_field(UnboundPartitionField {
@@ -1828,8 +1736,6 @@ mod tests {
             },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
             TableUpdate::AddSpec {
-                // Because this is a new tables, field-ids are assigned
-                // partition_spec() has None set for field-id
                 spec: PartitionSpec::builder(schema)
                     .with_spec_id(0)
                     .build()
@@ -1852,14 +1758,12 @@ mod tests {
             .with_spec_id(10)
             .add_partition_fields(vec![
                 UnboundPartitionField {
-                    // The previous field - has field_id set
                     name: "y".to_string(),
                     transform: Transform::Identity,
                     source_id: 2,
                     field_id: Some(1000),
                 },
                 UnboundPartitionField {
-                    // A new field without field id - should still be without field id in changes
                     name: "z".to_string(),
                     transform: Transform::Identity,
                     source_id: 3,
@@ -1875,7 +1779,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // Spec id should be re-assigned
         let expected_change = added_spec.with_spec_id(1);
         let expected_spec = PartitionSpec::builder(schema())
             .with_spec_id(1)
@@ -1907,7 +1810,6 @@ mod tests {
             spec: expected_change
         });
 
-        // Remove the spec
         let build_result = build_result
             .metadata
             .into_builder(Some(
@@ -1957,7 +1859,6 @@ mod tests {
         assert_eq!(build_result.metadata.default_spec, Arc::new(expected_spec));
         assert_eq!(build_result.changes, vec![
             TableUpdate::AddSpec {
-                // Should contain the actual ID that was used
                 spec: added_spec.with_spec_id(1)
             },
             TableUpdate::SetDefaultSpec { spec_id: -1 }
@@ -1967,7 +1868,6 @@ mod tests {
     #[test]
     fn test_set_existing_default_partition_spec() {
         let builder = builder_without_changes(FormatVersion::V2);
-        // Add and set an unbound spec as current
         let unbound_spec = UnboundPartitionSpec::builder().with_spec_id(1).build();
         let build_result = builder
             .add_partition_spec(unbound_spec.clone())
@@ -1993,7 +1893,6 @@ mod tests {
             )
         );
 
-        // Set old spec again
         let build_result = build_result
             .metadata
             .into_builder(Some(
@@ -2135,7 +2034,6 @@ mod tests {
 
     #[test]
     fn test_no_metadata_log_entry_for_no_previous_location() {
-        // Used for first commit after stage-creation of tables
         let metadata = builder_without_changes(FormatVersion::V2)
             .build()
             .unwrap()
@@ -2357,12 +2255,10 @@ mod tests {
             .build()
             .unwrap();
 
-        // Verify snapshot log was created
         assert_eq!(result.metadata.snapshot_log.len(), 1);
         assert_eq!(result.metadata.snapshot_log[0].snapshot_id, 1);
         assert_eq!(result.metadata.current_snapshot_id, Some(1));
 
-        // Remove the main ref
         let result_after_remove = result
             .metadata
             .into_builder(Some(
@@ -2372,7 +2268,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // Verify snapshot log is kept even after removing main ref
         assert_eq!(result_after_remove.metadata.snapshot_log.len(), 1);
         assert_eq!(result_after_remove.metadata.snapshot_log[0].snapshot_id, 1);
         assert_eq!(result_after_remove.metadata.current_snapshot_id, None);
@@ -2385,8 +2280,7 @@ mod tests {
         );
     }
 
-    /// Shared fixture for the remove-snapshots completeness tests: snapshot 1 ← snapshot 2 on
-    /// `main`, built in two passes so the snapshot log carries both entries.
+    /// Fixture: snapshot 1 then snapshot 2 on `main`, built in two passes so the log holds both.
     fn metadata_with_two_snapshots() -> TableMetadata {
         let builder = builder_without_changes(FormatVersion::V2);
         let last_updated = builder.metadata.last_updated_ms;
@@ -2421,12 +2315,9 @@ mod tests {
             .metadata
     }
 
-    /// Risk pinned: stale statistics metadata surviving snapshot removal. Java 1.10.0
-    /// `rewriteSnapshotsInternal` (bytecode-verified) calls `removeStatistics` +
-    /// `removePartitionStatistics` for every removed snapshot id, recording both changes; without
-    /// it, expired snapshots leave dangling `statistics` / `partition-statistics` entries in the
-    /// metadata forever. A still-live snapshot's statistics must NOT be touched (the
-    /// over-pruning direction), and a live ref must not be swept.
+    /// Risk: statistics metadata that survives snapshot removal stays dangling forever. Java
+    /// drops the statistics and partition-statistics of every removed snapshot. This test also
+    /// pins the over-pruning direction: a live snapshot's statistics and a live ref must stay.
     #[test]
     fn test_remove_snapshots_prunes_statistics_of_removed_snapshots_only() {
         let statistics = |snapshot_id: i64| StatisticsFile {
@@ -2490,11 +2381,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned: removing the snapshot `main` points at leaving `current_snapshot_id` aimed at
-    /// a nonexistent snapshot — pre-fix the silent `refs.retain` sweep kept `current_snapshot_id`
-    /// and `build()` failed (`Cannot set invalid snapshot log`); Java removes the dangling ref via
-    /// `removeRef` (recording the change, resetting current to -1) and builds fine. Every catalog
-    /// path applying a `RemoveSnapshots` update runs through this.
+    /// Risk: removing the snapshot `main` points at leaves `current_snapshot_id` dangling and
+    /// `build()` fails with `Cannot set invalid snapshot log`. Java resets it to -1 through
+    /// `removeRef`. Every catalog path that applies `RemoveSnapshots` reaches this.
     #[test]
     fn test_remove_snapshots_dangling_main_resets_current_and_records_ref_removal() {
         let metadata = metadata_with_two_snapshots();
@@ -2781,7 +2670,6 @@ mod tests {
             statistics: statistics.clone()
         }]);
 
-        // Remove
         let builder = build_result.metadata.into_builder(None);
         let build_result = builder
             .remove_statistics(statistics.snapshot_id)
@@ -2793,7 +2681,6 @@ mod tests {
             snapshot_id: statistics.snapshot_id
         }]);
 
-        // Remove again yields no changes
         let builder = build_result.metadata.into_builder(None);
         let build_result = builder
             .remove_statistics(statistics.snapshot_id)
@@ -2827,7 +2714,6 @@ mod tests {
             }
         ]);
 
-        // Remove
         let builder = build_result.metadata.into_builder(None);
         let build_result = builder
             .remove_partition_statistics(statistics.snapshot_id)
@@ -2840,7 +2726,6 @@ mod tests {
             }
         ]);
 
-        // Remove again yields no changes
         let builder = build_result.metadata.into_builder(None);
         let build_result = builder
             .remove_partition_statistics(statistics.snapshot_id)
@@ -2880,7 +2765,6 @@ mod tests {
 
     #[test]
     fn test_construct_default_main_branch() {
-        // Load the table without ref
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
             env!("CARGO_MANIFEST_DIR"),
@@ -2932,7 +2816,6 @@ mod tests {
         assert_eq!(2, table.metadata().schemas.len());
 
         {
-            // can not remove active schema
             let meta_data_builder = table.metadata().clone().into_builder(None);
             meta_data_builder.remove_schemas(&[1]).unwrap_err();
         }
@@ -2993,7 +2876,6 @@ mod tests {
         let evolved_schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
-                // Adding a schema field with the same name as an existing partition field
                 NestedField::required(2, "bucket_data", Type::Primitive(PrimitiveType::Int)).into(),
             ])
             .build()
@@ -3003,7 +2885,6 @@ mod tests {
             "s3://bucket/test/location/metadata/metadata1.json".to_string(),
         ));
 
-        // Try to add the evolved schema - this should now fail immediately with a clear error
         let result = builder.add_current_schema(evolved_schema);
 
         assert!(result.is_err());
@@ -3049,7 +2930,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // This should succeed since there's no name conflict
         let result = metadata
             .clone()
             .into_builder(Some("test_location".to_string()))
@@ -3105,22 +2985,17 @@ mod tests {
         assert!(result.is_err());
         let error = result.unwrap_err();
         let error_message = error.message();
-        // The error comes from our multi-version validation: `bucket[8]` is neither identity nor void,
-        // and the name collides with a schema field, so it is rejected.
+        // `bucket[8]` is neither identity nor void and its name collides, so it is rejected.
         assert!(error_message.contains(
             "Cannot create partition with name 'existing_field' that conflicts with schema field"
         ));
         assert!(error_message.contains("and is not an identity transform"));
     }
 
-    // RISK (Java-parity, surfaced by the UpdatePartitionSpec interop suite): a `void` partition field
-    // named after its OWN source column must be ACCEPTED — Java's bind-path
-    // `checkAndAddPartitionName(name, sourceId)` permits a non-identity transform as long as the
-    // colliding schema field's id equals the partition source id. The canonical case is the V1 void
-    // replacement: removing identity(`existing_field`) re-adds `void(existing_field)` under the same name
-    // to keep the field id stable. The earlier identity-only guard wrongly rejected this. (Driven on V2
-    // so the orthogonal V1 sequential-field-id constraint does not mask the name-collision check; the V1
-    // end-to-end path is proven by the `remove_field_v1_void` interop scenario.)
+    // Risk: a `void` partition field named after its own source column must be ACCEPTED. Java
+    // `checkAndAddPartitionName` allows a non-identity transform when the colliding schema field
+    // id equals the partition source id. The V1 void replacement needs this. The test runs on V2
+    // so the V1 sequential-field-id rule cannot mask the name-collision check.
     #[test]
     fn test_partition_spec_evolution_allows_void_named_after_its_own_source_column() {
         let initial_schema = Schema::builder()
@@ -3132,7 +3007,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // Base partitioned by identity(existing_field) so the field exists to be void-replaced.
         let base_spec = UnboundPartitionSpec::builder()
             .with_spec_id(0)
             .add_partition_field(2, "existing_field", Transform::Identity)
@@ -3155,8 +3029,7 @@ mod tests {
             "s3://bucket/test/location/metadata/metadata1.json".to_string(),
         ));
 
-        // void(existing_field) named "existing_field", sourced from id 2 (== the colliding schema field's
-        // id) — the void replacement. Must be ACCEPTED.
+        // The void replacement is sourced from id 2, the colliding schema field. Accept it.
         let void_spec = UnboundPartitionSpec::builder()
             .with_spec_id(1)
             .add_partition_field(2, "existing_field", Transform::Void)
@@ -3171,14 +3044,12 @@ mod tests {
         );
     }
 
-    // RISK (Java-parity, source-id gate): the relaxed identity/void collision rule is source-id-GATED —
-    // a void (or identity) partition that COLLIDES with a schema-field name but is sourced from a
-    // DIFFERENT column must still be REJECTED, end-to-end through `add_partition_spec`. Mirrors Java
-    // `checkAndAddPartitionName(name, sourceId)`: when the colliding schema field exists, it requires
-    // `schemaField.fieldId() == sourceId`. Without the source-id gate (enforced on this path by BOTH
-    // `validate_partition_field_names` here AND `check_name_does_not_collide_with_schema` in partition.rs),
-    // Rust would accept a `void("category")` sourced from `data` — a spec Java would reject. Mutation-
-    // verified: forcing the source-id check to pass in BOTH layers makes this rejection disappear.
+    // Risk: the identity/void collision rule is source-id gated. A void or identity partition
+    // whose name collides but whose source is a DIFFERENT column must still be rejected. Java
+    // requires `schemaField.fieldId() == sourceId`.
+    //
+    // The mutation this discriminates: force the source-id check to pass in BOTH
+    // `validate_partition_field_names` and `check_name_does_not_collide_with_schema`.
     #[test]
     fn test_partition_spec_evolution_rejects_void_named_after_a_different_source_column() {
         let initial_schema = Schema::builder()
@@ -3189,7 +3060,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // Base partitioned by identity(data) so a partition spec already exists to evolve.
         let base_spec = UnboundPartitionSpec::builder()
             .with_spec_id(0)
             .add_partition_field(1, "data", Transform::Identity)
@@ -3212,8 +3082,7 @@ mod tests {
             "s3://bucket/test/location/metadata/metadata1.json".to_string(),
         ));
 
-        // void named "category" but sourced from id 1 (`data`), NOT the colliding schema field id 2
-        // (`category`). The name↔source-id correspondence is violated → must be REJECTED.
+        // void "category" sourced from id 1 (`data`), not the colliding field id 2. Reject it.
         let bad_spec = UnboundPartitionSpec::builder()
             .with_spec_id(1)
             .add_partition_field(1, "category", Transform::Void)
@@ -3236,7 +3105,6 @@ mod tests {
 
     #[test]
     fn test_schema_evolution_validates_against_all_historical_schemas() {
-        // Create a table with an initial schema that has a field "existing_field"
         let initial_schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
@@ -3265,7 +3133,6 @@ mod tests {
         .unwrap()
         .metadata;
 
-        // Add a second schema that removes the existing_field but keeps the data field
         let second_schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
@@ -3283,9 +3150,6 @@ mod tests {
             .unwrap()
             .metadata;
 
-        // Now try to add a third schema that reintroduces "existing_field"
-        // This should succeed because "existing_field" exists in a historical schema,
-        // even though there's a partition field named "bucket_data"
         let third_schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
@@ -3301,12 +3165,9 @@ mod tests {
             .clone()
             .into_builder(Some("test_location".to_string()));
 
-        // This should succeed because "existing_field" exists in a historical schema
         let result = builder.add_current_schema(third_schema);
         assert!(result.is_ok());
 
-        // However, trying to add a schema field that conflicts with the partition field
-        // and doesn't exist in any historical schema should fail
         let conflicting_schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
@@ -3323,8 +3184,6 @@ mod tests {
         let builder2 = metadata.into_builder(Some("test_location".to_string()));
         let result2 = builder2.add_current_schema(conflicting_schema);
 
-        // This should fail because "bucket_data" conflicts with partition field name
-        // and doesn't exist in any historical schema
         assert!(result2.is_err());
         let error = result2.unwrap_err();
         assert!(error.message().contains("Cannot add schema field 'bucket_data' because it conflicts with existing partition field name"));
@@ -3332,7 +3191,6 @@ mod tests {
 
     #[test]
     fn test_schema_evolution_allows_existing_partition_field_if_exists_in_historical_schema() {
-        // Create initial schema with a field
         let initial_schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
@@ -3361,7 +3219,6 @@ mod tests {
         .unwrap()
         .metadata;
 
-        // Add a new schema that still contains the partition_data field
         let evolved_schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
@@ -3373,7 +3230,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // This should succeed because partition_data exists in historical schemas
         let result = metadata
             .into_builder(Some("test_location".to_string()))
             .add_current_schema(evolved_schema);
@@ -3383,7 +3239,6 @@ mod tests {
 
     #[test]
     fn test_schema_evolution_prevents_new_field_conflicting_with_partition_field() {
-        // Create initial schema WITHOUT the conflicting field
         let initial_schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
@@ -3410,11 +3265,9 @@ mod tests {
         .unwrap()
         .metadata;
 
-        // Try to add a schema with a field that conflicts with partition field name
         let conflicting_schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "data", Type::Primitive(PrimitiveType::String)).into(),
-                // This field name conflicts with the partition field "bucket_data"
                 NestedField::required(2, "bucket_data", Type::Primitive(PrimitiveType::Int)).into(),
             ])
             .build()
@@ -3423,8 +3276,6 @@ mod tests {
         let builder = metadata.into_builder(Some("test_location".to_string()));
         let result = builder.add_current_schema(conflicting_schema);
 
-        // This should fail because "bucket_data" conflicts with partition field name
-        // and doesn't exist in any historical schema
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.message().contains("Cannot add schema field 'bucket_data' because it conflicts with existing partition field name"));
@@ -3464,7 +3315,6 @@ mod tests {
             "s3://bucket/test/location/metadata/metadata1.json".to_string(),
         ));
 
-        // Try to add a partition spec with a field name that does NOT conflict with existing schema fields
         let non_conflicting_partition_spec = UnboundPartitionSpec::builder()
             .with_spec_id(1)
             .add_partition_field(2, "new_partition_field", Transform::Bucket(8))
@@ -3590,21 +3440,17 @@ mod tests {
 
     #[test]
     fn test_row_lineage_append_branch() {
-        // Appends to a branch should still change last-row-id even if not on main, these changes
-        // should also affect commits to main
+        // A branch append advances last-row-id too, and a later main commit sees it.
 
         let branch = "some_branch";
 
-        // Start with V3 metadata to support row lineage
         let base = builder_without_changes(FormatVersion::V3)
             .build()
             .unwrap()
             .metadata;
 
-        // Initial next_row_id should be 0
         assert_eq!(base.next_row_id(), 0);
 
-        // Write to Branch - append 30 rows
         let branch_snapshot_1 = Snapshot::builder()
             .with_snapshot_id(1)
             .with_timestamp_ms(base.last_updated_ms + 1)
@@ -3627,10 +3473,8 @@ mod tests {
             .unwrap()
             .metadata;
 
-        // Current snapshot should be null (no main branch snapshot yet)
         assert!(table_after_branch_1.current_snapshot().is_none());
 
-        // Branch snapshot should have first_row_id = 0
         let branch_ref = table_after_branch_1.refs.get(branch).unwrap();
         let branch_snap_1 = table_after_branch_1
             .snapshots
@@ -3638,10 +3482,8 @@ mod tests {
             .unwrap();
         assert_eq!(branch_snap_1.first_row_id(), Some(0));
 
-        // Next row id should be 30
         assert_eq!(table_after_branch_1.next_row_id(), 30);
 
-        // Write to Main - append 28 rows
         let main_snapshot = Snapshot::builder()
             .with_snapshot_id(2)
             .with_timestamp_ms(table_after_branch_1.last_updated_ms + 1)
@@ -3673,14 +3515,11 @@ mod tests {
             .unwrap()
             .metadata;
 
-        // Main snapshot should have first_row_id = 30
         let current_snapshot = table_after_main.current_snapshot().unwrap();
         assert_eq!(current_snapshot.first_row_id(), Some(30));
 
-        // Next row id should be 58 (30 + 28)
         assert_eq!(table_after_main.next_row_id(), 58);
 
-        // Write again to branch - append 21 rows
         let branch_snapshot_2 = Snapshot::builder()
             .with_snapshot_id(3)
             .with_timestamp_ms(table_after_main.last_updated_ms + 1)
@@ -3703,7 +3542,6 @@ mod tests {
             .unwrap()
             .metadata;
 
-        // Branch snapshot should have first_row_id = 58 (30 + 28)
         let branch_ref_2 = table_after_branch_2.refs.get(branch).unwrap();
         let branch_snap_2 = table_after_branch_2
             .snapshots
@@ -3711,7 +3549,6 @@ mod tests {
             .unwrap();
         assert_eq!(branch_snap_2.first_row_id(), Some(58));
 
-        // Next row id should be 79 (30 + 28 + 21)
         assert_eq!(table_after_branch_2.next_row_id(), 79);
     }
 
@@ -3719,7 +3556,6 @@ mod tests {
     fn test_encryption_keys() {
         let builder = builder_without_changes(FormatVersion::V2);
 
-        // Create test encryption keys
         let encryption_key_1 = EncryptedKey::builder()
             .key_id("key-1")
             .encrypted_key_metadata(vec![1, 2, 3, 4])
@@ -3737,7 +3573,6 @@ mod tests {
             .properties(HashMap::new())
             .build();
 
-        // Add first encryption key
         let build_result = builder
             .add_encryption_key(encryption_key_1.clone())
             .build()
@@ -3753,7 +3588,6 @@ mod tests {
             encryption_key: encryption_key_1.clone()
         });
 
-        // Add second encryption key
         let build_result = build_result
             .metadata
             .into_builder(Some(
@@ -3777,7 +3611,6 @@ mod tests {
             encryption_key: encryption_key_2.clone()
         });
 
-        // Try to add duplicate key - should not create a change
         let build_result = build_result
             .metadata
             .into_builder(Some(
@@ -3790,7 +3623,6 @@ mod tests {
         assert_eq!(build_result.changes.len(), 0);
         assert_eq!(build_result.metadata.encryption_keys.len(), 2);
 
-        // Remove first encryption key
         let build_result = build_result
             .metadata
             .into_builder(Some(
@@ -3811,7 +3643,6 @@ mod tests {
             key_id: "key-1".to_string()
         });
 
-        // Try to remove non-existent key - should not create a change
         let build_result = build_result
             .metadata
             .into_builder(Some(
@@ -3824,7 +3655,6 @@ mod tests {
         assert_eq!(build_result.changes.len(), 0);
         assert_eq!(build_result.metadata.encryption_keys.len(), 1);
 
-        // Test encryption_keys_iter()
         let keys = build_result
             .metadata
             .encryption_keys_iter()
@@ -3832,7 +3662,6 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], &encryption_key_2);
 
-        // Remove last encryption key
         let build_result = build_result
             .metadata
             .into_builder(Some(
@@ -3849,7 +3678,6 @@ mod tests {
             key_id: "key-2".to_string()
         });
 
-        // Verify empty encryption_keys_iter()
         let keys = build_result.metadata.encryption_keys_iter();
         assert_eq!(keys.len(), 0);
     }
@@ -3866,7 +3694,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // Create initial table with spec 0: identity(id) -> field_id = 1000
         let initial_spec = UnboundPartitionSpec::builder()
             .add_partition_field(1, "id", Transform::Identity)
             .unwrap()
@@ -3885,7 +3712,6 @@ mod tests {
         .unwrap()
         .metadata;
 
-        // Add spec 1: bucket(data) -> field_id = 1001
         let spec1 = UnboundPartitionSpec::builder()
             .add_partition_field(2, "data_bucket", Transform::Bucket(10))
             .unwrap()
@@ -3894,8 +3720,6 @@ mod tests {
         let result = builder.add_partition_spec(spec1).unwrap().build().unwrap();
         metadata = result.metadata;
 
-        // Add spec 2: identity(id) + bucket(data) + year(timestamp)
-        // Should reuse field_id 1000 for identity(id) and 1001 for bucket(data)
         let spec2 = UnboundPartitionSpec::builder()
             .add_partition_field(1, "id", Transform::Identity) // Should reuse 1000
             .unwrap()
@@ -3907,23 +3731,16 @@ mod tests {
         let builder = metadata.into_builder(Some("s3://bucket/table/metadata/v2.json".to_string()));
         let result = builder.add_partition_spec(spec2).unwrap().build().unwrap();
 
-        // Verify field ID reuse: spec 2 should reuse IDs from specs 0 and 1, assign new ID for new field
         let spec2 = result.metadata.partition_spec_by_id(2).unwrap();
         let field_ids: Vec<i32> = spec2.fields().iter().map(|f| f.field_id).collect();
         assert_eq!(field_ids, vec![1000, 1001, 1002]); // Reused 1000, 1001; new 1002
     }
 
-    // -------------------------------------------------------------------------------------------------
-    // V3-only initial-default guard in `add_schema` (mirrors Java `Schema.checkCompatibility`).
-    //
-    // `add_schema` is the choke point every add-schema path flows through (UpdateSchema commits, CTAS,
-    // catalog commits — `TableUpdate::AddSchema::apply` calls it), so the guard belongs here. It must
-    // fire ONLY when a field carries a non-null `initial_default` AND the table is below v3. The
-    // overwhelming majority of v1/v2 schema additions carry no default and must be unaffected.
-    // -------------------------------------------------------------------------------------------------
+    // The V3-only initial-default guard lives in `add_schema`, the choke point every add-schema
+    // path reaches. It must fire only for a non-null `initial_default` below v3. Most v1 and v2
+    // schema additions carry no default and must stay unaffected.
 
-    /// Build a schema with a single extra column `w` (long) carrying an initial default, appended after
-    /// the base `x`/`y`/`z` so its id (4) doesn't collide. Used to drive the guard on/off.
+    /// Build a schema with one extra long column `w` (id 4) carrying an initial default.
     fn schema_with_initial_default() -> Schema {
         Schema::builder()
             .with_schema_id(1)
@@ -3940,9 +3757,8 @@ mod tests {
             .unwrap()
     }
 
-    // RISK: a top-level non-null initial default added on a **V2** table must be REJECTED by the guard
-    // (mirrors Java `Schema.checkCompatibility`: "non-null default ... is not supported until v3"). If
-    // the guard did not fire, Rust would emit V2 metadata Java refuses to read.
+    // Risk: a top-level non-null initial default on a V2 table must be rejected. Without the
+    // guard, Rust emits V2 metadata that Java refuses to read.
     #[test]
     fn test_add_schema_with_initial_default_rejected_on_v2() {
         let builder = builder_without_changes(FormatVersion::V2);
@@ -3972,8 +3788,7 @@ mod tests {
         );
     }
 
-    // RISK: the SAME schema (with a non-null initial default) on a **V3** table must be ACCEPTED — the
-    // guard must not over-fire and block the legal case (defaults are a V3 feature).
+    // Risk: the same schema on a V3 table must be accepted. The guard must not over-fire.
     #[test]
     fn test_add_schema_with_initial_default_allowed_on_v3() {
         let builder = builder_without_changes(FormatVersion::V3);
@@ -3996,14 +3811,12 @@ mod tests {
         );
     }
 
-    // RISK (the nested-reach contract — Java iterates `lazyIdToField()`, ALL fields): a non-null initial
-    // default buried inside a NESTED struct on a **V2** table must ALSO be rejected. A guard that only
-    // inspected top-level fields would silently let a nested default through.
+    // Risk: a non-null initial default inside a nested struct on V2 must also be rejected. Java
+    // iterates every field. A top-level-only guard would let a nested default through.
     #[test]
     fn test_add_schema_with_nested_initial_default_rejected_on_v2() {
-        // `payload` is a struct whose child `flag` (id 5) carries a non-null initial default; `payload`
-        // itself (id 4) is a plain struct. The guard must reach the nested child via the recursive
-        // id-to-field index.
+        // `payload` (id 4) is a plain struct. Its child `flag` (id 5) carries the default. The
+        // guard must reach the child through the recursive id-to-field index.
         let nested_default_schema = Schema::builder()
             .with_schema_id(1)
             .with_fields(vec![
@@ -4042,8 +3855,7 @@ mod tests {
         );
     }
 
-    // RISK (sanity — the guard must NOT touch the common case): a v2 schema add with NO initial default
-    // anywhere (the overwhelming majority of real schema additions) must succeed unchanged.
+    // Risk: the guard must not touch the common case. A v2 schema add with no default succeeds.
     #[test]
     fn test_add_schema_without_default_unaffected_on_v2() {
         let no_default_schema = Schema::builder()
@@ -4075,8 +3887,8 @@ mod tests {
         );
     }
 
-    /// Build an EVOLVED schema: the base `x`/`y`/`z` columns plus a new variant column `v`
-    /// (id 4) — the shape an `UpdateSchema.add_column(variant)` commit lands at this choke point.
+    /// Build the evolved schema an `UpdateSchema.add_column(variant)` commit produces: the base
+    /// columns plus a variant column `v` (id 4).
     fn schema_with_variant_column() -> Schema {
         Schema::builder()
             .with_schema_id(1)
@@ -4090,10 +3902,8 @@ mod tests {
             .unwrap()
     }
 
-    // RISK: a schema-evolution commit that introduces a VARIANT column on a V1/V2 table must be
-    // rejected at the `add_schema` choke point with Java's message (1.10.0 `MIN_FORMAT_VERSIONS`
-    // gates VARIANT at 3). Without it, Rust would commit V2 metadata Java refuses to read —
-    // schema corruption for every reader.
+    // Risk: adding a VARIANT column on a V1 or V2 table must be rejected. Java `MIN_FORMAT_VERSIONS`
+    // gates VARIANT at 3. Without the gate, Rust commits metadata Java refuses to read.
     #[test]
     fn test_add_schema_with_variant_rejected_on_v1_and_v2() {
         for format_version in [FormatVersion::V1, FormatVersion::V2] {
@@ -4112,10 +3922,8 @@ mod tests {
         }
     }
 
-    // RISK: the SAME evolved schema must be ACCEPTED on a V3 table (over-firing would make the V3
-    // type unusable), and the variant column must survive a full TableMetadata JSON round-trip —
-    // the serde proof that every metadata-bearing path (catalog commits, inspect/metadata readers)
-    // renders and re-parses the type without special handling.
+    // Risk: the same schema must be accepted on V3, or the type is unusable. The variant column
+    // must also survive a full TableMetadata JSON round trip, which every metadata path needs.
     #[test]
     fn test_add_schema_with_variant_allowed_on_v3_and_round_trips() {
         let builder = builder_without_changes(FormatVersion::V3);
@@ -4127,7 +3935,6 @@ mod tests {
             .build()
             .expect("build metadata with a variant column");
 
-        // Full metadata JSON round-trip: serialize and re-parse, then compare the schema.
         let json = serde_json::to_string(&result.metadata).expect("serialize table metadata");
         assert!(
             json.contains(r#""type":"variant""#),
@@ -4145,13 +3952,9 @@ mod tests {
         );
     }
 
-    // RISK (gate completeness — the CREATION path): `TableMetadataBuilder::new` routes its schema
-    // through `add_current_schema` → `add_schema`, so creating a table with a variant column must
-    // hit the SAME gate as evolution. Live-Java-probed: 1.10.0
-    // `TableMetadata.newTableMetadata(schema-with-variant, ..., formatVersion=2)` throws
-    // "Invalid schema for v2:\n- Invalid type for v: variant is not supported until v3", and the
-    // same call at v3 succeeds. A creation-path hole would let catalog create-table flows mint
-    // V1/V2 metadata Java refuses.
+    // Risk: the creation path must hit the same gate. `TableMetadataBuilder::new` routes its
+    // schema through `add_current_schema` to `add_schema`. Java `newTableMetadata` throws at v2
+    // and succeeds at v3. A hole here lets create-table flows mint metadata Java refuses.
     #[test]
     fn test_create_table_metadata_with_variant_gated_by_format_version() {
         let creation_schema = || {
@@ -4206,11 +4009,9 @@ mod tests {
         );
     }
 
-    // RISK (read tolerance, live-Java-probed): Java 1.10.0 `TableMetadataParser.fromJson` runs NO
-    // `Schema.checkCompatibility` — a (corrupt/foreign-written) V1/V2 metadata JSON whose schema
-    // already contains a variant column PARSES on both sides; the gate fires only on the next
-    // `add_schema`. Rejecting on read would strand every such table un-openable (Java can open it
-    // to repair/upgrade); the probe also confirmed Java accepts upgrading that metadata to v3.
+    // Risk: read tolerance. Java `TableMetadataParser.fromJson` runs no compatibility check, so
+    // a V1 or V2 metadata JSON holding a variant column parses on both sides. The gate fires only
+    // on the next `add_schema`. Rejecting on read would strand such a table un-openable.
     #[test]
     fn test_v1_v2_metadata_with_existing_variant_parses_read_tolerantly() {
         for format_version in [1u8, 2u8] {
@@ -4236,8 +4037,7 @@ mod tests {
                 Type::Variant
             );
 
-            // The Java-probed upgrade path: buildFrom(v2-with-variant).upgradeFormatVersion(3)
-            // succeeds (no re-check of pre-existing schemas).
+            // Java also upgrades such metadata to v3. It does not re-check existing schemas.
             if format_version == 2 {
                 let upgraded = metadata
                     .into_builder(None)
@@ -4250,13 +4050,10 @@ mod tests {
         }
     }
 
-    // RISK (the Identity-transform door on the READ path, live-Java-probed): metadata whose
-    // partition spec uses `identity` over a variant source must FAIL to parse — Java 1.10.0
-    // rejects it while binding the spec ("Unsupported type for identity: variant", the
-    // `Identity.UNSUPPORTED_TYPES` door; Rust's equivalent door is
-    // `Transform::result_type`'s identity arm). Silently accepting it would admit a partition
-    // layout no engine can evaluate. (Message texts differ — both pre-existing shapes — but the
-    // reject-on-read BEHAVIOR is the parity contract pinned here.)
+    // Risk: `identity` over a variant source must fail to parse. Java rejects it when it binds
+    // the spec, through `Identity.UNSUPPORTED_TYPES`. The Rust door is `Transform::result_type`.
+    // Accepting it would admit a partition layout no engine can evaluate. The message texts
+    // differ; the reject-on-read behavior is the contract.
     #[test]
     fn test_v3_metadata_with_identity_partition_on_variant_rejected_on_parse() {
         let json = r#"{"format-version":3,"table-uuid":"9c12d441-03fe-4693-9a96-a0705ddf69c1",
@@ -4281,9 +4078,8 @@ mod tests {
         );
     }
 
-    // RISK (write_default is NOT gated — Java only checks `initialDefault`): a v2 schema add where a
-    // field carries ONLY a `write_default` (no initial default) must succeed. Gating `write_default`
-    // here would wrongly reject a legal v1/v2 write default.
+    // Risk: `write_default` is not gated. Java checks only `initialDefault`. A v2 schema add
+    // carrying only a `write_default` must succeed.
     #[test]
     fn test_add_schema_with_write_default_only_allowed_on_v2() {
         let write_default_only_schema = Schema::builder()

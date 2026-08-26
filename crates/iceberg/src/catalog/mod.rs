@@ -87,29 +87,16 @@ pub trait Catalog: Debug + Sync + Send {
         properties: HashMap<String, String>,
     ) -> Result<()>;
 
-    /// Partial namespace-property update: apply `removals` and `updates` atomically.
-    /// =============================================================================
+    /// Partial namespace-property update: apply `removals`, then `updates`.
     ///
-    /// Mirrors the Java REST `updateNamespaceMetadata(ns, updates, removals)` shape
-    /// (`UpdateNamespacePropertiesRequest { removals, updates }`), which is itself the
-    /// union of the two public `SupportsNamespaces` methods —
-    /// `setProperties(ns, Map)` and `removeProperties(ns, Set)`. Unlike those two
-    /// methods (which return `boolean`), this returns `Result<()>` to match
-    /// [`Catalog::update_namespace`].
+    /// Mirrors Java REST `updateNamespaceMetadata`, the union of
+    /// `SupportsNamespaces.setProperties` and `removeProperties`. Removing an absent key is a
+    /// no-op. The default composes over the full-replace [`Catalog::update_namespace`], so a
+    /// catalog that does not delete keys absent from the new map must override this method.
     ///
-    /// This default composes over the full-replace [`Catalog::update_namespace`]
-    /// primitive: it (1) rejects any key that appears in *both* `removals` and
-    /// `updates` with [`ErrorKind::DataInvalid`] (the Java REST disjoint contract;
-    /// `UpdateNamespacePropertiesRequest.validate()` forbids overlap), (2) loads the
-    /// current properties via [`Catalog::get_namespace`] (erroring if the namespace
-    /// does not exist), (3) drops the `removals` keys — removing an absent key is a
-    /// no-op, matching `removeProperties` tolerance and the REST `missing` report —
-    /// (4) applies the `updates`, and (5) writes the merged set back via
-    /// [`Catalog::update_namespace`].
+    /// # Errors
     ///
-    /// A catalog whose `update_namespace` is not a faithful full-replace (i.e. does
-    /// not delete keys absent from the new map) will not observe `removals`; such a
-    /// catalog must override this method or fix its `update_namespace`.
+    /// [`ErrorKind::DataInvalid`] if a key appears in both `removals` and `updates`.
     async fn update_namespace_properties(
         &self,
         namespace: &NamespaceIdent,
@@ -196,22 +183,14 @@ pub trait Catalog: Debug + Sync + Send {
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
 
-    /// Publish a fully staged **create** table (metadata already on FileIO).
+    /// Publish a fully staged **create** table. Default: [`Catalog::register_table`].
     ///
-    /// Default: [`Catalog::register_table`]. Used by
-    /// [`crate::transaction::StagedTableTransaction::commit`] for
-    /// [`crate::transaction::StagedTableMode::Create`].
+    /// # Notes
     ///
-    /// # Atomicity
-    ///
-    /// Publishing MUST be all-or-nothing: if any step fails — in particular reloading the staged
-    /// metadata, which fails when it was written through a `FileIO` this catalog cannot read — the
-    /// catalog MUST be left with **no** pointer for `table`'s identifier, so `table_exists` stays
-    /// `false` and a `CREATE TABLE IF NOT EXISTS` retry / re-create of the same identifier succeeds.
-    /// The default implementation satisfies this by reading the metadata before inserting the
-    /// pointer (see [`Catalog::register_table`]); an override MUST preserve the guarantee.
-    /// Implementations MAY release any catalog mutex across the FileIO read (I/O outside the
-    /// lock) so long as a failed read still inserts nothing.
+    /// Publishing is all-or-nothing. On failure the catalog must hold no pointer for `table`, so
+    /// a `CREATE TABLE IF NOT EXISTS` retry succeeds. The default reads the metadata before it
+    /// inserts the pointer, and an override must keep that order. The read may happen outside
+    /// any catalog lock.
     async fn publish_create_table(
         &self,
         table: crate::table::Table,
@@ -286,72 +265,50 @@ pub trait Catalog: Debug + Sync + Send {
 
     /// Update a view in the catalog.
     ///
-    /// Mirrors how Java `BaseViewOperations.commit(base, metadata)` is driven by a
-    /// `ReplaceViewVersion` / `UpdateViewProperties` pending update: the [`ViewCommit`]
-    /// carries the requirement set (`[AssertViewUUID]`) and the metadata updates.
+    /// Mirrors Java `BaseViewOperations.commit(base, metadata)`. The [`ViewCommit`] carries the
+    /// requirement set and the metadata updates.
     async fn update_view(&self, _commit: ViewCommit) -> Result<View> {
         Err(views_unsupported())
     }
 
     /// The catalog's name.
-    /// ====================
     ///
-    /// Mirrors Java `Catalog.name()`, which is itself a **default** method
-    /// (`org.apache.iceberg.catalog.Catalog`, javap-confirmed): its default body is
-    /// `return this.toString();` — i.e. the `Object.toString()` fallback. Following
-    /// that precedent this is a **default** trait method (it does not force every
-    /// implementor to add a `name()`), returning the [`UNNAMED_CATALOG`] sentinel for
-    /// catalogs that hold no name. Every in-tree catalog overrides it to return the
-    /// name supplied at construction (the `name` argument of
-    /// [`CatalogBuilder::load`]).
+    /// Mirrors Java `Catalog.name()`, also a default method. This default returns the
+    /// [`UNNAMED_CATALOG`] sentinel. Every in-tree catalog overrides it with the name from
+    /// [`CatalogBuilder::load`].
     fn name(&self) -> &str {
         UNNAMED_CATALOG
     }
 
     /// The catalog's configuration properties.
-    /// =======================================
     ///
-    /// **Rust-convenience accessor — NOT a Java `Catalog`-interface method.** In Java,
-    /// `properties()` is **not** declared on `org.apache.iceberg.catalog.Catalog`,
-    /// `ViewCatalog`, or `SupportsNamespaces`; it exists only as a concrete method on
-    /// `org.apache.iceberg.rest.RESTCatalog` (javap-confirmed). It is surfaced here as
-    /// a documented default (empty map) so the in-tree catalogs can expose the
-    /// properties they were loaded with — mirroring `RESTCatalog.properties()` for the
-    /// REST catalog and offering the same convenience for the others — without claiming
-    /// it as part of the Java `Catalog` contract. Catalogs that hold the
-    /// load-time properties override it to return them.
+    /// This is a convenience accessor, not a Java `Catalog`-interface method. Java declares
+    /// `properties()` only on `RESTCatalog`. The default returns an empty map. A catalog that
+    /// keeps its load-time properties overrides it.
     fn properties(&self) -> &HashMap<String, String> {
         static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
         EMPTY.get_or_init(HashMap::new)
     }
 
     /// Invalidate any cached metadata held for `table`.
-    /// =================================================
     ///
-    /// Mirrors Java `Catalog.invalidateTable(TableIdentifier)`, a **default** method
-    /// whose default body is an empty `return` (javap-confirmed: a no-op). Catalogs
-    /// that cache table metadata override this to evict their cache entry; catalogs
-    /// that hold no cache (every in-tree catalog today) inherit the no-op default.
+    /// Mirrors Java `Catalog.invalidateTable`, also a no-op default. A catalog that caches
+    /// table metadata overrides this to evict its entry.
     async fn invalidate_table(&self, _table: &TableIdent) -> Result<()> {
         Ok(())
     }
 
     /// Invalidate any cached metadata held for `view`.
-    /// ================================================
     ///
-    /// Mirrors Java `ViewCatalog.invalidateView(TableIdentifier)`, a **default** method
-    /// whose default body is an empty `return` (javap-confirmed: a no-op). Catalogs
-    /// that cache view metadata override this to evict their cache entry; catalogs
-    /// without view caching inherit the no-op default.
+    /// Mirrors Java `ViewCatalog.invalidateView`, also a no-op default. A catalog that caches
+    /// view metadata overrides this to evict its entry.
     async fn invalidate_view(&self, _view: &TableIdent) -> Result<()> {
         Ok(())
     }
 }
 
-/// The sentinel name returned by the default [`Catalog::name`] for a catalog that holds no
-/// name — the Rust analog of the `Object.toString()` fallback Java's `Catalog.name()` default
-/// uses. Every in-tree catalog overrides `name()` with the name supplied at construction, so this
-/// is only observed by bare/external implementors that do not.
+/// The sentinel name that the default [`Catalog::name`] returns for a catalog with no name.
+/// Only an implementor that does not override `name()` observes it.
 pub const UNNAMED_CATALOG: &str = "unnamed";
 
 /// The error returned by the default (no-op) view methods on the [`Catalog`] trait. A catalog
@@ -369,14 +326,10 @@ pub trait CatalogBuilder: Default + Debug + Send + Sync {
     /// The catalog type that this builder creates.
     type C: Catalog;
 
-    /// Set a custom StorageFactory to use for storage operations.
+    /// Set a custom `StorageFactory` for storage operations.
     ///
-    /// When a StorageFactory is provided, the catalog will use it to build FileIO
-    /// instances for all storage operations instead of using the default factory.
-    ///
-    /// # Arguments
-    ///
-    /// * `storage_factory` - The StorageFactory to use for creating storage instances
+    /// The catalog builds every FileIO instance from `storage_factory` instead of from the
+    /// default factory.
     ///
     /// # Example
     ///
@@ -594,17 +547,13 @@ pub struct TableCommit {
     requirements: Vec<TableRequirement>,
     /// The updates of the table.
     updates: Vec<TableUpdate>,
-    /// The metadata location of the base the commit was built against — the Rust analogue of the
-    /// `base` argument Java passes into `InMemoryTableOperations.doCommit` /
-    /// `BaseMetastoreTableOperations.commit`.
+    /// The metadata location of the base the commit was built against. Mirrors the `base`
+    /// argument of Java `BaseMetastoreTableOperations.commit`.
     ///
-    /// An in-process catalog with no transactional store (e.g. [`crate::catalog::memory`]) uses
-    /// this to detect a stale commit: it compares the location currently stored for the table
-    /// against this value (Java's `Objects.equal(stored, base.metadataFileLocation())`) and rejects
-    /// the commit with a retryable conflict when they differ — the optimistic-concurrency CAS Java
-    /// performs in `doCommit`. `None` models Java's `base == null` create edge; the catalog update
-    /// paths always carry `Some`. Catalogs with their own store-side CAS (REST server, SQL `... AND
-    /// metadata_location = ?`) ignore this field.
+    /// A catalog with no transactional store compares the location it holds for the table
+    /// against this value. A difference is a stale commit, and the catalog rejects it with a
+    /// retryable conflict. That comparison is the optimistic-concurrency CAS. `None` models
+    /// Java's `base == null` create edge. A catalog with its own store-side CAS ignores it.
     #[builder(default)]
     base_metadata_location: Option<String>,
     /// Optional pre-loaded base table for metastore catalogs (Glue / S3 Tables) that can skip a
@@ -635,15 +584,12 @@ pub enum CommitBaseLoadPlan {
 
 /// Plan whether a metastore catalog can reuse a pre-loaded base table for apply.
 ///
-/// * `service_metadata_location` — metadata location currently stored by the service (Glue
-///   parameters / S3 Tables GetTable).
-/// * `base_metadata_location` — [`TableCommit::base_metadata_location`].
-/// * `provided_base_metadata_location` — location on the optional pre-loaded base table.
+/// # Notes
 ///
-/// **OCC contract:** a mismatched commit base vs service pointer is always [`Conflict`], even if
-/// a provided table's location already matches the service (stale base + "current" forge). Reuse
-/// is location-only and assumes Iceberg metadata immutability at a given path; callers must not
-/// supply a `base_table` whose content does not match that location.
+/// A commit base that differs from the service pointer is always
+/// [`CommitBaseLoadPlan::Conflict`], even when the provided table matches the service. Reuse
+/// compares locations only, and assumes the metadata at a path never changes. The caller must
+/// not supply a `base_table` whose content does not match its location.
 pub fn plan_commit_base_load(
     service_metadata_location: &str,
     base_metadata_location: Option<&str>,
@@ -660,12 +606,10 @@ pub fn plan_commit_base_load(
 
 /// Retryable conflict when a metastore commit base no longer matches the service pointer.
 ///
-/// Metastore catalogs (Glue / S3 Tables) return this from `resolve_commit_base` on
-/// [`CommitBaseLoadPlan::Conflict`]. The error **must** stay
-/// [`ErrorKind::CatalogCommitConflicts`] and **retryable** so
-/// [`crate::transaction::Transaction::commit`] reloads, re-applies actions, and retries
-/// (Java `CommitFailedException` / only-retry-on-conflict). Dropping `retryable` permanently
-/// fails concurrent writers.
+/// Glue and S3 Tables return this from `resolve_commit_base` on
+/// [`CommitBaseLoadPlan::Conflict`]. The error must stay [`ErrorKind::CatalogCommitConflicts`]
+/// and retryable, so [`crate::transaction::Transaction::commit`] reloads and retries. A
+/// non-retryable error permanently fails concurrent writers.
 pub fn commit_base_conflict_error(
     table_ident: &TableIdent,
     expected_base_metadata_location: Option<&str>,
@@ -718,11 +662,8 @@ impl TableCommit {
         take(&mut self.updates)
     }
 
-    /// Applies this [`TableCommit`] to the given [`Table`] as part of a catalog update.
-    /// Typically used by [`Catalog::update_table`] to validate requirements and apply metadata updates.
-    ///
-    /// Returns a new [`Table`] with updated metadata,
-    /// or an error if validation or application fails.
+    /// Check the requirements, apply the updates, and return the new [`Table`].
+    /// [`Catalog::update_table`] calls this.
     pub fn apply(self, table: Table) -> Result<Table> {
         // check requirements
         for requirement in self.requirements {
@@ -1298,10 +1239,8 @@ pub struct ViewCreation {
 impl ViewRepresentations {
     /// Construct a list of view representations from the given representations.
     ///
-    /// The tuple constructor of [`ViewRepresentations`] is crate-private; this public constructor
-    /// lets out-of-crate catalog implementations (the SQL / REST / Glue / S3 Tables catalogs) build
-    /// the [`ViewCreation::representations`] field, which is otherwise unconstructable outside the
-    /// `iceberg` crate.
+    /// The tuple constructor is crate-private. An out-of-crate catalog needs this to build the
+    /// [`ViewCreation::representations`] field.
     pub fn new(representations: Vec<ViewRepresentation>) -> Self {
         Self(representations)
     }
@@ -1369,10 +1308,8 @@ pub enum ViewUpdate {
 impl ViewUpdate {
     /// Applies the update to the view metadata builder.
     ///
-    /// Mirrors Java `ViewMetadata.Builder` update application (the `MetadataUpdate.ViewUpdate`
-    /// visitor in `BaseViewOperations`/`ViewMetadata.Builder`). Each arm forwards to the
-    /// corresponding [`crate::spec::ViewMetadataBuilder`] method, which carries the version-id
-    /// assignment, identical-version reuse, schema interning, and history rules.
+    /// Mirrors the Java `MetadataUpdate.ViewUpdate` visitor. Each arm forwards to a
+    /// [`crate::spec::ViewMetadataBuilder`] method, which holds the version-id and history rules.
     pub fn apply(self, builder: ViewMetadataBuilder) -> Result<ViewMetadataBuilder> {
         match self {
             ViewUpdate::AssignUuid { uuid } => Ok(builder.assign_uuid(uuid)),
@@ -1393,12 +1330,9 @@ impl ViewUpdate {
 
 /// ViewRequirement represents a requirement for a view in the catalog.
 ///
-/// Mirrors Java `UpdateRequirement` for views. Java emits these from
-/// `UpdateRequirements.forReplaceView(base, updates)`, which seeds exactly one
-/// [`ViewRequirement::UuidMatch`] (`AssertViewUUID`) and applies the per-update dispatch — but
-/// no view update contributes an additional requirement (the dispatch `Builder` is constructed
-/// with a `null` table base, so even the shared `AddSchema` arm is a no-op). The result is that
-/// a view replace commit carries `[UuidMatch]` alone. The `NotExist` variant gates a create.
+/// Mirrors Java `UpdateRequirement` for views. Java
+/// `UpdateRequirements.forReplaceView` emits one [`ViewRequirement::UuidMatch`] and nothing
+/// else, because no view update adds a requirement. The `NotExist` variant gates a create.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ViewRequirement {
@@ -2650,9 +2584,8 @@ mod tests {
         );
     }
 
-    // RISK: the view requirement wire format must match Java's `UpdateRequirement` JSON tags —
-    // `assert-create` (NotExist) and `assert-view-uuid` (AssertViewUUID). A wrong tag would make a
-    // REST view commit's requirement set unreadable by a Java server.
+    // RISK: the view requirement JSON tags must match Java `UpdateRequirement`. A wrong tag
+    // makes a REST view commit unreadable by a Java server.
     #[test]
     fn test_view_requirement_serde() {
         test_serde_json(
@@ -2677,8 +2610,7 @@ mod tests {
         );
     }
 
-    // RISK: ViewUpdate::apply must forward each arm to the correct builder method — a wrongly wired
-    // arm would silently drop a metadata change on the catalog commit path.
+    // RISK: a wrongly wired `ViewUpdate::apply` arm silently drops a metadata change.
     #[test]
     fn test_view_update_apply_set_properties_and_location() {
         use crate::spec::ViewMetadata;
@@ -2949,10 +2881,8 @@ mod tests {
         );
     }
 
-    /// Pin the metastore commit base-load plan: reuse when the service pointer still matches
-    /// the commit base and a provided base is available; conflict when the pointer moved;
-    /// full load otherwise. A regression here either double-loads metadata on the hot path
-    /// or silences concurrent-writer detection.
+    /// Pin the commit base-load plan. A regression either double-loads metadata on the hot
+    /// path, or silences concurrent-writer detection.
     #[test]
     fn test_plan_commit_base_load() {
         let service = "s3://b/m/v1.json";
@@ -2976,16 +2906,15 @@ mod tests {
             plan_commit_base_load(service, Some(service), Some("s3://b/m/stale.json")),
             CommitBaseLoadPlan::FullLoad
         );
-        // Concurrent forge matrix: commit base is stale (L0) while a provided table points at the
-        // *current* service pointer (L1). Must Conflict — never Reuse — or L0-planned updates
-        // would be applied against L1 content under a location-only match arm.
+        // The commit base is stale (L0) and the provided table points at the current pointer
+        // (L1). This must Conflict. A Reuse here applies L0-planned updates to L1 content.
         let service_l1 = "s3://b/m/v2.json";
         assert_eq!(
             plan_commit_base_load(service_l1, Some(service), Some(service_l1)),
             CommitBaseLoadPlan::Conflict,
             "stale base_metadata_location must win over a provided table at the current pointer"
         );
-        // Empty-string locations: still location-equality only (no special-case silent reuse).
+        // Empty-string locations still compare by equality alone.
         assert_eq!(
             plan_commit_base_load("", Some(""), Some("")),
             CommitBaseLoadPlan::ReuseProvided
@@ -3061,10 +2990,8 @@ mod tests {
         );
     }
 
-    /// A minimal [`Catalog`] that overrides NONE of the default accessor/lifecycle methods, so
-    /// it exercises the trait-supplied defaults: `name()` → [`UNNAMED_CATALOG`], `properties()`
-    /// → empty map, `invalidate_table`/`invalidate_view` → no-op `Ok(())`. The table/namespace
-    /// methods are never called in these tests; they return a typed error rather than panicking.
+    /// A [`Catalog`] that overrides no default method, so the tests exercise the trait
+    /// defaults. The table and namespace methods return a typed error instead of a panic.
     #[derive(Debug)]
     struct BareCatalog;
 
@@ -3142,24 +3069,20 @@ mod tests {
 
     #[test]
     fn test_bare_catalog_name_default_is_sentinel() {
-        // A catalog that does not override `name()` falls through to the trait default —
-        // the Rust analog of Java's `Object.toString()` fallback for `Catalog.name()`.
+        // A catalog that does not override `name()` gets the trait default.
         assert_eq!(BareCatalog.name(), UNNAMED_CATALOG);
     }
 
     #[test]
     fn test_bare_catalog_properties_default_is_empty() {
-        // `properties()` is a Rust-convenience default (empty map); Java has no
-        // `Catalog.properties()` on the plain-Catalog surface — it's concrete only on
-        // RESTCatalog there (it also appears on the SessionCatalog/BaseSessionCatalog hierarchy).
+        // `properties()` is a convenience default. Java declares it only on RESTCatalog.
         assert!(BareCatalog.properties().is_empty());
     }
 
     #[tokio::test]
     async fn test_bare_catalog_invalidate_defaults_are_noops() {
         let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
-        // Both mirror Java's empty-`return` default bodies (`Catalog.invalidateTable`,
-        // `ViewCatalog.invalidateView`): no-op, never error.
+        // Both mirror Java's no-op defaults. They never error.
         BareCatalog
             .invalidate_table(&ident)
             .await

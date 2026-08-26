@@ -15,159 +15,88 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! ExpireSnapshots FILE CLEANUP — the physical half of Java's `ExpireSnapshots`
-//! (`cleanExpiredFiles(true)`), Increment B2 on top of the metadata-only
-//! [`ExpireSnapshotsAction`](crate::transaction::ExpireSnapshotsAction) (B1).
+//! ExpireSnapshots file cleanup: the physical half of Java's `ExpireSnapshots`
+//! (`cleanExpiredFiles(true)`), on top of the metadata-only
+//! [`ExpireSnapshotsAction`](crate::transaction::ExpireSnapshotsAction).
 //!
-//! **THIS MODULE DELETES FILES.** Deleting a file still reachable from any retained snapshot
-//! destroys data unrecoverably, so every design choice here biases toward UNDER-deletion, and
-//! the deletion set is computed exclusively by the conservative set algebra below.
+//! **This module deletes files.** Deleting a file that a retained snapshot still reaches destroys
+//! data unrecoverably. Every choice here biases toward under-deletion, and the deletion set comes
+//! only from the set algebra below.
 //!
-//! # What is ported
+//! # The set algebra (Java 1.10.0 `ReachableFileCleanup.cleanFiles(before, after)`)
 //!
-//! Java 1.10.0 `ReachableFileCleanup` (every step bytecode-verified against
-//! `iceberg-core-1.10.0.jar`) — the general-correct cleanup strategy Java selects whenever the
-//! expiry is anything but a pure linear main-ancestry trim. Given the table metadata BEFORE and
-//! AFTER a successful expire-snapshots commit (`cleanFiles(beforeExpiration, afterExpiration)`):
+//! | set | rule |
+//! |---|---|
+//! | expired snapshots | `before.snapshots() − after.snapshots()`, by id |
+//! | manifest lists | each expired snapshot's `manifest_list`, unless a retained snapshot names it too |
+//! | candidate manifests | every manifest the expired lists name, minus every manifest a retained snapshot names, by path |
+//! | content files | live entry paths of the candidate manifests, minus live entry paths of every retained manifest |
+//! | statistics files | present in `before`, absent from `after` |
 //!
-//! 1. **Expired snapshots** = `before.snapshots() − after.snapshots()` (Java diffs `Snapshot`
-//!    sets; `BaseSnapshot.equals` compares id/parent/sequence-number/timestamp/schema-id —
-//!    all immutable once a snapshot is written, so within one table's (before, after) pair an
-//!    id diff is equivalent).
-//! 2. **Manifest lists:** every expired snapshot's `manifest_list` location is deleted.
-//!    *Rust safety divergence:* a location also referenced by a RETAINED snapshot is spared.
-//!    Java 1.10.0 deletes expired manifest-list locations unconditionally — safe there only
-//!    because every Java-written snapshot owns a unique manifest-list file. Sparing a shared one
-//!    is strictly under-deleting and is pinned by a test.
-//! 3. **Candidate manifests** = the union of all `ManifestFile`s listed by expired snapshots'
-//!    manifest lists, MINUS every manifest listed by ANY retained (post-expiry) snapshot —
-//!    compared **by path** (`GenericManifestFile.equals`/`hashCode` use `manifestPath` only,
-//!    bytecode-verified). This subtraction is what protects carried-forward manifests: a fast
-//!    append re-lists every prior manifest, so an expired snapshot's manifests are usually still
-//!    referenced by its retained descendants.
-//! 4. **Content files** (only when candidate manifests survive step 3): the union of the
-//!    **live** entry paths of every candidate manifest, minus the live entry paths of every
-//!    retained manifest. "Live" = entry status `ADDED` or `EXISTING` — `ManifestReader
-//!    .liveEntries()` filters `status != DELETED` (`isLiveEntry`, bytecode-verified) on BOTH
-//!    sides of the subtraction. Both DATA and DELETE manifests are walked: Java's cleanup
-//!    projection (`FileCleanupStrategy.MANIFEST_PROJECTION` = path/length/spec-id/snapshot-id/
-//!    deleted-files-count) omits the `content` field and the avro-read
-//!    `GenericManifestFile` constructor defaults it to `DATA` (bytecode-verified), so
-//!    `ManifestFiles.readPaths` reads delete manifests through the data-manifest reader — the
-//!    entry schemas share the `file_path` field, so the paths come out correctly. The Rust port
-//!    reads both manifest contents through the typed reader instead, with identical results.
-//!    A deletion-vector entry's `file_path` is its PUFFIN location, so a puffin shared by
-//!    several DVs is naturally deduplicated by the path-set, and one retained DV in the puffin
-//!    protects the whole file. Each surviving path is tagged with its entry's
-//!    [`DataContentType`] so the report can be read per content class — Java's own tagging
-//!    (`BaseSparkAction$ReadManifest.toFileInfo`, 1.10.0 bytecode) uses `ContentFile.content()`
-//!    ALONE and never the file format, so a deletion vector counts as a POSITION delete and
-//!    there is no fourth class (see [`CleanupReport::deleted_position_delete_files`]).
-//! 5. **Statistics files:** `statistics`/`partition-statistics` locations present in `before`
-//!    but absent from `after` (`FileCleanupStrategy.expiredStatisticsFilesLocations`).
+//! Sparing a shared manifest list is a Rust divergence. Java deletes unconditionally, which is safe
+//! only because every Java-written snapshot owns its list file.
 //!
-//! Deletion order mirrors Java: content files → manifests → manifest lists → statistics files.
+//! The candidates-minus-retained subtraction protects a carried-forward manifest: a fast append
+//! re-lists every prior manifest, so an expired snapshot's manifests usually survive in a retained
+//! descendant. Live means status `ADDED` or `EXISTING`, on **both** sides. A deletion vector's
+//! `file_path` is its Puffin location, so one retained vector protects the whole Puffin file.
+//!
+//! Deletion order mirrors Java: content files, manifests, manifest lists, statistics files.
 //!
 //! # The post-commit seam
 //!
-//! Java `RemoveSnapshots.commit()` (bytecode): run the metadata commit in the retry loop
-//! (`internalApply(); ops.commit(base, updated)`), and ONLY after it returns successfully run
-//! `cleanExpiredSnapshots()`, which re-reads the POST-commit metadata (`ops.refresh()`) and
-//! calls `cleanFiles(base, current)` with the PRE-commit base. File deletion never runs inside
-//! the retry loop and never on a failed commit.
+//! Java runs the metadata commit in the retry loop and cleans files only after it succeeds.
+//! Deletion never runs inside the retry loop, and never on a failed commit.
 //!
-//! The Rust action seam ([`TransactionAction`](crate::transaction::TransactionAction)) has no
-//! post-commit hook, so the cleanup lives OUTSIDE the action as this standalone entry point:
+//! The Rust [`TransactionAction`](crate::transaction::TransactionAction) seam has no post-commit
+//! hook, so cleanup lives outside the action:
 //!
-//! - [`ExpireSnapshotsCleanup::clean_expired_files`] — the two-state core (`cleanFiles`):
-//!   takes the pre-commit and post-commit [`TableMetadata`], plans the deletion set, and sweeps
-//!   it through the injectable delete function. **`after` must be the table's CURRENT committed
-//!   metadata** — passing a stale "after" state would delete files the real table still
-//!   reaches.
-//! - [`ExpireSnapshotsCleanup::commit_and_clean`] — the recommended wrapper mirroring Java's
-//!   `commit()` ordering: capture the pre-commit metadata, `Transaction::commit`, and run the
-//!   cleanup only on the successfully returned table. The `?` on the commit makes the deletion
-//!   path structurally unreachable on a failed commit (pinned by a test). The captured "before"
-//!   may be staler than the final retry base (the transaction re-bases internally).
-//!   Decomposing `before − after`: snapshots a concurrent commit ADDED are absent from
-//!   `before` (never candidates — the expired set shrinks), while snapshots a concurrent
-//!   EXPIRE removed do ENTER the expired set — but they are absent from the committed `after`
-//!   too, so the sweep still deletes only files unreachable from the table's current metadata.
-//!   Java's `cleanFiles(base, current)` has the identical property (`base` is the
-//!   construction-time metadata); the grown case is the benign double-delete race with the
-//!   other expirer's own cleanup — the second sweep sees the other's wins per file (an
-//!   idempotent `Ok` or a collected failure, backend-dependent) or aborts at planning when
-//!   the expired lists are already gone (pinned by the re-run test), and never over-deletes.
+//! - [`ExpireSnapshotsCleanup::clean_expired_files`] is the two-state core. **`after` must be the
+//!   table's current committed metadata.** A staler `after` deletes files the live table reaches.
+//! - [`ExpireSnapshotsCleanup::commit_and_clean`] wraps commit and cleanup in Java's order. The
+//!   `?` on the commit makes the deletion path unreachable after a failed commit.
 //!
-//! Java's `current = ops.refresh()` may observe commits that landed after the expiry; this port
-//! uses the committed table returned by `Transaction::commit` instead. Equivalent safety: a
-//! later snapshot can only reference files reachable from the committed state (already
-//! protected by the retained-side subtraction) or files it newly added (never deletion
-//! candidates).
+//! The captured `before` may be staler than the final retry base. A snapshot a concurrent commit
+//! added is absent from `before`, so it never becomes a candidate. A snapshot a concurrent expire
+//! removed does enter the expired set, but it is absent from the committed `after` too, so the
+//! sweep still deletes only what the current metadata cannot reach. Java's `cleanFiles(base,
+//! current)` has the same property. The overlap is a benign double-delete race with the other
+//! expirer's own sweep.
 //!
-//! **The inherited B1 ref-resurrection window (not widened by B2).** A ref created or rolled
-//! back concurrently AT a to-be-expired snapshot id is not guardable by the expiry's
-//! `RefSnapshotIdMatch` guards (recorded at B1; Java-REST shares it — its `UpdateRequirements`
-//! derives no requirement for snapshot removal): if the racing ref commit lands first
-//! unguarded, the expiry's apply-side sweep drops the now-dangling ref, and the COMMITTED
-//! metadata no longer reaches that snapshot. This cleanup derives strictly from that
-//! already-committed metadata, so it deletes the files the dropped ref pointed at — making the
-//! metadata-level loss physical. The window belongs to the metadata commit, not to this
-//! module: full-CAS catalogs (Java's primary path) reject the racing ref commit, and a ref
-//! commit attempted AFTER the expiry committed fails validation (its snapshot no longer
-//! exists).
+//! **The inherited ref-resurrection window.** A ref created concurrently at a to-be-expired
+//! snapshot id is not guardable by the expiry's `RefSnapshotIdMatch` guards. If it lands first, the
+//! expiry drops the now-dangling ref and the committed metadata stops reaching that snapshot. This
+//! cleanup derives from that metadata, so it makes the loss physical. The window belongs to the
+//! metadata commit: a full-CAS catalog rejects the racing ref commit, and a ref commit after the
+//! expiry fails validation.
 //!
-//! **Default posture divergence:** Java's `cleanExpiredFiles` defaults to TRUE — `commit()`
-//! deletes files unless told otherwise. The Rust [`ExpireSnapshotsAction`]
-//! (crate::transaction::ExpireSnapshotsAction) commits metadata only; file cleanup happens only
-//! when the caller explicitly invokes this module (the `cleanExpiredFiles(false)` posture by
-//! default). Rationale: the action seam cannot express Java's post-commit step, and a library
-//! port of an irreversible file-deletion path must be opt-in, not ambient.
+//! **Default posture divergence.** Java's `cleanExpiredFiles` defaults to true. The Rust action
+//! commits metadata only, and cleanup runs only when the caller invokes this module. An
+//! irreversible file-deletion path in a library must be opt-in, not ambient.
 //!
 //! # Failure posture
 //!
-//! Java logs-and-continues through cleanup failures (`Tasks.suppressFailureWhenFinished` +
-//! SLF4J warnings). Silent swallowing is unacceptable for a deletion sweep, so every failure is
-//! **collected and returned** in the [`CleanupReport`] — the caller gets a structured, complete
-//! record of what failed. In ADDITION (and matching Java's SLF4J warnings), each failure is also
-//! emitted as a `tracing::warn!` carrying the file path and the funnel kind, so an operator gets a
-//! live signal without waiting for the returned report. The collect-and-return remains the
-//! authoritative contract; the warn is purely additive observability:
+//! Java logs and continues. Silent swallowing is unacceptable for a deletion sweep, so every
+//! failure is collected in the [`CleanupReport`], which is the authoritative contract. Each
+//! failure also emits a `tracing::warn!`, so an operator sees it without waiting for the report.
 //!
-//! - A **manifest-list read failure** (either side) aborts with `Err` BEFORE any deletion —
-//!   Java's `readManifests`/`pruneReferencedManifests` use `throwFailureWhenFinished` and run
-//!   before the first delete, so the abort-clean semantics match. (Rust is marginally
-//!   stricter: Java never reads the RETAINED lists when no candidate manifest exists and its
-//!   prune walk early-exits once the candidate set empties, so a corrupt retained list can
-//!   escape Java's walk; Rust always reads both sides — a hard `Err` in strictly more cases,
-//!   all of them pre-deletion.)
-//! - A **candidate-manifest read failure** records a [`CleanupFailureKind::ReadCandidateManifest`]
-//!   and skips that manifest's content files (Java suppresses it) — under-deletes only. The
-//!   unreadable manifest itself is still deleted (it is referenced by no retained snapshot).
-//! - A **retained-manifest read failure** records a [`CleanupFailureKind::ReadRetainedManifest`]
-//!   and clears the ENTIRE content-file deletion set — Java's `findFilesToDelete` catches any
-//!   `Throwable` while enumerating live files and returns the empty set: when the live set
-//!   cannot be proven, no content file may die. Manifests and manifest lists are still swept
-//!   (their subtraction needed no manifest reads).
-//! - A **per-file delete failure** records the path + funnel kind and the sweep continues —
-//!   never a panic, never an abort that leaves an unreported partial sweep.
+//! | failure | effect |
+//! |---|---|
+//! | manifest-list read, either side | `Err` before any deletion |
+//! | candidate-manifest read | skip that manifest's content files; still delete the manifest |
+//! | retained-manifest read | clear the whole content-file set: liveness cannot be proven |
+//! | per-file delete | record the path and funnel kind, continue the sweep |
 //!
-//! # Deferred (loudly)
+//! Rust is marginally stricter than Java on the first row. Java never reads the retained lists
+//! when no candidate manifest exists, so a corrupt retained list can escape its walk.
 //!
-//! - **`IncrementalFileCleanup`** — Java's second strategy, picked only when NO explicit
-//!   snapshot ids were expired, NO snapshot outside the main ancestry was removed, and NO
-//!   non-main snapshots remain (`RemoveSnapshots.cleanExpiredSnapshots`, bytecode-verified; an
-//!   explicit `incrementalCleanup(true)` outside those bounds throws). It walks
-//!   manifest provenance (`added_snapshot_id`, `hasDeletedFiles`, DELETED entries of expired
-//!   ancestor snapshots, cherry-pick `source-snapshot-id` protection) to delete files
-//!   logically removed by expired main-line history — an OPTIMIZATION that avoids reading
-//!   retained manifests on huge tables, not a correctness requirement: `ReachableFileCleanup`
-//!   is the strategy Java itself falls back to for every non-linear history. The reachable
-//!   strategy's deletion set is correct for every eligible incremental case; porting the
-//!   incremental walk adds a second, more intricate deletion-set derivation for performance
-//!   only — deferred until profiling demands it (B3/never).
-//! - `cleanExpiredMetadata` (unreachable spec/schema pruning) — same deferral as B1.
-//! - Java interop evidence for the cleanup (the GAP_MATRIX row stays 🟡).
+//! # Deferred
+//!
+//! `IncrementalFileCleanup` is Java's other strategy, chosen only for a pure linear main-ancestry
+//! trim. It walks manifest provenance to avoid reading retained manifests on a huge table. That is
+//! throughput, not correctness: `ReachableFileCleanup` is what Java itself falls back to for every
+//! non-linear history, and its deletion set is correct for every incremental case too.
+//! `cleanExpiredMetadata`, the unreachable spec and schema pruning, is also deferred.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -181,37 +110,31 @@ use crate::transaction::Transaction;
 use crate::transaction::expire_snapshots::parse_property;
 use crate::{Catalog, Error, ErrorKind};
 
-/// The injectable delete function: receives the absolute file location, resolves to the
-/// deletion outcome. The default deletes through [`FileIO::delete`].
+/// The injectable delete function. The default deletes through [`FileIO::delete`].
 pub type DeleteFunction = dyn Fn(String) -> BoxFuture<'static, Result<()>> + Send + Sync;
 
-/// Which cleanup step a [`CleanupFailure`] belongs to — the four delete funnels (Java
-/// `FileCleanupStrategy.deleteFiles(set, fileType)`) plus the two manifest-read planning steps
-/// whose failures Java suppresses.
+/// Which cleanup step a [`CleanupFailure`] belongs to: the four delete funnels, plus the two
+/// manifest-read planning steps whose failures Java suppresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupFailureKind {
-    /// Deleting a content file (a data file, a position/equality delete file, or a
-    /// deletion-vector puffin) failed — Java's `"data"` funnel.
-    DeleteContentFile,
-    /// Deleting a manifest file failed — Java's `"manifest"` funnel.
-    DeleteManifest,
-    /// Deleting a manifest-list file failed — Java's `"manifest list"` funnel.
-    DeleteManifestList,
-    /// Deleting a statistics / partition-statistics file failed — Java's `"statistics files"`
+    /// Deleting a data file, a delete file, or a deletion-vector Puffin failed. Java's `"data"`
     /// funnel.
+    DeleteContentFile,
+    /// Deleting a manifest file failed.
+    DeleteManifest,
+    /// Deleting a manifest-list file failed.
+    DeleteManifestList,
+    /// Deleting a statistics or partition-statistics file failed.
     DeleteStatisticsFile,
-    /// A candidate (expired-only) manifest could not be read while enumerating content files;
-    /// its content files were skipped (under-deletion only — the manifest itself is still
-    /// referenced by no retained snapshot and is still deleted).
+    /// A candidate manifest could not be read. Its content files were skipped, which
+    /// under-deletes. No retained snapshot references the manifest, so it is still deleted.
     ReadCandidateManifest,
-    /// A RETAINED manifest could not be read while enumerating live content files; the entire
-    /// content-file deletion set was cleared (Java's catch-`Throwable` → empty set): when the
+    /// A retained manifest could not be read, so the whole content-file set was cleared. When the
     /// live set cannot be proven, no content file may die.
     ReadRetainedManifest,
 }
 
-/// One collected, non-aborting cleanup failure (the Rust replacement for Java's
-/// log-and-continue posture — see the [module docs](self)).
+/// One collected, non-aborting cleanup failure. Java logs and continues instead.
 #[derive(Debug)]
 pub struct CleanupFailure {
     /// The file the failed step was operating on.
@@ -222,41 +145,27 @@ pub struct CleanupFailure {
     pub error: Error,
 }
 
-/// The outcome of one cleanup sweep: every successfully deleted path, per delete funnel
-/// (mirroring Java's four `deleteFiles` calls), plus every collected failure. Vectors are
-/// deterministic: paths sorted within each funnel, funnels in Java's deletion order. The
-/// content funnel is additionally readable per content class through the DERIVED typed views
-/// ([`Self::deleted_data_files`] / [`Self::deleted_position_delete_files`] /
-/// [`Self::deleted_equality_delete_files`]) — Spark's three per-content-type
-/// `expire_snapshots` columns.
+/// The outcome of one cleanup sweep: every deleted path per funnel, plus every collected
+/// failure. Paths sort within a funnel, and funnels follow Java's deletion order.
 ///
-/// **`#[non_exhaustive]`:** this report is produced by the cleanup and READ by callers, never
-/// built by them, and it gains a funnel whenever the cleanup learns to report one. Downstream
-/// crates therefore construct it — in the rare case they need to, e.g. a test double — as
-/// `CleanupReport::default()` followed by field assignment, which keeps compiling as fields are
-/// added; cross-crate struct-literal construction (exhaustive or `..Default::default()`) and
-/// exhaustive destructuring are deliberately closed off so no future funnel breaks a consumer.
+/// The report is `#[non_exhaustive]` because the cleanup produces it and callers only read it. It
+/// gains a funnel whenever the cleanup learns to report one. A downstream crate that needs to
+/// build one starts from `CleanupReport::default()` and assigns fields, which keeps compiling as
+/// fields are added.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct CleanupReport {
-    /// Deleted content files: data files, position/equality delete files, deletion-vector
-    /// puffins (Java's `"data"` funnel — its `readPaths` walk emits all three classes).
+    /// Deleted content files: data files, delete files, and deletion-vector Puffins.
     ///
-    /// **This is the UNION and it is the authority on membership.** The per-content-type views
-    /// ([`Self::deleted_data_files`], [`Self::deleted_position_delete_files`],
-    /// [`Self::deleted_equality_delete_files`], [`Self::deleted_content_files_of_type`]) are
-    /// DERIVED by filtering this vector, so a typed view can never name a file the union does
-    /// not — including when the fail-closed posture clears the content set (see
-    /// [`Self::clean_expired_files`](ExpireSnapshotsCleanup::clean_expired_files)).
+    /// **This union is the authority on membership.** Every per-content-type view filters this
+    /// vector, so a view can never name a file the union does not, including when the fail-closed
+    /// posture clears the content set.
     pub deleted_content_files: Vec<String>,
-    /// The manifest-entry content type of each path in [`Self::deleted_content_files`], keyed by
-    /// path — a TYPE LOOKUP, not a second membership list. Populated from the same walk that
-    /// produced the union (the classification is `ManifestEntry::content_type()`, Java
-    /// `ContentFile.content()`), so its key set equals the union's element set.
+    /// The content type of each path in [`Self::deleted_content_files`]. This is a type lookup,
+    /// not a second membership list. The same walk fills both, so the key set equals the union.
     ///
-    /// Consumers should read it through the typed accessors rather than directly. A
-    /// [`BTreeMap`], not a hash map, so the field — and therefore the derived [`Debug`]
-    /// rendering of the whole report — has a deterministic, path-sorted order.
+    /// Read it through the typed accessors. It is a [`BTreeMap`] so the report's derived [`Debug`]
+    /// output stays deterministic.
     pub deleted_content_file_types: BTreeMap<String, DataContentType>,
     /// Deleted manifest files (data and delete manifests).
     pub deleted_manifests: Vec<String>,
@@ -278,13 +187,10 @@ impl CleanupReport {
             && self.failures.is_empty()
     }
 
-    /// The deleted content files whose manifest-entry content type is `content_type`, in the
-    /// union's order (sorted by path).
+    /// The deleted content files of `content_type`, in the union's path order.
     ///
-    /// **Derived, never stored** — this filters [`Self::deleted_content_files`], so the union
-    /// remains the single membership authority: concatenating the three
-    /// [`DataContentType`] views reproduces the union exactly, and an empty union (the
-    /// fail-closed clear) empties every view.
+    /// This filters [`Self::deleted_content_files`] and stores nothing, so the union stays the
+    /// single membership authority and an empty union empties every view.
     pub fn deleted_content_files_of_type(&self, content_type: DataContentType) -> Vec<&str> {
         self.deleted_content_files
             .iter()
@@ -295,35 +201,30 @@ impl CleanupReport {
             .collect()
     }
 
-    /// The deleted DATA files — Spark's `deleted_data_files_count` column
-    /// (`FileContent.DATA`).
+    /// The deleted data files. Spark's `deleted_data_files_count` column.
     pub fn deleted_data_files(&self) -> Vec<&str> {
         self.deleted_content_files_of_type(DataContentType::Data)
     }
 
-    /// The deleted POSITION-delete files — Spark's `deleted_position_delete_files_count`
-    /// column (`FileContent.POSITION_DELETES`).
+    /// The deleted position-delete files. Spark's `deleted_position_delete_files_count` column.
     ///
-    /// **Deletion-vector puffins land HERE.** Java tags a content file by
-    /// `ContentFile.content()` alone (`BaseSparkAction$ReadManifest.toFileInfo`, bytecode
-    /// 1.10.0), never by file format, and a DV is a `DeleteFile` whose content is
-    /// `POSITION_DELETES` — so DVs are counted as position deletes and are NOT separable from
-    /// Parquet position deletes. There is no fourth bucket in Java and there is none here.
+    /// **A deletion-vector Puffin lands here.** Java tags a content file by `ContentFile.content()`
+    /// alone, never by file format, and a vector is a delete file whose content is
+    /// `POSITION_DELETES`. Java has no fourth bucket, so neither does this.
     pub fn deleted_position_delete_files(&self) -> Vec<&str> {
         self.deleted_content_files_of_type(DataContentType::PositionDeletes)
     }
 
-    /// The deleted EQUALITY-delete files — Spark's `deleted_equality_delete_files_count`
-    /// column (`FileContent.EQUALITY_DELETES`).
+    /// The deleted equality-delete files. Spark's `deleted_equality_delete_files_count` column.
     pub fn deleted_equality_delete_files(&self) -> Vec<&str> {
         self.deleted_content_files_of_type(DataContentType::EqualityDeletes)
     }
 }
 
-/// Post-commit physical file cleanup for snapshot expiry — the Rust port of Java 1.10.0
-/// `ReachableFileCleanup` (see the [module docs](self) for the exact set algebra, the seam
-/// design, and the failure posture). **This deletes files**; construct it with the table's
-/// [`FileIO`] and run it only against a successfully committed expiry, preferably through
+/// Post-commit file cleanup for snapshot expiry (Java `ReachableFileCleanup`). The module docs
+/// carry the set algebra, the seam, and the failure posture.
+///
+/// **This deletes files.** Run it only against a successfully committed expiry, preferably through
 /// [`Self::commit_and_clean`].
 pub struct ExpireSnapshotsCleanup {
     file_io: FileIO,
@@ -343,10 +244,9 @@ impl ExpireSnapshotsCleanup {
         }
     }
 
-    /// Replaces the delete function (Java `ExpireSnapshots.deleteWith`) — the testability /
-    /// dry-run seam: inject a recorder that returns `Ok` without deleting to compute the
-    /// would-be deletion set without touching storage, or route deletions through an external
-    /// queue. The planning reads still go through the construction-time [`FileIO`].
+    /// Replaces the delete function (Java `ExpireSnapshots.deleteWith`). A recorder that returns
+    /// `Ok` without deleting computes the would-be deletion set. Planning reads still use the
+    /// construction-time [`FileIO`].
     pub fn delete_with(
         mut self,
         delete_function: impl Fn(String) -> BoxFuture<'static, Result<()>> + Send + Sync + 'static,
@@ -355,24 +255,19 @@ impl ExpireSnapshotsCleanup {
         self
     }
 
-    /// Commit `transaction` through `catalog` and, ONLY if the commit succeeds, clean the files
-    /// expired by it — the Java `RemoveSnapshots.commit()` ordering (commit retry loop first,
-    /// `cleanExpiredSnapshots()` strictly after success; bytecode-verified). On a failed commit
-    /// the error propagates before any deletion is planned or executed.
+    /// Commits `transaction`, then cleans the files it expired only if the commit succeeded.
+    /// This is Java's `RemoveSnapshots.commit()` ordering. A failed commit propagates before
+    /// anything is planned or deleted.
     ///
-    /// The pre-commit state is captured from the transaction's table; the post-commit state is
-    /// the committed table the catalog returned. Mirroring Java's `commit()` gate
-    /// (`cleanExpiredFiles && !base.snapshots().isEmpty()`), a pre-commit table with no
-    /// snapshots commits but skips cleanup.
+    /// A pre-commit table with no snapshots commits but skips cleanup, matching Java's gate.
     pub async fn commit_and_clean(
         &self,
         transaction: Transaction,
         catalog: &dyn Catalog,
     ) -> Result<(Table, CleanupReport)> {
         let before = transaction.table.metadata_ref();
-        // The `?` is the safety gate: a failed/uncertain commit returns here, making the
-        // deletion path below structurally unreachable (pinned by
-        // `test_failed_commit_performs_zero_deletions`).
+        // The `?` is the safety gate. A failed or uncertain commit returns here, so the deletion
+        // path below is structurally unreachable.
         let committed = transaction.commit(catalog).await?;
         if before.snapshots().len() == 0 {
             return Ok((committed, CleanupReport::default()));
@@ -383,27 +278,23 @@ impl ExpireSnapshotsCleanup {
         Ok((committed, report))
     }
 
-    /// The two-state cleanup core (Java `ReachableFileCleanup.cleanFiles(before, after)`):
-    /// delete every file reachable from `before` but unreachable from `after`, per the set
-    /// algebra in the [module docs](self).
+    /// Deletes every file that `before` reaches and `after` does not (Java `cleanFiles`).
     ///
-    /// **`after` MUST be the table's current committed metadata** (the state a successful
-    /// expire-snapshots commit produced). Passing anything staler deletes files the live table
-    /// still reaches — use [`Self::commit_and_clean`] unless you are wiring your own commit.
+    /// **`after` must be the table's current committed metadata.** Anything staler deletes files
+    /// the live table still reaches. Prefer [`Self::commit_and_clean`].
     ///
-    /// Returns `Err` without deleting anything when a manifest LIST cannot be read or the
-    /// table's `gc.enabled` gate refuses; per-file problems after planning are collected in the
-    /// returned [`CleanupReport`] instead (see the failure posture in the module docs).
+    /// # Errors
+    ///
+    /// Fails without deleting anything when a manifest list cannot be read, or when the
+    /// `gc.enabled` gate refuses. Later problems land in the [`CleanupReport`].
     pub async fn clean_expired_files(
         &self,
         before: &TableMetadata,
         after: &TableMetadata,
     ) -> Result<CleanupReport> {
-        // Re-honor the GC gate at the cleanup door. Java's gate sits in the RemoveSnapshots
-        // CONSTRUCTOR (bytecode: `PropertyUtil.propertyAsBoolean(base.properties, "gc.enabled",
-        // true)` + verbatim message), which covers cleanup because cleanup runs inside the same
-        // object; this standalone entry point must re-check, or a direct call would bypass the
-        // gate the action enforced at commit.
+        // Java's gate sits in the RemoveSnapshots constructor, which covers cleanup because
+        // cleanup runs on the same object. This standalone entry point must re-check, or a direct
+        // call bypasses the gate the action enforced at commit.
         let gc_enabled = parse_property(
             before.properties(),
             TableProperties::PROPERTY_GC_ENABLED,
@@ -417,9 +308,8 @@ impl ExpireSnapshotsCleanup {
             ));
         }
 
-        // 1. Expired snapshots (before − after, by id) and their manifest lists. The
-        //    retained-shared filter on the lists is the documented Rust-only under-deletion
-        //    guard (Java deletes expired manifest-list locations unconditionally).
+        // Step 1 and 2. The retained-shared filter on the lists is the Rust-only under-deletion
+        // guard; Java deletes an expired manifest-list location unconditionally.
         let retained_ids: HashSet<i64> = after.snapshots().map(|s| s.snapshot_id()).collect();
         let expired_snapshots: Vec<&SnapshotRef> = before
             .snapshots()
@@ -434,9 +324,7 @@ impl ExpireSnapshotsCleanup {
             .map(str::to_string)
             .collect();
 
-        // 2 + 3. Candidate manifests (from expired snapshots) minus retained manifests, BY PATH
-        //    (GenericManifestFile path equality). A manifest-list read failure on either side
-        //    aborts here, before any deletion (Java `throwFailureWhenFinished`).
+        // Step 3. A manifest-list read failure on either side aborts here, before any deletion.
         let candidate_manifests = self
             .manifests_by_path(expired_snapshots.iter().copied(), before)
             .await?;
@@ -448,15 +336,9 @@ impl ExpireSnapshotsCleanup {
 
         let mut report = CleanupReport::default();
 
-        // 4. Content files: live entries of the deleted manifests minus live entries of every
-        //    retained manifest (Java `findFilesToDelete`; "live" = status != DELETED on BOTH
-        //    sides). Skipped entirely when no manifest dies (Java's `!manifestsToDelete
-        //    .isEmpty()` gate).
-        //    Keyed by path (the deduplicating set algebra is unchanged) and VALUED by the
-        //    entry's content type (Java `ContentFile.content()` — the only thing Spark's
-        //    `toFileInfo` tags a deleted content file with). Two entries sharing a path share a
-        //    content type in every legal shape (a puffin's DVs are all POSITION_DELETES), so
-        //    the last-write-wins insert is not a classification hazard.
+        // Step 4, skipped entirely when no manifest dies. The map keys on path, so the set
+        // algebra is unchanged. Two entries that share a path share a content type in every legal
+        // shape, so the last-write-wins insert cannot misclassify.
         let mut content_files_to_delete: BTreeMap<String, DataContentType> = BTreeMap::new();
         if !manifests_to_delete.is_empty() {
             for (path, manifest_file) in &manifests_to_delete {
@@ -497,8 +379,8 @@ impl ExpireSnapshotsCleanup {
                             }
                         }
                         Err(error) => {
-                            // Java catches any Throwable here and returns the EMPTY set: when
-                            // the live file set cannot be proven, no content file may die.
+                            // Java catches any Throwable here and returns the empty set. When the
+                            // live file set cannot be proven, no content file may die.
                             tracing::warn!(
                                 path = %path,
                                 kind = ?CleanupFailureKind::ReadRetainedManifest,
@@ -520,19 +402,14 @@ impl ExpireSnapshotsCleanup {
             }
         }
 
-        // 5. Statistics files present before but not after (Java
-        //    `expiredStatisticsFilesLocations` — plain location-set difference).
         let statistics_to_delete: BTreeSet<String> = statistics_locations(before)
             .difference(&statistics_locations(after))
             .cloned()
             .collect();
 
-        // 6. The sweep, in Java's deletion order: content files → manifests → manifest lists →
-        //    statistics. Per-file failures are collected; the sweep never aborts.
-        // The content funnel sweeps the map's KEYS (identical set, identical sorted order to
-        // the previous `BTreeSet`), then records the type of each SUCCESSFULLY deleted path.
-        // Both come from `content_files_to_delete`, so every union member has a type entry by
-        // construction, and a path that failed to delete is in neither.
+        // The sweep follows Java's deletion order and never aborts. The content funnel sweeps the
+        // map's keys, then records the type of each path it deleted. Both come from
+        // `content_files_to_delete`, so a path that failed to delete is in neither.
         let content_paths: BTreeSet<String> = content_files_to_delete.keys().cloned().collect();
         report.deleted_content_files = self
             .delete_all(
@@ -572,11 +449,9 @@ impl ExpireSnapshotsCleanup {
         Ok(report)
     }
 
-    /// Read the manifest lists of `snapshots` and collect every listed [`ManifestFile`] keyed
-    /// by path (Java `readManifests(Set<Snapshot>)` / the prune walk — both keyed on
-    /// `GenericManifestFile`'s path equality). DATA and DELETE manifests are both collected. A
-    /// manifest-list read failure is a hard error (Java `throwFailureWhenFinished`; the caller
-    /// runs this before any deletion).
+    /// Reads the manifest lists of `snapshots` and collects every listed [`ManifestFile`] by
+    /// path, data and delete alike. A manifest-list read failure is a hard error, and the caller
+    /// runs this before any deletion.
     async fn manifests_by_path<'a>(
         &self,
         snapshots: impl Iterator<Item = &'a SnapshotRef>,
@@ -604,10 +479,8 @@ impl ExpireSnapshotsCleanup {
         Ok(manifests)
     }
 
-    /// Delete every path in `paths` through the injected delete function, returning the
-    /// successfully deleted paths (in `paths`' sorted order) and recording failures tagged
-    /// `kind` — the per-funnel sweep (Java `FileCleanupStrategy.deleteFiles(set, fileType)`,
-    /// with collect-and-return replacing log-and-continue). Never aborts.
+    /// Deletes every path through the injected delete function and returns the ones that
+    /// succeeded, in sorted order. A failure is recorded under `kind`. This never aborts.
     async fn delete_all(
         &self,
         paths: BTreeSet<String>,
@@ -634,8 +507,7 @@ impl ExpireSnapshotsCleanup {
     }
 }
 
-/// All statistics + partition-statistics file locations of `metadata` (Java
-/// `FileCleanupStrategy.statsFileLocations`).
+/// Every statistics and partition-statistics location of `metadata`.
 fn statistics_locations(metadata: &TableMetadata) -> BTreeSet<String> {
     metadata
         .statistics_iter()
@@ -672,8 +544,7 @@ mod tests {
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, Error, ErrorKind};
 
-    /// A `tracing` [`Layer`] that formats each event (message + fields) into one line and pushes
-    /// it onto a shared sink, so a test can assert on emitted log events.
+    /// Formats each `tracing` event onto a shared sink, so a test can assert on log events.
     struct CapturingLayer {
         sink: Arc<Mutex<Vec<String>>>,
     }
@@ -780,8 +651,7 @@ mod tests {
         table.file_io().exists(path).await.expect("exists check")
     }
 
-    /// A recording delete fn that "succeeds" without touching storage — the dry-run /
-    /// zero-deletion-proof seam.
+    /// A recording delete function that succeeds without touching storage.
     #[allow(clippy::type_complexity)] // the tuple IS the seam: (recorded paths, injectable fn)
     fn recording_delete_fn() -> (
         Arc<Mutex<Vec<String>>>,
@@ -796,8 +666,7 @@ mod tests {
         (recorded, delete_fn)
     }
 
-    /// Expire everything age-eligible keeping each branch head (`expire_older_than(i64::MAX)` +
-    /// `retain_last(1)`), committed + cleaned through the `commit_and_clean` wrapper.
+    /// Expires everything age-eligible, keeping each branch head, through `commit_and_clean`.
     async fn expire_and_clean(
         catalog: &impl Catalog,
         table: &Table,
@@ -816,8 +685,7 @@ mod tests {
             .expect("commit and clean")
     }
 
-    /// Commit the same expiry WITHOUT cleanup, returning (pre-commit table, post-commit table) —
-    /// for tests that need to intervene (corrupt a file) between commit and cleanup.
+    /// Commits the same expiry without cleanup, for a test that intervenes in between.
     async fn expire_metadata_only(catalog: &impl Catalog, table: &Table) -> (Table, Table) {
         let tx = Transaction::new(table);
         let tx = tx
@@ -833,11 +701,10 @@ mod tests {
     /// =======================================================================
     /// The deletion-set pins — every class, both directions
     /// =======================================================================
-    /// Risk pinned (THE most important pin): fast-append chains CARRY manifests forward, so an
-    /// expired snapshot's manifest is almost always still listed by its retained descendants. A
-    /// shared manifest must SURVIVE (deleting it destroys the retained snapshot's data
-    /// unrecoverably — the data-loss class the candidates-minus-retained subtraction exists
-    /// for), while the expired snapshot's now-unreferenced manifest LIST must die.
+    /// A fast-append chain carries manifests forward, so an expired snapshot's manifest usually
+    /// survives in a retained descendant. Dropping the candidates-minus-retained subtraction
+    /// deletes that shared manifest and destroys the retained snapshot's data. The expired
+    /// snapshot's own manifest list must still die.
     #[tokio::test]
     async fn test_carried_forward_shared_manifest_survives_expired_list_dies() {
         let catalog = new_memory_catalog().await;
@@ -884,9 +751,8 @@ mod tests {
         assert!(exists(&table2, &s2_list).await);
     }
 
-    /// Risk pinned: a data file REWRITTEN into a new manifest (rewrite_manifests) but still LIVE
-    /// in the retained state must survive even though its original manifest dies — the
-    /// retained-side live-file subtraction in (c). Skipping that check deletes live data.
+    /// A data file rewritten into a new manifest stays live while its original manifest dies.
+    /// Dropping the retained-side live-file subtraction deletes live data.
     #[tokio::test]
     async fn test_rewritten_but_live_data_file_survives_its_old_manifest_dies() {
         let catalog = new_memory_catalog().await;
@@ -931,10 +797,8 @@ mod tests {
         }
     }
 
-    /// Risk pinned (the other direction of (c)): a data file live ONLY in expired snapshots —
-    /// removed by a retained `delete_files` commit — must DIE exactly once, and the DELETED
-    /// tombstone the retained rewritten manifest carries for it must NOT protect it ("live" =
-    /// status != DELETED on the retained side too, Java `isLiveEntry`).
+    /// A data file live only in expired snapshots must die. The retained manifest's DELETED
+    /// tombstone must not protect it: liveness excludes DELETED on the retained side too.
     #[tokio::test]
     async fn test_data_file_only_in_expired_snapshots_dies_tombstone_does_not_protect() {
         let catalog = new_memory_catalog().await;
@@ -953,8 +817,7 @@ mod tests {
             .expect("apply delete files");
         let table2 = tx.commit(&catalog).await.expect("commit delete files");
         let s2 = table2.metadata().current_snapshot_id().expect("s2");
-        // Pre-flight: the retained state really carries the DELETED tombstone for the file (the
-        // suppression-fixture rule — prove the case reaches the path under test).
+        // Prove the fixture reaches the path under test.
         let s2_manifests = manifests_of(&table2, s2).await;
         let mut tombstone_seen = false;
         for (path, _) in &s2_manifests {
@@ -1002,19 +865,12 @@ mod tests {
         }
     }
 
-    /// Risk pinned: a puffin path referenced by BOTH a dying delete manifest and a retained one
-    /// must SURVIVE, while a puffin referenced only by the dying manifest dies — the path-set
-    /// dedup + retained-side subtraction, both directions in one fixture. DM1 holds DV-A@P and
-    /// DV-C@P3; replacing DV-C rewrites DM1 into a retained manifest carrying DV-A as EXISTING
-    /// (same puffin P), so when DM1 dies with its snapshots, P is still live (survives) and P3
-    /// is not (dies).
+    /// A Puffin that a dying delete manifest and a retained one both reference must survive. A
+    /// Puffin only the dying manifest references must die. Both directions in one fixture.
     ///
-    /// Note the shape deliberately avoids "two DVs in one puffin, remove one": delete-file
-    /// removal is BY PATH in Java too (1.10.0 `ManifestFilterManager.delete(F)` adds
-    /// `file.location()` to the `deletePaths` CharSequenceSet — bytecode-verified), so removing
-    /// one DV of a shared puffin tombstones every same-path entry and the puffin genuinely
-    /// becomes unreachable. The cross-MANIFEST share below is the real-world shared-puffin
-    /// shape the cleanup must protect.
+    /// The shape shares across manifests, not within one Puffin. Java removes a delete file by
+    /// path, so removing one vector of a shared Puffin tombstones every same-path entry and the
+    /// Puffin does become unreachable. The cross-manifest share is the real hazard.
     #[tokio::test]
     async fn test_shared_puffin_with_one_retained_dv_survives() {
         let catalog = new_memory_catalog().await;
@@ -1077,9 +933,8 @@ mod tests {
         assert!(report.failures.is_empty());
     }
 
-    /// The kill direction of the puffin class: a puffin whose EVERY DV expired (the lone DV was
-    /// replaced) is referenced by no retained manifest and must DIE; the successor puffin and
-    /// the data files stay.
+    /// A Puffin whose every vector expired is referenced by no retained manifest and must die.
+    /// The successor Puffin and the data files stay.
     #[tokio::test]
     async fn test_expired_only_dv_puffin_dies() {
         let catalog = new_memory_catalog().await;
@@ -1118,11 +973,9 @@ mod tests {
         assert!(report.failures.is_empty());
     }
 
-    /// Risk pinned: the documented Rust-only SAFETY DIVERGENCE — Java 1.10.0 deletes every
-    /// expired snapshot's manifest-list location unconditionally; this port spares a location a
-    /// RETAINED snapshot also references (a grafted/cloned-metadata shape no Java writer
-    /// produces, but unconditional deletion would destroy the retained snapshot). A
-    /// documented-but-unpinned divergence is indistinguishable from an accidental one.
+    /// The Rust-only safety divergence: this port spares a manifest-list location a retained
+    /// snapshot also references, where Java deletes unconditionally. No Java writer produces the
+    /// shape, but unconditional deletion would destroy the retained snapshot.
     #[tokio::test]
     async fn test_manifest_list_shared_with_retained_snapshot_survives() {
         let catalog = new_memory_catalog().await;
@@ -1171,8 +1024,7 @@ mod tests {
         assert!(exists(&table1, &s1_list).await);
     }
 
-    /// Risk pinned: statistics files of expired snapshots die; a retained snapshot's statistics
-    /// survive (the before-minus-after location diff, both directions in one fixture).
+    /// An expired snapshot's statistics die and a retained snapshot's survive.
     #[tokio::test]
     async fn test_expired_snapshot_statistics_file_dies_retained_one_survives() {
         let catalog = new_memory_catalog().await;
@@ -1235,10 +1087,8 @@ mod tests {
     /// =======================================================================
     /// The seam pins — commit ordering, dry-run, failure posture, gates
     /// =======================================================================
-    /// Risk pinned (THE structural safety pin): file deletion must be IMPOSSIBLE when the
-    /// commit fails — Java's `commit()` runs `cleanExpiredSnapshots()` strictly after the
-    /// successful CAS. A failing catalog must propagate the error with ZERO delete-fn
-    /// invocations and storage untouched.
+    /// A failed commit must make deletion impossible. A refusing catalog must propagate the
+    /// error with zero delete calls and storage untouched.
     #[tokio::test]
     async fn test_failed_commit_performs_zero_deletions() {
         let catalog = new_memory_catalog().await;
@@ -1290,9 +1140,7 @@ mod tests {
         assert!(exists(&table2, &s1_list).await, "storage must be untouched");
     }
 
-    /// Risk pinned: dry-run by injection — a recording delete fn that never touches storage
-    /// computes the full would-be deletion set (report + recorder agree) while every file
-    /// remains on storage.
+    /// An injected recorder computes the full would-be deletion set while every file survives.
     #[tokio::test]
     async fn test_dry_run_by_injection_leaves_storage_untouched() {
         let catalog = new_memory_catalog().await;
@@ -1324,9 +1172,8 @@ mod tests {
         );
     }
 
-    /// Risk pinned: a delete failure is COLLECTED and the sweep CONTINUES — never an abort
-    /// leaving the rest of the sweep undone and unreported, never a silent swallow (the
-    /// documented divergence from Java's log-and-continue).
+    /// A delete failure is collected and the sweep continues. It never aborts and leaves the rest
+    /// unreported, and it never swallows the error.
     #[tokio::test]
     async fn test_injected_delete_failure_is_collected_and_sweep_continues() {
         let catalog = new_memory_catalog().await;
@@ -1364,8 +1211,7 @@ mod tests {
                 })
             },
         );
-        // Capture log events while the sweep runs: the failure must be BOTH collected-returned
-        // (asserted below, unchanged) AND warn-logged (the additive QUAL-01 Site-3 signal).
+        // The failure must be both returned in the report and warn-logged.
         let logs = Arc::new(Mutex::new(Vec::<String>::new()));
         let subscriber = tracing_subscriber::registry().with(CapturingLayer { sink: logs.clone() });
         let (report, captured) = {
@@ -1389,8 +1235,7 @@ mod tests {
         assert!(exists(&table3, &s1_list).await);
         assert!(!exists(&table3, &s2_list).await);
 
-        // The additive warn fired for the failed path (collect-and-return is unchanged above).
-        // Removing the `warn!` in `delete_all` makes this fail, so the assertion is non-vacuous.
+        // Removing the `warn!` in `delete_all` reddens this assertion.
         assert!(
             captured.iter().any(|line| {
                 line.contains("failed to delete a file") && line.contains(&s1_list)
@@ -1399,10 +1244,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned: an UNREADABLE RETAINED manifest must clear the ENTIRE content-file deletion
-    /// set (Java's catch-`Throwable` → empty set): when liveness cannot be proven, no content
-    /// file may die — while manifests/lists (whose subtraction needed no manifest reads) are
-    /// still swept and the failure is reported.
+    /// An unreadable retained manifest clears the whole content-file set: liveness cannot be
+    /// proven, so no content file may die. Manifests and lists still sweep, and the failure is
+    /// reported.
     #[tokio::test]
     async fn test_unreadable_retained_manifest_spares_all_content_files() {
         let catalog = new_memory_catalog().await;
@@ -1453,9 +1297,8 @@ mod tests {
         );
     }
 
-    /// Risk pinned: an unreadable CANDIDATE manifest skips only ITS content files
-    /// (under-deletion), is itself still deleted (no retained snapshot references it), and the
-    /// failure is reported — Java suppresses the read and proceeds.
+    /// An unreadable candidate manifest skips only its own content files, is itself still
+    /// deleted, and the failure is reported.
     #[tokio::test]
     async fn test_unreadable_candidate_manifest_skips_its_files_but_still_dies() {
         let catalog = new_memory_catalog().await;
@@ -1503,9 +1346,8 @@ mod tests {
         );
     }
 
-    /// Risk pinned: an unreadable manifest LIST aborts the cleanup with `Err` BEFORE any
-    /// deletion — planning happens strictly before the sweep (Java `throwFailureWhenFinished`
-    /// in the pre-delete walks).
+    /// An unreadable manifest list aborts with `Err` before any deletion, because planning runs
+    /// strictly before the sweep.
     #[tokio::test]
     async fn test_unreadable_manifest_list_aborts_before_any_deletion() {
         let catalog = new_memory_catalog().await;
@@ -1548,8 +1390,8 @@ mod tests {
         assert!(exists(&table2, &m1).await);
     }
 
-    /// Risk pinned: an empty expiry (identical before/after) deletes nothing and reports
-    /// nothing — scheduled maintenance must be able to run the cleanup unconditionally.
+    /// An empty expiry deletes nothing, so scheduled maintenance can run the cleanup
+    /// unconditionally.
     #[tokio::test]
     async fn test_empty_expiry_is_a_noop() {
         let catalog = new_memory_catalog().await;
@@ -1587,14 +1429,12 @@ mod tests {
         assert!(exists(&table1, &s1_list).await);
     }
 
-    /// Risk pinned (structural — the crash-resume property): the sweep runs Java's funnel order,
-    /// content files → manifests → manifest lists → statistics (`cleanFiles` bytecode: "data" →
-    /// "manifest" → "manifest list" → "statistics files"). Leaves die before the structures that
-    /// index them, so a crash mid-sweep always leaves the expired manifest LISTS readable until
-    /// last and a re-run can still PLAN (and finish) the remainder; a lists-first sweep that
-    /// crashed would orphan every manifest/content file beneath it beyond any re-run (only a
-    /// future DeleteOrphanFiles could reclaim them). No per-funnel report assertion can see
-    /// cross-funnel order, so this pins the recorder's raw invocation sequence.
+    /// The sweep follows Java's funnel order, so a leaf dies before the structure that indexes
+    /// it. A crash mid-sweep leaves the expired manifest lists readable, and a re-run can still
+    /// plan the remainder. A lists-first sweep would orphan everything beneath them.
+    ///
+    /// No per-funnel report assertion can see cross-funnel order, so this pins the recorder's raw
+    /// invocation sequence.
     #[tokio::test]
     async fn test_sweep_order_content_manifests_lists_statistics() {
         let catalog = new_memory_catalog().await;
@@ -1641,7 +1481,7 @@ mod tests {
         let cleanup = ExpireSnapshotsCleanup::new(table2.file_io().clone()).delete_with(delete_fn);
         let (_, report) = expire_and_clean(&catalog, &table2, &cleanup).await;
 
-        // Every funnel must be exercised, or the order pin is vacuous.
+        // An unexercised funnel would make the order pin vacuous.
         assert_eq!(report.deleted_content_files, vec![data_path.to_string()]);
         assert!(!report.deleted_manifests.is_empty(), "fixture: no manifest");
         assert!(
@@ -1665,13 +1505,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned (the re-run story): running the SAME (before, after) cleanup twice — a
-    /// retried maintenance job, or a race with another process's cleanup of the same expiry —
-    /// must never over-delete and never panic. After a complete first sweep the expired
-    /// manifest lists are gone, so the second run aborts at PLANNING with a hard `Err` and
-    /// ZERO delete calls (Java's `readManifests` throws identically) — the under-deletion
-    /// direction. A sweep interrupted EARLIER re-plans from the still-intact lists instead
-    /// (the order pin above keeps them alive until last).
+    /// Running the same cleanup twice must never over-delete and never panic. After a complete
+    /// first sweep the expired manifest lists are gone, so the second run aborts at planning with
+    /// zero delete calls. A sweep interrupted earlier re-plans from the intact lists.
     #[tokio::test]
     async fn test_rerun_after_complete_sweep_aborts_at_planning_with_zero_deletions() {
         let catalog = new_memory_catalog().await;
@@ -1711,9 +1547,8 @@ mod tests {
         );
     }
 
-    /// Risk pinned: the `gc.enabled` gate is re-honored at the CLEANUP door — the standalone
-    /// entry point must refuse with Java's constructor message (the B1 gate runs at the
-    /// action's commit; a direct cleanup call must not bypass it).
+    /// The `gc.enabled` gate is re-honored at the cleanup door, so a direct call cannot bypass
+    /// the gate the action enforced at commit.
     #[tokio::test]
     async fn test_gc_disabled_cleanup_refused() {
         let catalog = new_memory_catalog().await;
@@ -1746,10 +1581,8 @@ mod tests {
             "Cannot expire snapshots: GC is disabled (deleting files may corrupt other tables)"
         );
 
-        // The gate reads the PRE-expiry state (Java's gate lives in the `RemoveSnapshots`
-        // constructor and consults `base`, never the post-state): before=disabled must refuse
-        // even when after=enabled — a gate consulting only `after` would run a cleanup the
-        // expiry's own commit-time gate refused.
+        // The gate reads the pre-expiry state, as Java's constructor does. A gate that read only
+        // `after` would run a cleanup the expiry's own commit-time gate refused.
         let error = cleanup
             .clean_expired_files(&disabled, table1.metadata())
             .await
@@ -1764,9 +1597,8 @@ mod tests {
     /// =======================================================================
     /// Content-type classification of the deleted content funnel (F-2)
     /// =======================================================================
-    /// A synthetic PARQUET position-delete file (NOT a deletion vector — no
-    /// `referenced_data_file` / `content_offset`), routed to partition `x = 0`. V2-legal;
-    /// exists so the position-delete bucket can be pinned by a non-puffin file too.
+    /// A parquet position-delete file, not a deletion vector, so the position-delete bucket is
+    /// pinned by a non-Puffin file too.
     fn synthetic_position_delete_file(path: &str) -> DataFile {
         DataFileBuilder::default()
             .content(DataContentType::PositionDeletes)
@@ -1795,11 +1627,8 @@ mod tests {
             .expect("build synthetic equality delete file")
     }
 
-    /// The union must equal the concatenation of the three typed views (Java's `FileContent`
-    /// has exactly three members — `DATA`, `POSITION_DELETES`, `EQUALITY_DELETES`,
-    /// bytecode-verified against `iceberg-api-1.10.0.jar` — so the three views partition the
-    /// funnel with nothing left over). Asserted as SORTED multisets because the views are
-    /// order-preserving filters of a sorted union.
+    /// The union must equal the three typed views concatenated. Java's `FileContent` has exactly
+    /// three members, so the views partition the funnel with nothing left over.
     fn assert_union_is_concatenation_of_parts(report: &super::CleanupReport) {
         let mut concatenated: Vec<&str> = report.deleted_data_files();
         concatenated.extend(report.deleted_position_delete_files());
@@ -1812,11 +1641,9 @@ mod tests {
         );
     }
 
-    /// Builds a table whose expiry kills exactly one DATA file, one PARQUET position delete and
-    /// one EQUALITY delete, expires it, and returns `(data_path, pos_path, eq_path, report)`.
-    /// Shared by the per-bucket test and the partition-invariant test so the invariant can be
-    /// asserted ALONE (an invariant asserted after exhaustive per-bucket equality would be
-    /// dominated by it and could not be mutation-proven).
+    /// Builds and expires a table that kills one data file, one parquet position delete, and one
+    /// equality delete. Two tests share it so the partition invariant can be asserted alone: after
+    /// exhaustive per-bucket equality it would be dominated and could not be mutation-proven.
     async fn expire_one_file_of_each_content_type() -> (
         &'static str,
         &'static str,
@@ -1842,8 +1669,8 @@ mod tests {
             .expect("apply row delta deletes");
         let table2 = tx.commit(&catalog).await.expect("commit row delta deletes");
 
-        // Remove all three in ONE commit, so the retained head's manifests hold only
-        // tombstones and every one of the three becomes an expired-only live entry.
+        // One commit, so the retained head holds only tombstones and all three become
+        // expired-only live entries.
         let tx = Transaction::new(&table2);
         let tx = tx
             .row_delta()
@@ -1857,8 +1684,7 @@ mod tests {
         let (_, report) = expire_and_clean(&catalog, &table3, &cleanup).await;
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
-        // Pre-flight: the fixture really did kill all three (otherwise every assertion the
-        // callers make could pass vacuously on an empty funnel).
+        // An empty funnel would make every caller's assertion vacuous.
         assert_eq!(
             report.deleted_content_files,
             vec![
@@ -1871,11 +1697,8 @@ mod tests {
         (data_path, pos_path, eq_path, report)
     }
 
-    /// Risk pinned: the deleted content funnel must be SPLIT by manifest-entry content type, so
-    /// a consumer can fill Spark's `deleted_data_files_count` /
-    /// `deleted_position_delete_files_count` / `deleted_equality_delete_files_count` columns
-    /// separately instead of reporting one lumped number. One expiry kills a DATA file, a
-    /// PARQUET position delete and an EQUALITY delete; each must land in exactly its own view.
+    /// The content funnel splits by entry content type, so a consumer can fill Spark's three
+    /// per-type columns separately. Each of the three killed files lands in its own view.
     #[tokio::test]
     async fn test_deleted_content_files_split_by_content_type() {
         let (data_path, pos_path, eq_path, report) = expire_one_file_of_each_content_type().await;
@@ -1885,24 +1708,17 @@ mod tests {
         assert_eq!(report.deleted_equality_delete_files(), vec![eq_path]);
     }
 
-    /// Risk pinned: the union is the membership authority and the three typed views PARTITION
-    /// it — no file may be dropped by the classification, and none may be counted twice.
-    /// Asserted ALONE (no per-bucket equality in this test) so a bucket that drops a file
-    /// reddens THIS assertion and not merely a stricter one ahead of it.
+    /// The three typed views partition the union: the classification drops no file and counts
+    /// none twice. Asserted alone, so a bucket that drops a file reddens this assertion.
     #[tokio::test]
     async fn test_typed_views_partition_the_deleted_content_union() {
         let (_, _, _, report) = expire_one_file_of_each_content_type().await;
         assert_union_is_concatenation_of_parts(&report);
     }
 
-    /// Risk pinned — THE deletion-vector question, settled by Java 1.10.0 bytecode: a DV puffin
-    /// is counted as a POSITION delete, not as a fourth class.
-    /// `BaseSparkAction$ReadManifest.toFileInfo(ContentFile)` tags a file with
-    /// `file.content().toString()` ALONE — the file FORMAT is never consulted — and
-    /// `BaseSparkAction$DeleteSummary.deletedFile` dispatches that string against
-    /// `FileContent.POSITION_DELETES.name()`. A DV is a `DeleteFile` whose `content()` is
-    /// `POSITION_DELETES`, so its Puffin format is irrelevant: DVs are NOT separable from
-    /// Parquet position deletes in Spark's counts, and no fourth bucket exists.
+    /// A deletion-vector Puffin counts as a position delete, not as a fourth class. Java tags a
+    /// file by `content()` alone and never consults the format, so a vector is not separable from
+    /// a parquet position delete.
     #[tokio::test]
     async fn test_deletion_vector_puffin_is_counted_as_a_position_delete_not_a_fourth_bucket() {
         let catalog = new_memory_catalog().await;
@@ -1959,11 +1775,9 @@ mod tests {
         assert_union_is_concatenation_of_parts(&report);
     }
 
-    /// Risk pinned: the fail-closed posture covers the TYPED views too. When a retained
-    /// manifest cannot be read, liveness cannot be proven and the whole content set is cleared
-    /// — so every typed view must be empty as well, not just the union. (The typed views are
-    /// derived by filtering the union, which is what makes this structural; a shape that
-    /// stored the classification independently could report deletions the union denies.)
+    /// The fail-closed posture covers the typed views too. Every view must empty with the union,
+    /// which holds because each view filters it. A stored classification could report deletions
+    /// the union denies.
     #[tokio::test]
     async fn test_unreadable_retained_manifest_spares_every_typed_content_view() {
         let catalog = new_memory_catalog().await;
@@ -2002,8 +1816,7 @@ mod tests {
         );
 
         let (before, after) = expire_metadata_only(&catalog, &table3).await;
-        // Corrupt EVERY retained manifest after the commit, before the cleanup, so the
-        // retained-side liveness walk cannot succeed whichever manifest it reads first.
+        // Corrupt every retained manifest, so the liveness walk fails whichever it reads first.
         for path in &retained_manifests {
             table3
                 .file_io()

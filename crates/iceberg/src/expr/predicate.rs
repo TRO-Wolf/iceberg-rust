@@ -32,73 +32,24 @@ use crate::expr::{Bind, BoundReference, PredicateOperator, Reference};
 use crate::spec::{Datum, PrimitiveLiteral, SchemaRef};
 use crate::{Error, ErrorKind};
 
-/// The deepest logical nesting (`AND`/`OR`/`NOT` levels) that [`Predicate::bind`] and the
-/// predicate-tree visitors accept before returning `DataInvalid`.
+/// The deepest logical nesting that [`Predicate::bind`] and the predicate-tree visitors accept
+/// before they return `DataInvalid`. It bounds the RECURSIVE walks only: `bind` and the two
+/// visitors. `negate`, `rewrite_not` and both `Display` impls cost O(1) stack at any depth. The
+/// DERIVED `Drop`, `Clone` and `PartialEq` glue still recurses, and no depth check can intercept
+/// `Drop`, because the tree is destroyed after every gate has run. The number below is a measured
+/// stack budget: the bytes one level costs, bisected on a thread of exact `stack_size`.
 ///
-/// # What this actually protects
+/// | recursive walk                   | dev profile | release profile |
+/// |----------------------------------|-------------|-----------------|
+/// | `Predicate::bind`                | 5,504 B     | 964 B           |
+/// | `bound_predicate_visitor::visit` | 4,650 B     | 787 B           |
+/// | `predicate_visitor::visit`       | 4,245 B     | 771 B           |
 ///
-/// It bounds the **recursive** walks only: [`Predicate::bind`],
-/// [`crate::expr::visitors::bound_predicate_visitor::visit`] and its unbound twin. The walks that
-/// are *not* bounded do not need to be, because they were rewritten to an explicit stack —
-/// [`Predicate::negate`], [`BoundPredicate::negate`], [`Predicate::rewrite_not`],
-/// [`BoundPredicate::rewrite_not`] and both `Display` impls consume O(1) stack at any depth.
-/// The remaining unbounded recursion in this module is the DERIVED glue — `Drop`, and equally
-/// `Clone` and `PartialEq`, all of which walk the tree structurally. Dropping, cloning or comparing
-/// a tree deeper than this limit still recurses, and no depth check can intercept `Drop` because
-/// the tree is destroyed after every gate has already run.
-///
-/// # Where the number comes from
-///
-/// It is a measured stack budget, not a copy of the JSON parser's limit. Each figure below is the
-/// bytes of stack one nesting level costs, obtained by spawning a thread with an exact
-/// `stack_size`, walking a left-spine `AND` chain of N binary leaves, and bisecting the largest N
-/// that returns instead of dying on the guard page (x86-64 Linux, rustc per
-/// `rust-toolchain.toml`). Repeating the bisect at 1/2/4/8 MiB reproduced each figure to within
-/// 1.2%, confirming the cost is linear in depth.
-///
-/// | recursive walk                        | dev profile | release profile |
-/// |---------------------------------------|-------------|-----------------|
-/// | `Predicate::bind`                     | 5,504 B     | 964 B           |
-/// | `bound_predicate_visitor::visit`      | 4,650 B     | 787 B           |
-/// | `predicate_visitor::visit`            | 4,245 B     | 771 B           |
-///
-/// Those `bind` figures are *after* splitting the leaf arms into the `#[inline(never)]`
-/// `Predicate::bind_leaf`; with the arms inlined into the recursive function the same bisect gave
-/// 12,336 B (dev) / 1,800 B (release) per level, so the split more than halved the cost.
-///
-/// The arithmetic, sized for the smallest stack a realistic caller has — a **tokio worker thread,
-/// which defaults to 2 MiB**, far below the 8 MiB main thread:
-///
-/// ```text
-///   2,097,152 B  (tokio worker stack)
-/// ÷           2  (safety factor: half the stack reserved for the scan/delete-filter frames
-///                 already live when the walk is entered)
-/// ÷         964  (worst recursive walk, release: Predicate::bind)
-/// = 1,087 levels → MAX_PREDICATE_DEPTH = 1000
-/// ```
-///
-/// **Dev-profile caveat, stated rather than hidden:** an unoptimized build costs 5,504 B per
-/// `bind` level, so a 2 MiB worker aborts near level 380 — before this limit can reject anything.
-/// A dev-profile caller that legitimately nests deeper must run on the main thread or raise
-/// `RUST_MIN_STACK` / the worker `stack_size`. Release builds — what the library ships as — have
-/// the 2× margin above.
-///
-/// # Why 1000 and not 100
-///
-/// The previous value, 100, was below what this crate's own read path constructs, so it turned
-/// working tables into scan failures:
-///
-/// * `DeleteFilter::build_equality_delete_predicate` LEFT-folds one conjunct per equality-delete
-///   file attached to a data file, on top of each file's own (balanced) fold. A Flink upsert
-///   table with ~102 single-row delete files, or ~87 delete files of 4,096 rows over a
-///   two-column key, exceeded 100. At 1000 the same shapes admit ~1000 and ~985 files.
-/// * `iceberg-datafusion`'s `expr_to_predicate` reduces the pushed-down filters with
-///   `Predicate::and`, so a query with N conjuncts nests N−1 levels deep.
-///
-/// Java has no counterpart limit at all: `Binder.bind` and `ExpressionVisitors.visit`
-/// (`iceberg-api` 1.10.0) carry no depth parameter, and a program built against those jars binds
-/// and visits a 5,000-deep left-folded `AND` on the default stack. This limit is therefore a
-/// stack-safety backstop that must stay far above real workloads, not a semantic constraint.
+/// Half a 2 MiB tokio worker stack, divided by 964 B, gives 1,087 levels. The `bind` figures hold
+/// only while the leaf arms stay in the `#[inline(never)]` [`Predicate::bind_leaf`]. A dev build
+/// aborts near level 380 before the limit rejects anything; raise `RUST_MIN_STACK` there. The limit
+/// must stay far above real workloads: Java has no counterpart, and the previous value of 100
+/// turned working tables into scan failures, at one conjunct per equality-delete file.
 pub(crate) const MAX_PREDICATE_DEPTH: usize = 1000;
 
 /// Logical expression, such as `AND`, `OR`, `NOT`.
@@ -166,38 +117,20 @@ where T::Bound: Sized
     }
 }
 
-/// Unary predicate, for example, `a IS NULL`.
-///
-/// Deserialization goes through `SerdeUnaryExpression` so that the operator's
-/// arity is validated at the wire boundary — [`UnaryExpression::new`] only
-/// `debug_assert!`s it, so without this a crafted/corrupt serialized predicate
-/// could smuggle a non-unary operator past construction (see the audit note on
-/// the `SerdeUnaryExpression` shadow).
+/// Unary predicate, for example `a IS NULL`. `SerdeUnaryExpression` validates its arity.
 #[derive(PartialEq, Clone, Serialize, Deserialize)]
 #[serde(
     try_from = "SerdeUnaryExpression<T>",
     bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>")
 )]
 pub struct UnaryExpression<T> {
-    /// Operator of this predicate, must be single operand operator.
     op: PredicateOperator,
-    /// Term of this predicate, for example, `a` in `a IS NULL`.
     term: T,
 }
 
-/// Serde deserialization shadow for [`UnaryExpression`]: it captures the raw
-/// wire fields, then the [`TryFrom`] impl rejects a non-unary operator BEFORE a
-/// [`UnaryExpression`] value exists.
-///
-/// The public constructor [`UnaryExpression::new`] guards arity with a
-/// `debug_assert!` only, which is compiled out in release. Because
-/// `UnaryExpression`/[`Predicate`]/[`BoundPredicate`] derive `Deserialize` and a
-/// `BoundPredicate` is reachable over the wire (it is a field of a
-/// `Serialize`/`Deserialize` `FileScanTask`), a serialized predicate encoding a
-/// mismatched op (e.g. a binary op in a unary shape) would otherwise bypass
-/// `new` entirely and later panic the visitor dispatch in a release build
-/// (audit SAF-004). Validating here closes that hole; `Serialize` stays derived
-/// on the real type because we never emit an invalid shape.
+/// Serde shadow for [`UnaryExpression`]: [`TryFrom`] rejects a non-unary operator BEFORE a value
+/// exists. `new` guards arity with a `debug_assert!` that release builds compile out, and a
+/// `BoundPredicate` is reachable over the wire, so a mismatched op would panic the visitor.
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct SerdeUnaryExpression<T> {
@@ -249,8 +182,6 @@ impl<T: Bind> Bind for UnaryExpression<T> {
 impl<T> UnaryExpression<T> {
     /// Creates a unary expression with the given operator and term.
     ///
-    /// # Example
-    ///
     /// ```rust
     /// use iceberg::expr::{PredicateOperator, Reference, UnaryExpression};
     ///
@@ -261,10 +192,7 @@ impl<T> UnaryExpression<T> {
         Self { op, term }
     }
 
-    /// Test-only constructor that bypasses the `is_unary` guard, so a test can
-    /// build an invalid-arity value and exercise the visitor's defensive error
-    /// path. The serde boundary and `debug_assert!` make such a value otherwise
-    /// unconstructable.
+    /// Test-only constructor that bypasses `is_unary`, to build an invalid-arity value.
     #[cfg(test)]
     pub(crate) fn new_unchecked(op: PredicateOperator, term: T) -> Self {
         Self { op, term }
@@ -281,28 +209,19 @@ impl<T> UnaryExpression<T> {
     }
 }
 
-/// Binary predicate, for example, `a > 10`.
-///
-/// Deserialization goes through `SerdeBinaryExpression` so that a non-binary
-/// operator is rejected at the wire boundary; see the `SerdeUnaryExpression`
-/// shadow for why the derived `Deserialize` alone is unsafe (audit SAF-004).
+/// Binary predicate, for example `a > 10`. `SerdeBinaryExpression` validates its arity.
 #[derive(PartialEq, Clone, Serialize, Deserialize)]
 #[serde(
     try_from = "SerdeBinaryExpression<T>",
     bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>")
 )]
 pub struct BinaryExpression<T> {
-    /// Operator of this predicate, must be binary operator, such as `=`, `>`, `<`, etc.
     op: PredicateOperator,
-    /// Term of this predicate, for example, `a` in `a > 10`.
     term: T,
-    /// Literal of this predicate, for example, `10` in `a > 10`.
     literal: Datum,
 }
 
-/// Serde deserialization shadow for [`BinaryExpression`]; the [`TryFrom`] impl
-/// rejects a non-binary operator before the value exists. See
-/// [`SerdeUnaryExpression`] for the rationale.
+/// Serde shadow for [`BinaryExpression`]; see [`SerdeUnaryExpression`].
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct SerdeBinaryExpression<T> {
@@ -342,8 +261,6 @@ impl<T: Debug> Debug for BinaryExpression<T> {
 impl<T> BinaryExpression<T> {
     /// Creates a binary expression with the given operator, term and literal.
     ///
-    /// # Example
-    ///
     /// ```rust
     /// use iceberg::expr::{BinaryExpression, PredicateOperator, Reference};
     /// use iceberg::spec::Datum;
@@ -359,8 +276,7 @@ impl<T> BinaryExpression<T> {
         Self { op, term, literal }
     }
 
-    /// Test-only constructor that bypasses the `is_binary` guard; see
-    /// [`UnaryExpression::new_unchecked`].
+    /// Test-only constructor that bypasses `is_binary`; see [`UnaryExpression::new_unchecked`].
     #[cfg(test)]
     pub(crate) fn new_unchecked(op: PredicateOperator, term: T, literal: Datum) -> Self {
         Self { op, term, literal }
@@ -401,28 +317,19 @@ impl<T: Bind> Bind for BinaryExpression<T> {
     }
 }
 
-/// Set predicates, for example, `a in (1, 2, 3)`.
-///
-/// Deserialization goes through `SerdeSetExpression` so that a non-set operator
-/// is rejected at the wire boundary; see the `SerdeUnaryExpression` shadow for
-/// why the derived `Deserialize` alone is unsafe (audit SAF-004).
+/// Set predicate, for example `a in (1, 2, 3)`. `SerdeSetExpression` validates its arity.
 #[derive(PartialEq, Clone, Serialize, Deserialize)]
 #[serde(
     try_from = "SerdeSetExpression<T>",
     bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>")
 )]
 pub struct SetExpression<T> {
-    /// Operator of this predicate, must be set operator, such as `IN`, `NOT IN`, etc.
     op: PredicateOperator,
-    /// Term of this predicate, for example, `a` in `a in (1, 2, 3)`.
     term: T,
-    /// Literals of this predicate, for example, `(1, 2, 3)` in `a in (1, 2, 3)`.
     literals: FnvHashSet<Datum>,
 }
 
-/// Serde deserialization shadow for [`SetExpression`]; the [`TryFrom`] impl
-/// rejects a non-set operator before the value exists. See
-/// [`SerdeUnaryExpression`] for the rationale.
+/// Serde shadow for [`SetExpression`]; see [`SerdeUnaryExpression`].
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct SerdeSetExpression<T> {
@@ -462,8 +369,6 @@ impl<T: Debug> Debug for SetExpression<T> {
 impl<T> SetExpression<T> {
     /// Creates a set expression with the given operator, term and literal.
     ///
-    /// # Example
-    ///
     /// ```rust
     /// use fnv::FnvHashSet;
     /// use iceberg::expr::{PredicateOperator, Reference, SetExpression};
@@ -480,8 +385,7 @@ impl<T> SetExpression<T> {
         Self { op, term, literals }
     }
 
-    /// Test-only constructor that bypasses the `is_set` guard; see
-    /// [`UnaryExpression::new_unchecked`].
+    /// Test-only constructor that bypasses `is_set`; see [`UnaryExpression::new_unchecked`].
     #[cfg(test)]
     pub(crate) fn new_unchecked(
         op: PredicateOperator,
@@ -628,18 +532,12 @@ impl Predicate {
         }
     }
 
-    /// The non-recursive arms of [`Predicate::bind_at_depth`], deliberately **not inlined**.
-    ///
-    /// Keeping the leaf arms out of the recursive function keeps its stack frame small. An
-    /// unoptimized build gives every match arm's temporaries their own stack slot, so folding
-    /// these arms back in costs `bind` 12,336 bytes per level instead of 5,504 — see the
-    /// measurement recorded on [`MAX_PREDICATE_DEPTH`], which is derived from that figure.
+    /// The non-recursive arms of `bind_at_depth`, deliberately NOT inlined: folding them back in
+    /// costs `bind` 12,336 bytes per level instead of 5,504, and [`MAX_PREDICATE_DEPTH`] uses it.
     #[inline(never)]
     fn bind_leaf(&self, schema: SchemaRef, case_sensitive: bool) -> Result<BoundPredicate> {
         match self {
-            // Structurally unreachable: `bind_at_depth` handles every logical node itself and
-            // only delegates the leaf arms here. Typed rather than `unreachable!()` so a future
-            // refactor that breaks the split cannot panic a caller.
+            // Unreachable: only leaf arms come here. Typed, so a broken split cannot panic.
             Predicate::And(_) | Predicate::Or(_) | Predicate::Not(_) => Err(Error::new(
                 ErrorKind::Unexpected,
                 "bind_leaf reached a logical predicate node",
@@ -772,24 +670,16 @@ impl Predicate {
     }
 }
 
-/// One item of the pending output of a predicate `Display` walk: either a subtree still to be
-/// rendered or a fixed separator already scheduled around it.
+/// One pending item of a `Display` walk: a subtree, or a scheduled separator.
 enum DisplayToken<'a, P> {
-    /// A subtree whose rendering has not started.
     Node(&'a P),
-    /// Literal text to emit verbatim.
     Text(&'static str),
 }
 
 impl Display for Predicate {
-    /// Renders the predicate with an **explicit stack** rather than by recursing into the
-    /// children.
-    ///
-    /// `Display` cannot report an error of its own and is reachable from any `{}`/`{:?}` on a
-    /// user-supplied or deserialized predicate — including from inside the messages this crate
-    /// builds for depth failures — so a recursive impl would abort the process on exactly the
-    /// trees the depth limit exists to reject. The emitted text is byte-identical to the
-    /// recursive form.
+    /// Renders the predicate with an EXPLICIT STACK, never by recursion. `Display` cannot report an
+    /// error and is reachable from any `{}` on a deserialized predicate, so a recursive impl would
+    /// abort the process on exactly the trees the depth limit exists to reject.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut pending = vec![DisplayToken::Node(self)];
         while let Some(token) = pending.pop() {
@@ -838,8 +728,6 @@ impl Display for Predicate {
 impl Predicate {
     /// Combines two predicates with `AND`.
     ///
-    /// # Example
-    ///
     /// ```rust
     /// use std::ops::Bound::Unbounded;
     ///
@@ -866,8 +754,6 @@ impl Predicate {
 
     /// Combines two predicates with `OR`.
     ///
-    /// # Example
-    ///
     /// ```rust
     /// use std::ops::Bound::Unbounded;
     ///
@@ -892,11 +778,7 @@ impl Predicate {
         }
     }
 
-    /// Returns a predicate representing the negation ('NOT') of this one,
-    /// by using inverse predicates rather than wrapping in a `NOT`.
-    /// Used for `NOT` elimination.
-    ///
-    /// # Example
+    /// Returns the negation of this predicate, using inverse predicates rather than a `NOT`.
     ///
     /// ```rust
     /// use std::ops::Bound::Unbounded;
@@ -915,17 +797,11 @@ impl Predicate {
     /// let result = expr2.negate();
     /// assert_eq!(&format!("{result}"), "(b >= 5) OR (c >= 10)");
     /// ```
-    /// # Stack safety
-    ///
-    /// De Morgan's laws push the negation through every `AND`/`OR` level, so the walk is as deep
-    /// as the tree. It is written as an **in-place, explicit-stack** rewrite rather than a
-    /// recursion (AGENTS.md "Crate code — recursion safety", second alternative): `negate` is infallible and
-    /// public, so it has no way to report a depth error, and a recursive form would abort the
-    /// process on a deep hand-built or deserialized tree.
+    /// De Morgan's laws push the negation through every level, so the walk is as deep as the tree.
+    /// It uses an in-place EXPLICIT STACK: `negate` is infallible and public, so it cannot report a
+    /// depth error, and a recursive form would abort the process on a deep tree.
     pub fn negate(mut self) -> Predicate {
-        // Every step relabels ONE node in place and, for `AND`/`OR` only, queues its two children.
-        // Correctness relies on `PredicateOperator::negate` being arity-preserving (unary↔unary,
-        // binary↔binary, set↔set), so no node ever changes shape.
+        // Correctness needs `PredicateOperator::negate` to preserve arity: no node changes shape.
         let mut pending: Vec<&mut Predicate> = vec![&mut self];
         while let Some(node) = pending.pop() {
             // `AlwaysTrue` is a placeholder: it is overwritten before the loop can observe it.
@@ -934,8 +810,7 @@ impl Predicate {
                 Predicate::AlwaysFalse => (Predicate::AlwaysTrue, false),
                 Predicate::And(expr) => (Predicate::Or(expr), true),
                 Predicate::Or(expr) => (Predicate::And(expr), true),
-                // `NOT` cancels: the inner tree is spliced in UNCHANGED, so it must not be
-                // queued — descending into it would negate an already-correct subtree.
+                // `NOT` cancels: the spliced subtree is already correct, so it is NOT queued.
                 Predicate::Not(expr) => {
                     let LogicalExpression { inputs: [input_0] } = expr;
                     (*input_0, false)
@@ -978,13 +853,7 @@ impl Predicate {
         self
     }
 
-    /// Simplifies the expression by removing `NOT` predicates,
-    /// directly negating the inner expressions instead. The transformation
-    /// applies logical laws (such as De Morgan's laws) to
-    /// recursively negate and simplify inner expressions within `NOT`
-    /// predicates.
-    ///
-    /// # Example
+    /// Removes `NOT` predicates by negating the inner expressions, through De Morgan's laws.
     ///
     /// ```rust
     /// use std::ops::Not;
@@ -998,36 +867,17 @@ impl Predicate {
     /// assert_eq!(&format!("{result}"), "a >= 5");
     /// ```
     ///
-    /// # Stack safety and infallibility
-    ///
-    /// This is an **explicit-stack** post-order rewrite; it deliberately does NOT route through
-    /// `expr::visitors::predicate_visitor::visit` (deliberately not an intra-doc link: that module
-    /// is `#[cfg(test)]` as of this rewrite, so a link would not resolve in published docs). That
-    /// walk is recursive and
-    /// depth-limited, so driving `rewrite_not` through it would have made an infallible `pub`
-    /// method — reachable from infallible builders such as `TableScanBuilder::with_filter` —
-    /// abort the process on a deep filter. The iterative form neither overflows the stack nor
-    /// panics, and the depth limit still applies where it can be reported: at
-    /// [`Predicate::bind`].
-    ///
-    /// One deliberate consequence: the visitor form returned `DataInvalid` for a predicate
-    /// carrying an operator of the wrong arity (e.g. a unary node holding `Eq`), which
-    /// `rewrite_not` could only turn into a panic. Here such a node passes through untouched and
-    /// the typed error is raised by [`Predicate::bind`] or by the visitors, which can report it.
-    /// Outside `cfg(test)` such a value is unconstructable anyway: `UnaryExpression::new` and
-    /// friends guard arity, and the serde boundary rejects it.
+    /// An EXPLICIT-STACK post-order rewrite. It does NOT route through the recursive,
+    /// depth-limited `predicate_visitor::visit`, which would make this infallible `pub` method
+    /// abort on a deep filter. The depth limit still applies at [`Predicate::bind`], where it can
+    /// be reported. So a node whose operator has the wrong arity passes through untouched here.
     pub fn rewrite_not(self) -> Predicate {
-        /// A suspended parent waiting on the child currently being rewritten.
+        /// A parent suspended on the child now being rewritten; it holds the sibling result.
         enum Frame {
-            /// An `AND` whose left child is being rewritten; holds the unvisited right child.
             AndRight(Predicate),
-            /// An `AND` whose right child is being rewritten; holds the rewritten left child.
             AndCombine(Predicate),
-            /// An `OR` whose left child is being rewritten; holds the unvisited right child.
             OrRight(Predicate),
-            /// An `OR` whose right child is being rewritten; holds the rewritten left child.
             OrCombine(Predicate),
-            /// A `NOT` whose inner child is being rewritten.
             Negate,
         }
 
@@ -1058,14 +908,12 @@ impl Predicate {
                         frames.push(Frame::Negate);
                         node = *inner;
                     }
-                    // `AlwaysTrue`/`AlwaysFalse`/`Unary`/`Binary`/`Set` rewrite to themselves,
-                    // exactly as `RewriteNotVisitor`'s leaf methods did (it cloned; we move).
+                    // Every leaf rewrites to itself, as `RewriteNotVisitor` did.
                     other => break other,
                 }
             };
 
-            // Resume suspended parents while their result is complete. The loop returns when the
-            // frame stack empties, so the function is total without an `unwrap`/`expect`.
+            // The loop returns when the frame stack empties, so it is total without an `unwrap`.
             loop {
                 match frames.pop() {
                     None => {
@@ -1096,10 +944,7 @@ impl Predicate {
 impl Not for Predicate {
     type Output = Predicate;
 
-    /// Create a predicate which is the reverse of this predicate. For example: `NOT (a > 10)`.
-    ///
-    /// This is different from [`Predicate::negate()`] since it doesn't rewrite expression, but
-    /// just adds a `NOT` operator.
+    /// Creates the reverse of this predicate. Unlike [`Predicate::negate()`], it rewrites nothing.
     ///
     /// # Example
     ///     
@@ -1150,8 +995,7 @@ impl BoundPredicate {
         BoundPredicate::Or(LogicalExpression::new([Box::new(self), Box::new(other)]))
     }
 
-    /// In-place, explicit-stack negation — the bound twin of [`Predicate::negate`]; see that
-    /// method's `# Stack safety` note for why it is not recursive.
+    /// In-place, explicit-stack negation; see [`Predicate::negate`] for why it does not recurse.
     pub(crate) fn negate(mut self) -> BoundPredicate {
         let mut pending: Vec<&mut BoundPredicate> = vec![&mut self];
         while let Some(node) = pending.pop() {
@@ -1204,13 +1048,7 @@ impl BoundPredicate {
         self
     }
 
-    /// Simplifies the expression by removing `NOT` predicates,
-    /// directly negating the inner expressions instead. The transformation
-    /// applies logical laws (such as De Morgan's laws) to
-    /// recursively negate and simplify inner expressions within `NOT`
-    /// predicates.
-    ///
-    /// # Example
+    /// Removes `NOT` predicates by negating the inner expressions, through De Morgan's laws.
     ///
     /// ```rust
     /// use std::ops::Not;
@@ -1223,22 +1061,15 @@ impl BoundPredicate {
     /// // let result = expression.rewrite_not();
     /// ```
     ///
-    /// # Stack safety and infallibility
-    ///
-    /// Explicit-stack post-order rewrite, the bound twin of [`Predicate::rewrite_not`]; see that
-    /// method for why it does not route through the recursive, depth-limited bound visitor.
+    /// The explicit-stack bound twin of [`Predicate::rewrite_not`]. See it for why this does not
+    /// route through the recursive, depth-limited bound visitor.
     pub fn rewrite_not(self) -> BoundPredicate {
-        /// A suspended parent waiting on the child currently being rewritten.
+        /// A parent suspended on the child now being rewritten; it holds the sibling result.
         enum Frame {
-            /// An `AND` whose left child is being rewritten; holds the unvisited right child.
             AndRight(BoundPredicate),
-            /// An `AND` whose right child is being rewritten; holds the rewritten left child.
             AndCombine(BoundPredicate),
-            /// An `OR` whose left child is being rewritten; holds the unvisited right child.
             OrRight(BoundPredicate),
-            /// An `OR` whose right child is being rewritten; holds the rewritten left child.
             OrCombine(BoundPredicate),
-            /// A `NOT` whose inner child is being rewritten.
             Negate,
         }
 
@@ -1300,9 +1131,7 @@ impl BoundPredicate {
 }
 
 impl Display for BoundPredicate {
-    /// Explicit-stack rendering, the bound twin of the [`Predicate`] impl; see it for why
-    /// `Display` must not recurse. The emitted text is byte-identical to the recursive form
-    /// (note the bound spelling `True`/`False`, which differs from the unbound `TRUE`/`FALSE`).
+    /// Explicit-stack rendering; see the [`Predicate`] impl for why `Display` must not recurse.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut pending = vec![DisplayToken::Node(self)];
         while let Some(token) = pending.pop() {
@@ -1586,16 +1415,10 @@ mod tests {
         predicate
     }
 
-    /// The measured dev-profile cost of one `Predicate::bind` recursion level, in bytes — the
-    /// worst of the three recursive walks and the figure recorded on [`MAX_PREDICATE_DEPTH`].
-    ///
-    /// The depth tests below size their own thread from it rather than trusting whatever stack
-    /// the harness happens to give a test thread, so a raised limit shows up as a test failure
-    /// rather than as a stack-overflow abort on somebody else's machine.
+    /// The measured cost of one `bind` level. A depth test sizes its thread from it, never guesses.
     const DEV_BYTES_PER_BIND_LEVEL: usize = 5_504;
 
-    /// Runs `body` on a thread whose stack is sized for `depth` levels of the deepest recursive
-    /// walk, with a 3× margin over the measured dev-profile cost.
+    /// Runs `body` on a thread sized for `depth` levels, with a 3x margin over the measured cost.
     fn with_stack_for_depth<T: Send + 'static>(
         depth: usize,
         body: impl FnOnce() -> T + Send + 'static,
@@ -1609,10 +1432,7 @@ mod tests {
             .expect("the depth-test thread must not panic or overflow its stack")
     }
 
-    /// A left-spine `AND` chain of `conjuncts` binary leaves — the shape both
-    /// `DeleteFilter::build_equality_delete_predicate` (one conjunct per equality-delete file)
-    /// and `iceberg-datafusion`'s `expr_to_predicate` (one conjunct per pushed-down filter)
-    /// build, and therefore the shape whose depth `MAX_PREDICATE_DEPTH` has to clear.
+    /// A left-spine `AND` chain: the shape whose depth `MAX_PREDICATE_DEPTH` must clear.
     fn left_folded_conjunction(conjuncts: usize) -> Predicate {
         let mut predicate = Predicate::AlwaysTrue;
         for i in 0..conjuncts {
@@ -1622,14 +1442,8 @@ mod tests {
         predicate
     }
 
-    /// FINDING 4 / FINDING 11 regression pin: the depth a realistic upsert table produces must
-    /// BIND and VISIT, not fail.
-    ///
-    /// 512 equality-delete files attached to one data file, each contributing a 12-level balanced
-    /// per-file fold (4,096 delete rows) plus the one level the cross-file LEFT fold adds. Java
-    /// reads this table — `Binder.bind` / `ExpressionVisitors.visit` in `iceberg-api` 1.10.0 have
-    /// no depth counter at all — so failing it is a parity break, not a safety win. RED at the
-    /// old `MAX_PREDICATE_DEPTH = 100`, and at anything below 524.
+    /// Regression pin: 512 equality-delete files, each with a 12-level fold, must BIND and VISIT.
+    /// Java reads this table, so failing it is a parity break. RED below depth 524.
     #[test]
     fn eq_delete_fold_depth_binds_and_visits() {
         const EQ_DELETE_FILES: usize = 512;
@@ -1654,8 +1468,7 @@ mod tests {
         });
     }
 
-    /// The limit is inclusive on both of the walks that enforce it, and rejecting is a typed
-    /// `DataInvalid` — never a panic. Catches `depth > MAX` drifting to `depth >= MAX`.
+    /// The limit is inclusive on both walks, and a rejection is typed. Catches `>` drifting to `>=`.
     #[test]
     fn bind_and_visit_depth_limit_is_inclusive() {
         let schema = table_schema_simple();
@@ -1676,7 +1489,7 @@ mod tests {
         });
     }
 
-    /// A trivial bound visitor that counts leaves; used to prove a deep tree is actually walked.
+    /// Counts leaves, to prove a deep tree is really walked.
     struct DepthCountingVisitor {
         combinators: usize,
     }
@@ -1790,9 +1603,7 @@ mod tests {
         }
     }
 
-    /// A corpus of unbound shapes that exercises every arm the rewrites can take: both logical
-    /// arities, `NOT` over each of them, stacked `NOT`s, the constant-folding doors in
-    /// `Predicate::and`/`or`, and one leaf of each expression kind.
+    /// Every arm the rewrites take, including the constant-folding doors and stacked `NOT`s.
     fn rewrite_corpus() -> Vec<Predicate> {
         let lt = || Reference::new("bar").less_than(Datum::int(40));
         let gt = || Reference::new("bar").greater_than(Datum::int(3));
@@ -1833,11 +1644,7 @@ mod tests {
         ]
     }
 
-    /// Differential oracle for the explicit-stack `Predicate::rewrite_not`.
-    ///
-    /// The iterative walk must produce exactly what the `RewriteNotVisitor` post-order visit
-    /// produced before it replaced that route — that visitor is retained under `cfg(test)` for
-    /// precisely this comparison. Catches swapping `and`/`or` in the combine step, reversing the
+    /// Differential oracle for `Predicate::rewrite_not`. Catches swapping `and`/`or`, reversing the
     /// child order, dropping the `Negate` frame, and splicing a cancelled `NOT` wrongly.
     #[test]
     fn rewrite_not_matches_the_visitor_oracle() {
@@ -1870,11 +1677,7 @@ mod tests {
         }
     }
 
-    /// `negate` must splice a cancelled `NOT`'s subtree in UNCHANGED.
-    ///
-    /// Catches queueing the spliced child in the explicit-stack walk (`descend = true` on the
-    /// `Not` arm), which would negate an already-correct subtree: `NOT((a < 40) AND (b > 3))`
-    /// would come back as `(a >= 40) OR (b <= 3)` instead of the inner conjunction.
+    /// `negate` must splice a cancelled `NOT` in UNCHANGED, or it negates a correct subtree.
     #[test]
     fn negate_splices_a_cancelled_not_without_descending() {
         let inner = Reference::new("bar")
@@ -1885,7 +1688,7 @@ mod tests {
         assert_eq!(&format!("{negated}"), "(bar < 40) AND (foo IS NULL)");
     }
 
-    /// A hand-written recursive renderer, used only as the `Display` oracle.
+    /// A recursive renderer, used only as the `Display` oracle.
     fn render_recursively(predicate: &Predicate) -> String {
         match predicate {
             Predicate::AlwaysTrue => "TRUE".to_string(),
@@ -1912,10 +1715,8 @@ mod tests {
         }
     }
 
-    /// The explicit-stack `Display` must be byte-identical to the recursive form it replaced.
-    ///
-    /// Catches an out-of-order token push (the stack is filled in reverse), a dropped parenthesis,
-    /// and the wrong separator on either logical arm.
+    /// `Display` must be byte-identical to the recursive form. Catches an out-of-order token push,
+    /// a dropped parenthesis, and a wrong separator on a logical arm.
     #[test]
     fn display_matches_the_recursive_rendering() {
         for predicate in rewrite_corpus() {
@@ -1927,12 +1728,8 @@ mod tests {
         }
     }
 
-    /// `rewrite_not`, `negate` and `Display` must consume O(1) stack — they are infallible and
-    /// `pub`, so they have no way to report a depth error and must not be depth-limited either.
-    ///
-    /// Run 50× beyond `MAX_PREDICATE_DEPTH` on a deliberately small 2 MiB stack (a tokio worker's
-    /// default). A recursive form of ANY of the three aborts the process here: even the cheapest
-    /// of them costs hundreds of bytes per level, so 2 MiB runs out around a few thousand levels.
+    /// `rewrite_not`, `negate` and `Display` must cost O(1) stack: they are infallible and `pub`,
+    /// so they cannot report a depth error. Run 50x beyond the limit on a 2 MiB stack.
     #[test]
     fn deep_trees_are_rewritten_negated_and_rendered_without_recursion() {
         const DEPTH: usize = 50_000;
@@ -1941,10 +1738,7 @@ mod tests {
         let handle = std::thread::Builder::new()
             .stack_size(TOKIO_WORKER_STACK)
             .spawn(|| {
-                // `NOT` at every level, so `rewrite_not` must run its `Negate` frame 50,000 times
-                // and `negate` must walk the whole spine. Built fresh for each subject: the
-                // DERIVED `Clone`, `PartialEq` and `Drop` glue all recurse (see the residue note
-                // below), so a deep tree must never be cloned, compared or dropped here.
+                // The DERIVED `Clone`, `PartialEq` and `Drop` recurse: never apply them here.
                 let build_deep = || {
                     let mut deep = Reference::new("bar").less_than(Datum::int(40));
                     for _ in 0..DEPTH {
@@ -1953,9 +1747,7 @@ mod tests {
                     deep
                 };
 
-                // Render / rewrite / negate FIRST, leak the tree, and only then assert: a failing
-                // assertion would otherwise unwind through the recursive derived `Drop` and abort
-                // the process instead of reporting the failure.
+                // Leak before asserting: a failure would unwind through `Drop` and abort.
                 let subject = build_deep();
                 let rendered = format!("{subject}");
                 std::mem::forget(subject);
@@ -1970,9 +1762,7 @@ mod tests {
                 let negated_text = format!("{negated}");
                 std::mem::forget(negated);
 
-                // A `NOT` chain never makes `negate` recurse — its `Not` arm splices and stops —
-                // so the second subject is a left-spine `AND`, whose De Morgan rewrite descends
-                // every level. This is also the shape `Display` and `rewrite_not` recurse on.
+                // A `NOT` chain never makes `negate` descend: its `Not` arm splices and stops.
                 let spine = left_folded_conjunction(DEPTH);
                 let spine_text = format!("{spine}");
                 std::mem::forget(spine);
@@ -1992,17 +1782,14 @@ mod tests {
                 assert_eq!(rewritten_text, "bar < 40");
                 assert_eq!(negated_text, rendered[5..rendered.len() - 1]);
 
-                // De Morgan turns every one of the 49,999 `AND`s into an `OR` and every `=` leaf
-                // into a `!=`; `rewrite_not` leaves a NOT-free tree alone.
+                // De Morgan turns every `AND` into an `OR` and every `=` leaf into a `!=`.
                 assert_eq!(spine_text.matches(") AND (").count(), DEPTH - 1);
                 assert_eq!(spine_negated_text.matches(") OR (").count(), DEPTH - 1);
                 assert_eq!(spine_negated_text.matches(") AND (").count(), 0);
                 assert_eq!(spine_negated_text.matches("bar != ").count(), DEPTH);
                 assert_eq!(spine_rewritten_text, spine_text);
 
-                // Dropping a tree this deep still recurses — the derived `Drop` glue is the one
-                // walk no depth check can intercept (named as residue). Leaking is deliberate:
-                // the test measures the rewrites, not `Drop`.
+                // The derived `Drop` is the one walk no depth check can intercept, so leak it.
             })
             .expect("spawning the deep-tree thread must succeed");
         handle
@@ -2165,7 +1952,6 @@ mod tests {
     #[test]
     fn test_bind_equal_to_above_max() {
         let schema = table_schema_simple();
-        // int32 can hold up to 2147483647
         let expr = Reference::new("bar").equal_to(Datum::long(2147483648i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "False");
@@ -2175,7 +1961,6 @@ mod tests {
     #[test]
     fn test_bind_equal_to_below_min() {
         let schema = table_schema_simple();
-        // int32 can hold up to -2147483647
         let expr = Reference::new("bar").equal_to(Datum::long(-2147483649i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "False");
@@ -2185,7 +1970,6 @@ mod tests {
     #[test]
     fn test_bind_not_equal_to_above_max() {
         let schema = table_schema_simple();
-        // int32 can hold up to 2147483647
         let expr = Reference::new("bar").not_equal_to(Datum::long(2147483648i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "True");
@@ -2195,7 +1979,6 @@ mod tests {
     #[test]
     fn test_bind_not_equal_to_below_min() {
         let schema = table_schema_simple();
-        // int32 can hold up to -2147483647
         let expr = Reference::new("bar").not_equal_to(Datum::long(-2147483649i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "True");
@@ -2205,7 +1988,6 @@ mod tests {
     #[test]
     fn test_bind_less_than_above_max() {
         let schema = table_schema_simple();
-        // int32 can hold up to 2147483647
         let expr = Reference::new("bar").less_than(Datum::long(2147483648i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "True");
@@ -2215,7 +1997,6 @@ mod tests {
     #[test]
     fn test_bind_less_than_below_min() {
         let schema = table_schema_simple();
-        // int32 can hold up to -2147483647
         let expr = Reference::new("bar").less_than(Datum::long(-2147483649i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "False");
@@ -2225,7 +2006,6 @@ mod tests {
     #[test]
     fn test_bind_less_than_or_equal_to_above_max() {
         let schema = table_schema_simple();
-        // int32 can hold up to 2147483647
         let expr = Reference::new("bar").less_than_or_equal_to(Datum::long(2147483648i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "True");
@@ -2235,7 +2015,6 @@ mod tests {
     #[test]
     fn test_bind_less_than_or_equal_to_below_min() {
         let schema = table_schema_simple();
-        // int32 can hold up to -2147483647
         let expr = Reference::new("bar").less_than_or_equal_to(Datum::long(-2147483649i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "False");
@@ -2245,7 +2024,6 @@ mod tests {
     #[test]
     fn test_bind_great_than_above_max() {
         let schema = table_schema_simple();
-        // int32 can hold up to 2147483647
         let expr = Reference::new("bar").greater_than(Datum::long(2147483648i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "False");
@@ -2255,7 +2033,6 @@ mod tests {
     #[test]
     fn test_bind_great_than_below_min() {
         let schema = table_schema_simple();
-        // int32 can hold up to -2147483647
         let expr = Reference::new("bar").greater_than(Datum::long(-2147483649i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "True");
@@ -2265,7 +2042,6 @@ mod tests {
     #[test]
     fn test_bind_great_than_or_equal_to_above_max() {
         let schema = table_schema_simple();
-        // int32 can hold up to 2147483647
         let expr = Reference::new("bar").greater_than_or_equal_to(Datum::long(2147483648i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "False");
@@ -2275,7 +2051,6 @@ mod tests {
     #[test]
     fn test_bind_great_than_or_equal_to_below_min() {
         let schema = table_schema_simple();
-        // int32 can hold up to -2147483647
         let expr = Reference::new("bar").greater_than_or_equal_to(Datum::long(-2147483649i64));
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "True");
@@ -2508,12 +2283,10 @@ mod tests {
     fn test_bound_predicate_rewrite_not_binary() {
         let schema = table_schema_simple();
 
-        // Test NOT elimination on binary predicates: NOT(bar < 10) => bar >= 10
         let predicate = Reference::new("bar").less_than(Datum::int(10)).not();
         let bound_predicate = predicate.bind(schema.clone(), true).unwrap();
         let result = bound_predicate.rewrite_not();
 
-        // The result should be bar >= 10
         let expected_predicate = Reference::new("bar").greater_than_or_equal_to(Datum::int(10));
         let expected_bound = expected_predicate.bind(schema, true).unwrap();
 
@@ -2525,12 +2298,10 @@ mod tests {
     fn test_bound_predicate_rewrite_not_unary() {
         let schema = table_schema_simple();
 
-        // Test NOT elimination on unary predicates: NOT(foo IS NULL) => foo IS NOT NULL
         let predicate = Reference::new("foo").is_null().not();
         let bound_predicate = predicate.bind(schema.clone(), true).unwrap();
         let result = bound_predicate.rewrite_not();
 
-        // The result should be foo IS NOT NULL
         let expected_predicate = Reference::new("foo").is_not_null();
         let expected_bound = expected_predicate.bind(schema, true).unwrap();
 
@@ -2542,19 +2313,16 @@ mod tests {
     fn test_bound_predicate_rewrite_not_set() {
         let schema = table_schema_simple();
 
-        // Test NOT elimination on set predicates: NOT(bar IN (10, 20)) => bar NOT IN (10, 20)
         let predicate = Reference::new("bar")
             .is_in([Datum::int(10), Datum::int(20)])
             .not();
         let bound_predicate = predicate.bind(schema.clone(), true).unwrap();
         let result = bound_predicate.rewrite_not();
 
-        // The result should be bar NOT IN (10, 20)
         let expected_predicate = Reference::new("bar").is_not_in([Datum::int(10), Datum::int(20)]);
         let expected_bound = expected_predicate.bind(schema, true).unwrap();
 
         assert_eq!(result, expected_bound);
-        // Note: HashSet order may vary, so we check that it contains the expected format
         let result_str = format!("{result}");
         assert!(
             result_str.contains("bar NOT IN")
@@ -2567,8 +2335,6 @@ mod tests {
     fn test_bound_predicate_rewrite_not_and_demorgan() {
         let schema = table_schema_simple();
 
-        // Test De Morgan's law: NOT(A AND B) = (NOT A) OR (NOT B)
-        // NOT((bar < 10) AND (foo IS NULL)) => (bar >= 10) OR (foo IS NOT NULL)
         let predicate = Reference::new("bar")
             .less_than(Datum::int(10))
             .and(Reference::new("foo").is_null())
@@ -2577,7 +2343,6 @@ mod tests {
         let bound_predicate = predicate.bind(schema.clone(), true).unwrap();
         let result = bound_predicate.rewrite_not();
 
-        // Expected: (bar >= 10) OR (foo IS NOT NULL)
         let expected_predicate = Reference::new("bar")
             .greater_than_or_equal_to(Datum::int(10))
             .or(Reference::new("foo").is_not_null());
@@ -2592,8 +2357,6 @@ mod tests {
     fn test_bound_predicate_rewrite_not_or_demorgan() {
         let schema = table_schema_simple();
 
-        // Test De Morgan's law: NOT(A OR B) = (NOT A) AND (NOT B)
-        // NOT((bar < 10) OR (foo IS NULL)) => (bar >= 10) AND (foo IS NOT NULL)
         let predicate = Reference::new("bar")
             .less_than(Datum::int(10))
             .or(Reference::new("foo").is_null())
@@ -2602,7 +2365,6 @@ mod tests {
         let bound_predicate = predicate.bind(schema.clone(), true).unwrap();
         let result = bound_predicate.rewrite_not();
 
-        // Expected: (bar >= 10) AND (foo IS NOT NULL)
         let expected_predicate = Reference::new("bar")
             .greater_than_or_equal_to(Datum::int(10))
             .and(Reference::new("foo").is_not_null());
@@ -2617,12 +2379,10 @@ mod tests {
     fn test_bound_predicate_rewrite_not_double_negative() {
         let schema = table_schema_simple();
 
-        // Test double negative elimination: NOT(NOT(bar < 10)) => bar < 10
         let predicate = Reference::new("bar").less_than(Datum::int(10)).not().not();
         let bound_predicate = predicate.bind(schema.clone(), true).unwrap();
         let result = bound_predicate.rewrite_not();
 
-        // The result should be bar < 10 (original predicate)
         let expected_predicate = Reference::new("bar").less_than(Datum::int(10));
         let expected_bound = expected_predicate.bind(schema, true).unwrap();
 
@@ -2634,7 +2394,6 @@ mod tests {
     fn test_bound_predicate_rewrite_not_always_true_false() {
         let schema = table_schema_simple();
 
-        // Test NOT(AlwaysTrue) => AlwaysFalse
         let predicate = Reference::new("bar").is_not_null().not(); // This becomes NOT(AlwaysTrue) since bar is required
         let bound_predicate = predicate.bind(schema.clone(), true).unwrap();
         let result = bound_predicate.rewrite_not();
@@ -2642,7 +2401,6 @@ mod tests {
         assert_eq!(result, BoundPredicate::AlwaysFalse);
         assert_eq!(&format!("{result}"), "False");
 
-        // Test NOT(AlwaysFalse) => AlwaysTrue
         let predicate2 = Reference::new("bar").is_null().not(); // This becomes NOT(AlwaysFalse) since bar is required
         let bound_predicate2 = predicate2.bind(schema, true).unwrap();
         let result2 = bound_predicate2.rewrite_not();
@@ -2655,9 +2413,6 @@ mod tests {
     fn test_bound_predicate_rewrite_not_complex_nested() {
         let schema = table_schema_simple();
 
-        // Test complex nested expression:
-        // NOT(NOT((bar >= 10) AND (foo IS NOT NULL)) OR (bar < 5))
-        // Should become: ((bar >= 10) AND (foo IS NOT NULL)) AND (bar >= 5)
         let inner_predicate = Reference::new("bar")
             .greater_than_or_equal_to(Datum::int(10))
             .and(Reference::new("foo").is_not_null())
@@ -2670,8 +2425,7 @@ mod tests {
         let bound_predicate = complex_predicate.bind(schema.clone(), true).unwrap();
         let result = bound_predicate.rewrite_not();
 
-        // Expected: ((bar >= 10) AND (foo IS NOT NULL)) AND (bar >= 5)
-        // This is because NOT(NOT(A) OR B) = A AND NOT(B)
+        // NOT(NOT(A) OR B) = A AND NOT(B)
         let expected_predicate = Reference::new("bar")
             .greater_than_or_equal_to(Datum::int(10))
             .and(Reference::new("foo").is_not_null())
@@ -2686,13 +2440,8 @@ mod tests {
         );
     }
 
-    /// Pins for audit SAF-004 — op/arity validation on the predicate serde
-    /// boundary. They lock three properties: (1) valid payloads keep their exact
-    /// on-disk bytes (wire-format stability), (2) a wrong-class operator is
-    /// rejected at deserialize time with a typed message for every shape, bound
-    /// and unbound, and (3) the constructors' `is_*` guards still admit the
-    /// valid shapes. The visitor's defensive error path is pinned in the two
-    /// visitor modules.
+    /// Op and arity validation on the predicate serde boundary. Valid payloads keep their exact
+    /// on-disk bytes, and a wrong-class operator is rejected for every shape.
     mod serde_arity_pins {
         use fnv::FnvHashSet;
 
@@ -2702,11 +2451,7 @@ mod tests {
         };
 
         // -- Wire-format STABILITY --------------------------------------------
-        // Frozen JSON captured from the pre-change serializer. Each payload must
-        // still deserialize to the same value AND re-serialize to identical
-        // bytes now that the deserialize path routes through the shadow structs
-        // — proving already-serialized `FileScanTask` predicates round-trip
-        // unchanged (the serialized FORMAT of valid predicates is load-bearing).
+        // Frozen JSON: each payload must re-serialize to identical bytes through the shadows.
 
         const FROZEN_UNARY: &str = r#"{"Unary":{"op":"IsNull","term":{"name":"bar"}}}"#;
         const FROZEN_BINARY: &str = r#"{"Binary":{"op":"LessThan","term":{"name":"bar"},"literal":{"type":"int","literal":10}}}"#;
@@ -2824,9 +2569,7 @@ mod tests {
         }
 
         // -- Rejection at the serde boundary (bound), typed message -----------
-        // A valid bound predicate is serialized, then only its `op` token is
-        // rewritten to a wrong-class operator — so the payload is byte-identical
-        // to a real one except for the smuggled op, mirroring the wire attack.
+        // Only the `op` token of a real payload is rewritten, mirroring the wire attack.
 
         fn corrupt_op(json: &str, from: &str, to: &str) -> String {
             let needle = format!(r#""op":"{from}""#);
@@ -2910,8 +2653,7 @@ mod tests {
             );
         }
 
-        // Silence unused-import lint for the unchecked constructors, which are
-        // exercised by the visitor-module pins rather than here.
+        // The unchecked constructors are exercised by the visitor-module pins, not here.
         #[test]
         fn unchecked_constructors_build_invalid_shapes() {
             let unary =

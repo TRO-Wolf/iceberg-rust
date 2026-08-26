@@ -324,12 +324,9 @@ fn json_map() {
     );
 }
 
-/// RISK PIN (from_json implemented): `try_from_json` for fixed/binary was `todo!()` — any
-/// Java-written metadata carrying a fixed/binary single value PANICKED the reader. Fixture
-/// strings are Java's own: `TestSingleValueParser.testValidDefaults` (1.10.0, L53-54) uses
-/// `fixed[2]` = `"111f"` and `binary` = `"0000ff"`. Re-introducing an unimplemented/error arm
-/// turns this RED. The lowercase fixtures also pin case-insensitive accept (Java decodes
-/// `text.toUpperCase(Locale.ROOT)`, SingleValueParser.java L169/L175).
+/// Risk: `try_from_json` for fixed and binary was `todo!()` and panicked on Java-written
+/// metadata. The fixtures are Java's own, and their lowercase form pins case-insensitive accept.
+/// The mutation this discriminates: restore an unimplemented or error arm.
 #[test]
 fn json_fixed_binary_from_json_java_fixtures() {
     let fixed = Literal::try_from_json(
@@ -348,7 +345,7 @@ fn json_fixed_binary_from_json_java_fixtures() {
     .expect("non-null");
     assert_eq!(binary, Literal::binary(vec![0x00u8, 0x00, 0xff]));
 
-    // Case-insensitive accept, all three spellings decode to the same bytes.
+    // All three spellings decode to the same bytes.
     for spelling in ["a1b2", "A1B2", "a1B2"] {
         let lit = Literal::try_from_json(
             JsonValue::String(spelling.to_string()),
@@ -360,12 +357,9 @@ fn json_fixed_binary_from_json_java_fixtures() {
     }
 }
 
-/// CROWN JEWEL — the realistic Java-written-metadata entry path: a schema JSON whose fields
-/// carry fixed/binary `initial-default` / `write-default` single values, exactly as Java's
-/// `SchemaParser` + `SingleValueParser.toJson` emit them (UPPERCASE base16 per Guava
-/// `BaseEncoding.base16()`; field shape per the spec "Appendix D: Single-value serialization").
-/// Before this change, deserializing this document PANICKED via the `todo!()` arms
-/// (`SerdeNestedField -> NestedField` calls `Literal::try_from_json`, datatypes.rs).
+/// The realistic Java-written-metadata entry path: a schema JSON whose fields carry fixed and
+/// binary defaults, exactly as Java's `SchemaParser` and `SingleValueParser.toJson` emit them in
+/// uppercase base16. Deserializing this document used to panic through the `todo!()` arms.
 #[test]
 fn json_schema_with_fixed_and_binary_defaults_from_java_metadata() {
     let java_schema_json = r#"
@@ -412,13 +406,9 @@ fn json_schema_with_fixed_and_binary_defaults_from_java_metadata() {
     );
 }
 
-/// RISK PIN (emit case + padding Java-compatible): `try_into_json` used to emit `{x:x}` —
-/// lowercase AND unpadded, so byte 0x0A serialized as `"a"`: odd-length garbage no Java
-/// reader (`BaseEncoding.base16().decode`, strict) can parse. Java emits UPPERCASE with
-/// exactly two hex digits per byte (`BaseEncoding.base16().encode`; the Guava base16
-/// alphabet is `0123456789ABCDEF`). The expected strings below are byte-for-byte what Java
-/// `SingleValueParser.toJson` produces for these values. Flipping the emit case or dropping
-/// the zero-padding turns this RED.
+/// Risk: `try_into_json` emitted lowercase unpadded hex, so byte 0x0A became `"a"`, which Java's
+/// strict decoder cannot parse. The strings below are byte-for-byte Java's uppercase two-digit
+/// output. The mutations this discriminates: flip the emit case, or drop the zero padding.
 #[test]
 fn json_binary_fixed_emit_uppercase_padded_java_compatible() {
     let json = Literal::binary(vec![0x00u8, 0x0a, 0x1b, 0xff])
@@ -431,16 +421,15 @@ fn json_binary_fixed_emit_uppercase_padded_java_compatible() {
         .expect("fixed emit");
     assert_eq!(json, JsonValue::String("0BAD".to_string()));
 
-    // Empty binary is legal and emits the empty string (Java: base16().encode(new byte[0])).
+    // Empty binary is legal and emits the empty string, as Java does.
     let json = Literal::binary(vec![])
         .try_into_json(&Type::Primitive(PrimitiveType::Binary))
         .expect("empty binary emit");
     assert_eq!(json, JsonValue::String(String::new()));
 }
 
-/// RISK PIN (round-trip): parse(emit(x)) == x byte-exact for both binary and fixed,
-/// including bytes below 0x10 (the class the old unpadded emitter corrupted) and 0x00/0xFF
-/// extremes.
+/// Risk: `parse(emit(x))` must be byte-exact for binary and fixed. It covers bytes below 0x10,
+/// which the old unpadded emitter corrupted, and the 0x00 and 0xFF extremes.
 #[test]
 fn json_binary_fixed_round_trip_byte_exact() {
     let bytes = vec![0x00u8, 0x01, 0x0a, 0x10, 0x7f, 0x80, 0xf0, 0xff];
@@ -464,15 +453,12 @@ fn json_binary_fixed_round_trip_byte_exact() {
     assert_eq!(back, Literal::fixed(bytes));
 }
 
-/// RISK PIN (Fixed length enforcement, BOTH directions + ON the boundary): Java checks the
-/// hex-string length against `2 * L` on parse (SingleValueParser.java L160-167; its
-/// `testInvalidFixed` fixture is `"111ff"` on `fixed[2]`) and the byte length against `L`
-/// on emit (L331-337). Dropping either check turns this RED; the legal boundary case
-/// (exactly L bytes) is pinned by `json_fixed_binary_from_json_java_fixtures` /
-/// `json_binary_fixed_round_trip_byte_exact`, so over-broadening the guard also goes RED.
+/// Risk: fixed length must be enforced both ways. Java checks `2 * L` on parse and `L` on emit.
+/// The mutation this discriminates: drop either check. Over-broadening also reds, because the
+/// round-trip tests pin the legal boundary case.
 #[test]
 fn json_fixed_length_mismatch_is_data_invalid() {
-    // Parse side — Java's own invalid fixture: 5 hex chars on fixed[2] (odd AND wrong length).
+    // Java's own invalid fixture: 5 hex chars on fixed[2], both odd and the wrong length.
     let err = Literal::try_from_json(
         JsonValue::String("111ff".to_string()),
         &Type::Primitive(PrimitiveType::Fixed(2)),
@@ -480,8 +466,7 @@ fn json_fixed_length_mismatch_is_data_invalid() {
     .expect_err("fixed[2] must reject a 5-char hex string");
     assert_eq!(err.kind(), ErrorKind::DataInvalid);
 
-    // Parse side — even-length, valid hex, but 3 bytes against fixed[2]: only the length
-    // check (not the hex decoder) can reject this.
+    // Even-length valid hex, but 3 bytes against fixed[2]. Only the length check rejects it.
     let err = Literal::try_from_json(
         JsonValue::String("1122FF".to_string()),
         &Type::Primitive(PrimitiveType::Fixed(2)),
@@ -489,16 +474,15 @@ fn json_fixed_length_mismatch_is_data_invalid() {
     .expect_err("fixed[2] must reject a 3-byte value");
     assert_eq!(err.kind(), ErrorKind::DataInvalid);
 
-    // Emit side — a 3-byte literal against fixed[2].
+    // The emit side: a 3-byte literal against fixed[2].
     let err = Literal::fixed(vec![0x11u8, 0x22, 0xff])
         .try_into_json(&Type::Primitive(PrimitiveType::Fixed(2)))
         .expect_err("fixed[2] must refuse to emit a 3-byte value");
     assert_eq!(err.kind(), ErrorKind::DataInvalid);
 }
 
-/// RISK PIN (malformed-input fail-closed): odd-length hex, non-hex ASCII, and non-ASCII
-/// input must all be `DataInvalid` errors — never a panic, never silently accepted. Java's
-/// strict `BaseEncoding.base16().decode` throws `IllegalArgumentException` on each.
+/// Risk: odd-length hex, non-hex ASCII, and non-ASCII input must all be `DataInvalid`, never a
+/// panic and never accepted. Java's strict `base16().decode` throws on each.
 #[test]
 fn json_binary_fixed_malformed_hex_is_data_invalid() {
     let binary_type = Type::Primitive(PrimitiveType::Binary);
@@ -508,7 +492,7 @@ fn json_binary_fixed_malformed_hex_is_data_invalid() {
         assert_eq!(err.kind(), ErrorKind::DataInvalid, "input: {bad:?}");
     }
 
-    // The fixed door too: correct string length but non-hex content.
+    // The fixed door too: the right string length, but non-hex content.
     let err = Literal::try_from_json(
         JsonValue::String("zz".to_string()),
         &Type::Primitive(PrimitiveType::Fixed(1)),
@@ -648,18 +632,11 @@ fn datum_decimal_boundaries_preserve_negative_binary_encoding() {
     }
 }
 
-/// [`Datum::try_from_bytes`] is a metadata READ door, so it must accept every decimal type Java
-/// can build and reject only what Java itself refuses.
+/// [`Datum::try_from_bytes`] is a metadata READ door. It must accept every decimal type Java can
+/// build and refuse only `of(39,0)`, which Java itself refuses.
 ///
-/// Live against iceberg-api-1.10.0: `DecimalType.of(1,2)` and `of(0,0)` construct without
-/// complaint (only `scale`/`precision` field writes follow the single `precision <= 38`
-/// precondition in `<init>`), while `of(39,0)` throws
-/// `IllegalArgumentException: Decimals with precision larger than 38 are not supported: 39`.
-///
-/// Mutation this catches: re-adding a `Type::decimal(precision, scale)` /
-/// `validate_decimal_literal` call to the decimal arm of `try_from_bytes` (which is exactly what
-/// made a `decimal(1,2)` column unreadable), or deleting the `ensure_java_decimal_precision` call
-/// that keeps precision 39 out.
+/// The mutations this discriminates: add `Type::decimal` or `validate_decimal_literal` to the
+/// decimal arm, which made `decimal(1,2)` unreadable; or delete `ensure_java_decimal_precision`.
 #[test]
 fn datum_decimal_bytes_accept_java_legal_metadata_and_reject_precision_over_38() {
     for (precision, scale) in [(1, 2), (0, 0), (10, 11), (38, 38), (2, 0)] {
@@ -678,26 +655,15 @@ fn datum_decimal_bytes_accept_java_legal_metadata_and_reject_precision_over_38()
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
 }
 
-/// FINDING 1 pin: a NON-minimal (zero- or sign-padded) decimal bound decodes, exactly as it does
-/// in Java.
+/// A zero-padded or sign-padded decimal bound decodes, as it does in Java. Java's DECIMAL arm is
+/// a bare `new BigInteger`, and it rejects only an empty buffer. The LONG and DOUBLE arms in the
+/// same switch DO branch on `remaining()`, which proves the omission is deliberate.
 ///
-/// `Conversions.internalFromByteBuffer` (iceberg-api 1.10.0) DECIMAL arm, bytecode offsets
-/// 254-294, is `new BigInteger(new byte[buf.remaining()])` — no `remaining()` branch at all,
-/// unlike the LONG arm (152-177) and the DOUBLE arm (186-211) in the same `tableswitch`, which
-/// proves the omission is deliberate. Live output from the 1.10.0 jars:
+/// It matters beyond one value: `parse_bytes_entry` propagates with `?`, so one padded bound
+/// makes the whole manifest unparsable and aborts every scan.
 ///
-/// ```text
-/// fromByteBuffer(decimal(9,2), 00 00 04 D2) -> 12.34
-/// fromByteBuffer(decimal(9,2), FF FF FB 2E) -> -12.34
-/// fromByteBuffer(decimal(9,2), <20 bytes, 04 D2 in the tail>) -> 12.34
-/// fromByteBuffer(decimal(9,2), <empty>) -> NumberFormatException: Zero length BigInteger
-/// ```
-///
-/// This matters far beyond one value: `manifest::_serde::parse_bytes_entry` propagates the error
-/// with `?`, so ONE padded bound would make the whole manifest unparsable and abort every scan.
-///
-/// Mutation this catches: restoring the `bytes == i128_to_be_bytes_min(value)` canonical-encoding
-/// check in `Datum::try_from_bytes`, or dropping the empty-buffer guard beside it.
+/// The mutations this discriminates: restore the `i128_to_be_bytes_min` canonical check in
+/// `Datum::try_from_bytes`, or drop the empty-buffer guard beside it.
 #[test]
 fn datum_decimal_byte_decode_accepts_non_minimal_encodings_like_java() {
     let decimal_9_2 = PrimitiveType::Decimal {
@@ -717,7 +683,7 @@ fn datum_decimal_byte_decode_accepts_non_minimal_encodings_like_java() {
     padded_20_negative[19] = 0x2e;
 
     for (data_type, bytes, expected) in [
-        // The finding's own example: Java decodes this to 12.34.
+        // Java decodes this to 12.34.
         (decimal_9_2.clone(), vec![0x00, 0x00, 0x04, 0xd2], 1234),
         (decimal_9_2.clone(), vec![0xff, 0xff, 0xfb, 0x2e], -1234),
         (decimal_9_2.clone(), padded_20, 1234),
@@ -743,8 +709,7 @@ fn datum_decimal_byte_decode_accepts_non_minimal_encodings_like_java() {
         );
     }
 
-    // The one byte-level input Java rejects: `new BigInteger(new byte[0])` throws
-    // `NumberFormatException: Zero length BigInteger` (verified live).
+    // The one byte-level input Java rejects: an empty buffer throws in `new BigInteger`.
     let error = Datum::try_from_bytes(&[], decimal_2_0.clone())
         .expect_err("Java throws on a zero-length decimal buffer, so we must reject it");
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
@@ -753,7 +718,7 @@ fn datum_decimal_byte_decode_accepts_non_minimal_encodings_like_java() {
         "the empty-buffer diagnostic should name Java's own failure: {error}"
     );
 
-    // Still rejected: a magnitude that genuinely exceeds i128 (not mere sign padding).
+    // A magnitude that genuinely exceeds i128, not mere sign padding, is still rejected.
     let mut too_large = vec![0x00; 17];
     too_large[1] = 0x80;
     let error = Datum::try_from_bytes(&too_large, decimal_2_0)
@@ -761,15 +726,9 @@ fn datum_decimal_byte_decode_accepts_non_minimal_encodings_like_java() {
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
 }
 
-/// Java does not compare a decimal's magnitude against its declared precision on READ.
-///
-/// Live: `Conversions.fromByteBuffer(DecimalType.of(2,0), 0F 42 3F)` returns `999999`, and
-/// `fromByteBuffer(DecimalType.of(38,0), <i128::MIN bytes>)` decodes a 39-digit value.
-/// The fork keeps its precision gate only where the encoder would otherwise TRUNCATE — see
-/// `datum_decimal_write_path_still_rejects_values_wider_than_precision`.
-///
-/// Mutation this catches: re-adding `validate_decimal_literal` after the match in
-/// `Datum::try_from_bytes`.
+/// Java does not compare a decimal's magnitude against its precision on READ. It decodes
+/// `999999` at `decimal(2,0)`. The fork gates only where the encoder would truncate. The mutation
+/// this discriminates: add `validate_decimal_literal` after the match in `try_from_bytes`.
 #[test]
 fn datum_decimal_byte_decode_accepts_values_wider_than_declared_precision() {
     let decimal_2_0 = PrimitiveType::Decimal {
@@ -807,20 +766,13 @@ fn datum_decimal_byte_decode_accepts_values_wider_than_declared_precision() {
     );
 }
 
-/// A `Datum` produced by the Java-permissive read path must survive its own serde round trip.
+/// A `Datum` from the Java-permissive read path must survive its own serde round trip. Scan
+/// tasks carry `Datum` bounds across process boundaries, so a precision gate in `Serialize` would
+/// let a Java-written table plan but fail to distribute.
 ///
-/// Scan tasks carry `Datum` bounds across process boundaries; if `Serialize` re-applied the
-/// precision gate that `try_from_bytes` deliberately drops, a table Java wrote would plan but fail
-/// to distribute. The `precision <= 38` invariant still holds, enforced by the `PrimitiveType`
-/// field's own `serialize_decimal`/`deserialize_decimal`.
-///
-/// Both `DatumVisitor` arms are exercised: `visit_map` is the self-describing (JSON object) route,
-/// and `visit_seq` is the route taken by compact, non-self-describing formats — which is exactly
-/// the cross-process scan-task distribution this permissiveness exists for, so it needs its own
-/// pin rather than riding on the map arm's coverage.
-///
-/// Mutation this catches: re-adding `validate_decimal_literal` to `impl Serialize for Datum` or to
-/// either `DatumVisitor` arm.
+/// Both `DatumVisitor` arms run here: `visit_map` for self-describing formats, `visit_seq` for
+/// the compact formats that carry a scan task. The mutation this discriminates: add
+/// `validate_decimal_literal` to `impl Serialize for Datum` or to either arm.
 #[test]
 fn datum_decimal_serde_round_trip_preserves_java_readable_values() {
     let decimal_type = PrimitiveType::Decimal {
@@ -847,8 +799,8 @@ fn datum_decimal_serde_round_trip_preserves_java_readable_values() {
         );
     }
 
-    // The sequence route (compact formats: bincode, MessagePack, postcard) must be just as
-    // permissive as the map route. A JSON array drives `DatumVisitor::visit_seq` directly.
+    // The sequence route must be as permissive as the map route. A JSON array drives
+    // `DatumVisitor::visit_seq` directly.
     for value in [99_i128, -99, 100, -100, 999_999] {
         let seq = serde_json::json!(["decimal(2,0)", value.to_be_bytes()]);
         assert_eq!(
@@ -881,14 +833,10 @@ fn datum_decimal_serde_round_trip_preserves_java_readable_values() {
     );
 }
 
-/// The write path keeps its gate, because `Datum::to_bytes` TRUNCATES the two's-complement buffer
-/// to `decimal_required_bytes(precision)` — silently corrupting a value that needs more.
-///
-/// Java has no equivalent check (`Conversions.toByteBuffer` is a bare
-/// `unscaledValue().toByteArray()`), but Java also never truncates, so refusing is the honest
-/// behavior rather than a parity loss.
-///
-/// Mutation this catches: deleting `validate_decimal_literal` from `Datum::to_bytes`.
+/// The write path keeps its gate, because `Datum::to_bytes` truncates the two's-complement
+/// buffer and silently corrupts a wider value. Java has no such check, but Java also never
+/// truncates. The mutation this discriminates: delete `validate_decimal_literal` from
+/// `Datum::to_bytes`.
 #[test]
 fn datum_decimal_write_path_still_rejects_values_wider_than_precision() {
     let decimal_2_0 = PrimitiveType::Decimal {
@@ -932,8 +880,7 @@ fn datum_decimal_write_path_still_rejects_values_wider_than_precision() {
 
 #[test]
 fn datum_decimal_serialization_rejects_invalid_metadata() {
-    // `precision > 38` is the one decimal-metadata rule Java itself enforces
-    // (`Types$DecimalType.<init>`), so both the byte encoder and the JSON encoder still refuse it.
+    // `precision > 38` is the one decimal-metadata rule Java enforces, so both encoders refuse.
     let over_max = Datum::new(
         PrimitiveType::Decimal {
             precision: 39,
@@ -953,10 +900,8 @@ fn datum_decimal_serialization_rejects_invalid_metadata() {
     let error = serde_json::to_string(&over_max).expect_err("precision 39 must not serialize");
     assert!(error.to_string().contains("Decimals with precision larger"));
 
-    // `precision = 0` has no byte width (`decimal_required_bytes` cannot serve it), so the ENCODER
-    // still refuses even though Java's `DecimalType.of(0,0)` constructs. The metadata itself
-    // remains readable and writable as a type string — see
-    // `datatypes::tests::java_legal_decimal_type_strings_still_deserialize`.
+    // `precision = 0` has no byte width, so the encoder refuses even though Java's
+    // `DecimalType.of(0,0)` constructs. The type string itself stays readable and writable.
     let zero_precision = Datum::new(
         PrimitiveType::Decimal {
             precision: 0,
@@ -972,8 +917,7 @@ fn datum_decimal_serialization_rejects_invalid_metadata() {
         ErrorKind::DataInvalid
     );
 
-    // `scale > precision` is NOT a Java invariant (`DecimalType.of(1,2)` constructs live), so a
-    // value that fits the precision must still encode.
+    // `scale > precision` is not a Java invariant, so a value that fits the precision encodes.
     let odd_shape = Datum::new(
         PrimitiveType::Decimal {
             precision: 1,
@@ -1037,7 +981,6 @@ fn check_raw_literal_bytes_serde_via_avro(
 ) {
     use apache_avro::types::Value;
 
-    // Create an Avro bytes value and deserialize it through the RawLiteral path
     let avro_value = Value::Bytes(input_bytes);
     let raw_literal: _serde::RawLiteral = apache_avro::from_value(&avro_value).unwrap();
     let result = raw_literal.try_into(expected_type).unwrap();
@@ -1124,7 +1067,6 @@ fn test_raw_literal_bytes_uuid_wrong_length() {
 
 #[test]
 fn test_raw_literal_bytes_decimal_precision_4_scale_2() {
-    // Precision 4 requires 2 bytes
     let decimal_bytes = vec![0x04, 0xd2]; // 1234 in 2 bytes
     let expected_decimal = 1234i128;
     check_raw_literal_bytes_serde_via_avro(
@@ -1139,7 +1081,6 @@ fn test_raw_literal_bytes_decimal_precision_4_scale_2() {
 
 #[test]
 fn test_raw_literal_bytes_decimal_precision_4_negative() {
-    // Precision 4 requires 2 bytes, negative number
     let decimal_bytes = vec![0xfb, 0x2e]; // -1234 in 2 bytes
     let expected_decimal = -1234i128;
     check_raw_literal_bytes_serde_via_avro(
@@ -1154,7 +1095,6 @@ fn test_raw_literal_bytes_decimal_precision_4_negative() {
 
 #[test]
 fn test_raw_literal_bytes_decimal_precision_9_scale_2() {
-    // Precision 9 requires 4 bytes
     let decimal_bytes = vec![0x00, 0x12, 0xd6, 0x87]; // 1234567 in 4 bytes
     let expected_decimal = 1234567i128;
     check_raw_literal_bytes_serde_via_avro(
@@ -1169,7 +1109,6 @@ fn test_raw_literal_bytes_decimal_precision_9_scale_2() {
 
 #[test]
 fn test_raw_literal_bytes_decimal_precision_18_scale_2() {
-    // Precision 18 requires 8 bytes
     let decimal_bytes = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0xd2]; // 1234 in 8 bytes
     let expected_decimal = 1234i128;
     check_raw_literal_bytes_serde_via_avro(
@@ -1184,7 +1123,6 @@ fn test_raw_literal_bytes_decimal_precision_18_scale_2() {
 
 #[test]
 fn test_raw_literal_bytes_decimal_precision_38_scale_2() {
-    // Precision 38 requires 16 bytes (maximum precision)
     let decimal_bytes = vec![
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
         0xd2, // 1234 in 16 bytes
@@ -1202,7 +1140,6 @@ fn test_raw_literal_bytes_decimal_precision_38_scale_2() {
 
 #[test]
 fn test_raw_literal_bytes_decimal_precision_1_scale_0() {
-    // Precision 1 requires 1 byte
     let decimal_bytes = vec![0x07]; // 7 in 1 byte
     let expected_decimal = 7i128;
     check_raw_literal_bytes_serde_via_avro(
@@ -1217,7 +1154,6 @@ fn test_raw_literal_bytes_decimal_precision_1_scale_0() {
 
 #[test]
 fn test_raw_literal_bytes_decimal_precision_1_negative() {
-    // Precision 1 requires 1 byte, negative number
     let decimal_bytes = vec![0xf9]; // -7 in 1 byte (two's complement)
     let expected_decimal = -7i128;
     check_raw_literal_bytes_serde_via_avro(
@@ -1230,12 +1166,8 @@ fn test_raw_literal_bytes_decimal_precision_1_negative() {
     );
 }
 
-/// The Avro `bytes` decimal decode is a READ door and carries no precision gate, matching Java's
-/// `new BigInteger(bytes)`; the surviving length rule (`v.len() == decimal_required_bytes`) is
-/// pre-existing and unrelated to this finding.
-///
-/// Mutation this catches: re-adding `validate_decimal_value` to the `RawLiteralEnum::Bytes`
-/// decimal arm in `spec::values::serde`.
+/// The Avro `bytes` decimal decode is a READ door with no precision gate, as Java has none. The
+/// mutation this discriminates: add `validate_decimal_value` to the `RawLiteralEnum::Bytes` arm.
 #[test]
 fn raw_literal_decimal_decode_accepts_values_wider_than_declared_precision() {
     let decimal_type = Type::Primitive(PrimitiveType::Decimal {
@@ -1254,11 +1186,9 @@ fn raw_literal_decimal_decode_accepts_values_wider_than_declared_precision() {
     }
 }
 
-/// The same absence of a precision gate on the recursive (struct/partition) route.
-///
-/// Mutation this catches: re-adding `validate_decimal_value` to the `PrimitiveLiteral::Int128`
-/// arm of `RawLiteral::try_from`, which would make a Java-written partition value unwritable on
-/// the way back out.
+/// The same absence of a precision gate on the recursive struct and partition route. The
+/// mutation this discriminates: add `validate_decimal_value` to the `PrimitiveLiteral::Int128`
+/// arm of `RawLiteral::try_from`, which makes a Java-written partition value unwritable.
 #[test]
 fn raw_literal_recursive_struct_route_accepts_java_written_decimals() {
     let decimal_type = Type::Primitive(PrimitiveType::Decimal {
@@ -1277,7 +1207,6 @@ fn raw_literal_recursive_struct_route_accepts_java_written_decimals() {
         );
     }
 
-    // An Int128 literal still has to be typed as a decimal.
     let literal = Literal::Struct(Struct::from_iter([Some(Literal::decimal(1))]));
     let wrong_type = Type::Struct(StructType::new(vec![
         NestedField::required(
@@ -1409,8 +1338,7 @@ fn literal_decimal_json_boundaries_validate_direct_and_nested_values() {
         );
     }
 
-    // A genuinely malformed nested value must still surface as a typed error rather than being
-    // swallowed into a missing field (the struct route no longer discards errors with `.ok()`).
+    // A malformed nested value must surface as a typed error, not vanish into a missing field.
     assert_eq!(
         Literal::try_from_json(serde_json::json!({"1": 123}), &struct_type)
             .expect_err("a non-string decimal default is not parseable")
@@ -1419,15 +1347,10 @@ fn literal_decimal_json_boundaries_validate_direct_and_nested_values() {
     );
 }
 
-/// The `decimal(P,S)` JSON value path applies Java's rules only.
-///
-/// Java 1.10.0 `SingleValueParser.fromJson` DECIMAL arm checks `isTextual`, then
-/// `new BigDecimal(text)`, then only `bigDecimal.scale() == decimalType.scale()`; `toJson` writes
-/// `value.toString()` with no gate at all. So `decimal(0,0)`, `decimal(39,0)` and `decimal(2,3)`
-/// — the three shapes the first hardening pass rejected — must not be refused here.
-///
-/// Mutation this catches: re-adding `Type::decimal(precision, scale)?` or `validate_decimal_value`
-/// to `Literal::try_from_json` / `Literal::try_into_json`.
+/// The `decimal(P,S)` JSON value path applies Java's rules only: `isTextual`, `new BigDecimal`,
+/// and a scale match. `toJson` has no gate, so `decimal(0,0)`, `decimal(39,0)`, and
+/// `decimal(2,3)` must not be refused. The mutation this discriminates: add `Type::decimal` or
+/// `validate_decimal_value` to `Literal::try_from_json` or `try_into_json`.
 #[test]
 fn literal_decimal_json_applies_no_precision_gate_like_java() {
     for data_type in [
@@ -1455,7 +1378,6 @@ fn literal_decimal_json_applies_no_precision_gate_like_java() {
         );
     }
 
-    // The type still has to be a decimal for an Int128 literal.
     assert_eq!(
         Literal::decimal(0)
             .try_into_json(&Type::Primitive(PrimitiveType::Int))
@@ -1467,7 +1389,6 @@ fn literal_decimal_json_applies_no_precision_gate_like_java() {
 
 #[test]
 fn test_raw_literal_bytes_decimal_wrong_length() {
-    // 3 bytes provided, but precision 4 requires 2 bytes
     let bytes = vec![1u8, 2u8, 3u8];
     check_raw_literal_bytes_error_via_avro(
         bytes,
@@ -1480,7 +1401,6 @@ fn test_raw_literal_bytes_decimal_wrong_length() {
 
 #[test]
 fn test_raw_literal_bytes_decimal_wrong_length_too_few() {
-    // 1 byte provided, but precision 9 requires 4 bytes
     let bytes = vec![0x42];
     check_raw_literal_bytes_error_via_avro(
         bytes,
@@ -1571,8 +1491,8 @@ fn avro_convert_test_timestamptz() {
 
 #[test]
 fn avro_convert_test_timestamp_ns() {
-    // RISK: Long → timestamp_ns was missing from RawLiteralEnum::try_into, so a V3 identity
-    // partition written as Avro long could not be reloaded (inspect died before projection).
+    // Risk: `Long -> timestamp_ns` was missing, so a V3 identity partition written as an Avro
+    // long could not be reloaded.
     check_convert_with_avro(
         Literal::Primitive(PrimitiveLiteral::Long(1_704_083_400_000_000_000)),
         &Type::Primitive(PrimitiveType::TimestampNs),
@@ -1581,8 +1501,7 @@ fn avro_convert_test_timestamp_ns() {
 
 #[test]
 fn avro_convert_test_timestamptz_ns() {
-    // RISK: same-class twin of Timestamptz — Long → timestamptz_ns must decode for inspect to
-    // reach the data_file projection arm.
+    // Risk: the twin of the arm above. `Long -> timestamptz_ns` must decode for inspect.
     check_convert_with_avro(
         Literal::Primitive(PrimitiveLiteral::Long(1_704_083_400_000_000_000)),
         &Type::Primitive(PrimitiveType::TimestamptzNs),
@@ -1619,11 +1538,9 @@ fn avro_convert_test_list() {
 
 #[test]
 fn avro_convert_test_uuid() {
-    // Round-trip pin for the UInt128/Uuid Avro serde fix (R2): a Uuid-typed `UInt128` literal must
-    // round-trip through a REAL Avro schema (`schema_to_avro_schema` emits `AvroSchema::Uuid`). The
-    // deserialize side accepts BOTH the String form (this serialize arm) and the legacy 16-byte
-    // Bytes form (covered by `test_raw_literal_bytes_uuid_correct_length`), so Java-written bytes
-    // still decode.
+    // A Uuid-typed `UInt128` literal must round-trip through a real Avro schema, which emits
+    // `AvroSchema::Uuid`. The deserialize side takes both the String form used here and the
+    // legacy 16-byte Bytes form, so Java-written bytes still decode.
     let uuid = Uuid::parse_str("f79c3e09-677c-4bbd-a479-3f349cb785e7").unwrap();
     check_convert_with_avro(
         Literal::Primitive(PrimitiveLiteral::UInt128(uuid.as_u128())),
@@ -1633,13 +1550,10 @@ fn avro_convert_test_uuid() {
 
 #[test]
 fn avro_serialize_uuid_resolves_against_schema_uuid() {
-    // Mutation-resistant pin for the load-bearing R2 fix. The production bug was on the Avro
-    // schema-RESOLUTION path (`.resolve(&avro_schema)` against `AvroSchema::Uuid`), NOT the plain
-    // round-trip: apache-avro's `resolve_uuid` accepts a `Value::String` (or `Value::Uuid`) but
-    // REJECTS a `Value::Bytes` with an unresolvable-union error. `check_serialize_avro` exercises
-    // exactly that `.resolve()` path, so reverting the serialize arm to `Bytes` makes this fail
-    // closed (the plain `check_convert_with_avro` round-trip above does NOT, because the 16-byte
-    // deserialize arm still decodes the bytes).
+    // The bug was on the Avro schema-RESOLUTION path, which `check_serialize_avro` drives.
+    // `resolve_uuid` takes a `Value::String` and rejects a `Value::Bytes`. The mutation this
+    // discriminates: revert the serialize arm to `Bytes`. The plain round trip above stays green,
+    // because the 16-byte deserialize arm still decodes.
     let uuid = Uuid::parse_str("f79c3e09-677c-4bbd-a479-3f349cb785e7").unwrap();
     check_serialize_avro(
         Literal::Primitive(PrimitiveLiteral::UInt128(uuid.as_u128())),
@@ -1812,10 +1726,8 @@ fn avro_convert_test_record() {
     );
 }
 
-// # TODO:https://github.com/apache/iceberg-rust/issues/86
-// rust avro don't support deserialize any bytes representation now:
-// - binary
-// - decimal
+// TODO(#86): rust avro cannot deserialize a bytes representation, so binary and decimal are
+// not covered here.
 #[test]
 fn avro_convert_test_binary_ser() {
     let literal = Literal::Primitive(PrimitiveLiteral::Binary(vec![1, 2, 3, 4, 5]));
@@ -1835,10 +1747,8 @@ fn avro_convert_test_decimal_ser() {
     check_serialize_avro(literal, &ty, expect_value);
 }
 
-// # TODO:https://github.com/apache/iceberg-rust/issues/86
-// rust avro can't support to convert any byte-like type to fixed in avro now.
-// - uuid ser/de
-// - fixed ser/de
+// TODO(#86): rust avro cannot convert a byte-like type to avro fixed, so uuid and fixed
+// ser/de are not covered here.
 
 #[test]
 fn test_parse_timestamp() {
@@ -2027,10 +1937,8 @@ fn test_datum_long_convert_to_timestamptz() {
     assert_eq!(result, expected);
 }
 
-// Java `DecimalLiteral.to` has NO LONG case — `default: return null` rejects Decimal→Long (only
-// `case DECIMAL: return this` is accepted). These pin the strict-parity reject across the value
-// range (in-range + over/under the i64 bounds); re-introducing the removed `Int128→Long` arm flips
-// them from `is_err()` back to `is_ok()`.
+// Java `DecimalLiteral.to` accepts DECIMAL only, so Decimal-to-Long is a reject. These pin it
+// across the value range. The mutation this discriminates: restore the `Int128 -> Long` arm.
 #[test]
 fn test_datum_decimal_convert_to_long_rejected() {
     let datum = Datum::decimal(decimal_new(12345, 0)).unwrap();
@@ -2052,10 +1960,9 @@ fn test_datum_decimal_convert_to_long_below_i64_min_rejected() {
     assert!(result.is_err());
 }
 
-// Java `StringLiteral.to` has NO BOOLEAN/INTEGER/LONG case — all three fall to `default: null`
-// (a reject). The inputs below are well-formed (`"true"` / `"12345"`), so these pin the *type
-// contract*, not a parse failure: re-introducing any of the removed over-permissive arms flips
-// these from `is_err()` back to `is_ok()`.
+// Java `StringLiteral.to` rejects BOOLEAN, INTEGER, and LONG. The inputs below are well-formed,
+// so these pin the type contract, not a parse failure. The mutation this discriminates: restore
+// any of the over-permissive arms.
 #[test]
 fn test_datum_string_convert_to_boolean_rejected() {
     let result = Datum::string("true").to(&Primitive(PrimitiveType::Boolean));
@@ -2096,9 +2003,7 @@ fn test_datum_string_convert_to_timestamptz() {
     assert_eq!(result, expected);
 }
 
-// ===== Additive `Datum::to` promotions (Java `Literals.*Literal.to`) =====
-// One assertion per new arm: accept, boundary/sentinel, and reject, each baited so flipping a
-// rule reds a test.
+// `Datum::to` promotions, one assertion per arm: accept, boundary sentinel, and reject.
 
 #[test]
 fn test_datum_int_convert_to_float_and_double() {
@@ -2136,7 +2041,7 @@ fn test_datum_long_convert_to_date() {
 
 #[test]
 fn test_datum_long_convert_to_date_above_max() {
-    // One past Integer.MAX_VALUE must yield the `aboveMax` sentinel, typed as Date.
+    // One past Integer.MAX_VALUE gives the `aboveMax` sentinel, typed as Date.
     let result = Datum::long(INT_MAX as i64 + 1)
         .to(&Primitive(PrimitiveType::Date))
         .unwrap();
@@ -2175,7 +2080,7 @@ fn test_datum_double_convert_to_float() {
 
 #[test]
 fn test_datum_double_convert_to_float_above_max() {
-    // Beyond Float.MAX_VALUE (~3.4e38) must yield the `aboveMax` sentinel, typed as Float.
+    // Beyond Float.MAX_VALUE the result is the `aboveMax` sentinel, typed as Float.
     let result = Datum::double(1.0e40)
         .to(&Primitive(PrimitiveType::Float))
         .unwrap();
@@ -2196,9 +2101,8 @@ fn test_datum_double_convert_to_float_below_min() {
     );
 }
 
-// At-exact-boundary cases: a value EQUAL to the sentinel threshold must keep the value, not
-// trip the sentinel. These red a `>`→`>=` (or `<`→`<=`) mutation of the bound, which the
-// `+1`/`-1` tests above do not catch.
+// A value EQUAL to the sentinel threshold must keep the value. The mutation this discriminates:
+// `>` to `>=`, or `<` to `<=`, which the `+1` and `-1` tests above do not catch.
 #[test]
 fn test_datum_long_convert_to_date_at_int_max() {
     let result = Datum::long(INT_MAX as i64)
@@ -2225,8 +2129,7 @@ fn test_datum_double_convert_to_float_at_max() {
 
 #[test]
 fn test_datum_decimal_convert_to_decimal_preserves_scale() {
-    // Java DecimalLiteral.to(DECIMAL) returns `this` — the source value/scale is unchanged even
-    // when the target decimal type declares a different scale.
+    // Java returns `this`, so the source value and scale survive a different target scale.
     let datum = Datum::decimal(decimal_new(12345, 2)).unwrap();
     let expected = datum.clone();
     let result = datum
@@ -2291,15 +2194,13 @@ fn test_datum_string_convert_to_time() {
 
 #[test]
 fn test_datum_boolean_convert_to_int_rejected() {
-    // Java BooleanLiteral.to only accepts BOOLEAN; everything else is null (a reject). Guards
-    // against an accidentally over-permissive arm.
+    // Java `BooleanLiteral.to` accepts BOOLEAN only. This guards an over-permissive arm.
     let result = Datum::bool(true).to(&Primitive(PrimitiveType::Int));
     assert!(result.is_err());
 }
 
 #[test]
 fn test_iceberg_float_order() {
-    // Test float ordering
     let float_values = vec![
         Datum::float(f32::NAN),
         Datum::float(-f32::NAN),
@@ -2331,7 +2232,6 @@ fn test_iceberg_float_order() {
 
     assert_eq!(float_sorted, float_expected);
 
-    // Test double ordering
     let double_values = vec![
         Datum::double(f64::NAN),
         Datum::double(-f64::NAN),
@@ -2389,26 +2289,14 @@ fn test_negative_zero_less_than_positive_zero() {
     }
 }
 
-/// Test Date deserialization from JSON as number (days since epoch).
-///
-/// This reproduces the scenario from Iceberg Java's TestAddFilesProcedure where:
-/// - Date partition columns have initial_default values in manifests
-/// - These values are serialized as days since epoch (e.g., 18628 for 2021-01-01)
-/// - The JSON schema includes: {"type":"date","initial-default":18628}
-///
-/// Prior to this fix, Date values in JSON were only parsed from String format ("2021-01-01"),
-/// causing initial_default values to be lost during schema deserialization.
-///
-/// This test ensures both formats are supported:
-/// - String format: "2021-01-01" (used in table metadata)
-/// - Number format: 18628 (used in initial-default values from add_files)
-///
-/// See: Iceberg Java TestAddFilesProcedure.addDataPartitionedByDateToPartitioned()
+/// A Date must deserialize from JSON as a number of days since epoch, not only from a string.
+/// Java's `TestAddFilesProcedure` writes a date partition default as `18628`, and parsing strings
+/// only lost every such `initial_default`. Both forms must work.
 #[test]
 fn test_date_from_json_as_number() {
     use serde_json::json;
 
-    // Test Date as number (days since epoch) - used in initial-default from add_files
+    // The number form, used in an `add_files` initial default.
     let date_number = json!(18628); // 2021-01-01 is 18628 days since 1970-01-01
     let result =
         Literal::try_from_json(date_number, &Type::Primitive(PrimitiveType::Date)).unwrap();
@@ -2417,7 +2305,7 @@ fn test_date_from_json_as_number() {
         Some(Literal::Primitive(PrimitiveLiteral::Int(18628)))
     );
 
-    // Test Date as string - traditional format
+    // The string form.
     let date_string = json!("2021-01-01");
     let result =
         Literal::try_from_json(date_string, &Type::Primitive(PrimitiveType::Date)).unwrap();
@@ -2426,32 +2314,29 @@ fn test_date_from_json_as_number() {
         Some(Literal::Primitive(PrimitiveLiteral::Int(18628)))
     );
 
-    // Both formats should produce the same Literal value
+    // Both forms give the same literal.
 }
 
-// RISK: a variant column can carry NO default value — Java 1.10.0 `SingleValueParser.fromJson`
-// has no VARIANT case (default branch throws "Type: %s is not supported"), while a JSON null
-// parses to "no default" for every type (the up-front null return). Silently accepting a variant
-// default would write metadata Java cannot parse back.
+// Risk: a variant column can carry no default. Java's parser has no VARIANT case and throws,
+// while a JSON null means no default. Accepting one writes metadata Java cannot parse back.
 #[test]
 fn test_variant_default_value_json_is_rejected_but_null_is_none() {
     use serde_json::json;
 
-    // Null parses to None (no default), like every other type.
+    // Null parses to None, as it does for every other type.
     let null_result = Literal::try_from_json(JsonValue::Null, &Type::Variant)
         .expect("a JSON null is 'no default' for variant too");
     assert_eq!(null_result, None);
 
-    // Any non-null default is rejected with Java's message.
+    // A non-null default is rejected with Java's message.
     let error = Literal::try_from_json(json!({"a": 1}), &Type::Variant)
         .expect_err("a non-null variant default must be rejected");
     assert_eq!(error.kind(), crate::ErrorKind::FeatureUnsupported);
     assert_eq!(error.message(), "Type: variant is not supported");
 }
 
-// RISK: the WRITE direction must also fail loudly — no `Literal` can represent a variant value
-// (there is no variant literal in either language; Java's `SingleValueParser.toJson` default
-// throws too). The catch-all must not silently render some other literal under a variant type.
+// Risk: the write direction must also fail loudly. Neither language has a variant literal, and
+// Java's `toJson` throws. The catch-all must not render another literal under a variant type.
 #[test]
 fn test_variant_literal_to_json_is_rejected() {
     let error = Literal::Primitive(PrimitiveLiteral::Long(7))
@@ -2465,9 +2350,8 @@ fn test_variant_literal_to_json_is_rejected() {
     );
 }
 
-// RISK: `unknown` has NO single-value byte encoding (its values are always null; Java keeps no
-// value class for `UnknownType`). `Datum::try_from_bytes` must REJECT it rather than fabricate a
-// `Datum`. Mutation guard: a value-producing arm here would flip this test red.
+// Risk: `unknown` has no single-value byte encoding, because its values are always null.
+// `Datum::try_from_bytes` must reject it. The mutation: add a value-producing arm.
 #[test]
 fn test_datum_try_from_bytes_rejects_unknown() {
     let error = Datum::try_from_bytes(&[0u8, 1u8, 2u8], PrimitiveType::Unknown)
@@ -2480,9 +2364,8 @@ fn test_datum_try_from_bytes_rejects_unknown() {
     );
 }
 
-// RISK: a null single-value JSON for an `unknown` column must round-trip to `None` (the column is
-// always null), mirroring Java `SingleValueParser.fromJson` returning null for a null node of any
-// type. A non-null JSON value for an unknown column must NOT silently parse.
+// Risk: a null single-value JSON for an `unknown` column must give `None`, as Java gives null
+// for a null node of any type. A non-null value for such a column must not parse.
 #[test]
 fn test_unknown_single_value_json_null_is_none() {
     let none = Literal::try_from_json(JsonValue::Null, &Primitive(PrimitiveType::Unknown))

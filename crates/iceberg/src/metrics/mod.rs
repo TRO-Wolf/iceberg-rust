@@ -17,42 +17,15 @@
 
 //! Metrics reporting for table operations.
 //!
-//! This module ports the self-contained core of Java's `org.apache.iceberg.metrics`
-//! package: the immutable metrics-report data model, the [`MetricsReporter`] API, the
-//! [`InMemoryMetricsReporter`], and the [`LoggingMetricsReporter`] (which logs each
-//! received report through `tracing`, mirroring Java's SLF4J-based reporter). It is also
-//! the wire contract for the REST catalog's `report-metrics` endpoint.
+//! Ports the core of Java's `org.apache.iceberg.metrics`, and carries the wire contract for the
+//! REST catalog `report-metrics` endpoint. The serde shapes byte-match Java's parsers.
 //!
-//! # Java parity
+//! # Notes
 //!
-//! - [`MetricsReport`] mirrors Java's marker interface `MetricsReport`, modelled here as
-//!   an `enum` (currently a single [`MetricsReport::Scan`] variant) rather than a trait
-//!   object: a closed sum type avoids `dyn` downcasting and makes an illegal report kind
-//!   unrepresentable, while still admitting future report kinds (e.g. a commit report) as
-//!   new variants.
-//! - [`ScanReport`] / [`ScanMetricsResult`] / [`CounterResult`] / [`TimerResult`] mirror the
-//!   Java types of the same names. Every metric on [`ScanMetricsResult`] is an `Option`,
-//!   matching Java's `@Nullable` accessors: a counter (or timer) that was never incremented
-//!   is absent from the result and omitted from the JSON.
-//! - The metric names match Java's `ScanMetrics` constants exactly (e.g.
-//!   `total-planning-duration`, `result-data-files`).
-//!
-//! # JSON serialization
-//!
-//! The serde representation matches Java's `ScanReportParser` / `ScanMetricsResultParser` /
-//! `CounterResultParser` / `TimerResultParser` for the metrics object, the counter shape
-//! (`{"unit": <display-name>, "value": <i64>}`), the timer shape
-//! (`{"count": <i64>, "time-unit": <lowercase>, "total-duration": <i64 in that unit>}`),
-//! and the report's top-level field names (`table-name`, `snapshot-id`, `schema-id`,
-//! `projected-field-ids`, `projected-field-names`, `metrics`, `metadata`).
-//!
-//! **The `filter` field** is serialized through the canonical Java-`ExpressionParser` codec
-//! ([`crate::expr::expression_parser`]) via custom serde, so the emitted `ScanReport.filter`
-//! sub-document byte-matches Java `ExpressionParser.toJson`. Deserialization mirrors Java's
-//! schema-less `ScanReportParser.fromJson` (which reads the filter via untyped
-//! `ExpressionParser.fromJson(JsonNode)`): integral literals become `long`, floating `double`,
-//! and date/time/timestamp/decimal literals collapse to their JSON scalar — exactly as in Java,
-//! because a `ScanReport` carries no schema to recover those types.
+//! [`MetricsReport`] is a closed enum, not a trait object, so an illegal report kind cannot be
+//! built. A metric that was never incremented is `None` and is omitted from the JSON, as Java's
+//! `@Nullable` accessors are. A deserialized `filter` loses its literal types the way Java's
+//! schema-less `ScanReportParser.fromJson` does, because a `ScanReport` carries no schema.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -140,9 +113,8 @@ pub enum TimeUnit {
 impl TimeUnit {
     /// Returns the number of nanoseconds in one tick of this unit.
     ///
-    /// Used to convert a [`Duration`] (always nanosecond-precise) to and from the integer
-    /// `total-duration` value the JSON carries, which is expressed in this unit — exactly
-    /// Java `TimerResultParser.fromDuration`/`toDuration` (`unit.convert(...)`).
+    /// Converts a [`Duration`] to and from the integer `total-duration` the JSON carries, as
+    /// Java `TimerResultParser` does.
     const fn nanos_per_unit(self) -> u128 {
         match self {
             TimeUnit::Nanoseconds => 1,
@@ -205,8 +177,7 @@ impl TimerResult {
 
 /// The on-the-wire shape of a [`TimerResult`], matching Java `TimerResultParser`.
 ///
-/// `total-duration` is the duration expressed in `time-unit` ticks (a truncating integer
-/// conversion, exactly Java's `unit.convert(duration.toNanos(), NANOSECONDS)`).
+/// `total-duration` counts `time-unit` ticks, and the conversion truncates as Java's does.
 #[derive(Serialize, Deserialize)]
 struct TimerResultSerde {
     count: i64,
@@ -369,9 +340,8 @@ pub struct ScanMetricsResult {
     pub dvs: Option<CounterResult>,
 }
 
-// A compile-time guard that the metric-name constants match the serde `rename`s above.
-// If a name and its `#[serde(rename = ...)]` ever drift, this `const` block fails to
-// compile, catching the mismatch at build time rather than in a round-trip test.
+// A drift between a metric-name constant and its `#[serde(rename)]` fails this const block at
+// build time, not in a round-trip test.
 const _: () = {
     assert!(matches_str(
         metric_names::TOTAL_PLANNING_DURATION,
@@ -492,8 +462,7 @@ pub struct ScanReport {
     pub scan_metrics: ScanMetricsResult,
     /// Free-form metadata attached to the report. Java `metadata()` → `metadata`.
     ///
-    /// Omitted from the JSON when empty, matching Java `ScanReportParser` (which only
-    /// writes `metadata` when the map is non-empty).
+    /// Omitted from the JSON when empty, as Java `ScanReportParser` does.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
 }
@@ -577,8 +546,8 @@ impl InMemoryMetricsReporter {
 
     /// Returns the most recent report if it is a [`ScanReport`], else `None`.
     ///
-    /// Mirrors Java `InMemoryMetricsReporter.scanReport()` (without the throw-on-mismatch:
-    /// the Rust enum already encodes the kind, so a non-scan report simply yields `None`).
+    /// Mirrors Java `InMemoryMetricsReporter.scanReport`. Java throws on a kind mismatch; the
+    /// enum here encodes the kind, so a non-scan report yields `None`.
     pub fn last_scan_report(&self) -> Option<ScanReport> {
         match self.last_report()? {
             MetricsReport::Scan(scan_report) => Some(scan_report),
@@ -701,9 +670,8 @@ mod tests {
         }
     }
 
-    /// Risk: the report's accessors silently drop or reorder a field, so a caller reads a
-    /// different value than was constructed. Pins every Java-named field round-trips through
-    /// the struct.
+    /// Pins that every Java-named field round-trips through the struct, so no accessor drops
+    /// or reorders one.
     #[test]
     fn test_scan_report_fields_round_trip_through_accessors() {
         let report = sample_report();
@@ -737,9 +705,8 @@ mod tests {
         );
     }
 
-    /// Risk: a metric that was never incremented is reported as `Some(0)` instead of absent,
-    /// diverging from Java's `@Nullable` optionality (and bloating the JSON). Pins the default
-    /// is `None` and stays `None` when other metrics are set.
+    /// A metric that was never incremented must stay `None`, not become `Some(0)`, or the
+    /// JSON diverges from Java's `@Nullable` optionality.
     #[test]
     fn test_absent_counter_is_none() {
         let metrics = sample_metrics();
@@ -789,10 +756,8 @@ mod tests {
         assert_eq!(reporter.last_scan_report(), Some(second));
     }
 
-    /// Risk: the JSON serialization drifts from Java's `ScanReportParser` shape — a renamed or
-    /// reordered top-level field, or a wrong metric/counter name — silently breaking the REST
-    /// `report-metrics` contract. Pins the round-trip AND the exact field/metric names against
-    /// a hand-written expected JSON.
+    /// A renamed field or metric silently breaks the REST `report-metrics` contract. Pins the
+    /// round-trip and the exact names against a hand-written expected JSON.
     #[test]
     fn test_scan_report_json_round_trips_and_matches_java_shape() {
         let report = sample_report();
@@ -862,9 +827,8 @@ mod tests {
         assert_eq!(restored, report);
     }
 
-    /// Risk: the timer's `total-duration` is written in nanoseconds regardless of `time-unit`
-    /// (or converted with the wrong factor), diverging from Java `TimerResultParser`, which
-    /// expresses the duration in the reported unit. Pins a non-nanosecond unit converts.
+    /// Java `TimerResultParser` expresses the duration in the reported unit. Pins that a
+    /// non-nanosecond unit converts, rather than emitting nanoseconds.
     #[test]
     fn test_timer_total_duration_is_expressed_in_its_time_unit() {
         let timer = TimerResult::new(TimeUnit::Milliseconds, Duration::from_millis(250), 4);
@@ -898,11 +862,8 @@ mod tests {
         assert_eq!(restored, report);
     }
 
-    /// Risk: the `LoggingMetricsReporter` does not actually log the received report (or logs the
-    /// wrong message), so the Java `LOG.info("Received metrics report: {}", report)` parity is
-    /// silently lost. Pins that `report` emits a captured event carrying the "Received metrics
-    /// report" message and the report's identifiers. Removing the `tracing::info!` in `report`
-    /// makes this fail, so the assertion is non-vacuous.
+    /// Pins that `report` emits an event carrying the Java message and the report identifiers.
+    /// Discriminates the mutation that removes the `tracing::info!` call.
     #[test]
     fn test_logging_metrics_reporter_logs_the_report() {
         let logs = Arc::new(Mutex::new(Vec::<String>::new()));

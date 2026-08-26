@@ -47,19 +47,16 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use super::expr_to_predicate::convert_filters_to_predicate;
 use crate::to_datafusion_error;
 
-/// Iceberg-specific scan knobs registered on DataFusion [`ConfigOptions`].
+/// Iceberg-specific scan knobs registered on DataFusion [`ConfigOptions`], prefix `iceberg.`.
 ///
-/// Prefix: `iceberg.`
-///
-/// - `multi_partition_scan` (default `true`): dedicated off-switch for multi-partition
-///   SELECT. When `false`, forces `T = 1` without requiring session `target_partitions = 1`.
-/// - `data_file_concurrency` (default `0`): total data-file concurrency budget `L`.
-///   `0` means "derive from `target_partitions`" (Wave E mapping). Distinct from `T`.
+/// | Knob | Default | Meaning |
+/// |---|---|---|
+/// | `multi_partition_scan` | `true` | `false` forces `T = 1` without touching `target_partitions` |
+/// | `data_file_concurrency` | `0` | the budget `L`; `0` derives it from `target_partitions` |
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct IcebergScanOptions {
-    /// When false, multi-partition output is disabled (`T = 1`) regardless of
-    /// `target_partitions`. Default true (feature shipped ON).
+    /// `false` disables multi-partition output, whatever `target_partitions` says.
     pub multi_partition_scan: bool,
     /// Total data-file concurrency budget `L`. Zero → use `target_partitions`.
     pub data_file_concurrency: usize,
@@ -132,93 +129,56 @@ impl ConfigExtension for IcebergScanOptions {
     const PREFIX: &'static str = "iceberg";
 }
 
-/// How one advertised output column is produced from the scanned data.
-///
-/// Resolution is by FIELD ID, never by name: a column's name is mutable metadata in Iceberg
-/// (`RENAME COLUMN` keeps the id and creates no snapshot), so a name-keyed binding silently reads
-/// the wrong column — or fabricates NULLs over live data — the moment a rename lands.
+/// How one advertised output column is produced from the scanned data. Resolution is by FIELD ID:
+/// `RENAME COLUMN` keeps the id, so a name-keyed binding reads the wrong column after a rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ColumnSource {
-    /// Take the scanned column with this name — the name the SCANNED snapshot's schema gives the
-    /// advertised field's id, which is not necessarily the advertised name.
+    /// Take the scanned column under the name the SCANNED snapshot gives the advertised field id.
     Scanned(String),
-    /// The advertised field's id is not in the scanned snapshot's schema at all (e.g. a column
-    /// added after that snapshot): emit NULLs, as Java's readers do for an absent projected field.
+    /// The scanned snapshot has no such field id, so emit NULLs, as Java does.
     Absent,
 }
 
-/// Manages the scanning process of an Iceberg [`Table`], encapsulating the
-/// necessary details and computed properties required for execution planning.
-///
-/// When planned via [`IcebergTableScan::plan`], work is assigned through core
-/// [`iceberg::scan::TableScan::plan_tasks`] into `N` [`PartitionWork`] units and this node
-/// advertises [`Partitioning::UnknownPartitioning`]`(N)`. `execute(i)` streams only
-/// `PartitionWork(i)` (legacy single-stream reader — WG2 within-file parallel is not composed
-/// into this path on v1).
+/// Manages the scanning process of an Iceberg [`Table`]. [`IcebergTableScan::plan`] assigns the
+/// work of core `plan_tasks` into `N` [`PartitionWork`] units, as `UnknownPartitioning(N)`.
 #[derive(Debug)]
 pub struct IcebergTableScan {
-    /// A table in the catalog.
     table: Table,
-    /// Snapshot of the table to scan (plan input; may be `None` for "current at plan time").
+    /// `None` means the current snapshot at plan time.
     snapshot_id: Option<i64>,
     /// Concrete snapshot id resolved at plan time and frozen on the node (pin 12).
     resolved_snapshot_id: i64,
-    /// Stores certain, often expensive to compute,
-    /// plan properties used in query optimization.
     plan_properties: Arc<PlanProperties>,
-    /// Projection column names, None means all columns
     projection: Option<Vec<String>>,
-    /// The column names actually selected from the table — the SCANNED snapshot schema's name for
-    /// each advertised field whose id it carries. See [`IcebergTableScan::new`].
+    /// The SCANNED snapshot's name for each advertised field id. See [`IcebergTableScan::new`].
     scan_columns: Vec<String>,
     /// How each advertised output column is produced, parallel to the advertised schema's fields.
     sources: Vec<ColumnSource>,
-    /// Filters to apply to the table scan
     predicates: Option<Predicate>,
-    /// Optional limit on the number of rows to return.
-    ///
-    /// Applied **only** when `N = 1`. When `N > 1`, global LIMIT correctness belongs to
-    /// DataFusion's `GlobalLimitExec` (pin 5); a sole per-partition hard cap of `k` is illegal.
+    /// Optional row limit. It applies only when `N = 1`, because a per-partition cap over-counts,
+    /// so `GlobalLimitExec` owns the limit above that.
     limit: Option<usize>,
-    /// Eager multi-partition assignment from `plan_tasks` (empty when built via [`Self::new`]
-    /// without planning — legacy single-stream execute path).
+    /// Empty when built by [`Self::new`] without planning, which takes the single-stream path.
     partition_work: Vec<PartitionWork>,
     /// Per-partition data-file concurrency `P = max(1, ceil(L/N))`.
     per_partition_concurrency: usize,
-    /// Batch size for the Iceberg reader.
     batch_size: Option<usize>,
 }
 
 impl IcebergTableScan {
     /// Creates a new [`IcebergTableScan`] object.
     ///
-    /// Returns a planning error when `projection` holds an index outside `schema`
-    /// (previously an `unwrap` panic — SAF-004). The projected column names are derived
-    /// from the projected schema itself, so they can never index out of bounds.
+    /// # Errors
     ///
-    /// # The advertised schema is a contract (BUG-011)
+    /// Fails when `projection` holds an index outside `schema`.
     ///
-    /// `schema` is the schema DataFusion PLANNED this query against — `projection` indexes into
-    /// it, and every parent operator was built against its projection. That projection is therefore
-    /// the schema this node advertises, and the batches it emits MUST match it. Two things can make
-    /// the table disagree with it:
+    /// # Notes
     ///
-    /// * the caller reloaded the table between planning and scanning (the catalog-backed provider
-    ///   does exactly that), and
-    /// * `ADD COLUMN` does not create a snapshot, so a table's CURRENT schema routinely has columns
-    ///   the scanned snapshot's schema — the schema the core scan resolves names against — lacks.
-    ///
-    /// So the scan never says "give me everything the table has now" (`select_all`). It resolves
-    /// each advertised field BY FIELD ID against the scanned snapshot's schema (see
-    /// [`ColumnSource`]), selects the name that schema gives the id, and [`conform_batch`] renames,
-    /// promotes or null-fills on the way out.
-    ///
-    /// # Pushed-down filters are rebound too
-    ///
-    /// A pushed filter PRUNES: rows it excludes never reach DataFusion, so an `Inexact` pushdown
-    /// only lets DataFusion remove false positives — it cannot recover a row the scan dropped. The
-    /// filter therefore has to be rebound to the scanned snapshot's names exactly like the
-    /// projection ([`rebind_filters`]), and any filter that cannot be rebound is not pushed at all.
+    /// The advertised schema is a contract: every parent operator was built against it. The table
+    /// can still disagree, because the caller may reload it between planning and scanning, and
+    /// because `ADD COLUMN` creates no snapshot. So the scan never calls `select_all`; it binds
+    /// each advertised field BY FIELD ID, and [`conform_batch`] renames, promotes or null-fills.
+    /// [`rebind_filters`] rebinds each pushed filter and drops the ones it cannot.
     pub(crate) fn new(
         table: Table,
         snapshot_id: Option<i64>,
@@ -227,8 +187,7 @@ impl IcebergTableScan {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Self> {
-        // Bind the FULL advertised schema, not just the projection: a pushed-down filter may
-        // reference a column the projection does not output.
+        // The FULL schema, not the projection: a pushed filter may reference an unprojected column.
         let bindings = resolve_bindings(&table, snapshot_id, &schema)?;
 
         let (output_schema, projection) = match projection {
@@ -247,7 +206,6 @@ impl IcebergTableScan {
         let plan_properties = Self::compute_properties(output_schema, 1);
         let predicates = convert_filters_to_predicate(&rebind_filters(filters, &bindings));
 
-        // Resolve a best-effort snapshot id for display / freeze when not fully planned.
         let resolved_snapshot_id = match snapshot_id {
             Some(id) => id,
             None => table
@@ -273,11 +231,7 @@ impl IcebergTableScan {
         })
     }
 
-    /// Eager multi-partition plan: `plan_tasks` → strip → fixed-T assign → store on the node.
-    ///
-    /// Shipped default: multi-partition **ON** when `T > 1` and post-strip `|G| > 1`.
-    /// Dedicated off-switch: [`IcebergScanOptions::multi_partition_scan`] = false forces `T = 1`
-    /// without collapsing session `target_partitions` (pin 13).
+    /// Eager multi-partition plan, on when `T > 1` and the post-strip group count is above 1.
     pub(crate) async fn plan(
         table: Table,
         snapshot_id: Option<i64>,
@@ -321,21 +275,20 @@ impl IcebergTableScan {
         scan_builder = scan_builder.with_data_file_concurrency_limit(l);
 
         let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
-        // Eager plan_tasks assignment (C7). Planning failures MUST fail closed — never silently
-        // demote to legacy N=1 (that unfreezes the snapshot at execute and hides root cause).
+        // Fail closed: demoting to N=1 unfreezes the snapshot at execute time.
         let work = table_scan
             .plan_partition_work(t)
             .await
             .map_err(to_datafusion_error)?;
 
         let n = work.len().max(1);
-        // P = max(1, ceil(L/N)); when N > L, P = 1 and total ≈ N may exceed L (not a bug).
+        // With N > L this gives P = 1, and the total may exceed L. That is intended.
         let p = l.div_ceil(n).max(1);
 
         if let Some(first) = work.first() {
             scan.resolved_snapshot_id = first.snapshot_id();
         }
-        // Pin 5: do not keep a sole per-partition hard limit when N > 1.
+        // A sole per-partition hard limit over-counts when N > 1.
         if n > 1 {
             scan.limit = None;
         }
@@ -354,12 +307,11 @@ impl IcebergTableScan {
         self.snapshot_id
     }
 
-    /// Concrete snapshot id frozen at plan time (pin 12).
     pub fn resolved_snapshot_id(&self) -> i64 {
         self.resolved_snapshot_id
     }
 
-    /// Assigned partition work (`N = len`). Empty when built via [`Self::new`] without plan.
+    /// Assigned partition work, `N = len`. Empty when built without a plan.
     pub fn partition_work(&self) -> &[PartitionWork] {
         &self.partition_work
     }
@@ -376,7 +328,6 @@ impl IcebergTableScan {
         self.limit
     }
 
-    /// Computes [`PlanProperties`] with `UnknownPartitioning(n)`.
     fn compute_properties(schema: ArrowSchemaRef, n: usize) -> Arc<PlanProperties> {
         Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
@@ -415,7 +366,6 @@ impl ExecutionPlan for IcebergTableScan {
         let advertised_schema = self.schema();
         let sources = self.sources.clone();
 
-        // Multi-partition path (eager plan_tasks assignment).
         if !self.partition_work.is_empty() {
             let n = self.partition_work.len();
             if partition >= n {
@@ -424,8 +374,7 @@ impl ExecutionPlan for IcebergTableScan {
                 )));
             }
             let work = self.partition_work[partition].clone();
-            // Pin 12 snapshot freeze: embedded work id must match the plan-time resolved id
-            // (including empty-table sentinel 0 — both sides must agree).
+            // The embedded work id must match the plan-time id, sentinel 0 included.
             if work.snapshot_id() != self.resolved_snapshot_id {
                 return Err(DataFusionError::Execution(format!(
                     "IcebergTableScan snapshot freeze violation: work snapshot {} != plan {}",
@@ -444,7 +393,7 @@ impl ExecutionPlan for IcebergTableScan {
                         futures::future::ready(conform_batch(batch, &advertised_schema, &sources))
                     });
 
-            // Pin 5: limit only when N == 1 (GlobalLimitExec owns N>1).
+            // GlobalLimitExec owns the limit when N > 1.
             let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
                 if n == 1 {
                     if let Some(limit) = self.limit {
@@ -474,7 +423,6 @@ impl ExecutionPlan for IcebergTableScan {
             )));
         }
 
-        // Legacy single-stream path (`IcebergTableScan::new` without plan).
         if partition > 0 {
             return Err(DataFusionError::Execution(format!(
                 "IcebergTableScan partition index {partition} out of range (N=1 legacy)"
@@ -527,12 +475,9 @@ impl DisplayAs for IcebergTableScan {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         let n = self.partition_work.len().max(1);
-        // Keep the historic `IcebergTableScan projection:[...]` prefix so EXPLAIN
-        // assertions (integration_datafusion_test) and the sqllogictest goldens stay
-        // stable. `N` is deterministic for a fixed fixture and stays in the default
-        // form; the resolved snapshot id is PER-RUN RANDOM (snapshot ids are generated
-        // at commit time), so it renders only under EXPLAIN VERBOSE — a golden-matched
-        // default EXPLAIN can never pin it (the fork's slt harness has no normalizer).
+        // The historic `IcebergTableScan projection:[...]` prefix keeps the EXPLAIN assertions and
+        // the sqllogictest goldens stable. `N` is deterministic for a fixed fixture. A snapshot id
+        // is per-run random, so it renders under EXPLAIN VERBOSE only.
         write!(
             f,
             "IcebergTableScan projection:[{}] predicate:[{}]",
@@ -550,26 +495,19 @@ impl DisplayAs for IcebergTableScan {
     }
 }
 
-/// Session-derived knobs applied when building an Iceberg core [`TableScan`](iceberg::scan::TableScan)
-/// and multi-partition assignment.
+/// Session-derived knobs for building an Iceberg core `TableScan` and its partition assignment.
+/// DataFusion's `TaskContext` supplies them. Row selection stays at the core default, off, because
+/// parsing the Parquet page index can outweigh the gain.
 ///
-/// Wired from DataFusion's `TaskContext` so session `batch_size` / `target_partitions` affect the
-/// Iceberg reader. Row selection is **not** auto-enabled here: the core default is off because
-/// parsing the Parquet page index can outweigh the gain; enable via the core scan API when the
-/// table layout warrants it.
-///
-/// # `T` vs `L` vs multi-partition off-switch
-///
-/// - **`T`** = output partition budget = `target_partitions` when `multi_partition_scan` is true,
-///   else `1` (dedicated off-switch, pin 13).
-/// - **`L`** = total data-file concurrency = `IcebergScanOptions::data_file_concurrency` when
-///   non-zero, else `target_partitions` (distinct surface, pin 14).
-/// - **`P`** = per-partition concurrency = `max(1, ceil(L/N))` computed at plan time.
+/// | Symbol | Value |
+/// |---|---|
+/// | `T` | the output partition budget: `target_partitions`, or `1` with `multi_partition_scan` off |
+/// | `L` | the data-file concurrency: `data_file_concurrency`, else `target_partitions` |
+/// | `P` | the per-partition concurrency `max(1, ceil(L/N))` |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScanKnobs {
-    /// Arrow record-batch size for the Iceberg reader (`TableScanBuilder::with_batch_size`).
     pub batch_size: Option<usize>,
-    /// Total data-file concurrency budget `L` (`TableScanBuilder::with_data_file_concurrency_limit`).
+    /// The budget `L`, for `TableScanBuilder::with_data_file_concurrency_limit`.
     pub data_file_concurrency: Option<usize>,
     /// Session target partition count (raw `T` input before off-switch).
     pub target_partitions: usize,
@@ -588,23 +526,18 @@ impl Default for ScanKnobs {
     }
 }
 
-/// Floor session-derived scan knobs so a misconfigured 0 cannot empty the reader.
-///
-/// Parquet's `ParquetRecordBatchReader` treats `batch_size == 0` as end-of-stream (`Ok(None)`),
-/// which would surface as a successful empty scan. `try_buffer_unordered(0)` never pulls tasks
-/// (hang). Both knobs therefore clamp to at least 1.
+/// Floor the session-derived knobs. `ParquetRecordBatchReader` reads `batch_size == 0` as
+/// end-of-stream, which looks like a successful empty scan, and `try_buffer_unordered(0)` hangs.
 pub(crate) fn clamp_scan_knob(value: usize) -> usize {
     value.max(1)
 }
 
-/// Derive Iceberg scan knobs from a DataFusion [`TaskContext`].
 pub(crate) fn scan_knobs_from_context(context: &TaskContext) -> ScanKnobs {
     let config = context.session_config();
-    // Clamp batch_size: DF does not normalize 0; Parquet returns an empty stream on batch_size 0.
+    // DataFusion does not normalize 0, and Parquet returns an empty stream for it.
     let batch_size = clamp_scan_knob(config.batch_size());
     let target_partitions = clamp_scan_knob(config.target_partitions());
 
-    // Optional iceberg.* extension (pin 13 off-switch + pin 14 distinct L).
     let iceberg_opts = config
         .options()
         .extensions
@@ -612,7 +545,7 @@ pub(crate) fn scan_knobs_from_context(context: &TaskContext) -> ScanKnobs {
         .cloned()
         .unwrap_or_default();
     let multi_partition_scan = iceberg_opts.multi_partition_scan;
-    // L: dedicated surface when non-zero; else Wave E mapping from target_partitions.
+    // L falls back to target_partitions when the dedicated surface is zero.
     let data_file_concurrency = if iceberg_opts.data_file_concurrency > 0 {
         clamp_scan_knob(iceberg_opts.data_file_concurrency)
     } else {
@@ -627,9 +560,7 @@ pub(crate) fn scan_knobs_from_context(context: &TaskContext) -> ScanKnobs {
     }
 }
 
-/// Register default [`IcebergScanOptions`] on a session config if not already present.
-///
-/// Public for consumers wiring pin-13 / pin-14 knobs before building a session.
+/// Register default [`IcebergScanOptions`] on a session config, if absent.
 pub fn ensure_iceberg_scan_options(config: &mut datafusion::prelude::SessionConfig) {
     if config
         .options()
@@ -644,11 +575,7 @@ pub fn ensure_iceberg_scan_options(config: &mut datafusion::prelude::SessionConf
     }
 }
 
-/// Asynchronously retrieves a stream of [`RecordBatch`] instances
-/// from a given table.
-///
-/// This function initializes a [`TableScan`], builds it,
-/// and then converts it into a stream of Arrow [`RecordBatch`]es.
+/// Builds a [`TableScan`] and converts it into a stream of Arrow [`RecordBatch`]es.
 pub(crate) async fn get_batch_stream(
     table: Table,
     snapshot_id: Option<i64>,
@@ -661,22 +588,19 @@ pub(crate) async fn get_batch_stream(
         None => table.scan(),
     };
 
-    // Always an explicit selection — NEVER `select_all()`, which would read whatever column set the
-    // table happens to have now rather than the one the plan advertised (BUG-011).
+    // Never `select_all()`: it reads the column set the table has now, not the advertised one.
     let mut scan_builder = scan_builder.select(column_names);
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
-    // Clamp at the apply site (not only in from_context) so a hand-built ScanKnobs with
-    // Some(0) cannot reach Parquet empty-stream or try_buffer_unordered(0) hang.
+    // Clamped here too, so a hand-built `ScanKnobs` holding `Some(0)` cannot reach Parquet.
     if let Some(batch_size) = knobs.batch_size {
         scan_builder = scan_builder.with_batch_size(Some(clamp_scan_knob(batch_size)));
     }
     if let Some(concurrency) = knobs.data_file_concurrency {
         scan_builder = scan_builder.with_data_file_concurrency_limit(clamp_scan_knob(concurrency));
     }
-    // Row selection: left at the core default (disabled). Auto-enabling when filters are present
-    // is not clearly safe — page-index parse cost can dominate; opt in via the core API instead.
+    // Row selection stays at the core default, off: the page-index parse cost can dominate.
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
     let stream = table_scan
@@ -687,22 +611,12 @@ pub(crate) async fn get_batch_stream(
     Ok(Box::pin(stream))
 }
 
-/// Binds every advertised column to the scanned snapshot's schema BY FIELD ID: advertised name →
-/// the name that schema gives the same field id, or `None` when it has no field with that id.
+/// Binds every advertised column to the scanned snapshot's schema BY FIELD ID, mapping an
+/// advertised name to that schema's name for the same id, or to `None` when it lacks the id.
 ///
-/// Names are not identities in Iceberg — `RENAME COLUMN` keeps the field id, rewrites the name and
-/// creates no snapshot, so the schema the data is read with (the snapshot's) and the schema the plan
-/// advertised routinely disagree on names for the SAME column. Field ids are the identities, and
-/// they are already carried on the advertised Arrow fields as `PARQUET:field_id` metadata (written
-/// by `schema_to_arrow_schema`). An advertised field without that metadata cannot be bound at all,
-/// so it is a loud error rather than a name-based guess.
-///
-/// A name this returns is one `TableScanBuilder::build` accepts, because it came out of the very
-/// schema that builder resolves against — the scan can never fail on a column the plan advertised.
-///
-/// When there is no snapshot to resolve against — an unknown snapshot id (the core scan reports
-/// that itself, with the better message) or a table with no snapshot at all (an empty scan that
-/// emits no batches) — the binding is the identity and field ids are not consulted.
+/// A name is not an identity in Iceberg, so the two schemas disagree on names after a rename. The
+/// advertised Arrow fields carry `PARQUET:field_id`; a field without it is a loud error rather than
+/// a name-based guess. With no snapshot to resolve against, the binding is the identity.
 fn resolve_bindings(
     table: &Table,
     snapshot_id: Option<i64>,
@@ -724,8 +638,7 @@ fn resolve_bindings(
 
     let mut bindings = HashMap::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        // Reserved metadata columns (`_file`, `_pos`, ...) are not table fields; the core scan
-        // resolves their reserved ids from the name itself.
+        // A reserved metadata column is not a table field; the core scan resolves it by name.
         if is_metadata_column_name(field.name()) {
             bindings.insert(field.name().clone(), Some(field.name().clone()));
             continue;
@@ -741,8 +654,7 @@ fn resolve_bindings(
     Ok(bindings)
 }
 
-/// Turns the advertised OUTPUT columns' bindings into the names to `select` and the per-column
-/// [`ColumnSource`]s, in advertised order.
+/// Turns the output columns' bindings into `select` names and [`ColumnSource`]s, in order.
 fn project_bindings(
     output_schema: &ArrowSchemaRef,
     bindings: &HashMap<String, Option<String>>,
@@ -767,18 +679,11 @@ fn project_bindings(
     Ok((scan_columns, sources))
 }
 
-/// Rewrites pushed-down filters onto the scanned snapshot's column names, dropping any filter that
-/// cannot be rewritten.
+/// Rewrites pushed-down filters onto the scanned snapshot's names, dropping the rest.
 ///
-/// A pushed filter is applied to the DATA, so it must speak the names the scanned snapshot's schema
-/// uses — after a rename those differ from the advertised ones, and pushing the advertised name
-/// either fails to bind or, worse, binds to a DIFFERENT column that happens to carry that name now
-/// (a name swap), pruning rows DataFusion can never get back: `TableProviderFilterPushDown::Inexact`
-/// lets DataFusion re-check the rows it RECEIVES, not resurrect the ones the scan discarded.
-///
-/// A filter over a column with no counterpart in the scanned snapshot (dropped, or dropped and
-/// re-added under a fresh id) is not pushed at all: its column reads as NULL, and only DataFusion's
-/// own re-check — over the conformed batches — can evaluate it correctly.
+/// A pushed filter runs against the DATA. After a rename the advertised name fails to bind, or
+/// binds to a DIFFERENT column that now carries it, which prunes rows DataFusion cannot get back.
+/// A filter over a column the snapshot lacks is not pushed at all, because that column reads NULL.
 fn rebind_filters(filters: &[Expr], bindings: &HashMap<String, Option<String>>) -> Vec<Expr> {
     filters
         .iter()
@@ -786,8 +691,7 @@ fn rebind_filters(filters: &[Expr], bindings: &HashMap<String, Option<String>>) 
         .collect()
 }
 
-/// One filter, rewritten onto the scanned snapshot's names, or `None` if any column it references
-/// cannot be bound there.
+/// One filter rewritten onto the scanned snapshot's names, or `None` if a column cannot bind.
 fn rebind_filter(filter: &Expr, bindings: &HashMap<String, Option<String>>) -> Option<Expr> {
     let mut unbound = false;
     let rewritten = filter
@@ -802,8 +706,7 @@ fn rebind_filter(filter: &Expr, bindings: &HashMap<String, Option<String>>) -> O
                         ))));
                     }
                     Some(Some(_)) => {}
-                    // Either the column has no counterpart in the scanned snapshot, or it is not a
-                    // table column at all: refuse to push this filter rather than guess.
+                    // The scanned snapshot has no such column, so refuse to push rather than guess.
                     Some(None) | None => unbound = true,
                 }
             }
@@ -843,13 +746,8 @@ fn advertised_field_id(field: &ArrowField) -> DFResult<i32> {
     })
 }
 
-/// Whether an Arrow type change is one of Iceberg's LEGAL type promotions.
-///
-/// This is the Arrow-side mirror of [`iceberg::spec::is_promotion_allowed`] (int → long,
-/// float → double, decimal precision widening at equal scale, plus identity) — the Iceberg
-/// primitives involved map one-to-one onto these Arrow types. The mirror is pinned against the
-/// authority itself by `test_arrow_promotion_mirror_agrees_with_iceberg_rule`, so the two cannot
-/// drift apart silently.
+/// Whether an Arrow type change is one of Iceberg's LEGAL type promotions. It mirrors
+/// [`iceberg::spec::is_promotion_allowed`], pinned by the mirror test below.
 fn is_arrow_promotion_allowed(from: &DataType, to: &DataType) -> bool {
     if from == to {
         return true;
@@ -869,23 +767,21 @@ fn is_arrow_promotion_allowed(from: &DataType, to: &DataType) -> bool {
     }
 }
 
-/// Coerces a scanned batch to the schema the plan advertised (BUG-011).
+/// Coerces a scanned batch to the schema the plan advertised.
 ///
-/// A DataFusion operator addresses its input by ORDINAL against the schema its child advertised, so
-/// a batch that merely happens to carry the right columns in a different order — or an extra one —
-/// is silent corruption, not a nuisance. This rebuilds the batch in the advertised order from the
-/// field-id bindings [`resolve_projection`] computed:
+/// A DataFusion operator addresses its input by ORDINAL, so a batch carrying the right columns in
+/// the wrong order, or one extra, is silent corruption. This rebuilds the batch in advertised order
+/// from the bindings [`resolve_projection`] computed:
 ///
-/// * bound, same type → taken as is (the steady-state case, where the batch already equals the
-///   advertised schema and is returned untouched);
-/// * bound under a different NAME (`RENAME COLUMN`) → the same values, under the advertised name;
-/// * bound with a legally PROMOTED type (`int` → `long`, ...) → cast to the advertised type;
-/// * unbound and nullable → an all-NULL column, matching Java, whose readers null-fill a projected
-///   field the data it reads does not have (e.g. a column added after the scanned snapshot);
-/// * unbound and NOT nullable, or an illegal type change → a typed error naming the column.
-///   Silently coercing here would hand DataFusion data that contradicts its plan.
+/// | Binding | Result |
+/// |---|---|
+/// | bound, same type | taken as is |
+/// | bound under a different name | the same values, under the advertised name |
+/// | bound with a legal promotion | cast to the advertised type |
+/// | unbound and nullable | an all-NULL column, as Java's readers null-fill |
+/// | unbound and not nullable, or an illegal type change | a typed error naming the column |
 ///
-/// The row count is carried explicitly so a zero-column projection (`SELECT count(*)`) keeps it.
+/// The row count is carried explicitly, so a zero-column `SELECT count(*)` keeps it.
 fn conform_batch(
     batch: RecordBatch,
     advertised: &ArrowSchemaRef,
@@ -946,19 +842,9 @@ fn conform_batch(
     })
 }
 
-/// Coerces ONE scanned column to its advertised field, recursing through nested types.
-///
-/// Iceberg evolves nested fields exactly as it evolves top-level ones — `ADD COLUMN s.b`,
-/// `RENAME COLUMN s.a`, `ALTER COLUMN s.a TYPE bigint` — and none of those create a snapshot either,
-/// so a struct read from an older snapshot can be missing a child the plan advertises, carry it
-/// under a different name, or carry it at a narrower type. Nested Arrow fields carry
-/// `PARQUET:field_id` just like top-level ones, so the same field-id resolution applies at every
-/// level; `path` accumulates the dotted column path (`s.b`) so an error names the offending field
-/// and not just its root column.
-///
-/// Lists and maps are conformed through their element / entry types, preserving offsets and null
-/// buffers, so a nested evolution inside a `list<struct<...>>` or `map<..., struct<...>>` is handled
-/// at the level where it actually happened.
+/// Coerces ONE scanned column to its advertised field, recursing through nested types. Iceberg
+/// evolves a nested field as it evolves a top-level one, and none of those DDLs creates a snapshot.
+/// A nested Arrow field carries `PARQUET:field_id`, and `path` names the offending field on error.
 fn conform_column(column: &ArrayRef, target: &ArrowField, path: &str) -> DFResult<ArrayRef> {
     if column.data_type() == target.data_type() {
         return Ok(column.clone());
@@ -977,8 +863,7 @@ fn conform_column(column: &ArrayRef, target: &ArrowField, path: &str) -> DFResul
             let scanned = downcast::<StructArray>(column, path)?;
             let len = scanned.len();
 
-            // Every scanned child must be identifiable, or a target child that fails to match one
-            // could not be told apart from a child that is genuinely absent.
+            // An unidentifiable scanned child is indistinguishable from an absent one.
             let scanned_ids = scanned_fields
                 .iter()
                 .map(|field| advertised_field_id(field))
@@ -1075,8 +960,7 @@ fn conform_column(column: &ArrayRef, target: &ArrowField, path: &str) -> DFResul
     }
 }
 
-/// Downcasts an array whose `DataType` has already been matched; a failure here is a broken Arrow
-/// invariant, not user input, so it is an internal error naming the column path.
+/// Downcasts an array whose `DataType` already matched. A failure is a broken Arrow invariant.
 fn downcast<'a, T: 'static>(column: &'a ArrayRef, path: &str) -> DFResult<&'a T> {
     column.as_any().downcast_ref::<T>().ok_or_else(|| {
         datafusion::error::DataFusionError::Internal(format!(
@@ -1153,8 +1037,7 @@ mod tests {
         ]))
     }
 
-    /// SAF-004 P5a: an out-of-bounds projection index must yield a PLANNING error —
-    /// previously `schema.project(projection).unwrap()` panicked.
+    /// An out-of-bounds projection index must give a PLANNING error, not a panic.
     #[test]
     fn test_scan_out_of_bounds_projection_is_error_not_panic() {
         let err = IcebergTableScan::new(
@@ -1172,8 +1055,7 @@ mod tests {
         );
     }
 
-    /// BUG-011: an advertised column the scan could not read is restored as NULL, and the columns
-    /// are returned in the ADVERTISED order — DataFusion addresses them by ordinal.
+    /// An unreadable advertised column comes back as NULL, in ADVERTISED order.
     #[test]
     fn test_conform_batch_null_fills_and_reorders() {
         let scanned = RecordBatch::try_new(
@@ -1222,8 +1104,7 @@ mod tests {
         );
     }
 
-    /// A zero-column projection (`SELECT count(*)`) must keep its row count — a rebuilt batch with
-    /// no columns has no other way to carry it.
+    /// A zero-column projection must keep its row count: no column can carry it.
     #[test]
     fn test_conform_batch_preserves_row_count_with_no_columns() {
         let scanned = RecordBatch::try_new(
@@ -1248,8 +1129,7 @@ mod tests {
         );
     }
 
-    /// A column whose type changed after planning must be a loud, named error — handing DataFusion
-    /// data that contradicts its plan is the corruption this whole path exists to prevent.
+    /// A column whose type changed after planning must be a loud, named error.
     #[test]
     fn test_conform_batch_rejects_a_changed_type() {
         let scanned = RecordBatch::try_new(
@@ -1280,8 +1160,7 @@ mod tests {
         );
     }
 
-    /// An advertised NON-nullable column that the scan could not read cannot be null-filled, so it
-    /// must error rather than fabricate values.
+    /// An advertised NON-nullable column the scan could not read must error, not fabricate values.
     #[test]
     fn test_conform_batch_rejects_absent_required_column() {
         let scanned = RecordBatch::try_new(
@@ -1313,25 +1192,15 @@ mod tests {
         );
     }
 
-    /// S2-3: the Arrow promotion mirror must agree with the AUTHORITY,
-    /// [`iceberg::spec::is_promotion_allowed`], over ALL 17 `PrimitiveType` variants — a drift
-    /// between the two would either reject a legal promotion or, worse, cast something Iceberg
-    /// forbids.
-    ///
-    /// The one documented exception is where the mirror is NECESSARILY coarser: distinct Iceberg
-    /// primitives that share ONE Arrow representation (`uuid` and `fixed[16]` are both
-    /// `FixedSizeBinary(16)`; `binary` and an oversized `fixed` are both `LargeBinary`) are
-    /// indistinguishable to an Arrow-typed check, so the mirror's identity arm accepts a pair the
-    /// Iceberg rule rejects. That is inert: `ensure_promotion_allowed` blocks such a change at the
-    /// DDL, so no table can present it — and if one somehow did, the representations are identical,
-    /// so the values would be read correctly anyway. The assertion below encodes exactly that
-    /// exception rather than papering over it.
+    /// The Arrow promotion mirror must agree with [`iceberg::spec::is_promotion_allowed`] over all
+    /// 17 `PrimitiveType` variants. A drift rejects a legal promotion, or casts a forbidden one.
+    /// It is coarser where two primitives share one Arrow type, such as `uuid` and `fixed[16]`, but
+    /// that is inert: `ensure_promotion_allowed` blocks such a change at the DDL.
     #[test]
     fn test_arrow_promotion_mirror_agrees_with_iceberg_rule() {
         use iceberg::spec::{PrimitiveType as P, Type as T, is_promotion_allowed};
 
-        // Every variant of `PrimitiveType` (17), with three decimals to exercise the
-        // precision/scale arm in both directions.
+        // All 17 variants, with three decimals for the precision arm in both directions.
         let primitives = [
             P::Boolean,
             P::Int,
@@ -1362,15 +1231,13 @@ mod tests {
             P::Binary,
             P::Unknown,
         ];
-        // Sanity: the list must cover every variant the authority can be asked about.
         assert_eq!(
             primitives.len(),
             17 + 2,
             "17 variants, with two extra decimals for the precision/scale arm"
         );
 
-        // The Arrow form of each primitive, via the crate's own converter — so the mirror is checked
-        // against the very mapping production uses.
+        // The crate's own converter, so the mirror is checked against the production mapping.
         let arrow_of = |primitive: &P| -> ArrowDataType {
             let schema = Schema::builder()
                 .with_fields(vec![Arc::new(NestedField::optional(
@@ -1411,21 +1278,19 @@ mod tests {
             }
         }
         assert_eq!(checked, primitives.len() * primitives.len());
-        // Non-vacuity: the matrix must contain at least one allowed NON-identity promotion...
+        // Non-vacuity: at least one allowed NON-identity promotion...
         assert!(is_arrow_promotion_allowed(
             &ArrowDataType::Int32,
             &ArrowDataType::Int64
         ));
-        // ...and the collision exception must be exercised, not merely available (uuid <-> fixed[16]
-        // in both directions).
+        // ...and the collision exception exercised, uuid and fixed[16] in both directions.
         assert_eq!(
             collisions, 2,
             "the uuid / fixed[16] collision must be the only one this matrix hits"
         );
     }
 
-    /// S2-2: a struct read from an older snapshot gains the advertised child as NULLs, keeps the
-    /// one it has, and the struct's own null buffer survives.
+    /// A struct from an older snapshot gains the advertised child as NULLs, keeping its buffer.
     #[test]
     fn test_conform_column_null_fills_a_nested_field() {
         use datafusion::arrow::array::{Int32Array, StructArray};
@@ -1467,8 +1332,7 @@ mod tests {
         );
     }
 
-    /// S2-2: the same evolution one level down, inside a `list<struct<...>>` — offsets and the
-    /// list's null buffer must be preserved while the element struct is conformed.
+    /// The same evolution inside a `list<struct<...>>`: offsets and the null buffer survive.
     #[test]
     fn test_conform_column_recurses_into_a_list_element() {
         use datafusion::arrow::array::{Int32Array, ListArray, StructArray};
@@ -1528,8 +1392,7 @@ mod tests {
         );
     }
 
-    /// S2-2: and inside a `map<string, struct<...>>` — the entries struct is conformed through the
-    /// map's key/value pair, preserving offsets.
+    /// And inside a `map<string, struct<...>>`, through the key/value pair, keeping offsets.
     #[test]
     fn test_conform_column_recurses_into_a_map_value() {
         use datafusion::arrow::array::{Int32Array, MapArray, StringArray, StructArray};
@@ -1626,7 +1489,7 @@ mod tests {
         );
     }
 
-    /// S2-2: an illegal change BENEATH a column must name the nested PATH, not just the root.
+    /// An illegal change BENEATH a column must name the nested PATH, not only the root.
     #[test]
     fn test_conform_column_names_the_nested_path_on_an_illegal_change() {
         use datafusion::arrow::array::{Int64Array, StructArray};
@@ -1654,7 +1517,7 @@ mod tests {
         );
     }
 
-    /// S2-3: a legally promoted column is cast to the advertised type, not rejected.
+    /// A legally promoted column is cast to the advertised type, not rejected.
     #[test]
     fn test_conform_batch_promotes_a_legal_type_change() {
         let scanned = RecordBatch::try_new(
@@ -1692,8 +1555,7 @@ mod tests {
         );
     }
 
-    /// A table whose CURRENT SNAPSHOT resolves to the 3-column schema `x`(1), `y`(2), `z`(3) — the
-    /// committed V2 fixture, so the field-id binding is exercised against real metadata.
+    /// A table whose current snapshot holds `x`(1), `y`(2), `z`(3): real metadata to bind against.
     async fn table_with_snapshot() -> Table {
         let metadata_file_path = format!(
             "{}/tests/test_data/TableMetadataV2Valid.json",
@@ -1716,8 +1578,7 @@ mod tests {
         )]))
     }
 
-    /// S1-1: an advertised field with no `PARQUET:field_id` cannot be bound to a table field, and
-    /// guessing by name is exactly the bug field-id binding exists to prevent — so it errors.
+    /// An advertised field with no `PARQUET:field_id` errors, rather than guess by name.
     #[tokio::test]
     async fn test_resolve_projection_requires_a_field_id() {
         let table = table_with_snapshot().await;
@@ -1735,8 +1596,7 @@ mod tests {
         );
     }
 
-    /// S1-1: a renamed column binds to the SNAPSHOT schema's name for its FIELD ID — not to the
-    /// advertised name — and an id the snapshot schema does not have becomes a null-fill.
+    /// A renamed column binds by FIELD ID; an id the snapshot lacks becomes a null-fill.
     #[tokio::test]
     async fn test_resolve_projection_binds_by_field_id_not_by_name() {
         let table = table_with_snapshot().await;
@@ -1761,8 +1621,7 @@ mod tests {
         ]);
     }
 
-    /// SAF-004 P5b (regression): a valid projection still produces the projected output schema
-    /// and the projected column names, and no projection passes the schema through unchanged.
+    /// A valid projection gives the projected schema, and no projection passes it through.
     #[test]
     fn test_scan_valid_projection_schema_and_names() {
         let projected = IcebergTableScan::new(
@@ -1793,8 +1652,7 @@ mod tests {
         assert_eq!(unprojected.schema(), test_arrow_schema());
     }
 
-    /// Pin: session `batch_size` and `target_partitions` flow into Iceberg scan knobs so
-    /// `execute` does not hardcode the core reader defaults.
+    /// Session `batch_size` and `target_partitions` must reach the Iceberg scan knobs.
     #[test]
     fn test_scan_knobs_from_context_wires_batch_size_and_concurrency() {
         use datafusion::execution::SessionStateBuilder;
@@ -1811,8 +1669,7 @@ mod tests {
         assert_eq!(knobs.data_file_concurrency, Some(5));
     }
 
-    /// Pin: clamp floor is 1 — a raw 0 must never reach Parquet (`batch_size == 0` → empty
-    /// stream) or `try_buffer_unordered(0)` (hang).
+    /// The clamp floor is 1: a raw 0 empties the Parquet stream, or hangs the buffer.
     #[test]
     fn test_clamp_scan_knob_floors_zero_to_one() {
         assert_eq!(clamp_scan_knob(0), 1);
@@ -1820,11 +1677,9 @@ mod tests {
         assert_eq!(clamp_scan_knob(8), 8);
     }
 
-    /// Pin: hand-built ScanKnobs with Some(0) are still floored at apply time (get_batch_stream),
-    /// not only when derived from TaskContext.
+    /// A hand-built `ScanKnobs` holding `Some(0)` is floored at apply time too.
     #[test]
     fn test_get_batch_stream_clamps_zero_knobs_at_apply() {
-        // Pure contract of the apply-site clamp (mirrors get_batch_stream body).
         let knobs = ScanKnobs {
             batch_size: Some(0),
             data_file_concurrency: Some(0),
@@ -1837,8 +1692,7 @@ mod tests {
         assert_eq!(effective_conc, Some(1));
     }
 
-    /// Pin: session `batch_size = 0` is accepted by DF config but must not wire through as 0
-    /// (Parquet treats batch_size 0 as end-of-stream — silent empty scan).
+    /// DataFusion accepts `batch_size = 0`, which Parquet reads as end-of-stream.
     #[test]
     fn test_scan_knobs_clamps_zero_batch_size() {
         use datafusion::execution::SessionStateBuilder;
@@ -1890,7 +1744,6 @@ mod tests {
         let knobs = scan_knobs_from_context(&state.task_ctx());
         assert!(!knobs.multi_partition_scan);
         assert_eq!(knobs.target_partitions, 8);
-        // T effective = 1 when off-switch engaged
         let t = if knobs.multi_partition_scan {
             knobs.target_partitions
         } else {
@@ -1917,7 +1770,6 @@ mod tests {
         assert_eq!(knobs.target_partitions, 4);
         assert_eq!(knobs.data_file_concurrency, Some(16));
 
-        // Second L value with same T
         let mut config2 =
             SessionConfig::new().set_usize("datafusion.execution.target_partitions", 4);
         config2.options_mut().extensions.insert(IcebergScanOptions {
@@ -2011,7 +1863,6 @@ mod tests {
     /// Pin 5: when N > 1, provider must clear sole per-partition hard limit.
     #[test]
     fn test_pin5_limit_demoted_when_n_gt_1() {
-        // Pure contract: demote logic mirrors IcebergTableScan::plan
         let n = 3usize;
         let mut limit = Some(5usize);
         if n > 1 {
@@ -2114,16 +1965,13 @@ mod tests {
             );
         }
         let ctx = Arc::new(TaskContext::default());
-        // Healthy path: execute(0) must not freeze-error (empty stream OK)
         let stream = scan.execute(0, ctx).expect("execute 0");
         drop(stream);
     }
 
-    /// EXPLAIN display split: the DEFAULT form is a golden-matched surface (sqllogictest
-    /// exact-matches physical-plan lines, no normalizer) so it must carry only deterministic
-    /// fields (`N=`); the PER-RUN-RANDOM snapshot id renders under Verbose ONLY.
-    /// Mutations: render snapshot_id in Default → first assert REDs; drop it from Verbose →
-    /// third assert REDs; drop N from Default → second assert REDs.
+    /// The DEFAULT EXPLAIN form is golden-matched with no normalizer, so it carries deterministic
+    /// fields only, and the per-run-random snapshot id renders under Verbose. Mutations: rendering
+    /// the id in Default, dropping it from Verbose, or dropping `N` each RED one assert.
     #[test]
     fn test_display_default_deterministic_snapshot_id_verbose_only() {
         use datafusion::physical_plan::displayable;
