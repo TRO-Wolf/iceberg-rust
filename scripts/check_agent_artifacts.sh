@@ -51,6 +51,11 @@
 # excludes "Critical" and "Critically" in either case. An anti-probe proves that
 # exclusion.
 #
+# The '"MUTANT' needle is a QUOTED LITERAL on purpose, added 2026-08-26 after a commit shipped a
+# live `Err(.., "MUTANT: ..")` injection into production code and passed a green gate. Test doc
+# comments legitimately discuss mutants in prose, so the needle matches only a string literal
+# opening MUTANT; the anti-probes are real prose lines from this repo.
+#
 # The self-test reaches the needles, the family size, and the flag and pathspec
 # VARIABLES. It does not reach the grep call: a flag, a pathspec or a hit count
 # substituted in place still passes. Those are single visible edits to the
@@ -100,16 +105,20 @@ residue_patterns=(
   "${C}ritic"
   "Falsifier"
   "SEPMO"
+  '"MUTANT'
 )
 residue_samples=(
   "the ${c}ritic-octo probe found it"
   "Falsifier F9 found the gap"
   "SEPMO cycle 2 remediation"
+  'Err(Error::new(ErrorKind::DataInvalid, "MUTANT: sibling refused"))'
 )
 residue_pathspec='crates/'
 
 # Strings that must NOT match: proof the needles stay word-bounded.
 residue_anti_patterns=(
+  "EXPLICITLY NOT A MUTANT-KILLER for the empty-candidates guard"
+  "NAMED MUTANT, APPLIED: the builder swap"
   "Critically this pins the snapshot id"
   "BUG-001 Critical / BUG-004"
   "the load-bearing Critical pin"
@@ -151,7 +160,7 @@ self_test() {
 
   # Wiring, not detection: a self-test that only exercises the needles passes
   # while the shipped scan points at nothing.
-  if [ "${#residue_patterns[@]}" -ne 3 ]; then
+  if [ "${#residue_patterns[@]}" -ne 4 ]; then
     echo "ERROR: residue needle family changed size — update the count in the OK line" >&2
     return 1
   fi
@@ -255,4 +264,4 @@ if [ "$residue_hits" -ne 0 ]; then
   exit 1
 fi
 
-echo "OK: no agent-session artifacts or review residue in tracked files (11 + 3 needles, self-tested)."
+echo "OK: no agent-session artifacts or review residue in tracked files (11 + 4 needles, self-tested)."

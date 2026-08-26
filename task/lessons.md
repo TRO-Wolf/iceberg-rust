@@ -1158,3 +1158,32 @@ remembering to write it.
   citation set was right and the closure over it was wrong. An unclearable-state claim is a claim
   about EVERY action in the tree, so it needs a sweep, not two examples — and where a fixture cannot
   be built (no ORC writer exists), say the claim is a code read rather than a measurement.
+
+### 2026-08-26 — `git status` under-reported a real divergence, and a committed injection passed a green gate
+
+- **DO verify a commit by `git archive`, never by the working tree.** Commit `241e4ea70` on
+  `parity/f7-u3-rewrite-pos-deletes-v3` contained a live
+  `return Err(Error::new(ErrorKind::DataInvalid, "MUTANT: sibling refused"))` in PRODUCTION code and
+  fails its own suite when built from the commit. Index and HEAD carried one blob, the worktree
+  another, and `git status --porcelain` reported CLEAN — the stat cache never re-hashed files
+  touched after the commit. Every gate result reported for that commit had run against the worktree,
+  not against what was committed. `git archive <sha> | tar -x` into a scratch dir and gate THAT, or
+  hash tracked files against the index; a clean `git status` is not evidence.
+- **DO chain mutate / run / restore into ONE command.** The injection survived because the restore
+  was a later, separate command and the tree stayed dirty across the gap. A mutation that outlives
+  its own shell invocation is a mutation that can be committed.
+- **DO give a mutation-residue needle to the armed gate.** `check_agent_artifacts.sh` scanned for
+  `Critic` / `Falsifier` / `SEPMO` but not for an injected `"MUTANT` literal, though that is exactly
+  "review residue in tracked files". One needle would have caught this. It is quoted-literal on
+  purpose: test docs discuss mutants in prose, so only a STRING LITERAL opening MUTANT is residue,
+  and the anti-probes are real prose lines from this repo.
+- **DO NOT let one passing mutation launder a second claim it never touched.** A mutation was
+  reported as proving both that closure siblings reach a check with an empty position set AND that
+  the check's position relative to a later merge makes a refusal safe. It proved only the first;
+  moving the check after the merge was 0 red, because what makes the refusal safe is that no writer
+  runs until later — not source order. Name the invariant the mutation can actually kill.
+- **DO NOT trust a fixture that fabricates a file format.** A probe suggested a documented
+  capability limit was wrong; the limit held. The in-tree ORC position-delete fixtures are PARQUET
+  bytes carrying an ORC stamp, so the loader reads them and the probe proved nothing. Where no
+  genuine fixture can exist — the fork has no ORC position-delete writer — record the limit as a
+  CODE READ and say so, rather than manufacturing a green that means nothing.
