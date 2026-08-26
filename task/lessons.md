@@ -1138,3 +1138,23 @@ remembering to write it.
   Pin each grep FLAG whose loss is silent: dropping `-w` reds the tree loudly and so protects
   itself, but dropping `-i` just re-greens the gate over lowercase residue, so a lowercase sample
   must fail the self-test when it goes.
+- **DO NOT leave a mutation in the working tree between commands, and DO restore it in the SAME
+  command that applied it** (2026-08-27). A coverage mutation is an injection into production code.
+  On this fork the orchestrator may commit while a unit is mid-run, so the window between "apply"
+  and "restore" is a window in which a `return Err("MUTANT: ...")` can be committed — it was, at
+  `241e4ea70`, which then failed its own suite when built from `git archive`. Chain the mutate,
+  the run and the restore into ONE `&&`/`;` command, and check `git status` before reporting.
+- **DO separate what a mutation actually witnesses from what it was aimed at** (2026-08-27). One
+  mutation was reported as proving two facts — that a check runs before a merge, and that closure
+  siblings reach it with an empty set. It proved only the second: moving the check after the merge
+  is 0 red, because the refusal aborts before any IO wherever it sits in the loop. Source order is
+  not a safety property; the property was "no output file is opened until a later function". Name
+  the invariant the mutation can actually kill, and do not let a passing mutation launder a second
+  claim it never touched.
+- **DO enumerate the escapes from a refusal by EXECUTING them, before calling a state unclearable**
+  (2026-08-27). A limit was written as "no in-tree action clears it", citing two actions that
+  genuinely do not. A third did: `RewriteDataFiles` steps over a SHADOWED delete because the scan
+  never reads it, so the rewrite preserves the live rows and both delete files fall dangling. The
+  citation set was right and the closure over it was wrong. An unclearable-state claim is a claim
+  about EVERY action in the tree, so it needs a sweep, not two examples — and where a fixture cannot
+  be built (no ORC writer exists), say the claim is a code read rather than a measurement.

@@ -38,6 +38,7 @@ use super::*;
 use crate::delete_file_index::referenced_data_file_location;
 use crate::expr::Reference;
 use crate::io::LocalFsStorageFactory;
+use crate::maintenance::RewriteDataFiles;
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, Literal, ManifestContentType,
@@ -5709,7 +5710,14 @@ async fn test_v3_refuses_when_the_existing_vector_does_not_cover_the_legacy_dele
         error
             .to_string()
             .contains("THIS ACTION CANNOT CLEAR THAT STATE"),
-        "and says the arm cannot clear it, rather than offering a remedy it does not provide: {error}"
+        "and says the arm cannot clear it: {error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("RewriteDataFiles with remove_dangling_deletes"),
+        "and names the escape that DOES clear it, pinned by \
+         test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files: {error}"
     );
 
     let reloaded = catalog.load_table(table.identifier()).await.unwrap();
@@ -5816,4 +5824,98 @@ async fn test_v3_shadowed_unreadable_delete_says_no_filter_width_helps() {
             .contains("NO filter setting converts this table"),
         "the refusal states the capability limit instead of an unreachable remedy: {error}"
     );
+}
+
+/// Build limit (k)'s shape: data file A whose deletion vector masks position 0 while a live legacy
+/// position delete masks position 2 and is SHADOWED by that vector. Live rows are `{11, 12}`.
+async fn build_non_superset_vector_table(catalog: &impl Catalog) -> (Table, HashSet<i64>) {
+    let table = create_partitioned_table(catalog, FormatVersion::V2).await;
+    let a = write_data_file(&table, "a.parquet", 7, &[
+        (7, 10, 1),
+        (7, 11, 2),
+        (7, 12, 3),
+    ])
+    .await;
+    let a_path = a.file_path().to_string();
+    let table = append_files(catalog, &table, vec![a]).await;
+
+    let shadowed = write_position_delete_file(&table, Some(7), &[(a_path.as_str(), 2)]).await;
+    let table = add_deletes(catalog, &table, vec![shadowed]).await;
+    let scratch = write_position_delete_file(&table, Some(7), &[(a_path.as_str(), 0)]).await;
+    let scratch_path = scratch.file_path().to_string();
+    let table = add_deletes(catalog, &table, vec![scratch]).await;
+    let table = upgrade_to_v3(catalog, &table).await;
+
+    let scratch_seq = live_delete_seq(&table, &scratch_path).await;
+    let vector = write_deletion_vectors_in_one_puffin(&table, 7, &[(&a_path, &[0])]).await;
+    let removed: Vec<DataFile> = live_delete_files(&table)
+        .await
+        .into_iter()
+        .filter(|f| f.file_path() == scratch_path)
+        .collect();
+    let table = swap_delete_files(catalog, &table, removed, vector, scratch_seq).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([11, 12]),
+        "fixture NON-VACUITY: the DV masks position 0 and SHADOWS the delete masking position 2"
+    );
+    (table, before)
+}
+
+/// LIMIT (k)'s ESCAPE, executed rather than asserted. The arm refuses this table for ever, but
+/// `RewriteDataFiles` clears it: the legacy delete is SHADOWED, so the rewrite's scan never reads it,
+/// the new data file gets exactly today's live rows, and both delete files fall dangling.
+///
+/// This is what separates (k) from (j). In (j) the unreadable delete is LIVE, so the scan must read
+/// it and cannot, and `RewriteDataFiles` is blocked too.
+#[tokio::test]
+async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let (table, before) = build_non_superset_vector_table(&catalog).await;
+
+    let refusal = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .expect_err("the arm refuses this shape");
+    assert!(
+        refusal
+            .to_string()
+            .contains("THIS ACTION CANNOT CLEAR THAT STATE")
+    );
+
+    // THE ESCAPE. A one-file group needs both floors relaxed; the delete-file threshold is what
+    // makes a data file with any delete a rewrite candidate at all.
+    let rewrite = RewriteDataFiles::new(table.clone())
+        .min_input_files(1)
+        .delete_file_threshold(1)
+        .remove_dangling_deletes(true)
+        .execute(&catalog)
+        .await
+        .expect("RewriteDataFiles clears the shadowed state");
+    assert_eq!(rewrite.rewritten_data_files_count, 1);
+    assert_eq!(rewrite.added_data_files_count, 1);
+    assert_eq!(
+        rewrite.removed_delete_files_count, 2,
+        "both the vector and the shadowed legacy delete fall dangling"
+    );
+
+    let cleared = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&cleared).await,
+        before,
+        "the escape preserves the live rows exactly — it does not resolve the shadow by deleting"
+    );
+    assert!(
+        live_delete_files(&cleared).await.is_empty(),
+        "no delete file survives, so nothing is left to refuse"
+    );
+
+    // And the arm now runs clean on the same table: honest zeros, not a refusal.
+    let second = RewritePositionDeleteFiles::new(cleared.clone())
+        .execute(&catalog)
+        .await
+        .expect("the cleared table converts without refusing");
+    assert_eq!(second, RewritePositionDeleteFilesResult::default());
 }

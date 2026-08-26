@@ -1464,10 +1464,11 @@ impl RewritePositionDeleteFiles {
             if let Some(entry) = inventory.deletion_vectors.get(data_file_path) {
                 let previous = load_delete_vector(self.table.file_io(), &entry.data_file).await?;
                 // THE OTHER DIRECTION of the shadow. This DV already suppresses the legacy delete,
-                // so a position the DV does NOT hold is a row the table returns TODAY. Folding it in
-                // would silently delete it. Runs BEFORE the merge below, so a refused table is never
-                // partially converted; `positions` still holds only legacy-derived positions here,
-                // so a Puffin-closure sibling — which has none — passes rather than being refused.
+                // so a position it does NOT hold is a row the table returns TODAY; folding it in
+                // would silently delete it. `positions` holds only legacy-derived positions here, so
+                // a Puffin-closure sibling — which has none — passes. What makes a refusal safe is
+                // NOT this line's position but `write_deletion_vectors`: no Puffin is opened and no
+                // commit attempted until then, strictly later than every refusal in this function.
                 if let Some(unshadowed) = plan
                     .positions
                     .iter()
@@ -1479,9 +1480,10 @@ impl RewritePositionDeleteFiles {
                             "Data file '{data_file_path}' holds a deletion vector that does not \
                              cover position {unshadowed} of a legacy position delete it already \
                              suppresses. Converting would DELETE rows the table returns today, so \
-                             this run refuses. THIS ACTION CANNOT CLEAR THAT STATE: no filter width \
-                             makes it safe, and both ways out — extending the vector to cover the \
-                             delete, or dropping the delete — need a tool it does not provide."
+                             this run refuses. THIS ACTION CANNOT CLEAR THAT STATE at any filter \
+                             width. RewriteDataFiles with remove_dangling_deletes can: the legacy \
+                             delete is shadowed, so rewriting the data file keeps today's live rows \
+                             and drops both delete files as dangling."
                         ),
                     ));
                 }
