@@ -1463,6 +1463,30 @@ impl RewritePositionDeleteFiles {
             let data_file = inventory.live_data_file(data_file_path)?;
             if let Some(entry) = inventory.deletion_vectors.get(data_file_path) {
                 let previous = load_delete_vector(self.table.file_io(), &entry.data_file).await?;
+                // THE OTHER DIRECTION of the shadow. This DV already suppresses the legacy delete,
+                // so a position the DV does NOT hold is a row the table returns TODAY. Folding it in
+                // would silently delete it. Java's own rewrite writes this shape: its
+                // `loadPreviousDeletes` is `path -> null`, so a group that converts some of a data
+                // file's deletes leaves the rest live and inert under a non-superset DV.
+                if plan.positions.is_empty() {
+                    return Err(Error::new(ErrorKind::DataInvalid, "MUTANT: sibling refused"));
+                }
+                if let Some(unshadowed) = plan
+                    .positions
+                    .iter()
+                    .find(|position| !previous.contains(**position))
+                {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Data file '{data_file_path}' holds a deletion vector that does not \
+                             cover position {unshadowed} of a legacy position delete it already \
+                             suppresses. Converting would DELETE rows the table returns today. \
+                             Rewrite the deletion vector to cover them first, or drop the legacy \
+                             delete; no filter setting makes this run safe."
+                        ),
+                    ));
+                }
                 plan.positions.extend(previous.iter());
                 plan.sequence_number = plan.sequence_number.max(entry.sequence_number);
                 superseded_puffin_paths.insert(entry.data_file.file_path().to_string());
@@ -1969,12 +1993,12 @@ struct DeletionVectorPlan {
 ///
 /// A DV wins over every position delete for the same data file (`get_deletes_for_data_file` returns
 /// on the `dv_by_path` hit, Java `findDV`), so an excluded delete goes INERT and its rows come back.
-/// Reachable because a file-scoped delete is routed BY PATH with no partition condition, while the
-/// filter judges it by its stamped tuple.
+/// This RE-DERIVES that routing rather than sharing it: `PopulatedDeleteFileIndex::new` owns the
+/// real keying, and if that changes, this diverges and nothing fails.
 ///
 /// # Errors
 ///
-/// `DataInvalid`. Widen or drop the filter so the same run converts it.
+/// `DataInvalid`. Widen the filter — unless the delete is ORC or Avro, which no width converts.
 fn refuse_shadowed_deletes(
     inventory: &V3DeleteInventory,
     plans: &HashMap<String, DeletionVectorPlan>,
@@ -2005,12 +2029,19 @@ fn refuse_shadowed_deletes(
         let Some(shadowed_data_file) = shadowed_data_file else {
             continue;
         };
+        // Widening the filter only helps if the arm could then READ it. An ORC or Avro delete is
+        // routed to `FeatureUnsupported` at any filter width, so such a table cannot be converted.
+        let remedy = if delete_file.file_format() == DataFileFormat::Parquet {
+            "Widen the filter so the same run converts it."
+        } else {
+            "This arm cannot read that format, so NO filter setting converts this table."
+        };
         return Err(Error::new(
             ErrorKind::DataInvalid,
             format!(
                 "Position delete '{}' still applies to {shadowed_data_file} but the filter excluded \
                  it: the deletion vector this run would write there SHADOWS it and its deleted rows \
-                 would come back. Widen the filter so the same run converts it.",
+                 would come back. {remedy}",
                 delete_file.file_path()
             ),
         ));

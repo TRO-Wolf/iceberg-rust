@@ -58,9 +58,20 @@ deliberate and argued on row R136: no size gate (V-1) and one commit per run (V-
 - [x] Per-DV sequence stamp pinned (the V3 twin of the bin-max pin).
 - [x] Tests + the interop V3 leg; GAP_MATRIX R136 cell.
 
-Outcome: 11 offline V3 tests + the interop V3 leg green. Mutations applied one at a time, each RED.
-Open follow-up, not taken here: Java's rewrite writer passes `path -> null` as `loadPreviousDeletes`
-and so does not merge; the fork merges, which divergence (g) records.
+- [x] **S2 (2026-08-26) — the closure completed in BOTH directions.** The shadow guard's PARTITION
+      leg is now pinned (it was 0-red before: the fork's `truncate(16)` bounds make partition-scoped
+      the DEFAULT delete shape, so the unpinned leg was the common one). And the OPPOSITE loss is
+      closed: an admitted legacy delete whose data file already holds a NON-SUPERSET DV is refused,
+      because merging it would DELETE rows the table returns today. Java 1.10.0's own rewrite writes
+      that shape — its `loadPreviousDeletes` is `path -> null` — so divergence (g)'s old "no real
+      writer produces this" envelope was wrong and is corrected on row R136.
+- [x] Capability limit (j) stated: a v3 table whose ORC/Avro position deletes OVERLAP convertible
+      ones cannot be converted at any filter width, and the refusal says so.
+- [x] V-1's third reason re-argued (gating can leave TWO live DVs for one data file, which
+      `DeleteFileIndex` rejects); V-2's cost stated (no partial progress under `validate_from_snapshot`).
+
+Outcome: 15 offline V3 tests + the interop V3 leg green. Mutations applied one at a time, each RED.
+Residue lettering on R136 runs (e), (f), (g), (i), (j); (h) was retired with the dangling refusal.
 
 ---
 
