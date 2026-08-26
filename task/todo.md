@@ -31,6 +31,36 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-25): F-7 U3 — `RewritePositionDeleteFiles` extends to format v3
+
+Branch `parity/f7-u3-rewrite-pos-deletes-v3` off `2b34ec414`. ENGINE-FIRST, not a parity flip:
+`iceberg-core` 1.10.0 ships the planner/group/result/commit-manager but the RUNNER is
+`iceberg-spark` (verified: no `Rewrite*Runner` class in the core or api jar, and the oracle pom
+depends on core/api/data/parquet/orc only). Evidence available is read-identity, not a Java oracle.
+
+- [x] Version dispatch in `execute`: V1/V2 keep the bin-pack arm untouched; V3 takes a new
+      DV arm. Today V3 + parquet position deletes does not even commit — the producer's
+      `validate_delete_file_for_version` rejects a fresh parquet position delete on V3.
+- [x] Case 2: convert every live filter-matching PARQUET position delete into one Puffin DV per
+      referenced data file, merged with that data file's existing DV. No size gate: a DV is
+      file-scoped, so bin-packing has no meaning.
+- [x] The Puffin-file CLOSURE. Delete-file removal is PATH-keyed
+      (`SnapshotProducer::resolve_delete_file_paths`), so superseding one DV blob removes every
+      sibling blob in the same Puffin. Rewrite the whole Puffin when any of its DVs is superseded.
+- [x] Case 1: `Ok(zeros)` means "looked, found nothing to do". Make that TOTAL on the V3 arm —
+      every case the arm cannot express returns `Err`, so zeros can never mean "did not look".
+- [x] Hazard R114 bound (c): pass a `PartitionKey` on EVERY `DVFileWriter::delete` call, resolved
+      from the referenced data file's own live `(spec_id, partition)`. Never `with_partition_spec`,
+      never `(None, None)`.
+- [x] Tests + a V3 leg on `run-interop-rewrite-pos-deletes.sh`; GAP_MATRIX R136 cell.
+
+Outcome: 8 offline tests + the interop V3 leg green; 8 mutations applied one at a time, all RED.
+The merge follows the charter and is named as divergence (g) on row R136: a live DV SHADOWS a
+position delete at read time, so folding shadowed positions in can shrink the live row set on a
+table no real writer produced.
+
+---
+
 ## QUEUED (2026-08-25): engine-agreed order — R166 interop, then F-13-or-F-7
 
 Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next.

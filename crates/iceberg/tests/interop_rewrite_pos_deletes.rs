@@ -34,6 +34,12 @@
 //! ANTI-CIRCULAR: the masked subset + the expected live set are hand-declared HERE and INDEPENDENTLY in
 //! the Java oracle from the fixture definition, never from the other engine's output.
 //!
+//! THE V3 LEG (F-7 U3) adds a second pair: `<gen_dir>/rust_table_v3` is the same PRE world upgraded to
+//! format version 3, still carrying its four legacy PARQUET position deletes, and
+//! `<gen_dir>/rust_table_v3_dv` is that world after the action converted them into Puffin DELETION
+//! VECTORS. Java reads both and asserts identical live rows plus the conversion shape. ENGINE-FIRST,
+//! not a Java-parity flip: `iceberg-core` 1.10.0 has no runner for this action at all.
+//!
 //! GATED on `ICEBERG_INTEROP_REWRITE_POS_DELETES_GEN_DIR` (unset ⇒ a clean no-op; the offline `cargo test`
 //! gate stays green). `dev/java-interop/run-interop-rewrite-pos-deletes.sh` is the driver.
 
@@ -275,6 +281,140 @@ async fn build_pre_world(catalog: &impl Catalog, table: Table) -> Table {
     add_deletes(catalog, &table, vec![pd_a2, pd_b2]).await
 }
 
+/// Upgrade to format version 3 — how a table ends up holding parquet position deletes it can no
+/// longer write, which is exactly the state the V3 arm converts.
+async fn upgrade_to_v3(catalog: &impl Catalog, table: &Table) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .upgrade_table_version()
+        .set_format_version(FormatVersion::V3)
+        .apply(tx)
+        .expect("apply upgrade_table_version");
+    tx.commit(catalog)
+        .await
+        .expect("commit upgrade_table_version")
+}
+
+/// The count of live delete files of `content` in `format`.
+async fn live_delete_count_of_format(
+    table: &Table,
+    content: DataContentType,
+    format: DataFileFormat,
+) -> usize {
+    let snapshot = table.metadata().current_snapshot().expect("snapshot");
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("manifest list");
+    let mut count = 0;
+    for manifest_file in manifest_list.entries() {
+        if manifest_file.content != ManifestContentType::Deletes {
+            continue;
+        }
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .expect("manifest");
+        for entry in manifest.entries() {
+            if entry.is_alive()
+                && entry.content_type() == content
+                && entry.data_file().file_format() == format
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Write the V3 PAIR: a table upgraded to V3 that still carries the four parquet position deletes,
+/// and the same table after the V3 arm converted them into Puffin deletion vectors.
+async fn write_v3_pair(catalog: &impl Catalog, warehouse: &str, expected_ids: &HashSet<i64>) {
+    let pre_location = format!("{warehouse}/rust_table_v3");
+    let pre = create_table(catalog, "rust_table_v3", &pre_location).await;
+    let pre = build_pre_world(catalog, pre).await;
+    let pre = upgrade_to_v3(catalog, &pre).await;
+    pre.metadata()
+        .clone()
+        .write_to(
+            pre.file_io(),
+            &format!("{pre_location}/metadata/final.metadata.json"),
+        )
+        .await
+        .expect("write v3 pre final.metadata.json");
+    assert_eq!(
+        &scan_ids(&pre).await,
+        expected_ids,
+        "GEN sanity: the upgraded V3 table still masks id 120/220"
+    );
+    assert_eq!(
+        live_delete_count_of_format(
+            &pre,
+            DataContentType::PositionDeletes,
+            DataFileFormat::Parquet
+        )
+        .await,
+        4,
+        "GEN sanity: the V3 PRE table carries FOUR legacy parquet position deletes"
+    );
+
+    let post_location = format!("{warehouse}/rust_table_v3_dv");
+    let post = create_table(catalog, "rust_table_v3_dv", &post_location).await;
+    let post = build_pre_world(catalog, post).await;
+    let post = upgrade_to_v3(catalog, &post).await;
+    // NO `min_input_files` knob: the V3 arm converts every legacy file and applies no size gate.
+    let result = RewritePositionDeleteFiles::new(post.clone())
+        .execute(catalog)
+        .await
+        .expect("run RewritePositionDeleteFiles on the V3 table");
+    assert_eq!(
+        result.rewritten_delete_files_count, 4,
+        "GEN sanity: all four legacy parquet position deletes consumed"
+    );
+    assert_eq!(
+        result.added_delete_files_count, 2,
+        "GEN sanity: one deletion vector per referenced data file"
+    );
+
+    let post = catalog
+        .load_table(post.identifier())
+        .await
+        .expect("reload v3 post table");
+    post.metadata()
+        .clone()
+        .write_to(
+            post.file_io(),
+            &format!("{post_location}/metadata/final.metadata.json"),
+        )
+        .await
+        .expect("write v3 post final.metadata.json");
+    assert_eq!(
+        &scan_ids(&post).await,
+        expected_ids,
+        "GEN sanity: read identity — the deletion vectors mask exactly the same rows"
+    );
+    assert_eq!(
+        live_delete_count_of_format(
+            &post,
+            DataContentType::PositionDeletes,
+            DataFileFormat::Parquet
+        )
+        .await,
+        0,
+        "GEN sanity: no legacy parquet position delete survives on the V3 table"
+    );
+    assert_eq!(
+        live_delete_count_of_format(
+            &post,
+            DataContentType::PositionDeletes,
+            DataFileFormat::Puffin
+        )
+        .await,
+        2,
+        "GEN sanity: TWO Puffin deletion vectors, one per referenced data file"
+    );
+}
+
 /// The merge-on-read live `id` set.
 async fn scan_ids(table: &Table) -> HashSet<i64> {
     let stream = table
@@ -451,6 +591,9 @@ async fn test_rewrite_pos_deletes_gen() {
         HashSet::from([100, 120, 130, 200, 220, 230]),
         "GEN sanity: the no-deletes table reads the FULL id set (the sabotage read-identity breaker)"
     );
+
+    // The V3 PAIR — legacy parquet position deletes converted into Puffin deletion vectors.
+    write_v3_pair(&catalog, &warehouse, &pre_ids).await;
 
     println!(
         "interop_rewrite_pos_deletes GEN OK — wrote {pre_location} ({pre_pos} pos-deletes) + \

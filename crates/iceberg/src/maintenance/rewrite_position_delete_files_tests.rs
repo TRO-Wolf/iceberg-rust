@@ -783,7 +783,7 @@ async fn test_filter_restricts_compacted_partitions() {
 // variants exhaust the domain:
 //
 //   Parquet -> KEPT.    Pinned by every admission test below.
-//   Puffin  -> DROPPED. `test_v3_deletion_vectors_are_not_compacted` (immediately below).
+//   Puffin  -> DROPPED, and now UNREACHABLE end to end (see the Puffin note below the table).
 //   Orc     -> DROPPED. `test_non_parquet_position_deletes_skipped_at_collection_orc`.
 //   Avro    -> DROPPED. `test_non_parquet_position_deletes_skipped_at_collection_avro`.
 //
@@ -798,6 +798,13 @@ async fn test_filter_restricts_compacted_partitions() {
 //   exempt Orc    (`Parquet | Orc` in the skip)    -> 1 RED: orc only
 //   exempt Avro   (`Parquet | Avro`)               -> 1 RED: avro only
 //   exempt Puffin (`Parquet | Puffin`)             -> 1 RED: puffin only
+//
+// THE PUFFIN ELEMENT IS NOW UNKILLABLE, recorded rather than quietly counted. Since the V3 arm
+// landed, `execute` dispatches a V3 table away before this skip runs, and V1/V2 cannot commit a
+// Puffin position delete at all (`validate_delete_file_for_version` rejects a DV below V3). So no
+// table reaches the skip's Puffin leg. It stays as defensive code against externally written
+// metadata. `test_v3_deletion_vectors_are_not_compacted` now pins the V3 arm's honest zeros
+// instead. The Orc and Avro elements are unaffected and still kill their own mutants.
 //
 // So each variant of the closed enum has a mutant that ONLY its own pin kills — none of the three
 // is a duplicate of another, and no other test in the suite covers any of them.
@@ -829,11 +836,11 @@ async fn test_filter_restricts_compacted_partitions() {
 // is discharged here and cross-referenced above, so neither scope loses its pin.
 // =================================================================================================
 
-/// V2-PARQUET-ONLY SCOPE, and C-008's Puffin element. On a V3 table, FIVE data files in partition 0
-/// are each masked by a Puffin DELETION VECTOR. A DV is file-scoped and never bin-packed, so this
-/// action must SKIP all five — even though they share `(spec 0, partition 0)` and, at five files,
-/// would form an admissible bin under Java's DEFAULT `min_input_files` of five. The action is a
-/// no-op: all five DVs stay live, the read set is unchanged.
+/// CASE 1 — HONEST ZEROS. On a V3 table, FIVE data files in partition 0 are each masked by a Puffin
+/// DELETION VECTOR. A DV is file-scoped, so there is nothing to bin-pack and nothing to convert: the
+/// arm LOOKS at all five and returns zero counts with no commit. On the V3 arm those zeros are a
+/// total statement — an input the arm cannot express is an `Err` — so a caller can tell "looked,
+/// found nothing to do" from "did not look". The five DVs stay live and the read set is unchanged.
 ///
 /// NO KNOB, deliberately (C-014 element 7). The previous form was a TWO-DV fixture carrying
 /// `.min_input_files(2)`, and that knob was load-bearing only for the MUTATED build — under the
@@ -842,10 +849,10 @@ async fn test_filter_restricts_compacted_partitions() {
 /// remove the knob and the dependency on it: the mutated build clears `enough_input_files` on its
 /// own (5 > 1 and 5 >= 5), so this pin now measures the SKIP and nothing else.
 ///
-/// MUTATION COVERAGE — APPLIED, not predicted: delete the `file_format() != Parquet` skip in
-/// `collect_position_delete_groups` and the five DVs are enumerated as a five-file
-/// `(spec 0, partition 0)` "position delete" group, admitted by `enough_input_files`, and read as
-/// parquet by `compact_group`. RED.
+/// MUTATION COVERAGE — APPLIED: classify a Puffin DV as a convertible legacy delete in
+/// `admit_position_delete` and the arm tries to convert all five. RED. The former claim on the
+/// `file_format() != Parquet` skip no longer holds — see the Puffin note in the C-008 banner above,
+/// and deleting the version dispatch leaves this test GREEN because that skip still drops all five.
 ///
 /// FIXTURE PRECONDITIONS asserted before `execute` (so a drifted fixture reds instead of passing
 /// vacuously): five DVs in ONE partition, every one sub-min, and the resolved floor is FIVE.
@@ -4905,4 +4912,453 @@ async fn test_admitted_bin_with_zero_pairs_is_skipped() {
         RewritePositionDeleteFilesResult::default(),
         "and it contributed zero to ALL FOUR counts"
     );
+}
+
+// =================================================================================================
+// THE V3 ARM — legacy PARQUET position deletes become Puffin DELETION VECTORS. Every pin here is a
+// read-identity proof plus a SHAPE assertion, because a V3 arm that declined to act would satisfy
+// read identity on its own. The evidence class is read identity, not Java parity: `iceberg-core`
+// 1.10.0 has no runner for this action.
+// =================================================================================================
+
+/// Upgrade `table` to format version 3 — how a table acquires legacy parquet position deletes it
+/// can no longer write.
+async fn upgrade_to_v3(catalog: &impl Catalog, table: &Table) -> Table {
+    let tx = Transaction::new(table);
+    let action = tx
+        .upgrade_table_version()
+        .set_format_version(FormatVersion::V3);
+    let tx = action.apply(tx).unwrap();
+    tx.commit(catalog).await.unwrap()
+}
+
+/// Write ONE Puffin file holding a deletion vector per `(target_path, positions)` entry, in
+/// partition x=`part_value`. The multi-blob shape a real engine writes, and the fixture the Puffin
+/// closure is pinned on.
+async fn write_deletion_vectors_in_one_puffin(
+    table: &Table,
+    part_value: i64,
+    targets: &[(&str, &[u64])],
+) -> Vec<DataFile> {
+    use crate::writer::base_writer::deletion_vector_writer::DVFileWriter;
+
+    let dv_path = format!(
+        "{}/data/dv-{}.puffin",
+        table.metadata().location(),
+        uuid::Uuid::now_v7()
+    );
+    let output = table.file_io().new_output(&dv_path).unwrap();
+    let partition_key = PartitionKey::new(
+        table.metadata().default_partition_spec().as_ref().clone(),
+        table.metadata().current_schema().clone(),
+        Struct::from_iter([Some(Literal::long(part_value))]),
+    )
+    .expect("PartitionKey::new: valid partition tuple");
+    let mut writer = DVFileWriter::new(output);
+    for (target_path, positions) in targets {
+        for &pos in *positions {
+            writer
+                .delete(target_path, pos, Some(&partition_key))
+                .expect("record DV position");
+        }
+    }
+    writer.close().await.expect("close DV writer")
+}
+
+/// Swap delete files through `RewriteFiles`, each added file stamped with `sequence_number`.
+///
+/// `RowDelta`'s `validate_fresh_dvs_only` refuses to add a DV for a data file a live position delete
+/// still covers, so this is the only in-tree route to the half-migrated shape those pins need.
+async fn swap_delete_files(
+    catalog: &impl Catalog,
+    table: &Table,
+    removed: Vec<DataFile>,
+    added: Vec<DataFile>,
+    sequence_number: i64,
+) -> Table {
+    let tx = Transaction::new(table);
+    let mut action = tx
+        .rewrite_files(Vec::new(), Vec::new())
+        .delete_delete_files(removed);
+    for file in added {
+        action = action.add_delete_file_with_sequence_number(file, sequence_number);
+    }
+    let tx = action.apply(tx).unwrap();
+    tx.commit(catalog).await.unwrap()
+}
+
+/// The data sequence number of the live delete entry at `path`.
+async fn live_delete_seq(table: &Table, path: &str) -> i64 {
+    live_delete_entries_with_seq(table)
+        .await
+        .into_iter()
+        .find(|(file, _)| file.file_path() == path)
+        .and_then(|(_, seq)| seq)
+        .expect("a live delete entry at that path, carrying a sequence number")
+}
+
+/// CROWN JEWEL of the V3 arm. A table upgraded from V2 holds TWO parquet position deletes for one
+/// data file. On V3 those cannot be compacted into a third parquet file, so the arm converts them
+/// into ONE deletion vector. Read identity plus SHAPE: the live rows are unchanged, both parquet
+/// deletes are gone, and exactly one Puffin DV referencing that data file is live.
+///
+/// MUTATION COVERAGE — APPLIED: delete the version dispatch in `execute` and the run dies on the
+/// commit's "Must use DVs for position deletes in V3". RED.
+#[tokio::test]
+async fn test_v3_converts_parquet_position_deletes_into_one_deletion_vector() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 7, &[
+        (7, 10, 100),
+        (7, 20, 200),
+        (7, 30, 300),
+        (7, 40, 400),
+        (7, 50, 500),
+    ])
+    .await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+
+    let pd1 = write_position_delete_file(&table, Some(7), &[(&x_path, 1)]).await;
+    let table = add_deletes(&catalog, &table, vec![pd1]).await;
+    let pd2 = write_position_delete_file(&table, Some(7), &[(&x_path, 3)]).await;
+    let table = add_deletes(&catalog, &table, vec![pd2]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([10, 30, 50]),
+        "before: the two parquet position deletes mask y=20 and y=40"
+    );
+    assert_eq!(
+        count_pos(&live_delete_files(&table).await),
+        2,
+        "fixture: two live parquet position deletes on a V3 table"
+    );
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(result.rewritten_delete_files_count, 2);
+    assert_eq!(result.added_delete_files_count, 1);
+    assert!(result.rewritten_bytes_count > 0);
+    assert!(result.added_bytes_count > 0);
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "read identity: the deletion vector masks exactly the rows the parquet deletes masked"
+    );
+
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 1, "exactly one delete file survives");
+    assert_eq!(
+        after[0].file_format(),
+        DataFileFormat::Puffin,
+        "the survivor is a Puffin deletion vector, not a parquet position delete"
+    );
+    assert_eq!(
+        after[0].referenced_data_file().as_deref(),
+        Some(x_path.as_str()),
+        "the deletion vector references the data file the position deletes named"
+    );
+    assert_eq!(after[0].record_count, 2, "both positions landed in the DV");
+}
+
+/// THE `(None, None)` HAZARD (row R114 bound (c)). Every `DVFileWriter::delete` call the arm makes
+/// carries the referenced data file's OWN `PartitionKey`, so `resolve_partition_spec_id` always
+/// takes its key arm and never the keyless one that stamps spec 0 with an EMPTY partition tuple.
+///
+/// MUTATION COVERAGE — APPLIED: pass `None` instead of `Some(&partition_key)` in
+/// `write_deletion_vectors` and the DV lands with an empty partition. RED on the partition
+/// assertion. A partition-keyed maintenance action then reasons over a field that lies.
+#[tokio::test]
+async fn test_v3_deletion_vector_carries_its_data_file_partition_and_spec() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 7, &[(7, 10, 1), (7, 20, 2)]).await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+    let pd = write_position_delete_file(&table, Some(7), &[(&x_path, 1)]).await;
+    let table = add_deletes(&catalog, &table, vec![pd]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 1, "one deletion vector");
+    assert_eq!(
+        after[0].partition(),
+        &Struct::from_iter([Some(Literal::long(7))]),
+        "the DV carries the data file's OWN partition tuple, not an empty one"
+    );
+    assert_eq!(
+        after[0].partition_spec_id, 0,
+        "and the spec the data file was written under"
+    );
+}
+
+/// THE MERGE. One data file carries BOTH a legacy parquet position delete and a deletion vector, and
+/// the converted DV must union both sets. The DV here ABSORBS the parquet position, the shape Java's
+/// `BaseDVFileWriter.loadPreviousDeletes` produces, so the union preserves read identity.
+///
+/// MUTATION COVERAGE — APPLIED: drop the previous-DV load in `plan_deletion_vectors` and the DV's
+/// own masked row comes back. RED on read identity, with y=40 resurrected.
+#[tokio::test]
+async fn test_v3_conversion_merges_the_data_file_existing_deletion_vector() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 7, &[
+        (7, 10, 100),
+        (7, 20, 200),
+        (7, 30, 300),
+        (7, 40, 400),
+        (7, 50, 500),
+    ])
+    .await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+
+    let keep = write_position_delete_file(&table, Some(7), &[(&x_path, 1)]).await;
+    let table = add_deletes(&catalog, &table, vec![keep]).await;
+    let replaced = write_position_delete_file(&table, Some(7), &[(&x_path, 3)]).await;
+    let replaced_path = replaced.file_path().to_string();
+    let table = add_deletes(&catalog, &table, vec![replaced]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    // Turn the SECOND parquet delete into a DV, leaving the first behind — the shape Java produces
+    // when a DV lands beside a partition-scoped position delete it may not discard.
+    let replaced_seq = live_delete_seq(&table, &replaced_path).await;
+    let existing_dv = write_deletion_vectors_in_one_puffin(&table, 7, &[(&x_path, &[1, 3])]).await;
+    let removed: Vec<DataFile> = live_delete_files(&table)
+        .await
+        .into_iter()
+        .filter(|f| f.file_path() == replaced_path)
+        .collect();
+    let table = swap_delete_files(&catalog, &table, removed, existing_dv, replaced_seq).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([10, 30, 50]),
+        "fixture: the DV shadows the parquet delete and masks y=20 and y=40"
+    );
+    let live = live_delete_files(&table).await;
+    assert_eq!(live.len(), 2, "fixture: one parquet delete AND one DV");
+    assert_eq!(
+        live.iter()
+            .filter(|f| f.file_format() == DataFileFormat::Puffin)
+            .count(),
+        1,
+        "fixture: exactly one of the two is a deletion vector"
+    );
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rewritten_delete_files_count, 2,
+        "the parquet delete AND the superseded DV are both consumed"
+    );
+    assert_eq!(
+        result.added_delete_files_count, 1,
+        "one merged DV replaces them"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "read identity: the merged DV masks BOTH y=20 and y=40"
+    );
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 1, "exactly one delete file survives");
+    assert_eq!(
+        after[0].record_count, 2,
+        "the merged DV holds both positions"
+    );
+}
+
+/// THE PUFFIN CLOSURE — the delete-correctness pin of this arm. Delete-file removal is PATH-keyed,
+/// so superseding one DV blob removes every sibling blob in the same Puffin. Each sibling must be
+/// rewritten or its deleted rows come back.
+///
+/// MUTATION COVERAGE — APPLIED: delete the sibling loop in `plan_deletion_vectors` and data file
+/// Y's deletion vector is removed without a replacement. RED on read identity, with y=41
+/// resurrected — a silent, irreversible resurrection in committed metadata.
+#[tokio::test]
+async fn test_v3_rewrite_keeps_sibling_deletion_vectors_of_the_same_puffin() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 7, &[(7, 10, 1), (7, 11, 2)]).await;
+    let y = write_data_file(&table, "y.parquet", 7, &[(7, 40, 1), (7, 41, 2)]).await;
+    let x_path = x.file_path().to_string();
+    let y_path = y.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x, y]).await;
+
+    // A throwaway parquet delete, present only so the `RewriteFiles` below has something to remove.
+    let scratch = write_position_delete_file(&table, Some(7), &[(&y_path, 0)]).await;
+    let scratch_path = scratch.file_path().to_string();
+    let table = add_deletes(&catalog, &table, vec![scratch]).await;
+    // The legacy delete this arm will consume: it masks X's position 1 only.
+    let legacy = write_position_delete_file(&table, Some(7), &[(&x_path, 1)]).await;
+    let table = add_deletes(&catalog, &table, vec![legacy]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    // ONE Puffin: X's vector absorbed the legacy delete's position 1, Y's masks position 1.
+    let scratch_seq = live_delete_seq(&table, &scratch_path).await;
+    let puffin =
+        write_deletion_vectors_in_one_puffin(&table, 7, &[(&x_path, &[0, 1]), (&y_path, &[1])])
+            .await;
+    let puffin_path = puffin[0].file_path().to_string();
+    assert!(
+        puffin.iter().all(|f| f.file_path() == puffin_path),
+        "fixture: both deletion vectors live in ONE Puffin file"
+    );
+    let removed: Vec<DataFile> = live_delete_files(&table)
+        .await
+        .into_iter()
+        .filter(|f| f.file_path() == scratch_path)
+        .collect();
+    let table = swap_delete_files(&catalog, &table, removed, puffin, scratch_seq).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([40]),
+        "fixture: X's rows 10 and 11 and Y's row 41 are all masked"
+    );
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "read identity: the sibling vector's masked row did NOT come back"
+    );
+    assert_eq!(
+        result.rewritten_delete_files_count, 3,
+        "the legacy parquet delete plus BOTH deletion vectors of the superseded Puffin"
+    );
+    assert_eq!(
+        result.added_delete_files_count, 2,
+        "X's merged vector AND Y's rewritten sibling"
+    );
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 2, "one deletion vector per data file");
+    assert!(
+        after.iter().all(|f| f.file_path() != puffin_path),
+        "the superseded Puffin is gone; both vectors were rewritten into a new one"
+    );
+    // Two DV entries, ONE physical Puffin: the added bytes are that file's size, not twice it.
+    assert_eq!(
+        result.added_bytes_count, after[0].file_size_in_bytes,
+        "added bytes are summed over DISTINCT file paths"
+    );
+}
+
+/// The user filter restricts which partitions the V3 arm converts, exactly as it restricts which
+/// the bin-pack arm compacts.
+#[tokio::test]
+async fn test_v3_filter_restricts_the_converted_partitions() {
+    use crate::expr::Reference;
+    use crate::spec::Datum;
+
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let a = write_data_file(&table, "a.parquet", 0, &[(0, 10, 1), (0, 11, 2)]).await;
+    let b = write_data_file(&table, "b.parquet", 1, &[(1, 20, 1), (1, 21, 2)]).await;
+    let a_path = a.file_path().to_string();
+    let b_path = b.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![a, b]).await;
+
+    let pda = write_position_delete_file(&table, Some(0), &[(&a_path, 1)]).await;
+    let pdb = write_position_delete_file(&table, Some(1), &[(&b_path, 1)]).await;
+    let table = add_deletes(&catalog, &table, vec![pda, pdb]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let before = scan_y_values(&table).await;
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .filter(Reference::new("x").equal_to(Datum::long(0)))
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(result.rewritten_delete_files_count, 1, "partition 0 only");
+    assert_eq!(result.added_delete_files_count, 1);
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 2, "partition 1's parquet delete is untouched");
+    assert_eq!(
+        after
+            .iter()
+            .filter(|f| f.file_format() == DataFileFormat::Parquet)
+            .count(),
+        1,
+        "exactly one parquet position delete remains — partition 1's"
+    );
+}
+
+/// A legacy position delete naming a data file the current snapshot no longer holds is REFUSED, not
+/// silently dropped. Dropping it would make zero counts mean "did not look"; it is
+/// `RemoveDanglingDeleteFiles` that removes a dangling delete, not this action.
+#[tokio::test]
+async fn test_v3_dangling_position_delete_reference_is_refused() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 7, &[(7, 10, 1), (7, 20, 2)]).await;
+    let table = append_files(&catalog, &table, vec![x]).await;
+    let ghost = format!("{}/data/ghost.parquet", table.metadata().location());
+    let pd = write_position_delete_file(&table, Some(7), &[(ghost.as_str(), 0)]).await;
+    let table = add_deletes(&catalog, &table, vec![pd]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let error = RewritePositionDeleteFiles::new(table)
+        .execute(&catalog)
+        .await
+        .expect_err("a dangling reference must fail closed");
+    assert!(
+        error.to_string().contains("RemoveDanglingDeleteFiles"),
+        "the refusal names the action that removes a dangling delete: {error}"
+    );
+}
+
+/// A live ORC position delete on a V3 table is REFUSED, where the V1/V2 arm silently skips it. That
+/// refusal is what makes `Ok(zeros)` total on this arm: an input it cannot express is an error.
+#[tokio::test]
+async fn test_v3_non_parquet_position_delete_is_refused_not_skipped() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 1), (0, 20, 2)]).await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+    let (table, _sizes) =
+        add_fabricated_non_parquet_pos_deletes(&catalog, &table, &x_path, DataFileFormat::Orc)
+            .await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let error = RewritePositionDeleteFiles::new(table)
+        .execute(&catalog)
+        .await
+        .expect_err("an unreadable position-delete format must fail closed on V3");
+    assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
 }
