@@ -5943,8 +5943,10 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
         .expect("the cleared table converts without refusing");
     assert_eq!(second, RewritePositionDeleteFilesResult::default());
 
-    // THE TIE. The refusal must name EVERY knob this test just had to pass, or the message promises
-    // an invocation nobody has executed. Both directions of drift red here.
+    // THE TIE, and what it does NOT bind. The refusal must name every knob in this list, so a
+    // message that drops one reds here. The list is MANUAL: it cannot be derived from the builder
+    // chain above, so adding a knob to the invocation without adding it here stays green — which is
+    // the exact drift that shipped a one-knob message twice. Change the chain, change the list.
     for knob in ["remove_dangling_deletes(true)", "delete_file_threshold"] {
         assert!(
             refusal.to_string().contains(knob),
