@@ -39,35 +39,28 @@ pub(crate) struct DeleteFileIndex {
 enum DeleteFileIndexState {
     Populating(Arc<Notify>),
     Populated(PopulatedDeleteFileIndex),
-    /// The populate task terminated WITHOUT publishing an index — it unwound, or its future was
-    /// dropped by a runtime teardown (whether parked at `collect()` or never polled at all).
+    /// The populate task ended without publishing an index.
     ///
-    /// Terminal, exactly like [`DeleteFileIndexState::Populated`]: the populate task is the sole
-    /// writer and runs once, so if it dies the state can never advance on its own. Without this
-    /// variant the state would stay `Populating` forever and every scan parked in
-    /// [`DeleteFileIndex::get_deletes_for_data_file`] would wait on a notification that can no
-    /// longer be sent. The `String` is the reason, rendered into each waiter's typed error. This
-    /// mirrors `EqDelState::Failed` in [`crate::arrow::delete_filter`].
+    /// Terminal, like [`DeleteFileIndexState::Populated`]. The populate task is the sole writer
+    /// and runs once, so a dead task can never advance the state. Without this variant every
+    /// parked scan waits on a notification that can no longer be sent. The `String` is the reason,
+    /// rendered into each waiter's typed error.
     Failed(String),
 }
 
-/// Publishes the populate task's TERMINAL state and wakes the waiters.
+/// Publishes the populate task's terminal state and wakes the waiters.
 ///
-/// Constructed in the `spawn` PRELUDE — not inside the `async move` block — so the populate
-/// future CAPTURES an already-armed guard rather than arming it on its first poll. That
-/// distinction is the whole guarantee: a future constructed-on-poll that is dropped before it is
-/// ever polled runs no local destructors, so a runtime torn down between `spawn` and the first
-/// poll would leave the state stranded at `Populating`.
+/// Construct it in the `spawn` prelude, never inside the `async move` block. The future must
+/// capture an armed guard. A future dropped before its first poll runs no local destructors, so a
+/// guard built on first poll would strand the state at `Populating`.
 ///
-/// [`PopulateGuard::publish`] disarms it on the success path. If that call is never reached,
-/// `Drop` publishes [`DeleteFileIndexState::Failed`] instead, so every waiter reaches a terminal
-/// state and gets a typed error rather than hanging forever. `Drop` therefore covers all three
-/// ways the task can die without publishing: never polled, unwound (tokio drops the task's future
-/// as the panic propagates), and cancelled/parked-future teardown.
+/// [`PopulateGuard::publish`] disarms the guard on the success path. Otherwise `Drop` publishes
+/// [`DeleteFileIndexState::Failed`], so every waiter reaches a terminal state instead of hanging.
+/// That covers all three deaths: never polled, unwound, and torn down.
 ///
-/// Both paths write the state under the write lock and fire the notifier only AFTER releasing it,
-/// so a woken waiter always observes the terminal state (see [`DeleteFileIndex::lookup_or_arm`]
-/// for the other half of that handshake).
+/// Both paths write the state under the write lock and fire the notifier after releasing it. A
+/// woken waiter therefore always observes the terminal state. See
+/// [`DeleteFileIndex::lookup_or_arm`] for the other half of the handshake.
 struct PopulateGuard {
     state: Arc<RwLock<DeleteFileIndexState>>,
     notify: Arc<Notify>,
@@ -85,15 +78,12 @@ impl PopulateGuard {
 
     /// Publish `terminal` and wake every waiter, disarming the guard.
     ///
-    /// Respects an EXISTING terminal state: if another writer already moved the index out of
-    /// `Populating` — [`DeleteFileIndex::mark_failed`] on a delete-entry processing error — the
-    /// earlier terminal wins and this publish only disarms + re-notifies (harmless). Behavior-
-    /// identical for the pre-existing single-writer paths, which both publish from `Populating`.
+    /// The first terminal state wins. If [`DeleteFileIndex::mark_failed`] already moved the index
+    /// out of `Populating`, this call only disarms the guard and re-notifies.
     fn publish(&mut self, terminal: DeleteFileIndexState) {
         {
-            // Recover a poisoned guard rather than cascading the panic: recovering and completing
-            // the transition is always the right move (a stranded `Populating` state would hang
-            // every waiting scan on the notifier below).
+            // Recover a poisoned guard instead of cascading the panic. A stranded `Populating`
+            // state hangs every waiting scan on the notifier below.
             let mut guard = self
                 .state
                 .write()
@@ -127,15 +117,13 @@ enum IndexLookup {
     Wait(OwnedNotified),
 }
 
-/// Partition delete maps are nested `spec_id → partition → deletes` so lookup is
-/// `get(spec_id).get(partition)` without cloning the partition `Struct` (FK2.3 / scout #15).
+/// Partition delete maps nest as `spec_id → partition → deletes`, so lookup clones no partition
+/// `Struct`.
 ///
-/// Java `DeleteFileIndex` / `PartitionMap` keys by the composite `(spec_id, partition)` — never by
-/// partition tuple alone. A flat `HashMap<Struct, _>` forced a post-filter linear scan on `spec_id`
-/// and, on a wrong-key bug, resurrects deletes onto data files of a different evolved spec that
-/// share the same partition values. A flat `HashMap<(i32, Struct), _>` is correct but clones the
-/// partition on every lookup; the nested form is equivalent and keeps the pre-FK2.3 zero-clone
-/// `get(partition)` hot path.
+/// Java `DeleteFileIndex` keys by the composite `(spec_id, partition)`, never by the partition
+/// tuple alone. Keying by tuple alone resurrects deletes onto data files of a different evolved
+/// spec that share the same partition values. A flat `(i32, Struct)` key is correct but clones the
+/// partition on every lookup.
 type PartitionDeleteMap = HashMap<i32, HashMap<Struct, Vec<Arc<DeleteFileContext>>>>;
 
 #[derive(Debug)]
@@ -150,30 +138,19 @@ struct PopulatedDeleteFileIndex {
     /// Partition-scoped position deletes keyed by `(spec_id, partition)` via nested maps (FK2.3).
     /// Each list is seq-sorted.
     pos_deletes_by_partition: PartitionDeleteMap,
-    /// FILE-SCOPED position deletes keyed by the data file they reference, mirroring Java
-    /// `DeleteFileIndex.posDeletesByPath` (`Builder.add(Map<String, PositionDeletes>,
-    /// PartitionMap<PositionDeletes>, DeleteFile)`: when
-    /// `ContentFileUtil.referencedDataFileLocation(file)` is non-null the file goes here INSTEAD of
-    /// into [`Self::pos_deletes_by_partition`]).
+    /// File-scoped position deletes keyed by the data file they reference. Java
+    /// `DeleteFileIndex.posDeletesByPath`. A delete lands here INSTEAD of in
+    /// [`Self::pos_deletes_by_partition`] when its referenced data file is derivable.
     ///
-    /// Consulted by path ALONE — no spec condition, no partition condition (Java `findPathDeletes`
-    /// = `posDeletesByPath.get(dataFile.location())`). Spark's default write granularity is FILE, so
-    /// this is the common shape in Java-written merge-on-read tables; before this map existed such a
-    /// delete was indexed by its own `(spec_id, partition)` and a data file whose partition or spec
-    /// differed never found it — the masked rows silently resurrected.
-    ///
-    /// Each list is seq-sorted so [`applicable_pos_deletes`] can `partition_point` the applicable
-    /// tail (Java `PositionDeletes.filter` / `findStartIndex`).
+    /// Lookup uses the path alone: no spec condition, no partition condition. Such a delete is
+    /// routinely stamped with another spec's partition, and a partition-keyed lookup never finds
+    /// it. The masked rows would then resurrect. Each list is seq-sorted for `partition_point`.
     pos_deletes_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
-    /// Deletion vectors keyed by the data file they apply to (the DV's
-    /// `referenced_data_file`), mirroring Java `DeleteFileIndex.dvByPath`
-    /// (`DeleteFileIndex.Builder.build` L500/L505-506: a POSITION_DELETES file with
-    /// `ContentFileUtil.isDV` — format == PUFFIN — is indexed by `referencedDataFile()`).
+    /// Deletion vectors keyed by their `referenced_data_file`. Java `DeleteFileIndex.dvByPath`.
     ///
-    /// A valid table has AT MOST ONE DV per data file; Java's `add(dvByPath, dv)` (L528-535)
-    /// raises `ValidationException` ("Can't index multiple DVs for %s") on a duplicate. This
-    /// index's lookup signature is infallible, so duplicates are kept HERE and rejected
-    /// fail-loud at the load door instead (`CachingDeleteFileLoader::load_deletes`).
+    /// A valid table holds at most one DV per data file. Java rejects a duplicate here. This map
+    /// keeps duplicates instead, and `CachingDeleteFileLoader::load_deletes` rejects them
+    /// fail-loud at the load door.
     dv_by_path: HashMap<String, Vec<Arc<DeleteFileContext>>>,
 }
 
@@ -228,37 +205,27 @@ pub(crate) fn is_deletion_vector(data_file: &DataFile) -> bool {
 
 /// The single data file a delete file references, or `None` when it references more than one.
 ///
-/// The Rust mirror of Java `ContentFileUtil.referencedDataFile(DeleteFile)` +
-/// `referencedDataFileLocation` (1.10.0 bytecode-decoded), which is THE routing predicate for
-/// position deletes: `DeleteFileIndex.Builder.add` sends a delete with a referenced data file into
-/// the PATH-keyed map and every other delete into the `(spec, partition)`-keyed map. The same
-/// predicate governs which deletes the [`RemoveDanglingDeleteFiles`] maintenance action may collect
-/// (`crate::maintenance::remove_dangling_delete_files`), so it lives in exactly one place — a reader
-/// and a collector that disagree about file-scoping is how a still-applicable delete gets deleted.
+/// Mirrors Java `ContentFileUtil.referencedDataFile`, the routing predicate for position deletes.
+/// A delete with a referenced data file goes into the path-keyed map, every other delete into the
+/// `(spec_id, partition)`-keyed map. The same predicate decides which deletes
+/// [`RemoveDanglingDeleteFiles`] may collect, so it lives in one place. A reader and a collector
+/// that disagree about file-scoping is how a still-applicable delete gets deleted.
 ///
 /// Three legs, in Java's order:
 ///
-/// 1. **Equality deletes are never file-scoped.** Java returns null before looking at anything else
-///    (`content() == EQUALITY_DELETES → null`): an equality delete matches by VALUE across a whole
-///    partition, so a `file_path` bound on it would be meaningless.
-/// 2. **The explicit back-reference wins.** `referenced_data_file` (spec field 143), when set, is
-///    returned as-is. Deletion vectors always carry it; a PARQUET position delete essentially never
-///    does — through Iceberg 1.11.0 the only writer that sets the field is `deletes.BaseDVFileWriter`
-///    (the V3 DV writer), so this leg is dead for every Spark-written V2 table and leg 3 carries them
-///    all. Independently bytecode-verified at 1.10.0 and 1.11.0 by the RePark consumer, 2026-07-25.
-/// 3. **Otherwise derive it from the `file_path`-column bounds.** Java reads the lower and upper
-///    bound of the reserved `file_path` column ([`RESERVED_FIELD_ID_DELETE_FILE_PATH`]) and returns
-///    the decoded value only when BOTH exist and are EQUAL — equal bounds mean every row in the
-///    delete file names the same data file. This leg is not an optimization: Java's own
-///    `PositionDeleteWriter.close()` never sets `referenced_data_file`, it only preserves those
-///    bounds (`metrics()` strips them once a second referenced file appears), so leg 3 is how
-///    virtually every Java-written file-granularity position delete is recognised. Implementing only
-///    leg 2 leaves that entire class unrouted — and no fixture that sets the field can detect it.
+/// 1. **An equality delete is never file-scoped.** It matches by value across a whole partition,
+///    so a `file_path` bound on it carries no meaning.
+/// 2. **The explicit back-reference wins.** `referenced_data_file` (field 143) is returned as-is.
+///    Only the V3 DV writer sets it, so this leg is dead for every Spark-written V2 table.
+/// 3. **Otherwise derive it from the `file_path`-column bounds.** The decoded value is returned
+///    only when both bounds exist and are equal. Java's `PositionDeleteWriter` sets no back
+///    reference and keeps these bounds, so leg 3 recognises nearly every Java-written
+///    file-granularity position delete. Leg 2 alone leaves that whole class unrouted, and no
+///    fixture that sets the field can detect the gap.
 ///
-/// Bounds that are absent, unequal, or not string-typed leave the delete partition-scoped, exactly
-/// as in Java (which compares the raw bound `ByteBuffer`s and decodes with the `file_path` column's
-/// string type). Bound TRUNCATION cannot forge a match: a truncated lower bound is shortened and the
-/// matching upper bound is rounded UP, so the two are equal only when both are the full value.
+/// Bounds that are absent, unequal, or not string-typed leave the delete partition-scoped.
+/// Truncation cannot forge a match: a truncated lower bound is shortened and the upper bound is
+/// rounded up, so the two are equal only at the full value.
 pub fn referenced_data_file_location(delete_file: &DataFile) -> Option<String> {
     if delete_file.content_type() == DataContentType::EqualityDeletes {
         return None;
@@ -283,27 +250,21 @@ pub fn referenced_data_file_location(delete_file: &DataFile) -> Option<String> {
     }
 }
 
-/// Backpressure buffer capacity for delete-file contexts streamed into the index populate
-/// task. Sized to absorb a burst of delete entries without stalling concurrent manifest
-/// processing under typical scan concurrency; not a hard limit on total delete files (the
-/// receiver drains the stream into a `Vec` before indexing).
+/// Backpressure buffer for delete-file contexts streamed into the populate task. It absorbs a
+/// burst without stalling manifest processing. It does not cap the total delete-file count.
 const DELETE_FILE_INDEX_CHANNEL_CAPACITY: usize = 1024;
 
 impl DeleteFileIndex {
-    /// Move a still-`Populating` index to `Failed` and wake every parked waiter (review rider,
-    /// 2026-08-03). Used by the plan path when DELETE-ENTRY processing errors: without this the
-    /// entry error only reaches the task channel — the delete senders drop, the populate task
-    /// sees a normal end-of-channel, and a PARTIAL delete set publishes as `Populated`. Data
-    /// tasks streamed before the consumer observes the `Err` would read with missing deletes —
-    /// silent row resurrection for an early-terminating (e.g. LIMIT-k) consumer. Java plans
-    /// deletes before emitting any task; this restores fail-before-results under FK2.2's
-    /// concurrent planning.
+    /// Move a still-`Populating` index to `Failed` and wake every parked waiter. The plan path
+    /// calls it when delete-entry processing errors. Without it the senders drop, the populate
+    /// task sees a normal end-of-channel, and a PARTIAL delete set publishes as `Populated`. A
+    /// consumer that stops early then reads with missing deletes and resurrects rows.
     ///
-    /// No-op when the state is already terminal (`Populated` / `Failed`): the first terminal
-    /// state wins, matching [`PopulateGuard::publish`]'s respect-terminal rule. Callers that
-    /// need the failure to win DETERMINISTICALLY must call this while they still hold a live
-    /// delete-channel sender — the populate task cannot publish before the channel closes, so
-    /// `Failed` is guaranteed to land first.
+    /// # Notes
+    ///
+    /// The call is a no-op once the state is terminal, because the first terminal state wins. To
+    /// make the failure win deterministically, call it while you still hold a live delete-channel
+    /// sender. The populate task cannot publish before the channel closes.
     pub(crate) fn mark_failed(&self, reason: &str) {
         let notify = {
             let mut guard = self
@@ -337,11 +298,9 @@ impl DeleteFileIndex {
         let delete_file_stream = rx.boxed();
 
         spawn({
-            // Armed HERE, in the prelude, so the future below CAPTURES the guard instead of
-            // constructing it on its first poll. Dropping the future then always runs the guard's
-            // `Drop` — including when the future is dropped before it is ever polled (a runtime
-            // torn down between this `spawn` and the first poll), which a guard constructed inside
-            // the `async move` block would miss entirely.
+            // Armed in the prelude, so the future below CAPTURES the guard. Dropping the future
+            // then always runs `Drop`, including when it is dropped before its first poll. A guard
+            // built inside the `async move` block would miss that case.
             let mut guard = PopulateGuard::new(state.clone(), notify);
 
             async move {
@@ -373,10 +332,9 @@ impl DeleteFileIndex {
             IndexLookup::Wait(notified) => notified.await,
         }
 
-        // The populate task publishes a TERMINAL state under the write lock and only then fires
-        // the notifier, so a woken waiter always observes `Populated` or `Failed`. (This second
-        // call arms a notifier it will not use — one `Arc` clone — which keeps the lock/arm
-        // handshake in exactly one place.)
+        // The populate task publishes under the write lock and fires the notifier afterwards, so
+        // a woken waiter always observes a terminal state. This second call arms a notifier it
+        // does not use, which keeps the lock and arm handshake in one place.
         match self.lookup_or_arm(data_file, seq_num)? {
             IndexLookup::Ready(deletes) => Ok(deletes),
             IndexLookup::Wait(_) => Err(Error::new(
@@ -389,18 +347,12 @@ impl DeleteFileIndex {
     /// Read the index state once: answer outright if it is terminal, otherwise ARM the notifier.
     ///
     /// The arming MUST happen here, while the read lock is still held.
-    /// [`Notify::notify_waiters`] stores no permit and only wakes `Notified` futures that already
-    /// EXIST when it fires, and `Notify::notified_owned` snapshots the notifier's
-    /// `notify_waiters` counter at CALL time — so a `Notified` created after the populate task
-    /// fired is never woken. Returning a bare `Arc<Notify>` and calling `.notified()` at the await
-    /// site left exactly that window open between releasing the read lock and creating the future:
-    /// if the populate task published and notified in it, the wakeup was dropped and the scan
-    /// awaited forever (upstream apache/iceberg-rust#2696, the same class as #2859 on the
-    /// positional-delete wait path).
+    /// [`Notify::notify_waiters`] stores no permit and wakes only `Notified` futures that already
+    /// exist. Arming after the lock drops leaves a window: a publish inside it loses the wakeup
+    /// and the scan awaits forever (upstream apache/iceberg-rust#2696).
     ///
-    /// Creating the future under the read lock closes the window: the populate task cannot fire
-    /// the notifier until it has taken the WRITE lock, which cannot be granted while this read
-    /// lock is held, so any notification necessarily follows this arming and is delivered.
+    /// Creating the future under the read lock closes that window. The populate task must take the
+    /// write lock to notify, and cannot while this read lock is held.
     fn lookup_or_arm(&self, data_file: &DataFile, seq_num: Option<i64>) -> Result<IndexLookup> {
         let guard = self.state.read().map_err(|_| {
             Error::new(
@@ -450,12 +402,9 @@ impl PopulatedDeleteFileIndex {
             let arc_ctx = Arc::new(ctx);
 
             // A deletion vector is FILE-scoped: it indexes by the data file it references, never
-            // by partition (Java `DeleteFileIndex.Builder.build` L505-506 routes
-            // POSITION_DELETES + `isDV` to `dvByPath` keyed by `referencedDataFile()`). A Puffin
-            // position delete WITHOUT a referenced data file is invalid per the Puffin spec
-            // (`referenced-data-file` is mandatory for `deletion-vector-v1`); it falls through to
-            // the partition map so the loader's DV dispatch rejects it loudly by name instead of
-            // it being silently dropped here.
+            // by partition. Java `DeleteFileIndex.Builder.build`. A Puffin position delete with no
+            // referenced data file is invalid, and falls through to the partition map. The
+            // loader's DV dispatch then rejects it by name instead of dropping it here.
             if arc_ctx.manifest_entry.content_type() == DataContentType::PositionDeletes
                 && is_deletion_vector(arc_ctx.manifest_entry.data_file())
                 && let Some(referenced_data_file) =
@@ -481,12 +430,10 @@ impl PopulatedDeleteFileIndex {
 
             let destination_map = match arc_ctx.manifest_entry.content_type() {
                 DataContentType::PositionDeletes => {
-                    // Java `DeleteFileIndex.Builder.add(Map<String, PositionDeletes>,
-                    // PartitionMap<PositionDeletes>, DeleteFile)`: a position delete with a
-                    // derivable referenced data file is keyed by that PATH, otherwise by
-                    // `(spec_id, partition)`. The two are EXCLUSIVE — indexing a file-scoped delete
-                    // in both maps would attach it to every sibling data file in its partition and
-                    // return it TWICE for the file it actually references.
+                    // Java `DeleteFileIndex.Builder.add`: a position delete with a derivable
+                    // referenced data file is keyed by that PATH, otherwise by
+                    // `(spec_id, partition)`. The two maps are EXCLUSIVE. Both would attach the
+                    // delete to every sibling in the partition and return it twice for its own.
                     if let Some(referenced_data_file) =
                         referenced_data_file_location(arc_ctx.manifest_entry.data_file())
                     {
@@ -499,20 +446,15 @@ impl PopulatedDeleteFileIndex {
                     &mut pos_deletes_by_partition
                 }
                 DataContentType::EqualityDeletes => &mut eq_deletes_by_partition,
-                // A `Data`-typed entry cannot legitimately reach the delete-file index:
-                // `TableScan::process_delete_manifest_entry` (scan/mod.rs) rejects any data-file
-                // entry found in a delete manifest before it is ever sent here. Skip it defensively
-                // rather than panicking the populate task — a panic there strands every waiting
-                // scan on the populate notifier, which would then never fire. Matching `Data`
-                // explicitly (instead of a `_` arm) also turns a future `DataContentType` variant
-                // into a compile error at this site, forcing a routing decision rather than a
-                // silent insert into the wrong map.
+                // `process_delete_manifest_entry` rejects a data-file entry in a delete manifest,
+                // so this arm is unreachable in production. Skip defensively: a panic here strands
+                // every waiting scan on a notifier that never fires. Matching `Data` explicitly
+                // also turns a new `DataContentType` variant into a compile error at this site.
                 DataContentType::Data => return,
             };
 
-            // FK2.3: nested `(spec_id → partition)` — DeleteFileContext's manifest spec id matches
-            // the lookup key `data_file.partition_spec_id` (what the pre-FK2.3 linear post-filter
-            // compared). Partition is cloned only on first insert into a bucket, not on lookup.
+            // The context's manifest spec id matches the lookup key `partition_spec_id`. The
+            // partition is cloned on first insert into a bucket, never on lookup.
             destination_map
                 .entry(arc_ctx.partition_spec_id)
                 .or_default()
@@ -521,8 +463,7 @@ impl PopulatedDeleteFileIndex {
                 .push(arc_ctx);
         });
 
-        // Sort once at build time so lookup can `partition_point` the applicable tail
-        // (Java `EqualityDeletes` / `PositionDeletes` keep seq-sorted lists + `findStartIndex`).
+        // Sort once at build time so lookup can `partition_point` the applicable tail.
         sort_deletes_by_sequence(&mut global_equality_deletes);
         for by_partition in eq_deletes_by_partition.values_mut() {
             for list in by_partition.values_mut() {
@@ -549,15 +490,12 @@ impl PopulatedDeleteFileIndex {
 
     /// Determine all the delete files that apply to the provided `DataFile`.
     ///
-    /// FALLIBLE because of the deletion-vector sequence-number validation (Java
-    /// `DeleteFileIndex.findDV` L208-214, 1.10.0-bytecode-verified): a DV attached to a data file
-    /// MUST have `dv.dataSequenceNumber() >= dataFile.dataSequenceNumber()`, or the table is
-    /// invalid and the scan must fail loud rather than silently apply the wrong DV. The lookup was
-    /// infallible before this validation landed (D1's deferred residue); the ripple was assessed
-    /// small (one production caller — `scan/context.rs`, already `Result`-returning) and the index
-    /// is the ONLY place both sequence numbers are in hand (`seq_num` = the data file's, the DV's via
-    /// its manifest entry), so the check lives here rather than at the load door (the caching loader
-    /// never receives either sequence number — `FileScanTaskDeleteFile` drops them).
+    /// # Errors
+    ///
+    /// Fails when a DV has a lower data sequence number than the data file it applies to. Java
+    /// `DeleteFileIndex.findDV` raises the same validation error. The table is invalid, and the
+    /// scan must fail loud instead of applying the wrong DV. The check lives here because the
+    /// index is the only place that holds both sequence numbers.
     fn get_deletes_for_data_file(
         &self,
         data_file: &DataFile,
@@ -565,13 +503,12 @@ impl PopulatedDeleteFileIndex {
     ) -> Result<Vec<FileScanTaskDeleteFile>> {
         let mut results = vec![];
 
-        // Global equality: seq-sorted + partition_point for `delete_seq > data_seq`.
+        // Global equality: `delete_seq > data_seq` over the seq-sorted list.
         for delete in applicable_eq_deletes(&self.global_equality_deletes, seq_num) {
             results.push(delete.as_ref().into());
         }
 
-        // FK2.3: nested `(spec_id → partition)` lookup — no post-filter linear scan on
-        // spec_id, no partition Struct clone on the hot path.
+        // Nested `(spec_id → partition)` lookup: no post-filter scan, no partition clone.
         if let Some(by_partition) = self
             .eq_deletes_by_partition
             .get(&data_file.partition_spec_id)
@@ -582,24 +519,16 @@ impl PopulatedDeleteFileIndex {
             }
         }
 
-        // A data file with a DELETION VECTOR uses the DV INSTEAD of any parquet position
-        // deletes: Java `DeleteFileIndex.forDataFile` (L156-167) returns
-        // {global eq, partition eq, dv} when `findDV` hits and only consults the
-        // position-delete maps when it does not. The DV lookup is by the data file's PATH
-        // (Java `findDV` L202-216: `dvByPath.get(dataFile.location())`) and is NOT
-        // sequence-filtered. Instead Java VALIDATES `dv.dataSequenceNumber() >= seq` (the data
-        // file's sequence number) and throws a `ValidationException` otherwise (L208-214,
-        // 1.10.0-bytecode-verified) — a DV must never be attached to a data file from a LATER
-        // sequence number. That validation now lives HERE (was D1's deferred residue): the index
-        // is the only place both sequence numbers are in hand. Duplicate DVs for one path (Java's
-        // other ValidationException, L528-535) are all returned so the loader rejects them loudly.
+        // A data file with a DELETION VECTOR uses the DV INSTEAD of any parquet position delete.
+        // Java `DeleteFileIndex.forDataFile` consults the position-delete maps only when `findDV`
+        // misses. The DV lookup is by path and is NOT sequence-filtered. Java validates
+        // `dv_seq >= data_seq` instead, so a DV never attaches to later data. Duplicate DVs for
+        // one path are all returned, so the loader rejects them loudly.
         if let Some(dvs) = self.dv_by_path.get(data_file.file_path()) {
             for delete in dvs {
-                // Java `findDV` L208-214: a DV's data sequence number must be >= the data file's.
-                // `seq_num` is the data file's data sequence number (Java `seq`); the DV's is its
-                // manifest entry's. A `None` data-file seq (only in unit fixtures that pass
-                // `seq_num = None`) cannot be violated, so it is treated as valid — Java always has
-                // a concrete `seq`. The mirror is the EXACT 1.10.0 message.
+                // Java `findDV`: a DV's data sequence number must be >= the data file's. A `None`
+                // data-file seq occurs only in unit fixtures and cannot be violated. The message
+                // mirrors Java exactly.
                 if let Some(data_seq) = seq_num
                     && let Some(dv_seq) = delete.manifest_entry.sequence_number()
                     && dv_seq < data_seq
@@ -616,9 +545,8 @@ impl PopulatedDeleteFileIndex {
             return Ok(results);
         }
 
-        // Java `findPosPartitionDeletes` (L304-328): the `(spec_id, partition)`-keyed position
-        // deletes — the ones with no derivable referenced data file. Seq-sorted +
-        // `partition_point` for `delete_seq >= data_seq`.
+        // Java `findPosPartitionDeletes`: the `(spec_id, partition)`-keyed position deletes, the
+        // ones with no derivable referenced data file. Applicable when `delete_seq >= data_seq`.
         if let Some(by_partition) = self
             .pos_deletes_by_partition
             .get(&data_file.partition_spec_id)
@@ -629,16 +557,11 @@ impl PopulatedDeleteFileIndex {
             }
         }
 
-        // Java `findPathDeletes` (L355-377): the FILE-SCOPED position deletes, looked up by the data
-        // file's LOCATION and filtered ONLY by sequence number — `posDeletesByPath.get(dataFile
-        // .location())` then `PositionDeletes.filter(seq)`. There is deliberately NO spec condition
-        // and NO partition condition here: the delete names this exact file, so the partition tuple
-        // it happens to be stamped with is irrelevant (and is routinely a different spec's — Spark's
-        // default write granularity is FILE). The sequence rule is the same `>=` as the partition
-        // map (Java `findStartIndex` keeps `delete_seq >= data_seq`); only the KEY changes.
-        //
-        // Appended after the partition-keyed deletes to mirror Java's
-        // `concat(global, eqPartition, posPartition, posPath)` result order.
+        // Java `findPathDeletes`: the FILE-SCOPED position deletes, looked up by the data file's
+        // LOCATION and filtered only by sequence number. There is deliberately NO spec condition
+        // and NO partition condition. The delete names this exact file, so the partition tuple it
+        // carries is irrelevant, and is routinely another spec's. Only the KEY changes; the `>=`
+        // sequence rule is the same. The append order mirrors Java's result order.
         if let Some(deletes) = self.pos_deletes_by_path.get(data_file.file_path()) {
             for delete in applicable_pos_deletes(deletes, seq_num) {
                 results.push(delete.as_ref().into());

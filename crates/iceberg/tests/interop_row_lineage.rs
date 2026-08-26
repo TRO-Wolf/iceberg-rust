@@ -176,10 +176,10 @@ async fn rust_reads_java_assigned_row_lineage() {
 
 /// D1 UPGRADED — the fork's view of a V2 table Java upgraded to V3 and then rewrote.
 ///
-/// This is the only fixture either side can build in which a live EXISTING entry reaches the reader
-/// with NO stored `first_row_id`: the rewrite reads the V2 manifest, whose range is absent, so every
-/// entry is nulled before the survivor is written forward. It is therefore the only leg that can
-/// observe the reader's DELETED-vs-ADDED skip test.
+/// This is the only fixture in which a live EXISTING entry reaches the reader with NO stored
+/// `first_row_id`. The rewrite reads the V2 manifest, whose range is absent, so every entry is
+/// nulled before the survivor is written forward. It is the only leg that observes the reader's
+/// deleted-against-added skip test.
 #[tokio::test]
 async fn rust_reads_java_upgraded_row_lineage() {
     let Some(dir) = fixture_dir(D1_ENV) else {
@@ -370,10 +370,10 @@ async fn row_lineage_write_gen() {
 /// D2 GEN UPGRADED — the fork's own V2-upgraded-to-V3 table, for Java to read back.
 ///
 /// Mirrors the Java `upgraded` fixture: two V2 appends, an upgrade, then a rewrite as the FIRST V3
-/// commit so the survivor is written forward with no stored `first_row_id`. Two appends, not one, so
-/// two carried-forward data manifests reach the V3 commit still needing a range and each still
-/// holding live rows — their relative order is what decides which takes which. The four record
-/// counts are distinct so a swap survives the cross-check's name stripping.
+/// commit, so the survivor is written forward with no stored `first_row_id`. Two appends, not one,
+/// so two carried-forward manifests reach the V3 commit still needing a range. Their relative order
+/// decides which takes which. The four record counts are distinct, so a swap survives the
+/// cross-check's name stripping.
 #[tokio::test]
 async fn row_lineage_upgraded_write_gen() {
     let Some(dir) = fixture_dir(D2_ENV) else {
@@ -472,9 +472,9 @@ async fn row_lineage_upgraded_write_gen() {
 /// Erase every file NAME from a lineage view, then RE-SORT the file list.
 ///
 /// The name is the one field that legitimately differs: Java names by ordinal, the fork by uuid.
-/// Both sides sort their file list by the rendered string, so the name they are about to lose is
-/// what ordered it. Comparing the stripped lists in place would therefore rest on the fork's uuids
-/// happening to sort in creation order; re-sorting compares the lineage numbers as a multiset.
+/// Both sides sort by the rendered string, so the name they lose is what ordered the list.
+/// Comparing in place would rest on the fork's uuids sorting in creation order. Re-sorting compares
+/// the lineage numbers as a multiset.
 fn strip_names(view: &str) -> String {
     let mut out = String::with_capacity(view.len());
     let mut rest = view;
@@ -512,10 +512,9 @@ fn resort_file_list(view: &str) -> String {
 /// The cross-check that closes D2's circularity.
 ///
 /// D2 proves Java can READ what the fork wrote, because both sides render the same table. It
-/// cannot prove the fork ASSIGNS what Java assigns — a wrong-but-consistent writer passes it. This
-/// compares the two INDEPENDENTLY produced views of the SAME logical chain (two files in one
-/// append, then a third) with the file names stripped, so only the lineage numbers remain: the
-/// metadata counter, the snapshot range, each manifest's range, and each file's inherited id.
+/// cannot prove the fork ASSIGNS what Java assigns; a wrong-but-consistent writer passes it. This
+/// compares two INDEPENDENTLY produced views of the same logical chain with the names stripped, so
+/// only the lineage numbers remain.
 #[tokio::test]
 async fn rust_assigns_the_same_row_ids_java_does() {
     let (Some(d1), Some(d2)) = (fixture_dir(D1_ENV), fixture_dir(D2_ENV)) else {
@@ -526,9 +525,7 @@ async fn rust_assigns_the_same_row_ids_java_does() {
     let java = fs::read_to_string(d1.join("java_row_lineage.json")).expect("read the Java view");
     let rust =
         fs::read_to_string(d2.join("rust_row_lineage_expected.json")).expect("read the Rust view");
-    // Strip BEFORE any ordering matters: the lists arrive sorted by the file name, which this
-    // erases, so comparing them as-is would rest on the fork's uuid names happening to sort in
-    // creation order.
+    // Strip BEFORE ordering matters. The lists arrive sorted by the file name, which this erases.
     let java_numbers = strip_names(java.trim());
     let rust_numbers = strip_names(rust.trim());
 

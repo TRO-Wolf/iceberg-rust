@@ -15,34 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! MAINTENANCE `RewritePositionDeleteFiles` interop — the PARQUET position-delete COMPACTION action proven
-//! against Java's OWN merge-on-read read WITHOUT Spark (the real Java action is a Spark-surface class NOT on
-//! the iceberg-core oracle classpath, and Java cannot DRIVE the compaction). The proof is therefore the
-//! corruption-class READ-IDENTITY claim, in the GEN direction only:
-//!
-//! - **Rust GEN (the only direction):** Rust writes a PRE table (data + TWO parquet POSITION-delete files
-//!   masking a known subset) to `<gen_dir>/rust_table`, then builds a SEPARATE identical table, runs
-//!   `RewritePositionDeleteFiles` (many parquet pos-deletes → ONE compacted pos-delete), and writes the
-//!   POST table to `<gen_dir>/rust_table_compacted`. Java's `verify-interop-rewrite-pos-deletes` then loads
-//!   BOTH tables, reads each via `IcebergGenerics` (applying whichever delete files the table carries), and
-//!   asserts the live row sets are IDENTICAL — AND that the PRE table carried MORE position-delete files
-//!   than the POST table (so the compaction genuinely fused files, not merely no-op'd). This is the
-//!   no-Spark corroboration that the compacted position delete masks EXACTLY the rows the original
-//!   position deletes masked, with the data sequence number preserved (a wrong seq-stamp would resurrect or
-//!   over-mask a row and break read identity).
-//!
-//! ANTI-CIRCULAR: the masked subset + the expected live set are hand-declared HERE and INDEPENDENTLY in
-//! the Java oracle from the fixture definition, never from the other engine's output.
-//!
-//! THE V3 LEG (F-7 U3) adds a second pair: `<gen_dir>/rust_table_v3` is the same PRE world upgraded to
-//! format version 3, still carrying its four legacy PARQUET position deletes, and
-//! `<gen_dir>/rust_table_v3_dv` is that world after the action converted them into Puffin DELETION
-//! VECTORS. Java reads both and asserts identical live rows plus the conversion shape. ENGINE-FIRST,
-//! not a Java-parity flip: `iceberg-core` 1.10.0 has no runner. The SPARK action does convert on
-//! v3, but `iceberg-spark` is outside this fork's parity envelope — see GAP_MATRIX row R136.
-//!
-//! GATED on `ICEBERG_INTEROP_REWRITE_POS_DELETES_GEN_DIR` (unset ⇒ a clean no-op; the offline `cargo test`
-//! gate stays green). `dev/java-interop/run-interop-rewrite-pos-deletes.sh` is the driver.
+//! `RewritePositionDeleteFiles` interop, in the GEN direction only. Java has no runnable oracle
+//! here: the real action is a Spark class, absent from the `iceberg-core` classpath. The claim is
+//! read identity. Rust writes a PRE table, then a POST table compacted from an identical world.
+//! Java reads both and asserts equal live rows, with PRE holding more position-delete files than
+//! POST. A wrong data sequence number resurrects or over-masks a row and breaks that identity.
+//! The masked subset and the expected live set are declared here and again in the Java oracle,
+//! never taken from the other engine. The V3 leg repeats the pair after the action converts the
+//! parquet position deletes into Puffin deletion vectors. An unset
+//! `ICEBERG_INTEROP_REWRITE_POS_DELETES_GEN_DIR` makes every test a no-op.
+//! `dev/java-interop/run-interop-rewrite-pos-deletes.sh` drives it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -259,9 +241,8 @@ async fn add_deletes(catalog: &impl Catalog, table: &Table, deletes: Vec<DataFil
     tx.commit(catalog).await.expect("commit row_delta")
 }
 
-/// Build the PRE world: two partitions (cat=A id 100/120/130, cat=B id 200/220/230) at seq 1; then TWO
-/// separate position-delete files per partition (in separate commits, so they share a partition group
-/// but carry different seqs), masking pos 1 (id=120 / id=220).
+/// Build the PRE world: two partitions at seq 1, then two position-delete files per partition.
+/// Separate commits give the two files different sequence numbers inside one partition group.
 async fn build_pre_world(catalog: &impl Catalog, table: Table) -> Table {
     let a = write_data_file(&table, "A", &[(100, 10), (120, 20), (130, 30)]).await;
     let b = write_data_file(&table, "B", &[(200, 10), (220, 20), (230, 30)]).await;
@@ -274,9 +255,8 @@ async fn build_pre_world(catalog: &impl Catalog, table: Table) -> Table {
     let pd_b1 = write_position_delete(&table, "B", &[(&b_path, 1)]).await;
     let table = add_deletes(catalog, &table, vec![pd_a1, pd_b1]).await;
 
-    // Second pos-delete per partition (seq 3): DUPLICATE the same masked positions (Java does not dedup
-    // within a group — the reader bitmap dedups), so the group has TWO files to compact while the masked
-    // set is unchanged.
+    // Duplicate the masked positions. Java does not dedup within a group; the reader bitmap does.
+    // The group then holds two files to compact and the masked set does not change.
     let pd_a2 = write_position_delete(&table, "A", &[(&a_path, 1)]).await;
     let pd_b2 = write_position_delete(&table, "B", &[(&b_path, 1)]).await;
     add_deletes(catalog, &table, vec![pd_a2, pd_b2]).await
@@ -510,24 +490,12 @@ async fn test_rewrite_pos_deletes_gen() {
     // Build a SEPARATE compacted table so Java can read BOTH the PRE and POST tables.
     let compacted = create_table(&catalog, "rust_table_compacted", &compacted_location).await;
     let compacted = build_pre_world(&catalog, compacted).await;
-    // `.min_input_files(2)` — the ONE knob this suite needs after the size-based admission gate
-    // landed. This oracle's subject is READ IDENTITY across a compaction, not admission, so the
-    // fixture is deliberately NOT grown (growing it would re-open the Java oracle recording, and
-    // `RewritePosDeleteOracle.expectedLiveIds()` is a golden).
-    //
-    // WHY 2. Each partition carries exactly TWO ~1.4 KB position-delete files. Both are far below
-    // the resolved `min_file_size_bytes` (50331648), so both are candidates; both fit one bin under
-    // the 100 GiB group default. At the gate, of the three clauses only
-    // `enough_input_files = size > 1 && size >= min_input_files` can fire — `enough_content` needs
-    // the bin's ~2.8 KB to exceed the 67108864 target and `too_much_content` needs it to exceed the
-    // 120795955 max, and neither can. So the bin is admitted iff `2 >= min_input_files`: the
-    // admitting set is exactly `{1, 2}` (0 is rejected outright by the `min_input_files > 0`
-    // precondition), and at Java's default of 5 the bin is DECLINED — the regression this knob
-    // repairs. 2 is the MINIMUM ADMITTING RELAXATION of the gate: it is the largest floor that
-    // still admits, so it weakens the shipped default by the smallest amount that restores the
-    // pre-gate behaviour. `min_input_files(1)` would also green this suite, but it would additionally
-    // switch off the `size >= min_input_files` conjunct for every bin, which this oracle has no
-    // business doing.
+    // `min_input_files(2)`: each partition holds two ~1.4 KB position deletes, so only the
+    // `size >= min_input_files` clause of the admission gate can fire. The bin is admitted iff
+    // `2 >= min_input_files`, and Java's default of 5 declines it. 2 is the largest floor that
+    // still admits, so it weakens the shipped default the least. `1` also passes, but it switches
+    // that clause off for every bin. Growing the fixture instead would re-open the golden
+    // `RewritePosDeleteOracle.expectedLiveIds()`.
     let result = RewritePositionDeleteFiles::new(compacted.clone())
         .min_input_files(2)
         .execute(&catalog)
@@ -570,10 +538,8 @@ async fn test_rewrite_pos_deletes_gen() {
         "GEN sanity: compaction must FUSE files (POST {post_pos} < PRE {pre_pos})"
     );
 
-    // A THIRD table holding the SAME data with NO deletes — used ONLY by the shell sabotage battery as a
-    // read-identity breaker (swapping it for the compacted POST metadata makes POST read the full id set
-    // {100,120,130,200,220,230} != PRE, so the read-identity leg must fail closed). Never read by the
-    // verify path itself.
+    // A third table with the same data and no deletes. The shell sabotage battery swaps it for the
+    // POST metadata, so the read-identity leg must fail closed. The verify path never reads it.
     let nodeletes_location = format!("{warehouse}/rust_table_nodeletes");
     let nodeletes = create_table(&catalog, "rust_table_nodeletes", &nodeletes_location).await;
     let a = write_data_file(&nodeletes, "A", &[(100, 10), (120, 20), (130, 30)]).await;

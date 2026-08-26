@@ -15,14 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! This module contains transaction api.
+//! The transaction API: make changes to an existing table. A transaction can also produce new
+//! manifest files.
 //!
-//! The transaction API enables changes to be made to an existing table.
-//!
-//! Note that this may also have side effects, such as producing new manifest
-//! files.
-//!
-//! Below is a basic example using the "fast-append" action:
+//! A basic example using the fast-append action:
 //!
 //! ```ignore
 //! use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -50,17 +46,13 @@
 //!
 //! # Engine-facing action types
 //!
-//! Every [`Transaction`] factory method hands out a concrete action builder — [`FastAppendAction`],
-//! [`MergeAppendAction`], [`OverwriteFilesAction`], [`DeleteFilesAction`], [`ReplacePartitionsAction`],
-//! [`RewriteFilesAction`], [`RowDeltaAction`], [`ManageSnapshotsAction`], [`CherryPickAction`] — and
-//! each is re-exported from this module so an external engine can NAME it (store it in a field, pass
-//! it to a helper, use it as a trait bound), not merely chain methods off the factory call.
+//! Every [`Transaction`] factory method hands out a concrete action builder, and each is
+//! re-exported here so an external engine can NAME it: store it in a field, pass it to a helper, or
+//! use it as a trait bound.
 //!
-//! For row-level DML (`DELETE` / `UPDATE` / `MERGE`), the merge-on-read commit is
-//! [`Transaction::row_delta`]: an engine produces position/equality delete files or deletion vectors
-//! with the [`writer`](crate::writer) builders, then commits them via [`RowDeltaAction::add_deletes`]
-//! in a single snapshot. See [`RowDeltaAction`] for the format-version gating and conflict-validation
-//! contract.
+//! For row-level DML the merge-on-read commit is [`Transaction::row_delta`]. An engine writes
+//! delete files with the [`writer`](crate::writer) builders, then commits them through
+//! [`RowDeltaAction::add_deletes`] in one snapshot.
 
 /// The `ApplyTransactionAction` trait provides an `apply` method
 /// that allows users to apply a transaction action to a `Transaction`.
@@ -216,26 +208,19 @@ impl Transaction {
         FastAppendAction::new()
     }
 
-    /// Creates a merge-append action: append data files in one `Operation::Append` snapshot (exactly like
-    /// [`Self::fast_append`]) and then MERGE the resulting manifest list into a minimal number of
-    /// manifests (Java `MergeAppend`). Java's `Table.newAppend()` returns this MERGING producer, whereas
-    /// `newFastAppend()` returns the non-merging one this fork exposes as [`Self::fast_append`].
+    /// Creates a merge-append action. It appends data files exactly like [`Self::fast_append`], then
+    /// MERGES the manifest list into a minimal number of manifests. Java `MergeAppend`, which
+    /// `Table.newAppend()` returns.
     ///
-    /// The merge honors three table properties (read at commit time, Java `ManifestMergeManager`):
-    /// - `commit.manifest-merge.enabled` (default `true`) — when `false`, the manifest list is left as-is
-    ///   (the action then behaves like a fast append).
-    /// - `commit.manifest.min-count-to-merge` (default `100`) — the bin holding this commit's NEW added
-    ///   manifest is merged only once it accumulates at least this many manifests.
-    /// - `commit.manifest.target-size-bytes` (default 8 MB) — the bin-packing target weight (by manifest
-    ///   length).
+    /// The merge reads three table properties at commit time: `commit.manifest-merge.enabled`
+    /// (default `true`; `false` behaves like a fast append), `commit.manifest.min-count-to-merge`
+    /// (default 100), and `commit.manifest.target-size-bytes` (default 8 MB).
     ///
-    /// Merged manifests preserve every carried-forward entry's provenance (original snapshot id + data /
-    /// file sequence numbers, status `Existing`); this commit's added entries stay `Added` and re-inherit
-    /// the new snapshot's sequence number. The live file set is identical to the equivalent fast append.
+    /// Merged manifests preserve every carried-forward entry's provenance. This commit's added
+    /// entries stay `Added` and re-inherit the new snapshot's sequence number. The live file set
+    /// matches the equivalent fast append.
     ///
-    /// **Deferred (vs Java):** delete-manifest merging (delete manifests are carried forward unchanged),
-    /// `appendManifest`, and the retry cache / orphan cleanup. See the
-    /// [`merge_append`](crate::transaction) module for the full Java contract and deviations.
+    /// **Deferred against Java:** delete-manifest merging, `appendManifest`, and the retry cache.
     pub fn merge_append(&self) -> MergeAppendAction {
         MergeAppendAction::new()
     }
@@ -268,14 +253,11 @@ impl Transaction {
     /// data files with a new set in one `Replace` snapshot (Java `BaseRewriteFiles`). The files to delete
     /// must be non-empty and present in the current snapshot. Rewriting DELETE files is not yet supported.
     ///
-    /// **Preserving outstanding equality deletes:** by default the added files take a fresh, higher data
-    /// sequence number, so an outstanding merge-on-read EQUALITY delete (which applies only to data with a
-    /// strictly lower data seq) stops applying to them and silently resurrects deleted rows. Call
-    /// [`RewriteFilesAction::data_sequence_number`] with the (max) data seq of the replaced files to preserve
-    /// the seq so the deletes still apply (Java `RewriteFiles.dataSequenceNumber`). Without it this is the
-    /// caller's responsibility — exactly as in Java, which has no guard against the hazard.
-    /// [`RewriteFilesAction::validate`] rejects a commit when a concurrent row-level delete conflicts with a
-    /// replaced data file (Java `validateNoNewDeletesForDataFiles`).
+    /// **Preserving outstanding equality deletes.** By default the added files take a fresh, higher
+    /// data sequence number, so an outstanding equality delete stops applying and silently
+    /// resurrects rows. Call [`RewriteFilesAction::data_sequence_number`] with the max data seq of
+    /// the replaced files. Without it this is the caller's responsibility, as in Java, which has no
+    /// guard either.
     pub fn rewrite_files(
         &self,
         files_to_delete: impl IntoIterator<Item = crate::spec::DataFile>,
@@ -304,14 +286,10 @@ impl Transaction {
     /// recorded operation is dynamic, matching Java `BaseRowDelta`: adds-data-only → `Append`,
     /// adds-deletes-only → `Delete`, both → `Overwrite`.
     ///
-    /// Added delete files are FORMAT-VERSION gated at commit (Java `validateDeleteFileForVersion`):
-    /// V1 rejects all deletes, V2 rejects Puffin deletion vectors, V3 REQUIRES position deletes to be
-    /// deletion vectors; equality deletes are exempt at every version. Opt-in concurrent-commit
-    /// conflict validation (`validate_no_conflicting_data_files` / `validate_no_conflicting_delete_files`
-    /// / `validate_data_files_exist`) and the always-on deletion-vector conflict check
-    /// (`validateAddedDVs`) are supported; the previous-deletes MERGE for DVs is deferred — a DV add
-    /// for a data file with a live position-scoped delete is rejected (the fresh-DV-only door, see
-    /// [`row_delta`](crate::transaction::row_delta)).
+    /// Added delete files are FORMAT-VERSION gated at commit: V1 rejects all deletes, V2 rejects
+    /// Puffin deletion vectors, and V3 REQUIRES position deletes to be deletion vectors. Equality
+    /// deletes are exempt at every version. The previous-deletes MERGE for DVs is deferred, so a DV
+    /// add for a data file with a live position-scoped delete is rejected.
     pub fn row_delta(&self) -> RowDeltaAction {
         RowDeltaAction::new()
     }
@@ -326,20 +304,14 @@ impl Transaction {
         ManageSnapshotsAction::new()
     }
 
-    /// Creates an expire-snapshots action — the METADATA retention semantics of Java
-    /// `ExpireSnapshots` (`Table.expireSnapshots()` / core `RemoveSnapshots`): per-branch
-    /// age+count retention, branch/tag `max_ref_age_ms` ref expiry (`main` never expires),
-    /// unreferenced-snapshot retention, and explicit [`ExpireSnapshotsAction::expire_snapshot_id`],
-    /// honoring the `history.expire.*` table properties.
+    /// Creates an expire-snapshots action: the METADATA retention semantics of Java
+    /// `ExpireSnapshots`. It covers per-branch age and count retention, ref expiry where `main`
+    /// never expires, unreferenced-snapshot retention, and explicit
+    /// [`ExpireSnapshotsAction::expire_snapshot_id`].
     ///
-    /// **THIS ACTION NEVER DELETES FILES.** It emits `RemoveSnapshots` / `RemoveSnapshotRef`
-    /// updates and nothing else. Physical cleanup of newly-unreachable manifest lists /
-    /// manifests / content files / statistics files (Java's `cleanExpiredFiles(true)` default,
-    /// `ReachableFileCleanup`) is the EXPLICIT post-commit step [`ExpireSnapshotsCleanup`] —
-    /// run it via [`ExpireSnapshotsCleanup::commit_and_clean`], which commits the transaction
-    /// and cleans only on success (the Java `RemoveSnapshots.commit()` ordering). See
-    /// [`expire_snapshots`](crate::transaction::expire_snapshots) for the retention contract
-    /// and [`expire_cleanup`](crate::transaction::expire_cleanup) for the cleanup contract.
+    /// **THIS ACTION NEVER DELETES FILES.** Physical cleanup is the explicit post-commit step
+    /// [`ExpireSnapshotsCleanup`]. Run it through [`ExpireSnapshotsCleanup::commit_and_clean`],
+    /// which commits the transaction and cleans only on success.
     pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
         ExpireSnapshotsAction::new()
     }
@@ -387,16 +359,13 @@ impl Transaction {
 
     /// Commit transaction.
     ///
-    /// An [`ErrorKind::CommitStateUnknown`](crate::ErrorKind::CommitStateUnknown) outcome (the
-    /// update request may have durably landed but the response was lost) is never retried;
-    /// instead it is RECONCILED by re-reading the catalog (Java
-    /// `BaseMetastoreOperations.checkCommitStatus`, see [`commit_status`]): if the attempted
-    /// commit is found in the reloaded metadata — even buried under later third-party commits —
-    /// the commit is treated as SUCCESS and the reloaded table is returned (no re-apply, no
-    /// duplicate); otherwise the original unknown-outcome error surfaces (Java's production
-    /// non-strict semantics: an absent-after-refresh commit stays UNKNOWN, because the in-flight
-    /// request may still land after the check). Commits that add no snapshot carry no
-    /// reconciliation evidence and surface the unknown outcome as-is.
+    /// An [`ErrorKind::CommitStateUnknown`](crate::ErrorKind::CommitStateUnknown) outcome is never
+    /// retried. It is RECONCILED by re-reading the catalog. Java
+    /// `BaseMetastoreOperations.checkCommitStatus`. Finding the attempted commit in the reloaded
+    /// metadata, even under later third-party commits, treats it as SUCCESS and returns the
+    /// reloaded table. Otherwise the original error surfaces, because the in-flight request may
+    /// still land after the check. A commit that adds no snapshot carries no evidence to
+    /// reconcile.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         if self.actions.is_empty() {
             // nothing to commit
@@ -439,22 +408,15 @@ impl Transaction {
         }
     }
 
-    /// Resolve an [`ErrorKind::CommitStateUnknown`](crate::ErrorKind::CommitStateUnknown) commit
-    /// outcome by re-reading the catalog — the Java `checkCommitStatus` composition at this
-    /// fork's catalog-agnostic seam (`GlueTableOperations.doCommit` L164-191 hosts it per-catalog
-    /// in Java; here every catalog's unknown outcome funnels through `Transaction::commit`, so
-    /// REST/SQL unknowns are reconciled too — Java's REST/JDBC ops never reconcile, and this is
-    /// a strictly-outcome-improving, read-only divergence).
+    /// Resolve a [`ErrorKind::CommitStateUnknown`](crate::ErrorKind::CommitStateUnknown) outcome by
+    /// re-reading the catalog. Java hosts `checkCommitStatus` per catalog; this fork funnels every
+    /// catalog through one seam, so REST and SQL unknowns reconcile too. That is a read-only,
+    /// outcome-improving divergence.
     ///
-    /// - **Landed** ⇒ `Ok` with the reloaded table (Java `CommitStatus.SUCCESS` swallows the
-    ///   persist failure). No re-apply — the caller's commit already stands.
-    /// - **Absent after a successful refresh** ⇒ the original error surfaces UNCHANGED: Java's
-    ///   production path converts strict-`FAILURE` to `UNKNOWN`
-    ///   (`BaseMetastoreOperations.checkCommitStatus` L71-78, bytecode offsets 11-34) because the
-    ///   in-flight request may still land after the check — declaring failure here and letting
-    ///   the caller re-run is the double-commit corruption class.
-    /// - **Still unknown** (refreshes kept failing) ⇒ the original error surfaces unchanged
-    ///   (Java `CommitStateUnknownException(persistFailure)` — the original failure is the cause).
+    /// - **Landed**: `Ok` with the reloaded table. No re-apply, because the commit already stands.
+    /// - **Absent after a successful refresh**: the original error surfaces UNCHANGED. The
+    ///   in-flight request may still land, so declaring failure invites a double commit.
+    /// - **Still unknown**: the original error surfaces unchanged.
     async fn reconcile_unknown_commit_outcome(
         self,
         catalog: &dyn Catalog,
@@ -1051,29 +1013,20 @@ mod tests {
         }
     }
 
-    /// CROWN JEWEL (GAP_MATRIX row R157). Risk: an UNKNOWN-outcome commit failure (the update
-    /// request durably LANDED but the response was lost) is either auto-RETRIED — `do_commit`
-    /// re-applies the same action on a refreshed base that already CONTAINS attempt #1's
-    /// snapshot, appending the same `DataFile` twice (duplicate rows) — or surfaced UNRESOLVED,
-    /// forcing the caller into manual reconciliation for a commit that in fact succeeded. Java
-    /// contract: `SnapshotProducer.commit()` retries ONLY `CommitFailedException`
-    /// (`onlyRetryOn(CommitFailedException.class)`) and rethrows `CommitStateUnknownException`
-    /// ahead of the cleanup catch; the metastore ops layer then RECONCILES the unknown by
-    /// re-reading the catalog (`BaseMetastoreOperations.checkCommitStatus`, invoked from
-    /// `GlueTableOperations.doCommit` L174) and swallows the failure on `CommitStatus.SUCCESS`
-    /// — the commit stands, nothing is re-applied.
+    /// Risk: an UNKNOWN-outcome commit failure is either auto-RETRIED, which re-applies the action
+    /// on a base that already contains attempt one's snapshot and duplicates the rows, or surfaced
+    /// unresolved, which forces manual reconciliation for a commit that succeeded. Java retries only
+    /// `CommitFailedException`, rethrows `CommitStateUnknownException`, and reconciles it by
+    /// re-reading the catalog.
     ///
-    /// Pins, on the OBSERVABLE post-commit state of a real in-memory catalog:
-    /// 1. NO retry and NO re-apply: exactly ONE `update_table` call, and the commit resolves
-    ///    `Ok` via reconciliation (a mutated retry-on-unknown OR re-apply-on-landed makes the
-    ///    call count 2 and doubles the snapshot);
-    /// 2. the table is NOT double-committed: exactly one new snapshot, and the appended file
-    ///    appears exactly ONCE in the returned table's live manifest set;
-    /// 3. NO cleanup ran on the unknown branch: the attempt's manifest list + manifest files
-    ///    are still readable (Java skips `cleanAll` for `CommitStateUnknownException`; this
-    ///    fork's commit path must not INTRODUCE deletion on this branch);
-    /// 4. the reconciliation is OBSERVABLE: exactly one extra `load_table` beyond `do_commit`'s
-    ///    refresh.
+    /// Pins, on the observable post-commit state of a real in-memory catalog:
+    ///
+    /// 1. NO retry and NO re-apply: exactly one `update_table` call, and the commit resolves `Ok`.
+    ///    Either mutation makes the call count 2 and doubles the snapshot.
+    /// 2. The table is not double-committed: one new snapshot, and the file appears exactly once.
+    /// 3. NO cleanup ran on the unknown branch: the attempt's manifest list and manifests are still
+    ///    readable. Java skips `cleanAll` here, and this path must not introduce deletion.
+    /// 4. The reconciliation is observable: exactly one extra `load_table`.
     #[tokio::test]
     async fn test_unknown_outcome_landed_commit_reconciles_to_success_without_reapply() {
         use crate::memory::tests::new_memory_catalog;
@@ -1269,19 +1222,14 @@ mod tests {
         (table, data_file, appended_file_path)
     }
 
-    /// Risk (GAP_MATRIX row R157 reconciliation): the landed check compares only the CURRENT
-    /// snapshot pointer, so a commit that landed but was immediately BURIED under a third-party
-    /// commit reads as absent — the caller is told "unknown" (or worse, retries) for a commit
-    /// that succeeded. Java searches the metadata-log HISTORY for exactly this window
-    /// (`BaseMetastoreOperations.checkCommitStatus` javadoc: "all the previous locations must
-    /// also be searched on the chance that a second committer was able to successfully commit on
-    /// top of our commit"); the Rust equivalent searches the reloaded snapshot SET for the
-    /// attempted snapshot id.
+    /// Risk: a landed check that compares only the CURRENT snapshot pointer reads a commit BURIED
+    /// under a third-party commit as absent, so the caller is told "unknown" for a commit that
+    /// succeeded. Java searches the metadata-log history for exactly this window. The Rust
+    /// equivalent searches the reloaded snapshot SET for the attempted snapshot id.
     ///
-    /// Shape: our `update_table` durably lands, then a CONCURRENT writer commits ANOTHER
-    /// fast-append on top (through the real catalog) before the lost response is reconciled. The
-    /// reloaded current pointer is the concurrent writer's snapshot, ours is its parent — and the
-    /// commit must still resolve LANDED with no re-apply.
+    /// Shape: `update_table` durably lands, then a CONCURRENT writer commits another fast-append on
+    /// top before the lost response is reconciled. The reloaded pointer is the concurrent writer's
+    /// snapshot and ours is its parent, and the commit must still resolve LANDED with no re-apply.
     #[tokio::test]
     async fn test_unknown_outcome_commit_buried_by_concurrent_writer_still_reconciles_landed() {
         use crate::memory::tests::new_memory_catalog;
