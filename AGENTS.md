@@ -39,9 +39,9 @@ These three are the whole list. Nothing else is an exception, and "it would be h
 one.
 
 1. **Doc comments the compiler demands.** `crates/iceberg/src/lib.rs` sets
-   `#![deny(missing_docs)]`, so a public item without a doc comment does not build. Write the
-   minimum that compiles — one line stating what the item is. Not a paragraph, not a rationale,
-   not an example.
+   `#![deny(missing_docs)]`, so a public item without a doc comment does not build.
+   **WRITE THE MINIMUM THAT COMPILES. ONE LINE STATING WHAT THE ITEM IS. NOT A PARAGRAPH. NOT A
+   RATIONALE. NOT AN EXAMPLE. ONE LINE.**
 2. **The ASF license header.** It is a comment, CI enforces it (skywalking-eyes,
    `.licenserc.yaml`), and a file without it fails. Copy it verbatim from a sibling file.
 3. **Markdown.** Minor comments and ordinary prose in `.md` files are allowed. The ban is about
