@@ -664,6 +664,7 @@ fn datum_decimal_bytes_accept_java_legal_metadata_and_reject_precision_over_38()
 ///
 /// The mutations this discriminates: restore the `i128_to_be_bytes_min` canonical check in
 /// `Datum::try_from_bytes`, or drop the empty-buffer guard beside it.
+/// Live-probe transcript: [`task/spec-decode-evidence.md`].
 #[test]
 fn datum_decimal_byte_decode_accepts_non_minimal_encodings_like_java() {
     let decimal_9_2 = PrimitiveType::Decimal {
