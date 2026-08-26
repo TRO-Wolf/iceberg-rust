@@ -38,7 +38,8 @@
 //! format version 3, still carrying its four legacy PARQUET position deletes, and
 //! `<gen_dir>/rust_table_v3_dv` is that world after the action converted them into Puffin DELETION
 //! VECTORS. Java reads both and asserts identical live rows plus the conversion shape. ENGINE-FIRST,
-//! not a Java-parity flip: `iceberg-core` 1.10.0 has no runner for this action at all.
+//! not a Java-parity flip: `iceberg-core` 1.10.0 has no runner. The SPARK action does convert on
+//! v3, but `iceberg-spark` is outside this fork's parity envelope — see GAP_MATRIX row R136.
 //!
 //! GATED on `ICEBERG_INTEROP_REWRITE_POS_DELETES_GEN_DIR` (unset ⇒ a clean no-op; the offline `cargo test`
 //! gate stays green). `dev/java-interop/run-interop-rewrite-pos-deletes.sh` is the driver.

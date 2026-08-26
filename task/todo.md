@@ -33,31 +33,34 @@ How to use it (see the manuals' §1):
 
 ## ACTIVE (2026-08-25): F-7 U3 — `RewritePositionDeleteFiles` extends to format v3
 
-Branch `parity/f7-u3-rewrite-pos-deletes-v3` off `2b34ec414`. ENGINE-FIRST, not a parity flip:
-`iceberg-core` 1.10.0 ships the planner/group/result/commit-manager but the RUNNER is
-`iceberg-spark` (verified: no `Rewrite*Runner` class in the core or api jar, and the oracle pom
-depends on core/api/data/parquet/orc only). Evidence available is read-identity, not a Java oracle.
+Branch `parity/f7-u3-rewrite-pos-deletes-v3` off `2b34ec414`. ENGINE-FIRST. **Correction 2026-08-26:
+a Java counterpart DOES exist and the first pass wrongly said it did not.** It is Spark-only —
+`RewritePositionDeleteFilesSparkAction`, decoded from
+`iceberg-spark-runtime-4.0_2.13-1.10.0.jar`: `execute()` returns `EMPTY_RESULT` only when
+`TableUtil.formatVersion >= 3` (offset 66-70) AND `requiresRewriteToDVs()` is false (74-77), so on a
+v3 table still holding legacy parquet position deletes it falls through to the planner and
+`doExecute` and CONVERTS them to DVs. Not mirroring the Spark surface is a scope decision;
+`iceberg-spark` is outside this fork's core/api parity envelope. Two divergences from it are
+deliberate and argued on row R136: no size gate (V-1) and one commit per run (V-2).
 
-- [x] Version dispatch in `execute`: V1/V2 keep the bin-pack arm untouched; V3 takes a new
-      DV arm. Today V3 + parquet position deletes does not even commit — the producer's
-      `validate_delete_file_for_version` rejects a fresh parquet position delete on V3.
-- [x] Case 2: convert every live filter-matching PARQUET position delete into one Puffin DV per
-      referenced data file, merged with that data file's existing DV. No size gate: a DV is
-      file-scoped, so bin-packing has no meaning.
-- [x] The Puffin-file CLOSURE. Delete-file removal is PATH-keyed
-      (`SnapshotProducer::resolve_delete_file_paths`), so superseding one DV blob removes every
-      sibling blob in the same Puffin. Rewrite the whole Puffin when any of its DVs is superseded.
-- [x] Case 1: `Ok(zeros)` means "looked, found nothing to do". Make that TOTAL on the V3 arm —
-      every case the arm cannot express returns `Err`, so zeros can never mean "did not look".
-- [x] Hazard R114 bound (c): pass a `PartitionKey` on EVERY `DVFileWriter::delete` call, resolved
-      from the referenced data file's own live `(spec_id, partition)`. Never `with_partition_spec`,
-      never `(None, None)`.
-- [x] Tests + a V3 leg on `run-interop-rewrite-pos-deletes.sh`; GAP_MATRIX R136 cell.
+- [x] Version dispatch in `execute`: V1/V2 keep the bin-pack arm; V3 takes the DV arm.
+- [x] Case 2: one Puffin DV per referenced data file, merged with its existing DV.
+- [x] THE PUFFIN CLOSURE — path-keyed removal drags every sibling blob out of a superseded Puffin,
+      so each sibling is rewritten too (including in partitions the filter excluded).
+- [x] THE SHADOW CLOSURE — a DV shadows every position delete for its data file, so a live delete
+      the filter EXCLUDED goes inert. The run now fails closed. Repro before the fix:
+      two file-scoped deletes stamped `x=0` / `x=1` for one data file, `filter(x = 0)` →
+      `Ok {rewritten: 1, added: 1}`, live `{12}` → `{12, 11}`.
+- [x] Case 1: `Ok(zeros)` = "looked, found nothing", total WITHIN the filter's scope.
+- [x] Hazard R114 bound (c): a `PartitionKey` on every `DVFileWriter::delete` call.
+- [x] Stale positions are DROPPED, not refused — refusing dead-ended the table, since R137 keys on
+      `(spec_id, partition)` and cannot clear a delete file that still names one live data file.
+- [x] Per-DV sequence stamp pinned (the V3 twin of the bin-max pin).
+- [x] Tests + the interop V3 leg; GAP_MATRIX R136 cell.
 
-Outcome: 8 offline tests + the interop V3 leg green; 8 mutations applied one at a time, all RED.
-The merge follows the charter and is named as divergence (g) on row R136: a live DV SHADOWS a
-position delete at read time, so folding shadowed positions in can shrink the live row set on a
-table no real writer produced.
+Outcome: 11 offline V3 tests + the interop V3 leg green. Mutations applied one at a time, each RED.
+Open follow-up, not taken here: Java's rewrite writer passes `path -> null` as `loadPreviousDeletes`
+and so does not merge; the fork merges, which divergence (g) records.
 
 ---
 
