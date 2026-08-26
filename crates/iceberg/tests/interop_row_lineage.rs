@@ -174,6 +174,36 @@ async fn rust_reads_java_assigned_row_lineage() {
     );
 }
 
+/// D1 UPGRADED — the fork's view of a V2 table Java upgraded to V3 and then rewrote.
+///
+/// This is the only fixture either side can build in which a live EXISTING entry reaches the reader
+/// with NO stored `first_row_id`: the rewrite reads the V2 manifest, whose range is absent, so every
+/// entry is nulled before the survivor is written forward. It is therefore the only leg that can
+/// observe the reader's DELETED-vs-ADDED skip test.
+#[tokio::test]
+async fn rust_reads_java_upgraded_row_lineage() {
+    let Some(dir) = fixture_dir(D1_ENV) else {
+        eprintln!("{D1_ENV} unset — skipping (run dev/java-interop/run-interop-row-lineage.sh)");
+        return;
+    };
+
+    let table = load_table(
+        &dir.join("upgraded/metadata/final.metadata.json"),
+        "row_lineage_upgraded",
+    );
+    let rust_view = lineage_view(&table).await;
+    let java_view = fs::read_to_string(dir.join("java_row_lineage_upgraded.json"))
+        .expect("read java_row_lineage_upgraded.json")
+        .trim()
+        .to_string();
+
+    assert_eq!(
+        rust_view, java_view,
+        "the fork's row-lineage view of the UPGRADED Java table differs from Java's own.\n \
+         rust: {rust_view}\n java: {java_view}"
+    );
+}
+
 // ---- D2: "JAVA reads what RUST writes" ---------------------------------------------------------
 
 /// The env var naming D2's output directory, consumed by `verify-interop-row-lineage`.
@@ -289,7 +319,7 @@ async fn row_lineage_write_gen() {
     let tx = Transaction::new(&table);
     let tx = tx
         .fast_append()
-        .add_data_files(vec![file_a, file_b])
+        .add_data_files(vec![file_a.clone(), file_b])
         .apply(tx)
         .expect("apply the first fast append");
     let table = tx.commit(&catalog).await.expect("commit the first append");
@@ -298,10 +328,31 @@ async fn row_lineage_write_gen() {
     let tx = Transaction::new(&table);
     let tx = tx
         .fast_append()
-        .add_data_files(vec![file_c])
+        .add_data_files(vec![file_c.clone()])
         .apply(tx)
         .expect("apply the second fast append");
     let table = tx.commit(&catalog).await.expect("commit the second append");
+
+    // A REWRITE: file a is replaced by d. File b survives in the SAME manifest and is rewritten as
+    // an EXISTING entry, the status the append-only part of this fixture never produces.
+    let file_d = write_data_file(&table, vec![130, 140], vec!["m", "n"]).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .rewrite_files(vec![file_a], vec![file_d])
+        .apply(tx)
+        .expect("apply the rewrite");
+    let table = tx.commit(&catalog).await.expect("commit the rewrite");
+
+    // An OVERWRITE: file c is replaced by e, through the other merging producer.
+    let file_e = write_data_file(&table, vec![150, 160], vec!["o", "p"]).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .overwrite_files()
+        .add_file(file_e)
+        .delete_data_files(vec![file_c])
+        .apply(tx)
+        .expect("apply the overwrite");
+    let table = tx.commit(&catalog).await.expect("commit the overwrite");
 
     let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
     table
@@ -316,6 +367,148 @@ async fn row_lineage_write_gen() {
     println!("interop_row_lineage GEN OK — {table_location}\n  rust view: {view}");
 }
 
+/// D2 GEN UPGRADED — the fork's own V2-upgraded-to-V3 table, for Java to read back.
+///
+/// Mirrors the Java `upgraded` fixture: two V2 appends, an upgrade, then a rewrite as the FIRST V3
+/// commit so the survivor is written forward with no stored `first_row_id`. Two appends, not one, so
+/// two carried-forward data manifests reach the V3 commit still needing a range and each still
+/// holding live rows — their relative order is what decides which takes which. The four record
+/// counts are distinct so a swap survives the cross-check's name stripping.
+#[tokio::test]
+async fn row_lineage_upgraded_write_gen() {
+    let Some(dir) = fixture_dir(D2_ENV) else {
+        eprintln!("{D2_ENV} unset — skipping (run dev/java-interop/run-interop-row-lineage.sh)");
+        return;
+    };
+    fs::create_dir_all(&dir).expect("create the gen dir");
+
+    let table_location = format!("{}/rust_upgraded_table", dir.to_string_lossy());
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "memory",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+
+    let namespace = NamespaceIdent::new("interop_upgraded".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+    let creation = TableCreation::builder()
+        .name("rust_upgraded_table".to_string())
+        .location(table_location.clone())
+        .schema(row_lineage_schema())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create V2 rust_upgraded_table");
+
+    let file_f = write_data_file(&table, vec![210, 220, 230], vec!["q", "r", "s"]).await;
+    let file_g = write_data_file(&table, vec![240, 250], vec!["t", "u"]).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_f.clone(), file_g])
+        .apply(tx)
+        .expect("apply the first V2 append");
+    let table = tx
+        .commit(&catalog)
+        .await
+        .expect("commit the first V2 append");
+
+    // A SECOND V2 append, so the V3 commit below carries TWO unassigned data manifests forward.
+    let file_i = write_data_file(&table, vec![260, 270, 280, 290], vec!["v", "w", "x", "y"]).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file_i])
+        .apply(tx)
+        .expect("apply the second V2 append");
+    let table = tx
+        .commit(&catalog)
+        .await
+        .expect("commit the second V2 append");
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .upgrade_table_version()
+        .set_format_version(FormatVersion::V3)
+        .apply(tx)
+        .expect("apply the upgrade");
+    let table = tx.commit(&catalog).await.expect("commit the upgrade");
+
+    // The rewrite replaces f, leaving g live in the rewritten manifest and i live in the manifest
+    // carried forward beside it.
+    let file_h = write_data_file(&table, vec![300], vec!["z"]).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .rewrite_files(vec![file_f], vec![file_h])
+        .apply(tx)
+        .expect("apply the rewrite");
+    let table = tx.commit(&catalog).await.expect("commit the rewrite");
+
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+
+    let view = lineage_view(&table).await;
+    fs::write(dir.join("rust_row_lineage_upgraded_expected.json"), &view)
+        .expect("write rust_row_lineage_upgraded_expected.json");
+    println!("interop_row_lineage UPGRADED GEN OK — {table_location}\n  rust view: {view}");
+}
+
+/// Erase every file NAME from a lineage view, then RE-SORT the file list.
+///
+/// The name is the one field that legitimately differs: Java names by ordinal, the fork by uuid.
+/// Both sides sort their file list by the rendered string, so the name they are about to lose is
+/// what ordered it. Comparing the stripped lists in place would therefore rest on the fork's uuids
+/// happening to sort in creation order; re-sorting compares the lineage numbers as a multiset.
+fn strip_names(view: &str) -> String {
+    let mut out = String::with_capacity(view.len());
+    let mut rest = view;
+    while let Some(start) = rest.find("\"file\":\"") {
+        out.push_str(&rest[..start + "\"file\":\"".len()]);
+        rest = &rest[start + "\"file\":\"".len()..];
+        let end = rest.find('"').expect("a closing quote on the file name");
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    resort_file_list(&out)
+}
+
+/// Sort the elements of the view's `files` array. Only valid once the names are erased.
+fn resort_file_list(view: &str) -> String {
+    const OPEN: &str = "\"files\":[";
+    let start = view.find(OPEN).expect("the view carries a files array") + OPEN.len();
+    let end = view[start..].find(']').expect("the files array is closed") + start;
+    if start == end {
+        return view.to_string();
+    }
+    let inner = view[start..end]
+        .trim_start_matches('{')
+        .trim_end_matches('}');
+    let mut elements: Vec<&str> = inner.split("},{").collect();
+    elements.sort();
+    format!(
+        "{}{{{}}}{}",
+        &view[..start],
+        elements.join("},{"),
+        &view[end..]
+    )
+}
+
 /// The cross-check that closes D2's circularity.
 ///
 /// D2 proves Java can READ what the fork wrote, because both sides render the same table. It
@@ -328,21 +521,6 @@ async fn rust_assigns_the_same_row_ids_java_does() {
     let (Some(d1), Some(d2)) = (fixture_dir(D1_ENV), fixture_dir(D2_ENV)) else {
         eprintln!("{D1_ENV}/{D2_ENV} unset — skipping");
         return;
-    };
-
-    // The file NAME is the only field that legitimately differs: Java names by ordinal, the fork
-    // by uuid. Everything else is the contract under test.
-    let strip_names = |view: &str| -> String {
-        let mut out = String::with_capacity(view.len());
-        let mut rest = view;
-        while let Some(start) = rest.find("\"file\":\"") {
-            out.push_str(&rest[..start + "\"file\":\"".len()]);
-            rest = &rest[start + "\"file\":\"".len()..];
-            let end = rest.find('"').expect("a closing quote on the file name");
-            rest = &rest[end..];
-        }
-        out.push_str(rest);
-        out
     };
 
     let java = fs::read_to_string(d1.join("java_row_lineage.json")).expect("read the Java view");
@@ -435,6 +613,32 @@ async fn rust_materializes_java_row_ids() {
     );
 }
 
+/// D1 UPGRADED materialization — the per-row half of the same fixture.
+///
+/// The surviving file's rows take their `_row_id` from the rewritten manifest's range, because the
+/// entry carries no stored id. A reader that skips a non-ADDED entry reports NULL for every one.
+#[tokio::test]
+async fn rust_materializes_java_upgraded_row_ids() {
+    let Some(dir) = fixture_dir(D1_ENV) else {
+        eprintln!("{D1_ENV} unset — skipping");
+        return;
+    };
+    let table = load_table(
+        &dir.join("upgraded/metadata/final.metadata.json"),
+        "row_lineage_upgraded",
+    );
+    let rust_rows = row_ids_view(&table).await;
+    let java_rows = fs::read_to_string(dir.join("java_row_ids_upgraded.json"))
+        .expect("read java_row_ids_upgraded.json")
+        .trim()
+        .to_string();
+    assert_eq!(
+        rust_rows, java_rows,
+        "the fork's per-row _row_id over the UPGRADED Java table differs from Java's own read.\n \
+         rust: {rust_rows}\n java: {java_rows}"
+    );
+}
+
 /// D2 materialization — Java's per-row read of the RUST table must equal the fork's own.
 #[tokio::test]
 async fn java_materializes_rust_row_ids() {
@@ -461,5 +665,56 @@ async fn java_materializes_rust_row_ids() {
         "Java's per-row read of the RUST-written table differs from the fork's own.\n \
          rust: {rust_rows}\n java: {}",
         java_rows.trim()
+    );
+}
+
+/// D2 UPGRADED materialization — Java's per-row read of the fork's upgraded table.
+#[tokio::test]
+async fn java_materializes_rust_upgraded_row_ids() {
+    let Some(dir) = fixture_dir(D2_ENV) else {
+        eprintln!("{D2_ENV} unset — skipping");
+        return;
+    };
+    // Once the env var is set the fixture MUST exist: a missing artifact is a failure, not a skip.
+    let java_path = dir.join("java_row_ids_of_rust_upgraded_table.json");
+    let java_rows = fs::read_to_string(&java_path).unwrap_or_else(|error| {
+        panic!(
+            "read {} ({error}) — run the oracle's verify first",
+            java_path.display()
+        )
+    });
+    let table = load_table(
+        &dir.join("rust_upgraded_table/metadata/final.metadata.json"),
+        "rust_row_lineage_upgraded",
+    );
+    let rust_rows = row_ids_view(&table).await;
+    assert_eq!(
+        rust_rows,
+        java_rows.trim(),
+        "Java's per-row read of the fork's UPGRADED table differs from the fork's own.\n \
+         rust: {rust_rows}\n java: {}",
+        java_rows.trim()
+    );
+}
+
+/// The same cross-check for the UPGRADED pair: two independently produced tables, names stripped.
+#[tokio::test]
+async fn rust_assigns_the_same_upgraded_row_ids_java_does() {
+    let (Some(d1), Some(d2)) = (fixture_dir(D1_ENV), fixture_dir(D2_ENV)) else {
+        eprintln!("{D1_ENV}/{D2_ENV} unset — skipping");
+        return;
+    };
+
+    let java = fs::read_to_string(d1.join("java_row_lineage_upgraded.json"))
+        .expect("read the Java upgraded view");
+    let rust = fs::read_to_string(d2.join("rust_row_lineage_upgraded_expected.json"))
+        .expect("read the Rust upgraded view");
+    let java_numbers = strip_names(java.trim());
+    let rust_numbers = strip_names(rust.trim());
+
+    assert_eq!(
+        rust_numbers, java_numbers,
+        "the fork ASSIGNED different row ids than Java did for the same upgraded chain.\n \
+         rust: {rust_numbers}\n java: {java_numbers}"
     );
 }

@@ -173,7 +173,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
     added_dv_candidate_delete_files_after, deleted_data_files_after, dv_desc,
     validate_no_conflicting_added_data_files, validate_no_conflicting_added_delete_files,
     validate_no_new_deletes_for_data_files,
@@ -887,6 +887,7 @@ impl TransactionAction for RowDeltaAction {
             self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
+            FirstRowIdPolicy::Suppress,
         )
         .with_added_delete_files(self.added_delete_files.clone())
         .with_removed_delete_files(self.removed_delete_files.clone());
@@ -1237,7 +1238,7 @@ mod tests {
     };
     use crate::table::Table;
     use crate::transaction::snapshot::{
-        DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+        DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
     };
     use crate::transaction::tests::{
         make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog,
@@ -4850,9 +4851,15 @@ mod tests {
             synthetic_delete_file("test/a-pos-del.parquet", 0),
             synthetic_equality_delete_file("test/a-eq-del.parquet", 0),
         ] {
-            let producer =
-                SnapshotProducer::new(&table, uuid::Uuid::now_v7(), None, HashMap::new(), vec![])
-                    .with_added_delete_files(vec![delete_file]);
+            let producer = SnapshotProducer::new(
+                &table,
+                uuid::Uuid::now_v7(),
+                None,
+                HashMap::new(),
+                vec![],
+                FirstRowIdPolicy::Suppress,
+            )
+            .with_added_delete_files(vec![delete_file]);
             let err = producer
                 .validate_added_delete_files()
                 .expect_err("a V1 table must reject every added delete file");
@@ -5200,10 +5207,17 @@ mod tests {
             self: Arc<Self>,
             table: &Table,
         ) -> crate::Result<crate::transaction::ActionCommit> {
-            SnapshotProducer::new(table, uuid::Uuid::now_v7(), None, HashMap::new(), vec![])
-                .with_added_delete_files(vec![self.dv.clone()])
-                .commit(ReplaceOpAddDvOperation, DefaultManifestProcess)
-                .await
+            SnapshotProducer::new(
+                table,
+                uuid::Uuid::now_v7(),
+                None,
+                HashMap::new(),
+                vec![],
+                FirstRowIdPolicy::Suppress,
+            )
+            .with_added_delete_files(vec![self.dv.clone()])
+            .commit(ReplaceOpAddDvOperation, DefaultManifestProcess)
+            .await
         }
     }
 

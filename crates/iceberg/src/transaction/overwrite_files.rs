@@ -107,7 +107,7 @@ use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation, Schema};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
     validate_deleted_data_files, validate_no_conflicting_added_data_files,
     validate_no_conflicting_added_delete_files, validate_no_new_deletes_for_data_files,
 };
@@ -501,6 +501,7 @@ impl TransactionAction for OverwriteFilesAction {
             self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
+            FirstRowIdPolicy::Suppress,
         );
 
         // Validate the added files like fast append: data content type, partition-spec match, and
