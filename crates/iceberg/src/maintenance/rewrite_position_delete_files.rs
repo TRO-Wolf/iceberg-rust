@@ -1465,12 +1465,9 @@ impl RewritePositionDeleteFiles {
                 let previous = load_delete_vector(self.table.file_io(), &entry.data_file).await?;
                 // THE OTHER DIRECTION of the shadow. This DV already suppresses the legacy delete,
                 // so a position the DV does NOT hold is a row the table returns TODAY. Folding it in
-                // would silently delete it. Java's own rewrite writes this shape: its
-                // `loadPreviousDeletes` is `path -> null`, so a group that converts some of a data
-                // file's deletes leaves the rest live and inert under a non-superset DV.
-                if plan.positions.is_empty() {
-                    return Err(Error::new(ErrorKind::DataInvalid, "MUTANT: sibling refused"));
-                }
+                // would silently delete it. Runs BEFORE the merge below, so a refused table is never
+                // partially converted; `positions` still holds only legacy-derived positions here,
+                // so a Puffin-closure sibling — which has none — passes rather than being refused.
                 if let Some(unshadowed) = plan
                     .positions
                     .iter()
@@ -1481,9 +1478,10 @@ impl RewritePositionDeleteFiles {
                         format!(
                             "Data file '{data_file_path}' holds a deletion vector that does not \
                              cover position {unshadowed} of a legacy position delete it already \
-                             suppresses. Converting would DELETE rows the table returns today. \
-                             Rewrite the deletion vector to cover them first, or drop the legacy \
-                             delete; no filter setting makes this run safe."
+                             suppresses. Converting would DELETE rows the table returns today, so \
+                             this run refuses. THIS ACTION CANNOT CLEAR THAT STATE: no filter width \
+                             makes it safe, and both ways out — extending the vector to cover the \
+                             delete, or dropping the delete — need a tool it does not provide."
                         ),
                     ));
                 }

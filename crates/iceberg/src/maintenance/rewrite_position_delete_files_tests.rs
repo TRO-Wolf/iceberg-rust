@@ -5705,6 +5705,12 @@ async fn test_v3_refuses_when_the_existing_vector_does_not_cover_the_legacy_dele
             .contains("DELETE rows the table returns today"),
         "the refusal names the loss direction: {error}"
     );
+    assert!(
+        error
+            .to_string()
+            .contains("THIS ACTION CANNOT CLEAR THAT STATE"),
+        "and says the arm cannot clear it, rather than offering a remedy it does not provide: {error}"
+    );
 
     let reloaded = catalog.load_table(table.identifier()).await.unwrap();
     assert_eq!(
