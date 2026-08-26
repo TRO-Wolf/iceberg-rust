@@ -27,6 +27,7 @@
 //! deletion vector, a V2 ORC pos-delete and a V2 Avro pos-delete are all SKIPPED, not compacted).
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
@@ -34,10 +35,11 @@ use futures::TryStreamExt;
 use tempfile::TempDir;
 
 use super::*;
+use crate::expr::Reference;
 use crate::io::LocalFsStorageFactory;
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, FormatVersion, Literal, ManifestContentType,
+    DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, Literal, ManifestContentType,
     NestedField, Operation, PartitionKey, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
     SnapshotRef, Struct, Transform, Type,
 };
@@ -95,6 +97,40 @@ fn three_long_schema() -> IcebergSchema {
         ])
         .build()
         .expect("build schema")
+}
+
+/// A partitioned table at a DELIBERATELY SHORT location. `parquet-rs` truncates byte-array
+/// statistics at 64 bytes and the metrics aggregator drops a non-exact bound, so a data-file path
+/// longer than that leaves a position delete with NO `file_path` bounds — the reader then treats it
+/// as partition-scoped. A short path is what lets a fixture reach the real file-scoped routing.
+async fn create_short_path_partitioned_table(
+    catalog: &impl Catalog,
+    warehouse: &Path,
+    format_version: FormatVersion,
+) -> Table {
+    let schema = three_long_schema();
+    let spec = PartitionSpec::builder(schema.clone())
+        .with_spec_id(0)
+        .add_partition_field("x", "x", Transform::Identity)
+        .expect("add partition field")
+        .build()
+        .expect("build spec");
+    let namespace = NamespaceIdent::new("n".to_string());
+    catalog
+        .create_namespace(&namespace, std::collections::HashMap::new())
+        .await
+        .expect("create namespace");
+    let creation = TableCreation::builder()
+        .name("t".to_string())
+        .location(format!("{}/w", warehouse.to_str().expect("utf8 temp path")))
+        .schema(schema)
+        .partition_spec(spec)
+        .format_version(format_version)
+        .build();
+    catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create table")
 }
 
 async fn create_partitioned_table(catalog: &impl Catalog, format_version: FormatVersion) -> Table {
@@ -237,6 +273,58 @@ async fn write_position_delete_file(
     let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
         Arc::new(StringArray::from(paths)) as ArrayRef,
         Arc::new(Int64Array::from(positions)) as ArrayRef,
+    ])
+    .unwrap();
+    writer.write(batch).await.unwrap();
+    writer.close().await.unwrap().into_iter().next().unwrap()
+}
+
+/// Write a FILE-SCOPED parquet position delete: one that carries FULL, untruncated `file_path`
+/// bounds, so the reader routes it by PATH with no partition condition.
+///
+/// The plain [`write_position_delete_file`] helper leaves the default `truncate(16)` metrics config
+/// in place, which shortens the bounds and makes every delete it writes partition-scoped. Java's
+/// `MetricsConfig.forPositionDelete` is what a real position-delete writer uses, and the fork's own
+/// production path sets it too.
+async fn write_file_scoped_position_delete_file(
+    table: &Table,
+    part_value: i64,
+    target_path: &str,
+    positions: &[i64],
+) -> DataFile {
+    let schema = table.metadata().current_schema().clone();
+    let config = PositionDeleteWriterConfig::new().unwrap();
+    let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "fs-pos-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        config.schema().clone(),
+    )
+    .with_metrics_config(MetricsConfig::for_position_delete());
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    let partition_key = PartitionKey::new(
+        table.metadata().default_partition_spec().as_ref().clone(),
+        schema,
+        Struct::from_iter([Some(Literal::long(part_value))]),
+    )
+    .expect("PartitionKey::new: valid partition tuple");
+    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .build(Some(partition_key))
+        .await
+        .unwrap();
+    let paths: Vec<&str> = positions.iter().map(|_| target_path).collect();
+    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+        Arc::new(StringArray::from(paths)) as ArrayRef,
+        Arc::new(Int64Array::from(positions.to_vec())) as ArrayRef,
     ])
     .unwrap();
     writer.write(batch).await.unwrap();
@@ -5276,9 +5364,6 @@ async fn test_v3_rewrite_keeps_sibling_deletion_vectors_of_the_same_puffin() {
 /// the bin-pack arm compacts.
 #[tokio::test]
 async fn test_v3_filter_restricts_the_converted_partitions() {
-    use crate::expr::Reference;
-    use crate::spec::Datum;
-
     let (catalog, _temp) = local_fs_catalog().await;
     let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
 
@@ -5316,29 +5401,173 @@ async fn test_v3_filter_restricts_the_converted_partitions() {
     );
 }
 
-/// A legacy position delete naming a data file the current snapshot no longer holds is REFUSED, not
-/// silently dropped. Dropping it would make zero counts mean "did not look"; it is
-/// `RemoveDanglingDeleteFiles` that removes a dangling delete, not this action.
+/// A position naming a data file the snapshot no longer holds is DROPPED, not refused — it can
+/// delete nothing, which is what the V1/V2 arm effectively does too. REFUSING dead-ends the table:
+/// `RemoveDanglingDeleteFiles` keys on `(spec_id, partition)` and the partition's live data
+/// sequence, so it cannot clear a delete file that still names ONE live data file.
+///
+/// MUTATION COVERAGE — APPLIED: restore the refusal (error on the liveness miss) and this test reds.
 #[tokio::test]
-async fn test_v3_dangling_position_delete_reference_is_refused() {
+async fn test_v3_position_naming_a_non_live_data_file_is_dropped() {
     let (catalog, _temp) = local_fs_catalog().await;
     let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
 
-    let x = write_data_file(&table, "x.parquet", 7, &[(7, 10, 1), (7, 20, 2)]).await;
+    let x = write_data_file(&table, "x.parquet", 7, &[(7, 10, 1), (7, 11, 2)]).await;
+    let x_path = x.file_path().to_string();
     let table = append_files(&catalog, &table, vec![x]).await;
+    // ONE delete file naming a LIVE data file and a GHOST one — the post-compaction shape
+    // `RemoveDanglingDeleteFiles` cannot classify as dangling.
     let ghost = format!("{}/data/ghost.parquet", table.metadata().location());
-    let pd = write_position_delete_file(&table, Some(7), &[(ghost.as_str(), 0)]).await;
+    let pd = write_position_delete_file(&table, Some(7), &[
+        (x_path.as_str(), 1),
+        (ghost.as_str(), 0),
+    ])
+    .await;
     let table = add_deletes(&catalog, &table, vec![pd]).await;
     let table = upgrade_to_v3(&catalog, &table).await;
 
-    let error = RewritePositionDeleteFiles::new(table)
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([10]),
+        "fixture: the live position masks y=11"
+    );
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
         .execute(&catalog)
         .await
-        .expect_err("a dangling reference must fail closed");
-    assert!(
-        error.to_string().contains("RemoveDanglingDeleteFiles"),
-        "the refusal names the action that removes a dangling delete: {error}"
+        .expect("a stale reference must not dead-end the arm");
+    assert_eq!(result.rewritten_delete_files_count, 1);
+    assert_eq!(
+        result.added_delete_files_count, 1,
+        "one DV for the LIVE data file; the ghost position is dropped"
     );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "read identity: dropping a position that could delete nothing changes nothing"
+    );
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 1, "one deletion vector");
+    assert_eq!(
+        after[0].referenced_data_file().as_deref(),
+        Some(x_path.as_str()),
+        "and it references the LIVE data file, not the ghost"
+    );
+}
+
+/// THE SHADOW CLOSURE — the second half of the delete-correctness line. A file-scoped position
+/// delete is routed BY PATH with no partition condition, so one stamped `x=1` still applies to a
+/// data file in `x=0`. Convert only the `x=0` delete and the new DV SHADOWS the other, which goes
+/// inert.
+///
+/// MUTATION COVERAGE — APPLIED: drop the `refuse_shadowed_deletes` call and the run returns
+/// `Ok {rewritten: 1, added: 1}`, live rows `{12}` becoming `{11, 12}` — y=11 resurrected.
+#[tokio::test]
+async fn test_v3_refuses_when_a_filtered_out_delete_would_be_shadowed() {
+    let (catalog, temp) = local_fs_catalog().await;
+    let table = create_short_path_partitioned_table(&catalog, temp.path(), FormatVersion::V2).await;
+
+    let a = write_data_file(&table, "a.parquet", 0, &[
+        (0, 10, 1),
+        (0, 11, 2),
+        (0, 12, 3),
+    ])
+    .await;
+    let a_path = a.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![a]).await;
+
+    // Both name ONLY a.parquet, so both are FILE-scoped (equal `file_path` bounds) and both apply by
+    // path — but they are stamped in different partitions, and the filter judges them by that stamp.
+    let in_scope = write_file_scoped_position_delete_file(&table, 0, &a_path, &[0]).await;
+    let out_of_scope = write_file_scoped_position_delete_file(&table, 1, &a_path, &[1]).await;
+    let table = add_deletes(&catalog, &table, vec![in_scope, out_of_scope]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([12]),
+        "fixture NON-VACUITY: BOTH file-scoped deletes apply to a.parquet despite their stamps"
+    );
+
+    let error = RewritePositionDeleteFiles::new(table.clone())
+        .filter(Reference::new("x").equal_to(Datum::long(0)))
+        .execute(&catalog)
+        .await
+        .expect_err("a delete that would be shadowed must fail the run closed");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert!(
+        error.to_string().contains("SHADOWS"),
+        "the refusal says what would happen: {error}"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "fail CLOSED: nothing was committed, so no row came back"
+    );
+}
+
+/// THE PER-DV SEQ STAMP — the V3 twin of `test_each_bin_output_carries_its_own_bin_max_not_the_partition_max`.
+/// Each deletion vector must carry ITS OWN plan maximum, not the run-wide one. A run-wide stamp
+/// reads the same today but writes false metadata that `RemoveDanglingDeleteFiles` and conflict
+/// detection then reason over.
+///
+/// MUTATION COVERAGE — APPLIED: stamp every DV with `plans.values().map(..).max()` and A's vector
+/// carries B's 3 instead of its own 2. RED.
+#[tokio::test]
+async fn test_v3_each_deletion_vector_carries_its_own_source_max_seq() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let a = write_data_file(&table, "a.parquet", 0, &[(0, 10, 1), (0, 11, 2)]).await;
+    let b = write_data_file(&table, "b.parquet", 0, &[(0, 20, 1), (0, 21, 2)]).await;
+    let a_path = a.file_path().to_string();
+    let b_path = b.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![a, b]).await; // data seq 1
+
+    // SEPARATE commits, so the two legacy deletes carry DIFFERENT data sequence numbers.
+    let pd_a = write_position_delete_file(&table, Some(0), &[(a_path.as_str(), 1)]).await;
+    let pd_a_file = pd_a.file_path().to_string();
+    let table = add_deletes(&catalog, &table, vec![pd_a]).await; // seq 2
+    let pd_b = write_position_delete_file(&table, Some(0), &[(b_path.as_str(), 1)]).await;
+    let pd_b_file = pd_b.file_path().to_string();
+    let table = add_deletes(&catalog, &table, vec![pd_b]).await; // seq 3
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let a_source_seq = live_delete_seq(&table, &pd_a_file).await;
+    let b_source_seq = live_delete_seq(&table, &pd_b_file).await;
+    assert_ne!(
+        a_source_seq, b_source_seq,
+        "fixture NON-VACUITY: the two plan maxima must DIFFER, or a run-wide stamp is unkillable"
+    );
+
+    let before = scan_y_values(&table).await;
+    RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+    let stamped = live_delete_entries_with_seq(&reloaded).await;
+    let seq_for = |data_file_path: &str| -> i64 {
+        stamped
+            .iter()
+            .find(|(file, _)| file.referenced_data_file().as_deref() == Some(data_file_path))
+            .and_then(|(_, seq)| *seq)
+            .expect("a deletion vector referencing that data file")
+    };
+    assert_eq!(
+        seq_for(&a_path),
+        a_source_seq,
+        "A's vector carries A's own source max, not the run-wide max"
+    );
+    assert_eq!(seq_for(&b_path), b_source_seq, "B's vector carries B's own");
 }
 
 /// A live ORC position delete on a V3 table is REFUSED, where the V1/V2 arm silently skips it. That

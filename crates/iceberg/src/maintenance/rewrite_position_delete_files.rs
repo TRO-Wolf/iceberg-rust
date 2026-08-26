@@ -152,14 +152,16 @@
 //! V1 and V2 bin-pack PARQUET position deletes exactly as described above. A V3 table cannot hold a
 //! FRESH parquet position delete — the commit path rejects one — so the V3 arm converts every legacy
 //! parquet position delete into one Puffin DV per referenced data file, merged with that data file's
-//! existing DV. See [`RewritePositionDeleteFiles::rewrite_to_deletion_vectors`]. A DV is file-scoped,
-//! so the V3 arm never bin-packs and never applies the size gate. V2 ORC and Avro stay skipped.
+//! existing DV. See [`RewritePositionDeleteFiles::rewrite_to_deletion_vectors`]. V2 ORC and Avro
+//! position deletes stay skipped on V1/V2 and are refused on V3.
 //!
 //! # No-op — zeros mean "looked, found nothing to do"
 //!
-//! On the V3 arm that reading is TOTAL: every input the arm cannot express returns `Err`, so zero
-//! counts can never mean "did not look". The V1/V2 arm keeps its older, weaker contract — it also
-//! returns zeros for a V2 ORC or Avro position delete it skipped.
+//! On the V3 arm that reading is total WITHIN THE FILTER'S SCOPE: an input the arm cannot express
+//! returns `Err` if the filter admits it, or if it would be shadowed by a vector this run writes. An
+//! unreadable delete the filter rejects that touches nothing this run converts is still skipped
+//! silently. The V1/V2 arm keeps its older, weaker contract — it returns zeros for any V2 ORC or
+//! Avro position delete it skipped.
 //!
 //! With no current snapshot, no live parquet position-delete files, a [`filter`](RewritePositionDeleteFiles::filter)
 //! that matches none, no CANDIDATE in a partition, or a bin the three-clause admission gate declines,
@@ -1289,14 +1291,14 @@ impl RewritePositionDeleteFiles {
     }
 
     /// THE V3 ARM. Convert every live filter-matching PARQUET position delete into one Puffin
-    /// DELETION VECTOR per referenced data file, merged with that file's existing DV. No size gate:
-    /// a DV is file-scoped. ENGINE-FIRST — `iceberg-core` 1.10.0's runner is `iceberg-spark`.
+    /// DELETION VECTOR per referenced data file, merged with that file's existing DV, in ONE
+    /// `RewriteFiles`. ENGINE-FIRST; its two divergences from Spark's are argued on row R136.
     ///
     /// # Errors
     ///
-    /// An unreadable format, a position naming a data file the snapshot does not hold, two live DVs
-    /// for one data file, or a DV whose sequence number would fall below its data file's. So `Ok`
-    /// with zero counts means "looked, found nothing to convert".
+    /// A format the arm cannot read, a live excluded delete a written vector would SHADOW, two live
+    /// DVs for one data file, or a DV whose sequence would fall below its data file's. So `Ok` with
+    /// zero counts means "looked, found nothing to convert".
     async fn rewrite_to_deletion_vectors(
         &self,
         catalog: &dyn Catalog,
@@ -1312,6 +1314,7 @@ impl RewritePositionDeleteFiles {
         }
 
         let (plans, superseded_puffin_paths) = self.plan_deletion_vectors(&inventory).await?;
+        refuse_shadowed_deletes(&inventory, &plans)?;
         let new_deletion_vectors = self.write_deletion_vectors(&plans, &inventory).await?;
 
         // Every DV in a superseded Puffin is removed, INCLUDING the siblings the closure rewrote.
@@ -1428,6 +1431,14 @@ impl RewritePositionDeleteFiles {
                     )
                     .with_source(error)
                 })?;
+                // A position naming a data file the snapshot no longer holds can delete nothing, so
+                // it is dropped rather than carried into a DV. Refusing here dead-ends the table:
+                // `RemoveDanglingDeleteFiles` keys on `(spec_id, partition)` and the partition's
+                // live data sequence, so it cannot clear a delete file that still names ONE live
+                // data file — nothing could, and the arm would refuse for ever.
+                if !inventory.data_files.contains_key(&data_file_path) {
+                    continue;
+                }
                 let plan = plans.entry(data_file_path).or_default();
                 plan.positions.push(position);
                 plan.sequence_number = plan.sequence_number.max(entry.sequence_number);
@@ -1441,7 +1452,9 @@ impl RewritePositionDeleteFiles {
             .collect();
         // The closure: pull in every sibling blob of a superseded Puffin (see the Notes above).
         for (data_file_path, entry) in &inventory.deletion_vectors {
-            if superseded_puffin_paths.contains(entry.data_file.file_path()) {
+            if superseded_puffin_paths.contains(entry.data_file.file_path())
+                && inventory.data_files.contains_key(data_file_path)
+            {
                 plans.entry(data_file_path.clone()).or_default();
             }
         }
@@ -1849,6 +1862,9 @@ struct V3DeleteInventory {
     legacy_position_deletes: Vec<LiveDeleteEntry>,
     /// The live Puffin deletion vectors, keyed by the data file each one references.
     deletion_vectors: HashMap<String, LiveDeleteEntry>,
+    /// The live NON-Puffin position deletes the filter REJECTED. They stay live, so a new deletion
+    /// vector for a data file they still cover would SHADOW them — see [`refuse_shadowed_deletes`].
+    unconverted_position_deletes: Vec<LiveDeleteEntry>,
 }
 
 impl V3DeleteInventory {
@@ -1895,6 +1911,8 @@ impl V3DeleteInventory {
             DataFileFormat::Parquet => {
                 if partition_filter.matches(metadata, data_file)? {
                     self.legacy_position_deletes.push(entry);
+                } else {
+                    self.unconverted_position_deletes.push(entry);
                 }
                 Ok(())
             }
@@ -1911,6 +1929,9 @@ impl V3DeleteInventory {
                         ),
                     ));
                 }
+                // Outside the filter's scope, so unreadable is not yet fatal — but it still cannot
+                // be shadowed by a new DV. `refuse_shadowed_deletes` decides that.
+                self.unconverted_position_deletes.push(entry);
                 Ok(())
             }
         }
@@ -1920,16 +1941,14 @@ impl V3DeleteInventory {
     ///
     /// # Errors
     ///
-    /// `DataInvalid` when the current snapshot does not hold it — a dangling position delete, which
-    /// [`RemoveDanglingDeleteFiles`](super::remove_dangling_delete_files) drops and this arm will
-    /// not silently discard.
+    /// `Unexpected` when the current snapshot does not hold it. Planned paths are filtered to live
+    /// data files before this runs, so a miss is a bug in this module, not a table state.
     fn live_data_file(&self, data_file_path: &str) -> Result<&LiveDataFile> {
         self.data_files.get(data_file_path).ok_or_else(|| {
             Error::new(
-                ErrorKind::DataInvalid,
+                ErrorKind::Unexpected,
                 format!(
-                    "Position delete references data file '{data_file_path}', which is not live in \
-                     the current snapshot; run RemoveDanglingDeleteFiles first"
+                    "Planned deletion vector names data file '{data_file_path}', which is not live"
                 ),
             )
         })
@@ -1942,6 +1961,61 @@ impl V3DeleteInventory {
 struct DeletionVectorPlan {
     positions: Vec<u64>,
     sequence_number: i64,
+}
+
+/// REFUSE a run that would leave a live position delete SHADOWED by a deletion vector it wrote.
+///
+/// # Notes
+///
+/// A DV wins over every position delete for the same data file (`get_deletes_for_data_file` returns
+/// on the `dv_by_path` hit, Java `findDV`), so an excluded delete goes INERT and its rows come back.
+/// Reachable because a file-scoped delete is routed BY PATH with no partition condition, while the
+/// filter judges it by its stamped tuple.
+///
+/// # Errors
+///
+/// `DataInvalid`. Widen or drop the filter so the same run converts it.
+fn refuse_shadowed_deletes(
+    inventory: &V3DeleteInventory,
+    plans: &HashMap<String, DeletionVectorPlan>,
+) -> Result<()> {
+    if plans.is_empty() {
+        return Ok(());
+    }
+    // The `(spec_id, partition)` of every data file about to gain a DV — the key the reader routes a
+    // PARTITION-scoped position delete on.
+    let mut planned_partitions: HashSet<(i32, &Struct)> = HashSet::new();
+    for data_file_path in plans.keys() {
+        let data_file = inventory.live_data_file(data_file_path)?;
+        planned_partitions.insert((data_file.partition_spec_id, &data_file.partition));
+    }
+
+    for entry in &inventory.unconverted_position_deletes {
+        let delete_file = &entry.data_file;
+        let shadowed_data_file = match referenced_data_file_location(delete_file) {
+            // File-scoped: routed by path alone.
+            Some(referenced) => plans.contains_key(&referenced).then_some(referenced),
+            // Partition-scoped: routed by the DATA file's spec and partition. The sequence rule is
+            // deliberately NOT applied — refusing a delete that could not have applied is a false
+            // alarm the caller can clear, while missing one loses rows.
+            None => planned_partitions
+                .contains(&(delete_file.partition_spec_id, delete_file.partition()))
+                .then(|| "a data file in the same partition".to_string()),
+        };
+        let Some(shadowed_data_file) = shadowed_data_file else {
+            continue;
+        };
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Position delete '{}' still applies to {shadowed_data_file} but the filter excluded \
+                 it: the deletion vector this run would write there SHADOWS it and its deleted rows \
+                 would come back. Widen the filter so the same run converts it.",
+                delete_file.file_path()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The stamp for one written deletion vector, read back out of the plan it came from.
