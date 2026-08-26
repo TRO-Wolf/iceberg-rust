@@ -33,6 +33,24 @@
 This rule outranks every other instruction in this repository about comments, including
 "Comments and prose" below. A human contributor may write comments. An Anthropic model may not.
 
+## The only exceptions
+
+These three are the whole list. Nothing else is an exception, and "it would be helpful here" is not
+one.
+
+1. **Doc comments the compiler demands.** `crates/iceberg/src/lib.rs` sets
+   `#![deny(missing_docs)]`, so a public item without a doc comment does not build. Write the
+   minimum that compiles — one line stating what the item is. Not a paragraph, not a rationale,
+   not an example.
+2. **The ASF license header.** It is a comment, CI enforces it (skywalking-eyes,
+   `.licenserc.yaml`), and a file without it fails. Copy it verbatim from a sibling file.
+3. **Markdown.** Minor comments and ordinary prose in `.md` files are allowed. The ban is about
+   comments in CODE. `docs/parity/GAP_MATRIX.md`, the `task/` ledgers and the `map.md` files are
+   where explanation belongs, and routing evidence there is still required.
+
+Everything else stays banned. If a fact seems to need a code comment, it belongs in a `task/`
+ledger or a matrix row instead — that routing rule is unchanged and is now the only route.
+
 
 This is the **single authoritative contract** for this repository, written for **any contributor —
 human or automated agent**, naming no tool or model. It holds the read order, the precedence chain,

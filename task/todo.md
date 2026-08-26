@@ -31,21 +31,18 @@ How to use it (see the manuals' §1):
 
 ---
 
-## OWNER RULING NEEDED (2026-08-26): two toolchain collisions with the model comment ban
+## RULED (2026-08-26): the model comment ban and its three exceptions
 
-The ban at the top of AGENTS.md and CLAUDE.md is in force. Two places in this repository will stop
-a model that follows it literally, and neither is a matter of judgement — the toolchain refuses.
+The owner ruled the same day it was raised. Both toolchain collisions are now written exceptions in
+AGENTS.md and CLAUDE.md, alongside a third the owner added:
 
-1. **`crates/iceberg/src/lib.rs:63` is `#![deny(missing_docs)]`.** A new public item added by a model
-   with no doc comment does not compile. Every public crate item is affected, not only new ones.
-2. **The ASF license header is a comment, and CI enforces it** (`.github/workflows/ci.yml`, the
-   skywalking-eyes "Check License Header" step, backed by `.licenserc.yaml`). A new file created by
-   a model without that header fails CI. This already happened once on 2026-08-25.
+1. Doc comments the compiler demands — `#![deny(missing_docs)]` — at the minimum that compiles.
+2. The ASF license header, which is a comment and is enforced by CI.
+3. Minor comments and ordinary prose in markdown.
 
-Neither is written as an exception, because inventing exceptions to a ban is the owner's call and
-not an agent's. The options are to carve out the two mechanically-forced cases, to relax
-`deny(missing_docs)`, or to route new public items and new files through a human. Until this is
-ruled on, a model adding a new public item or a new file is blocked.
+Nothing else is an exception. A model adding a new public item or a new file is no longer blocked.
+Routing evidence to a `task/` ledger or a GAP_MATRIX row is unchanged, and is now the ONLY route for
+anything that would previously have become a code comment.
 
 ---
 
