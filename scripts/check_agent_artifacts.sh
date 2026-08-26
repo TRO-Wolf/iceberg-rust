@@ -54,7 +54,11 @@
 # The '"MUTANT' needle is a QUOTED LITERAL on purpose, added 2026-08-26 after a commit shipped a
 # live `Err(.., "MUTANT: ..")` injection into production code and passed a green gate. Test doc
 # comments legitimately discuss mutants in prose, so the needle matches only a string literal
-# opening MUTANT; the anti-probes are real prose lines from this repo.
+# opening MUTANT. The `[a-z]*` prefix is load-bearing: -w requires a NON-word char before the match,
+# so a bare `"MUTANT` needle is defeated by `r"MUTANT` / `b"MUTANT` / `br"MUTANT`, which are the
+# idiomatic Rust forms. A bare `MUTANT:` needle was tried and REJECTED — it false-positives on two
+# real prose lines in scan/task.rs. No needle makes injection impossible (`"probe MUTANT here"`
+# still escapes any quote-anchored pattern); the load-bearing defence is archive verification.
 #
 # The self-test reaches the needles, the family size, and the flag and pathspec
 # VARIABLES. It does not reach the grep call: a flag, a pathspec or a hit count
@@ -105,7 +109,7 @@ residue_patterns=(
   "${C}ritic"
   "Falsifier"
   "SEPMO"
-  '"MUTANT'
+  '[a-z]*"MUTANT'
 )
 residue_samples=(
   "the ${c}ritic-octo probe found it"

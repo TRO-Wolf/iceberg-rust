@@ -1169,6 +1169,13 @@ remembering to write it.
   touched after the commit. Every gate result reported for that commit had run against the worktree,
   not against what was committed. `git archive <sha> | tar -x` into a scratch dir and gate THAT, or
   hash tracked files against the index; a clean `git status` is not evidence.
+- **DO give each archive a FRESH `CARGO_TARGET_DIR`, or `touch` the extracted sources.** The archive
+  practice can otherwise certify a tree it never built: `git archive` stamps files with commit-era
+  mtimes, older than any artifact already in a shared target dir, so cargo's staleness check reuses
+  the stale binary. A verification run of the tip reported a FAILING test that does not exist in the
+  tree under test (`grep -c` on its name returned 0), then reported clean on re-run. This is the
+  trap recorded above for `cargo` staleness, now reached through the very practice added to escape
+  the previous one.
 - **DO chain mutate / run / restore into ONE command.** The injection survived because the restore
   was a later, separate command and the tree stayed dirty across the gap. A mutation that outlives
   its own shell invocation is a mutation that can be committed.
