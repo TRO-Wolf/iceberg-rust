@@ -21619,6 +21619,11 @@ public final class InteropOracle {
                   + " (expected PRE pos > POST pos > 0)");
           failures++;
         }
+
+        // (4)-(6) THE V3 LEG. The same PRE world upgraded to format version 3 still carries the four
+        // legacy PARQUET position deletes; the POST table is that world after the action converted
+        // them into Puffin DELETION VECTORS. Java reads both and the live rows must be identical.
+        failures += verifyV3(dir, tag, preIds);
       } catch (RuntimeException | IOException error) {
         System.out.println("FAIL " + tag + ": unexpected error running the rewrite-pos-deletes verify: " + error);
         failures++;
@@ -21629,6 +21634,78 @@ public final class InteropOracle {
             "verify-interop-rewrite-pos-deletes OK — Java's IcebergGenerics read is IDENTICAL before "
                 + "(many position deletes) and after (fewer, compacted position deletes); the compaction "
                 + "preserved every live row and masked exactly the same rows (seq-stamp preserved).");
+      }
+      return failures;
+    }
+
+    /**
+     * The V3 leg: a table upgraded to V3 that still holds legacy parquet position deletes, and the
+     * same world after the Rust action converted them into Puffin deletion vectors. Java's read of
+     * the two must be identical, and the conversion must have actually happened.
+     */
+    private static int verifyV3(Path dir, String tag, java.util.Set<Long> preIds)
+        throws IOException {
+      int failures = 0;
+      Path v3PreMeta = dir.resolve("rust_table_v3").resolve("metadata").resolve("final.metadata.json");
+      Path v3PostMeta =
+          dir.resolve("rust_table_v3_dv").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(v3PreMeta) || !Files.exists(v3PostMeta)) {
+        System.out.println(
+            "FAIL " + tag + ": missing V3 tables (" + v3PreMeta + " / " + v3PostMeta + ")");
+        return 1;
+      }
+
+      BaseTable v3Pre = loadConvertTable(v3PreMeta);
+      BaseTable v3Post = loadConvertTable(v3PostMeta);
+
+      java.util.Set<Long> v3PreIds = liveIdsConvert(v3Pre);
+      if (v3PreIds.equals(expectedLiveIds())) {
+        System.out.println("PASS " + tag + ": V3 PRE live ids = " + v3PreIds + " match expected");
+      } else {
+        System.out.println(
+            "FAIL " + tag + ": V3 PRE live ids = " + v3PreIds + " but expected = " + expectedLiveIds());
+        failures++;
+      }
+
+      java.util.Set<Long> v3PostIds = liveIdsConvert(v3Post);
+      if (v3PostIds.equals(preIds)) {
+        System.out.println(
+            "PASS " + tag + ": V3 read-identity — deletion-vector live ids = " + v3PostIds + " == PRE");
+      } else {
+        System.out.println(
+            "FAIL "
+                + tag
+                + ": V3 read-identity BROKEN — deletion-vector live ids = "
+                + v3PostIds
+                + " but PRE = "
+                + preIds
+                + " (the converted deletion vectors do not mask the same rows)");
+        failures++;
+      }
+
+      int v3PreParquet = countDeletes(v3Pre, FileContent.POSITION_DELETES, FileFormat.PARQUET);
+      int v3PostParquet = countDeletes(v3Post, FileContent.POSITION_DELETES, FileFormat.PARQUET);
+      int v3PostPuffin = countDeletes(v3Post, FileContent.POSITION_DELETES, FileFormat.PUFFIN);
+      if (v3PreParquet > 0 && v3PostParquet == 0 && v3PostPuffin > 0) {
+        System.out.println(
+            "PASS "
+                + tag
+                + ": V3 conversion shape — PRE parquet="
+                + v3PreParquet
+                + " became POST puffin="
+                + v3PostPuffin);
+      } else {
+        System.out.println(
+            "FAIL "
+                + tag
+                + ": V3 conversion shape WRONG — PRE parquet="
+                + v3PreParquet
+                + ", POST parquet="
+                + v3PostParquet
+                + ", POST puffin="
+                + v3PostPuffin
+                + " (expected PRE parquet > 0, POST parquet = 0, POST puffin > 0)");
+        failures++;
       }
       return failures;
     }
@@ -21652,6 +21729,26 @@ public final class InteropOracle {
         throw new RuntimeException("failed to read live rows via IcebergGenerics", error);
       }
       return ids;
+    }
+
+    /** The count of LIVE delete files of `content` written in `format`. */
+    private static int countDeletes(BaseTable table, FileContent content, FileFormat format) {
+      Snapshot snapshot = table.currentSnapshot();
+      FileIO io = table.io();
+      int count = 0;
+      for (ManifestFile manifest : snapshot.deleteManifests(io)) {
+        try (ManifestReader<DeleteFile> reader =
+            ManifestFiles.readDeleteManifest(manifest, io, table.specs())) {
+          for (ManifestEntry<DeleteFile> entry : reader.liveEntries()) {
+            if (entry.file().content() == content && entry.file().format() == format) {
+              count++;
+            }
+          }
+        } catch (IOException error) {
+          throw new RuntimeException("failed reading delete manifest " + manifest.path(), error);
+        }
+      }
+      return count;
     }
 
     /** The count of LIVE delete files of `content` in the current snapshot. */

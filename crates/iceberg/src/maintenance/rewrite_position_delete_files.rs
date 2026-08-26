@@ -147,14 +147,19 @@
 //! correctly and load-bearingly. Re-broadening the pattern to the camelCase spellings would classify
 //! both of those required, correct sentences as violations.
 //!
-//! # Divergence: V2 PARQUET only (V3 deletion vectors are OUT of scope)
+//! # Format-version dispatch: V1/V2 compact, V3 converts to deletion vectors
 //!
-//! This action compacts V2 PARQUET position-delete files only. V3 Puffin DELETION VECTORS are
-//! file-scoped (one DV per data file, never bin-packed across files) and are SKIPPED here — a DV is never
-//! "compacted" by this action. (Java's V3 DV maintenance is a separate concern.) This divergence is
-//! documented on `docs/parity/GAP_MATRIX.md` row R136.
+//! V1 and V2 bin-pack PARQUET position deletes exactly as described above. A V3 table cannot hold a
+//! FRESH parquet position delete — the commit path rejects one — so the V3 arm converts every legacy
+//! parquet position delete into one Puffin DV per referenced data file, merged with that data file's
+//! existing DV. See [`RewritePositionDeleteFiles::rewrite_to_deletion_vectors`]. A DV is file-scoped,
+//! so the V3 arm never bin-packs and never applies the size gate. V2 ORC and Avro stay skipped.
 //!
-//! # No-op
+//! # No-op — zeros mean "looked, found nothing to do"
+//!
+//! On the V3 arm that reading is TOTAL: every input the arm cannot express returns `Err`, so zero
+//! counts can never mean "did not look". The V1/V2 arm keeps its older, weaker contract — it also
+//! returns zeros for a V2 ORC or Avro position delete it skipped.
 //!
 //! With no current snapshot, no live parquet position-delete files, a [`filter`](RewritePositionDeleteFiles::filter)
 //! that matches none, no CANDIDATE in a partition, or a bin the three-clause admission gate declines,
@@ -163,8 +168,8 @@
 //! UNLESS that file is larger than `max_file_size_bytes`, which `too_much_content` admits with no
 //! such guard.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
@@ -176,6 +181,8 @@ use super::rewrite_data_files::{
     MIN_INPUT_FILES_DEFAULT, pack_bins,
 };
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
+use crate::delete_file_index::referenced_data_file_location;
+use crate::delete_vector::load_delete_vector;
 use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
 use crate::expr::visitors::inclusive_projection::InclusiveProjection;
 use crate::expr::{Bind, BoundPredicate, Predicate};
@@ -183,17 +190,18 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, MetricsConfig, PartitionKey, Schema, Snapshot,
-    Struct, TableMetadata, TableProperties,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionKey, Schema,
+    Snapshot, Struct, TableMetadata, TableProperties,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::writer::base_writer::deletion_vector_writer::DVFileWriter;
 use crate::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
 };
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
@@ -634,6 +642,20 @@ impl RewritePositionDeleteFiles {
         // MICRO-RESIDUE, stated not claimed: whether Java also binds on a snapshot-less table is
         // unverified, so this port keeps its pre-binding early return.
         let mut partition_filter = self.bind_filter()?;
+
+        // FORMAT-VERSION DISPATCH. On V3 a fresh parquet position delete cannot be committed at all
+        // (`validate_delete_file_for_version`), so compacting one into another is unreachable. The V3
+        // arm converts instead. V1/V2 fall through to the bin-pack pipeline below, unchanged.
+        if metadata.format_version() >= FormatVersion::V3 {
+            return self
+                .rewrite_to_deletion_vectors(
+                    catalog,
+                    &snapshot,
+                    &mut partition_filter,
+                    starting_snapshot_id,
+                )
+                .await;
+        }
 
         // S1 + S2 + S3 — enumerate the live PARQUET position-delete entries, drop the ones the filter
         // rejects, and group by (spec_id, partition). Puffin DVs are SKIPPED (file-scoped, never
@@ -1265,6 +1287,240 @@ impl RewritePositionDeleteFiles {
 
         require_non_empty(writer.close().await?)
     }
+
+    /// THE V3 ARM. Convert every live filter-matching PARQUET position delete into one Puffin
+    /// DELETION VECTOR per referenced data file, merged with that file's existing DV. No size gate:
+    /// a DV is file-scoped. ENGINE-FIRST — `iceberg-core` 1.10.0's runner is `iceberg-spark`.
+    ///
+    /// # Errors
+    ///
+    /// An unreadable format, a position naming a data file the snapshot does not hold, two live DVs
+    /// for one data file, or a DV whose sequence number would fall below its data file's. So `Ok`
+    /// with zero counts means "looked, found nothing to convert".
+    async fn rewrite_to_deletion_vectors(
+        &self,
+        catalog: &dyn Catalog,
+        snapshot: &Snapshot,
+        partition_filter: &mut PartitionFilter,
+        starting_snapshot_id: i64,
+    ) -> Result<RewritePositionDeleteFilesResult> {
+        let inventory = self
+            .collect_v3_delete_inventory(snapshot, partition_filter)
+            .await?;
+        if inventory.legacy_position_deletes.is_empty() {
+            return Ok(RewritePositionDeleteFilesResult::default());
+        }
+
+        let (plans, superseded_puffin_paths) = self.plan_deletion_vectors(&inventory).await?;
+        let new_deletion_vectors = self.write_deletion_vectors(&plans, &inventory).await?;
+
+        // Every DV in a superseded Puffin is removed, INCLUDING the siblings the closure rewrote.
+        let mut rewritten_files: Vec<DataFile> = inventory
+            .legacy_position_deletes
+            .iter()
+            .map(|entry| entry.data_file.clone())
+            .collect();
+        rewritten_files.extend(
+            inventory
+                .deletion_vectors
+                .values()
+                .filter(|entry| superseded_puffin_paths.contains(entry.data_file.file_path()))
+                .map(|entry| entry.data_file.clone()),
+        );
+
+        let result = summarize_v3_rewrite(&rewritten_files, &new_deletion_vectors)?;
+
+        let transaction = Transaction::new(&self.table);
+        let mut action = transaction
+            .rewrite_files(Vec::new(), Vec::new())
+            .delete_delete_files(rewritten_files);
+        for delete_file in new_deletion_vectors {
+            let sequence_number = deletion_vector_sequence_number(&delete_file, &plans)?;
+            action = action.add_delete_file_with_sequence_number(delete_file, sequence_number);
+        }
+        let action = action.validate_from_snapshot(starting_snapshot_id);
+        action.apply(transaction)?.commit(catalog).await?;
+
+        Ok(result)
+    }
+
+    /// Take the V3 delete inventory in ONE manifest walk: every live data file, every live PARQUET
+    /// position delete the user filter admits, and every live Puffin DV keyed by the data file it
+    /// references.
+    ///
+    /// # Errors
+    ///
+    /// A live position delete that is neither Parquet nor Puffin, a Puffin DV with no derivable
+    /// referenced data file, or two live DVs for one data file.
+    async fn collect_v3_delete_inventory(
+        &self,
+        snapshot: &Snapshot,
+        partition_filter: &mut PartitionFilter,
+    ) -> Result<V3DeleteInventory> {
+        let metadata = self.table.metadata();
+        let manifest_list = snapshot
+            .load_manifest_list(self.table.file_io(), metadata)
+            .await?;
+
+        let mut inventory = V3DeleteInventory::default();
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+            for entry in manifest.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+                let data_file = entry.data_file();
+                let sequence_number = entry.sequence_number().unwrap_or(0);
+                match data_file.content_type() {
+                    DataContentType::Data => {
+                        inventory.data_files.insert(
+                            data_file.file_path().to_string(),
+                            LiveDataFile {
+                                partition_spec_id: data_file.partition_spec_id,
+                                partition: data_file.partition().clone(),
+                                sequence_number,
+                            },
+                        );
+                    }
+                    DataContentType::PositionDeletes => {
+                        inventory.admit_position_delete(
+                            metadata,
+                            partition_filter,
+                            data_file,
+                            sequence_number,
+                        )?;
+                    }
+                    DataContentType::EqualityDeletes => {}
+                }
+            }
+        }
+
+        Ok(inventory)
+    }
+
+    /// Plan one merged deletion vector per data file, and name the Puffin files the plan supersedes.
+    ///
+    /// # Notes
+    ///
+    /// THE PUFFIN CLOSURE. A delete file is removed BY PATH, and one Puffin holds a blob per data
+    /// file, so superseding one DV removes every sibling blob with it. Each sibling is rewritten
+    /// too, or its deleted rows come back. The merge also makes a SHADOWED position effective; Java's
+    /// `BaseDVFileWriter` already folds those into the DV it writes, so a real writer's table holds
+    /// a superset and the live rows do not move.
+    async fn plan_deletion_vectors(
+        &self,
+        inventory: &V3DeleteInventory,
+    ) -> Result<(HashMap<String, DeletionVectorPlan>, HashSet<String>)> {
+        let mut plans: HashMap<String, DeletionVectorPlan> = HashMap::new();
+        for entry in &inventory.legacy_position_deletes {
+            let mut pairs: Vec<(String, i64)> = Vec::new();
+            self.read_position_pairs(&self.table, &entry.data_file, &mut pairs)
+                .await?;
+            for (data_file_path, position) in pairs {
+                let position = u64::try_from(position).map_err(|error| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Position delete '{}' has a negative position {position} for data file \
+                             '{data_file_path}'",
+                            entry.data_file.file_path()
+                        ),
+                    )
+                    .with_source(error)
+                })?;
+                let plan = plans.entry(data_file_path).or_default();
+                plan.positions.push(position);
+                plan.sequence_number = plan.sequence_number.max(entry.sequence_number);
+            }
+        }
+
+        let mut superseded_puffin_paths: HashSet<String> = plans
+            .keys()
+            .filter_map(|path| inventory.deletion_vectors.get(path))
+            .map(|entry| entry.data_file.file_path().to_string())
+            .collect();
+        // The closure: pull in every sibling blob of a superseded Puffin (see the Notes above).
+        for (data_file_path, entry) in &inventory.deletion_vectors {
+            if superseded_puffin_paths.contains(entry.data_file.file_path()) {
+                plans.entry(data_file_path.clone()).or_default();
+            }
+        }
+
+        for (data_file_path, plan) in &mut plans {
+            let data_file = inventory.live_data_file(data_file_path)?;
+            if let Some(entry) = inventory.deletion_vectors.get(data_file_path) {
+                let previous = load_delete_vector(self.table.file_io(), &entry.data_file).await?;
+                plan.positions.extend(previous.iter());
+                plan.sequence_number = plan.sequence_number.max(entry.sequence_number);
+                superseded_puffin_paths.insert(entry.data_file.file_path().to_string());
+            }
+            // A DV below its data file's sequence number fails the scan (Java `findDV`), so refuse
+            // to write one rather than commit a table the reader rejects.
+            if plan.sequence_number < data_file.sequence_number {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Deletion vector for data file '{data_file_path}' would carry data sequence \
+                         number {} but the data file is at {}",
+                        plan.sequence_number, data_file.sequence_number
+                    ),
+                ));
+            }
+        }
+
+        Ok((plans, superseded_puffin_paths))
+    }
+
+    /// Write every planned deletion vector into ONE Puffin file and return the DV `DataFile`s.
+    ///
+    /// # Notes
+    ///
+    /// Every [`DVFileWriter::delete`] call carries the referenced data file's OWN [`PartitionKey`],
+    /// resolved from the live entry. That is what keeps the writer off `resolve_partition_spec_id`'s
+    /// keyless arm, which would stamp spec 0 with an empty partition tuple (row R114 bound (c)).
+    /// [`DVFileWriter::with_partition_spec`] is deliberately NOT used: one Puffin spans every
+    /// partition this arm touches, so no single spec describes it.
+    async fn write_deletion_vectors(
+        &self,
+        plans: &HashMap<String, DeletionVectorPlan>,
+        inventory: &V3DeleteInventory,
+    ) -> Result<Vec<DataFile>> {
+        let metadata = self.table.metadata();
+        let schema = metadata.current_schema().clone();
+        let location_generator = DefaultLocationGenerator::new(metadata.clone())?;
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "rewritten-dv".to_string(),
+            Some(uuid::Uuid::now_v7().to_string()),
+            DataFileFormat::Puffin,
+        );
+        let location =
+            location_generator.generate_location(None, &file_name_generator.generate_file_name());
+        let mut writer = DVFileWriter::new(self.table.file_io().new_output(location)?);
+
+        for (data_file_path, plan) in plans {
+            let data_file = inventory.live_data_file(data_file_path)?;
+            let spec = metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Data file '{data_file_path}' references unknown partition spec {}",
+                            data_file.partition_spec_id
+                        ),
+                    )
+                })?
+                .as_ref()
+                .clone();
+            let partition_key =
+                PartitionKey::new(spec, schema.clone(), data_file.partition.clone())?;
+            for position in &plan.positions {
+                writer.delete(data_file_path, *position, Some(&partition_key))?;
+            }
+        }
+
+        writer.close().await
+    }
 }
 
 /// One `(file_path, pos)` pair's MEASURED serialized size: the UTF-8 length of the path plus 8 for
@@ -1574,6 +1830,175 @@ fn locate_reserved_columns<'a>(
 struct LiveDeleteEntry {
     data_file: DataFile,
     sequence_number: i64,
+}
+
+/// One live DATA file, as the V3 arm needs it: where a deletion vector covering it must be stamped,
+/// and the sequence number such a vector must not fall below.
+struct LiveDataFile {
+    partition_spec_id: i32,
+    partition: Struct,
+    sequence_number: i64,
+}
+
+/// The live delete inventory of a V3 table, taken in ONE manifest walk by
+/// [`RewritePositionDeleteFiles::collect_v3_delete_inventory`].
+#[derive(Default)]
+struct V3DeleteInventory {
+    data_files: HashMap<String, LiveDataFile>,
+    /// The live PARQUET position deletes the user filter admits — the files the V3 arm consumes.
+    legacy_position_deletes: Vec<LiveDeleteEntry>,
+    /// The live Puffin deletion vectors, keyed by the data file each one references.
+    deletion_vectors: HashMap<String, LiveDeleteEntry>,
+}
+
+impl V3DeleteInventory {
+    /// Route ONE live position-delete entry into the inventory.
+    ///
+    /// # Errors
+    ///
+    /// A format that is neither Parquet nor Puffin, a Puffin DV with no derivable referenced data
+    /// file, or a second live DV for a data file that already has one.
+    fn admit_position_delete(
+        &mut self,
+        metadata: &TableMetadata,
+        partition_filter: &mut PartitionFilter,
+        data_file: &DataFile,
+        sequence_number: i64,
+    ) -> Result<()> {
+        let entry = LiveDeleteEntry {
+            data_file: data_file.clone(),
+            sequence_number,
+        };
+        match data_file.file_format() {
+            DataFileFormat::Puffin => {
+                let referenced = referenced_data_file_location(data_file).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Deletion vector '{}' names no referenced data file",
+                            data_file.file_path()
+                        ),
+                    )
+                })?;
+                if self
+                    .deletion_vectors
+                    .insert(referenced.clone(), entry)
+                    .is_some()
+                {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Data file '{referenced}' has more than one live deletion vector"),
+                    ));
+                }
+                Ok(())
+            }
+            DataFileFormat::Parquet => {
+                if partition_filter.matches(metadata, data_file)? {
+                    self.legacy_position_deletes.push(entry);
+                }
+                Ok(())
+            }
+            // Refused, not skipped: the V1/V2 arm reads and writes parquet only, and silently
+            // dropping these here would make zero counts mean "did not look".
+            format => {
+                if partition_filter.matches(metadata, data_file)? {
+                    return Err(Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        format!(
+                            "Position delete '{}' is {format}: only Parquet position deletes and \
+                             Puffin deletion vectors are supported on format version 3",
+                            data_file.file_path()
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The live data file at `data_file_path`.
+    ///
+    /// # Errors
+    ///
+    /// `DataInvalid` when the current snapshot does not hold it — a dangling position delete, which
+    /// [`RemoveDanglingDeleteFiles`](super::remove_dangling_delete_files) drops and this arm will
+    /// not silently discard.
+    fn live_data_file(&self, data_file_path: &str) -> Result<&LiveDataFile> {
+        self.data_files.get(data_file_path).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Position delete references data file '{data_file_path}', which is not live in \
+                     the current snapshot; run RemoveDanglingDeleteFiles first"
+                ),
+            )
+        })
+    }
+}
+
+/// The deletion vector the V3 arm will write for ONE data file: the merged positions and the data
+/// sequence number to stamp on it.
+#[derive(Default)]
+struct DeletionVectorPlan {
+    positions: Vec<u64>,
+    sequence_number: i64,
+}
+
+/// The stamp for one written deletion vector, read back out of the plan it came from.
+///
+/// # Errors
+///
+/// `Unexpected` when the written DV carries no referenced data file, or names one the plan does not
+/// hold — both are writer bugs, not table states.
+fn deletion_vector_sequence_number(
+    delete_file: &DataFile,
+    plans: &HashMap<String, DeletionVectorPlan>,
+) -> Result<i64> {
+    delete_file
+        .referenced_data_file()
+        .and_then(|path| plans.get(&path))
+        .map(|plan| plan.sequence_number)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "Written deletion vector '{}' has no planned sequence number",
+                    delete_file.file_path()
+                ),
+            )
+        })
+}
+
+/// The four `Result` counts of one V3 rewrite. DVs count as delete files on both sides.
+///
+/// # Notes
+///
+/// Bytes are summed over DISTINCT file paths, counts are not. One Puffin holds a blob per data file
+/// and every one of those `DataFile`s carries the WHOLE Puffin's size, so summing per entry would
+/// report the same bytes once per blob.
+fn summarize_v3_rewrite(
+    rewritten_files: &[DataFile],
+    added_files: &[DataFile],
+) -> Result<RewritePositionDeleteFilesResult> {
+    let distinct_bytes = |files: &[DataFile]| -> Result<u64> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut total: u64 = 0;
+        for file in files {
+            if seen.insert(file.file_path()) {
+                total = total.checked_add(file.file_size_in_bytes).ok_or_else(|| {
+                    Error::new(ErrorKind::Unexpected, "rewrite bytes count overflow")
+                })?;
+            }
+        }
+        Ok(total)
+    };
+
+    Ok(RewritePositionDeleteFilesResult {
+        rewritten_delete_files_count: rewritten_files.len(),
+        added_delete_files_count: added_files.len(),
+        rewritten_bytes_count: distinct_bytes(rewritten_files)?,
+        added_bytes_count: distinct_bytes(added_files)?,
+    })
 }
 
 #[cfg(test)]
