@@ -35,6 +35,7 @@ use futures::TryStreamExt;
 use tempfile::TempDir;
 
 use super::*;
+use crate::delete_file_index::referenced_data_file_location;
 use crate::expr::Reference;
 use crate::io::LocalFsStorageFactory;
 use crate::memory::MemoryCatalogBuilder;
@@ -5590,4 +5591,223 @@ async fn test_v3_non_parquet_position_delete_is_refused_not_skipped() {
         .await
         .expect_err("an unreadable position-delete format must fail closed on V3");
     assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+}
+
+/// THE SHADOW CLOSURE, PARTITION LEG — the COMMON shape, not the rare one: a fork-written position
+/// delete carries `truncate(16)` path bounds, so partition-scoped is its default. Data file A sits
+/// in `x=0`; a FILE-scoped delete stamped `x=1` is admitted by `filter(x = 1)` and plans A, while a
+/// PARTITION-scoped delete in `x=0` is excluded and still applies to A.
+///
+/// MUTATION COVERAGE — APPLIED: replace the partition arm with `None => None` and the run returns
+/// `Ok {rewritten: 1, added: 1}`, live rows `{10}` becoming `{10, 12}` — y=12 resurrected.
+#[tokio::test]
+async fn test_v3_refuses_when_a_partition_scoped_delete_would_be_shadowed() {
+    let (catalog, temp) = local_fs_catalog().await;
+    let table = create_short_path_partitioned_table(&catalog, temp.path(), FormatVersion::V2).await;
+
+    let a = write_data_file(&table, "a.parquet", 0, &[
+        (0, 10, 1),
+        (0, 11, 2),
+        (0, 12, 3),
+    ])
+    .await;
+    let a_path = a.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![a]).await;
+
+    // Admitted by `filter(x = 1)`: file-scoped, so it applies to A by PATH despite its `x=1` stamp.
+    let admitted = write_file_scoped_position_delete_file(&table, 1, &a_path, &[1]).await;
+    // Excluded by that filter: partition-scoped in `x=0`, so it applies to A by (spec, partition).
+    let excluded = write_position_delete_file(&table, Some(0), &[(a_path.as_str(), 2)]).await;
+    assert!(
+        referenced_data_file_location(&excluded).is_none(),
+        "fixture NON-VACUITY: the excluded delete must be PARTITION-scoped, or this pins the path leg"
+    );
+    let table = add_deletes(&catalog, &table, vec![admitted, excluded]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([10]),
+        "fixture NON-VACUITY: BOTH deletes apply to a.parquet, by different routes"
+    );
+
+    let error = RewritePositionDeleteFiles::new(table.clone())
+        .filter(Reference::new("x").equal_to(Datum::long(1)))
+        .execute(&catalog)
+        .await
+        .expect_err("a partition-scoped delete that would be shadowed must fail the run closed");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert!(error.to_string().contains("SHADOWS"), "{error}");
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "fail CLOSED: nothing committed, so no row came back"
+    );
+}
+
+/// THE ALREADY-SHADOWED DIRECTION. A deletion vector that does NOT cover a legacy delete it already
+/// suppresses: merging makes those positions effective and DELETES rows the table returns today.
+/// Java 1.10.0's own rewrite writes this shape — its `loadPreviousDeletes` is `path -> null`.
+///
+/// MUTATION COVERAGE — APPLIED: drop the superset check and the run returns
+/// `Ok {rewritten: 2, added: 1}`, live rows `{11, 12}` becoming `{11}` — y=12 silently gone.
+#[tokio::test]
+async fn test_v3_refuses_when_the_existing_vector_does_not_cover_the_legacy_delete() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let a = write_data_file(&table, "a.parquet", 7, &[
+        (7, 10, 1),
+        (7, 11, 2),
+        (7, 12, 3),
+    ])
+    .await;
+    let a_path = a.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![a]).await;
+
+    // The legacy delete the DV will shadow without covering: it masks position 2 (y=12).
+    let shadowed = write_position_delete_file(&table, Some(7), &[(a_path.as_str(), 2)]).await;
+    let table = add_deletes(&catalog, &table, vec![shadowed]).await;
+    // A throwaway, present only so the `RewriteFiles` below has something to remove.
+    let scratch = write_position_delete_file(&table, Some(7), &[(a_path.as_str(), 0)]).await;
+    let scratch_path = scratch.file_path().to_string();
+    let table = add_deletes(&catalog, &table, vec![scratch]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let scratch_seq = live_delete_seq(&table, &scratch_path).await;
+    let vector = write_deletion_vectors_in_one_puffin(&table, 7, &[(&a_path, &[0])]).await;
+    let removed: Vec<DataFile> = live_delete_files(&table)
+        .await
+        .into_iter()
+        .filter(|f| f.file_path() == scratch_path)
+        .collect();
+    let table = swap_delete_files(&catalog, &table, removed, vector, scratch_seq).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([11, 12]),
+        "fixture NON-VACUITY: the DV masks position 0 and SHADOWS the delete masking position 2"
+    );
+
+    // NO FILTER — so the shadow closure is silent and only the superset check can catch this.
+    let error = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .expect_err("a non-superset vector must fail the run closed");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert!(
+        error
+            .to_string()
+            .contains("DELETE rows the table returns today"),
+        "the refusal names the loss direction: {error}"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "fail CLOSED: y=12 is still live"
+    );
+}
+
+/// The Puffin closure's LIVENESS guard: a sibling blob whose data file is no longer live is dropped
+/// with its Puffin, not planned. Without the guard it reaches `live_data_file` and errors.
+///
+/// MUTATION COVERAGE — APPLIED: drop `&& inventory.data_files.contains_key(data_file_path)` from the
+/// sibling loop and the run returns `Unexpected`. RED on the success expectation.
+#[tokio::test]
+async fn test_v3_puffin_closure_skips_a_sibling_whose_data_file_is_gone() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 7, &[(7, 10, 1), (7, 11, 2)]).await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+
+    let legacy = write_position_delete_file(&table, Some(7), &[(x_path.as_str(), 1)]).await;
+    let table = add_deletes(&catalog, &table, vec![legacy]).await;
+    let scratch = write_position_delete_file(&table, Some(7), &[(x_path.as_str(), 0)]).await;
+    let scratch_path = scratch.file_path().to_string();
+    let table = add_deletes(&catalog, &table, vec![scratch]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    // ONE Puffin: X's vector (a SUPERSET of the legacy delete) beside a sibling for a data file the
+    // snapshot no longer holds.
+    let ghost = format!("{}/data/ghost.parquet", table.metadata().location());
+    let scratch_seq = live_delete_seq(&table, &scratch_path).await;
+    let puffin =
+        write_deletion_vectors_in_one_puffin(&table, 7, &[(&x_path, &[0, 1]), (&ghost, &[0])])
+            .await;
+    let removed: Vec<DataFile> = live_delete_files(&table)
+        .await
+        .into_iter()
+        .filter(|f| f.file_path() == scratch_path)
+        .collect();
+    let table = swap_delete_files(&catalog, &table, removed, puffin, scratch_seq).await;
+
+    let before = scan_y_values(&table).await;
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .expect("a sibling naming a dead data file must not fail the run");
+    assert_eq!(
+        result.added_delete_files_count, 1,
+        "only X's vector is rewritten; the ghost sibling is dropped with its Puffin"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 1, "one deletion vector survives");
+    assert_eq!(
+        after[0].referenced_data_file().as_deref(),
+        Some(x_path.as_str())
+    );
+}
+
+/// A CAPABILITY LIMIT, stated rather than given a remedy that cannot work. A file-scoped ORC delete
+/// the filter excluded still references a planned data file, so the closure refuses — but "widen the
+/// filter" would only route it to `FeatureUnsupported`. No filter width converts such a table.
+///
+/// MUTATION COVERAGE — APPLIED: collapse the remedy to the unconditional "Widen the filter" string
+/// and this test reds on the message.
+#[tokio::test]
+async fn test_v3_shadowed_unreadable_delete_says_no_filter_width_helps() {
+    let (catalog, temp) = local_fs_catalog().await;
+    let table = create_short_path_partitioned_table(&catalog, temp.path(), FormatVersion::V2).await;
+
+    let a = write_data_file(&table, "a.parquet", 0, &[
+        (0, 10, 1),
+        (0, 11, 2),
+        (0, 12, 3),
+    ])
+    .await;
+    let a_path = a.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![a]).await;
+
+    let admitted = write_position_delete_file(&table, Some(0), &[(a_path.as_str(), 2)]).await;
+    let mut unreadable = write_file_scoped_position_delete_file(&table, 1, &a_path, &[1]).await;
+    unreadable.file_format = DataFileFormat::Orc;
+    assert!(
+        referenced_data_file_location(&unreadable).is_some(),
+        "fixture NON-VACUITY: the ORC delete must be FILE-scoped, or it never reaches the path leg"
+    );
+    let table = add_deletes(&catalog, &table, vec![admitted, unreadable]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let error = RewritePositionDeleteFiles::new(table)
+        .filter(Reference::new("x").equal_to(Datum::long(0)))
+        .execute(&catalog)
+        .await
+        .expect_err("an unreadable shadowed delete must fail the run closed");
+    assert!(
+        error
+            .to_string()
+            .contains("NO filter setting converts this table"),
+        "the refusal states the capability limit instead of an unreachable remedy: {error}"
+    );
 }

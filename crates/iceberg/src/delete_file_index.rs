@@ -434,6 +434,9 @@ impl PopulatedDeleteFileIndex {
     /// 3. A FILE-SCOPED position delete (one with a derivable referenced data file — see
     ///    [`referenced_data_file_location`]) is added to `pos_deletes_by_path`, keyed by that file.
     /// 4. Otherwise, the delete file is added to one of two hash maps based on its content type.
+    ///
+    /// This keying is RE-DERIVED, not shared, by `maintenance::rewrite_position_delete_files`'s
+    /// `refuse_shadowed_deletes`. Change it here and that guard diverges silently.
     fn new(files: Vec<DeleteFileContext>) -> PopulatedDeleteFileIndex {
         let mut eq_deletes_by_partition: PartitionDeleteMap = HashMap::default();
         let mut pos_deletes_by_partition: PartitionDeleteMap = HashMap::default();
