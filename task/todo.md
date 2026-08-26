@@ -65,20 +65,23 @@ deliberate and argued on row R136: no size gate (V-1) and one commit per run (V-
       because merging it would DELETE rows the table returns today. Java 1.10.0's own rewrite writes
       that shape — its `loadPreviousDeletes` is `path -> null` — so divergence (g)'s old "no real
       writer produces this" envelope was wrong and is corrected on row R136.
-- [x] **Limit (k) named as a residue, not left in an error string.** The (g) fix makes a
-      Java-rewrite-shaped table — a NON-SUPERSET vector beside a live legacy delete for the same
-      data file — unconvertible at any filter width. Refusing is still right, but no in-tree action
-      clears it: R137 removes only deletes that apply to nothing, and the V3 DML arm refuses such a
-      data file outright (R114 U4). The error says the action cannot clear it rather than naming a
-      remedy it cannot help with.
+- [x] **Limit (k) named as a residue — and CORRECTED 2026-08-27: it is not a dead end.** The (g) fix
+      makes a Java-rewrite-shaped table unconvertible BY THIS ARM at any filter width, but
+      `RewriteDataFiles` with `remove_dangling_deletes(true)` clears it, executed here: 1 rewritten /
+      1 added / 2 delete files removed, live rows preserved exactly, second V3 run honest zeros. It
+      works because the legacy delete is SHADOWED, so the rewrite's scan never reads it. R137 and the
+      V3 DML arm still do NOT work and stay cited. The refusal names the escape.
 - [x] Capability limit (j) stated: a v3 table whose ORC/Avro position deletes OVERLAP convertible
       ones cannot be converted at any filter width, and the refusal says so.
 - [x] V-1's third reason re-argued (gating can leave TWO live DVs for one data file, which
       `DeleteFileIndex` rejects); V-2's cost stated (no partial progress under `validate_from_snapshot`).
 
-Refusal placement VERIFIED by mutation, not intent: it returns before the merge and before any
-write or commit, and `plan.positions` holds only legacy-derived positions there, so a Puffin-closure
-sibling passes. Refusing an empty legacy set reds the sibling test, 1 of 3490.
+Refusal placement, corrected 2026-08-27. Mutation E witnessed ONE of the two facts, not both: it
+proves closure siblings reach the check with an EMPTY position set (refusing an empty set reds the
+sibling test, 1 of 3490). It does NOT witness the ordering claim — moving the check after the merge
+is 0 red, because the refusal aborts before any IO wherever it sits. The real guarantee is that
+`write_deletion_vectors` opens the first Puffin and is strictly later than every refusal; the
+comment now says that instead.
 
 Outcome: 15 offline V3 tests + the interop V3 leg green. Mutations applied one at a time, each RED.
 Residue lettering on R136 runs (e), (f), (g), (i), (j); (h) was retired with the dangling refusal.
