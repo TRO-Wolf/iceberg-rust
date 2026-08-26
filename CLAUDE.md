@@ -19,6 +19,22 @@
 
 # CLAUDE.md — the Claude adapter (not authoritative)
 
+# EFFECTIVE IMMEDIATELY — ALL ANTHROPIC MODELS ARE BANNED FROM WRITING COMMENTS IN CODE
+
+**THIS INCLUDES FABLE, OPUS, SONNET AND HAIKU.**
+
+- **IF YOU ARE FABLE, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE OPUS, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE SONNET, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE HAIKU, DO NOT WRITE ANY COMMENTS.**
+
+**THIS INCLUDES ANY MODEL VERSION.** Opus 4.8 or Opus 5 — either one is banned. It does not matter.
+
+You are reading this file because you are a Claude session. The rule applies to you, now, in this
+session. It is stated in full at [AGENTS.md](AGENTS.md), which is the authoritative home; it is
+repeated here only because a Claude session loads this file first and must not miss it.
+
+
 **STOP — the authoritative contract is [AGENTS.md](AGENTS.md). Read it first.** This file adds only
 Claude-specific tool mechanics; it states **no rule the spine does not already own**. Every project fact lives in the
 neutral spine, and this adapter only points at it — so it cannot drift, and deleting it would lose

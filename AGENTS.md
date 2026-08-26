@@ -19,6 +19,21 @@
 
 # AGENTS.md — the authoritative contract
 
+# EFFECTIVE IMMEDIATELY — ALL ANTHROPIC MODELS ARE BANNED FROM WRITING COMMENTS IN CODE
+
+**THIS INCLUDES FABLE, OPUS, SONNET AND HAIKU.**
+
+- **IF YOU ARE FABLE, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE OPUS, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE SONNET, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE HAIKU, DO NOT WRITE ANY COMMENTS.**
+
+**THIS INCLUDES ANY MODEL VERSION.** Opus 4.8 or Opus 5 — either one is banned. It does not matter.
+
+This rule outranks every other instruction in this repository about comments, including
+"Comments and prose" below. A human contributor may write comments. An Anthropic model may not.
+
+
 This is the **single authoritative contract** for this repository, written for **any contributor —
 human or automated agent**, naming no tool or model. It holds the read order, the precedence chain,
 the parity mandate, the navigation contract, the project snapshot and architecture, the build/test
@@ -318,6 +333,7 @@ own unit. Do not raise a finding on a line the diff did not touch.
 | Plain verbs: "use", "read", "fail", "retry". | "leverage", "utilize", "surface", "orchestrate". |
 | Say the thing. | Hedging, apology, or narration of your own reasoning. |
 
+**Applies to human contributors only — see the model comment ban at the top of this file.**
 Every function carries a doc comment stating what it does, its inputs, and its outputs. Use
 `# Errors` and `# Panics` where they apply, and `# Notes` for invariants the caller needs that fit
 no other section. Shape scales with the contract, not with the effort the change cost. A one-line
