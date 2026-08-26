@@ -5715,7 +5715,7 @@ async fn test_v3_refuses_when_the_existing_vector_does_not_cover_the_legacy_dele
     assert!(
         error
             .to_string()
-            .contains("RewriteDataFiles with remove_dangling_deletes"),
+            .contains("RewriteDataFiles can, given remove_dangling_deletes(true)"),
         "and names the escape that DOES clear it, pinned by \
          test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files: {error}"
     );
@@ -5885,12 +5885,36 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
             .contains("THIS ACTION CANNOT CLEAR THAT STATE")
     );
 
-    // THE ESCAPE. A one-file group needs both floors relaxed; the delete-file threshold is what
-    // makes a data file with any delete a rewrite candidate at all.
-    let rewrite = RewriteDataFiles::new(table.clone())
-        .min_input_files(1)
-        .delete_file_threshold(1)
+    // NEGATIVE CONTROL, and the reason the knobs are named in the message: the unknobbed form does
+    // NOTHING here. `DELETE_FILE_THRESHOLD_DEFAULT` is `usize::MAX`, so a well-sized data file
+    // carrying deletes is never a candidate and the planner returns an empty plan.
+    let unknobbed = RewriteDataFiles::new(table.clone())
         .remove_dangling_deletes(true)
+        .execute(&catalog)
+        .await
+        .expect("the unknobbed run succeeds — it just does nothing");
+    assert_eq!(
+        (
+            unknobbed.rewritten_data_files_count,
+            unknobbed.removed_delete_files_count
+        ),
+        (0, 0),
+        "`remove_dangling_deletes` ALONE is a no-op on this shape; a message promising it would          send the operator round a loop"
+    );
+    assert_eq!(
+        live_delete_files(&catalog.load_table(table.identifier()).await.unwrap())
+            .await
+            .len(),
+        2,
+        "and both delete files are still live afterwards"
+    );
+
+    // THE ESCAPE, exactly as the refusal words it. `min_input_files` is NOT needed: the gate's
+    // `any_too_many_deletes` clause carries no `size > 1` guard, so the delete count admits the lone
+    // file on its own.
+    let rewrite = RewriteDataFiles::new(table.clone())
+        .remove_dangling_deletes(true)
+        .delete_file_threshold(1)
         .execute(&catalog)
         .await
         .expect("RewriteDataFiles clears the shadowed state");
@@ -5918,4 +5942,13 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
         .await
         .expect("the cleared table converts without refusing");
     assert_eq!(second, RewritePositionDeleteFilesResult::default());
+
+    // THE TIE. The refusal must name EVERY knob this test just had to pass, or the message promises
+    // an invocation nobody has executed. Both directions of drift red here.
+    for knob in ["remove_dangling_deletes(true)", "delete_file_threshold"] {
+        assert!(
+            refusal.to_string().contains(knob),
+            "the refusal names '{knob}', the escape this test actually runs: {refusal}"
+        );
+    }
 }

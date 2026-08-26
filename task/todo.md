@@ -67,10 +67,17 @@ deliberate and argued on row R136: no size gate (V-1) and one commit per run (V-
       writer produces this" envelope was wrong and is corrected on row R136.
 - [x] **Limit (k) named as a residue — and CORRECTED 2026-08-27: it is not a dead end.** The (g) fix
       makes a Java-rewrite-shaped table unconvertible BY THIS ARM at any filter width, but
-      `RewriteDataFiles` with `remove_dangling_deletes(true)` clears it, executed here: 1 rewritten /
-      1 added / 2 delete files removed, live rows preserved exactly, second V3 run honest zeros. It
-      works because the legacy delete is SHADOWED, so the rewrite's scan never reads it. R137 and the
-      V3 DML arm still do NOT work and stay cited. The refusal names the escape.
+      `RewriteDataFiles` clears it — but with TWO knobs, corrected again 2026-08-28: the one-knob
+      wording shipped twice and is a NO-OP (0/0/0, both deletes still live, same refusal). Executed:
+      `remove_dangling_deletes(true).delete_file_threshold(1)` gives 1 rewritten / 1 added / 2
+      removed, live rows preserved exactly, second V3 run honest zeros. The threshold's default is
+      `usize::MAX`, so the delete-count clause is off; `min_input_files` is NOT needed because
+      `any_too_many_deletes` has no `size > 1` guard. Not universally unavailable at defaults —
+      a partition of five small files admits the group anyway. R137 and the V3 DML arm still do NOT
+      work and stay cited. The test runs the ADVERTISED invocation, keeps the one-knob no-op as a
+      negative control, and asserts the refusal names every knob it passes.
+- [x] (j) gains a TRIGGER: the block is an incidental parquet parse failure, not a guard, so (j)
+      dissolves silently the day an ORC/Avro delete reader lands. Re-audit it in that change.
 - [x] Capability limit (j) stated: a v3 table whose ORC/Avro position deletes OVERLAP convertible
       ones cannot be converted at any filter width, and the refusal says so.
 - [x] V-1's third reason re-argued (gating can leave TWO live DVs for one data file, which
