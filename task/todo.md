@@ -31,6 +31,29 @@ How to use it (see the manuals' §1):
 
 ---
 
+## CLOSED (2026-08-26): 1,000-line Rust source-file gate
+
+Port RePark's fail-closed Rust file-size guard to this workspace. The default ceiling is 1,000
+lines. Existing files above the ceiling receive exact-count legacy ratchets because 104 files
+already exceed the limit; no legacy file may grow and no new over-limit file may land.
+
+- [x] Add `scripts/check_rust_file_size.py` with the 1,000-line default, exact legacy ratchets,
+      actionable failures, and fail-closed handling for empty scans, unreadable files, and stale
+      ratchet paths. The live scan passes over all 363 Rust files.
+- [x] Add `scripts/check_rust_file_size_test.py` and the thin shell wrapper. Pin the boundary,
+      over-limit rejection, ratchet behavior, stale paths, unreadable files, and empty scans.
+      Eleven tests pass, including a real 1,001-line rejection.
+- [x] Wire `check-rust-file-size` into `Makefile` `check` and add a direct CI check step in
+      `.github/workflows/ci.yml`.
+- [x] Update `AGENTS.md` so the build-gate roster points to the checker without duplicating its
+      ceiling table.
+- [x] Run the checker tests, clean-tree gate, explicit over-limit provocation, `make check`, and an
+      independent fresh-context Critic review. The Critic's findings were remediated before it declared
+      convergence with no open S0–S2 findings. All unrelated working-tree changes remain intact.
+
+Outcome: the gate scans 363 Rust files. It freezes 104 inherited overages at their exact current
+counts, rejects new files above 1,000 lines, and fails if legacy debt grows or leaves stale headroom.
+
 ## QUEUED (2026-08-25): engine-agreed order — R166 interop, then F-13-or-F-7
 
 Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next.
