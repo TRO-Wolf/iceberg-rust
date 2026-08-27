@@ -17,89 +17,47 @@
 
 //! This module contains the cherry-pick action — the write-audit-publish (WAP) "publish" commit.
 //!
-//! [`CherryPickAction`] mirrors Java `CherryPickOperation` (`core/CherryPickOperation.java`, 288 lines).
-//! Given the id of a STAGED snapshot (one that exists in table metadata but is NOT on the `main` branch —
-//! typically written by a WAP audit job with a `wap.id` summary property), it publishes that snapshot onto
-//! `main`. There are three published shapes, dispatched on the staged snapshot's operation + a precedence
-//! rule:
+//! [`CherryPickAction`] mirrors Java `CherryPickOperation`. Given the id of a STAGED snapshot, one
+//! that exists in table metadata but is not on `main`, it publishes that snapshot onto `main`. There
+//! are three published shapes, dispatched on the staged snapshot's operation and a precedence rule:
 //!
-//! 1. **Fast-forward (precedence over replay, Java `apply` L193-204):** when the staged snapshot's PARENT is
-//!    the current `main` head (or both are null), `main` is moved to the staged snapshot AS-IS — NO new
-//!    snapshot is produced, no files are replayed. This is checked BEFORE the replay paths, so an APPEND or a
-//!    replace-partitions OVERWRITE whose parent == head ALSO fast-forwards (cite L193-204:
-//!    `requireFastForward || isFastForward(base)`).
-//! 2. **APPEND replay (Java `cherrypick` L78-92):** the staged snapshot's added data files are replayed
-//!    through the producer's add path into a NEW snapshot on `main` (operation `Append`), tagged with the
-//!    `source-snapshot-id` summary property (the staged id) and — iff the staged snapshot carries a non-empty
-//!    `wap.id` — the `published-wap-id` summary property.
-//! 3. **OVERWRITE + `replace-partitions=true` replay (Java `cherrypick` L93-129):** the staged snapshot's
-//!    added AND removed data files are replayed into a NEW `Overwrite` snapshot (the removed files are dropped
-//!    by-path through the producer's `process_deletes`, so they must still be live in the table —
-//!    `failMissingDeletePaths`). Same `source-snapshot-id` / `published-wap-id` tagging. The replaced
-//!    partitions are tracked so [`CherryPickAction::validate`] can reject a concurrent change in them.
+//! | # | shape |
+//! |---|---|
+//! | 1 | Fast-forward when parent is `main` head (or both null). No new snapshot. Takes precedence. |
+//! | 2 | APPEND replay: added data files into a new `Append` snapshot. |
+//! | 3 | OVERWRITE `replace-partitions=true` replay: added and removed files. Removed paths must be live. |
 //!
-//! Anything else (a staged DELETE, a non-replace OVERWRITE, or an append/overwrite whose parent is neither
-//! head nor null) is rejected: "Cannot cherry-pick snapshot %s: not append, dynamic overwrite, or
-//! fast-forward".
+//! Anything else is rejected: a staged delete, a non-replace overwrite, or an append or overwrite
+//! whose parent is neither head nor null.
 //!
-//! **The action is STATELESS across the commit retry loop** (mirroring every other action): it stores only
-//! the staged snapshot id. Both [`CherryPickAction::validate`] and the `TransactionAction::commit` resolve
-//! everything — case dispatch, file replay, WAP/dedup checks — against the REFRESHED table passed in by
-//! `do_commit`. An "unknown snapshot id" is rejected the same way against the refreshed base.
+//! **The action is STATELESS across the commit retry loop.** It stores only the staged snapshot id.
+//! Both [`CherryPickAction::validate`] and the commit resolve everything against the REFRESHED table
+//! `do_commit` passes in.
 //!
-//! **Java-parity surface note.** Java exposes cherry-pick via `ManageSnapshots.cherrypick(long)`, routed
-//! through the transaction. Rust exposes it as a STANDALONE action ([`crate::transaction::Transaction::cherry_pick`])
-//! rather than a method on `ManageSnapshotsAction`: the ref-op action only EMITS `SetSnapshotRef` /
-//! `RemoveSnapshotRef` updates and has no snapshot-producing path, whereas cherry-pick (in its replay shapes)
-//! needs the full [`SnapshotProducer`]. The two do not compose cleanly, so the honest shape is a separate
-//! action — the same choice already made for `replace_partitions` / `overwrite_files`, which Java also reaches
-//! through producer subclasses. `ManageSnapshotsAction` carries a doc pointer here.
+//! **Java-parity surface note.** Java exposes cherry-pick through `ManageSnapshots.cherrypick(long)`.
+//! Rust exposes it as a standalone action, because the ref-op action emits only ref updates and has
+//! no snapshot-producing path, while cherry-pick's replay shapes need the full [`SnapshotProducer`].
 //!
-//! **Multi-spec replay (Java parity since 2026-06-11).** Java's add path (`MergingSnapshotProducer.add`)
-//! preserves each added file's OWN partition spec id and writes per-spec manifests, so cherry-picking a
-//! snapshot whose data files belong to an OLDER partition spec onto a table whose default spec has since moved
-//! SUCCEEDS in Java. The Rust replay reuses the producer's `validate_added_data_files`, which now mirrors
-//! Java: an added file is accepted as long as its `partition_spec_id` EXISTS in the table's specs (an UNKNOWN
-//! spec id is rejected with Java's "Cannot find partition spec %s for data file: %s"), and the producer
-//! writes ONE manifest per partition-spec group — so the same old-spec replay SUCCEEDS, the replayed files
-//! land in a manifest stamped with their own spec id, and a scan reads them correctly. Pinned by
-//! `test_cherrypick_multispec_replay_produces_per_spec_manifest`.
+//! **Multi-spec replay.** Java's add path preserves each added file's OWN partition spec id and
+//! writes per-spec manifests, so cherry-picking a snapshot whose files belong to an older spec
+//! succeeds. The Rust replay mirrors that: an added file is accepted while its `partition_spec_id`
+//! exists in the table's specs, and the producer writes one manifest per spec group.
 //!
-//! The stage-only WAP WRITE path that creates a staged snapshot in the first place
-//! (`FastAppendAction::stage_only()` / `DeleteFilesAction::stage_only()`, Java `SnapshotProducer.stageOnly()`)
-//! landed in Group V (2026-06-11); see [`crate::transaction::snapshot::SnapshotProducer::with_stage_only`].
-//! Most tests here still graft staged snapshots by `set_current`-ing main off a normally-published snapshot
-//! (a staged snapshot is just a dangling one), which is equivalent for the publish path under test.
+//! **WAP-path publish dedup.** Ancestry first, WAP-id last. When both apply, ancestry wins.
+//! WAP-id walks current ancestry and matches both `wap.id` and `published-wap-id`. Replay
+//! stamps the latter; fast-forward keeps only the staged `wap.id`.
 //!
-//! **WAP-path publish dedup (Group V V2, 2026-06-11).** Two dedup paths run in [`CherryPickAction::validate`],
-//! in Java's order (`CherryPickOperation.validate`, 1.10.0 bytecode): `validateNonAncestor` FIRST (the
-//! ancestry path — already-an-ancestor + the `source-snapshot-id` double-publish lookup), `validateWapPublish`
-//! LAST (the WAP-id path). When BOTH apply, the ANCESTRY error fires (Java order). The WAP-id check
-//! ([`Self::validate_wap_publish`] → [`is_wap_id_published`]) walks the CURRENT ancestry and rejects with the
-//! verbatim `DuplicateWAPCommitException` message iff the picked snapshot's non-empty `wap.id` already appears
-//! among the ancestors — comparing it against each ancestor's OWN `wap.id` (`STAGED_WAP_ID_PROP`) AND its
-//! `published-wap-id` (`PUBLISHED_WAP_ID_PROP`). BOTH arms matter: a REPLAY publish stamps `published-wap-id`
-//! (caught via that arm), but a FAST-FORWARD publish keeps only the staged snapshot's own `wap.id` (caught via
-//! the STAGED arm — Java `TestWapWorkflow.testDuplicateCherrypick`'s first publish is a fast-forward). The
-//! corruption this prevents is a duplicate WAP publish double-applying the same audited change.
+//! **Dedup scope is the CURRENT ANCESTRY of `main`, by design.** A `wap.id` that has left the live
+//! `main` line is no longer seen as published, so a rollback reopens it and a second publish of the
+//! same id succeeds. Java behaves identically. This is not a fork divergence.
 //!
-//! **Dedup scope is the CURRENT ANCESTRY of `main`, by design (Java-faithful escape hatch).** Because the walk
-//! roots at `metadata.current_snapshot()` (Java `WapUtil.isWapIdPublished` → `SnapshotUtil.ancestorIds(meta.
-//! currentSnapshot(), ...)`), a `wap.id` that has left the live `main` line is NO LONGER seen as published: a
-//! WAP publish that is rolled BACK past — or whose publishing snapshot is orphaned (cherry-pick only ever
-//! targets `main`) — reopens its `wap.id`, so a second same-id publish then succeeds. This is identical in Java
-//! (same ancestry source); it is NOT a Rust divergence, and is pinned by
-//! `test_cherrypick_rollback_reopens_wap_id_java_faithful`.
+//! **`write.wap.enabled` is engine-side only.** No core production class reads it, and
+//! `SnapshotProducer.apply()` never calls `WapUtil`. Only `CherryPickOperation` validates a WAP
+//! publish, so core does not gate an ordinary commit that carries a `wap.id`. There is no core gate
+//! to port.
 //!
-//! **`write.wap.enabled` is ENGINE-side only — core does NOT gate ordinary commits (V3, settled OUT by
-//! 1.10.0 bytecode).** `TableProperties.WRITE_AUDIT_PUBLISH_ENABLED = "write.wap.enabled"` is defined in core
-//! but read by NO core production class (only `SparkWriteConf`/`SparkReadConf`/`SparkTableUtil` consume it,
-//! to decide whether the engine stages and sets `wap.id`). `SnapshotProducer.apply()` calls only the
-//! overridable per-subclass `validate` — never `WapUtil`; only `CherryPickOperation` calls `validateWapPublish`.
-//! So a `wap.id` present on a NON-staged ordinary commit is not validated/blocked core-side. No core gate to port.
-//!
-//! **Out of scope (deferred):** Java↔Rust byte-level interop for the published snapshot, incl. the staged-WAP
-//! interop fixture (this is a 🟡 unit-proven action).
+//! **Deferred:** Java-to-Rust byte-level interop for the published snapshot, including the
+//! staged-WAP interop fixture.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -342,20 +300,16 @@ impl CherryPickAction {
         Ok(())
     }
 
-    /// Java `validateReplacedPartitions` (L218-252). Only meaningful for the replace-partitions replay shape
-    /// (`replaced_partitions` non-empty) and only when the table has a current snapshot. First re-checks the
-    /// parent-ancestry against the refreshed base, then walks every snapshot committed between the current
-    /// head and `picked.parent` (`SnapshotUtil.ancestorsBetween(currentSnapshot, parentId)` — inclusive of the
-    /// head, EXCLUSIVE of the parent) and rejects if any file ADDED by those snapshots lands in a replaced
-    /// partition.
+    /// Java `validateReplacedPartitions`. It applies only to the replace-partitions replay shape, and
+    /// only when the table has a current snapshot. It re-checks the parent ancestry against the
+    /// refreshed base, then walks the snapshots between the current head and `picked.parent`,
+    /// inclusive of the head and exclusive of the parent. Any file those snapshots ADDED into a
+    /// replaced partition rejects the commit.
     ///
-    /// **Concurrent-window pin (the mandatory no-override rule): the walk's starting id is `picked.parentId`,
-    /// NOT the transaction-captured `starting_snapshot_id`.** Cherry-pick's concurrent window is defined by the
-    /// PICKED snapshot's parent (Java `ancestorsBetween(currentSnapshot, picked.parentId)`), so the
-    /// tx-captured start is **N/A for this shape** — there is no `validate_from_snapshot` override and the
-    /// transaction's read point is irrelevant here. The `do_commit`-supplied `starting_snapshot_id` is
-    /// therefore intentionally unused by this validation; the walk re-derives its window from the picked
-    /// snapshot every time, which is exactly what survives a commit retry.
+    /// **Concurrent-window pin: the walk starts at `picked.parentId`, NOT the transaction-captured
+    /// `starting_snapshot_id`.** Cherry-pick's window is defined by the PICKED snapshot's parent, so
+    /// the transaction's read point is irrelevant here. `do_commit`'s `starting_snapshot_id` is
+    /// intentionally unused, and the walk re-derives its window on every retry.
     async fn validate_replaced_partitions(
         &self,
         table: &Table,
@@ -439,16 +393,14 @@ impl CherryPickAction {
 
 #[async_trait]
 impl TransactionAction for CherryPickAction {
-    /// Serializable-isolation validation (Java `CherryPickOperation.validate` L161-171). Runs against the
-    /// REFRESHED base BEFORE the commit produces anything. Skipped entirely for the fast-forward shape (Java
-    /// `if (!isFastForward(base))`). For the replay shapes it runs `validateNonAncestor`,
-    /// `validateReplacedPartitions`, and the WAP-publish re-check.
+    /// Serializable-isolation validation. Java `CherryPickOperation.validate`. It runs against the
+    /// REFRESHED base before the commit produces anything, and is skipped for the fast-forward
+    /// shape. The replay shapes run `validateNonAncestor`, `validateReplacedPartitions`, and the
+    /// WAP-publish re-check.
     ///
-    /// `starting_snapshot_id` (the transaction-captured head) is intentionally unused: cherry-pick's
-    /// concurrent window is defined by the PICKED snapshot's parent, not the transaction's read point — see
-    /// [`CherryPickAction::validate_replaced_partitions`]. An unknown staged id surfaces from [`Self::plan`] in
-    /// `commit`; here, the dispatch errors (unknown id / not-eligible op) are produced by `plan` too, so a
-    /// failing `plan` propagates non-retryably before any update is emitted.
+    /// `starting_snapshot_id` is intentionally unused. Cherry-pick's window comes from the PICKED
+    /// snapshot's parent. The dispatch errors come from [`Self::plan`], so a failing plan propagates
+    /// non-retryably before any update is emitted.
     async fn validate(
         self: Arc<Self>,
         _starting_snapshot_id: Option<i64>,
@@ -619,16 +571,12 @@ async fn picked_snapshot_changes(
     Ok(PickedSnapshotChanges { added, removed })
 }
 
-/// Enumerate the DATA files ADDED to `table` by snapshots committed between the current head (inclusive) and
-/// `starting_snapshot_id` (EXCLUSIVE) — the Rust port of Java's `validateReplacedPartitions` file walk
-/// (`SnapshotUtil.ancestorsBetween(currentSnapshot, parentId)` filtered to `manifestsCreatedBy(snap)` →
-/// `ADDED` entries, L225-246).
+/// Enumerate the DATA files ADDED between the current head, inclusive, and `starting_snapshot_id`,
+/// exclusive. The Rust port of Java's `validateReplacedPartitions` file walk.
 ///
-/// This is the SAME walk shape as `snapshot::files_after` (inclusive of the head, exclusive of the start, only
-/// manifests the snapshot itself wrote, only `Added` entries) but with NO operation filter — Java's
-/// `manifestsCreatedBy(snap)` inspects every ancestor's own data manifests regardless of operation. It is
-/// kept local to cherry-pick rather than widening `snapshot.rs`'s walk family because cherry-pick is the only
-/// caller that wants the operation-unfiltered variant.
+/// The walk shape matches `snapshot::files_after` but applies NO operation filter, because Java's
+/// `manifestsCreatedBy` inspects every ancestor's own data manifests whatever the operation. It
+/// stays local to cherry-pick, the only caller wanting the unfiltered variant.
 async fn added_data_files_between(
     table: &Table,
     starting_snapshot_id: Option<i64>,
@@ -1770,34 +1718,22 @@ mod tests {
         );
     }
 
-    // ============================================================================================
-    // WAP-PATH publish dedup (Group V increment V2, 2026-06-11). The `wap.id`-keyed duplicate-publish
-    // rejection (Java `WapUtil.validateWapPublish` / `isWapIdPublished`), complementing the ancestry-path
-    // dedup above. `is_wap_id_published` walks the CURRENT ancestors and compares the picked snapshot's
-    // `wap.id` against EACH ancestor's OWN `wap.id` (STAGED_WAP_ID_PROP) AND its `published-wap-id`
-    // (PUBLISHED_WAP_ID_PROP) — both arms (1.10.0 bytecode `WapUtil.isWapIdPublished` offsets 53-74).
+    // WAP-PATH publish dedup. Java `WapUtil.validateWapPublish` / `isWapIdPublished`.
+    // `is_wap_id_published` walks the CURRENT ancestors and compares the picked snapshot's `wap.id`
+    // against each ancestor's OWN `wap.id` AND its `published-wap-id`. Both arms matter.
     //
-    // The existing `test_cherrypick_duplicate_wap_id_is_rejected` exercises the REPLAY → `published-wap-id`
-    // arm (both staged snapshots replay because their parent != head, so the first publish mints a NEW
-    // snapshot stamped with `published-wap-id`). The tests below add the FAST-FORWARD → own-`wap.id` arm
-    // (a FF publish does NOT restamp `published-wap-id`, so the second publish is caught only by the
-    // STAGED `wap.id` arm), the no-false-positive distinct-ids case, the non-WAP negative control, the
-    // state-unchanged-on-rejection re-parse, and the both-paths ordering pin.
-    // ============================================================================================
+    // `test_cherrypick_duplicate_wap_id_is_rejected` covers the replay arm, where the first publish
+    // mints a snapshot stamped with `published-wap-id`. The tests below cover the fast-forward arm,
+    // which restamps nothing and is caught only by the staged `wap.id`.
 
-    /// FAST-FORWARD-PATH WAP DEDUP (crown jewel — pins the STAGED `wap.id` arm of `is_wap_id_published`).
-    /// Stage S1 with `wap.id = X` off the current head (so cherry-pick FAST-FORWARDS — publishes S1 verbatim
-    /// onto `main` WITHOUT minting a new snapshot or stamping `published-wap-id`). Stage S2 ALSO with
-    /// `wap.id = X` off the same parent. After the FF publish of S1, the second cherry-pick of S2 is REJECTED
-    /// with the verbatim `DuplicateWAPCommitException` message.
+    /// FAST-FORWARD-PATH WAP DEDUP, which pins the STAGED `wap.id` arm of `is_wap_id_published`.
+    /// S1 and S2 both carry `wap.id = X` off the same parent, and S1's parent is head, so its
+    /// cherry-pick FAST-FORWARDS and stamps no `published-wap-id`. The second cherry-pick is then
+    /// REJECTED with the verbatim `DuplicateWAPCommitException` message.
     ///
-    /// Risk pinned: a duplicate WAP publish via the FF path slips through because `published-wap-id` was never
-    /// stamped (the FF publishes verbatim). Java catches it because `isWapIdPublished` also compares each
-    /// ancestor's OWN `wap.id`: after the FF, S1 is a current ancestor carrying `wap.id = X`. A dedup that
-    /// only checked `published-wap-id` (dropping the STAGED arm) would FALSELY ALLOW this double-apply — the
-    /// exact corruption WAP exists to prevent. This is the FF-path coverage the brief flags; the existing
-    /// replay test does NOT cover it (replay stamps `published-wap-id`, so it hits the other arm).
-    /// Mirror of Java `TestWapWorkflow.testDuplicateCherrypick` (its first publish IS a fast-forward).
+    /// Risk pinned: a dedup checking only `published-wap-id`, dropping the STAGED arm, would FALSELY
+    /// ALLOW this double-apply, the exact corruption WAP exists to prevent. The replay test cannot
+    /// see it, because replay stamps `published-wap-id` and hits the other arm.
     #[tokio::test]
     async fn test_cherrypick_duplicate_wap_id_rejected_via_fast_forward_published() {
         let catalog = new_memory_catalog().await;
@@ -2091,20 +2027,14 @@ mod tests {
         );
     }
 
-    /// ROLLBACK REOPENS A WAP ID — DOCUMENTED JAVA-FAITHFUL ESCAPE HATCH. The WAP dedup walks the CURRENT
-    /// ancestry ONLY (`is_wap_id_published` roots at `metadata.current_snapshot_id()` — the exact mirror of
-    /// Java `WapUtil.isWapIdPublished`, which walks `SnapshotUtil.ancestorIds(meta.currentSnapshot(), ...)`;
-    /// `SnapshotUtil.ancestorIds` → `ancestorsOf` follows parent links from that root). So once `main` is
-    /// rolled BACK past a WAP publish, the publishing snapshot leaves the current ancestry and its `wap.id` is
-    /// no longer "published" for dedup purposes — a SECOND staged snapshot carrying the SAME `wap.id` then
-    /// publishes successfully (a double-publish *after* a rollback). This is NOT a Rust divergence: Java has the
-    /// identical hole because both implementations key the dedup off the live ancestry chain, by design (WAP
-    /// deduplicates publishes that are still on the line, not every publish that ever happened).
+    /// ROLLBACK REOPENS A WAP ID, a documented Java-faithful escape hatch. The dedup walks the
+    /// CURRENT ancestry only, rooted at the current snapshot, exactly as Java does. Rolling `main`
+    /// back past a WAP publish takes that snapshot out of the ancestry, so a second staged snapshot
+    /// with the same `wap.id` publishes successfully. Java has the identical hole by design.
     ///
-    /// Risk pinned: that the dedup-walk SCOPE matches Java's exactly. A port that walked ALL snapshots (or any
-    /// retained-but-orphaned chain) instead of the current ancestry would REJECT this second publish — a
-    /// stricter-than-Java divergence that would surface as a spurious `DuplicateWAPCommitException` after a
-    /// legitimate rollback-and-redo. The test asserts the second publish SUCCEEDS (the Java-faithful outcome).
+    /// Risk pinned: that the dedup-walk SCOPE matches Java's. A port walking ALL snapshots would
+    /// REJECT this second publish, a stricter-than-Java divergence surfacing as a spurious
+    /// `DuplicateWAPCommitException` after a legitimate rollback and redo.
     #[tokio::test]
     async fn test_cherrypick_rollback_reopens_wap_id_java_faithful() {
         let catalog = new_memory_catalog().await;

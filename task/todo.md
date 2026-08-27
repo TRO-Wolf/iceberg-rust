@@ -31,6 +31,19 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-27): F-16 delete-ratio + F-7 V3 DV accounting + comment part 2
+
+One PR. Java `BinPackRewriteFilePlanner.tooHighDeleteRatio` (default 0.3) and
+`MergingSnapshotProducer.removeDanglingDeletesFor` DV drops on `RewriteDataFiles`.
+Status lives on GAP_MATRIX row R135 (and the limit-(k) wording on row R136).
+
+- [x] Port `tooHighDeleteRatio` / `DELETE_RATIO_THRESHOLD_DEFAULT = 0.3`. Only file-scoped deletes count.
+- [x] Drop DVs that reference rewritten data files in the same `RewriteFiles` commit. Rewrite Puffin siblings.
+- [x] Comment part 2: apply `origin/docs/comment-compaction-part2` onto the 13 code-identical stack files.
+- [ ] Gates + independent Critic + PR.
+
+---
+
 ## CLOSED (2026-08-26): 1,000-line Rust source-file gate
 
 Port RePark's fail-closed Rust file-size guard to this workspace. The default ceiling is 1,000

@@ -17,81 +17,50 @@
 
 //! This module contains the replace-partitions action (dynamic partition overwrite).
 //!
-//! [`ReplacePartitionsAction`] mirrors Java `BaseReplacePartitions`: when committed, for every
-//! partition that an ADDED file belongs to it DELETES all existing live data files in that same
-//! `(spec_id, partition)` tuple, then adds the new files — in ONE `Overwrite` snapshot. The replace is
-//! BY PARTITION VALUE (not by file path or row filter), so no metrics evaluators are needed.
+//! [`ReplacePartitionsAction`] mirrors Java `BaseReplacePartitions`. For every partition an added file
+//! belongs to, it deletes the live data files in that same `(spec_id, partition)` tuple and adds the new
+//! files, in one `Overwrite` snapshot. The replace works by PARTITION VALUE, not by path or row filter, so
+//! it needs no metrics evaluator. The added files reach the producer like fast-append. The deletes resolve
+//! through [`SnapshotProducer::resolve_partition_deletes`] into the shared `process_deletes` rewrite.
 //!
-//! How it reuses the existing machinery: the added files reach the producer exactly as fast-append does
-//! (written to a new added manifest), and the partition-scoped deletes are resolved + filtered out of the
-//! current snapshot's manifests via the shared [`SnapshotProducer::resolve_partition_deletes`] (the
-//! by-partition sibling of `resolve_delete_paths`) feeding the SAME `process_deletes` rewrite path that
-//! `DeleteFiles` / `OverwriteFiles` use. Both happen in one snapshot.
+//! | Java | here |
+//! |---|---|
+//! | `operation()` | always [`Operation::Overwrite`] |
+//! | constructor | sets `REPLACE_PARTITIONS_PROP` |
+//! | unpartitioned data spec | full replace across every spec |
+//! | empty replaced partition | pure add |
 //!
-//! **Java semantics mirrored (cited against `core/.../BaseReplacePartitions.java`):**
-//! - `operation()` returns `DataOperations.OVERWRITE` → always [`Operation::Overwrite`].
-//! - the constructor sets `SnapshotSummary.REPLACE_PARTITIONS_PROP = "replace-partitions" = "true"`.
-//! - `addFile(file)` drops `file.partition()` (in `file.specId()`) then adds the file.
-//! - **Unpartitioned data spec = FULL replace:** Java `apply()` adds `deleteByRowFilter(alwaysTrue)` when
-//!   `dataSpec().fields().isEmpty()`, removing every live data file **under every spec** — see
-//!   [`ReplacePartitionsAction::is_full_table_replace`]. On a table that only ever had one, unpartitioned
-//!   spec this coincides with dropping the single empty partition; on a table whose spec evolved it does
-//!   NOT, which is why the branch is explicit here rather than emergent.
-//! - **A replaced partition with no existing files is a pure add** (no spurious delete, no error): Java's
-//!   `failMissingDeletePaths` guards only path/file deletes, never partition drops.
+//! **Summary.** Java `SnapshotProducer.summary()` has NO full-table-truncate branch. It computes
+//! `total = previous + added - removed` unconditionally. The producer's `truncate_full_table` flag
+//! therefore stays `false`. The by-partition resolution already reports every removed file, so the deleted
+//! counts and the running totals stay correct and cannot underflow. `replace-partitions=true` is only a
+//! summary property.
 //!
-//! **Summary note (Java-faithful, NOT a Rust truncate):** Java `SnapshotProducer.summary()` has NO
-//! full-table-truncate branch — it computes `total = previous + added - removed` unconditionally via
-//! `updateTotal`. So the producer's `truncate_full_table` flag stays `false` here: the by-partition
-//! resolution already reports EVERY removed file, so `deleted-data-files` / `deleted-records` are correct
-//! and `update_totals` yields the right post-replace totals (e.g. an unpartitioned full replace of N files
-//! adding M: `N + M - N = M`, no underflow). `replace-partitions=true` is just a summary property.
+//! **Concurrent-commit conflict validation.** Two independent opt-in flags. Scope is the
+//! replaced partitions, or every file when the added spec is unpartitioned.
+//! | flag | rejects |
+//! |---|---|
+//! | `validate_no_conflicting_data` | concurrent added data in a replaced partition |
+//! | `validate_no_conflicting_deletes` | concurrent deleted data or added deletes there |
 //!
-//! **Concurrent-commit conflict validation (serializable isolation):** opt-in, mirroring Java
-//! `BaseReplacePartitions.validate`. Two INDEPENDENT flags, each evaluated over the scope
-//! [`ConflictScope`] resolves for this commit — normally PARTITION-SET-based over the replaced
-//! `(spec_id, partition)` tuples (unlike OverwriteFiles/RowDelta's per-data-file checks), but the
-//! spec-agnostic `alwaysTrue` scope covering EVERY file when the added files' spec is unpartitioned:
-//! - [`ReplacePartitionsAction::validate_no_conflicting_data`] (Java `validateNoConflictingData`) rejects
-//!   when a concurrent snapshot ADDED DATA to a replaced partition.
-//! - [`ReplacePartitionsAction::validate_no_conflicting_deletes`] (Java `validateNoConflictingDeletes`)
-//!   rejects when, in a replaced partition, a concurrent snapshot either DELETED a data file
-//!   (`validateDeletedDataFiles`) or ADDED a delete file (`validateNoNewDeleteFiles`).
+//! **Append-only assertion.** [`ReplacePartitionsAction::validate_append_only`] is opt-in and ORTHOGONAL to
+//! the two conflict checks, because it guards the SAME commit, not a concurrent one. It mirrors Java
+//! `validateAppendOnly()` → `failAnyDelete()`: the commit fails if this overwrite would remove any live
+//! data file, so the operation must stay purely additive. Java enforces it inside `filterManifest`. Here it
+//! is one non-empty check on the resolved partition deletes in [`ReplacePartitionsOperation::delete_files`].
+//! Java 1.10.0 exposes `validateAppendOnly` on `ReplacePartitions` only, not on the other actions.
 //!
-//! **Append-only assertion (Java `ReplacePartitions.validateAppendOnly`):** opt-in, and ORTHOGONAL to the two
-//! conflict checks above (it is a SAME-COMMIT guard, not a concurrent-commit one).
-//! [`ReplacePartitionsAction::validate_append_only`] mirrors `BaseReplacePartitions.validateAppendOnly()` →
-//! `MergingSnapshotProducer.failAnyDelete()` → `ManifestFilterManager.failAnyDelete = true`: the commit is
-//! rejected (Java's non-retryable `DeleteException`) if this dynamic overwrite would REMOVE any existing live
-//! data file — i.e. the operation must be purely additive. Java enforces it in `filterManifest` the moment a
-//! manifest is found to delete files; here the equivalent is one non-empty check on the resolved partition
-//! deletes (which already enumerate the exact files removed) inside
-//! [`ReplacePartitionsOperation::delete_files`]. `validateAppendOnly` is on `ReplacePartitions` ONLY in the
-//! Java 1.10.0 API (`javap` — it is NOT on `DeleteFiles`/`OverwriteFiles`/`RowDelta`).
+//! **No `caseSensitive(boolean)`, by Java API parity.** The Java `ReplacePartitions` interface exposes no
+//! such method. `BaseReplacePartitions` inherits the field but never surfaces it. This action's validate
+//! path compares partition tuples, or binds the `alwaysTrue` scope, and takes no caller-supplied predicate.
+//! No column name resolves here, so the flag would be an inert no-op that diverges from the Java surface.
 //!
-//! **No `caseSensitive(boolean)` — intentionally absent (Java API parity):** unlike `DeleteFiles` /
-//! `OverwriteFiles` / `RowDelta`, the Java `ReplacePartitions` interface (`api/ReplacePartitions.java`,
-//! 1.10.0) exposes NO `caseSensitive(boolean)` method (`javap -p` on `iceberg-api-1.10.0.jar` lists only
-//! `addFile`, `validateAppendOnly`, `validateFromSnapshot`, `validateNoConflictingDeletes`,
-//! `validateNoConflictingData`). `BaseReplacePartitions` inherits the field from `MergingSnapshotProducer`
-//! but never surfaces it, and this action's validate path is PURELY PARTITION-SET-BASED (it compares
-//! `(spec_id, partition)` tuples, or the spec-agnostic `alwaysTrue` scope — see [`ConflictScope`]) with NO
-//! caller-supplied `Expression`/`Predicate`, so there is no column-name resolution for a case-sensitivity
-//! flag to affect (the `alwaysTrue` filter binds no column names). Adding one would be an inert no-op that
-//! diverges from the Java public surface. Deferred deliberately.
-//!
-//! **No `replaceByRowFilter` / explicit-partition API — there is none in Java to port.** `javap -p` on
-//! `iceberg-api-1.10.0.jar` lists exactly five methods on `org.apache.iceberg.ReplacePartitions`
-//! (`addFile`, `validateAppendOnly`, `validateFromSnapshot`, `validateNoConflictingDeletes`,
-//! `validateNoConflictingData`) and `BaseReplacePartitions` (`iceberg-core-1.10.0.jar`) adds no public
-//! selector of its own. `overwriteByRowFilter(Expression)` is a method of `OverwriteFiles`, ported at
+//! **No `replaceByRowFilter` or explicit-partition API, because Java has none to port.** Java
+//! `ReplacePartitions` carries exactly five methods, and `BaseReplacePartitions` adds no public selector.
+//! `overwriteByRowFilter(Expression)` belongs to `OverwriteFiles` and is ported at
 //! [`crate::transaction::overwrite_files::OverwriteFilesAction::overwrite_by_row_filter`]. Spark's static
-//! `INSERT OVERWRITE` reaches THAT action, not this one: `SparkWriteBuilder.overwrite(Filter[])` sets
-//! `overwriteByFilter` and `SparkWrite$OverwriteByFilter` calls
-//! `table.newOverwrite().overwriteByRowFilter(expr)`, while only `overwriteDynamicPartitions()` /
-//! `SparkWrite$DynamicOverwrite` calls `table.newReplacePartitions()` (bytecode-verified against
-//! `iceberg-spark-runtime-4.0_2.13-1.10.0.jar`). Adding such a method here would be an ANTI-parity
-//! addition to the Java surface.
+//! `INSERT OVERWRITE` reaches that action, not this one. Only `overwriteDynamicPartitions()` calls
+//! `newReplacePartitions()`. Adding such a method here would diverge from the Java surface.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -213,56 +182,41 @@ impl ReplacePartitionsAction {
         self
     }
 
-    /// ENABLE concurrent-commit conflict validation (Java `ReplacePartitions.validateNoConflictingData`):
-    /// the commit is rejected with a non-retryable `ValidationException` if any snapshot committed since the
-    /// starting snapshot ADDED data to a partition this action replaces. This is the serializable-isolation
-    /// guard against silently clobbering concurrently-appended data.
-    ///
-    /// Default (this method NOT called) = snapshot isolation = no validation (current behavior unchanged).
+    /// ENABLE concurrent-commit conflict validation. Java
+    /// `ReplacePartitions.validateNoConflictingData`. The commit is rejected, non-retryably, when a
+    /// snapshot committed since the starting snapshot ADDED data to a replaced partition. It guards
+    /// against silently clobbering concurrently-appended data. The default is no validation.
     pub fn validate_no_conflicting_data(mut self) -> Self {
         self.validate_no_conflicting_data = true;
         self
     }
 
-    /// ENABLE concurrent-commit conflicting-DELETE validation (Java
-    /// `ReplacePartitions.validateNoConflictingDeletes`): the commit is rejected with a non-retryable
-    /// `ValidationException` if, in any partition this action replaces, a snapshot committed since the
-    /// starting snapshot either DELETED a data file (Java `validateDeletedDataFiles` — you cannot dynamically
-    /// replace a partition whose data a concurrent commit removed) or ADDED a delete file (Java
-    /// `validateNoNewDeleteFiles` — a concurrent row-delete in a partition you are about to replace).
+    /// ENABLE concurrent-commit conflicting-DELETE validation. Java
+    /// `ReplacePartitions.validateNoConflictingDeletes`. The commit is rejected, non-retryably, when
+    /// a snapshot committed since the starting snapshot either DELETED a data file or ADDED a delete
+    /// file in a replaced partition.
     ///
-    /// INDEPENDENT of [`Self::validate_no_conflicting_data`]: enabling one does NOT enable the other (Java's
-    /// `validateConflictingData` / `validateConflictingDeletes` are separate flags branched separately in
-    /// `BaseReplacePartitions.validate`).
-    ///
-    /// Default (this method NOT called) = snapshot isolation = no validation (current behavior unchanged).
+    /// It is INDEPENDENT of [`Self::validate_no_conflicting_data`]. Java branches the two flags
+    /// separately. The default is no validation.
     pub fn validate_no_conflicting_deletes(mut self) -> Self {
         self.validate_no_conflicting_deletes = true;
         self
     }
 
-    /// ENABLE the append-only assertion (Java `ReplacePartitions.validateAppendOnly`): the commit is rejected
-    /// with a non-retryable error if this dynamic overwrite would actually REMOVE any existing live data file.
-    /// In other words, the replace must be PURELY ADDITIVE — it may only fill partitions that currently have
-    /// no live data; if any replaced `(spec_id, partition)` already holds a live file (so a real delete would
-    /// occur), the commit fails.
+    /// ENABLE the append-only assertion. Java `ReplacePartitions.validateAppendOnly`. The commit is
+    /// rejected, non-retryably, when this dynamic overwrite would REMOVE any live data file. The
+    /// replace must stay purely additive.
     ///
-    /// **Java chain mirrored:** `BaseReplacePartitions.validateAppendOnly()` calls
-    /// `MergingSnapshotProducer.failAnyDelete()`, which sets `ManifestFilterManager.failAnyDelete = true`;
-    /// during `filterManifest` Java throws a `DeleteException` ("Operation would delete existing data") the
-    /// moment any manifest is found to delete files. Here the equivalent is enforced in
-    /// [`ReplacePartitionsOperation::delete_files`]: the by-partition resolution
-    /// ([`crate::transaction::snapshot::SnapshotProducer::resolve_partition_deletes`]) already returns the
-    /// EXACT set of live files this overwrite would remove, so the guard is one non-empty check on that result.
+    /// Java enforces it inside `filterManifest`. Here
+    /// [`ReplacePartitionsOperation::delete_files`] checks the by-partition resolution, which already
+    /// returns the EXACT set of live files this overwrite would remove.
     ///
-    /// **Unpartitioned tables = full replace:** every file is in the single empty partition, so any added file
-    /// removes ALL existing files — `validate_append_only` therefore rejects any replace on a non-empty
-    /// unpartitioned table (Java has the same effect via `deleteByRowFilter(alwaysTrue)`).
+    /// On an unpartitioned table every file sits in the one empty partition, so any added file
+    /// removes all existing files and this assertion rejects the replace.
     ///
-    /// INDEPENDENT of [`Self::validate_no_conflicting_data`] / [`Self::validate_no_conflicting_deletes`]: those
-    /// are concurrent-commit (serializable-isolation) partition-set checks against the REFRESHED base; this is
-    /// a SAME-COMMIT check on this action's OWN resolved deletes. Default (this method NOT called) = no
-    /// assertion (current behavior unchanged).
+    /// It is INDEPENDENT of [`Self::validate_no_conflicting_data`] and
+    /// [`Self::validate_no_conflicting_deletes`], which check a CONCURRENT commit against the
+    /// refreshed base. This checks this action's OWN resolved deletes.
     pub fn validate_append_only(mut self) -> Self {
         self.validate_append_only = true;
         self
@@ -280,24 +234,12 @@ impl ReplacePartitionsAction {
     /// The partition-spec id shared by every added file — the Rust analogue of Java
     /// `MergingSnapshotProducer.dataSpec()`, which reads the key set of `newDataFilesBySpec`.
     ///
-    /// **This returns `None` where Java THROWS**, and that difference is a NAMED, deliberate divergence
-    /// rather than an oversight — see the two `Preconditions.checkState` calls in the 1.10.0 bytecode
-    /// (`javap -c -p org.apache.iceberg.MergingSnapshotProducer`, `dataSpec()`):
-    ///
-    /// ```text
-    ///  24: ldc "Cannot determine partition specs: no data files have been added"
-    ///  26: invokestatic Preconditions.checkState:(ZLjava/lang/Object;)V
-    ///  44: ldc "Cannot return a single partition spec: data files with different partition specs have been added"
-    ///  46: invokestatic Preconditions.checkState:(ZLjava/lang/Object;)V
-    /// ```
-    ///
-    /// Porting those two `IllegalStateException`s would make an empty replace and a mixed-spec replace
-    /// hard errors here; both currently commit (the empty case is pinned by
-    /// `test_replace_partitions_with_no_added_files_adds_nothing`). Returning `None` keeps that behavior
-    /// and makes the *scope* decision fall back to the narrower, spec-keyed
-    /// [`ConflictScope::Partitions`] / by-partition delete resolution — never to the wider
-    /// [`ConflictScope::AllFiles`], so `None` can only ever under-fire relative to Java, never over-fire.
-    /// Recorded as residue on GAP_MATRIX row R104.
+    /// **This returns `None` where Java THROWS**, and that is a NAMED, deliberate divergence. Java
+    /// raises `IllegalStateException` when no data file was added, and again when the added files
+    /// carry different specs. Porting both would make an empty replace and a mixed-spec replace hard
+    /// errors; both commit today. Returning `None` keeps that behaviour and falls back to the
+    /// narrower spec-keyed [`ConflictScope::Partitions`], never the wider
+    /// [`ConflictScope::AllFiles`]. So `None` can only under-fire against Java, never over-fire.
     fn data_spec_id(&self) -> Option<i32> {
         let mut ids = self.added_data_files.iter().map(|f| f.partition_spec_id);
         let first = ids.next()?;
@@ -337,23 +279,14 @@ impl ReplacePartitionsAction {
         }
     }
 
-    /// Whether this replace is a FULL-TABLE replace on the apply side — Java
-    /// `BaseReplacePartitions.apply`'s `dataSpec().fields().isEmpty()` branch, which adds
-    /// `deleteByRowFilter(alwaysTrue)` so EVERY live data file is removed regardless of its spec:
+    /// Whether this replace is a FULL-TABLE replace on the apply side. Java
+    /// `BaseReplacePartitions.apply` takes the `dataSpec().fields().isEmpty()` branch and adds
+    /// `deleteByRowFilter(alwaysTrue)`, which removes every live data file whatever its spec.
     ///
-    /// ```text
-    ///   1: invokevirtual dataSpec:()Lorg/apache/iceberg/PartitionSpec;
-    ///   4: invokevirtual org/apache/iceberg/PartitionSpec.fields:()Ljava/util/List;
-    ///   7: invokeinterface java/util/List.isEmpty:()Z
-    ///  12: ifeq 22
-    ///  16: invokestatic  org/apache/iceberg/expressions/Expressions.alwaysTrue:()
-    ///  19: invokevirtual deleteByRowFilter:(Lorg/apache/iceberg/expressions/Expression;)V
-    /// ```
-    ///
-    /// **The apply test is STRICTER than the validate test** and the asymmetry is Java's, not ours:
-    /// `apply` uses `fields().isEmpty()`, `validate` uses `isUnpartitioned()` (= empty **or** all-VOID).
-    /// An all-VOID evolved spec therefore takes the WIDE branch in `validate` and the NARROW
-    /// (per-partition) branch in `apply`. Do not "harmonize" these two predicates.
+    /// **The apply test is STRICTER than the validate test, and the asymmetry is Java's.** `apply`
+    /// tests `fields().isEmpty()`, `validate` tests `isUnpartitioned()`, which also accepts an
+    /// all-VOID spec. An all-VOID evolved spec therefore takes the WIDE branch in `validate` and the
+    /// NARROW branch in `apply`. Do not harmonize the two predicates.
     fn is_full_table_replace(&self, current: &Table) -> bool {
         self.data_spec_id()
             .and_then(|spec_id| current.metadata().partition_spec_by_id(spec_id))
@@ -361,23 +294,11 @@ impl ReplacePartitionsAction {
     }
 }
 
-/// The scope a `ReplacePartitions` conflict check tests a concurrently-written file against — the Rust
-/// analogue of the TWO overload families `BaseReplacePartitions.validate` picks between (1.10.0 bytecode,
-/// `javap -c -p org.apache.iceberg.BaseReplacePartitions`):
-///
-/// ```text
-///   0: getfield  validateConflictingData
-///   7: invokevirtual dataSpec:()Lorg/apache/iceberg/PartitionSpec;
-///  11: invokevirtual org/apache/iceberg/PartitionSpec.isUnpartitioned:()Z
-///  14: ifeq 33
-///  23: invokestatic  org/apache/iceberg/expressions/Expressions.alwaysTrue:()   // UNPARTITIONED branch
-///  27: invokevirtual validateAddedDataFiles:(…Ljava/lang/Long;Lorg/…/Expression;…)V
-///  40: getfield      replacedPartitions:Lorg/apache/iceberg/util/PartitionSet;  // PARTITIONED branch
-///  44: invokevirtual validateAddedDataFiles:(…Ljava/lang/Long;Lorg/…/util/PartitionSet;…)V
-/// ```
-///
-/// The same `isUnpartitioned()` branch guards the two `validateConflictingDeletes` calls
-/// (`validateDeletedDataFiles` and `validateNoNewDeleteFiles`) at bytecode offsets 54-118.
+/// The scope a `ReplacePartitions` conflict check tests a concurrently-written file against. Java
+/// `BaseReplacePartitions.validate` picks between two overload families on
+/// `dataSpec().isUnpartitioned()`: the `alwaysTrue` expression for an unpartitioned spec, and the
+/// replaced `PartitionSet` otherwise. The same branch guards both `validateConflictingDeletes`
+/// calls.
 enum ConflictScope {
     /// Java's PARTITIONED branch: `PartitionSet` membership, keyed by `(specId, StructLike)` — a
     /// concurrently-written file conflicts only when BOTH its spec id AND its partition tuple are among the
@@ -442,19 +363,15 @@ impl TransactionAction for ReplacePartitionsAction {
             .await
     }
 
-    /// Serializable-isolation conflict validation (Java `BaseReplacePartitions.validate`). Two INDEPENDENT,
-    /// opt-in checks, each evaluated over the [`ConflictScope`] this commit resolves — PARTITION-SET-based
-    /// over the replaced `(spec_id, partition)` tuples, or the spec-agnostic `alwaysTrue` scope covering
-    /// EVERY file when the added files' spec is unpartitioned (see [`Self::conflict_scope`]). Where the
-    /// bullets below say "a replaced partition", read "within the resolved scope":
-    /// - [`Self::validate_no_conflicting_data`] (Java `validateConflictingData` branch →
-    ///   `validateAddedDataFiles`): reject if a concurrent snapshot ADDED DATA to a replaced partition.
-    /// - [`Self::validate_no_conflicting_deletes`] (Java `validateConflictingDeletes` branch →
-    ///   `validateDeletedDataFiles` + `validateNoNewDeleteFiles`): reject if, in a replaced partition, a
-    ///   concurrent snapshot DELETED a data file or ADDED a delete file.
+    /// Serializable-isolation conflict validation. Java `BaseReplacePartitions.validate`. Two
+    /// INDEPENDENT opt-in checks, each evaluated over the [`ConflictScope`] this commit resolves.
+    /// Read "a replaced partition" below as "within the resolved scope":
     ///
-    /// Neither flag enables the other (Java branches them separately). When neither is set this is a no-op
-    /// (snapshot isolation, current behavior unchanged).
+    /// - [`Self::validate_no_conflicting_data`] rejects a concurrent snapshot that ADDED data there.
+    /// - [`Self::validate_no_conflicting_deletes`] rejects one that DELETED a data file or ADDED a
+    ///   delete file there.
+    ///
+    /// Neither flag enables the other. With neither set this is a no-op.
     ///
     /// The effective starting snapshot ([`Self::validate_from_snapshot`] if set, else the transaction-captured
     /// `starting_snapshot_id`) and the [`ConflictScope`] are computed ONCE and shared by all enabled
@@ -645,22 +562,17 @@ impl SnapshotProduceOperation for ReplacePartitionsOperation {
     }
 
     async fn delete_files(&self, snapshot_produce: &SnapshotProducer<'_>) -> Result<Vec<DataFile>> {
-        // Java `BaseReplacePartitions.apply` FIRST adds `deleteByRowFilter(alwaysTrue)` when the data spec
-        // has no partition fields, and only then delegates to `MergingSnapshotProducer.apply`. That row
-        // filter is spec-AGNOSTIC: it removes every live data file, including files written under an OLDER,
-        // PARTITIONED spec that the `(spec_id, <empty tuple>)` drop-partition key can never reach. Route it
-        // through the shared `resolve_filter_deletes`, which is the port of the same
-        // `ManifestFilterManager` machinery Java's row filter drives (an `alwaysTrue` residual is
-        // trivially strict, so every live data file resolves and no PARTIAL-match error is reachable).
+        // Java `BaseReplacePartitions.apply` adds `deleteByRowFilter(alwaysTrue)` when the data spec
+        // has no partition fields. That filter is spec-AGNOSTIC: it removes every live data file,
+        // including files under an OLDER PARTITIONED spec that the drop-partition key can never
+        // reach. `resolve_filter_deletes` ports the same machinery. An `alwaysTrue` residual is
+        // trivially strict, so no PARTIAL-match error is reachable.
         //
-        // `case_sensitive = true` is not a choice: `ReplacePartitions` exposes no `caseSensitive(boolean)`
-        // in the 1.10.0 API, so the `MergingSnapshotProducer` constructor default (`true`) always applies —
-        // and `alwaysTrue` binds no column names anyway.
+        // `case_sensitive = true` is not a choice: `ReplacePartitions` exposes no
+        // `caseSensitive(boolean)`, and `alwaysTrue` binds no column names anyway.
         //
-        // Otherwise resolve the drop-partition set against the current snapshot's live data entries: every
-        // live data file whose `(spec_id, partition)` is in the set is removed (Java
-        // `ManifestFilterManager`'s `dropPartitions.contains(...)`). No missing-target validation —
-        // a replaced partition with no existing files is a pure add.
+        // Otherwise remove every live data file whose `(spec_id, partition)` is in the drop set.
+        // There is no missing-target validation: an empty replaced partition is a pure add.
         let resolved = if self.full_table_replace {
             snapshot_produce
                 .resolve_filter_deletes(&Predicate::AlwaysTrue, true)

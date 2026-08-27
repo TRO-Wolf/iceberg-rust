@@ -17,88 +17,44 @@
 
 //! This module contains the merge-append action (Java `MergeAppend` / `ManifestMergeManager`).
 //!
-//! [`MergeAppendAction`] is the "minimal number of manifest files" append: it appends data files in
-//! one `Operation::Append` snapshot exactly like [`crate::transaction::append::FastAppendAction`], but
-//! then BIN-PACKS the resulting manifest list and MERGES the small manifests into fewer, larger ones
-//! (Java `MergeAppend extends MergingSnapshotProducer<AppendFiles>`, `core/MergeAppend.java`). Java's
-//! `Table.newAppend()` returns this MERGING producer; `newFastAppend()` returns the non-merging one —
-//! this fork's [`crate::transaction::Transaction::fast_append`] is `newFastAppend`, and
-//! [`crate::transaction::Transaction::merge_append`] is `newAppend`.
+//! [`MergeAppendAction`] is the minimal-manifest-count append. It appends data files in one
+//! `Operation::Append` snapshot exactly like [`crate::transaction::append::FastAppendAction`], then
+//! BIN-PACKS the manifest list and MERGES the small manifests into fewer, larger ones. Java's
+//! `Table.newAppend()` returns this merging producer, and `newFastAppend()` the non-merging one.
 //!
-//! ## The merge contract (Java `ManifestMergeManager`, `core/ManifestMergeManager.java`)
+//! ## The merge contract (Java `ManifestMergeManager`)
 //!
-//! After the producer writes the new added-data manifest and carries the existing manifests forward,
-//! [`MergeManifestProcess`] runs the manager (`mergeManifests` L79-94):
+//! After the producer writes the added-data manifest and carries the existing ones forward,
+//! [`MergeManifestProcess`] runs the manager:
 //!
-//! 1. **Disabled / empty short-circuit** (L80-83): if `commit.manifest-merge.enabled` is `false` or
-//!    the list is empty, return it UNCHANGED.
-//! 2. **Group by partition spec id, REVERSE-sorted** (`groupBySpec` L129-137): manifests are grouped
-//!    by spec id into a `TreeMap` with `Comparator.reverseOrder()` — higher spec ids are processed
-//!    (and emitted) first. Manifests of different spec ids are NEVER merged together (a merged manifest
-//!    carries exactly one spec id).
-//! 3. **Bin-pack each group** (`mergeGroup` L140-185): `ListPacker(targetSizeBytes, lookback=1,
-//!    largestBinFirst=false).packEnd(group, ManifestFile::length)` packs the group by manifest length
-//!    from the END (so the under-filled bin is the FIRST one — it gets merged on the next append). Then
-//!    per bin:
-//!    - `bin.size() == 1` ⇒ keep the single manifest as-is (no rewrite).
-//!    - the bin CONTAINS the FIRST manifest (this commit's new added manifest) AND `bin.size() <
-//!      minCountToMerge` ⇒ keep ALL manifests in the bin as-is (the min-count gate applies ONLY to the
-//!      bin holding the in-memory/new manifest, so a large old manifest can't block merging older
-//!      groups, L175-181).
-//!    - else ⇒ MERGE the bin into one manifest (`createManifest`).
-//! 4. **`createManifest`** (L187-239): per entry of each merged manifest —
-//!    - `DELETED` ⇒ kept ONLY if `entry.snapshotId() == this snapshot` (`writer.delete`); older
-//!      tombstones from previous snapshots are SUPPRESSED (L203-208).
-//!    - `ADDED` and `entry.snapshotId() == this snapshot` ⇒ `writer.add` (stays Added; re-inherits the
-//!      new snapshot's sequence number).
-//!    - else ⇒ `writer.existing` (provenance preserved: original snapshot id + data/file sequence
-//!      numbers, status Existing). RE-STAMPING a carried entry's provenance is the #1 silent-corruption
-//!      class.
+//! | step | rule |
+//! |---|---|
+//! | 1 | Short-circuit when merging is off or the list is empty. |
+//! | 2 | Group by spec id, reverse-sorted. Specs never merge across. |
+//! | 3 | Bin-pack from the end. A one-file bin, or this commit's new manifest below `minCountToMerge`, stays. |
+//! | 4 | `DELETED` only for this snapshot. `ADDED` from this snapshot stays Added. Else Existing, provenance intact. |
 //!
-//! The apply order mirrors Java `MergingSnapshotProducer.apply` L1007-1008: the NEW added-data manifest
-//! is FIRST, then the existing manifests in their current order, then `mergeManager.mergeManifests`.
+//! The apply order mirrors Java: the new added-data manifest first, then the existing manifests in
+//! order, then the merge.
 //!
-//! ## Physics: the new added manifest read back before commit
+//! ## Physics: the new added manifest is read back before commit
 //!
-//! The new added-data manifest is read BACK (via [`ManifestFile::load_manifest`]) to merge it, while the
-//! snapshot is still UNCOMMITTED — so its manifest-list entry carries `sequence_number ==
-//! UNASSIGNED_SEQUENCE_NUMBER` (-1). [`crate::spec::ManifestEntry::inherit_data`] then makes each
-//! `Added` entry inherit `Some(-1)` as its data/file sequence number (the `status == Added` branch
-//! inherits regardless of the manifest seq). When that entry is re-routed through the merged writer's
-//! [`crate::spec::ManifestWriter::add_entry`], the writer STRIPS the negative seq back to `None` (its
-//! `sequence_number().is_some_and(|n| n >= 0)` test is false for -1), so the merged manifest stores the
-//! re-added entry with a NULL sequence number ON DISK — it re-inherits the new snapshot's REAL sequence
-//! number at commit (same as a fast append). Carried-forward entries from COMMITTED manifests have real
-//! `Some(seq)` values, so [`crate::spec::ManifestWriter::add_existing_entry`] writes those EXPLICITLY on
-//! disk (status Existing, original snapshot id, original seqs). The merged manifest's `added_snapshot_id`
-//! is the new snapshot id (the cluster writer stamps it), so the manifest-list writer's
-//! `assign_sequence_numbers` legally stamps the new sequence number onto the merged manifest-list entry.
+//! The new manifest is read back while the snapshot is still UNCOMMITTED, so its list entry carries
+//! `UNASSIGNED_SEQUENCE_NUMBER`. Each `Added` entry inherits `Some(-1)`, and the merged writer
+//! strips that negative seq back to `None` on disk. The entry then re-inherits the real sequence
+//! number at commit, exactly as in a fast append. Carried-forward entries from COMMITTED manifests
+//! hold real values and are written explicitly. The merged manifest's `added_snapshot_id` is the new
+//! snapshot id, so the manifest-list writer legally stamps the new sequence number onto it.
 //!
-//! ## Adaptations / deviations from Java (each named here per the parity contract)
+//! ## Named deviations from Java
 //!
-//! - **Delete-manifest merging is deferred.** Java runs a SEPARATE `deleteMergeManager.mergeManifests`
-//!   over the delete manifests (`MergingSnapshotProducer.apply` L1023). This port carries every DELETE
-//!   manifest forward UNCHANGED (appended after the merged data manifests) — a merge_append never adds a
-//!   delete file, so there is at most the outstanding set, and carrying them forward is correctness-safe
-//!   (the conservative direction shared by every delete-bearing action in this fork). Merging them is a
-//!   future increment.
-//! - **The retry cache + `cleanUncommitted` + `replacedManifestsCount` are not ported.** Java caches
-//!   merged manifests across commit retries (`mergedManifests`), deletes orphaned merged manifests on a
-//!   failed attempt (`cleanUncommitted`), and tracks a replaced-manifest count for `CommitMetrics`. The
-//!   Rust producer recomputes the merge from the refreshed base on every attempt (no cross-attempt state)
-//!   and there is NO orphan-file cleanup anywhere in the Rust producer (a known fork-wide gap, not
-//!   merge-specific). `replacedManifestsCount` feeds `CommitMetrics`, not the snapshot summary.
-//! - **`appendManifest` is not ported.** Java `MergeAppend.appendManifest` (L52-64) adds a pre-built
-//!   manifest of NEW files (rejecting existing/deleted files — the OPPOSITE of
-//!   `RewriteManifests.addManifest`, which rejects ADDED files). This fork's `fast_append` has no
-//!   `add_manifest` either, so this is a documented parity gap, not a regression.
-//! - **No `manifests-created/-kept/-replaced` summary keys.** Java's `MergingSnapshotProducer.apply`
-//!   appends those three keys via `buildManifestCountSummary` (`SnapshotProducer.java` L716-733). The Rust
-//!   [`crate::transaction::snapshot::SnapshotProducer::summary`] does not emit them, and this manager does
-//!   not inject them, so a merge_append's snapshot summary has the SAME SHAPE as a fast_append's (only
-//!   `RewriteManifests` sets those keys in this fork). Documented divergence from Java.
-//! - **`scanManifestsWith(ExecutorService)` parallelism is not ported.** Java bin-merges in parallel
-//!   (`Tasks.range(...).executeWith(workerPool)`); the Rust path is sequential async.
+//! | not ported | consequence |
+//! |---|---|
+//! | delete-manifest merge | DELETE manifests carry forward unchanged |
+//! | retry cache / `cleanUncommitted` | recompute from the refreshed base |
+//! | `appendManifest` | same gap as `fast_append` |
+//! | extra summary keys | same shape as fast_append |
+//! | `scanManifestsWith` | sequential async |
 
 use std::collections::HashMap;
 use std::sync::Arc;

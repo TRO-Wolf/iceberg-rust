@@ -4606,7 +4606,7 @@ async fn test_v3_refuses_when_the_existing_vector_does_not_cover_the_legacy_dele
     assert!(
         error
             .to_string()
-            .contains("RewriteDataFiles can, given remove_dangling_deletes(true)"),
+            .contains("RewriteDataFiles with remove_dangling_deletes(true)"),
         "and names the escape that DOES clear it, pinned by \
          test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files: {error}"
     );
@@ -4744,7 +4744,7 @@ async fn build_non_superset_vector_table(catalog: &impl Catalog) -> (Table, Hash
     (table, before)
 }
 
-/// Escape: `RewriteDataFiles` with `remove_dangling_deletes(true)` and a low `delete_file_threshold`.
+/// Escape: `RewriteDataFiles` with `remove_dangling_deletes(true)`. Default delete-ratio 0.3 admits this file.
 #[tokio::test]
 async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -4760,38 +4760,34 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
             .contains("THIS ACTION CANNOT CLEAR THAT STATE")
     );
 
-    let unknobbed = RewriteDataFiles::new(table.clone())
-        .remove_dangling_deletes(true)
+    let without_gc = RewriteDataFiles::new(table.clone())
         .execute(&catalog)
         .await
-        .expect("the unknobbed run succeeds — it just does nothing");
+        .expect("the default delete-ratio admits this 1/3 file");
+    assert_eq!(without_gc.rewritten_data_files_count, 1);
     assert_eq!(
-        (
-            unknobbed.rewritten_data_files_count,
-            unknobbed.removed_delete_files_count
-        ),
-        (0, 0),
-        "`remove_dangling_deletes` ALONE is a no-op on this shape; a message promising it would          send the operator round a loop"
+        without_gc.removed_delete_files_count, 1,
+        "the rewrite drops the DV; the shadowed parquet delete stays until GC"
     );
+    let after_rewrite = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(scan_y_values(&after_rewrite).await, before);
     assert_eq!(
-        live_delete_files(&catalog.load_table(table.identifier()).await.unwrap())
-            .await
-            .len(),
-        2,
-        "and both delete files are still live afterwards"
+        live_delete_files(&after_rewrite).await.len(),
+        1,
+        "the parquet position delete is still live without remove_dangling_deletes"
     );
 
+    let (table, before) = build_non_superset_vector_table(&catalog).await;
     let rewrite = RewriteDataFiles::new(table.clone())
         .remove_dangling_deletes(true)
-        .delete_file_threshold(1)
         .execute(&catalog)
         .await
-        .expect("RewriteDataFiles clears the shadowed state");
+        .expect("RewriteDataFiles clears the shadowed state at default ratio");
     assert_eq!(rewrite.rewritten_data_files_count, 1);
     assert_eq!(rewrite.added_data_files_count, 1);
     assert_eq!(
         rewrite.removed_delete_files_count, 2,
-        "both the vector and the shadowed legacy delete fall dangling"
+        "the DV drops with the rewritten file; the shadowed parquet delete is GC'd"
     );
 
     let cleared = catalog.load_table(table.identifier()).await.unwrap();
@@ -4812,7 +4808,7 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
         .expect("the cleared table converts without refusing");
     assert_eq!(second, RewritePositionDeleteFilesResult::default());
 
-    for knob in ["remove_dangling_deletes(true)", "delete_file_threshold"] {
+    for knob in ["remove_dangling_deletes(true)", "delete-ratio-threshold"] {
         assert!(
             refusal.to_string().contains(knob),
             "the refusal names '{knob}', the escape this test actually runs: {refusal}"

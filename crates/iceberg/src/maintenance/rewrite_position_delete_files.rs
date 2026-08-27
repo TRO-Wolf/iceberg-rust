@@ -850,12 +850,10 @@ impl RewritePositionDeleteFiles {
                              cover position {unshadowed} of a legacy position delete it already \
                              suppresses. Converting would DELETE rows the table returns today, so \
                              this run refuses. THIS ACTION CANNOT CLEAR THAT STATE at any filter \
-                             width. RewriteDataFiles can, given remove_dangling_deletes(true) AND a \
-                             delete_file_threshold low enough to make this data file a rewrite \
-                             candidate — its default disables that clause, so the rewrite is a \
-                             no-op without it unless the planner admits the file for another \
-                             reason. The legacy delete is shadowed, so rewriting keeps today's live \
-                             rows and both delete files then fall dangling."
+                             width. RewriteDataFiles with remove_dangling_deletes(true) clears it \
+                             when the planner admits the file. The default delete-ratio-threshold \
+                             0.3 admits a file whose file-scoped deletes cover at least 30% of its \
+                             rows."
                         ),
                     ));
                 }

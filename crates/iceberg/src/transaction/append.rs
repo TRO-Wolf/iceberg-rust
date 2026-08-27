@@ -60,16 +60,14 @@ impl FastAppendAction {
         self
     }
 
-    /// STAGE this append for write-audit-publish (WAP) instead of publishing it to `main` (Java
-    /// `SnapshotProducer.stageOnly()`, exposed on the `SnapshotUpdate` interface). When called, committing
-    /// this action ADDS the new snapshot to table metadata but moves NO ref: `current-snapshot-id`, the
-    /// `main` ref, and the snapshot-log are left UNCHANGED, so readers continue to see the pre-staging data
-    /// and the staged snapshot is invisible until a later [`crate::transaction::Transaction::cherry_pick`]
-    /// publishes it. The staged snapshot still consumes a sequence number exactly like a normal commit.
+    /// STAGE this append for write-audit-publish instead of publishing it to `main`. Java
+    /// `SnapshotProducer.stageOnly()`. The commit ADDS the new snapshot but moves NO ref, so
+    /// `current-snapshot-id`, the `main` ref and the snapshot log stay UNCHANGED. Readers keep
+    /// seeing the pre-staging data until a [`crate::transaction::Transaction::cherry_pick`]
+    /// publishes it. The staged snapshot still consumes a sequence number.
     ///
-    /// A WAP audit job stamps the staged snapshot's `wap.id` via [`Self::set_snapshot_properties`] (the
-    /// Rust equivalent of Java's engine-side `set(SnapshotSummary.STAGED_WAP_ID_PROP, ...)`); cherry-pick
-    /// then carries it forward as `published-wap-id`.
+    /// A WAP audit job stamps the staged snapshot's `wap.id` through
+    /// [`Self::set_snapshot_properties`], and cherry-pick carries it forward as `published-wap-id`.
     pub fn stage_only(mut self) -> Self {
         self.stage_only = true;
         self
@@ -164,22 +162,13 @@ impl SnapshotProduceOperation for FastAppendOperation {
             )
             .await?;
 
-        // Carry EVERY prior manifest forward, UNFILTERED — Java parity (`FastAppend.apply`,
-        // `core/FastAppend.java`): `manifests.addAll(snapshot.allManifests(ops().io()))` with NO
-        // predicate, and `BaseSnapshot.allManifests` returns the manifest list verbatim. The
-        // non-merging fast append keeps the manifest-list STRUCTURE intact, including a manifest left
-        // ALL-DELETED (every entry a tombstone) by a prior copy-on-write delete that emptied it.
+        // Carry EVERY prior manifest forward, UNFILTERED. Java `FastAppend.apply` adds the whole
+        // manifest list with no predicate. The non-merging fast append keeps the manifest-list
+        // STRUCTURE intact, including a manifest a prior delete left ALL-DELETED. Filtering those
+        // out drops a manifest Java keeps referenced, which could then be collected.
         //
-        // The previous `has_added_files() || has_existing_files()` filter DROPPED such all-tombstone
-        // manifests, diverging from Java on any append-after-emptying-delete history (the new
-        // snapshot's manifest list omitted a manifest Java keeps referenced, and the dropped manifest
-        // — now unreferenced — could be GC'd, a manifest-LIST structure divergence visible to interop
-        // and to tombstone-visibility consumers). Fixed 2026-06-11 (Wave-4 Group O / A3 STOP-finding).
-        //
-        // NOTE: the MERGING append (`MergeAppendAction`) does NOT carry all-tombstone manifests — Java
-        // `MergingSnapshotProducer.apply` filters its carried set through `shouldKeep = hasAddedFiles
-        // || hasExistingFiles || snapshotId() == snapshotId()`, which drops them. That filter is
-        // intentionally kept in `merge_append.rs`; only the non-merging fast append carries unfiltered.
+        // The MERGING append does NOT carry all-tombstone manifests, because Java's
+        // `MergingSnapshotProducer.apply` filters them out. That filter stays in `merge_append.rs`.
         Ok(manifest_list.entries().to_vec())
     }
 }
@@ -1365,18 +1354,15 @@ mod tests {
         );
     }
 
-    /// EXACT UPDATE-SET + REQUIREMENT-SET pin (the wire-level Java-parity oracle, mirroring `test_fast_append`
-    /// for the staged path). A staged `fast_append` emits EXACTLY one update — `AddSnapshot` ALONE (no
-    /// `SetSnapshotRef`) — and EXACTLY one requirement — `UuidMatch` ALONE (no `RefSnapshotIdMatch`). This is
-    /// what Java's `UpdateRequirements.forUpdateTable(base, [AddSnapshot])` derives: `AssertTableUUID` only
-    /// (the `Builder.update` dispatcher has NO `AddSnapshot` case — 1.10.0 bytecode). This pins the
-    /// requirement-set at the SOURCE (the ActionCommit), where the end-to-end concurrency tests cannot — the
-    /// retry/rebase machinery recomputes a `RefSnapshotIdMatch` against the refreshed base, so an over-strict
-    /// staged requirement is invisible end-to-end in MemoryCatalog but DIVERGES from Java's REST wire protocol.
+    /// EXACT update-set and requirement-set pin for the staged path. A staged `fast_append` emits
+    /// `AddSnapshot` alone and `UuidMatch` alone, which is what Java's
+    /// `UpdateRequirements.forUpdateTable` derives. The pin sits at the ActionCommit, because the
+    /// retry machinery recomputes a `RefSnapshotIdMatch` against the refreshed base and hides the
+    /// divergence end to end.
     ///
-    /// Risk pinned: an over-strict staged commit emitting `RefSnapshotIdMatch` (a REST-interop divergence:
-    /// Java derives no ref requirement for an AddSnapshot-only update) OR an under-strict one dropping the
-    /// UuidMatch (a staged snapshot clobbering a different table's metadata).
+    /// Risk pinned: an over-strict staged commit emitting `RefSnapshotIdMatch`, which diverges from
+    /// Java on the REST wire, or an under-strict one dropping the `UuidMatch`, which lets a staged
+    /// snapshot clobber another table's metadata.
     #[tokio::test]
     async fn test_stage_only_emits_add_snapshot_alone_with_uuid_match_only() {
         let catalog = new_memory_catalog().await;

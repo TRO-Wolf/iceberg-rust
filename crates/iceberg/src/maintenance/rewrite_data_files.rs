@@ -23,7 +23,7 @@
 //! |---|---|
 //! | enumerate | scan the current snapshot with [`with_file_prune_only`](crate::scan::TableScanBuilder::with_file_prune_only) |
 //! | group | file partition, or empty struct when the spec is not the table default |
-//! | filter files | outside `[min_file_size, max_file_size]`, or at `delete_file_threshold` |
+//! | filter files | outside `[min_file_size, max_file_size]`, at `delete_file_threshold`, or at `delete_ratio_threshold` |
 //! | bin-pack | forward greedy first-fit, lookback 1 |
 //! | filter groups | enough files, enough content, too much content, or any delete-laden file |
 //! | rewrite | live rows only; one [`RewriteFilesAction`](crate::transaction::Transaction::rewrite_files) per group |
@@ -40,6 +40,7 @@
 //! | `max_file_size_bytes` | `1.8 * target` |
 //! | `min_input_files` | 5 |
 //! | `delete_file_threshold` | disabled (`usize::MAX`) |
+//! | `delete_ratio_threshold` | 0.3 |
 //! | `max_file_group_size_bytes` | 100 GiB |
 //! | `use_starting_sequence_number` | true |
 //! | `remove_dangling_deletes` | false |
@@ -54,36 +55,29 @@
 //! | partial progress | each group commits alone; one failure aborts |
 //! | concurrency | sequential |
 //! | sort and Z-order | only bin-pack is ported |
-//! | `delete_ratio_threshold` | the ratio clause never fires |
 //! | `output_spec_id`, `rewrite_all`, job order | current default spec; plan order |
 //! | oversized-file splitting | an input over `max_file_size` is rewritten whole |
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::Catalog;
 use crate::error::{Error, ErrorKind, Result};
 use crate::expr::Predicate;
 use crate::maintenance::RemoveDanglingDeleteFiles;
+use crate::maintenance::rewrite_data_files_dv::plan_dv_removal;
+use crate::maintenance::rewrite_data_files_plan::{
+    DELETE_FILE_THRESHOLD_DEFAULT, DELETE_RATIO_THRESHOLD_DEFAULT, ResolvedConfig, plan_file_groups,
+};
+pub(super) use crate::maintenance::rewrite_data_files_plan::{
+    MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO, MIN_FILE_SIZE_DEFAULT_RATIO,
+    MIN_INPUT_FILES_DEFAULT, pack_bins,
+};
+#[cfg(test)]
+use crate::maintenance::rewrite_data_files_plan::{group_qualifies, is_candidate};
 use crate::scan::FileScanTask;
 use crate::spec::{DataFile, PartitionSpec, Struct, TableProperties};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
-
-/// Java `SizeBasedFileRewritePlanner.MIN_FILE_SIZE_DEFAULT_RATIO`.
-pub(super) const MIN_FILE_SIZE_DEFAULT_RATIO: f64 = 0.75;
-
-/// Java `SizeBasedFileRewritePlanner.MAX_FILE_SIZE_DEFAULT_RATIO`.
-pub(super) const MAX_FILE_SIZE_DEFAULT_RATIO: f64 = 1.80;
-
-/// Java `SizeBasedFileRewritePlanner.MIN_INPUT_FILES_DEFAULT`.
-pub(super) const MIN_INPUT_FILES_DEFAULT: usize = 5;
-
-/// Java `SizeBasedFileRewritePlanner.MAX_FILE_GROUP_SIZE_BYTES_DEFAULT`.
-pub(super) const MAX_FILE_GROUP_SIZE_BYTES_DEFAULT: u64 = 100 * 1024 * 1024 * 1024;
-
-/// Java `BinPackRewriteFilePlanner.DELETE_FILE_THRESHOLD_DEFAULT`, which disables the
-/// delete-count clause.
-const DELETE_FILE_THRESHOLD_DEFAULT: usize = usize::MAX;
 
 /// The outcome of a [`RewriteDataFiles::execute`] run (Java `RewriteDataFiles.Result`).
 ///
@@ -97,11 +91,7 @@ pub struct RewriteDataFilesResult {
     pub rewritten_data_files_count: usize,
     /// Bytes of the replaced input files (Java `Result.rewrittenBytesCount()`).
     pub rewritten_bytes_count: u64,
-    /// Delete files removed by the composed `remove-dangling-deletes` sub-action (Java
-    /// `Result.removedDeleteFilesCount()`). Zero unless
-    /// [`RewriteDataFiles::remove_dangling_deletes`] was set. **This count lives only at the top
-    /// level.** Java's per-group accessor returns a constant zero, and nothing on this path sets
-    /// it.
+    /// Delete files removed: apply-path DVs plus the composed dangling-delete sub-action.
     pub removed_delete_files_count: usize,
     /// Per-group results, in commit order (Java `Result.rewriteResults()`).
     pub file_groups: Vec<FileGroupRewriteResult>,
@@ -131,6 +121,7 @@ pub struct RewriteDataFiles {
     max_file_size_bytes: Option<u64>,
     min_input_files: usize,
     delete_file_threshold: usize,
+    delete_ratio_threshold: f64,
     max_file_group_size_bytes: u64,
     use_starting_sequence_number: bool,
     /// Java `REMOVE_DANGLING_DELETES`, default `false`.
@@ -149,6 +140,7 @@ impl RewriteDataFiles {
             max_file_size_bytes: None,
             min_input_files: MIN_INPUT_FILES_DEFAULT,
             delete_file_threshold: DELETE_FILE_THRESHOLD_DEFAULT,
+            delete_ratio_threshold: DELETE_RATIO_THRESHOLD_DEFAULT,
             max_file_group_size_bytes: MAX_FILE_GROUP_SIZE_BYTES_DEFAULT,
             use_starting_sequence_number: true,
             remove_dangling_deletes: false,
@@ -186,6 +178,12 @@ impl RewriteDataFiles {
     /// rewritten whatever its file count (Java `DELETE_FILE_THRESHOLD`).
     pub fn delete_file_threshold(mut self, delete_file_threshold: usize) -> Self {
         self.delete_file_threshold = delete_file_threshold;
+        self
+    }
+
+    /// File-scoped delete ratio that always admits a file (Java `DELETE_RATIO_THRESHOLD`). Default 0.3. Must be in `(0, 1]`.
+    pub fn delete_ratio_threshold(mut self, delete_ratio_threshold: f64) -> Self {
+        self.delete_ratio_threshold = delete_ratio_threshold;
         self
     }
 
@@ -266,6 +264,7 @@ impl RewriteDataFiles {
             result.added_data_files_count += group_result.0.added_data_files_count;
             result.rewritten_data_files_count += group_result.0.rewritten_data_files_count;
             result.rewritten_bytes_count += group_result.0.rewritten_bytes_count;
+            result.removed_delete_files_count += group_result.2;
             result.file_groups.push(group_result.0);
             // The committed table is the base for the next group's commit.
             table = group_result.1;
@@ -334,6 +333,24 @@ impl RewriteDataFiles {
                 "'max-file-group-size-bytes' is set to 0 but must be > 0",
             ));
         }
+        if self.delete_ratio_threshold.is_nan() || self.delete_ratio_threshold <= 0.0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "'delete-ratio-threshold' is set to {} but must be > 0",
+                    self.delete_ratio_threshold
+                ),
+            ));
+        }
+        if self.delete_ratio_threshold > 1.0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "'delete-ratio-threshold' is set to {} but must be <= 1",
+                    self.delete_ratio_threshold
+                ),
+            ));
+        }
 
         Ok(ResolvedConfig {
             target_file_size_bytes: target,
@@ -341,14 +358,12 @@ impl RewriteDataFiles {
             max_file_size_bytes,
             min_input_files: self.min_input_files,
             delete_file_threshold: self.delete_file_threshold,
+            delete_ratio_threshold: self.delete_ratio_threshold,
             max_file_group_size_bytes: self.max_file_group_size_bytes,
         })
     }
 
-    /// Plan the current snapshot's live data-file scan tasks with the configured filter used for
-    /// **file selection only** (partition + inclusive metrics), matching Java
-    /// `BinPackRewriteFilePlanner` + `ignoreResiduals()`: surviving files keep every live row for
-    /// the rewrite read. Uses [`TableScanBuilder::with_file_prune_only`].
+    /// Plan live data-file scan tasks. The filter selects files only; no residual applies.
     async fn plan_scan_tasks(&self) -> Result<Vec<FileScanTask>> {
         use futures::TryStreamExt;
 
@@ -387,20 +402,10 @@ impl RewriteDataFiles {
     }
 }
 
-/// The thresholds after defaults and preconditions are applied.
-struct ResolvedConfig {
-    target_file_size_bytes: u64,
-    min_file_size_bytes: u64,
-    max_file_size_bytes: u64,
-    min_input_files: usize,
-    delete_file_threshold: usize,
-    max_file_group_size_bytes: u64,
-}
-
 impl RewriteDataFiles {
     /// Rewrites one planned group and commits a single `RewriteFiles` that replaces exactly its
-    /// data files. Returns the group result and the committed table, which is the next group's
-    /// base.
+    /// data files. Returns the group result, the committed table, and the number of DVs dropped
+    /// because they referenced a rewritten file.
     #[allow(clippy::too_many_arguments)]
     async fn rewrite_group(
         &self,
@@ -411,7 +416,7 @@ impl RewriteDataFiles {
         starting_snapshot_id: i64,
         starting_sequence_number: i64,
         target_file_size_bytes: u64,
-    ) -> Result<(FileGroupRewriteResult, Table)> {
+    ) -> Result<(FileGroupRewriteResult, Table, usize)> {
         // A path that vanished since planning means a concurrent commit removed it. Fail here,
         // naming the file, rather than in the writer's own missing-path check.
         let mut files_to_delete: Vec<DataFile> = Vec::with_capacity(group.len());
@@ -443,6 +448,12 @@ impl RewriteDataFiles {
             rewritten_bytes_count,
         };
 
+        let rewritten_paths: HashSet<String> = files_to_delete
+            .iter()
+            .map(|file| file.file_path().to_string())
+            .collect();
+        let dv_plan = plan_dv_removal(table, &rewritten_paths).await?;
+
         let transaction = Transaction::new(table);
         let mut action = transaction
             .rewrite_files(files_to_delete, added_files)
@@ -450,15 +461,19 @@ impl RewriteDataFiles {
         if self.use_starting_sequence_number {
             action = action.data_sequence_number(starting_sequence_number);
         }
+        if !dv_plan.removed.is_empty() {
+            action = action.delete_delete_files(dv_plan.removed);
+            for (delete_file, sequence_number) in dv_plan.rewritten_siblings {
+                action = action.add_delete_file_with_sequence_number(delete_file, sequence_number);
+            }
+        }
         let transaction = action.apply(transaction)?;
         let committed = transaction.commit(catalog).await?;
 
-        Ok((group_result, committed))
+        Ok((group_result, committed, dv_plan.removed_count))
     }
 
-    /// Reads the group's live rows, with each task's delete files applied, and writes them through
-    /// the rolling data-file writer. Batches stream from the reader into the writer and are never
-    /// collected. A large group stays bounded by the rolling writer, not by the full live row set.
+    /// Read the group's live rows and write them through the rolling writer.
     async fn write_compacted_files(
         &self,
         table: &Table,
@@ -565,117 +580,6 @@ fn group_partition_tuple(group: &[FileScanTask], spec: &PartitionSpec) -> Result
     Ok(Some(partition))
 }
 
-/// Groups the scan tasks by partition, filters candidates, bin-packs, and filters groups (Java
-/// `BinPackRewriteFilePlanner.planFileGroups`). Groups follow the packer's order within a
-/// partition, and partitions follow map order, which correctness does not depend on.
-fn plan_file_groups(
-    tasks: Vec<FileScanTask>,
-    config: &ResolvedConfig,
-    default_spec: &crate::spec::PartitionSpecRef,
-) -> Vec<Vec<FileScanTask>> {
-    let default_spec_id = default_spec.spec_id();
-
-    // Java `groupByPartition` keys on the file's partition only when its spec id is the table's
-    // current default. Anything else goes in the unpartitioned bucket.
-    let mut by_partition: HashMap<Struct, Vec<FileScanTask>> = HashMap::new();
-    for task in tasks {
-        let key = match (&task.partition, task_spec_id(&task)) {
-            (Some(partition), Some(spec_id)) if spec_id == default_spec_id => partition.clone(),
-            _ => Struct::empty(),
-        };
-        by_partition.entry(key).or_default().push(task);
-    }
-
-    let mut groups: Vec<Vec<FileScanTask>> = Vec::new();
-    for (_partition, partition_tasks) in by_partition {
-        let candidates: Vec<FileScanTask> = partition_tasks
-            .into_iter()
-            .filter(|task| is_candidate(task, config))
-            .collect();
-        if candidates.is_empty() {
-            continue;
-        }
-
-        let bins = pack_bins(
-            candidates,
-            |task| task.file_size_in_bytes,
-            config.max_file_group_size_bytes,
-        );
-
-        for bin in bins {
-            if group_qualifies(&bin, config) {
-                groups.push(bin);
-            }
-        }
-    }
-    groups
-}
-
-/// The file's partition spec id, if the task carries its spec (it does after scan planning).
-fn task_spec_id(task: &FileScanTask) -> Option<i32> {
-    task.partition_spec.as_ref().map(|spec| spec.spec_id())
-}
-
-/// Java `BinPackRewriteFilePlanner.filterFiles`. A task is a candidate when its size falls outside
-/// the desired range, or when it has too many deletes. The ratio clause is deferred.
-fn is_candidate(task: &FileScanTask, config: &ResolvedConfig) -> bool {
-    let length = task.file_size_in_bytes;
-    let outside_desired_size =
-        length < config.min_file_size_bytes || length > config.max_file_size_bytes;
-    let too_many_deletes = task.deletes.len() >= config.delete_file_threshold;
-    outside_desired_size || too_many_deletes
-}
-
-/// Java `SizeBasedFileRewritePlanner.filterFileGroups`, plus the delete clause. A group survives on
-/// enough input files, enough content, too much content, or any delete-laden file.
-fn group_qualifies(group: &[FileScanTask], config: &ResolvedConfig) -> bool {
-    let size = group.len();
-    let input_size: u64 = group.iter().fold(0u64, |sum, task| {
-        sum.saturating_add(task.file_size_in_bytes)
-    });
-
-    let enough_input_files = size > 1 && size >= config.min_input_files;
-    let enough_content = size > 1 && input_size > config.target_file_size_bytes;
-    let too_much_content = input_size > config.max_file_size_bytes;
-    let any_too_many_deletes = group
-        .iter()
-        .any(|task| task.deletes.len() >= config.delete_file_threshold);
-
-    enough_input_files || enough_content || too_much_content || any_too_many_deletes
-}
-
-/// Forward greedy first-fit bin-packing, matching Java `BinPacking.ListPacker` with lookback 1. One
-/// bin is open at a time: an item goes in it if it fits, otherwise the bin closes and a fresh one
-/// opens. The fork's merge-append `bin_packing::pack` is the same algorithm, but it is private to
-/// `transaction/`, and opening it is out of this action's scope.
-pub(super) fn pack_bins<T>(
-    items: Vec<T>,
-    weight: impl Fn(&T) -> u64,
-    target_weight: u64,
-) -> Vec<Vec<T>> {
-    let mut bins: Vec<Vec<T>> = Vec::new();
-    let mut open_bin: Vec<T> = Vec::new();
-    let mut open_weight: u64 = 0;
-
-    for item in items {
-        let w = weight(&item);
-        if !open_bin.is_empty() && open_weight.saturating_add(w) <= target_weight {
-            open_weight = open_weight.saturating_add(w);
-            open_bin.push(item);
-        } else {
-            if !open_bin.is_empty() {
-                bins.push(std::mem::take(&mut open_bin));
-            }
-            open_weight = w;
-            open_bin.push(item);
-        }
-    }
-    if !open_bin.is_empty() {
-        bins.push(open_bin);
-    }
-    bins
-}
-
 /// Parses `write.target-file-size-bytes` (Java `defaultTargetFileSize`). An unparsable value is a
 /// loud error, and an absent one gives the 512 MiB default.
 ///
@@ -699,7 +603,7 @@ pub(super) fn parse_target_file_size(properties: &HashMap<String, String>) -> Re
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
@@ -734,7 +638,7 @@ mod tests {
     // identity(x) over three long columns.
 
     /// A memory catalog over the local filesystem. Returns the catalog and the temp-dir guard.
-    async fn local_fs_catalog() -> (impl Catalog, TempDir) {
+    pub(crate) async fn local_fs_catalog() -> (impl Catalog, TempDir) {
         let temp_dir = TempDir::new().expect("temp dir");
         let warehouse = temp_dir
             .path()
@@ -777,7 +681,7 @@ mod tests {
     }
 
     /// A table partitioned by identity(x), format version `format_version`, under a fresh namespace.
-    async fn create_partitioned_table(
+    pub(crate) async fn create_partitioned_table(
         catalog: &impl Catalog,
         format_version: crate::spec::FormatVersion,
     ) -> Table {
@@ -807,7 +711,7 @@ mod tests {
     }
 
     /// Writes a real parquet data file into partition `x = part_value`.
-    async fn write_data_file(
+    pub(crate) async fn write_data_file(
         table: &Table,
         file_name: &str,
         part_value: i64,
@@ -903,7 +807,7 @@ mod tests {
     }
 
     /// Writes a real parquet position-delete file in partition `x = part_value`.
-    async fn write_position_delete_file(
+    pub(crate) async fn write_position_delete_file(
         table: &Table,
         part_value: i64,
         deletes: &[(String, i64)],
@@ -950,7 +854,11 @@ mod tests {
     }
 
     /// Append `files` in one fast-append commit, returning the updated table.
-    async fn append_files(catalog: &impl Catalog, table: &Table, files: Vec<DataFile>) -> Table {
+    pub(crate) async fn append_files(
+        catalog: &impl Catalog,
+        table: &Table,
+        files: Vec<DataFile>,
+    ) -> Table {
         let tx = Transaction::new(table);
         let action = tx.fast_append().add_data_files(files);
         let tx = action.apply(tx).unwrap();
@@ -958,7 +866,11 @@ mod tests {
     }
 
     /// Add `deletes` (a row_delta) in one commit, returning the updated table.
-    async fn add_deletes(catalog: &impl Catalog, table: &Table, deletes: Vec<DataFile>) -> Table {
+    pub(crate) async fn add_deletes(
+        catalog: &impl Catalog,
+        table: &Table,
+        deletes: Vec<DataFile>,
+    ) -> Table {
         let tx = Transaction::new(table);
         let action = tx.row_delta().add_deletes(deletes);
         let tx = action.apply(tx).unwrap();
@@ -966,7 +878,7 @@ mod tests {
     }
 
     /// Collects every row the scan returns, with merge-on-read deletes applied.
-    async fn scan_rows(table: &Table) -> Vec<(i64, i64, i64)> {
+    pub(crate) async fn scan_rows(table: &Table) -> Vec<(i64, i64, i64)> {
         let stream = table
             .scan()
             .select(["x", "y", "z"])
@@ -1001,7 +913,7 @@ mod tests {
     }
 
     /// The set of live (Added/Existing) data-file paths in the table's current snapshot.
-    async fn live_data_file_paths(table: &Table) -> HashSet<String> {
+    pub(crate) async fn live_data_file_paths(table: &Table) -> HashSet<String> {
         let snapshot = table.metadata().current_snapshot().unwrap();
         let manifest_list = snapshot
             .load_manifest_list(table.file_io(), table.metadata())
@@ -2294,7 +2206,7 @@ mod tests {
 
     /// A minimal [`FileScanTask`] with a size, an `x` partition value, and a delete count. It
     /// carries an identity spec so partition grouping works.
-    fn synthetic_task(
+    pub(crate) fn synthetic_task(
         path: &str,
         size: u64,
         part_value: i64,
@@ -2340,7 +2252,8 @@ mod tests {
     }
 
     /// The identity(x) spec + schema for the synthetic tasks (spec id 0).
-    fn synthetic_spec_and_schema() -> (Arc<crate::spec::PartitionSpec>, crate::spec::SchemaRef) {
+    pub(crate) fn synthetic_spec_and_schema()
+    -> (Arc<crate::spec::PartitionSpec>, crate::spec::SchemaRef) {
         let schema: crate::spec::SchemaRef = Arc::new(three_long_schema());
         let spec = Arc::new(
             PartitionSpec::builder(schema.clone())
@@ -2353,13 +2266,19 @@ mod tests {
         (spec, schema)
     }
 
-    fn config_for(target: u64, min: u64, max: u64, min_input_files: usize) -> ResolvedConfig {
+    pub(crate) fn config_for(
+        target: u64,
+        min: u64,
+        max: u64,
+        min_input_files: usize,
+    ) -> ResolvedConfig {
         ResolvedConfig {
             target_file_size_bytes: target,
             min_file_size_bytes: min,
             max_file_size_bytes: max,
             min_input_files,
             delete_file_threshold: DELETE_FILE_THRESHOLD_DEFAULT,
+            delete_ratio_threshold: DELETE_RATIO_THRESHOLD_DEFAULT,
             max_file_group_size_bytes: 1_000_000,
         }
     }
@@ -2640,7 +2559,7 @@ mod tests {
 
     /// The live delete-file paths of the current snapshot, the signal for whether a delete file was
     /// really removed.
-    async fn live_delete_file_paths(table: &Table) -> HashSet<String> {
+    pub(crate) async fn live_delete_file_paths(table: &Table) -> HashSet<String> {
         let snapshot = table.metadata().current_snapshot().unwrap();
         let manifest_list = snapshot
             .load_manifest_list(table.file_io(), table.metadata())

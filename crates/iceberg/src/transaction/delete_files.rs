@@ -15,62 +15,38 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! This module contains the delete-files action.
+//! The delete-files action.
 //!
-//! [`DeleteFilesAction`] removes data files from a table by file path (or [`DataFile`] reference),
-//! producing a new snapshot whose manifests no longer reference the removed files. It mirrors Java
-//! `StreamingDelete` / `DeleteFiles` and reuses the manifest-filter / rewrite machinery in
-//! [`SnapshotProducer`]: at commit time the requested paths are resolved against the current
-//! snapshot's manifests, each manifest containing a matching live entry is rewritten (matching
-//! entries → `Deleted`, the rest copied forward as `Existing`), and the new snapshot is committed.
+//! [`DeleteFilesAction`] removes data files from a table by file path or [`DataFile`] reference. It
+//! mirrors Java `StreamingDelete` / `DeleteFiles` and reuses the manifest-rewrite machinery in
+//! [`SnapshotProducer`]. At commit the requested paths are resolved against the current snapshot's
+//! manifests. Each manifest with a matching live entry is rewritten. Matching entries become `Deleted`,
+//! and the rest are copied forward as `Existing`.
 //!
-//! Deleting a path that is not present in any live entry of the table is an error (mirrors Java
-//! `failMissingDeletePaths`).
+//! Deleting a path that no live entry carries is an error (Java `failMissingDeletePaths`).
 //!
-//! **Delete-by-row-filter mode (`deleteFromRowFilter(Expression)`):**
-//! [`DeleteFilesAction::delete_from_row_filter`] stores a row predicate (Java
-//! `StreamingDelete.deleteFromRowFilter` → `MergingSnapshotProducer.deleteByRowFilter`, 1.10.0
-//! bytecode-verified). At apply time the producer resolves every LIVE data file the predicate
-//! STRICTLY matches (all of its rows match) via [`SnapshotProducer::resolve_filter_deletes`] — the
-//! Rust port of Java `ManifestFilterManager.manifestHasDeletedFiles` + `PartitionAndMetricsEvaluator`
-//! that `OverwriteFiles.overwriteByRowFilter` already drives, REUSED unchanged (not forked). Per LIVE
-//! data file the predicate is reduced to its per-partition RESIDUAL (Java
-//! `ResidualEvaluator.residualFor`) using that file's OWN partition spec, then the strict / inclusive
-//! METRICS evaluators classify the file: KEEP (inclusive says no rows can match) / DELETE (strict says
-//! all rows match) / PARTIAL. A PARTIAL match (some-but-not-all rows) is a non-retryable error (Java's
-//! "Cannot delete file where some, but not all, rows match filter %s: %s" — `StreamingDelete` deletes
-//! WHOLE files only, it cannot split a file). An unpartitioned `Predicate::AlwaysTrue` row filter
-//! deletes every data file (full delete). The recorded operation stays [`Operation::Delete`]
-//! unconditionally — Java `StreamingDelete.operation()` is the CONSTANT `"delete"` (NOT the dynamic
-//! `BaseOverwriteFiles.operation()`), confirmed by the 1.10.0 bytecode. When a by-path delete is ALSO
-//! set, the by-filter matches are UNIONED with the by-path resolution (de-duped by path) in the one
-//! `Delete` snapshot — mirroring Java's single `ManifestFilterManager` carrying both the `deletePaths`
-//! set and the `deleteExpression`.
+//! **Delete by row filter** (Java `StreamingDelete.deleteFromRowFilter`).
+//! [`DeleteFilesAction::delete_from_row_filter`] stores a row predicate. At apply time
+//! [`SnapshotProducer::resolve_filter_deletes`] resolves every live data file the predicate strictly
+//! matches. This is the same helper `OverwriteFiles.overwriteByRowFilter` drives, reused unchanged.
 //!
-//! **Known inherited divergence (fail-safe, by-path + PARTIAL filter on the SAME file).** Java's
-//! `ManifestFilterManager.manifestHasDeletedFiles` (1.10.0 bytecode, offsets 68-96) computes
-//! `markedForDelete = deletePaths.contains(file) || deleteFiles.contains(file) ||
-//! dropPartitions.contains(...)` BEFORE the metrics check, and a `markedForDelete` file skips the
-//! `rowsMightMatch`/`rowsMustMatch` classification entirely (forcing `allRowsMatch = true`, offsets
-//! 195-245) — so a file already marked for deletion by path is DELETED even when the row filter matches
-//! only SOME of its rows. The shared [`SnapshotProducer::resolve_filter_deletes`] (in `snapshot.rs`) has
-//! NO such short-circuit: it classifies every live data file by metrics alone, so a file that is BOTH
-//! `delete_file`d by path AND a PARTIAL row-filter match raises the non-retryable "some, but not all,
-//! rows match" error where Java would have deleted it. This is PRE-EXISTING and INHERITED — the same
-//! helper drives `OverwriteFiles.overwriteByRowFilter`, which shares the blind spot — and it is FAIL-SAFE
-//! (Rust refuses the commit and never wrongly deletes data). The fix (the `markedForDelete` short-circuit)
-//! belongs in `snapshot.rs` and is deferred; the divergence is pinned by
-//! `test_delete_from_row_filter_bypath_and_partial_match_diverges_failsafe`.
+//! Per live data file the predicate is reduced to its per-partition residual under that file's OWN
+//! partition spec. The strict and inclusive metrics evaluators then classify the file as KEEP, DELETE,
+//! or PARTIAL. A PARTIAL match is a non-retryable error, because `StreamingDelete` deletes whole files
+//! and cannot split one. An unpartitioned `Predicate::AlwaysTrue` filter deletes every data file.
 //!
-//! **Case sensitivity (`caseSensitive(boolean)`):** [`DeleteFilesAction::case_sensitive`] threads the Java
-//! `MergingSnapshotProducer.caseSensitive` flag into the row-filter binding (Java
-//! `ManifestFilterManager.caseSensitive` → `ResidualEvaluator.of(spec, expr, caseSensitive)` and the
-//! metrics-evaluator binding). It DEFAULTS to `true` (the Iceberg/Java default, 1.10.0-bytecode-confirmed:
-//! the `MergingSnapshotProducer`/`ManifestFilterManager` ctors set `caseSensitive = true`), so the row
-//! filter resolves column names case-sensitively unless the caller opts into `case_sensitive(false)`.
+//! The recorded operation stays [`Operation::Delete`] unconditionally. Java
+//! `StreamingDelete.operation()` is a constant, unlike the dynamic `BaseOverwriteFiles.operation()`.
+//! A by-path delete set at the same time is unioned with the by-filter matches, de-duped by path, in the
+//! one `Delete` snapshot.
 //!
-//! **Out of scope (deferred):** `dropPartition` (Java `DeleteFiles.dropPartition` partition-drop —
-//! `ReplacePartitions` territory).
+//! **Inherited divergence:** a by-path delete plus a PARTIAL filter match. Java deletes the
+//! file (path mark skips metrics). This port raises "some, but not all, rows match". Fail-safe:
+//! it never wrongly deletes. Fix belongs in `snapshot.rs`.
+//!
+//! [`DeleteFilesAction::case_sensitive`] defaults true, matching Java.
+//!
+//! Out of scope: `DeleteFiles.dropPartition`, which is `ReplacePartitions` territory.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -101,27 +77,21 @@ pub struct DeleteFilesAction {
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
-    /// Whether to reject the commit if a data file this action is deleting was already DELETED by a
-    /// concurrent commit since the starting snapshot (Java `StreamingDelete.validateFilesExist` /
-    /// `MergingSnapshotProducer.validateDataFilesExist`). OFF by default = snapshot isolation (no check).
+    /// Whether to reject the commit when a concurrent commit already DELETED a data file this action
+    /// deletes (Java `StreamingDelete.validateFilesExist`). Off by default, which is snapshot isolation.
     validate_files_exist: bool,
-    /// An explicit starting snapshot for the files-exist check (Java `validateFromSnapshot`). When `None`,
-    /// the check uses the transaction's starting snapshot (the table head when the transaction was created).
+    /// An explicit starting snapshot for the files-exist check (Java `validateFromSnapshot`). `None`
+    /// uses the transaction's starting snapshot.
     validate_from_snapshot: Option<i64>,
     /// Stage the produced delete snapshot for write-audit-publish instead of moving `main` (Java
     /// `SnapshotProducer.stageOnly()`). See [`DeleteFilesAction::stage_only`].
     stage_only: bool,
-    /// The delete-by-row-filter predicate (Java `StreamingDelete.deleteFromRowFilter` →
-    /// `MergingSnapshotProducer.deleteByRowFilter`, stored as `deleteExpression`). When `Some`, every LIVE
-    /// data file the predicate STRICTLY matches is removed at apply time via
-    /// [`SnapshotProducer::resolve_filter_deletes`] (per-partition residual + strict/inclusive metrics;
-    /// a PARTIAL match is a non-retryable error). When `None`, no by-filter delete is performed (Java
-    /// `alwaysFalse()`). See [`DeleteFilesAction::delete_from_row_filter`].
+    /// The delete-by-row-filter predicate (Java `deleteExpression`). `Some` removes every live data file
+    /// the predicate strictly matches at apply time. A PARTIAL match is a non-retryable error. `None`
+    /// performs no by-filter delete. See [`DeleteFilesAction::delete_from_row_filter`].
     row_filter: Option<Predicate>,
-    /// Column-name resolution case sensitivity for binding the [`Self::row_filter`] predicate (Java
-    /// `MergingSnapshotProducer.caseSensitive`). DEFAULTS to `true` (the Iceberg/Java default — the
-    /// `MergingSnapshotProducer` ctor sets `caseSensitive = true`, 1.10.0 bytecode). `case_sensitive(false)`
-    /// switches the row filter to case-insensitive column resolution. See [`DeleteFilesAction::case_sensitive`].
+    /// Column-name case sensitivity for binding [`Self::row_filter`] (Java
+    /// `MergingSnapshotProducer.caseSensitive`). It defaults to `true`, the Java default.
     case_sensitive: bool,
 }
 
@@ -136,16 +106,16 @@ impl DeleteFilesAction {
             validate_from_snapshot: None,
             stage_only: false,
             row_filter: None,
-            // Java `MergingSnapshotProducer` ctor default `caseSensitive = true` (1.10.0 bytecode).
+            // Java `MergingSnapshotProducer` defaults `caseSensitive` to true.
             case_sensitive: true,
         }
     }
 
     /// Delete a single file by its fully-qualified path.
     ///
-    /// To remove a file from the table, this path must equal a path in the table's metadata. Paths
-    /// that are different but equivalent (e.g. `file:/p/f.parquet` vs `file:///p/f.parquet`) will not
-    /// be removed (mirrors Java `DeleteFiles.deleteFile(CharSequence)`).
+    /// The path must equal a path in the table's metadata. A different but equivalent path, such as
+    /// `file:/p/f.parquet` against `file:///p/f.parquet`, does not match (Java
+    /// `DeleteFiles.deleteFile(CharSequence)`).
     pub fn delete_file(mut self, path: impl Into<String>) -> Self {
         self.delete_paths.insert(path.into());
         self
@@ -164,39 +134,24 @@ impl DeleteFilesAction {
         self
     }
 
-    /// DELETE every current data file the `predicate` STRICTLY matches (Java
-    /// `DeleteFiles.deleteFromRowFilter(Expression)` → `StreamingDelete.deleteFromRowFilter` →
-    /// `MergingSnapshotProducer.deleteByRowFilter`, 1.10.0 bytecode-verified). At apply time the producer
-    /// resolves the live data files whose ALL rows match the predicate (via
-    /// [`SnapshotProducer::resolve_filter_deletes`]) and removes them in the SAME `Delete` snapshot as any
-    /// explicit [`Self::delete_file`] / [`Self::delete_files`] / [`Self::delete_data_files`] removals.
-    ///
-    /// Per LIVE data file the predicate is reduced to its per-partition RESIDUAL (Java
-    /// `ResidualEvaluator.residualFor`) using THAT file's own partition spec, then classified by the
-    /// strict / inclusive METRICS evaluators: KEEP (inclusive: no rows can match) / DELETE (strict: all
-    /// rows match) / PARTIAL. A file the predicate matches only PARTIALLY (some-but-not-all rows) makes the
-    /// commit fail with a non-retryable error ("Cannot delete file where some, but not all, rows match
-    /// filter ...") — `StreamingDelete` deletes WHOLE files only and cannot split a file. An unpartitioned
-    /// [`Predicate::AlwaysTrue`] filter deletes EVERY data file.
-    ///
-    /// The recorded operation stays [`Operation::Delete`] (Java `StreamingDelete.operation()` is the
-    /// constant `"delete"`). The predicate is bound with this action's case-sensitivity (default `true`, the
-    /// Iceberg/Java default — see [`Self::case_sensitive`]).
+    /// DELETE every current data file the `predicate` strictly matches (Java
+    /// `DeleteFiles.deleteFromRowFilter(Expression)`). The matches are removed in the same `Delete`
+    /// snapshot as any explicit by-path removal. A PARTIAL match fails the commit with a non-retryable
+    /// error, because `StreamingDelete` deletes whole files and cannot split one. An unpartitioned
+    /// [`Predicate::AlwaysTrue`] filter deletes every data file. The module doc states the full
+    /// classification rule.
     pub fn delete_from_row_filter(mut self, predicate: Predicate) -> Self {
         self.row_filter = Some(predicate);
         self
     }
 
-    /// Set whether the [`Self::delete_from_row_filter`] predicate resolves column names CASE-SENSITIVELY
-    /// (Java `DeleteFiles.caseSensitive(boolean)` → `MergingSnapshotProducer.caseSensitive`).
+    /// Set whether the [`Self::delete_from_row_filter`] predicate resolves column names case-sensitively
+    /// (Java `DeleteFiles.caseSensitive(boolean)`).
     ///
-    /// DEFAULT (this method NOT called) = `true`, the Iceberg/Java default (1.10.0 bytecode: the
-    /// `MergingSnapshotProducer` ctor sets `caseSensitive = true`). With `true`, a column named `X` in the
-    /// row filter binds only to a schema column named exactly `X`; a wrong-cased reference (filter on `X` for
-    /// a schema column `x`) fails to bind and the commit errors. Calling `case_sensitive(false)` switches to
-    /// case-INSENSITIVE column resolution, so the filter on `X` binds to the schema column `x` and deletes
-    /// its matching files. Only affects the by-row-filter mode ([`Self::delete_from_row_filter`]); by-path
-    /// deletes do not resolve column names.
+    /// The default is `true`, the Java default. A filter on `X` then binds only to a schema column named
+    /// exactly `X`, and a wrong-cased reference fails to bind, so the commit errors.
+    /// `case_sensitive(false)` binds `X` to the schema column `x` instead. This affects only the
+    /// by-row-filter mode. By-path deletes resolve no column names.
     pub fn case_sensitive(mut self, case_sensitive: bool) -> Self {
         self.case_sensitive = case_sensitive;
         self
@@ -220,37 +175,32 @@ impl DeleteFilesAction {
         self
     }
 
-    /// ENABLE the files-exist conflict check (Java `StreamingDelete.validateFilesExist` →
-    /// `MergingSnapshotProducer.validateDataFilesExist`): the commit is rejected with a non-retryable
-    /// `ValidationException` if any data file this action is deleting was ALREADY DELETED by a snapshot
-    /// committed since the starting snapshot. Without it, a concurrent removal of the same file is
-    /// silently absorbed (the path simply no longer resolves to a live entry on the re-based commit).
+    /// Enable the files-exist conflict check (Java `StreamingDelete.validateFilesExist`). The commit is
+    /// then rejected, non-retryably, when a snapshot committed since the starting snapshot already
+    /// deleted a data file this action deletes. Without the check that concurrent removal is absorbed
+    /// silently, because the path no longer resolves to a live entry on the re-based commit.
     ///
-    /// Default (this method NOT called) = snapshot isolation = no check (current behavior unchanged).
+    /// The default is snapshot isolation, with no check.
     pub fn validate_files_exist(mut self) -> Self {
         self.validate_files_exist = true;
         self
     }
 
-    /// Override the snapshot from which the files-exist check starts (Java
+    /// Override the snapshot where the files-exist check starts (Java
     /// `DeleteFiles.validateFromSnapshot(long)`). By default the check uses the transaction's starting
-    /// snapshot (the table head when [`crate::transaction::Transaction::new`] was called); this lets the
-    /// caller pin a specific earlier snapshot id (the snapshot it read when selecting the files to delete).
+    /// snapshot. This pins an earlier snapshot id instead.
     ///
-    /// On its own this does NOT enable the check — call [`Self::validate_files_exist`] for that.
+    /// On its own this does not enable the check. Call [`Self::validate_files_exist`] for that.
     pub fn validate_from_snapshot(mut self, snapshot_id: i64) -> Self {
         self.validate_from_snapshot = Some(snapshot_id);
         self
     }
 
-    /// STAGE this delete for write-audit-publish (WAP) instead of publishing it to `main` (Java
-    /// `SnapshotProducer.stageOnly()`). When called, committing this action ADDS the new `Delete` snapshot
-    /// (with its rewritten/tombstoned manifests) to table metadata but moves NO ref: `current-snapshot-id`,
-    /// the `main` ref, and the snapshot-log are left UNCHANGED, so readers continue to see the pre-staging
-    /// data — the deleted rows stay visible — until a later
-    /// [`crate::transaction::Transaction::cherry_pick`] publishes the staged snapshot. The staged snapshot
-    /// still consumes a sequence number exactly like a normal commit. Mirrors `FastAppendAction::stage_only`
-    /// on a delete-bearing action (Java's `stageOnly()` is on the base producer, so it stages identically).
+    /// STAGE this delete for write-audit-publish instead of publishing it to `main` (Java
+    /// `SnapshotProducer.stageOnly()`). The commit adds the new `Delete` snapshot to table metadata but
+    /// moves no ref. `current-snapshot-id`, the `main` ref, and the snapshot log stay unchanged, so
+    /// readers still see the deleted rows until [`crate::transaction::Transaction::cherry_pick`]
+    /// publishes the staged snapshot. The staged snapshot still consumes a sequence number.
     pub fn stage_only(mut self) -> Self {
         self.stage_only = true;
         self
@@ -275,11 +225,7 @@ impl TransactionAction for DeleteFilesAction {
             .commit(
                 DeleteFilesOperation {
                     delete_paths: self.delete_paths.clone(),
-                    // The delete-by-row-filter predicate (Java `deleteExpression`). When `Some`, the producer
-                    // also resolves the live data files this predicate strictly matches.
                     row_filter: self.row_filter.clone(),
-                    // Column-name case sensitivity for binding the row filter (Java
-                    // `MergingSnapshotProducer.caseSensitive`, default `true`).
                     case_sensitive: self.case_sensitive,
                 },
                 DefaultManifestProcess,
@@ -287,49 +233,36 @@ impl TransactionAction for DeleteFilesAction {
             .await
     }
 
-    /// Files-exist conflict validation (Java `StreamingDelete.validate` → `failMissingDeletePaths` /
-    /// `MergingSnapshotProducer.validateDataFilesExist`). Only runs when [`Self::validate_files_exist`] was
-    /// enabled; otherwise a no-op (snapshot isolation).
+    /// Files-exist conflict validation (Java `MergingSnapshotProducer.validateDataFilesExist`). It runs
+    /// only when [`Self::validate_files_exist`] is enabled, and is otherwise a no-op.
     ///
-    /// When enabled: compute the effective starting snapshot ([`Self::validate_from_snapshot`] if set, else
-    /// the transaction-provided `starting_snapshot_id`), enumerate every DATA file DELETED from the refreshed
-    /// base by snapshots committed since it (the shared [`deleted_data_files_after`] helper = Java
-    /// `deletedDataFiles` over `VALIDATE_DATA_FILES_EXIST_OPERATIONS` + `ManifestStatus::Deleted`), and reject
-    /// the commit if ANY of those removed files is a file this action also needs to delete (its path ∈
-    /// `self.delete_paths`, Java `requiredDataFiles.contains(entry.file().location())`). The rejection is a
-    /// NON-retryable [`ErrorKind::DataInvalid`] (Java's non-retryable `ValidationException`), naming the
-    /// missing file so the retry loop stops and the validation message propagates.
-    ///
-    /// `requiredDataFiles` here is `self.delete_paths` — the set of files the delete operation requires (the
-    /// ones it is removing) — mirroring Java `StreamingDelete`, whose required-deletes are the paths/files
-    /// passed to `deleteFile`.
+    /// It takes the effective starting snapshot, enumerates every DATA file deleted from the refreshed
+    /// base since then, and rejects the commit when one of those files is also in `self.delete_paths`.
+    /// The rejection is a non-retryable [`ErrorKind::DataInvalid`] naming the missing file, so the retry
+    /// loop stops and the message reaches the caller.
     async fn validate(
         self: Arc<Self>,
         starting_snapshot_id: Option<i64>,
         current: &Table,
     ) -> Result<()> {
         if !self.validate_files_exist {
-            // Default: snapshot isolation, no files-exist check (current behavior unchanged).
+            // The default is snapshot isolation, with no files-exist check.
             return Ok(());
         }
 
-        // Nothing requested to delete ⇒ nothing can be missing — skip the manifest walk.
+        // With nothing to delete, nothing can be missing. Skip the manifest walk.
         if self.delete_paths.is_empty() {
             return Ok(());
         }
 
-        // Java `validateDataFilesExist` uses `startingSnapshotId` (the `validateFromSnapshot` override) when
-        // set, else the operation's starting snapshot.
         let effective_start = self.validate_from_snapshot.or(starting_snapshot_id);
 
-        // `skip_deletes == false`: a `DeleteFiles` commit validates against ALL data-removing operations
-        // INCLUDING concurrent DELETE-op snapshots (Java `validateDataFilesExist` is called with
-        // `skipDeletes = false` here — the files this op needs to delete must still exist regardless of which
-        // operation removed them). `RowDelta` is the variant that skips DELETE-op snapshots by default.
+        // `skip_deletes == false`: a `DeleteFiles` commit validates against ALL data-removing operations,
+        // including concurrent DELETE-op snapshots. The files it deletes must still exist whichever
+        // operation removed them. `RowDelta` is the variant that skips DELETE-op snapshots by default.
         let deleted = deleted_data_files_after(current, effective_start, false).await?;
 
-        // Reject on the FIRST concurrently-deleted file this action also requires (Java throws on the first
-        // matching entry, naming the missing data files).
+        // Reject on the FIRST concurrently-deleted file this action also requires, as Java does.
         if let Some(missing) = deleted
             .iter()
             .find(|file| self.delete_paths.contains(file.file_path()))
@@ -346,26 +279,21 @@ impl TransactionAction for DeleteFilesAction {
 
 /// The [`SnapshotProduceOperation`] for [`DeleteFilesAction`].
 ///
-/// Records `Operation::Delete` (Java `StreamingDelete.operation()` is the constant `"delete"`),
-/// exposes every current data manifest as the set to filter, and resolves the files to remove —
-/// the requested paths against the current snapshot's live data entries, UNIONED with the live data
-/// files the optional row filter strictly matches (the resolved [`DataFile`]s drive the producer's
-/// manifest rewrite).
+/// It records `Operation::Delete`, exposes every current manifest as the set to filter, and resolves
+/// the files to remove. The resolved set is the requested paths against the current snapshot's live
+/// entries, unioned with the live data files the optional row filter strictly matches.
 struct DeleteFilesOperation {
     delete_paths: HashSet<String>,
-    /// The delete-by-row-filter predicate (Java `deleteExpression`). When `Some`, `delete_files` also
-    /// resolves every live data file this predicate STRICTLY matches (via `resolve_filter_deletes`),
-    /// unioned with the path-resolved deletes. `None` ⇒ Java `alwaysFalse` (no by-filter delete).
+    /// The delete-by-row-filter predicate (Java `deleteExpression`). `Some` unions every live data file
+    /// this predicate strictly matches with the path-resolved deletes.
     row_filter: Option<Predicate>,
-    /// Column-name resolution case sensitivity for binding `row_filter` (Java
-    /// `MergingSnapshotProducer.caseSensitive`, default `true`). Passed into `resolve_filter_deletes`.
+    /// Column-name case sensitivity for binding `row_filter`. It defaults to `true`.
     case_sensitive: bool,
 }
 
 impl SnapshotProduceOperation for DeleteFilesOperation {
     fn operation(&self) -> Operation {
-        // Java `StreamingDelete.operation()` returns the CONSTANT `"delete"` (1.10.0 bytecode) — UNLIKE
-        // `BaseOverwriteFiles.operation()`, a by-row-filter delete is still a plain `Delete`.
+        // Java `StreamingDelete.operation()` is a constant. A by-row-filter delete is still a `Delete`.
         Operation::Delete
     }
 
@@ -377,19 +305,14 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
     }
 
     async fn delete_files(&self, snapshot_produce: &SnapshotProducer<'_>) -> Result<Vec<DataFile>> {
-        // Resolve the requested paths against the current snapshot's live data entries, validating that
-        // EVERY requested path matched a live entry (Java `failMissingDeletePaths`). Shared with
-        // `OverwriteFiles` via `SnapshotProducer::resolve_delete_paths`.
+        // Every requested path must match a live entry (Java `failMissingDeletePaths`).
         let mut resolved = snapshot_produce
             .resolve_delete_paths(&self.delete_paths)
             .await?;
 
-        // Union the delete-by-row-filter matches (Java `deleteByRowFilter` — every live data file the
-        // predicate STRICTLY matches; per-partition residual + strict/inclusive metrics, a PARTIAL match is a
-        // non-retryable error inside `resolve_filter_deletes`). De-dupe by path so a file removed by BOTH an
-        // explicit path and the row filter is not deleted twice (the producer's `process_deletes` matches by
-        // path, so a duplicate would be harmless, but the summary counts must stay accurate). Mirrors
-        // `OverwriteFilesOperation::delete_files` — the SAME shared helper, not a fork.
+        // Union the delete-by-row-filter matches. De-dupe by path so a file removed by BOTH a path and
+        // the row filter is not counted twice. `process_deletes` matches by path, so a duplicate is
+        // harmless there, but the summary counts must stay accurate.
         if let Some(row_filter) = &self.row_filter {
             let filter_deletes = snapshot_produce
                 .resolve_filter_deletes(row_filter, self.case_sensitive)
@@ -412,13 +335,10 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // Expose EVERY current manifest — DATA and DELETE — via the shared
-        // [`SnapshotProducer::current_manifests`]. The producer's `process_deletes` decides per DATA manifest
-        // whether to rewrite, carry forward unchanged, or drop it; every DELETE manifest carries forward
-        // UNCHANGED (its entries are delete-file paths, never in the data-file `delete_paths`), so a delete
-        // on a merge-on-read table preserves all outstanding position / equality deletes instead of silently
-        // dropping them and resurrecting deleted rows. The conservative dangling-delete posture (no pruning)
-        // is documented on the helper.
+        // Expose EVERY current manifest, DATA and DELETE. `process_deletes` decides per DATA manifest
+        // whether to rewrite, carry forward, or drop it. Every DELETE manifest carries forward unchanged,
+        // so a delete on a merge-on-read table keeps all outstanding position and equality deletes
+        // instead of dropping them and resurrecting deleted rows.
         snapshot_produce.current_manifests().await
     }
 }
@@ -453,8 +373,7 @@ mod tests {
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
     use crate::{Catalog, ErrorKind};
 
-    /// Build a data file routed to partition `x = part_value` (the V3 minimal table is partitioned by
-    /// identity(x), spec id 0) with a unique path.
+    /// Build a data file with a unique path, routed to partition `x = part_value`.
     fn data_file(path: &str, part_value: i64) -> DataFile {
         DataFileBuilder::default()
             .content(DataContentType::Data)
@@ -468,14 +387,10 @@ mod tests {
             .unwrap()
     }
 
-    /// Build a data file routed to partition `x = part_value` whose column `y` (schema field id 2, a
-    /// `long`) carries `[y_lower, y_upper]` value bounds (no null/nan counts). The bounds let
-    /// [`crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator`] include or
-    /// exclude this file against a `y` predicate — the discriminating input for KEEP vs PARTIAL. Without
-    /// the zero null/nan counts the [`crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator`]
-    /// conservatively returns "might not match", so a file built with this helper can never be classified
-    /// DELETE on a `y` predicate (it lands in the KEEP or PARTIAL branch) — exactly what the partial-match
-    /// and keep-non-matching tests need. The minimal V3 schema is `x,y,z: long` (ids 1,2,3).
+    /// Build a data file in partition `x = part_value` whose column `y` carries `[y_lower, y_upper]`
+    /// bounds and no null or nan counts. The bounds drive the inclusive evaluator, which discriminates
+    /// KEEP from PARTIAL. Without the zero counts the strict evaluator returns "might not match", so a
+    /// file from this helper never classifies as DELETE on a `y` predicate.
     fn data_file_with_y_bounds(
         path: &str,
         part_value: i64,
@@ -496,13 +411,10 @@ mod tests {
             .unwrap()
     }
 
-    /// Like [`data_file_with_y_bounds`] but with COMPLETE `y` (field id 2) stats: lower/upper bounds plus
-    /// `value_counts`, `null_value_counts = 0`, `nan_value_counts = 0`. The zero null/nan counts let the
-    /// [`crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator`] classify the file as
-    /// strictly-all-match against a `y` predicate (the strict evaluator conservatively returns "might not
-    /// match" when a column might contain a null/nan). This is the realistic shape a real Parquet writer
-    /// produces, and it is what the delete-by-row-filter DELETE branch needs to classify a file's whole
-    /// `y` range as covered without a spurious partial-match error.
+    /// Like [`data_file_with_y_bounds`] but with complete `y` stats: bounds plus `value_counts` and zero
+    /// null and nan counts. The zero counts let the strict evaluator classify the file as
+    /// strictly-all-match, which the DELETE branch needs. The strict evaluator returns "might not match"
+    /// whenever a column might hold a null or a nan.
     fn data_file_with_y_stats(path: &str, part_value: i64, y_lower: i64, y_upper: i64) -> DataFile {
         DataFileBuilder::default()
             .content(DataContentType::Data)
@@ -521,14 +433,11 @@ mod tests {
             .unwrap()
     }
 
-    /// Build a data file routed to a TWO-field partition `(x = x_value, y = y_value)` under partition spec
-    /// `spec_id` — the shape produced by evolving the base `identity(x)` spec to `identity(x), identity(y)`
-    /// (spec id 1) via [`crate::transaction::Transaction::update_partition_spec`]. Carries NO `y` column
-    /// bounds, so a `y` predicate can only be decided by the PARTITION residual: under the 2-field spec the
-    /// partition value `y` reduces `y == y_value` to `alwaysTrue` (DELETE), but evaluated under the base
-    /// 1-field spec (`y` not partitioned) the predicate stays `y == y_value` with no bounds to satisfy
-    /// strict metrics (PARTIAL ⇒ error). That divergence is exactly what the two-spec residual-cache test
-    /// uses to distinguish "uses this file's OWN spec" from "hard-codes spec 0".
+    /// Build a data file in a two-field partition `(x = x_value, y = y_value)` under partition spec
+    /// `spec_id`. It carries NO `y` bounds, so only the partition residual can decide a `y` predicate.
+    /// Under the 2-field spec the residual of `y == y_value` is `alwaysTrue`, which is DELETE. Under the
+    /// base 1-field spec it stays `y == y_value` with no bounds, which is PARTIAL and errors. That
+    /// difference separates "uses this file's OWN spec" from "hard-codes spec 0".
     fn data_file_spec1_xy(path: &str, spec_id: i32, x_value: i64, y_value: i64) -> DataFile {
         DataFileBuilder::default()
             .content(DataContentType::Data)
@@ -545,8 +454,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Collect the set of live (Added or Existing) data file paths across the table's current
-    /// snapshot — the real correctness signal (what a scan would read).
+    /// Collect the live data file paths in the current snapshot. This is what a scan reads.
     async fn live_file_paths(table: &Table) -> HashSet<String> {
         let snapshot = table
             .metadata()
@@ -580,10 +488,8 @@ mod tests {
         tx.commit(catalog).await.unwrap()
     }
 
-    /// Commit a CONCURRENT `delete_files` that removes the given paths in its own `Delete` snapshot, via the
-    /// catalog — the removal that a files-exist check must detect. The resulting snapshot records
-    /// `Operation::Delete` (in `VALIDATE_DATA_FILES_EXIST_OPERATIONS`) and rewrites the affected manifest,
-    /// stamping a `Deleted` tombstone for each removed path under its own `added_snapshot_id`.
+    /// Commit a concurrent `delete_files` through the catalog, in its own `Delete` snapshot. This is the
+    /// removal a files-exist check must detect.
     async fn commit_concurrent_delete(
         catalog: &impl Catalog,
         table: &Table,
@@ -597,14 +503,13 @@ mod tests {
         tx.commit(catalog).await.unwrap()
     }
 
-    /// Pins: deleting one of several files in the SAME manifest removes exactly that file from the
-    /// live scan set and leaves the others — the core "wrong live set / data loss" risk.
+    /// Deleting one of several files in the SAME manifest must remove exactly that file and leave the
+    /// others. A wrong live set is data loss.
     #[tokio::test]
     async fn test_delete_files_removes_only_targeted_file_from_live_scan() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // Fast-append A, B, C in one commit (one manifest containing all three).
         let table = append_files(&catalog, &table, vec![
             data_file("test/a.parquet", 0),
             data_file("test/b.parquet", 0),
@@ -626,7 +531,6 @@ mod tests {
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
-        // The new snapshot is a delete, and the live set is exactly {A, C}.
         assert_eq!(
             table
                 .metadata()
@@ -642,8 +546,8 @@ mod tests {
         );
     }
 
-    /// Pins: the deleted file's entry is present as DELETED (informational) in the rewritten manifest
-    /// and the manifest counts (existing vs deleted) are correct — guards against manifest corruption.
+    /// The deleted file's entry must be present as `Deleted` in the rewritten manifest, with correct
+    /// existing and deleted counts. Wrong counts are manifest corruption.
     #[tokio::test]
     async fn test_delete_files_marks_entry_deleted_and_counts_are_correct() {
         let catalog = new_memory_catalog().await;
@@ -665,7 +569,6 @@ mod tests {
             .load_manifest_list(table.file_io(), table.metadata())
             .await
             .unwrap();
-        // One rewritten manifest, with one existing (A) and one deleted (B) entry.
         assert_eq!(manifest_list.entries().len(), 1);
         let manifest_file = &manifest_list.entries()[0];
         assert_eq!(manifest_file.existing_files_count, Some(1));
@@ -685,19 +588,17 @@ mod tests {
         ]);
     }
 
-    /// Pins: a delete that targets a file in only ONE of two manifests leaves the OTHER manifest
-    /// carried forward UNCHANGED (same manifest_path) — guards efficiency + against rewriting (and
-    /// possibly corrupting) manifests the delete does not touch.
+    /// A delete that targets a file in only ONE of two manifests must carry the other forward unchanged,
+    /// at the same manifest path. Rewriting an untouched manifest risks corrupting it.
     #[tokio::test]
     async fn test_delete_files_carries_untouched_manifest_forward_unchanged() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // Two separate appends → two separate manifests.
         let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
         let table = append_files(&catalog, &table, vec![data_file("test/b.parquet", 0)]).await;
 
-        // Identify the manifest that holds A (the one we will NOT touch).
+        // Find the manifest that holds A. The delete must not touch it.
         let before = table
             .metadata()
             .current_snapshot()
@@ -724,7 +625,6 @@ mod tests {
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
-        // A's manifest is carried forward byte-for-byte (same path), and the live set is {A}.
         let after = table
             .metadata()
             .current_snapshot()
@@ -745,19 +645,17 @@ mod tests {
         );
     }
 
-    /// Pins: a delete that spans MULTIPLE manifests removes the targeted file from each — guards
-    /// against only rewriting the first matching manifest.
+    /// A delete that spans multiple manifests must remove the targeted file from each, not only from the
+    /// first matching manifest.
     #[tokio::test]
     async fn test_delete_files_across_multiple_manifests() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // Three appends → three manifests, each with one file.
         let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
         let table = append_files(&catalog, &table, vec![data_file("test/b.parquet", 0)]).await;
         let table = append_files(&catalog, &table, vec![data_file("test/c.parquet", 0)]).await;
 
-        // Delete A and C (in different manifests) in one commit; keep B.
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
@@ -771,8 +669,7 @@ mod tests {
         );
     }
 
-    /// Pins: deleting EVERY live file in a manifest leaves an empty live set (no carried-forward
-    /// added/existing files) and does not error — the all-deleted-manifest case.
+    /// Deleting EVERY live file in a manifest must leave an empty live set and must not error.
     #[tokio::test]
     async fn test_delete_all_files_in_a_manifest_leaves_empty_live_set() {
         let catalog = new_memory_catalog().await;
@@ -794,8 +691,7 @@ mod tests {
         assert!(live_file_paths(&table).await.is_empty());
     }
 
-    /// Pins: a delete-only commit (no added files) is allowed — the relaxed precondition. Without the
-    /// relaxation this would fail the "no added data files" guard.
+    /// A delete-only commit, with no added files, is allowed.
     #[tokio::test]
     async fn test_delete_only_commit_is_allowed() {
         let catalog = new_memory_catalog().await;
@@ -811,17 +707,14 @@ mod tests {
         assert!(live_file_paths(&result.unwrap()).await.is_empty());
     }
 
-    /// Pins: a truly-empty delete commit (no paths requested → no adds, no deletes, no snapshot
-    /// properties) is REJECTED. The precondition relaxation lets delete-only commits through, but it
-    /// must still reject a no-op commit (Java `SnapshotProducer` rejects an empty commit). Guards
-    /// against the relaxation being too permissive (producing an empty no-op delete snapshot).
+    /// A truly empty delete commit is rejected, as Java `SnapshotProducer` rejects one. The relaxation
+    /// that allows delete-only commits must not also allow a no-op snapshot.
     #[tokio::test]
     async fn test_empty_delete_commit_is_rejected() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
 
-        // No delete_file() / delete_files() calls → nothing to delete, nothing added.
         let tx = Transaction::new(&table);
         let action = tx.delete_files();
         let tx = action.apply(tx).unwrap();
@@ -833,8 +726,8 @@ mod tests {
         );
     }
 
-    /// Pins: deleting a file NOT present in the table is an error (Java `failMissingDeletePaths`) —
-    /// guards against silently dropping an unmatched path and producing a no-op delete snapshot.
+    /// Deleting a file that is NOT in the table is an error (Java `failMissingDeletePaths`). A silent
+    /// drop of the unmatched path produces a no-op delete snapshot.
     #[tokio::test]
     async fn test_delete_absent_file_errors() {
         let catalog = new_memory_catalog().await;
@@ -856,29 +749,19 @@ mod tests {
         );
     }
 
-    /// Pins provenance preservation across snapshots — the #1 corruption risk. When a delete
-    /// rewrites a manifest, every SURVIVING entry must be copied forward as `Existing` carrying its
-    /// ORIGINAL `snapshot_id`, `sequence_number`, and `file_sequence_number` (Java `writer.existing`
-    /// preserves all three) — NOT re-stamped with the new delete snapshot/seq. The `Deleted`
-    /// tombstone for the removed file gets the NEW snapshot id (Java `writer.delete`) but keeps the
-    /// removed file's original data/file seq. A carried-forward (untouched) manifest's entries also
-    /// keep their provenance.
-    ///
-    /// Risk pinned: a rewrite that re-stamps surviving entries with the commit snapshot/seq is
-    /// silent table corruption (wrong data-sequence number breaks merge-on-read delete application
-    /// and incremental scans). The other delete_files tests assert only the live PATH set + statuses
-    /// + counts, so they all pass under a snapshot-id re-stamp (verified by mutation) — only this
-    /// test catches it.
+    /// Every SURVIVING entry must be copied forward as `Existing` with its original `snapshot_id`,
+    /// `sequence_number`, and `file_sequence_number`. The `Deleted` tombstone takes the new snapshot id
+    /// but keeps the removed file's original seqs. Re-stamping a survivor is silent table corruption: it
+    /// breaks merge-on-read delete application and incremental scans. Every other delete_files test
+    /// asserts only paths, statuses, and counts, so all of them pass under a snapshot-id re-stamp.
     #[tokio::test]
     async fn test_delete_preserves_surviving_entry_provenance_across_snapshots() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // Append A in its OWN commit (snapshot S1, data seq 1).
         let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
         let s1 = table.metadata().current_snapshot().unwrap().snapshot_id();
 
-        // Append B and C in ONE commit (snapshot S2, data seq 2; one manifest with both).
         let table = append_files(&catalog, &table, vec![
             data_file("test/b.parquet", 0),
             data_file("test/c.parquet", 0),
@@ -887,14 +770,13 @@ mod tests {
         let s2 = table.metadata().current_snapshot().unwrap().snapshot_id();
         assert_ne!(s1, s2);
 
-        // Capture A's original provenance before the delete.
         let (a_snap, a_seq, a_fseq) = entry_provenance(&table, "test/a.parquet").await;
         let (b_snap, b_seq, b_fseq) = entry_provenance(&table, "test/b.parquet").await;
         assert_eq!(a_snap, Some(s1), "A added by S1");
         assert_eq!(b_snap, Some(s2), "B added by S2");
         assert_ne!(a_seq, b_seq, "A and B must have different data seq numbers");
 
-        // Delete B → forces a rewrite of S2's manifest. C (the surviving S2 entry) must keep S2/seq2.
+        // Deleting B rewrites S2's manifest. The surviving C must keep S2 and seq 2.
         let tx = Transaction::new(&table);
         let action = tx.delete_files().delete_file("test/b.parquet");
         let tx = action.apply(tx).unwrap();
@@ -902,7 +784,6 @@ mod tests {
         let s3 = table.metadata().current_snapshot().unwrap().snapshot_id();
         assert_ne!(s3, s2);
 
-        // C survived: rewritten as Existing, MUST keep S2's snapshot id + seq numbers (NOT S3).
         let (c_snap, c_seq, c_fseq) = entry_provenance(&table, "test/c.parquet").await;
         assert_eq!(
             c_snap,
@@ -918,14 +799,12 @@ mod tests {
             "surviving C must keep its ORIGINAL file seq"
         );
 
-        // A survived in its own (untouched, carried-forward) manifest with S1 provenance intact.
         let (a2_snap, a2_seq, a2_fseq) = entry_provenance(&table, "test/a.parquet").await;
         assert_eq!(a2_snap, Some(s1), "carried-forward A keeps S1");
         assert_eq!(a2_seq, a_seq, "carried-forward A keeps its data seq");
         assert_eq!(a2_fseq, a_fseq, "carried-forward A keeps its file seq");
 
-        // The DELETED tombstone for B carries the NEW snapshot id S3 (Java writer.delete) but keeps
-        // B's original data/file seq numbers.
+        // B's tombstone carries the new snapshot id S3 but keeps B's original data and file seqs.
         let del = deleted_entry_provenance(&table, "test/b.parquet").await;
         assert_eq!(
             del.0,
@@ -942,19 +821,15 @@ mod tests {
         );
     }
 
-    /// Pins the all-deleted-manifest lifecycle (Java `MergingSnapshotProducer.apply` keep/drop): a
-    /// rewritten manifest whose live entries all became `Deleted` is KEPT by the commit that created
-    /// it (its `added_snapshot_id` == the new snapshot id, Java's `snapshotId()==snapshotId()`), so
-    /// its tombstones survive for one snapshot; the NEXT delete commit then DROPS it (it has no live
-    /// files and `added_snapshot_id` != that commit's id, so `hasAddedFiles||hasExistingFiles` is
-    /// false). Risk pinned: wrongly dropping the tombstones in the creating commit (loses Deleted
-    /// records downstream/expiry needs) or wrongly retaining an empty manifest forever (clutter).
+    /// The all-deleted-manifest lifecycle (Java `MergingSnapshotProducer.apply`). The commit that
+    /// creates an all-deleted manifest KEEPS it, because its `added_snapshot_id` equals the new snapshot
+    /// id, so its tombstones survive one snapshot. The next delete commit then DROPS it. Dropping the
+    /// tombstones early loses records that expiry needs. Keeping the manifest forever is clutter.
     #[tokio::test]
     async fn test_all_deleted_manifest_kept_by_creating_commit_then_dropped_by_next() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // M1: {A, B} in one manifest. M2: {C} in another.
         let table = append_files(&catalog, &table, vec![
             data_file("test/a.parquet", 0),
             data_file("test/b.parquet", 0),
@@ -962,7 +837,7 @@ mod tests {
         .await;
         let table = append_files(&catalog, &table, vec![data_file("test/c.parquet", 0)]).await;
 
-        // Delete A and B → M1 becomes all-deleted; it must be KEPT (tombstones for A,B present).
+        // Deleting A and B makes M1 all-deleted. It must be kept, with both tombstones.
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
@@ -990,14 +865,13 @@ mod tests {
                 }
             }
         }
-        // The all-deleted M1' is kept: 2 Deleted tombstones present. C carried forward (Added in M2).
         assert_eq!(
             total_deleted, 2,
             "all-deleted manifest must be KEPT with its tombstones"
         );
         assert_eq!(total_added + total_existing, 1, "only C is live");
 
-        // Now delete C → a NEW commit. The all-deleted M1' (no live files) must be DROPPED now.
+        // A new commit that deletes C must now drop the all-deleted M1'.
         let tx = Transaction::new(&table);
         let action = tx.delete_files().delete_file("test/c.parquet");
         let tx = action.apply(tx).unwrap();
@@ -1010,7 +884,6 @@ mod tests {
             .load_manifest_list(table.file_io(), table.metadata())
             .await
             .unwrap();
-        // M1' is gone (dropped); only M2-rewritten remains (C tombstone). A/B tombstones not retained.
         let mut a_or_b_tombstone = false;
         for mf in manifest_list.entries() {
             let m = mf.load_manifest(table.file_io()).await.unwrap();
@@ -1077,8 +950,8 @@ mod tests {
         panic!("no deleted entry for {path}");
     }
 
-    /// Pins: a delete that targets a present file AND an absent file still errors (the present file
-    /// is not silently removed while the absent one is ignored).
+    /// A delete that targets a present file AND an absent file must still error. The present file must
+    /// not be removed while the absent one is ignored.
     #[tokio::test]
     async fn test_delete_mixed_present_and_absent_errors() {
         let catalog = new_memory_catalog().await;
@@ -1098,23 +971,16 @@ mod tests {
         assert!(error.message().contains("test/absent.parquet"));
     }
 
-    // ============================================================================================
-    // Files-exist conflict validation (Java `StreamingDelete.validateFilesExist` /
-    // `MergingSnapshotProducer.validateDataFilesExist`).
+    // Files-exist conflict validation (Java `MergingSnapshotProducer.validateDataFilesExist`).
     //
-    // The race these tests simulate: a `delete_files` is BUILT against table head S0, but BEFORE it commits a
-    // SEPARATE commit lands that DELETES a live data file (advancing the head to S1). When the delete then
-    // commits, `do_commit` refreshes to S1 and runs the action's `validate` against that refreshed base. With
-    // `validate_files_exist()` enabled, a concurrent removal of a file THIS action is also deleting must FAIL
-    // the commit (non-retryable) naming the missing file — committing over a vanished required file is a
-    // serializable-isolation violation. A concurrent removal of a DIFFERENT file must NOT fail. With the check
-    // OFF (the default), neither fails (snapshot isolation, unchanged behavior).
-    // ============================================================================================
+    // The race: a `delete_files` is built against head S0, then a separate commit deletes a live data file
+    // and advances the head to S1. `do_commit` refreshes to S1 and runs `validate` against it. With the
+    // check enabled, a concurrent removal of a file THIS action deletes must fail the commit, because
+    // committing over a vanished required file violates serializable isolation. A concurrent removal of a
+    // different file must not fail. With the check off, neither fails.
 
-    /// NO CONCURRENT DELETION. With the files-exist check enabled but nothing landing concurrently, the
-    /// delete commits normally (the concurrent-deleted set is empty ⇒ no conflict). Pins that enabling the
-    /// check does not block a race-free commit. Risk: a files-exist check that wrongly fails with no
-    /// concurrent deletion.
+    /// With the check enabled and nothing landing concurrently, the delete commits normally. The check
+    /// must not block a race-free commit.
     #[tokio::test]
     async fn test_delete_files_exist_validation_no_concurrent_deletion_succeeds() {
         let catalog = new_memory_catalog().await;
@@ -1145,21 +1011,14 @@ mod tests {
         );
     }
 
-    /// THE HEADLINE FILES-EXIST TEST. Append S0 ({a, b}). Build a `delete_files(a)` with
-    /// `.validate_from_snapshot(S0).validate_files_exist()`. Then a CONCURRENT `delete_files(a)` lands (S1),
-    /// removing the SAME file this action is deleting. Committing must FAIL with a NON-retryable `DataInvalid`
-    /// whose message NAMES the missing file `a` — a concurrent removal of a required file is a lost-update
-    /// conflict under serializable isolation.
-    ///
-    /// Risk pinned: silently committing over a file that a concurrent commit already deleted. Without the
-    /// check the re-based delete would either no-op or (because the file is no longer live) fail with a
-    /// generic "missing required files to delete" — NOT the serializable-isolation validation error.
+    /// A concurrent `delete_files(a)` removes the same file this action deletes. The commit must fail
+    /// with a non-retryable `DataInvalid` naming `a`. Without the check the re-based delete no-ops, or
+    /// fails with the generic "missing required files to delete" instead.
     #[tokio::test]
     async fn test_delete_files_exist_rejects_concurrent_deletion_of_same_file() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // S0: {a, b}.
         let table = append_files(&catalog, &table, vec![
             data_file("test/a.parquet", 0),
             data_file("test/b.parquet", 0),
@@ -1167,7 +1026,7 @@ mod tests {
         .await;
         let s0 = table.metadata().current_snapshot().unwrap().snapshot_id();
 
-        // Build delete(a) with the files-exist check enabled, pinned to start at S0 (the head we read).
+        // Build delete(a) with the check enabled, pinned to start at S0.
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
@@ -1176,11 +1035,10 @@ mod tests {
             .validate_files_exist();
         let tx = action.apply(tx).unwrap();
 
-        // CONCURRENT commit (S1): a separate delete removes the SAME file a.
+        // The concurrent commit S1 removes the same file a.
         let _table_after_concurrent =
             commit_concurrent_delete(&catalog, &table, ["test/a.parquet"]).await;
 
-        // Committing the delete must FAIL: S1 already removed the required file a.
         let err = tx.commit(&catalog).await.expect_err(
             "delete must fail: a concurrent commit removed the file this delete also requires",
         );
@@ -1206,7 +1064,7 @@ mod tests {
             err.message()
         );
 
-        // The catalog head is still S1 (the concurrent delete) — the conflicting delete did NOT commit.
+        // The catalog head is still S1. The conflicting delete did not commit.
         let reloaded = catalog.load_table(table.identifier()).await.unwrap();
         assert_eq!(
             live_file_paths(&reloaded).await,
@@ -1215,9 +1073,8 @@ mod tests {
         );
     }
 
-    /// Commit a CONCURRENT COMPACTION: rewrite `delete_path` into `add_path` through `rewrite_files`, whose
-    /// snapshot records `Operation::Replace` (Java `BaseRewriteFiles.operation()` = `DataOperations.REPLACE`).
-    /// The rewritten data file gets a `Deleted` tombstone on a DATA manifest the new snapshot itself wrote.
+    /// Commit a concurrent compaction that rewrites `delete_path` into `add_path`. Its snapshot records
+    /// `Operation::Replace`, and the rewritten file gets a `Deleted` tombstone.
     async fn commit_concurrent_replace_compaction(
         catalog: &impl Catalog,
         table: &Table,
@@ -1234,26 +1091,19 @@ mod tests {
             .expect("the concurrent compaction commit must succeed")
     }
 
-    /// THE `skip_deletes == false` ARM. `DeleteFiles` always validates with `skip_deletes == false`, which
-    /// routes to `operation_removes_data_files` (Java `VALIDATE_DATA_FILES_EXIST_OPERATIONS =
-    /// {overwrite, replace, delete}`, 1.10.0 bytecode) — a DIFFERENT predicate from the one `RowDelta` uses
-    /// by default.
+    /// The `skip_deletes == false` arm. `DeleteFiles` always validates against
+    /// `operation_removes_data_files`, which is Java's `{overwrite, replace, delete}` set, not the
+    /// predicate `RowDelta` uses by default. A concurrent compaction rewrites `a`, so the commit must
+    /// fail with the non-retryable error naming `a`.
     ///
-    /// Append S0 ({a, b}). Build `delete_files(a).validate_from_snapshot(S0).validate_files_exist()`. Then a
-    /// concurrent COMPACTION (`rewrite_files`, `Operation::Replace`) rewrites `a` into `a-compacted` (S1).
-    /// The commit must fail with the NON-retryable `validateDataFilesExist` error NAMING `a`.
-    ///
-    /// Risk pinned: drop `Operation::Replace` from `operation_removes_data_files` and the compaction's
-    /// tombstone for `a` is never inspected — the validation passes and the commit fails LATER (or not at
-    /// all) on the generic path-resolution error, which is a different contract. The test asserts BOTH that
-    /// the validation message is present AND that the generic path-resolution message is absent, so the
-    /// no-longer-validated path cannot pass this test by failing for the wrong reason.
+    /// The discriminating mutation: drop `Operation::Replace` from `operation_removes_data_files`. The
+    /// compaction's tombstone is then never inspected. The test asserts the validation message is present
+    /// AND the generic path-resolution message is absent, so the mutant cannot pass by failing elsewhere.
     #[tokio::test]
     async fn test_delete_files_exist_rejects_concurrent_replace_compaction_of_same_file() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // S0: {a, b}.
         let table = append_files(&catalog, &table, vec![
             data_file("test/a.parquet", 0),
             data_file("test/b.parquet", 0),
@@ -1273,7 +1123,7 @@ mod tests {
             .validate_files_exist();
         let tx = action.apply(tx).expect("delete_files action applies");
 
-        // CONCURRENT commit (S1): a compaction that REPLACES the file this delete also requires.
+        // The concurrent commit S1 is a compaction that replaces the file this delete requires.
         let compacted = commit_concurrent_replace_compaction(
             &catalog,
             &table,
@@ -1282,7 +1132,7 @@ mod tests {
         )
         .await;
 
-        // Fixture pin: the concurrent snapshot really is a REPLACE, and `a` really is gone.
+        // The concurrent snapshot really is a Replace, and `a` really is gone.
         assert_eq!(
             compacted
                 .metadata()
@@ -1331,18 +1181,14 @@ mod tests {
         );
     }
 
-    /// NEGATIVE CONTROL: same setup, but the concurrent deletion removes a DIFFERENT file (b) than the one
-    /// this action deletes (a). The `delete_files(a)` files-exist check PASSES and the commit succeeds — a
-    /// concurrent removal of an unrelated file is not a conflict.
-    ///
-    /// Risk pinned: an over-eager check that rejects ANY concurrent deletion (false positive) would break
+    /// The concurrent deletion removes a different file than this action deletes, so the check passes and
+    /// the commit succeeds. An over-eager check that rejects any concurrent deletion would break
     /// legitimate concurrent deletes of disjoint files.
     #[tokio::test]
     async fn test_delete_files_exist_allows_concurrent_deletion_of_different_file() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // S0: {a, b, c} in one manifest.
         let table = append_files(&catalog, &table, vec![
             data_file("test/a.parquet", 0),
             data_file("test/b.parquet", 0),
@@ -1351,7 +1197,6 @@ mod tests {
         .await;
         let s0 = table.metadata().current_snapshot().unwrap().snapshot_id();
 
-        // Build delete(a) with the check enabled.
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
@@ -1360,15 +1205,13 @@ mod tests {
             .validate_files_exist();
         let tx = action.apply(tx).unwrap();
 
-        // CONCURRENT commit (S1): a separate delete removes a DIFFERENT file b.
+        // The concurrent commit S1 removes b, which does not race a's deletion.
         let _ = commit_concurrent_delete(&catalog, &table, ["test/b.parquet"]).await;
 
-        // The delete must SUCCEED — b's removal does not race a's deletion.
         let table = tx.commit(&catalog).await.expect(
             "delete must succeed: the concurrent deletion removed a different file (b), not a",
         );
 
-        // Both a (this delete) and b (concurrent delete) are gone; c survives.
         assert_eq!(
             live_file_paths(&table).await,
             HashSet::from(["test/c.parquet".to_string()]),
@@ -1376,36 +1219,29 @@ mod tests {
         );
     }
 
-    /// OFF CONTROL: with the files-exist check NOT enabled (no `validate_files_exist()` call), a concurrent
-    /// deletion of the same file does NOT fail with the validation error — this is snapshot isolation, the
-    /// DEFAULT behavior, unchanged by this increment. (The re-based delete instead finds the file already
-    /// gone and reports the generic missing-file error from path resolution — distinct from the
-    /// validateDataFilesExist message — so this also proves the validation path is the OPT-IN one.)
-    ///
-    /// Risk pinned: the files-exist validation must be OPT-IN — turning it on for every delete by default
-    /// would change existing behavior.
+    /// Without `validate_files_exist()`, a concurrent deletion of the same file does not raise the
+    /// validation error. That is snapshot isolation, the default. The re-based delete instead reports the
+    /// generic missing-file error from path resolution, which proves the validation is opt-in.
     #[tokio::test]
     async fn test_delete_files_exist_off_does_not_run_validation() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // S0: {a, b}.
         let table = append_files(&catalog, &table, vec![
             data_file("test/a.parquet", 0),
             data_file("test/b.parquet", 0),
         ])
         .await;
 
-        // Build delete(a) WITHOUT enabling the check (default = snapshot isolation).
+        // Build delete(a) without the check.
         let tx = Transaction::new(&table);
         let action = tx.delete_files().delete_file("test/a.parquet");
         let tx = action.apply(tx).unwrap();
 
-        // CONCURRENT commit (S1): a separate delete removes the SAME file a.
+        // The concurrent commit S1 removes the same file a.
         let _ = commit_concurrent_delete(&catalog, &table, ["test/a.parquet"]).await;
 
-        // With the check OFF, the validateDataFilesExist path never runs. The re-based delete finds a already
-        // gone and fails the generic path-resolution check instead (NOT the validation error).
+        // With the check off, the re-based delete fails the generic path-resolution check instead.
         let err = tx.commit(&catalog).await.expect_err(
             "with the check OFF, the re-based delete still cannot resolve the vanished file",
         );
@@ -1423,21 +1259,15 @@ mod tests {
         );
     }
 
-    /// VALIDATE-FROM-SNAPSHOT OVERRIDE TEST. The `validate_from_snapshot(id)` override changes which commits
-    /// count as concurrent. Append S0 ({a, b}); a concurrent delete removes a (S1); then build delete(a) and
-    /// commit. With `validate_from_snapshot(S0)` (the EARLIER snapshot) the S1 removal IS in the window ⇒ the
-    /// files-exist check FAILS. With `validate_from_snapshot(S1)` (the CURRENT head) the window is empty ⇒ the
-    /// check finds nothing (and the commit fails LATER, on path resolution, because a is already gone — NOT on
-    /// the validation error).
-    ///
-    /// Risk pinned: ignoring the override (always using the tx start) would change which concurrent removals
-    /// are detected; this proves the override widens / narrows the window as specified.
+    /// `validate_from_snapshot(id)` changes which commits count as concurrent. With S0, the earlier
+    /// snapshot, S1's removal is in the window and the check fails. With S1, the current head, the window
+    /// is empty and the commit instead fails later on path resolution. Ignoring the override would change
+    /// which concurrent removals are detected.
     #[tokio::test]
     async fn test_delete_files_exist_validate_from_snapshot_override_changes_window() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // S0: {a, b}.
         let table = append_files(&catalog, &table, vec![
             data_file("test/a.parquet", 0),
             data_file("test/b.parquet", 0),
@@ -1445,7 +1275,7 @@ mod tests {
         .await;
         let s0 = table.metadata().current_snapshot().unwrap().snapshot_id();
 
-        // S1: a concurrent delete removes a (committed via the catalog, advancing the head).
+        // S1 is a concurrent delete of a, which advances the head.
         let table_s1 = commit_concurrent_delete(&catalog, &table, ["test/a.parquet"]).await;
         let s1 = table_s1
             .metadata()
@@ -1454,7 +1284,7 @@ mod tests {
             .snapshot_id();
         assert_ne!(s0, s1);
 
-        // With validate_from_snapshot(S0): the window includes S1's removal ⇒ files-exist check FAILS naming a.
+        // With S0 the window includes S1's removal, so the check fails naming a.
         let tx = Transaction::new(&table_s1);
         let action = tx
             .delete_files()
@@ -1474,9 +1304,7 @@ mod tests {
             err.message()
         );
 
-        // With validate_from_snapshot(S1): the window starts AT the current head ⇒ empty ⇒ the validation
-        // check finds nothing. The commit still fails, but on the GENERIC path-resolution error (a is gone),
-        // NOT the validation error — proving the narrowed window skipped S1's removal.
+        // With S1 the window is empty, so the commit fails on the generic path-resolution error instead.
         let tx = Transaction::new(&table_s1);
         let action = tx
             .delete_files()
@@ -1497,35 +1325,26 @@ mod tests {
         );
     }
 
-    /// TX-CAPTURED START SURVIVES RE-BASE. The files-exist check works WITHOUT an explicit
-    /// `validate_from_snapshot`, relying SOLELY on the transaction-captured starting snapshot id surviving
-    /// `do_commit`'s re-base. Build `delete_files(a).validate_files_exist()` (NO `validate_from_snapshot`);
-    /// the starting snapshot is the one captured in `Transaction::new` (= S0). A concurrent `delete_files(a)`
-    /// lands (S1) removing the SAME file; `do_commit` overwrites `self.table` with the refreshed base (S1),
-    /// but `starting_snapshot_id` must SURVIVE — so S1's removal of `a` is still enumerated and rejected with
-    /// the `validateDataFilesExist` message naming `a`.
+    /// The check must work without `validate_from_snapshot`, on the transaction-captured starting
+    /// snapshot alone. `do_commit` overwrites `self.table` with the refreshed base, but
+    /// `starting_snapshot_id` must survive, so S1's removal of `a` is still enumerated and rejected.
     ///
-    /// Risk pinned: if `effective_start` were re-read from the REFRESHED head at validation time
-    /// (`current.metadata().current_snapshot_id()`) instead of the tx-captured `starting_snapshot_id`, the
-    /// window would start AT the current head ⇒ empty ⇒ the check silently always passes (a
-    /// serializable-isolation hole) and the commit would instead fail on the GENERIC path-resolution error.
-    /// Every OTHER files-exist test pins `validate_from_snapshot`, which short-circuits
-    /// `validate_from_snapshot.or(starting_snapshot_id)` and never reads the tx-captured field — so this is
-    /// the ONLY test that pins the `Transaction::new` capture surviving the re-base for DeleteFiles.
+    /// The discriminating mutation: read `effective_start` from the refreshed head instead. The window is
+    /// then empty, the check always passes, and the commit fails on the generic path-resolution error.
+    /// Every other files-exist test pins `validate_from_snapshot`, which short-circuits
+    /// `validate_from_snapshot.or(starting_snapshot_id)`, so only this test covers the capture.
     #[tokio::test]
     async fn test_delete_files_exist_rejects_concurrent_using_tx_captured_starting_snapshot() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // S0: {a, b} (the head captured when the transaction is created below).
         let table = append_files(&catalog, &table, vec![
             data_file("test/a.parquet", 0),
             data_file("test/b.parquet", 0),
         ])
         .await;
 
-        // Build delete(a) with the check enabled but WITHOUT validate_from_snapshot — the start is the
-        // tx-captured head (S0).
+        // Build delete(a) with the check enabled and no validate_from_snapshot. The start is S0.
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
@@ -1533,11 +1352,10 @@ mod tests {
             .validate_files_exist();
         let tx = action.apply(tx).unwrap();
 
-        // CONCURRENT commit (S1): a separate delete removes the SAME file a, advancing the head.
+        // The concurrent commit S1 removes the same file a and advances the head.
         let _concurrent = commit_concurrent_delete(&catalog, &table, ["test/a.parquet"]).await;
 
-        // Committing must FAIL via the tx-captured start surviving the re-base: S1's removal of a is in the
-        // window, so the files-exist check fires with the validateDataFilesExist message naming a.
+        // The tx-captured start survives the re-base, so S1's removal is in the window and the check fires.
         let err = tx.commit(&catalog).await.expect_err(
             "conflict must be detected via the tx-captured starting snapshot (no validate_from_snapshot)",
         );
@@ -1552,19 +1370,14 @@ mod tests {
         );
     }
 
-    // ============================================================================================
-    // Merge-on-read DELETE-MANIFEST CARRY (Increment 2b — the silent-resurrection bug fix).
+    // Merge-on-read delete-manifest carry.
     //
-    // `existing_manifest` now returns the FULL manifest list (DATA + DELETE) via the shared
-    // `SnapshotProducer::current_manifests`, so a `delete_files` commit on a table that already carries
-    // outstanding position/equality deletes preserves those delete manifests instead of dropping them
-    // table-wide. These tests use the row_delta crown-jewel fixture (real parquet + a REAL position-delete
-    // file written by the production writer + a production scan), so the resurrection physics is proven
-    // end-to-end, not just at the manifest-metadata level.
-    // ============================================================================================
+    // `existing_manifest` returns the full manifest list, DATA and DELETE, so a `delete_files` commit on a
+    // table with outstanding position or equality deletes keeps those delete manifests. These tests use
+    // real parquet, a real position-delete file from the production writer, and a real scan, so the
+    // resurrection physics is proven end-to-end.
 
-    /// Write a REAL parquet data file with rows `(x, y, z)` into the table location, routed to partition
-    /// `x = part_value`. Returns the finished partitioned [`DataFile`]. Mirrors the row_delta fixture.
+    /// Write a real parquet data file with rows `(x, y, z)`, routed to partition `x = part_value`.
     async fn write_data_file(
         table: &Table,
         file_name: &str,
@@ -1605,8 +1418,8 @@ mod tests {
             .unwrap()
     }
 
-    /// Write a REAL position-delete parquet file (via the production `PositionDeleteFileWriter`) into the
-    /// table location, deleting the given `(data_file_path, pos)` pairs, in partition `x = part_value`.
+    /// Write a real position-delete parquet file for the given `(data_file_path, pos)` pairs, in
+    /// partition `x = part_value`.
     async fn write_position_delete_file(
         table: &Table,
         part_value: i64,
@@ -1653,8 +1466,8 @@ mod tests {
         writer.close().await.unwrap().into_iter().next().unwrap()
     }
 
-    /// Scan the table and collect the `y` column values across all returned batches — the real read-side
-    /// signal (what a query would see, with merge-on-read deletes applied).
+    /// Scan the table and collect the `y` values. This is the read-side signal, with merge-on-read
+    /// deletes applied.
     async fn scan_y_values(table: &Table) -> HashSet<i64> {
         let stream = table
             .scan()
@@ -1680,9 +1493,8 @@ mod tests {
         values
     }
 
-    /// Count the DELETE-content manifests in the table's current snapshot manifest list (structural
-    /// signal, independent of the read path). A delete must carry outstanding delete manifests forward,
-    /// so this count must NOT drop to 0 across the commit.
+    /// Count the DELETE-content manifests in the current snapshot. This is a structural signal,
+    /// independent of the read path.
     async fn count_delete_manifests(table: &Table) -> usize {
         let snapshot = table.metadata().current_snapshot().unwrap();
         let manifest_list = snapshot
@@ -1696,28 +1508,26 @@ mod tests {
             .count()
     }
 
-    /// THE CROWN JEWEL (risk: a `delete_files` on a merge-on-read table silently DROPS every outstanding
-    /// delete manifest, resurrecting deleted rows table-wide). Data file X (partition 0) carries a real
-    /// position delete masking its row y=20; data file Y lives in partition 1. `delete_files(Y)` must
-    /// remove Y AND keep X's delete applying — the scan after the commit is exactly {10} (X's masked y=20
-    /// stays absent, Y's rows are gone).
+    /// A `delete_files` on a merge-on-read table must not drop the outstanding delete manifests, which
+    /// would resurrect deleted rows table-wide. `delete_files(Y)` must remove Y and keep X's position
+    /// delete applying, so the scan is exactly {10}.
     ///
-    /// MUTATION (run manually, then restore): in `DeleteFilesOperation::existing_manifest`, filter the
-    /// `current_manifests()` result to DATA manifests only (the old data-only behavior) ⇒ this test FAILS
-    /// with y=20 resurrected (the scan returns {10, 20}) AND the structural delete-manifest count drops to 0.
+    /// The discriminating mutation, run manually: in `DeleteFilesOperation::existing_manifest`, filter
+    /// `current_manifests()` to DATA manifests only. y=20 then resurrects and the delete-manifest count
+    /// drops to 0.
     #[tokio::test]
     async fn test_delete_files_preserves_outstanding_delete_manifests_no_resurrection() {
         let catalog = new_memory_catalog().await;
         let table = make_v2_minimal_table_in_catalog(&catalog).await;
 
-        // X in partition 0 with rows y = [10, 20]; Y in partition 1 with rows y = [60, 70].
+        // X holds y = [10, 20] in partition 0. Y holds y = [60, 70] in partition 1.
         let x = write_data_file(&table, "x.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
         let x_path = x.file_path().to_string();
         let y = write_data_file(&table, "y.parquet", 1, &[(1, 60, 600), (1, 70, 700)]).await;
         let y_path = y.file_path().to_string();
         let table = append_files(&catalog, &table, vec![x, y]).await;
 
-        // RowDelta a REAL position delete masking X's row at position 1 (y=20).
+        // Row-delta a real position delete that masks X's row at position 1, which is y=20.
         let pos_delete = write_position_delete_file(&table, 0, &[(x_path.clone(), 1)]).await;
         let tx = Transaction::new(&table);
         let action = tx.row_delta().add_deletes(vec![pos_delete]);
@@ -1729,14 +1539,13 @@ mod tests {
             "the row_delta must leave one delete manifest in the snapshot"
         );
 
-        // Sanity: before the delete_files, the scan drops y=20 (X's masked row) and shows Y's rows.
         assert_eq!(
             scan_y_values(&table).await,
             HashSet::from([10, 60, 70]),
             "the position delete masks y=20 from X; Y's rows are present"
         );
 
-        // Delete Y (partition 1). This must NOT drop X's outstanding delete manifest.
+        // Deleting Y must not drop X's outstanding delete manifest.
         let tx = Transaction::new(&table);
         let action = tx.delete_files().delete_file(&y_path);
         let tx = action.apply(tx).unwrap();
@@ -1751,14 +1560,14 @@ mod tests {
             Operation::Delete
         );
 
-        // SCAN PIN: X's masked row y=20 is STILL ABSENT and Y's rows are gone ⇒ exactly {10}.
+        // X's masked y=20 stays absent and Y's rows are gone, so the scan is exactly {10}.
         assert_eq!(
             scan_y_values(&table).await,
             HashSet::from([10]),
             "Y's rows are deleted AND X's masked y=20 stays absent — no resurrection"
         );
 
-        // STRUCTURAL PIN: the delete manifest survived the commit (count must not drop to 0).
+        // The delete manifest survived the commit.
         assert_eq!(
             count_delete_manifests(&table).await,
             1,
@@ -1766,25 +1575,17 @@ mod tests {
         );
     }
 
-    // ===============================================================================================
-    // stage_only() on a DELETE-bearing action (Java `SnapshotProducer.stageOnly()` is on the base
-    // producer, so a delete stages identically to an append). A staged delete ADDS its `Delete` snapshot
-    // (with its rewritten/tombstoned manifests) to metadata but moves NO ref, so the deleted rows stay
-    // VISIBLE to readers until the staged snapshot is published.
-    // ===============================================================================================
+    // stage_only() on a delete-bearing action. A staged delete adds its `Delete` snapshot to metadata but
+    // moves no ref, so the deleted rows stay visible to readers until the snapshot is published.
 
-    /// STAGE_ONLY on a delete-bearing action stages identically to an append: the staged `Delete` snapshot
-    /// is added to metadata but `main` / current-snapshot-id / snapshot-log are UNCHANGED, and a scan still
-    /// sees the row the staged delete would remove (the delete is invisible until published).
-    ///
-    /// Risk pinned: a staged DELETE that publishes its removal early (the deleted rows vanish from readers
-    /// before audit) — the inverse of the append crown jewel, on the removal path.
+    /// A staged delete adds its `Delete` snapshot to metadata but leaves `main`, current-snapshot-id, and
+    /// the snapshot log unchanged. A scan still sees the row it would remove. A staged delete that
+    /// published early would drop rows from readers before the audit.
     #[tokio::test]
     async fn test_delete_files_stage_only_stages_without_moving_main() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // Publish {a, b}.
         let table = append_files(&catalog, &table, vec![
             data_file("test/a.parquet", 0),
             data_file("test/b.parquet", 0),
@@ -1794,7 +1595,6 @@ mod tests {
         let base_log = table.metadata().history().to_vec();
         let base_snapshot_count = table.metadata().snapshots().count();
 
-        // STAGE a delete of a.
         let tx = Transaction::new(&table);
         let action = tx.delete_files().stage_only().delete_file("test/a.parquet");
         let tx = action.apply(tx).unwrap();
@@ -1802,7 +1602,7 @@ mod tests {
         let reloaded = catalog.load_table(staged_table.identifier()).await.unwrap();
         let metadata = reloaded.metadata();
 
-        // A new (Delete) snapshot was ADDED, but main did not move.
+        // A new snapshot was added, but main did not move.
         assert_eq!(
             metadata.snapshots().count(),
             base_snapshot_count + 1,
@@ -1823,14 +1623,13 @@ mod tests {
             base_log,
             "stage_only on a delete must NOT add a snapshot-log entry"
         );
-        // The staged snapshot records Operation::Delete.
         let staged_snapshot = metadata
             .snapshots()
             .find(|s| Some(s.snapshot_id()) != base_id)
             .unwrap();
         assert_eq!(staged_snapshot.summary().operation, Operation::Delete);
 
-        // SCAN PIN: the readable (current-snapshot) live set still includes a — the staged delete is hidden.
+        // The readable live set still includes a, so the staged delete is hidden.
         assert_eq!(
             live_file_paths(&reloaded).await,
             HashSet::from(["test/a.parquet".to_string(), "test/b.parquet".to_string()]),
@@ -1838,34 +1637,26 @@ mod tests {
         );
     }
 
-    // ============================================================================================
-    // Delete-by-row-filter (Java `StreamingDelete.deleteFromRowFilter(Expression)` →
-    // `MergingSnapshotProducer.deleteByRowFilter`, 1.10.0 bytecode-verified). The producer's
-    // `resolve_filter_deletes` (`snapshot.rs`) ports Java `ManifestFilterManager.manifestHasDeletedFiles`
-    // + `PartitionAndMetricsEvaluator`: per live data file, reduce the predicate to its per-partition
-    // RESIDUAL via `ResidualEvaluator::residual_for` (the file's OWN spec), then DELETE if strict-metrics
-    // says all rows match, KEEP if inclusive says none match, and ERROR ("some, but not all, rows match")
-    // on a partial match. `StreamingDelete` deletes WHOLE files only — a partial match is a hard error,
-    // never a silent partial delete. The recorded operation stays the constant `Delete`.
-    // ============================================================================================
+    // Delete by row filter (Java `StreamingDelete.deleteFromRowFilter`). Per live data file,
+    // `resolve_filter_deletes` reduces the predicate to its per-partition residual under the file's own
+    // spec. It then deletes when strict metrics say all rows match, keeps when inclusive says none
+    // match, and errors on a partial match. `StreamingDelete` deletes whole files only, so a partial match is a hard
+    // error, never a silent partial delete. The recorded operation stays the constant `Delete`.
 
-    /// THE THREE-FILE CROWN JEWEL (A strictly-covered ⇒ DELETE, B provably-cannot-match ⇒ KEEP, C
-    /// partially-overlapping ⇒ ERROR). Under one filter `y >= 50`: A `x=0,y=[60,70]` (complete stats,
-    /// strict-metrics all-match ⇒ DELETE), B `x=1,y=[0,10]` (inclusive says no rows match ⇒ KEEP), C
-    /// `x=0,y=[40,60]` (inclusive yes, strict no — straddles ⇒ PARTIAL). Because C is a partial match,
-    /// `StreamingDelete` (which deletes whole files only) FAILS the WHOLE commit with Java's exact message
-    /// and commits NOTHING — A stays, B stays, C stays. This pins the data-loss line: a partially-matching
-    /// file is NEVER silently dropped, and the failure is atomic (A is not deleted either).
+    /// All three classifications under one filter `y >= 50`. A is strictly covered and would be deleted.
+    /// B provably cannot match and is KEPT. C straddles 50 and is PARTIAL. Because C is partial, the
+    /// whole commit fails and nothing is committed. A partially-matching file is never silently dropped,
+    /// and the failure is atomic, so A is not deleted either.
     #[tokio::test]
     async fn test_delete_from_row_filter_partial_file_is_never_silently_dropped() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append_files(&catalog, &table, vec![
-            // A: x=0, y=[60,70] — complete stats so strict-metrics can prove ALL rows >= 50 ⇒ DELETE.
+            // A: complete stats, so strict metrics prove all rows >= 50. DELETE.
             data_file_with_y_stats("test/a.parquet", 0, 60, 70),
-            // B: x=1, y=[0,10] — upper 10 < 50 ⇒ inclusive says no rows match ⇒ KEEP.
+            // B: upper bound 10 is below 50, so inclusive says no rows match. KEEP.
             data_file_with_y_bounds("test/b.parquet", 1, 0, 10),
-            // C: x=0, y=[40,60] — straddles 50 ⇒ inclusive yes, strict no ⇒ PARTIAL.
+            // C: straddles 50, so inclusive says yes and strict says no. PARTIAL.
             data_file_with_y_bounds("test/c.parquet", 0, 40, 60),
         ])
         .await;
@@ -1897,8 +1688,7 @@ mod tests {
             err.message()
         );
 
-        // ATOMICITY / NO-DATA-LOSS PIN: the failed commit changed nothing — A (strictly covered) is NOT
-        // deleted, B (non-matching) stays, C (partial) stays. All three remain live.
+        // The failed commit changed nothing. All three files remain live.
         let reloaded = catalog.load_table(table.identifier()).await.unwrap();
         assert_eq!(
             live_file_paths(&reloaded).await,
@@ -1911,17 +1701,15 @@ mod tests {
         );
     }
 
-    /// DELETE BRANCH (A, strictly covered). With NO partial file present, `delete_from_row_filter(y >= 50)`
-    /// DELETES the strictly-covered file A (`x=0,y=[60,70]`, complete stats ⇒ strict-metrics all-match) and
-    /// the post-commit SCAN no longer contains it. Pins the observable DELETE of a strictly-matching file
-    /// and that the operation recorded is the constant `Delete` (NOT the dynamic Overwrite).
+    /// The DELETE branch. With no partial file present, `delete_from_row_filter(y >= 50)` deletes the
+    /// strictly-covered file A, and the recorded operation is the constant `Delete`, not Overwrite.
     #[tokio::test]
     async fn test_delete_from_row_filter_deletes_strictly_matching_file() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append_files(&catalog, &table, vec![
             data_file_with_y_stats("test/a.parquet", 0, 60, 70),
-            // A keep-anchor with y entirely below 50 so the commit is non-empty AND survives.
+            // A keep-anchor with y entirely below 50, so the commit is non-empty and it survives.
             data_file_with_y_bounds("test/keep.parquet", 1, 0, 10),
         ])
         .await;
@@ -1941,7 +1729,7 @@ mod tests {
             HashSet::from(["test/keep.parquet".to_string()]),
             "A (all rows y>=50) is deleted; the y<50 anchor survives"
         );
-        // Java `StreamingDelete.operation()` is the constant "delete" — a by-row-filter delete is a Delete.
+        // A by-row-filter delete is still a plain Delete.
         assert_eq!(
             table
                 .metadata()
@@ -1954,21 +1742,17 @@ mod tests {
         );
     }
 
-    /// KEEP / NEGATIVE BRANCH (B, residual reduces to a non-matching predicate). `delete_from_row_filter`
-    /// must NOT delete a file whose per-partition residual cannot match. Using the partition predicate
-    /// `x == 0`: file B in partition x=1 has residual `alwaysFalse` ⇒ inclusive says no rows ⇒ KEEP. The
-    /// post-commit SCAN still contains B. This is the mandatory residual-non-match negative: a file the
-    /// residual excludes is never deleted (mutation: swapping the per-file residual for the FULL predicate
-    /// would still exclude B here via partition projection, but the partition-residual is what makes A's
-    /// no-`x`-bounds file deletable — see the companion DELETE test). Pins KEEP on the boundary.
+    /// The KEEP branch. `delete_from_row_filter` must not delete a file whose per-partition residual
+    /// cannot match. Under `x == 0`, file B in partition x=1 has residual `alwaysFalse`, so inclusive says
+    /// no rows match and B survives.
     #[tokio::test]
     async fn test_delete_from_row_filter_keeps_residual_non_matching_file() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append_files(&catalog, &table, vec![
-            // Deleted: x=0 ⇒ residual of `x==0` is alwaysTrue ⇒ strict-match ⇒ DELETE.
+            // x=0: the residual of `x==0` is alwaysTrue, so strict metrics match. DELETE.
             data_file("test/del.parquet", 0),
-            // Kept: x=1 ⇒ residual of `x==0` is alwaysFalse ⇒ inclusive no rows ⇒ KEEP.
+            // x=1: the residual is alwaysFalse, so inclusive says no rows match. KEEP.
             data_file("test/keep.parquet", 1),
         ])
         .await;
@@ -1990,17 +1774,16 @@ mod tests {
         );
     }
 
-    /// PARTITION-RESIDUAL PIN (the silent-data-loss line). A file in partition x=0 carries NO `x` column
-    /// bounds, yet `delete_from_row_filter(x == 0)` must DELETE it: the predicate is reduced to its
-    /// per-partition RESIDUAL (`ResidualEvaluator::residual_for`) which is `alwaysTrue` for partition x=0,
-    /// and strict-metrics trivially satisfies `alwaysTrue`. Running the metrics on the FULL `x == 0`
-    /// predicate instead (the mutation) would wrongly classify the file as PARTIAL (no `x` bounds ⇒ strict
-    /// false, inclusive true) and ERROR — so this test FAILS under that mutation. Pins residual-not-full.
+    /// A file in partition x=0 carries NO `x` bounds, yet `delete_from_row_filter(x == 0)` must delete
+    /// it. The residual for partition x=0 is `alwaysTrue`, which strict metrics satisfy trivially.
+    ///
+    /// The discriminating mutation: run the metrics on the FULL `x == 0` predicate. With no `x` bounds the
+    /// file then classifies as PARTIAL and the commit errors.
     #[tokio::test]
     async fn test_delete_from_row_filter_uses_partition_residual_not_full_predicate() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
-        // x=0 file with NO column bounds at all — only the partition value identifies it as x=0.
+        // This file has no column bounds. Only the partition value identifies it as x=0.
         let table = append_files(&catalog, &table, vec![
             data_file("test/no-bounds.parquet", 0),
             data_file("test/other.parquet", 1),
@@ -2024,9 +1807,7 @@ mod tests {
         );
     }
 
-    /// FULL-DELETE (unpartitioned-style `AlwaysTrue` residual). `delete_from_row_filter(AlwaysTrue)`
-    /// deletes EVERY live data file (the residual is the whole `alwaysTrue`, strict-matched by every file).
-    /// Pins the full-delete shape — and that an all-matching by-filter delete leaves an empty live set.
+    /// `delete_from_row_filter(AlwaysTrue)` deletes every live data file and leaves an empty live set.
     #[tokio::test]
     async fn test_delete_from_row_filter_always_true_deletes_all() {
         let catalog = new_memory_catalog().await;
@@ -2053,10 +1834,8 @@ mod tests {
         );
     }
 
-    /// NO-OP REJECTION (a by-filter delete that matches nothing). `delete_from_row_filter(x == 99)` matches
-    /// no live file (every residual is `alwaysFalse`), so the resolved delete set is empty and the producer
-    /// rejects the truly-empty commit — it does NOT silently produce an empty no-op Delete snapshot, and it
-    /// deletes nothing. Pins that a non-matching by-filter delete neither deletes nor commits.
+    /// A by-filter delete that matches nothing resolves to an empty delete set, and the producer rejects
+    /// the empty commit. It must not produce a no-op Delete snapshot.
     #[tokio::test]
     async fn test_delete_from_row_filter_matching_nothing_is_rejected_and_deletes_nothing() {
         let catalog = new_memory_catalog().await;
@@ -2078,7 +1857,7 @@ mod tests {
             result.is_err(),
             "a by-filter delete that matches no file is an empty no-op commit and must be rejected"
         );
-        // Nothing was deleted — both files stay live.
+        // Nothing was deleted. Both files stay live.
         let reloaded = catalog.load_table(table.identifier()).await.unwrap();
         assert_eq!(
             live_file_paths(&reloaded).await,
@@ -2087,11 +1866,9 @@ mod tests {
         );
     }
 
-    /// COMBINE WITH BY-PATH DELETE (Java: one `ManifestFilterManager` carries both `deletePaths` and the
-    /// `deleteExpression`). A `delete_file("a")` (by path, x=0) PLUS `delete_from_row_filter(x == 1)`
-    /// (by filter) in one action removes BOTH a (path) and the x=1 file b (filter), de-duped, in one Delete
-    /// snapshot — c (x=0, not the named path, residual alwaysFalse for `x==1`) survives. Pins that the
-    /// by-path and by-filter removals are unioned and both applied.
+    /// A by-path delete and a by-filter delete in one action remove both files, de-duped, in one Delete
+    /// snapshot. The unmatched third file survives. Java carries both sets on one
+    /// `ManifestFilterManager`.
     #[tokio::test]
     async fn test_delete_from_row_filter_combines_with_by_path_delete() {
         let catalog = new_memory_catalog().await;
@@ -2130,18 +1907,14 @@ mod tests {
         );
     }
 
-    /// PROVENANCE ACROSS SNAPSHOTS for a by-filter delete (the #1 corruption class). Append A (x=0) in S1
-    /// and B,C (x=0) in S2 (one manifest). `delete_from_row_filter` deleting B's partition without touching
-    /// C would re-stamp; here the filter `x == 0` strictly covers A, B, C. We instead delete only C's
-    /// neighbour by a `y`-keyed filter to force a manifest rewrite that keeps a survivor: filter
-    /// `y >= 100` deletes B (`y=[100,110]`, complete stats) and KEEPS C (`y=[0,10]`). The surviving C must
-    /// carry its ORIGINAL S2 snapshot id + sequence numbers (not the delete snapshot's). Pins no re-stamp.
+    /// Provenance across snapshots for a by-filter delete. The filter `y >= 100` deletes B and keeps C in
+    /// the same rewritten manifest. The surviving C must carry its original S2 snapshot id and sequence
+    /// numbers, not the delete snapshot's.
     #[tokio::test]
     async fn test_delete_from_row_filter_preserves_surviving_entry_provenance() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // S1: A alone.
         let table = append_files(&catalog, &table, vec![data_file_with_y_stats(
             "test/a.parquet",
             0,
@@ -2150,7 +1923,7 @@ mod tests {
         )])
         .await;
 
-        // S2: B (y high, will be deleted) and C (y low, survives) in ONE manifest.
+        // S2 holds B, which the filter deletes, and C, which survives, in one manifest.
         let table = append_files(&catalog, &table, vec![
             data_file_with_y_stats("test/b.parquet", 0, 100, 110),
             data_file_with_y_bounds("test/c.parquet", 0, 0, 10),
@@ -2161,7 +1934,7 @@ mod tests {
             entry_provenance(&table, "test/c.parquet").await;
         assert_eq!(c_snap_before, Some(s2), "C added by S2");
 
-        // Delete B by row filter (y >= 100) — forces a rewrite of S2's manifest; C survives.
+        // The filter rewrites S2's manifest. C survives.
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
@@ -2180,7 +1953,7 @@ mod tests {
             "B (y>=100) deleted; A and C survive"
         );
 
-        // The surviving C keeps its ORIGINAL S2 provenance — NOT re-stamped with the delete snapshot S3.
+        // The surviving C keeps its original S2 provenance, not the delete snapshot S3.
         let (c_snap_after, c_seq_after, c_fseq_after) =
             entry_provenance(&table, "test/c.parquet").await;
         assert_eq!(
@@ -2198,43 +1971,22 @@ mod tests {
         );
     }
 
-    /// INHERITED DIVERGENCE PIN (by-path delete + PARTIAL row-filter match on the SAME file). Java's
-    /// `ManifestFilterManager.manifestHasDeletedFiles` (iceberg-core 1.10.0 bytecode, offsets 68-96)
-    /// computes `markedForDelete = deletePaths.contains(file) || deleteFiles.contains(file) ||
-    /// dropPartitions.contains(...)` BEFORE the metrics check, then at offsets 195-245 a `markedForDelete`
-    /// file SKIPS `rowsMightMatch`/`rowsMustMatch` and forces `allRowsMatch = true` (iconst_1 at offset
-    /// 223) — so the PARTIAL guard `ValidationException.check(allRowsMatch || isDelete, "Cannot delete file
-    /// where some, but not all, rows match filter %s: %s", ...)` at offsets 230-269 NEVER fires for a file
-    /// already marked for deletion by path. Java DELETES such a file outright.
+    /// The inherited divergence: a by-path delete plus a PARTIAL row-filter match on the same file.
+    /// Java's `ManifestFilterManager.manifestHasDeletedFiles` marks a file for deletion by path before the
+    /// metrics check. A marked file skips the classification and Java deletes it outright.
     ///
-    /// Rust DIVERGES here and ERRORS instead: the shared `SnapshotProducer::resolve_filter_deletes`
-    /// (`snapshot.rs`) classifies EVERY live data file by metrics with NO knowledge of the by-path
-    /// `delete_paths` set (it has no `markedForDelete` short-circuit — that lives in the helper, OUTSIDE
-    /// this increment's allowed file set). So file C below — which is BOTH explicitly `delete_file`d AND a
-    /// some-but-not-all match for `y >= 50` — raises the non-retryable partial-match error where Java would
-    /// have deleted it.
+    /// The fork errors instead. `SnapshotProducer::resolve_filter_deletes` classifies every live data file
+    /// by metrics with no knowledge of the by-path set, so file C raises the non-retryable partial-match
+    /// error where Java would delete it.
     ///
-    /// This divergence is PRE-EXISTING and INHERITED: the identical shared helper drives
-    /// `OverwriteFiles.overwriteByRowFilter`, which has the same blind spot. It is FAIL-SAFE — Rust REFUSES
-    /// the commit (non-retryable, names the file) and never silently drops or wrongly deletes data, so the
-    /// only behavioral cost is rejecting a commit Java would accept. The eventual fix (teach
-    /// `resolve_filter_deletes` the `markedForDelete` short-circuit) is in `snapshot.rs` and is therefore
-    /// deferred to a separate increment.
-    ///
-    /// Risk pinned: this test makes the divergence VISIBLE and asserts its exact fail-safe shape (the bug
-    /// was previously an UNPINNED blind spot — no test flagged that this case errors in Rust). When the
-    /// `snapshot.rs` short-circuit lands, this assertion FLIPS (ERR → the file is deleted) — at which point
-    /// this test is updated in the SAME change as the fix, guaranteeing the divergence is not closed
-    /// silently. The throwaway probe in remediation confirmed the live behavior: `DataInvalid`,
-    /// non-retryable, message `Cannot delete file where some, but not all, rows match filter y >= 50:
-    /// test/c.parquet`.
+    /// When the deferred `snapshot.rs` fix lands, this assertion flips from an error to a deletion.
+    /// Update this test in the same change, so the divergence cannot close silently.
     #[tokio::test]
     async fn test_delete_from_row_filter_bypath_and_partial_match_diverges_failsafe() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
-        // C: x=0, y=[40,60] — straddles 50 ⇒ inclusive yes, strict no ⇒ PARTIAL for `y >= 50`. It is ALSO
-        // explicitly named in `delete_file` below (Java would mark it for delete by path and skip the
-        // metrics PARTIAL check entirely).
+        // C straddles 50, so it is PARTIAL for `y >= 50`. It is also named in `delete_file` below, which
+        // in Java would mark it for delete by path and skip the metrics check.
         let table = append_files(&catalog, &table, vec![data_file_with_y_bounds(
             "test/c.parquet",
             0,
@@ -2246,10 +1998,10 @@ mod tests {
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
-            // C is requested BY PATH (markedForDelete in Java) ...
+            // C is requested by path.
             .delete_file("test/c.parquet")
-            // ... AND is a PARTIAL match for this filter. Java deletes it via the markedForDelete
-            // short-circuit; Rust's shared helper has no such short-circuit and errors.
+            // C is also a PARTIAL match for this filter. The shared helper has no short-circuit, so it
+            // errors.
             .delete_from_row_filter(Reference::new("y").greater_than_or_equal_to(Datum::long(50)));
         let tx = action.apply(tx).unwrap();
         let err = tx.commit(&catalog).await.expect_err(
@@ -2259,8 +2011,7 @@ mod tests {
              it lands, flip this assertion to expect the file deleted, in the SAME change.",
         );
 
-        // The divergence is FAIL-SAFE: a non-retryable validation error naming the offending file — never a
-        // silent partial delete or data loss.
+        // The divergence is fail-safe: a non-retryable error naming the file, never a partial delete.
         assert_eq!(
             err.kind(),
             ErrorKind::DataInvalid,
@@ -2282,8 +2033,7 @@ mod tests {
             err.message()
         );
 
-        // ATOMICITY / NO-DATA-LOSS PIN: the refused commit changed nothing — C is STILL live (it was
-        // neither deleted by path nor by filter; the whole commit was rejected).
+        // The refused commit changed nothing. C is still live.
         let reloaded = catalog.load_table(table.identifier()).await.unwrap();
         assert_eq!(
             live_file_paths(&reloaded).await,
@@ -2292,40 +2042,24 @@ mod tests {
         );
     }
 
-    /// TWO-SPEC RESIDUAL PIN (the per-file partition spec is what reduces the predicate). The shared
-    /// `SnapshotProducer::resolve_filter_deletes` reduces the row filter to its per-partition RESIDUAL using
-    /// EACH live data file's OWN `partition_spec_id` (Java `PartitionAndMetricsEvaluator` is per-spec — Rust
-    /// caches one `ResidualEvaluator` per spec id, building a fresh one on the Vacant branch). Every OTHER
-    /// row-filter test in this file (and in `overwrite_files.rs`) uses a table with a SINGLE spec
-    /// (`partition_spec_id(0)`), so the second-spec residual path and the per-spec cache miss are NEVER
-    /// exercised — a mutation that hard-codes spec 0 (ignoring `data_file.partition_spec_id`) would survive
-    /// the entire suite. This test builds a table with TWO live specs and proves the per-file spec drives
-    /// the residual.
+    /// The per-file partition spec is what reduces the predicate. `resolve_filter_deletes` builds one
+    /// `ResidualEvaluator` per spec id and picks it by each file's own `partition_spec_id`. Every other
+    /// row-filter test here and in `overwrite_files.rs` uses a single-spec table, so a mutation that
+    /// hard-codes spec 0 would survive the whole suite.
     ///
-    /// Setup: spec 0 = `identity(x)`. Append `s0-keep.parquet` in partition `x=5` WITH `y` bounds `[0,10]`.
-    /// Evolve to spec 1 = `identity(x), identity(y)` (`update_partition_spec().add_field("y")`). Append
-    /// `s1-del.parquet` in partition `(x=0, y=99)` with NO `y` bounds. Filter `y == 99`.
+    /// Spec 0 is `identity(x)` and spec 1 is `identity(x), identity(y)`. Under the filter `y == 99`,
+    /// `s0-keep.parquet` keeps the residual `y == 99`, which its `y` bounds `[0,10]` exclude, so it is
+    /// KEPT. `s1-del.parquet` has residual `alwaysTrue` under spec 1, so it is deleted. The commit
+    /// succeeds.
     ///
-    /// - `s0-keep.parquet` (spec 0): `y` is NOT a partition field under spec 0, so the residual stays
-    ///   `y == 99`; the `y` bounds `[0,10]` exclude 99 ⇒ inclusive says no rows match ⇒ KEEP.
-    /// - `s1-del.parquet` (spec 1): for partition `y=99` the spec-1 residual of `y == 99` is `alwaysTrue` ⇒
-    ///   strict metrics trivially all-match ⇒ DELETE.
-    ///
-    /// Correct behavior: the commit SUCCEEDS, `s1-del.parquet` is deleted, `s0-keep.parquet` survives.
-    ///
-    /// MUTATION KILLED: hard-code the residual evaluator to spec 0 (i.e. evaluate `s1-del.parquet` with the
-    /// spec-0 evaluator instead of its own spec 1). Then `s1-del.parquet`'s residual stays the full `y == 99`
-    /// (spec 0 does not partition `y`) and the file has NO `y` bounds ⇒ strict false, inclusive true ⇒ PARTIAL
-    /// ⇒ the WHOLE commit ERRORS with "Cannot delete file where some, but not all, rows match filter" naming
-    /// `s1-del.parquet`. So this test FAILS under the hard-coded-spec-0 mutation (commit errors instead of
-    /// succeeding) — pinning that the per-file `partition_spec_id` is what selects the residual evaluator.
+    /// The discriminating mutation: hard-code the residual evaluator to spec 0. `s1-del.parquet` then
+    /// keeps the full `y == 99` with no `y` bounds, classifies as PARTIAL, and the whole commit errors.
     #[tokio::test]
     async fn test_delete_from_row_filter_uses_each_files_own_partition_spec() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        // S0 under spec 0 (`identity(x)`): a keep-anchor in partition x=5 with y bounds [0,10] (so the
-        // residual `y == 99` excludes it on the spec-0 evaluator ⇒ KEEP, deterministically).
+        // A keep-anchor under spec 0, in partition x=5 with y bounds [0,10].
         let table = append_files(&catalog, &table, vec![data_file_with_y_bounds(
             "test/s0-keep.parquet",
             5,
@@ -2334,7 +2068,7 @@ mod tests {
         )])
         .await;
 
-        // Evolve the spec to `identity(x), identity(y)` (a SECOND distinct spec id).
+        // Evolve to a second, distinct spec id.
         let tx = Transaction::new(&table);
         let action = tx.update_partition_spec().add_field("y");
         let tx = action.apply(tx).unwrap();
@@ -2347,8 +2081,8 @@ mod tests {
             "fixture sanity: the evolved spec partitions by both x and y"
         );
 
-        // S1 under spec 1 (`identity(x), identity(y)`): a file in partition (x=0, y=99) with NO y bounds —
-        // deletable ONLY via the spec-1 partition residual (`y == 99` ⇒ alwaysTrue for partition y=99).
+        // A file under spec 1 in partition (x=0, y=99) with no y bounds. Only the spec-1 partition
+        // residual can delete it.
         let table = append_files(&catalog, &table, vec![data_file_spec1_xy(
             "test/s1-del.parquet",
             spec1,
@@ -2357,7 +2091,6 @@ mod tests {
         )])
         .await;
 
-        // Sanity: two live files, one under each spec.
         assert_eq!(
             live_file_paths(&table).await,
             HashSet::from([
@@ -2366,8 +2099,7 @@ mod tests {
             ]),
         );
 
-        // Delete by `y == 99`. The spec-1 file deletes via its OWN spec's partition residual; the spec-0 file
-        // is KEPT (its residual stays `y == 99`, excluded by the [0,10] bounds).
+        // The spec-1 file deletes via its own spec's residual. The spec-0 file is kept.
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
@@ -2394,30 +2126,22 @@ mod tests {
         );
     }
 
-    /// DEDUP PIN (a file removed by BOTH an explicit path AND the row filter is counted ONCE). When a
-    /// single live file matches a `delete_file(path)` AND a `delete_from_row_filter(predicate)` in the same
-    /// action, `DeleteFilesOperation::delete_files` de-dupes by path (the `seen` guard) so the file lands in
-    /// the resolved removal set ONCE. The on-disk manifest rewrite is path-set-deduped downstream
-    /// (`process_deletes` keys on a `HashSet`), so the LIVE set is correct either way — but the snapshot
-    /// SUMMARY counters (`deleted-data-files` / `deleted-records`) are computed by iterating the resolved
-    /// `removed_data_files` Vec one entry at a time (`snapshot.rs` summary loop), so a double-push would
-    /// report `deleted-data-files=2` / `deleted-records=2` for a SINGLE removed file — a Java-parity
-    /// divergence in downstream-readable metadata (the builder's own comment requires "the summary counts
-    /// must stay accurate"). File A (x=0, record_count=1) is named by path AND strictly matched by the
-    /// `x == 0` partition residual; the summary must report exactly ONE deleted file / record.
+    /// A file removed by BOTH a path and the row filter must be counted once. `process_deletes` keys on a
+    /// `HashSet`, so the live set is correct either way. The summary counters instead iterate the resolved
+    /// `removed_data_files` one entry at a time, so a double push reports two deleted files and two
+    /// deleted records for a single file. That is downstream-readable metadata.
     ///
-    /// MUTATION KILLED: drop the `seen.insert` dedup guard (push every filter match unconditionally). A is
-    /// then pushed twice and the summary reports `deleted-data-files=2` / `deleted-records=2`, failing the
-    /// `Some("1")` assertions below.
+    /// The discriminating mutation: drop the `seen.insert` guard and push every filter match. A is then
+    /// pushed twice and the summary reports 2 instead of 1.
     #[tokio::test]
     async fn test_delete_from_row_filter_bypath_and_filter_same_file_counted_once() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let table = append_files(&catalog, &table, vec![
-            // A: x=0, record_count=1 — strictly matches `x == 0` (partition residual alwaysTrue) AND is
-            // named by path below, so it is resolved by BOTH removal paths.
+            // A strictly matches `x == 0` and is also named by path below, so both removal paths resolve
+            // it.
             data_file("test/a.parquet", 0),
-            // A keep-anchor in a different partition so the commit is non-empty and survives.
+            // A keep-anchor in another partition, so the commit is non-empty.
             data_file("test/keep.parquet", 1),
         ])
         .await;
@@ -2433,14 +2157,14 @@ mod tests {
             .await
             .expect("A removed by both path and filter; the keep-anchor survives");
 
-        // LIVE set is correct (A gone, keep survives) regardless of the dedup.
+        // The live set is correct whether or not the dedup runs.
         assert_eq!(
             live_file_paths(&table).await,
             HashSet::from(["test/keep.parquet".to_string()]),
             "A is removed (by path and filter); the x=1 anchor survives"
         );
 
-        // SUMMARY must count A exactly ONCE — not twice (the dedup pin).
+        // The summary must count A exactly once.
         let summary = table.metadata().current_snapshot().unwrap().summary();
         let props = &summary.additional_properties;
         assert_eq!(
@@ -2455,25 +2179,18 @@ mod tests {
         );
     }
 
-    // ============================================================================================
-    // caseSensitive(boolean) on the delete-by-row-filter binding (Java
-    // `DeleteFiles.caseSensitive(boolean)` → `MergingSnapshotProducer.caseSensitive`, DEFAULT TRUE).
+    // caseSensitive(boolean) on the delete-by-row-filter binding. The default is true.
     //
-    // The minimal V3 schema is `x,y,z: long` partitioned by identity(x). A row filter on the WRONG-cased
-    // column `X` (schema column is `x`) binds ONLY when case sensitivity is OFF. These three tests pin the
-    // load-bearing flag in BOTH directions on the boundary:
-    //   (1) DEFAULT (flag unset) + correctly-cased `x` ⇒ binds and deletes (regression: behaves as today).
-    //   (2) case_sensitive(false) + wrong-cased `X` ⇒ binds case-insensitively and deletes x=0's file.
-    //   (3) DEFAULT / case_sensitive(true) + wrong-cased `X` ⇒ REJECTS at bind (the flag is load-bearing).
-    // Mutation guards: ignore the flag (always true) ⇒ (2) fails to bind; hard-code false ⇒ (1)/(3) bind
-    // the wrong-case column and (3) stops rejecting.
-    // ============================================================================================
+    // The schema column is `x`. A row filter on the wrong-cased `X` binds ONLY when case sensitivity is
+    // off. Three tests pin the flag in both directions on the boundary:
+    //   1. Default plus correctly-cased `x` binds and deletes.
+    //   2. `case_sensitive(false)` plus wrong-cased `X` binds case-insensitively and deletes.
+    //   3. Default plus wrong-cased `X` rejects at bind.
+    // Discriminating mutations: ignoring the flag breaks 2; hard-coding false breaks 1 and 3.
 
-    /// REGRESSION PIN (default unchanged). With the flag UNSET (Java default `caseSensitive = true`) a
-    /// CORRECTLY-cased row filter `x == 0` binds and deletes the x=0 file exactly as today. Risk: a default
-    /// flip to case-insensitive would still bind here (so this alone is not the boundary), but a regression
-    /// that broke the case-sensitive happy path (e.g. wiring the flag to always-false-then-error) would fail
-    /// this. Asserts the OBSERVABLE post-commit live set.
+    /// With the flag unset, a correctly-cased filter `x == 0` binds and deletes the x=0 file. A default
+    /// flip to case-insensitive would still bind here, so this alone is not the boundary. It catches a
+    /// regression that breaks the case-sensitive happy path.
     #[tokio::test]
     async fn test_delete_from_row_filter_default_case_sensitive_correct_case_deletes() {
         let catalog = new_memory_catalog().await;
@@ -2484,7 +2201,7 @@ mod tests {
         ])
         .await;
 
-        // No case_sensitive(..) call ⇒ default true; correctly-cased `x`.
+        // No `case_sensitive` call, so the default is true. The filter is correctly cased.
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
@@ -2501,11 +2218,9 @@ mod tests {
         );
     }
 
-    /// LOAD-BEARING (false direction). With `case_sensitive(false)` a WRONG-cased row filter `X == 0` (schema
-    /// column is `x`) binds CASE-INSENSITIVELY and deletes the x=0 file. Risk pinned: a missed delete (stale
-    /// data) when the engine binds case-insensitively — proves `case_sensitive(false)` actually switches
-    /// resolution. Mutation `ignore the flag (always true)` ⇒ the wrong-case `X` fails to bind and this test
-    /// errors. Asserts the OBSERVABLE post-commit live set.
+    /// With `case_sensitive(false)` a wrong-cased filter `X == 0` binds case-insensitively and deletes the
+    /// x=0 file. The discriminating mutation: ignore the flag and always bind case-sensitively. `X` then
+    /// fails to bind and this test errors.
     #[tokio::test]
     async fn test_delete_from_row_filter_case_insensitive_wrong_case_deletes() {
         let catalog = new_memory_catalog().await;
@@ -2516,7 +2231,7 @@ mod tests {
         ])
         .await;
 
-        // WRONG-cased `X` (schema column is `x`); case_sensitive(false) ⇒ binds case-insensitively.
+        // The wrong-cased `X` binds case-insensitively under `case_sensitive(false)`.
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
@@ -2534,12 +2249,9 @@ mod tests {
         );
     }
 
-    /// THE BOUNDARY (true direction — proves the flag is load-bearing). With the DEFAULT (flag unset =
-    /// `case_sensitive(true)`), a WRONG-cased row filter `X == 0` (schema column is `x`) must REJECT at bind:
-    /// the column `X` does not exist case-sensitively, so the commit errors and NOTHING is deleted. Risk
-    /// pinned: a wrongly-matched bind (deleting under a name the user did not spell) — and the both-direction
-    /// guard against (2). Mutation `hard-code false` ⇒ the wrong-case `X` would bind and this rejection test
-    /// fails. Asserts the OBSERVABLE result: the commit errors and the live set is unchanged.
+    /// With the default, a wrong-cased filter `X == 0` must reject at bind, so nothing is deleted. A
+    /// wrongly-matched bind deletes under a name the user did not spell. The discriminating mutation:
+    /// hard-code the flag to false. `X` then binds and this test fails.
     #[tokio::test]
     async fn test_delete_from_row_filter_default_case_sensitive_wrong_case_rejects() {
         let catalog = new_memory_catalog().await;
@@ -2550,7 +2262,7 @@ mod tests {
         ])
         .await;
 
-        // No case_sensitive(..) call ⇒ default true; WRONG-cased `X` ⇒ must fail to bind.
+        // No `case_sensitive` call, so the default is true. The wrong-cased `X` must fail to bind.
         let tx = Transaction::new(&table);
         let action = tx
             .delete_files()
@@ -2560,7 +2272,7 @@ mod tests {
             "a wrong-cased X must NOT bind under the default (case-sensitive) and must reject",
         );
 
-        // The table is untouched — the rejected delete removed nothing (re-load from the catalog).
+        // The rejected delete removed nothing.
         let reloaded = catalog.load_table(table.identifier()).await.unwrap();
         assert_eq!(
             live_file_paths(&reloaded).await,
@@ -2570,8 +2282,8 @@ mod tests {
             ]),
             "the rejected case-sensitive bind deleted nothing: both files survive"
         );
-        // The same wrong-case column under case_sensitive(false) succeeds (the both-direction guard) — see
-        // `test_delete_from_row_filter_case_insensitive_wrong_case_deletes`. Sanity-pin the error here.
+        // The same wrong-cased column succeeds under `case_sensitive(false)`. See
+        // `test_delete_from_row_filter_case_insensitive_wrong_case_deletes`.
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
 }

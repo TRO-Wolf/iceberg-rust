@@ -18,59 +18,31 @@
 //! This module contains the rewrite-manifests action (manifest re-organization, NOT data change).
 //!
 //! [`RewriteManifestsAction`] re-organizes a table's MANIFEST files without changing the set of live
-//! data files: it produces an `Operation::Replace` snapshot whose LIVE FILE SET IS IDENTICAL to the
-//! base snapshot's — only the grouping of entries into manifests changes (Java `BaseRewriteManifests`,
-//! which extends `SnapshotProducer<RewriteManifests>`, NOT `MergingSnapshotProducer`). It is the commit
-//! primitive a manifest-compaction / re-clustering job uses.
+//! data files. It produces an `Operation::Replace` snapshot whose LIVE FILE SET IS IDENTICAL to the
+//! base snapshot's; only the grouping of entries into manifests changes. Java
+//! `BaseRewriteManifests`. It is the commit primitive a manifest-compaction job uses.
 //!
-//! Two modes (a single commit may use both):
-//! - **Clustered rewrite** ([`RewriteManifestsAction::cluster_by`]): every current DATA manifest that
-//!   matches [`RewriteManifestsAction::rewrite_if`] is re-read and its LIVE entries are re-grouped into
-//!   new manifests keyed by `(cluster_key, partition_spec_id)`. Each re-grouped entry is written via the
-//!   manifest writer's EXISTING-entry path — **the load-bearing invariant: its original `snapshot_id` +
-//!   data sequence number + file sequence number are preserved and its status becomes `Existing`** (Java
-//!   `ManifestWriter.existing(entry)`, `core/BaseRewriteManifests.java` L372). Re-stamping provenance
-//!   here is the #1 silent-corruption class — it breaks merge-on-read delete application and incremental
-//!   scans.
-//! - **Explicit replacement** ([`RewriteManifestsAction::add_manifest`] /
-//!   [`RewriteManifestsAction::delete_manifest`]): replace a specific current manifest with an
-//!   externally-prepared one carrying the SAME active files.
+//! Two modes, and one commit may use both:
 //!
-//! **Operation recorded:** always [`Operation::Replace`] (Java `BaseRewriteManifests.operation()`
-//! returns `DataOperations.REPLACE`, L87-89).
+//! | mode | rule |
+//! |---|---|
+//! | clustered | live DATA entries regroup by `(cluster_key, spec_id)` as `Existing`, provenance intact |
+//! | explicit | swap a current manifest for one carrying the same live files |
 //!
-//! **Delete manifests are immune:** a `Deletes`-content manifest is never re-clustered (Java
-//! `containsDeletes(manifest)` ⇒ kept, L252). It is carried forward byte-identical, so any outstanding
-//! merge-on-read deletes still apply after the rewrite. (The clustered rewrite only touches DATA
-//! manifests; their live data entries keep their provenance, so `data_seq <= delete_seq` still holds.)
+//! Re-stamping provenance here is silent corruption.
 //!
-//! ## Adaptations / deviations from Java (each one named here per the parity contract)
+//! **Delete manifests are immune.** A `Deletes`-content manifest is never re-clustered. It carries
+//! forward byte-identical, so outstanding merge-on-read deletes still apply after the rewrite.
 //!
-//! - **String cluster key.** Java `clusterBy(Function<DataFile, Object>)` clusters on `Object` equality.
-//!   This port takes `Fn(&DataFile) -> String`: a `String` key covers the practical cluster keys (a
-//!   partition value rendered to a string, a bucket id, etc.) and gives a `Hash + Eq` key for the
-//!   per-cluster writer map without an `Any`-downcast dance. Documented on [`RewriteManifestsAction::cluster_by`].
-//! - **Estimated-length size rolling.** Java rolls a cluster writer to a new manifest when
-//!   `writer.length() >= manifestTargetSizeBytes` (L368). The Rust [`crate::spec::ManifestWriter`] BUFFERS
-//!   its entries and exposes NO incremental on-disk length, so this port uses an ESTIMATED-length proxy:
-//!   for each appended entry it adds the source manifest's average per-entry byte size
-//!   (`source.manifest_length / source-entry-count`) to a running estimate and rolls when the estimate
-//!   reaches the target. This only shifts the roll POINTS, never correctness (every live entry is written
-//!   exactly once with preserved provenance regardless of which manifest it lands in); with the default
-//!   8 MB target, rolling is rare. See [`ClusterWriters`].
-//! - **V1 `add_manifest` is unsupported.** On a V2+ table an added manifest can inherit the new snapshot
-//!   id (Java `canInheritSnapshotId()` ⇒ `addedManifests.add(manifest)`, L143-144). On a V1 table Java
-//!   instead COPIES the manifest, re-stamping every entry with the new snapshot id
-//!   (`copyManifest` / `rewrittenAddedManifests`, L145-167). That copy path is deferred; this action
-//!   rejects [`RewriteManifestsAction::add_manifest`] on a V1 table with [`ErrorKind::FeatureUnsupported`].
-//! - **No-current-snapshot is a clean error, not a panic.** Java reads `base.currentSnapshot().allManifests`
-//!   (L171) and NPEs on an empty table. This port returns a clean [`ErrorKind::DataInvalid`] instead.
-//! - **`scanManifestsWith(ExecutorService)` is not ported.** Java parallelizes the per-manifest rewrite
-//!   over a worker pool (L248-249). The Rust path is sequential async; there is no executor surface.
-//! - **`requiresRewrite` statefulness is dropped.** Java caches `rewrittenManifests` across commit retries
-//!   and short-circuits a full rewrite when the cached set is still valid (L206-219). The Rust action holds
-//!   no cross-attempt state and recomputes the rewrite from the refreshed base on every commit attempt,
-//!   which is semantically equivalent (the cache is a retry optimization, not a behavior).
+//! ## Named deviations from Java
+//!
+//! | not ported | consequence |
+//! |---|---|
+//! | `Object` cluster key | `Fn(&DataFile) -> String` |
+//! | incremental on-disk length | estimated roll points; every live entry still written once |
+//! | V1 `add_manifest` | `FeatureUnsupported` |
+//! | empty-table NPE | typed error |
+//! | `scanManifestsWith` / rewrite cache | sequential recompute from the refreshed base |
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -101,15 +73,11 @@ type RewriteIfPredicate = Arc<dyn Fn(&ManifestFile) -> bool + Send + Sync>;
 /// producing one `Operation::Replace` snapshot (the manifest-compaction commit primitive — Java
 /// `BaseRewriteManifests`).
 ///
-/// Create one with [`crate::transaction::Transaction::rewrite_manifests`]. Configure it with
-/// [`RewriteManifestsAction::cluster_by`] (re-cluster matching data manifests) and/or
-/// [`RewriteManifestsAction::add_manifest`] + [`RewriteManifestsAction::delete_manifest`] (explicit
-/// replacement). A no-op rewrite (no cluster fn, no add/delete) is allowed and keeps every manifest
-/// as-is (Java allows it).
+/// Create one with [`crate::transaction::Transaction::rewrite_manifests`]. A no-op rewrite is
+/// allowed and keeps every manifest as-is, as in Java.
 ///
-/// The live file set (the set of paths a scan would read) is IDENTICAL before and after the rewrite;
-/// re-clustered entries keep their original provenance (snapshot id + sequence numbers). See the module
-/// doc for the full Java contract and the documented adaptations.
+/// The live file set is IDENTICAL before and after the rewrite, and re-clustered entries keep their
+/// original provenance. See the module doc.
 pub struct RewriteManifestsAction {
     /// The cluster-key function (Java `clusterByFunc`). `None` ⇒ no clustered rewrite is performed.
     cluster_by: Option<ClusterByFunction>,
@@ -198,12 +166,11 @@ impl RewriteManifestsAction {
     /// - **Assigned sequence number** (`sequence_number != -1` /
     ///   [`UNASSIGNED_SEQUENCE_NUMBER`]) ⇒ "Sequence must be assigned during commit".
     ///
-    /// **V1 tables are unsupported** ([`ErrorKind::FeatureUnsupported`]): on V2+ the manifest inherits the
-    /// new snapshot id (Java `canInheritSnapshotId()`); on V1 Java instead COPIES the manifest, a path this
-    /// action defers (see the module doc).
+    /// **V1 tables are unsupported** ([`ErrorKind::FeatureUnsupported`]). On V2 and above the
+    /// manifest inherits the new snapshot id. On V1 Java copies the manifest, a path this action
+    /// defers.
     ///
-    /// The precondition checks return their error eagerly so the caller learns immediately. (Java throws in
-    /// `addManifest` itself.)
+    /// The preconditions return eagerly, so the caller learns immediately.
     pub fn add_manifest(mut self, manifest: ManifestFile) -> Result<Self> {
         if manifest.has_added_files() {
             return Err(Error::new(
