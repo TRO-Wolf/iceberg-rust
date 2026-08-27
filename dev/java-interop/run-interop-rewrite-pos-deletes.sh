@@ -45,6 +45,10 @@
 #        -> Java loads the PRE + POST tables, reads each via IcebergGenerics, and asserts: PRE live ids ==
 #           {100,130,200,230}; READ IDENTITY POST == PRE; and the compaction shape (PRE pos > POST pos > 0).
 #           Nonzero failures => exit 1.
+#   2b. V3 leg. Rust writes rust_table_v3 (PRE, still parquet deletes) and rust_table_v3_dv
+#       (POST, converted to Puffin DVs). Java asserts identical live ids and conversion shape.
+#       Engine-first: iceberg-core has no runner. See GAP_MATRIX row R136.
+#
 #   3. Sabotage battery (each on a SCRATCH copy; HARD-FAIL never SKIP if a corruption cannot be applied):
 #        (a) read-identity breaker — swap the POST metadata with the no-deletes table's, so POST reads the
 #            FULL id set != PRE ⇒ FAIL via the read-identity-BROKEN line (proves the read-identity leg is
@@ -82,7 +86,7 @@ echo "==> [1/5] Reset the temp table dir: ${TMP}"
 rm -rf "${TMP}"
 mkdir -p "${TMP}"
 
-echo "==> [2/5] Rust GEN: write rust_table (many pos-deletes) + rust_table_compacted (compacted) + rust_table_nodeletes (sabotage breaker)"
+echo "==> [2/5] Rust GEN: write rust_table + rust_table_compacted + rust_table_nodeletes + the V3 pair (rust_table_v3, rust_table_v3_dv)"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_REWRITE_POS_DELETES_GEN_DIR="${TMP}" \
@@ -111,6 +115,8 @@ build_scratch() {
   cp -r "${TMP}/rust_table" "${scratch}/rust_table"
   cp -r "${TMP}/rust_table_compacted" "${scratch}/rust_table_compacted"
   cp -r "${TMP}/rust_table_nodeletes" "${scratch}/rust_table_nodeletes"
+  cp -r "${TMP}/rust_table_v3" "${scratch}/rust_table_v3"
+  cp -r "${TMP}/rust_table_v3_dv" "${scratch}/rust_table_v3_dv"
   echo "${scratch}"
 }
 
@@ -141,6 +147,33 @@ if ! echo "${SAB_OUT}" | grep -q 'read-identity BROKEN'; then
   exit 1
 fi
 echo "PASS sabotage(read-identity): a compacted table that resurrected a masked row fails closed via the read-identity-BROKEN path"
+
+# (a2) SEMANTIC — the V3 leg's own read-identity breaker. Replace the CONVERTED (deletion-vector)
+#      table's metadata with the no-deletes table's, so the V3 POST reads the FULL id set and the
+#      masked rows 120/220 are resurrected ⇒ FAIL via the V3-read-identity-BROKEN line. Without this
+#      the V3 leg's read-identity comparison is unproven.
+SCRATCH="$(build_scratch)"
+V3_POST_META="${SCRATCH}/rust_table_v3_dv/metadata/final.metadata.json"
+NODELETES_META="${SCRATCH}/rust_table_nodeletes/metadata/final.metadata.json"
+if [[ ! -f "${V3_POST_META}" || ! -f "${NODELETES_META}" ]]; then
+  echo "==> FAILED — cannot apply V3 read-identity sabotage: metadata absent (GEN gated?)"
+  exit 1
+fi
+cp "${NODELETES_META}" "${V3_POST_META}"
+SAB_OUT="$(run_oracle -Dexec.args=verify-interop-rewrite-pos-deletes \
+  -Dinterop.rewrite_pos_deletes.dir="${SCRATCH}")" || true
+if echo "${SAB_OUT}" | grep -q 'verify-interop-rewrite-pos-deletes: 0 failures'; then
+  echo "FAIL sabotage(v3-read-identity): verify PASSED on a converted table that resurrected a masked row"
+  echo "${SAB_OUT}"
+  exit 1
+fi
+if ! echo "${SAB_OUT}" | grep -q 'V3 read-identity BROKEN'; then
+  echo "FAIL sabotage(v3-read-identity): verify failed but NOT via the V3-read-identity-BROKEN path —"
+  echo "  the V3 comparison was never reached (a different failure masks the claim)."
+  echo "${SAB_OUT}"
+  exit 1
+fi
+echo "PASS sabotage(v3-read-identity): a converted table that resurrected a masked row fails closed"
 
 # (b) STRUCTURAL — truncate the PRE table's final.metadata.json so it no longer parses ⇒ the verify's load
 #     branch errors ⇒ FAIL closed, pinned to the load/parse-error path.
@@ -177,6 +210,9 @@ echo "==> [5/5] DONE — RewritePositionDeleteFiles interop passed."
 echo "    Java's IcebergGenerics read is IDENTICAL before (many position deletes) and after (fewer,"
 echo "    compacted position deletes); the compaction preserved every live row and masked exactly the same"
 echo "    rows (live ids {100,130,200,230}), seq-stamp preserved."
-echo "    Sabotage battery: read-identity-breaker (read-identity-BROKEN line) + structural-truncate"
-echo "                      (load-error line); control passed in step 3."
+echo "    The V3 leg: the same world upgraded to V3 reads identically before (four legacy parquet"
+echo "               position deletes) and after (two Puffin deletion vectors) the conversion."
+echo "    Sabotage battery: read-identity-breaker (read-identity-BROKEN line) + V3 read-identity-breaker"
+echo "                      (V3 read-identity-BROKEN line) + structural-truncate (load-error line);"
+echo "                      control passed in step 3."
 echo "    Spark-action-output comparison: N/A (RewritePositionDeleteFiles is Spark-surface, out of core-parity scope)"

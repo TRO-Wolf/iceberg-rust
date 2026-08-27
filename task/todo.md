@@ -54,6 +54,68 @@ already exceed the limit; no legacy file may grow and no new over-limit file may
 Outcome: the gate scans 363 Rust files. It freezes 104 inherited overages at their exact current
 counts, rejects new files above 1,000 lines, and fails if legacy debt grows or leaves stale headroom.
 
+## ACTIVE (2026-08-25): F-7 U3 — `RewritePositionDeleteFiles` extends to format v3
+
+Branch `parity/f7-u3-rewrite-pos-deletes-v3` off `2b34ec414`. ENGINE-FIRST. **Correction 2026-08-26:
+a Java counterpart DOES exist and the first pass wrongly said it did not.** It is Spark-only —
+`RewritePositionDeleteFilesSparkAction`, decoded from
+`iceberg-spark-runtime-4.0_2.13-1.10.0.jar`: `execute()` returns `EMPTY_RESULT` only when
+`TableUtil.formatVersion >= 3` (offset 66-70) AND `requiresRewriteToDVs()` is false (74-77), so on a
+v3 table still holding legacy parquet position deletes it falls through to the planner and
+`doExecute` and CONVERTS them to DVs. Not mirroring the Spark surface is a scope decision;
+`iceberg-spark` is outside this fork's core/api parity envelope. Two divergences from it are
+deliberate and argued on row R136: no size gate (V-1) and one commit per run (V-2).
+
+- [x] Version dispatch in `execute`: V1/V2 keep the bin-pack arm; V3 takes the DV arm.
+- [x] Case 2: one Puffin DV per referenced data file, merged with its existing DV.
+- [x] THE PUFFIN CLOSURE — path-keyed removal drags every sibling blob out of a superseded Puffin,
+      so each sibling is rewritten too (including in partitions the filter excluded).
+- [x] THE SHADOW CLOSURE — a DV shadows every position delete for its data file, so a live delete
+      the filter EXCLUDED goes inert. The run now fails closed. Repro before the fix:
+      two file-scoped deletes stamped `x=0` / `x=1` for one data file, `filter(x = 0)` →
+      `Ok {rewritten: 1, added: 1}`, live `{12}` → `{12, 11}`.
+- [x] Case 1: `Ok(zeros)` = "looked, found nothing", total WITHIN the filter's scope.
+- [x] Hazard R114 bound (c): a `PartitionKey` on every `DVFileWriter::delete` call.
+- [x] Stale positions are DROPPED, not refused — refusing dead-ended the table, since R137 keys on
+      `(spec_id, partition)` and cannot clear a delete file that still names one live data file.
+- [x] Per-DV sequence stamp pinned (the V3 twin of the bin-max pin).
+- [x] Tests + the interop V3 leg; GAP_MATRIX R136 cell.
+
+- [x] **S2 (2026-08-26) — the closure completed in BOTH directions.** The shadow guard's PARTITION
+      leg is now pinned (it was 0-red before: the fork's `truncate(16)` bounds make partition-scoped
+      the DEFAULT delete shape, so the unpinned leg was the common one). And the OPPOSITE loss is
+      closed: an admitted legacy delete whose data file already holds a NON-SUPERSET DV is refused,
+      because merging it would DELETE rows the table returns today. Java 1.10.0's own rewrite writes
+      that shape — its `loadPreviousDeletes` is `path -> null` — so divergence (g)'s old "no real
+      writer produces this" envelope was wrong and is corrected on row R136.
+- [x] **Limit (k) named as a residue — and CORRECTED 2026-08-27: it is not a dead end.** The (g) fix
+      makes a Java-rewrite-shaped table unconvertible BY THIS ARM at any filter width, but
+      `RewriteDataFiles` clears it — but with TWO knobs, corrected again 2026-08-28: the one-knob
+      wording shipped twice and is a NO-OP (0/0/0, both deletes still live, same refusal). Executed:
+      `remove_dangling_deletes(true).delete_file_threshold(1)` gives 1 rewritten / 1 added / 2
+      removed, live rows preserved exactly, second V3 run honest zeros. The threshold's default is
+      `usize::MAX`, so the delete-count clause is off; `min_input_files` is NOT needed because
+      `any_too_many_deletes` has no `size > 1` guard. Not universally unavailable at defaults —
+      a partition of five small files admits the group anyway. R137 and the V3 DML arm still do NOT
+      work and stay cited. The test runs the ADVERTISED invocation, keeps the one-knob no-op as a
+      negative control, and asserts the refusal names every knob it passes.
+- [x] (j) gains a TRIGGER: the block is an incidental parquet parse failure, not a guard, so (j)
+      dissolves silently the day an ORC/Avro delete reader lands. Re-audit it in that change.
+- [x] Capability limit (j) stated: a v3 table whose ORC/Avro position deletes OVERLAP convertible
+      ones cannot be converted at any filter width, and the refusal says so.
+- [x] V-1's third reason re-argued (gating can leave TWO live DVs for one data file, which
+      `DeleteFileIndex` rejects); V-2's cost stated (no partial progress under `validate_from_snapshot`).
+
+Refusal placement, corrected 2026-08-27. Mutation E witnessed ONE of the two facts, not both: it
+proves closure siblings reach the check with an EMPTY position set (refusing an empty set reds the
+sibling test, 1 of 3490). It does NOT witness the ordering claim — moving the check after the merge
+is 0 red, because the refusal aborts before any IO wherever it sits. The real guarantee is that
+`write_deletion_vectors` opens the first Puffin and is strictly later than every refusal; the
+comment now says that instead.
+
+Outcome: 15 offline V3 tests + the interop V3 leg green. Mutations applied one at a time, each RED.
+Residue lettering on R136 runs (e), (f), (g), (i), (j); (h) was retired with the dangling refusal.
+
 ## QUEUED (2026-08-25): engine-agreed order — R166 interop, then F-13-or-F-7
 
 Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next.

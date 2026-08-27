@@ -15,27 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! MAINTENANCE `RewritePositionDeleteFiles` interop — the PARQUET position-delete COMPACTION action proven
-//! against Java's OWN merge-on-read read WITHOUT Spark (the real Java action is a Spark-surface class NOT on
-//! the iceberg-core oracle classpath, and Java cannot DRIVE the compaction). The proof is therefore the
-//! corruption-class READ-IDENTITY claim, in the GEN direction only:
-//!
-//! - **Rust GEN (the only direction):** Rust writes a PRE table (data + TWO parquet POSITION-delete files
-//!   masking a known subset) to `<gen_dir>/rust_table`, then builds a SEPARATE identical table, runs
-//!   `RewritePositionDeleteFiles` (many parquet pos-deletes → ONE compacted pos-delete), and writes the
-//!   POST table to `<gen_dir>/rust_table_compacted`. Java's `verify-interop-rewrite-pos-deletes` then loads
-//!   BOTH tables, reads each via `IcebergGenerics` (applying whichever delete files the table carries), and
-//!   asserts the live row sets are IDENTICAL — AND that the PRE table carried MORE position-delete files
-//!   than the POST table (so the compaction genuinely fused files, not merely no-op'd). This is the
-//!   no-Spark corroboration that the compacted position delete masks EXACTLY the rows the original
-//!   position deletes masked, with the data sequence number preserved (a wrong seq-stamp would resurrect or
-//!   over-mask a row and break read identity).
-//!
-//! ANTI-CIRCULAR: the masked subset + the expected live set are hand-declared HERE and INDEPENDENTLY in
-//! the Java oracle from the fixture definition, never from the other engine's output.
-//!
-//! GATED on `ICEBERG_INTEROP_REWRITE_POS_DELETES_GEN_DIR` (unset ⇒ a clean no-op; the offline `cargo test`
-//! gate stays green). `dev/java-interop/run-interop-rewrite-pos-deletes.sh` is the driver.
+//! GEN-direction interop for [`RewritePositionDeleteFiles`]. Java has no core runner; the claim
+//! is read identity. PRE and POST live ids are declared here and in the Java oracle, never taken
+//! from the other engine. The V3 leg repeats the pair after conversion to Puffin DVs.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -88,8 +70,7 @@ fn rewrite_schema() -> Schema {
         .expect("build schema")
 }
 
-/// The hand-declared live `id` set before AND after compaction: the two pos-deletes mask id=120 (pos 1
-/// of cat=A) and id=220 (pos 1 of cat=B); everything else lives.
+/// Live `id` set before and after: the two pos-deletes mask 120 and 220.
 fn expected_live_ids() -> HashSet<i64> {
     HashSet::from([100, 130, 200, 230])
 }
@@ -189,7 +170,7 @@ async fn write_data_file(table: &Table, cat: &str, rows: &[(i64, i64)]) -> DataF
         .expect("one data file")
 }
 
-/// Write a PARQUET position-delete file in partition `cat` masking the given `(target_path, pos)` pairs.
+/// Write a parquet position-delete file in partition `cat`.
 async fn write_position_delete(table: &Table, cat: &str, pairs: &[(&str, i64)]) -> DataFile {
     let config = PositionDeleteWriterConfig::new().expect("pos-delete config");
 
@@ -252,9 +233,7 @@ async fn add_deletes(catalog: &impl Catalog, table: &Table, deletes: Vec<DataFil
     tx.commit(catalog).await.expect("commit row_delta")
 }
 
-/// Build the PRE world: two partitions (cat=A id 100/120/130, cat=B id 200/220/230) at seq 1; then TWO
-/// separate position-delete files per partition (in separate commits, so they share a partition group
-/// but carry different seqs), masking pos 1 (id=120 / id=220).
+/// PRE world: two partitions, then two position deletes per partition in separate commits.
 async fn build_pre_world(catalog: &impl Catalog, table: Table) -> Table {
     let a = write_data_file(&table, "A", &[(100, 10), (120, 20), (130, 30)]).await;
     let b = write_data_file(&table, "B", &[(200, 10), (220, 20), (230, 30)]).await;
@@ -267,12 +246,142 @@ async fn build_pre_world(catalog: &impl Catalog, table: Table) -> Table {
     let pd_b1 = write_position_delete(&table, "B", &[(&b_path, 1)]).await;
     let table = add_deletes(catalog, &table, vec![pd_a1, pd_b1]).await;
 
-    // Second pos-delete per partition (seq 3): DUPLICATE the same masked positions (Java does not dedup
-    // within a group — the reader bitmap dedups), so the group has TWO files to compact while the masked
-    // set is unchanged.
+    // Duplicate the mask. Java does not dedup; the reader bitmap does.
     let pd_a2 = write_position_delete(&table, "A", &[(&a_path, 1)]).await;
     let pd_b2 = write_position_delete(&table, "B", &[(&b_path, 1)]).await;
     add_deletes(catalog, &table, vec![pd_a2, pd_b2]).await
+}
+
+/// Upgrade to V3, leaving parquet position deletes the table can no longer write.
+async fn upgrade_to_v3(catalog: &impl Catalog, table: &Table) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .upgrade_table_version()
+        .set_format_version(FormatVersion::V3)
+        .apply(tx)
+        .expect("apply upgrade_table_version");
+    tx.commit(catalog)
+        .await
+        .expect("commit upgrade_table_version")
+}
+
+/// The count of live delete files of `content` in `format`.
+async fn live_delete_count_of_format(
+    table: &Table,
+    content: DataContentType,
+    format: DataFileFormat,
+) -> usize {
+    let snapshot = table.metadata().current_snapshot().expect("snapshot");
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("manifest list");
+    let mut count = 0;
+    for manifest_file in manifest_list.entries() {
+        if manifest_file.content != ManifestContentType::Deletes {
+            continue;
+        }
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .expect("manifest");
+        for entry in manifest.entries() {
+            if entry.is_alive()
+                && entry.content_type() == content
+                && entry.data_file().file_format() == format
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Write V3 PRE (legacy parquet deletes) and POST (converted Puffin DVs).
+async fn write_v3_pair(catalog: &impl Catalog, warehouse: &str, expected_ids: &HashSet<i64>) {
+    let pre_location = format!("{warehouse}/rust_table_v3");
+    let pre = create_table(catalog, "rust_table_v3", &pre_location).await;
+    let pre = build_pre_world(catalog, pre).await;
+    let pre = upgrade_to_v3(catalog, &pre).await;
+    pre.metadata()
+        .clone()
+        .write_to(
+            pre.file_io(),
+            &format!("{pre_location}/metadata/final.metadata.json"),
+        )
+        .await
+        .expect("write v3 pre final.metadata.json");
+    assert_eq!(
+        &scan_ids(&pre).await,
+        expected_ids,
+        "GEN sanity: the upgraded V3 table still masks id 120/220"
+    );
+    assert_eq!(
+        live_delete_count_of_format(
+            &pre,
+            DataContentType::PositionDeletes,
+            DataFileFormat::Parquet
+        )
+        .await,
+        4,
+        "GEN sanity: the V3 PRE table carries FOUR legacy parquet position deletes"
+    );
+
+    let post_location = format!("{warehouse}/rust_table_v3_dv");
+    let post = create_table(catalog, "rust_table_v3_dv", &post_location).await;
+    let post = build_pre_world(catalog, post).await;
+    let post = upgrade_to_v3(catalog, &post).await;
+    // NO `min_input_files` knob: the V3 arm converts every legacy file and applies no size gate.
+    let result = RewritePositionDeleteFiles::new(post.clone())
+        .execute(catalog)
+        .await
+        .expect("run RewritePositionDeleteFiles on the V3 table");
+    assert_eq!(
+        result.rewritten_delete_files_count, 4,
+        "GEN sanity: all four legacy parquet position deletes consumed"
+    );
+    assert_eq!(
+        result.added_delete_files_count, 2,
+        "GEN sanity: one deletion vector per referenced data file"
+    );
+
+    let post = catalog
+        .load_table(post.identifier())
+        .await
+        .expect("reload v3 post table");
+    post.metadata()
+        .clone()
+        .write_to(
+            post.file_io(),
+            &format!("{post_location}/metadata/final.metadata.json"),
+        )
+        .await
+        .expect("write v3 post final.metadata.json");
+    assert_eq!(
+        &scan_ids(&post).await,
+        expected_ids,
+        "GEN sanity: read identity — the deletion vectors mask exactly the same rows"
+    );
+    assert_eq!(
+        live_delete_count_of_format(
+            &post,
+            DataContentType::PositionDeletes,
+            DataFileFormat::Parquet
+        )
+        .await,
+        0,
+        "GEN sanity: no legacy parquet position delete survives on the V3 table"
+    );
+    assert_eq!(
+        live_delete_count_of_format(
+            &post,
+            DataContentType::PositionDeletes,
+            DataFileFormat::Puffin
+        )
+        .await,
+        2,
+        "GEN sanity: TWO Puffin deletion vectors, one per referenced data file"
+    );
 }
 
 /// The merge-on-read live `id` set.
@@ -369,24 +478,7 @@ async fn test_rewrite_pos_deletes_gen() {
     // Build a SEPARATE compacted table so Java can read BOTH the PRE and POST tables.
     let compacted = create_table(&catalog, "rust_table_compacted", &compacted_location).await;
     let compacted = build_pre_world(&catalog, compacted).await;
-    // `.min_input_files(2)` — the ONE knob this suite needs after the size-based admission gate
-    // landed. This oracle's subject is READ IDENTITY across a compaction, not admission, so the
-    // fixture is deliberately NOT grown (growing it would re-open the Java oracle recording, and
-    // `RewritePosDeleteOracle.expectedLiveIds()` is a golden).
-    //
-    // WHY 2. Each partition carries exactly TWO ~1.4 KB position-delete files. Both are far below
-    // the resolved `min_file_size_bytes` (50331648), so both are candidates; both fit one bin under
-    // the 100 GiB group default. At the gate, of the three clauses only
-    // `enough_input_files = size > 1 && size >= min_input_files` can fire — `enough_content` needs
-    // the bin's ~2.8 KB to exceed the 67108864 target and `too_much_content` needs it to exceed the
-    // 120795955 max, and neither can. So the bin is admitted iff `2 >= min_input_files`: the
-    // admitting set is exactly `{1, 2}` (0 is rejected outright by the `min_input_files > 0`
-    // precondition), and at Java's default of 5 the bin is DECLINED — the regression this knob
-    // repairs. 2 is the MINIMUM ADMITTING RELAXATION of the gate: it is the largest floor that
-    // still admits, so it weakens the shipped default by the smallest amount that restores the
-    // pre-gate behaviour. `min_input_files(1)` would also green this suite, but it would additionally
-    // switch off the `size >= min_input_files` conjunct for every bin, which this oracle has no
-    // business doing.
+    // Floor 2: Java's default 5 declines this two-file bin. 1 would disable the size>=N clause.
     let result = RewritePositionDeleteFiles::new(compacted.clone())
         .min_input_files(2)
         .execute(&catalog)
@@ -429,10 +521,8 @@ async fn test_rewrite_pos_deletes_gen() {
         "GEN sanity: compaction must FUSE files (POST {post_pos} < PRE {pre_pos})"
     );
 
-    // A THIRD table holding the SAME data with NO deletes — used ONLY by the shell sabotage battery as a
-    // read-identity breaker (swapping it for the compacted POST metadata makes POST read the full id set
-    // {100,120,130,200,220,230} != PRE, so the read-identity leg must fail closed). Never read by the
-    // verify path itself.
+    // A third table with the same data and no deletes. The shell sabotage battery swaps it for the
+    // POST metadata, so the read-identity leg must fail closed. The verify path never reads it.
     let nodeletes_location = format!("{warehouse}/rust_table_nodeletes");
     let nodeletes = create_table(&catalog, "rust_table_nodeletes", &nodeletes_location).await;
     let a = write_data_file(&nodeletes, "A", &[(100, 10), (120, 20), (130, 30)]).await;
@@ -451,6 +541,9 @@ async fn test_rewrite_pos_deletes_gen() {
         HashSet::from([100, 120, 130, 200, 220, 230]),
         "GEN sanity: the no-deletes table reads the FULL id set (the sabotage read-identity breaker)"
     );
+
+    // The V3 PAIR — legacy parquet position deletes converted into Puffin deletion vectors.
+    write_v3_pair(&catalog, &warehouse, &pre_ids).await;
 
     println!(
         "interop_rewrite_pos_deletes GEN OK — wrote {pre_location} ({pre_pos} pos-deletes) + \

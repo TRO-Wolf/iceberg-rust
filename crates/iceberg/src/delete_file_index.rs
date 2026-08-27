@@ -425,15 +425,10 @@ impl DeleteFileIndex {
 }
 
 impl PopulatedDeleteFileIndex {
-    /// Creates a new populated delete file index from a list of delete file contexts, which
-    /// allows for fast lookup when determining which delete files apply to a given data file.
+    /// Build the index. File-scoped position deletes go in `pos_deletes_by_path`.
     ///
-    /// 1. The partition information is extracted from each delete file's manifest entry.
-    /// 2. If the partition is empty and the delete file is not a positional delete,
-    ///    it is added to the `global_equality_deletes` vector
-    /// 3. A FILE-SCOPED position delete (one with a derivable referenced data file — see
-    ///    [`referenced_data_file_location`]) is added to `pos_deletes_by_path`, keyed by that file.
-    /// 4. Otherwise, the delete file is added to one of two hash maps based on its content type.
+    /// `refuse_shadowed_deletes` re-derives this keying and does not share it.
+    /// Change the routing here and that guard diverges silently.
     fn new(files: Vec<DeleteFileContext>) -> PopulatedDeleteFileIndex {
         let mut eq_deletes_by_partition: PartitionDeleteMap = HashMap::default();
         let mut pos_deletes_by_partition: PartitionDeleteMap = HashMap::default();
