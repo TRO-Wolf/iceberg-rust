@@ -472,6 +472,28 @@ format-sensitive work still leads; well-templated breadth follows.
 
 ---
 
+## Engine queue — the RePark handoff items, and where each lives here
+
+The consumer engine files its asks in its own handoff
+(`task/roadmap/mid-term/iceberg-rust-handoff-2026-08-23.md`, engine repo) as numbered F-items;
+this fork answered two of them ad hoc (#224) and named only one in this file. This table is
+the standing router: one row per item, the matrix row(s) that own it, and the engine pin
+whose flip is the acceptance. **Status lives in the matrix, never here** — a row here says
+where to look and what closes the item, not how far along it is. Each landed batch returns to
+the engine as one repin unit (handoff §5); the engine's RP-2 charter takes the first three.
+
+| Item | The ask, in one line | Owning row(s) | Closes when |
+|---|---|---|---|
+| F-3 | `RewriteDataFiles` drops dangling deletes and reports a true `removed_delete_files_count` | R135, R137 | the engine stops hard-coding `0` — landed 2026-08-23, taken by engine RP-2 |
+| F-7 | row lineage carried through every row rewrite (compaction, COW DML); DV-aware delete maintenance; dangling-DV removal on compaction | R107, R166 (lineage); R135, R137 (maintenance) | engine guards `V3-LINEAGE-1` / `V3-COW-1` lift on a Spark-equal read-back — U1+U2 landed 2026-08-25 (#225, #226); the maintenance half is open |
+| F-9 | S3 Tables `register_table` — implement, or a dated permanent service-gap ruling | R126 | an engine tier-2 pin on a live register, or the matrix row the engine guide cites |
+| F-13 | Puffin deletion-vector write path, reachable from the DataFusion merge-on-read arm | R114 | the engine's v3 MOR pin — landed 2026-08-24 (#219, #221, #222), taken by engine RP-2 |
+| F-14 | `MetadataLocation` next-pointer math for Hadoop-convention `vN.metadata.json` names, or a dated gap ruling | none yet — needs a row (catalog/table-ops area, near R126) | engine pin `call_register_table_of_hadoop_named_metadata_writes_name_the_convention` retargets to "the write succeeds", or cites the ruling |
+| F-15 | the v3 schema-model delta — `variant`, `geometry`/`geography`, `timestamp_ns`/`timestamptz_ns`, `unknown`, column defaults — through metadata and Parquet IO, one row per type | R88, R89, R90, R91, R92 (the Phase 4 V3 slate) | every type has a row that is ✅ or a dated "not yet" — R92's `write_default` consumer under `writer/` is the open cell |
+| F-16 | `RewriteDataFiles` delete-RATIO candidate clause (Java `DELETE_RATIO_THRESHOLD_DEFAULT = 0.3`, `tooHighDeleteRatio`) | R135 | the engine's MW-7 1e7×50 sequence ends at zero delete files, as Spark's does |
+
+---
+
 ## Risks & mitigations
 
 | Risk | Mitigation |
@@ -502,3 +524,5 @@ compatibility with Java in both directions where applicable.
 - [docs/ENGINE_CONTRACT.md](docs/ENGINE_CONTRACT.md) — the engine-facing integration contract
   (DRAFT 2026-07-01: isolation-level → validation recipes pending bytecode verification).
 - [README.md](README.md) — project front door.
+- The engine's handoff (`task/roadmap/mid-term/iceberg-rust-handoff-2026-08-23.md` in the RePark
+  repo) — the consumer's asks; routed above under "Engine queue".
