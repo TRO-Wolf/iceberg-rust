@@ -21620,9 +21620,7 @@ public final class InteropOracle {
           failures++;
         }
 
-        // (4)-(6) THE V3 LEG. The same PRE world upgraded to format version 3 still carries the four
-        // legacy PARQUET position deletes; the POST table is that world after the action converted
-        // them into Puffin DELETION VECTORS. Java reads both and the live rows must be identical.
+        // V3: same PRE world upgraded, then converted to Puffin DVs. Live ids must match.
         failures += verifyV3(dir, tag, preIds);
       } catch (RuntimeException | IOException error) {
         System.out.println("FAIL " + tag + ": unexpected error running the rewrite-pos-deletes verify: " + error);
@@ -21638,11 +21636,7 @@ public final class InteropOracle {
       return failures;
     }
 
-    /**
-     * The V3 leg: a table upgraded to V3 that still holds legacy parquet position deletes, and the
-     * same world after the Rust action converted them into Puffin deletion vectors. Java's read of
-     * the two must be identical, and the conversion must have actually happened.
-     */
+    /** V3 PRE vs POST after conversion to Puffin DVs. Live ids must match; conversion must have happened. */
     private static int verifyV3(Path dir, String tag, java.util.Set<Long> preIds)
         throws IOException {
       int failures = 0;

@@ -15,16 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Tests for [`RewritePositionDeleteFiles`]. Each is a corruption-class READ-IDENTITY proof: the
-//! merge-on-read live row set is asserted IDENTICAL before and after the rewrite, plus the four
-//! `Result` counts. The file count moves in BOTH directions across this file and identity holds in
-//! each: most fixtures FUSE many parquet pos-deletes into fewer compacted ones, while the split
-//! battery (`test_output_splits_into_multiple_files_at_a_small_explicit_config` and its siblings)
-//! rewrites a bin into MORE files than it consumed. The crown jewel + the seq-stamp test pin the
-//! silent-corruption staller (the compacted file must carry the group MAX rewritten data seq); the
-//! grouping + partition-isolation tests pin the `(spec, partition)` planning; the C-008 format
-//! battery pins the V2-parquet-only scope over all four `DataFileFormat` variants (a Puffin
-//! deletion vector, a V2 ORC pos-delete and a V2 Avro pos-delete are all SKIPPED, not compacted).
+//! Tests for [`RewritePositionDeleteFiles`]. Read identity plus result counts.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -56,9 +47,7 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
 use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
-// =================================================================================================
 // Helpers (table build / data + position-delete writers / scan) — same shape as the convert tests.
-// =================================================================================================
 
 async fn local_fs_catalog() -> (impl Catalog, TempDir) {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -101,10 +90,7 @@ fn three_long_schema() -> IcebergSchema {
         .expect("build schema")
 }
 
-/// A partitioned table at a DELIBERATELY SHORT location. `parquet-rs` truncates byte-array
-/// statistics at 64 bytes and the metrics aggregator drops a non-exact bound, so a data-file path
-/// longer than that leaves a position delete with NO `file_path` bounds — the reader then treats it
-/// as partition-scoped. A short path is what lets a fixture reach the real file-scoped routing.
+/// A partitioned table at a DELIBERATELY SHORT location.
 async fn create_short_path_partitioned_table(
     catalog: &impl Catalog,
     warehouse: &Path,
@@ -182,8 +168,7 @@ async fn create_table_with_spec(
         .expect("create table")
 }
 
-/// Write a DATA file in partition `part_value` holding `rows` (the file path is returned for use as the
-/// position-delete `file_path` target).
+/// Write a DATA file in partition `part_value` holding `rows` (the file path is returned for use as the position-delete `file_path` target).
 async fn write_data_file(
     table: &Table,
     file_name: &str,
@@ -229,9 +214,7 @@ async fn write_data_file(
         .unwrap()
 }
 
-/// Write a real PARQUET position-delete file masking the given `(target_path, pos)` pairs in partition
-/// `part_value`. Returns the resulting position-delete [`DataFile`] (so it can be committed via
-/// `add_deletes`). This is the multi-pos-delete fixture the action compacts.
+/// Write a real PARQUET position-delete file masking the given `(target_path, pos)` pairs in partition `part_value`.
 async fn write_position_delete_file(
     table: &Table,
     part_value: Option<i64>,
@@ -281,13 +264,7 @@ async fn write_position_delete_file(
     writer.close().await.unwrap().into_iter().next().unwrap()
 }
 
-/// Write a FILE-SCOPED parquet position delete: one that carries FULL, untruncated `file_path`
-/// bounds, so the reader routes it by PATH with no partition condition.
-///
-/// The plain [`write_position_delete_file`] helper leaves the default `truncate(16)` metrics config
-/// in place, which shortens the bounds and makes every delete it writes partition-scoped. Java's
-/// `MetricsConfig.forPositionDelete` is what a real position-delete writer uses, and the fork's own
-/// production path sets it too.
+/// Write a FILE-SCOPED parquet position delete.
 async fn write_file_scoped_position_delete_file(
     table: &Table,
     part_value: i64,
@@ -423,23 +400,9 @@ fn count_pos(files: &[DataFile]) -> usize {
         .count()
 }
 
-// =================================================================================================
 // CROWN JEWEL — read-identity over a data file masked by 2+ parquet position-delete files.
-// =================================================================================================
 
-/// THE CROWN JEWEL (read-identity). A single data file is masked by TWO separate parquet position-delete
-/// files (one masking pos 1 = y=20, one masking pos 3 = y=40). Compact them; the post-compaction MoR
-/// scan must return the SAME live rows ({10,30,50}), the two old pos-delete files must be GONE, exactly
-/// ONE compacted pos-delete added, and the Result counts must be (2 rewritten, 1 added).
-///
-/// MUTATION COVERAGE: grouping — if compaction collected positions from only one of the two files (e.g.
-/// a `break` after the first), one masked row would resurrect and the after-set would differ from
-/// before, failing the read-identity assertion.
-/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
-/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is READ IDENTITY across a compaction — not
-/// admission. It therefore sets `.min_input_files(2)` explicitly, which is also acceptance item
-/// 2: the floor is configuration, not a hard-coded constant. Removing that knob must RED this
-/// test — it asserts post-`execute` SHAPE, never read identity alone.
+/// THE CROWN JEWEL (read-identity). One data file is masked by TWO parquet position-delete files (pos 1 = y=20, pos 3 = y=40). After.
 #[tokio::test]
 async fn test_crown_jewel_read_identity_data_file_masked_by_two_pos_deletes() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -511,30 +474,9 @@ async fn test_crown_jewel_read_identity_data_file_masked_by_two_pos_deletes() {
     );
 }
 
-// =================================================================================================
 // STALLER (seq stamping) — the compacted file must carry the group MAX rewritten data seq.
-// =================================================================================================
 
-/// SEQ STAMPING (the silent-corruption staller). Data X is at seq 1; two pos-deletes mask it at seqs 2
-/// and 3. The compacted file MUST carry the BIN MAX rewritten data seq (3) — NOT the inherited
-/// (higher) rewrite-snapshot seq, NOT the min (2). If it carried the inherited seq it would still apply
-/// here (4 > 1) so the read would look fine — this test therefore asserts the EXACT stamped seq is 3,
-/// pinning the precise stamp.
-///
-/// C-010 element 1 — the ONE-OUTPUT bin, which fixes the stamp's BASE VALUE. The two other elements
-/// fix the other two dimensions: `test_every_split_output_carries_bin_max_rewritten_seq` the FAN-OUT
-/// (every output of a split bin, not just the first) and
-/// `test_each_bin_output_carries_its_own_bin_max_not_the_partition_max` the RANGING (this bin's
-/// entries, not the partition's).
-///
-/// MUTATION COVERAGE: change `add_delete_file_with_sequence_number(.., max_seq)` to
-/// `add_delete_file(..)` (inherit) and the live compacted pos-delete seq becomes the rewrite snapshot's
-/// seq (4), not 3; the seq assertion fails. Change `.max()` to `.min()` and the stamp becomes 2; fails.
-/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
-/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is the sequence-number STAMP the compacted
-/// file carries — not admission. It therefore sets `.min_input_files(2)` explicitly, which is
-/// also acceptance item 2: the floor is configuration, not a hard-coded constant. Removing that
-/// knob must RED this test — it asserts post-`execute` SHAPE, never read identity alone.
+/// SEQ STAMPING. Data X is at seq 1; two position deletes mask it at seqs 2 and 3. The compacted file must carry the BIN MAX.
 #[tokio::test]
 async fn test_compacted_file_carries_bin_max_rewritten_seq() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -598,17 +540,7 @@ async fn test_compacted_file_carries_bin_max_rewritten_seq() {
     assert_eq!(scan_y_values(&reloaded).await, HashSet::from([30]));
 }
 
-/// SEQ STAMPING — the resurrection guard. Data X at seq 1 is masked by two pos-deletes; a SECOND data
-/// file W at seq 4 (committed AFTER the deletes) also lives. The compacted file must be stamped seq 3
-/// (the group max of the rewritten deletes), which is `< 4` so it never touches W, and `> 1` so it still
-/// masks X. If the stamp were inherited (seq 5 from the rewrite), it would `> 1` so X stays masked
-/// (looks fine) — but the resurrection failure mode is the INVERSE: an OVER-low stamp. We pin the read
-/// identity across BOTH data files so any wrong stamp that changes the masked set fails.
-/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
-/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is the sequence-number STAMP (resurrection
-/// / over-apply) — not admission. It therefore sets `.min_input_files(2)` explicitly, which is
-/// also acceptance item 2: the floor is configuration, not a hard-coded constant. Removing that
-/// knob must RED this test — it asserts post-`execute` SHAPE, never read identity alone.
+/// SEQ STAMPING, the resurrection guard. Data X at seq 1 is masked by two position deletes. A second data file W at seq 4 also.
 #[tokio::test]
 async fn test_seq_stamp_does_not_resurrect_or_over_apply() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -640,10 +572,6 @@ async fn test_seq_stamp_does_not_resurrect_or_over_apply() {
         .await
         .unwrap();
 
-    // SHAPE FIRST (acceptance criterion 4 / design call 2). Read identity ALONE is satisfied by a
-    // DECLINED bin doing nothing, so this test asserts the bin was actually ADMITTED before it
-    // asserts anything about what the admitted run produced. Remove the `.min_input_files(2)` knob
-    // above and these two assertions red.
     assert_eq!(
         result.rewritten_delete_files_count, 2,
         "the two pos-deletes must actually be rewritten — a declined bin rewrites nothing"
@@ -661,10 +589,6 @@ async fn test_seq_stamp_does_not_resurrect_or_over_apply() {
         1,
         "the two pos-deletes compacted into ONE — a declined bin would leave two"
     );
-    // POWER ON ITS OWN SUBJECT: pin the EXACT stamp, not just the row set. Read identity cannot
-    // separate `max` from `inherit` here (both are > X's seq 1, so X stays masked either way), and
-    // it cannot separate `max` from `min` either (2 and 3 both mask X and both miss W). The stamp
-    // assertion can, and does.
     assert_eq!(
         pos_entries[0].1,
         Some(3),
@@ -678,18 +602,9 @@ async fn test_seq_stamp_does_not_resurrect_or_over_apply() {
     );
 }
 
-// =================================================================================================
 // GROUPING + PARTITION ISOLATION.
-// =================================================================================================
 
-/// MULTI-FILE GROUPING across DATA files in one partition. Two data files in partition 0, each masked by
-/// its own pos-delete file. Both pos-deletes share `(spec 0, partition 0)`, so they compact into ONE
-/// file carrying both data files' positions. Read identity must hold.
-/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
-/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is GROUPING across data files in one
-/// partition — not admission. It therefore sets `.min_input_files(2)` explicitly, which is also
-/// acceptance item 2: the floor is configuration, not a hard-coded constant. Removing that knob
-/// must RED this test — it asserts post-`execute` SHAPE, never read identity alone.
+/// MULTI-FILE GROUPING across data files in one partition.
 #[tokio::test]
 async fn test_multi_file_grouping_one_partition() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -730,23 +645,7 @@ async fn test_multi_file_grouping_one_partition() {
     assert_eq!(count_pos(&live_delete_files(&reloaded).await), 1);
 }
 
-/// PARTITION ISOLATION + MULTI-GROUP TABLE ADVANCE. Two partitions, each with two pos-delete
-/// files. The action compacts EACH partition's group SEPARATELY (one compacted file per
-/// partition, never merging across partitions). Read identity per-partition must hold.
-///
-/// Each group commits its own `Replace` snapshot; the action advances the base table after each
-/// group commit (mirrors `RewriteDataFiles`) so the next `Transaction` is built on the prior
-/// group's tip. Without advance, `do_commit` still refreshes + re-applies (correctness holds;
-/// cost is extra re-apply work — not forced CAS conflict retries).
-///
-/// MUTATION COVERAGE: collapse the `(spec, partition)` group key to spec-only and both partitions' files
-/// would merge into one group; the compacted file's partition would be wrong and the per-partition read
-/// identity would break (or the writer/commit would error on a partition mismatch).
-/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
-/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is PARTITION ISOLATION and the per-group
-/// commit — not admission. It therefore sets `.min_input_files(2)` explicitly, which is also
-/// acceptance item 2: the floor is configuration, not a hard-coded constant. Removing that knob
-/// must RED this test — it asserts post-`execute` SHAPE, never read identity alone.
+/// PARTITION ISOLATION and multi-group table advance.
 #[tokio::test]
 async fn test_partition_isolation_compacts_each_group_separately() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -797,9 +696,6 @@ async fn test_partition_isolation_compacts_each_group_separately() {
         2,
         "exactly two compacted files (one per partition)"
     );
-    // Two sequential group commits each append a snapshot log entry. (Advance is a re-apply
-    // avoidance / RewriteDataFiles parity seam; history +2 pins multi-group commits, not that
-    // CAS would fail without advance — `do_commit` refreshes a stale base on first attempt.)
     assert_eq!(
         reloaded.metadata().history().len(),
         history_before + 2,
@@ -807,13 +703,7 @@ async fn test_partition_isolation_compacts_each_group_separately() {
     );
 }
 
-/// FILTER restriction. Two partitions, each with two pos-deletes. `filter(x == 0)` compacts ONLY the
-/// partition-0 group; partition 1's pos-deletes are left untouched. Read identity holds throughout.
-/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
-/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is the user FILTER stage (C-005 S2) — not
-/// admission. It therefore sets `.min_input_files(2)` explicitly, which is also acceptance item
-/// 2: the floor is configuration, not a hard-coded constant. Removing that knob must RED this
-/// test — it asserts post-`execute` SHAPE, never read identity alone.
+/// Filter restriction. `filter(x == 0)` compacts only partition 0. Partition 1 stays untouched.
 #[tokio::test]
 async fn test_filter_restricts_compacted_partitions() {
     use crate::expr::Reference;
@@ -864,88 +754,7 @@ async fn test_filter_restricts_compacted_partitions() {
     );
 }
 
-// =================================================================================================
-// C-008 — THE FORMAT SKIP. `file_format() != Parquet` drops EVERY non-Parquet position delete, a
-// FORK DIVERGENCE from Java's format-blind `BinPackRewritePositionDeletePlanner` (zero
-// case-insensitive `FileFormat` / `PUFFIN` matches in its class file; Java's DV avoidance lives one
-// level up, in the Spark action). `DataFileFormat` is a CLOSED four-variant enum
-// (`spec/manifest/data_file.rs:387-396`) and the predicate reads exactly that field, so the four
-// variants exhaust the domain:
-//
-//   Parquet -> KEPT.    Pinned by every admission test below.
-//   Puffin  -> DROPPED, and now UNREACHABLE end to end (see the Puffin note below the table).
-//   Orc     -> DROPPED. `test_non_parquet_position_deletes_skipped_at_collection_orc`.
-//   Avro    -> DROPPED. `test_non_parquet_position_deletes_skipped_at_collection_avro`.
-//
-// Every one of the three DROPPED pins carries the SAME applied mutation — delete the
-// `file_format() != Parquet` skip — and each is armed independently: five same-partition entries at
-// the DEFAULT floor of five, so the mutated build forms one admissible bin.
-//
-// NON-REDUNDANT, MEASURED not argued. Four mutations were APPLIED against the whole lib suite
-// (population 3378) and their failure sets recorded:
-//
-//   delete the skip entirely                       -> 3 RED: puffin + orc + avro, nothing else
-//   exempt Orc    (`Parquet | Orc` in the skip)    -> 1 RED: orc only
-//   exempt Avro   (`Parquet | Avro`)               -> 1 RED: avro only
-//   exempt Puffin (`Parquet | Puffin`)             -> 1 RED: puffin only
-//
-// THE PUFFIN ELEMENT IS NOW UNKILLABLE, recorded rather than quietly counted. Since the V3 arm
-// landed, `execute` dispatches a V3 table away before this skip runs, and V1/V2 cannot commit a
-// Puffin position delete at all (`validate_delete_file_for_version` rejects a DV below V3). So no
-// table reaches the skip's Puffin leg. It stays as defensive code against externally written
-// metadata. `test_v3_deletion_vectors_are_not_compacted` now pins the V3 arm's honest zeros
-// instead. The Orc and Avro elements are unaffected and still kill their own mutants.
-//
-// So each variant of the closed enum has a mutant that ONLY its own pin kills — none of the three
-// is a duplicate of another, and no other test in the suite covers any of them.
-//
-// DISCLOSURE — C-036 NEEDS A THIRTEENTH RECIPE, and by its own rule ("a pin needing a tenth recipe
-// is a finding") that is a finding, filed here rather than silently invented. All three pins below
-// stand on a fixture the enumeration does not describe, and so do two PRE-EXISTING tests:
-//
-//   * RECIPE 13 — the DEFAULT-FLOOR ADMISSIBLE BIN. FIVE SUB-MIN position-delete entries in ONE
-//     partition at the SHIPPED defaults, NO knobs; asserted by every measured size < the resolved
-//     `min_file_size_bytes` and `min_input_files == 5`, so the five are all candidates, pack into
-//     one bin and clear `enough_input_files` on their own.
-//
-// It is NOT recipe 8 (five IN-RANGE files, zero candidates, the candidate filter's existence pin)
-// and not recipe 7 (four files behind four explicit knobs). It is the fixture a pin needs whenever
-// the thing under test must be reached THROUGH admission at the default config rather than around
-// it — which is why `test_admission_min_input_files_default_five_declines_four_admits_five` (G2)
-// and `test_admitted_bin_with_zero_pairs_is_skipped` (G4) already built it before this group did.
-// This extends G3's recipe 10/11/12 finding; the ledger edit is outside this group's fence and is
-// carried as a hand-off.
-//
-// ADJUDICATION, recorded because two clauses name this fixture. C-008's enumeration names the
-// Puffin pin `test_non_parquet_position_deletes_skipped_at_collection_puffin`, while C-014 element 7
-// rules the PRE-EXISTING `test_v3_deletion_vectors_are_not_compacted` "reworked to FIVE Puffin DVs,
-// NO KNOB". Both describe the SAME fixture (five Puffin DVs, one partition, default config) and the
-// SAME pin form (the applied skip mutation), so they are ONE test, not two: a duplicate would share
-// the single mutant and discriminate nothing. The pre-existing NAME is kept, because C-014's
-// disposition table cites it and the V3-DV scope is the older, wider claim; C-008's Puffin element
-// is discharged here and cross-referenced above, so neither scope loses its pin.
-// =================================================================================================
-
-/// CASE 1 — HONEST ZEROS. On a V3 table, FIVE data files in partition 0 are each masked by a Puffin
-/// DELETION VECTOR. A DV is file-scoped, so there is nothing to bin-pack and nothing to convert: the
-/// arm LOOKS at all five and returns zero counts with no commit. On the V3 arm those zeros are a
-/// total statement — an input the arm cannot express is an `Err` — so a caller can tell "looked,
-/// found nothing to do" from "did not look". The five DVs stay live and the read set is unchanged.
-///
-/// NO KNOB, deliberately (C-014 element 7). The previous form was a TWO-DV fixture carrying
-/// `.min_input_files(2)`, and that knob was load-bearing only for the MUTATED build — under the
-/// size gate a two-file group is below the floor, so the mutant that deletes the skip would have
-/// been declined by admission rather than caught by this test. FIVE DVs at the shipped defaults
-/// remove the knob and the dependency on it: the mutated build clears `enough_input_files` on its
-/// own (5 > 1 and 5 >= 5), so this pin now measures the SKIP and nothing else.
-///
-/// MUTATION COVERAGE — APPLIED: classify a Puffin DV as a convertible legacy delete in
-/// `admit_position_delete` and the arm tries to convert all five. RED. The former claim on the
-/// `file_format() != Parquet` skip no longer holds — see the Puffin note in the C-008 banner above,
-/// and deleting the version dispatch leaves this test GREEN because that skip still drops all five.
-///
-/// FIXTURE PRECONDITIONS asserted before `execute` (so a drifted fixture reds instead of passing
-/// vacuously): five DVs in ONE partition, every one sub-min, and the resolved floor is FIVE.
+/// Honest zeros: five Puffin DVs on V3. File-scoped, so nothing to convert and no commit.
 #[tokio::test]
 async fn test_v3_deletion_vectors_are_not_compacted() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -979,8 +788,6 @@ async fn test_v3_deletion_vectors_are_not_compacted() {
         "before: each DV masks its data file's second row (y = 11, 21, 31, 41, 51)"
     );
 
-    // FIXTURE PRECONDITIONS at the DEFAULT config — the mutated build must be ADMITTED, or the
-    // skip is not what this test measures.
     let action = || RewritePositionDeleteFiles::new(table.clone());
     let config = action().resolve_config().expect("the defaults are legal");
     let dvs = live_delete_files(&table).await;
@@ -1038,9 +845,7 @@ async fn test_v3_deletion_vectors_are_not_compacted() {
     );
 }
 
-/// Write a single-data-file Puffin DELETION VECTOR masking the given absolute positions of `target_path`,
-/// in partition x=0. Uses the [`DVFileWriter`] (the same writer the DV write path uses), so the produced
-/// `DeleteFile` is a faithful Puffin DV the scan applies.
+/// Write a single-data-file Puffin DELETION VECTOR masking the given absolute positions of `target_path`, in partition x=0.
 async fn write_deletion_vector(table: &Table, target_path: &str, positions: &[u64]) -> DataFile {
     use crate::writer::base_writer::deletion_vector_writer::DVFileWriter;
 
@@ -1071,22 +876,7 @@ async fn write_deletion_vector(table: &Table, target_path: &str, positions: &[u6
         .expect("one DV delete file")
 }
 
-/// Commit FIVE live position-delete manifest entries in partition 0 whose `file_format` is
-/// `format` — the fixture for C-008's V2 ORC and Avro elements — and return their measured sizes.
-///
-/// WHY FABRICATED, AND WHY THAT IS SOUND. The format skip fires during the manifest walk, BEFORE
-/// any file is opened (`collect_position_delete_groups` reads `file_format()` off the entry and
-/// `continue`s; nothing between the walk and the skip touches the bytes). So the pin needs a
-/// manifest ENTRY that says ORC/Avro, not an ORC/Avro encoder the fork does not have. Each entry is
-/// produced by a real [`write_position_delete_file`] write — i.e. through the writer's own
-/// `DataFileBuilder`, so every required field is populated exactly as a genuine entry's would be —
-/// and only the `file_format` field is re-stamped. The bytes on disk stay PARQUET on purpose: under
-/// the applied mutation (skip deleted) the entries are then read successfully and COMPACTED, so the
-/// mutant reds on this test's own count/shape assertions rather than on an IO error. That is the
-/// stronger red — it proves the SKIP is what drops these files, not a failed read.
-///
-/// The five entries mask the same `(target_path, pos)` pair, which keeps them the same size class
-/// and makes the group's composition the only thing that varies between the Orc and Avro pins.
+/// Commit FIVE live position-delete manifest entries in partition 0 whose `file_format` is `format`, and return their measured sizes.
 async fn add_fabricated_non_parquet_pos_deletes(
     catalog: &impl Catalog,
     table: &Table,
@@ -1109,22 +899,7 @@ async fn add_fabricated_non_parquet_pos_deletes(
     (table, sizes)
 }
 
-/// The shared body of C-008's ORC and Avro elements: FIVE live position-delete entries in one
-/// partition whose `file_format` is `format` are dropped at collection, so the action is a no-op.
-///
-/// FIXTURE PRECONDITIONS asserted before `execute`: all five entries live and carrying `format`,
-/// content `PositionDeletes` (so they clear the CONTENT filter and actually REACH the format skip),
-/// every one sub-min, and the resolved floor is FIVE — i.e. the mutated build forms exactly one
-/// ADMISSIBLE bin. Without those the pin could pass because the group was declined on count.
-///
-/// A post-`execute` SCAN is deliberately NOT asserted, and the omission is not a gap: the table's
-/// metadata now claims five ORC/Avro delete files the scan has no reader for, so a read would fail
-/// for a reason that has nothing to do with this action. The post-`execute` signal is SHAPE —
-/// zero counts, no new snapshot, all five entries still live and still carrying `format`.
-///
-/// MUTATION COVERAGE — APPLIED, not predicted: delete the `file_format() != Parquet` skip and the
-/// five entries become one admissible five-file bin, are read (the bytes really are parquet),
-/// compacted into one file and committed. RED on the counts, the snapshot id and the live set.
+/// The shared body of C-008's ORC and Avro elements: five live position-delete entries in one partition whose `file_format` is `format` are dropped at collection, so the action is a no-op.
 async fn assert_non_parquet_pos_deletes_are_skipped(format: DataFileFormat) {
     let (catalog, _temp) = local_fs_catalog().await;
     let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
@@ -1182,32 +957,17 @@ async fn assert_non_parquet_pos_deletes_are_skipped(format: DataFileFormat) {
     );
 }
 
-/// C-008, `Orc` element. A V2 table carrying FIVE live ORC position-delete entries in one partition
-/// is left completely alone: the `file_format() != Parquet` skip drops them at collection.
-///
-/// THIS IS THE DIVERGENCE, not a parity claim. Java's `BinPackRewritePositionDeletePlanner` is
-/// format-blind and WOULD compact these five; the fork cannot, because `compact_group` reads
-/// through the parquet reader and writes through `ParquetWriterBuilder`. Recorded in
-/// `docs/parity/GAP_MATRIX.md` row R136 and at the skip itself.
+/// C-008 ORC: five live ORC position deletes on V2 are skipped, not compacted.
 #[tokio::test]
 async fn test_non_parquet_position_deletes_skipped_at_collection_orc() {
     assert_non_parquet_pos_deletes_are_skipped(DataFileFormat::Orc).await;
 }
 
-/// C-008, `Avro` element — the same fixture and the same applied mutation as the ORC pin, over the
-/// last of `DataFileFormat`'s four variants. Both are listed because the skip is a single
-/// inequality against `Parquet`: a future implementation that special-cased ORC (say, by adding an
-/// ORC reader) would keep one pin green and red the other.
+/// C-008, `Avro` element — the same fixture and mutation as the ORC pin.
 #[tokio::test]
 async fn test_non_parquet_position_deletes_skipped_at_collection_avro() {
     assert_non_parquet_pos_deletes_are_skipped(DataFileFormat::Avro).await;
 }
-
-// =================================================================================================
-// NO-OP edges. The SINGLE-FILE no-op moved into C-021's size-class trio (see
-// `test_admission_sub_min_single_file_is_declined`): a lone position-delete file is a no-op only in
-// size classes 1 and 2 — class 3, above `max_file_size`, is ADMITTED and SPLIT.
-// =================================================================================================
 
 /// No current snapshot → no-op, zero counts, no commit.
 #[tokio::test]
@@ -1221,13 +981,7 @@ async fn test_no_current_snapshot_is_a_no_op() {
     assert_eq!(result, RewritePositionDeleteFilesResult::default());
 }
 
-/// Unpartitioned table: two pos-delete files in the single unpartitioned group compact into one. Read
-/// identity holds.
-/// MIGRATED (size gate): this fixture is a TWO-file group, deliberately BELOW Java's
-/// `MIN_INPUT_FILES_DEFAULT` of 5, because its subject is the UNPARTITIONED group key — not
-/// admission. It therefore sets `.min_input_files(2)` explicitly, which is also acceptance item
-/// 2: the floor is configuration, not a hard-coded constant. Removing that knob must RED this
-/// test — it asserts post-`execute` SHAPE, never read identity alone.
+/// Unpartitioned table: two position deletes in the single unpartitioned group compact into one.
 #[tokio::test]
 async fn test_unpartitioned_group_compacts() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -1264,19 +1018,7 @@ async fn test_unpartitioned_group_compacts() {
     assert_eq!(count_pos(&live_delete_files(&reloaded).await), 1);
 }
 
-// =================================================================================================
-// CONFIG SEAM — the size/count thresholds, their Java defaults, the delete-specific property, the
-// `Long.parseLong`-exact parse, and Java's `sizeThresholds` preconditions.
-//
-// Every default here is asserted WHITE-BOX through `resolve_config()` (private, but reachable — this
-// is a child module), never end to end: observing 50331648 / 120795955 end to end would need ~48 MiB
-// and ~115 MiB fixtures. These pins are therefore named `test_config_*` / `test_resolve_config_*` /
-// `test_parse_delete_target_*` and NEVER `test_admission_*`, so no later change lowers the target to
-// make them end-to-end and thereby unpins the ratio constants.
-// =================================================================================================
-
 /// A minimal unpartitioned table carrying `properties` — the fixture for the white-box config pins.
-/// The config seam reads only `metadata().properties()`, so the table needs no snapshot and no files.
 async fn config_table(properties: &[(&str, &str)]) -> (TempDir, Table) {
     let (catalog, temp_dir) = local_fs_catalog().await;
     let schema = three_long_schema();
@@ -1308,8 +1050,7 @@ async fn config_table(properties: &[(&str, &str)]) -> (TempDir, Table) {
     (temp_dir, table)
 }
 
-/// `write.delete.target-file-size-bytes` as a `HashMap`, for the pins that exercise the parse function
-/// alone (no table needed).
+/// `write.delete.target-file-size-bytes` as a `HashMap`, for the pins that exercise the parse function alone (no table needed).
 fn delete_target_property(value: &str) -> std::collections::HashMap<String, String> {
     std::collections::HashMap::from([(
         TableProperties::PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES.to_string(),
@@ -1317,9 +1058,7 @@ fn delete_target_property(value: &str) -> std::collections::HashMap<String, Stri
     )])
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-035 — the parse: one function whose accept/reject domain is `Long.parseLong`'s, EXACTLY.
-// ------------------------------------------------------------------------------------------------
 
 /// C-035 element 1 (ABSENT). No property ⇒ the 64 MiB delete default.
 #[test]
@@ -1331,8 +1070,7 @@ fn test_parse_delete_target_absent_is_64_mib() {
     );
 }
 
-/// C-035 element 2 (a well-formed decimal in `[2, i64::MAX - 1]`) — the only class that can also
-/// SURVIVE the preconditions. A leading `+` is accepted, matching `Long.parseLong`.
+/// C-035 element 2 (a well-formed decimal in `[2, i64::MAX - 1]`) — the only class that can also SURVIVE the preconditions.
 #[test]
 fn test_parse_delete_target_mid_band_is_accepted() {
     assert_eq!(
@@ -1346,9 +1084,7 @@ fn test_parse_delete_target_mid_band_is_accepted() {
     );
 }
 
-/// C-035 element 3, upper endpoint. `i64::MAX` PARSES (this is a parse-function assertion only —
-/// whether it then survives the preconditions is `resolve_config`'s business, pinned separately by
-/// `test_resolve_config_rejects_target_at_i64_max_on_the_max_precondition`).
+/// C-035: `i64::MAX` parses, matching `Long.parseLong`. Downstream preconditions may still reject it.
 #[test]
 fn test_parse_delete_target_at_i64_max_is_accepted_by_the_parse() {
     assert_eq!(
@@ -1367,9 +1103,7 @@ fn test_parse_delete_target_at_one_is_accepted_by_the_parse() {
     );
 }
 
-/// C-035 element 6 (unparsable / empty). Every one of these throws `NumberFormatException` in Java,
-/// so every one must be a `DataInvalid` here — including the forms Rust's parser could plausibly have
-/// accepted (`1_000` is a Rust literal, not a `Long.parseLong` input).
+/// C-035: unparsable and empty strings fail, matching `NumberFormatException`.
 #[test]
 fn test_parse_delete_target_unparsable_is_data_invalid() {
     for value in ["", "abc", "1_000", " 12", "12 ", "0x10", "1.0", "12,3", "+"] {
@@ -1386,9 +1120,7 @@ fn test_parse_delete_target_unparsable_is_data_invalid() {
     }
 }
 
-/// C-035 element 6 (magnitude outside the `long` range) — THE anti-`u64` pin. `Long.parseLong` throws
-/// on anything above `Long.MAX_VALUE`, so these must be rejected AT THE PARSE. A `u64` parse would
-/// accept every one of them and hand the action a threshold Java cannot express.
+/// C-035 element 6 (magnitude outside the `long` range) — THE anti-`u64` pin.
 #[test]
 fn test_parse_delete_target_above_i64_max_is_rejected() {
     for value in [
@@ -1408,9 +1140,7 @@ fn test_parse_delete_target_above_i64_max_is_rejected() {
     );
 }
 
-/// C-035 element 4 (`"0"`). It PARSES — and is then rejected downstream by precondition (1) carrying
-/// Java's verbatim `'%s' is set to %s but must be > 0`. A `u64` parse would also parse it, so the
-/// discriminating half is the message.
+/// C-035: `"0"` parses, then precondition (1) rejects it with Java's verbatim message.
 #[tokio::test]
 async fn test_parse_delete_target_zero_is_rejected_by_the_target_precondition() {
     assert_eq!(
@@ -1429,14 +1159,7 @@ async fn test_parse_delete_target_zero_is_rejected_by_the_target_precondition() 
     );
 }
 
-/// C-035 element 5 (a NEGATIVE decimal). `"-1"` PARSES as `i64` exactly as `Long.parseLong` parses it
-/// — a `u64` parse would reject it at the parse with a fork-only message — and is then rejected by
-/// precondition (1).
-///
-/// This is also the ORDER pin for C-006: at `target = -1` this port's `d2l` saturates BOTH ratio
-/// products to `0`, so `min = 0` and precondition (3) `target > min` (`-1 > 0`) is INDEPENDENTLY
-/// false. Hoisting (3) above (1) therefore reports the min-threshold message instead, and this
-/// assertion reds.
+/// C-035: `"-1"` parses as `i64`, matching `Long.parseLong`. Then precondition (1) rejects it. a `u64` parse would reject it.
 #[tokio::test]
 async fn test_parse_delete_target_negative_is_rejected_by_the_target_precondition() {
     assert_eq!(
@@ -1456,9 +1179,7 @@ async fn test_parse_delete_target_negative_is_rejected_by_the_target_preconditio
     );
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-002 / C-032 — the target resolves from the DELETE property, never from the data-file one.
-// ------------------------------------------------------------------------------------------------
 
 /// C-002. No property ⇒ 64 MiB (Java `defaultTargetFileSize`'s `ldc2_w 67108864L`).
 #[tokio::test]
@@ -1483,10 +1204,7 @@ async fn test_config_target_file_size_resolves_delete_property() {
     assert_eq!(config.max_file_size_bytes, 22222220);
 }
 
-/// C-002, the NEGATIVE CONTROL. `write.target-file-size-bytes` is the DATA-file target (512 MiB) and
-/// must not move the delete target by so much as a byte — Java's
-/// `BinPackRewritePositionDeletePlanner.defaultTargetFileSize` never reads it. Reds if the port
-/// resolves from `TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES`.
+/// C-002: the data-file target property must not change this action's delete-file target. move the delete target. Reds if.
 #[tokio::test]
 async fn test_config_write_target_file_size_does_not_move_delete_target() {
     let (_temp, table) = config_table(&[("write.target-file-size-bytes", "536870912")]).await;
@@ -1511,12 +1229,9 @@ async fn test_config_target_file_size_builder_overrides_property() {
     assert_eq!(config.target_file_size_bytes, 99_999_999);
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-007 — the ratio defaults through the shared `d2l` helper.
-// ------------------------------------------------------------------------------------------------
 
-/// C-007. `min = d2l(target * 0.75)`; at the 64 MiB delete default that is EXACTLY 50331648 (dyadic,
-/// so no rounding is involved). Asserted as a literal so the ratio constant cannot drift.
+/// C-007: at the 64 MiB default, `d2l(target * 0.75)` is exactly 50331648. so no rounding is involved)..
 #[tokio::test]
 async fn test_config_min_file_size_default_is_three_quarters_target() {
     let (_temp, table) = config_table(&[]).await;
@@ -1526,9 +1241,7 @@ async fn test_config_min_file_size_default_is_three_quarters_target() {
     assert_eq!(config.min_file_size_bytes, 50331648);
 }
 
-/// C-007. `max = d2l(target * 1.8)`; at the 64 MiB delete default `1.8 * 2^26 = 120795955.2`, which
-/// Java's `d2l` TRUNCATES to 120795955. Asserted as a literal, so both the ratio and the truncation
-/// (vs rounding) are pinned.
+/// C-007: at the 64 MiB default, `d2l(target * 1.8)` truncates as Java does.
 #[tokio::test]
 async fn test_config_max_file_size_default_is_one_point_eight_target() {
     let (_temp, table) = config_table(&[]).await;
@@ -1538,18 +1251,10 @@ async fn test_config_max_file_size_default_is_one_point_eight_target() {
     assert_eq!(config.max_file_size_bytes, 120795955);
 }
 
-/// C-007, THE CLAMP. Java's `d2l` saturates at `Long.MAX_VALUE`; Rust's `as u64` saturates at
-/// `u64::MAX`, so `.min(i64::MAX as u64)` is the parity act.
-///
-/// The window in which it is OBSERVABLE is `target ∈ (2^63 / 1.8, i64::MAX - 1]`: there the clamped
-/// max IS `i64::MAX` while the unclamped one is larger, and BOTH are above the target, so
-/// `resolve_config` returns `Ok` either way and the equality is the discriminator rather than the
-/// Ok/Err split. `6e18` sits inside it.
+/// C-007: clamp `d2l` at `i64::MAX`, matching Java. Unclamped Rust saturates at `u64::MAX`. `u64::MAX`, so `.min(i64::MAX as u64)`.
 #[tokio::test]
 async fn test_config_max_file_size_clamps_to_java_long_max() {
     const TARGET: u64 = 6_000_000_000_000_000_000;
-    // Fixture preconditions: inside the observable window, and the unclamped product really does
-    // exceed Java's ceiling (otherwise this test would pass with the clamp deleted).
     assert!(
         (TARGET as f64) > (i64::MAX as f64) / 1.8,
         "fixture: the target must sit above 2^63 / 1.8"
@@ -1573,15 +1278,9 @@ async fn test_config_max_file_size_clamps_to_java_long_max() {
     assert_ne!(config.max_file_size_bytes, unclamped);
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-001 — the remaining two ported options and their defaults.
-// ------------------------------------------------------------------------------------------------
 
-/// C-001. `min_input_files` defaults to Java's `MIN_INPUT_FILES_DEFAULT = 5`. Asserted with
-/// `assert_eq!` so it reds on a raise AND on a lower.
-///
-/// TODO(tests): the two-sided ADMISSION pin — four files declined, five admitted, at the DEFAULT
-/// config — belongs to the gate, not to this config seam, and is owed by the test increment.
+/// C-001: `min_input_files` defaults to Java's 5.
 #[tokio::test]
 async fn test_config_min_input_files_default_is_five() {
     let (_temp, table) = config_table(&[]).await;
@@ -1591,8 +1290,7 @@ async fn test_config_min_input_files_default_is_five() {
     assert_eq!(config.min_input_files, 5);
 }
 
-/// C-001. `max_file_group_size_bytes` defaults to Java's
-/// `MAX_FILE_GROUP_SIZE_BYTES_DEFAULT = 107374182400` (100 GiB).
+/// C-001: `max_file_group_size_bytes` defaults to Java's 100 GiB. `MAX_FILE_GROUP_SIZE_BYTES_DEFAULT = 107374182400` (100 GiB).
 #[tokio::test]
 async fn test_config_max_file_group_size_default_is_100_gib() {
     let (_temp, table) = config_table(&[]).await;
@@ -1603,8 +1301,7 @@ async fn test_config_max_file_group_size_default_is_100_gib() {
     assert_eq!(config.max_file_group_size_bytes, 100 * 1024 * 1024 * 1024);
 }
 
-/// C-001. All five ported builders land on the resolved config — one assertion per option, so a
-/// builder wired to the wrong field reds.
+/// C-001: all five ported builders land on the resolved config. builder wired to the wrong field.
 #[tokio::test]
 async fn test_config_explicit_overrides_are_returned_unchanged() {
     let (_temp, table) = config_table(&[]).await;
@@ -1623,9 +1320,7 @@ async fn test_config_explicit_overrides_are_returned_unchanged() {
     assert_eq!(config.max_file_group_size_bytes, 1_000_000);
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-006 — Java's `sizeThresholds` preconditions, each with Java's verbatim message.
-// ------------------------------------------------------------------------------------------------
 
 /// C-006 precondition (1), via the builder path.
 #[tokio::test]
@@ -1642,9 +1337,7 @@ async fn test_resolve_config_rejects_target_zero() {
     );
 }
 
-/// C-006 precondition (1) at a NEGATIVE target — the ORDER-discriminating pin. See
-/// `test_parse_delete_target_negative_is_rejected_by_the_target_precondition` for why `min` is `0`
-/// here and why that makes precondition (3) independently false.
+/// C-006 precondition (1) at a NEGATIVE target — the ORDER-discriminating pin.
 #[tokio::test]
 async fn test_resolve_config_rejects_target_negative_with_the_must_be_positive_message() {
     let (_temp, table) = config_table(&[("write.delete.target-file-size-bytes", "-7")]).await;
@@ -1752,13 +1445,7 @@ async fn test_resolve_config_rejects_max_file_group_size_zero() {
         .expect("max_file_group_size_bytes = 1 is legal");
 }
 
-/// C-006 precondition (7) — ONE LEG PER KNOB. Java's thresholds are `long`s fed by `Long.parseLong`,
-/// so an override above `i64::MAX` is a config Java cannot express; admitting it would open a state
-/// in which `too_much_content` (`input_size > max`) is unreachable for every possible input.
-///
-/// Each leg sets exactly ONE over-range knob and asserts that knob's own message, which is what
-/// forces (7) to run at override-READ time: checked after (3)/(4) instead, the `min` leg would be
-/// caught by (3) and the `target` leg by (4), both with the wrong message.
+/// C-006 precondition (7) — ONE LEG PER KNOB.
 #[tokio::test]
 async fn test_resolve_config_rejects_size_override_above_i64_max() {
     const ABOVE: u64 = i64::MAX as u64 + 1;
@@ -1792,17 +1479,13 @@ async fn test_resolve_config_rejects_size_override_above_i64_max() {
         );
     }
 
-    // Two-sided: `i64::MAX` itself is accepted BY (7) on every knob (the `max` leg then resolves
-    // cleanly; the other two are rejected later, by (3)/(4), which is a different message).
     RewritePositionDeleteFiles::new(table)
         .max_file_size_bytes(i64::MAX as u64)
         .resolve_config()
         .expect("i64::MAX is inside Java's long domain");
 }
 
-/// C-035 element 3 downstream. `i64::MAX` PARSES, then falls to precondition (4): its defaulted max
-/// CLAMPS to `i64::MAX`, so `target < max` is false. Asserts `Err` + the message, never a resolved
-/// value.
+/// C-035: `i64::MAX` parses, then precondition (4) rejects the defaulted max. CLAMPS to `i64::MAX`, so `target.
 #[tokio::test]
 async fn test_resolve_config_rejects_target_at_i64_max_on_the_max_precondition() {
     let (_temp, table) =
@@ -1818,24 +1501,7 @@ async fn test_resolve_config_rejects_target_at_i64_max_on_the_max_precondition()
     );
 }
 
-// =================================================================================================
-// THE ADMISSION GATE — the candidate filter (C-004), the six-stage pipeline order (C-005), the
-// three-clause group filter (C-003), the shared bin packer (C-027) and the saturating input sum
-// (C-041).
-//
-// FIXTURE DISCIPLINE (C-036), applied without exception below: a size-class fixture is NEVER sized
-// to fixed knobs. The position-delete file is written first, its `file_size_in_bytes` is MEASURED
-// off the returned `DataFile`, and the knobs are then set AROUND that measurement. Every size-class
-// test asserts its measured size against the RESOLVED thresholds BEFORE `execute`, so a fixture that
-// drifts out of its size class fails loudly instead of passing vacuously. Where a knob derivation
-// makes a window assert an algebraic identity in the fixture size, that is RECORDED as true by
-// construction rather than dressed up as a check.
-// =================================================================================================
-
-/// Write a position-delete file masking `count` consecutive positions of `target_path` starting at
-/// `first_pos`, in partition 0. This is the SIZE DIAL for the size-class fixtures: more masked
-/// positions ⇒ a strictly larger file (the `file_path` column dictionary-encodes to one value, so the
-/// growth is the `pos` column). The size is never predicted — it is measured off the return value.
+/// Write a position-delete file masking `count` consecutive positions of `target_path` from `first_pos`, in partition 0.
 async fn write_sized_pos_delete(
     table: &Table,
     target_path: &str,
@@ -1848,9 +1514,7 @@ async fn write_sized_pos_delete(
     write_position_delete_file(table, Some(0), &pairs).await
 }
 
-/// A partitioned table with ONE five-row data file (y = 10,20,30,40,50 at positions 0..5) already
-/// committed — the base every gate fixture below builds its position-delete files on. Returns the
-/// catalog, the temp dir (kept alive), the table and the data file's path.
+/// A partitioned table with ONE five-row data file (y = 10,20,30,40,50 at positions 0.
 async fn gate_table() -> (impl Catalog, TempDir, Table, String) {
     let (catalog, temp) = local_fs_catalog().await;
     let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
@@ -1867,9 +1531,7 @@ async fn gate_table() -> (impl Catalog, TempDir, Table, String) {
     (catalog, temp, table, x_path)
 }
 
-/// The live position-delete files in MANIFEST ORDER — the same order
-/// `collect_position_delete_groups` walks, so a fixture whose packing depends on order can assert
-/// the order it actually gets instead of assuming it.
+/// The live position-delete files in MANIFEST ORDER — the same order `collect_position_delete_groups` walks, so a fixture whose packing depends on order can assert the order it actually gets instead of assuming it.
 async fn live_pos_delete_paths(table: &Table) -> Vec<String> {
     live_delete_files(table)
         .await
@@ -1879,18 +1541,9 @@ async fn live_pos_delete_paths(table: &Table) -> Vec<String> {
         .collect()
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-003 element 1 — `enough_input_files`'s `size > 1` conjunct.
-// ------------------------------------------------------------------------------------------------
 
-/// C-003 element 1. `.min_input_files(1)` with a SINGLE sub-min position-delete file. The file IS a
-/// candidate (sub-min) and forms a bin of one, so the gate is reached; `enough_input_files` is
-/// `size > 1 && size >= min_input_files`, and only the `size > 1` conjunct declines it — `1 >= 1`
-/// holds. `enough_content` is false for the same reason, and the file is far below `max`, so
-/// `too_much_content` is false too.
-///
-/// MUTATION COVERAGE: this is the ONLY killer of `enough_input_files`'s `size > 1` conjunct. Drop it
-/// and the bin is admitted, producing a Replace snapshot and non-zero counts.
+/// C-003: a lone sub-min file with `min_input_files(1)` is a candidate but still declined.
 #[tokio::test]
 async fn test_admission_min_input_files_one_still_declines_lone_sub_min_file() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -1940,23 +1593,9 @@ async fn test_admission_min_input_files_one_still_declines_lone_sub_min_file() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-003 element 2 (+ C-001, and the execute-altitude proof that the resolved config is CONSULTED).
-// ------------------------------------------------------------------------------------------------
 
-/// C-003 element 2, TWO-SIDED at the DEFAULT config — the acceptance-criterion-1 pin and THE parity
-/// number this whole change is about. Four small position-delete files in one partition are DECLINED
-/// under Java's `MIN_INPUT_FILES_DEFAULT = 5`; a fifth flips the same partition to ADMITTED.
-///
-/// NON-VACUITY: the fixture asserts that the four/five-file input size is at or below BOTH the
-/// resolved target and the resolved max, so neither `enough_content` nor `too_much_content` can be
-/// the admitter — the fifth file admits through `enough_input_files` and nothing else.
-///
-/// MUTATION COVERAGE, two-sided and both applied: `MIN_INPUT_FILES_DEFAULT` 5 → 4 admits the
-/// four-file case (first half reds); 5 → 6 declines the five-file case (second half reds). It is
-/// also the EXECUTE-ALTITUDE pin that the resolved config is actually consumed by the planner: the
-/// action sets no builder overrides at all, so a planner that ignored `config.min_input_files` (say,
-/// by keeping a hard-coded floor of 2) admits the four-file case and reds here.
+/// C-003 element 2, TWO-SIDED at the DEFAULT config.
 #[tokio::test]
 async fn test_admission_min_input_files_default_five_declines_four_admits_five() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2055,23 +1694,9 @@ async fn test_admission_min_input_files_default_five_declines_four_admits_five()
     );
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-003 element 4 — `enough_content` and its STRICTNESS at the target.
-// ------------------------------------------------------------------------------------------------
 
-/// C-003 element 4. TWO sub-min position-delete files whose MEASURED sizes sum to just over the
-/// target: below the count floor of five, so only `enough_content` can admit them.
-///
-/// KNOBS FROM THE MEASUREMENTS: `target := S_A + S_B - 1`, with min/max defaulted (0.75x / 1.8x), so
-/// both files are sub-min candidates and the bin's input is one byte over the target.
-///
-/// RECORDED AS TRUE BY CONSTRUCTION, not asserted as if it were falsifiable: `input_size > target`
-/// is an identity under `target := S_A + S_B - 1`. The falsifiable content is on the MEASURED
-/// OUTPUT — one Replace snapshot, two files rewritten, one added — plus the preconditions that make
-/// the OTHER two clauses provably false.
-///
-/// MUTATION COVERAGE: delete the `enough_content` disjunct and the bin is declined (2 < 5, and the
-/// input is far below max) — zero counts, no snapshot.
+/// C-003: two sub-min files whose sizes sum just over target are admitted. target. They are below the count.
 #[tokio::test]
 async fn test_admission_enough_content_admits_two_files_over_target() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2122,14 +1747,7 @@ async fn test_admission_enough_content_admits_two_files_over_target() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-/// C-003 element 4, THE BOUNDARY. The same two sub-min files, but `target := S_A + S_B` exactly.
-/// `enough_content` is `input_size > target`, STRICT, so an input EQUAL to the target is declined.
-///
-/// RECORDED AS TRUE BY CONSTRUCTION: `input_size == target` is an identity under the knob choice.
-/// The falsifiable content is the MEASURED OUTCOME — zero counts and no new snapshot — plus the
-/// preconditions that rule out the other two clauses.
-///
-/// MUTATION COVERAGE: relax `input_size > target` to `>=` and this bin is admitted.
+/// C-003 element 4, THE BOUNDARY. The same two sub-min files with `target := S_A + S_B` exactly.
 #[tokio::test]
 async fn test_admission_input_size_exactly_target_is_declined() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2175,22 +1793,9 @@ async fn test_admission_input_size_exactly_target_is_declined() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-003 element 5 — `too_much_content` EXISTS and carries NO `size > 1` guard.
-// ------------------------------------------------------------------------------------------------
 
-/// C-003 element 5, and acceptance criterion 3's ADMISSION leg. A LONE position-delete file above
-/// `max_file_size_bytes` IS admitted: `too_much_content` is `input_size > max_file_size_bytes` with
-/// no `size > 1` guard, unlike the other two clauses.
-///
-/// KNOBS FROM THE MEASUREMENT: `max := S - 1`, `target := S - 2`, `min := S - 3`, so the single file
-/// is oversized (hence a candidate) and forms a bin of one.
-///
-/// This test pins ADMISSION only. What the writer then does with an oversized input — the roll bound
-/// and the fixed point — is the writer increment's subject, not this clause's.
-///
-/// MUTATION COVERAGE: delete the `too_much_content` disjunct and this bin is declined by both
-/// `size > 1` guards — zero counts, no snapshot.
+/// C-003: a lone file above `max_file_size_bytes` is admitted (`too_much_content` has no size>1 guard). `too_much_content` is `input_size >.
 #[tokio::test]
 async fn test_admission_too_much_content_admits_lone_oversized_file() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2236,62 +1841,7 @@ async fn test_admission_too_much_content_admits_lone_oversized_file() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-// ------------------------------------------------------------------------------------------------
-// C-021 — SINGLE-FILE GROUPS, all three size classes. `is_candidate` and `group_qualifies` read
-// exactly ONE scalar per file (its length) against exactly TWO thresholds, and both comparisons are
-// STRICT, so the real line is TRICHOTOMOUS and both boundary values fall in the middle class:
-//
-//   1. `size < min_file_size`            -> candidate, bin of 1, all three clauses FALSE -> DECLINED
-//   2. `min <= size <= max`              -> NOT a candidate, never reaches packing       -> DECLINED
-//   3. `size > max_file_size`            -> candidate, bin of 1, too_much_content TRUE   -> ADMITTED
-//
-// Element 3 is `test_admission_too_much_content_admits_lone_oversized_file`, directly above (it is
-// also C-003 element 5's pin and acceptance criterion 3's admission leg); elements 1 and 2 follow.
-//
-// WHY EACH CARRIES A WHITE-BOX `is_candidate` LEG. Classes 1 and 2 are INDISTINGUISHABLE BY OUTCOME
-// — both are DECLINED with zero counts and no snapshot — so the end-to-end assertions alone cannot
-// tell which mechanism did the work, and a fixture that drifted from one class into the other would
-// still pass. The measured-size precondition (asserted FIRST, per C-021 and C-036) fixes the class;
-// the `is_candidate` leg then asserts the MECHANISM that class implies. It is the same white-box
-// seam `test_gate_*_white_box` already opens on `group_qualifies`, used here for the same reason:
-// the fact is real, and no black-box fixture can express it.
-//
-// The two BOUNDARY values (`size == min`, `size == max`) are deliberately NOT pinned here: a LONE
-// boundary file cannot discriminate the strictness mutants (both leave the observable DECLINED with
-// zero counts), which is why C-004's pins pair the boundary file with a sub-min COMPANION.
-// ------------------------------------------------------------------------------------------------
-
-/// C-021 element 1 (C-036 recipe 1). A LONE SUB-MIN position-delete file is DECLINED. It IS a
-/// candidate — `outsideDesiredFileSizeRange` is true below `min` — so it forms a bin of one and
-/// REACHES the gate, where all three clauses are false: `enough_input_files` and `enough_content`
-/// are both killed by their `size > 1` conjunct, and `too_much_content` is false because the file is
-/// nowhere near `max`.
-///
-/// KNOBS FROM THE MEASUREMENT (recipe 1): `min := S + 1`, `target := S + 2`, `max := S + 3`. The
-/// gaps are the smallest values that satisfy C-006's STRICT `min < target < max`.
-///
-/// TRUE BY CONSTRUCTION, RECORDED not dressed up (C-036): with `min := S + 1` the precondition
-/// `S < min` is an algebraic identity in `S`. The knobs are derived FROM the measured size, so the
-/// fixture CANNOT drift out of its class and the assert cannot red on drift. It is asserted anyway
-/// because it is not tautological against the SEAM — it still reds if `resolve_config` ever stopped
-/// honouring the explicit overrides — but it is NOT this test's falsifiable content. That content is
-/// the `is_candidate` leg plus the declined outcome, each with an APPLIED killer recorded below.
-///
-/// PROVENANCE — this test REPLACES `test_single_file_group_is_a_no_op`, whose name and doc asserted
-/// a universal the size gate FALSIFIES: "Java's planner drops single-file groups" is false, because
-/// `too_much_content` has no `size > 1` guard, so a lone file above `max` is admitted (element 3
-/// above). The old fixture also lost its mutant — under the deleted `entries.len() < 2` guard it
-/// pinned that guard, and the guard is gone. C-014 element 9 routes it instead to C-003 element 1's
-/// pin; that destination is ALREADY OCCUPIED by
-/// `test_admission_min_input_files_one_still_declines_lone_sub_min_file`, which carries the
-/// `.min_input_files(1)` knob that mutant needs, so following C-014 element 9 literally would have
-/// produced a duplicate sharing a single mutant. C-021's own proposition names THIS destination.
-/// Recorded as a deviation from C-014 element 9, in favour of C-021.
-///
-/// MUTATION COVERAGE, each APPLIED against the whole lib suite: `is_candidate`'s
-/// `length < min_file_size` disjunct deleted (the file stops being a candidate — the white-box leg
-/// reds); and `too_much_content`'s `input_size > max` flipped to `input_size < max` (the lone bin is
-/// admitted — the end-to-end legs red). What this test does NOT kill is recorded next to element 2.
+/// C-021: a lone sub-min file is a candidate and still declined by the group filter.
 #[tokio::test]
 async fn test_admission_sub_min_single_file_is_declined() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2312,16 +1862,12 @@ async fn test_admission_sub_min_single_file_is_declined() {
     };
     let config = action().resolve_config().expect("recipe 1 knobs are legal");
 
-    // PRECONDITION FIRST — the measured size against the RESOLVED thresholds. See the doc: an
-    // identity in `S` given the knob derivation, kept because it still checks the resolve_config
-    // seam, but NOT this test's falsifiable content.
+    // PRECONDITION FIRST — the measured size against the RESOLVED thresholds. An identity in `S`
     assert!(
         size < config.min_file_size_bytes,
         "fixture: the lone file must be SUB-MIN (measured {size}, resolved min {})",
         config.min_file_size_bytes
     );
-    // MECHANISM — what separates this class from element 2: sub-min means CANDIDATE, so the file
-    // does reach the gate and is declined THERE, not by the candidate filter.
     assert!(
         is_candidate(&entry, &config),
         "class 1 mechanism: a sub-min file IS a candidate and reaches the gate as a bin of one"
@@ -2351,26 +1897,7 @@ async fn test_admission_sub_min_single_file_is_declined() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-/// C-021 element 2 (C-036 recipe 2). A LONE IN-RANGE position-delete file is DECLINED for a
-/// DIFFERENT REASON than element 1: `outsideDesiredFileSizeRange` is false, so it is NOT a candidate
-/// and never reaches packing at all. The gate is not consulted.
-///
-/// KNOBS FROM THE MEASUREMENT (recipe 2): `min := S - 1`, `target := S`, `max := S + 1`, which puts
-/// the measured size strictly inside the band with the smallest legal gaps.
-///
-/// TRUE BY CONSTRUCTION, RECORDED not dressed up (C-036): with knobs derived as `S-1` / `S+1`, the
-/// window `min <= S <= max` is an algebraic identity in `S`. It is asserted anyway because it is NOT
-/// tautological against the SEAM — it still reds if `resolve_config` ever stopped honouring the
-/// explicit overrides in a direction that moved the band off `S` — but it is NOT this test's
-/// falsifiable content. That content is the `is_candidate` leg plus the declined outcome.
-///
-/// MUTATION COVERAGE, APPLIED: `is_candidate` forced to `true` (the candidate filter deleted) reds
-/// the white-box leg. HONESTLY RECORDED, with the arithmetic: the END-TO-END legs of this test
-/// survive that mutant, because a lone in-range file promoted to candidacy forms a bin of ONE and is
-/// then declined by the `size > 1` conjuncts anyway — outcome unchanged. That is exactly why
-/// C-004's existence pin (`test_candidate_filter_drops_in_range_files_before_packing`) uses FIVE
-/// in-range files, and why this element gets a white-box leg instead of pretending the end-to-end
-/// assertions cover the filter.
+/// C-021: a lone in-range file is not a candidate, so it never forms a bin. element 1.
 #[tokio::test]
 async fn test_admission_in_range_single_file_is_declined() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2391,16 +1918,12 @@ async fn test_admission_in_range_single_file_is_declined() {
     };
     let config = action().resolve_config().expect("recipe 2 knobs are legal");
 
-    // PRECONDITION FIRST. See the doc: an identity in `S` given the knob derivation, kept because it
-    // still checks the resolve_config seam, but NOT this test's falsifiable content.
     assert!(
         config.min_file_size_bytes <= size && size <= config.max_file_size_bytes,
         "fixture: the lone file must be IN RANGE (measured {size}, resolved band [{}, {}])",
         config.min_file_size_bytes,
         config.max_file_size_bytes
     );
-    // MECHANISM — what separates this class from element 1: in-range means NOT a candidate, so the
-    // file is dropped BEFORE packing and the gate never sees it.
     assert!(
         !is_candidate(&entry, &config),
         "class 2 mechanism: an in-range file is NOT a candidate and never reaches packing"
@@ -2430,25 +1953,9 @@ async fn test_admission_in_range_single_file_is_declined() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-004 — the size-only candidate filter, and its two STRICT boundaries.
-// ------------------------------------------------------------------------------------------------
 
-/// C-004 element 1 (C-036 recipe 8), and C-042's OUTCOME pin. FIVE position-delete files in one
-/// partition, every one of them strictly IN RANGE, so `outsideDesiredFileSizeRange` rejects all
-/// five: zero candidates, zero bins, zero commits — even though five files WOULD satisfy
-/// `enough_input_files` had they reached the gate.
-///
-/// KNOBS FROM THE MEASUREMENTS: `min := min_i(S_i)`, `max := max_i(S_i) + 1`, `target := min + 1`
-/// (the five files are written with different masked-position counts so their sizes differ).
-///
-/// MUTATION COVERAGE: delete the candidate filter and all five files reach the packer as one bin,
-/// which `enough_input_files` (5 >= 5) then admits — non-zero counts and a Replace snapshot.
-///
-/// EXPLICITLY NOT A MUTANT-KILLER for C-042's `if candidates.is_empty() { continue; }`
-/// short-circuit: deleting that branch is observationally a no-op, because `pack_bins` on an empty
-/// input returns an empty `Vec` and the per-bin loop then never runs. That line is recorded as
-/// UNKILLABLE, not as covered.
+/// C-004 element 1. FIVE position-delete files in one partition, every one strictly IN RANGE, so `outsideDesiredFileSizeRange`.
 #[tokio::test]
 async fn test_candidate_filter_drops_in_range_files_before_packing() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2476,8 +1983,6 @@ async fn test_candidate_filter_drops_in_range_files_before_packing() {
     };
     let config = action().resolve_config().expect("legal knobs");
 
-    // PRECONDITIONS. The two window legs are true by construction (min := min_i, max := max_i + 1);
-    // they are asserted anyway because they also check that the builders reach the resolved config.
     for size in &sizes {
         assert!(
             *size >= config.min_file_size_bytes && *size <= config.max_file_size_bytes,
@@ -2512,15 +2017,7 @@ async fn test_candidate_filter_drops_in_range_files_before_packing() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-/// C-004 element 2 (C-036 recipe 4). `length < min_file_size_bytes` is STRICT: a file whose MEASURED
-/// size is EXACTLY the resolved min is NOT a candidate.
-///
-/// A lone boundary file cannot discriminate this (both the mutated and the unmutated planner leave a
-/// declined, zero-count table), so the fixture adds a strictly smaller COMPANION that makes
-/// candidacy outcome-bearing: unmutated, only the companion is a candidate and its bin of one is
-/// declined; mutated to `<=`, the boundary file joins it and the two-file bin clears the target.
-///
-/// MUTATION COVERAGE: `length < min` → `length <= min` admits the bin and reds this test.
+/// C-004: `length < min` is strict. A file whose size equals min is not a candidate.
 #[tokio::test]
 async fn test_candidate_filter_keeps_file_at_exactly_min_file_size() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2576,11 +2073,7 @@ async fn test_candidate_filter_keeps_file_at_exactly_min_file_size() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-/// C-004 element 3 (C-036 recipe 4, mirrored). `length > max_file_size_bytes` is STRICT: a file whose
-/// MEASURED size is EXACTLY the resolved max is NOT a candidate. Same companion construction as the
-/// min boundary, for the same reason.
-///
-/// MUTATION COVERAGE: `length > max` → `length >= max` admits the bin and reds this test.
+/// C-004: `length > max` is strict. A file whose size equals max is not a candidate.
 #[tokio::test]
 async fn test_candidate_filter_keeps_file_at_exactly_max_file_size() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2639,26 +2132,9 @@ async fn test_candidate_filter_keeps_file_at_exactly_max_file_size() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-005 — the pipeline ORDER (S4 strictly before S5) and the filter STAGE.
-// ------------------------------------------------------------------------------------------------
 
-/// C-005's ORDER pin (C-036 recipe 5), discriminating BY BIN COUNT. One partition, THREE files in
-/// manifest order A, X, B: A and B sub-min candidates, X strictly in range. The knobs come from the
-/// measurements — `min := S_X - 1`, `target := S_X`, `max := S_X + 1`, and a group size
-/// `W := S_A + S_B` that A and B exactly fill.
-///
-/// FILTER-THEN-PACK (Java's order, and this port's): X is dropped at S4, so A and B pack into ONE
-/// bin whose input clears the target ⇒ one Replace snapshot, two files rewritten.
-///
-/// PACK-THEN-FILTER (the mutant): X is still present at packing, and since `S_A + S_X > W` and
-/// `S_X + S_B > W`, the greedy lookback-1 packer emits the three SINGLETONS [A], [X], [B]. Dropping X
-/// afterwards leaves two bins of one, both declined by the `size > 1` guards ⇒ ZERO snapshots.
-///
-/// RECORDED AS TRUE BY CONSTRUCTION, not asserted as falsifiable: `min < S_X < max` and
-/// `S_A + S_B <= W` are identities under the knob choice. The falsifiable preconditions are the
-/// ones that make the mutant emit singletons (`S_X > S_A`, `S_X > S_B`), the ones that make A and B
-/// candidates while X is not, the MANIFEST ORDER, and `S_A + S_B > target`.
+/// C-005's ORDER pin, discriminating BY BIN COUNT.
 #[tokio::test]
 async fn test_candidate_filter_runs_before_packing() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2749,15 +2225,7 @@ async fn test_candidate_filter_runs_before_packing() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-/// C-005's FILTER-STAGE pin for the hoist's NAMED CONSEQUENCE (behaviour flip 2). The user `filter`
-/// is now bound ONCE, right after the no-snapshot early return and BEFORE the manifest walk, exactly
-/// where Java binds it (at the `PositionDeletes` scan). So an UNBINDABLE filter fails on ANY table
-/// with a current snapshot — here one that has no position-delete files at all, and therefore no
-/// group that could ever be admitted.
-///
-/// Under the pre-hoist, per-group binding this same call returned `Ok` with zero counts, because the
-/// bind only ran inside a group that already had two files. The flip is deliberate: a filter the
-/// engine cannot bind is a caller error, and failing loudly beats silently compacting nothing.
+/// C-005: the user filter binds once, after the no-snapshot return and before the walk. BEFORE the manifest walk, where.
 #[tokio::test]
 async fn test_unbindable_filter_errors_even_when_no_group_is_admissible() {
     use crate::expr::Reference;
@@ -2788,22 +2256,9 @@ async fn test_unbindable_filter_errors_even_when_no_group_is_admissible() {
     );
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-027 — the SHARED bin packer, reused through a weight closure.
-// ------------------------------------------------------------------------------------------------
 
-/// C-027 (C-036 recipe 7's fixture shape). `max_file_group_size_bytes` splits ONE partition into TWO
-/// bins, and each admitted bin commits its own Replace snapshot — which is only possible if the
-/// position-delete planner really goes through the shared `pack_bins` with the delete file's size as
-/// its weight.
-///
-/// KNOBS FROM THE MEASUREMENTS: four files A, B, C, D in manifest order, all sub-min (so all four are
-/// candidates), `.min_input_files(2)`, and `W := max(S_A + S_B, S_C + S_D)` with `W < S_A + S_B + S_C`
-/// asserted — under the greedy forward first-fit that yields exactly {A, B} and {C, D}.
-///
-/// MUTATION COVERAGE: pass a constant weight (or `u64::MAX` as the group size) and the four files
-/// pack into ONE bin — one snapshot, one added file, and both assertions red. Reverse the packer's
-/// emission order and the manifest-order precondition reds.
+/// C-027: `max_file_group_size_bytes` splits one partition into two bins. Each commits separately. commits its own Replace snapshot..
 #[tokio::test]
 async fn test_admission_max_file_group_size_splits_partition_into_bins() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2891,22 +2346,9 @@ async fn test_admission_max_file_group_size_splits_partition_into_bins() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-041 — the group input-size sum SATURATES where Java's `long` sum wraps.
-// ------------------------------------------------------------------------------------------------
 
 /// C-041. The bin input-size sum is `saturating_add`, so an overflowing bin resolves to `u64::MAX`
-/// and stays ADMITTED. Java's `inputSize` is `stream().mapToLong(..).sum()`, which WRAPS to a small
-/// (or negative) value and would DECLINE — a named, recorded divergence in the safe direction.
-///
-/// WHITE-BOX on `group_qualifies` with two fabricated entries, because an end-to-end fixture would
-/// then try to READ 16 EiB of position deletes. The thresholds are chosen so the two arithmetics
-/// disagree on the OUTCOME: saturating gives `u64::MAX > target`, while wrapping gives
-/// `u64::MAX + 10 = 9`, which clears neither the target nor the max, and the count floor is above
-/// the bin size either way.
-///
-/// MUTATION COVERAGE: change `saturating_add` to `wrapping_add` in `group_qualifies` and the bin is
-/// declined.
 #[tokio::test]
 async fn test_group_input_size_saturates_not_wraps() {
     let (_catalog, _temp, table, x_path) = gate_table().await;
@@ -2944,20 +2386,9 @@ async fn test_group_input_size_saturates_not_wraps() {
     );
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-003 elements 3 and 5b — the two gate leaves that are unreachable END TO END, pinned WHITE BOX.
-//
-// C-003 recorded both as "UNKILLABLE, never claimed pinned". That scoping is now SUPERSEDED, in the
-// fork's favour: both proofs rest on candidate-filter REACHABILITY (a bin in those states cannot be
-// produced by `plan_bins`, because its member would not have been a candidate), not on the config
-// space, and this module already opens a white-box seam on `group_qualifies`. Through that seam the
-// states ARE constructible and both mutants DO die. The end-to-end unreachability argument stays
-// true and stays recorded on `group_qualifies`; what changes is that neither leaf is now unpinned.
-// ------------------------------------------------------------------------------------------------
 
-/// A [`LiveDeleteEntry`] whose `file_size_in_bytes` is SET to `size` — the same white-box seam
-/// `test_group_input_size_saturates_not_wraps` uses. The underlying file is real but is never read:
-/// `group_qualifies` reads nothing off the entry except its size.
+/// A [`LiveDeleteEntry`] whose `file_size_in_bytes` is SET to `size` — the same white-box seam `test_group_input_size_saturates_not_wraps` uses.
 async fn entry_of_size(table: &Table, target_path: &str, size: u64) -> LiveDeleteEntry {
     let mut data_file = write_sized_pos_delete(table, target_path, 1, 1).await;
     data_file.file_size_in_bytes = size;
@@ -2967,9 +2398,7 @@ async fn entry_of_size(table: &Table, target_path: &str, size: u64) -> LiveDelet
     }
 }
 
-/// The thresholds both white-box gate pins run against: `min < target < max` (C-006 preconditions
-/// (3) and (4)), with `min_input_files` well above the bin size so `enough_input_files` cannot be
-/// the admitter under any of the mutants below.
+/// The thresholds both white-box gate pins run against: `min < target < max` (C-006 preconditions (3) and (4)), with `min_input_files` well above the bin size so `enough_input_files` cannot be the admitter under any of the mutants below.
 fn white_box_gate_config() -> ResolvedConfig {
     ResolvedConfig {
         target_file_size_bytes: 100,
@@ -2984,15 +2413,7 @@ fn white_box_gate_config() -> ResolvedConfig {
     }
 }
 
-/// C-003 element 5b — `too_much_content`'s BOUNDARY STRICTNESS. A bin whose input size is EXACTLY
-/// `max_file_size_bytes` is DECLINED, because the comparison is `input_size > max`, strict.
-///
-/// END-TO-END UNREACHABLE, and that is why C-003 recorded it as unkillable: such a bin is either of
-/// size 1 — and then its file's length equals max, so `outsideDesiredFileSizeRange` never made it a
-/// candidate and it never reaches the gate — or of size >= 2, and then `enough_content` is already
-/// true because `max > target`. WHITE BOX the state is trivially constructible, so the mutant dies.
-///
-/// MUTATION COVERAGE: `input_size > max` → `>=` admits this bin.
+/// C-003 element 5b — `too_much_content`'s BOUNDARY STRICTNESS.
 #[tokio::test]
 async fn test_gate_input_size_exactly_max_is_declined_white_box() {
     let (_catalog, _temp, table, x_path) = gate_table().await;
@@ -3006,17 +2427,7 @@ async fn test_gate_input_size_exactly_max_is_declined_white_box() {
     );
 }
 
-/// C-003 element 3 — `enough_content`'s `size > 1` conjunct. A LONE file whose length is above the
-/// target but at or below the max is DECLINED: `enough_content` is `size > 1 && input_size > target`,
-/// and the `size > 1` conjunct is the only thing that declines it.
-///
-/// END-TO-END UNREACHABLE, and that is why C-003 recorded it as unkillable: a bin of one that
-/// reaches the gate must be a candidate, so its length is either below min — and `min < target`, so
-/// `enough_content` is false either way — or above max, in which case `too_much_content` is already
-/// true and carries the admission. WHITE BOX the in-band lone file is constructible, so the mutant
-/// dies.
-///
-/// MUTATION COVERAGE: drop the `size > 1` conjunct from `enough_content` and this bin is admitted.
+/// C-003 element 3 — `enough_content`'s `size > 1` conjunct.
 #[tokio::test]
 async fn test_gate_enough_content_size_guard_declines_lone_over_target_file_white_box() {
     let (_catalog, _temp, table, x_path) = gate_table().await;
@@ -3036,34 +2447,6 @@ async fn test_gate_enough_content_size_guard_declines_lone_over_target_file_whit
     );
 }
 
-// =================================================================================================
-// G3 — THE WRITER. C-009 (the roll bound), C-025 (the bounded chunk feed), C-026 (the fixed point),
-// C-044 (global sort before split), C-046 (the fail-closed guard at the new arity), C-010 (the
-// `Vec<DataFile>` fan-out and the BIN-max stamp).
-//
-// FIXTURE DISCIPLINE (C-036, N-C2, N-C3). Recipes 3 and 9 derive their target `T` from the fixture's
-// MEASURED size, which makes every `S`- or `B`-relative window an ALGEBRAIC IDENTITY that can never
-// red. Those windows are RECORDED in prose as true by construction and are NOT asserted; the
-// falsifiable content of both recipes lives on the MEASURED OUTPUTS instead.
-//
-// DISCLOSURE — C-036's NINE-RECIPE ENUMERATION IS INCOMPLETE, and by its own rule ("a pin needing a
-// tenth recipe is a finding") that is a finding, filed here rather than left silent. This group
-// needed THREE size-class fixtures the nine do not describe, named below at their definition sites:
-//
-//   * RECIPE 10 — the SMALL-EXPLICIT-BAND SPLIT (`split_fixture_run`). Two sub-min files in one bin
-//     at `min = 0.55C / target = 0.60C / max = 0.75C`, `min_input_files(2)`. An ENGINEERING CHOICE,
-//     not a clause requirement: it is the cheap counterpart to recipe 3, carrying four split pins at
-//     ~0.24 MB instead of ~4.7 MB. Recipe 3 keeps the two assertions that genuinely need the wide
-//     DEFAULT band (outputs inside `[min, max]`, and the fixed point).
-//   * RECIPE 11 — FIVE BINS OF ONE, each splitting to a sub-min tail (C-026 counterexample 2).
-//   * RECIPE 12 — TWO BINS OF ONE, each splitting to a sub-min tail (C-026 counterexample 3).
-//
-// Recipes 11 and 12 are MANDATED BY C-026's own pin form — it names both counterexamples and
-// requires them pinned — while C-036 describes no fixture that can build either. That half is a
-// ledger-completeness defect this build surfaced, not a scope escape. The ledger edit is outside
-// this unit's two-file fence and is carried as a hand-off.
-// =================================================================================================
-
 /// Every live PARQUET position-delete file in the current snapshot.
 async fn live_pos_delete_files(table: &Table) -> Vec<DataFile> {
     live_delete_files(table)
@@ -3073,9 +2456,7 @@ async fn live_pos_delete_files(table: &Table) -> Vec<DataFile> {
         .collect()
 }
 
-/// Read one position-delete file's `(file_path, pos)` pairs back off disk, by RESERVED FIELD ID —
-/// the same way the action reads them. This is what turns "two files exist" into "these exact pairs
-/// are in these exact files", which is what C-044's ordering pin needs.
+/// Read one position-delete file's `(file_path, pos)` pairs back off disk, by RESERVED FIELD ID — the same way the action reads them.
 async fn read_pos_delete_pairs(table: &Table, delete_file: &DataFile) -> Vec<(String, i64)> {
     let loader = BasicDeleteFileLoader::new(table.file_io().clone());
     let mut stream = loader
@@ -3094,10 +2475,7 @@ async fn read_pos_delete_pairs(table: &Table, delete_file: &DataFile) -> Vec<(St
     pairs
 }
 
-/// The live position-delete files with their pairs, in WRITE order — sorted by each file's FIRST
-/// pair, not by manifest order, which does not track the order the rolling writer produced them in.
-/// Every "first output" / "output k vs k+1" assertion below is made through this, so none of them
-/// silently depends on a manifest ordering nobody pinned.
+/// Live position-delete files with their pairs, sorted by each file's first pair.
 async fn outputs_in_write_order(table: &Table) -> Vec<(DataFile, Vec<(String, i64)>)> {
     let mut outputs = Vec::new();
     for file in live_pos_delete_files(table).await {
@@ -3109,11 +2487,6 @@ async fn outputs_in_write_order(table: &Table) -> Vec<(DataFile, Vec<(String, i6
 }
 
 /// Write ONE position-delete file holding `path_count` pairs, each naming a DISTINCT data-file path.
-///
-/// This is C-036's dictionary-defeating size dial: `write_sized_pos_delete` grows the `pos` column
-/// against ONE repeated path, which dictionary-encodes to a single value, so it cannot reach the
-/// multi-megabyte size class recipe 3 needs. Growing the PATH COUNT is what recipe 3 mandates —
-/// never growing the knobs, which is what would make the window tautological.
 async fn write_wide_path_pos_delete(table: &Table, path_count: i64) -> DataFile {
     let base = format!("{}/data", table.metadata().location());
     let paths: Vec<String> = (0..path_count)
@@ -3128,24 +2501,8 @@ async fn write_wide_path_pos_delete(table: &Table, path_count: i64) -> DataFile 
 }
 
 /// C-036 RECIPE 3 — the LONE OVERSIZED file, WIDE BAND.
-///
-/// ONE position-delete file whose MEASURED size `S` clears `240 * CHUNK_MAX_SERIALIZED_BYTES`
-/// (3_932_160), built by growing the DISTINCT PATH COUNT. Only `.target_file_size_bytes(T)` is set,
-/// with `T = S * 10 / 24`; min / max are DEFAULTED, giving `min = 0.75T`, `max = 1.8T`,
-/// `write_max = 1.4T` and — since `(max - write_max) / 2 = 0.2T` is far above the cap —
-/// `chunk_budget = 16384`.
-///
-/// RECORDED as TRUE BY CONSTRUCTION and deliberately NOT asserted, because `T := S * 10 / 24` makes
-/// each an identity in `S` that no drift could ever red (N-C3):
-/// - `S > resolved max` (i.e. `S > 1.8T = 0.75S`), which is why `too_much_content` admits the lone
-///   file at all; and
-/// - `2.15T <= S <= 2.8T`, the two-output window expressed on the INPUT.
-///
-/// Returns the catalog, the temp dir (kept alive), the committed table, `S` and `T`.
 async fn recipe_3_lone_oversized_fixture() -> (impl Catalog, TempDir, Table, u64, u64) {
     let (catalog, temp, table, _x_path) = gate_table().await;
-    // 34_000 distinct ~105-byte paths measure ~4.74 MB here — ~20% above the 3_932_160 floor, which
-    // the test asserts rather than assumes. The path count is the only dial; the knobs never move.
     let pd = write_wide_path_pos_delete(&table, 34_000).await;
     let s = pd.file_size_in_bytes;
     let t = s * 10 / 24;
@@ -3153,9 +2510,7 @@ async fn recipe_3_lone_oversized_fixture() -> (impl Catalog, TempDir, Table, u64
     (catalog, temp, table, s, t)
 }
 
-/// Recipe 3's shared PRE-ASSERTIONS, run before `execute` in both of its tests: the fixture really is
-/// in the size class the recipe claims, and the chunk budget really is the ruled constant. A size
-/// drift therefore fails HERE, loudly, instead of reddening the fixed point for an unrelated reason.
+/// Recipe 3's shared PRE-ASSERTIONS, run before `execute` in both of its tests: the fixture really is in the size class the recipe claims, and the chunk budget really is the ruled constant.
 fn assert_recipe_3_preconditions(s: u64, config: &ResolvedConfig) {
     assert!(
         s >= 240 * CHUNK_MAX_SERIALIZED_BYTES,
@@ -3169,20 +2524,9 @@ fn assert_recipe_3_preconditions(s: u64, config: &ResolvedConfig) {
     );
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-009 — the roll bound is Java's `writeMaxFileSize()`, NOT the resolved target.
-// ------------------------------------------------------------------------------------------------
 
-/// C-009 pin 1 (C-036 recipe 6 — no fixture). The VALUE, white-box through the `resolve_config`
-/// seam: at the delete defaults `write_max_file_size` is EXACTLY Java's 93952409, and in particular
-/// is NOT the resolved target 67108864.
-///
-/// `writeMaxFileSize()` = `target + (max - target) * 0.5` with the subtraction a LONG `lsub` BEFORE
-/// the `l2d` — `67108864 + (120795955 - 67108864) * 0.5 = 93952409.5`, `d2l` → 93952409.
-///
-/// MUTATION COVERAGE: any drift in the ratio, in the subtraction order, or a revert to "roll at the
-/// target" moves this literal. The `assert_ne!` is the specific guard against the reversion R-1
-/// exists to prevent, which an `assert!(write_max > 0)` style check would not catch.
+/// C-009: `write_max_file_size` at delete defaults, white-box through `resolve_config`. `write_max_file_size` is exactly Java's.
 #[tokio::test]
 async fn test_config_write_max_file_size_default_is_java_write_max() {
     let (_temp, table) = config_table(&[]).await;
@@ -3199,16 +2543,6 @@ async fn test_config_write_max_file_size_default_is_java_write_max() {
         "the roll bound is write-max, NOT the resolved target — that reversion is what R-1 forbids"
     );
 
-    // THE SUBTRACTION ORDER, which nothing else in this suite discriminates. Java's bytecode is
-    // `getfield maxFileSize; getfield targetFileSize; lsub; l2d` — a LONG subtraction BEFORE the
-    // widening — so the Rust mirror must subtract in `u64` and only then convert. At the delete
-    // defaults both orders agree (the values sit far below 2^53), so the property needs a config
-    // where the two roundings diverge. This is one: the `u64` subtraction yields 48764580662105708
-    // exactly, whose `l2d` differs from `l2d(max) - l2d(target)` by enough to move the result by 32.
-    //
-    // MUTATION COVERAGE: rewrite the derivation as
-    // `d2l(target as f64 + ((max_file_size_bytes as f64) - (target as f64)) * RATIO)` and this
-    // reads 198299551875299584.
     let (_temp, table) = config_table(&[]).await;
     let ordered = RewritePositionDeleteFiles::new(table)
         .target_file_size_bytes(173_917_261_544_246_756)
@@ -3222,18 +2556,7 @@ async fn test_config_write_max_file_size_default_is_java_write_max() {
     );
 }
 
-/// C-009 pin 2 (A-001 — `write_max_file_size` gets its OWN clamp pair, never a borrowed one).
-/// Java's `d2l` saturates at `Long.MAX_VALUE`; Rust's `as u64` saturates at `u64::MAX`, so the
-/// `.min(i64::MAX as u64)` inside [`d2l`] IS the parity act on this call site too.
-///
-/// The fixture is the only shape in which the two disagree: `target = 2^63 - 512` (whose `l2d`
-/// rounds UP to `2^63`) with an EXPLICIT `max = i64::MAX`. Then
-/// `write_max = d2l(2^63 + (i64::MAX - target) * 0.5) = d2l(2^63 + 255.5)`, whose `f64` value is
-/// `2^63` exactly (the spacing there is 2048) — 9223372036854775808 unclamped, i64::MAX clamped.
-/// Both branches resolve Ok, so the equality assertion is the discriminator, not the Ok/Err.
-///
-/// MUTATION COVERAGE: drop the `.min(i64::MAX as u64)` from `d2l` and this reads
-/// 9223372036854775808.
+/// C-009 pin 2. `write_max_file_size` gets its OWN clamp pair, never a borrowed one. Java's `d2l`
 #[tokio::test]
 async fn test_config_write_max_file_size_clamps_to_java_long_max() {
     let (_temp, table) = config_table(&[]).await;
@@ -3256,27 +2579,7 @@ async fn test_config_write_max_file_size_clamps_to_java_long_max() {
     );
 }
 
-/// C-009 pin 3 (C-036 RECIPE 9) — the CALL-SITE DISCRIMINATOR, and the only pin that can tell the
-/// two candidate bounds apart.
-///
-/// The bound reaches [`RollingFileWriterBuilder::new`] as an opaque `usize`, so no white-box config
-/// assertion can distinguish "passed `write_max`" from "passed the resolved target"; and rolling at
-/// the smaller target only ever produces MORE outputs, so a bare "more than one file" assertion
-/// cannot discriminate either. Only an OUTPUT COUNT inside the window where the two bounds DISAGREE
-/// does — and per N-C3 that window is asserted on the MEASURED OUTPUT, never implied by an identity
-/// in the fixture size.
-///
-/// RECIPE 9: FIVE sub-min position-delete files in one partition whose MEASURED total `B` clears
-/// `30 * CHUNK_MAX_SERIALIZED_BYTES` (491_520), with `T = B * 10 / 12` and min / max DEFAULTED —
-/// `min = 0.625B`, `max = 1.5B`, `write_max = 1.1667B`.
-///
-/// RECORDED as TRUE BY CONSTRUCTION and deliberately NOT asserted (STRUCK per N-C3): `target < B <=
-/// write_max`, an identity in `B` once `T := B * 10 / 12` is substituted.
-///
-/// NAMED MUTANT, APPLIED: `RollingFileWriterBuilder::new(builder,
-/// usize::try_from(config.write_max_file_size)...)` → `...config.target_file_size_bytes...`. The
-/// asserted `target + 2 * chunk_budget < O` IS that mutant's roll condition, so the pin proves its
-/// own non-vacuity at runtime: under the mutant the single output would have rolled into two.
+/// C-009 pin 3 — the CALL-SITE DISCRIMINATOR, and the only pin that tells the two candidate bounds apart.
 #[tokio::test]
 async fn test_roll_bound_is_write_max_not_target() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -3338,8 +2641,6 @@ async fn test_roll_bound_is_write_max_not_target() {
     assert_eq!(outputs.len(), 1);
     let o = outputs[0].file_size_in_bytes;
 
-    // NON-VACUITY, ON THE MEASURED OUTPUT. The left inequality is the mutant's roll condition; the
-    // right is the reason the real bound does NOT roll.
     assert!(
         config.target_file_size_bytes + 2 * config.chunk_budget < o,
         "the single output ({o}) must exceed target + 2 * chunk_budget ({}) — this is exactly the \
@@ -3356,10 +2657,7 @@ async fn test_roll_bound_is_write_max_not_target() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-/// Write a position-delete file masking `count` positions of `target_path` STRIDED by `stride` from
-/// `first_pos`. Two strided files offset by one INTERLEAVE, which is what makes the global sort
-/// observable: with consecutive, disjoint ranges the concatenated input is ALREADY sorted and
-/// C-044's ordering pin is vacuous — a mutation proof caught exactly that.
+/// Write a position-delete file masking `count` positions of `target_path` STRIDED by `stride` from `first_pos`.
 async fn write_strided_pos_delete(
     table: &Table,
     target_path: &str,
@@ -3377,10 +2675,7 @@ async fn write_strided_pos_delete(
 struct SplitFixture {
     table: Table,
     input_sizes: Vec<u64>,
-    /// The two inputs' pairs READ BACK OFF DISK and concatenated in MANIFEST ORDER — the exact
-    /// sequence `compact_group` builds before it sorts. This is measured, never reconstructed from
-    /// the fixture's own construction, because the ordering pin's non-vacuity depends on this
-    /// sequence being UNSORTED and a reconstructed value could not witness that.
+    /// The two inputs' pairs READ BACK OFF DISK and concatenated in MANIFEST ORDER — the exact sequence `compact_group` builds before it sorts.
     input_concat: Vec<(String, i64)>,
     /// `input_concat` sorted — the multiset the split outputs must reproduce exactly.
     input_pairs: Vec<(String, i64)>,
@@ -3389,24 +2684,10 @@ struct SplitFixture {
     result: RewritePositionDeleteFilesResult,
 }
 
-/// **C-036 RECIPE 10 (NEW — not one of the ledger's nine; see the section banner's disclosure).**
-///
-/// The SMALL-EXPLICIT-BAND SPLIT fixture, built and run once: TWO ~118 KB position-delete files over
-/// DISJOINT position ranges of one data file, committed in TWO separate snapshots so their data
-/// sequence numbers are 2 and 3 (bin max = 3). The knobs are set as fractions of the MEASURED
-/// combined size `C` — `min = 0.55C`, `target = 0.60C`, `max = 0.75C`, so `write_max = 0.675C` —
-/// which puts the ONE bin comfortably above the roll bound and makes it split.
-///
-/// This is the cheap counterpart to recipe 3: it exercises the SPLIT (fan-out, ordering, counts,
-/// stamping) without paying for a multi-megabyte fixture. Recipe 3 stays the home of the two
-/// assertions that genuinely need the wide default band — the run-1 outputs landing inside
-/// `[min, max]`, and the fixed point.
+/// The SMALL-EXPLICIT-BAND SPLIT fixture (recipe 10), built and run once: two ~118 KB position-delete files over disjoint position ranges of one data file, committed in two snapshots so their data sequence numbers are 2 and 3 (bin max = 3).
 async fn split_fixture_run() -> (impl Catalog, TempDir, SplitFixture) {
     let (catalog, temp, table, x_path) = gate_table().await;
 
-    // ODD positions and EVEN positions over the SAME range: whichever order the manifest walk
-    // reads them in, the concatenated pair list is NOT sorted, so only the GLOBAL sort in
-    // `compact_group` can produce ascending outputs (C-044).
     let pd1 = write_strided_pos_delete(&table, &x_path, 1, 12_000, 2).await;
     let table = add_deletes(&catalog, &table, vec![pd1]).await; // seq 2
     let pd2 = write_strided_pos_delete(&table, &x_path, 2, 12_000, 2).await;
@@ -3419,7 +2700,6 @@ async fn split_fixture_run() -> (impl Catalog, TempDir, SplitFixture) {
         .collect();
     let c: u64 = input_sizes.iter().sum();
     // READ the inputs back in MANIFEST ORDER — the same order `collect_position_delete_groups`
-    // walks them — so the fixture can witness what the writer is actually fed.
     let mut input_concat: Vec<(String, i64)> = Vec::new();
     for file in live_pos_delete_files(&table).await {
         input_concat.extend(read_pos_delete_pairs(&table, &file).await);
@@ -3471,15 +2751,7 @@ async fn split_fixture_run() -> (impl Catalog, TempDir, SplitFixture) {
     })
 }
 
-/// C-009 pin 4. With an explicit SMALL band the bin exceeds `write_max` and the rolling writer
-/// really rolls, so ONE bin produces MORE THAN ONE file — which the pre-G3 action could not do at
-/// any configuration, because it wrote a single whole-bin batch to a writer bounded by the 512 MiB
-/// DATA default.
-///
-/// MUTATION COVERAGE: revert `RollingFileWriterBuilder::new(.., write_max, ..)` to
-/// `new_with_default_file_size` and the whole bin lands in ONE file. Revert the chunked feed to a
-/// single `writer.write(batch)` and it also lands in one file, because `should_roll` is evaluated
-/// once per `write`.
+/// C-009: an explicit small band makes the bin exceed `write_max`, so the rolling writer splits. rolls, so ONE bin produces MORE THAN.
 #[tokio::test]
 async fn test_output_splits_into_multiple_files_at_a_small_explicit_config() {
     let (catalog, _temp, fixture) = split_fixture_run().await;
@@ -3510,26 +2782,7 @@ async fn test_output_splits_into_multiple_files_at_a_small_explicit_config() {
     );
 }
 
-// ------------------------------------------------------------------------------------------------
-// C-025 — the BOUNDED CHUNK FEED. Three FORK-AUTHORED literals with no Java analogue (R-11 / R-14):
-// CHUNK_PAIRS = 256, CHUNK_MAX_SERIALIZED_BYTES = 16384, and the /2 footer reservation.
-//
-// R-16 is the shape of this section: the CONFIG-TIME assert inside `resolve_config` is trivially
-// true by construction and is kept only as intent documentation with a tripwire; the RUNTIME
-// clearance is established by `test_no_split_output_exceeds_max_file_size`'s MEASURED OUTPUTS.
-// ------------------------------------------------------------------------------------------------
-
-/// C-025 pin 1 (C-036 recipe 6 — no fixture). `chunk_budget` is
-/// `min(CHUNK_MAX_SERIALIZED_BYTES, (max - write_max) / 2)`, and BOTH limbs are exercised:
-///
-/// - at the DELETE DEFAULTS the headroom is 26843546, so half of it (13421773) is far above the cap
-///   and the CAP binds: `chunk_budget == 16384`;
-/// - on a NARROW band the headroom half binds instead: `min 100 / target 200 / max 1000` gives
-///   `write_max = 600`, headroom 400, and `chunk_budget == 200`.
-///
-/// MUTATION COVERAGE: drop the `min(CHUNK_MAX_SERIALIZED_BYTES, ..)` cap and the defaults case reads
-/// 13421773. Drop the `/ CHUNK_HEADROOM_FOOTER_SHARE` footer reservation and the narrow case reads
-/// 400. Neither mutant is caught by the other case, which is why both are here.
+/// C-025 pin 1 (C-036 recipe 6 — no fixture).
 #[tokio::test]
 async fn test_feed_chunk_budget_is_the_ruled_constant() {
     let (_temp, table) = config_table(&[]).await;
@@ -3565,9 +2818,6 @@ async fn test_feed_chunk_budget_is_the_ruled_constant() {
     );
 
     // RES-8's THROUGHPUT half, pinned rather than left as prose: a band of `max - target <= 2`
-    // resolves `chunk_budget` to ZERO, which is below ANY pair's serialized size, so the one-pair
-    // floor governs and the feed degrades to one Arrow batch per pair. Legal config, named residue —
-    // see `write_compacted_file`'s RES-8 section.
     let (_degenerate_temp, degenerate_table) = config_table(&[]).await;
     let degenerate = RewritePositionDeleteFiles::new(degenerate_table)
         .min_file_size_bytes(100)
@@ -3585,16 +2835,7 @@ async fn test_feed_chunk_budget_is_the_ruled_constant() {
     );
 }
 
-/// C-025 pin 2 — the CHUNKING RULE itself, white-box on [`chunk_end`], because neither the pair cap
-/// nor the one-pair floor is observable end to end (raising `CHUNK_PAIRS` only changes how often
-/// `should_roll` runs, and a zero-pair chunk HANGS rather than failing an assertion).
-///
-/// MUTATION COVERAGE, one per element:
-/// - raise or lower `CHUNK_PAIRS` ⇒ the "count cap binds" case reds;
-/// - drop the `next > chunk_budget` break ⇒ the "byte cap binds" case reds;
-/// - drop the `end > start` one-pair floor ⇒ the floor case returns `start` (0 pairs), which is
-///   caught HERE as a failed assertion instead of spinning the feed loop forever;
-/// - change `pair_serialized_bytes` from `len + 8` ⇒ the byte-cap boundary moves.
+/// C-025 pin 2 — the CHUNKING RULE itself, white-box on [`chunk_end`], because neither the pair cap nor the one-pair floor is observable end to end (raising `CHUNK_PAIRS` only changes how often `should_roll` runs, and a zero-pair chunk HANGS rather than failing an assertion).
 #[test]
 fn test_chunk_end_takes_at_least_one_pair_and_respects_both_caps() {
     let pairs: Vec<(String, i64)> = (0..1_000i64).map(|pos| ("aaaa".to_string(), pos)).collect();
@@ -3626,18 +2867,7 @@ fn test_chunk_end_takes_at_least_one_pair_and_respects_both_caps() {
     );
 }
 
-/// C-025 pin 3 (C-036 RECIPE 3) — THE RUNTIME CLEARANCE PIN, which is where R-16 puts the weight
-/// that the config-time assert must NOT be credited with carrying.
-///
-/// It measures, on real outputs, the two things the config assert cannot see:
-/// 1. that a chunk's PARQUET contribution really does fit inside the raw-byte budget it was
-///    denominated in (the stated assumption on `write_compacted_file`), and
-/// 2. that the Parquet FOOTER — which `current_written_size()` EXCLUDES, and which this action
-///    inflates by writing FULL untruncated `file_path` bounds — fits inside its reserved half.
-///
-/// Together those are what keep every run-1 output inside `[min, max]`, where the candidate filter
-/// declines it forever. That containment is C-026's convergence argument, MEASURED here rather than
-/// asserted.
+/// C-025 pin 3 (RECIPE 3) — THE RUNTIME CLEARANCE PIN.
 #[tokio::test]
 async fn test_no_split_output_exceeds_max_file_size() {
     let (catalog, _temp, table, s, t) = recipe_3_lone_oversized_fixture().await;
@@ -3704,32 +2934,9 @@ async fn test_no_split_output_exceeds_max_file_size() {
     );
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-026 — THE FIXED POINT, and the three counterexamples that BOUND it.
-//
-// This closes the non-convergence G2 deliberately opened: at G2's state a lone file above
-// `max_file_size_bytes` was admitted, rewritten to about the same size, and RE-ADMITTED on every
-// subsequent run — unbounded churn. The convergence does NOT come from the roll bound directly. It
-// comes from the CANDIDATE FILTER: a run-1 output that lands inside [min, max] fails
-// `outsideDesiredFileSizeRange`, is therefore never a candidate, and no bin forms.
-//
-// The claim is CONDITIONAL, not universal, and the two counterexamples below are PARITY-CORRECT —
-// Java behaves identically — so they are pinned as EXPECTED behaviour. They are not defects and no
-// later change should "fix" them.
-// ------------------------------------------------------------------------------------------------
 
-/// C-026 — ACCEPTANCE 3, in its ruled fixed-point form (R-3): the no-op is the three-way
-/// CONJUNCTION `rewritten == 0 && added == 0 && current_snapshot_id() unchanged`.
-///
-/// The MANDATORY pre-assertions on run 1's state come FIRST, so a size drift fails loudly on a
-/// precondition instead of reddening the fixed point for an unrelated reason. Per C-029, a red on
-/// the three conjuncts THEMSELVES is a DESIGN failure to escalate — never an assert to weaken.
-///
-/// MUTATION COVERAGE: revert the roll bound to the resolved target and output 1 is ~T, still inside
-/// [0.75T, 1.8T], so this test alone would still pass — which is exactly why C-009 pin 3 exists.
-/// What this test kills is the far more dangerous class: any change that lets a run-1 output land
-/// OUTSIDE [min, max] (drop the chunk cap, drop the footer reservation, roll at `max` instead of
-/// `write_max`) re-admits it forever and reds the conjuncts.
+/// C-026 — the no-op in its ruled fixed-point form: the three-way conjunction `rewritten == 0 && added == 0 && current_snapshot_id() unchanged`.
 #[tokio::test]
 async fn test_second_run_is_a_no_op_after_split() {
     let (catalog, _temp, table, s, t) = recipe_3_lone_oversized_fixture().await;
@@ -3808,22 +3015,7 @@ async fn test_second_run_is_a_no_op_after_split() {
     );
 }
 
-/// C-026 COUNTEREXAMPLE 2, PINNED AS EXPECTED BEHAVIOUR — **not** a defect, and **not** to be
-/// "fixed": Java behaves identically.
-///
-/// **C-036 RECIPE 11 (NEW — not one of the ledger's nine; see the section banner's disclosure).**
-/// C-026 requires this counterexample pinned but C-036 describes no fixture that can build it.
-///
-/// `B >= min_input_files` bins in one partition each leave a SUB-MIN TAIL. Those tails co-bin on the
-/// next run and are admitted by `enough_input_files` — the COUNT clause — so the second run is not a
-/// no-op even though every non-tail output converged.
-///
-/// The fixture ISOLATES the count clause: five ~118 KB files, knobs at `min = 0.80C`,
-/// `target = 0.85C`, `max = 0.95C` (so `write_max = 0.90C`) and `max_file_group_size_bytes = 1.05C`,
-/// which forces FIVE bins of one. Each bin is admitted by `too_much_content` (its file exceeds max)
-/// and splits into a ~0.9C output that lands IN RANGE plus a ~0.11C tail that does not. On run 2 the
-/// five tails sum to well UNDER the target, so `enough_content` is false and `too_much_content` is
-/// false — the admission is `enough_input_files` and nothing else, which the assertions below pin.
+/// C-026 COUNTEREXAMPLE 2, PINNED AS EXPECTED BEHAVIOUR — not a defect and not to be "fixed": Java behaves identically.
 #[tokio::test]
 async fn test_multi_bin_tails_are_readmitted_on_second_run() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -3916,20 +3108,7 @@ async fn test_multi_bin_tails_are_readmitted_on_second_run() {
     );
 }
 
-/// **C-036 RECIPE 12 (NEW — not one of the ledger's nine; see the section banner's disclosure).**
-/// As with recipe 11, C-026 requires this counterexample pinned and C-036 describes no fixture for it.
-///
-/// C-026 COUNTEREXAMPLE 3, DISTINCT from counterexample 2 and likewise PINNED AS EXPECTED BEHAVIOUR:
-/// as few as **TWO** bins whose sub-min tails SUM ABOVE THE TARGET are re-admitted, by
-/// `enough_content`, which needs only `size > 1`. Two is far below the default count floor of five,
-/// which is what makes this a separate bound on the fixed-point claim rather than a weaker case of
-/// counterexample 2.
-///
-/// The fixture ISOLATES the content clause: two ~118 KB files, knobs at `min = 0.55C`,
-/// `target = 0.60C`, `max = 0.75C` (so `write_max = 0.675C`) and `max_file_group_size_bytes = 1.05C`,
-/// forcing TWO bins of one. Each splits into an in-range ~0.675C output plus a ~0.32C sub-min tail.
-/// On run 2 the two tails sum ABOVE the target but BELOW the max, and two is below the DEFAULT count
-/// floor, so `enough_content` is the sole admitter.
+/// C-026 COUNTEREXAMPLE 3, DISTINCT from counterexample 2 and likewise PINNED AS EXPECTED BEHAVIOUR.
 #[tokio::test]
 async fn test_two_bin_tails_over_target_are_readmitted() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -4011,27 +3190,7 @@ async fn test_two_bin_tails_over_target_are_readmitted() {
     );
 }
 
-// ------------------------------------------------------------------------------------------------
-// C-010 — `write_compacted_file` returns `Vec<DataFile>`, and EVERY output of a bin is stamped with
-// THAT BIN's own max rewritten data-seq.
-//
-// The stamp is a function of exactly two variables: which ENTRIES the max ranges over, and which
-// OUTPUTS receive it. `test_compacted_file_carries_bin_max_rewritten_seq` (above) fixes the base
-// value on a one-output bin; the two pins below fix the other two dimensions.
-//
-// DIRECTION OF DANGER, against the fork's OWN rule (`delete_file_index.rs`'s applicable_pos_deletes
-// keeps `delete_seq >= data_seq`): an OVER-HIGH stamp OVER-APPLIES; an UNDER-LOW stamp stops
-// applying and RESURRECTS rows. Stamping bin 2 from bin 1's entries is the UNDER-stamp path whenever
-// bin 1's max is the lower one — the resurrection direction, and the reason the ranging dimension
-// gets its own pin rather than being folded into the fan-out one.
-// ------------------------------------------------------------------------------------------------
-
-/// C-010 element 2 — the FAN-OUT dimension. A bin that SPLITS must stamp EVERY output with the bin
-/// max, not just the first one the old `.next()` shape happened to return.
-///
-/// MUTATION COVERAGE: stamp only `new_files[0]` and let the rest inherit (i.e. `add_delete_file`)
-/// and the second output carries the rewrite snapshot's seq (4) instead of 3 — an OVER-HIGH stamp,
-/// which over-applies. Asserting only `pos_entries[0]` would miss it, which is why this iterates.
+/// C-010 element 2 — the FAN-OUT dimension.
 #[tokio::test]
 async fn test_every_split_output_carries_bin_max_rewritten_seq() {
     let (catalog, _temp, fixture) = split_fixture_run().await;
@@ -4067,21 +3226,6 @@ async fn test_every_split_output_carries_bin_max_rewritten_seq() {
 }
 
 /// C-010 element 3 — the RANGING dimension, and the pin that kills the two most dangerous mutants.
-///
-/// ONE partition, FOUR position-delete files committed in FOUR separate snapshots so their data
-/// sequence numbers are 2, 3, 5 and 6 (a dummy data-file append sits at seq 4). The group-size cap
-/// is `2 * max(S_i)`, with `< 3 * min(S_i)` asserted, so the sequential first-fit packer puts
-/// exactly TWO files in each bin — whatever the manifest order turns out to be.
-///
-/// The expected stamp per bin is DERIVED from what each output actually contains (each input masks a
-/// disjoint 1000-block of positions, so an output's positions name its bin's members), never assumed
-/// from an unpinned manifest ordering. The test then asserts the two bins' expected maxima DIFFER,
-/// which is what makes both mutants lethal:
-///
-/// MUTATIONS, APPLIED:
-/// - range the max over the PARTITION's whole entry list ⇒ both outputs carry 6 ⇒ the lower bin reds;
-/// - compute bin 2's max from bin 1's entries ⇒ the second output carries the first bin's value ⇒
-///   reds (and that is the UNDER-stamp, row-resurrection direction).
 #[tokio::test]
 async fn test_each_bin_output_carries_its_own_bin_max_not_the_partition_max() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -4094,8 +3238,6 @@ async fn test_each_bin_output_carries_its_own_bin_max_not_the_partition_max() {
         let pd = write_sized_pos_delete(&table, &x_path, block * 1_000, count).await;
         table = add_deletes(&catalog, &table, vec![pd]).await;
         if index == 1 {
-            // A dummy data-file append between the bins, so the seqs are 2, 3, 5, 6 and the two
-            // bins' maxima cannot coincide by accident.
             let w = write_data_file(&table, "w.parquet", 0, &[(0, 60, 600)]).await;
             table = append_files(&catalog, &table, vec![w]).await;
         }
@@ -4182,12 +3324,7 @@ async fn test_each_bin_output_carries_its_own_bin_max_not_the_partition_max() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-/// C-010's counting half: `added_delete_files_count` is the REAL number of files added across the
-/// split, and `added_bytes_count` is the CHECKED sum of their sizes — not the hard-coded `+= 1` and
-/// single `file_size_in_bytes` the one-output shape carried.
-///
-/// MUTATION COVERAGE: restore `added_delete_files_count += 1` and the count reds against the live
-/// pos-delete count; sum only the first output's bytes and the byte assertion reds.
+/// C-010's counting half: `added_delete_files_count` is the REAL number of files added across the split, and `added_bytes_count` is the CHECKED sum of their sizes — not the hard-coded `+= 1` and single `file_size_in_bytes` the one-output shape carried.
 #[tokio::test]
 async fn test_result_counts_added_files_and_bytes_across_split_outputs() {
     let (catalog, _temp, fixture) = split_fixture_run().await;
@@ -4216,21 +3353,9 @@ async fn test_result_counts_added_files_and_bytes_across_split_outputs() {
     );
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-044 — the GLOBAL SORT happens BEFORE any split, and the split preserves it.
-// ------------------------------------------------------------------------------------------------
 
-/// C-044. A bin's pairs are sorted by `(file_path, pos)` ONCE, globally, and the feed then chunks
-/// that already-sorted `Vec` in order — so output *k*'s range lies entirely below output *k+1*'s and
-/// the union of the outputs is EXACTLY the input multiset.
-///
-/// Java does not dedup within a group either (the reader bitmap dedups), so the multiset equality is
-/// the right relation, not set equality.
-///
-/// MUTATION COVERAGE: move `pairs.sort()` below the chunking, or sort per chunk instead of globally,
-/// and the ranges interleave — output *k*'s max exceeds output *k+1*'s min. The multiset equality
-/// and the read-identity assertion both survive that mutation, which is precisely why the ORDERING
-/// assertion has to be here: the masked row set alone cannot see it.
+/// C-044: pairs are sorted globally once. Chunks are contiguous slices of that order. sorted `Vec` in order — so output.
 #[tokio::test]
 async fn test_split_outputs_have_disjoint_ascending_ranges() {
     let (catalog, _temp, fixture) = split_fixture_run().await;
@@ -4240,26 +3365,6 @@ async fn test_split_outputs_have_disjoint_ascending_ranges() {
     );
 
     // NON-VACUITY, ON THE MEASURED INPUT SEQUENCE — not on the fixture's own construction.
-    //
-    // Everything below can only distinguish a GLOBAL sort from no sort at all if what the writer is
-    // FED is not already ascending. `input_concat` is the two inputs read back off disk and
-    // concatenated in MANIFEST ORDER, i.e. exactly the sequence `compact_group` builds before it
-    // sorts; asserting that THAT is unsorted is the property, and a fixture edit that makes the two
-    // inputs consecutive-and-disjoint again reds HERE.
-    //
-    // This replaces an earlier guard that asserted `input_pairs.len() == 24_000` while
-    // `input_pairs` was built four lines above as `(1..=24_000).map(..)` — an unconditional
-    // identity in the fixture's own construction that could never red. Reverting only the two
-    // stride arguments and touching no assertion left the suite green
-    // under the sort mutation. Same over-claim class R-16 corrected on the config-time assert.
-    //
-    // The witness form is deliberate: ONE descending adjacent pair is logically equivalent to "not
-    // already ascending", and it fails in one line. Comparing the whole `Vec` against its own sorted
-    // clone would emit a ~3.9 MB panic message for the same information. Not asserted, because it
-    // would be the SAME unkillable class this round deleted from `assert_recipe_3_preconditions`:
-    // `input_pairs` IS `sort(clone(input_concat))` by construction (see `split_fixture_run`), so
-    // re-deriving it here and comparing could never red. The multiset relation that CAN red is the
-    // union-vs-`input_pairs` assertion at the end of this test, against the real split OUTPUTS.
     assert!(
         fixture
             .input_concat
@@ -4309,24 +3414,9 @@ async fn test_split_outputs_have_disjoint_ascending_ranges() {
     );
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-046 — the FAIL-CLOSED guard SURVIVES the `Vec<DataFile>` change at the new arity.
-// ------------------------------------------------------------------------------------------------
 
-/// C-046. A bin whose `pairs` are NON-EMPTY must produce at least one file. "No file" is a NORMAL
-/// return from the parquet writer, not an error — `ParquetWriter::close` returns `Ok(vec![])` and
-/// DELETES the output whenever `current_row_num == 0` — so nothing below this guard would object.
-///
-/// With the guard removed, `execute` goes on to commit a `Replace` snapshot that REMOVES live
-/// position-delete files and adds none: silent UNDER-masking, the row-RESURRECTION direction. Nothing
-/// downstream rejects it either, because `RewriteFilesAction::validate` early-returns when
-/// `deleted_data_files` is empty, which is always true for this action.
-///
-/// WHITE-BOX on the extracted [`require_non_empty`], because the state is unreachable end to end:
-/// the guard's whole point is that it fires where no fixture can put the writer.
-///
-/// MUTATION COVERAGE: delete the guard (return `Ok(files)` unconditionally) and the empty case
-/// returns `Ok(vec![])`.
+/// C-046: a non-empty bin must produce at least one file. The parquet writer treats empty as normal. return from the parquet writer —.
 #[tokio::test]
 async fn test_bin_with_pairs_but_no_output_file_is_a_hard_error() {
     let error = require_non_empty(Vec::new()).expect_err("an empty file list is a hard error");
@@ -4349,21 +3439,7 @@ async fn test_bin_with_pairs_but_no_output_file_is_a_hard_error() {
     );
 }
 
-// =================================================================================================
-// THE COMMIT LOOP — one `RewriteFiles` per admitted BIN (C-011), the abort contract (C-037), and
-// the per-bin zero-pairs skip (C-040).
-//
-// C-011 and C-037 both run on C-036 RECIPE 7, so the fixture is built once here. Every window the
-// knob derivation makes tautological is RECORDED as true by construction below and its falsifiable
-// content moved onto MEASURED quantities — the bin COMPOSITION is read back off the outputs rather
-// than assumed from the packer's arithmetic.
-// =================================================================================================
-
 /// C-036 RECIPE 7 — TWO ADMITTED BINS in ONE partition.
-///
-/// FOUR position-delete files A, B, C, D in MANIFEST order, each masking a DISJOINT 1000-block of
-/// positions so an output's pairs NAME the bin members that produced it. Sizes are MEASURED, never
-/// predicted, and the knobs are set around them.
 struct Recipe7 {
     table: Table,
     /// `S_A .. S_D`, MEASURED, in MANIFEST order.
@@ -4374,23 +3450,13 @@ struct Recipe7 {
     group_size: u64,
 }
 
-/// `m` — recipe 7's `min_file_size_bytes` knob. FIXED, not derived: every measured `S_i` is asserted
-/// BELOW it, so a size drift that pushed a position-delete file past 100 KB reds on the precondition
-/// instead of silently emptying the candidate set. `m < target` (200_000) closes C-006's (3).
+/// `m` — recipe 7's `min_file_size_bytes` knob.
 const RECIPE_7_MIN: u64 = 100_000;
 
-/// Build C-036 recipe 7. `W := max(S_A + S_B, S_C + S_D)`.
-///
-/// RECORDED as TRUE BY CONSTRUCTION and deliberately NOT asserted (C-036: no window assert may be an
-/// algebraic identity in the fixture size): `S_A + S_B <= W` and `S_C + S_D <= W`, both immediate
-/// from `W := max(..)`. The remaining leg, `W < S_A + S_B + S_C`, is FALSIFIABLE — it holds only
-/// while `S_D < S_A + S_B` — and IS asserted. The bin composition the three legs are supposed to
-/// force is then read back off the MEASURED outputs by the pins themselves.
+/// Build C-036 recipe 7.
 async fn recipe_7_two_bin_fixture() -> (impl Catalog, TempDir, Recipe7) {
     let (catalog, temp, table, x_path) = gate_table().await;
 
-    // Disjoint 1000-blocks (block = pos / 1000) with distinct pair counts, so the sizes differ and
-    // each output's pairs identify its bin's members.
     let pd_a = write_sized_pos_delete(&table, &x_path, 1_000, 1).await;
     let pd_b = write_sized_pos_delete(&table, &x_path, 2_000, 2).await;
     let pd_c = write_sized_pos_delete(&table, &x_path, 3_000, 3).await;
@@ -4466,8 +3532,7 @@ fn assert_recipe_7_preconditions(fixture: &Recipe7, config: &ResolvedConfig) {
     );
 }
 
-/// The 1000-BLOCKS each live position-delete file covers, one sorted+deduped `Vec` per output,
-/// themselves sorted so the comparison does not depend on manifest order.
+/// The 1000-BLOCKS each live position-delete file covers, one sorted+deduped `Vec` per output, themselves sorted so the comparison does not depend on manifest order.
 async fn output_blocks(table: &Table) -> Vec<Vec<i64>> {
     let mut all = Vec::new();
     for file in live_pos_delete_files(table).await {
@@ -4507,43 +3572,9 @@ fn delete_file_counters(snapshot: &Snapshot) -> (Option<String>, Option<String>)
     )
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-011 — exactly ONE `RewriteFiles` (one Replace snapshot) per admitted BIN.
-// ------------------------------------------------------------------------------------------------
 
-/// C-011. `execute` iterates BINS, not partitions, and commits ONE `RewriteFiles` per admitted bin:
-/// a single partition packed into TWO bins produces TWO `Replace` snapshots, chained (each built on
-/// the previous bin's committed tip), each removing exactly its OWN bin's inputs and adding exactly
-/// its own output.
-///
-/// The correctness of committing sequentially against a FIXED `starting_snapshot_id` rests on two
-/// facts verified at source: the bins replace DISJOINT delete-file sets (`pack_bins` partitions the
-/// candidate list; group keys are disjoint), and `RewriteFilesAction::validate` early-returns when
-/// `deleted_data_files` is empty — always true here, because this action passes
-/// `rewrite_files(Vec::new(), Vec::new())` and only `delete_delete_files`.
-///
-/// NON-VACUITY: the two bins' MEMBERSHIP is not assumed from the packer's arithmetic — it is read
-/// back off the outputs' `(file_path, pos)` pairs, each input file masking a disjoint 1000-block. A
-/// commit shape that merged the partition into one bin, or split it differently, would show up in
-/// the block coverage as well as in the snapshot count. The read-identity assertion at the end is a
-/// REGRESSION guard, not the discriminating one: this fixture's inputs mask positions 1000..4004 of
-/// a FIVE-row data file, so no live row is masked and the row set is full either way (the same
-/// disclosure `test_bin_commit_failure_leaves_earlier_bins_committed` carries). `output_blocks` is
-/// what does the work — design call 2's "never read identity alone" is satisfied by it.
-///
-/// RECORDED, NOT PINNED — the base-advance conjunct. C-011's proposition also says "the base table
-/// is advanced after each bin commit". That leg is UNPINNABLE BY OBSERVATION: pointing the loop at
-/// `self.table` instead of the advanced `table` leaves the WHOLE lib suite green, because
-/// `Transaction::do_commit` refreshes a stale base and re-applies, so the two commits chain either
-/// way. The advance is a re-apply-COST optimisation, exactly as the merged comment above the loop
-/// says ("not required for CAS correctness under the retry/refresh loop"). The `parent_snapshot_id`
-/// assertion below therefore pins only what it CAN — that the two commits CHAIN rather than FORK —
-/// and deliberately does not imply the optimisation, the same discipline applied to recipe 7's
-/// `S_A + S_B <= W` window.
-///
-/// MUTATION, APPLIED: replace `plan_bins`'s S5 + S6 block with `admitted.push((key, candidates))`
-/// (one bin per PARTITION, the pre-unit shape). RED — one snapshot instead of two, one added file
-/// instead of two, and the surviving output covers all four blocks.
+/// C-011: `execute` iterates bins, not partitions, and commits one `RewriteFiles` per bin. one partition packed into two.
 #[tokio::test]
 async fn test_one_rewrite_files_commit_per_bin() {
     let (catalog, _temp, fixture) = recipe_7_two_bin_fixture().await;
@@ -4607,26 +3638,9 @@ async fn test_one_rewrite_files_commit_per_bin() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-037 — the abort contract: earlier bins STAND, no partial result reaches the caller.
-// ------------------------------------------------------------------------------------------------
 
-/// C-037. A bin commit failure aborts `execute` with `Err`; the bins committed BEFORE it STAND and
-/// are NOT rolled back; the caller receives NO partial [`RewritePositionDeleteFilesResult`].
-///
-/// The failure is injected by DELETING bin 2's first input file off disk after the fixture is
-/// committed — deterministic, because within a partition the entry order is manifest order, so the
-/// packer's bins are `{A, B}` then `{C, D}` and `execute` reaches `{C, D}` only after `{A, B}` has
-/// already committed. The sabotage is asserted to have APPLIED before `execute` runs; a fixture in
-/// which the file is not where the manifest says it is HARD-FAILS rather than proving nothing.
-///
-/// This RETAINS the pre-unit behaviour and makes it explicit — the bin change only multiplies the
-/// windows in which the state arises, from one per partition to one per bin. The same contract
-/// covers the `DataInvalid` raised mid-loop when a bin's `spec_id` is absent from table metadata.
-///
-/// MUTATION, APPLIED: swallow the per-bin error in `execute` (`match .. { Ok(t) => table = t, Err(_)
-/// => continue }`). RED — `execute` returns `Ok` with a partial result. A rollback of bin 1 would
-/// red the "bin 1 STANDS" assertions instead.
+/// C-037: a bin commit failure aborts `execute`. Earlier bins stay committed. No rollback.
 #[tokio::test]
 async fn test_bin_commit_failure_leaves_earlier_bins_committed() {
     let (catalog, _temp, fixture) = recipe_7_two_bin_fixture().await;
@@ -4638,8 +3652,6 @@ async fn test_bin_commit_failure_leaves_earlier_bins_committed() {
     let before = scan_y_values(&fixture.table).await;
     let history_before = fixture.table.metadata().history().len();
 
-    // SABOTAGE — bin 2's first member (C, the third file in manifest order). HARD-FAIL if it cannot
-    // be applied: a sabotage that corrupted nothing has proven nothing.
     let victim = fixture.paths[2]
         .strip_prefix("file://")
         .unwrap_or(&fixture.paths[2])
@@ -4733,9 +3745,6 @@ async fn test_bin_commit_failure_leaves_earlier_bins_committed() {
          masks exactly what it replaced"
     );
 
-    // A post-`execute` read-identity scan is deliberately NOT asserted: the sabotage physically
-    // removed a delete file that is still LIVE in metadata, so any scan of this table now fails on
-    // the missing bytes. `before` is captured pre-sabotage only to document what the fixture masked.
     assert_eq!(
         before,
         HashSet::from([10, 20, 30, 40, 50]),
@@ -4743,21 +3752,9 @@ async fn test_bin_commit_failure_leaves_earlier_bins_committed() {
     );
 }
 
-// ------------------------------------------------------------------------------------------------
 // C-040 — an admitted BIN yielding ZERO pairs is skipped PER BIN.
-// ------------------------------------------------------------------------------------------------
 
-/// Write a genuinely ZERO-ROW parquet position-delete file into `table`'s data directory, in
-/// partition `part_value`, and return the [`DataFile`] that describes it.
-///
-/// It cannot be produced through [`write_position_delete_file`]: `ParquetWriter::close` DELETES a
-/// zero-row output and returns `Ok(vec![])`, which is precisely why this action's own writer can
-/// never put such a file in a manifest. So the parquet bytes are written directly with the parquet
-/// crate's `ArrowWriter` over the position-delete ARROW schema — field ids included, so the
-/// reserved-column lookup still resolves if the reader hands back an empty batch — and the
-/// manifest-side `DataFile` is taken from a real one-pair write (for the content type, format,
-/// partition tuple and spec id) and re-pointed at the empty file with its row count, size and
-/// per-column metrics corrected.
+/// Write a genuinely ZERO-ROW parquet position-delete file into `table`'s data directory, in partition `part_value`, and return the [`DataFile`] describing it.
 async fn write_zero_row_pos_delete(table: &Table, part_value: i64, name: &str) -> DataFile {
     use parquet::arrow::ArrowWriter;
 
@@ -4798,35 +3795,7 @@ async fn write_zero_row_pos_delete(table: &Table, part_value: i64, name: &str) -
     file
 }
 
-/// C-040. An admitted BIN whose files yield ZERO `(file_path, pos)` pairs is SKIPPED **per bin**: it
-/// contributes zero to all four counts, commits nothing, and does not abort the loop over the
-/// remaining bins.
-///
-/// The state is REACHED, not simulated: partition 0 holds EXACTLY five zero-row parquet
-/// position-deletes and nothing else — so they cannot co-bin with non-empty files — and the bin is
-/// admitted by `enough_input_files` at the DEFAULT floor of five. Partition 1 carries a normal
-/// admissible group of five. The admission precondition (all five sub-min, count >= the resolved
-/// floor) is asserted BEFORE `execute`, so a fixture that stopped reaching the branch would red
-/// rather than pass vacuously.
-///
-/// The branch is DEFENSIVE and NOT a parity claim: Java cannot reach this state at all
-/// (`RewritePositionDeletesGroup`'s ctor `Preconditions`-checks `!tasks.isEmpty()`), and the fork's
-/// own writer cannot emit a zero-row position-delete, so only an externally-written file gets here.
-///
-/// WHY THE WHITE-BOX LEG EXISTS — do not "simplify" it away. MEASURED BY THE G4 REVIEW (not by this
-/// author): against the hazard mutant — branch deleted from `compact_group` AND an early
-/// `return Ok(result)` hoisted into `execute` — 10 runs went 6 RED on the end-to-end leg (zero bin
-/// scheduled first) and 4 RED on the white-box leg (normal bin first): 10/10 lethal, the two legs
-/// EXACT COMPLEMENTS. So the end-to-end leg ALONE is ~50% flaky against that mutant, and the
-/// white-box leg is not a weaker substitute for it — it is the half that removes the coin flip. No
-/// end-to-end-only construction can close it: for ANY mix of k zero bins and m normal bins,
-/// `HashMap` iteration order may place every zero bin LAST.
-///
-/// MUTATION, APPLIED: delete the `if pairs.is_empty()` branch. RED — but note the CAUSE: the mutant
-/// does NOT raise the error itself. `ParquetWriter::close` returns `Ok(vec![])` for zero rows and
-/// deletes the empty output, so "no file" is a normal return; it is `require_non_empty` that turns
-/// the empty `Vec` into `Err(Unexpected)`, and the mutant reds THROUGH that guard. Without the guard
-/// the mutant would return `Ok`, add nothing, and drop five live delete files.
+/// C-040: an admitted bin with zero pairs is skipped. Later bins still run. zero to all four counts, commits.
 #[tokio::test]
 async fn test_admitted_bin_with_zero_pairs_is_skipped() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -4857,8 +3826,6 @@ async fn test_admitted_bin_with_zero_pairs_is_skipped() {
     all.extend(normals);
     let table = add_deletes(&catalog, &table, all).await;
 
-    // ADMISSION PRECONDITIONS at the DEFAULT config — both bins must actually be admitted, or the
-    // zero-pairs branch is never reached and this pin proves nothing.
     let action = || RewritePositionDeleteFiles::new(table.clone());
     let config = action().resolve_config().expect("the defaults are legal");
     for size in empty_sizes.iter().chain(normal_sizes.iter()) {
@@ -4886,10 +3853,6 @@ async fn test_admitted_bin_with_zero_pairs_is_skipped() {
         "fixture: the second partition must be admissible too"
     );
 
-    // Acceptance item 4's read-identity leg, and SUBSTANTIVE here unlike recipe 7's: partition 1's
-    // deletes genuinely mask a live row (p1's position 1, y = 40), so the pre/post comparison can
-    // actually detect a compaction that changed the masked set. It also proves the production scan
-    // path READS the five surviving zero-row position-deletes without error.
     let before = scan_y_values(&table).await;
     assert_eq!(
         before,
@@ -4962,11 +3925,6 @@ async fn test_admitted_bin_with_zero_pairs_is_skipped() {
         "read identity — and the scan still reads the five untouched zero-row position-deletes"
     );
 
-    // WHITE BOX, the leg the end-to-end shape cannot force: `plan_bins` iterates a `HashMap`, so
-    // which of the two bins `execute` reaches FIRST is not fixed. Driving `compact_group` directly
-    // on the zero-pairs bin pins what the loop actually depends on — the skip RETURNS the table
-    // unchanged (so the caller's loop CONTINUES) and leaves the result counters alone, rather than
-    // signalling an abort.
     let entries: Vec<LiveDeleteEntry> = live_pos_delete_files(&reloaded)
         .await
         .into_iter()
@@ -5004,15 +3962,7 @@ async fn test_admitted_bin_with_zero_pairs_is_skipped() {
     );
 }
 
-// =================================================================================================
-// THE V3 ARM — legacy PARQUET position deletes become Puffin DELETION VECTORS. Every pin here is a
-// read-identity proof plus a SHAPE assertion, because a V3 arm that declined to act would satisfy
-// read identity on its own. The evidence class is read identity, not Java parity: `iceberg-core`
-// 1.10.0 has no runner for this action.
-// =================================================================================================
-
-/// Upgrade `table` to format version 3 — how a table acquires legacy parquet position deletes it
-/// can no longer write.
+/// Upgrade `table` to format version 3 — how a table acquires legacy parquet position deletes it can no longer write.
 async fn upgrade_to_v3(catalog: &impl Catalog, table: &Table) -> Table {
     let tx = Transaction::new(table);
     let action = tx
@@ -5022,9 +3972,7 @@ async fn upgrade_to_v3(catalog: &impl Catalog, table: &Table) -> Table {
     tx.commit(catalog).await.unwrap()
 }
 
-/// Write ONE Puffin file holding a deletion vector per `(target_path, positions)` entry, in
-/// partition x=`part_value`. The multi-blob shape a real engine writes, and the fixture the Puffin
-/// closure is pinned on.
+/// Write ONE Puffin file holding a deletion vector per `(target_path, positions)` entry, in partition x=`part_value`.
 async fn write_deletion_vectors_in_one_puffin(
     table: &Table,
     part_value: i64,
@@ -5056,9 +4004,6 @@ async fn write_deletion_vectors_in_one_puffin(
 }
 
 /// Swap delete files through `RewriteFiles`, each added file stamped with `sequence_number`.
-///
-/// `RowDelta`'s `validate_fresh_dvs_only` refuses to add a DV for a data file a live position delete
-/// still covers, so this is the only in-tree route to the half-migrated shape those pins need.
 async fn swap_delete_files(
     catalog: &impl Catalog,
     table: &Table,
@@ -5087,13 +4032,7 @@ async fn live_delete_seq(table: &Table, path: &str) -> i64 {
         .expect("a live delete entry at that path, carrying a sequence number")
 }
 
-/// CROWN JEWEL of the V3 arm. A table upgraded from V2 holds TWO parquet position deletes for one
-/// data file. On V3 those cannot be compacted into a third parquet file, so the arm converts them
-/// into ONE deletion vector. Read identity plus SHAPE: the live rows are unchanged, both parquet
-/// deletes are gone, and exactly one Puffin DV referencing that data file is live.
-///
-/// MUTATION COVERAGE — APPLIED: delete the version dispatch in `execute` and the run dies on the
-/// commit's "Must use DVs for position deletes in V3". RED.
+/// Crown jewel: two parquet position deletes on a V2 table upgraded to V3 convert into one Puffin DV.
 #[tokio::test]
 async fn test_v3_converts_parquet_position_deletes_into_one_deletion_vector() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5159,13 +4098,8 @@ async fn test_v3_converts_parquet_position_deletes_into_one_deletion_vector() {
     assert_eq!(after[0].record_count, 2, "both positions landed in the DV");
 }
 
-/// THE `(None, None)` HAZARD (row R114 bound (c)). Every `DVFileWriter::delete` call the arm makes
-/// carries the referenced data file's OWN `PartitionKey`, so `resolve_partition_spec_id` always
-/// takes its key arm and never the keyless one that stamps spec 0 with an EMPTY partition tuple.
-///
-/// MUTATION COVERAGE — APPLIED: pass `None` instead of `Some(&partition_key)` in
-/// `write_deletion_vectors` and the DV lands with an empty partition. RED on the partition
-/// assertion. A partition-keyed maintenance action then reasons over a field that lies.
+/// Each `DVFileWriter::delete` carries that data file's own `PartitionKey`.
+/// `with_partition_spec` is not used: one Puffin spans every partition.
 #[tokio::test]
 async fn test_v3_deletion_vector_carries_its_data_file_partition_and_spec() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5197,12 +4131,7 @@ async fn test_v3_deletion_vector_carries_its_data_file_partition_and_spec() {
     );
 }
 
-/// THE MERGE. One data file carries BOTH a legacy parquet position delete and a deletion vector, and
-/// the converted DV must union both sets. The DV here ABSORBS the parquet position, the shape Java's
-/// `BaseDVFileWriter.loadPreviousDeletes` produces, so the union preserves read identity.
-///
-/// MUTATION COVERAGE — APPLIED: drop the previous-DV load in `plan_deletion_vectors` and the DV's
-/// own masked row comes back. RED on read identity, with y=40 resurrected.
+/// A data file with both a legacy parquet delete and a DV gets one merged DV.
 #[tokio::test]
 async fn test_v3_conversion_merges_the_data_file_existing_deletion_vector() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5280,13 +4209,7 @@ async fn test_v3_conversion_merges_the_data_file_existing_deletion_vector() {
     );
 }
 
-/// THE PUFFIN CLOSURE — the delete-correctness pin of this arm. Delete-file removal is PATH-keyed,
-/// so superseding one DV blob removes every sibling blob in the same Puffin. Each sibling must be
-/// rewritten or its deleted rows come back.
-///
-/// MUTATION COVERAGE — APPLIED: delete the sibling loop in `plan_deletion_vectors` and data file
-/// Y's deletion vector is removed without a replacement. RED on read identity, with y=41
-/// resurrected — a silent, irreversible resurrection in committed metadata.
+/// Delete-file removal is path-keyed. Superseding one DV blob removes every sibling in that Puffin.
 #[tokio::test]
 async fn test_v3_rewrite_keeps_sibling_deletion_vectors_of_the_same_puffin() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5362,8 +4285,7 @@ async fn test_v3_rewrite_keeps_sibling_deletion_vectors_of_the_same_puffin() {
     );
 }
 
-/// The user filter restricts which partitions the V3 arm converts, exactly as it restricts which
-/// the bin-pack arm compacts.
+/// The user filter restricts which partitions the V3 arm converts, exactly as it restricts which the bin-pack arm compacts.
 #[tokio::test]
 async fn test_v3_filter_restricts_the_converted_partitions() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5403,12 +4325,7 @@ async fn test_v3_filter_restricts_the_converted_partitions() {
     );
 }
 
-/// A position naming a data file the snapshot no longer holds is DROPPED, not refused — it can
-/// delete nothing, which is what the V1/V2 arm effectively does too. REFUSING dead-ends the table:
-/// `RemoveDanglingDeleteFiles` keys on `(spec_id, partition)` and the partition's live data
-/// sequence, so it cannot clear a delete file that still names ONE live data file.
-///
-/// MUTATION COVERAGE — APPLIED: restore the refusal (error on the liveness miss) and this test reds.
+/// A position naming a data file the snapshot no longer holds is DROPPED, not refused — it can delete nothing, which is what the V1/V2 arm effectively does too.
 #[tokio::test]
 async fn test_v3_position_naming_a_non_live_data_file_is_dropped() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5417,8 +4334,6 @@ async fn test_v3_position_naming_a_non_live_data_file_is_dropped() {
     let x = write_data_file(&table, "x.parquet", 7, &[(7, 10, 1), (7, 11, 2)]).await;
     let x_path = x.file_path().to_string();
     let table = append_files(&catalog, &table, vec![x]).await;
-    // ONE delete file naming a LIVE data file and a GHOST one — the post-compaction shape
-    // `RemoveDanglingDeleteFiles` cannot classify as dangling.
     let ghost = format!("{}/data/ghost.parquet", table.metadata().location());
     let pd = write_position_delete_file(&table, Some(7), &[
         (x_path.as_str(), 1),
@@ -5460,13 +4375,7 @@ async fn test_v3_position_naming_a_non_live_data_file_is_dropped() {
     );
 }
 
-/// THE SHADOW CLOSURE — the second half of the delete-correctness line. A file-scoped position
-/// delete is routed BY PATH with no partition condition, so one stamped `x=1` still applies to a
-/// data file in `x=0`. Convert only the `x=0` delete and the new DV SHADOWS the other, which goes
-/// inert.
-///
-/// MUTATION COVERAGE — APPLIED: drop the `refuse_shadowed_deletes` call and the run returns
-/// `Ok {rewritten: 1, added: 1}`, live rows `{12}` becoming `{11, 12}` — y=11 resurrected.
+/// A file-scoped delete is routed by path. Converting only the matching partition would shadow it.
 #[tokio::test]
 async fn test_v3_refuses_when_a_filtered_out_delete_would_be_shadowed() {
     let (catalog, temp) = local_fs_catalog().await;
@@ -5514,13 +4423,7 @@ async fn test_v3_refuses_when_a_filtered_out_delete_would_be_shadowed() {
     );
 }
 
-/// THE PER-DV SEQ STAMP — the V3 twin of `test_each_bin_output_carries_its_own_bin_max_not_the_partition_max`.
-/// Each deletion vector must carry ITS OWN plan maximum, not the run-wide one. A run-wide stamp
-/// reads the same today but writes false metadata that `RemoveDanglingDeleteFiles` and conflict
-/// detection then reason over.
-///
-/// MUTATION COVERAGE — APPLIED: stamp every DV with `plans.values().map(..).max()` and A's vector
-/// carries B's 3 instead of its own 2. RED.
+/// Each DV carries its own plan max. A run-wide stamp writes false metadata.
 #[tokio::test]
 async fn test_v3_each_deletion_vector_carries_its_own_source_max_seq() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5572,8 +4475,7 @@ async fn test_v3_each_deletion_vector_carries_its_own_source_max_seq() {
     assert_eq!(seq_for(&b_path), b_source_seq, "B's vector carries B's own");
 }
 
-/// A live ORC position delete on a V3 table is REFUSED, where the V1/V2 arm silently skips it. That
-/// refusal is what makes `Ok(zeros)` total on this arm: an input it cannot express is an error.
+/// A live ORC position delete on a V3 table is REFUSED, where the V1/V2 arm silently skips it.
 #[tokio::test]
 async fn test_v3_non_parquet_position_delete_is_refused_not_skipped() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5594,13 +4496,7 @@ async fn test_v3_non_parquet_position_delete_is_refused_not_skipped() {
     assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
 }
 
-/// THE SHADOW CLOSURE, PARTITION LEG — the COMMON shape, not the rare one: a fork-written position
-/// delete carries `truncate(16)` path bounds, so partition-scoped is its default. Data file A sits
-/// in `x=0`; a FILE-scoped delete stamped `x=1` is admitted by `filter(x = 1)` and plans A, while a
-/// PARTITION-scoped delete in `x=0` is excluded and still applies to A.
-///
-/// MUTATION COVERAGE — APPLIED: replace the partition arm with `None => None` and the run returns
-/// `Ok {rewritten: 1, added: 1}`, live rows `{10}` becoming `{10, 12}` — y=12 resurrected.
+/// Partition-scoped is the fork default (`truncate(16)` path bounds). The path-only guard is not enough.
 #[tokio::test]
 async fn test_v3_refuses_when_a_partition_scoped_delete_would_be_shadowed() {
     let (catalog, temp) = local_fs_catalog().await;
@@ -5649,12 +4545,7 @@ async fn test_v3_refuses_when_a_partition_scoped_delete_would_be_shadowed() {
     );
 }
 
-/// THE ALREADY-SHADOWED DIRECTION. A deletion vector that does NOT cover a legacy delete it already
-/// suppresses: merging makes those positions effective and DELETES rows the table returns today.
-/// Java 1.10.0's own rewrite writes this shape — its `loadPreviousDeletes` is `path -> null`.
-///
-/// MUTATION COVERAGE — APPLIED: drop the superset check and the run returns
-/// `Ok {rewritten: 2, added: 1}`, live rows `{11, 12}` becoming `{11}` — y=12 silently gone.
+/// Merging a non-superset DV would make a shadowed position effective and delete live rows.
 #[tokio::test]
 async fn test_v3_refuses_when_the_existing_vector_does_not_cover_the_legacy_delete() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5730,9 +4621,6 @@ async fn test_v3_refuses_when_the_existing_vector_does_not_cover_the_legacy_dele
 
 /// The Puffin closure's LIVENESS guard: a sibling blob whose data file is no longer live is dropped
 /// with its Puffin, not planned. Without the guard it reaches `live_data_file` and errors.
-///
-/// MUTATION COVERAGE — APPLIED: drop `&& inventory.data_files.contains_key(data_file_path)` from the
-/// sibling loop and the run returns `Unexpected`. RED on the success expectation.
 #[tokio::test]
 async fn test_v3_puffin_closure_skips_a_sibling_whose_data_file_is_gone() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5749,8 +4637,6 @@ async fn test_v3_puffin_closure_skips_a_sibling_whose_data_file_is_gone() {
     let table = add_deletes(&catalog, &table, vec![scratch]).await;
     let table = upgrade_to_v3(&catalog, &table).await;
 
-    // ONE Puffin: X's vector (a SUPERSET of the legacy delete) beside a sibling for a data file the
-    // snapshot no longer holds.
     let ghost = format!("{}/data/ghost.parquet", table.metadata().location());
     let scratch_seq = live_delete_seq(&table, &scratch_path).await;
     let puffin =
@@ -5783,12 +4669,7 @@ async fn test_v3_puffin_closure_skips_a_sibling_whose_data_file_is_gone() {
     );
 }
 
-/// A CAPABILITY LIMIT, stated rather than given a remedy that cannot work. A file-scoped ORC delete
-/// the filter excluded still references a planned data file, so the closure refuses — but "widen the
-/// filter" would only route it to `FeatureUnsupported`. No filter width converts such a table.
-///
-/// MUTATION COVERAGE — APPLIED: collapse the remedy to the unconditional "Widen the filter" string
-/// and this test reds on the message.
+/// An excluded ORC delete still shadows. No filter width converts that table.
 #[tokio::test]
 async fn test_v3_shadowed_unreadable_delete_says_no_filter_width_helps() {
     let (catalog, temp) = local_fs_catalog().await;
@@ -5826,8 +4707,7 @@ async fn test_v3_shadowed_unreadable_delete_says_no_filter_width_helps() {
     );
 }
 
-/// Build limit (k)'s shape: data file A whose deletion vector masks position 0 while a live legacy
-/// position delete masks position 2 and is SHADOWED by that vector. Live rows are `{11, 12}`.
+/// Build limit (k)'s shape: data file A whose deletion vector masks position 0 while a live legacy position delete masks position 2 and is SHADOWED by that vector.
 async fn build_non_superset_vector_table(catalog: &impl Catalog) -> (Table, HashSet<i64>) {
     let table = create_partitioned_table(catalog, FormatVersion::V2).await;
     let a = write_data_file(&table, "a.parquet", 7, &[
@@ -5864,12 +4744,7 @@ async fn build_non_superset_vector_table(catalog: &impl Catalog) -> (Table, Hash
     (table, before)
 }
 
-/// LIMIT (k)'s ESCAPE, executed rather than asserted. The arm refuses this table for ever, but
-/// `RewriteDataFiles` clears it: the legacy delete is SHADOWED, so the rewrite's scan never reads it,
-/// the new data file gets exactly today's live rows, and both delete files fall dangling.
-///
-/// This is what separates (k) from (j). In (j) the unreadable delete is LIVE, so the scan must read
-/// it and cannot, and `RewriteDataFiles` is blocked too.
+/// Escape: `RewriteDataFiles` with `remove_dangling_deletes(true)` and a low `delete_file_threshold`.
 #[tokio::test]
 async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -5885,9 +4760,6 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
             .contains("THIS ACTION CANNOT CLEAR THAT STATE")
     );
 
-    // NEGATIVE CONTROL, and the reason the knobs are named in the message: the unknobbed form does
-    // NOTHING here. `DELETE_FILE_THRESHOLD_DEFAULT` is `usize::MAX`, so a well-sized data file
-    // carrying deletes is never a candidate and the planner returns an empty plan.
     let unknobbed = RewriteDataFiles::new(table.clone())
         .remove_dangling_deletes(true)
         .execute(&catalog)
@@ -5909,9 +4781,6 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
         "and both delete files are still live afterwards"
     );
 
-    // THE ESCAPE, exactly as the refusal words it. `min_input_files` is NOT needed: the gate's
-    // `any_too_many_deletes` clause carries no `size > 1` guard, so the delete count admits the lone
-    // file on its own.
     let rewrite = RewriteDataFiles::new(table.clone())
         .remove_dangling_deletes(true)
         .delete_file_threshold(1)
@@ -5943,10 +4812,6 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
         .expect("the cleared table converts without refusing");
     assert_eq!(second, RewritePositionDeleteFilesResult::default());
 
-    // THE TIE, and what it does NOT bind. The refusal must name every knob in this list, so a
-    // message that drops one reds here. The list is MANUAL: it cannot be derived from the builder
-    // chain above, so adding a knob to the invocation without adding it here stays green — which is
-    // the exact drift that shipped a one-knob message twice. Change the chain, change the list.
     for knob in ["remove_dangling_deletes(true)", "delete_file_threshold"] {
         assert!(
             refusal.to_string().contains(knob),

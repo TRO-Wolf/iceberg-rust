@@ -45,15 +45,9 @@
 #        -> Java loads the PRE + POST tables, reads each via IcebergGenerics, and asserts: PRE live ids ==
 #           {100,130,200,230}; READ IDENTITY POST == PRE; and the compaction shape (PRE pos > POST pos > 0).
 #           Nonzero failures => exit 1.
-#   2b. The V3 LEG (F-7 U3). Rust also writes "$TMP/rust_table_v3" — the same PRE world upgraded to format
-#       version 3, still carrying its four legacy PARQUET position deletes — and "$TMP/rust_table_v3_dv",
-#       that world after RewritePositionDeleteFiles converted them into Puffin DELETION VECTORS. Java
-#       reads both and asserts identical live ids plus the conversion shape (PRE parquet > 0, POST
-#       parquet = 0, POST puffin > 0). ENGINE-FIRST, not a Java-parity flip: iceberg-core 1.10.0 has no
-#       runner for this action. The SPARK action DOES convert on v3 — decoded 2026-08-26 from
-#       iceberg-spark-runtime-4.0_2.13-1.10.0, whose execute() early-returns only when
-#       formatVersion >= 3 AND requiresRewriteToDVs() is false — but iceberg-spark is outside this
-#       fork's parity envelope, so no Spark-output comparison is made. See GAP_MATRIX row R136.
+#   2b. V3 leg. Rust writes rust_table_v3 (PRE, still parquet deletes) and rust_table_v3_dv
+#       (POST, converted to Puffin DVs). Java asserts identical live ids and conversion shape.
+#       Engine-first: iceberg-core has no runner. See GAP_MATRIX row R136.
 #
 #   3. Sabotage battery (each on a SCRATCH copy; HARD-FAIL never SKIP if a corruption cannot be applied):
 #        (a) read-identity breaker — swap the POST metadata with the no-deletes table's, so POST reads the
