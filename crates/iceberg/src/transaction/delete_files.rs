@@ -83,7 +83,8 @@ use crate::expr::Predicate;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer, deleted_data_files_after,
+    DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
+    deleted_data_files_after,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
@@ -266,6 +267,7 @@ impl TransactionAction for DeleteFilesAction {
             self.snapshot_properties.clone(),
             // A delete-only commit adds no data files.
             vec![],
+            FirstRowIdPolicy::Suppress,
         )
         .with_stage_only(self.stage_only);
 

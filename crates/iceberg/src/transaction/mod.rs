@@ -1854,8 +1854,14 @@ mod test_row_lineage {
             .await
             .unwrap();
         assert_eq!(manifest_list.entries().len(), 2);
-        let manifest_file = &manifest_list.entries()[1];
-        assert_eq!(manifest_file.first_row_id, Some(30));
+        // The NEW manifest comes first (Java `FastAppend.apply`: `writeNewManifests()` then
+        // `snapshot.allManifests()`), and the manifest-list writer assigns ranges in that order.
+        let new_manifest = &manifest_list.entries()[0];
+        assert_eq!(new_manifest.added_files_count, Some(2));
+        assert_eq!(new_manifest.first_row_id, Some(30));
+        let carried_manifest = &manifest_list.entries()[1];
+        assert_eq!(carried_manifest.added_files_count, Some(1));
+        assert_eq!(carried_manifest.first_row_id, Some(0));
     }
 }
 

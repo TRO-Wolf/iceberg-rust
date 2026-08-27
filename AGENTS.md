@@ -243,7 +243,8 @@ The canonical entry points are in the [Makefile](Makefile) (run from the repo ro
 ```bash
 make build         # cargo build --all-targets --all-features --workspace
 make check         # fmt --check + clippy -D warnings + taplo TOML check + cargo-machete (unused deps)
-                   #   + check-agent-artifacts + check-matrix-anchors
+                   #   + check-agent-artifacts + check-matrix-anchors + check-comment-blocks
+                   #   + Rust source-file size
 make unit-test     # doc tests + lib tests only (faster)
 make test          # docker-up + cargo nextest run --all-targets --all-features --workspace
 make check-msrv    # cargo +<MSRV> check --workspace
@@ -498,6 +499,9 @@ relax the rules above.
   half a cell as a phantom column), the row anchors below, and citation resolution. It runs in CI
   and the aggregate `make check`. _Promoted 2026-06-11 from lessons as a manual pipe-count sweep;
   automated 2026-07-01._
+- **Keep Rust source files within the ceilings in [the file-size checker](scripts/check_rust_file_size.py).**
+  Legacy ceilings freeze existing debt and only move down. The aggregate `make check` and CI both
+  run the checker.
 - **Cite GAP_MATRIX rows by permanent anchor — `row R<id>` — never by file line number.** Line
   numbers shift when ANY line is inserted above them — the +2 drift that broke ~45 citations
   between 2026-06-17 and 2026-07-01 (discovered in four separate waves) came from two PROSE lines

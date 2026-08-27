@@ -26150,6 +26150,35 @@ public final class InteropOracle {
               new String[] {"i", "j", "k", "l"});
       // A SECOND commit: the range continues across snapshots, not just within a manifest.
       table.newAppend().appendFile(c).commit();
+
+      // A REWRITE: file a is replaced by d. File b survives in the SAME manifest and is rewritten
+      // as an EXISTING entry, which is the entry status the append-only part of this fixture never
+      // produces.
+      DataFile d =
+          writeDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data-d.parquet").getAbsolutePath(),
+              new long[] {130L, 140L},
+              new String[] {"m", "n"});
+      table
+          .newRewrite()
+          .rewriteFiles(
+              new java.util.HashSet<>(Collections.singletonList(a)),
+              new java.util.HashSet<>(Collections.singletonList(d)))
+          .commit();
+
+      // An OVERWRITE: file c is replaced by e, through the other merging producer.
+      DataFile e =
+          writeDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data-e.parquet").getAbsolutePath(),
+              new long[] {150L, 160L},
+              new String[] {"o", "p"});
+      table.newOverwrite().deleteFile(c).addFile(e).commit();
       table.refresh();
 
       Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
@@ -26159,7 +26188,106 @@ public final class InteropOracle {
 
       writeJson(dir.resolve("java_row_lineage.json"), lineageJson(table));
       writeJson(dir.resolve("java_row_ids.json"), rowIdsJson(table));
+
+      generateUpgraded(dir, schema, spec);
       System.out.println("generate-interop-row-lineage: wrote " + dir);
+    }
+
+    /**
+     * The SECOND fixture: a V2 table upgraded to V3 and then rewritten.
+     *
+     * <p>It is the only shape either implementation can build in which a live EXISTING entry
+     * reaches the reader with no stored {@code first_row_id}. The rewrite reads the V2 manifest,
+     * whose {@code firstRowId} is null, so {@code ManifestReader.idAssigner} nulls every entry
+     * before the survivor is written forward; the V3 manifest list then gives the rewritten
+     * manifest a range. Without it the reader's DELETED-vs-ADDED skip test cannot be observed from
+     * either direction.
+     *
+     * <p>It takes TWO V2 appends, not one, so that two carried-forward data manifests reach the V3
+     * commit still needing a range and each still holding live rows. Their relative order then
+     * decides which of them takes which range. The four record counts are distinct so a swap
+     * survives the name-stripping the assignment cross-check does.
+     */
+    private static void generateUpgraded(Path dir, Schema schema, PartitionSpec spec)
+        throws IOException {
+      File tableDir = new File(dir.toFile(), "upgraded");
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.mkdirs() && !metadataDir.isDirectory()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.mkdirs() && !dataDir.isDirectory()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_row_lineage_upgraded");
+
+      DataFile f =
+          writeDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data-f.parquet").getAbsolutePath(),
+              new long[] {210L, 220L, 230L},
+              new String[] {"q", "r", "s"});
+      DataFile g =
+          writeDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data-g.parquet").getAbsolutePath(),
+              new long[] {240L, 250L},
+              new String[] {"t", "u"});
+      table.newAppend().appendFile(f).appendFile(g).commit();
+
+      // A SECOND V2 append, so the V3 commit below carries TWO unassigned data manifests forward.
+      DataFile i =
+          writeDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data-i.parquet").getAbsolutePath(),
+              new long[] {260L, 270L, 280L, 290L},
+              new String[] {"v", "w", "x", "y"});
+      table.newAppend().appendFile(i).commit();
+      table.refresh();
+
+      ops.commit(ops.current(), TableMetadata.buildFrom(ops.current()).upgradeFormatVersion(3).build());
+      table.refresh();
+
+      // The FIRST V3 commit must be the rewrite: the source manifests are still the V2 ones, so
+      // their entries reach the writer with no id. It replaces f, which leaves g live in the
+      // rewritten manifest and i live in the manifest carried forward beside it.
+      DataFile h =
+          writeDataFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data-h.parquet").getAbsolutePath(),
+              new long[] {300L},
+              new String[] {"z"});
+      table
+          .newRewrite()
+          .rewriteFiles(
+              new java.util.HashSet<>(Collections.singletonList(f)),
+              new java.util.HashSet<>(Collections.singletonList(h)))
+          .commit();
+      table.refresh();
+
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+
+      writeJson(dir.resolve("java_row_lineage_upgraded.json"), lineageJson(table));
+      writeJson(dir.resolve("java_row_ids_upgraded.json"), rowIdsJson(table));
     }
 
     static void verify(Path dir) throws IOException {
@@ -26220,7 +26348,63 @@ public final class InteropOracle {
         }
       }
 
+      failures += verifyUpgraded(dir);
+
       System.out.println("verify-interop-row-lineage: " + failures + " failures");
+    }
+
+    /**
+     * The upgraded fixture's D2 half: Java reads the V2-upgraded-to-V3 table the fork wrote. Its
+     * surviving EXISTING entry has no stored id, so a reader that skips a non-ADDED entry reports a
+     * null row id for every one of its rows.
+     */
+    private static int verifyUpgraded(Path dir) throws IOException {
+      Path rustTable = dir.resolve("rust_upgraded_table");
+      Path rustMetadata = rustTable.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(rustMetadata)) {
+        System.out.println("FAIL row-lineage upgraded: no Rust metadata at " + rustMetadata);
+        return 1;
+      }
+
+      int failures = 0;
+      TableMetadata metadata =
+          TableMetadataParser.read(new LocalFileIO(), rustMetadata.toAbsolutePath().toString());
+      LocalTableOperations ops =
+          new LocalTableOperations(rustTable.toFile(), rustTable.resolve("metadata").toFile());
+      ops.commit(null, metadata);
+      BaseTable table = new BaseTable(ops, "rust_row_lineage_upgraded");
+
+      String javaView = lineageJson(table);
+      writeJson(dir.resolve("java_view_of_rust_row_lineage_upgraded.json"), javaView);
+
+      Path expectedPath = dir.resolve("rust_row_lineage_upgraded_expected.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println("FAIL row-lineage upgraded: no Rust expectation at " + expectedPath);
+        failures++;
+      } else {
+        String expected = readString(expectedPath).trim();
+        if (!expected.equals(javaView)) {
+          System.out.println("FAIL row-lineage upgraded: Java's view of the RUST table differs.");
+          System.out.println("  rust  : " + expected);
+          System.out.println("  java  : " + javaView);
+          failures++;
+        }
+      }
+
+      writeJson(dir.resolve("java_row_ids_of_rust_upgraded_table.json"), rowIdsJson(table));
+
+      for (ManifestFile manifest : table.currentSnapshot().dataManifests(table.io())) {
+        try (CloseableIterable<DataFile> files = ManifestFiles.read(manifest, table.io())) {
+          for (DataFile file : files) {
+            if (file.firstRowId() == null) {
+              System.out.println(
+                  "FAIL row-lineage upgraded: Java read a NULL first_row_id for " + file.location());
+              failures++;
+            }
+          }
+        }
+      }
+      return failures;
     }
 
     private static DataFile writeDataFile(

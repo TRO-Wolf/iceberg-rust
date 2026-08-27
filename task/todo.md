@@ -31,20 +31,28 @@ How to use it (see the manuals' §1):
 
 ---
 
-## RULED (2026-08-26): the model comment ban and its three exceptions
+## CLOSED (2026-08-26): 1,000-line Rust source-file gate
 
-The owner ruled the same day it was raised. Both toolchain collisions are now written exceptions in
-AGENTS.md and CLAUDE.md, alongside a third the owner added:
+Port RePark's fail-closed Rust file-size guard to this workspace. The default ceiling is 1,000
+lines. Existing files above the ceiling receive exact-count legacy ratchets because 104 files
+already exceed the limit; no legacy file may grow and no new over-limit file may land.
 
-1. Doc comments the compiler demands — `#![deny(missing_docs)]` — at the minimum that compiles.
-2. The ASF license header, which is a comment and is enforced by CI.
-3. Minor comments and ordinary prose in markdown.
+- [x] Add `scripts/check_rust_file_size.py` with the 1,000-line default, exact legacy ratchets,
+      actionable failures, and fail-closed handling for empty scans, unreadable files, and stale
+      ratchet paths. The live scan passes over all 363 Rust files.
+- [x] Add `scripts/check_rust_file_size_test.py` and the thin shell wrapper. Pin the boundary,
+      over-limit rejection, ratchet behavior, stale paths, unreadable files, and empty scans.
+      Eleven tests pass, including a real 1,001-line rejection.
+- [x] Wire `check-rust-file-size` into `Makefile` `check` and add a direct CI check step in
+      `.github/workflows/ci.yml`.
+- [x] Update `AGENTS.md` so the build-gate roster points to the checker without duplicating its
+      ceiling table.
+- [x] Run the checker tests, clean-tree gate, explicit over-limit provocation, `make check`, and an
+      independent fresh-context Critic review. The Critic's findings were remediated before it declared
+      convergence with no open S0–S2 findings. All unrelated working-tree changes remain intact.
 
-Nothing else is an exception. A model adding a new public item or a new file is no longer blocked.
-Routing evidence to a `task/` ledger or a GAP_MATRIX row is unchanged, and is now the ONLY route for
-anything that would previously have become a code comment.
-
----
+Outcome: the gate scans 363 Rust files. It freezes 104 inherited overages at their exact current
+counts, rejects new files above 1,000 lines, and fails if legacy debt grows or leaves stale headroom.
 
 ## QUEUED (2026-08-25): engine-agreed order — R166 interop, then F-13-or-F-7
 
@@ -906,3 +914,33 @@ retroactively and R-G7-5 (R2's six-field mandate vs the claim board's table shap
 - **R3 was violated by #208 and #209** (R-G7-3) — both carry GitHub's auto-generated branch-name
   titles with no `[repark]` tag, and no merged PR title names the BREAKING flip. Nothing to fix
   retroactively; recorded so the next unit tags its PRs at open time rather than at merge time.
+
+## F-7 U1 — `first_row_id` suppression at the merging-producer add seam (2026-08-25)
+
+Branch `parity/f7-u1-suppress-first-row-id`, base `249a9556b`. Two stages, one branch.
+
+- [x] Stage 1 — port Java `MergingSnapshotProducer.add(DataFile)` → `Delegates.suppressFirstRowId`.
+      Seam: a REQUIRED `FirstRowIdPolicy` argument on `SnapshotProducer::new`, so every call site
+      states its policy and a new producer cannot inherit one by omission. `FastAppend` +
+      `RewriteManifests` pass `Preserve` (both extend Java `SnapshotProducer`); the six merging
+      producers plus `CherryPickOperation` pass `Suppress`.
+- [x] Stage 1 evidence — domain table over the seven producers of the charter's partition, plus a
+      per-rule mutation run with its arithmetic.
+- [x] Stage 2 — extend the row-lineage interop fixture with a `RewriteFiles` and an
+      `OverwriteFiles` commit so `Existing` entries exist, and pin that a survivor keeps its
+      `first_row_id` and its per-row `_row_id`, both directions.
+- [x] Stage 2 evidence — measure the `== Added` vs `!= Deleted` mutation named in row R166.
+- [x] Matrix cells + full done gate.
+
+Outcome: Stage 1 landed as a required `FirstRowIdPolicy` argument on `SnapshotProducer::new`.
+Stage 2 found a REAL divergence and it is fixed in the same change: the fork emitted the
+carried-forward manifests before the newly written ones, where Java emits new first, and the V3
+manifest-list writer assigns row-id ranges in list order — so a newly added file took a row id
+Java does not give it (15 against Java's 12 on the rewrite fixture). Both facts are recorded in
+row R166. The order has three conjuncts and each is now mutation-pinned separately; the
+data-before-deletes one is `MergingSnapshotProducer.apply`'s shape alone, and is unreachable
+because no producer on either side emits a delete manifest ahead of a data manifest.
+Stage 2's named mutation now goes RED, but only through a V2-to-V3 upgrade fixture: a
+rewrite reads its source through the assigning reader on both sides, so an ordinary rewrite's
+survivor already carries a stored id. NOT built and escalated: Java's `add(ManifestFile)`
+`first_row_id` precondition has no fork surface to land on (see the R166 residue).

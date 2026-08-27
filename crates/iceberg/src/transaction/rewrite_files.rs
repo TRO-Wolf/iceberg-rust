@@ -135,8 +135,8 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, PendingDeleteFile, SnapshotProduceOperation, SnapshotProducer,
-    validate_no_new_deletes_for_data_files,
+    DefaultManifestProcess, FirstRowIdPolicy, PendingDeleteFile, SnapshotProduceOperation,
+    SnapshotProducer, validate_no_new_deletes_for_data_files,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
@@ -501,6 +501,7 @@ impl TransactionAction for RewriteFilesAction {
             self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
+            FirstRowIdPolicy::Suppress,
         );
 
         // Preserve the replaced files' data sequence number on the added files when requested (Java

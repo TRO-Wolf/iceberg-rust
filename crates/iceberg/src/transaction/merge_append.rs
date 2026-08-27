@@ -112,7 +112,9 @@ use crate::spec::{
     TableProperties,
 };
 use crate::table::Table;
-use crate::transaction::snapshot::{ManifestProcess, SnapshotProduceOperation, SnapshotProducer};
+use crate::transaction::snapshot::{
+    FirstRowIdPolicy, ManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+};
 use crate::transaction::{ActionCommit, TransactionAction};
 
 /// A transaction action that appends data files in one `Operation::Append` snapshot and then MERGES the
@@ -185,6 +187,7 @@ impl TransactionAction for MergeAppendAction {
             self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
+            FirstRowIdPolicy::Suppress,
         );
 
         // Validate added files (identical to fast append — only DATA content, matching spec, valid

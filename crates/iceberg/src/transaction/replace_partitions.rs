@@ -104,8 +104,8 @@ use crate::expr::Predicate;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation, Struct};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer, added_data_files_after,
-    added_delete_files_after, deleted_data_files_after,
+    DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
+    added_data_files_after, added_delete_files_after, deleted_data_files_after,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
@@ -422,6 +422,7 @@ impl TransactionAction for ReplacePartitionsAction {
             self.key_metadata.clone(),
             snapshot_properties,
             self.added_data_files.clone(),
+            FirstRowIdPolicy::Suppress,
         );
 
         // Validate the added files like fast append: data content type, partition-spec match, and

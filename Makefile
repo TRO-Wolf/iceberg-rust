@@ -56,6 +56,10 @@ check-comment-blocks:
 check-matrix-anchors:
 	./scripts/check_matrix_anchors.sh
 
+check-rust-file-size:
+	python3 -B -m unittest scripts/check_rust_file_size_test.py
+	./scripts/check_rust_file_size.sh
+
 # The scheduled Java-interop regression net (dev/java-interop/, discovered dynamically).
 # Full set — what .github/workflows/nightly_interop.yml runs. Needs mvn + JDK 11 + cargo
 # (hard-fails if absent, never skips). See scripts/run_interop_suites.sh for the contract.
@@ -72,7 +76,8 @@ MSRV_VERSION    := $(shell awk -F'"' '/^rust-version/ {print $$2}' Cargo.toml)
 check-msrv:
 	cargo +$(MSRV_VERSION) check --workspace
 
-check: check-fmt check-clippy check-toml cargo-machete check-agent-artifacts check-matrix-anchors check-comment-blocks
+check: check-fmt check-clippy check-toml cargo-machete check-agent-artifacts \
+	check-matrix-anchors check-comment-blocks check-rust-file-size
 
 doc-test:
 	cargo test --no-fail-fast --doc --all-features --workspace
