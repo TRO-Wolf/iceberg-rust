@@ -114,6 +114,10 @@ where
             file_name_generator: self.file_name_generator.clone(),
         }
     }
+
+    pub(crate) fn iceberg_schema(&self) -> Option<&crate::spec::SchemaRef> {
+        self.inner_builder.iceberg_schema()
+    }
 }
 
 /// A writer that automatically rolls over to a new file when the data size
@@ -211,7 +215,6 @@ where
             );
         }
 
-        // write the input
         if let Some(writer) = self.inner.as_mut() {
             Ok(writer.write(input).await?)
         } else {

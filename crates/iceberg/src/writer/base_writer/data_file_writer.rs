@@ -20,14 +20,17 @@
 //! It also hosts `resolve_partition_spec_id` — the partition-spec-id stamping rule shared by all
 //! three base writers (data, position-delete, equality-delete).
 
+use std::borrow::Cow;
+
 use arrow_array::RecordBatch;
 
 use crate::spec::{
-    DEFAULT_PARTITION_SPEC_ID, DataContentType, DataFile, PartitionKey, PartitionSpec,
+    DEFAULT_PARTITION_SPEC_ID, DataContentType, DataFile, PartitionKey, PartitionSpec, SchemaRef,
 };
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileWriterBuilder};
+use crate::writer::write_defaults::apply_write_defaults;
 use crate::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
@@ -150,6 +153,7 @@ where
             inner: Some(self.inner.build()),
             partition_key,
             partition_spec_id,
+            schema: self.inner.iceberg_schema().cloned(),
         })
     }
 }
@@ -162,6 +166,7 @@ pub struct DataFileWriter<B: FileWriterBuilder, L: LocationGenerator, F: FileNam
     /// The spec id stamped on every produced file, resolved once at build time by
     /// `resolve_partition_spec_id`.
     partition_spec_id: i32,
+    schema: Option<SchemaRef>,
 }
 
 #[async_trait::async_trait]
@@ -172,8 +177,12 @@ where
     F: FileNameGenerator,
 {
     async fn write(&mut self, batch: RecordBatch) -> Result<()> {
+        let filled = match &self.schema {
+            Some(schema) => apply_write_defaults(schema, &batch)?,
+            None => Cow::Borrowed(&batch),
+        };
         if let Some(writer) = self.inner.as_mut() {
-            writer.write(&self.partition_key, &batch).await
+            writer.write(&self.partition_key, filled.as_ref()).await
         } else {
             Err(Error::new(
                 ErrorKind::Unexpected,

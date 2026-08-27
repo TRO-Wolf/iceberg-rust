@@ -22,7 +22,7 @@ use futures::Future;
 
 use super::CurrentFileStatus;
 use crate::Result;
-use crate::spec::DataFileBuilder;
+use crate::spec::{DataFileBuilder, SchemaRef};
 
 mod avro_writer;
 pub use avro_writer::{AvroWriter, AvroWriterBuilder};
@@ -43,6 +43,10 @@ pub trait FileWriterBuilder<O = DefaultOutput>: Clone + Send + Sync + 'static {
     type R: FileWriter<O>;
     /// Build file writer.
     fn build(&self, output_file: OutputFile) -> impl Future<Output = Result<Self::R>> + Send;
+    /// Iceberg schema this builder writes. Used to fill `write-default` for missing columns.
+    fn iceberg_schema(&self) -> Option<&SchemaRef> {
+        None
+    }
 }
 
 /// File writer focus on writing record batch to different physical file format.(Such as parquet. orc)

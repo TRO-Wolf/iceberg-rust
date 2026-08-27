@@ -96,9 +96,11 @@ impl AvroWriterBuilder {
 impl FileWriterBuilder for AvroWriterBuilder {
     type R = AvroWriter;
 
+    fn iceberg_schema(&self) -> Option<&crate::spec::SchemaRef> {
+        Some(&self.schema)
+    }
+
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
-        // Reject types the reader cannot round-trip before any IO so the failure is loud and early
-        // (mirrors the reader's variant/unknown rejection — see `reject_unsupported_types`).
         reject_unsupported_types(self.schema.as_struct())?;
 
         let avro_schema = schema_to_avro_schema(AVRO_ROOT_RECORD_NAME, &self.schema)?;
@@ -122,18 +124,16 @@ impl FileWriterBuilder for AvroWriterBuilder {
 /// borrows its schema for the writer's lifetime, which cannot be held across this trait's
 /// `&mut self async` calls without a self-referential struct. We therefore resolve each row to an
 /// owned [`AvroValue`](apache_avro::types::Value) as it arrives (the CPU-bound Arrow → Iceberg →
-/// Avro encode), buffer the values, and build the OCF exactly once in [`close`](FileWriter::close) —
-/// a single async [`OutputFile::write`]. Nothing touches storage until close, so an empty input
-/// never creates a phantom file.
+/// Avro encode), buffer the values, and build the OCF exactly once in [`close`](FileWriter::close).
+/// Empty input never creates a phantom file.
 pub struct AvroWriter {
     schema: SchemaRef,
     avro_schema: AvroSchema,
     codec: Codec,
     output_file: OutputFile,
-    /// Resolved Avro row values accumulated across `write` calls; serialized into one OCF at close.
+    /// Resolved Avro rows; serialized into one OCF at close.
     rows: Vec<AvroValue>,
-    /// Running sum of the per-row uncompressed Avro datum sizes — the live roll signal (see
-    /// [`CurrentFileStatus::current_written_size`]).
+    /// Uncompressed Avro datum size sum; the live roll signal (`current_written_size`).
     encoded_size_estimate: usize,
     current_row_num: usize,
 }

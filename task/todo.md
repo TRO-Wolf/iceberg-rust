@@ -31,6 +31,18 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-27): F-9 S3 Tables register_table + F-15 write_default
+
+One PR. F-9 is a dated service-gap ruling (S3 Tables has no register-by-metadata-location API).
+F-15 consumes `write_default` on the data-file write path (row R92).
+
+- [x] F-9: keep `FeatureUnsupported`, name the service gap, pin it, record on row R126.
+- [x] F-15: fill missing top-level primitive columns from `write_default` in DataFileWriter.
+- [x] Tests on the real `register_table` and `DataFileWriter` entry points.
+- [ ] Independent Critic + gates + PR.
+
+---
+
 ## ACTIVE (2026-08-27): F-16 delete-ratio + F-7 V3 DV accounting + comment part 2
 
 One PR. Java `BinPackRewriteFilePlanner.tooHighDeleteRatio` (default 0.3) and
