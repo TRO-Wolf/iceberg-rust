@@ -77,6 +77,9 @@ jobs:
       - name: Check comment block length
         run: make check-comment-blocks
 
+      - name: Check Rust source-file size
+        run: make check-rust-file-size
+
       - name: Install protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
