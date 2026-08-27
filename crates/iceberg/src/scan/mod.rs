@@ -197,15 +197,9 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
-    /// Specifies a predicate to use as a filter
-    ///
-    /// The predicate prunes manifests and files at plan time, and stays as a residual row filter
-    /// on each surviving [`FileScanTask`]. Matches Java `Scan.filter`.
-    ///
-    /// The residual drops co-located non-matching rows inside a surviving file. A copy-on-write
-    /// MERGE target scan must use [`with_file_prune_only`](Self::with_file_prune_only) instead.
-    ///
-    /// The last of the two calls wins.
+    /// Specifies a predicate to use as a filter The predicate prunes manifests and files at plan
+    /// time, and stays as a residual row filter on each surviving [`FileScanTask`]. Matches Java
+    /// `Scan.filter`. The residual drops co-located non-matching rows inside a surviving file.
     pub fn with_filter(mut self, predicate: Predicate) -> Self {
         // calls rewrite_not to remove Not nodes, which must be absent
         // when applying the manifest evaluator
@@ -214,13 +208,9 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
-    /// Specifies a predicate used **only** for planning-time file / manifest pruning.
-    ///
-    /// Pruning works as in [`with_filter`](Self::with_filter), but a surviving file returns every
-    /// row. No residual reaches [`FileScanTask`], so no row filter and no row-group filter runs.
-    ///
-    /// Copy-on-write MERGE needs this mode. It prunes files that cannot match the ON clause, then
-    /// rewrites whole surviving files. The last of the two calls wins.
+    /// Specifies a predicate used **only** for planning-time file / manifest pruning. Pruning works
+    /// as in [`with_filter`](Self::with_filter), but a surviving file returns every row. No
+    /// residual reaches [`FileScanTask`], so no row filter and no row-group filter runs.
     pub fn with_file_prune_only(mut self, predicate: Predicate) -> Self {
         self.filter = Some(predicate.rewrite_not());
         self.file_prune_only = true;
@@ -263,15 +253,9 @@ impl<'a> TableScanBuilder<'a> {
         self.table
     }
 
-    /// Scan the snapshot that a branch or tag reference points to.
-    ///
-    /// Mirrors Java `TableScan.useRef`. [`build`](Self::build) resolves the name, and rejects
-    /// both an unknown name and a [`snapshot_id`](Self::snapshot_id) set alongside it.
-    /// `"main"` resolves to the table's current snapshot.
-    ///
-    /// # Arguments
-    ///
-    /// * `ref_name` - the branch or tag name to resolve.
+    /// Scan the snapshot that a branch or tag reference points to. Mirrors Java `TableScan.useRef`.
+    /// [`build`](Self::build) resolves the name, and rejects both an unknown name and a
+    /// [`snapshot_id`](Self::snapshot_id) set alongside it.
     pub fn use_ref(mut self, ref_name: impl Into<String>) -> Self {
         self.snapshot_ref = Some(ref_name.into());
         self
@@ -292,14 +276,10 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
-    /// Enable or disable within-file read parallelism for [`TableScan::to_arrow`].
-    ///
-    /// When enabled, and the data-file concurrency limit exceeds 1, a whole-file task that
-    /// carries row-group `split_offsets` expands into per-offset sub-tasks. They read under the
-    /// same concurrency budget as cross-file tasks. Default on.
-    ///
-    /// Batch order across sub-tasks of one file is not preserved. A scan that projects `_pos`
-    /// suppresses the expansion.
+    /// Enable or disable within-file read parallelism for [`TableScan::to_arrow`]. When enabled,
+    /// and the data-file concurrency limit exceeds 1, a whole-file task that carries row-group
+    /// `split_offsets` expands into per-offset sub-tasks. They read under the same concurrency
+    /// budget as cross-file tasks.
     pub fn with_within_file_read_parallelism(mut self, enabled: bool) -> Self {
         self.within_file_read_parallelism = enabled;
         self
@@ -653,13 +633,9 @@ pub struct TableScan {
 }
 
 /// The reporter, the shared counter collector, and the immutable inputs needed to build a
-/// [`ScanReport`] at stream-completion time.
-///
-/// Bundled so the opt-in is one `Option` on [`TableScan`]. When it is `None`,
-/// [`TableScan::plan_files`] installs no collector, no timer and no stream wrapper.
-///
-/// [`build`](TableScanBuilder::build) captures the report metadata once, from the same values
-/// Java `SnapshotScan.planFiles` reads.
+/// [`ScanReport`] at stream-completion time. Bundled so the opt-in is one `Option` on
+/// [`TableScan`]. When it is `None`, [`TableScan::plan_files`] installs no collector, no timer and
+/// no stream wrapper.
 #[derive(Clone)]
 struct ScanMetricsContext {
     reporter: Arc<dyn MetricsReporter>,
@@ -840,13 +816,8 @@ impl TableScan {
     }
 
     /// Plans the scan into split and bin-packed [`CombinedScanTask`] groups. Ports Java
-    /// `Scan.planTasks()`.
-    ///
-    /// This layer drives [`plan_files`](Self::plan_files) unchanged, splits each task at the
-    /// build-time [`SplitConfig`] target, then packs with `largestBinFirst`.
-    ///
-    /// No bin carries a grouping key, because Java's `planTaskGroups` overload is out of scope.
-    /// The packer is order-sensitive, so the tasks are collected in arrival order first.
+    /// `Scan.planTasks()`. This layer drives [`plan_files`](Self::plan_files) unchanged, splits
+    /// each task at the build-time [`SplitConfig`] target, then packs with `largestBinFirst`.
     pub async fn plan_tasks(&self) -> Result<CombinedScanTaskStream> {
         let SplitConfig {
             split_size,
@@ -977,11 +948,8 @@ impl TableScan {
                 .and_then(move |task| async move {
                     // Expand only a whole-file Parquet task whose split offsets are the strictly
                     // ascending row-group grid, so each sub-task covers one row group. The
-                    // fixed-size fallback is byte-arbitrary and can leave a sub-task empty.
-                    //
-                    // Only the `split_offsets` conjuncts are load-bearing. `offsets.len() > 1` is
-                    // deliberately stricter than `split`'s own gate. The other two conjuncts
-                    // restate preconditions `FileScanTask::split` enforces itself.
+                    // fixed-size fallback is byte-arbitrary and can leave a sub-task empty. Only
+                    // the `split_offsets` conjuncts are load-bearing.
                     let can_expand = task.start == 0
                         && task.data_file_format == DataFileFormat::Parquet
                         && task.split_offsets.as_ref().is_some_and(|offsets| {
@@ -3277,9 +3245,7 @@ pub mod tests {
         );
     }
 
-    // =======================================================================================
     // plan_tasks() — split + bin-pack grouping (Java Scan.planTasks()).
-    // =======================================================================================
 
     /// The total byte length across all sub-tasks of all groups — the conservation quantity that
     /// must equal the sum of the source files' declared sizes (the split tiles every file with no
@@ -4170,13 +4136,9 @@ pub mod tests {
         assert_eq!(batches[0].num_rows(), 1024);
     }
 
-    /// An identity-partition column's value comes from partition metadata, not from the data
-    /// file. The fixture's parquet `x` is `[1; 1024]` and its partition value is 999, so the scan
-    /// must return 999.
-    ///
-    /// The output must also be a plain `Int64Array`, not run-end-encoded.
-    ///
-    /// Mutation this catches: `task.partition_spec = None`, which reads 1 from the file.
+    /// An identity-partition column's value comes from partition metadata, not from the data file.
+    /// The fixture's parquet `x` is `[1; 1024]` and its partition value is 999, so the scan must
+    /// return 999. The output must also be a plain `Int64Array`, not run-end-encoded.
     #[tokio::test]
     async fn test_identity_partition_column_value_comes_from_metadata_not_file() {
         let mut fixture = TableTestFixture::new();
@@ -4274,12 +4236,9 @@ pub mod tests {
     }
 
     /// A null identity-partition value, end-to-end through the scan and reader path.
-    ///
     /// Column-projection rule 4 keeps a null partition value out of the constants map, so it
-    /// overrides nothing. This fixture's file holds `x`, so the column resolves to the file
-    /// value and does not error, and it keeps its declared scan-schema type.
-    ///
-    /// The transformer unit test covers the file-lacks-the-column case.
+    /// overrides nothing. This fixture's file holds `x`, so the column resolves to the file value
+    /// and does not error, and it keeps its declared scan-schema type.
     #[tokio::test]
     async fn test_identity_partition_null_value_does_not_override_and_does_not_error() {
         let mut fixture = TableTestFixture::new();
@@ -4421,12 +4380,8 @@ pub mod tests {
     }
 
     /// Full-path pins for the null-semantics family under Java's nulls-first total order.
-    /// `2.parquet` was written before `dbl_nan` existed, so that column is absent there.
-    ///
-    /// `!=` must keep the NULL cell and the whole schema-evolved file. `<` and `<=` must keep
-    /// both too, because `compare(null, lit)` is -1 under `Comparators.nullsFirst()`.
-    ///
-    /// Both engines exclude the NaN row.
+    /// `2.parquet` was written before `dbl_nan` existed, so that column is absent there. `!=` must
+    /// keep the NULL cell and the whole schema-evolved file.
     #[tokio::test]
     async fn test_filter_on_arrow_nulls_first_neq_lt_lteq_full_path() {
         let mut fixture = TableTestFixture::new_nan_floats();
@@ -5973,7 +5928,6 @@ pub mod tests {
         assert!(result.is_ok(), "Scan timed out - deadlock detected");
     }
 
-    // =======================================================================================
     // BatchScan (Java BatchScan / BatchScanAdapter) — the typed adapter over the SAME pipeline.
     //
     // The contract: `table.batch_scan()` is a thin typed wrapper whose plan_files()/plan_tasks()
@@ -5982,7 +5936,6 @@ pub mod tests {
     // first-wins mutual exclusion). The fixture's snapshot LOG is
     //   {id 3051729675574597004 @ 1515100955770} then {id 3055729675574597004 @ 1555100955770}
     // with current = 3055729675574597004 and a `test` tag → 3051729675574597004.
-    // =======================================================================================
 
     /// Older snapshot-log entry's timestamp (id 3051729675574597004).
     const SNAP1_TS: i64 = 1515100955770;

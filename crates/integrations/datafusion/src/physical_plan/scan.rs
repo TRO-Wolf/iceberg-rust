@@ -166,19 +166,9 @@ pub struct IcebergTableScan {
 }
 
 impl IcebergTableScan {
-    /// Creates a new [`IcebergTableScan`] object.
-    ///
-    /// # Errors
-    ///
-    /// Fails when `projection` holds an index outside `schema`.
-    ///
-    /// # Notes
-    ///
-    /// The advertised schema is a contract: every parent operator was built against it. The table
-    /// can still disagree, because the caller may reload it between planning and scanning, and
-    /// because `ADD COLUMN` creates no snapshot. So the scan never calls `select_all`; it binds
-    /// each advertised field BY FIELD ID, and [`conform_batch`] renames, promotes or null-fills.
-    /// [`rebind_filters`] rebinds each pushed filter and drops the ones it cannot.
+    /// Creates a new [`IcebergTableScan`] object. # Errors Fails when `projection` holds an index
+    /// outside `schema`. # Notes The advertised schema is a contract: every parent operator was
+    /// built against it.
     pub(crate) fn new(
         table: Table,
         snapshot_id: Option<i64>,

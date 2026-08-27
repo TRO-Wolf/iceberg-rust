@@ -621,9 +621,7 @@ mod tests {
         Transaction::new(table).expire_snapshots().with_now_ms(NOW)
     }
 
-    // =======================================================================
     // retain_last boundaries
-    // =======================================================================
 
     /// Risk: OVER-expiry past the count floor (head history destroyed) or UNDER-expiry (retention
     /// never shrinks the chain). `retain_last(2)` with everything age-expired must keep EXACTLY
@@ -692,9 +690,7 @@ mod tests {
         );
     }
 
-    // =======================================================================
     // expire_older_than age boundary — pinned ON the boundary
-    // =======================================================================
 
     /// Risk: the age comparison flipping `>=` to `>` (one extra snapshot silently expired — the
     /// over-expiry direction) or to always-true (nothing ever expires). Pinned ON the boundary:
@@ -723,9 +719,7 @@ mod tests {
         assert_eq!(removed, vec![S1, S2, ROOT, CURRENT]);
     }
 
-    // =======================================================================
     // per-branch retention overrides
-    // =======================================================================
 
     /// Risk: dropping the per-branch min-snapshots floor — an old-but-protected snapshot must
     /// SURVIVE age expiry because a branch's own `min_snapshots_to_keep` (3) outranks the default
@@ -881,9 +875,7 @@ mod tests {
         assert_eq!(log, vec![A3]);
     }
 
-    // =======================================================================
     // ref (tag/branch) age expiry
-    // =======================================================================
 
     /// Risk pinned: the ref-age boundary. Java retains on `now - ts <= max_ref_age_ms`, so a ref
     /// whose age equals its limit is kept, and one millisecond older goes. A `<=` to `<` flip
@@ -980,9 +972,7 @@ mod tests {
         );
     }
 
-    // =======================================================================
     // expire_snapshot_id
-    // =======================================================================
 
     /// Risk: explicitly expiring a snapshot a retained ref points at (the ref would dangle).
     /// Java's exact message, non-retryable.
@@ -1080,9 +1070,7 @@ mod tests {
         assert!(removed_snapshot_ids(&updates).contains(&X));
     }
 
-    // =======================================================================
     // unreferenced-snapshot retention
-    // =======================================================================
 
     /// Risk: the unreferenced-retention boundary flipping (recent dangling snapshots expired /
     /// old ones kept forever). Pinned ON the cutoff: a dangling snapshot AT the cutoff is kept, a
@@ -1107,9 +1095,7 @@ mod tests {
         );
     }
 
-    // =======================================================================
     // no-op / idempotence / emitted shape
-    // =======================================================================
 
     /// Risk: a no-op expiry emitting updates/requirements anyway (a spurious commit on every
     /// maintenance run). Nothing expires at cutoff 0 ⇒ nothing is emitted.
@@ -1272,9 +1258,7 @@ mod tests {
         assert!(error.retryable());
     }
 
-    // =======================================================================
     // gates
-    // =======================================================================
 
     /// Risk: expiring on a GC-disabled table (its files may be shared; B2's cleanup would corrupt
     /// other tables). Java's constructor check, verbatim message.
@@ -1332,9 +1316,7 @@ mod tests {
         assert!(requirements.is_empty());
     }
 
-    // =======================================================================
     // end-to-end through a real catalog commit
-    // =======================================================================
 
     /// Risk: the action working in isolation but not through the real commit path (requirement
     /// checks, metadata rebuild, snapshot-log pruning at the catalog layer). Three appends, then

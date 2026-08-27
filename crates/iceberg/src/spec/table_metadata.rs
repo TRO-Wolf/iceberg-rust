@@ -137,22 +137,9 @@ pub struct TableMetadata {
 }
 
 impl std::fmt::Debug for TableMetadata {
-    /// Hand-written instead of derived so that `properties` renders through [`RedactedProps`].
-    ///
-    /// # Notes
-    ///
-    /// SECURITY (SEC-002): `properties` is an operator-controlled `String -> String` map, and
-    /// operators do store credentials in it. It reaches `Debug` from places this crate does not
-    /// control: `Table` embeds a `TableMetadataRef`, and the REST `LoadTableResult` and
-    /// `CommitTableResponse` carry a whole `TableMetadata`. Every other field renders as the derive
-    /// did, in declaration order. Serde is unaffected, so the on-disk format is untouched.
-    ///
-    /// NAMED RESIDUE, deliberately not masked here: `snapshots[*].summary.additional_properties`,
-    /// `encryption_keys[*].properties` with `encrypted_key_metadata`, and
-    /// `statistics[*].blob_metadata[*].properties` with `statistics[*].key_metadata` still print
-    /// in clear through their own derived `Debug`. `PartitionStatisticsFile` carries neither.
-    /// `table.rs` and `crates/catalog/rest/src/types.rs` mirror this ledger; update all three
-    /// together. `test_named_residue_table_metadata_debug_renders_nested_property_maps` pins it.
+    /// Hand-written so `properties` renders through [`RedactedProps`]. Operators store credentials
+    /// there. Named residue: snapshot summaries, encryption keys, and statistics blobs still print
+    /// in clear. Update this, `table.rs`, and REST types together.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableMetadata")
             .field("format_version", &self.format_version)

@@ -198,23 +198,11 @@ struct SqlCatalogConfig {
     props: HashMap<String, String>,
 }
 
-/// Masks the password in a database DSN, so [`SqlCatalogConfig::uri`] can reach a `Debug` sink.
+/// Mask the password in a DSN so [`SqlCatalogConfig::uri`] can reach a `Debug` sink.
 ///
-/// The rule is deliberately COARSE, because it must be provably sound. It strips a leading
-/// `<scheme>://` only when the bytes from position 0 form a valid URI scheme, then masks the span
-/// from the first `:` to the LAST `@`. A password always lies inside that span, so no password
-/// byte survives. Two earlier precise parsers each leaked one layer deeper, because they computed
-/// an exact boundary; this rule computes none.
-///
-/// The anchored scheme strip is load-bearing. A bare `find("://")` reads a `://` INSIDE a password
-/// (`user:pass://x@host`) as the scheme separator, pushes the scan past the userinfo `:`, and
-/// returns the DSN unmasked.
-///
-/// The price is over-redaction when a non-userinfo `:` precedes a non-userinfo `@`. The mask then
-/// swallows host and path bytes: `postgres://host:5432/db?x=a@b` becomes `postgres://host:***@b`.
-/// The guarantee is directional: a masked component may hold non-secrets, but a visible component
-/// never holds a secret. A DSN with no `:` before an `@`, or no `@` after the first `:`, is
-/// returned unchanged.
+/// Strip `<scheme>://` only after a valid URI scheme, then mask first `:` to last `@`.
+/// A bare `find("://")` treats `://` inside a password as the scheme and leaks the DSN.
+/// Over-redaction of host bytes is accepted. A visible component never holds a secret.
 fn redact_dsn_password(uri: &str) -> String {
     // A `://` is a scheme separator ONLY after a valid URI scheme; see the fn doc.
     let authority_start = match uri.find("://") {
@@ -508,11 +496,7 @@ impl SqlCatalog {
 /// pre-check. The CAS binds the COMMIT'S BASE location, not the freshly-loaded current one, so a
 /// strictly sequential stale commit is rejected, not only one racing the load-to-UPDATE window. A
 /// `None` base models Java's create edge and falls back to the loaded location, which never equals
-/// a stale stored value. `update_table` and `update_view` share this ONE code path.
-///
-/// # Errors
-///
-/// A retryable `CatalogCommitConflicts` when the commit's base differs from the stored location.
+/// a stale stored value.
 fn resolve_commit_cas_location(
     base_metadata_location: Option<&str>,
     current_metadata_location: &str,
@@ -1191,10 +1175,8 @@ impl Catalog for SqlCatalog {
         Ok(staged_table)
     }
 
-    // ========================================================================
     // View surface. Views live in the SAME `iceberg_tables` table, discriminated by an exact
     // `iceberg_type = 'VIEW'`, and share one name space with tables.
-    // ========================================================================
 
     async fn list_views(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
         if !self.namespace_exists(namespace).await? {
@@ -2984,9 +2966,7 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // View CRUD lifecycle tests, plus the SQL-specific location-CAS conflict test.
-    // ========================================================================
 
     fn simple_view_schema() -> Schema {
         Schema::builder()
@@ -3417,7 +3397,6 @@ mod tests {
             .collect()
     }
 
-    // ========================================================================
     // Base-location CAS tests. Binding the CAS to the freshly loaded location guards only the
     // load-to-UPDATE window: a strictly sequential stale commit re-loads the winner's location,
     // CAS's against it, and silently overwrites the winner. Java binds the commit's BASE instead.
@@ -3426,7 +3405,6 @@ mod tests {
     // VIEW path. Both paths resolve the CAS through ONE shared function, so a knockout of it fails
     // these view tests and would have broken the table arm. Before that unification a table-arm
     // knockout left every test green.
-    // ========================================================================
 
     // RISK: a sequential stale VIEW commit, made after a winner advanced the stored location, must
     // be rejected as a retryable CatalogCommitConflicts, never accepted as last-write-win.

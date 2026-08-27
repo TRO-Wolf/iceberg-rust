@@ -40,12 +40,7 @@ use crate::spec::{
 use crate::{Error, ErrorKind, Result};
 
 /// Builds the field id to constant map for identity-partitioned fields. Java
-/// `PartitionUtil.constantsMap`.
-///
-/// # Notes
-///
-/// Only identity transforms qualify. A bucket, truncate, or year transform stores a DERIVED value
-/// in partition metadata, so the reader must take the source column from the data file.
+/// `PartitionUtil.constantsMap`. # Notes Only identity transforms qualify.
 fn constants_map(
     partition_spec: &PartitionSpec,
     partition_data: &Struct,
@@ -2056,11 +2051,9 @@ mod test {
 
     /// Risk pinned: a REORDERED and SUBSET projection must give an output schema exactly equal to
     /// the declared projection, in names, plain physical types, nullability, AND order. The
-    /// constant column must be a plain array carrying the PARTITION value.
-    ///
-    /// The reordered shape already forces the `Modify` path, so this does not isolate the
-    /// `constant_overrides_file_column` flag. The scan test
-    /// `test_identity_partition_column_value_comes_from_metadata_not_file` pins that alone.
+    /// constant column must be a plain array carrying the PARTITION value. The reordered shape
+    /// already forces the `Modify` path, so this does not isolate the
+    /// `constant_overrides_file_column` flag.
     #[test]
     fn identity_partition_reordered_subset_projection_matches_declared_schema() {
         use arrow_schema::DataType;

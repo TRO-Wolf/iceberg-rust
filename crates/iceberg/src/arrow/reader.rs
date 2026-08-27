@@ -757,16 +757,10 @@ impl ArrowReader {
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
 
-    /// Fail closed on a task carrying a real byte sub-window for a format whose reader
-    /// materializes WHOLE files.
-    ///
-    /// The Avro and ORC readers ignore `task.start` and `task.length` and decode the whole file.
-    /// A ranged sub-task therefore re-emits every row, and an N-way split returns N copies with no
-    /// error. A 500-row Avro file split four ways returned 2000 rows.
-    ///
-    /// [`FileScanTask::split`] declines to split these formats, so the planner never makes such a
-    /// task. This guard covers the public `PartitionWork` and direct-reader seams. A whole-file
-    /// task carries `start == 0` and either `length == 0` or `length == file_size_in_bytes`.
+    /// Fail closed on a task carrying a real byte sub-window for a format whose reader materializes
+    /// WHOLE files. The Avro and ORC readers ignore `task.start` and `task.length` and decode the
+    /// whole file. A ranged sub-task therefore re-emits every row, and an N-way split returns N
+    /// copies with no error.
     fn reject_ranged_whole_file_task(task: &FileScanTask, format: &str) -> Result<()> {
         let whole_file =
             task.start == 0 && (task.length == 0 || task.length == task.file_size_in_bytes);
@@ -787,16 +781,9 @@ impl ArrowReader {
         ))
     }
 
-    /// Read one **Avro** data-file scan task into an [`ArrowRecordBatchStream`].
-    ///
-    /// Avro has no footer, statistics, or row groups, so there is no pushdown. The reader
-    /// materializes the file and applies every filter after the decode. The three steps are:
-    ///
-    /// 1. Read through [`read_avro_data_file`] against the projected Iceberg schema, resolved by
-    ///    field id with full schema evolution.
-    /// 2. Transform each batch through the same [`RecordBatchTransformer`] the Parquet path feeds.
-    /// 3. Apply merge-on-read deletes and the scan residual to the materialized batch, with the
-    ///    same kernels the Parquet `RowFilter` and `RowSelection` use.
+    /// Read one **Avro** data-file scan task into an [`ArrowRecordBatchStream`]. Avro has no
+    /// footer, statistics, or row groups, so there is no pushdown. The reader materializes the file
+    /// and applies every filter after the decode.
     async fn process_avro_file_scan_task(
         task: FileScanTask,
         batch_size: Option<usize>,
@@ -884,13 +871,11 @@ impl ArrowReader {
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
 
-    /// The format-agnostic tail shared by the Avro and ORC paths, run once a whole-file reader
-    /// has materialized `batches`. It builds the same [`RecordBatchTransformer`] the Parquet path
+    /// The format-agnostic tail shared by the Avro and ORC paths, run once a whole-file reader has
+    /// materialized `batches`. It builds the same [`RecordBatchTransformer`] the Parquet path
     /// feeds, ANDs the equality-delete predicate with the scan residual into one survival
-    /// predicate, and applies merge-on-read deletes after materialization.
-    ///
-    /// The per-batch apply is [`Self::apply_pos_aware_batch`], shared with the Parquet `_pos`
-    /// streaming path.
+    /// predicate, and applies merge-on-read deletes after materialization. The per-batch apply is
+    /// [`Self::apply_pos_aware_batch`], shared with the Parquet `_pos` streaming path.
     async fn finish_whole_file_scan_task(
         task: FileScanTask,
         batches: Vec<RecordBatch>,
@@ -983,13 +968,9 @@ impl ArrowReader {
 
     /// Transform one decoded batch, assign `_pos` from the running physical counter (via the
     /// transformer), apply MoR survival (positional / residual / eq), advance `absolute_pos` by the
-    /// **full pre-filter** row count. Shared by Parquet `_pos` streaming and Avro/ORC whole-file.
-    ///
-    /// # Notes
-    ///
-    /// `absolute_pos` and the transformer's `next_row_position` must track the same physical
-    /// ordinal base. A decode-layer row skip desyncs them, so a caller that projects `_pos` must
-    /// not enable one.
+    /// **full pre-filter** row count. Shared by Parquet `_pos` streaming and Avro/ORC whole-file. #
+    /// Notes `absolute_pos` and the transformer's `next_row_position` must track the same physical
+    /// ordinal base.
     fn apply_pos_aware_batch(
         batch: RecordBatch,
         transformer: &mut RecordBatchTransformer,
@@ -1079,13 +1060,9 @@ impl ArrowReader {
     }
 
     /// Builds the per-row survival mask for a transformed batch, from the positional deletes over
-    /// `[batch_base, batch_base + num_rows)`, the scan residual, and the equality deletes.
-    /// Returns `None` when nothing applies, else a mask where `true` keeps the row.
-    ///
-    /// `eq_delete_sets`, when `Some`, holds the hashed key sets for the task's eq-delete files. A
-    /// row goes when it matches any set's tuple, which equals the predicate result for a batch
-    /// with no NULL key. If any set reports a NULL key column, the whole batch falls back to
-    /// `eq_delete_predicate`, the three-valued-logic-correct path.
+    /// `[batch_base, batch_base + num_rows)`, the scan residual, and the equality deletes. Returns
+    /// `None` when nothing applies, else a mask where `true` keeps the row. `eq_delete_sets`, when
+    /// `Some`, holds the hashed key sets for the task's eq-delete files.
     fn survival_mask(
         batch: &RecordBatch,
         num_rows: usize,
@@ -1655,14 +1632,8 @@ impl ArrowReader {
 
     /// Java's `ParquetMetadataConverter.getOffset(ColumnChunk)`: the byte offset at which a column
     /// chunk's data begins, which for the first column of a row group is that row group's real
-    /// start position in the file.
-    ///
-    /// The rule is `MIN(data_page_offset, dictionary_page_offset)`. The dictionary offset wins
-    /// only when it is set AND strictly smaller.
-    ///
-    /// This is hand-rolled because `ColumnChunkMetaData::byte_range()` takes no `min`, so it
-    /// diverges from Java, and it asserts on a negative offset, which panics on corrupt
-    /// metadata.
+    /// start position in the file. The rule is `MIN(data_page_offset, dictionary_page_offset)`. The
+    /// dictionary offset wins only when it is set AND strictly smaller.
     fn parquet_column_chunk_offset(column: &ColumnChunkMetaData) -> i64 {
         let data_page_offset = column.data_page_offset();
         match column.dictionary_page_offset() {
@@ -1810,14 +1781,9 @@ fn leaf_count(ty: &parquet::schema::types::Type) -> usize {
     }
 }
 
-/// Maps fallback field ids to leaf column indices, for primitive top-level fields only.
-/// Java `ParquetSchemaUtil.addFallbackIds()`.
-///
-/// # Notes
-///
-/// Use top-level field positions, not leaf positions, to match
-/// `add_fallback_field_ids_to_arrow_schema`. Leaf positions give wrong indices once a nested type
-/// expands into several leaf columns.
+/// Maps fallback field ids to leaf column indices, for primitive top-level fields only. Java
+/// `ParquetSchemaUtil.addFallbackIds()`. # Notes Use top-level field positions, not leaf positions,
+/// to match `add_fallback_field_ids_to_arrow_schema`.
 fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32, usize> {
     let mut column_map = HashMap::new();
     let mut leaf_idx = 0;
@@ -1834,14 +1800,10 @@ fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32
 }
 
 /// Assigns Iceberg field ids by column name, so a migrated file projects correctly. Java
-/// `ParquetSchemaUtil.applyNameMapping()`, on an Arrow schema instead of a Parquet `MessageType`.
-///
-/// # Arguments
-/// * `arrow_schema` - the Arrow schema read from the file, without field ids
-/// * `name_mapping` - the table's `schema.name-mapping.default`
-///
-/// # Returns
-/// The Arrow schema with field ids assigned.
+/// `ParquetSchemaUtil.applyNameMapping()`, on an Arrow schema instead of a Parquet `MessageType`. #
+/// Arguments * `arrow_schema` - the Arrow schema read from the file, without field ids *
+/// `name_mapping` - the table's `schema.name-mapping.default` # Returns The Arrow schema with field
+/// ids assigned.
 fn apply_name_mapping_to_arrow_schema(
     arrow_schema: ArrowSchemaRef,
     name_mapping: &NameMapping,
@@ -3338,20 +3300,16 @@ message schema {
         );
     }
 
-    // ============================================================================================
     // Midpoint row-group selection (parquet-mr `filterFileMetaDataByMidpoint`).
     //
     // Every helper here derives row-group positions from the REAL footer. A helper that uses the
     // `4 + Σ compressed_size` model cannot catch offset drift.
-    // ============================================================================================
 
     /// Writes `num_row_groups` row groups of `rows_per_group` sequential `id` values (ids start at
-    /// 0 and run across row-group boundaries).
-    ///
-    /// With `bloom_filters = true`, parquet-rs writes each bloom filter after its row group, so
-    /// the row groups are not contiguous and their real offsets diverge from the naive model.
-    ///
-    /// [`DEFAULT_BLOOM_FILTER_POSITION`]: parquet::file::properties::DEFAULT_BLOOM_FILTER_POSITION
+    /// 0 and run across row-group boundaries). With `bloom_filters = true`, parquet-rs writes each
+    /// bloom filter after its row group, so the row groups are not contiguous and their real
+    /// offsets diverge from the naive model. [`DEFAULT_BLOOM_FILTER_POSITION`]:
+    /// parquet::file::properties::DEFAULT_BLOOM_FILTER_POSITION.
     fn write_midpoint_fixture(path: &str, num_row_groups: usize, rows_per_group: i32, bloom: bool) {
         use arrow_array::Int32Array;
 
@@ -3578,15 +3536,10 @@ message schema {
     }
 
     /// A task with the legacy whole-file sentinel `start == 0, length == 0` must still read every
-    /// row after [`FileScanTask::split`], the way `TableScan::plan_tasks` calls it.
-    ///
-    /// Without the sentinel guard, the fixed-size branch returned zero sub-tasks: the file left
-    /// `plan_tasks` while `plan_files` still listed it, and the scan read 0 rows with no error.
-    /// The reader accepts the same spelling as whole-file, so the two halves must agree.
-    ///
-    /// This fixture is answered by the `length != file_size_in_bytes` disjunct, so both sentinel
-    /// mutants leave it green. The `file_size_in_bytes == 0` shape reaches the reader only as a
-    /// footer-decode failure, so a unit test in `scan::task::tests` pins it instead.
+    /// row after [`FileScanTask::split`], the way `TableScan::plan_tasks` calls it. Without the
+    /// sentinel guard, the fixed-size branch returned zero sub-tasks: the file left `plan_tasks`
+    /// while `plan_files` still listed it, and the scan read 0 rows with no error. The reader
+    /// accepts the same spelling as whole-file, so the two halves must agree.
     #[tokio::test]
     async fn test_whole_file_length_sentinel_survives_split_and_reads_every_row() {
         let tmp = TempDir::new().unwrap();
@@ -3651,15 +3604,10 @@ message schema {
         );
     }
 
-    /// Splitting an already-ranged task must not relocate its byte window.
-    ///
-    /// Both split branches treat the byte space as absolute from zero. Without the `start != 0`
-    /// passthrough, a parent covering `[starts[1], file_size)` came back anchored at 0: the
-    /// products re-read a prefix the parent never owned and dropped the tail it did. That is
-    /// silent corruption, and the `pub` struct and derived `Deserialize` reach it.
-    ///
-    /// The first parent trips both disjuncts, so only the second half, which keeps
-    /// `length == file_size_in_bytes`, discriminates `start != 0`.
+    /// Splitting an already-ranged task must not relocate its byte window. Both split branches
+    /// treat the byte space as absolute from zero. Without the `start != 0` passthrough, a parent
+    /// covering `[starts[1], file_size)` came back anchored at 0: the products re-read a prefix the
+    /// parent never owned and dropped the tail it did.
     #[tokio::test]
     async fn test_split_of_a_ranged_task_reads_the_parents_rows_not_the_whole_file() {
         let tmp = TempDir::new().unwrap();
@@ -3974,16 +3922,9 @@ message schema {
 
     /// Builds row groups from `(data_page_offset, compressed_size, dict_offset)` triples — the
     /// triple always describes `columns()[0]` — so the selection rule can be probed at exact byte
-    /// positions.
-    ///
-    /// Two properties keep the fixture discriminating.
-    ///
-    /// Each row group carries three column chunks, the trailing two [`FABRICATED_COLUMN_STRIDE`]
-    /// bytes apart, so reading any column but `columns()[0]` changes the answer. They declare a
-    /// zero compressed size, so the row group's sum stays the requested `compressed_size`.
-    ///
-    /// `total_byte_size` differs clearly from the compressed size, so reading it instead of
-    /// `compressed_size()` changes the answer.
+    /// positions. Two properties keep the fixture discriminating. Each row group carries three
+    /// column chunks, the trailing two [`FABRICATED_COLUMN_STRIDE`] bytes apart, so reading any
+    /// column but `columns()[0]` changes the answer.
     fn midpoint_test_metadata(groups: &[(i64, i64, Option<i64>)]) -> Arc<ParquetMetaData> {
         const TRAILING_COLUMNS: usize = 2;
 
@@ -4728,12 +4669,10 @@ message schema {
         assert_eq!(pos_col.values(), &[0, 1, 2, 3, 4]);
     }
 
-    // ===========================================================================================
     // The `_pos` projection streaming half.
     //
     // Covered: dense and sparse pos-deletes with a residual, row sets and `_pos` values against an
     // unpruned oracle, multi-batch continuity, a MERGE-shaped write pin, and ordinal-advance bait.
-    // ===========================================================================================
 
     /// Collect `(id, _pos)` pairs from a scan projecting field 1 + `_pos`, sorted by id.
     fn collect_id_pos_pairs(batches: &[RecordBatch]) -> Vec<(i32, i64)> {
@@ -7546,14 +7485,10 @@ message schema {
         }
     }
 
-    /// Test bucket partitioning reads source column from data file (not partition metadata).
-    ///
-    /// The spec takes a value from partition metadata only for an identity transform. A
-    /// `bucket(4, id)` partition stores the bucket number, not the source value, so the reader
-    /// must read `id` from the data file. Java `PartitionUtil.constantsMap()`.
-    ///
-    /// The fixture holds `id` values `[1, 5, 9, 13]` under partition `bucket = 1`. A reader that
-    /// takes the constant returns `1` for every row, which breaks runtime filtering.
+    /// Test bucket partitioning reads source column from data file (not partition metadata). The
+    /// spec takes a value from partition metadata only for an identity transform. A `bucket(4, id)`
+    /// partition stores the bucket number, not the source value, so the reader must read `id` from
+    /// the data file.
     #[tokio::test]
     async fn test_bucket_partitioning_reads_source_column_from_file() {
         use arrow_array::Int32Array;
@@ -8510,13 +8445,8 @@ message schema {
         let table_location = tmp_dir.path().to_str().unwrap().to_string();
         let file_path = format!("{table_location}/map_int96.parquet");
 
-        // MAP encoding:
-        //   optional group ts_map (MAP) {
-        //     repeated group key_value {
-        //       required binary key (UTF8);
-        //       optional int96 value;
-        //     }
-        //   }
+        // MAP encoding: optional group ts_map (MAP) { repeated group key_value { required binary
+        // key (UTF8); optional int96 value; } }.
         let key_type = SchemaType::primitive_type_builder("key", PhysicalType::BYTE_ARRAY)
             .with_repetition(Repetition::REQUIRED)
             .with_logical_type(Some(parquet::basic::LogicalType::String))
@@ -9070,16 +9000,11 @@ mod avro_scan_tests {
 
     // -- U3 cycle 3 / hazard-1 sibling: AVRO must never be read through a byte sub-window. ------------
 
-    /// The AVRO reader decodes WHOLE files — it never reads `task.start` / `task.length`. So if
-    /// the planner split an Avro file into byte windows, every sub-task would re-emit every row
-    /// and an N-way split would silently return N copies of the file: the exact silent-duplication
-    /// class the Parquet midpoint row-group selection was written to eliminate, with no error at
-    /// any layer.
-    ///
-    /// This drives the REAL `FileScanTask::split` → `ArrowReader::read` path (what
-    /// `TableScan::plan_tasks` does at `scan/mod.rs`) and asserts the exactly-once property over
-    /// the whole split set. Before `scan::task::reader_honors_byte_range` this returned 4× the
-    /// file's rows.
+    /// The AVRO reader decodes WHOLE files — it never reads `task.start` / `task.length`. So if the
+    /// planner split an Avro file into byte windows, every sub-task would re-emit every row and an
+    /// N-way split would silently return N copies of the file: the exact silent-duplication class
+    /// the Parquet midpoint row-group selection was written to eliminate, with no error at any
+    /// layer.
     #[tokio::test]
     async fn avro_split_reads_every_row_exactly_once() {
         let tmp = TempDir::new().unwrap();
@@ -9321,12 +9246,10 @@ mod avro_scan_tests {
 
     /// The ORC half of the fail-closed guard, mirroring
     /// [`avro_ranged_task_is_rejected_with_a_typed_error`] one-for-one.
-    ///
     /// `reject_ranged_whole_file_task` is invoked from BOTH `process_avro_file_scan_task` and
     /// `process_orc_file_scan_task`, but only the AVRO call site was pinned: deleting the ORC line
-    /// left the whole suite green. Since
-    /// `process_orc_file_scan_task` never reads `task.start` / `task.length`, an unguarded ranged
-    /// ORC task re-emits every row of the file — N copies per N-way split, with no error.
+    /// left the whole suite green. Since `process_orc_file_scan_task` never reads `task.start` /
+    /// `task.length`, an unguarded ranged ORC task re-emits every row of the file — N copies per.
     #[tokio::test]
     async fn orc_ranged_task_is_rejected_with_a_typed_error() {
         let tmp = TempDir::new().unwrap();
@@ -9573,14 +9496,11 @@ mod avro_scan_tests {
 
 #[cfg(test)]
 mod parquet_eq_keyset_mor_tests {
-    //! Wave B: Parquet MoR path wires [`EqDeleteKeySet`] when key columns are projected.
-    //!
-    //! Routing (see `process_parquet_file_scan_task`):
-    //! * keys ⊆ projected non-metadata field ids → post-decode keyset keep-mask (RowFilter residual
-    //!   is scan-predicate only);
-    //! * otherwise → today's AND of eq-delete predicate into the Parquet RowFilter.
-    //!
-    //! Both routes must produce the same survivors (predicate oracle).
+    //! Wave B: Parquet MoR path wires [`EqDeleteKeySet`] when key columns are projected. Routing
+    //! (see `process_parquet_file_scan_task`): * keys ⊆ projected non-metadata field ids →
+    //! post-decode keyset keep-mask (RowFilter residual is scan-predicate only); * otherwise →
+    //! today's AND of eq-delete predicate into the Parquet RowFilter. Both routes must produce the
+    //! same survivors (predicate oracle).
 
     use std::collections::HashMap;
     use std::fs::File;

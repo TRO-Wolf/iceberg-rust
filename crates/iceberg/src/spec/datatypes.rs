@@ -182,16 +182,10 @@ impl Type {
         Ok(REQUIRED_LENGTH[precision as usize - 1])
     }
 
-    /// Creates a decimal type.
-    ///
-    /// This construction door is stricter than Java `Types$DecimalType`, which checks only
-    /// `precision <= 38`. It also requires `precision >= 1`, because a zero-precision decimal has
-    /// no byte width, and `scale <= precision`, because Arrow `Decimal128` rejects anything else.
-    ///
-    /// # Notes
-    ///
-    /// Metadata READ paths must not use this door. A table Java can open must stay openable.
-    /// They use `ensure_java_decimal_precision` instead.
+    /// Creates a decimal type. This construction door is stricter than Java `Types$DecimalType`,
+    /// which checks only `precision <= 38`. It also requires `precision >= 1`, because a
+    /// zero-precision decimal has no byte width, and `scale <= precision`, because Arrow
+    /// `Decimal128` rejects anything else.
     #[inline(always)]
     pub fn decimal(precision: u32, scale: u32) -> Result<Self> {
         ensure_data_valid!(
@@ -283,13 +277,8 @@ pub enum PrimitiveType {
     /// Arbitrary-length byte array.
     Binary,
     /// Unknown type (format version 3+): a column whose values are always null and that has no
-    /// physical storage.
-    ///
-    /// Java `Types.UnknownType` extends `Type.PrimitiveType`, unlike [`Type::Variant`]. So this
-    /// is a `PrimitiveType` arm, not a top-level [`Type`] variant.
-    ///
-    /// It has no [`PrimitiveLiteral`](crate::spec::PrimitiveLiteral) form, because its values are
-    /// always null. The literal layer rejects it. Data-file I/O for it fails loudly.
+    /// physical storage. Java `Types.UnknownType` extends `Type.PrimitiveType`, unlike
+    /// [`Type::Variant`]. So this is a `PrimitiveType` arm, not a top-level [`Type`] variant.
     Unknown,
 }
 
@@ -375,14 +364,9 @@ impl Serialize for PrimitiveType {
     }
 }
 
-/// The only invariant Java `Types$DecimalType` enforces: `precision <= 38`.
-///
-/// Java has no `precision > 0` check and no `scale <= precision` check.
-///
-/// # Notes
-///
-/// Every metadata READ path must use this rule, not [`Type::decimal`]. The stricter constructor
-/// makes a table Java can open unopenable here.
+/// The only invariant Java `Types$DecimalType` enforces: `precision <= 38`. Java has no `precision
+/// > 0` check and no `scale <= precision` check. # Notes Every metadata READ path must use this
+/// rule, not [`Type::decimal`].
 pub(crate) fn ensure_java_decimal_precision(precision: u32) -> Result<()> {
     ensure_data_valid!(
         precision <= MAX_DECIMAL_PRECISION,
@@ -859,14 +843,10 @@ pub(super) mod _serde {
         ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, StructType, Type,
     };
 
-    /// Marker that deserializes the JSON string `"variant"` (case-insensitively) and serializes
-    /// the lowercase `"variant"`.
-    ///
-    /// Java `SchemaParser` writes variant as the bare string `"variant"` and reads it through
-    /// `Types.fromTypeName`, which lowercases first. So this marker folds case too.
-    ///
-    /// It rejects every non-`variant` string. That makes the untagged [`SerdeType`] fall through
-    /// to [`SerdeType::Primitive`] for a real primitive name.
+    /// Marker that deserializes the JSON string `"variant"` (case-insensitively) and serializes the
+    /// lowercase `"variant"`. Java `SchemaParser` writes variant as the bare string `"variant"` and
+    /// reads it through `Types.fromTypeName`, which lowercases first. So this marker folds case
+    /// too.
     pub(super) struct VariantTypeName;
 
     impl serde::Serialize for VariantTypeName {
@@ -939,12 +919,10 @@ pub(super) mod _serde {
 
     impl SerdeType<'_> {
         /// Returns `Some((actual, expected))` when a wrapper arm's `type` string is not Java's
-        /// exact lowercase wrapper name, else `None`.
-        ///
-        /// Java `SchemaParser.typeFromJson` selects the wrapper handler case-sensitively, so it
-        /// rejects `"STRUCT"`. The untagged enum here matches a wrapper by its field shape and
-        /// never reads the `type` string, so [`Type`]'s deserializer calls this to re-impose the
-        /// check. Primitive and variant arms carry no wrapper `type` and return `None`.
+        /// exact lowercase wrapper name, else `None`. Java `SchemaParser.typeFromJson` selects the
+        /// wrapper handler case-sensitively, so it rejects `"STRUCT"`. The untagged enum here
+        /// matches a wrapper by its field shape and never reads the `type` string, so [`Type`]'s
+        /// deserializer calls this to re-impose the check.
         pub(super) fn wrapper_type_mismatch(&self) -> Option<(&str, &'static str)> {
             let (actual, expected) = match self {
                 SerdeType::List { r#type, .. } => (r#type.as_str(), "list"),

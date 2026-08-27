@@ -15,15 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! REST catalog HTTP client, including OAuth2 credential exchange and automatic token refresh.
-//!
-//! # Notes
-//!
-//! The refresh trigger matches Java `OAuth2Util$AuthSession.scheduleTokenRefresh`. Two
+//! REST catalog HTTP client, including OAuth2 credential exchange and automatic token refresh. #
+//! Notes The refresh trigger matches Java `OAuth2Util$AuthSession.scheduleTokenRefresh`. Two
 //! divergences remain, both from the missing token-exchange grant (GAP_MATRIX row R159).
-//! The fork always refreshes through the `client_credentials` exchange, so the wire grant
-//! differs from Java's token exchange. A caller that configures a bare `token` and no
-//! credential gets no proactive refresh; the token is used until it expires.
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -312,18 +306,8 @@ impl HttpClient {
         Ok(())
     }
 
-    /// Authenticates the request by adding a bearer token to the authorization header.
-    ///
-    /// A missing `credential` and `token` skip authentication. `token` wins over `credential`.
-    ///
-    /// # Notes
-    ///
-    /// With refresh on and a `credential` set, a token inside its refresh window is refreshed
-    /// before use, so no request carries a known-expired bearer token. Concurrent stale-token
-    /// requests collapse into one exchange through [`Self::obtain_token_single_flight`]. With
-    /// refresh off the token is cached forever. See the module note for the R159 divergence.
-    /// `reqwest` drops this header on a cross-origin redirect. Java `HTTPClient` keeps it, so
-    /// the fork fails closed where Java follows the redirect authenticated.
+    /// Authenticates the request by adding a bearer token to the authorization header. A missing
+    /// `credential` and `token` skip authentication. `token` wins over `credential`.
     async fn authenticate(&self, req: &mut Request) -> Result<()> {
         // Clone the current token state without holding the lock across any await.
         let snapshot = self.token.lock().await.clone();
@@ -369,13 +353,9 @@ impl HttpClient {
     }
 
     /// Acquire a usable token under the single-flight [`Self::refresh_gate`], collapsing a stampede
-    /// of concurrent stale requests into ONE token-endpoint exchange.
-    ///
-    /// `prev` is the caller's pre-gate snapshot, and it selects the failure policy as Java does.
-    /// `None` propagates the exchange error, because no token can serve. `Some` suppresses it and
-    /// keeps the old token, matching Java's `suppressFailureWhenFinished` refresh task.
-    ///
-    /// Lock order: take `refresh_gate` first, then `token` for brief non-`await` sections only.
+    /// of concurrent stale requests into ONE token-endpoint exchange. `prev` is the caller's
+    /// pre-gate snapshot, and it selects the failure policy as Java does. `None` propagates the
+    /// exchange error, because no token can serve.
     async fn obtain_token_single_flight(&self, prev: Option<TokenState>) -> Result<String> {
         let _gate = self.refresh_gate.lock().await;
 
@@ -435,13 +415,10 @@ impl HttpClient {
         self.execute(request).await
     }
 
-    /// [`Self::query_catalog`] for COMMIT requests (table / view update): transport failures
-    /// are classified sent-vs-unsent.
-    ///
-    /// A failure that may have happened after the request reached the service maps to
-    /// [`ErrorKind::CommitStateUnknown`], because a retry could apply the commit twice. A request
-    /// that provably never left the client keeps the terminal mapping. See
-    /// [`commit_transport_failure_may_have_reached_service`].
+    /// [`Self::query_catalog`] for COMMIT requests (table / view update): transport failures are
+    /// classified sent-vs-unsent. A failure that may have happened after the request reached the
+    /// service maps to [`ErrorKind::CommitStateUnknown`], because a retry could apply the commit
+    /// twice. A request that provably never left the client keeps the terminal mapping.
     pub async fn query_catalog_for_commit(&self, mut request: Request) -> Result<Response> {
         // Pre-send: an authentication failure means the commit request was never sent — the
         // existing (non-unknown) mapping stands.
@@ -470,11 +447,8 @@ impl HttpClient {
 
 /// True when a transport failure on a commit request may have happened after the request reached
 /// the service. False only when the request provably never left the client: it could not be built,
-/// or the connection could not be established.
-///
-/// Java collapses every client-side transport failure into `RESTException`, which
-/// `SnapshotProducer.commit` neither retries nor cleans up. The fork names the post-send
-/// ambiguity as [`ErrorKind::CommitStateUnknown`], so the caller can tell the outcome apart.
+/// or the connection could not be established. Java collapses every client-side transport failure
+/// into `RESTException`, which `SnapshotProducer.commit` neither retries nor cleans up.
 pub(crate) fn commit_transport_failure_may_have_reached_service(error: &reqwest::Error) -> bool {
     !(error.is_builder() || error.is_connect())
 }
@@ -485,13 +459,9 @@ pub(crate) fn commit_transport_failure_may_have_reached_service(error: &reqwest:
 const REDACTED_VALUE: &str = "***";
 
 /// A `serde_json` parse failure reduced to the facts that provably cannot carry payload.
-///
-/// `iceberg::Error` renders its `source` verbatim, and `serde_json` echoes the value at the
-/// failure position. At a container boundary that value is a whole sub-document, so a stringified
-/// nested object puts vended credentials into every `{e}` site.
-///
-/// The chain stays reachable: this type is the source. Only the free text is dropped, because a
-/// message sanitizer would have to out-guess every `Unexpected` rendering forever.
+/// `iceberg::Error` renders its `source` verbatim, and `serde_json` echoes the value at the failure
+/// position. At a container boundary that value is a whole sub-document, so a stringified nested
+/// object puts vended credentials into every `{e}` site.
 #[derive(Debug)]
 pub(crate) struct SanitizedJsonError {
     /// `serde_json`'s failure category, as a fixed word from a closed set.
@@ -567,14 +537,10 @@ fn redact_secret_values(value: &mut serde_json::Value, depth: u32) {
     }
 }
 
-/// Renders a non-2xx response body for attachment to an error, with secret-keyed values masked.
-///
-/// A JSON body keeps its diagnostic shape, including the `ErrorResponse` `message`, but every
+/// Renders a non-2xx response body for attachment to an error, with secret-keyed values masked. A
+/// JSON body keeps its diagnostic shape, including the `ErrorResponse` `message`, but every
 /// secret-keyed value is masked. A write route can echo the submitted property map back, and that
 /// is how a credential returns.
-///
-/// A non-JSON body cannot be key-redacted, so only its byte length is reported. The caller
-/// attaches the status and the redacted headers separately.
 fn redacted_response_body(bytes: &[u8]) -> String {
     match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(mut body) => {
@@ -585,18 +551,8 @@ fn redacted_response_body(bytes: &[u8]) -> String {
     }
 }
 
-/// Deserializes a catalog response into the given [`DeserializedOwned`] type.
-///
-/// # Errors
-///
-/// Fails when the response bytes do not parse.
-///
-/// # Notes
-///
-/// This is the 2xx path, so the bytes carry credentials. Never attach the raw body: only the
-/// status, the URL and the body length, because `iceberg::Error` renders its context verbatim.
-/// The `source` is a [`SanitizedJsonError`], never the raw `serde_json` error, which would echo
-/// the value at the failure position.
+/// Deserializes a catalog response into the given [`DeserializedOwned`] type. # Errors Fails when
+/// the response bytes do not parse. # Notes This is the 2xx path, so the bytes carry credentials.
 pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
     response: Response,
 ) -> Result<R> {
@@ -660,15 +616,10 @@ fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> Stri
     format!("{redacted:?}")
 }
 
-/// Deserializes a unexpected catalog response into an error.
-///
-/// # Notes
-///
-/// Unlike [`deserialize_catalog_response`] this non-2xx path keeps the body, because Java
-/// surfaces `ErrorResponse.message` to the caller. [`redacted_response_body`] masks every
-/// secret-keyed value first: a write route can echo the submitted property map back. The token
-/// endpoint withholds its body entirely in [`HttpClient::exchange_credential_for_token`].
-/// Residue: key redaction cannot mask a secret the server splices into free text, as in Java.
+/// Deserializes a unexpected catalog response into an error. # Notes Unlike
+/// [`deserialize_catalog_response`] this non-2xx path keeps the body, because Java surfaces
+/// `ErrorResponse.message` to the caller. [`redacted_response_body`] masks every secret-keyed value
+/// first: a write route can echo the submitted property map back.
 pub(crate) async fn deserialize_unexpected_catalog_error(
     response: Response,
     disable_header_redaction: bool,
@@ -1138,9 +1089,7 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // GAP_MATRIX R159 — automatic OAuth token refresh (lazy refresh-before-use)
-    // ========================================================================
 
     use std::sync::Arc;
 
@@ -1414,7 +1363,6 @@ mod tests {
         mock.assert_async().await;
     }
 
-    // ========================================================================
     // SEC-001 — the TOKEN endpoint's two parse sites, end to end
     //
     // `test_sanitized_json_error_withholds_the_serde_message` above pins the adapter, and
@@ -1423,7 +1371,6 @@ mod tests {
     // non-2xx arms inside `exchange_credential_for_token` — which are the highest-value payload
     // in the crate: the 200-OK body IS the document carrying `access_token`. They reuse the
     // `refresh_client` helper above to aim the client's token endpoint at a mock server.
-    // ========================================================================
 
     /// The shared shape both arms below exercise: an API gateway that stringifies the body, so the
     /// document arrives DOUBLE-ENCODED and the type mismatch lands at the STRUCT boundary. `serde`

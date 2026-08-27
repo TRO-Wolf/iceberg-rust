@@ -54,12 +54,8 @@ const WRITE_METADATA_PATH_PROPERTY: &str = "write.metadata.path";
 const STATS_FILE_EXTENSION: &str = "stats";
 
 /// Computes per-column NDV statistics over a table snapshot and writes them to a Puffin statistics
-/// file. Rust port of Java `ComputeTableStats`.
-///
-/// # Notes
-///
-/// By default the action reads every top-level primitive column of the current snapshot. A named
-/// nested column is rejected. [`Self::execute`] applies merge-on-read deletes.
+/// file. Rust port of Java `ComputeTableStats`. # Notes By default the action reads every top-level
+/// primitive column of the current snapshot.
 pub struct ComputeTableStats {
     table: Table,
     columns: Option<Vec<String>>,
@@ -161,13 +157,9 @@ impl ComputeTableStats {
     }
 
     /// Runs the action: scan → per-column theta sketches → Puffin file → register the
-    /// [`StatisticsFile`]. Returns the refreshed [`Table`] and the registered [`StatisticsFile`].
-    ///
-    /// # Errors
-    ///
-    /// - `DataInvalid` for an unknown snapshot id, a missing current snapshot, or a non-existent /
-    ///   non-primitive named column.
-    /// - Propagates scan / IO / Puffin-write / catalog-commit errors.
+    /// [`StatisticsFile`]. Returns the refreshed [`Table`] and the registered [`StatisticsFile`]. #
+    /// Errors - `DataInvalid` for an unknown snapshot id, a missing current snapshot, or a
+    /// non-existent / non-primitive named column.
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<ComputeTableStatsResult> {
         let snapshot = self.resolve_snapshot()?;
         let columns = self.resolve_columns()?;
@@ -399,14 +391,12 @@ mod tests {
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
     use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
-    // ============================================================================================
     // Test harness — a local-fs memory catalog (REAL parquet on disk) + a multi-type table:
     //   id      (long,   field 1)   — duplicates + distinct
     //   name    (string, field 2)   — duplicates
     //   day     (date,   field 3)   — distinct
     //   amount  (decimal(9,2), 4)   — distinct
     //   maybe   (long,   field 5, OPTIONAL) — contains nulls
-    // ============================================================================================
 
     const DECIMAL_PRECISION: u32 = 9;
     const DECIMAL_SCALE: u32 = 2;
@@ -674,9 +664,7 @@ mod tests {
         result
     }
 
-    // ============================================================================================
     // Crown jewel — multi-column table, hand-counted NDV per column, full round-trip.
-    // ============================================================================================
 
     #[tokio::test]
     async fn test_crown_jewel_per_column_ndv_round_trips_against_hand_counts() {
@@ -736,12 +724,10 @@ mod tests {
         assert_eq!(committed.blob_metadata.len(), 5);
     }
 
-    // ============================================================================================
     // Estimation-mode `ndv` pin, driven through the production `write_stats_file`. The crown jewel
     // feeds only exact-mode data, where the Alpha update estimate and the COMPACT estimate agree, so
     // it cannot see which object the writer reads. A 1M-distinct sketch makes them diverge. A
     // mutation that reads the update sketch's `estimate()` fails here with 1002319.
-    // ============================================================================================
 
     #[tokio::test]
     async fn test_write_stats_file_ndv_property_reads_compact_estimate_in_estimation_mode() {
@@ -802,11 +788,9 @@ mod tests {
         );
     }
 
-    // ============================================================================================
     // Per-type byte-form pins — the Conversions.toByteBuffer single-value serialization, declared
     // by hand. RISK: feeding the JSON / display form (or BE longs, or length-prefixed strings)
     // diverges every NDV silently. A sketch fed the hand-declared bytes must equal the action's.
-    // ============================================================================================
 
     fn datum_bytes(datum: &Datum) -> Vec<u8> {
         datum.to_bytes().expect("to_bytes").to_vec()
@@ -975,12 +959,10 @@ mod tests {
         );
     }
 
-    // ============================================================================================
     // Estimation-mode value pin — the Y2 STOP-finding CLOSED on Alpha (Y3). The action now builds an
     // Alpha sketch and reads the `ndv` off the COMPACT sketch, so a high-cardinality column's `ndv`
     // matches what Spark/Trino/Flink write. This pins the Alpha value AND proves the suite discriminates
     // families: a revert to QuickSelect would break this pin while the exact-mode pins survive.
-    // ============================================================================================
 
     #[test]
     fn test_estimation_mode_ndv_matches_java_alpha_not_quickselect() {
@@ -1036,9 +1018,7 @@ mod tests {
         );
     }
 
-    // ============================================================================================
     // Nulls excluded — a null cell never updates the sketch.
-    // ============================================================================================
 
     #[test]
     fn test_nulls_are_excluded_from_distinct_count() {
@@ -1079,9 +1059,7 @@ mod tests {
         assert_eq!(blobs[0].2, "3");
     }
 
-    // ============================================================================================
     // Deletes applied — a deleted row's value is absent from the NDV (MoR fixture).
-    // ============================================================================================
 
     #[tokio::test]
     async fn test_deleted_rows_are_excluded_from_distinct_count() {
@@ -1119,9 +1097,7 @@ mod tests {
         assert_eq!(blobs[0].2, "3");
     }
 
-    // ============================================================================================
     // Column selection + non-existent / non-primitive column errors.
-    // ============================================================================================
 
     #[tokio::test]
     async fn test_column_selection_limits_blobs() {
@@ -1163,9 +1139,7 @@ mod tests {
         assert!(error.to_string().contains("Can't find column nope"));
     }
 
-    // ============================================================================================
     // Multi-snapshot — stats are keyed to the COMPUTED snapshot.
-    // ============================================================================================
 
     #[tokio::test]
     async fn test_stats_keyed_to_requested_snapshot() {
@@ -1246,9 +1220,7 @@ mod tests {
         assert!(error.to_string().contains("999999"));
     }
 
-    // ============================================================================================
     // Mutation bait — swapping two columns' sketches must break the field-id ↔ NDV pairing.
-    // ============================================================================================
 
     #[tokio::test]
     async fn test_field_id_pairing_is_load_bearing() {

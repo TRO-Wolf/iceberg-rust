@@ -15,47 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Physical plans for `DELETE FROM` and `UPDATE` — the [`TableProvider::delete_from`] and
-//! [`TableProvider::update`] hooks. The plan emits one `UInt64` `count` row, per DataFusion's DML
-//! contract. The table property `write.delete.mode` / `write.update.mode` picks the mode:
+//! `DELETE FROM` and `UPDATE` physical plans. One `UInt64` `count` row, per DataFusion's DML contract.
 //!
 //! | Mode | Writes | Commit |
 //! |---|---|---|
 //! | `merge-on-read` | position deletes or deletion vectors, plus new rows for UPDATE | `RowDelta` |
-//! | `copy-on-write` (default) | a rewrite of only the files holding a matched row | `OverwriteFiles` |
+//! | `copy-on-write` (default) | rewrite of files that hold a matched row | `OverwriteFiles` |
 //!
-//! **The exact filter is the contract.** These paths evaluate the original DataFusion `WHERE`
-//! [`PhysicalExpr`] over the scanned rows. They never delete by Iceberg pushdown:
-//! `convert_filters_to_predicate` is inexact and loosens an `AND` branch it cannot convert. That is
-//! harmless for a SELECT, which re-filters, but it OVER-DELETES here. Pushdown may only prune under
-//! the exact filter.
-//!
-//! **Memory.** Every path streams its scan, and none is O(1). Merge-on-read buffers the matched
-//! `(path, pos)` pairs, because position deletes must be grouped and sorted before they are written.
-//! Copy-on-write is two-pass by nature: a file becomes affected on its last row as easily as its
-//! first, so the affected set must be complete before the first survivor is emitted. Pass 1 keeps
-//! only the affected paths; pass 2 re-scans and streams rows into the writer, at the price of a
-//! second full read. Pass 2 is skipped when no row matched, and for a predicate-less `DELETE FROM`.
-//!
-//! Both passes read ONE snapshot by construction: `Table` is a frozen handle, and an unpinned
-//! `build()` resolves from that frozen metadata, never a fresh catalog read. The explicit
-//! `snapshot_id` pin documents that invariant; it fixes no live bug.
-//!
-//! **Concurrency.** Each commit arms the ENGINE_CONTRACT §5 validations. Java
-//! `SparkRowLevelOperationBuilder.isolationLevel` is the oracle: property
-//! `write.<op>.isolation-level`, default serializable. The conflict filter is `AlwaysTrue`, because
-//! these paths push no filter into the scan. Removed files carry FULL metadata; a bare path has no
-//! partition or metrics and makes the conflicting-deletes check inert. A zero-match DML commits
-//! nothing. A validation failure is a non-retryable `DataInvalid`. See `docs/ENGINE_CONTRACT.md` §5.
+//! The original DataFusion `WHERE` is the contract. Iceberg pushdown is inexact and would over-delete.
+//! Copy-on-write is two-pass: the affected set must be complete before the first survivor is written.
+//! Both passes read one frozen snapshot. Conflict filter is `AlwaysTrue`. A zero-match DML commits nothing.
 //!
 //! | Path | Always validates | Serializable adds |
 //! |---|---|---|
 //! | copy-on-write DELETE and UPDATE | no conflicting deletes | no conflicting data |
 //! | merge-on-read DELETE | referenced data files exist | no conflicting data files |
 //! | merge-on-read UPDATE | files exist, deleted files, no conflicting delete files | no conflicting data files |
-//!
-//! **Out of scope.** No test covers a table whose partition specs evolved. Writer-side buffering
-//! stays unbounded: a fanout `TaskWriter` holds one open writer per partition.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
@@ -1124,12 +1099,7 @@ fn legacy_position_delete_applies(
 
 /// Writes the deletion vectors for `pairs` — the V3 merge-on-read delete output. One Puffin file
 /// carries one blob per data file touched, so the writer splits by referenced data file instead of
-/// grouping by partition. Each DV carries its data file's own `PartitionKey`. An existing DV is
-/// loaded, merged, and returned in `rewritten_delete_files`: V3 allows only one DV per data file.
-///
-/// # Errors
-///
-/// Fails when a pair's data file is not live, its spec is unknown, or an existing DV is unreadable.
+/// grouping by partition. Each DV carries its data file's own `PartitionKey`.
 async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFResult<DVWriteResult> {
     let metadata = table.metadata();
     let schema = metadata.current_schema();
@@ -1439,9 +1409,7 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
     )))
 }
 
-// =================================================================================================
 // UPDATE
-// =================================================================================================
 
 /// `UPDATE … SET … WHERE` plan. It applies the assignments, commits, and counts the rows.
 pub(crate) struct IcebergUpdateExec {

@@ -650,15 +650,11 @@ impl Catalog for S3TablesCatalog {
         Ok(staged_table)
     }
 
-    /// Atomically publish a fully staged replace through a metadata-pointer CAS.
-    ///
-    /// `CREATE OR REPLACE TABLE ... AS SELECT` stages files under the existing table location,
-    /// then calls this to swap the catalog pointer.
-    ///
-    /// # Errors
-    ///
-    /// A `Some(expected_base_metadata_location)` that does not match the service-current
-    /// pointer returns a retryable [`ErrorKind::CatalogCommitConflicts`] before any update.
+    /// Atomically publish a fully staged replace through a metadata-pointer CAS. `CREATE OR REPLACE
+    /// TABLE ... AS SELECT` stages files under the existing table location, then calls this to swap
+    /// the catalog pointer. # Errors A `Some(expected_base_metadata_location)` that does not match
+    /// the service-current pointer returns a retryable [`ErrorKind::CatalogCommitConflicts`] before
+    /// any update.
     async fn publish_replace_table(
         &self,
         table: Table,

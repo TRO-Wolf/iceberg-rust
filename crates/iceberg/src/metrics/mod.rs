@@ -15,17 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Metrics reporting for table operations.
-//!
-//! Ports the core of Java's `org.apache.iceberg.metrics`, and carries the wire contract for the
-//! REST catalog `report-metrics` endpoint. The serde shapes byte-match Java's parsers.
-//!
-//! # Notes
-//!
-//! [`MetricsReport`] is a closed enum, not a trait object, so an illegal report kind cannot be
-//! built. A metric that was never incremented is `None` and is omitted from the JSON, as Java's
-//! `@Nullable` accessors are. A deserialized `filter` loses its literal types the way Java's
-//! schema-less `ScanReportParser.fromJson` does, because a `ScanReport` carries no schema.
+//! Metrics reporting for table operations. Ports the core of Java's `org.apache.iceberg.metrics`,
+//! and carries the wire contract for the REST catalog `report-metrics` endpoint. The serde shapes
+//! byte-match Java's parsers.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -36,8 +28,6 @@ use serde::{Deserialize, Serialize};
 use crate::expr::Predicate;
 
 /// The metric name constants, matching Java's `ScanMetrics` string constants.
-///
-/// =====================================================================================
 mod metric_names {
     pub(super) const TOTAL_PLANNING_DURATION: &str = "total-planning-duration";
     pub(super) const RESULT_DATA_FILES: &str = "result-data-files";
@@ -63,8 +53,6 @@ mod metric_names {
 /// Mirrors Java's `MetricsContext.Unit`. The serde representation uses the lowercase
 /// display name (`undefined` / `bytes` / `count`), matching Java's
 /// `Unit.displayName()` used by `CounterResultParser`.
-///
-/// =====================================================================================
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetricUnit {
     /// An unspecified unit. Java `Unit.UNDEFINED` (`"undefined"`).
@@ -83,8 +71,6 @@ pub enum MetricUnit {
 /// Mirrors `java.util.concurrent.TimeUnit` (the subset Iceberg uses). The serde
 /// representation uses the lowercase name (e.g. `nanoseconds`), matching Java's
 /// `TimerResultParser`, which writes `timeUnit.name().toLowerCase()`.
-///
-/// =====================================================================================
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimeUnit {
     /// Nanoseconds — the unit Iceberg's planning timer uses.
@@ -129,8 +115,6 @@ impl TimeUnit {
 }
 
 /// A serializable counter value, mirroring Java's `CounterResult`.
-///
-/// =====================================================================================
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CounterResult {
     /// The unit the counter is measured in.
@@ -152,8 +136,6 @@ impl CounterResult {
 /// `count` of timed events. The JSON `total-duration` is the duration expressed in
 /// `time_unit` ticks; this type preserves the [`Duration`] exactly and converts only at
 /// the serde boundary.
-///
-/// =====================================================================================
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimerResult {
     /// The unit the JSON `total-duration` is expressed in.
@@ -219,8 +201,6 @@ impl<'de> Deserialize<'de> for TimerResult {
 /// Mirrors Java's `ScanMetricsResult`. Every field is optional, matching Java's
 /// `@Nullable` accessors: a metric that was never recorded is `None` and is omitted from
 /// the JSON.
-///
-/// =====================================================================================
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ScanMetricsResult {
     /// Total wall-clock time spent planning the scan. Java `totalPlanningDuration()`.
@@ -431,8 +411,6 @@ const fn matches_str(left: &str, right: &str) -> bool {
 ///
 /// Mirrors Java's `ScanReport`. The `filter` is the (bound or unbound) row filter applied
 /// to the scan; see the module docs for the JSON divergence on this one field.
-///
-/// =====================================================================================
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanReport {
     /// The fully-qualified table name. Java `tableName()` → `table-name`.
@@ -495,8 +473,6 @@ where D: serde::Deserializer<'de> {
 /// [`MetricsReport::Scan`]; future operations (e.g. commits) become new variants. Modelling
 /// the closed set as an `enum` (rather than a `dyn MetricsReport`) avoids downcasting and
 /// makes an unknown report kind unrepresentable.
-///
-/// =====================================================================================
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum MetricsReport {
@@ -507,8 +483,6 @@ pub enum MetricsReport {
 /// Reports [`MetricsReport`]s produced by table operations.
 ///
 /// Mirrors Java's `MetricsReporter` interface (`report(MetricsReport)`).
-///
-/// =====================================================================================
 pub trait MetricsReporter: Send + Sync {
     /// Reports a completed operation's metrics.
     ///
@@ -521,8 +495,6 @@ pub trait MetricsReporter: Send + Sync {
 /// Mirrors Java's `InMemoryMetricsReporter` (`report` stores; `scanReport()` reads). Useful
 /// for tests and for the future scan-emission wiring. The last report is held behind a
 /// [`Mutex`] so the reporter is `Send + Sync` and can be shared.
-///
-/// =====================================================================================
 #[derive(Debug, Default)]
 pub struct InMemoryMetricsReporter {
     last_report: Mutex<Option<MetricsReport>>,
@@ -574,8 +546,6 @@ impl MetricsReporter for InMemoryMetricsReporter {
 /// table name and snapshot id of a scan report) are attached as structured fields so an operator
 /// can filter without parsing the message, and nothing sensitive (e.g. the filter expression) is
 /// included.
-///
-/// =====================================================================================
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LoggingMetricsReporter;
 

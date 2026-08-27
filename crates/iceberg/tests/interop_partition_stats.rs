@@ -1091,16 +1091,8 @@ async fn test_partition_stats_cross_version_v2_file_v3_schema() {
 
 // ---- The incremental path: the SUBTRACT arm. -----------------------------------------------------
 
-/// GEN test: the incremental partition-stats SUBTRACT arm.
-///
-/// S1 fast-appends file_a (cat=a) and file_b (cat=b), then registers full stats. S2 runs
-/// `delete_files(file_a)`, which commits a DELETED tombstone. The registered S1 base makes
-/// `compute_and_write_stats_file` select the incremental path, which subtracts file_a.
-///
-/// After S2, cat=a holds zeros and cat=b is unchanged at 2 records, 1 file, 200 bytes. The test
-/// pins the path two ways: S1 must have a registered stats file, and cat=b's
-/// `last_updated_snapshot_id` must stay S1, which only a carried base row gives. It emits
-/// `rust_incr_table/metadata/final.metadata.json` and `incr_expected.json` for Java's verify.
+/// GEN test: the incremental partition-stats SUBTRACT arm. S1 fast-appends file_a (cat=a) and
+/// file_b (cat=b), then registers full stats.
 #[tokio::test]
 async fn test_partition_stats_incr_gen() {
     let Some(incr_dir) = incr_dir() else {

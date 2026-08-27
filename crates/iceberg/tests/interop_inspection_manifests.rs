@@ -48,10 +48,8 @@ use iceberg::spec::{Datum, TableMetadata};
 use iceberg::table::Table;
 use serde::Deserialize;
 
-// ===========================================================================================
 // The Java oracle row model — deserialized from java_{files,data_files,delete_files}.json. Every column is
 // present EXCEPT the deferred `readable_metrics`. Bound maps are {field_id-as-string: hex-of-bytes}.
-// ===========================================================================================
 
 /// One row of Java's `FilesTable` / `DataFilesTable` / `DeleteFilesTable`, keyed by COLUMN NAME (the Java
 /// oracle derives name→position from `mt.schema().columns()`).
@@ -203,9 +201,7 @@ fn decode_hex(hex: &str) -> Vec<u8> {
         .collect()
 }
 
-// ===========================================================================================
 // Fixture loading + Table construction.
-// ===========================================================================================
 
 /// The temp dir the Java oracle wrote the table + JSON rows into. `None` when the env var is unset.
 fn manifest_dir() -> Option<PathBuf> {
@@ -241,9 +237,7 @@ fn load_table(dir: &std::path::Path) -> Table {
         .expect("build table from Java-written final.metadata.json")
 }
 
-// ===========================================================================================
 // Arrow column extraction — a files-table batch into the comparable [`FileRow`]s.
-// ===========================================================================================
 
 /// A by-name column source: a `files`-family Arrow batch, or the nested `data_file` struct inside an
 /// `entries` row. `RecordBatch` and `StructArray` expose the same `column_by_name`, so one
@@ -465,9 +459,7 @@ fn canonical_sorted(rows: Vec<FileRow>) -> Vec<FileRow> {
     rows
 }
 
-// ===========================================================================================
 // The single env-gated interop test.
-// ===========================================================================================
 
 #[tokio::test]
 async fn test_files_tables_match_java_rows_from_real_manifests() {
@@ -583,9 +575,7 @@ async fn test_files_tables_match_java_rows_from_real_manifests() {
         "KNOWN DIVERGENCE pin: an absent metric map projects to an EMPTY map in Rust (Java emits null)"
     );
 
-    // ============================================================================================
     // Focused, named assertions — a single regressed column / filter is pinpointed here.
-    // ============================================================================================
 
     // The content FILTER: `data_files` excludes the delete file; `delete_files` excludes the data files.
     let delete_path = &rust_deletes[0].file_path;
@@ -664,7 +654,6 @@ fn leaf(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-// ===========================================================================================
 // A2 — the `entries` / `manifests` / `partitions` manifest-reading inspection tables.
 //
 // The Java oracle writes a richer V2 table to `<dir>/table_a2`, partitioned by identity(category),
@@ -672,7 +661,6 @@ fn leaf(path: &str) -> String {
 // Java's real ManifestEntriesTable / ManifestsTable / PartitionsTable. These tests read the same
 // table and compare field-for-field, order-independent. The A1 env gate, canonical form, and
 // `readable_metrics` deferral all carry over.
-// ===========================================================================================
 
 /// Build a `Table` over the Java-written A2 `final.metadata.json` (under `<dir>/table_a2`), local-fs FileIO.
 fn load_table_a2(dir: &std::path::Path) -> Table {
@@ -702,9 +690,7 @@ fn read_java<T: serde::de::DeserializeOwned>(dir: &std::path::Path, file_name: &
         .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
-// ---------------------------------------------------------------------------------------------
 // `entries` — one row per manifest entry of the current snapshot, INCLUDING DELETED tombstones.
-// ---------------------------------------------------------------------------------------------
 
 /// One Java `ManifestEntriesTable` row: the 4 scalar columns + the nested `data_file` (a [`JavaFileRow`]).
 #[derive(Debug, Clone, Deserialize)]
@@ -858,9 +844,7 @@ async fn test_entries_table_matches_java_rows() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
 // `manifests` — one row per manifest in the CURRENT snapshot's manifest list.
-// ---------------------------------------------------------------------------------------------
 
 /// One Java `ManifestsTable` partition-summary struct (lower/upper bounds are STRINGS in Java).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1105,9 +1089,7 @@ async fn test_manifests_table_matches_java_rows() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
 // `partitions` — one row per partition value over the current snapshot's LIVE entries.
-// ---------------------------------------------------------------------------------------------
 
 /// One Java `PartitionsTable` row. The `partition` struct reuses the A1 [`JavaPartition`] (single
 /// `category`).
@@ -1288,7 +1270,6 @@ async fn test_partitions_table_matches_java_rows() {
     );
 }
 
-// ===========================================================================================
 // A3 — the five cross-snapshot `all_*` inspection tables: `all_data_files`, `all_delete_files`,
 // `all_files`, `all_entries`, `all_manifests`. They run over A2's `<dir>/table_a2`, whose commits
 // already carry the cross-snapshot shape:
@@ -1303,7 +1284,6 @@ async fn test_partitions_table_matches_java_rows() {
 // one row per (manifest x referencing snapshot), so M1 yields two rows with distinct
 // `reference_snapshot_id`. These tables MAY RETURN DUPLICATE ROWS, so both sides sort by the full
 // row's `Debug` repr, a total order here, and compare element by element with no dedup.
-// ===========================================================================================
 
 /// Sort plain data rows by their `Debug` repr, for an order-independent MULTISET comparison that
 /// keeps duplicates. For these derive-`Debug` structs two rows are `==` exactly when their `Debug`
@@ -1313,10 +1293,8 @@ fn multiset_sorted<T: std::fmt::Debug>(mut rows: Vec<T>) -> Vec<T> {
     rows
 }
 
-// ---------------------------------------------------------------------------------------------
 // all_data_files / all_delete_files / all_files — A1's flat `files` schema over the cross-snapshot
 // reachable union, where rows may be DUPLICATED, so the comparison is a multiset.
-// ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_all_data_files_table_matches_java_rows() {
@@ -1521,10 +1499,8 @@ async fn test_all_files_table_matches_java_rows() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
 // all_entries — every manifest entry across ALL reachable manifests, tombstones included. The
 // multiset comparison keeps the duplicates a file in two reachable manifests produces.
-// ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_all_entries_table_matches_java_rows() {
@@ -1588,9 +1564,7 @@ async fn test_all_entries_table_matches_java_rows() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
 // all_manifests — one row per (manifest x referencing snapshot), never dedup'd.
-// ---------------------------------------------------------------------------------------------
 
 /// One Java `AllManifestsTable` row — the regular [`JavaManifestRow`] columns PLUS `reference_snapshot_id`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1736,7 +1710,6 @@ async fn test_all_manifests_table_matches_java_rows() {
     );
 }
 
-// ===========================================================================================
 // A4 — SCAN PLANNING interop: does Rust plan the same data files Java does for a given filter?
 //
 // Planning reads the AVRO manifests, prunes data files by partition predicate and by column-metric
@@ -1761,7 +1734,6 @@ async fn test_all_manifests_table_matches_java_rows() {
 // covered by partitioning" (Java `residual().op() == Operation.TRUE`; Rust `task.predicate` of
 // `None` or `Some(BoundPredicate::AlwaysTrue)`). Comparing the residual EXPRESSION would need a
 // cross-language normalization design, and `scan/mod.rs` already unit-tests Rust residuals.
-// ===========================================================================================
 
 /// One Java scan-plan row from `java_scan_<name>.json`: a planned data file, its applicable (sorted) delete
 /// paths, and whether its residual is fully covered by partitioning.
@@ -2005,7 +1977,6 @@ async fn test_scan_planning_matches_java_plans() {
     );
 }
 
-// ===========================================================================================
 // readable_metrics — the typed-decode interop proof for the `files` table's trailing virtual
 // `readable_metrics` struct, which A1-A4 defer.
 //
@@ -2026,7 +1997,6 @@ async fn test_scan_planning_matches_java_plans() {
 //
 // Deferred: the PROMOTED-TYPE bound (an int-encoded bound on a column promoted to long). It needs
 // schema evolution and an old-schema data file. Long, string, and double pin the typed decode.
-// ===========================================================================================
 
 /// The decoded `readable_metrics` of ONE leaf column. Exactly one of the three typed-bound
 /// `Option`s is populated per column, and the other two stay `None`.

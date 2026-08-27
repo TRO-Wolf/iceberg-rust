@@ -41,18 +41,9 @@ pub(crate) struct DeleteVectorCoordinates {
     pub(crate) content_size_in_bytes: u64,
 }
 
-/// Validates the DV metadata on a delete file and range-checks the coordinates into `u64`.
-///
-/// Java `BaseDeleteLoader.validateDV`, plus a keying prerequisite. `referenced_data_file` must be
-/// present. The Puffin spec makes it mandatory, and the loaded vector is keyed by it.
-///
-/// # Errors
-///
-/// `DataInvalid` when a field is absent, the offset is negative, or the size is outside 0..=2GB.
-///
-/// # Notes
-///
-/// The scan path and the public loader share this, so their messages cannot drift.
+/// Validates the DV metadata on a delete file and range-checks the coordinates into `u64`. Java
+/// `BaseDeleteLoader.validateDV`, plus a keying prerequisite. `referenced_data_file` must be
+/// present.
 pub(crate) fn validate_delete_vector_coordinates(
     file_path: &str,
     referenced_data_file: Option<String>,
@@ -98,20 +89,8 @@ pub(crate) fn validate_delete_vector_coordinates(
     })
 }
 
-/// Read one committed deletion vector back off storage.
-///
-/// Java `BaseDeleteLoader.readDV`. One ranged read at the manifest's blob coordinates, then the
-/// `deletion-vector-v1` decode. To merge into an existing DV, pass the result to
-/// [`crate::writer::base_writer::deletion_vector_writer::DVFileWriter::with_previous_deletes`].
-///
-/// # Errors
-///
-/// `DataInvalid` when `delete_file` is not a Puffin position-delete file, when its blob coordinates
-/// are missing or out of range, or when the decoded cardinality disagrees with `record_count`.
-///
-/// # Notes
-///
-/// This does not cache. The scan path has its own caching loader. A writer reads each DV once.
+/// Read one committed deletion vector back off storage. Java `BaseDeleteLoader.readDV`. One ranged
+/// read at the manifest's blob coordinates, then the `deletion-vector-v1` decode.
 pub async fn load_delete_vector(file_io: &FileIO, delete_file: &DataFile) -> Result<DeleteVector> {
     let file_path = delete_file.file_path();
     if delete_file.content_type() != DataContentType::PositionDeletes
@@ -230,12 +209,8 @@ impl DeleteVector {
         self.inner |= &other.inner;
     }
 
-    /// Marks the given `positions` as deleted and returns the number of elements appended.
-    ///
-    /// The input slice must ascend strictly, and every value must exceed all existing values.
-    ///
-    /// # Errors
-    ///
+    /// Marks the given `positions` as deleted and returns the number of elements appended. The
+    /// input slice must ascend strictly, and every value must exceed all existing values. # Errors
     /// Returns an error if the precondition is not met.
     #[allow(dead_code)]
     pub fn insert_positions(&mut self, positions: &[u64]) -> Result<usize> {
@@ -600,18 +575,8 @@ impl Iterator for DeleteVectorIterator<'_> {
 
 impl DeleteVectorIterator<'_> {
     /// Fast-forwards the iterator so the next yielded position is the smallest delete `>= pos`.
-    ///
     /// `pos` splits into the high-bits group `hi = pos >> 32` and the low value `lo = pos as u32`.
-    /// The outer walk steps groups until the current group is `>= hi`. It skips within the bitmap
-    /// only when it lands exactly on `hi`.
-    ///
-    /// # Notes
-    ///
-    /// When `hi`'s group is ABSENT, the outer walk overshoots into the next present group. Every
-    /// position there is already `> pos`, so the inner skip must not run. It would consume an
-    /// in-range position. The iterator therefore stops at that group's start.
-    ///
-    /// The call does nothing until one `next()` primes the iterator. It only moves forward.
+    /// The outer walk steps groups until the current group is `>= hi`.
     pub fn advance_to(&mut self, pos: u64) {
         let hi = (pos >> 32) as u32;
         let lo = pos as u32;

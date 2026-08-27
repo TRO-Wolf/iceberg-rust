@@ -28,9 +28,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use tempfile::TempDir;
 
-// =============================================================================================
 // Unit tests — URI normalization, the orphan join, the hidden-path filter (the risk core)
-// =============================================================================================
 use super::delete_orphan_files::test_hooks::{
     FileUriProbe, classify_one, default_equal_schemes_probe, flatten_map_probe,
     is_hidden_under_probe, split_uri_probe, version_hint_probe,
@@ -281,9 +279,7 @@ fn test_version_hint_location_shape() {
     );
 }
 
-// =============================================================================================
 // End-to-end fixtures — a local-fs-backed memory catalog, real files on disk
-// =============================================================================================
 
 /// A memory catalog over the local filesystem, rooted at a fresh `TempDir`. Returns the catalog,
 /// a [`FileIO`] for planting files, and the temp-dir guard.
@@ -512,9 +508,7 @@ fn dedup_sort(vec: &mut Vec<String>) {
     vec.dedup();
 }
 
-// =============================================================================================
 // End-to-end tests — the crown jewel and the algorithm pins
-// =============================================================================================
 
 /// The crown-jewel GC-safety pin. A multi-snapshot table with planted orphans, swept with every
 /// file age-eligible. Exactly the planted orphans go. Every reachable file survives, enumerated by
@@ -1176,12 +1170,8 @@ async fn test_gc_disabled_refuses_with_java_message() {
 }
 
 /// A file removed by a copy-on-write delete is not live in the current snapshot. The prior
-/// snapshot's manifest still names it, and the valid universe spans every snapshot, so it is not
-/// an orphan. Deleting it corrupts the readable history.
-///
-/// Here the file is still alive in S1's manifest, so this pins history reachability only. The
-/// tombstone-only case has its own test,
-/// [`test_tombstone_only_referenced_file_is_not_orphan_after_expire`].
+/// snapshot's manifest still names it, and the valid universe spans every snapshot, so it is not an
+/// orphan.
 #[tokio::test]
 async fn test_copy_on_write_deleted_file_survives_because_history_references_it() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -1396,13 +1386,7 @@ async fn test_table_under_hidden_parent_dir_still_sweeps_orphans() {
 }
 
 /// Metadata carries `file://` while the local listing returns bare paths. No live file may go and
-/// the action must not error. The universe normalizes `file://…/x` to `/…/x`, so the join holds.
-///
-/// # Notes
-///
-/// A scheme-qualified `location` makes `relative_under` unable to strip the base, so every listed
-/// file reads as hidden and the sweep is a silent no-op. That is under-deletion, never corruption.
-/// The OpenDAL backends re-prefix listed entries with the scheme, so they sweep normally.
+/// the action must not error.
 #[tokio::test]
 async fn test_file_scheme_location_never_deletes_live_files() {
     let temp_dir = TempDir::new().expect("temp dir");

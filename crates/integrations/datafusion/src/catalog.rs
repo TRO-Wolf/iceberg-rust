@@ -24,31 +24,19 @@ use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result};
 
 use crate::schema::IcebergSchemaProvider;
 
-/// Joins the levels of a multi-level [`NamespaceIdent`] into one DataFusion schema name.
-///
-/// DataFusion maps exactly one `&str` to one [`SchemaProvider`], so the level list must flatten.
+/// Joins the levels of a multi-level [`NamespaceIdent`] into one DataFusion schema name. DataFusion
+/// maps exactly one `&str` to one [`SchemaProvider`], so the level list must flatten.
 /// [`NamespaceIdent::to_url_string`] already uses `U+001F`, so the fork keeps one flattening.
-///
-/// A split on the separator recovers the exact level list. The recovery is total because
-/// [`validate_namespace_renderable`] rejects any level that contains the separator.
 const NAMESPACE_SEPARATOR: char = '\u{1f}';
 
-/// The separator of the ergonomic, non-canonical schema-name alias: a plain dot.
-///
-/// A query cannot type `U+001F`, so each multi-level namespace also gets a dot-joined alias.
-/// Java `Namespace.toString` renders a namespace the same way.
-///
-/// A level may itself contain a dot, so the alias is not injective. See
-/// [`IcebergCatalogProvider`] for the precedence rules that stop an alias from shadowing.
+/// The separator of the ergonomic, non-canonical schema-name alias: a plain dot. A query cannot
+/// type `U+001F`, so each multi-level namespace also gets a dot-joined alias. Java
+/// `Namespace.toString` renders a namespace the same way.
 const NAMESPACE_ALIAS_SEPARATOR: &str = ".";
 
-/// Maximum number of levels a discovered namespace may have.
-///
-/// The catalog server controls the tree, so it is untrusted input. Without this cap a server
-/// that answers each listing with a deeper namespace lists forever. The cap does not stop a
-/// cycle, because a cycle never gains depth. The `seen` set in [`discover_namespaces`] does.
-///
-/// 64 matches `MAX_WRITE_COMPATIBILITY_DEPTH`. A deeper namespace fails loud, never truncates.
+/// Maximum number of levels a discovered namespace may have. The catalog server controls the tree,
+/// so it is untrusted input. Without this cap a server that answers each listing with a deeper
+/// namespace lists forever.
 const MAX_NAMESPACE_DEPTH: usize = 64;
 
 /// Maximum number of catalog listing round-trips in flight at once during discovery.
@@ -57,16 +45,10 @@ const MAX_NAMESPACE_DEPTH: usize = 64;
 /// `DEFAULT_LIST_STAT_CONCURRENCY` in `iceberg-storage-opendal`.
 const NAMESPACE_DISCOVERY_CONCURRENCY: usize = 16;
 
-/// Serves every namespace of an Iceberg [`Catalog`] as a DataFusion [`SchemaProvider`].
-///
-/// Each namespace registers under its canonical [`NAMESPACE_SEPARATOR`]-joined name, which is
-/// what [`Self::schema_names`] reports. A multi-level namespace also resolves through its
-/// dot-joined alias. An alias is never listed and never takes precedence.
-///
-/// # Notes
-///
-/// Construction rejects a level that contains [`NAMESPACE_SEPARATOR`], so the canonical join
-/// stays injective. An alias registers only when unclaimed, and a dropped alias gives `None`.
+/// Serves every namespace of an Iceberg [`Catalog`] as a DataFusion [`SchemaProvider`]. Each
+/// namespace registers under its canonical [`NAMESPACE_SEPARATOR`]-joined name, which is what
+/// [`Self::schema_names`] reports. A multi-level namespace also resolves through its dot-joined
+/// alias.
 #[derive(Debug)]
 pub struct IcebergCatalogProvider {
     /// Canonical schema name to provider. This is what [`CatalogProvider::schema_names`] reports.
@@ -77,29 +59,15 @@ pub struct IcebergCatalogProvider {
 
 impl IcebergCatalogProvider {
     /// Builds a schema provider for every namespace of the catalog, at every nesting level.
-    ///
     /// Discovery is a breadth-first walk from `list_namespaces(None)`. To snapshot only some
     /// namespaces, use [`Self::try_new_with_namespace_scope`].
-    ///
-    /// # Errors
-    ///
-    /// A namespace that cannot be listed fails this call and is named in the error. It is never
-    /// dropped: this crate has no `tracing` dependency, so a skip would be silent.
-    ///
-    /// # Notes
-    ///
-    /// This call issues no `list_tables`, so an unreadable table cannot break construction.
     pub async fn try_new(client: Arc<dyn Catalog>) -> Result<Self> {
         Self::try_new_with_scope(client, NamespaceWalkScope::Unscoped).await
     }
 
-    /// Like [`Self::try_new`], but snapshots only `namespaces` and their descendants.
-    ///
-    /// The named identifiers seed the same walk. This call never issues
-    /// `list_namespaces(None)`, so a sibling of a named root is neither listed nor registered.
-    ///
-    /// An empty iterator walks nothing and returns an empty provider. [`Self::try_new`] is the
-    /// unset case and still walks the whole catalog.
+    /// Like [`Self::try_new`], but snapshots only `namespaces` and their descendants. The named
+    /// identifiers seed the same walk. This call never issues `list_namespaces(None)`, so a sibling
+    /// of a named root is neither listed nor registered.
     pub async fn try_new_with_namespace_scope(
         client: Arc<dyn Catalog>,
         namespaces: impl IntoIterator<Item = NamespaceIdent>,
@@ -225,14 +193,9 @@ enum NamespaceWalkScope {
     Scoped(Vec<NamespaceIdent>),
 }
 
-/// Breadth-first walk of the namespace tree, optionally seeded at a named scope.
-///
-/// Two guarantees terminate the walk, and neither replaces the other. `seen` expands a
-/// namespace at most once, the only defence against a cycle and against a server that ignores
-/// the parent filter. Neither shape gains depth, so the depth cap never fires on them.
-/// [`MAX_NAMESPACE_DEPTH`] fails loud on a server that answers with deeper, unseen namespaces.
-///
-/// A scoped walk adds a descendant filter, so an ignored parent cannot pull in a sibling.
+/// Breadth-first walk of the namespace tree, optionally seeded at a named scope. Two guarantees
+/// terminate the walk, and neither replaces the other. `seen` expands a namespace at most once, the
+/// only defence against a cycle and against a server that ignores the parent filter.
 async fn discover_namespaces(
     client: &Arc<dyn Catalog>,
     scope: NamespaceWalkScope,
@@ -1142,12 +1105,8 @@ mod tests {
 
     /// Providers must stay aligned with the namespaces they zip against even when the catalog
     /// answers out of request order. Otherwise a query reads another namespace's tables.
-    ///
     /// [`ScriptedCatalog`] lists namespaces sorted, so `a_delayed` is requested first and its
-    /// sleeping table listing completes last. The reversal is deterministic, not luck.
-    ///
-    /// Mutation: `buffered` becomes `buffer_unordered` in `build_schema_providers`, and both
-    /// table assertions go RED.
+    /// sleeping table listing completes last.
     #[tokio::test]
     async fn providers_stay_bound_to_their_own_namespace_when_listings_finish_out_of_order() {
         let (inner, _dir) = memory_catalog().await;

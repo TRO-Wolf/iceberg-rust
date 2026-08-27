@@ -59,12 +59,7 @@ enum PosDelState {
     Loaded,
     /// The claiming task died without publishing its delete vectors. Any error or cancellation in
     /// the claim, read, parse, or merge window does that. The claiming task is the sole writer and
-    /// runs once, so the state can never advance on its own. Waiters MUST treat this as terminal
-    /// and surface a typed error. A re-wait on the notifier blocks the scan forever.
-    ///
-    /// Carries the CAUSE as a `String`, because [`Error`] is not `Clone` and reaches only the task
-    /// that produced it. [`PosDelLoadGuard::note_failure`] records it where a cause exists. An
-    /// unwind, a cancelled future, or a runtime shutdown publishes a generic reason instead.
+    /// runs once, so the state can never advance on its own.
     Failed(String),
 }
 
@@ -79,11 +74,6 @@ struct DeleteFileFilterState {
     /// The load cache: parsed positional-delete content, PER SOURCE. The key is the source's
     /// [`pos_del_claim_key`], and each value maps a DATA file path to the positions that source
     /// deletes from it. Java `BaseDeleteLoader.getOrReadPosDeletes` caches the same shape.
-    ///
-    /// The per-source maps stay SEPARATE, which scopes delete application to each task's own
-    /// delete set. A source loaded for one task cannot delete rows for a task that does not list
-    /// it. An installed map is never mutated again, because each claim key loads exactly once, so
-    /// resolution snapshots the `Arc`s and unions them outside the lock.
     pos_del_contributions: HashMap<String, Arc<HashMap<String, DeleteVector>>>,
     /// Memoized per-task merged vectors. See [`PosDelResolutionKey`]. An entry installs only once
     /// every claim key it depends on is present, and contributions are immutable, so a memoized
@@ -134,27 +124,15 @@ pub(crate) enum PosDelLoadAction {
     /// The file is already loaded, nothing to do.
     AlreadyLoaded,
     /// Another task is loading the file. The caller MUST pass this future to
-    /// [`DeleteFilter::wait_for_pos_del_load`], because `get_delete_vector` is synchronous.
-    ///
-    /// The future is ARMED HERE, under the state lock. That closes a lost-wakeup race.
-    /// [`Notify::notify_waiters`] stores no permit and wakes only futures that already exist, and
-    /// `notified_owned` snapshots the counter at CALL time. A bare `Arc<Notify>` armed at the
-    /// await site leaves a window where the loader publishes and notifies, the wakeup is lost, and
-    /// the scan parks forever. The loader cannot notify before it takes the WRITE lock, which this
-    /// lock blocks, so every notification follows this arming.
+    /// [`DeleteFilter::wait_for_pos_del_load`], because `get_delete_vector` is synchronous. The
+    /// future is ARMED HERE, under the state lock.
     WaitFor(OwnedNotified),
 }
 
 /// Publishes the TERMINAL state of one positional-delete file's load and wakes its waiters.
-///
 /// [`DeleteFilter::try_start_pos_del_load`] arms it in the same critical section that installs
 /// [`PosDelState::Loading`], so the claim never exists without its guard.
-/// [`PosDelLoadGuard::publish_loaded`] disarms it on success. Otherwise `Drop` publishes
-/// [`PosDelState::Failed`], which covers every way the loading task can die: an early `?`, a
-/// sibling task's error, an unwind, and a runtime shutdown.
-///
-/// Both paths write the state under the write lock and fire the notifier only after releasing it,
-/// so a woken waiter always observes the terminal state.
+/// [`PosDelLoadGuard::publish_loaded`] disarms it on success.
 pub(crate) struct PosDelLoadGuard {
     state: Arc<RwLock<DeleteFileFilterState>>,
     notify: Arc<Notify>,
@@ -222,16 +200,10 @@ impl Drop for PosDelLoadGuard {
     }
 }
 
-/// Publishes the TERMINAL state of one equality-delete file's load and wakes its waiters.
-///
-/// The counterpart of [`PosDelLoadGuard`], armed by [`DeleteFilter::try_start_eq_del_load`] in the
-/// same critical section that installs [`EqDelState::Loading`]. It carries the notifier that claim
-/// installed, so the notifier waiters arm on is the one that fires. A fresh notifier at publish
-/// time would strand a waiter that armed in between.
-///
-/// [`EqDelLoadGuard::spawn_publisher`] hands the guard to the publishing task, which CAPTURES it
-/// rather than build it inside the future. A future dropped before its first poll runs no local
-/// destructors, but still drops the captured guard.
+/// Publishes the TERMINAL state of one equality-delete file's load and wakes its waiters. The
+/// counterpart of [`PosDelLoadGuard`], armed by [`DeleteFilter::try_start_eq_del_load`] in the same
+/// critical section that installs [`EqDelState::Loading`]. It carries the notifier that claim
+/// installed, so the notifier waiters arm on is the one that fires.
 pub(crate) struct EqDelLoadGuard {
     state: Arc<RwLock<DeleteFileFilterState>>,
     notify: Arc<Notify>,
@@ -251,13 +223,10 @@ impl EqDelLoadGuard {
         self.notify.notify_waiters();
     }
 
-    /// Spawns the task that turns the loader's oneshot into this file's terminal state.
-    ///
-    /// The loader sends the parsed predicate once it reads the file. A sender dropped without
-    /// sending, which any error or cancellation in the load window does, makes the await err and
-    /// the entry move to [`EqDelState::Failed`]. It STILL wakes the waiters, because a stranded
-    /// `Loading` parks every waiter forever. A waiter reads `Failed` as absence and the caller
-    /// raises a typed error.
+    /// Spawns the task that turns the loader's oneshot into this file's terminal state. The loader
+    /// sends the parsed predicate once it reads the file. A sender dropped without sending, which
+    /// any error or cancellation in the load window does, makes the await err and the entry move to
+    /// [`EqDelState::Failed`].
     pub(crate) fn spawn_publisher(mut self, eq_del: Receiver<(Predicate, Option<EqDeleteKeySet>)>) {
         crate::runtime::spawn(async move {
             let terminal = match eq_del.await {
@@ -332,21 +301,10 @@ impl DeleteFilter {
     }
 
     /// Resolves the positional deletes that a task's `deletes` apply to its `data_file_path`: the
-    /// union, over the task's own positional sources only, of each source's contribution.
-    ///
-    /// # Notes
-    ///
+    /// union, over the task's own positional sources only, of each source's contribution. # Notes
     /// This is Java's per-task scope. Java builds one `data.DeleteFilter` per task over
     /// `task.deletes()` alone, and `deletedRowPositions()` merges only those files' contributions
-    /// into a fresh index. A delete file loaded for a DIFFERENT task never contributes here, and a
-    /// listed file's rows that name other data files are ignored.
-    ///
-    /// The merged vector is memoized per [`PosDelResolutionKey`], so every task with the same
-    /// delete set and data file gets the SAME `Arc`. Java memoizes the same merge.
-    ///
-    /// Returns `None` when no listed source contributes a position. Two shapes the contract makes
-    /// unreachable also give `None`, and both log at WARN: a source with an underivable claim key,
-    /// and one whose contribution never installed. Dropping a REAL source resurrects deleted rows.
+    /// into a fresh index.
     pub(crate) fn resolve_delete_vector(
         &self,
         deletes: &[FileScanTaskDeleteFile],
@@ -459,14 +417,9 @@ impl DeleteFilter {
         })
     }
 
-    /// Tries to claim a positional delete file for loading. The action tells the caller to load
-    /// the file, to wait for another task, or to do nothing.
-    ///
-    /// # Errors
-    ///
-    /// When a previous loader terminated without publishing. That state is terminal, so a fresh
-    /// claim would lie and a wait would never end. The scan fails loudly instead of running
-    /// without this file's deletes, which would resurrect deleted rows.
+    /// Tries to claim a positional delete file for loading. The action tells the caller to load the
+    /// file, to wait for another task, or to do nothing. # Errors When a previous loader terminated
+    /// without publishing.
     pub(crate) fn try_start_pos_del_load(&self, file_path: &str) -> Result<PosDelLoadAction> {
         let mut state = recover_poison(self.state.write());
 
@@ -497,14 +450,9 @@ impl DeleteFilter {
         }))
     }
 
-    /// Waits for another task's positional-delete load to reach a terminal state.
-    ///
-    /// `notified` MUST be the future [`Self::try_start_pos_del_load`] armed under the state lock.
-    /// A `Notified` created here reopens the lost-wakeup window.
-    ///
-    /// # Errors
-    ///
-    /// When the loading task died without publishing. It never hangs.
+    /// Waits for another task's positional-delete load to reach a terminal state. `notified` MUST
+    /// be the future [`Self::try_start_pos_del_load`] armed under the state lock. A `Notified`
+    /// created here reopens the lost-wakeup window.
     pub(crate) async fn wait_for_pos_del_load(
         &self,
         file_path: &str,
@@ -532,17 +480,8 @@ impl DeleteFilter {
     }
 
     /// Reads one equality-delete entry once. It answers outright when the entry is terminal, and
-    /// otherwise ARMS the notifier.
-    ///
-    /// # Notes
-    ///
-    /// The arming MUST happen under the read lock, the same handshake
-    /// [`PosDelLoadAction::WaitFor`] documents. A future created after the loader published is
-    /// never woken, so arming at the await site loses the wakeup and parks the scan forever. The
-    /// publisher cannot notify before it takes the WRITE lock, which this read lock blocks.
-    ///
-    /// `Ready(None)` covers an unknown file and a terminally failed one. The caller surfaces
-    /// absence, and `build_equality_delete_predicate` raises a typed error.
+    /// otherwise ARMS the notifier. # Notes The arming MUST happen under the read lock, the same
+    /// handshake [`PosDelLoadAction::WaitFor`] documents.
     fn lookup_or_arm_eq_del<T>(
         &self,
         file_path: &str,
@@ -666,14 +605,9 @@ impl DeleteFilter {
     }
 
     /// Installs the parsed `data file path` to `positions` map of ONE freshly loaded positional
-    /// delete source, under the claim the loading task holds.
-    ///
-    /// Call it BEFORE [`PosDelLoadGuard::publish_loaded`], in the same await-free block. A woken
-    /// waiter resolves synchronously, so publishing first hands it an absent contribution.
-    ///
-    /// Taking the guard rather than a bare key ties the install to the claim. Only the task that
-    /// owns the load can install, and only under the key it claimed. Key drift between the claim,
-    /// the install, and the resolution silently drops deletes.
+    /// delete source, under the claim the loading task holds. Call it BEFORE
+    /// [`PosDelLoadGuard::publish_loaded`], in the same await-free block. A woken waiter resolves
+    /// synchronously, so publishing first hands it an absent contribution.
     pub(crate) fn install_pos_del_contribution(
         &self,
         claim: &PosDelLoadGuard,
@@ -740,14 +674,8 @@ impl DeleteFilter {
     }
 
     /// Applies `task`'s deletes to one Arrow `batch` of its data file and returns the surviving
-    /// rows. Java `DeleteFilter.filter`.
-    ///
-    /// `row_base` is the 0-based position of `batch`'s first row in the data file, the `_pos` of
-    /// row 0. Batches MUST arrive in file order with no rows skipped, so positions stay aligned.
-    ///
-    /// `equality_predicate` is the once-resolved result of
-    /// [`equality_delete_predicate`](Self::equality_delete_predicate). Pass `None` when the task
-    /// has no equality deletes. To apply them, `batch` must carry the equality-delete columns.
+    /// rows. Java `DeleteFilter.filter`. `row_base` is the 0-based position of `batch`'s first row
+    /// in the data file, the `_pos` of row 0.
     pub fn apply(
         &self,
         task: &FileScanTask,
@@ -1528,13 +1456,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// The equality path does not share the cross-task over-delete defect. Equality-delete state
-    /// is a load cache keyed by DELETE FILE path, and application iterates `task.deletes`, so a
+    /// The equality path does not share the cross-task over-delete defect. Equality-delete state is
+    /// a load cache keyed by DELETE FILE path, and application iterates `task.deletes`, so a
     /// predicate loaded for one task cannot fold into a task that does not list its file. Java
     /// `DeleteFilter.applyEqDeletes` reads only the task's own partitioned list.
-    ///
-    /// MUTATION: fold every loaded eq predicate from the shared state into the task's predicate,
-    /// ignoring `task.deletes`. The `id = 20` assertion goes RED.
     #[tokio::test]
     async fn test_eq_delete_application_scoped_to_tasks_own_files() {
         let schema = Arc::new(
@@ -1627,7 +1552,6 @@ pub(crate) mod tests {
         );
     }
 
-    // =============================================================================================
     // Equivalence harness: eq-delete SET membership against the production PREDICATE path.
     //
     // Production builds a leaf predicate per delete cell, AND-folds the cells, negates per row,
@@ -1636,7 +1560,6 @@ pub(crate) mod tests {
     //
     // These tests pin the exact semantics a set-membership rewrite must reproduce, and show where
     // a naive `HashSet<Datum>` diverges from the oracle.
-    // =============================================================================================
 
     /// The production deleted-mask oracle for a single-column eq-delete. It builds the survival
     /// predicate as `parse_equality_deletes_record_batch_stream` does, binds it, evaluates it over
@@ -1837,7 +1760,6 @@ pub(crate) mod tests {
         );
     }
 
-    // =============================================================================================
     // The real `EqDeleteKeySet` fast path, proven byte-identical to the predicate ORACLE across
     // the non-float type matrix, and the type GATE proven to route Float and Double back to the
     // predicate path.
@@ -1846,7 +1768,6 @@ pub(crate) mod tests {
     // `EqDeleteKeySet::delete_mask`, then asserts the masks are IDENTICAL. Both sides start from
     // the SAME `Datum`s and decode the data column the same way, so the only thing under test is
     // that `Datum` equality matches the Arrow `eq` kernel for the admitted types.
-    // =============================================================================================
 
     /// The multi-column predicate oracle. A row is DELETED when it matches some delete tuple under
     /// the production survival predicate. It builds exactly what
@@ -2330,11 +2251,7 @@ pub(crate) mod tests {
 
     /// The null-data soundness boundary. A NULL in a key column makes `delete_mask` return `None`,
     /// which routes the batch to the predicate fallback. Under Java nulls-first the predicate path
-    /// KEEPS such a row unless a NULL delete tuple matches it. The bail stays mandatory, because
-    /// the predicate path is the oracle.
-    ///
-    /// MUTATION: delete the `column.null_count() > 0` bail in `EqDeleteKeySet::delete_mask`. This
-    /// test goes RED, because it returns `Some` instead of `None`.
+    /// KEEPS such a row unless a NULL delete tuple matches it.
     #[test]
     fn test_h6_set_returns_none_when_key_column_has_null() {
         let schema = opt_schema(vec![(1, "v", PrimitiveType::Long)]);
@@ -2795,10 +2712,8 @@ pub(crate) mod tests {
     /// Risk pinned: the positional-delete waiter must ARM its notifier while
     /// [`DeleteFilter::try_start_pos_del_load`] still holds the state lock. `notify_waiters()`
     /// stores no permit, so this test's publish-first, await-second ordering completes only when
-    /// the `Notified` already existed at publish time.
-    ///
-    /// MUTATION: make `PosDelLoadAction::WaitFor` carry a raw `Arc<Notify>` and call `.notified()`
-    /// at the await site. The wakeup is lost and the timeout fires (RED).
+    /// the `Notified` already existed at publish time. MUTATION: make `PosDelLoadAction::WaitFor`
+    /// carry a raw `Arc<Notify>` and call `.notified()` at the await site.
     #[tokio::test]
     async fn test_pos_del_waiter_is_armed_before_the_publisher_can_notify() {
         let filter = DeleteFilter::default();
@@ -2830,10 +2745,8 @@ pub(crate) mod tests {
     /// Risk pinned: a loader that dies WITHOUT publishing must move the entry to
     /// [`PosDelState::Failed`] and STILL wake its waiters, so each gets a typed error inside a
     /// BOUNDED await. The claiming task is the sole writer, so without that transition the entry
-    /// stays `Loading` and every waiter parks on a notification nobody can send.
-    ///
-    /// MUTATION: disarm the guard before it drops, so no `Failed` publishes. The waiter never
-    /// wakes and the timeout fires (RED).
+    /// stays `Loading` and every waiter parks on a notification nobody can send. MUTATION: disarm
+    /// the guard before it drops, so no `Failed` publishes.
     #[tokio::test]
     async fn test_dead_pos_del_loader_yields_a_typed_error_not_a_hang() {
         let filter = DeleteFilter::default();
@@ -2885,9 +2798,6 @@ pub(crate) mod tests {
     /// [`DeleteFilter::lookup_or_arm_eq_del`], while the read lock is held. Both eq-delete
     /// accessors go through that seam, so this pins both. The production publisher runs to
     /// completion, asserted rather than assumed, BEFORE the waiter awaits.
-    ///
-    /// MUTATION: clone the `Arc<Notify>` out of the lock and call `.notified()` at the await site.
-    /// The wakeup is lost and the timeout fires (RED).
     #[tokio::test]
     async fn test_eq_del_waiter_is_armed_before_the_publisher_can_notify() {
         let filter = DeleteFilter::default();
@@ -2981,12 +2891,9 @@ pub(crate) mod tests {
     }
 
     /// Risk pinned: the eq-delete publisher future can be dropped BEFORE its first poll, when a
-    /// runtime is torn down between `spawn` and that poll. Such a future runs no local
-    /// destructors, so a guard built inside the `async move` block would never exist and the entry
-    /// would strand at `Loading`. The claim therefore builds the guard and the future captures it.
-    ///
-    /// MUTATION: rebuild the guard inside `spawn_publisher`'s `async move` block. The entry stays
-    /// `Loading` and the timeout fires (RED).
+    /// runtime is torn down between `spawn` and that poll. Such a future runs no local destructors,
+    /// so a guard built inside the `async move` block would never exist and the entry would strand
+    /// at `Loading`. The claim therefore builds the guard and the future captures it.
     #[tokio::test]
     async fn test_never_polled_eq_del_publisher_yields_absence_not_a_hang() {
         let filter = DeleteFilter::default();

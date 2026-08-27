@@ -397,12 +397,9 @@ impl DeleteOrphanFiles {
     }
 
     /// Plans the orphan set and deletes it. The module docs carry the algorithm and the failure
-    /// posture.
-    ///
-    /// # Errors
-    ///
-    /// Fails without deleting anything when the `gc.enabled` gate refuses, when planning cannot
-    /// read a manifest list or manifest, or when an `ERROR`-mode prefix conflict remains.
+    /// posture. # Errors Fails without deleting anything when the `gc.enabled` gate refuses, when
+    /// planning cannot read a manifest list or manifest, or when an `ERROR`-mode prefix conflict
+    /// remains.
     pub async fn execute(self) -> Result<DeleteOrphanFilesResult> {
         // Refuse before any listing or deletion.
         self.check_gc_enabled()?;

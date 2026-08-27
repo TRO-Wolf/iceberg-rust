@@ -47,20 +47,9 @@ use crate::expr::{
 };
 use crate::spec::{Datum, PartitionSpecRef, Schema, SchemaRef, Struct};
 
-/// Computes the residual of a row filter for a given partition's values.
-///
-/// Mirrors Java `ResidualEvaluator`. The filter is a [`BoundPredicate`] and the
-/// residual is an unbound [`Predicate`]. Partition source columns are top-level
-/// schema fields, so a kept leaf rebuilds its reference from the bound field
-/// name.
-///
-/// # Memo contract
-///
-/// [`residual_bound_for`](Self::residual_bound_for) keys its memo on the
-/// partition tuple alone. Never reuse one evaluator across snapshot schemas or
-/// bind-case settings. `bind_case_sensitive` must match the stored
-/// `case_sensitive` field. [`RESIDUAL_BOUND_MEMO_SOFT_CAP`] bounds memo growth
-/// on a high-cardinality scan.
+/// Computes the residual of a row filter for a given partition's values. Mirrors Java
+/// `ResidualEvaluator`. The filter is a [`BoundPredicate`] and the residual is an unbound
+/// [`Predicate`].
 #[derive(Debug)]
 pub(crate) struct ResidualEvaluator {
     /// `Some(spec, partition_schema)` for a partitioned spec; `None` for an
@@ -150,13 +139,9 @@ impl ResidualEvaluator {
         visit(&mut visitor, &self.filter)
     }
 
-    /// Returns the residual of the filter for `partition`, already bound to
-    /// `snapshot_schema` under `bind_case_sensitive`.
-    ///
-    /// The memo keys on the partition tuple only. It is valid only while the
-    /// filter and partition state stay fixed and `bind_case_sensitive` matches
-    /// the first insert. Past [`RESIDUAL_BOUND_MEMO_SOFT_CAP`] a partition
-    /// still computes but is not inserted.
+    /// Returns the residual of the filter for `partition`, already bound to `snapshot_schema` under
+    /// `bind_case_sensitive`. The memo keys on the partition tuple only. It is valid only while the
+    /// filter and partition state stay fixed and `bind_case_sensitive` matches the first insert.
     pub(crate) fn residual_bound_for(
         &self,
         partition: &Struct,

@@ -114,10 +114,8 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
-// ===========================================================================================
 // The scenario contract, hand-declared identically in Java `RemoveDanglingOracle` and here, from
 // the `findDanglingDeletes` spec and never from the other engine's output.
-// ===========================================================================================
 
 /// The hand-declared outcome of a partition's delete file under `findDanglingDeletes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,9 +241,7 @@ fn expected_live_ids(world: &World) -> HashSet<i64> {
     }
 }
 
-// ===========================================================================================
 // Env-var gates.
-// ===========================================================================================
 
 fn gen_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_REMOVE_DANGLING_GEN_DIR")
@@ -259,9 +255,7 @@ fn validate_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-// ===========================================================================================
 // Schema + table helpers ({id, cat, y}, identity(cat), V3 so DVs are legal).
-// ===========================================================================================
 
 /// The fixture schema `{1 id long required, 2 cat string required, 3 y long required}`.
 fn dangling_schema() -> Schema {
@@ -318,9 +312,7 @@ async fn create_dangling_table(
         .expect("create the dangling fixture table")
 }
 
-// ===========================================================================================
 // Real-parquet / real-delete writers (partition-scoped).
-// ===========================================================================================
 
 /// Write a REAL parquet DATA file in partition `cat` with the given `(id, y)` rows.
 async fn write_data_file(table: &Table, cat: &str, rows: &[(i64, i64)]) -> DataFile {
@@ -509,9 +501,7 @@ async fn write_dv_file(
         .expect("one DV file")
 }
 
-// ===========================================================================================
 // Commit helpers.
-// ===========================================================================================
 
 async fn fast_append(catalog: &impl Catalog, table: &Table, files: Vec<DataFile>) -> Table {
     let tx = Transaction::new(table);
@@ -555,10 +545,8 @@ async fn rewrite_fresh(
     tx.commit(catalog).await.expect("commit rewrite_files")
 }
 
-// ===========================================================================================
 // The fixture builders — one per world. Each returns the table at the PRE-cleanup (dangling) state the
 // action must clean. The V2 world covers parquet position + equality + no-data; the V3 world covers DVs.
-// ===========================================================================================
 
 /// Build the world for `world` and return the PRE-cleanup table.
 async fn build_world(catalog: &impl Catalog, world: &World, table: Table) -> Table {
@@ -636,9 +624,7 @@ async fn build_v3_world(catalog: &impl Catalog, mut table: Table) -> Table {
     table
 }
 
-// ===========================================================================================
 // Read-side + survivor helpers.
-// ===========================================================================================
 
 /// Scan the table and collect the live `id` set (merge-on-read deletes applied) — the read-identity signal.
 async fn scan_ids(table: &Table) -> HashSet<i64> {
@@ -738,9 +724,7 @@ fn removed_cat(file: &DataFile) -> String {
     partition_cat(file)
 }
 
-// ===========================================================================================
 // D2 GEN — Rust writes the PRE-cleanup + CLEANED tables for Java's verify.
-// ===========================================================================================
 
 /// Rust builds `<gen_dir>/rust_table<suffix>` in the dangling state and
 /// `<gen_dir>/rust_table_cleaned<suffix>` after the action, for each world. A Rust-side check asserts
@@ -844,9 +828,7 @@ async fn test_remove_dangling_gen() {
     }
 }
 
-// ===========================================================================================
 // D1 — Rust validates the JAVA-written table (register + run the action).
-// ===========================================================================================
 
 /// Direction 1: Rust registers the Java-written pre-cleanup table for each world, runs
 /// `RemoveDanglingDeleteFiles`, and asserts the removed set, the survivors, the counters, and
@@ -931,9 +913,7 @@ async fn test_rust_validates_java_remove_dangling() {
     }
 }
 
-// ===========================================================================================
 // The shared contract assertion — removed == REMOVE set, survivors == KEEP set, per-content counters.
-// ===========================================================================================
 
 /// Which engine BUILT the table under test — selects the V3 DV expectation. Java AUTO-PRUNES a dangling
 /// DV at the commit that removes its referenced data file (1.10.0 `ManifestFilterManager`); Rust's

@@ -189,13 +189,11 @@ fn is_file_scoped(delete_file: &DataFile) -> bool {
     }
 }
 
-/// Writer for deletion vectors (V3 Puffin DVs), mirroring Java `BaseDVFileWriter`.
-///
-/// Accumulate deleted positions with [`delete`](Self::delete), then call [`close`](Self::close)
-/// for the DVs alone, or [`close_with_result`](Self::close_with_result) for the DVs plus the
-/// superseded delete files. Either writes one Puffin file and returns the per-data-file
-/// `DeleteFile` metadata for a row-delta commit. With no recorded positions and no previous
-/// deletes, `close` writes no file at all.
+/// Writer for deletion vectors (V3 Puffin DVs), mirroring Java `BaseDVFileWriter`. Accumulate
+/// deleted positions with [`delete`](Self::delete), then call [`close`](Self::close) for the DVs
+/// alone, or [`close_with_result`](Self::close_with_result) for the DVs plus the superseded delete
+/// files. Either writes one Puffin file and returns the per-data-file `DeleteFile` metadata for a
+/// row-delta commit.
 #[derive(Debug)]
 pub struct DVFileWriter {
     /// Where the Puffin file goes. The underlying file is only created when `close()` actually
@@ -229,27 +227,15 @@ impl DVFileWriter {
     /// Set the spec to stamp on a DV whose [`delete`](Self::delete) calls carried no
     /// [`PartitionKey`]. Without it such a DV claims `DEFAULT_PARTITION_SPEC_ID` (0), an id no
     /// table stands behind. Java takes the spec as a required per-call argument
-    /// (`BaseDVFileWriter.delete`). Use the spec of the data files the DV references, which is not
-    /// always the table's current spec. A key wins; see `resolve_partition_spec_id`.
-    ///
-    /// # Notes
-    ///
-    /// A partitioned spec with no key fails at [`close`](Self::close), not here. The writer takes
-    /// its key per `delete` call, so the pairing is unknown until close.
+    /// (`BaseDVFileWriter.delete`).
     pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
         self.partition_spec = Some(partition_spec);
         self
     }
 
     /// Supply each data file's previous deletes to merge at close time. Mirrors the Java
-    /// `loadPreviousDeletes` constructor argument.
-    ///
-    /// # Notes
-    ///
-    /// The merge visits only a path that also has new positions from [`delete`](Self::delete).
-    /// Java skips a path with previous deletes alone, and so does this writer. Each merged path
-    /// returns its file-scoped source files as rewritten delete files. An empty map leaves the
-    /// output byte-identical to a fresh-only writer. A repeated call replaces the map.
+    /// `loadPreviousDeletes` constructor argument. # Notes The merge visits only a path that also
+    /// has new positions from [`delete`](Self::delete).
     pub fn with_previous_deletes(
         mut self,
         previous_deletes_by_path: HashMap<String, PreviousDeletes>,
@@ -258,16 +244,9 @@ impl DVFileWriter {
         self
     }
 
-    /// Marks `position` of the data file at `data_file_path` as deleted, in the partition
-    /// context `partition_key` (`None` for an unpartitioned table).
-    ///
-    /// Mirrors Java `BaseDVFileWriter.delete`. The first call for a path captures the partition
-    /// context. A later call for the same path adds positions and ignores its partition argument.
-    ///
-    /// # Errors
-    ///
-    /// Rejects `position > DV_MAX_POSITION`. The serialized dense bitmap cannot hold such a
-    /// position.
+    /// Marks `position` of the data file at `data_file_path` as deleted, in the partition context
+    /// `partition_key` (`None` for an unpartitioned table). Mirrors Java `BaseDVFileWriter.delete`.
+    /// The first call for a path captures the partition context.
     pub fn delete(
         &mut self,
         data_file_path: &str,
@@ -307,13 +286,6 @@ impl DVFileWriter {
 
     /// Write every accumulated deletion vector into one Puffin file. Return the DV `DeleteFile`s
     /// and the superseded file-scoped delete files. Mirrors Java `BaseDVFileWriter.close`.
-    ///
-    /// # Notes
-    ///
-    /// For each data file with new positions, the previous deletes join that file's DV, so
-    /// `record_count` covers old and new. Each file-scoped source file of those previous deletes
-    /// lands in [`rewritten_delete_files`](DVWriteResult::rewritten_delete_files). Java leaves a
-    /// non-file-scoped previous delete in place. With no recorded deletes this writes no file.
     pub async fn close_with_result(mut self) -> Result<DVWriteResult> {
         // Merge each file's previous deletes into its new DV. Only a path with new positions is
         // visited, as in Java. Collect the file-scoped superseded sources.
@@ -612,12 +584,8 @@ mod tests {
     }
 
     /// Risk pinned: determinism. Two runs over the same logical deletes, in different insertion
-    /// order, must produce an identical blob region and a structurally identical footer. Java
-    /// gives no such guarantee, so the sorted blob order is this fork's contract.
-    ///
-    /// Residue: the footer JSON is not byte-deterministic. `PuffinWriter` serializes
-    /// `BlobMetadata.properties` from a `HashMap`, so the key order varies per process. Every
-    /// reader parses the footer as JSON, which is key-order-insensitive.
+    /// order, must produce an identical blob region and a structurally identical footer. Java gives
+    /// no such guarantee, so the sorted blob order is this fork's contract.
     #[tokio::test]
     async fn test_dv_writer_deterministic_output_across_runs() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -853,9 +821,7 @@ mod tests {
         assert_eq!(positions_y, (100u64..200).collect::<Vec<_>>());
     }
 
-    // ============================================================================================
     // Previous-deletes MERGE hook (Java `BaseDVFileWriter.loadPreviousDeletes` + `isFileScoped`).
-    // ============================================================================================
 
     /// A synthetic DV `DeleteFile` for `referenced_data_file` (file-scoped: carries the referenced
     /// field) — the shape a previous DV's source file has.

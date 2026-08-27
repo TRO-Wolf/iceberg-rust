@@ -164,18 +164,10 @@ impl ReassignFieldIds {
 /// every flow.
 pub type NextId<'a> = dyn FnMut() -> Result<i32> + 'a;
 
-/// Maximum nesting depth the raw-`Type` entry points descend before they return a typed error.
-///
-/// A [`Schema`] argument is already bounded by the depth-checked builder. [`assign_fresh_ids`]
-/// and [`assign_ids`] take an unvalidated caller-supplied `Type` instead, straight from
+/// Maximum nesting depth the raw-`Type` entry points descend before they return a typed error. A
+/// [`Schema`] argument is already bounded by the depth-checked builder. [`assign_fresh_ids`] and
+/// [`assign_ids`] take an unvalidated caller-supplied `Type` instead, straight from
 /// `UpdateSchemaAction::add_column`.
-///
-/// `128` matches every other nesting bound in the crate. Depth follows the schema visitor's
-/// convention, so `SchemaBuilder::build` rejects one level earlier than this door. The bound can
-/// never refuse an otherwise-legal column.
-///
-/// Java does not bound this recursion and raises `StackOverflowError`. The typed
-/// [`ErrorKind::DataInvalid`] is a deliberate divergence, only where Java has no behavior.
 const MAX_ASSIGN_IDS_NESTING_DEPTH: usize = 128;
 
 /// The typed refusal for a `Type` nesting deeper than [`MAX_ASSIGN_IDS_NESTING_DEPTH`]. It is
@@ -1536,13 +1528,9 @@ mod tests {
         field_type
     }
 
-    /// Run `call` on a thread with a known, bounded stack. `field_type` goes in and comes back
-    /// out, so the deep fixture's recursive DROP runs on the harness stack, not this one.
-    ///
-    /// 3 MiB comes from a measurement. Bisecting `stack_size` in the dev profile, the bounded walk
-    /// overflows at 1152 KiB and succeeds at 1280 KiB, so it needs about 1.25 MiB. The 4096 levels
-    /// these tests feed in need about 40 MiB unbounded. 3 MiB therefore passes with the guard and
-    /// aborts on `fatal runtime error: stack overflow` without it.
+    /// Run `call` on a thread with a known, bounded stack. `field_type` goes in and comes back out,
+    /// so the deep fixture's recursive DROP runs on the harness stack, not this one. 3 MiB comes
+    /// from a measurement.
     fn on_bounded_stack(field_type: Type, call: fn(&Type) -> Result<Type>) -> (Type, Result<Type>) {
         std::thread::Builder::new()
             .name("assign-ids-bounded-stack".to_string())
@@ -1634,12 +1622,6 @@ mod tests {
     // Risk: the bound must count LIST and MAP nesting. A container-only chain reaches the same
     // recursion through other match arms, and a lost `depth + 1` on one arm leaves it unbounded
     // while every struct test stays green. One chain per container arm pins each independently.
-    //
-    // The mutations this discriminates: drop the `depth + 1` on the list-element arm, the map-KEY
-    // arm, or the map-VALUE arm. Each turns exactly one `expect_err` below RED.
-    //
-    // A map key may itself be a nested type. Neither `MapType::new` nor Java restricts it, so
-    // `map<map<...>,v>` reaches the key arm from `UpdateSchemaAction::add_column`.
     #[test]
     fn assign_fresh_ids_bounds_list_and_map_nesting_too() {
         let mut list_chain = Type::Primitive(PrimitiveType::Boolean);

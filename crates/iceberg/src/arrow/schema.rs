@@ -861,15 +861,9 @@ impl SchemaVisitor for ToArrowSchemaConverter {
     }
 
     /// Iceberg `variant` becomes the canonical Arrow variant extension type: `{metadata: Binary,
-    /// value: Binary}` carrying the `arrow.parquet.variant` name.
-    ///
-    /// Java throws here, because its Arrow bridge predates the canonical type. The fork emits
-    /// the type that `parquet` variant support reads and writes.
-    ///
-    /// # Notes
-    ///
-    /// Field ids are stamped by the caller. The `metadata` / `value` children carry no field ids:
-    /// they are components of one Iceberg field.
+    /// value: Binary}` carrying the `arrow.parquet.variant` name. Java throws here, because its
+    /// Arrow bridge predates the canonical type. The fork emits the type that `parquet` variant
+    /// support reads and writes.
     fn variant(&mut self) -> crate::Result<ArrowSchemaOrFieldOrType> {
         Ok(ArrowSchemaOrFieldOrType::Type(variant_arrow_data_type()))
     }

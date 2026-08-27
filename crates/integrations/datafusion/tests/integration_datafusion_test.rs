@@ -1128,9 +1128,7 @@ async fn test_update_copy_on_write() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
 // COW UPDATE — partitioned table tests (U2)
-// ============================================================================
 
 /// COW UPDATE of a non-partition column, matching one partition of two. The electronics rows take
 /// the new value and the books rows stay unchanged.
@@ -2218,9 +2216,7 @@ async fn test_delete_cow_unpartitioned_exact_filter_preserved() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
 // ADDITIONAL EDGE-CASE PROBES — U1 COW DELETE adversarial verification
-// ============================================================================
 
 /// Affected-path matching, checked at the manifest level rather than by row count. The deleted
 /// source file must leave the live set, a rewritten file must appear, and the unaffected file must
@@ -2612,9 +2608,7 @@ async fn test_delete_cow_no_match_is_noop() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
 // ADDITIONAL EDGE-CASE PROBES — U2 COW UPDATE adversarial verification
-// ============================================================================
 
 /// Row conservation for COW UPDATE, checked at the manifest level. file_A holds a matching and a
 /// non-matching row, file_B sits in another partition.
@@ -3193,9 +3187,7 @@ async fn test_update_cow_partition_move_manifest_level_verification() -> Result<
     Ok(())
 }
 
-// ============================================================================
 // MoR UPDATE — partitioned table tests (U3)
-// ============================================================================
 
 /// Builds a V2 `identity(category)`-partitioned `{id, category, value}` table with both DML modes
 /// set to merge-on-read. V2 is required for position deletes.
@@ -3524,9 +3516,7 @@ async fn test_update_mread_partitioned_moves_partition() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
 // MoR PARTITION PROBES — manifest-level position-delete partition-stamp verification
-// ============================================================================
 
 /// Cross-partition MoR DELETE. The write must produce one position-delete file per partition,
 /// each stamped with its data file's `(spec_id, partition)`. A single file with the wrong stamp is
@@ -3942,11 +3932,9 @@ async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()
     Ok(())
 }
 
-// =================================================================================================
 // An evolved table whose default spec is unpartitioned can still hold data under older
 // partitioned specs. The fast path may stamp `partition_key = None` only when the table has one
 // spec and that spec is unpartitioned.
-// =================================================================================================
 
 /// After DROP PARTITION FIELD (default becomes unpartitioned) a MoR DELETE must still stamp
 /// each position-delete file with the data file's own `(spec_id, partition)` so the read-side
@@ -4206,11 +4194,9 @@ async fn test_delete_mread_after_drop_partition_field_no_resurrection() -> Resul
     Ok(())
 }
 
-// =================================================================================================
 // A predicate that evaluates to NULL is not a match, so the row is neither deleted nor updated.
 // Every DML path enforces it with `mask.is_valid(row) && mask.value(row)`. These tests make that
 // guard load-bearing.
-// =================================================================================================
 
 /// Copy-on-write DELETE: `foo2 = 'alan'` is NULL for the NULL-`foo2` row, so that row must SURVIVE.
 #[tokio::test]
@@ -4349,14 +4335,12 @@ async fn test_update_cow_null_predicate_three_valued_logic() -> Result<()> {
     Ok(())
 }
 
-// =================================================================================================
 // Non-vacuous three-valued logic for the copy-on-write paths.
 //
 // The `=`-only tests above cannot falsify the `is_valid` guard: on a NULL operand Arrow gives
 // (valid=false, value=false), so the guard is redundant there. Both stayed green when the guard
 // was dropped. One `match_mask` line now governs three of the four DML paths, and these two `<>`
 // tests turn red when it goes.
-// =================================================================================================
 
 /// COW DELETE with a `<>` predicate over a NULL operand: the NULL-`foo2` row evaluates to
 /// (valid=false, value=TRUE), so ONLY the `is_valid` guard in `match_mask` keeps it out of the
@@ -4506,13 +4490,11 @@ fn nullable_merge_on_read_table_creation(
         .build()
 }
 
-// =================================================================================================
 // Merge-on-read DML streaming coverage.
 //
 // The MoR executors consume the live scan batch by batch. Three invariants must hold. The survivor
 // set stays the same over a multi-file table whose scan interleaves batches. A failure at the
 // single commit leaves zero new snapshots. A NULL predicate result is not a match.
-// =================================================================================================
 
 use std::fmt::Debug;
 
@@ -4919,13 +4901,11 @@ async fn test_update_mread_null_predicate_three_valued_logic() -> Result<()> {
     Ok(())
 }
 
-// =================================================================================================
 // Non-vacuous three-valued logic, zero-file, and `(file_path, pos)` sort coverage.
 //
 // On a NULL operand `=` gives (valid=false, value=false), so the `is_valid` guard is redundant
 // there. `<>` gives (valid=false, value=TRUE), where the guard alone keeps the NULL row out. The
 // tests below use `<>`.
-// =================================================================================================
 
 /// MoR DELETE with a `<>` predicate over a NULL operand. The NULL row gives
 /// (valid=false, value=TRUE), so only `mask.is_valid(row)` keeps it. Dropping that guard turns
@@ -5269,7 +5249,6 @@ async fn test_neq_pushdown_sql_3vl_refilter_drops_null_rows() -> Result<()> {
     Ok(())
 }
 
-// =================================================================================================
 // ENGINE_CONTRACT §5 and §8 — DML optimistic-concurrency validations and the operation id.
 //
 // Every test below uses one two-handle race. The DML statement's physical plan freezes a table
@@ -5278,7 +5257,6 @@ async fn test_neq_pushdown_sql_3vl_refilter_drops_null_rows() -> Result<()> {
 // between the two. A true conflict is rejected loudly and non-retryably, with Java's message.
 //
 // Oracles: Java `SparkWrite`, `SparkPositionDeltaWrite`, and `SparkRowLevelOperationBuilder`.
-// =================================================================================================
 
 /// A `{foo1 int, foo2 string}` table creation with caller-chosen table properties.
 fn get_table_creation_with_props(
@@ -6869,13 +6847,8 @@ async fn test_delete_mread_v3_after_drop_partition_field_stamps_the_files_own_sp
     Ok(())
 }
 
-/// The PARTITIONED form of the legacy-position-delete refusal.
-///
-/// It does NOT isolate the partition-tuple carry, though an earlier version of this comment claimed
-/// it did. The fork's own V2 position delete satisfies BOTH legs at once — it carries a derivable
-/// name AND its data file's own `(spec_id, partition)` — so killing either leg alone leaves the
-/// other holding this test up; only killing both reddens it. The per-leg pins live in the seam
-/// tests. This one pins that the whole rule still refuses on a partitioned table.
+/// The PARTITIONED form of the legacy-position-delete refusal. It does NOT isolate the
+/// partition-tuple carry, though an earlier version of this comment claimed it did.
 #[tokio::test]
 async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_position_deletes()
 -> Result<()> {

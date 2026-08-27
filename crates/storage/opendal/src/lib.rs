@@ -225,13 +225,9 @@ fn opendal_timestamp_to_millis(timestamp: opendal::raw::Timestamp) -> i64 {
     }
 }
 
-/// Whether list-entry metadata is complete enough to skip a per-file `stat`.
-///
-/// Trust list metadata only when `content_length` is positive. OpenDAL returns `0` both for an
-/// unset size and for a genuinely empty object, so a zero length always falls back to `stat`.
-///
-/// Do not treat `last_modified` alone as proof of size. A backend can set mtime without size,
-/// as S3 does for a delete marker, and the entry would then report as an empty file.
+/// Whether list-entry metadata is complete enough to skip a per-file `stat`. Trust list metadata
+/// only when `content_length` is positive. OpenDAL returns `0` both for an unset size and for a
+/// genuinely empty object, so a zero length always falls back to `stat`.
 fn list_entry_metadata_complete(meta: &opendal::Metadata) -> bool {
     !meta.is_deleted() && meta.content_length() > 0
 }
@@ -724,15 +720,11 @@ impl Storage for OpenDalStorage {
         Ok(op.remove_all(&path).await.map_err(from_opendal_error)?)
     }
 
-    /// Recursively list every file under `prefix`, as Java `HadoopFileIO.listPrefix` does.
-    ///
-    /// # Notes
-    ///
+    /// Recursively list every file under `prefix`, as Java `HadoopFileIO.listPrefix` does. # Notes
     /// The prefix is normalized to a trailing `/`, so prefix `ab` never reports a sibling key
     /// `ab2/...`. Size and last-modified come from the list entry when
     /// [`list_entry_metadata_complete`] allows it, and from `stat` otherwise, so size 0 stays
-    /// authoritative. A file with no last-modified reports `created_at_millis = 0`. The
-    /// fallback `stat`s run under [`CLIENT_LIST_STAT_CONCURRENCY`] to bound HEAD QPS.
+    /// authoritative.
     async fn list(&self, path: &str) -> Result<Vec<FileInfo>> {
         let (op, relative_path) = self.create_operator(&path)?;
         // The base re-prefixes each entry back into the scheme-qualified location the

@@ -235,17 +235,9 @@ impl MemoryCatalog {
     }
 }
 
-/// Optimistic-concurrency CAS for the in-process catalog. Ports the location-equality check in
-/// Java `InMemoryTableOperations.doCommit`, which throws a retryable `CommitFailedException` on a
-/// mismatch.
-///
-/// # Notes
-///
-/// A stored location equal to the commit base means the commit is current. Anything else is a
-/// retryable [`ErrorKind::CatalogCommitConflicts`]. `base_metadata_location == None` models
-/// Java's `base == null` create edge. A `None` base never equals a stored location, so it
-/// conflicts instead of passing silently. `object_kind` is `"table"` or `"view"`, the only
-/// difference between the two Java messages.
+/// Optimistic-concurrency CAS for the in-process catalog. Ports the location-equality check in Java
+/// `InMemoryTableOperations.doCommit`, which throws a retryable `CommitFailedException` on a
+/// mismatch. # Notes A stored location equal to the commit base means the commit is current.
 fn check_no_concurrent_modification(
     object_kind: &str,
     identifier: &TableIdent,
@@ -439,13 +431,10 @@ impl Catalog for MemoryCatalog {
             .build()
     }
 
-    /// Load table from the catalog.
-    ///
-    /// Snapshot the metadata pointer under a short lock, then read FileIO outside it, so
-    /// concurrent loads and commits do not serialize on metadata I/O.
-    ///
-    /// With a [`TableMetadataCache`] injected, an unchanged pointer reuses the cached `Arc` and
-    /// skips the GET and the re-parse.
+    /// Load table from the catalog. Snapshot the metadata pointer under a short lock, then read
+    /// FileIO outside it, so concurrent loads and commits do not serialize on metadata I/O. With a
+    /// [`TableMetadataCache`] injected, an unchanged pointer reuses the cached `Arc` and skips the
+    /// GET and the re-parse.
     async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
         let metadata_location = self.table_metadata_location(table_ident).await?;
         self.load_table_from_location(table_ident, &metadata_location)
@@ -494,15 +483,9 @@ impl Catalog for MemoryCatalog {
     }
 
     /// Register an existing table (also the default publish path for a staged **create** via
-    /// [`Catalog::publish_create_table`]).
-    ///
-    /// # Notes
-    ///
-    /// Registration is all-or-nothing. The read of `metadata_location` proves this catalog's
-    /// [`FileIO`] reaches the metadata, and it happens before the pointer insert. The read runs
-    /// outside the catalog lock, and the insert is a short critical section after it. A failed
-    /// read leaves the catalog unchanged, so a later create of the same identifier succeeds. An
-    /// insert-first order would leave a pointer whose `load_table` fails.
+    /// [`Catalog::publish_create_table`]). # Notes Registration is all-or-nothing. The read of
+    /// `metadata_location` proves this catalog's [`FileIO`] reaches the metadata, and it happens
+    /// before the pointer insert.
     async fn register_table(
         &self,
         table_ident: &TableIdent,
@@ -569,14 +552,8 @@ impl Catalog for MemoryCatalog {
         Ok(updated)
     }
 
-    /// Update a table in the catalog.
-    ///
-    /// Optimistic CAS over short critical sections. Step 1 snapshots the stored pointer under the
-    /// lock. Step 2 loads, applies, and writes the metadata outside the lock. Step 3 re-reads the
-    /// pointer under the lock, compares it with the commit base, and flips it on a match.
-    ///
-    /// A concurrent winner advances the stored location, so step 3 returns a retryable
-    /// [`ErrorKind::CatalogCommitConflicts`]. FileIO never runs under the lock.
+    /// Update a table in the catalog. Optimistic CAS over short critical sections. Step 1 snapshots
+    /// the stored pointer under the lock.
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
         let base_metadata_location = commit.base_metadata_location().map(str::to_string);
@@ -2510,9 +2487,7 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    // ========================================================================
     // View CRUD lifecycle tests (the MemoryCatalog view surface).
-    // ========================================================================
 
     fn simple_view_schema() -> Schema {
         Schema::builder()
@@ -2795,10 +2770,8 @@ pub(crate) mod tests {
         assert!(catalog.table_exists(&table_ident).await.unwrap());
     }
 
-    // ========================================================================
     // Optimistic-concurrency parity (increment O1) — the location-CAS in MemoryCatalog
     // `update_table` / `update_view`, mirroring Java `InMemory{Table,View}Operations.doCommit`.
-    // ========================================================================
 
     // RISK: two REPLACE commits built from the SAME base view, applied sequentially, must NOT
     // last-write-win — the second is STALE and Java `InMemoryViewOperations.doCommit` rejects it
@@ -3045,9 +3018,7 @@ pub(crate) mod tests {
             .expect("invalidate_view default must be a no-op");
     }
 
-    // ========================================================================
     // FK3 / scout #13 — lock hygiene: I/O outside the catalog mutex; atomicity pins.
-    // ========================================================================
 
     /// RISK: a `register_table` whose metadata path is UNREACHABLE must leave NO catalog pointer
     /// (half-create refused). Read-before-insert is the guarantee; FileIO now runs outside the
@@ -3191,9 +3162,7 @@ pub(crate) mod tests {
         );
     }
 
-    // ========================================================================
     // FK4.1 / scout #7 — metadata-pointer cache (opt-in, default OFF).
-    // ========================================================================
 
     async fn new_memory_catalog_with_cache(cache: Arc<TableMetadataCache>) -> MemoryCatalog {
         let warehouse_location = temp_path();

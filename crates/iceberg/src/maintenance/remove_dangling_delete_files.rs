@@ -139,16 +139,10 @@ impl RemoveDanglingDeleteFiles {
         RemoveDanglingDeleteFiles { table }
     }
 
-    /// Find the dangling delete files in the current snapshot and remove them in one `Replace` snapshot.
-    ///
-    /// # Notes
-    ///
-    /// The run commits nothing and returns an empty result when nothing dangles, when the table has no
-    /// current snapshot, or when the table has one unpartitioned spec.
-    ///
-    /// # Errors
-    ///
-    /// Fails when reading the manifests fails, or when the commit fails.
+    /// Find the dangling delete files in the current snapshot and remove them in one `Replace`
+    /// snapshot. # Notes The run commits nothing and returns an empty result when nothing dangles,
+    /// when the table has no current snapshot, or when the table has one unpartitioned spec. #
+    /// Errors Fails when reading the manifests fails, or when the commit fails.
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RemoveDanglingDeleteFilesResult> {
         // An unpartitioned single-spec table has nothing to do. Every commit's ManifestFilterManager
         // already drops table-wide-applicable deletes.
@@ -369,9 +363,7 @@ mod tests {
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
     use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
-    // =========================================================================================
     // Pure-fn tests (the dangling predicate — the off-by-one corruption edge, IO-free)
-    // =========================================================================================
 
     /// Build a synthetic delete [`DataFile`] of the given content / format in partition `x = part`.
     fn delete_file(
@@ -566,15 +558,10 @@ mod tests {
         );
     }
 
-    /// The irreversible-delete pin. The read path routes a file-scoped position delete BY PATH, with no
-    /// spec and no partition condition. Calling it dangling because its own group holds no live data
-    /// file removes a delete the reader still honors, and the masked rows resurrect permanently.
-    ///
-    /// A non-file-scoped delete in the same empty group must still dangle. The rule is "route by
-    /// reference", not "stop collecting".
-    ///
-    /// Mutation: drop the file-scoped leg and both file-scoped deletes enter the dangling set. Drop the
-    /// `contains` check and `pos-file-scoped-gone.parquet` is never collected. Both turn this test red.
+    /// The irreversible-delete pin. The read path routes a file-scoped position delete BY PATH,
+    /// with no spec and no partition condition. Calling it dangling because its own group holds no
+    /// live data file removes a delete the reader still honors, and the masked rows resurrect
+    /// permanently.
     #[test]
     fn test_file_scoped_position_delete_referencing_live_data_is_not_dangling() {
         let referenced_field = {
@@ -664,14 +651,7 @@ mod tests {
 
     /// An equality delete is never file-scoped, whatever bounds it carries. Java's
     /// `ContentFileUtil.referencedDataFile` returns null for equality deletes before it reads the
-    /// bounds. The min-seq rule must judge it. Both directions:
-    ///
-    /// - it dangles when its partition holds no live data, even though its bounds name a live file;
-    /// - it does not dangle while it still applies, even though its bounds name a file that is gone.
-    ///   Removing it would resurrect the rows it masks, and the removal is irreversible.
-    ///
-    /// Mutation: drop the equality early return in `referenced_data_file_location` and both flip. No
-    /// read-path test catches the second case, because the index routes by content type first.
+    /// bounds. The min-seq rule must judge it.
     #[test]
     fn test_equality_delete_with_path_bounds_is_judged_by_min_seq_not_by_reference() {
         let path_bounds = |path: &str| {
@@ -781,9 +761,7 @@ mod tests {
         );
     }
 
-    // =========================================================================================
     // End-to-end tests. Real parquet, real delete writers, real scans, real commits.
-    // =========================================================================================
 
     async fn local_fs_catalog() -> (impl Catalog, TempDir) {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -993,13 +971,10 @@ mod tests {
         writer.close().await.unwrap().into_iter().next().unwrap()
     }
 
-    /// Write a real parquet position delete with [`MetricsConfig::for_position_delete`]. That config
-    /// forces the reserved `file_path` column to full metrics, so the file carries equal `file_path`
-    /// bounds and is file-scoped, as a Java-written one is. Java's `PositionDeleteWriter` never sets
-    /// `referenced_data_file`; it preserves those bounds instead.
-    ///
-    /// `part_value` is the partition tuple the delete is stamped with. Callers pick one that differs
-    /// from the referenced data file's partition.
+    /// Write a real parquet position delete with [`MetricsConfig::for_position_delete`]. That
+    /// config forces the reserved `file_path` column to full metrics, so the file carries equal
+    /// `file_path` bounds and is file-scoped, as a Java-written one is. Java's
+    /// `PositionDeleteWriter` never sets `referenced_data_file`; it preserves those bounds instead.
     async fn write_file_scoped_position_delete_file(
         table: &Table,
         part_value: i64,
@@ -1560,18 +1535,10 @@ mod tests {
         );
     }
 
-    /// The irreversible-delete pin, end to end through real parquet metrics.
-    ///
-    /// A position delete written with [`MetricsConfig::for_position_delete`] carries equal `file_path`
-    /// bounds, so it is file-scoped and routes by path. This one is stamped with partition `x=2`, which
-    /// holds no live data file, while the file it references lives in `x=1`.
-    ///
-    /// Two things must hold together. The read path must apply the delete, or the masked row returns on
-    /// every scan. The action must not collect it, or a committed metadata change resurrects the row
-    /// permanently.
-    ///
-    /// Mutation: revert the file-scoped leg and `removed_delete_files.is_empty()` fails. Revert the
-    /// index's path map and the first `scan_y_values` assertion fails with `{10, 20, 30}`.
+    /// The irreversible-delete pin, end to end through real parquet metrics. A position delete
+    /// written with [`MetricsConfig::for_position_delete`] carries equal `file_path` bounds, so it
+    /// is file-scoped and routes by path. This one is stamped with partition `x=2`, which holds no
+    /// live data file, while the file it references lives in `x=1`.
     #[tokio::test]
     async fn test_file_scoped_position_delete_in_a_foreign_partition_applies_and_survives() {
         let (catalog, _temp) = local_fs_catalog().await;
@@ -1718,14 +1685,9 @@ mod tests {
         );
     }
 
-    /// Deletion vectors, end to end. A plain RewriteFiles of data file A carries a real Puffin deletion
-    /// vector forward. The vector now references a gone file, so it dangles, and this action removes it.
-    /// The scan is correct before and after: A' carries no vector, so the masked row is already back.
-    ///
-    /// Java prunes a dangling deletion vector during RewriteFiles, so it rarely needs this action for
-    /// them. The fork's RewriteFiles carries it forward and relies on this action instead.
-    ///
-    /// The risk pinned is a reference branch that never fires end to end.
+    /// Deletion vectors, end to end. A plain RewriteFiles of data file A carries a real Puffin
+    /// deletion vector forward. The vector now references a gone file, so it dangles, and this
+    /// action removes it.
     #[tokio::test]
     async fn test_dangling_deletion_vector_removed_after_referenced_data_rewritten_away() {
         use crate::spec::ManifestContentType;

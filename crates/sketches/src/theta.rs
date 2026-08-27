@@ -245,15 +245,11 @@ impl ThetaSketch {
         hashes
     }
 
-    /// Serializes to the compact ordered byte form, which is the Iceberg theta blob payload.
-    ///
-    /// The mode picks the preamble shape:
-    /// - empty: 8-byte preamble, EMPTY flag, no seed hash, no hashes;
-    /// - one hash and theta == MAX: 16-byte SINGLEITEM form;
-    /// - otherwise: 2 longs when theta == MAX, 3 when theta < MAX, then the ascending hashes.
-    ///
-    /// # Errors
-    /// Returns [`SketchError::ZeroSeedHash`] if the seed hashes to zero. Seed 9001 never does.
+    /// Serializes to the compact ordered byte form, which is the Iceberg theta blob payload. The
+    /// mode picks the preamble shape: - empty: 8-byte preamble, EMPTY flag, no seed hash, no
+    /// hashes; - one hash and theta == MAX: 16-byte SINGLEITEM form; - otherwise: 2 longs when
+    /// theta == MAX, 3 when theta < MAX, then the ascending hashes. # Errors Returns
+    /// [`SketchError::ZeroSeedHash`] if the seed hashes to zero.
     pub fn serialize_compact(&self) -> SketchResult<Vec<u8>> {
         let hashes = self.sorted_hashes();
         serialize_compact_from_parts(self.is_empty, self.theta, &hashes, self.seed)
@@ -490,12 +486,9 @@ pub(crate) fn serialize_compact_from_parts(
 }
 
 /// The DataSketches estimate: `curCount * (2^63_as_f64 / thetaLong)`, as Java `Sketch.estimate`.
-///
-/// Java has no special case for empty or exact mode. Keep the exact order of operations:
-/// `count * (MAX / theta)` and `count / (theta / MAX)` differ by up to one ULP, and the estimate
-/// is part of the cross-engine NDV contract. A corrupt `theta == 0` yields `+inf`, as Java does.
-///
-/// This is the family-COMPACT estimator, not [`crate::alpha::AlphaSketch::estimate`].
+/// Java has no special case for empty or exact mode. Keep the exact order of operations: `count *
+/// (MAX / theta)` and `count / (theta / MAX)` differ by up to one ULP, and the estimate is part of
+/// the cross-engine NDV contract.
 pub(crate) fn estimate(theta: i64, retained: usize, _is_empty: bool) -> f64 {
     let max_theta_as_f64 = MAX_THETA as f64;
     (retained as f64) * (max_theta_as_f64 / (theta as f64))

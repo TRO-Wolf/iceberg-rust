@@ -128,15 +128,9 @@ where
     L: LocationGenerator,
     F: FileNameGenerator,
 {
-    /// Create a new `PositionDeleteFileWriterBuilder` using a `RollingFileWriterBuilder`.
-    ///
-    /// The inner [`RollingFileWriterBuilder`] must carry the position-delete schema.
-    ///
-    /// # Notes
-    ///
-    /// Chain [`with_partition_spec`](Self::with_partition_spec). Without it, a writer that also has
-    /// no [`PartitionKey`] stamps spec id 0. The read side pairs deletes to data on
-    /// `(spec_id, partition)`, so the delete never applies and the rows come back.
+    /// Create a new `PositionDeleteFileWriterBuilder` using a `RollingFileWriterBuilder`. The inner
+    /// [`RollingFileWriterBuilder`] must carry the position-delete schema. # Notes Chain
+    /// [`with_partition_spec`](Self::with_partition_spec).
     pub fn new(
         inner: RollingFileWriterBuilder<B, L, F>,
         config: PositionDeleteWriterConfig,
@@ -148,15 +142,9 @@ where
         }
     }
 
-    /// Set the [`PartitionSpec`] the produced delete files are written under.
-    ///
-    /// Java `PositionDeleteWriter` takes the same spec as a required argument.
-    ///
-    /// # Notes
-    ///
-    /// Pass the spec of the DATA FILES the deletes reference, not the table's current spec. A
-    /// [`PartitionKey`] always wins over it. `close()` stamps `partition_spec_id` unconditionally,
-    /// overriding whatever a custom file writer put on the `DataFileBuilder`.
+    /// Set the [`PartitionSpec`] the produced delete files are written under. Java
+    /// `PositionDeleteWriter` takes the same spec as a required argument. # Notes Pass the spec of
+    /// the DATA FILES the deletes reference, not the table's current spec.
     pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
         self.partition_spec = Some(partition_spec);
         self
@@ -667,7 +655,6 @@ mod test {
 }
 
 /// End-to-end partition-spec-id stamping
-/// ======================================
 ///
 /// Writer, commit, then scan, over a table whose partition spec evolved. These pin the observable
 /// consequences of a fabricated `DEFAULT_PARTITION_SPEC_ID` stamp, which
@@ -703,9 +690,7 @@ mod spec_stamp_e2e_test {
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
     use crate::{Catalog, ErrorKind, TableCreation, TableIdent};
 
-    // -------------------------------------------------------------------------------------------
     // Fixtures.
-    // -------------------------------------------------------------------------------------------
 
     /// `1: id long`, `2: dept string`, both required.
     fn test_schema() -> Schema {
@@ -993,19 +978,10 @@ mod spec_stamp_e2e_test {
         (table, spec_id)
     }
 
-    // -------------------------------------------------------------------------------------------
     // The two consequences.
-    // -------------------------------------------------------------------------------------------
 
-    /// Silent under-delete, in the shape an engine reaches.
-    ///
-    /// Spec 0 is unpartitioned and the table evolved to a partitioned spec 1. Data lands under
-    /// spec 1. A delete with no key and no configured spec claims spec 0, whose partition type is
-    /// empty, so the commit accepts it. The read side never pairs it with the data.
-    ///
-    /// This delete differs from the data on BOTH halves of the `(spec_id, partition)` key. The twin
-    /// [`test_e2e_same_tuple_wrong_spec_id_alone_silently_under_deletes`] isolates the spec id.
-    /// The second half proves the fix rejects the call at build time.
+    /// Silent under-delete, in the shape an engine reaches. Spec 0 is unpartitioned and the table
+    /// evolved to a partitioned spec 1. Data lands under spec 1.
     #[tokio::test]
     async fn test_e2e_unstamped_delete_under_evolved_spec_commits_and_never_applies() {
         let catalog = new_memory_catalog().await;
@@ -1175,14 +1151,9 @@ mod spec_stamp_e2e_test {
         assert_eq!(delete_spec_id, cur_spec_id);
     }
 
-    /// Silent under-delete, isolated on the spec id alone.
-    ///
-    /// The twin above cannot attribute the miss to the spec id, because its delete also differs in
-    /// the tuple. Here the tuple is constant: `truncate[5](dept)` and `identity(dept)` both yield
-    /// `{"eng"}`. The delete claims the old spec id while carrying the data file's exact value.
-    ///
-    /// The commit accepts it, because `validate_partition_value` checks only the tuple shape. The
-    /// read side then drops it. Deleting the spec-id condition in the read side turns this red.
+    /// Silent under-delete, isolated on the spec id alone. The twin above cannot attribute the miss
+    /// to the spec id, because its delete also differs in the tuple. Here the tuple is constant:
+    /// `truncate[5](dept)` and `identity(dept)` both yield `{"eng"}`.
     #[tokio::test]
     async fn test_e2e_same_tuple_wrong_spec_id_alone_silently_under_deletes() {
         let catalog = new_memory_catalog().await;
@@ -1275,14 +1246,9 @@ mod spec_stamp_e2e_test {
         assert_eq!(correct_spec_id, cur_spec_id);
     }
 
-    /// A keyless equality delete is GLOBAL, not inert.
-    ///
-    /// The spec applies an equality delete stored with an unpartitioned spec as a global delete.
-    /// Rust routes on the file's empty tuple, Java on the spec being unpartitioned. The global
-    /// bucket applies with no spec-id and no partition condition, only the sequence-number filter.
-    ///
-    /// So a missing `PartitionKey` inverts between the two delete kinds. A position delete
-    /// under-deletes. An equality delete over-deletes table-wide. This pins §7a.
+    /// A keyless equality delete is GLOBAL, not inert. The spec applies an equality delete stored
+    /// with an unpartitioned spec as a global delete. Rust routes on the file's empty tuple, Java
+    /// on the spec being unpartitioned.
     #[tokio::test]
     async fn test_e2e_keyless_equality_delete_is_global_not_inert() {
         let catalog = new_memory_catalog().await;

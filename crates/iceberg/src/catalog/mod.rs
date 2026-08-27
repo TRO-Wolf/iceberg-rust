@@ -87,16 +87,9 @@ pub trait Catalog: Debug + Sync + Send {
         properties: HashMap<String, String>,
     ) -> Result<()>;
 
-    /// Partial namespace-property update: apply `removals`, then `updates`.
-    ///
-    /// Mirrors Java REST `updateNamespaceMetadata`, the union of
-    /// `SupportsNamespaces.setProperties` and `removeProperties`. Removing an absent key is a
-    /// no-op. The default composes over the full-replace [`Catalog::update_namespace`], so a
-    /// catalog that does not delete keys absent from the new map must override this method.
-    ///
-    /// # Errors
-    ///
-    /// [`ErrorKind::DataInvalid`] if a key appears in both `removals` and `updates`.
+    /// Partial namespace-property update: apply `removals`, then `updates`. Mirrors Java REST
+    /// `updateNamespaceMetadata`, the union of `SupportsNamespaces.setProperties` and
+    /// `removeProperties`. Removing an absent key is a no-op.
     async fn update_namespace_properties(
         &self,
         namespace: &NamespaceIdent,
@@ -183,14 +176,8 @@ pub trait Catalog: Debug + Sync + Send {
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
 
-    /// Publish a fully staged **create** table. Default: [`Catalog::register_table`].
-    ///
-    /// # Notes
-    ///
-    /// Publishing is all-or-nothing. On failure the catalog must hold no pointer for `table`, so
-    /// a `CREATE TABLE IF NOT EXISTS` retry succeeds. The default reads the metadata before it
-    /// inserts the pointer, and an override must keep that order. The read may happen outside
-    /// any catalog lock.
+    /// Publish a fully staged **create** table. Default: [`Catalog::register_table`]. # Notes
+    /// Publishing is all-or-nothing.
     async fn publish_create_table(
         &self,
         table: crate::table::Table,
@@ -547,13 +534,9 @@ pub struct TableCommit {
     requirements: Vec<TableRequirement>,
     /// The updates of the table.
     updates: Vec<TableUpdate>,
-    /// The metadata location of the base the commit was built against. Mirrors the `base`
-    /// argument of Java `BaseMetastoreTableOperations.commit`.
-    ///
-    /// A catalog with no transactional store compares the location it holds for the table
-    /// against this value. A difference is a stale commit, and the catalog rejects it with a
-    /// retryable conflict. That comparison is the optimistic-concurrency CAS. `None` models
-    /// Java's `base == null` create edge. A catalog with its own store-side CAS ignores it.
+    /// The metadata location of the base the commit was built against. Mirrors the `base` argument
+    /// of Java `BaseMetastoreTableOperations.commit`. A catalog with no transactional store
+    /// compares the location it holds for the table against this value.
     #[builder(default)]
     base_metadata_location: Option<String>,
     /// Optional pre-loaded base table for metastore catalogs (Glue / S3 Tables) that can skip a
@@ -582,14 +565,10 @@ pub enum CommitBaseLoadPlan {
     FullLoad,
 }
 
-/// Plan whether a metastore catalog can reuse a pre-loaded base table for apply.
-///
-/// # Notes
-///
-/// A commit base that differs from the service pointer is always
-/// [`CommitBaseLoadPlan::Conflict`], even when the provided table matches the service. Reuse
-/// compares locations only, and assumes the metadata at a path never changes. The caller must
-/// not supply a `base_table` whose content does not match its location.
+/// Plan whether a metastore catalog can reuse a pre-loaded base table for apply. # Notes A commit
+/// base that differs from the service pointer is always [`CommitBaseLoadPlan::Conflict`], even when
+/// the provided table matches the service. Reuse compares locations only, and assumes the metadata
+/// at a path never changes.
 pub fn plan_commit_base_load(
     service_metadata_location: &str,
     base_metadata_location: Option<&str>,

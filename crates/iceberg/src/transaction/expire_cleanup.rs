@@ -145,13 +145,9 @@ pub struct CleanupFailure {
     pub error: Error,
 }
 
-/// The outcome of one cleanup sweep: every deleted path per funnel, plus every collected
-/// failure. Paths sort within a funnel, and funnels follow Java's deletion order.
-///
-/// The report is `#[non_exhaustive]` because the cleanup produces it and callers only read it. It
-/// gains a funnel whenever the cleanup learns to report one. A downstream crate that needs to
-/// build one starts from `CleanupReport::default()` and assigns fields, which keeps compiling as
-/// fields are added.
+/// The outcome of one cleanup sweep: every deleted path per funnel, plus every collected failure.
+/// Paths sort within a funnel, and funnels follow Java's deletion order. The report is
+/// `#[non_exhaustive]` because the cleanup produces it and callers only read it.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct CleanupReport {
@@ -278,15 +274,9 @@ impl ExpireSnapshotsCleanup {
         Ok((committed, report))
     }
 
-    /// Deletes every file that `before` reaches and `after` does not (Java `cleanFiles`).
-    ///
-    /// **`after` must be the table's current committed metadata.** Anything staler deletes files
-    /// the live table still reaches. Prefer [`Self::commit_and_clean`].
-    ///
-    /// # Errors
-    ///
-    /// Fails without deleting anything when a manifest list cannot be read, or when the
-    /// `gc.enabled` gate refuses. Later problems land in the [`CleanupReport`].
+    /// Deletes every file that `before` reaches and `after` does not (Java `cleanFiles`). **`after`
+    /// must be the table's current committed metadata.** Anything staler deletes files the live
+    /// table still reaches. Prefer [`Self::commit_and_clean`].
     pub async fn clean_expired_files(
         &self,
         before: &TableMetadata,
@@ -572,10 +562,8 @@ mod tests {
         }
     }
 
-    /// =======================================================================
     /// Fixture helpers — real tables in a memory catalog, real manifest /
     /// manifest-list files in the table's FileIO
-    /// =======================================================================
     /// A synthetic data file routed to partition `x = 0` (metadata-only; the parquet bytes never
     /// exist — content-file deletions are asserted on the REPORT and the injected delete fn).
     fn synthetic_data_file(path: &str) -> DataFile {
@@ -698,9 +686,7 @@ mod tests {
         (table.clone(), committed)
     }
 
-    /// =======================================================================
     /// The deletion-set pins — every class, both directions
-    /// =======================================================================
     /// A fast-append chain carries manifests forward, so an expired snapshot's manifest usually
     /// survives in a retained descendant. Dropping the candidates-minus-retained subtraction
     /// deletes that shared manifest and destroys the retained snapshot's data. The expired
@@ -1084,9 +1070,7 @@ mod tests {
         );
     }
 
-    /// =======================================================================
     /// The seam pins — commit ordering, dry-run, failure posture, gates
-    /// =======================================================================
     /// A failed commit must make deletion impossible. A refusing catalog must propagate the
     /// error with zero delete calls and storage untouched.
     #[tokio::test]
@@ -1594,9 +1578,7 @@ mod tests {
         );
     }
 
-    /// =======================================================================
     /// Content-type classification of the deleted content funnel (F-2)
-    /// =======================================================================
     /// A parquet position-delete file, not a deletion vector, so the position-delete bucket is
     /// pinned by a non-Puffin file too.
     fn synthetic_position_delete_file(path: &str) -> DataFile {

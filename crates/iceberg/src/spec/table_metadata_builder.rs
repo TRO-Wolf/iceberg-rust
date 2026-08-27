@@ -228,13 +228,8 @@ impl TableMetadataBuilder {
         Ok(self)
     }
 
-    /// Set properties. An existing key is overwritten.
-    ///
-    /// A reserved property performs its action and is not persisted. `format-version` is the
-    /// only reserved property today.
-    ///
-    /// # Errors
-    /// - If properties contains a reserved property
+    /// Set properties. An existing key is overwritten. A reserved property performs its action and
+    /// is not persisted.
     pub fn set_properties(mut self, properties: HashMap<String, String>) -> Result<Self> {
         let reserved_properties = properties
             .keys()
@@ -313,14 +308,9 @@ impl TableMetadataBuilder {
         self
     }
 
-    /// Add a snapshot to the table metadata.
-    ///
-    /// # Errors
-    /// - Snapshot id already exists.
-    /// - For format version > 1: the sequence number of the snapshot is lower than the highest sequence number specified so far.
-    /// - For format version >= 3: the first-row-id of the snapshot is lower than the next-row-id of the table.
-    /// - For format version >= 3: added-rows is null or first-row-id is null.
-    /// - For format version >= 3: next-row-id would overflow when adding added-rows.
+    /// Add a snapshot to the table metadata. # Errors - Snapshot id already exists. - For format
+    /// version > 1: the sequence number of the snapshot is lower than the highest sequence number
+    /// specified so far.
     pub fn add_snapshot(mut self, snapshot: Snapshot) -> Result<Self> {
         if self
             .metadata
@@ -666,13 +656,8 @@ impl TableMetadataBuilder {
         Ok(self)
     }
 
-    /// Set the current schema id.
-    ///
-    /// If `schema_id` is -1, the last added schema is set as the current schema.
-    ///
-    /// Errors:
-    /// - provided `schema_id` is -1 but no schema has been added via `add_schema`.
-    /// - No schema with the provided `schema_id` exists.
+    /// Set the current schema id. If `schema_id` is -1, the last added schema is set as the current
+    /// schema. Errors: - provided `schema_id` is -1 but no schema has been added via `add_schema`.
     pub fn set_current_schema(mut self, mut schema_id: i32) -> Result<Self> {
         if schema_id == Self::LAST_ADDED {
             schema_id = self.last_added_schema_id.ok_or_else(|| {

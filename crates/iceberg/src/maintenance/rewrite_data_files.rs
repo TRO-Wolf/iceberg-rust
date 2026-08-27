@@ -15,52 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `RewriteDataFiles`, the bin-pack compaction action. Rust port of Java
-//! `org.apache.iceberg.actions.RewriteDataFiles`. It plans small-file groups per partition, reads
-//! each group's live rows with merge-on-read deletes applied, and rewrites them into target-sized
-//! files through [`RewriteFilesAction`](crate::transaction::Transaction::rewrite_files).
+//! Bin-pack compaction. Java `RewriteDataFiles`. A wrong replaced set is silent corruption.
 //!
-//! **This action rewrites data.** A compaction that loses rows, resurrects deleted rows, or commits
-//! the wrong replaced set is silent corruption. Tests pin row conservation and delete
-//! applicability.
-//!
-//! # The algorithm (Java `BinPackRewriteFilePlanner.plan`)
+//! # Algorithm (Java `BinPackRewriteFilePlanner.plan`)
 //!
 //! | step | rule |
 //! |---|---|
-//! | enumerate | scan the current snapshot with [`with_file_prune_only`](crate::scan::TableScanBuilder::with_file_prune_only), giving one [`FileScanTask`](crate::scan::FileScanTask) per live candidate file |
-//! | group | key on the file's partition, or on the empty struct when its spec id is not the table's current default |
-//! | filter files | a candidate falls outside `[min_file_size, max_file_size]`, or reaches `delete_file_threshold` |
-//! | bin-pack | forward greedy first-fit, lookback 1, bins of at most `max_file_group_size_bytes` |
-//! | filter groups | keep on enough input files, enough content, too much content, or any delete-laden file |
-//! | rewrite | read the group's live rows, write target-sized files, commit one [`RewriteFilesAction`](crate::transaction::Transaction::rewrite_files) replacing exactly the group's data files |
+//! | enumerate | scan the current snapshot with [`with_file_prune_only`](crate::scan::TableScanBuilder::with_file_prune_only) |
+//! | group | file partition, or empty struct when the spec is not the table default |
+//! | filter files | outside `[min_file_size, max_file_size]`, or at `delete_file_threshold` |
+//! | bin-pack | forward greedy first-fit, lookback 1 |
+//! | filter groups | enough files, enough content, too much content, or any delete-laden file |
+//! | rewrite | live rows only; one [`RewriteFilesAction`](crate::transaction::Transaction::rewrite_files) per group |
 //!
-//! A file of a non-default spec can hold values of several current partitions, which is why Java
-//! groups it as unpartitioned.
+//! A non-default-spec file can hold several current partitions, so Java groups it as unpartitioned.
+//! `use_starting_sequence_number` defaults true so outstanding equality deletes still apply.
 //!
-//! Each group is read through the table scan, so merge-on-read deletes apply and the output carries
-//! only live rows. That is what `delete_file_threshold` exists for: a delete-laden file is
-//! rewritten to physically drop its deletes. A position delete or deletion vector that referenced a
-//! rewritten file then dangles, which is harmless, and Java keeps it. An equality delete still
-//! applies through the preserved sequence number.
-//!
-//! # The sequence-number rule
-//!
-//! `use_starting_sequence_number` defaults true, as in Java. Every added file is then stamped with
-//! the starting snapshot's data sequence number. An outstanding equality delete applies only to
-//! data with a strictly lower data sequence number, so keeping the rewritten data at its original
-//! sequence number keeps every such delete applicable. Nothing resurrects.
-//!
-//! Set it false and the added files take a fresh, higher sequence number, and outstanding equality
-//! deletes stop applying. Java has the same hazard and no guard against it.
-//!
-//! # Defaults (Java parity)
+//! # Defaults
 //!
 //! | option | default |
 //! |---|---|
-//! | `target_file_size_bytes` | `write.target-file-size-bytes`, itself 512 MiB |
-//! | `min_file_size_bytes` | `0.75 * target`, resolved lazily |
-//! | `max_file_size_bytes` | `1.8 * target`, resolved lazily |
+//! | `target_file_size_bytes` | `write.target-file-size-bytes`, 512 MiB |
+//! | `min_file_size_bytes` | `0.75 * target` |
+//! | `max_file_size_bytes` | `1.8 * target` |
 //! | `min_input_files` | 5 |
 //! | `delete_file_threshold` | disabled (`usize::MAX`) |
 //! | `max_file_group_size_bytes` | 100 GiB |
@@ -68,37 +45,18 @@
 //! | `remove_dangling_deletes` | false |
 //! | `filter` | always true |
 //!
-//! [`Self::execute`] mirrors Java's `sizeThresholds` preconditions: `target > 0`, `target > min`,
-//! and `target < max`, each with Java's message.
-//!
-//! # The composed `remove-dangling-deletes` sub-action
-//!
-//! Java composes the standalone dangling-delete pass after the group loop, and this port pins three
-//! consequences.
-//!
-//! 1. It runs whenever the plan was non-empty, even when it removes nothing. The sub-action itself
-//!    commits only on a non-empty dangling set, so a run that finds nothing adds no snapshot.
-//! 2. A failure there fails the whole action. Java lets the throw propagate, and this port `?`s it.
-//! 3. Java passes its original table handle, which every `TableOperations.commit` leaves current,
-//!    so the loop's final committed table is equivalent. Java's refresh would also see a concurrent
-//!    third-party commit; that narrower window is recorded as residue.
-//!
-//! # Empty plan
-//!
-//! When nothing qualifies the action is a no-op: a zero-count [`RewriteDataFilesResult`] and no
-//! commit. **The `remove-dangling-deletes` sub-action does not run on an empty plan**, because Java
-//! returns its empty result before reaching that step.
+//! `remove-dangling-deletes` runs after a non-empty plan only. Failure fails the action.
 //!
 //! # Deferred
 //!
 //! | not ported | consequence |
 //! |---|---|
-//! | partial progress | each group commits in its own transaction, and one commit failure aborts |
-//! | concurrency | the sweep is sequential |
-//! | sort and Z-order | Java throws outside Spark; only bin-pack is ported |
-//! | `delete_ratio_threshold` | it needs per-file deleted-record accounting, so the ratio clause never fires |
-//! | `output_spec_id`, `rewrite_all`, `max_file_group_input_files`, `max_files_to_rewrite`, `rewrite_job_order` | the output spec is the table's current default, and groups commit in plan order |
-//! | oversized-file splitting | an input over `max_file_size` is rewritten whole, never split |
+//! | partial progress | each group commits alone; one failure aborts |
+//! | concurrency | sequential |
+//! | sort and Z-order | only bin-pack is ported |
+//! | `delete_ratio_threshold` | the ratio clause never fires |
+//! | `output_spec_id`, `rewrite_all`, job order | current default spec; plan order |
+//! | oversized-file splitting | an input over `max_file_size` is rewritten whole |
 
 use std::collections::HashMap;
 
@@ -141,11 +99,9 @@ pub struct RewriteDataFilesResult {
     pub rewritten_bytes_count: u64,
     /// Delete files removed by the composed `remove-dangling-deletes` sub-action (Java
     /// `Result.removedDeleteFilesCount()`). Zero unless
-    /// [`RewriteDataFiles::remove_dangling_deletes`] was set.
-    ///
-    /// **This count lives only at the top level.** Java's per-group accessor returns a constant
-    /// zero, and nothing on this path sets it. [`FileGroupRewriteResult`] therefore carries no such
-    /// field: adding one would invent a shape Java never populates.
+    /// [`RewriteDataFiles::remove_dangling_deletes`] was set. **This count lives only at the top
+    /// level.** Java's per-group accessor returns a constant zero, and nothing on this path sets
+    /// it.
     pub removed_delete_files_count: usize,
     /// Per-group results, in commit order (Java `Result.rewriteResults()`).
     pub file_groups: Vec<FileGroupRewriteResult>,
@@ -267,14 +223,8 @@ impl RewriteDataFiles {
 
     /// Plans the compaction, rewrites each group into target-sized files, and commits each group
     /// through [`RewriteFilesAction`](crate::transaction::rewrite_files). Each group is read with
-    /// merge-on-read deletes applied, so the output carries only live rows.
-    ///
-    /// When no file qualifies it returns zero counts and commits nothing.
-    ///
-    /// # Errors
-    ///
-    /// Fails when a `sizeThresholds` precondition is violated, when planning fails, when a group
-    /// commit fails, or when the composed `remove-dangling-deletes` sub-action fails.
+    /// merge-on-read deletes applied, so the output carries only live rows. When no file qualifies
+    /// it returns zero counts and commits nothing.
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RewriteDataFilesResult> {
         let config = self.resolve_config()?;
 
@@ -507,12 +457,8 @@ impl RewriteDataFiles {
     }
 
     /// Reads the group's live rows, with each task's delete files applied, and writes them through
-    /// the rolling data-file writer.
-    ///
-    /// Batches stream from the reader into the writer and are never collected. A large group stays
-    /// bounded by the rolling writer, not by the full live row set.
-    ///
-    /// The planner groups by partition, so every file in a group shares one partition key.
+    /// the rolling data-file writer. Batches stream from the reader into the writer and are never
+    /// collected. A large group stays bounded by the rolling writer, not by the full live row set.
     async fn write_compacted_files(
         &self,
         table: &Table,
@@ -585,15 +531,9 @@ impl RewriteDataFiles {
     }
 }
 
-/// The partition tuple a group's output files carry under `spec`.
-///
-/// `None` for an unpartitioned spec. An all-`void` spec has fields and still reports
-/// [`PartitionSpec::is_unpartitioned`], so this must branch on that method, never on a field count.
-///
-/// A partitioned spec needs a present tuple of matching arity. [`plan_file_groups`] buckets a
-/// non-default-spec task under the empty struct while the task keeps its own tuple, so a group can
-/// reach here shaped for another spec. Java recomputes the partition per row; this port stamps one
-/// key per group, so a mismatch must fail loudly.
+/// The partition tuple a group's output files carry under `spec`. `None` for an unpartitioned spec.
+/// An all-`void` spec has fields and still reports [`PartitionSpec::is_unpartitioned`], so this
+/// must branch on that method, never on a field count.
 fn group_partition_tuple(group: &[FileScanTask], spec: &PartitionSpec) -> Result<Option<Struct>> {
     if spec.is_unpartitioned() {
         return Ok(None);
@@ -704,19 +644,10 @@ fn group_qualifies(group: &[FileScanTask], config: &ResolvedConfig) -> bool {
     enough_input_files || enough_content || too_much_content || any_too_many_deletes
 }
 
-/// Forward greedy first-fit bin-packing, matching Java `BinPacking.ListPacker` with lookback 1.
-/// One bin is open at a time: an item goes in it if it fits, otherwise the bin closes and a fresh
-/// one opens.
-///
-/// The fork's merge-append `bin_packing::pack` is the same algorithm, but it is private to
+/// Forward greedy first-fit bin-packing, matching Java `BinPacking.ListPacker` with lookback 1. One
+/// bin is open at a time: an item goes in it if it fits, otherwise the bin closes and a fresh one
+/// opens. The fork's merge-append `bin_packing::pack` is the same algorithm, but it is private to
 /// `transaction/`, and opening it is out of this action's scope.
-///
-/// This action does not expose Java's `maxGroupCount`, so a bin has no item cap. The running sum
-/// saturates defensively.
-///
-/// It is generic so [`rewrite_position_delete_files`](super::rewrite_position_delete_files) packs
-/// through this same code. Java's position-delete planner inherits the packer unchanged, so one
-/// home here is the faithful shape. `weight` is evaluated once per item.
 pub(super) fn pack_bins<T>(
     items: Vec<T>,
     weight: impl Fn(&T) -> u64,
@@ -799,10 +730,8 @@ mod tests {
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
     use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
-    // ============================================================================================
     // Test harness: a local-fs memory catalog with real parquet on disk, and a table partitioned by
     // identity(x) over three long columns.
-    // ============================================================================================
 
     /// A memory catalog over the local filesystem. Returns the catalog and the temp-dir guard.
     async fn local_fs_catalog() -> (impl Catalog, TempDir) {
@@ -1124,9 +1053,7 @@ mod tests {
         seqs
     }
 
-    // ============================================================================================
     // E2E tests on the local-fs MemoryCatalog + real parquet.
-    // ============================================================================================
 
     /// Row conservation. A compaction that drops or duplicates a row is silent corruption, so the
     /// post-compaction row set must equal the pre-compaction one exactly, sorted, and the file
@@ -1370,12 +1297,6 @@ mod tests {
 
     /// Filter-leak guard, a data-loss class. The filter must select files only. If it leaks into
     /// the group read, compacting a partially matching file silently discards its other live rows.
-    ///
-    /// Five files hold rows on both sides of `y = 100`. Compacting under `y >= 100` must keep every
-    /// live row.
-    ///
-    /// Mutation: plan with `with_filter` instead of `with_file_prune_only` and the `y < 100` rows
-    /// vanish.
     #[tokio::test]
     async fn test_filtered_compaction_keeps_non_matching_live_rows() {
         use crate::expr::Reference;
@@ -2194,10 +2115,6 @@ mod tests {
     /// the starting snapshot is captured but before the commit must still apply. Keeping the lower
     /// number does that, and the commit still succeeds because preserving it sets
     /// `ignore_equality_deletes` in the validate.
-    ///
-    /// The delete removes y=20 from a to-be-rewritten file, and y=20 must be gone afterward.
-    ///
-    /// Mutation: drop the `data_sequence_number` stamp and y=20 resurrects.
     #[tokio::test]
     async fn test_concurrent_equality_delete_still_applies_after_compaction() {
         let (catalog, _temp) = local_fs_catalog().await;
@@ -2607,9 +2524,7 @@ mod tests {
         );
     }
 
-    // ============================================================================================
     // The output partition tuple is validated against the output spec, never fabricated as empty.
-    // ============================================================================================
 
     /// A two-field output spec, the shape a table has after `add_field("y")` while its files still
     /// carry the one-value tuple of the older spec.
@@ -2721,9 +2636,7 @@ mod tests {
         assert!(group_partition_tuple(&[], &spec).is_err());
     }
 
-    // ============================================================================================
     // The composed `remove-dangling-deletes` sub-action.
-    // ============================================================================================
 
     /// The live delete-file paths of the current snapshot, the signal for whether a delete file was
     /// really removed.

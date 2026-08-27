@@ -664,14 +664,12 @@ impl FileWriter for ParquetWriter {
     }
 }
 
-// ==============================================================================================
 // UTC-alias timestamp normalization at the write funnel
 //
 // Iceberg-to-Arrow canonicalizes `timestamptz` to `Timestamp(_, "UTC")`. Arrow-to-Iceberg still
 // accepts the historical `"+00:00"` alias. A batch tagged with the other alias fails the schema
 // check although both denote UTC and hold identical instants. Java coerces write batches to the
 // file schema. This normalizes that closed alias case here, and lets every other mismatch fail.
-// ==============================================================================================
 
 /// Relabel a timestamp array's timezone metadata to `tz`, reusing the values buffer.
 ///
@@ -736,15 +734,9 @@ fn utc_alias_relabel(
     Ok(None)
 }
 
-/// Relabel the timezone of a top-level timestamp column that differs from `writer_schema` by a
-/// UTC alias alone. Returns `Some(batch)` when a column is relabeled, else `None`, and the caller
-/// then writes the original batch.
-///
-/// # Notes
-///
-/// Top-level only, by design. The Parquet writer checks each (writer field, column) pair
-/// positionally and recurses itself, so a nested UTC-alias timestamp still fails loudly here.
-/// That avoids a silent partial normalization.
+/// Relabel the timezone of a top-level timestamp column that differs from `writer_schema` by a UTC
+/// alias alone. Returns `Some(batch)` when a column is relabeled, else `None`, and the caller then
+/// writes the original batch. # Notes Top-level only, by design.
 fn normalize_utc_alias_timestamps(
     batch: &RecordBatch,
     writer_schema: &ArrowSchema,
@@ -2981,13 +2973,11 @@ mod tests {
         assert_eq!(upper_bounds, HashMap::from([(0, Datum::int(i32::MAX))]));
     }
 
-    // ==========================================================================================
     // timestamptz UTC-alias normalization at the parquet writer
     //
     // Iceberg-to-Arrow emits `Timestamp(_, "UTC")`. A historical `"+00:00"` batch differs from
     // the writer schema by that string, and the `ArrowWriter` check is timezone-sensitive.
     // `ParquetWriter::write` relabels the alias and touches no values.
-    // ==========================================================================================
 
     /// Read the single parquet data file back into one concatenated `RecordBatch`.
     async fn read_back_single_file(file_io: &FileIO, data_file: &DataFile) -> RecordBatch {

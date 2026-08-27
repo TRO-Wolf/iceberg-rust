@@ -222,13 +222,10 @@ struct MetadataLayout {
 }
 
 /// Computes the serialized layout for a dictionary (`Variants.metadata`): `dataSize` = total UTF-8
-/// bytes of all names, `offsetSize = sizeOf(dataSize)`, and
-/// `totalSize = 1 + offsetSize + (1 + numElements) * offsetSize + dataSize`.
-///
-/// # Errors
-///
-/// [`crate::ErrorKind::DataInvalid`] when a size escapes Java's `int` domain, or when the name
-/// COUNT does not fit `offsetSize`, the pathology Java silently truncates.
+/// bytes of all names, `offsetSize = sizeOf(dataSize)`, and `totalSize = 1 + offsetSize + (1 +
+/// numElements) * offsetSize + dataSize`. # Errors [`crate::ErrorKind::DataInvalid`] when a size
+/// escapes Java's `int` domain, or when the name COUNT does not fit `offsetSize`, the pathology
+/// Java silently truncates.
 fn metadata_layout(names: &[String]) -> Result<MetadataLayout> {
     let mut data_size = 0usize;
     for name in names {
@@ -281,13 +278,7 @@ impl VariantMetadata {
     /// Builds metadata from field names, exactly as Java `Variants.metadata(Collection)`. The
     /// dictionary keeps the INSERTION order, with no dedup and no re-sort. The sorted flag is set
     /// only when the input is already STRICTLY ascending in Java `String.compareTo` (UTF-16 code
-    /// unit) order, so a duplicate name clears it. An empty input gives the empty-v1 metadata
-    /// `01 00 00`, with the sorted flag NOT set.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::ErrorKind::DataInvalid`] when the dictionary escapes Java's `int` domain, or on the
-    /// count-truncation pathology (see the module doc).
+    /// unit) order, so a duplicate name clears it.
     pub fn from_field_names<I, S>(field_names: I) -> Result<VariantMetadata>
     where
         I: IntoIterator<Item = S>,
@@ -311,17 +302,10 @@ impl VariantMetadata {
     }
 
     /// Serializes this metadata to the on-disk layout: header byte, dictionary size,
-    /// `dictionarySize + 1` offsets, then the concatenated UTF-8 strings.
-    ///
-    /// Output is byte-identical to Java's for metadata built by [`Self::from_field_names`] and for
-    /// anything Java's own writer produced. A PARSED metadata re-encodes with the canonical writer
-    /// widths, because Java's `SerializedMetadata.writeTo` copies its original buffer verbatim. The
-    /// sorted flag is preserved as parsed, and the output length can then differ from
-    /// [`Self::size_in_bytes`], which reports the PARSED size.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::ErrorKind::DataInvalid`] per [`Self::from_field_names`]'s doors.
+    /// `dictionarySize + 1` offsets, then the concatenated UTF-8 strings. Output is byte-identical
+    /// to Java's for metadata built by [`Self::from_field_names`] and for anything Java's own
+    /// writer produced. A PARSED metadata re-encodes with the canonical writer widths, because
+    /// Java's `SerializedMetadata.writeTo` copies its original buffer verbatim.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let names = self.dictionary();
         let layout = metadata_layout(names)?;
@@ -509,10 +493,7 @@ fn decimal_precision(unscaled: i128) -> u32 {
 
 impl VariantValue {
     /// Returns the serialized size in bytes of this value (Java `sizeInBytes()`). An object needs
-    /// `metadata`, because its field-id width is `sizeOf(metadata.dictionarySize())`.
-    ///
-    /// # Errors
-    ///
+    /// `metadata`, because its field-id width is `sizeOf(metadata.dictionarySize())`. # Errors
     /// [`crate::ErrorKind::DataInvalid`] when the value escapes Java's `int` domain or exceeds
     /// [`MAX_NESTING_DEPTH`].
     pub fn size_in_bytes(&self, metadata: &VariantMetadata) -> Result<usize> {
@@ -520,10 +501,7 @@ impl VariantValue {
     }
 
     /// Writes this value into `buffer` at `offset` and returns the bytes written. The port of Java
-    /// `VariantValue.writeTo(ByteBuffer, int)`, with absolute offsets.
-    ///
-    /// # Errors
-    ///
+    /// `VariantValue.writeTo(ByteBuffer, int)`, with absolute offsets. # Errors
     /// [`crate::ErrorKind::DataInvalid`] when the buffer is too small, a field name is missing from
     /// `metadata` (Java `checkState`: "Invalid metadata, missing: %s"), the value escapes Java's
     /// `int` domain, or nesting exceeds [`MAX_NESTING_DEPTH`].

@@ -734,16 +734,11 @@ impl<'a> IncrementalChangelogScanBuilder<'a> {
         self
     }
 
-    /// **ENGINE-FIRST (beyond Java 1.10.0 core):** enables row-level changelog planning.
-    ///
-    /// The default `false` mirrors the Java rejection surface: 1.10.0
-    /// `BaseIncrementalChangelogScan.orderedChangelogSnapshots` throws for any non-`replace`
-    /// range snapshot that carries a delete manifest.
-    ///
-    /// `true` accepts such a range and emits the task taxonomy the Java api defines but
-    /// 1.10.0 core does not emit. An existing file the snapshot's ADDED deletes match yields
-    /// a [`ChangelogTaskKind::DeletedRows`] task. A file added in the same snapshot as its
-    /// deletes folds them into its [`ChangelogTaskKind::AddedRows`] task.
+    /// **ENGINE-FIRST (beyond Java 1.10.0 core):** enables row-level changelog planning. The
+    /// default `false` mirrors the Java rejection surface: 1.10.0
+    /// `BaseIncrementalChangelogScan.orderedChangelogSnapshots` throws for any non-`replace` range
+    /// snapshot that carries a delete manifest. `true` accepts such a range and emits the task
+    /// taxonomy the Java api defines but 1.10.0 core does not emit.
     pub fn with_row_level_deletes(mut self, include_row_level_deletes: bool) -> Self {
         self.include_row_level_deletes = include_row_level_deletes;
         self
@@ -922,13 +917,8 @@ impl IncrementalChangelogScan {
     }
 
     /// Returns the changelog snapshots in `(from_snapshot_id_exclusive, to_snapshot_id]`
-    /// OLDEST-FIRST (Java `orderedChangelogSnapshots`). It excludes `Operation::Replace`
-    /// snapshots. The caller assigns change ordinals over this order, oldest = 0.
-    ///
-    /// # Errors
-    ///
-    /// Fails with `FeatureUnsupported` when a kept snapshot references a DELETE manifest,
-    /// unless the row-level mode is on.
+    /// OLDEST-FIRST (Java `orderedChangelogSnapshots`). It excludes `Operation::Replace` snapshots.
+    /// The caller assigns change ordinals over this order, oldest = 0.
     async fn ordered_changelog_snapshots(
         &self,
         plan_context: &PlanContext,
@@ -1276,13 +1266,8 @@ impl IncrementalChangelogScan {
         }))
     }
 
-    /// Converts one manifest entry into a [`ChangelogScanTask`]. Returns `None` for an
-    /// `Existing` entry or an entry the filter prunes.
-    ///
-    /// Mirrors Java `CreateDataFileChangeTasks.apply`. In the default mode both delete lists
-    /// stay empty, Java 1.10.0 `NO_DELETES`. In row-level mode an `AddedRows` task takes the
-    /// deletes added with the file, and a `DeletedDataFile` task takes the pre-existing ones,
-    /// so only the rows live at removal are output as deleted.
+    /// Converts one manifest entry into a [`ChangelogScanTask`]. Returns `None` for an `Existing`
+    /// entry or an entry the filter prunes. Mirrors Java `CreateDataFileChangeTasks.apply`.
     async fn changelog_task_from_entry(
         manifest_entry_context: ManifestEntryContext,
         change_ordinal: i32,

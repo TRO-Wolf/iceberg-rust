@@ -798,13 +798,8 @@ impl Literal {
     }
 }
 
-/// Decode a JSON single-value hex string (spec Appendix D `fixed(L)` / `binary`) to bytes.
-///
-/// Matches Java `SingleValueParser.fromJson`. Mixed case is accepted. Odd-length or non-hex
-/// input fails closed with `DataInvalid`.
-///
-/// The expression wire format has its own decoder,
-/// `crate::expr::expression_parser::hex_to_bytes`.
+/// Decode a JSON single-value hex string (spec Appendix D `fixed(L)` / `binary`) to bytes. Matches
+/// Java `SingleValueParser.fromJson`. Mixed case is accepted.
 fn hex_str_to_bytes(s: &str) -> Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return Err(Error::new(

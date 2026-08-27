@@ -15,14 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java interop tests for data-level scan execution with merge-on-read deletes.
-//!
-//! Direction 1 loads a table the Java oracle wrote and compares against the rows Java emitted.
-//! Direction 2 writes a table through the production write path for Java to read back.
-//!
-//! Each direction is gated on its own env var, because the fixtures are regenerated per run.
-//! An unset var makes the test a runtime no-op, not an `#[ignore]`, so the offline `cargo test`
-//! gate stays green with no Java and no Maven. The driver scripts live in `dev/java-interop/`.
+//! Java interop tests for data-level scan execution with merge-on-read deletes. Direction 1 loads a
+//! table the Java oracle wrote and compares against the rows Java emitted.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -317,13 +311,11 @@ async fn test_scan_exec_merge_on_read_matches_java_read() {
     );
 }
 
-// ===========================================================================================
 // EQUALITY-DELETE, DIRECTION 1 — Java writes the equality delete, Rust reads it.
 //
 // Java wrote an unpartitioned V2 table: a 5-row data file at sequence 1, then an equality delete
 // on field id 1 for ids 20 and 40 at sequence 2. The delete applies because 1 < 2, so the live
 // set is {10,30,50}. Java emitted its own read into `java_eq_scan_rows.json`.
-// ===========================================================================================
 
 #[tokio::test]
 async fn test_scan_exec_equality_delete_matches_java_read() {
@@ -400,7 +392,6 @@ async fn test_scan_exec_equality_delete_matches_java_read() {
     );
 }
 
-// ===========================================================================================
 // PARTITIONED merge-on-read, DIRECTION 1 — Java writes the partitioned table and the
 // partition-scoped delete, Rust reads it.
 //
@@ -410,7 +401,6 @@ async fn test_scan_exec_equality_delete_matches_java_read() {
 //
 // Rust's delete_file_index keys deletes by partition and spec id, so the cat=a delete must reach
 // only the cat=a data file. Applying it to cat=b, or dropping a partition, fails this test.
-// ===========================================================================================
 
 #[tokio::test]
 async fn test_part_scan_exec_partition_scoped_merge_on_read_matches_java_read() {
@@ -493,13 +483,11 @@ async fn test_part_scan_exec_partition_scoped_merge_on_read_matches_java_read() 
     );
 }
 
-// ===========================================================================================
 // DIRECTION 2 — the GEN path: Rust writes a real on-disk table; Java reads it back.
 //
 // Commits through a `MemoryCatalog` backed by `LocalFsStorageFactory`, so metadata, manifests and
 // parquet land on the real local filesystem, and writes `final.metadata.json` at a known path.
 // Java loads that metadata, reads with `IcebergGenerics`, and asserts {10,30,50}.
-// ===========================================================================================
 
 /// The unpartitioned V2 schema Java expects: {1 id long required, 2 data string optional}.
 fn gen_schema() -> Schema {
@@ -678,12 +666,10 @@ async fn test_scan_exec_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // ENGINE-BOUNDARY OFFLINE PROOF — plays the downstream engine's role over the public core-crate
 // surface only: scan `(_file, _pos)` for row identity, write a position delete from the pairs,
 // commit it via `RowDelta`, and confirm merge-on-read omits exactly those rows. This is the
 // executable contract a DataFusion-wrapped engine builds DELETE, UPDATE and MERGE on.
-// ===========================================================================================
 
 /// Decode the reserved `_file` column at row `i`. The scan emits it as a per-file constant, which
 /// the transformer materializes run-end-encoded. Both the encoded and plain `Utf8` forms decode.
@@ -864,13 +850,11 @@ async fn test_engine_boundary_scan_pos_then_row_delta() {
     );
 }
 
-// ===========================================================================================
 // EQUALITY-DELETE, DIRECTION 2 — the GEN path: Rust writes the equality delete, Java reads it.
 //
 // Sequence ordering is the correctness point. The data is `fast_append`ed first at sequence 1 and
 // the equality delete is `row_delta`ed second at sequence 2, so the delete applies. Java reads the
 // resulting `final.metadata.json` and asserts {10,30,50}.
-// ===========================================================================================
 
 /// Write a real parquet equality-delete file keyed on field id 1, deleting ids 20 and 40. The
 /// Java-readable fixture's case of [`write_equality_delete_for_ids`]. Only `id` lands on disk.
@@ -963,14 +947,12 @@ async fn test_scan_exec_gen_rust_writes_java_readable_equality_delete_table() {
     );
 }
 
-// ===========================================================================================
 // PARTITIONED merge-on-read, DIRECTION 2 — the GEN path: Rust writes the partitioned table and the
 // partition-scoped delete, Java reads it back. The partition-write proof.
 //
 // The production `DataFileWriter` and `PositionDeleteFileWriter` are built with a `PartitionKey`,
 // which stamps the partition Struct and spec id onto each file and routes the parquet under the
 // partition path. Data commits at sequence 1, the delete at sequence 2. Java asserts {10,30,40,50}.
-// ===========================================================================================
 
 /// The partitioned V2 schema Java expects. `category` is a required top-level field, and the spec
 /// partitions by identity(category).
@@ -1267,7 +1249,6 @@ async fn test_part_scan_exec_gen_rust_writes_java_readable_partitioned_table() {
     );
 }
 
-// ===========================================================================================
 // ENGINE CUSTOM-SCAN EQUIVALENCE — the public `DeleteFilter` (Java
 // `org.apache.iceberg.data.DeleteFilter`) reproduces the built-in scan exactly. An engine plans the
 // files, reads each data file with the `parquet` crate directly, then reuses iceberg's delete
@@ -1281,7 +1262,6 @@ async fn test_part_scan_exec_gen_rust_writes_java_readable_partitioned_table() {
 // Non-vacuity: the equality predicate resolves `id` by Iceberg field id from the raw parquet
 // `PARQUET_FIELD_ID_META_KEY`. A broken round-trip reads the column as absent, the predicate keeps
 // every row, and the engine path diverges from ground truth, so these assertions fail loud.
-// ===========================================================================================
 
 /// Strip a `file://` scheme, so a `FileScanTask` data-file path opens as a local path. Either form
 /// can arrive.
@@ -1625,13 +1605,11 @@ async fn test_engine_deletefilter_equivalence_position_and_equality_deletes() {
     );
 }
 
-// ===========================================================================================
 // MULTI-FILE-PER-PARTITION merge-on-read. When one partition holds more than one data file, the
 // `DeleteFileIndex` routes a partition-scoped position delete to EVERY data-file task in that
 // partition. The delete must still apply only to the rows of the data file it references by path.
 // The path-keyed loader `parse_positional_deletes_record_batch_stream` is what makes that hold.
 // A loader that partition-broadcast positions instead would make the sibling row vanish.
-// ===========================================================================================
 
 #[tokio::test]
 async fn test_engine_deletefilter_multifile_partition_position_delete_spares_sibling() {
@@ -1835,12 +1813,10 @@ async fn test_engine_deletefilter_multifile_partition_equality_delete_applies_ac
     );
 }
 
-// ===========================================================================================
 // MULTI-FILE-PER-PARTITION merge-on-read INTEROP — the bidirectional proof. Direction 1: Java writes
 // two data files in one partition plus a position delete on file1, and Rust must drop id 20 (file1
 // position 1) while sparing id 50 (file2's same ordinal). Direction 2 writes the same shape from
 // Rust for Java to read back.
-// ===========================================================================================
 
 #[tokio::test]
 async fn test_multifile_scan_exec_matches_java_read() {
@@ -1904,14 +1880,12 @@ async fn test_multifile_scan_exec_matches_java_read() {
     );
 }
 
-// ===========================================================================================
 // FILE-SCOPED position-delete routing INTEROP — Java's `DeleteFileIndex` routes a position delete
 // with a derivable referenced data file into a path-keyed map, consulted with no spec and no
 // partition condition. Java writes deletes stamped with a spec and partition that match neither
 // data file: the field leg through `referenced_data_file`, the bounds leg through equal `file_path`
 // bounds, which is the shape Java's own `PositionDeleteWriter` emits. A partition-scoped control
 // delete must not apply.
-// ===========================================================================================
 
 #[tokio::test]
 async fn test_file_scoped_delete_scan_matches_java_read() {
@@ -2023,11 +1997,6 @@ async fn test_file_scoped_delete_scan_matches_java_read() {
 
 /// The cross-task over-delete pin. The control delete is stamped `category=b`, so the plan attaches
 /// it to file B's task, but its rows name file A's position 2.
-///
-/// Java builds one `data.DeleteFilter` per task and filters each delete file's rows to the task's
-/// own file path, so the control deletes nothing. A reader that merged every parsed positional
-/// delete into one shared map across tasks would wrongly delete id 30. This pins the per-task
-/// scoping through the real scan.
 #[tokio::test]
 async fn test_file_scoped_delete_crosstask_control_does_not_leak() {
     let Some(dir) = file_scoped_deletes_crosstask_dir() else {
@@ -2209,13 +2178,11 @@ async fn test_multifile_scan_exec_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // NON-IDENTITY TRANSFORM merge-on-read INTEROP — the bidirectional proof. The table is partitioned
 // by `truncate[10](id)`, so no raw id equals its partition value. This proves the `DeleteFileIndex`
 // matches a partition-scoped delete to the transformed partition Struct, not to a raw column value.
 // truncate=10 holds ids 11/13/15 and truncate=20 holds 21/23. A delete in partition 10 removes
 // position 1, so the live set is {11,15,21,23}.
-// ===========================================================================================
 
 /// The dir the Java oracle wrote the truncate-partitioned table and JSON rows into.
 fn nonidentity_scan_dir() -> Option<PathBuf> {
@@ -2546,12 +2513,7 @@ async fn write_truncate_partitioned_equality_delete_for_ids(
 }
 
 /// The non-identity `DeleteFilter`-equivalence proof (ENGINE_CONTRACT §2). The layout is
-/// `truncate[10](id)`: truncate=10 holds ids {11,13,15}, truncate=20 holds {21,23}. A position
-/// delete is scoped to truncate=10 and an equality delete to truncate=20.
-///
-/// Risk: the engine raw-read path must reproduce the built-in scan exactly when delete routing
-/// keys on transformed partition Structs. A skipped positional mask, or transform-mismatched
-/// index routing, breaks the equivalence or the live set {11,15,23}.
+/// `truncate[10](id)`: truncate=10 holds ids {11,13,15}, truncate=20 holds {21,23}.
 #[tokio::test]
 async fn test_engine_deletefilter_nonidentity_partition_equivalence() {
     use tempfile::TempDir;

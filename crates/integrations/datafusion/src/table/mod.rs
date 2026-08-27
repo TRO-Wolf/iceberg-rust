@@ -59,19 +59,6 @@ use crate::physical_plan::write::IcebergWriteExec;
 
 /// Catalog-backed table provider. It loads fresh table metadata on every scan and write. For
 /// read-only access to one snapshot, use [`IcebergStaticTableProvider`].
-///
-/// # Schema freshness comes from a new INSTANCE
-///
-/// [`TableProvider::schema`] is synchronous, so it returns one fixed Arrow schema per INSTANCE.
-/// That immutability is load-bearing. DataFusion resolves a projection to ORDINALS against
-/// `schema()` and stores them in the logical plan. Under a mutating schema those ordinals lie:
-/// `TableScan::try_new` PANICS once the schema shrinks, and maps the wrong columns when a
-/// drop-plus-add keeps the length. Java works the same way, building a `SparkTable` per query.
-///
-/// So `IcebergSchemaProvider::table` binds a new provider to fresh metadata on every resolution,
-/// and [`IcebergTableProvider::refreshed`] returns a new provider for a directly registered one.
-/// The DATA is always current: every operation reloads the table, so a scan reads the latest
-/// snapshot even while advertising an older schema, and [`IcebergTableScan`] binds by field id.
 #[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
     catalog: Arc<dyn Catalog>,

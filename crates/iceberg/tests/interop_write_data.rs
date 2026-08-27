@@ -73,9 +73,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use serde::Deserialize;
 
-// ===========================================================================================
 // Row model — the Java oracle's `{id, data}` JSON format (same as interop_scan_exec.rs).
-// ===========================================================================================
 
 /// One live row from Java's `IcebergGenerics` read: `id` (long) + nullable `data` string.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -99,9 +97,7 @@ fn cmp_opt(a: &Option<String>, b: &Option<String>) -> Ordering {
     }
 }
 
-// ===========================================================================================
 // Env-var gates.
-// ===========================================================================================
 
 fn merge_append_data_gen_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_MERGE_APPEND_DATA_GEN_DIR")
@@ -187,9 +183,7 @@ fn multi_bin_merge_data_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-// ===========================================================================================
 // Schema + spec helpers.
-// ===========================================================================================
 
 /// Fixture B schema: unpartitioned 2-field `{1 id long required, 2 data string optional}`.
 /// Matches `ScanExecOracle` / `EqDeleteOracle` — the simplest shape for the seq-preservation proof.
@@ -236,9 +230,7 @@ fn partition_key(schema: SchemaRef, spec: PartitionSpec, category: &str) -> Part
     .expect("PartitionKey::new: valid partition tuple")
 }
 
-// ===========================================================================================
 // Real-parquet writer helpers (production paths — the same pattern as interop_scan_exec.rs).
-// ===========================================================================================
 
 /// Write a REAL parquet DATA file for one partition via the production `DataFileWriter`.
 /// Each row carries the given `ids` and `data_values`; `category` matches the partition.
@@ -294,9 +286,7 @@ async fn write_data_file(
         .expect("one data file")
 }
 
-// ===========================================================================================
 // Scan helper — Arrow → ScanRow extraction (same as interop_scan_exec.rs).
-// ===========================================================================================
 
 fn extract_rows(batch: &RecordBatch) -> Vec<ScanRow> {
     let id = batch
@@ -630,9 +620,7 @@ async fn write_unpartitioned_eq_delete_file(table: &Table) -> DataFile {
         .expect("one equality-delete file")
 }
 
-// ===========================================================================================
 // Fixture A GEN — Rust writes the merge_append data table for Java to verify.
-// ===========================================================================================
 
 /// Fixture A GEN: the chain of Java's `MergeAppendDataOracle.generate`. Real parquet files let
 /// Java's `IcebergGenerics` scan read rows back.
@@ -747,11 +735,9 @@ async fn test_merge_append_data_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture B GEN — Rust writes the rewrite-data table (seq-preservation) for Java to verify.
 // The delete must be an EQUALITY delete: a position delete is path-based, so after A→A' it
 // dangles and cannot prove that `data_sequence_number` drives applicability.
-// ===========================================================================================
 
 /// Fixture B GEN: the chain of Java's revised `RewriteFilesDataOracle.generate`. A' carries
 /// `data_seq=1 < eq_del.seq=2`, so the delete still applies and live rows are `{10,30,50}`. The
@@ -862,9 +848,7 @@ async fn test_rewrite_data_gen_rust_writes_java_readable_seq_preserving_table() 
     );
 }
 
-// ===========================================================================================
 // Fixture A comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
 /// Direction 1 of fixture A: Rust reads the JAVA-written merge_append table and asserts the live
 /// rows equal `java_merge_append_rows.json`. Carried Existing entries must scan correctly.
@@ -948,9 +932,7 @@ async fn test_rust_reads_java_merge_append_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture B comparison — Rust reads Java's ground-truth rows (seq-preservation proof).
-// ===========================================================================================
 
 /// Direction 1 of fixture B: Rust reads the JAVA-written rewrite-data table and asserts the live
 /// rows equal `java_rewrite_data_rows.json`. Ids 20 and 40 must be ABSENT, because Java stamped
@@ -1028,9 +1010,7 @@ async fn test_rust_reads_java_rewrite_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture C GEN — Rust writes the overwrite_files data table for Java to verify.
-// ===========================================================================================
 
 /// Fixture C GEN: the chain of Java's `OverwriteFilesDataOracle.generate`. B (40) must be gone,
 /// B' (41) present, and A's rows intact.
@@ -1140,9 +1120,7 @@ async fn test_overwrite_data_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture C comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
 /// Direction 1 of fixture C: Rust reads the JAVA-written overwrite table and asserts the live
 /// rows equal `java_overwrite_data_rows.json`. Id 40 is absent, id 41 present, A's rows intact.
@@ -1229,9 +1207,7 @@ async fn test_rust_reads_java_overwrite_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture D GEN — Rust writes the delete_files data table for Java to verify.
-// ===========================================================================================
 
 /// Fixture D GEN: the chain of Java's `DeleteFilesDataOracle.generate`. B (cat=b, 40) must be
 /// gone, and A plus C_file (cat=a) intact.
@@ -1337,9 +1313,7 @@ async fn test_delete_data_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture D comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
 /// Direction 1 of fixture D: Rust reads the JAVA-written delete table and asserts the live rows
 /// equal `java_delete_data_rows.json`. Id 40 is absent, A and C_file rows intact.
@@ -1420,9 +1394,7 @@ async fn test_rust_reads_java_delete_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture E GEN — Rust writes the replace_partitions data table for Java to verify.
-// ===========================================================================================
 
 /// Fixture E GEN: the chain of Java's `ReplacePartitionsDataOracle.generate`. A's rows
 /// (10,20,30) must be absent, and E_new (11) plus B (40) present.
@@ -1533,9 +1505,7 @@ async fn test_replace_partitions_data_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture E comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
 /// Direction 1 of fixture E: Rust reads the JAVA-written replace_partitions table and asserts the
 /// live rows equal `java_replace_partitions_rows.json`. Ids 10/20/30 are absent, 11 and 40
@@ -1630,9 +1600,7 @@ async fn test_rust_reads_java_replace_partitions_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture F GEN — Rust writes the partitioned rewrite_files table for Java to verify.
-// ===========================================================================================
 
 /// Fixture F GEN: the chain of Java's `PartitionedRewriteFilesDataOracle.generate`. A' carries
 /// `data_seq=1 < eq_del.seq=2`, so id 20 stays deleted after the rewrite. B (40, cat=b) is
@@ -1763,9 +1731,7 @@ async fn test_partitioned_rewrite_data_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture F comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
 /// Direction 1 of fixture F: Rust reads the JAVA-written partitioned-rewrite table and asserts
 /// the live rows equal `java_partitioned_rewrite_rows.json`. Id 20 is absent, because the
@@ -1853,9 +1819,7 @@ async fn test_rust_reads_java_partitioned_rewrite_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture G GEN — Rust writes the multi-bin merge_append table for Java to verify.
-// ===========================================================================================
 
 /// Fixture G GEN: the chain of Java's `MultiBinMergeAppendDataOracle.generate`. All 7 rows must
 /// survive. The bin-count assertion (at least 2 manifests with `existing_files_count > 0`) proves
@@ -2058,9 +2022,7 @@ async fn test_multi_bin_merge_append_data_gen_rust_writes_java_readable_table() 
     );
 }
 
-// ===========================================================================================
 // Fixture G comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
 /// Direction 1 of fixture G: Rust reads the JAVA-written multi-bin merge-append table and asserts
 /// the live rows equal `java_multi_bin_merge_append_rows.json`. All 7 ids must be present, over

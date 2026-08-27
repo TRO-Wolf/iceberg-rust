@@ -163,12 +163,8 @@ impl RewriteTablePath {
     }
 
     /// Runs the full rewrite and returns the staging location and the copy plan. It copies no data
-    /// file.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the prefixes or the staging location are unset, or when a referenced data file is
-    /// not under the source prefix.
+    /// file. # Errors Fails when the prefixes or the staging location are unset, or when a
+    /// referenced data file is not under the source prefix.
     pub async fn execute(self, file_io: &FileIO) -> Result<RewriteTablePathResult> {
         let source = self.source_prefix.as_deref().ok_or_else(|| {
             Error::new(
@@ -583,9 +579,7 @@ pub(crate) fn replace_paths(
     Ok(rewritten)
 }
 
-// ============================================================================================
 // Path helpers — faithful ports of Java's `RewriteTablePathUtil` path math.
-// ============================================================================================
 
 /// `newPath(path, sourcePrefix, targetPrefix)` = `combinePaths(target, relativize(path, source))`.
 /// Errors (Java throws `IllegalArgumentException`) if `path` does not start with `source`.
@@ -647,9 +641,7 @@ fn replace_first_prefix(location: &str, source: &str, target: &str) -> String {
     }
 }
 
-// ============================================================================================
 // DataFile / DeleteFile path rewrite helpers.
-// ============================================================================================
 
 /// Rebuilds a [`DataFile`] with `file_path` rewritten and all other metadata preserved (Java
 /// `copy(df).withPath(newPath(loc))`). Errors if the location is not under the source prefix.
@@ -742,9 +734,7 @@ fn datum_as_string(datum: &Datum) -> Option<String> {
     }
 }
 
-// ============================================================================================
 // Identity-preserving manifest entry re-emission (Java `appendEntryWithFile`).
-// ============================================================================================
 
 /// Re-emits `entry` with `new_file`, dispatching on the original status like Java
 /// `appendEntryWithFile`. Status, sequence numbers, and snapshot ids must survive the rewrite,
@@ -788,9 +778,7 @@ fn reemit_entry(
     Ok(())
 }
 
-// ============================================================================================
 // Manifest / manifest-list writer construction (format-version-threaded).
-// ============================================================================================
 
 /// Build a [`ManifestListWriter`] for `format_version`, threading the snapshot identity.
 fn build_manifest_list_writer(

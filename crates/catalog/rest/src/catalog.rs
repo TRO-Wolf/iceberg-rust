@@ -48,15 +48,10 @@ use crate::types::{
     RenameTableRequest, StorageCredential,
 };
 
-/// REST catalog URI — the base address of the Iceberg REST catalog service.
-///
-/// # Notes
-///
-/// The `/v1/config` response can replace this value and `oauth2-server-uri`; server overrides
-/// outrank operator properties, as in Java `RESTSessionCatalog.initialize`. The config fetch uses
-/// pre-merge properties, so the response cannot redirect the request that fetched it. Like Java,
-/// the client applies no host, IP-range, or scheme filter: a private-IP blocklist would break
-/// private-endpoint deployments. Validate an untrusted catalog URI before it reaches this key.
+/// REST catalog URI — the base address of the Iceberg REST catalog service. # Notes The
+/// `/v1/config` response can replace this value and `oauth2-server-uri`; server overrides outrank
+/// operator properties, as in Java `RESTSessionCatalog.initialize`. The config fetch uses pre-merge
+/// properties, so the response cannot redirect the request that fetched it.
 pub const REST_CATALOG_PROP_URI: &str = "uri";
 /// REST catalog warehouse location
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
@@ -177,13 +172,9 @@ impl RestCatalogBuilder {
 }
 
 /// Returns true if a property key holds a secret value that must be redacted from `Debug`.
-///
 /// Delegates to the canonical needle test so this crate cannot drift from the other catalogs.
 /// [`RestCatalogConfig`]`::props` is cloned into the table `FileIO` props, so it carries storage
 /// credentials such as `s3.secret-access-key`; a REST-local exact-match list missed them.
-///
-/// The needle test is a deliberate superset. It also redacts a non-secret key that contains a
-/// needle, such as `token-refresh-enabled`. Over-redaction is the safe direction for a debug view.
 fn is_secret_prop_key(key: &str) -> bool {
     iceberg::io::is_secret_prop_key(key)
 }
@@ -546,10 +537,6 @@ impl RestCatalog {
         // Overlay the vended storage credential for this table's location. Mirrors Java
         // `RESTSessionCatalog.newFileIO`. The credential config is layered LAST, so it beats the
         // catalog and table props on a key collision, as Java's `buildKeepingLast` does.
-        //
-        // Java re-selects the credential per accessed path in `S3FileIO.clientForStoragePath`.
-        // The flat-props `FileIO` here cannot, so the fork selects once at `metadata_location`.
-        // A table whose data and metadata buckets differ diverges; see GAP_MATRIX row R160.
         if let Some(credential) = select_vended_credential(metadata_location, storage_credentials) {
             props.extend(credential.config.clone());
         }
@@ -1257,11 +1244,9 @@ impl Catalog for RestCatalog {
             .build()
     }
 
-    // ========================================================================
     // View surface — mirrors the Iceberg REST view routes / Java `RESTSessionCatalog`'s
     // `RESTViewBuilder` + `RESTViewOperations`. Endpoints: `GET/POST /namespaces/{ns}/views`,
     // `GET/POST/DELETE/HEAD /namespaces/{ns}/views/{view}`, `POST /views/rename`.
-    // ========================================================================
 
     async fn list_views(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
         let context = self.context().await?;
@@ -2318,13 +2303,9 @@ mod tests {
         );
     }
 
-    /// A `load_table` 200 body carries both the `config` overlay and the vended credentials.
-    /// The body here fails to parse because `metadata` has the wrong JSON type.
-    ///
-    /// Scope: a scalar mismatch only, where `serde_json` echoes just the offending scalar. A
-    /// mismatch at a container boundary echoes a whole sub-document; see
-    /// [`test_known_residue_double_encoded_body_leaks_through_error_source`].
-    /// Discriminates the mutation that restores `.with_context("json", …)`.
+    /// A `load_table` 200 body carries both the `config` overlay and the vended credentials. The
+    /// body here fails to parse because `metadata` has the wrong JSON type. Scope: a scalar
+    /// mismatch only, where `serde_json` echoes just the offending scalar.
     #[tokio::test]
     async fn test_load_table_parse_failure_does_not_leak_vended_credentials() {
         const SENTINEL: &str = "SENTINEL_MUST_NOT_APPEAR_IN_ERROR";
@@ -2389,11 +2370,9 @@ mod tests {
 
     /// `iceberg::Error` renders the `source` verbatim, so withholding the body from the context
     /// alone leaks nothing only if the source is sanitized too. `serde_json` echoes the value at
-    /// the failure position, which at a container boundary is a whole sub-document.
-    ///
-    /// A gateway that emits a nested object as a JSON string turns `config` into a string holding
-    /// the vended-credential map. `SanitizedJsonError` keeps the chain but carries only the
-    /// category and position. Discriminates restoring `.with_source(e)` on the `serde_json` error.
+    /// the failure position, which at a container boundary is a whole sub-document. A gateway that
+    /// emits a nested object as a JSON string turns `config` into a string holding the
+    /// vended-credential map.
     #[tokio::test]
     async fn test_double_encoded_body_does_not_leak_through_error_source() {
         const SENTINEL: &str = "SENTINEL_LEAKS_VIA_SERDE_SOURCE_KNOWN_RESIDUE";
@@ -2474,12 +2453,9 @@ mod tests {
     }
 
     /// `deserialize_unexpected_catalog_error` is the fallthrough for the write routes, whose
-    /// request types carry operator property maps. A server that echoes the offending request
-    /// back therefore returns a body with secrets in it.
-    ///
-    /// Pins that the attached body is key-redacted: the secret value is masked, the server
-    /// `message` and every non-secret property survive. Discriminates the mutation that restores
-    /// `.with_context("json", String::from_utf8_lossy(&bytes))`.
+    /// request types carry operator property maps. A server that echoes the offending request back
+    /// therefore returns a body with secrets in it. Pins that the attached body is key-redacted:
+    /// the secret value is masked, the server `message` and every non-secret property survive.
     #[tokio::test]
     async fn test_non_2xx_body_masks_echoed_secret_properties() {
         const SENTINEL: &str = "SENTINEL_ECHOED_BACK_BY_THE_SERVER";
@@ -3456,7 +3432,6 @@ mod tests {
         rename_table_mock.assert_async().await;
     }
 
-    // ===================================================================================
     // Vended storage credentials (GAP_MATRIX row R160)
     //
     // Mirrors Java `RESTSessionCatalog.newFileIO(SessionContext, Map, List<Credential>)` +
@@ -3464,7 +3439,6 @@ mod tests {
     // table's storage path, credential config layered LAST (wins on collision), no-match is a
     // silent skip. These pins are RED under the mutations named in the G4 charter (invert the
     // selection to shortest-prefix, swap the overlay order, or drop the wiring entirely).
-    // ===================================================================================
 
     /// Build a `load_table` response body from the shared testdata metadata, injecting a specific
     /// `config` map and (optionally) a `storage-credentials` array.
@@ -4536,10 +4510,8 @@ mod tests {
         }
     }
 
-    // ========================================================================
     // View method wiring tests — confirm each view method targets the correct REST route and maps
     // status codes to the right outcome. (Shape-level: a mock server, no real catalog backend.)
-    // ========================================================================
 
     fn view_metadata_body() -> &'static str {
         r#"{

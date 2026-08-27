@@ -655,16 +655,8 @@ fn datum_decimal_bytes_accept_java_legal_metadata_and_reject_precision_over_38()
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
 }
 
-/// A zero-padded or sign-padded decimal bound decodes, as it does in Java. Java's DECIMAL arm is
-/// a bare `new BigInteger`, and it rejects only an empty buffer. The LONG and DOUBLE arms in the
-/// same switch DO branch on `remaining()`, which proves the omission is deliberate.
-///
-/// It matters beyond one value: `parse_bytes_entry` propagates with `?`, so one padded bound
-/// makes the whole manifest unparsable and aborts every scan.
-///
-/// The mutations this discriminates: restore the `i128_to_be_bytes_min` canonical check in
-/// `Datum::try_from_bytes`, or drop the empty-buffer guard beside it.
-/// Live-probe transcript: [`task/spec-decode-evidence.md`].
+/// A zero-padded or sign-padded decimal bound decodes, as it does in Java. Java's DECIMAL arm is a
+/// bare `new BigInteger`, and it rejects only an empty buffer.
 #[test]
 fn datum_decimal_byte_decode_accepts_non_minimal_encodings_like_java() {
     let decimal_9_2 = PrimitiveType::Decimal {
@@ -767,13 +759,9 @@ fn datum_decimal_byte_decode_accepts_values_wider_than_declared_precision() {
     );
 }
 
-/// A `Datum` from the Java-permissive read path must survive its own serde round trip. Scan
-/// tasks carry `Datum` bounds across process boundaries, so a precision gate in `Serialize` would
-/// let a Java-written table plan but fail to distribute.
-///
-/// Both `DatumVisitor` arms run here: `visit_map` for self-describing formats, `visit_seq` for
-/// the compact formats that carry a scan task. The mutation this discriminates: add
-/// `validate_decimal_literal` to `impl Serialize for Datum` or to either arm.
+/// A `Datum` from the Java-permissive read path must survive its own serde round trip. Scan tasks
+/// carry `Datum` bounds across process boundaries, so a precision gate in `Serialize` would let a
+/// Java-written table plan but fail to distribute.
 #[test]
 fn datum_decimal_serde_round_trip_preserves_java_readable_values() {
     let decimal_type = PrimitiveType::Decimal {

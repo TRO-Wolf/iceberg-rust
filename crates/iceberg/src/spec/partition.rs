@@ -129,15 +129,10 @@ impl PartitionSpec {
         self.fields.iter().map(|f| f.field_id).max()
     }
 
-    /// Check if this partition spec is compatible with another partition spec.
-    ///
-    /// Returns true if the partition spec is equal to the other spec with partition field ids ignored and
-    /// spec_id ignored. The following must be identical:
-    /// * The number of fields
-    /// * Field order
-    /// * Field names
-    /// * Source column ids
-    /// * Transforms
+    /// Check if this partition spec is compatible with another partition spec. Returns true if the
+    /// partition spec is equal to the other spec with partition field ids ignored and spec_id
+    /// ignored. The following must be identical: * The number of fields * Field order * Field names
+    /// * Source column ids * Transforms.
     pub fn is_compatible_with(&self, other: &PartitionSpec) -> bool {
         if self.fields.len() != other.fields.len() {
             return false;
@@ -158,13 +153,6 @@ impl PartitionSpec {
     /// Returns the partition path: `name=value` pairs joined by `/`. Both sides of each pair are
     /// URL-escaped like Java (see [`escape_partition_path_component`]), so a `/`, `=` or space in a
     /// name or a value cannot forge path structure. A NULL value renders `name=null`.
-    ///
-    /// # Notes
-    ///
-    /// The call is TOTAL. An inconsistent `(spec, schema, data)` triple renders `null` for the
-    /// offending field and warns. This is wider than Java, which throws for all but a short tuple.
-    /// The write and commit callers cannot report failure and must not abort a long-running engine.
-    /// [`PartitionSpec::try_partition_to_path`] returns this same string on `Ok`, with typed errors.
     pub fn partition_to_path(&self, data: &Struct, schema: SchemaRef) -> String {
         let field_types = self.lenient_partition_field_types(&schema);
 
@@ -196,14 +184,10 @@ impl PartitionSpec {
     }
 
     /// The fallible sibling of [`PartitionSpec::partition_to_path`]. Returns the SAME string on
-    /// `Ok`, escaping included.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the `(spec, schema, data)` triple is not self-consistent: the
-    /// partition type is not derivable under `schema`, the tuple is shorter than the spec, a value
-    /// is not a primitive literal, or a value's literal kind fails `PrimitiveType::compatible`.
-    /// A NULL value, and a missing value for a [`Transform::Void`] field, are NOT errors.
+    /// `Ok`, escaping included. # Errors Returns an error when the `(spec, schema, data)` triple is
+    /// not self-consistent: the partition type is not derivable under `schema`, the tuple is
+    /// shorter than the spec, a value is not a primitive literal, or a value's literal kind fails
+    /// `PrimitiveType::compatible`.
     pub fn try_partition_to_path(&self, data: &Struct, schema: SchemaRef) -> Result<String> {
         let partition_type = self.partition_type(&schema)?;
         let mut rendered = Vec::with_capacity(self.fields.len());
@@ -397,15 +381,11 @@ pub struct PartitionKey {
 }
 
 impl PartitionKey {
-    /// Creates a new partition key with the given spec, schema, and data.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::DataInvalid`] or [`ErrorKind::Unexpected`] when `(spec, schema, data)`
-    /// is not self-consistent, under the same rules as
-    /// [`PartitionSpec::try_partition_to_path`]. An invalid partition tuple is unrepresentable as a
-    /// [`PartitionKey`], matching Java's `StructTransform`. A NULL slot is legal, and an all-`void`
-    /// spec may pair with an empty tuple.
+    /// Creates a new partition key with the given spec, schema, and data. # Errors Returns
+    /// [`ErrorKind::DataInvalid`] or [`ErrorKind::Unexpected`] when `(spec, schema, data)` is not
+    /// self-consistent, under the same rules as [`PartitionSpec::try_partition_to_path`]. An
+    /// invalid partition tuple is unrepresentable as a [`PartitionKey`], matching Java's
+    /// `StructTransform`.
     pub fn new(spec: PartitionSpec, schema: SchemaRef, data: Struct) -> Result<Self> {
         // Validate without building a path string, so the write path does not pay for rendering.
         spec.validate_partition_data(&data, schema.as_ref())?;
@@ -2380,9 +2360,7 @@ mod partition_path_totalisation_tests {
         (schema, spec)
     }
 
-    // ============================================================================================
     // NULL partition values stay legal: a NULL tuple slot is a first-class Iceberg value.
-    // ============================================================================================
 
     /// A `PartitionKey` carrying a NULL value renders `name=null` on both paths. Java renders a
     /// null partition value as the literal `"null"` (`Transform.toHumanString(type, null)`).
@@ -2442,9 +2420,7 @@ mod partition_path_totalisation_tests {
         assert_eq!(key.to_path(), "x_void=null");
     }
 
-    // ============================================================================================
     // V1 — tuple shorter than the spec.
-    // ============================================================================================
 
     /// V1: a tuple shorter than the spec renders the missing fields as `null` (Java's past-end
     /// `PartitionData.get` leniency) instead of indexing out of bounds.
@@ -2473,9 +2449,7 @@ mod partition_path_totalisation_tests {
         );
     }
 
-    // ============================================================================================
     // V2 — source column absent from the schema (the spec-evolved commit-path shape).
-    // ============================================================================================
 
     /// Rendering a spec against a schema that dropped one of its source columns renders THAT field
     /// as `null` and still renders the others. Java's `partitionType()` substitutes `UnknownType`.
@@ -2504,9 +2478,7 @@ mod partition_path_totalisation_tests {
         assert_eq!(err.kind(), crate::ErrorKind::Unexpected);
     }
 
-    // ============================================================================================
     // V3 — non-primitive partition-field type (a legal `void` over a non-primitive source).
-    // ============================================================================================
 
     /// `void` over a STRUCT source is a legal partition field, so the partition type can be
     /// non-primitive. A primitive value in that slot renders `null` instead of aborting.
@@ -2542,9 +2514,7 @@ mod partition_path_totalisation_tests {
         assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
     }
 
-    // ============================================================================================
     // V4 — value literal kind incompatible with the partition-field type.
-    // ============================================================================================
 
     /// An `Int` literal in a `Long`-typed partition slot renders `null`. `PrimitiveType::compatible`
     /// decides, the same predicate the commit-path `validate_partition_value` uses.
@@ -2585,10 +2555,8 @@ mod partition_path_totalisation_tests {
         );
     }
 
-    // ============================================================================================
     // The void trap: an all-`void` spec is `is_unpartitioned() == true`, so `(void_spec,
     // Struct::empty())` is a LEGITIMATE pair that a naive arity rule would reject.
-    // ============================================================================================
 
     /// TRAP: an all-`void` spec reports `is_unpartitioned() == true`, and callers legitimately hand
     /// it an EMPTY tuple. A missing value for a `void` field carries no information, so neither path
@@ -2662,9 +2630,7 @@ mod partition_path_totalisation_tests {
         );
     }
 
-    // ============================================================================================
     // The two paths agree on well-formed input.
-    // ============================================================================================
 
     /// On a self-consistent triple the fallible path returns EXACTLY the string the total path
     /// renders — the total path's leniency is confined to the anomaly branches.
@@ -2681,9 +2647,7 @@ mod partition_path_totalisation_tests {
         assert_eq!(total, "x=5/y=7");
     }
 
-    // ============================================================================================
     // Drift alarm: every pair `PrimitiveType::compatible` accepts must RENDER.
-    // ============================================================================================
 
     /// The anomaly guard admits exactly the pairs `PrimitiveType::compatible` accepts, and every
     /// admitted pair must survive `Datum`'s `Display`, whose `(_, _)` arm is `unreachable!()`. This
@@ -2804,9 +2768,7 @@ mod partition_path_escaping_tests {
         total
     }
 
-    // ============================================================================================
     // The escaper itself — a full printable-ASCII sweep against Java's `URLEncoder`.
-    // ============================================================================================
 
     /// The printable-ASCII characters `URLEncoder.encode(s, "UTF-8")` leaves untouched, verbatim
     /// from the jar sweep over `0x20..=0x7E` (note: a space is NOT here — it maps to `+`).
@@ -2846,9 +2808,7 @@ mod partition_path_escaping_tests {
         );
     }
 
-    // ============================================================================================
     // The VALUE side — jar-oracle table.
-    // ============================================================================================
 
     /// `identity(s: string)` named `s`: (partition value, Java `partitionToPath`).
     const JAVA_IDENTITY_STRING_PATHS: &[(&str, &str)] = &[
@@ -2903,9 +2863,7 @@ mod partition_path_escaping_tests {
         );
     }
 
-    // ============================================================================================
     // The NAME side — Java escapes it too.
-    // ============================================================================================
 
     /// `identity(s)` under a tricky partition-field NAME, value `"v"`: (field name, Java path).
     const JAVA_FIELD_NAME_PATHS: &[(&str, &str)] = &[
@@ -3040,9 +2998,7 @@ mod partition_path_escaping_tests {
         );
     }
 
-    // ============================================================================================
     // Structure vs. content.
-    // ============================================================================================
 
     /// The `/` between pairs and the `=` inside a pair are STRUCTURE — they stay raw — while a `/`
     /// or `=` inside a name or a value is CONTENT and is escaped.
@@ -3103,9 +3059,7 @@ mod partition_path_escaping_tests {
         assert_ne!(render("s", Some("a b")), render("s", Some("a+b")));
     }
 
-    // ============================================================================================
     // The no-churn invariant — the overwhelmingly common case must be BYTE-IDENTICAL to pre-R161.
-    // ============================================================================================
 
     /// Every partition value inside the URLEncoder safe set renders EXACTLY as it did before R161:
     /// no `%XX`, no `+`. This keeps ordinary table layouts unchanged, and it fails loudly under an

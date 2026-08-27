@@ -15,20 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `ComputePartitionStats`: the Rust port of Java 1.10.0 `PartitionStatsHandler`.
-//!
-//! It aggregates every manifest entry of a snapshot into the Java-exact partition-stats schema, then
-//! writes and registers the stats file. `ComputeTableStats` stays out of scope, because the
-//! workspace carries no sketch dependency.
-//!
-//! Partition stats feed planning downstream. A wrong aggregation misleads every consumer, and a
-//! wrong unified-partition-tuple mapping corrupts the file's keying. So the traversal mirrors Java
-//! exactly, from the 1.10.0 jar rather than the later MAIN source.
-//!
-//! # Schema field ids
-//!
-//! These become the on-disk parquet field ids, so they must match Java. Field 1 is
-//! `required(1, "partition", <unified partition type>)`. Then:
+//! Java 1.10.0 `PartitionStatsHandler`. Field ids are on-disk parquet ids and must match Java.
+//! Field 1 is `required(1, "partition", <unified partition type>)`.
 //!
 //! | id | name | type | v2 | v3 |
 //! |----|------|------|----|----|
@@ -45,12 +33,7 @@
 //! | 12 | `last_updated_snapshot_id` | long | optional | optional |
 //! | 13 | `dv_count` | int | (absent) | required (default 0) |
 //!
-//! Java `schema(StructType)` returns v2. `schema(StructType, formatVersion)` returns v2 for a
-//! version of 2 or less, and v3 otherwise.
-//!
-//! A full compute reads every data and delete manifest the snapshot reaches, and iterates ALL
-//! entries. A live entry rolls up the counters. A DELETED tombstone only bumps the last-updated
-//! info, and still creates the row, so a fully-deleted partition keeps a zero-count row.
+//! A DELETED tombstone still creates the row, so a fully-deleted partition keeps a zero-count row.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -308,16 +291,8 @@ impl PartitionStats {
         }
     }
 
-    /// Merges `input` into `self`. It ports Java `PartitionStats.appendStats`.
-    ///
-    /// Every primitive counter adds, `dv_count` included: the 1.10.0 jar adds it unconditionally.
-    /// `total_record_count` sets if null and adds otherwise. A set `input.last_updated_at` then
-    /// re-evaluates the last-updated pair.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DataInvalid` if the spec ids differ. The map key makes them equal by construction, so
-    /// this is defense in depth.
+    /// Merges `input` into `self`. It ports Java `PartitionStats.appendStats`. Every primitive
+    /// counter adds, `dv_count` included: the 1.10.0 jar adds it unconditionally.
     fn append_stats(&mut self, input: &PartitionStats) -> Result<()> {
         if self.spec_id != input.spec_id {
             return Err(Error::new(
@@ -353,14 +328,8 @@ impl PartitionStats {
     }
 }
 
-/// Builds the partition-stats [`Schema`]. It ports Java `PartitionStatsHandler.schema`.
-///
-/// A `format_version` of 2 or less gives the v2 schema of 12 fields. A higher one gives the v3
-/// schema, which makes the delete fields required and adds `dv_count`.
-///
-/// # Errors
-///
-/// Returns `DataInvalid` if `unified_partition_type` is empty, because the table is unpartitioned.
+/// Builds the partition-stats [`Schema`]. It ports Java `PartitionStatsHandler.schema`. A
+/// `format_version` of 2 or less gives the v2 schema of 12 fields.
 pub fn partition_stats_schema(
     unified_partition_type: &StructType,
     format_version: FormatVersion,
@@ -486,16 +455,6 @@ pub fn unified_partition_type(metadata: &TableMetadata) -> Result<StructType> {
 /// Computes per-partition statistics for a snapshot. It ports the full-compute branch of Java
 /// `computeAndWriteStatsFile`. It folds a per-manifest map for every manifest in
 /// `snapshot.allManifests` into one map, sorted by partition tuple.
-///
-/// # Errors
-///
-/// Returns `DataInvalid` if no spec has a non-void partition field. An unpartitioned table is an
-/// error, never an empty result. Propagates manifest read errors and a merge mismatch.
-///
-/// # Notes
-///
-/// A snapshot with no manifests gives an empty `Vec`. A partition that only delete files reach
-/// still gets a row. `total_record_count` stays unset.
 pub async fn compute_partition_stats(
     table: &Table,
     snapshot: &Snapshot,
@@ -590,12 +549,8 @@ fn latest_stats_file(
 }
 
 /// Aggregates the incremental diff over the lineage range `(from_snapshot, to_snapshot]`. It ports
-/// Java `computeStatsDiff`. For each snapshot in the range it takes only the manifests that snapshot
-/// added, which is `added_snapshot_id == snapshot_id`.
-///
-/// # Errors
-///
-/// Propagates manifest read errors.
+/// Java `computeStatsDiff`. For each snapshot in the range it takes only the manifests that
+/// snapshot added, which is `added_snapshot_id == snapshot_id`.
 async fn compute_stats_diff(
     table: &Table,
     unified_type: &StructType,
@@ -955,17 +910,9 @@ pub async fn compute_and_write_stats_file(
 
 /// Registers a [`PartitionStatisticsFile`] in the table metadata, and returns the refreshed
 /// [`Table`]. It ports Java `updatePartitionStatistics().setPartitionStatistics(file).commit()`.
-///
 /// The commit runs through the
 /// [`UpdatePartitionStatisticsAction`](crate::transaction::Transaction::update_partition_statistics)
-/// seam, which emits a `SetPartitionStatistics` update and one `AssertTableUUID` requirement. That
-/// update replaces any prior entry for the same snapshot id. The [`Transaction`] supplies the
-/// commit-retry loop. [`ComputePartitionStats`](crate::maintenance::ComputePartitionStats) uses the
-/// same seam, so no commit logic is duplicated.
-///
-/// # Errors
-///
-/// Propagates the catalog commit error and any metadata-build error.
+/// seam, which emits a `SetPartitionStatistics` update and one `AssertTableUUID` requirement.
 pub async fn register_partition_stats_file(
     catalog: &dyn Catalog,
     table: &Table,
@@ -982,11 +929,6 @@ pub async fn register_partition_stats_file(
 /// Reads a partition-stats file back into [`PartitionStats`] rows (Java `readPartitionStatsFile`).
 /// It decodes each row's columns positionally against `stats_schema`. [`arrow_struct_to_literal`]
 /// decodes the partition struct by field id, so a v2 and a v3 file each decode against their own.
-///
-/// # Errors
-///
-/// Returns `DataInvalid` for an unexpected Arrow type or a row shape the schema does not match,
-/// which means a corrupt or foreign file. Propagates IO and decode errors.
 pub async fn read_partition_stats_file(
     table: &Table,
     stats_schema: &Schema,
@@ -1424,12 +1366,11 @@ fn build_partition_field_column(
     }
 
     // Boolean, Int, Long, String, Time, Uuid, Fixed and Binary build with the plain Arrow
-    // constructors, into the types `schema_to_arrow_schema` emits for them: a Time64 of micros since
-    // midnight, a FixedSizeBinary(16) of the uuid's big-endian bytes, and a FixedSizeBinary(len) or
-    // LargeBinary of the raw bytes.
-    //
-    // A logical type carries a timezone, or a precision and scale, so it builds through
-    // `create_primitive_array_single_element` driven by the field's exact `arrow_data_type`.
+    // constructors, into the types `schema_to_arrow_schema` emits for them: a Time64 of micros
+    // since midnight, a FixedSizeBinary(16) of the uuid's big-endian bytes, and a
+    // FixedSizeBinary(len) or LargeBinary of the raw bytes. A logical type carries a timezone, or a
+    // precision and scale, so it builds through `create_primitive_array_single_element` driven by
+    // the field's exact `arrow_data_type`.
     let array: ArrayRef = match primitive_type {
         PrimitiveType::Boolean => {
             let values = collect_primitive!(PrimitiveLiteral::Boolean);
