@@ -17,11 +17,9 @@
 
 //! Tests for [`DeleteOrphanFiles`](super::DeleteOrphanFiles).
 //!
-//! The end-to-end tests run against a [`MemoryCatalog`](crate::memory::MemoryCatalog) wired with a
-//! LOCAL-FILESYSTEM [`FileIO`] (so real files land on disk under a `TempDir` and
-//! [`FileIO::list`](crate::io::FileIO::list) walks a real directory tree). The unit tests pin the
-//! URI normalization / orphan-join / hidden-path logic directly (cheaper, and the exact place the
-//! corruption-class risks live).
+//! The end-to-end tests use a [`MemoryCatalog`](crate::memory::MemoryCatalog) over a local
+//! filesystem [`FileIO`], so real files land under a `TempDir`. The unit tests pin the URI
+//! normalization, the orphan join, and the hidden-path filter directly.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,9 +28,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use tempfile::TempDir;
 
-// =============================================================================================
 // Unit tests — URI normalization, the orphan join, the hidden-path filter (the risk core)
-// =============================================================================================
 use super::delete_orphan_files::test_hooks::{
     FileUriProbe, classify_one, default_equal_schemes_probe, flatten_map_probe,
     is_hidden_under_probe, split_uri_probe, version_hint_probe,
@@ -48,10 +44,9 @@ use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::{Catalog, CatalogBuilder, NamespaceIdent, Result, TableCreation, TableIdent};
 
-/// Risk: the URI split MUST distinguish a scheme-less local path from a `file://` URI — a split
-/// that invents a scheme on a bare path (or drops the scheme on a `file://` path) either splits
-/// matching files (never deletes) or conflates them (deletes live data). Pins the exact
-/// (scheme, authority, path) tuple for each shape Iceberg writers produce.
+/// The split must tell a scheme-less local path from a `file://` URI. Inventing or dropping a
+/// scheme either splits matching files, or conflates them and deletes live data. Pins the
+/// `(scheme, authority, path)` tuple for every shape Iceberg writers produce.
 #[test]
 fn test_split_uri_distinguishes_local_path_from_file_scheme_and_object_store() {
     // Scheme-less absolute local path: no scheme, no authority, path is the whole string.
@@ -97,9 +92,9 @@ fn test_split_uri_distinguishes_local_path_from_file_scheme_and_object_store() {
     );
 }
 
-/// Risk: a scheme-less VALID path (metadata stores bare paths) must MATCH a `file://`-listed
-/// actual path — Java `uriComponentMatch` makes a null/empty valid component match any actual.
-/// Getting this backwards makes every local-fs table report all its files as scheme-conflicts.
+/// A scheme-less valid path must match a `file://`-listed actual path. Java `uriComponentMatch`
+/// makes an empty valid component match any actual one. Backwards, every local table reports
+/// every file as a scheme conflict.
 #[test]
 fn test_schemeless_valid_path_matches_any_actual_scheme() {
     let empty = HashMap::new();
@@ -123,9 +118,8 @@ fn test_schemeless_valid_path_matches_any_actual_scheme() {
     );
 }
 
-/// Risk: equal_schemes/equal_authorities must canonicalize BOTH sides so an `s3a://` listed file
-/// and an `s3://` valid file are recognized as the same. The default `{s3n,s3a → s3}` plus the
-/// merge-with-user semantics are pinned here.
+/// `equal_schemes` and `equal_authorities` must canonicalize both sides, so an `s3a://` listed
+/// file matches an `s3://` valid file. Pins the `{s3n,s3a → s3}` default and the user merge.
 #[test]
 fn test_equal_schemes_default_and_user_merge_canonicalize_both_sides() {
     // Defaults map s3a and s3n to s3.
@@ -152,10 +146,9 @@ fn test_equal_schemes_default_and_user_merge_canonicalize_both_sides() {
     assert_eq!(flattened.get("name2"), Some(&"service".to_string()));
 }
 
-/// Risk (PrefixMismatchMode, the three branches): a path-matched file with a scheme/authority
-/// conflict must be classified per the mode — DELETE ⇒ orphan, IGNORE ⇒ not orphan, ERROR ⇒ not
-/// orphan-now but registers a conflict (the action later fails). A wrong branch deletes live data
-/// (DELETE leaking) or never cleans (DELETE not firing).
+/// A path-matched file with a scheme or authority conflict follows the mode. DELETE makes it an
+/// orphan. IGNORE spares it. ERROR spares it and records a conflict, which fails the action later.
+/// A wrong branch deletes live data, or never cleans.
 #[test]
 fn test_prefix_mismatch_mode_classifies_scheme_conflict_three_ways() {
     let empty = HashMap::new();
@@ -198,9 +191,9 @@ fn test_prefix_mismatch_mode_classifies_scheme_conflict_three_ways() {
     assert_eq!(authorities.len(), 1);
 }
 
-/// Risk: a path-matched file that is FULLY compatible with ANY valid candidate is NEVER orphan and
-/// NEVER a conflict, even if another valid candidate on the same path conflicts. The "any match ⇒
-/// safe" reduction is the under-deletion bias; losing it would delete a reachable file.
+/// A path-matched file compatible with ANY valid candidate is never an orphan and never a
+/// conflict, even when another candidate on the same path conflicts. This "any match spares it"
+/// rule is the under-deletion bias. Losing it deletes a reachable file.
 #[test]
 fn test_any_compatible_valid_candidate_makes_file_not_orphan() {
     let empty = HashMap::new();
@@ -220,10 +213,9 @@ fn test_any_compatible_valid_candidate_makes_file_not_orphan() {
     );
 }
 
-/// Risk (the hidden-path filter): files under `.`/`_` directories are SKIPPED (Iceberg's own
-/// hidden/temp dirs), EXCEPT partition directories `_<field>=` for a partition field whose name
-/// starts with `_`/`.`. A filter that hides a real partition dir would orphan (and delete) live
-/// partition data; one that fails to hide `.tmp/` would delete an in-progress write.
+/// Files under `.` and `_` directories are skipped, except a partition directory `_<field>=` for
+/// a declared partition field. Hiding a real partition directory deletes live data. Failing to
+/// hide `.tmp/` deletes an in-progress write.
 #[test]
 fn test_hidden_path_filter_skips_hidden_dirs_except_named_partition_dirs() {
     let base = "/wh/t";
@@ -253,8 +245,7 @@ fn test_hidden_path_filter_skips_hidden_dirs_except_named_partition_dirs() {
         "/wh/t/data/_part=5/x.parquet",
         &partition_prefixes
     ));
-    // A `_other=` dir that is NOT a declared hidden-named partition IS hidden (only the exact
-    // declared field names are exempted).
+    // Only the declared field names are exempt, so a `_other=` dir stays hidden.
     assert!(is_hidden_under_probe(
         base,
         "/wh/t/data/_other=5/x.parquet",
@@ -274,8 +265,8 @@ fn test_hidden_path_filter_skips_hidden_dirs_except_named_partition_dirs() {
     ));
 }
 
-/// Risk: the version-hint location is part of the valid set so a stray `version-hint.text` is
-/// never deleted. Pins the exact path shape (Java `ReachableFileUtil.versionHintLocation`).
+/// The version-hint location is in the valid set, so `version-hint.text` is never deleted.
+/// Pins the path shape (Java `ReachableFileUtil.versionHintLocation`).
 #[test]
 fn test_version_hint_location_shape() {
     assert_eq!(
@@ -288,13 +279,10 @@ fn test_version_hint_location_shape() {
     );
 }
 
-// =============================================================================================
 // End-to-end fixtures — a local-fs-backed memory catalog, real files on disk
-// =============================================================================================
 
-/// A memory catalog whose FileIO is the LOCAL filesystem, rooted at a fresh `TempDir`. Returns the
-/// catalog, a local-fs [`FileIO`] for planting/inspecting files, and the temp-dir guard (kept
-/// alive for the test's duration).
+/// A memory catalog over the local filesystem, rooted at a fresh `TempDir`. Returns the catalog,
+/// a [`FileIO`] for planting files, and the temp-dir guard.
 async fn local_fs_catalog() -> (impl Catalog, FileIO, TempDir) {
     let temp_dir = TempDir::new().expect("temp dir");
     let warehouse = temp_dir
@@ -451,8 +439,7 @@ fn recording_delete_fn() -> (
     (recorded, delete_fn)
 }
 
-/// The set of every reachable file under the table location, by category — used to assert that a
-/// sweep leaves EVERY reachable file intact (a category omission fails loudly).
+/// Every reachable file under the table location, by category. A sweep must leave all of them.
 struct ReachableSet {
     data_files: Vec<String>,
     delete_files: Vec<String>,
@@ -462,8 +449,8 @@ struct ReachableSet {
     statistics: Vec<String>,
 }
 
-/// Enumerate the table's reachable files by category, directly (the assertion oracle — independent
-/// of the action's own `collect_valid_files`).
+/// Enumerates the reachable files by category. This oracle is independent of the action's own
+/// `collect_valid_files`.
 async fn enumerate_reachable(table: &Table) -> ReachableSet {
     let metadata = table.metadata();
     let file_io = table.file_io();
@@ -521,17 +508,12 @@ fn dedup_sort(vec: &mut Vec<String>) {
     vec.dedup();
 }
 
-// =============================================================================================
 // End-to-end tests — the crown jewel and the algorithm pins
-// =============================================================================================
 
-/// THE crown-jewel GC-safety pin: a table with multiple snapshots, data files, a delete file,
-/// plus PLANTED orphans (stray parquet in the data dir, stray avro in the metadata dir, an orphan
-/// in a nested partition-like dir). With `older_than = now+ε` (everything eligible by age):
-/// EXACTLY the planted orphans are deleted; EVERY reachable file (enumerated BY CATEGORY —
-/// data/delete/manifest/manifest-list/metadata-json) still exists; a full table scan still
-/// succeeds; non-current-snapshot files SURVIVE (history stays readable). A reachability omission
-/// in ANY category deletes live data and fails this test loudly.
+/// The crown-jewel GC-safety pin. A multi-snapshot table with planted orphans, swept with every
+/// file age-eligible. Exactly the planted orphans go. Every reachable file survives, enumerated by
+/// category, including files of non-current snapshots. A full scan still succeeds. A reachability
+/// omission in any category deletes live data and fails here.
 #[tokio::test]
 async fn test_crown_jewel_only_planted_orphans_deleted_all_reachable_survive() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -548,8 +530,8 @@ async fn test_crown_jewel_only_planted_orphans_deleted_all_reachable_survive() {
     .await;
     let s1_id = table.metadata().current_snapshot_id().expect("s1");
 
-    // S2: a position-delete file against data_a (V2 parquet delete). Both the delete file and a
-    // third data file land in a NEW snapshot — the prior snapshot's files must still be valid.
+    // S2: a delete file against data_a plus a third data file, in a new snapshot. The prior
+    // snapshot's files must stay valid.
     let delete_path = format!("{location}/data/del-a.parquet");
     let table = add_deletes(&catalog, &table, vec![
         real_position_delete_file(&file_io, &delete_path, &data_a, b"del").await,
@@ -571,8 +553,7 @@ async fn test_crown_jewel_only_planted_orphans_deleted_all_reachable_survive() {
         !reachable.metadata_json.is_empty(),
         "fixture: metadata json"
     );
-    // A non-current snapshot (s1) must have its manifest list among the reachable lists — proving
-    // history is in the valid set, not just the current snapshot.
+    // S1's manifest list must be reachable, so history is in the valid set.
     let s1_list = table
         .metadata()
         .snapshot_by_id(s1_id)
@@ -623,8 +604,7 @@ async fn test_crown_jewel_only_planted_orphans_deleted_all_reachable_survive() {
         );
     }
 
-    // EVERY reachable file, by category, still exists (statistics is empty for this fixture but
-    // enumerated so a future stats-bearing fixture inherits the per-category survival check).
+    // Every reachable file survives, by category. Statistics is empty here but stays enumerated.
     for (category, files) in [
         ("data", &reachable.data_files),
         ("delete", &reachable.delete_files),
@@ -660,9 +640,8 @@ async fn test_crown_jewel_only_planted_orphans_deleted_all_reachable_survive() {
     );
 }
 
-/// Risk (olderThan grace — in-flight-commit protection): a FRESH orphan (created now) must NOT be
-/// deleted under the default `older_than` (now−3d), but MUST be deleted with `older_than = now+ε`.
-/// A grace that does not apply would delete a file a concurrent commit is mid-write on.
+/// The `older_than` grace protects an in-flight commit. A fresh orphan survives the default
+/// cutoff of now minus three days, and goes once the cutoff passes it.
 #[tokio::test]
 async fn test_older_than_grace_protects_fresh_orphan_until_cutoff_passes() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -708,11 +687,9 @@ async fn test_older_than_grace_protects_fresh_orphan_until_cutoff_passes() {
     );
 }
 
-/// Risk (list-error propagation — a listing failure must NOT be read as "zero orphans, success"):
-/// if `FileIO::list` errors (an unreadable subtree under the location), `execute()` must return
-/// `Err` and delete NOTHING. Treating a listing IO error as an empty success would make the sweep
-/// silently no-op on a partially-unreadable store — masking real orphans, or worse, if a later
-/// re-list partially succeeded, classifying live files as orphan. A genuine IO error must surface.
+/// A listing failure must not read as "zero orphans, success". An unreadable subtree makes
+/// `execute()` return `Err` and delete nothing. A swallowed IO error hides real orphans, and a
+/// later partial re-list can classify a live file as an orphan.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_list_error_propagates_and_deletes_nothing() {
@@ -728,8 +705,8 @@ async fn test_list_error_propagates_and_deletes_nothing() {
     let orphan = format!("{location}/data/orphan.parquet");
     write_real_file(&file_io, &orphan, b"o").await;
 
-    // Plant an unreadable subdirectory under the listing root so the recursive walk fails mid-list.
-    // The local-fs warehouse is a BARE path, so `location` is already a filesystem path.
+    // An unreadable subdirectory makes the recursive walk fail mid-list. The local-fs warehouse
+    // is a bare path, so `location` is already a filesystem path.
     let unreadable_dir = format!("{location}/data/unreadable");
     write_real_file(&file_io, &format!("{unreadable_dir}/x.parquet"), b"x").await;
     let unreadable_path = std::path::PathBuf::from(&unreadable_dir);
@@ -759,11 +736,9 @@ async fn test_list_error_propagates_and_deletes_nothing() {
     );
 }
 
-/// Risk (statistics + PARTITION-statistics inclusion in the valid universe): a Puffin statistics
-/// file and a partition-statistics file referenced by table metadata must NOT be swept as orphans
-/// — they are reachable metadata. The builder CODES partition-statistics inclusion
-/// (`partition_statistics_iter`); this test PINS it so dropping that category from the universe
-/// (the "M-stats" mutation) deletes a referenced stats file and fails loudly.
+/// A statistics file and a partition-statistics file named by table metadata are reachable, so
+/// the sweep must spare them. Dropping either category from the valid universe deletes a
+/// referenced stats file and fails here.
 #[tokio::test]
 async fn test_statistics_and_partition_statistics_files_are_not_orphan() {
     use crate::spec::{PartitionStatisticsFile, StatisticsFile};
@@ -843,11 +818,9 @@ async fn test_statistics_and_partition_statistics_files_are_not_orphan() {
     );
 }
 
-/// Risk (the `olderThan` cut is a STRICT `<`, Java `createdAtMillis() < olderThanTimestamp`): a
-/// file whose modification time EXACTLY equals the cutoff must be SPARED — this boundary IS the
-/// in-flight-commit protection (a commit writing a file at time T must survive a sweep with
-/// `older_than == T`). Relaxing to `<=` would delete a file an in-flight commit is mid-write on.
-/// Pins the exact boundary by reading the planted orphan's real mtime and cutting AT it.
+/// The `older_than` cut is a strict `<` (Java `createdAtMillis() < olderThanTimestamp`). A file
+/// whose mtime equals the cutoff is spared. That boundary protects an in-flight commit that
+/// writes at exactly time T. A `<=` form deletes that file. The test cuts at the real mtime.
 #[tokio::test]
 async fn test_older_than_cut_is_strict_less_than_at_the_exact_boundary() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -898,9 +871,8 @@ async fn test_older_than_cut_is_strict_less_than_at_the_exact_boundary() {
     );
 }
 
-/// Risk (the default `older_than = now − 3 days` must make a sweep of a FRESH table a no-op): a
-/// table whose every file was just written must report ZERO orphans under the default cutoff — a
-/// default that swept fresh files would delete a just-committed table's data.
+/// The default cutoff of now minus three days makes a sweep of a fresh table a no-op. A default
+/// that swept fresh files deletes a just-committed table's data.
 #[tokio::test]
 async fn test_default_older_than_makes_fresh_table_sweep_a_no_op() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -931,10 +903,9 @@ async fn test_default_older_than_makes_fresh_table_sweep_a_no_op() {
     );
 }
 
-/// Risk (hidden-path filter): orphans under `.hidden/` and `_tmp/` must NOT be deleted (Iceberg's
-/// own hidden/temp dirs), while an orphan under a real partition dir `_<field>=x/` IS a candidate
-/// and is deleted. A filter that fails to exempt the partition dir would delete LIVE partition
-/// data; one that fails to hide `_tmp/` would delete an in-progress write.
+/// Orphans under `.hidden/` and `_tmp/` survive. An orphan under a real partition directory
+/// `_<field>=x/` is a candidate and goes. A filter that does not exempt the partition directory
+/// deletes live data. One that does not hide `_tmp/` deletes an in-progress write.
 #[tokio::test]
 async fn test_hidden_path_filter_spares_hidden_dirs_but_sweeps_named_partition_dirs() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -964,8 +935,7 @@ async fn test_hidden_path_filter_spares_hidden_dirs_but_sweeps_named_partition_d
         .expect("build partitioned data file");
     let table = append(&catalog, &table, vec![data_file]).await;
 
-    // Plant: orphans under `.hidden/` and `_tmp/` (must survive), and an orphan under the REAL
-    // partition dir `_part=7/` (must be deleted — it is not referenced).
+    // Orphans under `.hidden/` and `_tmp/` must survive. The one under `_part=7/` must go.
     let orphan_hidden = format!("{location}/data/.hidden/x.parquet");
     let orphan_tmp = format!("{location}/_tmp/x.parquet");
     let orphan_partition = format!("{location}/data/_part=7/orphan.parquet");
@@ -1002,9 +972,8 @@ async fn test_hidden_path_filter_spares_hidden_dirs_but_sweeps_named_partition_d
     );
 }
 
-/// Risk (location override): `.location(subdir)` sweeps only that subtree — an orphan OUTSIDE the
-/// subtree is untouched even though it is unreferenced. A location override that leaks to the full
-/// table root would delete files the caller did not intend to scan.
+/// `.location(subdir)` sweeps only that subtree. An unreferenced orphan outside it stays. An
+/// override that leaks to the table root deletes files the caller never asked to scan.
 #[tokio::test]
 async fn test_location_override_sweeps_only_the_subtree() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -1043,10 +1012,8 @@ async fn test_location_override_sweeps_only_the_subtree() {
     );
 }
 
-/// Risk (result contract + delete_with override): a custom delete function must receive EXACTLY
-/// the orphan set (nothing reachable), and the result's `orphan_file_locations` must match what
-/// was handed to the delete function. A mismatch means either a reachable file was passed to
-/// deletion (corruption) or the result under-reports.
+/// A custom delete function receives exactly the orphan set, and `orphan_file_locations` matches
+/// it. A mismatch means a reachable file reached deletion, or the result under-reports.
 #[tokio::test]
 async fn test_delete_with_receives_exactly_the_orphan_set() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -1096,10 +1063,8 @@ async fn test_delete_with_receives_exactly_the_orphan_set() {
     );
 }
 
-/// Risk (result contract on delete failure): a per-file delete failure must be COLLECTED (not
-/// abort the sweep), the other orphans must still be deleted, and `orphan_file_locations` must
-/// still report the FULL orphan set regardless of individual delete success (Java returns the
-/// orphan list before deletion).
+/// A per-file delete failure is collected, not fatal. The other orphans still go, and
+/// `orphan_file_locations` still reports the full set. Java returns the list before deletion.
 #[tokio::test]
 async fn test_delete_failure_is_collected_and_full_orphan_list_returned() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -1159,9 +1124,8 @@ async fn test_delete_failure_is_collected_and_full_orphan_list_returned() {
     );
 }
 
-/// Risk (GC gate): `gc.enabled=false` must REFUSE the action with Java's verbatim message, before
-/// any listing or deletion. A gate that does not fire would let orphan-deletion run on a table
-/// where another table may share files.
+/// `gc.enabled=false` refuses the action with Java's message, before any listing or deletion.
+/// Without the gate, the sweep can delete files another table shares.
 #[tokio::test]
 async fn test_gc_disabled_refuses_with_java_message() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -1205,19 +1169,9 @@ async fn test_gc_disabled_refuses_with_java_message() {
     );
 }
 
-/// Risk (history reachability across ALL snapshots): a file removed by a copy-on-write delete is
-/// no longer LIVE in the current snapshot, but it remains referenced by the PRIOR snapshot's
-/// manifest (and by a DELETED tombstone in the rewritten one). Because the valid-file universe
-/// spans every snapshot, the file must NOT be orphan — deleting it corrupts the readable history.
-///
-/// NOTE on the DELETED-tombstone clause specifically: Java's `contentFileDS` reads *every*
-/// manifest entry (`ManifestFiles.read`, not `liveEntries`), so even a file referenced ONLY by a
-/// tombstone counts as valid. In THIS test the tombstoned file is still also ALIVE in S1's manifest
-/// (the universe spans all snapshots), so this test pins the history-reachability guarantee. The
-/// genuinely tombstone-ONLY case — where the only surviving reference is a `Deleted` tombstone
-/// after the adding snapshot is expired — IS constructible and is pinned separately by
-/// [`test_tombstone_only_referenced_file_is_not_orphan_after_expire`] (which kills the no-liveness-
-/// filter mutation directly).
+/// A file removed by a copy-on-write delete is not live in the current snapshot. The prior
+/// snapshot's manifest still names it, and the valid universe spans every snapshot, so it is not an
+/// orphan.
 #[tokio::test]
 async fn test_copy_on_write_deleted_file_survives_because_history_references_it() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -1242,8 +1196,7 @@ async fn test_copy_on_write_deleted_file_survives_because_history_references_it(
         .expect("apply delete files");
     let table = tx.commit(&catalog).await.expect("commit delete files");
 
-    // data_a is no longer LIVE in the current snapshot, but it IS referenced by the prior
-    // snapshot's manifest and by a DELETED tombstone — so it must NOT be orphan.
+    // data_a is not live now, but the prior snapshot's manifest names it, so it is not an orphan.
     let result = DeleteOrphanFiles::new(table.clone())
         .older_than(now_plus_one_hour())
         .execute()
@@ -1264,16 +1217,13 @@ async fn test_copy_on_write_deleted_file_survives_because_history_references_it(
     );
 }
 
-/// Risk (PrefixMismatchMode::Error end-to-end): an ERROR-mode prefix conflict between the valid
-/// set and a listed file must FAIL the whole action with Java's pinned message — before any
-/// deletion. (Synthesized via a custom `.location()` whose listed scheme differs is impractical
-/// on local-fs, so this exercises the join path at the action level with equal_schemes mapping
-/// that creates a real authority conflict — see the unit tests for the exhaustive branch matrix.)
+/// An ERROR-mode prefix conflict fails the whole action with Java's message, before any deletion.
+/// A differing listed scheme is impractical on local-fs, so this drives an authority conflict.
+/// The unit tests carry the exhaustive branch matrix.
 #[tokio::test]
 async fn test_error_mode_prefix_conflict_message_pins() {
-    // The end-to-end conflict path is exercised at the unit level
-    // (`test_prefix_mismatch_mode_classifies_scheme_conflict_three_ways`); here we pin the exact
-    // ERROR message text by driving the conflict-error formatter through the public surface.
+    // The unit test covers the branches. This pins the ERROR message text through the public
+    // surface.
     let (catalog, file_io, _temp) = local_fs_catalog().await;
     let table = create_unpartitioned_table(&catalog).await;
     let location = table.metadata().location().to_string();
@@ -1281,8 +1231,7 @@ async fn test_error_mode_prefix_conflict_message_pins() {
         real_data_file(&file_io, &format!("{location}/data/a.parquet"), b"a").await,
     ])
     .await;
-    // A clean run (no scheme/authority conflict on local-fs) must NOT error in ERROR mode — the
-    // default mode must be safe for the common all-local-paths table.
+    // A clean run must not error in ERROR mode, so the default is safe for a local table.
     let result = DeleteOrphanFiles::new(table.clone())
         .prefix_mismatch_mode(PrefixMismatchMode::Error)
         .older_than(now_plus_one_hour())
@@ -1292,17 +1241,12 @@ async fn test_error_mode_prefix_conflict_message_pins() {
     assert!(result.orphan_file_locations.is_empty());
 }
 
-/// Risk (the LOAD-BEARING no-liveness-filter guarantee — Java reads every manifest entry, not
-/// `liveEntries`): a file whose ONLY remaining reference is a DELETED tombstone must NOT be orphan.
+/// A file whose only remaining reference is a DELETED tombstone must not be an orphan. Java reads
+/// every manifest entry, not `liveEntries`.
 ///
-/// This is the constructible form of the case the crown-jewel test could only document as
-/// "unconstructible": S1 adds `data_a`; S2 copy-on-write-deletes it (a DELETED tombstone in the
-/// rewritten manifest); then S1 is EXPIRED through the fork's own `ExpireSnapshots` (metadata-only
-/// — it deletes no files). Now `data_a` is on disk, S1's live entry is gone, and the SOLE manifest
-/// reference to `data_a` is S2's `Deleted` tombstone. Because the universe spans every entry of
-/// every retained snapshot WITHOUT a liveness filter, `data_a` must be spared. Adding an
-/// `is_alive()` filter to the universe (the surviving "M1" mutation) deletes `data_a` and corrupts
-/// the readable history — this test is what kills that mutation.
+/// S1 adds `data_a`. S2 copy-on-write-deletes it, leaving a tombstone. Expiring S1 removes the
+/// live entry but no file. The tombstone is then the sole reference, and the file must survive.
+/// Adding an `is_alive()` filter to the universe deletes it, and this test kills that mutation.
 #[tokio::test]
 async fn test_tombstone_only_referenced_file_is_not_orphan_after_expire() {
     let (catalog, file_io, _temp) = local_fs_catalog().await;
@@ -1328,8 +1272,7 @@ async fn test_tombstone_only_referenced_file_is_not_orphan_after_expire() {
     let table = tx.commit(&catalog).await.expect("commit delete files");
     assert_ne!(s1_id, table.metadata().current_snapshot_id().expect("s2"));
 
-    // Expire S1 through the fork's own ExpireSnapshots (metadata-only; it deletes NO files), so
-    // data_a survives on disk while its only surviving manifest reference is S2's tombstone.
+    // ExpireSnapshots is metadata-only, so data_a stays on disk with only S2's tombstone left.
     let tx = Transaction::new(&table);
     let tx = tx
         .expire_snapshots()
@@ -1395,11 +1338,9 @@ async fn test_tombstone_only_referenced_file_is_not_orphan_after_expire() {
     );
 }
 
-/// Risk (hidden filter is applied RELATIVE to the listed root, not to absolute segments): a table
-/// whose LOCATION itself sits under a `_`-prefixed parent directory must still have its files
-/// considered (Java `FileSystemWalker.isHiddenPath` only walks segments strictly UNDER baseDir, so
-/// a hidden segment IN the base never disqualifies). If the Rust filter checked absolute segments,
-/// every file under such a table would be masked (orphans never cleaned) — pin that it is NOT.
+/// The hidden filter applies relative to the listed root, not to absolute segments. Java
+/// `FileSystemWalker.isHiddenPath` walks only segments under baseDir. A table whose location sits
+/// under a `_`-prefixed parent must still be swept. An absolute check masks every file.
 #[tokio::test]
 async fn test_table_under_hidden_parent_dir_still_sweeps_orphans() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -1434,8 +1375,7 @@ async fn test_table_under_hidden_parent_dir_still_sweeps_orphans() {
         .await
         .expect("execute");
 
-    // The orphan under a table whose ROOT has a hidden segment is STILL swept (the base's `_internal`
-    // does not mask files under it); the live data file survives.
+    // The base's `_internal` does not mask files under it, so the orphan goes and the data stays.
     assert_eq!(
         result.orphan_file_locations,
         vec![orphan.clone()],
@@ -1445,19 +1385,8 @@ async fn test_table_under_hidden_parent_dir_still_sweeps_orphans() {
     assert!(exists(&file_io, &data_a).await, "live data file survives");
 }
 
-/// Risk (the INVERSE file:// composition — metadata carries `file://`, the local-fs listing
-/// returns BARE paths): no LIVE file may be deleted and the action must not error. The valid-file
-/// universe normalizes `file://…/x` to path `/…/x`, matching the bare listed path key, so the join
-/// is correct in principle.
-///
-/// CAVEAT pinned here (a SAFE under-deletion limitation, NOT corruption): when the table `location`
-/// itself carries a scheme (`file://`) that the local-fs backend strips on the listing side, the
-/// hidden-path filter's `relative_under(base=file://…, listed=/…)` cannot strip the base, so EVERY
-/// listed file is treated as hidden and the sweep is a silent no-op — it deletes nothing (orphans
-/// included). That is under-deletion-biased and never destroys live data; the OpenDAL backends
-/// (S3/Glue) re-prefix listed entries WITH the scheme so base and listing agree and the sweep works
-/// normally there. This test pins the safety guarantee (zero live deletions, no error) for the
-/// scheme-qualified-location case.
+/// Metadata carries `file://` while the local listing returns bare paths. No live file may go and
+/// the action must not error.
 #[tokio::test]
 async fn test_file_scheme_location_never_deletes_live_files() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -1484,8 +1413,7 @@ async fn test_file_scheme_location_never_deletes_live_files() {
     ])
     .await;
 
-    // The valid universe DOES normalize the file:// data file path to the bare path the listing
-    // would produce — pin the join-key equality (the matching logic is correct).
+    // The universe normalizes the file:// path to the bare listed form, so the join keys match.
     let listed = file_io.list(&location).await.expect("list");
     let empty = HashMap::new();
     let valid = FileUriProbe::parse(&data_a, &empty, &empty);
@@ -1526,11 +1454,9 @@ async fn test_file_scheme_location_never_deletes_live_files() {
     }
 }
 
-/// Risk (a trailing-slash warehouse must not corrupt the join): the Rust `split_uri` does NOT
-/// collapse doubled slashes the way Hadoop's `new Path(s).toUri()` does (a documented divergence).
-/// That is SAFE for a Rust-native table because BOTH the metadata-writer and the lister carry the
-/// identical `//` string, so they still join — pin that a trailing-slash warehouse leaves every
-/// reachable file intact (the doubled-slash divergence is internally consistent, not a deleter).
+/// Rust `split_uri` keeps doubled slashes, where Hadoop `new Path(s).toUri()` collapses them.
+/// The writer and the lister carry the same `//` string, so they still join. A trailing-slash
+/// warehouse must leave every reachable file intact.
 #[tokio::test]
 async fn test_trailing_slash_warehouse_leaves_reachable_files_intact() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -1565,7 +1491,7 @@ async fn test_trailing_slash_warehouse_leaves_reachable_files_intact() {
         .await
         .expect("execute");
 
-    // The orphan is still swept and EVERY reachable file survives (the `//` joins consistently).
+    // The `//` joins consistently, so the orphan goes and every reachable file survives.
     assert!(
         result.orphan_file_locations.contains(&orphan),
         "the orphan under a trailing-slash warehouse is still detected: {:?}",
@@ -1587,7 +1513,7 @@ async fn test_trailing_slash_warehouse_leaves_reachable_files_intact() {
     }
 }
 
-/// Current epoch millis + 1 hour — a cutoff comfortably in the future so every file is age-eligible.
+/// A cutoff one hour ahead, so every file is age-eligible.
 fn now_plus_one_hour() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()

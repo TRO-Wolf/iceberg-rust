@@ -15,46 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! MAINTENANCE `RemoveDanglingDeleteFiles` interop — the dangling-delete GC action proven against
-//! Java's `findDanglingDeletes` semantics WITHOUT Spark (the real Java action is
-//! `RemoveDanglingDeletesSparkAction`, a Spark-surface class NOT on the iceberg-core oracle classpath).
-//! The proof is therefore the three engine-agnostic, ANTI-CIRCULAR claims of the
-//! `dev/java-interop/run-interop-remove-dangling.sh` driver (see `RemoveDanglingOracle` for the Java
-//! half):
+//! MAINTENANCE `RemoveDanglingDeleteFiles` interop, proven against Java's `findDanglingDeletes`
+//! semantics WITHOUT Spark, whose `RemoveDanglingDeletesSparkAction` is off the oracle classpath.
+//! The proof is three ANTI-CIRCULAR claims. Detection: both sides hand-declare the dangling set
+//! from the published spec, and Java's oracle independently recomputes it over the pre-cleanup
+//! table. API contract: the removed-file counters and the survivor set match that declaration.
+//! Corruption safety: the live row set is IDENTICAL before and after, so nothing is lost or raised.
 //!
-//! 1. **Semantics-match (detection).** The hand-declared dangling set (REMOVE per scenario below) is
-//!    declared IDENTICALLY in Java and here, derived from the published `findDanglingDeletes` SPEC —
-//!    never from the other engine's output. Rust's `RemoveDanglingDeleteFiles` removes EXACTLY that set
-//!    and keeps the rest (D1, here); Java's oracle INDEPENDENTLY recomputes `findDanglingDeletes` over
-//!    the PRE-cleanup table's `ENTRIES`/`DATA_FILES`/`DELETE_FILES` (iceberg-core's engine-agnostic
-//!    manifest/metadata APIs) and confirms the SAME set (D2, the Java oracle).
-//! 2. **API contract.** The `removed-position-delete-files` / `removed-equality-delete-files` /
-//!    `removed-dvs` counters and the surviving-delete-file set match the declared partition of each
-//!    delete into KEEP/REMOVE.
-//! 3. **Corruption safety (read-identity — the load-bearing property).** The merge-on-read live row set
-//!    is IDENTICAL before and after cleanup: removing the danglers resurrects NOTHING and loses NO data.
-//!    Proven on BOTH sides — Rust scans pre + post here; Java's `IcebergGenerics` reads pre + the
-//!    Rust-cleaned table in the oracle.
+//! ## The dangling predicate, which both sides hand-declare from
 //!
-//! ## The dangling predicate (the SPEC both sides hand-declare from)
+//! Over the current snapshot, group LIVE DATA entries by `(spec_id, partition)` and take
+//! `min(data sequence number)`. A delete dangles when `min IS NULL`, or it is a POSITION delete with
+//! `seq < min` (strict), or an EQUALITY delete with `seq <= min` (non-strict, THE OFF-BY-ONE). A DV
+//! dangles when its `referenced_data_file` is not a live data-file path. The off-by-one is the
+//! corruption edge: a position delete at the exact min still applies and must be KEPT, and an
+//! equality delete at the exact min does not apply and must be REMOVED.
 //!
-//! Over the CURRENT snapshot: group LIVE DATA entries by `(spec_id, partition)`, take `min(data
-//! sequence number)`. A delete dangles when `min IS NULL` (no live data in its partition+spec) OR it is
-//! a POSITION delete with `seq < min` (STRICT) OR an EQUALITY delete with `seq <= min` (NON-strict —
-//! THE OFF-BY-ONE). A DV (PUFFIN position delete) dangles when its `referenced_data_file` is not a live
-//! data-file path. The off-by-one is the corruption edge: a position delete at the EXACT partition min
-//! still applies (`delete_seq >= data_seq`) and must be KEPT; an equality delete at the EXACT min does
-//! NOT apply (`delete_seq > data_seq` is strict) and must be REMOVED.
+//! ## The scenario contract, hand-coded identically in Java `RemoveDanglingOracle` and here
 //!
-//! ## The scenario contract (hand-coded IDENTICALLY in Java `RemoveDanglingOracle` and here)
+//! Schema `{1 id long required, 2 cat string required, 3 y long required}`, spec 0 `identity(cat)`.
+//! Each partition isolates one corruption edge. The fixture splits into two worlds because the spec
+//! mandates DVs for V3 position deletes and forbids parquet position deletes there, so the two
+//! cannot coexist in one table.
 //!
-//! Schema `{1 id long required, 2 cat string required, 3 y long required}`, spec 0 `identity(cat)`. Each
-//! partition isolates ONE corruption edge; the hand-declared KEEP/REMOVE outcome is per delete file. The
-//! fixture is split into TWO worlds because the on-disk spec mandates DVs for V3 position deletes (and
-//! forbids parquet position deletes there) while DVs are V3-only — so a parquet position delete and a DV
-//! cannot coexist in one table:
-//!
-//! **V2 world** (`<dir>/table`, parquet position + equality + no-data):
+//! V2 world (`<dir>/table`, parquet position + equality + no-data):
 //!
 //! | partition | data seq(s) | delete (seq)            | declared | reason                                        |
 //! |-----------|-------------|-------------------------|----------|-----------------------------------------------|
@@ -64,53 +48,41 @@
 //! | `er`      | 4           | EQUALITY (4, SAME seq)  | REMOVE   | `4 <= 4` — eq AT min (the OFF-BY-ONE) dangles |
 //! | `ne`      | (none live) | EQUALITY (5)            | REMOVE   | `min IS NULL` — no live data in partition+spec|
 //!
-//! **V3 world** (`<dir>/table_v3`, deletion vectors):
+//! V3 world (`<dir>/table_v3`, deletion vectors):
 //!
 //! | partition | data seq(s) | delete (seq)            | declared | reason                                        |
 //! |-----------|-------------|-------------------------|----------|-----------------------------------------------|
 //! | `dv`      | 1 → 3 (rw)  | DV on the rewritten file| REMOVE\* | referenced data file gone                     |
 //! | `dk`      | 1           | DV on the live file     | KEEP     | referenced data file live                     |
 //!
-//! \* THE V3 DV DIVERGENCE (1:1-faithful, the reason this action exists for DVs). Java AUTO-PRUNES a
-//! dangling DV at the commit that removes its referenced data file (1.10.0 `ManifestFilterManager`
-//! prunes DVs whose referenced file is gone). Rust's `RewriteFiles` carry-posture does NOT, leaving the
-//! dangling DV for THIS action. So the `dv` REMOVE is reachable on the RUST-built table (GEN/D2 — the
-//! headline that closes the prior pure-fn-only DV gap with a real e2e DV fixture), but Java's `table_v3`
-//! has the `dv` DV auto-pruned at commit, so over the JAVA-built table (D1) Rust's action correctly
-//! removes NOTHING — agreeing with Java's already-clean state. See [`Origin`].
+//! \* THE V3 DV DIVERGENCE. Java `ManifestFilterManager` AUTO-PRUNES a dangling DV at the commit that
+//! removes its referenced data file. Rust's `RewriteFiles` carry-posture does not, and leaves the
+//! dangling DV for this action. So the `dv` REMOVE is reachable on the Rust-built table, while over
+//! the Java-built table this action correctly removes NOTHING and agrees with Java's clean state.
+//! See [`Origin`].
 //!
-//! `pk` and `er` are the TWO off-by-one boundaries (one per content type), each built by committing the
-//! data file AND its delete in ONE `row_delta` so they share the snapshot sequence number, putting the
-//! delete AT the exact partition min: `pk` is a POSITION delete at-min (KEEP — `seq < min` is false,
-//! same-seq pos applies), `er` is an EQUALITY delete at-min (REMOVE — `seq <= min` is true, same-seq eq
-//! does not apply). Flipping the position branch `<`→`<=` resurrects `pk`'s masked row; flipping the
-//! equality branch `<=`→`<` strands `er`. `pr` and `dv` reach a dangling state via a FRESH-seq rewrite (no
-//! seq preservation) that pushes the partition min above the delete's seq (`pr`) or replaces the DV's
-//! referenced file (`dv`). `ne` is an equality delete in a partition that never received a live data file
-//! (`min IS NULL`); the `nb` partition holds live ballast data so the V2 world has a non-trivial live row
-//! set.
+//! `pk` and `er` are the two off-by-one boundaries, one per content type. Each commits the data file
+//! and its delete in ONE `row_delta`, so they share a sequence number and the delete sits at the
+//! exact partition min. Flipping the position branch `<` to `<=` resurrects `pk`'s masked row, and
+//! flipping the equality branch `<=` to `<` strands `er`. `pr` and `dv` dangle through a fresh-seq
+//! rewrite that lifts the partition min above the delete's seq, or replaces the referenced file.
+//! `ne` never held live data, and `nb` holds ballast so the V2 live row set is non-trivial.
 //!
-//! ## Read-identity (corruption safety)
+//! ## Read-identity
 //!
-//! The merge-on-read live `id` set is the same before and after the action. The KEPT deletes
-//! (`pk`/`ek`/`dk`) still mask their rows; the REMOVED deletes were ALREADY not applying (their
-//! referenced data was rewritten away / the eq delete never applied at-min / the partition has no data),
-//! so removing them brings NOTHING back. See `expected_live_ids`.
+//! The live `id` set is the same before and after the action. The kept deletes still mask their
+//! rows, and the removed deletes were already not applying. See `expected_live_ids`.
 //!
 //! ## Directions
 //!
-//! - **D1 (Rust validates Java's table):** `test_rust_validates_java_remove_dangling`. For each world,
-//!   Rust `register_table`s `<dir>/table<suffix>` (Java-built, pre-cleanup), runs
-//!   `RemoveDanglingDeleteFiles`, asserts removed == REMOVE set, survivors == KEEP set, counters, and
-//!   read-identity (scan pre before the action, scan post in-catalog).
-//! - **D2 (Java validates Rust's table):** `test_remove_dangling_gen` writes, per world,
-//!   `<dir>/rust_table<suffix>` (pre) + `<dir>/rust_table_cleaned<suffix>` (post-action); Java's
-//!   `verify-interop-remove-dangling` recomputes `findDanglingDeletes` on the pre table + reads
-//!   pre/cleaned for read-identity.
+//! D1, `test_rust_validates_java_remove_dangling`: Rust registers the Java-built pre-cleanup table,
+//! runs the action, and asserts the removed set, the survivors, the counters, and read-identity.
+//! D2, `test_remove_dangling_gen`: Rust writes `<dir>/rust_table<suffix>` and
+//! `<dir>/rust_table_cleaned<suffix>`, and Java recomputes `findDanglingDeletes` on the pre table and
+//! reads both for read-identity.
 //!
-//! GATED on env vars (both unset ⇒ clean no-ops; the offline `cargo test` gate stays green):
-//! - `ICEBERG_INTEROP_REMOVE_DANGLING_GEN_DIR` — Rust GEN (Rust writes pre + cleaned tables)
-//! - `ICEBERG_INTEROP_REMOVE_DANGLING_DIR`     — D1 comparison (Rust validates Java's table)
+//! `ICEBERG_INTEROP_REMOVE_DANGLING_GEN_DIR` gates D2 and `ICEBERG_INTEROP_REMOVE_DANGLING_DIR` gates
+//! D1. Both unset means a clean no-op, so the offline gate stays green.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -142,10 +114,8 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
-// ===========================================================================================
-// The scenario contract — hand-declared IDENTICALLY in Java (RemoveDanglingOracle) and here, from the
-// findDanglingDeletes SPEC (never derived from the other engine's output).
-// ===========================================================================================
+// The scenario contract, hand-declared identically in Java `RemoveDanglingOracle` and here, from
+// the `findDanglingDeletes` spec and never from the other engine's output.
 
 /// The hand-declared outcome of a partition's delete file under `findDanglingDeletes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,11 +145,10 @@ enum DeleteKind {
     DeletionVector,
 }
 
-/// One "world" — a single on-disk table at a fixed format version covering a subset of the scenarios.
-/// The fixture is split in two because the on-disk spec mandates DVs for V3 position deletes and forbids
-/// parquet position deletes in V3 (and DVs are V3-only): the V2 world covers the parquet position /
-/// equality / no-data scenarios, the V3 world covers the deletion-vector scenarios. Both are exercised in
-/// ONE driver run; the directory names (`<base>` + `_v3`) mirror Java's `RemoveDanglingOracle`.
+/// One world: a single on-disk table at a fixed format version, covering a subset of the scenarios.
+/// The V2 world holds the parquet position, equality, and no-data scenarios, and the V3 world holds
+/// the deletion vectors. One driver run exercises both. The directory names mirror Java's
+/// `RemoveDanglingOracle`.
 #[derive(Debug, Clone, Copy)]
 struct World {
     /// The directory-name suffix this world's tables use (`""` for V2, `"_v3"` for V3).
@@ -201,9 +170,8 @@ fn worlds() -> [World; 2] {
     [V2_WORLD, V3_WORLD]
 }
 
-/// The scenarios for `world`. The V2 world: position-keep, position-remove, equality-keep, equality-remove
-/// (off-by-one), no-live-data. The V3 world: DV-remove (referenced file gone), DV-keep. Java's
-/// `RemoveDanglingOracle` MUST mirror this split exactly (same `cat` values, kinds, verdicts).
+/// The scenarios for `world`. Java's `RemoveDanglingOracle` MUST mirror this split exactly, with the
+/// same `cat` values, kinds, and verdicts.
 fn scenarios(world: &World) -> Vec<Scenario> {
     match world.format_version {
         FormatVersion::V3 => vec![
@@ -273,9 +241,7 @@ fn expected_live_ids(world: &World) -> HashSet<i64> {
     }
 }
 
-// ===========================================================================================
 // Env-var gates.
-// ===========================================================================================
 
 fn gen_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_REMOVE_DANGLING_GEN_DIR")
@@ -289,9 +255,7 @@ fn validate_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-// ===========================================================================================
 // Schema + table helpers ({id, cat, y}, identity(cat), V3 so DVs are legal).
-// ===========================================================================================
 
 /// The fixture schema `{1 id long required, 2 cat string required, 3 y long required}`.
 fn dangling_schema() -> Schema {
@@ -348,9 +312,7 @@ async fn create_dangling_table(
         .expect("create the dangling fixture table")
 }
 
-// ===========================================================================================
 // Real-parquet / real-delete writers (partition-scoped).
-// ===========================================================================================
 
 /// Write a REAL parquet DATA file in partition `cat` with the given `(id, y)` rows.
 async fn write_data_file(table: &Table, cat: &str, rows: &[(i64, i64)]) -> DataFile {
@@ -539,9 +501,7 @@ async fn write_dv_file(
         .expect("one DV file")
 }
 
-// ===========================================================================================
 // Commit helpers.
-// ===========================================================================================
 
 async fn fast_append(catalog: &impl Catalog, table: &Table, files: Vec<DataFile>) -> Table {
     let tx = Transaction::new(table);
@@ -585,10 +545,8 @@ async fn rewrite_fresh(
     tx.commit(catalog).await.expect("commit rewrite_files")
 }
 
-// ===========================================================================================
 // The fixture builders — one per world. Each returns the table at the PRE-cleanup (dangling) state the
 // action must clean. The V2 world covers parquet position + equality + no-data; the V3 world covers DVs.
-// ===========================================================================================
 
 /// Build the world for `world` and return the PRE-cleanup table.
 async fn build_world(catalog: &impl Catalog, world: &World, table: Table) -> Table {
@@ -602,14 +560,11 @@ async fn build_world(catalog: &impl Catalog, world: &World, table: Table) -> Tab
 /// REMOVE via fresh-seq rewrite), ek (eq KEEP), er (eq REMOVE — off-by-one same-seq), ne (eq REMOVE — no
 /// live data in partition), plus `nb` data ballast.
 async fn build_v2_world(catalog: &impl Catalog, mut table: Table) -> Table {
-    // --- Commit 1 (seq 1): the POSITION OFF-BY-ONE `pk` — the pk data file AND its position delete in ONE
-    //     row_delta, so BOTH get THIS snapshot's sequence number. The position delete is then AT the exact
-    //     partition min (`pk_del seq == pk data seq`): under the read path a position delete applies when
-    //     `delete_seq >= data_seq` (`seq >= seq` true), so it KEEPs masking id=120, and under the dangling
-    //     predicate a position delete dangles only when `seq < min` (`seq < seq` false) ⇒ KEEP. Flipping the
-    //     position branch `<`→`<=` resurrects id=120 here (`seq <= seq` true ⇒ wrongly REMOVE), so the
-    //     position boundary is now interop-pinned, not unit-only (the `er` equality delete pins the `<=`
-    //     boundary in the opposite content type).
+    // --- Commit 1 (seq 1): the POSITION OFF-BY-ONE `pk`. One row_delta commits the data file and its
+    //     position delete, so both take this snapshot's sequence number and the delete sits at the exact
+    //     partition min. The read path still applies it, because `delete_seq >= data_seq`, and the
+    //     dangling predicate keeps it, because `seq < min` is false. Flipping the position branch `<`
+    //     to `<=` wrongly removes it and resurrects id=120.
     let pk = write_data_file(&table, "pk", &[(100, 10), (120, 20), (130, 30)]).await;
     let pk_path = pk.file_path().to_string();
     let pk_del = write_position_delete(&table, "pk", &[(pk_path, 1)]).await; // deletes id=120, at-min
@@ -621,8 +576,8 @@ async fn build_v2_world(catalog: &impl Catalog, mut table: Table) -> Table {
     let pr_path = pr.file_path().to_string();
     table = fast_append(catalog, &table, vec![ek.clone(), pr.clone()]).await;
 
-    // --- Commit 3 (seq 3): deletes at/above their partition min — ek eq KEEP, pr pos (KEEP-eligible until
-    //     pr is rewritten in commit 6, when the partition min jumps above this delete's seq).
+    // --- Commit 3 (seq 3): deletes at or above their partition min. `pr` stays keep-eligible until
+    //     commit 6 rewrites it and pushes the partition min above this delete's seq.
     let ek_del = write_equality_delete(&table, "ek", &[20]).await; // deletes y=20 (id 320)
     let pr_del = write_position_delete(&table, "pr", &[(pr_path, 1)]).await; // deletes id=220 (until rw)
     table = row_delta(catalog, &table, vec![], vec![ek_del, pr_del]).await;
@@ -633,9 +588,8 @@ async fn build_v2_world(catalog: &impl Catalog, mut table: Table) -> Table {
     let er_del = write_equality_delete(&table, "er", &[20]).await; // y=20 at seq == data seq
     table = row_delta(catalog, &table, vec![er], vec![er_del]).await;
 
-    // --- Commit 5 (seq 5): the `ne` (no-live-data) delete. Live data goes to partition `nb` (ids
-    //     500/520 — read-identity ballast); the dangling EQUALITY delete is committed under the EMPTY
-    //     partition `ne`, which has NO live data file ⇒ min IS NULL ⇒ the ne delete dangles.
+    // --- Commit 5 (seq 5): the `ne` no-live-data delete. The live data goes to `nb` as read-identity
+    //     ballast, and the equality delete lands in the empty `ne`, where `min IS NULL`.
     let nb = write_data_file(&table, "nb", &[(500, 10), (520, 20)]).await;
     table = fast_append(catalog, &table, vec![nb]).await;
     let ne_del = write_equality_delete(&table, "ne", &[20]).await; // partition `ne` has NO live data
@@ -670,9 +624,7 @@ async fn build_v3_world(catalog: &impl Catalog, mut table: Table) -> Table {
     table
 }
 
-// ===========================================================================================
 // Read-side + survivor helpers.
-// ===========================================================================================
 
 /// Scan the table and collect the live `id` set (merge-on-read deletes applied) — the read-identity signal.
 async fn scan_ids(table: &Table) -> HashSet<i64> {
@@ -727,8 +679,8 @@ async fn live_delete_paths(table: &Table) -> HashSet<String> {
     paths
 }
 
-/// Group the live delete files by their partition `cat` value, returning `cat -> path`. Used to map the
-/// surviving delete-file set to the scenario verdicts (each partition carries exactly one delete file).
+/// Group the live delete files by partition `cat`. Each partition carries exactly one delete file, so
+/// the map takes the survivor set to the scenario verdicts.
 async fn live_deletes_by_cat(table: &Table) -> HashMap<String, String> {
     let snapshot = table
         .metadata()
@@ -772,15 +724,12 @@ fn removed_cat(file: &DataFile) -> String {
     partition_cat(file)
 }
 
-// ===========================================================================================
 // D2 GEN — Rust writes the PRE-cleanup + CLEANED tables for Java's verify.
-// ===========================================================================================
 
-/// Rust builds, FOR EACH world, `<gen_dir>/rust_table<suffix>` (PRE-cleanup, the dangling state) and
-/// `<gen_dir>/rust_table_cleaned<suffix>` (POST-action), landing `final.metadata.json` in each. A
-/// Rust-side sanity check confirms the action's own removed/kept/counter/read-identity outcome matches the
-/// hand-declared contract BEFORE handing the tables to Java — so a Rust regression is caught here, not
-/// silently shipped to the Java verify.
+/// Rust builds `<gen_dir>/rust_table<suffix>` in the dangling state and
+/// `<gen_dir>/rust_table_cleaned<suffix>` after the action, for each world. A Rust-side check asserts
+/// the whole hand-declared contract BEFORE Java sees the tables, so a Rust regression fails here
+/// instead of reaching the Java verify.
 #[tokio::test]
 async fn test_remove_dangling_gen() {
     let Some(gen_dir) = gen_dir() else {
@@ -832,9 +781,8 @@ async fn test_remove_dangling_gen() {
             .expect("run RemoveDanglingDeleteFiles");
         assert_action_contract(&result, &world, Origin::RustBuilt, &pre, &catalog).await;
 
-        // Build a SEPARATE cleaned table holding the post-action state, so Java can read both the dangling
-        // PRE and the cleaned table for the read-identity comparison. The cleaned table must be its own
-        // on-disk table, so rebuild the world independently and run the action on it.
+        // Java reads the dangling PRE table and the cleaned table together, so the cleaned state needs
+        // its own on-disk table. Rebuild the world and run the action on the copy.
         let cleaned = create_dangling_table(
             &catalog,
             &cleaned_name,
@@ -880,14 +828,11 @@ async fn test_remove_dangling_gen() {
     }
 }
 
-// ===========================================================================================
 // D1 — Rust validates the JAVA-written table (register + run the action).
-// ===========================================================================================
 
-/// Rust `register_table`s the JAVA-written `<dir>/table<suffix>` (pre-cleanup) FOR EACH world, runs
-/// `RemoveDanglingDeleteFiles`, and asserts the full contract (removed == REMOVE set, survivors == KEEP
-/// set, per-content-type counters, and read-identity: the live id set is unchanged by the action).
-/// DIRECTION 1 — Rust's detection + GC runs against Java's exact on-disk manifests.
+/// Direction 1: Rust registers the Java-written pre-cleanup table for each world, runs
+/// `RemoveDanglingDeleteFiles`, and asserts the removed set, the survivors, the counters, and
+/// read-identity against Java's exact on-disk manifests.
 #[tokio::test]
 async fn test_rust_validates_java_remove_dangling() {
     let Some(dir) = validate_dir() else {
@@ -918,9 +863,8 @@ async fn test_rust_validates_java_remove_dangling() {
         let _ = catalog.create_namespace(&namespace, HashMap::new()).await;
 
         // The catalog derives the next metadata version from the registered file NAME, which must match
-        // `<version>-<uuid>.metadata.json`. Java writes a fixed-name `final.metadata.json`, so register a
-        // conventionally-named COPY (the action's commit then writes `<version+1>-…`; the fixed-name
-        // `final.metadata.json` is left untouched, keeping the fixture re-run-safe).
+        // `<version>-<uuid>.metadata.json`. Java writes a fixed-name `final.metadata.json`, so register
+        // a conventionally-named COPY and leave the original untouched for a re-run.
         let reg_path = dir.join(format!(
             "{table_name}/metadata/99999-{}.metadata.json",
             uuid::Uuid::now_v7()
@@ -969,9 +913,7 @@ async fn test_rust_validates_java_remove_dangling() {
     }
 }
 
-// ===========================================================================================
 // The shared contract assertion — removed == REMOVE set, survivors == KEEP set, per-content counters.
-// ===========================================================================================
 
 /// Which engine BUILT the table under test — selects the V3 DV expectation. Java AUTO-PRUNES a dangling
 /// DV at the commit that removes its referenced data file (1.10.0 `ManifestFilterManager`); Rust's

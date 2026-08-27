@@ -17,10 +17,8 @@
 
 //! Fresh field-id (re)assignment ported from Java `TypeUtil` / `AssignFreshIds`.
 //!
-//! Note for readers: `assign_fresh_ids_with_base` and `reassign_doc` are parity-complete and
-//! unit-tested but have **no in-tree caller yet** — they will be wired when the create-table /
-//! metadata-join consumers land. Do not assume they are load-bearing. (Status is tracked in
-//! `docs/parity/GAP_MATRIX.md`, row "Type utilities".)
+//! `assign_fresh_ids_with_base` and `reassign_doc` have no in-tree caller yet. The create-table
+//! and metadata-join consumers will wire them.
 
 use std::cell::Cell;
 
@@ -32,8 +30,7 @@ pub struct ReassignFieldIds {
     old_to_new_id: HashMap<i32, i32>,
 }
 
-// We are not using the visitor here, as post order traversal is not desired.
-// Instead we want to re-assign all fields on one level first before diving deeper.
+// Not the visitor: this walk must re-assign a whole level before it descends, not post-order.
 impl ReassignFieldIds {
     pub fn new(start_from: i32) -> Self {
         Self {
@@ -46,7 +43,7 @@ impl ReassignFieldIds {
         &mut self,
         fields: Vec<NestedFieldRef>,
     ) -> Result<Vec<NestedFieldRef>> {
-        // Visit fields on the same level first
+        // Pass 1: same-level fields.
         let outer_fields = fields
             .into_iter()
             .map(|field| {
@@ -57,7 +54,7 @@ impl ReassignFieldIds {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Now visit nested fields
+        // Pass 2: nested fields.
         outer_fields
             .into_iter()
             .map(|field| {
@@ -75,8 +72,7 @@ impl ReassignFieldIds {
     fn reassign_ids_visit_type(&mut self, field_type: Type) -> Result<Type> {
         match field_type {
             Type::Primitive(s) => Ok(Type::Primitive(s)),
-            // Leaf, like a primitive — Java 1.10.0 `AssignFreshIds.variant` returns the type
-            // unchanged (it carries no nested ids to reassign).
+            // A variant is a leaf. Java `AssignFreshIds.variant` returns the type unchanged.
             Type::Variant => Ok(Type::Variant),
             Type::Struct(s) => {
                 let new_fields = self.reassign_field_ids(s.fields().to_vec())?;
@@ -163,51 +159,19 @@ impl ReassignFieldIds {
     }
 }
 
-/// The `TypeUtil.NextID` seam: a stateful id source returning a fresh, strictly increasing id on
-/// every call. Mirrors Java `org.apache.iceberg.types.TypeUtil.NextID` (a `@FunctionalInterface`
-/// with `int get()`). All `assign_fresh_ids` entry points take one of these so the same recursion
-/// services `UpdateSchema`-style closures, `assignIncreasingFreshIds`, and the
-/// `reassignOrRefreshIds` "continue from the source's highest id" flow.
+/// A stateful id source. Every call returns a fresh, strictly increasing id. Mirrors Java
+/// `TypeUtil.NextID`. Every `assign_fresh_ids` entry point takes one, so one recursion serves
+/// every flow.
 pub type NextId<'a> = dyn FnMut() -> Result<i32> + 'a;
 
-/// Maximum type-nesting depth the raw-`Type` entry points of the assign-ids family will descend
-/// before returning a typed error instead of overflowing the thread stack.
-///
-/// **Why this recursion needs a bound at all.** Everything in this module that takes a [`Schema`]
-/// is already bounded by construction: a `Schema` can only be produced by `SchemaBuilder::build`,
-/// which runs `index_by_id` → `visit_struct` → the depth-checked `visit_type_at_depth`, so a type
-/// nested deeper than `spec::schema::visitor`'s `MAX_SCHEMA_NESTING_DEPTH` never reaches a `Schema`
-/// value. [`assign_fresh_ids`] and [`assign_ids`] are the exceptions — they take a **caller-supplied
-/// `Type`** that no builder has validated. `UpdateSchemaAction::add_column(name, field_type)` hands
-/// its argument straight through `SchemaEvolution::add_column` into [`assign_fresh_ids`], so a
-/// hostile or machine-generated `Type` reaches this recursion with nothing standing in front of it.
-///
-/// **Why `128`.** It keeps this door in lockstep with the rest of the crate's nesting bounds —
-/// `spec::schema::visitor`'s `MAX_SCHEMA_NESTING_DEPTH`, `avro::schema`'s `MAX_AVRO_SCHEMA_DEPTH`,
-/// `arrow::schema`'s `MAX_ARROW_SCHEMA_NESTING_DEPTH` and [`crate::variant::MAX_NESTING_DEPTH`] are
-/// all `128`. The depth convention is the schema visitor's too (the type handed in is depth `0`;
-/// each nested field / element / key / value recurses at `depth + 1`), which makes this bound
-/// strictly *looser* than the check the rebuilt schema will face: the added column's own field
-/// occupies one level, so `SchemaBuilder::build` rejects at 128 struct levels where this rejects at
-/// 129. The bound therefore can never be the thing that refuses an otherwise-legal column — it only
-/// converts a stack overflow into an error.
-///
-/// **A deliberate, documented divergence from Java, in the safe direction.** Java does NOT bound
-/// this. In `iceberg-api` 1.10.0, `TypeUtil.assignFreshIds(Type, NextID)` is
-/// `visit(type, new AssignFreshIds(nextId))` (bytecode offset 9), and
-/// `TypeUtil.visit(Type, CustomOrderSchemaVisitor)` is a bare `tableswitch` (offset 13, arms at
-/// 56/147/178/222/233) whose children are `VisitFuture` / `VisitFieldFuture` suppliers that call
-/// `TypeUtil.visit` again (`VisitFuture.get`, offset 8) — there is no depth counter anywhere on the
-/// path. Running it against those jars confirms the consequence: a struct chain 4096 levels deep
-/// through `TypeUtil.assignFreshIds` raises `StackOverflowError` on a 512 KiB thread, 200000 levels
-/// overflows even an 8 MiB thread, and 128/129 levels succeed. Java crashes the thread; we return a
-/// typed [`ErrorKind::DataInvalid`]. That is a divergence, not a parity break — it changes behavior
-/// only for inputs on which Java has no defined behavior at all.
+/// Maximum nesting depth the raw-`Type` entry points descend before they return a typed error. A
+/// [`Schema`] argument is already bounded by the depth-checked builder. [`assign_fresh_ids`] and
+/// [`assign_ids`] take an unvalidated caller-supplied `Type` instead, straight from
+/// `UpdateSchemaAction::add_column`.
 const MAX_ASSIGN_IDS_NESTING_DEPTH: usize = 128;
 
-/// The typed refusal raised when a caller-supplied `Type` nests deeper than
-/// [`MAX_ASSIGN_IDS_NESTING_DEPTH`]. Worded like the schema visitor's own depth error (and tagged
-/// with this door) so the two are greppable together.
+/// The typed refusal for a `Type` nesting deeper than [`MAX_ASSIGN_IDS_NESTING_DEPTH`]. It is
+/// worded like the schema visitor's depth error so the two are greppable together.
 fn nesting_depth_exceeded() -> Error {
     Error::new(
         ErrorKind::DataInvalid,
@@ -217,32 +181,19 @@ fn nesting_depth_exceeded() -> Error {
     )
 }
 
-// =====================================================================================
-// assign-ids family — `TypeUtil.assignFreshIds` / `assignIds` / `assignIncreasingFreshIds`.
+// assign-ids family: `TypeUtil.assignFreshIds` / `assignIds` / `assignIncreasingFreshIds`.
 //
-// Java's `AssignFreshIds` is a `CustomOrderSchemaVisitor`: a parent's ids are assigned BEFORE
-// its children's (top-down / level-order), and within a struct ALL immediate field ids are
-// assigned before any child type is recursed. We mirror that ordering explicitly here (the same
-// two-pass shape as `ReassignFieldIds`) so ids match Java byte-for-byte on round trips.
-// =====================================================================================
+// Java `AssignFreshIds` assigns a parent's ids before its children's, and every immediate struct
+// field id before any child type. Ids must match Java byte-for-byte on a round trip.
 
-/// Assign fresh ids to every field in `field_type`, pulling each new id from `next_id` in the
-/// Java `AssignFreshIds` (level-order) traversal order.
-///
-/// This is the Rust port of `TypeUtil.assignFreshIds(Type, NextID)` (the no-base-schema overload,
-/// whose `idFor` always falls through to `nextId.get()`). A primitive — and `variant`, which Java
-/// 1.10.0 `AssignFreshIds.variant` returns unchanged — carries no ids and passes through.
-///
-/// `field_type` is caller-supplied and unvalidated (see [`MAX_ASSIGN_IDS_NESTING_DEPTH`]), so the
-/// walk is depth-bounded: nesting beyond that limit returns a typed error rather than overflowing
-/// the thread stack.
+/// Assign fresh ids to every field in `field_type`, pulling each id from `next_id` in Java
+/// `AssignFreshIds` level order. A primitive and a variant carry no ids and pass through.
+/// `field_type` is unvalidated, so the walk is bounded by [`MAX_ASSIGN_IDS_NESTING_DEPTH`].
 pub fn assign_fresh_ids(field_type: &Type, next_id: &mut NextId<'_>) -> Result<Type> {
     assign_fresh_ids_at_depth(field_type, next_id, 0)
 }
 
-/// Depth-bounded body of [`assign_fresh_ids`]. `depth` is the current nesting level (the type
-/// handed to the public entry point is `0`); each nested field / element / key / value recurses at
-/// `depth + 1`, matching `spec::schema::visitor`'s convention exactly.
+/// Depth-bounded body of [`assign_fresh_ids`]. `depth` follows the schema visitor's convention.
 fn assign_fresh_ids_at_depth(
     field_type: &Type,
     next_id: &mut NextId<'_>,
@@ -287,13 +238,9 @@ fn assign_fresh_ids_at_depth(
     }
 }
 
-/// The struct body of [`assign_fresh_ids`]: assign fresh ids for ALL immediate fields first (pass
-/// 1, level-order), then recurse into each field's type (pass 2). Doc and default attributes are
-/// preserved (Java rebuilds with `NestedField.from(field).withId(id).ofType(type)`).
-///
-/// Entered at depth `0` — the only caller that starts here is [`assign_fresh_ids_to_schema`], whose
-/// `Schema` argument is already builder-validated; the unvalidated raw-`Type` route arrives through
-/// [`assign_fresh_ids_at_depth`] carrying its running depth.
+/// The struct body of [`assign_fresh_ids`]. Pass 1 assigns every immediate field id. Pass 2
+/// recurses into each field's type. Doc and default attributes survive. It is entered at depth
+/// `0` only from [`assign_fresh_ids_to_schema`], whose `Schema` is builder-validated.
 fn assign_fresh_ids_to_fields(
     fields: &[NestedFieldRef],
     next_id: &mut NextId<'_>,
@@ -301,12 +248,9 @@ fn assign_fresh_ids_to_fields(
     assign_fresh_ids_to_fields_at_depth(fields, next_id, 0)
 }
 
-/// Depth-carrying body of [`assign_fresh_ids_to_fields`]; `depth` is the enclosing STRUCT's level,
-/// so each field's type is visited at `depth + 1` (the schema visitor's convention).
-///
-/// No depth check of its own: this function never recurses directly, and every path back into the
-/// recursion goes through [`assign_fresh_ids_at_depth`], which owns the single bound. A second
-/// check here would be unreachable duplicate logic that no test could kill.
+/// Depth-carrying body of [`assign_fresh_ids_to_fields`]. `depth` is the enclosing struct's level.
+/// It runs no check: every path back into the recursion goes through
+/// [`assign_fresh_ids_at_depth`], which owns the single bound.
 fn assign_fresh_ids_to_fields_at_depth(
     fields: &[NestedFieldRef],
     next_id: &mut NextId<'_>,
@@ -328,10 +272,8 @@ fn assign_fresh_ids_to_fields_at_depth(
     Ok(StructType::new(new_fields))
 }
 
-/// Assign fresh ids to a whole schema, giving the result `schema_id` as its id. Rust port of
-/// `TypeUtil.assignFreshIds(int baseId, Schema schema, NextID)` — the `baseId` is the schema id of
-/// the produced schema (NOT a field id), and identifier fields are recomputed by name against the
-/// freshly-assigned struct via [`refresh_identifier_fields`].
+/// Assign fresh ids to a whole schema and stamp it with `schema_id`, which is a schema id, not a
+/// field id. [`refresh_identifier_fields`] recomputes the identifier fields by name.
 pub fn assign_fresh_ids_to_schema(
     schema_id: i32,
     schema: &Schema,
@@ -346,9 +288,8 @@ pub fn assign_fresh_ids_to_schema(
         .build()
 }
 
-/// Assign monotonically increasing fresh ids starting at 1, returning a new schema with the same
-/// schema id. Rust port of `TypeUtil.assignIncreasingFreshIds(Schema)`, which seeds an
-/// `AtomicInteger(0)` and pulls ids via `incrementAndGet` (so the first id is 1).
+/// Assign increasing fresh ids starting at 1, keeping the schema id. Ports
+/// `TypeUtil.assignIncreasingFreshIds`, whose first id is 1.
 pub fn assign_increasing_fresh_ids(schema: &Schema) -> Result<Schema> {
     let counter = Cell::new(0_i32);
     let mut next_id = || -> Result<i32> {
@@ -364,24 +305,16 @@ pub fn assign_increasing_fresh_ids(schema: &Schema) -> Result<Schema> {
     assign_fresh_ids_to_schema(schema.schema_id(), schema, &mut next_id)
 }
 
-/// Assign fresh ids to a whole schema, but REUSE the id of any field whose full dotted name is also
-/// present in `base` (the base schema). Rust port of `TypeUtil.assignFreshIds(Schema schema, Schema
-/// base, NextID)`.
+/// Assign fresh ids to a whole schema, but reuse the `base` id of any full dotted name present in
+/// `base`. Ports `TypeUtil.assignFreshIds(Schema, Schema, NextID)`.
 ///
-/// Java builds `AssignFreshIds(schema, base, nextId)` — a `CustomOrderSchemaVisitor` whose `idFor`
-/// is the only place the id comes from:
+/// Java's `idFor` is the only id source:
 /// ```text
-/// idFor(name):  baseSchema != null && name != null && baseSchema.findField(name) != null
-///                 ? baseSchema.findField(name).fieldId()
-///                 : nextId.get()
+/// idFor(name):  base.findField(name) != null ? base.findField(name).fieldId() : nextId.get()
 /// name(id):     visitingSchema.findColumnName(id)   // the field's current full dotted name
 /// ```
-/// So for every field/element/key/value the new id is the base id of the SAME-NAMED field when one
-/// exists, otherwise a fresh id from `next_id`. The struct walk is the same two-pass level-order as
-/// [`assign_fresh_ids_to_fields`] (Java's `struct` collects ALL immediate ids via `idFor` first,
-/// then recurses children lazily). The produced schema is built with the default schema id `0`
-/// (Java's `new Schema(fields, refreshIdentifierFields(struct, schema))` — no id arg), and
-/// identifier fields are recomputed by name against the freshly-id'd struct.
+/// The struct walk is the same two-pass level order as [`assign_fresh_ids_to_fields`]. The result
+/// carries the default schema id `0`, and identifier fields are recomputed by name.
 pub fn assign_fresh_ids_with_base(
     schema: &Schema,
     base: &Schema,
@@ -396,19 +329,14 @@ pub fn assign_fresh_ids_with_base(
         .build()
 }
 
-/// `idFor(name(field_id))` for the base-schema overload: reuse the base schema's id for the field
-/// whose current full dotted name matches, else pull a fresh id. `field_id` is the field's CURRENT
-/// id in `visiting` (Java's `name(int)` = `visitingSchema.findColumnName(id)`).
+/// `idFor(name(field_id))`: reuse the base id of the matching full dotted name, else pull a fresh
+/// id. `field_id` is the field's current id in `visiting`.
 fn base_id_for(
     field_id: i32,
     visiting: &Schema,
     base: &Schema,
     next_id: &mut NextId<'_>,
 ) -> Result<i32> {
-    // Resolve the field's current full name in `visiting`, then reuse the base schema's id for that
-    // same name (Java `idFor`: `baseSchema.findField(name)` reuse, else a fresh id). The name is
-    // bound into an owned `String` so the lookup reads as two plain steps; a borrowed `&str` from
-    // `visiting` would also be sound here (the `base` lookup borrows a different schema).
     let name: Option<String> = visiting.name_by_field_id(field_id).map(str::to_owned);
     if let Some(name) = name
         && let Some(reused) = base.field_id_by_name(&name)
@@ -418,9 +346,8 @@ fn base_id_for(
     next_id()
 }
 
-/// Struct body of [`assign_fresh_ids_with_base`]: two-pass level-order (assign every immediate id
-/// via [`base_id_for`] first, then recurse children) — the exact shape of Java's `AssignFreshIds.
-/// struct`, where the lazy `Iterables.transform` over `VisitFieldFuture`s is forced only in pass 2.
+/// Struct body of [`assign_fresh_ids_with_base`]. Pass 1 assigns every immediate id through
+/// [`base_id_for`]. Pass 2 recurses into the children. Java `AssignFreshIds.struct` has this shape.
 fn assign_fresh_ids_with_base_struct(
     struct_type: &StructType,
     visiting: &Schema,
@@ -444,14 +371,9 @@ fn assign_fresh_ids_with_base_struct(
     Ok(StructType::new(new_fields))
 }
 
-/// Recurse [`assign_fresh_ids_with_base_struct`] into a nested type. Element/key/value ids reuse the
-/// base id of the same-named element/key/value (Java's `list`/`map` call `idFor(name(elementId))`
-/// etc.), else pull fresh.
-///
-/// Not depth-bounded, and deliberately so: unlike [`assign_fresh_ids`] this walk is only reachable
-/// from [`assign_fresh_ids_with_base`], whose inputs are `Schema` values, and a `Schema` cannot
-/// exist with nesting beyond `MAX_SCHEMA_NESTING_DEPTH` (`SchemaBuilder::build` runs `index_by_id`
-/// → the depth-checked visitor first). See [`MAX_ASSIGN_IDS_NESTING_DEPTH`] for the rule.
+/// Recurse [`assign_fresh_ids_with_base_struct`] into a nested type. An element, key, or value id
+/// reuses the base id of the same name, else pulls fresh. It is deliberately not depth-bounded:
+/// only [`assign_fresh_ids_with_base`] reaches it, and its `Schema` inputs are already checked.
 fn assign_fresh_ids_with_base_type(
     field_type: &Type,
     visiting: &Schema,
@@ -465,7 +387,6 @@ fn assign_fresh_ids_with_base_type(
             s, visiting, base, next_id,
         )?)),
         Type::List(l) => {
-            // Level-order: the element id is the list's single immediate id; assign it first.
             let element_id = base_id_for(l.element_field.id, visiting, base, next_id)?;
             let element_type = assign_fresh_ids_with_base_type(
                 &l.element_field.field_type,
@@ -478,7 +399,6 @@ fn assign_fresh_ids_with_base_type(
             ))))
         }
         Type::Map(m) => {
-            // Level-order: assign key id THEN value id (both immediate) before recursing either.
             let key_id = base_id_for(m.key_field.id, visiting, base, next_id)?;
             let value_id = base_id_for(m.value_field.id, visiting, base, next_id)?;
             let key_type =
@@ -501,14 +421,9 @@ fn assign_fresh_ids_with_base_type(
     }
 }
 
-/// Re-key a type's ids through the `old_id -> new_id` map `get_id`. Rust port of
-/// `TypeUtil.assignIds(Type, GetID)`: unlike [`assign_fresh_ids`], the structure is preserved and
-/// EVERY id (including list element / map key+value) is rewritten by the caller-supplied function.
-/// A missing mapping is the caller's contract to handle (the closure returns the id to use).
-///
-/// Like [`assign_fresh_ids`], this takes a caller-supplied, unvalidated `Type`, so the walk is
-/// depth-bounded by [`MAX_ASSIGN_IDS_NESTING_DEPTH`] (Java's `TypeUtil.assignIds` is unbounded and
-/// `StackOverflowError`s — see that constant's doc for the bytecode and the measured divergence).
+/// Re-key a type's ids through `get_id`. Ports `TypeUtil.assignIds(Type, GetID)`. The structure
+/// survives and every id goes through `get_id`, list element and map key and value included. The
+/// caller handles a missing mapping. The walk is bounded by [`MAX_ASSIGN_IDS_NESTING_DEPTH`].
 pub fn assign_ids(field_type: &Type, get_id: &mut dyn FnMut(i32) -> i32) -> Result<Type> {
     assign_ids_at_depth(field_type, get_id, 0)
 }
@@ -564,21 +479,14 @@ fn assign_ids_at_depth(
     }
 }
 
-// =====================================================================================
-// reassign family — `TypeUtil.reassignIds` / `reassignOrRefreshIds` / `reassignDoc` /
+// reassign family: `TypeUtil.reassignIds` / `reassignOrRefreshIds` / `reassignDoc` /
 // `refreshIdentifierFields`.
 //
-// Java's `ReassignIds` is a `CustomOrderSchemaVisitor` that walks `schema` while tracking the
-// matching position in a `sourceSchema`, aligning ids BY NAME. The behavior at a name that is
-// absent from the source is controlled by an optional id source: `None` (→ `reassign_ids`) makes
-// the absence an error; a real `NextId` (→ `reassign_or_refresh_ids`) assigns fresh ids to the
-// whole unmatched subtree.
-// =====================================================================================
+// Java `ReassignIds` walks `schema`, tracks the position in a source schema, and aligns ids by
+// name. At an unmatched name, `None` is an error and a `NextId` assigns fresh subtree ids.
 
-/// Align the ids of `schema` to `id_source` BY NAME (case-sensitive). Rust port of
-/// `TypeUtil.reassignIds(Schema, Schema)` (= the `caseSensitive = true` overload). Every field in
-/// `schema` must have a same-named field in `id_source`; a name not present in the source is a
-/// hard error (`DataInvalid`), mirroring Java's `IllegalArgumentException("Field ... not found")`.
+/// Align the ids of `schema` to `id_source` by name, case-sensitive. Ports
+/// `TypeUtil.reassignIds(Schema, Schema)`. A name absent from the source is a hard error.
 pub fn reassign_ids(schema: &Schema, id_source: &Schema) -> Result<Schema> {
     reassign_ids_with_case(schema, id_source, true)
 }
@@ -600,9 +508,8 @@ pub fn reassign_ids_with_case(
         .build()
 }
 
-/// Align the ids of `schema` to `id_source` BY NAME, assigning FRESH ids (continuing from
-/// `id_source.highest_field_id()`) to any name not present in the source. Rust port of
-/// `TypeUtil.reassignOrRefreshIds(Schema, Schema)` (= the `caseSensitive = true` overload).
+/// Align the ids of `schema` to `id_source` by name. An unmatched name gets a fresh id,
+/// continuing from `id_source.highest_field_id()`. Ports `TypeUtil.reassignOrRefreshIds`.
 pub fn reassign_or_refresh_ids(schema: &Schema, id_source: &Schema) -> Result<Schema> {
     reassign_or_refresh_ids_with_case(schema, id_source, true)
 }
@@ -637,12 +544,9 @@ pub fn reassign_or_refresh_ids_with_case(
         .build()
 }
 
-/// Copy field docs from `doc_source` onto `schema` BY ID, leaving everything else unchanged. Rust
-/// port of `TypeUtil.reassignDoc(Schema, Schema)` (Java's `ReassignDoc` visitor): for each field,
-/// if `doc_source` has a field with the same id and a non-null doc, that doc replaces the field's
-/// doc; otherwise the doc is cleared. The result keeps the original schema id (Java's `reassignDoc`
-/// builds `new Schema(fields)`, i.e. the default id `0`); we preserve `schema.schema_id()` because
-/// the `Schema(List)` Java ctor and our builder both default to 0 but callers expect identity.
+/// Copy field docs from `doc_source` onto `schema` by id. A same-id source doc replaces the doc.
+/// Every other doc is cleared. The result keeps `schema.schema_id()`, where Java would give the
+/// default `0`, because callers here expect the schema id to survive.
 pub fn reassign_doc(schema: &Schema, doc_source: &Schema) -> Result<Schema> {
     let new_struct = reassign_doc_struct(schema.as_struct(), doc_source);
     Schema::builder()
@@ -673,8 +577,8 @@ fn reassign_doc_struct(s: &StructType, doc_source: &Schema) -> StructType {
     StructType::new(new_fields)
 }
 
-/// Recurse [`reassign_doc_struct`] into nested types. Element/key/value field docs are NOT carried
-/// by Java's `ReassignDoc` (its `list`/`map` only rebuild the container), so we leave them as-is.
+/// Recurse [`reassign_doc_struct`] into nested types. Java `ReassignDoc` does not carry element,
+/// key, or value docs, so they stay as they are.
 fn reassign_doc_type(field_type: &Type, doc_source: &Schema) -> Type {
     match field_type {
         Type::Struct(s) => Type::Struct(reassign_doc_struct(s, doc_source)),
@@ -697,17 +601,14 @@ fn reassign_doc_type(field_type: &Type, doc_source: &Schema) -> Type {
     }
 }
 
-/// Recompute the identifier-field id set of a freshly-id'd struct by carrying the source schema's
-/// identifier-field NAMES across. Rust port of `TypeUtil.refreshIdentifierFields(StructType,
-/// Schema)`: index the new struct by name, then for each identifier name in `source_schema` look
-/// up its id in the new struct. A name that no longer resolves is a hard error
-/// (`DataInvalid`), mirroring Java's `Preconditions.checkArgument(..., "Cannot find ID for
-/// identifier field %s in schema %s")`.
+/// Recompute a freshly-id'd struct's identifier-field ids by carrying the source identifier NAMES
+/// across. Ports `TypeUtil.refreshIdentifierFields`. A name that no longer resolves is a hard
+/// error.
 pub fn refresh_identifier_fields(
     new_struct: &StructType,
     source_schema: &Schema,
 ) -> Result<HashSet<i32>> {
-    // Java uses indexByName (full dotted names) so a nested identifier field resolves correctly.
+    // Index by full dotted name, as Java does, so a nested identifier field resolves.
     let name_to_id = {
         let mut index = IndexByName::default();
         visit_struct(new_struct, &mut index)?;
@@ -733,11 +634,9 @@ pub fn refresh_identifier_fields(
     Ok(identifier_field_ids)
 }
 
-/// The Java `ReassignIds` `CustomOrderSchemaVisitor`, expressed as an explicit recursive walk over
-/// `schema` that tracks the matching position in `source` (the id source). At each field the
-/// matching same-named source field supplies the id and the source position for the child walk;
-/// when there is no match, an `assign_id` source (if present) assigns fresh ids to the whole
-/// unmatched subtree, otherwise the absence is a hard error.
+/// Java `ReassignIds` as an explicit recursive walk over `schema`, tracking the position in
+/// `source`. A matching same-named source field supplies the id and the child source position. At
+/// an unmatched name, `assign_id` assigns fresh ids to the subtree, or the absence is an error.
 struct ReassignIds<'a, 'b> {
     source: &'a Schema,
     assign_id: Option<&'a mut NextId<'b>>,
@@ -783,17 +682,15 @@ impl<'a, 'b> ReassignIds<'a, 'b> {
         struct_type: &StructType,
         source_struct: &StructType,
     ) -> Result<StructType> {
-        // Two-phase, matching Java `ReassignIds.struct`: the `CustomOrderSchemaVisitor` first forces
-        // ALL child results (computing each field's reassigned TYPE, which pulls any fresh subtree
-        // ids in field order), and only THEN loops over the fields to assign each field's OWN id.
-        // Interleaving the two phases would change the fresh-id stream for unmatched subtrees.
+        // Two phases, as Java `ReassignIds.struct` has. Phase 1 computes every child type, which
+        // pulls the fresh subtree ids in field order. Phase 2 assigns each field's own id.
+        // Interleaving the phases would change the fresh-id stream for an unmatched subtree.
         let matched: Vec<Option<NestedFieldRef>> = struct_type
             .fields()
             .iter()
             .map(|field| self.source_field(source_struct, &field.name).cloned())
             .collect();
 
-        // Phase 1: child types (in field order).
         let mut new_types = Vec::with_capacity(struct_type.fields().len());
         for (field, source_field) in struct_type.fields().iter().zip(matched.iter()) {
             let new_type = match source_field {
@@ -805,7 +702,6 @@ impl<'a, 'b> ReassignIds<'a, 'b> {
             new_types.push(new_type);
         }
 
-        // Phase 2: each field's own id (in field order).
         let mut new_fields = Vec::with_capacity(struct_type.fields().len());
         for ((field, source_field), new_type) in
             struct_type.fields().iter().zip(matched).zip(new_types)
@@ -824,8 +720,8 @@ impl<'a, 'b> ReassignIds<'a, 'b> {
         Ok(StructType::new(new_fields))
     }
 
-    /// Reassign ids in `field_type`, aligning against `source_type` (the same-named source field's
-    /// type). The id for a nested container's element/key/value comes from the source container.
+    /// Reassign ids in `field_type` against `source_type`, the same-named source field's type. A
+    /// nested container takes its element, key, and value ids from the source container.
     fn reassign_type(&mut self, field_type: &Type, source_type: &Type) -> Result<Type> {
         match (field_type, source_type) {
             (Type::Struct(s), Type::Struct(source_s)) => {
@@ -861,32 +757,24 @@ impl<'a, 'b> ReassignIds<'a, 'b> {
                     )),
                 )))
             }
-            // A primitive / variant visited field carries no nested ids and passes through
-            // unchanged regardless of the source type — Java `ReassignIds.primitive`/`variant`
-            // simply `return type` with no `sourceType` check.
+            // A primitive or variant carries no nested ids and passes through whatever the
+            // source type is. Java runs no `sourceType` check on those arms.
             (Type::Primitive(_) | Type::Variant, _) => Ok(field_type.clone()),
-            // A structural type mismatch at a MATCHED name (e.g. the visited field is a list but the
-            // same-named source field is a struct). Java's `ReassignIds.struct`/`list`/`map` runs
-            // `Preconditions.checkArgument(sourceType.isXType(), "Not a X: %s", sourceType)` and
-            // THROWS `IllegalArgumentException` — it does NOT assign fresh ids here. We mirror the
-            // exact "Not a struct/list/map: <source>" message (`DataInvalid`).
+            // A structural mismatch at a MATCHED name, such as a list against a source struct.
+            // Java throws here and does NOT assign fresh ids. Mirror its message exactly.
             (Type::Struct(_), _) => Err(Self::not_a_type_error("struct", source_type)),
             (Type::List(_), _) => Err(Self::not_a_type_error("list", source_type)),
             (Type::Map(_), _) => Err(Self::not_a_type_error("map", source_type)),
         }
     }
 
-    /// Build the Java-faithful structural-mismatch error: `ReassignIds.struct`/`list`/`map` throws
-    /// `IllegalArgumentException("Not a struct/list/map: <sourceType>")` via `Preconditions.
-    /// checkArgument`. `kind` is the visited container kind ("struct"/"list"/"map") and `source` is
-    /// the same-named source field's (mismatching) type, rendered like Java's `%s` (`Type.toString`).
+    /// Build the structural-mismatch error Java throws: `Not a struct/list/map: <sourceType>`.
+    /// `kind` is the visited container kind. `source` is the mismatching source type.
     fn not_a_type_error(kind: &str, source: &Type) -> Error {
         Error::new(ErrorKind::DataInvalid, format!("Not a {kind}: {source}"))
     }
 
-    /// Assign fresh ids to a whole subtree (used when a name has no match in the source), or fail
-    /// when there is no id source — mirroring Java's `assignId != null ? assignFreshIds(..) :
-    /// throw`.
+    /// Assign fresh ids to a whole unmatched subtree, or fail when there is no id source.
     fn assign_fresh_or_fail(&mut self, field_type: &Type, name: &str) -> Result<Type> {
         if field_type.is_primitive() || matches!(field_type, Type::Variant) {
             return Ok(field_type.clone());
@@ -953,11 +841,9 @@ mod tests {
         assert_eq!(reassigned_schema.highest_field_id(), 2);
     }
 
-    // RISK: id reassignment over a schema containing a variant column must treat variant as a
-    // LEAF (Java 1.10.0 `AssignFreshIds.variant` returns the type unchanged): the column's own id
-    // is reassigned like any field, the type passes through, and SIBLING ids after it stay in
-    // sequence. A missing arm would make `with_reassigned_field_ids` (used by catalog
-    // create-table flows) fail on every variant schema.
+    // Risk: reassignment must treat variant as a LEAF. The column's own id is reassigned, the
+    // type passes through, and sibling ids after it stay in sequence. A missing arm makes
+    // `with_reassigned_field_ids` fail on every variant schema.
     #[test]
     fn test_reassign_ids_passes_variant_through() {
         let schema = Schema::builder()
@@ -1114,14 +1000,10 @@ mod tests {
         assert!(reassigned_schema.message().contains("'field.id' 3"));
     }
 
-    // ===== assign-ids family =====
-
-    /// `assign_fresh_ids` over a nested list-of-map type assigns ids in Java's level-order: the
-    /// element id BEFORE the map's key/value ids, and the map's key id BEFORE its value id. Risk: a
-    /// naive depth-first walk would interleave ids differently and break Java round-trip parity.
+    /// `assign_fresh_ids` over list-of-map assigns the element id before the map key and value
+    /// ids, and the key id before the value id. A depth-first walk would interleave them.
     #[test]
     fn test_assign_fresh_ids_level_order_nested() {
-        // list< map< string, int > > with arbitrary original ids.
         let field_type = Type::List(ListType::new(
             NestedField::list_element(
                 50,
@@ -1143,7 +1025,7 @@ mod tests {
         };
         let result = assign_fresh_ids(&field_type, &mut next).unwrap();
 
-        // Element id = 1 (assigned first), then key = 2, value = 3 (key before value).
+        // Element id 1 first, then key 2, then value 3.
         let Type::List(list) = result else {
             panic!("expected list")
         };
@@ -1155,17 +1037,11 @@ mod tests {
         assert_eq!(map.value_field.id, 3, "map value id after key id");
     }
 
-    /// `assign_fresh_ids` over a struct with a nested struct FOLLOWED BY a sibling assigns ids in
-    /// Java's level-order: ALL immediate struct field ids first (`a`, then `b`), and only THEN the
-    /// nested child id (`x`). Risk: a depth-first walk (assign `a`, immediately recurse into `x`,
-    /// then assign `b`) would yield a=1, x=2, b=3 instead of a=1, b=2, x=3 — exactly the regression
-    /// that breaks Java `AssignFreshIds` round-trip parity. This test DISCRIMINATES the two-pass
-    /// level-order from a depth-first walk (the list<map> test alone cannot, as it has no struct
-    /// sibling). Mirrors Java `AssignFreshIds.struct` (pass 1: all immediate `idFor`; pass 2:
-    /// recurse children).
+    /// A nested struct followed by a sibling takes every immediate id first, then the child id.
+    /// The mutation this discriminates: a depth-first walk yields a=1, x=2, b=3, not a=1, b=2,
+    /// x=3. The list-of-map test has no struct sibling and cannot catch it.
     #[test]
     fn test_assign_fresh_ids_level_order_struct_siblings() {
-        // struct< a: struct< x: int >, b: int > with arbitrary original ids.
         let field_type = Type::Struct(StructType::new(vec![
             NestedField::required(
                 90,
@@ -1189,7 +1065,7 @@ mod tests {
         let Type::Struct(s) = result else {
             panic!("expected struct")
         };
-        // Level-order: a=1 and b=2 (BOTH immediate ids) before the nested x=3.
+        // Both immediate ids (a=1, b=2) precede the nested x=3.
         assert_eq!(s.fields()[0].id, 1, "first immediate field `a` gets id 1");
         assert_eq!(
             s.fields()[1].id,
@@ -1206,9 +1082,7 @@ mod tests {
         );
     }
 
-    /// `assign_fresh_ids_to_schema` recomputes identifier fields by NAME against the fresh struct,
-    /// and stamps the given schema id. Risk: dropping the identifier-field carry-over would lose the
-    /// table's primary-key declaration after a fresh-id pass.
+    /// Recomputing identifier fields by name keeps the table's primary-key declaration.
     #[test]
     fn test_assign_fresh_ids_to_schema_carries_identifier_by_name() {
         let schema = Schema::builder()
@@ -1230,15 +1104,14 @@ mod tests {
         let fresh = assign_fresh_ids_to_schema(9, &schema, &mut next).unwrap();
 
         assert_eq!(fresh.schema_id(), 9);
-        // Fresh ids 1, 2 in field order; the identifier follows the `id` column to its new id (1).
+        // Fresh ids 1 and 2 in field order. The identifier follows `id` to its new id 1.
         assert_eq!(fresh.field_by_name("id").unwrap().id, 1);
         assert_eq!(fresh.field_by_name("name").unwrap().id, 2);
         let ids: Vec<i32> = fresh.identifier_field_ids().collect();
         assert_eq!(ids, vec![1]);
     }
 
-    /// `assign_increasing_fresh_ids` starts the id stream at 1 (Java seeds `AtomicInteger(0)` and
-    /// pulls via `incrementAndGet`). Risk: an off-by-one (starting at 0) would shift every id.
+    /// `assign_increasing_fresh_ids` starts the id stream at 1. Starting at 0 shifts every id.
     #[test]
     fn test_assign_increasing_fresh_ids_starts_at_one() {
         let schema = Schema::builder()
@@ -1257,9 +1130,7 @@ mod tests {
         assert_eq!(fresh.highest_field_id(), 2);
     }
 
-    /// `assign_ids` rewrites EVERY id through the supplied `old -> new` map (structure preserved),
-    /// unlike `assign_fresh_ids`. Risk: missing the list-element / map id rewrite would leave stale
-    /// ids dangling after a remap.
+    /// `assign_ids` rewrites every id and keeps the structure. A missed list or map id dangles.
     #[test]
     fn test_assign_ids_remaps_all_ids() {
         let field_type = Type::Struct(StructType::new(vec![
@@ -1273,7 +1144,6 @@ mod tests {
             .into(),
         ]));
 
-        // Map each old id to old + 100.
         let mut get_id = |old: i32| old + 100;
         let result = assign_ids(&field_type, &mut get_id).unwrap();
 
@@ -1287,15 +1157,9 @@ mod tests {
         assert_eq!(list.element_field.id, 102, "list element id remapped too");
     }
 
-    /// `assign_fresh_ids_with_base` REUSES the base schema's id for every field whose full dotted
-    /// name also appears in the base, and assigns FRESH ids (from `next_id`) to the rest. Java's
-    /// `idFor(name)` = `baseSchema.findField(name) != null ? found.fieldId() : nextId.get()`, where
-    /// `name` comes from the visiting schema's `findColumnName(currentId)`. Risk: ignoring the base
-    /// would re-number a matched column and break the "reuse base ids where structure matches"
-    /// contract this overload exists for.
+    /// The base id of a matching dotted name is reused; ignoring it re-numbers a matched column.
     #[test]
     fn test_assign_fresh_ids_with_base_reuses_base_ids_by_name() {
-        // The schema to re-id (current ids are arbitrary / colliding).
         let schema = Schema::builder()
             .with_schema_id(5)
             .with_fields(vec![
@@ -1305,7 +1169,6 @@ mod tests {
             ])
             .build()
             .unwrap();
-        // Base supplies canonical ids for `id` and `name`; `added` is absent.
         let base = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -1323,9 +1186,7 @@ mod tests {
         };
         let fresh = assign_fresh_ids_with_base(&schema, &base, &mut next).unwrap();
 
-        // Default schema id 0 (Java's `new Schema(fields, ids)` ctor, no id arg).
         assert_eq!(fresh.schema_id(), 0);
-        // `id` and `name` reuse the base ids; `added` gets a fresh id from `next_id`.
         assert_eq!(fresh.field_by_name("id").unwrap().id, 10, "reused base id");
         assert_eq!(
             fresh.field_by_name("name").unwrap().id,
@@ -1339,9 +1200,7 @@ mod tests {
         );
     }
 
-    /// `assign_fresh_ids_with_base` walks a NESTED struct in level-order, reusing base ids by full
-    /// dotted name and pulling fresh ids for unmatched nested names. Risk: looking up the wrong name
-    /// (short vs dotted) or reusing position would assign the wrong nested base id.
+    /// A short-name lookup or a positional match gives a nested field the wrong base id.
     #[test]
     fn test_assign_fresh_ids_with_base_nested_reuse_and_fresh() {
         let schema = Schema::builder()
@@ -1359,7 +1218,6 @@ mod tests {
             ])
             .build()
             .unwrap();
-        // Base matches `point` and `point.x` but NOT `point.y`.
         let base = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -1389,9 +1247,7 @@ mod tests {
             Some(31),
             "reused base id"
         );
-        // `point.y` is unmatched -> the first fresh id (1). The struct walk is level-order, so the
-        // two immediate ids (point reused=30, then point's child ids) precede the descent, but the
-        // ONLY fresh id pulled is for `point.y`.
+        // `point.y` is unmatched, so it takes the first fresh id (1). It is the only fresh id.
         assert_eq!(
             fresh.field_id_by_name("point.y"),
             Some(1),
@@ -1399,14 +1255,9 @@ mod tests {
         );
     }
 
-    // ===== reassign family =====
-
-    /// `reassign_ids` aligns ids to a source schema BY NAME (the source's ids win, even nested).
-    /// Risk: aligning by position instead of name would assign the wrong id to any reordered or
-    /// renamed column.
+    /// Aligning by position, not name, gives a reordered or renamed column the wrong id.
     #[test]
     fn test_reassign_ids_aligns_by_name() {
-        // Source provides the canonical ids.
         let source = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -1424,7 +1275,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // Same names, DIFFERENT ids and a different field order.
         let schema = Schema::builder()
             .with_schema_id(5)
             .with_fields(vec![
@@ -1446,14 +1296,11 @@ mod tests {
         assert_eq!(reassigned.schema_id(), 5, "schema id preserved");
         assert_eq!(reassigned.field_by_name("id").unwrap().id, 10);
         assert_eq!(reassigned.field_by_name("point").unwrap().id, 20);
-        // Nested fields align by their full names too.
         assert_eq!(reassigned.field_id_by_name("point.x"), Some(21));
         assert_eq!(reassigned.field_id_by_name("point.y"), Some(22));
     }
 
-    /// `reassign_ids` is a HARD ERROR when a field has no same-named field in the source (no id
-    /// source to fall back on). Risk: silently assigning some id would diverge from Java's throw and
-    /// could collide with a real source id.
+    /// A name absent from the source is a hard error. A silent id could collide with a source id.
     #[test]
     fn test_reassign_ids_fails_on_unmatched_name() {
         let source = Schema::builder()
@@ -1481,16 +1328,11 @@ mod tests {
         );
     }
 
-    /// `reassign_ids` is a HARD ERROR on a STRUCTURAL TYPE MISMATCH at a MATCHED name: the visited
-    /// field `payload` is a list but the same-named source field is a struct. Java's
-    /// `ReassignIds.list` runs `Preconditions.checkArgument(sourceType.isListType(), "Not a list:
-    /// %s", sourceType)` and throws `IllegalArgumentException` — it does NOT silently reassign or
-    /// fall through to fresh ids. Risk: the previous `(other, _)` arm
-    /// routed this to `assign_fresh_or_fail`, which for `reassign_or_refresh_ids` SILENTLY assigned
-    /// fresh ids (Java throws) and for `reassign_ids` errored with the WRONG "not found" message.
+    /// A structural mismatch at a matched name is a hard error: `payload` is a list here and a
+    /// struct in the source. The mutation this discriminates: route the mismatch to
+    /// `assign_fresh_or_fail`, which assigns fresh ids or raises the wrong `not found` message.
     #[test]
     fn test_reassign_ids_fails_on_matched_name_type_mismatch() {
-        // Source: `payload` is a STRUCT.
         let source = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -1505,7 +1347,6 @@ mod tests {
             ])
             .build()
             .unwrap();
-        // Schema: same name `payload`, but a LIST.
         let schema = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -1531,11 +1372,8 @@ mod tests {
         );
     }
 
-    /// The SAME structural mismatch under `reassign_or_refresh_ids` (which DOES carry an id source)
-    /// must ALSO throw, NOT silently assign fresh ids — Java's `ReassignIds.struct`/`list`/`map`
-    /// type guard fires regardless of whether `assignId` is set (the `assignId` fallback is only on
-    /// the no-MATCH path in `field()`/`id()`, not on a matched-name type mismatch). Risk: the prior
-    /// fall-through let `reassign_or_refresh_ids` accept a list-where-struct silently.
+    /// The same mismatch must also fail under `reassign_or_refresh_ids`, which carries an id
+    /// source. The `assignId` fallback covers the no-match path only.
     #[test]
     fn test_reassign_or_refresh_ids_fails_on_matched_name_type_mismatch() {
         let source = Schema::builder()
@@ -1559,7 +1397,6 @@ mod tests {
             ])
             .build()
             .unwrap();
-        // Same name `m`, but a STRUCT (not a map).
         let schema = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -1585,9 +1422,7 @@ mod tests {
         );
     }
 
-    /// `reassign_or_refresh_ids` reuses source ids by name where they match, and assigns FRESH ids
-    /// (continuing from the source's highest id) to unmatched names. Risk: not continuing from the
-    /// source high-water mark could reuse an id already present in the source (a collision).
+    /// Fresh ids must continue from the source's highest id, or they collide with a source id.
     #[test]
     fn test_reassign_or_refresh_ids_assigns_fresh_for_unmatched() {
         let source = Schema::builder()
@@ -1598,7 +1433,6 @@ mod tests {
             ])
             .build()
             .unwrap();
-        // highest_field_id of source is 15.
         let schema = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -1609,13 +1443,12 @@ mod tests {
             .unwrap();
 
         let result = reassign_or_refresh_ids(&schema, &source).unwrap();
-        // `id` matches the source -> id 10. `extra` is fresh, continuing from 15 -> 16.
+        // `id` matches the source and takes 10. `extra` is fresh and continues from 15 to 16.
         assert_eq!(result.field_by_name("id").unwrap().id, 10);
         assert_eq!(result.field_by_name("extra").unwrap().id, 16);
     }
 
-    /// `reassign_doc` copies docs from the doc source BY ID and clears docs absent from the source.
-    /// Risk: copying by name/position would attach the wrong comment to a column.
+    /// Docs copy by id. Copying by name or position attaches the wrong comment to a column.
     #[test]
     fn test_reassign_doc_copies_by_id() {
         let doc_source = Schema::builder()
@@ -1628,7 +1461,6 @@ mod tests {
             ])
             .build()
             .unwrap();
-        // Same ids; field 1 has a stale doc, field 2 has a doc that should be CLEARED (absent in src).
         let schema = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -1655,9 +1487,7 @@ mod tests {
         );
     }
 
-    /// `refresh_identifier_fields` is a HARD ERROR when an identifier name no longer resolves in the
-    /// freshly-id'd struct (Java's `Preconditions.checkArgument` "Cannot find ID for identifier
-    /// field"). Risk: silently dropping the identifier would lose the primary-key constraint.
+    /// An identifier name that no longer resolves is a hard error, not a dropped constraint.
     #[test]
     fn test_refresh_identifier_fields_fails_when_name_missing() {
         let source = Schema::builder()
@@ -1668,7 +1498,6 @@ mod tests {
             ])
             .build()
             .unwrap();
-        // A new struct that does NOT contain `id`.
         let new_struct = StructType::new(vec![
             NestedField::required(5, "other", Type::Primitive(PrimitiveType::Long)).into(),
         ]);
@@ -1686,9 +1515,8 @@ mod tests {
 
     // ===== recursion safety: the caller-supplied raw `Type` doors =====
 
-    /// A chain of `depth` nested single-field structs wrapping a boolean leaf, built iteratively so
-    /// the FIXTURE never recurses. Ids are arbitrary — the assign-ids family replaces them. This is
-    /// the exact shape a caller can hand to the public `UpdateSchemaAction::add_column`.
+    /// `depth` nested single-field structs around a boolean leaf, built iteratively so the
+    /// fixture never recurses. `UpdateSchemaAction::add_column` accepts this shape.
     fn deeply_nested_struct_type(depth: usize) -> Type {
         let mut field_type = Type::Primitive(PrimitiveType::Boolean);
         for level in (1..=depth).rev() {
@@ -1700,18 +1528,9 @@ mod tests {
         field_type
     }
 
-    /// Run `call` on a thread with a KNOWN, deliberately bounded stack, handing `field_type` in and
-    /// back out so the deep fixture's RECURSIVE DROP happens on the harness's own stack rather than
-    /// this one (dropping it inside would overflow for reasons unrelated to what is under test).
-    ///
-    /// 3 MiB is chosen from a measurement, not a guess. Bisecting `stack_size` in the **dev**
-    /// profile (the profile with the fattest frames — every temporary gets its own slot) against a
-    /// struct chain: the DEPTH-BOUNDED walk, which unwinds after
-    /// `MAX_ASSIGN_IDS_NESTING_DEPTH + 1 = 129` levels, overflows at 1152 KiB and succeeds at
-    /// 1280 KiB, i.e. it needs ≈1.25 MiB (≈9.7 KiB per nesting level, two frames each). The 4096
-    /// levels these tests feed in would need ≈40 MiB unbounded. 3 MiB therefore sits ~2.4× above
-    /// what the fixed code needs and ~13× below what the unbounded code needs: removing the guard
-    /// turns these tests into a hard `fatal runtime error: stack overflow` abort.
+    /// Run `call` on a thread with a known, bounded stack. `field_type` goes in and comes back out,
+    /// so the deep fixture's recursive DROP runs on the harness stack, not this one. 3 MiB comes
+    /// from a measurement.
     fn on_bounded_stack(field_type: Type, call: fn(&Type) -> Result<Type>) -> (Type, Result<Type>) {
         std::thread::Builder::new()
             .name("assign-ids-bounded-stack".to_string())
@@ -1752,12 +1571,9 @@ mod tests {
         );
     }
 
-    // RISK (the reachable hazard): `assign_fresh_ids` receives a CALLER-SUPPLIED `Type` — the
-    // argument of the public `UpdateSchemaAction::add_column` — that no `SchemaBuilder` has ever
-    // validated. Unbounded, a hostile struct chain overflows the thread stack (Java does exactly
-    // that; see `MAX_ASSIGN_IDS_NESTING_DEPTH`). Catches: deleting the
-    // `depth > MAX_ASSIGN_IDS_NESTING_DEPTH` guard from `assign_fresh_ids_at_depth` — the bounded
-    // stack then aborts the process instead of returning.
+    // Risk: `assign_fresh_ids` takes the unvalidated `Type` of `UpdateSchemaAction::add_column`.
+    // Unbounded, a hostile struct chain overflows the thread stack. The mutation this
+    // discriminates: delete the depth guard from `assign_fresh_ids_at_depth`, which aborts.
     #[test]
     fn assign_fresh_ids_rejects_hostile_nesting_instead_of_overflowing() {
         let (deep, result) = on_bounded_stack(deeply_nested_struct_type(4096), increasing_from_one);
@@ -1767,8 +1583,8 @@ mod tests {
         drop(deep);
     }
 
-    // RISK: `assign_ids` is the second public raw-`Type` door and must carry the same bound.
-    // Catches: deleting the guard from `assign_ids_at_depth`.
+    // Risk: `assign_ids` is the second raw-`Type` door and needs the same bound.
+    // The mutation this discriminates: delete the guard from `assign_ids_at_depth`.
     #[test]
     fn assign_ids_rejects_hostile_nesting_instead_of_overflowing() {
         let (deep, result) = on_bounded_stack(deeply_nested_struct_type(4096), identity_remap);
@@ -1778,11 +1594,9 @@ mod tests {
         drop(deep);
     }
 
-    // RISK: the bound must sit at EXACTLY `MAX_ASSIGN_IDS_NESTING_DEPTH` under the schema visitor's
-    // depth convention (the handed-in type is depth 0, each nested field/element/key/value is
-    // depth + 1), so it can never refuse a column `SchemaBuilder::build` would have accepted.
-    // Catches an off-by-one in either direction (`>=` for `>`, or passing `depth + 1` into
-    // `assign_fresh_ids_to_fields_at_depth`) and a changed constant.
+    // Risk: the bound must sit at exactly `MAX_ASSIGN_IDS_NESTING_DEPTH`, so it never refuses a
+    // column `SchemaBuilder::build` accepts. The mutations this discriminates: an off-by-one in
+    // either direction (`>=` for `>`, or `depth + 1` into the fields walk), and a new constant.
     #[test]
     fn assign_fresh_ids_depth_bound_is_exactly_the_family_constant() {
         assert_eq!(
@@ -1805,18 +1619,9 @@ mod tests {
         assert_depth_error(&error);
     }
 
-    // RISK: the bound must count LIST and MAP nesting too — a chain built only from containers
-    // reaches the same recursion through different match arms, and a lost `depth + 1` on any one of
-    // them leaves that arm unbounded while every struct test stays green. One chain per container
-    // recursion in `assign_fresh_ids_at_depth`, so each arm is pinned INDEPENDENTLY: dropping the
-    // `depth + 1` on the list-element arm, on the map-KEY arm, or on the map-VALUE arm each turns
-    // exactly one of the three `expect_err`s below RED.
-    //
-    // A map KEY may itself be a nested type: Rust's `MapType::new` imposes no restriction, and
-    // neither does Java — `Types$MapType.ofOptional` / `ofRequired` (iceberg-api 1.10.0) only
-    // `Preconditions.checkNotNull(valueType, "Value type cannot be null")` at offsets 0–6 and then
-    // hand both types straight to `NestedField.required` / `optional`. So `map<map<map<…>,v>,v>` is
-    // constructible and reaches the key arm straight from the public `UpdateSchemaAction::add_column`.
+    // Risk: the bound must count LIST and MAP nesting. A container-only chain reaches the same
+    // recursion through other match arms, and a lost `depth + 1` on one arm leaves it unbounded
+    // while every struct test stays green. One chain per container arm pins each independently.
     #[test]
     fn assign_fresh_ids_bounds_list_and_map_nesting_too() {
         let mut list_chain = Type::Primitive(PrimitiveType::Boolean);
@@ -1829,7 +1634,7 @@ mod tests {
         let error = increasing_from_one(&list_chain).expect_err("deep list chain must be rejected");
         assert_depth_error(&error);
 
-        // Nested through the VALUE position; every key is a shallow primitive.
+        // Nested through the value position. Every key is a shallow primitive.
         let mut map_value_chain = Type::Primitive(PrimitiveType::Boolean);
         for level in (1..=(MAX_ASSIGN_IDS_NESTING_DEPTH + 1)).rev() {
             let key_id = i32::try_from(2 * level).expect("test depth fits i32");
@@ -1842,9 +1647,8 @@ mod tests {
             .expect_err("deep map chain nested through VALUES must be rejected");
         assert_depth_error(&error);
 
-        // Nested through the KEY position; every value is a shallow primitive. Without this chain
-        // the key arm is unpinned — the value chain above cannot reach it, because its keys are
-        // primitives that return before any depth can accumulate.
+        // Nested through the key position. Without this chain the key arm is unpinned: the value
+        // chain above has primitive keys that return before any depth accumulates.
         let mut map_key_chain = Type::Primitive(PrimitiveType::String);
         for level in (1..=(MAX_ASSIGN_IDS_NESTING_DEPTH + 1)).rev() {
             let key_id = i32::try_from(2 * level).expect("test depth fits i32");

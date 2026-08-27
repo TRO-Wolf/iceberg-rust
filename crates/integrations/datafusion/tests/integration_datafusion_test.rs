@@ -95,8 +95,8 @@ fn get_table_creation(
     Ok(creation)
 }
 
-/// A `{foo1 int, foo2 string}` table creation with `write.delete.mode` and `write.update.mode` both set
-/// to `merge-on-read`, so `DELETE`/`UPDATE` use the position-delete (`RowDelta`) path.
+/// A `{foo1 int, foo2 string}` table with both DML modes set to merge-on-read, so DELETE and
+/// UPDATE take the position-delete path.
 fn get_merge_on_read_table_creation(
     location: impl ToString,
     name: impl ToString,
@@ -155,7 +155,7 @@ async fn test_provider_plan_stream_schema() -> Result<()> {
 
     let task_ctx = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await.unwrap();
-    // Empty table plans N=1; execute(i) for i≥N is a typed error (G1 pin 2). Use partition 0.
+    // An empty table plans one partition, and `execute(i)` past it is a typed error.
     let stream = plan.execute(0, task_ctx).unwrap();
 
     // Ensure both the plan and the stream conform to the same schema
@@ -221,7 +221,7 @@ async fn test_provider_list_table_names() -> Result<()> {
 
 #[tokio::test]
 async fn test_dollar_in_base_table_name_sql_read_and_metadata_twin() -> Result<()> {
-    // RISK: `split_once('$')` makes `table_exist("a$b")` false and `a$b$files` unresolvable.
+    // `split_once('$')` makes `table_exist("a$b")` false and `a$b$files` unresolvable.
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_dollar_name".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
@@ -330,14 +330,12 @@ async fn test_table_projection() -> Result<()> {
         .unwrap();
     assert_eq!(1, records.len());
     let record = &records[0];
-    // the first column is plan_type, the second column plan string.
     let s = record
         .column(1)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(2, s.len());
-    // the first row is logical_plan, the second row is physical_plan
     assert!(s.value(1).contains("projection:[foo1,foo2,foo3]"));
 
     // datafusion doesn't support query foo3.s_foo1, use foo3 instead
@@ -397,14 +395,12 @@ async fn test_table_predict_pushdown() -> Result<()> {
         .unwrap();
     assert_eq!(1, records.len());
     let record = &records[0];
-    // the first column is plan_type, the second column plan string.
     let s = record
         .column(1)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(2, s.len());
-    // the first row is logical_plan, the second row is physical_plan
     let expected = "predicate:[(foo > 1) OR (bar IS NULL)]";
     assert!(s.value(1).trim().contains(expected));
     Ok(())
@@ -551,7 +547,6 @@ async fn test_insert_into() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
 
-    // Verify table schema
     let provider = ctx.catalog("catalog").unwrap();
     let schema = provider.schema("test_insert_into").unwrap();
     let table = schema.table("my_table").await.unwrap().unwrap();
@@ -564,13 +559,11 @@ async fn test_insert_into() -> Result<()> {
         assert!(!field.is_nullable())
     }
 
-    // Insert data into the table
     let df = ctx
         .sql("INSERT INTO catalog.test_insert_into.my_table VALUES (1, 'alan'), (2, 'turing')")
         .await
         .unwrap();
 
-    // Verify the insert operation result
     let batches = df.collect().await.unwrap();
     assert_eq!(batches.len(), 1);
     let batch = &batches[0];
@@ -578,7 +571,6 @@ async fn test_insert_into() -> Result<()> {
         batch.num_rows() == 1 && batch.num_columns() == 1,
         "Results should only have one row and one column that has the number of rows inserted"
     );
-    // Verify the number of rows inserted
     let rows_inserted = batch
         .column(0)
         .as_any()
@@ -586,7 +578,6 @@ async fn test_insert_into() -> Result<()> {
         .unwrap();
     assert_eq!(rows_inserted.value(0), 2);
 
-    // Query the table to verify the inserted data
     let df = ctx
         .sql("SELECT * FROM catalog.test_insert_into.my_table")
         .await
@@ -594,7 +585,6 @@ async fn test_insert_into() -> Result<()> {
 
     let batches = df.collect().await.unwrap();
 
-    // Use check_record_batches to verify the data
     check_record_batches(
         batches,
         expect![[r#"
@@ -641,9 +631,8 @@ async fn test_insert_overwrite() -> Result<()> {
         .await
         .unwrap();
 
-    // INSERT OVERWRITE replaces ALL existing data with the new rows (DataFusion maps the
-    // `overwrite` flag to `InsertOp::Overwrite`, which `IcebergCommitExec` commits via
-    // `overwrite_files().overwrite_by_row_filter(AlwaysTrue)` — delete-all + add-new in one snapshot).
+    // INSERT OVERWRITE replaces all data: DataFusion's `InsertOp::Overwrite` becomes
+    // `overwrite_files().overwrite_by_row_filter(AlwaysTrue)`, one snapshot.
     let df = ctx
         .sql(
             "INSERT OVERWRITE catalog.test_insert_overwrite.my_table VALUES (9, 'replaced'), (10, 'fresh')",
@@ -662,8 +651,7 @@ async fn test_insert_overwrite() -> Result<()> {
         "INSERT OVERWRITE reports the 2 rows it wrote"
     );
 
-    // SELECT * must return ONLY the overwrite rows — the original (1,alan),(2,turing) are GONE.
-    // (An append would leave 4 rows; a correct overwrite leaves exactly the 2 new ones.)
+    // Only the overwrite rows survive. An append would leave 4 rows.
     let df = ctx
         .sql("SELECT * FROM catalog.test_insert_overwrite.my_table")
         .await
@@ -721,10 +709,9 @@ async fn test_delete_from_merge_on_read() -> Result<()> {
     .await
     .unwrap();
 
-    // DELETE WHERE foo1 > 0 AND lower(foo2) = 'alan'. The `lower(foo2)` branch is NOT convertible to an
-    // Iceberg predicate, so a buggy delete relying on inexact pushdown would LOOSEN the filter to
-    // `foo1 > 0` and OVER-DELETE all three rows. Our exact-filter delete removes only rows 1 and 3
-    // (foo2 case-insensitively equal to "alan"), leaving (2, 'turing').
+    // `lower(foo2)` is not convertible to an Iceberg predicate. A delete that trusts inexact
+    // pushdown loosens the filter to `foo1 > 0` and deletes all three rows. The exact filter
+    // removes rows 1 and 3 only.
     let df = ctx
         .sql("DELETE FROM catalog.test_delete_merge_read.my_table WHERE foo1 > 0 AND lower(foo2) = 'alan'")
         .await
@@ -834,7 +821,7 @@ async fn test_delete_across_data_files() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
 
-    // Two separate INSERT statements → two separate data files; each row's `_pos` is file-local (0,1 in each).
+    // Two INSERT statements give two data files, and `_pos` is file-local in each.
     ctx.sql("INSERT INTO catalog.test_delete_multifile.my_table VALUES (1, 'a'), (2, 'b')")
         .await
         .unwrap()
@@ -848,9 +835,8 @@ async fn test_delete_across_data_files() -> Result<()> {
         .await
         .unwrap();
 
-    // DELETE one row from EACH file (foo1=2 lives in file 1 at pos 1; foo1=3 in file 2 at pos 0). The
-    // position deletes must be PATH-keyed per file — a bug that confused per-file `_pos` would delete the
-    // wrong rows. Survivors must be exactly {1, 4}.
+    // Delete one row from each file. The position deletes must be path-keyed per file, because
+    // `_pos` is file-local. Survivors are exactly {1, 4}.
     let df = ctx
         .sql("DELETE FROM catalog.test_delete_multifile.my_table WHERE foo1 = 2 OR foo1 = 3")
         .await
@@ -920,8 +906,8 @@ async fn test_delete_from_copy_on_write() -> Result<()> {
     .await
     .unwrap();
 
-    // The SAME discriminating filter as the MoR test: `lower(foo2)` is unconvertible, so an inexact
-    // pushdown would over-delete. Copy-on-write must rewrite the data file keeping ONLY (2,'turing').
+    // The same discriminating filter as the MoR test. Copy-on-write must rewrite the file
+    // keeping only (2,'turing').
     let df = ctx
         .sql("DELETE FROM catalog.test_delete_cow.my_table WHERE foo1 > 0 AND lower(foo2) = 'alan'")
         .await
@@ -1024,9 +1010,8 @@ async fn test_update_merge_on_read() -> Result<()> {
     .await
     .unwrap();
 
-    // The discriminating filter again: only rows with foo2 case-insensitively 'alan' (rows 1, 3) are
-    // updated; row 2 is untouched. `foo1 = foo1 + 100` proves the assignment expression reads the OLD
-    // value. Merge-on-read writes the new rows + position-deletes the old in one RowDelta.
+    // Only rows 1 and 3 match. `foo1 = foo1 + 100` proves the assignment reads the old value.
+    // Merge-on-read writes the new rows and position-deletes the old, in one RowDelta.
     let df = ctx
         .sql(
             "UPDATE catalog.test_update_merge_read.my_table SET foo2 = 'X', foo1 = foo1 + 100 \
@@ -1143,17 +1128,10 @@ async fn test_update_copy_on_write() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
 // COW UPDATE — partitioned table tests (U2)
-// ============================================================================
 
-/// COW UPDATE on a partitioned table: update a non-partition column WHERE matches rows in one
-/// partition; assert updated values, untouched rows in the other partition survive unchanged.
-///
-/// Table: `{id int, category string, value string}` partitioned by `identity(category)`.
-/// Two partitions: `electronics` (ids 1,2) and `books` (ids 3,4).
-/// UPDATE sets `value = 'UPDATED'` WHERE `category = 'electronics'`.
-/// Post-UPDATE: electronics rows have the new value; books rows are unchanged.
+/// COW UPDATE of a non-partition column, matching one partition of two. The electronics rows take
+/// the new value and the books rows stay unchanged.
 #[tokio::test]
 async fn test_update_cow_partitioned() -> Result<()> {
     let (ctx, _client) = make_partitioned_delete_ctx("test_upd_cow_part", "items").await?;
@@ -1236,13 +1214,8 @@ async fn test_update_cow_partitioned() -> Result<()> {
     Ok(())
 }
 
-/// COW UPDATE on a partitioned table where the UPDATE CHANGES the partition-key column.
-///
-/// Table: `{id int, category string, value string}` partitioned by `identity(category)`.
-/// Row (id=1, category='electronics', value='laptop') is in the `electronics` partition.
-/// `UPDATE … SET category = 'books' WHERE id = 1` changes its partition key.
-/// Post-UPDATE: id=1 must appear with `category='books'` (in the books partition); all other
-/// rows are unchanged.
+/// COW UPDATE that changes the partition-key column. `SET category = 'books' WHERE id = 1` moves
+/// id 1 into the books partition. Every other row stays unchanged.
 #[tokio::test]
 async fn test_update_cow_partitioned_moves_partition() -> Result<()> {
     let (ctx, _client) = make_partitioned_delete_ctx("test_upd_cow_move", "items").await?;
@@ -1346,10 +1319,9 @@ async fn test_update_cow_partitioned_moves_partition() -> Result<()> {
     Ok(())
 }
 
-/// Confirm the existing unpartitioned COW UPDATE still passes under the new file-level path.
-/// The discriminating `lower(foo2) = 'alan'` filter is unconvertible — an inexact pushdown
-/// would over-update. The exact PhysicalExpr eval and the assignment expression (`foo1 + 100`)
-/// must be preserved end-to-end.
+/// The unpartitioned COW UPDATE under the file-level path. `lower(foo2) = 'alan'` is
+/// unconvertible, so an inexact pushdown over-updates. The exact eval and the assignment
+/// expression must both survive.
 #[tokio::test]
 async fn test_update_cow_unpartitioned_exact_filter_preserved() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -1556,14 +1528,11 @@ async fn test_update_null_into_required_is_rejected() -> Result<()> {
     Ok(())
 }
 
-/// The COPY-ON-WRITE twin of the test above (H7-S2 follow-up seed 6, scheduled rather than deferred).
+/// The copy-on-write twin of the test above.
 ///
-/// It pins the contract that survived the streaming refactor even though the FAILURE TIMING changed:
-/// before H7-S2 every rewrite batch was built before any Parquet I/O, so `apply_assignments` rejected
-/// the NULL with nothing written; now batch 1 may already be inside an open writer when a later batch
-/// trips the guard, and the writer is dropped without `close()` (leaving staged files that were never
-/// committed — the same shape `merge_on_read_update` has always had). What must NOT change, and is
-/// what this asserts, is that the statement ERRORS and the table is left exactly as it was.
+/// Streaming changed the failure timing: a later batch can trip the NULL guard while batch 1 is
+/// already inside an open writer, which is then dropped without `close()` and leaves staged files.
+/// What must not change is that the statement errors and the table stays exactly as it was.
 #[tokio::test]
 async fn test_update_cow_null_into_required_is_rejected() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -1608,18 +1577,10 @@ async fn test_update_cow_null_into_required_is_rejected() -> Result<()> {
 }
 
 fn get_nested_struct_type() -> StructType {
-    // Create a nested struct type with:
-    // - address: STRUCT<street: STRING, city: STRING, zip: INT>
-    // - contact: STRUCT<email: STRING, phone: STRING>
-    //
-    // DF54 re-pin (field-aware CastExpr): leaf fields under `address` are OPTIONAL, not
-    // REQUIRED. DataFusion 54's nested-struct cast validation rejects casting a nullable
-    // SQL `named_struct` field to a non-nullable nested target field
-    // (`validate_field_compatibility` in datafusion-common nested_struct.rs; upgrade guide
-    // § "CastColumnExpr removed in favor of field-aware CastExpr"). DF52 accepted the
-    // insert; required-nested insert via SQL named_struct needs a follow-up engine path
-    // (non-null runtime check without planning-time reject) — out of scope for the family
-    // bump alone. Nested shape + values remain covered.
+    // The leaf fields under `address` are OPTIONAL, not REQUIRED. DataFusion's nested-struct
+    // cast validation rejects a cast from a nullable SQL `named_struct` field to a non-nullable
+    // target field. A required-nested insert through `named_struct` needs an engine path that
+    // checks non-null at run time instead of rejecting at planning time.
     StructType::new(vec![
         NestedField::optional(
             10,
@@ -1650,7 +1611,6 @@ async fn test_insert_into_nested() -> Result<()> {
     set_test_namespace(&iceberg_catalog, &namespace).await?;
     let table_name = "nested_table";
 
-    // Create a schema with nested fields
     let schema = Schema::builder()
         .with_schema_id(0)
         .with_fields(vec![
@@ -1660,7 +1620,6 @@ async fn test_insert_into_nested() -> Result<()> {
         ])
         .build()?;
 
-    // Create the table with the nested schema
     let creation = get_table_creation(temp_path(), table_name, Some(schema))?;
     iceberg_catalog.create_table(&namespace, creation).await?;
 
@@ -1670,13 +1629,11 @@ async fn test_insert_into_nested() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
 
-    // Verify table schema
     let provider = ctx.catalog("catalog").unwrap();
     let schema = provider.schema("test_insert_nested").unwrap();
     let table = schema.table("nested_table").await.unwrap().unwrap();
     let table_schema = table.schema();
 
-    // Verify the schema has the expected structure
     assert_eq!(table_schema.fields().len(), 3);
     assert_eq!(table_schema.field(0).name(), "id");
     assert_eq!(table_schema.field(1).name(), "name");
@@ -1686,8 +1643,6 @@ async fn test_insert_into_nested() -> Result<()> {
         DataType::Struct(_)
     ));
 
-    // In DataFusion, we need to use named_struct to create struct values
-    // Insert data with nested structs
     let insert_sql = r#"
     INSERT INTO catalog.test_insert_nested.nested_table
     SELECT 
@@ -1721,16 +1676,13 @@ async fn test_insert_into_nested() -> Result<()> {
         ) as profile
     "#;
 
-    // Execute the insert
     let df = ctx.sql(insert_sql).await.unwrap();
     let batches = df.collect().await.unwrap();
 
-    // Verify the insert operation result
     assert_eq!(batches.len(), 1);
     let batch = &batches[0];
     assert!(batch.num_rows() == 1 && batch.num_columns() == 1);
 
-    // Verify the number of rows inserted
     let rows_inserted = batch
         .column(0)
         .as_any()
@@ -1738,7 +1690,6 @@ async fn test_insert_into_nested() -> Result<()> {
         .unwrap();
     assert_eq!(rows_inserted.value(0), 2);
 
-    // Query the table to verify the inserted data
     let df = ctx
         .sql("SELECT * FROM catalog.test_insert_nested.nested_table ORDER BY id")
         .await
@@ -1746,7 +1697,6 @@ async fn test_insert_into_nested() -> Result<()> {
 
     let batches = df.collect().await.unwrap();
 
-    // Use check_record_batches to verify the data
     check_record_batches(
         batches,
         expect![[r#"
@@ -1824,7 +1774,6 @@ async fn test_insert_into_nested() -> Result<()> {
         Some("id"),
     );
 
-    // Query with explicit field access to verify nested data
     let df = ctx
         .sql(
             r#"
@@ -1845,7 +1794,6 @@ async fn test_insert_into_nested() -> Result<()> {
 
     let batches = df.collect().await.unwrap();
 
-    // Use check_record_batches to verify the flattened data
     check_record_batches(
         batches,
         expect![[r#"
@@ -1905,7 +1853,6 @@ async fn test_insert_into_partitioned() -> Result<()> {
     let namespace = NamespaceIdent::new("test_partitioned_write".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
 
-    // Create a schema with a partition column
     let schema = Schema::builder()
         .with_schema_id(0)
         .with_fields(vec![
@@ -1915,13 +1862,11 @@ async fn test_insert_into_partitioned() -> Result<()> {
         ])
         .build()?;
 
-    // Create partition spec with identity transform on category
     let partition_spec = UnboundPartitionSpec::builder()
         .with_spec_id(0)
         .add_partition_field(2, "category", Transform::Identity)?
         .build();
 
-    // Create the partitioned table
     let creation = TableCreation::builder()
         .name("partitioned_table".to_string())
         .location(temp_path())
@@ -1938,7 +1883,6 @@ async fn test_insert_into_partitioned() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", catalog);
 
-    // Insert data with multiple partition values in a single batch
     let df = ctx
         .sql(
             r#"
@@ -1964,7 +1908,6 @@ async fn test_insert_into_partitioned() -> Result<()> {
         .unwrap();
     assert_eq!(rows_inserted.value(0), 5);
 
-    // Query the table to verify data
     let df = ctx
         .sql("SELECT * FROM catalog.test_partitioned_write.partitioned_table ORDER BY id")
         .await
@@ -2008,18 +1951,15 @@ async fn test_insert_into_partitioned() -> Result<()> {
         Some("id"),
     );
 
-    // Verify that data files exist under correct partition paths
     let table_ident = TableIdent::new(namespace.clone(), "partitioned_table".to_string());
     let table = client.load_table(&table_ident).await?;
     let table_location = table.metadata().location();
     let file_io = table.file_io();
 
-    // List files under each expected partition path
     let electronics_path = format!("{table_location}/data/category=electronics");
     let books_path = format!("{table_location}/data/category=books");
     let clothing_path = format!("{table_location}/data/category=clothing");
 
-    // Verify partition directories exist and contain data files
     assert!(
         file_io.exists(&electronics_path).await?,
         "Expected partition directory: {electronics_path}"
@@ -2036,10 +1976,9 @@ async fn test_insert_into_partitioned() -> Result<()> {
     Ok(())
 }
 
-/// Helper that builds a partitioned `{id int, category string, value string}` table partitioned by
-/// identity(category), registers it in a fresh `SessionContext`, and returns the context + catalog
-/// client so tests can issue SQL and inspect the catalog. The table namespace and name are supplied
-/// by the caller so multiple tests can coexist without namespace collisions.
+/// Builds an `identity(category)`-partitioned `{id, category, value}` table in a fresh
+/// `SessionContext` and returns the context and the catalog. The caller names the namespace, so
+/// tests do not collide.
 async fn make_partitioned_delete_ctx(
     ns: &str,
     tbl: &str,
@@ -2080,12 +2019,7 @@ async fn make_partitioned_delete_ctx(
     Ok((ctx, client))
 }
 
-/// COW DELETE on a partitioned table: delete rows in ONE partition, verify the other is untouched.
-///
-/// Table: `{id int, category string, value string}` partitioned by `identity(category)`.
-/// Two partitions: `electronics` (ids 1,2) and `books` (ids 3,4).
-/// DELETE removes all rows WHERE category = 'electronics'.
-/// Post-DELETE: only the `books` rows remain.
+/// COW DELETE of one partition of two. Only the books rows remain.
 #[tokio::test]
 async fn test_delete_cow_partitioned() -> Result<()> {
     let (ctx, _client) = make_partitioned_delete_ctx("test_del_cow_part", "items").await?;
@@ -2205,9 +2139,8 @@ async fn test_delete_cow_partitioned_delete_from_all() -> Result<()> {
     Ok(())
 }
 
-/// Confirm the existing unpartitioned COW test still passes under the new file-level path.
-/// The discriminating `lower(foo2) = 'alan'` filter is unconvertible — an inexact pushdown
-/// would over-delete (also remove row 2 'turing'). The exact PhysicalExpr eval must be preserved.
+/// The unpartitioned COW DELETE under the file-level path. `lower(foo2) = 'alan'` is
+/// unconvertible, so an inexact pushdown also removes row 2.
 #[tokio::test]
 async fn test_delete_cow_unpartitioned_exact_filter_preserved() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -2283,18 +2216,12 @@ async fn test_delete_cow_unpartitioned_exact_filter_preserved() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
 // ADDITIONAL EDGE-CASE PROBES — U1 COW DELETE adversarial verification
-// ============================================================================
 
-/// EDGE-CASE PROBE 1: Verify affected-path matching at the manifest level.
-/// After COW DELETE, inspect the post-commit snapshot's manifest data files
-/// directly (not just SELECT row counts). Confirm:
-/// a) The deleted source file is gone from the live manifest set.
-/// b) A new rewritten file was added (distinct path).
-/// c) The unaffected file is still present with its ORIGINAL path.
-/// This distinguishes silent no-op (old file stays + new file added = DUPLICATE rows)
-/// from correct behavior.
+/// Affected-path matching, checked at the manifest level rather than by row count. The deleted
+/// source file must leave the live set, a rewritten file must appear, and the unaffected file must
+/// keep its original path. A silent no-op leaves the old file beside the new one and duplicates
+/// rows.
 #[tokio::test]
 async fn test_delete_cow_path_matching_and_manifest_inspection() -> Result<()> {
     let (ctx, client) = make_partitioned_delete_ctx("dml_probe1", "items").await?;
@@ -2369,19 +2296,16 @@ async fn test_delete_cow_path_matching_and_manifest_inspection() -> Result<()> {
         }
     }
 
-    // CRITICAL assertions:
-    // 1. Exactly ONE live file after (the books file, untouched, plus a rewritten... wait:
-    //    the electronics file had 1 row deleted (all rows), so the rewrite produces NO survivors
-    //    for that file. The books file was unaffected and stays. So exactly 1 live file.
+    // The electronics file loses every row, so its rewrite produces no survivors. The books file
+    // is unaffected. Exactly one live file remains.
     assert_eq!(
         paths_after.len(),
         1,
         "after full-file DELETE, live set must be exactly 1 (unaffected books file); got {paths_after:?}"
     );
 
-    // 2. The surviving file MUST be the original books file (unchanged path).
-    // We can't distinguish paths before delete by content alone, so we check that the surviving
-    // path is one of the original paths (i.e., it is the unaffected original books file).
+    // The survivor must be the original books file. Content alone cannot tell the two pre-delete
+    // paths apart, so assert the survivor is one of them.
     let rows = ctx
         .sql("SELECT id, category FROM catalog.dml_probe1.items")
         .await
@@ -2392,8 +2316,7 @@ async fn test_delete_cow_path_matching_and_manifest_inspection() -> Result<()> {
     let total: usize = rows.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 1, "exactly 1 row survives");
 
-    // 3. No path in paths_after should be the SAME as any path_before AND also the electronics path.
-    //    The unaffected books file must still be present with its original path.
+    // The unaffected books file keeps its original path.
     let surviving_path = paths_after.iter().next().unwrap().clone();
     assert!(
         paths_before.contains(&surviving_path),
@@ -2404,10 +2327,8 @@ async fn test_delete_cow_path_matching_and_manifest_inspection() -> Result<()> {
     Ok(())
 }
 
-/// EDGE-CASE PROBE 2: Multi-file-per-partition — DELETE hits only FILE A; FILE B must be untouched.
-/// Partition has 2 data files (two INSERT transactions into the same partition).
-/// DELETE predicate matches rows in file A only.
-/// After commit: file A is gone, file B has its ORIGINAL path (not rewritten).
+/// A partition with two data files, where the DELETE matches file A only. File A goes and file B
+/// keeps its original path.
 #[tokio::test]
 async fn test_delete_cow_multi_file_per_partition_only_affected_rewritten() -> Result<()> {
     let (ctx, client) = make_partitioned_delete_ctx("dml_probe2", "items").await?;
@@ -2430,7 +2351,6 @@ async fn test_delete_cow_multi_file_per_partition_only_affected_rewritten() -> R
     let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
     let table_before = client.load_table(&tbl_id).await?;
 
-    // Collect paths before
     let snap_before = table_before.metadata().current_snapshot().unwrap();
     let ml_before = snap_before
         .load_manifest_list(table_before.file_io(), table_before.metadata())
@@ -2455,7 +2375,6 @@ async fn test_delete_cow_multi_file_per_partition_only_affected_rewritten() -> R
         .await
         .unwrap();
 
-    // Inspect post-commit live paths.
     let table_after = client.load_table(&tbl_id).await?;
     let snap_after = table_after.metadata().current_snapshot().unwrap();
     let ml_after = snap_after
@@ -2471,10 +2390,8 @@ async fn test_delete_cow_multi_file_per_partition_only_affected_rewritten() -> R
         }
     }
 
-    // After deleting id=1 (which was the only row in file A, fully deleted):
-    // - file A: fully deleted, no survivors → 0 rewritten files for A
-    // - file B: unaffected → still has original path
-    // Expected: exactly 1 live file, and it must be file B's original path.
+    // File A loses its only row, so it produces no rewritten file. File B is unaffected. Exactly
+    // one live file remains, at file B's original path.
     assert_eq!(
         paths_after.len(),
         1,
@@ -2510,10 +2427,9 @@ async fn test_delete_cow_multi_file_per_partition_only_affected_rewritten() -> R
     Ok(())
 }
 
-/// EDGE-CASE PROBE 3: Non-identity partition transform (truncate[4] on category string).
-/// This tests PartitionValueCalculator with a real transform, not identity.
-/// If the partition column calculation is wrong, the rewritten file would be assigned
-/// to the wrong partition → DataFile.partition() would carry the wrong value.
+/// A non-identity partition transform, `truncate[4]` on a string. A wrong partition calculation
+/// puts the rewritten file in the wrong partition, so `DataFile.partition()` carries the wrong
+/// value.
 #[tokio::test]
 async fn test_delete_cow_non_identity_transform_truncate() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -2633,10 +2549,7 @@ async fn test_delete_cow_non_identity_transform_truncate() -> Result<()> {
         }
     }
     partition_values.sort();
-    // Two files survive: 1 file for "book" partition (ids 3,4), 1 file for "elec" partition (id=2
-    // rewritten). After DELETE, the affected file is rewritten (dropping id=1), producing 1 new
-    // "elec"-keyed file. The "book" file is unaffected (or, if both partitions were in a single
-    // source file, both get correctly routed on rewrite).
+    // Two files survive: the untouched "book" file, and the rewritten "elec" file without id 1.
     assert_eq!(
         partition_values,
         vec!["book".to_string(), "elec".to_string()],
@@ -2695,32 +2608,19 @@ async fn test_delete_cow_no_match_is_noop() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
 // ADDITIONAL EDGE-CASE PROBES — U2 COW UPDATE adversarial verification
-// ============================================================================
 
-/// COW UPDATE PROBE 1: Row-conservation + manifest-level inspection for COW UPDATE.
+/// Row conservation for COW UPDATE, checked at the manifest level. file_A holds a matching and a
+/// non-matching row, file_B sits in another partition.
 ///
-/// Two files: file_A (id=1 matches, id=2 does not — in the same file because they're inserted
-/// together) and file_B (id=3, unaffected partition).
-/// After UPDATE SET value='NEW' WHERE id=1:
-///   - File_A must be DELETED from the live manifest and replaced by a NEW file with 2 rows
-///     (row1 updated, row2 carried unchanged).
-///   - File_B must remain with its ORIGINAL path (not rewritten).
-///   - Total row count = 3 (row conservation).
-///   - Row content: id=1 → 'NEW', id=2 → 'phone', id=3 → 'novel'.
-///
-/// This probe specifically catches:
-///   a) Phantom deletion (row count drops after UPDATE)
-///   b) Duplication (row count rises after UPDATE)
-///   c) Incorrect path matching (old file stays AND new file added = double rows)
-///   d) Over-rewrite (unaffected file_B rewritten when it should not be)
+/// file_A must be replaced by one new file of two rows, one updated and one carried. file_B must
+/// keep its original path. The total stays at three rows. A wrong result shows as a dropped row,
+/// a duplicated row, an old file left beside the new one, or a rewritten file_B.
 #[tokio::test]
 async fn test_update_cow_row_conservation_and_manifest_inspection() -> Result<()> {
     let (ctx, client) = make_partitioned_delete_ctx("upd_probe_u2_1", "items").await?;
 
-    // Insert two separate transactions so file_A (electronics) and file_B (books) are distinct.
-    // file_A: rows id=1 AND id=2 in the electronics partition (single INSERT = one file).
+    // Two transactions make file_A and file_B distinct. file_A holds ids 1 and 2.
     ctx.sql(
         "INSERT INTO catalog.upd_probe_u2_1.items VALUES \
          (1, 'electronics', 'laptop'), (2, 'electronics', 'phone')",
@@ -2739,7 +2639,6 @@ async fn test_update_cow_row_conservation_and_manifest_inspection() -> Result<()
         .await
         .unwrap();
 
-    // Record pre-UPDATE manifest state.
     let ns = NamespaceIdent::new("upd_probe_u2_1".to_string());
     let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
     let table_before = client.load_table(&tbl_id).await?;
@@ -2777,7 +2676,6 @@ async fn test_update_cow_row_conservation_and_manifest_inspection() -> Result<()
         .value(0);
     assert_eq!(upd_count, 1, "exactly 1 row updated (only id=1 matched)");
 
-    // Inspect manifest after UPDATE.
     let table_after = client.load_table(&tbl_id).await?;
     let snap_after = table_after.metadata().current_snapshot().unwrap();
     let ml_after = snap_after
@@ -2879,15 +2777,8 @@ async fn test_update_cow_row_conservation_and_manifest_inspection() -> Result<()
     Ok(())
 }
 
-/// COW UPDATE PROBE 2: Multi-file-per-partition UPDATE — only the affected file is rewritten;
-/// the second file in the same partition is untouched (verified at manifest path level).
-///
-/// Partition 'electronics' has 2 files: file_A (id=1) and file_B (id=2).
-/// UPDATE SET value='NEW' WHERE id=1.
-/// After UPDATE:
-///   - file_A is replaced by a new file (1 row, updated).
-///   - file_B retains its ORIGINAL path and content (not rewritten).
-///   - Total rows = 2.
+/// A partition with two files, where the UPDATE matches file_A only. file_A is replaced by a new
+/// one-row file and file_B keeps its original path and content.
 #[tokio::test]
 async fn test_update_cow_multi_file_per_partition_only_affected_rewritten() -> Result<()> {
     let (ctx, client) = make_partitioned_delete_ctx("upd_probe_u2_2", "items").await?;
@@ -2940,7 +2831,6 @@ async fn test_update_cow_multi_file_per_partition_only_affected_rewritten() -> R
         .value(0);
     assert_eq!(upd_count, 1, "exactly 1 row updated");
 
-    // Inspect post-commit live paths.
     let table_after = client.load_table(&tbl_id).await?;
     let snap_after = table_after.metadata().current_snapshot().unwrap();
     let ml_after = snap_after
@@ -2986,7 +2876,6 @@ async fn test_update_cow_multi_file_per_partition_only_affected_rewritten() -> R
         "exactly one NEW file (rewritten file_A) must appear; new_files={new_files:?}"
     );
 
-    // Row content correct.
     let rows = ctx
         .sql("SELECT id, value FROM catalog.upd_probe_u2_2.items ORDER BY id")
         .await
@@ -3025,15 +2914,8 @@ async fn test_update_cow_multi_file_per_partition_only_affected_rewritten() -> R
     Ok(())
 }
 
-/// COW UPDATE PROBE 3: COW UPDATE with no WHERE on a PARTITIONED table.
-///
-/// `predicate = None` path in a partitioned table — all files are affected and all rows updated.
-/// Table: 2 partitions, 2 rows each. UPDATE SET value='ALL' (no WHERE).
-/// Post-UPDATE:
-///   - All 4 rows must have value='ALL'.
-///   - Total row count = 4 (no loss, no dup).
-///   - Updated count returned = 4.
-///   - New snapshot must have been created.
+/// COW UPDATE with no WHERE on a partitioned table, so every file is affected. All four rows take
+/// the new value, the count returned is 4, and a new snapshot appears.
 #[tokio::test]
 async fn test_update_cow_partitioned_no_where_updates_all() -> Result<()> {
     let (ctx, client) = make_partitioned_delete_ctx("upd_probe_u2_3", "items").await?;
@@ -3132,10 +3014,7 @@ async fn test_update_cow_partitioned_no_where_updates_all() -> Result<()> {
     Ok(())
 }
 
-/// COW UPDATE PROBE 4: COW UPDATE zero-match is a no-op (no snapshot created).
-///
-/// UPDATE WHERE predicate matches zero rows → updated=0, no snapshot.
-/// This verifies the no-op early-exit path.
+/// A zero-match COW UPDATE is a no-op: the count is 0 and no snapshot appears.
 #[tokio::test]
 async fn test_update_cow_partitioned_no_match_is_noop() -> Result<()> {
     let (ctx, client) = make_partitioned_delete_ctx("upd_probe_u2_4", "items").await?;
@@ -3184,17 +3063,11 @@ async fn test_update_cow_partitioned_no_match_is_noop() -> Result<()> {
     Ok(())
 }
 
-/// COW UPDATE PROBE 5: Partition-move verified at manifest/DataFile level, not just SELECT.
+/// A partition move, checked at the `DataFile` level rather than by SELECT. One file holds a row
+/// that moves to books and a row that stays in electronics.
 ///
-/// File in partition 'electronics' with rows r1 (id=1, moves to 'books') and r2 (id=2, stays in
-/// 'electronics'). After UPDATE SET category='books' WHERE id=1:
-///   - The old electronics file is DELETED from the manifest.
-///   - Two new files appear: one in 'books' partition (r1), one in 'electronics' partition (r2).
-///   - Each new file's DataFile.partition() must carry the correct partition struct.
-///   - Total row count = 2 (unchanged).
-///
-/// This probe attacks the partition-move correctness at a deeper level than the existing SELECT
-/// test, verifying that the file-level partition metadata is correct, not just query results.
+/// The old file leaves the manifest, two new files appear, and each carries the right partition
+/// struct. The row count stays at two.
 #[tokio::test]
 async fn test_update_cow_partition_move_manifest_level_verification() -> Result<()> {
     let (ctx, client) = make_partitioned_delete_ctx("cow_update_move_probe", "items").await?;
@@ -3275,7 +3148,6 @@ async fn test_update_cow_partition_move_manifest_level_verification() -> Result<
          partition_vals={partition_vals:?}"
     );
 
-    // Verify via SELECT that row content is also correct.
     let batches = ctx
         .sql("SELECT * FROM catalog.cow_update_move_probe.items ORDER BY id")
         .await
@@ -3315,13 +3187,10 @@ async fn test_update_cow_partition_move_manifest_level_verification() -> Result<
     Ok(())
 }
 
-// ============================================================================
 // MoR UPDATE — partitioned table tests (U3)
-// ============================================================================
 
-/// Helper that builds a partitioned V2 `{id int, category string, value string}` table with
-/// `write.delete.mode = merge-on-read` and `write.update.mode = merge-on-read`, partitioned by
-/// `identity(category)`. The format version defaults to V2 (required for MoR position deletes).
+/// Builds a V2 `identity(category)`-partitioned `{id, category, value}` table with both DML modes
+/// set to merge-on-read. V2 is required for position deletes.
 async fn make_partitioned_mread_ctx(
     ns: &str,
     tbl: &str,
@@ -3365,14 +3234,8 @@ async fn make_partitioned_mread_ctx(
     Ok((ctx, client))
 }
 
-/// Prerequisite: confirm that partitioned MoR DELETE already works (no guard exists for DELETE).
-///
-/// Table: `{id int, category string, value string}` partitioned by `identity(category)`,
-/// `write.delete.mode = merge-on-read`, V2.
-/// Two partitions: `electronics` (ids 1,2) and `books` (ids 3,4).
-/// DELETE rows WHERE category = 'electronics'.
-/// Post-DELETE: only the books rows survive (confirms the position-delete RowDelta path works
-/// partitioned — the prerequisite for the MoR UPDATE path).
+/// Partitioned MoR DELETE of one partition of two. Only the books rows survive. This is the
+/// prerequisite for the MoR UPDATE path.
 #[tokio::test]
 async fn test_delete_mread_partitioned() -> Result<()> {
     let (ctx, _client) = make_partitioned_mread_ctx("test_del_mread_part", "items").await?;
@@ -3452,15 +3315,8 @@ async fn test_delete_mread_partitioned() -> Result<()> {
     Ok(())
 }
 
-/// MoR UPDATE on a partitioned table: update a non-partition column WHERE matches rows in one
-/// partition; assert updated values, untouched rows in the other partition survive unchanged.
-///
-/// Table: `{id int, category string, value string}` partitioned by `identity(category)`,
-/// `write.update.mode = merge-on-read`, V2.
-/// Two partitions: `electronics` (ids 1,2) and `books` (ids 3,4).
-/// UPDATE sets `value = 'UPDATED'` WHERE `category = 'electronics'`.
-/// MoR: position-deletes for old rows + new data file with updated rows, in one RowDelta.
-/// Post-UPDATE: electronics rows have the new value; books rows are unchanged.
+/// Partitioned MoR UPDATE of a non-partition column, matching one partition of two. One RowDelta
+/// carries the position deletes and the new data file. The books rows stay unchanged.
 #[tokio::test]
 async fn test_update_mread_partitioned() -> Result<()> {
     let (ctx, _client) = make_partitioned_mread_ctx("test_upd_mread_part", "items").await?;
@@ -3546,14 +3402,8 @@ async fn test_update_mread_partitioned() -> Result<()> {
     Ok(())
 }
 
-/// MoR UPDATE that changes the partition-key column: the old row is position-deleted (in the
-/// original partition's data file) and the new row is inserted into the NEW partition's data file,
-/// all in one RowDelta.
-///
-/// Table: `{id int, category string, value string}` partitioned by `identity(category)`,
-/// `write.update.mode = merge-on-read`, V2.
-/// `UPDATE … SET category = 'books' WHERE id = 1` moves id=1 from `electronics` to `books`.
-/// Post-UPDATE: id=1 appears with category='books'; id=2 stays in electronics unchanged.
+/// MoR UPDATE that changes the partition-key column. One RowDelta position-deletes the old row in
+/// its partition and writes the new row into the books partition. id 2 stays unchanged.
 #[tokio::test]
 async fn test_update_mread_partitioned_moves_partition() -> Result<()> {
     let (ctx, _client) = make_partitioned_mread_ctx("test_upd_mread_move", "items").await?;
@@ -3666,19 +3516,11 @@ async fn test_update_mread_partitioned_moves_partition() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
 // MoR PARTITION PROBES — manifest-level position-delete partition-stamp verification
-// ============================================================================
 
-/// MoR PARTITION PROBE 1: cross-partition MoR DELETE — both partitions.
-///
-/// DELETE WHERE id > 0 matches rows in BOTH partitions.  The implementation
-/// must produce TWO position-delete files (one per partition) each stamped
-/// with the correct `(spec_id, partition Struct)` of their data file.
-///
-/// This is the hardest case for `write_position_deletes`: cross-partition
-/// grouping.  A single delete file stamped with the wrong partition would
-/// either be rejected at commit time or silently scope the deletes incorrectly.
+/// Cross-partition MoR DELETE. The write must produce one position-delete file per partition,
+/// each stamped with its data file's `(spec_id, partition)`. A single file with the wrong stamp is
+/// either rejected at commit or silently scoped wrong.
 #[tokio::test]
 async fn test_delete_mread_cross_partition_manifest_stamp() -> Result<()> {
     let (ctx, client) = make_partitioned_mread_ctx("mread_partition_probe1", "items").await?;
@@ -3696,9 +3538,8 @@ async fn test_delete_mread_cross_partition_manifest_stamp() -> Result<()> {
     .await
     .unwrap();
 
-    // Single INSERT creates ONE data file (all 4 rows in one batch) but the
-    // partition-aware writer will split it into two files (one per partition).
-    // Record the data-file partition structs so we can compare against delete files.
+    // One INSERT, but the partition-aware writer splits it into one file per partition. Record
+    // the partition structs to compare against the delete files.
     let ns = NamespaceIdent::new("mread_partition_probe1".to_string());
     let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
 
@@ -3718,7 +3559,6 @@ async fn test_delete_mread_cross_partition_manifest_stamp() -> Result<()> {
         .value(0);
     assert_eq!(deleted, 4, "all 4 rows deleted");
 
-    // Inspect delete-file manifests.
     let table_after = client.load_table(&tbl_id).await?;
     let snap_after = table_after.metadata().current_snapshot().unwrap();
     let ml_after = snap_after
@@ -3805,13 +3645,9 @@ async fn test_delete_mread_cross_partition_manifest_stamp() -> Result<()> {
     Ok(())
 }
 
-/// MoR PARTITION PROBE 2: MoR UPDATE — manifest-level partition stamp on delete files.
-///
-/// The position-delete files committed by a MoR UPDATE must be stamped with
-/// the EXACT `(spec_id, partition Struct)` of the data file they delete from.
-/// This test inspects the committed delete files at the manifest level — not
-/// just the SELECT result — so a wrong stamp (e.g. empty Struct) would fail
-/// here even if the scan happens to still resolve correctly in some engine.
+/// The position-delete files a MoR UPDATE commits must carry the exact `(spec_id, partition)` of
+/// the data file they delete from. This reads the manifest, not the SELECT result, so a wrong
+/// stamp fails here even when a scan still resolves.
 #[tokio::test]
 async fn test_update_mread_partitioned_delete_file_stamp() -> Result<()> {
     let (ctx, client) = make_partitioned_mread_ctx("mread_partition_probe2", "items").await?;
@@ -3904,12 +3740,8 @@ async fn test_update_mread_partitioned_delete_file_stamp() -> Result<()> {
     Ok(())
 }
 
-/// MoR PARTITION PROBE 3: MoR UPDATE spanning two partitions — two delete files, each correctly stamped.
-///
-/// UPDATE touches rows in BOTH partitions (updates the `value` column).
-/// The implementation must produce two delete files (one per partition),
-/// each stamped with its partition's `category` value.  A merged or incorrectly-stamped
-/// delete file would fail here.
+/// A MoR UPDATE spanning both partitions must produce one delete file per partition, each stamped
+/// with its own `category`. A merged file, or one with the wrong stamp, fails here.
 #[tokio::test]
 async fn test_update_mread_cross_partition_delete_stamps() -> Result<()> {
     let (ctx, client) = make_partitioned_mread_ctx("mread_partition_probe3", "items").await?;
@@ -3998,14 +3830,9 @@ async fn test_update_mread_cross_partition_delete_stamps() -> Result<()> {
     Ok(())
 }
 
-/// MoR PARTITION PROBE 4: MoR UPDATE on a partitioned table where rows in one
-/// partition come from TWO distinct data files — confirm both sets of positions
-/// are grouped into a SINGLE delete file for that partition (same Struct → same group).
-///
-/// This probes `Struct` equality/hashing: two data files with the same partition
-/// value must produce identical `Struct` keys, collapsing into one group and one
-/// delete file.  A hash/equality bug would produce two delete files for the same
-/// partition.
+/// Two data files in one partition must group into a single delete file. This pins `Struct`
+/// equality and hashing: equal partition values must give equal keys. A hashing defect produces
+/// two delete files for one partition.
 #[tokio::test]
 async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()> {
     let (ctx, client) = make_partitioned_mread_ctx("mread_partition_probe4", "items").await?;
@@ -4105,11 +3932,9 @@ async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()
     Ok(())
 }
 
-// =================================================================================================
-// BUG-001 — evolved unpartitioned *default* still has partitioned data under older specs.
-// The fast path must NOT stamp partition_key=None solely because default_spec.is_unpartitioned();
-// Option A: fast path only when partition_specs.len()==1 && default is unpartitioned.
-// =================================================================================================
+// An evolved table whose default spec is unpartitioned can still hold data under older
+// partitioned specs. The fast path may stamp `partition_key = None` only when the table has one
+// spec and that spec is unpartitioned.
 
 /// After DROP PARTITION FIELD (default becomes unpartitioned) a MoR DELETE must still stamp
 /// each position-delete file with the data file's own `(spec_id, partition)` so the read-side
@@ -4136,8 +3961,7 @@ async fn test_delete_mread_after_drop_partition_field_no_resurrection() -> Resul
     let ns = NamespaceIdent::new("bug001_evolved_unpart".to_string());
     let tbl_id = TableIdent::new(ns.clone(), "items".to_string());
 
-    // Evolve: remove identity(category) → new default spec is unpartitioned, but data files
-    // remain under the original partitioned spec.
+    // Removing identity(category) leaves an unpartitioned default, over partitioned data files.
     let table = client.load_table(&tbl_id).await?;
     assert_eq!(
         table.metadata().partition_specs_iter().len(),
@@ -4192,8 +4016,8 @@ async fn test_delete_mread_after_drop_partition_field_no_resurrection() -> Resul
         }
     }
 
-    // DELETE half the pre-evolution rows — under BUG-001 the unconditional default-unpartitioned
-    // fast path stamps partition_key=None and the deletes never attach → full resurrection.
+    // An unconditional fast path stamps `partition_key = None` here, the deletes never attach,
+    // and every row comes back.
     let batches = ctx
         .sql("DELETE FROM catalog.bug001_evolved_unpart.items WHERE id IN (1, 3)")
         .await
@@ -4270,8 +4094,8 @@ async fn test_delete_mread_after_drop_partition_field_no_resurrection() -> Resul
         "at least one position-delete file must have been written"
     );
 
-    // C1-L-001: INSERT under the new unpartitioned default, then DELETE — stamps must match
-    // the post-DROP data file's (non-zero empty-spec id), not fabricated spec 0.
+    // INSERT under the new unpartitioned default, then DELETE. The stamps must match the new
+    // file's non-zero empty-spec id, not a fabricated spec 0.
     ctx.sql(
         "INSERT INTO catalog.bug001_evolved_unpart.items VALUES \
          (10, 'post', 'row-a'), (11, 'post', 'row-b')",
@@ -4370,11 +4194,9 @@ async fn test_delete_mread_after_drop_partition_field_no_resurrection() -> Resul
     Ok(())
 }
 
-// =================================================================================================
-// NULL three-valued-logic — a predicate evaluating to NULL is NOT a match (the row is neither
-// deleted nor updated). The implementation enforces this with `mask.is_valid(row) && mask.value(row)`
-// in every DML path; these tests make that guard load-bearing (inverting it goes RED here).
-// =================================================================================================
+// A predicate that evaluates to NULL is not a match, so the row is neither deleted nor updated.
+// Every DML path enforces it with `mask.is_valid(row) && mask.value(row)`. These tests make that
+// guard load-bearing.
 
 /// Copy-on-write DELETE: `foo2 = 'alan'` is NULL for the NULL-`foo2` row, so that row must SURVIVE.
 #[tokio::test]
@@ -4513,17 +4335,12 @@ async fn test_update_cow_null_predicate_three_valued_logic() -> Result<()> {
     Ok(())
 }
 
-// =================================================================================================
-// H7-S2 — NON-VACUOUS 3VL for the COPY-ON-WRITE paths.
+// Non-vacuous three-valued logic for the copy-on-write paths.
 //
-// The two `=`-only COW tests above cannot falsify the `is_valid` guard: for `=`, Arrow yields
-// (valid=false, value=false) on a NULL operand, so `is_valid` is redundant there. Deleting the
-// guard from `match_mask` left both of them GREEN, and only a
-// merge-on-read UPDATE test went red. H7-S2 routed COW DELETE's formerly-inline guard through the
-// shared `match_mask`, so ONE line now governs three of the four DML paths; these two `<>` tests make
-// it load-bearing on both COW paths. MUTATION PROOF (executed): dropping `is_valid` from `match_mask`
-// makes BOTH of these RED.
-// =================================================================================================
+// The `=`-only tests above cannot falsify the `is_valid` guard: on a NULL operand Arrow gives
+// (valid=false, value=false), so the guard is redundant there. Both stayed green when the guard
+// was dropped. One `match_mask` line now governs three of the four DML paths, and these two `<>`
+// tests turn red when it goes.
 
 /// COW DELETE with a `<>` predicate over a NULL operand: the NULL-`foo2` row evaluates to
 /// (valid=false, value=TRUE), so ONLY the `is_valid` guard in `match_mask` keeps it out of the
@@ -4645,8 +4462,7 @@ async fn select_foo1_sorted(ctx: &SessionContext, table: &str) -> Vec<i32> {
     ids
 }
 
-/// `{foo1 required int, foo2 OPTIONAL string}` — a nullable `foo2` so a row can carry a NULL operand
-/// for the three-valued-logic tests above.
+/// `{foo1 required int, foo2 optional string}`, so a row can carry a NULL operand.
 fn nullable_foo_schema() -> Schema {
     Schema::builder()
         .with_schema_id(0)
@@ -4674,25 +4490,19 @@ fn nullable_merge_on_read_table_creation(
         .build()
 }
 
-// =================================================================================================
-// H7-S1 — merge-on-read DML STREAMING regression coverage
+// Merge-on-read DML streaming coverage.
 //
-// The `merge_on_read_delete` / `merge_on_read_update` executors were refactored to consume the live
-// scan batch-by-batch instead of `try_collect`-ing the whole live row set. These tests pin the
-// invariants a streaming refactor must NOT break: (1) the deleted/updated survivor set is unchanged
-// across multi-file tables whose scan interleaves batches (output-equivalent behavior — H-ORDER/H-MEM),
-// (2) commit-once-after-close atomicity: a failure at the commit leaves ZERO new snapshots (H-COMMIT),
-// (3) SQL three-valued logic on the MoR UPDATE side: a NULL predicate result is not a match (H-3VL).
-// =================================================================================================
+// The MoR executors consume the live scan batch by batch. Three invariants must hold. The survivor
+// set stays the same over a multi-file table whose scan interleaves batches. A failure at the
+// single commit leaves zero new snapshots. A NULL predicate result is not a match.
 
 use std::fmt::Debug;
 
 use iceberg::{Namespace, TableCommit};
 
-/// A [`Catalog`] wrapper that delegates every operation to an inner catalog EXCEPT `update_table`,
-/// which unconditionally fails. Used to prove H-COMMIT: the DML executors write all delete/data files
-/// and then attempt exactly one commit; when that commit fails the table must be left untouched (no new
-/// snapshot), with the staged files simply orphaned.
+/// A [`Catalog`] that delegates everything except `update_table`, which always fails. The DML
+/// executors write their files and then attempt one commit. A failed commit must leave the table
+/// untouched, with the staged files orphaned.
 #[derive(Debug)]
 struct FailingCommitCatalog {
     inner: Arc<dyn Catalog>,
@@ -4780,10 +4590,8 @@ impl Catalog for FailingCommitCatalog {
     }
 }
 
-/// H-ORDER / H-MEM streaming output-equivalence: a MoR DELETE over a MULTI-FILE table (four separate
-/// inserts ⇒ four data files, whose scan interleaves batches unordered under the default concurrency)
-/// must delete EXACTLY the predicate-matched rows and leave EXACTLY the oracle survivor set. The
-/// streaming refactor changes only how rows reach the writer, never which rows are deleted.
+/// A MoR DELETE over four data files, whose scan interleaves batches, must delete exactly the
+/// matched rows. Streaming changes how rows reach the writer, never which rows go.
 #[tokio::test]
 async fn test_delete_mread_streaming_multifile_survivor_set() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -4838,9 +4646,8 @@ async fn test_delete_mread_streaming_multifile_survivor_set() -> Result<()> {
     Ok(())
 }
 
-/// H-ORDER / H-MEM streaming output-equivalence for MoR UPDATE over a multi-file table: the new-row data
-/// side streams into the writer per batch, the delete side buffers only the matched pairs. The updated
-/// values and the untouched rows must both match the oracle exactly.
+/// The same over a MoR UPDATE. The new rows stream per batch and the delete side buffers only the
+/// matched pairs. Updated and untouched rows must both match the oracle.
 #[tokio::test]
 async fn test_update_mread_streaming_multifile_survivor_set() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -4893,9 +4700,8 @@ async fn test_update_mread_streaming_multifile_survivor_set() -> Result<()> {
     Ok(())
 }
 
-/// H-COMMIT for MoR DELETE: with a catalog whose commit fails, the DELETE must return an error and the
-/// table's `current_snapshot_id` and snapshot COUNT must be unchanged — the position-delete file was
-/// staged then orphaned, never referenced by a snapshot.
+/// With a catalog whose commit fails, a MoR DELETE must error and leave the snapshot id and count
+/// unchanged. The position-delete file is staged, then orphaned.
 #[tokio::test]
 async fn test_delete_mread_commit_failure_leaves_snapshot_unchanged() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -4939,14 +4745,13 @@ async fn test_delete_mread_commit_failure_leaves_snapshot_unchanged() -> Result<
         .collect()
         .await;
     let err = result.expect_err("the DELETE must surface the injected commit failure as an error");
-    // Non-vacuity: the error is OUR injected commit fault (the executor reached the single commit
-    // after writing the position-delete file), not an incidental earlier failure.
+    // Non-vacuity: the error is the injected commit fault, not an earlier failure.
     assert!(
         err.to_string().contains("injected commit failure"),
         "the error must be the injected commit fault, got: {err}"
     );
 
-    // Reload from the REAL catalog: the commit failed AFTER files were written, so no snapshot moved.
+    // Reload from the real catalog: the commit failed after the writes, so no snapshot moved.
     let after = client.load_table(&tbl_id).await?;
     assert_eq!(
         after.metadata().current_snapshot_id(),
@@ -4974,8 +4779,7 @@ async fn test_delete_mread_commit_failure_leaves_snapshot_unchanged() -> Result<
     Ok(())
 }
 
-/// H-COMMIT for MoR UPDATE: identical invariant on the UPDATE path, which additionally writes new data
-/// files before the single commit. A commit failure must leave the table's snapshot untouched.
+/// The same invariant for MoR UPDATE, which also writes new data files before the one commit.
 #[tokio::test]
 async fn test_update_mread_commit_failure_leaves_snapshot_unchanged() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -5017,8 +4821,7 @@ async fn test_update_mread_commit_failure_leaves_snapshot_unchanged() -> Result<
         .collect()
         .await;
     let err = result.expect_err("the UPDATE must surface the injected commit failure as an error");
-    // Non-vacuity: the error is OUR injected commit fault (the executor reached the single commit
-    // after writing the delete + new data files), not an incidental earlier failure.
+    // Non-vacuity: the error is the injected commit fault, not an earlier failure.
     assert!(
         err.to_string().contains("injected commit failure"),
         "the error must be the injected commit fault, got: {err}"
@@ -5050,9 +4853,8 @@ async fn test_update_mread_commit_failure_leaves_snapshot_unchanged() -> Result<
     Ok(())
 }
 
-/// H-3VL for the MoR UPDATE path: `UPDATE ... WHERE nullable_col = X` must NOT update rows whose
-/// predicate operand is NULL (SQL three-valued logic — NULL is not a match). Guards the `match_mask`
-/// NULL-collapse that the streaming refactor preserves on the update path.
+/// `UPDATE ... WHERE nullable_col = X` must not update a row whose operand is NULL. This guards
+/// the `match_mask` NULL collapse on the update path.
 #[tokio::test]
 async fn test_update_mread_null_predicate_three_valued_logic() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -5099,20 +4901,15 @@ async fn test_update_mread_null_predicate_three_valued_logic() -> Result<()> {
     Ok(())
 }
 
-// =================================================================================================
-// H7-S1 hardening: NON-VACUOUS 3VL, zero-file, and (path,pos)-sort coverage
+// Non-vacuous three-valued logic, zero-file, and `(file_path, pos)` sort coverage.
 //
-// The `=`-only NULL tests above are VACUOUS against dropping the `is_valid` guard: for `=`, an Arrow
-// comparison on a NULL operand yields (valid=false, value=false), so `is_valid` is redundant. A `<>`
-// predicate on a NULL operand yields (valid=false, value=TRUE) — there the `is_valid` guard is
-// LOAD-BEARING (without it a NULL row is wrongly matched). The tests below use `<>` so the guard is
-// pinned, plus the zero-batch⇒zero-file contract and the spec-required `(file_path, pos)` sort.
-// =================================================================================================
+// On a NULL operand `=` gives (valid=false, value=false), so the `is_valid` guard is redundant
+// there. `<>` gives (valid=false, value=TRUE), where the guard alone keeps the NULL row out. The
+// tests below use `<>`.
 
-/// H-3VL (LOW-1) — MoR DELETE with a `<>` predicate over a NULL operand. The NULL-`foo2` row yields
-/// (valid=false, value=TRUE); the delete-loop guard `mask.is_valid(row) && mask.value(row)`
-/// (delete.rs) must therefore NOT delete it. MUTATION PROOF: dropping `is_valid` from that guard makes
-/// this test RED (the NULL row is wrongly deleted).
+/// MoR DELETE with a `<>` predicate over a NULL operand. The NULL row gives
+/// (valid=false, value=TRUE), so only `mask.is_valid(row)` keeps it. Dropping that guard turns
+/// this test red.
 #[tokio::test]
 async fn test_delete_mread_null_neq_predicate_isvalid_guard() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -5132,9 +4929,8 @@ async fn test_delete_mread_null_neq_predicate_isvalid_guard() -> Result<()> {
         .await
         .unwrap();
 
-    // `foo2 <> 'zzz'` is TRUE for 'alan' and 'bob' (both deleted) and UNKNOWN for the NULL row. Under
-    // three-valued logic the NULL row is NOT a match. The value-bit for the NULL row is TRUE, so only
-    // the `is_valid` guard keeps it alive — a vacuous `=`-test would not catch its removal.
+    // `foo2 <> 'zzz'` is TRUE for 'alan' and 'bob', and UNKNOWN for the NULL row. The NULL row's
+    // value bit is TRUE, so only the `is_valid` guard keeps it alive.
     let batches = ctx
         .sql("DELETE FROM catalog.test_del_mread_null_neq.my_table WHERE foo2 <> 'zzz'")
         .await
@@ -5162,9 +4958,8 @@ async fn test_delete_mread_null_neq_predicate_isvalid_guard() -> Result<()> {
     Ok(())
 }
 
-/// H-3VL (HIGH-1) — MoR UPDATE with a `<>` predicate over a NULL operand. Same load-bearing `is_valid`
-/// guard, this time in `match_mask` (delete.rs). MUTATION PROOF: dropping `is_valid` from `match_mask`
-/// makes this test RED (the NULL row is wrongly updated).
+/// MoR UPDATE with a `<>` predicate over a NULL operand. The same guard, this time in
+/// `match_mask`. Dropping it turns this test red.
 #[tokio::test]
 async fn test_update_mread_null_neq_predicate_isvalid_guard() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -5213,15 +5008,11 @@ async fn test_update_mread_null_neq_predicate_isvalid_guard() -> Result<()> {
     Ok(())
 }
 
-/// MEDIUM-2 — the zero-match no-op contract on the streaming MoR-UPDATE path. A MoR UPDATE whose WHERE
-/// matches NO rows must add NO new data file and create NO new snapshot. MUTATION PROOF (verified):
-/// disabling the `updated == 0` no-op guard in `merge_on_read_update` (so the streamed `data_writer`
-/// is finished and a RowDelta is committed on a no-op) makes this test RED.
+/// A MoR UPDATE matching no rows must add no data file and no snapshot. Disabling the
+/// `updated == 0` guard in `merge_on_read_update` turns this test red.
 ///
-/// Note on the `StreamingDataFileWriter::finish()`-opens-writer mutation the review named: it is
-/// benign, because a `TaskWriter` opened but never fed a batch emits ZERO files on `close()` — the
-/// zero-file guarantee is enforced by the underlying writer, and the lazy-init only additionally
-/// avoids constructing it. So the observable regression this test pins is the no-op guard above.
+/// A writer opened but never fed emits zero files on `close()`, so the underlying writer already
+/// holds the zero-file guarantee. The `updated == 0` guard is what this test pins.
 #[tokio::test]
 async fn test_update_mread_zero_match_writes_no_file_no_snapshot() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -5275,8 +5066,7 @@ async fn test_update_mread_zero_match_writes_no_file_no_snapshot() -> Result<()>
         "a zero-match MoR UPDATE must NOT create a new snapshot"
     );
 
-    // Belt-and-braces: walk the latest snapshot's manifests and assert NO position-delete file and NO
-    // extra data file were added by the no-op (there is exactly one data file — the seed insert).
+    // Walk the latest snapshot's manifests: the no-op added no delete file and no data file.
     let snap = after.metadata().current_snapshot().unwrap();
     let ml = snap
         .load_manifest_list(after.file_io(), after.metadata())
@@ -5307,14 +5097,12 @@ async fn test_update_mread_zero_match_writes_no_file_no_snapshot() -> Result<()>
     Ok(())
 }
 
-/// E2E pin for audit BUG-001 (constant-truth NaN residuals): `isnan(col)` maps to the Iceberg
-/// `is_nan` predicate (`expr_to_predicate.rs`) and is pushed down `Inexact` into the parquet
-/// `RowFilter`. Pre-fix, `not_nan` compiled to constant-`false` there, so
-/// `WHERE NOT isnan(x)` silently returned ZERO rows through SQL — DataFusion's re-filter can
-/// mask over-INCLUSION but cannot restore rows the RowFilter over-DROPPED. Expected row sets:
-/// the NaN row only under `isnan`; the finite row only under `NOT isnan` (Iceberg keeps the
-/// NULL row per Java `NaNUtil.isNaN(null) == false`; DataFusion's own SQL three-valued-logic
-/// re-filter then drops it, since `NOT isnan(NULL)` is SQL NULL).
+/// `isnan(col)` becomes the Iceberg `is_nan` predicate and pushes down `Inexact` into the parquet
+/// `RowFilter`. When `not_nan` compiled to constant false there, `WHERE NOT isnan(x)` returned
+/// zero rows: DataFusion's re-filter can mask over-inclusion, never restore an over-dropped row.
+///
+/// `isnan` returns the NaN row, `NOT isnan` the finite row. Iceberg keeps the NULL row, per Java
+/// `NaNUtil.isNaN(null) == false`, and DataFusion's re-filter then drops it.
 #[tokio::test]
 async fn test_isnan_filter_pushdown_returns_correct_rows() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -5386,14 +5174,12 @@ async fn test_isnan_filter_pushdown_returns_correct_rows() -> Result<()> {
     Ok(())
 }
 
-/// E2E documentation pin for the unit-A2 design decision (Java nulls-first null semantics in the
-/// library evaluators): DataFusion pushes `<>` down as an `Inexact` Iceberg `not_eq` filter, the
-/// scan now KEEPS NULL cells under it (Java `Evaluator` verdict: `notEq(null, lit)` is TRUE —
-/// proven at the library level by `test_filter_on_arrow_nulls_first_neq_lt_lteq_full_path`), and
-/// DataFusion's own SQL three-valued-logic re-filter then RE-DROPS those rows (`NULL <> 100.5`
-/// is SQL NULL). Net: SQL consumers still see SQL semantics — the nulls-first port is invisible
-/// to them — while direct library consumers get the Java contract. `IS NULL OR <>` proves the
-/// NULL rows are still reachable through SQL when asked for explicitly.
+/// DataFusion pushes `<>` down as an `Inexact` Iceberg `not_eq` filter. The scan keeps NULL cells
+/// under it, because Java `Evaluator` makes `notEq(null, lit)` TRUE. DataFusion's re-filter then
+/// drops those rows again, since `NULL <> 100.5` is SQL NULL.
+///
+/// So SQL consumers keep SQL semantics while library consumers get the Java contract.
+/// `IS NULL OR <>` shows the NULL rows are still reachable from SQL.
 #[tokio::test]
 async fn test_neq_pushdown_sql_3vl_refilter_drops_null_rows() -> Result<()> {
     let iceberg_catalog = get_iceberg_catalog().await;
@@ -5427,8 +5213,7 @@ async fn test_neq_pushdown_sql_3vl_refilter_drops_null_rows() -> Result<()> {
     .unwrap();
 
     for (filter, expected_ids) in [
-        // SQL 3VL: the NULL row (id 2) is kept by the Iceberg scan (Java nulls-first) but
-        // re-dropped by DataFusion's re-filter — the design decision's safety pin.
+        // The Iceberg scan keeps the NULL row and DataFusion's re-filter drops it again.
         ("dbl <> 100.5", vec![3]),
         ("dbl < 200.0", vec![1, 3]),
         // The NULL row remains reachable through SQL when requested explicitly.
@@ -5464,20 +5249,14 @@ async fn test_neq_pushdown_sql_3vl_refilter_drops_null_rows() -> Result<()> {
     Ok(())
 }
 
-// =================================================================================================
-// ENGINE_CONTRACT §5 / §8 — DML OCC validations + operation-id (2026-07-18, audit P0-3 /
-// BUG-002/003/004/011)
+// ENGINE_CONTRACT §5 and §8 — DML optimistic-concurrency validations and the operation id.
 //
-// Two-handle race pattern: a DML statement's PHYSICAL plan is created first (the provider loads its
-// immutable table handle THERE — the "scan snapshot"), a CONCURRENT commit then moves the catalog
-// head through a second engine handle, and only then is the frozen plan executed. The commit inside
-// the frozen plan refreshes to the new head and must run the §5 validations over the
-// (scan-snapshot, head] window — rejecting true conflicts LOUDLY (non-retryable, Java's
-// ValidationException messages) while letting non-conflicting concurrency through. Oracles:
-// `SparkWrite.java` L417-428/L446-509 (CoW + static overwrite), `SparkPositionDeltaWrite.java`
-// L239-292 (MoR), `SparkRowLevelOperationBuilder.java` L96-115 (per-op isolation defaults),
-// 1.10.0 @ 2114bf6.
-// =================================================================================================
+// Every test below uses one two-handle race. The DML statement's physical plan freezes a table
+// handle at plan time. A second engine handle then commits and moves the catalog head. The frozen
+// plan executes last, refreshes to the new head, and must run the §5 validations over the window
+// between the two. A true conflict is rejected loudly and non-retryably, with Java's message.
+//
+// Oracles: Java `SparkWrite`, `SparkPositionDeltaWrite`, and `SparkRowLevelOperationBuilder`.
 
 /// A `{foo1 int, foo2 string}` table creation with caller-chosen table properties.
 fn get_table_creation_with_props(
@@ -5500,8 +5279,8 @@ fn get_table_creation_with_props(
         .build())
 }
 
-/// A FRESH `SessionContext` over the shared catalog — an independent engine handle: its provider
-/// loads the table at ITS OWN plan time, so it sees the current head (not a frozen snapshot).
+/// A fresh `SessionContext` over the shared catalog. Its provider loads the table at its own plan
+/// time, so it sees the current head.
 async fn s5_new_ctx(client: &Arc<MemoryCatalog>) -> SessionContext {
     let provider = Arc::new(
         IcebergCatalogProvider::try_new(client.clone())
@@ -5513,8 +5292,8 @@ async fn s5_new_ctx(client: &Arc<MemoryCatalog>) -> SessionContext {
     ctx
 }
 
-/// Create `catalog.<namespace>.t` with `properties`, seed it with `INSERT INTO ... VALUES
-/// <seed_values>` (snapshot S1), and return the shared catalog + a context.
+/// Creates `catalog.<namespace>.t` with `properties`, seeds it with one INSERT, and returns the
+/// shared catalog and a context.
 async fn s5_fixture(
     namespace: &str,
     properties: HashMap<String, String>,
@@ -5661,11 +5440,12 @@ async fn s5_live_data_paths(client: &Arc<MemoryCatalog>, namespace: &str) -> Vec
     paths
 }
 
-/// A synthetic (manifest-only) POSITION-delete file for an UNPARTITIONED table — the concurrent
-/// "delete-file add" for races where a real merge-on-read DELETE is unavailable (the table's own
-/// `write.delete.mode` is copy-on-write). No metrics/bounds ⇒ conservatively applies to every data
-/// file, exactly what the conflict should see. NEVER select the table's content after committing
-/// one (the parquet does not exist on disk).
+/// A manifest-only position-delete file for an unpartitioned table, used where a real
+/// merge-on-read DELETE is unavailable. It carries no metrics, so it applies to every data file.
+///
+/// # Notes
+///
+/// Never select the table's content after committing one: the parquet is not on disk.
 fn s5_synthetic_position_delete(path: &str) -> iceberg::spec::DataFile {
     iceberg::spec::DataFileBuilder::default()
         .content(iceberg::spec::DataContentType::PositionDeletes)
@@ -5697,11 +5477,9 @@ async fn s5_commit_synthetic_delete(client: &Arc<MemoryCatalog>, namespace: &str
         .expect("concurrent synthetic delete commit");
 }
 
-/// P1 — CoW DELETE at the SERIALIZABLE DEFAULT (Java's per-op default,
-/// `SparkRowLevelOperationBuilder` L96-115 + `TableProperties` L361-362) × a concurrent APPEND
-/// committed between plan and execute → LOUD rejection via `validate_no_conflicting_data`
-/// (`SparkWrite.commitWithSerializableIsolation` L476), Java's message, and NO table mutation.
-/// Before this unit the delete would silently commit over the concurrent writer (BUG-002/011).
+/// CoW DELETE at the serializable default, against a concurrent append. Java
+/// `SparkWrite.commitWithSerializableIsolation` rejects it through `validate_no_conflicting_data`.
+/// The table must not change. It used to commit over the concurrent writer.
 #[tokio::test]
 async fn test_s5_cow_delete_serializable_default_rejects_concurrent_append()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -5709,8 +5487,8 @@ async fn test_s5_cow_delete_serializable_default_rejects_concurrent_append()
 
     let plan = s5_freeze_plan(&ctx, "DELETE FROM catalog.s5_cow_del_ser.t WHERE foo1 = 1").await;
 
-    // Concurrent append through an independent handle — under serializable, a concurrent insert
-    // matching the (AlwaysTrue) conflict filter violates the isolation contract.
+    // Under serializable, a concurrent insert matching the AlwaysTrue conflict filter breaks the
+    // isolation contract.
     let ctx2 = s5_new_ctx(&client).await;
     ctx2.sql("INSERT INTO catalog.s5_cow_del_ser.t VALUES (3, 'c')")
         .await?
@@ -5740,12 +5518,12 @@ async fn test_s5_cow_delete_serializable_default_rejects_concurrent_append()
     Ok(())
 }
 
-/// P2 — CoW DELETE at SNAPSHOT isolation (via `write.delete.isolation-level`) × a concurrent
-/// position-DELETE-file add applying to the file the CoW rewrite removes → LOUD rejection via
-/// `validate_no_conflicting_deletes` (`SparkWrite.commitWithSnapshotIsolation` L499) with Java's
-/// "found new delete for replaced data file" message NAMING the file. This is live ONLY because the
-/// removals now carry full `DataFile` metadata (`delete_data_files`) — the audit's silent hole was
-/// path-only removals making this check inert (BUG-002).
+/// CoW DELETE at snapshot isolation, against a concurrent position-delete file on the same data
+/// file. Java `SparkWrite.commitWithSnapshotIsolation` rejects it through
+/// `validate_no_conflicting_deletes`, naming the file.
+///
+/// The check works only because the removals carry full `DataFile` metadata. Path-only removals
+/// made it inert.
 #[tokio::test]
 async fn test_s5_cow_delete_snapshot_rejects_concurrent_delete_on_affected_file()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -5763,8 +5541,8 @@ async fn test_s5_cow_delete_snapshot_rejects_concurrent_delete_on_affected_file(
     )
     .await;
 
-    // Concurrent row-level delete lands a position-delete file (Operation::Delete) that applies to
-    // the seeded data file the frozen CoW DELETE is about to remove.
+    // The concurrent delete lands a position-delete file on the data file the frozen CoW DELETE
+    // is about to remove.
     s5_commit_synthetic_delete(
         &client,
         "s5_cow_del_snap_del",
@@ -5786,8 +5564,7 @@ async fn test_s5_cow_delete_snapshot_rejects_concurrent_delete_on_affected_file(
         seeded_paths[0]
     );
 
-    // Metadata-only post-check (the synthetic delete parquet does not exist — no content read):
-    // seed + concurrent delete = 2 snapshots; the rejected DELETE must not have added a third.
+    // Metadata only, because the synthetic parquet is not on disk. Two snapshots must remain.
     let table = client
         .load_table(&TableIdent::from_strs(["s5_cow_del_snap_del", "t"]).unwrap())
         .await?;
@@ -5799,9 +5576,8 @@ async fn test_s5_cow_delete_snapshot_rejects_concurrent_delete_on_affected_file(
     Ok(())
 }
 
-/// P3 — false-positive guard: CoW DELETE at SNAPSHOT isolation × a concurrent APPEND → the commit
-/// SUCCEEDS (snapshot isolation checks only deletes — `SparkWrite.commitWithSnapshotIsolation`
-/// L490-509 has no data check), the deleted row is gone AND the concurrent row survives.
+/// False-positive guard: CoW DELETE at snapshot isolation, against a concurrent append, commits.
+/// Snapshot isolation checks deletes only. The deleted row goes and the concurrent row stays.
 #[tokio::test]
 async fn test_s5_cow_delete_snapshot_allows_concurrent_append()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -5837,9 +5613,8 @@ async fn test_s5_cow_delete_snapshot_allows_concurrent_append()
     Ok(())
 }
 
-/// P4 — CoW UPDATE at the SERIALIZABLE DEFAULT × a concurrent APPEND → LOUD rejection. Java's
-/// isolation `switch` does not branch on the command (`SparkWrite.commit` L448-456): UPDATE uses
-/// the same CoW recipe as DELETE.
+/// CoW UPDATE at the serializable default, against a concurrent append, is rejected. Java's
+/// isolation switch does not branch on the command, so UPDATE follows the DELETE recipe.
 #[tokio::test]
 async fn test_s5_cow_update_serializable_default_rejects_concurrent_append()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -5879,8 +5654,8 @@ async fn test_s5_cow_update_serializable_default_rejects_concurrent_append()
     Ok(())
 }
 
-/// P4b — false-positive guard: CoW UPDATE at SNAPSHOT isolation × a concurrent APPEND → SUCCEEDS;
-/// the matched row takes the new value, the concurrent row survives untouched.
+/// False-positive guard: CoW UPDATE at snapshot isolation, against a concurrent append, commits.
+/// The matched row takes the new value and the concurrent row survives.
 #[tokio::test]
 async fn test_s5_cow_update_snapshot_allows_concurrent_append()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -5920,14 +5695,12 @@ async fn test_s5_cow_update_snapshot_allows_concurrent_append()
     Ok(())
 }
 
-/// P5 — MoR DELETE (`RowDelta`) × a concurrent COPY-ON-WRITE rewrite of the very data file its
-/// position deletes reference → LOUD rejection via `validate_data_files_exist`
-/// (`SparkPositionDeltaWrite.commit` L243 — UNCONDITIONAL, DELETE included) with Java's "Cannot
-/// commit, missing data files" message. The concurrent rewrite is a REAL CoW UPDATE (the table's
-/// `write.update.mode` stays copy-on-write while `write.delete.mode` is merge-on-read), producing an
-/// `Operation::Overwrite` snapshot that removes the referenced file — the audit's exact
-/// silently-lost-delete scenario (BUG-003). Isolation pinned to snapshot so the files-exist BASE
-/// check (not the serializable data check) is what rejects.
+/// MoR DELETE against a concurrent copy-on-write rewrite of the data file its position deletes
+/// reference. Java `SparkPositionDeltaWrite.commit` rejects it through `validate_data_files_exist`,
+/// which is unconditional.
+///
+/// The rewrite is a real CoW UPDATE, so it removes the referenced file. Isolation stays at
+/// snapshot, so the files-exist check is what rejects, not the serializable data check.
 #[tokio::test]
 async fn test_s5_merge_on_read_delete_rejects_concurrent_rewrite_of_target_file()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -5972,10 +5745,8 @@ async fn test_s5_merge_on_read_delete_rejects_concurrent_rewrite_of_target_file(
     Ok(())
 }
 
-/// P6 — false-positive guard: MoR DELETE at SNAPSHOT isolation × a concurrent APPEND → SUCCEEDS
-/// (the appended file is not referenced by the position deletes; snapshot level has no data check),
-/// the deleted row is gone, the concurrent row survives, and the committed `RowDelta` reads back
-/// correctly end-to-end.
+/// False-positive guard: MoR DELETE at snapshot isolation, against a concurrent append, commits.
+/// The position deletes do not reference the appended file, and the `RowDelta` reads back.
 #[tokio::test]
 async fn test_s5_merge_on_read_delete_snapshot_allows_concurrent_append()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -6014,9 +5785,8 @@ async fn test_s5_merge_on_read_delete_snapshot_allows_concurrent_append()
     Ok(())
 }
 
-/// P6b — MoR DELETE at the SERIALIZABLE DEFAULT × a concurrent APPEND → LOUD rejection via
-/// `validate_no_conflicting_data_files` (`SparkPositionDeltaWrite.commit` L256-258). Pins that the
-/// Java per-operation default (serializable) governs the MoR path too.
+/// MoR DELETE at the serializable default, against a concurrent append, is rejected through
+/// `validate_no_conflicting_data_files`. The per-operation default governs the MoR path too.
 #[tokio::test]
 async fn test_s5_merge_on_read_delete_serializable_default_rejects_concurrent_append()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -6053,11 +5823,9 @@ async fn test_s5_merge_on_read_delete_serializable_default_rejects_concurrent_ap
     Ok(())
 }
 
-/// P7 — the UPDATE-only §5 arms (`validate_deleted_files` + `validate_no_conflicting_delete_files`,
-/// Java `command == UPDATE || MERGE`, `SparkPositionDeltaWrite.commit` L251-254): a MoR UPDATE that
-/// READ rows × a concurrent REAL MoR DELETE of those rows → LOUD rejection with Java's "Found new
-/// conflicting delete files" message — even at SNAPSHOT isolation (the arm is
-/// isolation-independent).
+/// The UPDATE-only §5 arms, `validate_deleted_files` and `validate_no_conflicting_delete_files`,
+/// which Java runs for UPDATE and MERGE. A MoR UPDATE against a concurrent MoR DELETE of the rows
+/// it read is rejected, even at snapshot isolation: the arm is isolation-independent.
 #[tokio::test]
 async fn test_s5_merge_on_read_update_rejects_concurrent_delete_of_read_rows()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -6103,11 +5871,9 @@ async fn test_s5_merge_on_read_update_rejects_concurrent_delete_of_read_rows()
     Ok(())
 }
 
-/// P7b — the DELETE/UPDATE asymmetry (the §5 2026-07-09 correction): a MoR DELETE × a concurrent
-/// MoR DELETE of the SAME rows → COMMITS. Java arms the delete-conflict checks for UPDATE/MERGE
-/// ONLY (`SparkPositionDeltaWrite.commit` L251-254), and the files-exist check's default op set
-/// excludes `Operation::Delete` snapshots (`skipDeletes` default) — two deletes of the same row are
-/// idempotent, not a conflict.
+/// The DELETE and UPDATE asymmetry: two MoR deletes of the same rows commit. Java arms the
+/// delete-conflict checks for UPDATE and MERGE only, and the files-exist check skips
+/// `Operation::Delete` snapshots by default. Two deletes of one row are idempotent.
 #[tokio::test]
 async fn test_s5_merge_on_read_delete_tolerates_concurrent_delete_same_rows()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -6145,9 +5911,8 @@ async fn test_s5_merge_on_read_delete_tolerates_concurrent_delete_same_rows()
     Ok(())
 }
 
-/// P8 — §8 operation-id: every INSERT commit stamps `engine.operation-id` (a UUID) into the
-/// snapshot summary, the reconciliation marker for ambiguous commit outcomes (BUG-004's append
-/// half: a bare `fast_append` left retries un-reconcilable).
+/// Every INSERT commit stamps `engine.operation-id` into the snapshot summary. That marker is
+/// what reconciles an ambiguous commit outcome. A bare `fast_append` left a retry unreconcilable.
 #[tokio::test]
 async fn test_s8_insert_stamps_operation_id() -> std::result::Result<(), Box<dyn std::error::Error>>
 {
@@ -6163,30 +5928,29 @@ async fn test_s8_insert_stamps_operation_id() -> std::result::Result<(), Box<dyn
     Ok(())
 }
 
-/// P9 — the §8 idempotency shape: an INSERT whose commit must refresh-and-re-apply over a
-/// concurrent commit lands EXACTLY ONE snapshot carrying its operation-id — the re-applied attempt
-/// reuses the SAME id (action state), rows are not duplicated, and ids are unique per statement
-/// (a reconciler scanning summaries for one id can never false-match another operation).
+/// An INSERT that must refresh and re-apply over a concurrent commit lands exactly one snapshot
+/// carrying its operation id. The re-applied attempt reuses that id, rows are not duplicated, and
+/// ids stay unique per statement, so a reconciler cannot false-match another operation.
 #[tokio::test]
 async fn test_s8_insert_retry_single_stamp_no_duplicate()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (client, ctx) = s5_fixture("s8_insert_retry", HashMap::new(), "(1, 'a'), (2, 'b')").await;
 
-    // Freeze the INSERT's physical plan against the current head (S1)...
+    // Freeze the INSERT's physical plan against S1.
     let plan = s5_freeze_plan(
         &ctx,
         "INSERT INTO catalog.s8_insert_retry.t VALUES (5, 'e')",
     )
     .await;
 
-    // ...move the head with a concurrent INSERT (S2)...
+    // Move the head with a concurrent INSERT.
     let ctx2 = s5_new_ctx(&client).await;
     ctx2.sql("INSERT INTO catalog.s8_insert_retry.t VALUES (3, 'c')")
         .await?
         .collect()
         .await?;
 
-    // ...then execute: the frozen commit refreshes to S2 and re-applies, landing S3.
+    // The frozen commit then refreshes to S2 and re-applies, landing S3.
     let written = s5_execute_frozen(&ctx, plan)
         .await
         .expect("append never conflicts — the refresh-re-apply must land");
@@ -6233,12 +5997,10 @@ async fn test_s8_insert_retry_single_stamp_no_duplicate()
     Ok(())
 }
 
-/// P10 — INSERT OVERWRITE at the engine DEFAULT (`snapshot`) × a concurrent REAL merge-on-read
-/// DELETE (adds a position-delete file) → LOUD rejection via `validate_no_conflicting_deletes`
-/// with the row filter as the default conflict filter (`SparkWrite.OverwriteByFilter.commit`
-/// L374-375 arm; no explicit `conflictDetectionFilter` — Java never sets one on this path). Before
-/// this unit the bare `overwrite_by_row_filter(AlwaysTrue)` silently discarded the concurrent
-/// deleter's intent (BUG-004).
+/// INSERT OVERWRITE at the engine default of snapshot isolation, against a concurrent MoR DELETE.
+/// Java `SparkWrite.OverwriteByFilter.commit` rejects it through `validate_no_conflicting_deletes`,
+/// with the row filter as the conflict filter. A bare `overwrite_by_row_filter(AlwaysTrue)`
+/// silently discarded the concurrent deleter's intent.
 #[tokio::test]
 async fn test_s5_insert_overwrite_default_rejects_concurrent_delete()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -6271,10 +6033,8 @@ async fn test_s5_insert_overwrite_default_rejects_concurrent_delete()
     Ok(())
 }
 
-/// P11 — INSERT OVERWRITE at SERIALIZABLE (via the engine-defined
-/// `write.overwrite.isolation-level`) × a concurrent APPEND → LOUD rejection via
-/// `validate_no_conflicting_data` (`SparkWrite.OverwriteByFilter.commit` L371-373; the row filter
-/// is the default conflict filter, so ANY concurrent insert conflicts).
+/// INSERT OVERWRITE at serializable isolation, against a concurrent append, is rejected through
+/// `validate_no_conflicting_data`. The row filter is the conflict filter, so any insert conflicts.
 #[tokio::test]
 async fn test_s5_insert_overwrite_serializable_rejects_concurrent_append()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -6314,10 +6074,9 @@ async fn test_s5_insert_overwrite_serializable_rejects_concurrent_append()
     Ok(())
 }
 
-/// P12 — false-positive guard at the default (`snapshot`): INSERT OVERWRITE × a concurrent APPEND
-/// → SUCCEEDS, and the final table is EXACTLY the overwrite's rows — the refreshed re-apply
-/// replaces the concurrent append too (Spark static-overwrite semantics preserved; snapshot
-/// isolation deliberately tolerates concurrent inserts, `SparkWrite` L374-377).
+/// False-positive guard at snapshot isolation: INSERT OVERWRITE against a concurrent append
+/// commits, and the table holds exactly the overwrite's rows. The refreshed re-apply replaces the
+/// append too, which is Spark's static-overwrite behavior.
 #[tokio::test]
 async fn test_s5_insert_overwrite_snapshot_allows_concurrent_append_and_replaces_it()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -6354,9 +6113,9 @@ async fn test_s5_insert_overwrite_snapshot_allows_concurrent_append_and_replaces
     Ok(())
 }
 
-/// P13 — the `none` escape hatch restores Spark's UNVALIDATED default (Java: overwrite isolation
-/// exists only as a per-write option, absent by default ⇒ `SparkWrite.OverwriteByFilter.commit`
-/// runs no validations, L364-377): the same concurrent-delete race that P10 rejects now COMMITS,
+/// The `none` escape hatch restores Spark's unvalidated default: Java runs no validations on
+/// `SparkWrite.OverwriteByFilter.commit` unless a per-write option asks for them. The
+/// concurrent-delete race rejected above now commits,
 /// and the overwrite replaces the table.
 #[tokio::test]
 async fn test_s5_insert_overwrite_none_restores_unvalidated_java_default()
@@ -7088,13 +6847,8 @@ async fn test_delete_mread_v3_after_drop_partition_field_stamps_the_files_own_sp
     Ok(())
 }
 
-/// The PARTITIONED form of the legacy-position-delete refusal.
-///
-/// It does NOT isolate the partition-tuple carry, though an earlier version of this comment claimed
-/// it did. The fork's own V2 position delete satisfies BOTH legs at once — it carries a derivable
-/// name AND its data file's own `(spec_id, partition)` — so killing either leg alone leaves the
-/// other holding this test up; only killing both reddens it. The per-leg pins live in the seam
-/// tests. This one pins that the whole rule still refuses on a partitioned table.
+/// The PARTITIONED form of the legacy-position-delete refusal. It does NOT isolate the
+/// partition-tuple carry, though an earlier version of this comment claimed it did.
 #[tokio::test]
 async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_position_deletes()
 -> Result<()> {

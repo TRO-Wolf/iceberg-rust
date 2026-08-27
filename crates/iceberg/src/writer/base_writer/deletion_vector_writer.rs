@@ -15,62 +15,46 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! This module provides the [`DVFileWriter`] — the deletion-vector (V3 Puffin DV) file writer.
+//! Deletion-vector (V3 Puffin DV) file writer, [`DVFileWriter`].
 //!
-//! The Rust mirror of Java `BaseDVFileWriter` (`core/.../deletes/BaseDVFileWriter.java`): deleted
-//! positions are accumulated PER REFERENCED DATA FILE, and `close()` writes them all into **one
-//! Puffin file** holding one uncompressed `deletion-vector-v1` blob per referenced data file,
-//! returning one [`DeleteFile`](DataFile) metadata entry per referenced file.
+//! Mirrors Java `BaseDVFileWriter`. The writer accumulates deleted positions per referenced data
+//! file. `close()` writes one Puffin file that holds one uncompressed `deletion-vector-v1` blob
+//! per referenced data file, and returns one [`DeleteFile`](DataFile) entry per referenced file.
 //!
-//! # The on-disk contract (what Java must be able to read)
+//! # The on-disk contract Java must read
 //!
-//! Per `BaseDVFileWriter.toBlob` (L173-186), each blob carries:
+//! | Blob field | Value |
+//! |---|---|
+//! | type | `deletion-vector-v1`, uncompressed |
+//! | `fields` | `[2147483645]`, the reserved `_pos` column id, not the `pos` delete column |
+//! | `snapshot-id`, `sequence-number` | −1, inherited at commit time |
+//! | properties | `referenced-data-file` and `cardinality` |
 //!
-//! * blob type `deletion-vector-v1`, **uncompressed** (Java passes a null codec);
-//! * `fields` = `[2147483645]` — the reserved `ROW_POSITION` (`_pos`) column id,
-//!   `MetadataColumns.ROW_POSITION.fieldId()` = `Integer.MAX_VALUE - 2` (MetadataColumns.java
-//!   L39-44; *not* the `pos` delete-file column 2147483545);
-//! * `snapshot-id` = −1 and `sequence-number` = −1 (inherited at commit time, L177-178);
-//! * properties `referenced-data-file` (the data file path) and `cardinality` (the number of
-//!   deleted positions), L52-53 + L181-185.
-//!
-//! Per `BaseDVFileWriter.createDV` (L145-159), each returned [`DataFile`] carries: position-delete
-//! content, PUFFIN format, the SHARED Puffin path + file size, the partition captured for that
-//! data file, `referenced_data_file`, `content_offset`/`content_size_in_bytes` = the blob's
-//! coordinates from the Puffin footer metadata, and `record_count` = the cardinality.
+//! Each returned [`DataFile`] carries position-delete content, PUFFIN format, the shared Puffin
+//! path and size, the partition captured for that data file, `referenced_data_file`, the blob's
+//! `content_offset` and `content_size_in_bytes`, and `record_count` = the cardinality.
 //!
 //! # Determinism
 //!
-//! Blobs are written in **sorted referenced-data-file-path order**, and the returned `DeleteFile`s
-//! follow the same order. Java iterates a `HashMap` here, so blob order is NOT part of the Java
-//! contract — the sorting exists so that two identical writer runs produce byte-identical Puffin
-//! files (our own reproducibility/testing requirement).
+//! Blobs are written in sorted referenced-data-file-path order, and the returned files keep that
+//! order. Java iterates a `HashMap`, so blob order is not part of the Java contract. The sort
+//! makes two identical writer runs produce byte-identical Puffin files.
 //!
-//! # Previous-deletes merge (`loadPreviousDeletes`)
+//! # Previous-deletes merge
 //!
-//! Java's `close()` additionally MERGES the previous deletes for each path
-//! (`BaseDVFileWriter.close` L117-126): for each referenced data file it calls
-//! `loadPreviousDeletes.apply(path)` to obtain that file's existing positions, unions them into the
-//! new deletion vector (so the merged DV carries old + new positions), and collects the superseded
-//! delete files that are FILE-SCOPED (`ContentFileUtil.isFileScoped`) into `rewrittenDeleteFiles`
-//! for the commit to REPLACE (via `RowDelta.removeDeletes`). This is the merge-and-replace contract
-//! that keeps exactly ONE live DV per data file across overwriting writes.
+//! Java `close()` unions each path's previous deletes into the new deletion vector. It collects
+//! the superseded file-scoped delete files for the commit to replace. That keeps exactly one live
+//! DV per data file across overwriting writes.
 //!
-//! This writer mirrors it via [`DVFileWriter::with_previous_deletes`]: a caller supplies, per
-//! referenced data-file path, the previous positions ([`DeleteVector`]) plus the SOURCE delete
-//! `DataFile`(s) they came from (Java's `PositionDeleteIndex.deleteFiles()`). On
-//! [`close_with_result`](DVFileWriter::close_with_result) the previous positions are unioned into
-//! the new DV (`record_count`/cardinality reflect the MERGED set) and every file-scoped source file
-//! is returned as a [`rewritten delete file`](DVWriteResult::rewritten_delete_files). Files that are
-//! NOT file-scoped (partition-scoped parquet position deletes) are NOT rewritten — Java leaves them
-//! in place (`BaseDVFileWriter` L121-124: "only DVs and file-scoped deletes can be discarded from
-//! the table state"). With no previous deletes supplied the output is byte-IDENTICAL to a
-//! fresh-only run (the D2/D4 byte-parity pins are the floor).
+//! [`DVFileWriter::with_previous_deletes`] mirrors it. On
+//! [`close_with_result`](DVFileWriter::close_with_result) the previous positions join the new DV,
+//! and every file-scoped source file comes back in
+//! [`rewritten_delete_files`](DVWriteResult::rewritten_delete_files). A source file that is not
+//! file-scoped stays in place, because Java can discard only DVs and file-scoped deletes. With no
+//! previous deletes the output is byte-identical to a fresh-only run.
 //!
-//! The classic engine flow (Spark `SparkPositionDeltaWrite` L234-256) feeds the result straight
-//! into a `RowDelta`: `rowDelta.addDeletes(dv)` for each merged DV, then
-//! `for (DeleteFile f : result.rewrittenDeleteFiles()) rowDelta.removeDeletes(f)`. The Rust mirror
-//! is `row_delta().add_deletes(result.delete_files).remove_deletes_many(result.rewritten_delete_files)`.
+//! An engine feeds the result into a row delta:
+//! `row_delta().add_deletes(result.delete_files).remove_deletes_many(result.rewritten_delete_files)`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -84,60 +68,48 @@ use crate::spec::{
 use crate::writer::base_writer::data_file_writer::resolve_partition_spec_id;
 use crate::{Error, ErrorKind, Result};
 
-/// The largest position a deletion vector may record, mirroring Java
-/// `RoaringPositionBitmap.MAX_POSITION` = `toPosition(Integer.MAX_VALUE - 1, Integer.MIN_VALUE)`
-/// (RoaringPositionBitmap.java L53): the high 32 bits (the bitmap key) may be at most
-/// `i32::MAX - 1`, and the low word of the constant is `Integer.MIN_VALUE` masked unsigned
-/// (`0x8000_0000`) — a Java quirk faithfully mirrored, NOT `0xFFFF_FFFF`.
+/// The largest position a deletion vector may record. Mirrors Java
+/// `RoaringPositionBitmap.MAX_POSITION`. The bitmap key holds at most `i32::MAX - 1`. The low
+/// word is `Integer.MIN_VALUE` read unsigned, so it is `0x8000_0000`, not `0xFFFF_FFFF`. That
+/// quirk is Java's, and the fork mirrors it.
 pub const DV_MAX_POSITION: u64 = ((i32::MAX as u64 - 1) << 32) | 0x8000_0000;
 
-/// Snapshot id / sequence number recorded on a DV blob: −1 means "inherited at commit time"
-/// (Java `BaseDVFileWriter.toBlob` L177-178).
+/// Snapshot id and sequence number on a DV blob. −1 means the commit inherits them.
 const INHERITED: i64 = -1;
 
-/// Puffin blob property naming the data file a deletion vector applies to
-/// (Java `BaseDVFileWriter.REFERENCED_DATA_FILE_KEY`, L52).
+/// Puffin blob property naming the data file a deletion vector applies to.
 const REFERENCED_DATA_FILE_PROPERTY: &str = "referenced-data-file";
 
-/// Puffin blob property carrying the number of deleted positions
-/// (Java `BaseDVFileWriter.CARDINALITY_KEY`, L53).
+/// Puffin blob property carrying the number of deleted positions.
 const CARDINALITY_PROPERTY: &str = "cardinality";
 
-/// Per-referenced-data-file accumulation state (Java `BaseDVFileWriter.Deletes`, L188-216): the
-/// position set plus the partition context captured at the FIRST `delete` call for the path.
+/// Per-data-file accumulation state. Holds the position set and the partition context. The
+/// first `delete` call for a path captures the partition.
 #[derive(Debug)]
 struct DeletesForDataFile {
     positions: DeleteVector,
     partition_key: Option<PartitionKey>,
 }
 
-/// A data file's PREVIOUS deletes, supplied to [`DVFileWriter::with_previous_deletes`] for merging
-/// into a new deletion vector — the Rust mirror of the `PositionDeleteIndex` returned by Java's
-/// `loadPreviousDeletes: Function<String, PositionDeleteIndex>` (`BaseDVFileWriter` ctor L56/L66-71).
+/// A data file's previous deletes, for [`DVFileWriter::with_previous_deletes`]. Mirrors the Java
+/// `PositionDeleteIndex` that `loadPreviousDeletes` returns, which pairs a position bitmap with
+/// the source delete files.
 ///
-/// A Java `PositionDeleteIndex` bundles a bitmap of positions WITH the source `DeleteFile`s those
-/// positions came from (`BitmapPositionDeleteIndex.deleteFiles()`); this struct carries the same two
-/// pieces. The `positions` are unioned into the new DV; the `source_delete_files` that are
-/// [`is_file_scoped`] are returned as rewritten delete files for the commit to remove (Java
-/// `BaseDVFileWriter.close` L120-125).
+/// The merge unions `positions` into the new DV. It returns each file-scoped entry of
+/// `source_delete_files` as a rewritten delete file for the commit to remove.
 #[derive(Debug, Clone)]
 pub struct PreviousDeletes {
-    /// The data file's existing deleted positions (loaded via the production read path — e.g. a
-    /// decoded previous DV blob, NOT a hand-built vector).
+    /// The data file's existing deleted positions. Load them through the production read path,
+    /// not by hand.
     positions: DeleteVector,
-    /// The delete `DataFile`(s) those positions came from (Java `PositionDeleteIndex.deleteFiles()`).
-    /// Each one that is file-scoped becomes a rewritten (to-be-removed) delete file after the merge.
+    /// The delete files those positions came from. Each file-scoped entry becomes a rewritten
+    /// delete file after the merge.
     source_delete_files: Vec<DataFile>,
 }
 
 impl PreviousDeletes {
-    /// Build a `PreviousDeletes` from a data file's existing positions and the delete file(s) they
-    /// were loaded from.
-    ///
-    /// `positions` is the previous deletion set (typically read back through the production
-    /// loader/decoder); `source_delete_files` are the delete `DataFile`s carrying those positions
-    /// (the DV `DeleteFile`, or path-scoped position-delete files) — the ones the merge may mark as
-    /// superseded (Java's `PositionDeleteIndex.deleteFiles()`).
+    /// Build a `PreviousDeletes` from a data file's existing positions and the delete files they
+    /// came from. The merge may mark those delete files as superseded.
     pub fn new(positions: DeleteVector, source_delete_files: Vec<DataFile>) -> Self {
         Self {
             positions,
@@ -146,13 +118,10 @@ impl PreviousDeletes {
     }
 }
 
-/// The result of [`DVFileWriter::close_with_result`] — the Rust mirror of Java
-/// `org.apache.iceberg.io.DeleteWriteResult` (`DeleteWriteResult(deleteFiles, referencedDataFiles,
-/// rewrittenDeleteFiles)`).
+/// The result of [`DVFileWriter::close_with_result`]. Mirrors Java `DeleteWriteResult`.
 ///
-/// Java's `DeleteWriteResult` carries a third member, `referencedDataFiles` (a `CharSequenceSet`),
-/// used by conflict validation. It is recoverable from `delete_files`, so it is exposed as the
-/// derived accessors rather than stored as a field that could drift.
+/// Java also carries `referencedDataFiles` for conflict validation. `delete_files` already
+/// determines it, so accessors derive it. A stored field could drift.
 #[derive(Debug)]
 pub struct DVWriteResult {
     /// One DV `DeleteFile` per referenced data file (Java `DeleteWriteResult.deleteFiles()`); the
@@ -186,26 +155,17 @@ impl DVWriteResult {
     }
 }
 
-/// Whether a previous delete file is FILE-SCOPED and therefore safe to discard from the table state
-/// when its positions are merged into a new DV — the Rust mirror of Java
-/// `ContentFileUtil.isFileScoped(DeleteFile)` (1.10.0 jar bytecode: `return referencedDataFile(df)
-/// != null`), which `BaseDVFileWriter.close` (L121-124) uses to decide what goes into
-/// `rewrittenDeleteFiles` ("only DVs and file-scoped deletes can be discarded from the table state").
+/// Whether a previous delete file is file-scoped, so the merge may discard it from the table
+/// state. Mirrors Java `ContentFileUtil.isFileScoped`, which is
+/// `referencedDataFile(df) != null`. The predicate is broader than `is_deletion_vector`. A DV
+/// qualifies because it carries `referenced_data_file`, not because it is a DV.
 ///
-/// `ContentFileUtil.referencedDataFile` (the predicate's basis) is:
-///   1. EQUALITY deletes are never file-scoped → `false`;
-///   2. a non-null `referenced_data_file` field (every DV carries it; a path-scoped position delete
-///      may) → `true`;
-///   3. otherwise, the position delete's `_file_path` (reserved id 2147483546 =
-///      `RESERVED_FIELD_ID_DELETE_FILE_PATH`, Java `MetadataColumns.DELETE_FILE_PATH`) lower bound
-///      and upper bound are both present and EQUAL — i.e. the file's deletes all reference ONE data
-///      file (a file-scoped position delete) → `true`; unequal/absent bounds (a partition-scoped
-///      delete spanning many data files) → `false`.
-///
-/// This reuses the same public `DataFile` accessors `is_deletion_vector` keys on; it is NOT a fork
-/// of `is_deletion_vector` (`format == PUFFIN`) — Java's `isFileScoped` is the broader
-/// `referencedDataFile != null` predicate (DV OR path-scoped position delete), so a DV is file-scoped
-/// because it carries `referenced_data_file`, not because it is a DV.
+/// | Delete file | File-scoped |
+/// |---|---|
+/// | equality delete | no |
+/// | non-null `referenced_data_file` | yes |
+/// | position delete whose `_file_path` lower and upper bounds are present and equal | yes |
+/// | any other position delete, which spans many data files | no |
 fn is_file_scoped(delete_file: &DataFile) -> bool {
     if delete_file.content_type() == DataContentType::EqualityDeletes {
         return false;
@@ -229,15 +189,11 @@ fn is_file_scoped(delete_file: &DataFile) -> bool {
     }
 }
 
-/// Writer for deletion vectors (V3 Puffin DVs), mirroring Java `BaseDVFileWriter`.
-///
-/// Accumulate deleted positions with [`delete`](Self::delete) (optionally supplying a data file's
-/// PREVIOUS deletes to merge via [`with_previous_deletes`](Self::with_previous_deletes)), then call
-/// [`close`](Self::close) (just the DVs) or [`close_with_result`](Self::close_with_result) (the DVs
-/// PLUS the rewritten/superseded delete files) to write ONE Puffin file and obtain the per-data-file
-/// `DeleteFile` metadata ready for a `RowDelta` commit. If no positions were recorded AND no previous
-/// deletes were supplied, `close` writes NO file at all (Java L106-109: "Only create PuffinWriter if
-/// there are deletes").
+/// Writer for deletion vectors (V3 Puffin DVs), mirroring Java `BaseDVFileWriter`. Accumulate
+/// deleted positions with [`delete`](Self::delete), then call [`close`](Self::close) for the DVs
+/// alone, or [`close_with_result`](Self::close_with_result) for the DVs plus the superseded delete
+/// files. Either writes one Puffin file and returns the per-data-file `DeleteFile` metadata for a
+/// row-delta commit.
 #[derive(Debug)]
 pub struct DVFileWriter {
     /// Where the Puffin file goes. The underlying file is only created when `close()` actually
@@ -271,34 +227,15 @@ impl DVFileWriter {
     /// Set the spec to stamp on a DV whose [`delete`](Self::delete) calls carried no
     /// [`PartitionKey`]. Without it such a DV claims `DEFAULT_PARTITION_SPEC_ID` (0), an id no
     /// table stands behind. Java takes the spec as a required per-call argument
-    /// (`BaseDVFileWriter.delete`). Use the spec of the data files the DV references, which is not
-    /// always the table's current spec. A key wins; see `resolve_partition_spec_id`.
-    ///
-    /// # Notes
-    ///
-    /// A partitioned spec with no key fails at [`close`](Self::close), not here. The writer takes
-    /// its key per `delete` call, so the pairing is unknown until close.
+    /// (`BaseDVFileWriter.delete`).
     pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
         self.partition_spec = Some(partition_spec);
         self
     }
 
-    /// Supply each referenced data file's PREVIOUS deletes to MERGE into the new deletion vector at
-    /// close time — the Rust mirror of Java's `loadPreviousDeletes: Function<String,
-    /// PositionDeleteIndex>` ctor argument (`BaseDVFileWriter` L56/L66-71).
-    ///
-    /// `previous_deletes_by_path` maps a data-file path to its existing positions plus the source
-    /// delete file(s) they came from ([`PreviousDeletes`]). At [`close_with_result`](Self::close_with_result):
-    ///
-    /// * for every path THAT ALSO HAS NEW POSITIONS recorded via [`delete`](Self::delete), the
-    ///   previous positions are unioned into the new DV (Java iterates `deletesByPath.values()` and
-    ///   calls `loadPreviousDeletes.apply(path)` per entry — a path with ONLY previous deletes and no
-    ///   new position is never visited, so its previous deletes are NOT merged, exactly as Java);
-    /// * every file-scoped ([`is_file_scoped`]) source file of a merged path is returned as a
-    ///   rewritten delete file for the commit to remove.
-    ///
-    /// Calling this with an empty map (or not at all) leaves the output BYTE-IDENTICAL to a
-    /// fresh-only writer. Repeated calls REPLACE the map (last wins), mirroring a single ctor arg.
+    /// Supply each data file's previous deletes to merge at close time. Mirrors the Java
+    /// `loadPreviousDeletes` constructor argument. # Notes The merge visits only a path that also
+    /// has new positions from [`delete`](Self::delete).
     pub fn with_previous_deletes(
         mut self,
         previous_deletes_by_path: HashMap<String, PreviousDeletes>,
@@ -307,18 +244,9 @@ impl DVFileWriter {
         self
     }
 
-    /// Marks `position` of the data file at `data_file_path` as deleted, in the partition
-    /// context `partition_key` (`None` for an unpartitioned table).
-    ///
-    /// Mirrors Java `BaseDVFileWriter.delete(path, pos, spec, partition)` (L73-79): the partition
-    /// context is captured at the FIRST call for a given path (`computeIfAbsent`) — later calls
-    /// for the same path only add positions, their partition argument is ignored.
-    ///
-    /// # Errors
-    ///
-    /// Rejects `position > DV_MAX_POSITION`, mirroring Java
-    /// `RoaringPositionBitmap.validatePosition` (L342-348) — such a position is unrepresentable
-    /// in the serialized dense bitmap layout.
+    /// Marks `position` of the data file at `data_file_path` as deleted, in the partition context
+    /// `partition_key` (`None` for an unpartitioned table). Mirrors Java `BaseDVFileWriter.delete`.
+    /// The first call for a path captures the partition context.
     pub fn delete(
         &mut self,
         data_file_path: &str,
@@ -346,35 +274,21 @@ impl DVFileWriter {
         Ok(())
     }
 
-    /// Writes all accumulated deletion vectors into ONE Puffin file and returns one `DeleteFile`
-    /// metadata entry per referenced data file (Java `BaseDVFileWriter.close` L99-143 +
-    /// `createDV` L145-159) — just the DVs, discarding the rewritten-delete-files half.
+    /// Write every accumulated deletion vector into one Puffin file. Return one `DeleteFile` per
+    /// referenced data file, and discard the rewritten delete files.
     ///
-    /// With no recorded deletes this writes NO file and returns an empty vec (Java L106-109).
-    /// Equivalent to [`close_with_result`](Self::close_with_result)`().delete_files`; use that when
-    /// previous deletes were merged and the superseded files must be removed in the commit.
+    /// With no recorded deletes this writes no file and returns an empty vec. Use
+    /// [`close_with_result`](Self::close_with_result) when the commit must also remove the
+    /// superseded delete files.
     pub async fn close(self) -> Result<Vec<DataFile>> {
         Ok(self.close_with_result().await?.delete_files)
     }
 
-    /// Writes all accumulated deletion vectors into ONE Puffin file and returns both the DV
-    /// `DeleteFile`s AND the rewritten (superseded, file-scoped) previous delete files — the Rust
-    /// mirror of Java `BaseDVFileWriter.close` (L99-143) producing a
-    /// `DeleteWriteResult(dvs, referencedDataFiles, rewrittenDeleteFiles)`.
-    ///
-    /// The merge step (Java L114-129): for each referenced data file with new positions, any
-    /// PREVIOUS deletes supplied via [`with_previous_deletes`](Self::with_previous_deletes) are
-    /// unioned into that file's deletion vector (so `record_count`/cardinality reflect old + new),
-    /// and every file-scoped ([`is_file_scoped`]) source file of those previous deletes is collected
-    /// into [`rewritten_delete_files`](DVWriteResult::rewritten_delete_files). Non-file-scoped
-    /// previous deletes are NOT rewritten (Java leaves them, L121-124).
-    ///
-    /// With no recorded deletes this writes NO file and returns empty vecs (Java L106-109). With no
-    /// previous deletes the DV bytes are IDENTICAL to a fresh-only run.
+    /// Write every accumulated deletion vector into one Puffin file. Return the DV `DeleteFile`s
+    /// and the superseded file-scoped delete files. Mirrors Java `BaseDVFileWriter.close`.
     pub async fn close_with_result(mut self) -> Result<DVWriteResult> {
-        // Merge each referenced file's PREVIOUS deletes into its new DV (Java L114-129). Only paths
-        // with new positions are visited (Java iterates `deletesByPath.values()`); collect the
-        // file-scoped superseded source files as rewritten delete files.
+        // Merge each file's previous deletes into its new DV. Only a path with new positions is
+        // visited, as in Java. Collect the file-scoped superseded sources.
         let mut rewritten_delete_files: Vec<DataFile> = Vec::new();
         for (data_file_path, deletes) in &mut self.deletes_by_path {
             let Some(previous) = self.previous_deletes_by_path.get(data_file_path) else {
@@ -397,11 +311,10 @@ impl DVFileWriter {
             });
         }
 
-        // Resolve every spec id BEFORE opening the Puffin file. A partitioned configured spec with
-        // no PartitionKey fails here; resolving after the write would leave a fully written,
-        // unreferenced Puffin file on storage. The other three base writers resolve at build time,
-        // before any IO — this pre-pass is the DV writer's equivalent, since it takes its key per
-        // `delete` call.
+        // Resolve every spec id before the Puffin file opens. A partitioned spec with no
+        // PartitionKey fails here. A resolve after the write would leave a written, unreferenced
+        // Puffin file on storage. This writer takes its key per `delete` call, so it cannot
+        // resolve at build time like the other base writers.
         let spec_ids = self
             .deletes_by_path
             .values()
@@ -426,10 +339,9 @@ impl DVFileWriter {
         )
         .await?;
 
-        // One UNCOMPRESSED `deletion-vector-v1` blob per referenced data file, in sorted path
-        // order (determinism — see the module docs). The returned BlobMetadata carries the
-        // offset/length the DeleteFile must reference. The positions here already include any
-        // merged previous deletes (the loop above), so cardinality reflects the MERGED set.
+        // One uncompressed blob per referenced data file, in sorted path order for determinism.
+        // The returned BlobMetadata carries the offset and length the DeleteFile references. The
+        // positions already include the merged previous deletes.
         let mut blob_coordinates: Vec<(u64, u64)> = Vec::with_capacity(self.deletes_by_path.len());
         for (data_file_path, deletes) in &self.deletes_by_path {
             let blob_data = deletes.positions.serialize_deletion_vector_v1()?;
@@ -487,10 +399,8 @@ impl DVFileWriter {
         })
     }
 
-    /// Builds the `DeleteFile` metadata for one deletion vector — the Rust mirror of Java
-    /// `BaseDVFileWriter.createDV` (L145-159): position-delete content, PUFFIN format, the
-    /// shared Puffin path + file size, the captured partition, the blob coordinates, and
-    /// `record_count` = the cardinality.
+    /// Build the `DeleteFile` metadata for one deletion vector. Mirrors Java
+    /// `BaseDVFileWriter.createDV`.
     fn create_dv_metadata(
         puffin_path: &str,
         puffin_file_size: u64,
@@ -673,16 +583,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned: determinism — two runs over the same logical deletes (different insertion
-    /// order) must produce an identical BLOB REGION (identical blob order, bytes, and
-    /// coordinates) and a structurally identical footer. Java gives no such guarantee (HashMap
-    /// iteration); the sorted blob order is OUR reproducibility contract.
-    ///
-    /// KNOWN RESIDUE (flagged, pre-existing): the footer JSON itself is NOT byte-deterministic —
-    /// `PuffinWriter` serializes `BlobMetadata.properties` from a `HashMap`, so the
-    /// `referenced-data-file`/`cardinality` key ORDER varies per process. Every reader (Java's
-    /// Jackson included) parses the footer as JSON, key-order-insensitive. Fixing it would touch
-    /// `puffin/metadata.rs`, outside this increment's file set.
+    /// Risk pinned: determinism. Two runs over the same logical deletes, in different insertion
+    /// order, must produce an identical blob region and a structurally identical footer. Java gives
+    /// no such guarantee, so the sorted blob order is this fork's contract.
     #[tokio::test]
     async fn test_dv_writer_deterministic_output_across_runs() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -815,10 +718,8 @@ mod tests {
         assert_eq!(delete_files[0].partition_spec_id, 3);
     }
 
-    /// Risk pinned (D2 review): deleting the SAME position twice must merge — `record_count`
-    /// (and the blob's cardinality) is the count of DISTINCT positions, like Java's
-    /// `PositionDeleteIndex.delete` over a bitmap. Double-counting would corrupt the
-    /// `record_count` stats every planner trusts.
+    /// Risk pinned: deleting the same position twice must merge. `record_count` counts distinct
+    /// positions. Double-counting corrupts the stats every planner trusts.
     #[tokio::test]
     async fn test_dv_writer_duplicate_position_counted_once() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -862,11 +763,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned (the D1+D2 end-to-end tie, and the mutation-(d) sentinel): a Puffin file
-    /// written by THIS writer, loaded through D1's REAL caching loader using only the returned
-    /// DeleteFile metadata (path + offsets + record_count), must yield exactly the deleted
-    /// positions under each referenced data file. An offset off by even the 4-byte header magic
-    /// fails the framing/CRC here.
+    /// Risk pinned: a Puffin file this writer wrote, read back through the real caching loader
+    /// from the returned metadata alone, must yield exactly the deleted positions. An offset off
+    /// by the 4-byte header magic fails the framing check here.
     #[tokio::test]
     async fn test_dv_writer_round_trips_through_d1_loader() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -922,9 +821,7 @@ mod tests {
         assert_eq!(positions_y, (100u64..200).collect::<Vec<_>>());
     }
 
-    // ============================================================================================
     // Previous-deletes MERGE hook (Java `BaseDVFileWriter.loadPreviousDeletes` + `isFileScoped`).
-    // ============================================================================================
 
     /// A synthetic DV `DeleteFile` for `referenced_data_file` (file-scoped: carries the referenced
     /// field) — the shape a previous DV's source file has.
@@ -959,11 +856,9 @@ mod tests {
             .expect("build synthetic partition-scoped pos delete")
     }
 
-    /// Risk pinned: the previous-deletes MERGE — supplying a data file's existing positions must
-    /// UNION them into the new DV (Java `BaseDVFileWriter.close` L118-119
-    /// `positions.merge(previousPositions)`), so the merged blob deletes old + new and
-    /// `record_count`/cardinality is the MERGED count. A broken merge writes only the new positions
-    /// → the previous deletes RESURRECT.
+    /// Risk pinned: the previous-deletes merge. The existing positions must union into the new
+    /// DV, so the blob deletes old and new, and `record_count` is the merged count. A broken
+    /// merge writes only the new positions, and the previous deletes resurrect.
     #[tokio::test]
     async fn test_dv_writer_merges_previous_positions_into_new_dv() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -1009,11 +904,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned: `is_file_scoped` selectivity for rewritten files — a NON-file-scoped previous
-    /// delete (a partition-scoped parquet position delete spanning many data files) must NOT be
-    /// rewritten (Java `BaseDVFileWriter` L121-124 only discards file-scoped deletes); rewriting it
-    /// would drop a delete still applying to OTHER data files (resurrection on those files). The new
-    /// positions still merge in.
+    /// Risk pinned: `is_file_scoped` selectivity. A partition-scoped position delete spans many
+    /// data files, so the merge must not rewrite it. Rewriting it drops deletes that still apply
+    /// to the other data files, and rows resurrect there. The new positions still merge in.
     #[tokio::test]
     async fn test_dv_writer_does_not_rewrite_partition_scoped_previous_delete() {
         let temp_dir = TempDir::new().expect("temp dir");

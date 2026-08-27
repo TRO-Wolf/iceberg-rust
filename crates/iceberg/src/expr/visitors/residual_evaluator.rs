@@ -15,27 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The residual evaluator computes the *residual* of a row filter for a single
-//! partition's values: the part of the filter that is NOT already decided by
-//! the partition. It is the Rust port of Java
+//! The residual evaluator computes the part of a row filter that the partition
+//! values do not decide. Rust port of Java
 //! `org.apache.iceberg.expressions.ResidualEvaluator`.
 //!
-//! A residual expression is made by partially evaluating an expression using
-//! partition values. For example, if a table is partitioned by
-//! `day(utc_timestamp)` and is read with a filter `utc_timestamp >= a AND
-//! utc_timestamp <= b`, then for a partition value `d` there are 4 possible
-//! residuals:
+//! Scan planning calls [`ResidualEvaluator::residual_bound_for`] per
+//! [`crate::scan::FileScanTask`]. Filter-based conflict validation is the
+//! second consumer.
 //!
-//! - if `d > day(a)` and `d < day(b)`, the residual is always true;
-//! - if `d == day(a)` and `d != day(b)`, the residual is `utc_timestamp >= a`;
-//! - if `d == day(b)` and `d != day(a)`, the residual is `utc_timestamp <= b`;
-//! - if `d == day(a) == day(b)`, the residual is `utc_timestamp >= a AND
-//!   utc_timestamp <= b`.
+//! For `day(utc_timestamp)` partitioning under `utc_timestamp >= a AND
+//! utc_timestamp <= b`, partition value `d` gives:
 //!
-//! The evaluator is wired into scan planning (`scan/context.rs` computes each
-//! [`crate::scan::FileScanTask`]'s partition-reduced residual via
-//! [`ResidualEvaluator::residual_bound_for`] / [`ResidualEvaluator::residual_for`]);
-//! Increment 3 adds a second consumer in filter-based conflict validation.
+//! | partition value | residual |
+//! |---|---|
+//! | `day(a) < d < day(b)` | always true |
+//! | `d == day(a)`, `d != day(b)` | `utc_timestamp >= a` |
+//! | `d == day(b)`, `d != day(a)` | `utc_timestamp <= b` |
+//! | `d == day(a) == day(b)` | both bounds |
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -51,69 +47,39 @@ use crate::expr::{
 };
 use crate::spec::{Datum, PartitionSpecRef, Schema, SchemaRef, Struct};
 
-/// Computes the residual of a row filter for a given partition's values.
-///
-/// Mirrors Java `ResidualEvaluator`. Construct one with [`ResidualEvaluator::of`]
-/// (or [`ResidualEvaluator::unpartitioned`]) and call [`ResidualEvaluator::residual_for`]
-/// once per partition tuple.
-///
-/// Unlike Java — whose `Expression` is a single unbound/bound union — this port
-/// holds the filter as a [`BoundPredicate`] (the scan binds the filter before
-/// planning) and returns the residual as an unbound [`Predicate`]. The two leaf
-/// "keep the original predicate" cases reconstruct the unbound predicate from the
-/// bound one by name; partition source columns are always top-level schema
-/// fields, so the [`BoundReference`]'s field name is the unbound reference name.
-///
-/// When the evaluator is shared behind an `Arc` (scan planning),
-/// [`residual_bound_for`](Self::residual_bound_for) memoizes bound residuals by
-/// partition so many files in the same partition do not re-run residual evaluation.
-///
-/// # Memo contract
-///
-/// The memo is keyed **only by partition tuple**. That is safe because one
-/// [`ResidualEvaluator`] is constructed per scan-side filter/spec with fixed
-/// `case_sensitive` and filter; callers must not reuse the same evaluator across
-/// different snapshot schemas or bind-case settings. `residual_bound_for`'s
-/// `bind_case_sensitive` argument should match the evaluator's stored
-/// `case_sensitive` field (debug-asserted). Memo size is soft-capped
-/// ([`RESIDUAL_BOUND_MEMO_SOFT_CAP`]) so pathological partition cardinalities
-/// cannot grow unbounded within one scan.
+/// Computes the residual of a row filter for a given partition's values. Mirrors Java
+/// `ResidualEvaluator`. The filter is a [`BoundPredicate`] and the residual is an unbound
+/// [`Predicate`].
 #[derive(Debug)]
 pub(crate) struct ResidualEvaluator {
     /// `Some(spec, partition_schema)` for a partitioned spec; `None` for an
     /// unpartitioned spec (the residual is then always the whole filter).
     partitioned: Option<PartitionedState>,
-    /// The bound row filter.
     filter: BoundPredicate,
-    /// Case sensitivity used when binding projected predicates to the partition type.
+    /// Case sensitivity used to bind projected predicates to the partition type.
     case_sensitive: bool,
-    /// Memo of partition tuple → bound residual (for the snapshot-schema bind in
-    /// [`residual_bound_for`](Self::residual_bound_for)). Poisoned locks are recovered
-    /// (crate-wide scan-cache policy): values are pure derived data.
+    /// Memo of partition tuple → bound residual. A poisoned lock is recovered:
+    /// the values are pure derived data (crate-wide scan-cache policy).
     residual_bound_memo: RwLock<HashMap<Struct, Arc<BoundPredicate>>>,
 }
 
-/// Soft cap on `residual_bound_memo` entries (C1-SEC-001). Beyond this, new
-/// residuals are still computed but not inserted — prevents unbounded growth
-/// on high-cardinality partition scans while keeping hot partitions memoized.
+/// Soft cap on `residual_bound_memo` entries. Past it a residual still computes
+/// but is not inserted, so a high-cardinality scan cannot grow the memo without
+/// bound.
 const RESIDUAL_BOUND_MEMO_SOFT_CAP: usize = 8192;
 
 /// The state needed to evaluate residuals against a non-empty partition spec.
 #[derive(Debug, Clone)]
 struct PartitionedState {
-    /// The partition spec whose fields decide the residual.
     spec: PartitionSpecRef,
-    /// The partition type as a [`Schema`], used to bind projected predicates
-    /// (Java `spec.partitionType()`).
+    /// Java `spec.partitionType()`, as a [`Schema`] to bind projections against.
     partition_schema: SchemaRef,
 }
 
 impl ResidualEvaluator {
-    /// Returns a residual evaluator for an unpartitioned spec: every residual is
-    /// the whole filter, unchanged (Java `ResidualEvaluator.unpartitioned`).
-    ///
-    /// `case_sensitive` is stored so [`residual_bound_for`](Self::residual_bound_for)
-    /// bind flags stay consistent with the scan (memo contract).
+    /// Returns an evaluator for an unpartitioned spec. Every residual is the
+    /// whole filter (Java `ResidualEvaluator.unpartitioned`). `case_sensitive`
+    /// is stored to keep the memo contract.
     pub(crate) fn unpartitioned(filter: BoundPredicate, case_sensitive: bool) -> Self {
         Self {
             partitioned: None,
@@ -125,11 +91,10 @@ impl ResidualEvaluator {
 
     /// Returns a residual evaluator for a partition spec and a bound filter.
     ///
-    /// When the spec has no fields the evaluator degrades to the unpartitioned
-    /// form (Java `ResidualEvaluator.of`: `spec.fields().isEmpty()`). `schema` is
-    /// the table schema the filter was bound against; it is needed to compute the
-    /// partition type the projections bind to (Java's `PartitionSpec` carries its
-    /// schema, the Rust one does not).
+    /// An empty spec degrades to the unpartitioned form (Java
+    /// `ResidualEvaluator.of`). `schema` is the table schema the filter binds
+    /// against. It gives the partition type, which the Rust `PartitionSpec`
+    /// does not carry.
     pub(crate) fn of(
         spec: PartitionSpecRef,
         schema: &Schema,
@@ -159,9 +124,8 @@ impl ResidualEvaluator {
 
     /// Returns the residual of the filter for the given partition values.
     ///
-    /// `partition` is the partition tuple (Java `StructLike partitionData`). For
-    /// an unpartitioned evaluator the filter is returned verbatim (as an unbound
-    /// predicate).
+    /// `partition` is the partition tuple (Java `StructLike partitionData`). An
+    /// unpartitioned evaluator returns the filter verbatim.
     pub(crate) fn residual_for(&self, partition: &Struct) -> Result<Predicate> {
         let Some(state) = &self.partitioned else {
             return bound_to_unbound(&self.filter);
@@ -175,16 +139,9 @@ impl ResidualEvaluator {
         visit(&mut visitor, &self.filter)
     }
 
-    /// Returns the residual of the filter for `partition`, already bound to
-    /// `snapshot_schema` under `bind_case_sensitive`.
-    ///
-    /// Results are memoized by **partition tuple only**. Valid only while this
-    /// evaluator's filter / partition state stay fixed and `bind_case_sensitive`
-    /// matches the value used for the first insert of that partition (scan
-    /// planning always passes the same `case_sensitive` for the whole plan).
-    /// Poisoned memo locks are recovered. When the memo reaches
-    /// [`RESIDUAL_BOUND_MEMO_SOFT_CAP`], new partitions are still computed but
-    /// not inserted.
+    /// Returns the residual of the filter for `partition`, already bound to `snapshot_schema` under
+    /// `bind_case_sensitive`. The memo keys on the partition tuple only. It is valid only while the
+    /// filter and partition state stay fixed and `bind_case_sensitive` matches the first insert.
     pub(crate) fn residual_bound_for(
         &self,
         partition: &Struct,
@@ -200,9 +157,8 @@ impl ResidualEvaluator {
     }
 
     /// Same as [`residual_bound_for`](Self::residual_bound_for) with an explicit
-    /// memo insert soft-cap. Production always uses
-    /// [`RESIDUAL_BOUND_MEMO_SOFT_CAP`]; tests pass a smaller cap so the gate is
-    /// pin-able without filling 8192 partitions (C2-Q-001 / C1-SEC-001).
+    /// insert soft-cap. Tests pass a small cap to pin the gate without filling
+    /// 8192 partitions.
     fn residual_bound_for_with_cap(
         &self,
         partition: &Struct,
@@ -210,9 +166,8 @@ impl ResidualEvaluator {
         bind_case_sensitive: bool,
         soft_cap: usize,
     ) -> Result<Arc<BoundPredicate>> {
-        // Scan planning always uses one case-sensitivity for the evaluator and
-        // the bind step; a mismatch would make memo hits wrong if someone later
-        // called with a different bind flag (C1-Q-003 / C1-SEC-002).
+        // The memo does not key on the bind flag. A caller that changes it
+        // between calls gets wrong memo hits.
         debug_assert_eq!(
             bind_case_sensitive, self.case_sensitive,
             "residual_bound_for bind_case_sensitive must match ResidualEvaluator.case_sensitive"
@@ -235,10 +190,9 @@ impl ResidualEvaluator {
             .residual_bound_memo
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Double-check under the write lock (C4-Q-001 / C2-Q-003): a concurrent
-        // writer may have inserted this same partition (and filled the map to the
-        // soft-cap) between our read miss and this acquire. Prefer the memoized Arc
-        // over a fresh one so the Arc-identity contract holds at the CAP race edge.
+        // Double-check under the write lock. A concurrent writer can insert this
+        // partition, and fill the map to the cap, between the read miss and this
+        // acquire. Prefer the memoized Arc so Arc identity holds at that edge.
         if let Some(cached) = write.get(partition) {
             return Ok(cached.clone());
         }
@@ -249,7 +203,7 @@ impl ResidualEvaluator {
         Ok(write.entry(partition.clone()).or_insert(bound).clone())
     }
 
-    /// Current residual-bound memo size (test inspection for soft-cap / poison pins).
+    /// Memo size, for the soft-cap and poison pins.
     #[cfg(test)]
     fn residual_memo_len(&self) -> usize {
         self.residual_bound_memo
@@ -258,8 +212,7 @@ impl ResidualEvaluator {
             .len()
     }
 
-    /// Panic while holding the memo write guard so the lock is left poisoned
-    /// (setup for the C2-Q-002 recovery pin). Asserts the poison took.
+    /// Panics while holding the memo write guard to leave the lock poisoned.
     #[cfg(test)]
     fn poison_residual_memo_for_test(&self) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -277,29 +230,24 @@ impl ResidualEvaluator {
     }
 }
 
-/// The visitor that walks the bound filter and reduces each leaf against the
-/// partition values, mirroring Java `ResidualEvaluator.ResidualVisitor`.
+/// Java `ResidualEvaluator.ResidualVisitor`: reduces each leaf against the
+/// partition values.
 struct ResidualVisitor<'a> {
-    /// The partition tuple being evaluated.
     partition: &'a Struct,
-    /// The partition spec + partition schema.
     spec: &'a PartitionedState,
-    /// Case sensitivity for binding projected predicates.
     case_sensitive: bool,
 }
 
 impl ResidualVisitor<'_> {
-    /// Applies Java `ResidualVisitor.predicate(BoundPredicate)` (L227-288): for
-    /// every partition field on this predicate's source column, the STRICT
-    /// projection deciding `true` reduces the residual to `AlwaysTrue`, and the
-    /// INCLUSIVE projection deciding `false` reduces it to `AlwaysFalse`. If no
-    /// partition field is conclusive, the original predicate is kept.
+    /// Applies Java `ResidualVisitor.predicate(BoundPredicate)`. For each
+    /// partition field on the predicate's source column, a true strict
+    /// projection gives `AlwaysTrue` and a false inclusive projection gives
+    /// `AlwaysFalse`. No conclusive field keeps the original predicate.
     fn reduce_leaf(
         &self,
         reference: &BoundReference,
         predicate: &BoundPredicate,
     ) -> Result<Predicate> {
-        // Not associated with a partition field — the predicate can't be reduced.
         let source_id = reference.field().id;
         let parts: Vec<_> = self
             .spec
@@ -313,17 +261,16 @@ impl ResidualVisitor<'_> {
         }
 
         for part in parts {
-            // Strict projection: true iff the original predicate is guaranteed
-            // true for every row in the partition, so the predicate is dropped.
+            // Strict projection is true only if every row in the partition
+            // satisfies the predicate, so the predicate drops.
             if let Some(strict) = part.transform.strict_project(&part.name, predicate)?
                 && self.evaluate_projection(strict)?
             {
                 return Ok(Predicate::AlwaysTrue);
             }
 
-            // Inclusive projection: false iff the original predicate is
-            // guaranteed false for every row in the partition, so the whole
-            // residual is false.
+            // Inclusive projection is false only if no row in the partition
+            // satisfies the predicate, so the residual is false.
             if let Some(inclusive) = part.transform.project(&part.name, predicate)?
                 && !self.evaluate_projection(inclusive)?
             {
@@ -331,25 +278,19 @@ impl ResidualVisitor<'_> {
             }
         }
 
-        // Neither strict nor inclusive was conclusive — keep the original predicate.
         bound_to_unbound(predicate)
     }
 
-    /// Binds a projected (partition-column) predicate to the partition type and
-    /// evaluates it against the partition values, returning the boolean Java
-    /// reaches via `super.predicate(...)` → the leaf evaluation methods.
-    ///
-    /// An `AlwaysTrue` / `AlwaysFalse` projection short-circuits to its constant
-    /// (Java's "if the result is not a predicate, it must be a constant").
+    /// Binds a projected predicate to the partition type and evaluates it
+    /// against the partition values. A constant projection short-circuits.
     fn evaluate_projection(&self, projection: Predicate) -> Result<bool> {
         let bound = projection.bind(self.spec.partition_schema.clone(), self.case_sensitive)?;
         match bound {
             BoundPredicate::AlwaysTrue => Ok(true),
             BoundPredicate::AlwaysFalse => Ok(false),
             other => {
-                // `Not` must be rewritten before the expression evaluator can run
-                // it; the partition projections from `Transform::{project,
-                // strict_project}` never introduce a `Not`, but normalize anyway.
+                // The expression evaluator cannot run a `Not`. The transform
+                // projections never emit one, but normalize anyway.
                 let mut evaluator = ExpressionEvaluatorVisitor::new(self.partition);
                 visit(&mut evaluator, &other.rewrite_not())
             }
@@ -503,11 +444,9 @@ impl BoundPredicateVisitor for ResidualVisitor<'_> {
     }
 }
 
-/// Reconstructs an unbound [`Predicate`] from a bound one — used for the leaf
-/// "keep the original predicate" residual case and for the unpartitioned
-/// evaluator. Logical nodes recurse; leaves rebuild the unbound reference from
-/// the bound field's name (partition-source columns are top-level fields, so the
-/// field name is the unbound reference name).
+/// Reconstructs an unbound [`Predicate`] from a bound one, for a kept leaf and
+/// for the unpartitioned evaluator. A leaf rebuilds its reference from the bound
+/// field name, which is valid because partition sources are top-level fields.
 fn bound_to_unbound(predicate: &BoundPredicate) -> Result<Predicate> {
     Ok(match predicate {
         BoundPredicate::AlwaysTrue => Predicate::AlwaysTrue,
@@ -546,9 +485,8 @@ fn unbound_reference(reference: &BoundReference) -> Reference {
     Reference::new(reference.field().name.clone())
 }
 
-/// Negates a residual the way Java `Expressions.not` does: `not(true)=false`,
-/// `not(false)=true`, `not(not(x))=x`, otherwise wrap in `Not`. The `Predicate`
-/// `!` operator does NOT simplify constants, so `ResidualVisitor.not` must.
+/// Negates a residual like Java `Expressions.not`, folding constants and double
+/// negation. The `Predicate` `!` operator does not fold constants, so this must.
 fn simplifying_not(inner: Predicate) -> Predicate {
     match inner {
         Predicate::AlwaysTrue => Predicate::AlwaysFalse,
@@ -572,8 +510,7 @@ mod tests {
         UnboundPartitionField,
     };
 
-    /// A schema with a `ts` timestamp column (id 1), an `id` int column (id 2),
-    /// and a `name` string column (id 3).
+    /// Columns `ts` (id 1), `id` (id 2), and optional `name` (id 3).
     fn day_example_schema() -> SchemaRef {
         Arc::new(
             Schema::builder()
@@ -618,8 +555,7 @@ mod tests {
         )
     }
 
-    /// Microseconds since the Unix epoch for the given UTC date-time. Used to
-    /// build deterministic timestamp literals for the day-example tests.
+    /// Microseconds since the Unix epoch for a UTC date-time.
     fn micros(datetime: &str) -> i64 {
         match Datum::timestamp_from_str(datetime)
             .expect("valid timestamp")
@@ -630,8 +566,7 @@ mod tests {
         }
     }
 
-    /// The day-partition value (days since epoch) for a UTC date string, as the
-    /// partition `Struct` the evaluator receives.
+    /// The `day` partition tuple for a UTC date string.
     fn day_partition(date: &str) -> Struct {
         let day_value = match Datum::date_from_str(date).expect("valid date").literal() {
             PrimitiveLiteral::Int(value) => *value,
@@ -817,11 +752,9 @@ mod tests {
             .unwrap();
         let evaluator = ResidualEvaluator::of(spec, &schema, filter, true).unwrap();
 
-        // Use the partition that an `category = 5` row actually lands in:
-        // bucket(category) == bucket(5). The inclusive projection is then TRUE
-        // (so it does not reduce to false) and bucket has no strict projection
-        // for `eq` (non-invertible), so the original predicate survives — Java
-        // keeps the predicate because the partition value cannot decide it.
+        // Use the partition a `category = 5` row lands in. The inclusive
+        // projection is then true, and bucket has no strict projection for
+        // `eq`, so the predicate survives.
         let bucket_value = match create_transform_function(&Transform::Bucket(16))
             .unwrap()
             .transform_literal(&Datum::int(5))
@@ -904,11 +837,9 @@ mod tests {
 
     #[test]
     fn test_unpartitioned_spec_round_trips_a_not_filter_keeping_the_negation() {
-        // The unpartitioned path returns the filter verbatim through
-        // `bound_to_unbound`, which is the ONLY caller that reaches the And/Or/Not
-        // *logical* arms (the partitioned path decomposes those before the leaf
-        // methods). Pin the `Not` arm: a `NOT(id > 100)` filter must come back with
-        // the negation intact, not dropped to `id > 100`.
+        // Only the unpartitioned path reaches the And/Or/Not arms of
+        // `bound_to_unbound`. Pin the `Not` arm: dropping the negation would
+        // return `id > 100`.
         let schema = day_example_schema();
         let filter = Reference::new("id")
             .greater_than(Datum::int(100))
@@ -958,9 +889,8 @@ mod tests {
 
     #[test]
     fn test_and_of_reducible_and_non_reducible_keeps_only_the_non_reducible() {
-        // (category == 5) AND (other_predicate_on_partition is true) — here the
-        // identity partition leaf reduces to AlwaysTrue and the non-partition leaf
-        // survives; AND with AlwaysTrue simplifies to the survivor.
+        // The identity partition leaf reduces to AlwaysTrue. AND with the
+        // surviving non-partition leaf simplifies to that survivor.
         let schema = Arc::new(
             Schema::builder()
                 .with_fields(vec![
@@ -1107,7 +1037,7 @@ mod tests {
         assert_eq!(residual_miss, Predicate::AlwaysTrue);
     }
 
-    // ---- Truncate partition (reviewer-added: pin a non-day/identity/bucket class) ----
+    // ---- Truncate partition ----
 
     /// A schema with a single required `amount` int column (id 1).
     fn amount_schema() -> SchemaRef {
@@ -1153,8 +1083,8 @@ mod tests {
             .unwrap();
         let evaluator = ResidualEvaluator::of(spec, &schema, filter, true).unwrap();
 
-        // Partition bucket truncate=10 holds amounts 10..=19, which straddles 15:
-        // neither strict nor inclusive is conclusive, so the predicate is kept.
+        // truncate=10 holds 10..=19, which straddles 15. Neither projection is
+        // conclusive, so the predicate is kept.
         let straddling = evaluator
             .residual_for(&Struct::from_iter([Some(Literal::int(10))]))
             .unwrap();
@@ -1163,24 +1093,22 @@ mod tests {
             Reference::new("amount").greater_than_or_equal_to(Datum::int(15))
         );
 
-        // Partition truncate=20 holds amounts 20..=29, all >= 15: strict projection
-        // is true → residual AlwaysTrue.
+        // truncate=20 holds 20..=29, all >= 15, so strict projection is true.
         let all_match = evaluator
             .residual_for(&Struct::from_iter([Some(Literal::int(20))]))
             .unwrap();
         assert_eq!(all_match, Predicate::AlwaysTrue);
 
-        // Partition truncate=0 holds amounts 0..=9, all < 15: inclusive projection
-        // is false → residual AlwaysFalse.
+        // truncate=0 holds 0..=9, all < 15, so inclusive projection is false.
         let none_match = evaluator
             .residual_for(&Struct::from_iter([Some(Literal::int(0))]))
             .unwrap();
         assert_eq!(none_match, Predicate::AlwaysFalse);
     }
 
-    // ---- Temporal (year) partition (reviewer-added) ----
+    // ---- Temporal (year) partition ----
 
-    /// The `year(ts)` partition value (years since 1970) for a UTC date-time.
+    /// The `year(ts)` partition value for a UTC date-time.
     fn year_partition_value(datetime: &str) -> i32 {
         use crate::transform::create_transform_function;
         match create_transform_function(&Transform::Year)
@@ -1219,10 +1147,8 @@ mod tests {
             ts_between_filter(schema.clone(), "2021-06-01T00:00:00", "2021-06-30T00:00:00");
         let evaluator = ResidualEvaluator::of(spec, &schema, filter, true).unwrap();
 
-        // Partition year=2021 contains the whole [a, b] range but the year value
-        // alone cannot decide either bound (a row in 2021 could be before a or
-        // after b), so BOTH predicates are kept — the temporal analogue of the
-        // day-example "d == day(a) == day(b)" case.
+        // year=2021 contains the whole range, but the year alone decides
+        // neither bound, so both predicates are kept.
         let in_year = evaluator
             .residual_for(&Struct::from_iter([Some(Literal::int(
                 year_partition_value("2021-06-15T00:00:00"),
@@ -1236,8 +1162,8 @@ mod tests {
             );
         assert_eq!(in_year, expected);
 
-        // Partition year=2020 is entirely before the range (inclusive projection of
-        // `ts <= b` is false there) → AlwaysFalse.
+        // year=2020 is entirely before the range, so the inclusive projection of
+        // `ts <= b` is false.
         let before = evaluator
             .residual_for(&Struct::from_iter([Some(Literal::int(
                 year_partition_value("2020-06-15T00:00:00"),
@@ -1245,7 +1171,7 @@ mod tests {
             .unwrap();
         assert_eq!(before, Predicate::AlwaysFalse);
 
-        // Partition year=2022 is entirely after the range → AlwaysFalse.
+        // year=2022 is entirely after the range.
         let after = evaluator
             .residual_for(&Struct::from_iter([Some(Literal::int(
                 year_partition_value("2022-06-15T00:00:00"),
@@ -1254,14 +1180,13 @@ mod tests {
         assert_eq!(after, Predicate::AlwaysFalse);
     }
 
-    // ---- Void partition (reviewer-added: non-invertible, projects to null) ----
+    // ---- Void partition ----
 
     #[test]
     fn test_void_partition_keeps_predicate_unchanged() {
-        // void projects every value to null and has neither an inclusive nor a
-        // strict projection (Java `VoidTransform.project`/`projectStrict` return
-        // null), so a predicate on a void-partitioned column can never be reduced —
-        // it is always kept, with no panic on the null partition value.
+        // Java `VoidTransform.project` and `projectStrict` both return null, so
+        // a void-partitioned predicate never reduces. The null partition value
+        // must not panic.
         let schema = identity_schema();
         let spec = Arc::new(
             PartitionSpec::builder(schema.clone())
@@ -1289,20 +1214,18 @@ mod tests {
         assert_eq!(residual, Reference::new("category").equal_to(Datum::int(5)));
     }
 
-    // ---- Leaf reconstruction round-trip (reviewer-added) ----
+    // ---- Leaf reconstruction round-trip ----
     //
-    // The "keep the original predicate" path rebuilds an unbound `Predicate` from
-    // the bound leaf by field name (`bound_to_unbound`). A dropped negation, an
-    // operator swap, or a set collapsed to one value would be silent — pin the
-    // set (in/not_in) and unary (is_null) shapes for a non-partition column, since
-    // the existing kept-predicate tests only cover the binary shape.
+    // `bound_to_unbound` could drop a negation, swap an operator, or collapse a
+    // set, all silently. These pin the set and unary shapes; the other tests
+    // cover only the binary shape.
 
     #[test]
     fn test_in_predicate_on_non_partition_column_round_trips_as_same_in() {
         let schema = day_example_schema();
         let spec = day_partition_spec(schema.clone());
-        // `id` (column 2) is not a partition source column; an `in (1, 2, 3)` must
-        // come back as the same set, same operator, same column.
+        // `id` is not a partition source. `in (1, 2, 3)` must come back with the
+        // same set, operator, and column.
         let filter = Reference::new("id")
             .is_in([Datum::int(1), Datum::int(2), Datum::int(3)])
             .bind(schema.clone(), true)
@@ -1330,10 +1253,8 @@ mod tests {
         let residual = evaluator
             .residual_for(&day_partition("2021-01-01"))
             .unwrap();
-        // `not(in (1, 2))` binds to `Not(In {1, 2})` (the binder keeps the `Not`
-        // wrapper rather than folding it into a `NotIn` operator). The residual
-        // must round-trip that exact shape — the negation kept, the set intact —
-        // not drop the `Not` or collapse the set.
+        // The binder keeps `not(in (1, 2))` as `Not(In {1, 2})`. The residual
+        // must round-trip that shape, with the negation and the set intact.
         let expected = Reference::new("id")
             .is_in([Datum::int(1), Datum::int(2)])
             .not();
@@ -1357,8 +1278,8 @@ mod tests {
         assert_eq!(residual, Reference::new("name").is_null());
     }
 
-    /// Wave A: `residual_bound_for` memoizes by partition so files that share a
-    /// partition reuse one residual_for + bind (Arc identity on the second call).
+    /// Files that share a partition reuse one residual, proven by Arc identity
+    /// on the second call.
     #[test]
     fn test_residual_bound_for_memoizes_by_partition() {
         let schema = day_example_schema();
@@ -1394,9 +1315,8 @@ mod tests {
         );
     }
 
-    /// C1-L-001 / C1-Q-004: for a *boundary* day residual (not AlwaysTrue),
-    /// `residual_bound_for` equals `bind(residual_for(...))` on first call and
-    /// the second call is a memo hit (same Arc, same semantic value).
+    /// For a boundary day residual, `residual_bound_for` equals
+    /// `bind(residual_for(..))`, and the second call is a memo hit.
     #[test]
     fn test_residual_bound_for_boundary_day_matches_residual_for_bind() {
         let schema = day_example_schema();
@@ -1443,8 +1363,8 @@ mod tests {
         );
     }
 
-    /// C1-L-003: case_sensitive=false path for residual_bound_for still produces
-    /// a residual that matches residual_for + bind under the same flag.
+    /// The `case_sensitive = false` path still matches `residual_for` + bind
+    /// under the same flag.
     #[test]
     fn test_residual_bound_for_case_insensitive_matches_residual_for_bind() {
         let schema = day_example_schema();
@@ -1482,11 +1402,9 @@ mod tests {
         );
     }
 
-    /// C2-Q-001 / C1-SEC-001: soft-cap insert ceiling is real — past `soft_cap`,
-    /// residuals still compute correctly but the memo does not grow. Uses a tiny
-    /// cap via `residual_bound_for_with_cap` so removing the gate fails this test
-    /// without needing to insert 8192 partitions. Also pins the production
-    /// constant value so a silent raise/lower of the ceiling is deliberate.
+    /// Past `soft_cap` a residual still computes but the memo does not grow.
+    /// Removing the cap check fails this test. It also pins the production
+    /// constant, so a change to the ceiling must be deliberate.
     #[test]
     fn test_residual_bound_memo_soft_cap_skips_insert_past_ceiling() {
         assert_eq!(
@@ -1573,9 +1491,8 @@ mod tests {
         );
     }
 
-    /// C2-Q-002: residual memo recovers from a poisoned `RwLock` (crate-wide
-    /// scan-cache policy: `PoisonError::into_inner`). Hit and miss paths both
-    /// return correct residuals after a poisoning panic.
+    /// The memo recovers from a poisoned `RwLock`. Hit and miss paths both
+    /// return correct residuals after the poisoning panic.
     #[test]
     fn test_residual_bound_memo_recovers_from_poisoned_lock() {
         let schema = day_example_schema();
@@ -1640,16 +1557,14 @@ mod tests {
         );
     }
 
-    // ---- Multiple partition fields on one source column (reviewer-added) ----
+    // ---- Multiple partition fields on one source column ----
 
     #[test]
     fn test_multiple_partition_fields_on_one_source_reduce_via_the_conclusive_field() {
-        // Java loops over EVERY partition field whose source id matches the
-        // predicate's column (`getFieldsBySourceId`). Here `category` is the source
-        // of BOTH bucket(category, 16) (non-invertible — never conclusive for `eq`)
-        // and identity(category) (conclusive). The loop must skip past the bucket
-        // field and let the identity field decide; the existing tests only ever
-        // have one partition field per source, so they cannot exercise this loop.
+        // Java loops over every partition field with a matching source id.
+        // `category` sources both bucket(category, 16), never conclusive for
+        // `eq`, and identity(category), which is. The loop must reach the
+        // identity field. No other test has two fields on one source.
         let schema = identity_schema();
         let spec = Arc::new(
             PartitionSpec::builder(schema.clone())
@@ -1696,8 +1611,8 @@ mod tests {
             }
         };
 
-        // bucket(5) + identity=5: the identity field's strict projection is true →
-        // the loop reaches it past the inconclusive bucket field → AlwaysTrue.
+        // identity=5 has a true strict projection, reached past the
+        // inconclusive bucket field.
         let matching = evaluator
             .residual_for(&Struct::from_iter([
                 Some(Literal::int(bucket_value)),
@@ -1706,8 +1621,8 @@ mod tests {
             .unwrap();
         assert_eq!(matching, Predicate::AlwaysTrue);
 
-        // bucket(5) + identity=7: the identity field's inclusive projection is
-        // false → AlwaysFalse (again only reachable by continuing the loop).
+        // identity=7 has a false inclusive projection, again only reachable by
+        // continuing the loop.
         let non_matching = evaluator
             .residual_for(&Struct::from_iter([
                 Some(Literal::int(bucket_value)),
@@ -1719,12 +1634,8 @@ mod tests {
 
     // ---- Mutation guard: strict vs inclusive direction ----
     //
-    // The day-example reduction tests are the canonical mutation check. Swapping
-    // `strict_project` <-> `project` in `reduce_leaf` flips the headline cases:
-    // the "strictly between bounds" case stops reducing to AlwaysTrue (strict was
-    // the load-bearing projection there), and the "equals one bound" cases stop
-    // dropping the satisfied half. Making `residual_for` ignore the partition
-    // (always return the filter) breaks every reduction test above. Both
-    // mutations are exercised by the existing assertions; this comment documents
-    // the manual mutation runs.
+    // Swapping `strict_project` and `project` in `reduce_leaf` breaks the
+    // day-example tests: the between-bounds case stops reducing to AlwaysTrue,
+    // and the equals-one-bound cases stop dropping the satisfied half. Making
+    // `residual_for` ignore the partition breaks every reduction test.
 }

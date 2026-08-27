@@ -15,42 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The `files` family of metadata tables: `files`, `data_files`, `delete_files` (current snapshot) and
-//! their cross-snapshot siblings `all_files`, `all_data_files`, `all_delete_files`.
+//! The `files` family of metadata tables: `files`, `data_files`, `delete_files` (current snapshot)
+//! and their cross-snapshot siblings `all_files`, `all_data_files`, `all_delete_files`. All six
+//! share one schema, one read, and one row builder. They differ along two orthogonal axes, like
+//! Java `BaseFilesTable` and `AllFilesTable`.
 //!
-//! Each exposes data/delete files as rows, with the data-file column set (content, file path/format,
-//! partition, record/size counts, the metrics maps, and the V3 deletion-vector fields). All six tables
-//! share one schema, one read, and one row builder and differ along TWO orthogonal axes — mirroring Java
-//! `BaseFilesTable`:
+//! | Axis | Variant | Manifests it reads |
+//! |---|---|---|
+//! | content kind ([`FilesTableKind`]) | `All` | every manifest (Java `FilesTable`) |
+//! | | `Data` | DATA-content manifests (Java `DataFilesTable`) |
+//! | | `Deletes` | DELETE-content manifests (Java `DeleteFilesTable`) |
+//! | snapshot scope ([`MetadataScope`]) | `CurrentSnapshot` | the current snapshot only |
+//! | | `AllSnapshots` | the deduplicated union of manifests reachable from ALL snapshots (Java `AllFilesTable` family) |
 //!
-//! - **content kind** ([`FilesTableKind`]): which manifests by content —
-//!   - `All`     → all manifests          (Java `FilesTable` / `snapshot().allManifests()`)
-//!   - `Data`    → DATA-content manifests  (Java `DataFilesTable` / `snapshot().dataManifests()`)
-//!   - `Deletes` → DELETE-content manifests (Java `DeleteFilesTable` / `snapshot().deleteManifests()`)
-//! - **snapshot scope** ([`MetadataScope`]): which snapshots' manifests —
-//!   - `CurrentSnapshot` → the current snapshot only (`files` / `data_files` / `delete_files`)
-//!   - `AllSnapshots`    → the deduplicated union of manifests reachable from ALL snapshots
-//!     (`all_files` / `all_data_files` / `all_delete_files`, Java `AllFilesTable` /
-//!     `AllDataFilesTable` / `AllDeleteFilesTable`, "valid file = readable from ANY snapshot currently
-//!     tracked by the table"). Manifests are deduplicated, but the FILES inside them are NOT — Java's
-//!     javadoc: "may return duplicate rows".
+//! `AllSnapshots` deduplicates MANIFESTS but not the FILES inside them, so it may return duplicate
+//! rows, as Java's javadoc says. Only LIVE entries ([`ManifestEntry::is_alive`]) become rows.
 //!
-//! Within a selected manifest only LIVE entries (Added/Existing, [`ManifestEntry::is_alive`]) are rows.
-//! The manifest source (current-snapshot vs reachable-union) is the shared
-//! [`crate::inspect::manifest_source`] helper, so this table and `entries` cannot drift.
-//!
-//! The data-file column set (schema + row builder) is the shared [`crate::inspect::data_file`] projection
-//! — the `files` family flattens it to top-level columns, the `entries` table nests it under a `data_file`
-//! struct. See that module (Rule of Three).
-//!
-//! References:
-//! - <https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/BaseFilesTable.java>
-//! - <https://github.com/apache/iceberg/blob/main/core/src/main/java/org/apache/iceberg/AllFilesTable.java>
-//! - <https://github.com/apache/iceberg/blob/main/api/src/main/java/org/apache/iceberg/DataFile.java>
-//!
-//! The `readable_metrics` virtual STRUCT column (Java `MetricsUtil.readableMetricsStruct` — one sub-field
-//! per leaf DATA column, each a struct of human-readable min/max/counts) is APPENDED last, alongside the
-//! raw `data_file` columns. See [`crate::inspect::readable_metrics`].
+//! The manifest source comes from the shared [`crate::inspect::manifest_source`] helper, so this
+//! table and `entries` cannot drift. The column set comes from the shared
+//! [`crate::inspect::data_file`] projection: this family flattens it into top-level columns, and
+//! `entries` nests it under a `data_file` struct. The virtual `readable_metrics` struct (Java
+//! `MetricsUtil.readableMetricsStruct`, one sub-field per leaf data column) is appended last. See
+//! [`crate::inspect::readable_metrics`].
 
 use std::sync::Arc;
 
@@ -107,11 +93,8 @@ pub struct FilesTable<'a> {
 }
 
 impl<'a> FilesTable<'a> {
-    /// Fallible constructor: resolves the unified partition type up front.
-    ///
-    /// The DataFusion `IcebergMetadataTableProvider::try_new` is the public
-    /// fallible seam (A5). G1/G2 (`DataInvalid`) surface there via the
-    /// `try_*` constructors below.
+    /// Fallible constructor: resolves the unified partition type up front. The DataFusion
+    /// `IcebergMetadataTableProvider::try_new` is the public fallible seam.
     ///
     /// # Errors
     ///
@@ -126,10 +109,9 @@ impl<'a> FilesTable<'a> {
         })
     }
 
-    /// Infallible constructor. On a G1/G2 table this falls back to
-    /// [`crate::spec::TableMetadata::default_partition_type`] so
-    /// `inspect().files().schema()` cannot panic; the `try_*` constructors
-    /// are the loud refuse path.
+    /// Infallible constructor. It falls back to
+    /// [`crate::spec::TableMetadata::default_partition_type`] so `inspect().files().schema()`
+    /// cannot panic. The `try_*` constructors are the loud refuse path.
     fn new(table: &'a Table, kind: FilesTableKind, scope: MetadataScope) -> Self {
         match Self::try_new(table, kind, scope) {
             Ok(this) => this,
@@ -215,11 +197,9 @@ impl<'a> FilesTable<'a> {
 
     /// Returns the iceberg schema of the files metadata table.
     ///
-    /// Mirrors Java `BaseFilesTable.schema()`: `DataFile.getType(partitionType).fields()` (the
-    /// field ids are the canonical `DataFile` ids from `api/DataFile.java`), then
-    /// `TypeUtil.selectNot(schema, DataFile.PARTITION_ID)` when `partitionType.fields()` is empty
-    /// (so an empty struct is never advertised), then `TypeUtil.join` of `readable_metrics`.
-    /// The `files` family exposes the data_file projection FLAT as top-level columns.
+    /// Mirrors Java `BaseFilesTable.schema()`. It drops `PARTITION_ID` when the partition type has
+    /// no fields, so an empty struct is never advertised, then joins `readable_metrics`. The
+    /// `files` family exposes the data_file projection FLAT as top-level columns.
     pub fn schema(&self) -> Schema {
         let partition_type = &self.unified_partition_type;
         let data_file_schema = Schema::builder()
@@ -245,18 +225,12 @@ impl<'a> FilesTable<'a> {
 
     /// Scans the files metadata table.
     ///
-    /// Resolves the manifest source for this table's [`MetadataScope`] (the current snapshot's
-    /// manifests, or the deduplicated reachable union over ALL snapshots) via the shared
-    /// [`collect_manifest_files`] helper, selects the manifests whose content passes this table's
-    /// [`FilesTableKind`] filter, and emits one row per LIVE manifest entry built from its
-    /// [`crate::spec::DataFile`]. An empty table (no current snapshot / no snapshots) yields a single
-    /// empty batch.
+    /// Resolves the manifest source for this table's [`MetadataScope`], keeps the manifests whose
+    /// content passes its [`FilesTableKind`] filter, and emits one row per LIVE manifest entry. An
+    /// empty table yields a single empty batch.
     pub async fn scan(&self) -> Result<ArrowRecordBatchStream> {
-        // The flattened files-table Arrow schema is the `data_file` struct's child fields (top-level)
-        // FOLLOWED BY the appended `readable_metrics` struct column. The same `DataFileStructBuilder` that
-        // builds the `entries` nested column builds the data_file rows (we then split its `StructArray`
-        // into the top-level columns); `readable_metrics` is built alongside and appended as the last
-        // column.
+        // The `entries` nested column and these flat columns share one `DataFileStructBuilder`. Its
+        // `StructArray` splits into the top-level columns, and `readable_metrics` appends last.
         let arrow_schema = Arc::new(schema_to_arrow_schema(&self.schema())?);
         let partition_type = self.unified_partition_type.clone();
         let data_schema = self.table.metadata().current_schema().clone();
@@ -324,12 +298,10 @@ mod tests {
     /// manifest metadata, so no real parquet data file is needed).
     const FILE_SIZE: u64 = 1024;
 
-    /// Builds the current snapshot's manifest list with one DATA manifest (3 data files:
-    /// Added/Deleted/Existing across partitions 100/200/300) AND one DELETE manifest (1 Added
-    /// position-delete file in partition 100). Returns nothing — the fixture's current snapshot is wired.
-    ///
-    /// This drives only public crate APIs (`ManifestWriterBuilder`, `ManifestListWriter`, the fixture's
-    /// public `table`/`table_location`), so it does not depend on the scan fixture's private helpers.
+    /// Builds the current snapshot's manifest list: one DATA manifest with 3 data files
+    /// (Added/Deleted/Existing across partitions 100/200/300), and one DELETE manifest with one
+    /// Added position-delete file in partition 100. It drives only public crate APIs, so it does
+    /// not depend on the scan fixture's private helpers.
     async fn setup_data_and_delete_manifests(fixture: &TableTestFixture) {
         let metadata = fixture.table.metadata().clone();
         let current_snapshot = metadata.current_snapshot().unwrap();
@@ -482,10 +454,8 @@ mod tests {
         assert!(contents.contains(&ManifestContentType::Deletes));
     }
 
-    /// Writes a manifest list for `snapshot` referencing the given manifests, at the snapshot's own
-    /// `manifest_list()` location. Used by the multi-snapshot fixture so BOTH the parent and current
-    /// snapshots' manifest lists exist on disk (the current-snapshot tables only ever read the current
-    /// list, so the existing fixtures leave the parent list unwritten — the `all_*` tables read both).
+    /// Writes a manifest list for `snapshot` at its own `manifest_list()` location. The `all_*`
+    /// tables read the parent list too, and the current-snapshot fixtures leave it unwritten.
     async fn write_manifest_list(
         fixture: &TableTestFixture,
         snapshot: &crate::spec::Snapshot,
@@ -524,19 +494,17 @@ mod tests {
             .build()
     }
 
-    /// Builds a MULTI-SNAPSHOT fixture exercising the cross-snapshot (`all_*`) semantics.
+    /// Builds a MULTI-SNAPSHOT fixture for the cross-snapshot (`all_*`) semantics.
     ///
-    /// PARENT snapshot (`3051…`) manifest list:
-    /// - DATA manifest `old_data` → `old-1.parquet` (Added) — a file present ONLY in the OLD snapshot.
-    /// - SHARED DATA manifest `shared_data` → `shared-1.parquet` (Added) — referenced by BOTH snapshots.
+    /// | Snapshot | Manifest | Files |
+    /// |---|---|---|
+    /// | parent | `old_data` (DATA) | `old-1.parquet` Added, present ONLY in the old snapshot |
+    /// | parent + current | `shared_data` (DATA) | `shared-1.parquet` Added, the same `manifest_path` in both lists |
+    /// | current | `cur_data` (DATA) | `cur-1.parquet` Added, `cur-del.parquet` Deleted tombstone |
+    /// | current | `cur_delete` (DELETE) | `delete-1.parquet` Added position-delete |
     ///
-    /// CURRENT snapshot (`3055…`) manifest list:
-    /// - DATA manifest `cur_data` → `cur-1.parquet` (Added), `cur-del.parquet` (Deleted tombstone).
-    /// - DELETE manifest `cur_delete` → `delete-1.parquet` (Added position-delete).
-    /// - the SAME SHARED DATA manifest `shared_data` (same `manifest_path`).
-    ///
-    /// This pins: cross-snapshot inclusion (`old-1`), manifest dedup (`shared-1` read once across
-    /// snapshots), content filters across snapshots, and `all_entries` tombstones (`cur-del`).
+    /// It pins cross-snapshot inclusion, manifest dedup, the content filters across snapshots, and
+    /// `all_entries` tombstones.
     async fn setup_multi_snapshot(fixture: &TableTestFixture) {
         let metadata = fixture.table.metadata().clone();
         let current_snapshot = metadata.current_snapshot().unwrap();
@@ -559,13 +527,10 @@ mod tests {
             )
         };
 
-        // SHARED DATA manifest (written ONCE, referenced by both snapshots' lists by the same path).
-        // It was committed by the PARENT snapshot, so its sequence number is the parent's (0). Stamp it
-        // explicitly: a manifest list only ASSIGNS a sequence number to a manifest it ADDED (one whose
-        // `added_snapshot_id == list.snapshot_id`); a manifest carried forward into a LATER snapshot's
-        // list (here the current snapshot's) must already carry an assigned seq, exactly as a real
-        // commit would have stamped it. Without this the current list write fails "Found unassigned
-        // sequence number".
+        // A manifest list assigns a sequence number only to a manifest it ADDED. This shared manifest
+        // is carried forward into the current list, so it must arrive already stamped with the
+        // parent's seq, as a real commit would stamp it. Otherwise the current list write fails with
+        // "Found unassigned sequence number".
         let mut shared_writer = new_writer("shared_data.avro").build_v2_data();
         shared_writer
             .add_entry(added_data_entry(
@@ -1206,13 +1171,11 @@ mod tests {
         assert_eq!(total, 0);
     }
 
-    /// Grafts a THIRD snapshot that is a FORK off the parent (a sibling of the current snapshot, NOT in
-    /// the current snapshot's ancestry) onto the multi-snapshot fixture, and writes its manifest list (one
-    /// DATA manifest holding `fork-1.parquet`) to disk. The `main` ref stays at the CURRENT snapshot, so
-    /// the fork is a tracked-but-non-ancestor snapshot — exactly the shape Java's `table().snapshots()`
-    /// (ALL tracked snapshots) includes but a current-snapshot-ancestry walk would miss.
+    /// Grafts a third snapshot that FORKS off the parent, and writes its manifest list holding
+    /// `fork-1.parquet`. The `main` ref stays at the current snapshot, so the fork is tracked but is
+    /// not an ancestor. Java's `table().snapshots()` includes that shape; an ancestry walk misses it.
     ///
-    /// Returns the file_path leaf of the fork-only file (`fork-1.parquet`).
+    /// Returns the file_path leaf of the fork-only file.
     async fn graft_forked_snapshot(fixture: &mut TableTestFixture) -> String {
         const FORK_SNAPSHOT_ID: i64 = 3060729675574597004;
         // Must exceed the metadata's `last_sequence_number` (34) so `add_snapshot` accepts it; matches the
@@ -1317,12 +1280,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_files_includes_file_from_non_ancestor_snapshot() {
-        // RISK (mutation-pin for "all snapshots" vs a current-ancestry walk): Java `reachableManifests`
-        // unions over `table().snapshots()` = EVERY tracked snapshot, not just the current snapshot's
-        // parent chain. A FORK snapshot (a sibling of the current snapshot, not in its ancestry) holds
-        // `fork-1.parquet`; `all_files` MUST include it. An implementation that walked only the current
-        // snapshot's ancestry (current + parent…) would silently drop it — the 2-snapshot inclusion tests
-        // cannot catch that because their parent IS the only other snapshot and it is an ancestor.
+        // RISK (all snapshots versus a current-ancestry walk): Java `reachableManifests` unions over
+        // EVERY tracked snapshot, not the current parent chain. A walk of the ancestry alone drops the
+        // fork's `fork-1.parquet`. The 2-snapshot tests cannot catch that, because their only other
+        // snapshot is an ancestor.
         let mut fixture = TableTestFixture::new();
         setup_multi_snapshot(&fixture).await;
         let fork_file = graft_forked_snapshot(&mut fixture).await;
@@ -1378,9 +1339,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_files_readable_metrics_schema_present_with_one_struct_per_leaf_column() {
-        // RISK: the `readable_metrics` virtual column must exist on `files` with one sub-field per LEAF
-        // data column (the fixture schema has 8 primitive columns: a, bool, dbl, i32, i64, x, y, z), each
-        // a 6-field metric struct, and the lower/upper bounds carry the COLUMN's type (NOT binary).
+        // RISK: `readable_metrics` must carry one 6-field sub-struct per LEAF data column, and its
+        // bounds must carry the COLUMN's type, not binary.
         use arrow_schema::DataType;
         let fixture = TableTestFixture::new();
         let arrow = crate::arrow::schema_to_arrow_schema(&fixture.table.inspect().files().schema())
@@ -1432,11 +1392,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_files_readable_metrics_reports_counts_and_decoded_typed_bounds() {
-        // RISK (the load-bearing value test): for the Added file (1.parquet) the fixture sets
-        // column_sizes {1:42} and lower_bounds {1: Datum::long(1)} on column id 1 = `x` (long). So x's
-        // readable_metrics must report column_size=42 and lower_bound=1 DECODED to a typed long (not raw
-        // bytes), while value_count / null_value_count / nan_value_count / upper_bound are NULL (the file
-        // carries none), and a DIFFERENT column (`y`, id 2) has ALL metrics NULL.
+        // RISK (the load-bearing value test): the fixture sets `column_sizes {1:42}` and
+        // `lower_bounds {1: Datum::long(1)}` on column `x`. So x must report column_size 42 and
+        // lower_bound 1 DECODED to a typed long, its other four metrics NULL, and column `y` must
+        // report every metric NULL.
         use arrow_array::types::{Int32Type, Int64Type};
         let fixture = TableTestFixture::new();
         setup_data_and_delete_manifests(&fixture).await;
@@ -1507,9 +1466,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_files_raw_bound_and_count_maps_unchanged_alongside_readable_metrics() {
-        // RISK (backward-compat regression guard): adding `readable_metrics` must NOT alter the existing
-        // raw columns. The raw `lower_bounds`/`upper_bounds`/count-map columns must still be present as
-        // map<int,*> and still carry the committed values (column_sizes {1: 42}).
+        // RISK: `readable_metrics` must not alter the raw columns. They stay `map<int,*>` and keep
+        // their committed values.
         use arrow_schema::DataType;
         let fixture = TableTestFixture::new();
         setup_data_and_delete_manifests(&fixture).await;
@@ -1617,11 +1575,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_files_readable_metrics_lower_and_upper_bound_are_distinct_and_typed() {
-        // RISK (mutation-pin for swapping lower↔upper, AND for emitting raw bytes): with distinct bounds
-        // lower=10, upper=99 on column `x` (long), readable_metrics must report x.lower_bound==10 and
-        // x.upper_bound==99 as TYPED longs. A lower↔upper swap fails this; emitting the raw `to_bytes`
-        // value (8 LE bytes) instead of the decoded long would not even be Int64-typed (the cast panics or
-        // the value differs).
+        // RISK (a lower-upper swap, or raw bytes instead of a decode): with lower=10 and upper=99 on
+        // the long column `x`, readable_metrics must report both as TYPED longs. A swap fails the
+        // values, and the raw 8-byte form is not Int64-typed at all.
         use arrow_array::types::Int64Type;
         let fixture = TableTestFixture::new();
         setup_distinct_bounds_manifest(&fixture).await;

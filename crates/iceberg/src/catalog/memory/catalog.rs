@@ -67,8 +67,8 @@ impl Default for MemoryCatalogBuilder {
 impl MemoryCatalogBuilder {
     /// Inject a session-scoped [`TableMetadataCache`] consulted on `load_table`.
     ///
-    /// **Opt-in — default OFF.** No global/thread-local state; the caller owns the `Arc`
-    /// and may share it across catalogs in one session. See FK4.1 / scout #7.
+    /// Opt-in, and off by default. The caller owns the `Arc` and may share it across catalogs in
+    /// one session. The cache keeps no global state.
     pub fn with_table_metadata_cache(mut self, cache: Arc<TableMetadataCache>) -> Self {
         self.table_metadata_cache = Some(cache);
         self
@@ -235,23 +235,9 @@ impl MemoryCatalog {
     }
 }
 
-/// Optimistic-concurrency CAS for the in-process catalog — the Rust port of the location-equality
-/// check in Java `InMemoryTableOperations.doCommit` / `InMemoryViewOperations.doCommit`.
-///
-/// Java's `doCommit` runs `tables.compute(...)` / `views.compute(...)` inside a lock and compares
-/// the STORED metadata location (the map value) against the BASE the commit was built from
-/// (`base.metadataFileLocation()`); on a mismatch it throws `CommitFailedException` — the retryable
-/// "clean" conflict the commit-retry machinery refreshes-and-retries on.
-///
-/// Returns `Ok(())` when the stored location matches the commit's base location (the commit is not
-/// stale), or a retryable [`ErrorKind::CatalogCommitConflicts`] error mirroring Java's
-/// `CommitFailedException` message shape otherwise. `base_metadata_location == None` models Java's
-/// `base == null` create edge; the update paths never reach this helper with `None` (they always
-/// have a current stored location and a base), but a `None` base never equals a `Some` stored
-/// location, so it is correctly treated as a conflict rather than silently passing.
-///
-/// `object_kind` is `"table"` or `"view"` so one helper serves both seams (the Java messages differ
-/// only in that noun).
+/// Optimistic-concurrency CAS for the in-process catalog. Ports the location-equality check in Java
+/// `InMemoryTableOperations.doCommit`, which throws a retryable `CommitFailedException` on a
+/// mismatch. # Notes A stored location equal to the commit base means the commit is current.
 fn check_no_concurrent_modification(
     object_kind: &str,
     identifier: &TableIdent,
@@ -391,9 +377,9 @@ impl Catalog for MemoryCatalog {
 
     /// Create a new table inside the namespace.
     ///
-    /// FileIO (metadata write) runs **outside** the catalog lock. The pointer insert is a short
-    /// critical section after a successful write — a failed write leaves no catalog entry
-    /// (half-create refused). Concurrent creates of the same name race at `insert_new_table`.
+    /// The metadata write runs outside the catalog lock. The pointer insert is a short critical
+    /// section after a successful write, so a failed write leaves no catalog entry. Two concurrent
+    /// creates of one name race at `insert_new_table`.
     async fn create_table(
         &self,
         namespace_ident: &NamespaceIdent,
@@ -445,13 +431,10 @@ impl Catalog for MemoryCatalog {
             .build()
     }
 
-    /// Load table from the catalog.
-    ///
-    /// Snapshots the metadata pointer under a short lock, then reads FileIO outside it so concurrent
-    /// loads/commits are not serialized on metadata I/O (FK3 / scout #13).
-    ///
-    /// When a [`TableMetadataCache`] was injected at construction (FK4.1), an unchanged
-    /// metadata-location pointer reuses the cached `Arc` and skips the body GET + re-parse.
+    /// Load table from the catalog. Snapshot the metadata pointer under a short lock, then read
+    /// FileIO outside it, so concurrent loads and commits do not serialize on metadata I/O. With a
+    /// [`TableMetadataCache`] injected, an unchanged pointer reuses the cached `Arc` and skips the
+    /// GET and the re-parse.
     async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
         let metadata_location = self.table_metadata_location(table_ident).await?;
         self.load_table_from_location(table_ident, &metadata_location)
@@ -500,18 +483,9 @@ impl Catalog for MemoryCatalog {
     }
 
     /// Register an existing table (also the default publish path for a staged **create** via
-    /// [`Catalog::publish_create_table`]).
-    ///
-    /// # Atomicity guarantee
-    ///
-    /// Registration is all-or-nothing: the metadata at `metadata_location` is read (and thereby
-    /// proven reachable by this catalog's [`FileIO`]) **before** the pointer is inserted. FileIO
-    /// runs outside the catalog lock (FK3 / scout #13); the pointer insert is a short critical
-    /// section after a successful read. A read failure — e.g. staged metadata written through a
-    /// `FileIO` this catalog cannot read, the real staged-CTAS failure — therefore leaves catalog
-    /// state unchanged: `table_exists` stays `false` and a subsequent create of the same identifier
-    /// succeeds. Inserting first would leave a half-created table (pointer present, `load_table`
-    /// failing) and break `CREATE TABLE IF NOT EXISTS` idempotency on retry.
+    /// [`Catalog::publish_create_table`]). # Notes Registration is all-or-nothing. The read of
+    /// `metadata_location` proves this catalog's [`FileIO`] reaches the metadata, and it happens
+    /// before the pointer insert.
     async fn register_table(
         &self,
         table_ident: &TableIdent,
@@ -578,16 +552,8 @@ impl Catalog for MemoryCatalog {
         Ok(updated)
     }
 
-    /// Update a table in the catalog.
-    ///
-    /// Optimistic CAS over short critical sections (FK3 / scout #13):
-    /// 1. Snapshot the stored metadata pointer under the lock.
-    /// 2. Load + apply + write metadata **outside** the lock (FileIO free of the global mutex).
-    /// 3. Re-read the stored pointer under the lock, CAS against the commit base, flip on match.
-    ///
-    /// A concurrent winner advances the stored location so step 3 rejects with
-    /// [`ErrorKind::CatalogCommitConflicts`] (retryable) — same outcome as holding the lock for the
-    /// whole body, without serializing FileIO across sessions.
+    /// Update a table in the catalog. Optimistic CAS over short critical sections. Step 1 snapshots
+    /// the stored pointer under the lock.
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
         let base_metadata_location = commit.base_metadata_location().map(str::to_string);
@@ -612,10 +578,10 @@ impl Catalog for MemoryCatalog {
             &new_metadata_location,
         )?;
 
-        // Mid-point recheck under a short lock BEFORE writing: if a concurrent winner advanced the
-        // pointer during load/apply, refuse without writing an orphan metadata file. A race can
-        // still open between this recheck and the flip CAS (step 3); that loser may leave one
-        // orphan file — acceptable for I/O-outside-lock, and the pointer never half-flips.
+        // Recheck the pointer under a short lock before the write. A concurrent winner that
+        // advanced it during load and apply makes this refuse, and no orphan file is written. A
+        // loser that races between this recheck and the step 3 CAS may still leave one orphan
+        // file. The pointer never half-flips.
         {
             let root_namespace_state = self.root_namespace_state.lock().await;
             let stored_mid = root_namespace_state
@@ -665,12 +631,11 @@ impl Catalog for MemoryCatalog {
         Ok(updated_table)
     }
 
-    /// Evict the cached entry for this table's current metadata location when a cache is
-    /// injected; no-op when the cache is OFF (default) or the table does not exist.
+    /// Evict the cached entry for this table's metadata location. A no-op with no cache, or with
+    /// no such table.
     ///
-    /// Mirrors Java `Catalog.invalidateTable`: unknown tables are a no-op for other keys —
-    /// we do **not** `clear()` the whole session cache on a missing ident (that would thrash
-    /// unrelated pointer entries).
+    /// Mirrors Java `Catalog.invalidateTable`. An unknown table leaves other keys alone. A
+    /// `clear()` of the whole cache would thrash unrelated entries.
     async fn invalidate_table(&self, table: &TableIdent) -> Result<()> {
         let Some(cache) = self.table_metadata_cache.as_ref() else {
             return Ok(());
@@ -2522,9 +2487,7 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    // ========================================================================
     // View CRUD lifecycle tests (the MemoryCatalog view surface).
-    // ========================================================================
 
     fn simple_view_schema() -> Schema {
         Schema::builder()
@@ -2807,10 +2770,8 @@ pub(crate) mod tests {
         assert!(catalog.table_exists(&table_ident).await.unwrap());
     }
 
-    // ========================================================================
     // Optimistic-concurrency parity (increment O1) — the location-CAS in MemoryCatalog
     // `update_table` / `update_view`, mirroring Java `InMemory{Table,View}Operations.doCommit`.
-    // ========================================================================
 
     // RISK: two REPLACE commits built from the SAME base view, applied sequentially, must NOT
     // last-write-win — the second is STALE and Java `InMemoryViewOperations.doCommit` rejects it
@@ -3057,9 +3018,7 @@ pub(crate) mod tests {
             .expect("invalidate_view default must be a no-op");
     }
 
-    // ========================================================================
     // FK3 / scout #13 — lock hygiene: I/O outside the catalog mutex; atomicity pins.
-    // ========================================================================
 
     /// RISK: a `register_table` whose metadata path is UNREACHABLE must leave NO catalog pointer
     /// (half-create refused). Read-before-insert is the guarantee; FileIO now runs outside the
@@ -3203,9 +3162,7 @@ pub(crate) mod tests {
         );
     }
 
-    // ========================================================================
     // FK4.1 / scout #7 — metadata-pointer cache (opt-in, default OFF).
-    // ========================================================================
 
     async fn new_memory_catalog_with_cache(cache: Arc<TableMetadataCache>) -> MemoryCatalog {
         let warehouse_location = temp_path();

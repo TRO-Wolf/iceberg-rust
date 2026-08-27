@@ -17,12 +17,10 @@
 
 //! In-memory deletion vectors and their on-disk `deletion-vector-v1` (Puffin DV blob) encoding.
 //!
-//! [`DeleteVector`] is the Rust analogue of Java's `PositionDeleteIndex` — a roaring-treemap-backed
-//! set of deleted row positions for a single data file. It serializes to / deserializes from the
-//! Puffin `deletion-vector-v1` blob format byte-compatibly with Java
-//! (`BitmapPositionDeleteIndex.serialize`/`deserialize` + `RoaringPositionBitmap`), and is the type
-//! the merge-on-read scan applies and the [`crate::writer::base_writer::deletion_vector_writer`]
-//! writes. Callers supplying previous deletes to the DV writer construct a `DeleteVector` here.
+//! [`DeleteVector`] is the Rust analogue of Java's `PositionDeleteIndex`. It holds the deleted row
+//! positions of one data file in a roaring treemap. The blob encoding is byte-compatible with Java
+//! `BitmapPositionDeleteIndex` and `RoaringPositionBitmap`. The merge-on-read scan applies these
+//! vectors, and [`crate::writer::base_writer::deletion_vector_writer`] writes them.
 
 use std::io::Read;
 use std::ops::BitOrAssign;
@@ -43,19 +41,9 @@ pub(crate) struct DeleteVectorCoordinates {
     pub(crate) content_size_in_bytes: u64,
 }
 
-/// Validates the DV metadata on a delete file and range-checks the coordinates into `u64`.
-///
-/// Mirrors Java `BaseDeleteLoader.validateDV`, plus the keying prerequisite that
-/// `referenced_data_file` is present: the Puffin spec makes it mandatory for `deletion-vector-v1`,
-/// and the loaded vector is keyed by it.
-///
-/// # Errors
-///
-/// `DataInvalid` when a field is absent, the offset is negative, or the size is outside 0..=2GB.
-///
-/// # Notes
-///
-/// The scan path and the public loader share this so their Java-parity messages cannot drift.
+/// Validates the DV metadata on a delete file and range-checks the coordinates into `u64`. Java
+/// `BaseDeleteLoader.validateDV`, plus a keying prerequisite. `referenced_data_file` must be
+/// present.
 pub(crate) fn validate_delete_vector_coordinates(
     file_path: &str,
     referenced_data_file: Option<String>,
@@ -80,8 +68,7 @@ pub(crate) fn validate_delete_vector_coordinates(
             )
         })?;
 
-    // Java: "Can't read DV larger than 2GB" (contentSizeInBytes <= Integer.MAX_VALUE); negative
-    // sizes are equally invalid.
+    // Java caps contentSizeInBytes at Integer.MAX_VALUE. A negative size is equally invalid.
     let checked_size = content_size_in_bytes
         .filter(|size| (0..=i64::from(i32::MAX)).contains(size))
         .and_then(|size| u64::try_from(size).ok())
@@ -102,22 +89,8 @@ pub(crate) fn validate_delete_vector_coordinates(
     })
 }
 
-/// Read one committed deletion vector back off storage.
-///
-/// The public mirror of Java's `Function<String, PositionDeleteIndex>` previous-deletes source
-/// (`BaseDeleteLoader.readDV`): ONE ranged read at the manifest's blob coordinates, then the
-/// `deletion-vector-v1` decode. A caller that must merge into an existing DV — a second delete on
-/// a data file that already has one — feeds the result to
-/// [`crate::writer::base_writer::deletion_vector_writer::DVFileWriter::with_previous_deletes`].
-///
-/// # Errors
-///
-/// `DataInvalid` when `delete_file` is not a Puffin position-delete file, when its blob coordinates
-/// are missing or out of range, or when the decoded cardinality disagrees with `record_count`.
-///
-/// # Notes
-///
-/// This does not cache. The scan path has its own caching loader; a writer reads each DV once.
+/// Read one committed deletion vector back off storage. Java `BaseDeleteLoader.readDV`. One ranged
+/// read at the manifest's blob coordinates, then the `deletion-vector-v1` decode.
 pub async fn load_delete_vector(file_io: &FileIO, delete_file: &DataFile) -> Result<DeleteVector> {
     let file_path = delete_file.file_path();
     if delete_file.content_type() != DataContentType::PositionDeletes
@@ -160,9 +133,7 @@ pub async fn load_delete_vector(file_io: &FileIO, delete_file: &DataFile) -> Res
         .await?;
     let delete_vector = DeleteVector::deserialize_deletion_vector_v1(&blob)?;
 
-    // Java validates the decoded cardinality against the DeleteFile's recordCount
-    // (`deserializeBitmap`) — a mismatch means the manifest and the blob disagree about how many
-    // rows are deleted.
+    // A mismatch means the manifest and the blob disagree about how many rows are deleted.
     if delete_vector.len() != delete_file.record_count() {
         return Err(Error::new(
             ErrorKind::DataInvalid,
@@ -176,10 +147,8 @@ pub async fn load_delete_vector(file_io: &FileIO, delete_file: &DataFile) -> Res
     Ok(delete_vector)
 }
 
-/// An in-memory set of deleted row positions for a single data file — the Rust analogue of Java's
-/// `PositionDeleteIndex` / `BitmapPositionDeleteIndex`. Backed by a 64-bit roaring treemap so it
-/// stays compact for large or sparse position sets, and serializes to / deserializes from the
-/// Puffin `deletion-vector-v1` blob format (byte-compatible with Java).
+/// An in-memory set of deleted row positions for one data file. The Rust analogue of Java
+/// `BitmapPositionDeleteIndex`. A 64-bit roaring treemap keeps large or sparse sets compact.
 #[derive(Debug, Default, Clone)]
 pub struct DeleteVector {
     inner: RoaringTreemap,
@@ -192,9 +161,8 @@ const DV_LENGTH_PREFIX_SIZE: usize = 4;
 const DV_MAGIC_SIZE: usize = 4;
 /// Size in bytes of the big-endian CRC-32 trailer (Java `BitmapPositionDeleteIndex.CRC_SIZE_BYTES`).
 const DV_CRC_SIZE: usize = 4;
-/// The `deletion-vector-v1` magic sequence as it appears on disk: the little-endian encoding of
-/// Java `BitmapPositionDeleteIndex.MAGIC_NUMBER` (1681511377 = 0x6439D3D1), i.e. `D1 D3 39 64`
-/// per the Puffin spec ("A 4-byte magic sequence, `D1 D3 39 64`").
+/// The `deletion-vector-v1` magic sequence as it appears on disk. The Puffin spec fixes it at
+/// `D1 D3 39 64`, the little-endian form of Java `BitmapPositionDeleteIndex.MAGIC_NUMBER`.
 const DV_MAGIC_BYTES: [u8; DV_MAGIC_SIZE] = [0xD1, 0xD3, 0x39, 0x64];
 /// Size in bytes of the little-endian `u64` bitmap count that starts the portable 64-bit roaring
 /// serialization (Java `RoaringPositionBitmap.BITMAP_COUNT_SIZE_BYTES`).
@@ -202,12 +170,11 @@ const DV_BITMAP_COUNT_SIZE: usize = 8;
 /// Size in bytes of one little-endian `u32` bitmap key (Java
 /// `RoaringPositionBitmap.BITMAP_KEY_SIZE_BYTES`).
 const DV_BITMAP_KEY_SIZE: usize = 4;
-/// The minimum serialized size of one (key, 32-bit bitmap) pair: a 4-byte key plus an EMPTY
-/// standard-format roaring bitmap (4-byte cookie + 4-byte container count). Used to reject a
-/// hostile bitmap count that could not possibly fit in the payload before looping over it.
+/// The minimum serialized size of one (key, 32-bit bitmap) pair. It rejects a hostile bitmap
+/// count that cannot fit in the payload, before the decoder loops over it.
 const DV_MIN_BITMAP_ENTRY_SIZE: u64 = (DV_BITMAP_KEY_SIZE + 8) as u64;
-/// The largest key Java accepts (`RoaringPositionBitmap.readKey`: `key <= Integer.MAX_VALUE - 1`;
-/// a key with the sign bit set reads as negative in Java and is rejected by `key >= 0`).
+/// The largest key Java `RoaringPositionBitmap.readKey` accepts. A key with the sign bit set
+/// reads as negative in Java, so Java rejects it too.
 const DV_MAX_BITMAP_KEY: u32 = i32::MAX as u32 - 1;
 
 fn dv_blob_error(message: impl Into<String>) -> Error {
@@ -233,26 +200,17 @@ impl DeleteVector {
         self.inner.insert(pos)
     }
 
-    /// Unions every position of `other` into this vector (a set OR), mirroring Java
-    /// `PositionDeleteIndex.merge` / `BitmapPositionDeleteIndex.merge` (L61-65): the bitmaps are
-    /// OR-ed so the merged set is the union of both. Positions already present are no-ops (a set
-    /// union), so the cardinality after merge counts each position once.
+    /// Unions every position of `other` into this vector. Java `PositionDeleteIndex.merge`.
     ///
-    /// Used by [`crate::writer::base_writer::deletion_vector_writer::DVFileWriter`] to fold a data
-    /// file's PREVIOUS deletes into the new deletion vector (Java `BaseDVFileWriter.close`
-    /// L118-119: `positions.merge(previousPositions)`). Takes `&other` (not by value, unlike the
-    /// [`BitOrAssign`] impl) so the previous vector can be inspected for its source delete files
-    /// afterwards.
+    /// [`crate::writer::base_writer::deletion_vector_writer::DVFileWriter`] folds a data file's
+    /// previous deletes into the new vector with this. It takes `&other`, unlike the
+    /// [`BitOrAssign`] impl, so the caller can still read the previous vector's source files.
     pub fn merge(&mut self, other: &DeleteVector) {
         self.inner |= &other.inner;
     }
 
-    /// Marks the given `positions` as deleted and returns the number of elements appended.
-    ///
-    /// The input slice must be strictly ordered in ascending order, and every value must be greater than all existing values already in the set.
-    ///
-    /// # Errors
-    ///
+    /// Marks the given `positions` as deleted and returns the number of elements appended. The
+    /// input slice must ascend strictly, and every value must exceed all existing values. # Errors
     /// Returns an error if the precondition is not met.
     #[allow(dead_code)]
     pub fn insert_positions(&mut self, positions: &[u64]) -> Result<usize> {
@@ -276,35 +234,32 @@ impl DeleteVector {
         self.inner.is_empty()
     }
 
-    /// Returns `true` if `pos` is marked deleted (set membership). Used by the Avro scan read path
-    /// to apply positional deletes post-materialization (the Parquet path applies them via a
-    /// `RowSelection` built from the same bitmap); membership is the row-by-row analogue.
+    /// Returns `true` if `pos` is deleted. The Avro scan path applies positional deletes row by
+    /// row with this. The Parquet path builds a `RowSelection` from the same bitmap.
     pub fn contains(&self, pos: u64) -> bool {
         self.inner.contains(pos)
     }
 
     /// Deserializes a Puffin `deletion-vector-v1` blob payload into a [`DeleteVector`].
     ///
-    /// `blob` must be exactly the blob bytes the Puffin footer (and the `DeleteFile`'s
-    /// `content_offset` / `content_size_in_bytes`) describe. The on-disk layout — Puffin spec
-    /// "deletion-vector-v1 blob type" + Java `BitmapPositionDeleteIndex.serialize` — is:
+    /// `blob` must be exactly the bytes the `DeleteFile` coordinates describe.
     ///
-    /// 1. a big-endian `u32` length of (magic + bitmap),
-    /// 2. the 4-byte magic sequence `D1 D3 39 64`,
-    /// 3. the bitmap in the portable 64-bit roaring format (little-endian): a `u64` count of
-    ///    32-bit bitmaps, then per bitmap a `u32` key (ascending) + a standard-format 32-bit
-    ///    roaring bitmap; a 64-bit position is `(key << 32) | low32`,
-    /// 4. a big-endian `u32` CRC-32 (zlib polynomial) of (magic + bitmap).
+    /// | Bytes | Content |
+    /// |---|---|
+    /// | 4 | big-endian `u32` length of (magic + bitmap) |
+    /// | 4 | the magic sequence `D1 D3 39 64` |
+    /// | n | the portable 64-bit roaring bitmap |
+    /// | 4 | big-endian `u32` CRC-32 (zlib) of (magic + bitmap) |
     ///
-    /// This parses UNTRUSTED storage bytes: every framing violation (truncation, length-prefix
-    /// mismatch, bad magic, CRC mismatch, bitmap-count overflow, out-of-range or non-ascending
-    /// keys, garbage bitmap bytes, trailing bytes) returns a clean [`ErrorKind::DataInvalid`]
-    /// error naming what failed — never a panic. Validations mirror Java
-    /// `BitmapPositionDeleteIndex.deserialize` + `RoaringPositionBitmap.deserialize`
-    /// (`readBitmapCount` / `readKey`), with one deliberate ordering difference: the CRC is
-    /// verified BEFORE the bitmap is parsed (Java parses first, checks the CRC last) so corrupt
-    /// bytes are rejected at the door; the accepted-input set is identical because both sides
-    /// require every check to pass.
+    /// # Errors
+    ///
+    /// These bytes are untrusted. Every framing violation returns [`ErrorKind::DataInvalid`] and
+    /// names what failed. The parser never panics. Java `BitmapPositionDeleteIndex.deserialize`.
+    ///
+    /// # Notes
+    ///
+    /// The CRC is verified before the bitmap parses. Java parses first and checks the CRC last.
+    /// Both sides require every check to pass, so the accepted-input set is identical.
     pub fn deserialize_deletion_vector_v1(blob: &[u8]) -> Result<DeleteVector> {
         // 1. The big-endian length prefix covering magic + bitmap.
         let length_prefix: [u8; DV_LENGTH_PREFIX_SIZE] = blob
@@ -318,9 +273,8 @@ impl DeleteVector {
             })?;
         let bitmap_data_length = u64::from(u32::from_be_bytes(length_prefix));
 
-        // Java `readBitmapDataLength` rejects `length != contentSizeInBytes - LENGTH - CRC`; the
-        // slice we are given IS content_size_in_bytes bytes, so the equivalent check is that the
-        // declared length plus prefix and CRC equals the slice length exactly.
+        // The slice IS content_size_in_bytes bytes, so Java `readBitmapDataLength`'s check
+        // becomes: the declared length plus prefix and CRC equals the slice length exactly.
         let expected_total = (DV_LENGTH_PREFIX_SIZE + DV_CRC_SIZE) as u64 + bitmap_data_length;
         if blob.len() as u64 != expected_total {
             return Err(dv_blob_error(format!(
@@ -336,8 +290,7 @@ impl DeleteVector {
                 DV_MAGIC_SIZE + DV_BITMAP_COUNT_SIZE
             )));
         }
-        // The equality check above proved `bitmap_data_length == blob.len() - 8`, so this
-        // conversion cannot lose range (blob.len() is a usize).
+        // The equality check above proved `bitmap_data_length == blob.len() - 8`.
         let bitmap_data_end = blob.len() - DV_CRC_SIZE;
         let bitmap_data = &blob[DV_LENGTH_PREFIX_SIZE..bitmap_data_end];
 
@@ -349,8 +302,8 @@ impl DeleteVector {
             )));
         }
 
-        // 3. The CRC-32 trailer over magic + bitmap (Java `deserialize`: "Invalid CRC"). Checked
-        //    BEFORE parsing the bitmap so corrupt bytes never reach the bitmap parser.
+        // 3. The CRC-32 trailer over magic + bitmap. Checked before the bitmap parses, so
+        //    corrupt bytes never reach the bitmap parser.
         let mut crc = flate2::Crc::new();
         crc.update(bitmap_data);
         let actual_crc = crc.sum();
@@ -368,10 +321,11 @@ impl DeleteVector {
         Self::deserialize_portable_bitmap(&bitmap_data[DV_MAGIC_SIZE..])
     }
 
-    /// Parses the portable 64-bit roaring serialization (little-endian `u64` bitmap count, then
-    /// per bitmap an ascending little-endian `u32` key + a standard-format 32-bit roaring
-    /// bitmap), mirroring Java `RoaringPositionBitmap.deserialize`. The whole region must be
-    /// consumed exactly — trailing bytes are rejected as corruption.
+    /// Parses the portable 64-bit roaring serialization: a little-endian `u64` bitmap count, then
+    /// per bitmap an ascending little-endian `u32` key and a standard-format 32-bit roaring
+    /// bitmap. Java `RoaringPositionBitmap.deserialize`.
+    ///
+    /// The region must be consumed exactly. Trailing bytes are corruption, and are rejected.
     fn deserialize_portable_bitmap(region: &[u8]) -> Result<DeleteVector> {
         let mut cursor = std::io::Cursor::new(region);
 
@@ -382,9 +336,8 @@ impl DeleteVector {
         })?;
         let bitmap_count = u64::from_le_bytes(count_bytes);
 
-        // Java `readBitmapCount` rejects counts above Integer.MAX_VALUE; additionally reject any
-        // count that cannot fit in the remaining bytes (each entry needs at least a key plus an
-        // empty bitmap) so a hostile count fails fast with a named error.
+        // Java `readBitmapCount` rejects counts above Integer.MAX_VALUE. We also reject a count
+        // that cannot fit in the remaining bytes, so a hostile count fails fast and by name.
         if bitmap_count > i32::MAX as u64 {
             return Err(dv_blob_error(format!(
                 "Invalid deletion vector bitmap count: {bitmap_count} exceeds the maximum {}",
@@ -409,8 +362,7 @@ impl DeleteVector {
             })?;
             let key = u32::from_le_bytes(key_bytes);
 
-            // Java `readKey`: keys are non-negative signed ints (so the sign bit must be clear),
-            // at most Integer.MAX_VALUE - 1, and strictly ascending.
+            // Java `readKey`: keys are non-negative, at most `i32::MAX - 1`, and strictly ascend.
             if key > DV_MAX_BITMAP_KEY {
                 return Err(dv_blob_error(format!(
                     "Invalid deletion vector bitmap key: {key} exceeds the maximum {DV_MAX_BITMAP_KEY}"
@@ -425,8 +377,7 @@ impl DeleteVector {
                 )));
             }
 
-            // The checked deserializer validates the 32-bit bitmap's internal structure and
-            // consumes exactly its serialized bytes from the cursor.
+            // The checked deserializer consumes exactly the bitmap's serialized bytes.
             let bitmap = RoaringBitmap::deserialize_from(&mut cursor).map_err(|source| {
                 dv_blob_error(format!(
                     "Invalid deletion vector: malformed 32-bit roaring bitmap for key {key}"
@@ -434,9 +385,8 @@ impl DeleteVector {
                 .with_source(source)
             })?;
 
-            // Reassemble 64-bit positions: the key holds the high 32 bits, the bitmap the low 32
-            // (Java `RoaringPositionBitmap.toPosition`). Keys ascend strictly and positions
-            // within a bitmap iterate ascending, so the appended sequence is strictly ascending.
+            // The key holds the high 32 bits and the bitmap the low 32. Keys ascend strictly and
+            // each bitmap iterates ascending, so the appended sequence is strictly ascending.
             let high_bits = u64::from(key) << 32;
             treemap
                 .append(bitmap.iter().map(|low| high_bits | u64::from(low)))
@@ -450,8 +400,7 @@ impl DeleteVector {
             last_key = Some(key);
         }
 
-        // Every byte of the declared (and CRC-covered) bitmap region must belong to the bitmap;
-        // leftovers mean the length prefix and the bitmap disagree (corruption).
+        // Leftover bytes mean the length prefix and the bitmap disagree. That is corruption.
         let consumed = cursor.position();
         if consumed != region.len() as u64 {
             return Err(dv_blob_error(format!(
@@ -463,52 +412,37 @@ impl DeleteVector {
         Ok(DeleteVector { inner: treemap })
     }
 
-    /// Serializes this vector as a Puffin `deletion-vector-v1` blob payload, byte-identical to
-    /// what Java writes for the same position set.
+    /// Serializes this vector as a Puffin `deletion-vector-v1` blob payload. The bytes match what
+    /// Java `BitmapPositionDeleteIndex.serialize` writes for the same position set.
     ///
-    /// The layout mirrors Java `BitmapPositionDeleteIndex.serialize` (L124-137) framing around
-    /// `RoaringPositionBitmap.serialize` (L245-252):
+    /// | Bytes | Content |
+    /// |---|---|
+    /// | 4 | big-endian `u32` length of (magic + bitmap) |
+    /// | 4 | the magic sequence `D1 D3 39 64` |
+    /// | n | the dense portable 64-bit roaring bitmap |
+    /// | 4 | big-endian `u32` CRC-32 (zlib) of (magic + bitmap) |
     ///
-    /// 1. a big-endian `u32` length of (magic + bitmap),
-    /// 2. the 4-byte magic sequence `D1 D3 39 64` (the little-endian `MAGIC_NUMBER`),
-    /// 3. the bitmap in the portable 64-bit roaring format: a little-endian `u64` count of
-    ///    32-bit bitmaps that is **DENSE** — Java writes `bitmaps.length` (= highest key + 1)
-    ///    entries INCLUDING empty gap bitmaps — then per key `0..=max_key` a little-endian `u32`
-    ///    key + the standard-format 32-bit roaring bitmap,
-    /// 4. a big-endian `u32` CRC-32 (zlib polynomial) of (magic + bitmap).
+    /// # Notes
     ///
-    /// Each 32-bit sub-bitmap is run-length encoded first wherever that is smaller, exactly like
-    /// Java's `bitmap.runLengthEncode()` call at serialize time (`RoaringPositionBitmap`
-    /// L176-182, `runOptimize()` per sub-bitmap): for ARRAY and BITMAP stores — the only stores
-    /// an `insert()`-built treemap holds — `roaring-rs`'s [`RoaringBitmap::optimize`] applies the
-    /// identical run-iff-strictly-smaller criterion (Java RoaringBitmap 1.3.0
-    /// `ArrayContainer.runOptimize`: run iff `2 + 4·runs < 2·cardinality`, ties keep array;
-    /// `BitmapContainer.runOptimize`: run iff `2 + 4·runs < 8192`), so the container choice —
-    /// and therefore the serialized bytes — match Java's, exact ties included. CAVEAT (relevant
-    /// once DESERIALIZED vectors are re-serialized, e.g. the D3 previous-deletes merge): for a
-    /// store that is ALREADY a run container, `roaring-rs` compares against the array size
-    /// WITHOUT Java's 2-byte cardinality overhead (`Container::optimize` Run branch vs Java
-    /// `RunContainer.toEfficientContainer`), so at exactly `cardinality == 2·runs` Java keeps
-    /// the run container while we would emit the (equally readable) array form — a byte-parity,
-    /// not correctness, divergence. The optimization runs on per-sub-bitmap CLONES so `&self`
-    /// stays unmutated (Java mutates its bitmap in place; the output bytes are the same either
-    /// way).
+    /// The bitmap count is DENSE. Java writes `max key + 1` entries, and includes an empty bitmap
+    /// for every gap key. `roaring-rs` writes a sparse count, so the outer framing is hand-rolled
+    /// here. Readers accept both forms, but byte parity with Java needs the dense one.
     ///
-    /// NOTE: `roaring-rs`'s own `RoaringTreemap::serialize_into` writes a SPARSE count (present
-    /// keys only) — readers (including Java's) accept both, but byte parity with Java requires
-    /// the dense layout, so the outer framing is hand-rolled here.
+    /// Each sub-bitmap is run-length encoded on a clone first, like Java `runLengthEncode()`, so
+    /// `&self` stays unmutated. For array and bitmap stores [`RoaringBitmap::optimize`] uses
+    /// Java's run-iff-strictly-smaller criterion, so container choice matches on exact ties too.
+    /// One byte-parity divergence remains, and only a re-serialized DESERIALIZED vector reaches
+    /// it: for a store already a run container, `roaring-rs` omits Java's 2-byte cardinality
+    /// overhead, so at `cardinality == 2 * runs` Java keeps the run and we emit the array.
     ///
     /// # Errors
     ///
-    /// - the vector is EMPTY: `BaseDVFileWriter` never serializes an empty index (a per-path
-    ///   `Deletes` entry only exists once `delete()` recorded a position, BaseDVFileWriter.java
-    ///   L74-79), and a cardinality-0 DV `DeleteFile` is meaningless — fail loud instead of
-    ///   writing one;
-    /// - a position's high 32 bits exceed `i32::MAX - 1`: unrepresentable in Java's dense bitmap
-    ///   array (`RoaringPositionBitmap` doc L45-49 + `validatePosition`/`MAX_POSITION` L342-348);
-    ///   our `RoaringTreemap` can hold such keys, so the door check lives here;
-    /// - the serialized blob would exceed 2 GB: Java `computeBitmapDataLength` L158-163
-    ///   ("Can't serialize index > 2GB"), checked BEFORE allocating the buffer.
+    /// - the vector is EMPTY. `BaseDVFileWriter` never serializes an empty index, and a
+    ///   cardinality-0 DV `DeleteFile` is meaningless. Fail loud instead of writing one.
+    /// - a position's high 32 bits exceed `i32::MAX - 1`. Java's dense bitmap array cannot hold
+    ///   that key, but our `RoaringTreemap` can, so the door check lives here.
+    /// - the blob would exceed 2 GB. Java `computeBitmapDataLength` rejects the same. Checked
+    ///   before the buffer is allocated.
     pub fn serialize_deletion_vector_v1(&self) -> Result<Vec<u8>> {
         if self.inner.is_empty() {
             return Err(Error::new(
@@ -541,11 +475,9 @@ impl DeleteVector {
             .expect("non-empty vector has at least one sub-bitmap");
         let dense_bitmap_count = u64::from(max_key) + 1;
 
-        // Pre-compute the exact sizes (Java `serializedSizeInBytes` L220-226 +
-        // `computeBitmapDataLength` L158-163) and enforce the 2 GB bound BEFORE allocating.
-        // Every dense slot carries a key; an absent key additionally contributes an EMPTY
-        // standard-format bitmap. Computed in O(present keys) so a hostile sparse high key is
-        // rejected without looping the dense range.
+        // Enforce the 2 GB bound BEFORE allocating. Every dense slot carries a key, and an absent
+        // key adds an empty bitmap. The count is O(present keys), so a hostile sparse high key is
+        // rejected without a walk of the dense range.
         let empty_bitmap = RoaringBitmap::new();
         let empty_bitmap_size = empty_bitmap.serialized_size() as u64;
         let present_bitmaps_size: u64 = optimized_by_key
@@ -569,7 +501,7 @@ impl DeleteVector {
                 ),
             ));
         }
-        // Range-checked above; `as` would silently truncate, `try_from` keeps the proof local.
+        // `as` would silently truncate here. `try_from` keeps the range proof local.
         let bitmap_data_length_u32 = u32::try_from(bitmap_data_length)
             .expect("bitmap data length bounded by the 2GB check above");
 
@@ -602,18 +534,13 @@ impl DeleteVector {
     }
 }
 
-// Ideally, we'd just wrap `roaring::RoaringTreemap`'s iterator, `roaring::treemap::Iter` here.
-// But right now, it does not have a corresponding implementation of `roaring::bitmap::Iter::advance_to`,
-// which is very handy in ArrowReader::build_deletes_row_selection.
-// There is a PR open on roaring to add this (https://github.com/RoaringBitmap/roaring-rs/pull/314)
-// and if that gets merged then we can simplify `DeleteVectorIterator` here, refactoring `advance_to`
-// to just a wrapper around the underlying iterator's method.
+// `roaring::treemap::Iter` has no `advance_to`, which ArrowReader::build_deletes_row_selection
+// needs, so this type walks the bitmaps itself. Upstream PR:
+// https://github.com/RoaringBitmap/roaring-rs/pull/314.
 /// Ascending iterator over a [`DeleteVector`]'s positions, with an [`advance_to`](Self::advance_to)
 /// fast-forward used by the scan-side row-selection builder.
 pub struct DeleteVectorIterator<'a> {
-    // NB: `BitMapIter` was only exposed publicly in https://github.com/RoaringBitmap/roaring-rs/pull/316
-    // which is not yet released. As a consequence our Cargo.toml temporarily uses a git reference for
-    // the roaring dependency.
+    // `BitmapIter` is public only in an unreleased roaring version, so Cargo.toml pins a git ref.
     outer: BitmapIter<'a>,
     inner: Option<DeleteVectorIteratorInner<'a>>,
 }
@@ -647,26 +574,9 @@ impl Iterator for DeleteVectorIterator<'_> {
 }
 
 impl DeleteVectorIterator<'_> {
-    /// Fast-forwards the iterator so the next yielded position is the smallest delete `>= pos`,
-    /// skipping over any positions below it (used by the scan to align the delete stream to a
-    /// data-row position).
-    ///
-    /// `pos` splits into `hi = pos >> 32` (the roaring high-bits group) and `lo = pos as u32` (the
-    /// position within that group). The outer walk steps groups until the current group is `>= hi`,
-    /// then — *only when it landed EXACTLY on `hi`'s group* — skips within that group's bitmap to the
-    /// first low value `>= lo`.
-    ///
-    /// **Gap-group / overshoot contract.** When `hi`'s group is ABSENT from the treemap (a "gap
-    /// group"), the outer walk overshoots into the next PRESENT higher group (`inner.high_bits > hi`).
-    /// Every position in that higher group is already `> pos`, so we must NOT run the inner
-    /// `advance_to(lo)` on it — doing so would skip within the wrong group and silently consume an
-    /// in-range position that should still be yielded. We therefore leave the iterator at that higher
-    /// group's START. This preserves the postcondition (next yielded position is the smallest delete
-    /// `>= pos`) across gap groups, and keeps the O(D) fast-skip for the present-group case.
-    ///
-    /// `advance_to` is a no-op until the iterator has been primed with at least one `next()` (it
-    /// returns early while `inner` is `None`), and it only ever moves the iterator forward — calling
-    /// it with a `pos` already behind the current position does nothing.
+    /// Fast-forwards the iterator so the next yielded position is the smallest delete `>= pos`.
+    /// `pos` splits into the high-bits group `hi = pos >> 32` and the low value `lo = pos as u32`.
+    /// The outer walk steps groups until the current group is `>= hi`.
     pub fn advance_to(&mut self, pos: u64) {
         let hi = (pos >> 32) as u32;
         let lo = pos as u32;
@@ -686,9 +596,8 @@ impl DeleteVectorIterator<'_> {
             }
         }
 
-        // Only skip within the bitmap when we landed exactly on `hi`'s group. On overshoot
-        // (`inner.high_bits > hi`, because `hi`'s group is absent), every position in this higher
-        // group is already `> pos`, so we leave `bitmap_iter` at the group's start.
+        // On overshoot into a higher group, every position there is already `> pos`. Leave
+        // `bitmap_iter` at that group's start.
         if inner.high_bits == hi {
             inner.bitmap_iter.advance_to(lo);
         }
@@ -705,10 +614,8 @@ impl BitOrAssign for DeleteVector {
 pub(crate) mod tests {
     use super::*;
 
-    /// Frames `bitmap_bytes` (the portable 64-bit roaring serialization) as a
-    /// `deletion-vector-v1` blob: BE u32 length of (magic + bitmap), the magic, the bitmap, and
-    /// a BE u32 CRC-32 of (magic + bitmap). The trivial inverse of
-    /// [`DeleteVector::deserialize_deletion_vector_v1`]'s framing, used to synthesize fixtures.
+    /// Frames `bitmap_bytes` as a `deletion-vector-v1` blob, to synthesize fixtures. The inverse
+    /// of [`DeleteVector::deserialize_deletion_vector_v1`]'s framing.
     pub(crate) fn frame_deletion_vector_v1(bitmap_bytes: &[u8]) -> Vec<u8> {
         let mut bitmap_data = Vec::with_capacity(DV_MAGIC_SIZE + bitmap_bytes.len());
         bitmap_data.extend_from_slice(&DV_MAGIC_BYTES);
@@ -728,10 +635,8 @@ pub(crate) mod tests {
         blob
     }
 
-    /// Encodes a NON-EMPTY set of positions as a `deletion-vector-v1` blob via the PRODUCTION
-    /// serializer ([`DeleteVector::serialize_deletion_vector_v1`]) — the D1 test encoder this
-    /// helper replaced used the sparse `RoaringTreemap::serialize_into` layout; the production
-    /// serializer writes Java's dense layout, which the decoder equally accepts.
+    /// Encodes a NON-EMPTY position set through the production serializer, so the fixtures carry
+    /// Java's dense layout.
     pub(crate) fn encode_deletion_vector_v1(positions: &[u64]) -> Vec<u8> {
         let treemap: RoaringTreemap = positions.iter().copied().collect();
         DeleteVector::new(treemap)
@@ -739,8 +644,8 @@ pub(crate) mod tests {
             .expect("serialize test positions")
     }
 
-    /// Encodes explicit (key, 32-bit bitmap) pairs — full control over the serialized layout for
-    /// run-container and malformed-ordering fixtures.
+    /// Encodes explicit (key, 32-bit bitmap) pairs, for run-container and malformed-order
+    /// fixtures that need full control of the layout.
     fn encode_deletion_vector_v1_from_pairs(pairs: &[(u32, RoaringBitmap)]) -> Vec<u8> {
         let mut bitmap_bytes = Vec::new();
         bitmap_bytes.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
@@ -762,9 +667,8 @@ pub(crate) mod tests {
         blob[end..].copy_from_slice(&crc.sum().to_be_bytes());
     }
 
-    /// Asserts decode rejects `blob` with a `DataInvalid` error whose message contains
-    /// `expected_fragment`. Any panic inside fails the test, pinning the no-panic contract for
-    /// malformed untrusted input.
+    /// Asserts decode rejects `blob` with a `DataInvalid` error naming `expected_fragment`. A
+    /// panic inside fails the test, which pins the no-panic contract for malformed input.
     fn assert_rejects(blob: &[u8], expected_fragment: &str) {
         let error = DeleteVector::deserialize_deletion_vector_v1(blob)
             .expect_err("malformed deletion vector blob must be rejected");
@@ -775,8 +679,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Risk pinned: a framing/decode regression silently changing the position set — the exact
-    /// set (including values straddling the 32-bit key boundary) must survive a round-trip.
+    /// Risk pinned: a framing or decode regression that silently changes the position set. The
+    /// exact set, including values across the 32-bit key boundary, must survive a round-trip.
     #[test]
     fn test_dv_blob_round_trip_preserves_positions_across_key_boundary() {
         let positions = [0u64, 5, 1022, (1u64 << 32) + 5, (1u64 << 33) + 1];
@@ -790,9 +694,8 @@ pub(crate) mod tests {
         assert_eq!(decoded.len(), positions.len() as u64);
     }
 
-    /// Risk pinned: the high-bits reassembly (`(key << 32) | low`) — without the shift, the
-    /// positions above 2^32 collapse onto their low words and the set is wrong. This is the
-    /// mutation-(c) sentinel.
+    /// Risk pinned: the high-bits reassembly `(key << 32) | low`. Drop the shift and positions
+    /// above 2^32 collapse onto their low words.
     #[test]
     fn test_dv_blob_positions_above_u32_range_keep_high_bits() {
         let positions = [7u64, (1u64 << 32) + 7, (5u64 << 32) + 7];
@@ -808,10 +711,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// Risk pinned: an empty DV (0 bitmaps) must decode to an empty vector, not error — Java's
-    /// portable format legally encodes zero bitmaps (`RoaringPositionBitmap.serialize` over an
-    /// empty array writes count 0). The frame is synthesized raw because the PRODUCTION
-    /// serializer deliberately refuses empty vectors (see the sibling test below).
+    /// Risk pinned: a DV of 0 bitmaps must decode to an empty vector, not error. Java's portable
+    /// format legally encodes zero bitmaps. The frame is raw because the production serializer
+    /// refuses empty vectors.
     #[test]
     fn test_dv_blob_empty_vector_decodes_to_zero_positions() {
         let blob = frame_deletion_vector_v1(&0u64.to_le_bytes());
@@ -820,15 +722,10 @@ pub(crate) mod tests {
         assert_eq!(decoded.len(), 0);
     }
 
-    /// Risk pinned (D2 golden, exact bytes): a serializer regression silently changing ANY byte
-    /// of the on-disk encoding — framing, magic, dense count, key order, container layout, or
-    /// CRC — corrupts the table for every OTHER reader. The expected bytes for positions
-    /// {0, 5, 2^32+1} were HAND-COMPUTED from the Puffin spec + the Roaring format spec
-    /// (independent of this code, via python struct/zlib):
-    ///   length BE u32 = 58 (magic 4 + count 8 + 2×(key 4 + bitmap)), magic D1 D3 39 64,
-    ///   count 2 LE u64, key 0 + array container {0,5} (cookie 12346, 1 container, desc key 0
-    ///   card-1 1, offset 16, values 0/5 → 20 bytes), key 1 + array container {1} (18 bytes),
-    ///   CRC-32(zlib, magic+bitmap) = 0x9ACC8CA4 BE.
+    /// Risk pinned: a serializer regression that changes ANY byte of the on-disk encoding, which
+    /// corrupts the table for every other reader. The expected bytes for positions
+    /// {0, 5, 2^32+1} are hand-computed from the Puffin and Roaring format specs, independent of
+    /// this code. The array below names each field.
     #[test]
     fn test_dv_serialize_golden_bytes_hand_computed() {
         let treemap: RoaringTreemap = [0u64, 5, (1u64 << 32) + 1].into_iter().collect();
@@ -861,12 +758,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// Risk pinned (D2, the DENSE-layout contract — the mutation-(a) sentinel): Java writes
-    /// `bitmaps.length` = max key + 1 entries INCLUDING empty gap bitmaps
-    /// (`RoaringPositionBitmap.serialize` L245-252); a sparse encoding (present keys only) is
-    /// readable but NOT byte-identical to Java. Positions {0, 2^33} occupy keys 0 and 2, so the
-    /// blob must declare count 3 and carry a literal empty key-1 entry. Bytes hand-computed as
-    /// in the golden test; CRC = 0xBC98851A.
+    /// Risk pinned: the DENSE-layout contract. Java writes `max key + 1` entries and includes
+    /// empty gap bitmaps. A sparse encoding is readable but not byte-identical. Positions
+    /// {0, 2^33} take keys 0 and 2, so the blob must declare count 3 and carry an empty key-1
+    /// entry.
     #[test]
     fn test_dv_serialize_dense_gap_writes_empty_middle_bitmap_like_java() {
         let treemap: RoaringTreemap = [0u64, 1u64 << 33].into_iter().collect();
@@ -902,10 +797,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// Risk pinned (D2): the serializer must round-trip through D1's decoder for every shape the
-    /// writer can produce — position 0, gaps between keys, >2^32 positions, and a run-shaped
-    /// range. The decoder was proven against real Java bytes in D1, so round-tripping through it
-    /// is the in-house byte-compatibility floor.
+    /// Risk pinned: the serializer must round-trip through the decoder for every shape the writer
+    /// produces. Real Java bytes proved the decoder, so this round-trip is the in-house
+    /// byte-compatibility floor.
     #[test]
     fn test_dv_serialize_round_trips_through_decoder() {
         let shapes: Vec<Vec<u64>> = vec![
@@ -914,10 +808,9 @@ pub(crate) mod tests {
             vec![7, (1u64 << 32) + 7, (5u64 << 32) + 7], // gap keys 2..=4
             (1000..6000).collect(),                      // run-shaped
         ];
-        // NOTE: a position with key near DV_MAX_BITMAP_KEY cannot round-trip — the DENSE layout
-        // makes the blob > 2GB (the guard below fires), exactly as Java's serialize would
-        // (`computeBitmapDataLength` checkState). The decode-side accept boundary is pinned
-        // separately in `test_dv_blob_max_valid_key_boundary_accepted`.
+        // A key near DV_MAX_BITMAP_KEY cannot round-trip: the dense layout makes the blob > 2GB,
+        // and Java's serialize refuses it too. `test_dv_blob_max_valid_key_boundary_accepted`
+        // pins the decode-side accept boundary.
         for positions in shapes {
             let treemap: RoaringTreemap = positions.iter().copied().collect();
             let blob = DeleteVector::new(treemap)
@@ -930,11 +823,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Risk pinned (D2, runLengthEncode parity): Java calls `runLengthEncode()` before
-    /// serializing (`BitmapPositionDeleteIndex.serialize` L126), so a 5000-long contiguous run
-    /// serializes as a RUN container (cookie 12347). If our serializer skipped the equivalent
-    /// `optimize()`, the bytes would be a (much larger) array/bitmap container — readable, but
-    /// not byte-identical to Java.
+    /// Risk pinned: `runLengthEncode` parity. Java run-length encodes before it serializes, so a
+    /// 5000-long run becomes a RUN container (cookie 12347). Skip our `optimize()` and the bytes
+    /// become a larger array container. That is readable, but not byte-identical to Java.
     #[test]
     fn test_dv_serialize_run_shaped_input_emits_run_container_like_java() {
         let treemap: RoaringTreemap = (1000u64..6000).collect();
@@ -942,8 +833,8 @@ pub(crate) mod tests {
             .serialize_deletion_vector_v1()
             .expect("serialize run fixture");
 
-        // The first sub-bitmap starts after prefix(4) + magic(4) + count(8) + key(4); its first
-        // two bytes are the standard-format cookie: 12347 == "contains run containers".
+        // The first sub-bitmap starts after prefix(4) + magic(4) + count(8) + key(4). Its first
+        // two bytes are the cookie: 12347 means it contains run containers.
         let cookie_at =
             DV_LENGTH_PREFIX_SIZE + DV_MAGIC_SIZE + DV_BITMAP_COUNT_SIZE + DV_BITMAP_KEY_SIZE;
         let cookie = u16::from_le_bytes([blob[cookie_at], blob[cookie_at + 1]]);
@@ -957,14 +848,10 @@ pub(crate) mod tests {
         assert_eq!(decoded.len(), 5000);
     }
 
-    /// Risk pinned (D2 review, the run-vs-array TIE): positions {0,1,2} sit EXACTLY on the
-    /// array/run size tie — array = 2·3 = 6 bytes, run = 2 + 4·1 = 6 bytes. Java's
-    /// `ArrayContainer.runOptimize` converts only when the array is STRICTLY larger
-    /// (`getArraySizeInBytes() > sizeAsRunContainer`), so the tie keeps the ARRAY container;
-    /// `roaring-rs`'s `optimize` (`size_as_array <= size_as_run` ⇒ keep) agrees. A criterion
-    /// drift to `>=`/`<` on either side would flip the container cookie and break byte parity.
-    /// The same {0,1,2} set rides the interop fixture (`tests/interop_dv_write.rs`), where the
-    /// Java byte-compare settles the tie empirically.
+    /// Risk pinned: the run-versus-array TIE. Positions {0,1,2} cost 6 bytes either way. Java
+    /// converts only when the array is strictly larger, so the tie keeps the ARRAY container, and
+    /// `roaring-rs` agrees. A drift to `>=` or `<` on either side flips the container cookie and
+    /// breaks byte parity. `tests/interop_dv_write.rs` settles the same tie against Java.
     #[test]
     fn test_dv_serialize_array_run_size_tie_keeps_array_container_like_java() {
         let treemap: RoaringTreemap = [0u64, 1, 2].into_iter().collect();
@@ -986,9 +873,8 @@ pub(crate) mod tests {
         assert_eq!(decoded.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
     }
 
-    /// Risk pinned (D2): serializing an EMPTY vector must fail loud — `BaseDVFileWriter` never
-    /// writes one (a `Deletes` entry only exists once a position was recorded), and a
-    /// cardinality-0 DV `DeleteFile` would be a meaningless table entry.
+    /// Risk pinned: serializing an EMPTY vector must fail loud. `BaseDVFileWriter` never writes
+    /// one, and a cardinality-0 DV `DeleteFile` is a meaningless table entry.
     #[test]
     fn test_dv_serialize_empty_vector_rejected() {
         let error = DeleteVector::default()
@@ -1000,10 +886,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// Risk pinned (D2): a key above `i32::MAX - 1` is unrepresentable in Java's dense bitmap
-    /// array (`RoaringPositionBitmap` MAX_POSITION, L45-53) — serializing it would write a blob
-    /// Java's `readKey` rejects. Our treemap CAN hold such positions, so the serializer is the
-    /// door.
+    /// Risk pinned: a key above `i32::MAX - 1` does not fit Java's dense bitmap array, so writing
+    /// it makes a blob Java's `readKey` rejects. Our treemap can hold such a position, so the
+    /// serializer is the door.
     #[test]
     fn test_dv_serialize_key_above_java_max_rejected() {
         let mut treemap = RoaringTreemap::new();
@@ -1017,9 +902,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Risk pinned (D2): the 2GB bound (Java `computeBitmapDataLength` L158-163) must fire from
-    /// the size PRE-computation — before any allocation. A single position with a huge key forces
-    /// a dense count of ~179M entries × 12 bytes ≈ 2.15 GB of (mostly empty-gap) bitmaps.
+    /// Risk pinned: the 2GB bound must fire from the size pre-computation, before any allocation.
+    /// One position with a huge key forces a dense count of about 179M entries, near 2.15 GB.
     #[test]
     fn test_dv_serialize_over_2gb_rejected_before_allocating() {
         let mut treemap = RoaringTreemap::new();
@@ -1033,16 +917,16 @@ pub(crate) mod tests {
         );
     }
 
-    /// Risk pinned: Java run-length-encodes before serializing (`runLengthEncode`), so real DV
-    /// blobs carry RUN containers — the decoder must take that container path, not just arrays.
+    /// Risk pinned: real DV blobs carry RUN containers, because Java run-length encodes before it
+    /// serializes. The decoder must take that container path, not only the array path.
     #[test]
     fn test_dv_blob_run_length_container_decodes() {
         let mut dense = RoaringBitmap::new();
         dense.insert_range(1000..200_000);
         dense.optimize(); // run-length encode wherever smaller, like Java's runLengthEncode()
 
-        // Prove the fixture really serializes with run containers: the standard-format cookie
-        // for a bitmap CONTAINING run containers is 12347 (SERIAL_COOKIE); 12346 means none.
+        // Prove the fixture really carries run containers. Cookie 12347 means it does, 12346
+        // means it does not.
         let mut serialized = Vec::new();
         dense
             .serialize_into(&mut serialized)
@@ -1063,10 +947,8 @@ pub(crate) mod tests {
         assert_eq!(decoded_positions[198_999], 199_999);
     }
 
-    /// Risk pinned: Java pads the serialized bitmap array densely from key 0 to the max key, so
-    /// a blob with positions only in high keys carries EMPTY gap bitmaps
-    /// (`RoaringPositionBitmap.serialize` writes `bitmaps.length` entries) — they must decode as
-    /// "no positions", not error.
+    /// Risk pinned: Java pads the bitmap array densely from key 0 to the max key, so a blob with
+    /// only high keys carries EMPTY gap bitmaps. They must decode as no positions, not error.
     #[test]
     fn test_dv_blob_with_empty_gap_bitmap_decodes_like_java_writes_it() {
         let mut key0 = RoaringBitmap::new();
@@ -1083,9 +965,9 @@ pub(crate) mod tests {
         assert_eq!(decoded_positions, vec![3, (2u64 << 32) + 9]);
     }
 
-    /// Risk pinned: truncated untrusted input at every framing boundary must produce a clean
-    /// error (never a panic). Truncating a valid blob always trips the total-length equality
-    /// first; the inner truncation paths are exercised by the bitmap-garbage tests below.
+    /// Risk pinned: truncated input at every framing boundary must give a clean error, never a
+    /// panic. A truncated valid blob always trips the total-length equality first. The
+    /// bitmap-garbage tests below cover the inner truncation paths.
     #[test]
     fn test_dv_blob_truncation_at_each_boundary_rejects_cleanly() {
         let blob = encode_deletion_vector_v1(&[1, 2, 3]);
@@ -1093,15 +975,14 @@ pub(crate) mod tests {
         // Shorter than the 4-byte length prefix.
         assert_rejects(&[], "too short to hold the 4-byte length prefix");
         assert_rejects(&blob[..3], "too short to hold the 4-byte length prefix");
-        // Cut inside the magic, the bitmap, and the CRC trailer: the length prefix no longer
-        // matches the byte count.
+        // Cut inside the magic, the bitmap, and the CRC trailer.
         assert_rejects(&blob[..6], "length prefix declares");
         assert_rejects(&blob[..blob.len() / 2], "length prefix declares");
         assert_rejects(&blob[..blob.len() - 2], "length prefix declares");
     }
 
-    /// Risk pinned: a wrong magic sequence must be rejected by NAME even when the CRC is valid
-    /// for the corrupted bytes (the magic check is independent of the checksum).
+    /// Risk pinned: a wrong magic must be rejected by NAME even when the CRC is valid for the
+    /// corrupted bytes. The magic check does not depend on the checksum.
     #[test]
     fn test_dv_blob_wrong_magic_rejects() {
         let mut blob = encode_deletion_vector_v1(&[1, 2, 3]);
@@ -1110,9 +991,8 @@ pub(crate) mod tests {
         assert_rejects(&blob, "Invalid deletion vector magic");
     }
 
-    /// Risk pinned: the CRC check actually fires — a single corrupted bitmap byte (stored CRC
-    /// untouched) must be rejected as a CRC mismatch BEFORE the bitmap parser sees it. This is
-    /// the mutation-(a) sentinel.
+    /// Risk pinned: the CRC check fires. One corrupted bitmap byte, with the stored CRC
+    /// untouched, must be rejected as a CRC mismatch before the bitmap parser sees it.
     #[test]
     fn test_dv_blob_crc_mismatch_rejects() {
         let mut blob = encode_deletion_vector_v1(&[1, 2, 3]);
@@ -1127,8 +1007,8 @@ pub(crate) mod tests {
         assert_rejects(&blob, "Invalid deletion vector CRC");
     }
 
-    /// Risk pinned: a length prefix disagreeing with the actual payload (both directions, and a
-    /// hostile u32::MAX that would overflow naive arithmetic) must reject cleanly.
+    /// Risk pinned: a length prefix that disagrees with the payload must reject cleanly. Both
+    /// directions, and the hostile u32::MAX that overflows naive arithmetic.
     #[test]
     fn test_dv_blob_length_prefix_mismatch_rejects() {
         let blob = encode_deletion_vector_v1(&[1, 2, 3]);
@@ -1147,14 +1027,13 @@ pub(crate) mod tests {
         hostile[..4].copy_from_slice(&u32::MAX.to_be_bytes());
         assert_rejects(&hostile, "length prefix declares");
 
-        // A declared length too small to even hold magic + bitmap count: framing an EMPTY
-        // bitmap region declares length 4 (magic only) < the 12-byte minimum.
+        // An empty bitmap region declares length 4, below the 12-byte magic + count minimum.
         let tiny = frame_deletion_vector_v1(&[]);
         assert_rejects(&tiny, "shorter than the minimum");
     }
 
-    /// Risk pinned: garbage where the 32-bit bitmap should be (CRC recomputed so it passes the
-    /// checksum) must be rejected by the checked bitmap parser, not panic or wrongly decode.
+    /// Risk pinned: garbage where the 32-bit bitmap belongs, with the CRC recomputed so it
+    /// passes. The checked bitmap parser must reject it, not panic and not decode it.
     #[test]
     fn test_dv_blob_garbage_bitmap_bytes_reject() {
         // count = 1, key = 0, then garbage instead of a serialized bitmap.
@@ -1166,8 +1045,8 @@ pub(crate) mod tests {
         assert_rejects(&blob, "malformed 32-bit roaring bitmap");
     }
 
-    /// Risk pinned: a bitmap count larger than the payload could hold (including u64::MAX, which
-    /// would loop ~forever or overflow naive size math) must fail fast with a named error.
+    /// Risk pinned: a bitmap count larger than the payload holds must fail fast with a named
+    /// error. u64::MAX included, which loops near forever or overflows naive size math.
     #[test]
     fn test_dv_blob_bitmap_count_overflow_rejects() {
         // count = u64::MAX over an empty remainder.
@@ -1182,8 +1061,7 @@ pub(crate) mod tests {
         let blob = frame_deletion_vector_v1(&bitmap_bytes);
         assert_rejects(&blob, "cannot fit");
 
-        // count = 2 with one entry present sneaks under the minimum-size bound but must still
-        // reject cleanly when the second bitmap's bytes run out.
+        // count = 2 with one entry passes the minimum-size bound, then runs out of bytes.
         let mut bitmap_bytes =
             single[DV_LENGTH_PREFIX_SIZE + DV_MAGIC_SIZE..single.len() - DV_CRC_SIZE].to_vec();
         bitmap_bytes[..8].copy_from_slice(&2u64.to_le_bytes());
@@ -1191,8 +1069,8 @@ pub(crate) mod tests {
         assert_rejects(&blob, "truncated before a bitmap key");
     }
 
-    /// Risk pinned: Java rejects out-of-range and non-ascending keys (`readKey`) — accepting
-    /// them would silently reorder or alias position ranges.
+    /// Risk pinned: Java `readKey` rejects out-of-range and non-ascending keys. Accepting them
+    /// silently reorders or aliases position ranges.
     #[test]
     fn test_dv_blob_invalid_keys_reject() {
         let mut one = RoaringBitmap::new();
@@ -1215,11 +1093,9 @@ pub(crate) mod tests {
         assert_rejects(&blob, "strictly ascending");
     }
 
-    /// Risk pinned (reviewer, 2026-06-10): DoS-by-allocation via the INNER 32-bit roaring
-    /// container count — the outer bitmap_count bound cannot constrain what the per-key payload
-    /// claims, so a hostile cookie/size must be rejected by `RoaringBitmap::deserialize_from`
-    /// fast and allocation-bounded (roaring 0.11.3 caps the container count at 65536 BEFORE its
-    /// description allocation), never looped over or panicked on.
+    /// Risk pinned: denial of service by allocation through the INNER container count. The outer
+    /// bitmap-count bound cannot constrain what a per-key payload claims. `roaring` must reject a
+    /// hostile cookie fast and within bounded memory, never loop or panic.
     #[test]
     fn test_dv_blob_hostile_inner_container_count_rejects_fast() {
         // count = 1, key = 0, then a no-run cookie (12346) claiming u32::MAX containers.
@@ -1243,7 +1119,7 @@ pub(crate) mod tests {
         let run_cookie: u32 = 12347 | (0xFFFFu32 << 16);
         bitmap_bytes.extend_from_slice(&run_cookie.to_le_bytes());
         let blob = frame_deletion_vector_v1(&bitmap_bytes);
-        // Tripped EARLIER by the outer fit bound (the entry is smaller than the 12-byte minimum).
+        // The outer fit bound trips first: the entry is under the 12-byte minimum.
         assert_rejects(&blob, "cannot fit");
 
         // Same run cookie but padded past the outer fit bound so the inner parser sees it.
@@ -1267,10 +1143,9 @@ pub(crate) mod tests {
         assert_rejects(&blob, "malformed 32-bit roaring bitmap");
     }
 
-    /// Risk pinned (reviewer, 2026-06-10): the ACCEPT side of the key boundary — Java `readKey`
-    /// accepts keys up to exactly `Integer.MAX_VALUE - 1`; the builder pinned the reject side
-    /// (i32::MAX, u32::MAX). Over-tightening the bound would reject valid Java-written DVs with
-    /// high keys, shrinking the accepted-input set below Java's.
+    /// Risk pinned: the ACCEPT side of the key boundary. Java `readKey` accepts keys up to
+    /// `i32::MAX - 1`. A tighter bound here rejects valid Java-written DVs with high keys, and
+    /// shrinks the accepted-input set below Java's.
     #[test]
     fn test_dv_blob_max_valid_key_boundary_accepted() {
         let mut one = RoaringBitmap::new();
@@ -1283,8 +1158,8 @@ pub(crate) mod tests {
         assert_eq!(positions, vec![(u64::from(key) << 32) | 1]);
     }
 
-    /// Risk pinned: trailing bytes inside the declared (CRC-covered) bitmap region mean the
-    /// length prefix and the bitmap disagree — silent acceptance would mask corruption.
+    /// Risk pinned: trailing bytes inside the declared bitmap region mean the length prefix and
+    /// the bitmap disagree. Silent acceptance masks corruption.
     #[test]
     fn test_dv_blob_trailing_bytes_after_bitmaps_reject() {
         let valid = encode_deletion_vector_v1(&[1, 2, 3]);
@@ -1295,12 +1170,10 @@ pub(crate) mod tests {
         assert_rejects(&blob, "trailing bytes");
     }
 
-    /// EMPIRICAL Java byte-compatibility pin (env-gated; run by dev/java-interop/run-interop-dv.sh).
-    /// The Java oracle serializes a `BitmapPositionDeleteIndex` with positions spanning the
-    /// 32-bit key boundary AND a run-length-encoded range into `<dir>/dv_blob.bin` (+ the
-    /// expected positions in `dv_blob_expected.json`); this test decodes the REAL Java bytes and
-    /// asserts the exact position set. This is the test that settles whether `roaring-rs`'s
-    /// portable format is byte-compatible with Java's `RoaringPositionBitmap`.
+    /// Empirical Java byte-compatibility pin, env-gated behind
+    /// `dev/java-interop/run-interop-dv.sh`. The Java oracle writes `dv_blob.bin` and
+    /// `dv_blob_expected.json`. This test decodes the real Java bytes and asserts the exact
+    /// position set. It settles whether `roaring-rs`'s portable format matches Java's.
     #[test]
     fn test_dv_blob_decodes_java_written_blob_when_env_set() {
         let Some(dir) = std::env::var_os("ICEBERG_INTEROP_DV_DIR")
@@ -1354,7 +1227,7 @@ pub(crate) mod tests {
         assert_eq!(collected, positions);
     }
 
-    /// Testing scenario: bulk insertion fails because input positions are not strictly increasing.
+    /// Bulk insertion fails: the input positions do not strictly increase.
     #[test]
     fn test_failed_insertion_unsorted_elements() {
         let mut dv = DeleteVector::default();
@@ -1363,7 +1236,7 @@ pub(crate) mod tests {
         assert!(res.is_err());
     }
 
-    /// Testing scenario: bulk insertion fails because input positions have intersection with existing ones.
+    /// Bulk insertion fails: the input positions intersect the existing ones.
     #[test]
     fn test_failed_insertion_with_intersection() {
         let mut dv = DeleteVector::default();
@@ -1374,7 +1247,7 @@ pub(crate) mod tests {
         assert!(res.is_err());
     }
 
-    /// Testing scenario: bulk insertion fails because input positions have duplicates.
+    /// Bulk insertion fails: the input positions carry duplicates.
     #[test]
     fn test_failed_insertion_duplicate_elements() {
         let mut dv = DeleteVector::default();
@@ -1394,14 +1267,10 @@ pub(crate) mod tests {
         dv
     }
 
-    /// `advance_to` postcondition pinned across a GAP GROUP: a high-bits group absent between the
-    /// target's group and a present higher group. `deletes = {KB-2, 2*KB}` → group 0 = {KB-2},
-    /// group 2 = {0}; group 1 ABSENT. Advancing to a target in the absent group 1 must leave the
-    /// next yielded position as the smallest delete `>= pos` — i.e. `2*KB` — NOT skip it.
-    ///
-    /// This pins the overshoot contract: the outer walk overshoots group 1 into group 2, and the
-    /// iterator must be left at group 2's START rather than running `bitmap_iter.advance_to(lo)` on
-    /// it (which, with `lo = 0xFFFFFFFE`, would consume group 2's only element `0` and yield `None`).
+    /// Risk pinned: the `advance_to` overshoot contract across a GAP GROUP. Group 1 is absent, so
+    /// the outer walk overshoots into group 2. The iterator must stop at group 2's start. An
+    /// unconditional `bitmap_iter.advance_to(lo)` with `lo = 0xFFFFFFFE` would consume group 2's
+    /// only element and yield `None`.
     #[test]
     fn test_advance_to_across_gap_group_yields_next_higher_delete() {
         let dv = dv_with(&[KEY_BOUNDARY - 2, 2 * KEY_BOUNDARY]);
@@ -1418,10 +1287,9 @@ pub(crate) mod tests {
         assert_eq!(iter.next(), None, "no deletes beyond 2*KB");
     }
 
-    /// Two consecutive gap groups (groups 1 and 2 absent; deletes in group 0 and group 3): the outer
-    /// walk skips both gaps and still yields the in-range delete in group 3. The target's low bits
-    /// (`0xFFFFFFFE`) are LARGER than group 3's only element low bits (`7`), so the buggy
-    /// unconditional `bitmap_iter.advance_to(lo)` would consume group 3's element — pinning RED-ability.
+    /// Risk pinned: two consecutive gap groups. The outer walk skips both and still yields the
+    /// delete in group 3. The target's low bits `0xFFFFFFFE` exceed group 3's element low bits
+    /// `7`, so an unconditional `bitmap_iter.advance_to(lo)` would consume that element.
     #[test]
     fn test_advance_to_across_multiple_gap_groups() {
         let dv = dv_with(&[KEY_BOUNDARY - 1, 3 * KEY_BOUNDARY + 7]);
@@ -1438,8 +1306,8 @@ pub(crate) mod tests {
         assert_eq!(iter.next(), None);
     }
 
-    /// Non-gap case (target's group is PRESENT): `advance_to` must still skip WITHIN the group to
-    /// the first low value `>= lo`, preserving the O(D) fast-skip.
+    /// The target's group is PRESENT. `advance_to` must still skip within the group to the first
+    /// low value `>= lo`, which keeps the fast-skip.
     #[test]
     fn test_advance_to_within_present_group_skips_lower_positions() {
         // Single group 0 with several positions.
@@ -1585,8 +1453,8 @@ mod loader_tests {
         );
     }
 
-    /// Risk pinned: the manifest and the blob disagreeing about how many rows are deleted. A silent
-    /// accept here resurrects or over-deletes rows.
+    /// Risk pinned: the manifest and the blob disagree about how many rows are deleted. A silent
+    /// accept resurrects or over-deletes rows.
     #[tokio::test]
     async fn rejects_a_cardinality_mismatch() {
         let dir = TempDir::new().expect("temp dir");

@@ -15,135 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! DATA-LEVEL write-action interop (sprint increments S1 + W1 + W2) — `MergeAppend`,
-//! `RewriteFiles`, `OverwriteFiles`, `DeleteFiles`, `ReplacePartitions`, and partitioned
-//! `RewriteFiles` proven against Java's `IcebergGenerics` production scan.
+//! DATA-LEVEL write-action interop for `MergeAppend`, `RewriteFiles`, `OverwriteFiles`,
+//! `DeleteFiles`, `ReplacePartitions`, and partitioned `RewriteFiles`. Each fixture runs the
+//! same chain as the matching Java `*DataOracle.generate`, writes real parquet through the
+//! production writers, and lands at `<gen_dir>/rust_table` for Java's `IcebergGenerics` to
+//! read back. Every fixture pins the `category` column through `id_to_category_sorted`,
+//! because a wrong-partition write is invisible to an `{id, data}` compare.
 //!
-//! ## Fixture A — `merge_append` data-level
+//! All tables are V2, identity(category) partitioned unless said otherwise, schema
+//! `{id long, category string, data string}`.
 //!
-//! V2 partitioned table (identity(category), schema `{id long, category string, data string}`).
-//! Rust performs the SAME chain as Java's `MergeAppendDataOracle.generate`:
-//! - `fast_append` files A (cat=a, ids 10/20/30, data a/b/c) and B (cat=b, id 40, data d) — seq 1
-//! - `update_table_properties` set `commit.manifest.min-count-to-merge=2` (no snapshot)
-//! - `merge_append` G (cat=a, id 60, data g) — seq 2, MERGING: all manifests fit in one bin ⇒
-//!   ONE merged manifest with Existing A+B entries + G as Added
+//! | Fixture | Chain | What a defect does |
+//! |---|---|---|
+//! | A `merge_append` | append A(cat=a, 10/20/30) + B(cat=b, 40) at seq 1, set `commit.manifest.min-count-to-merge=2`, `merge_append` G(cat=a, 60) | dropping Existing entries loses A or B rows; the scan must yield `{10,20,30,40,60}` |
+//! | B `rewrite_files` (unpartitioned `{id, data}`) | append A(10..50), eq-delete on ids 20+40 at seq 2, rewrite {A}→{A'} stamped `data_sequence_number(1)` at seq 3 | stamping A' at seq 3 stops the eq-delete applying, so 20 and 40 wrongly survive; the scan must yield `{10,30,50}` |
+//! | C `overwrite_files` | append A + B, then overwrite that deletes B and adds B'(cat=b, 41) | B' replaces only B; A's rows stay; the scan must yield `{10,20,30,41}` |
+//! | D `delete_files` | append A, B, C_file(cat=a, 50), then delete B by path | only cat=b goes; the scan must yield `{10,20,30,50}` |
+//! | E `replace_partitions` | append A + B, then replace partition a with E_new(11) | all of partition a goes, and B carries forward with EXISTING manifest status instead of being re-ADDED |
+//! | F partitioned `rewrite_files` | append A + B, eq-delete id 20 scoped to partition a at seq 2, rewrite {A}→{A'} at seq 1 | the seq-preservation trap of fixture B, now with a partition spec; the scan must yield `{10,30,40}` |
+//! | G multi-bin `merge_append` | four separate appends build manifests m1..m4, `target-size-bytes` set to `2 * max_manifest_size + 1` so a bin holds exactly 2 | both bins must merge, so at least 2 manifests carry existing entries; fixture A's single-bin path passes without this |
 //!
-//! Correctness point: every row from A, B, and G must survive the scan. A Rust `merge_append` that
-//! silently discards Existing entries would yield a wrong (missing-row) result here.
-//! Java verifies: `IcebergGenerics.read(rust_table)` must yield exactly `{10,20,30,40,60}`.
+//! Position deletes are PATH-BASED, so after A→A' the delete on A's path dangles. Only an
+//! equality delete, which seq applicability governs, can prove `data_sequence_number`
+//! preservation.
 //!
-//! ## Fixture B — `rewrite_files` data-level (seq-preservation)
-//!
-//! Unpartitioned 2-field table `{id long, data string}`.
-//! Rust performs the SAME chain as Java's revised `RewriteFilesDataOracle.generate`:
-//! - `fast_append` A (5 rows: ids 10..50, data a..e) — seq 1
-//! - `row_delta` equality-delete (equality_ids=[1], deletes ids 20+40) — seq 2
-//! - `rewrite_files` {A}→{A'} with `data_sequence_number(1)` — seq 3
-//!
-//! Correctness point: A' is stamped with `data_sequence_number=1` (the replaced file's seq). The
-//! equality-delete has seq 2. Applicability rule: eq-delete applies to data files with
-//! `data_seq STRICTLY LESS THAN` the delete's seq. `A'.data_seq=1 < eq_del.seq=2`, so the delete
-//! STILL APPLIES after the rewrite. Live rows must be `{10,30,50}` (ids 20+40 absent). Were Rust
-//! to stamp A' with seq 3 the delete would not apply and ids 20/40 would wrongly survive.
-//! Java verifies: `IcebergGenerics.read(rust_table)` must yield `{(10,a),(30,c),(50,e)}`.
-//!
-//! NOTE: position deletes are PATH-BASED — after A→A' the delete on A's path is dangling (A' has
-//! a new path). To prove `data_sequence_number` preservation you MUST use an equality delete,
-//! which is governed by seq applicability rules, not by file path.
-//!
-//! ## Fixture C — `overwrite_files` data-level
-//!
-//! V2 partitioned table (identity(category), same 3-field schema as fixture A).
-//! Rust performs the SAME chain as Java's `OverwriteFilesDataOracle.generate`:
-//! - `fast_append` A (cat=a, ids 10/20/30, data a/b/c) and B (cat=b, id 40, data d) — seq 1
-//! - `overwrite_files` DELETE B + ADD B' (cat=b, id 41, data d') — seq 2, operation=overwrite
-//!
-//! Correctness point: B (id=40) is GONE; B' (id=41) is present; A's rows (10,20,30) INTACT.
-//! The partition column is pinned: a wrong-partition write of B' to cat="a" would be invisible to
-//! the `{id, data}` row compare but is caught by the `id_to_category_sorted` assertion.
-//! Java verifies: `IcebergGenerics.read(rust_table)` must yield `{(10,a),(20,b),(30,c),(41,d')}`.
-//!
-//! ## Fixture D — `delete_files` data-level
-//!
-//! V2 partitioned table (identity(category), same 3-field schema as fixture A).
-//! Rust performs the SAME chain as Java's `DeleteFilesDataOracle.generate`:
-//! - `fast_append` A (cat=a, ids 10/20/30, data a/b/c), B (cat=b, id 40, data d),
-//!   C_file (cat=a, id 50, data e) — seq 1
-//! - `delete_files` {B} by path — seq 2, operation=delete
-//!
-//! Correctness point: B (cat=b, id=40) is GONE; A and C_file (cat=a) are INTACT.
-//! Java verifies: `IcebergGenerics.read(rust_table)` must yield `{(10,a),(20,b),(30,c),(50,e)}`.
-//!
-//! All fixtures use REAL parquet files written via the production Rust writers (`DataFileWriter`).
-//! The tables land at `<gen_dir>/rust_table` with `metadata/final.metadata.json`; Java's
-//! `verify-interop-*` modes read them. The S3 partition-projection lesson is binding: every fixture
-//! pins the `category` column explicitly via `id_to_category_sorted` to catch wrong-partition writes.
-//!
-//! ## Fixture E — `replace_partitions` data-level
-//!
-//! V2 partitioned table (identity(category), same 3-field schema as fixture A).
-//! Rust performs the SAME chain as Java's `ReplacePartitionsDataOracle.generate`:
-//! - `fast_append` A (cat=a, ids 10/20/30, data a/b/c) and B (cat=b, id 40, data d) — seq 1
-//! - `replace_partitions` E_new (cat=a, id=11, data="a'") — seq 2, operation=overwrite,
-//!   summary replace-partitions=true; this REPLACES ALL of partition a (A deleted) while
-//!   partition b (B) carries forward with EXISTING manifest status
-//!
-//! Correctness point: A's rows (10,20,30) are ALL GONE; E_new (id=11) is present; B (id=40)
-//! is byte-untouched. Additionally: B's file carries forward with EXISTING manifest status
-//! (not re-added as ADDED) — proven by the Java oracle's manifest-entry assertion (step 3f).
-//! Java verifies: `IcebergGenerics.read(rust_table)` must yield `{(11,a'),(40,d)}`.
-//!
-//! ## Fixture F — partitioned `rewrite_files` with outstanding eq-delete
-//!
-//! V2 partitioned table (identity(category), same 3-field schema as fixture A).
-//! Rust performs the SAME chain as Java's `PartitionedRewriteFilesDataOracle.generate`:
-//! - `fast_append` A (cat=a, ids 10/20/30, data a/b/c) and B (cat=b, id 40, data d) — seq 1
-//! - `row_delta` equality-delete (equality_ids=[1], deletes id=20, SCOPED to partition a) — seq 2
-//! - `rewrite_files` {A}→{A'} with `data_sequence_number(1)` — seq 3
-//!
-//! Correctness point: A' is stamped with `data_sequence_number=1` (the replaced file's seq).
-//! The equality-delete has seq 2. `A'.data_seq=1 < eq_del.seq=2`, so the delete STILL APPLIES.
-//! id=20 must be ABSENT; id=10 and id=30 survive (cat=a); B (id=40, cat=b) is untouched.
-//! Java verifies: `IcebergGenerics.read(rust_table)` must yield `{(10,a),(30,c),(40,d)}`.
-//!
-//! ## Fixture G — multi-bin `merge_append` data-level (W3)
-//!
-//! V2 partitioned table (identity(category), same 3-field schema as fixture A).
-//! Four SEPARATE fast_appends build up four separate manifests m1..m4:
-//! - fast_append A (cat=a, ids 10/20/30, data a/b/c) — seq 1, manifest m1
-//! - fast_append B (cat=b, id 40, data d)             — seq 2, manifest m2
-//! - fast_append C1 (cat=a, id 50, data e)            — seq 3, manifest m3
-//! - fast_append C2 (cat=b, id 55, data f)            — seq 4, manifest m4
-//!
-//! After the four appends, the actual manifest sizes are measured from the manifest-list.
-//! `target-size-bytes` is set to `max_manifest_size * 2 + 1` so that `pack_end` fits exactly
-//! 2 manifests per bin. With `min-count-to-merge = 2` and 4 existing manifests, `pack_end`
-//! yields 2 bins of 2 → both satisfy min-count → both MERGE → ≥2 merged manifests output.
-//!
-//! Then `merge_append` G (cat=a, id 60, data g) fires the multi-bin merge (seq 5).
-//!
-//! Correctness point: all 7 rows must survive: A(10/20/30) + B(40) + C1(50) + C2(55) + G(60).
-//! The bin-count assertion (`≥2 manifests with existing_files_count > 0`) proves the multi-bin
-//! merge path fired — not just the single-bin path covered by fixture A.
-//! Java verifies: `IcebergGenerics.read(rust_table)` must yield
-//! `{(10,a),(20,b),(30,c),(40,d),(50,e),(55,f),(60,g)}` with the partition pin.
-//!
-//! GATED on env vars (all fourteen unset ⇒ clean no-ops; offline `cargo test` gate stays green):
-//!
-//! - `ICEBERG_INTEROP_MERGE_APPEND_DATA_GEN_DIR`       — fixture A GEN (Rust writes)
-//! - `ICEBERG_INTEROP_MERGE_APPEND_DATA_DIR`           — fixture A comparison (Rust reads Java rows)
-//! - `ICEBERG_INTEROP_REWRITE_DATA_GEN_DIR`            — fixture B GEN (Rust writes)
-//! - `ICEBERG_INTEROP_REWRITE_DATA_DIR`                — fixture B comparison (Rust reads Java rows)
-//! - `ICEBERG_INTEROP_OVERWRITE_DATA_GEN_DIR`          — fixture C GEN (Rust writes)
-//! - `ICEBERG_INTEROP_OVERWRITE_DATA_DIR`              — fixture C comparison (Rust reads Java rows)
-//! - `ICEBERG_INTEROP_DELETE_DATA_GEN_DIR`             — fixture D GEN (Rust writes)
-//! - `ICEBERG_INTEROP_DELETE_DATA_DIR`                 — fixture D comparison (Rust reads Java rows)
-//! - `ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_GEN_DIR` — fixture E GEN (Rust writes)
-//! - `ICEBERG_INTEROP_REPLACE_PARTITIONS_DATA_DIR`     — fixture E comparison (Rust reads Java rows)
-//! - `ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_GEN_DIR`— fixture F GEN (Rust writes)
-//! - `ICEBERG_INTEROP_PARTITIONED_REWRITE_DATA_DIR`    — fixture F comparison (Rust reads Java rows)
-//! - `ICEBERG_INTEROP_MULTI_BIN_MERGE_DATA_GEN_DIR`    — fixture G GEN (Rust writes)
-//! - `ICEBERG_INTEROP_MULTI_BIN_MERGE_DATA_DIR`        — fixture G comparison (Rust reads Java rows)
+//! Env vars gate every fixture. `..._GEN_DIR` makes Rust write the table, `..._DIR` makes Rust
+//! read Java's rows. All unset means a clean no-op, so the offline gate stays green.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -176,9 +73,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use serde::Deserialize;
 
-// ===========================================================================================
 // Row model — the Java oracle's `{id, data}` JSON format (same as interop_scan_exec.rs).
-// ===========================================================================================
 
 /// One live row from Java's `IcebergGenerics` read: `id` (long) + nullable `data` string.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -202,9 +97,7 @@ fn cmp_opt(a: &Option<String>, b: &Option<String>) -> Ordering {
     }
 }
 
-// ===========================================================================================
 // Env-var gates.
-// ===========================================================================================
 
 fn merge_append_data_gen_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_MERGE_APPEND_DATA_GEN_DIR")
@@ -290,9 +183,7 @@ fn multi_bin_merge_data_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-// ===========================================================================================
 // Schema + spec helpers.
-// ===========================================================================================
 
 /// Fixture B schema: unpartitioned 2-field `{1 id long required, 2 data string optional}`.
 /// Matches `ScanExecOracle` / `EqDeleteOracle` — the simplest shape for the seq-preservation proof.
@@ -339,9 +230,7 @@ fn partition_key(schema: SchemaRef, spec: PartitionSpec, category: &str) -> Part
     .expect("PartitionKey::new: valid partition tuple")
 }
 
-// ===========================================================================================
 // Real-parquet writer helpers (production paths — the same pattern as interop_scan_exec.rs).
-// ===========================================================================================
 
 /// Write a REAL parquet DATA file for one partition via the production `DataFileWriter`.
 /// Each row carries the given `ids` and `data_values`; `category` matches the partition.
@@ -397,9 +286,7 @@ async fn write_data_file(
         .expect("one data file")
 }
 
-// ===========================================================================================
 // Scan helper — Arrow → ScanRow extraction (same as interop_scan_exec.rs).
-// ===========================================================================================
 
 fn extract_rows(batch: &RecordBatch) -> Vec<ScanRow> {
     let id = batch
@@ -428,12 +315,10 @@ fn string_value(array: &ArrayRef, i: usize) -> Option<String> {
     }
 }
 
-/// Extract the `(id → category)` mapping from a fixture-A scan batch. The `category` column is the
-/// IDENTITY-PARTITION value; the `{id, data}` row compare deliberately drops it (Java's
-/// `readLiveRowsToJson` only emits `{id, data}`), so a partition-routing divergence in
-/// `merge_append` (a row materialized into the wrong partition) is invisible to the row compare.
-/// This map lets the fixture-A tests pin the partition column directly. Risk pinned: a wrong-partition
-/// write — the audit's Mutation 1 (route G to category="b") passed the row compare silently without it.
+/// Extract the `(id → category)` identity-partition mapping from a scan batch. Java's
+/// `readLiveRowsToJson` emits only `{id, data}`, so the row compare cannot see a row written to
+/// the wrong partition. Risk pinned: routing G to `category="b"` passes the row compare silently
+/// without this map.
 fn extract_id_to_category(batch: &RecordBatch) -> Vec<(i64, Option<String>)> {
     let id = batch
         .column_by_name("id")
@@ -447,8 +332,7 @@ fn extract_id_to_category(batch: &RecordBatch) -> Vec<(i64, Option<String>)> {
         .collect()
 }
 
-/// The expected `(id → category)` partition routing for fixture A: A's rows (10,20,30) and G (60)
-/// are `category="a"`; B (40) is `category="b"`. Sorted by id for a stable compare.
+/// Fixture A partition routing: 10/20/30 and 60 are `category="a"`, 40 is `category="b"`.
 fn expected_merge_append_categories() -> Vec<(i64, Option<String>)> {
     vec![
         (10, Some("a".to_string())),
@@ -459,12 +343,8 @@ fn expected_merge_append_categories() -> Vec<(i64, Option<String>)> {
     ]
 }
 
-/// The expected `(id → category)` partition routing for fixture C (overwrite_files):
-/// A's rows (10,20,30) are `category="a"`; B' (41) is `category="b"`. B (40) is ABSENT.
-/// Sorted by id for a stable compare.
-///
-/// S3 partition-projection lesson: a scan that drops the `category` column cannot detect a
-/// wrong-partition write of B' to `category="a"`. This pin makes that class of regression visible.
+/// Fixture C partition routing: 10/20/30 are `category="a"`, B' (41) is `category="b"`, and B
+/// (40) is absent. Risk pinned: a write of B' to `category="a"` passes the `{id, data}` compare.
 fn expected_overwrite_categories() -> Vec<(i64, Option<String>)> {
     vec![
         (10, Some("a".to_string())),
@@ -474,9 +354,7 @@ fn expected_overwrite_categories() -> Vec<(i64, Option<String>)> {
     ]
 }
 
-/// The expected `(id → category)` partition routing for fixture D (delete_files):
-/// A's rows (10,20,30) and C_file (50) are `category="a"`; B (40) is ABSENT (deleted).
-/// Sorted by id for a stable compare.
+/// Fixture D partition routing: 10/20/30 and 50 are `category="a"`, and B (40) is absent.
 fn expected_delete_categories() -> Vec<(i64, Option<String>)> {
     vec![
         (10, Some("a".to_string())),
@@ -486,21 +364,15 @@ fn expected_delete_categories() -> Vec<(i64, Option<String>)> {
     ]
 }
 
-/// The expected `(id → category)` partition routing for fixture E (replace_partitions):
-/// E_new (id=11) is `category="a"` (it replaced ALL of partition a); B (id=40) is `category="b"`.
-/// A's rows (10,20,30) are ABSENT (replaced). Sorted by id for a stable compare.
-///
-/// S3 partition-projection lesson: a wrong-partition write of E_new to `category="b"` would pass
-/// the `{id,data}` compare but is caught here (category would be `{11="b", 40="b"}` instead of
-/// `{11="a", 40="b"}`).
+/// Fixture E partition routing: E_new (11) is `category="a"`, B (40) is `category="b"`, and
+/// 10/20/30 are absent. Risk pinned: writing E_new to `category="b"` passes the `{id, data}`
+/// compare and gives `{11="b", 40="b"}` here.
 fn expected_replace_partitions_categories() -> Vec<(i64, Option<String>)> {
     vec![(11, Some("a".to_string())), (40, Some("b".to_string()))]
 }
 
-/// The expected `(id → category)` partition routing for fixture F (partitioned rewrite_files):
-/// A's surviving rows (10,30) are `category="a"` (id=20 was deleted by the eq-delete);
-/// B (id=40) is `category="b"` (untouched by both the eq-delete and the rewrite).
-/// Sorted by id for a stable compare.
+/// Fixture F partition routing: the surviving 10/30 are `category="a"`, and the untouched B (40)
+/// is `category="b"`.
 fn expected_partitioned_rewrite_categories() -> Vec<(i64, Option<String>)> {
     vec![
         (10, Some("a".to_string())),
@@ -509,12 +381,8 @@ fn expected_partitioned_rewrite_categories() -> Vec<(i64, Option<String>)> {
     ]
 }
 
-/// The expected `(id → category)` partition routing for fixture G (multi-bin merge_append):
-/// a-rows = {10,20,30,50,60}; b-rows = {40,55}. All 7 rows must survive the multi-bin merge
-/// and be read from the correct partition (S3 partition-projection lesson binding).
-///
-/// A wrong-partition write (e.g. C2 routed to cat="a" instead of cat="b") passes the `{id,data}`
-/// row compare but is caught here.
+/// Fixture G partition routing: `category="a"` holds {10,20,30,50,60}, `category="b"` holds
+/// {40,55}. Risk pinned: routing C2 to `category="a"` passes the `{id, data}` compare.
 fn expected_multi_bin_merge_append_categories() -> Vec<(i64, Option<String>)> {
     vec![
         (10, Some("a".to_string())),
@@ -752,14 +620,10 @@ async fn write_unpartitioned_eq_delete_file(table: &Table) -> DataFile {
         .expect("one equality-delete file")
 }
 
-// ===========================================================================================
 // Fixture A GEN — Rust writes the merge_append data table for Java to verify.
-// ===========================================================================================
 
-/// Rust performs the SAME merge_append chain as Java's `MergeAppendDataOracle.generate`:
-/// fast_append A(cat=a,ids=10/20/30)+B(cat=b,id=40) → set min-count-to-merge=2 →
-/// merge_append G(cat=a,id=60), landing `final.metadata.json` for the Java verify step.
-/// The real parquet files let Java's `IcebergGenerics` scan actually read and return rows.
+/// Fixture A GEN: the chain of Java's `MergeAppendDataOracle.generate`. Real parquet files let
+/// Java's `IcebergGenerics` scan read rows back.
 #[tokio::test]
 async fn test_merge_append_data_gen_rust_writes_java_readable_table() {
     let Some(gen_dir) = merge_append_data_gen_dir() else {
@@ -814,9 +678,8 @@ async fn test_merge_append_data_gen_rust_writes_java_readable_table() {
         .expect("apply update_table_properties");
     let table = tx.commit(&catalog).await.expect("commit s2 property set");
 
-    // s3 merge_append G (seq 2). With min-count=2 and KB-size manifests vs the 8 MB target, every
-    // manifest lands in ONE bin ⇒ the merge fires into ONE merged manifest carrying A+B as Existing
-    // plus G as Added. Rust must scan ALL three files (no Existing entry silently dropped).
+    // s3 merge_append G (seq 2). KB-size manifests against the 8 MB target all land in one bin, so
+    // the merge produces one manifest with A+B Existing and G Added. Rust must scan all three.
     let tx = Transaction::new(&table);
     let tx = tx
         .merge_append()
@@ -848,9 +711,7 @@ async fn test_merge_append_data_gen_rust_writes_java_readable_table() {
         "Rust scan of the merge_append table must yield {{10,20,30,40,60}} (all rows, no deletes)"
     );
 
-    // Pin the IDENTITY-PARTITION column too: the `{id, data}` compare drops `category`, so a
-    // partition-routing divergence (a row in the wrong partition) would be invisible to it. Assert
-    // each id materialized into the correct partition before handing the table to Java.
+    // The `{id, data}` compare drops `category`, so pin the partition column before Java sees it.
     assert_eq!(
         id_to_category_sorted(&batches),
         expected_merge_append_categories(),
@@ -874,22 +735,14 @@ async fn test_merge_append_data_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture B GEN — Rust writes the rewrite-data table (seq-preservation) for Java to verify.
-//
-// DESIGN: unpartitioned 2-field schema {id, data}, equality delete (not position delete).
-// A position-delete is PATH-BASED: after A→A' the delete on A's path is dangling (A' has a new
-// path) and cannot apply. To prove `data_sequence_number` matters for applicability you MUST use
-// an equality delete (which applies to data files with data_seq STRICTLY LESS than the delete's
-// seq). This is the same design as Java's revised `RewriteFilesDataOracle.generate`.
-// ===========================================================================================
+// The delete must be an EQUALITY delete: a position delete is path-based, so after A→A' it
+// dangles and cannot prove that `data_sequence_number` drives applicability.
 
-/// Rust performs the SAME chain as Java's revised `RewriteFilesDataOracle.generate`:
-/// fast_append A (5 rows, seq 1) → row_delta eq-delete (ids 20+40, seq 2) → rewrite {A}→{A'}
-/// with `data_sequence_number(1)` (seq 3). A' carries data_seq=1 < eq_del.seq=2, so the delete
-/// STILL APPLIES. Live rows = `{10,30,50}`. The transaction for the rewrite is built AFTER the
-/// row_delta commit (tx-captured start = row_delta snapshot = semantic twin of Java's explicit
-/// `validateFromSnapshot(rowDeltaSnapshotId)`).
+/// Fixture B GEN: the chain of Java's revised `RewriteFilesDataOracle.generate`. A' carries
+/// `data_seq=1 < eq_del.seq=2`, so the delete still applies and live rows are `{10,30,50}`. The
+/// rewrite transaction starts AFTER the row_delta commit, so its captured snapshot is the
+/// row_delta snapshot. That is the twin of Java's `validateFromSnapshot(rowDeltaSnapshotId)`.
 #[tokio::test]
 async fn test_rewrite_data_gen_rust_writes_java_readable_seq_preserving_table() {
     let Some(gen_dir) = rewrite_data_gen_dir() else {
@@ -945,10 +798,8 @@ async fn test_rewrite_data_gen_rust_writes_java_readable_seq_preserving_table() 
         .expect("apply row_delta eq-delete");
     let table = tx.commit(&catalog).await.expect("commit b2 row_delta");
 
-    // b3 rewrite_files {A}→{A'} preserving data_sequence_number=1. The transaction is created HERE,
-    // AFTER the row_delta commit, so its tx-captured starting snapshot IS b2 — the semantic twin of
-    // Java's explicit `validateFromSnapshot(rowDeltaSnapshotId)`; the concurrent window is empty.
-    // A' is stamped with data_seq=1 < eq_del.seq=2, so the equality-delete STILL APPLIES to A'.
+    // b3 rewrite_files {A}→{A'} keeps data_sequence_number=1. The transaction starts HERE, after
+    // the row_delta commit, so its captured snapshot is b2 and the concurrent window is empty.
     let tx = Transaction::new(&table);
     let tx = tx
         .rewrite_files(vec![file_a], vec![file_a_prime])
@@ -957,8 +808,7 @@ async fn test_rewrite_data_gen_rust_writes_java_readable_seq_preserving_table() 
         .expect("apply rewrite_files {A}→{A'} with data_sequence_number=1");
     let table = tx.commit(&catalog).await.expect("commit b3 rewrite");
 
-    // Sanity: Rust's OWN scan must yield {10,30,50} (ids 20+40 deleted by eq-delete that still
-    // applies to A' because A'.data_seq=1 < eq_del.seq=2 — seq-preservation holds).
+    // Sanity: Rust's own scan must yield {10,30,50} before Java sees the table.
     let batches: Vec<RecordBatch> = table
         .scan()
         .build()
@@ -998,16 +848,10 @@ async fn test_rewrite_data_gen_rust_writes_java_readable_seq_preserving_table() 
     );
 }
 
-// ===========================================================================================
 // Fixture A comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
-/// Rust reads the JAVA-written merge_append table and compares to `java_merge_append_rows.json`.
-///
-/// This is DIRECTION 1 of fixture A: Java's `MergeAppendDataOracle.generate` wrote a real table
-/// under `<dir>/table`, emitting `java_merge_append_rows.json` as the ground truth. Here Rust
-/// loads the SAME table, runs `scan().to_arrow()`, and asserts the live rows equal the JSON.
-/// This proves Rust reads a merge-appended Java table (carried Existing entries scan correctly).
+/// Direction 1 of fixture A: Rust reads the JAVA-written merge_append table and asserts the live
+/// rows equal `java_merge_append_rows.json`. Carried Existing entries must scan correctly.
 #[tokio::test]
 async fn test_rust_reads_java_merge_append_data_table() {
     let Some(dir) = merge_append_data_dir() else {
@@ -1088,18 +932,11 @@ async fn test_rust_reads_java_merge_append_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture B comparison — Rust reads Java's ground-truth rows (seq-preservation proof).
-// ===========================================================================================
 
-/// Rust reads the JAVA-written rewrite-data table and compares to `java_rewrite_data_rows.json`.
-///
-/// This is DIRECTION 1 of fixture B: Java's revised `RewriteFilesDataOracle.generate` wrote an
-/// unpartitioned 2-field table under `<dir>/table`, emitting `java_rewrite_data_rows.json` as the
-/// ground truth. Here Rust loads the SAME table, runs `scan().to_arrow()`, and asserts the live
-/// rows equal the JSON. The correctness point: ids 20 and 40 must be ABSENT (the equality-delete
-/// at seq 2 applied to A' because A' was stamped with `data_sequence_number=1` via
-/// `rewriteFiles(.., 1L)` in Java; `A'.data_seq=1 < eq_del.seq=2`).
+/// Direction 1 of fixture B: Rust reads the JAVA-written rewrite-data table and asserts the live
+/// rows equal `java_rewrite_data_rows.json`. Ids 20 and 40 must be ABSENT, because Java stamped
+/// A' with `data_sequence_number=1` and the eq-delete at seq 2 still applies to it.
 #[tokio::test]
 async fn test_rust_reads_java_rewrite_data_table() {
     let Some(dir) = rewrite_data_dir() else {
@@ -1173,15 +1010,10 @@ async fn test_rust_reads_java_rewrite_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture C GEN — Rust writes the overwrite_files data table for Java to verify.
-// ===========================================================================================
 
-/// Rust performs the SAME chain as Java's `OverwriteFilesDataOracle.generate`:
-/// fast_append A(cat=a,ids=10/20/30)+B(cat=b,id=40) → overwrite_files DELETE B ADD B'(cat=b,id=41,d'),
-/// landing `final.metadata.json` for the Java verify step.
-/// Correctness point: B (id=40) is GONE; B' (id=41) is PRESENT; A's rows INTACT.
-/// The partition column is pinned: a wrong-partition write of B' is caught by the category assert.
+/// Fixture C GEN: the chain of Java's `OverwriteFilesDataOracle.generate`. B (40) must be gone,
+/// B' (41) present, and A's rows intact.
 #[tokio::test]
 async fn test_overwrite_data_gen_rust_writes_java_readable_table() {
     let Some(gen_dir) = overwrite_data_gen_dir() else {
@@ -1288,16 +1120,10 @@ async fn test_overwrite_data_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture C comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
-/// Rust reads the JAVA-written overwrite table and compares to `java_overwrite_data_rows.json`.
-///
-/// Direction 1 of fixture C: Java's `OverwriteFilesDataOracle.generate` wrote the table under
-/// `<dir>/table`, emitting `java_overwrite_data_rows.json`. Rust loads the SAME table, runs
-/// `scan().to_arrow()`, and asserts the live rows equal the JSON. Correctness point: id=40 absent,
-/// id=41 present, A rows intact. The partition column is pinned via `expected_overwrite_categories`.
+/// Direction 1 of fixture C: Rust reads the JAVA-written overwrite table and asserts the live
+/// rows equal `java_overwrite_data_rows.json`. Id 40 is absent, id 41 present, A's rows intact.
 #[tokio::test]
 async fn test_rust_reads_java_overwrite_data_table() {
     let Some(dir) = overwrite_data_dir() else {
@@ -1381,15 +1207,10 @@ async fn test_rust_reads_java_overwrite_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture D GEN — Rust writes the delete_files data table for Java to verify.
-// ===========================================================================================
 
-/// Rust performs the SAME chain as Java's `DeleteFilesDataOracle.generate`:
-/// fast_append A(cat=a,ids=10/20/30)+B(cat=b,id=40)+C_file(cat=a,id=50,e) →
-/// delete_files {B} by path, landing `final.metadata.json` for the Java verify step.
-/// Correctness point: B (cat=b, id=40) is GONE; A and C_file (cat=a) INTACT.
-/// The partition column is pinned: B's cat="b" rows must be absent; A+C rows must be in cat="a".
+/// Fixture D GEN: the chain of Java's `DeleteFilesDataOracle.generate`. B (cat=b, 40) must be
+/// gone, and A plus C_file (cat=a) intact.
 #[tokio::test]
 async fn test_delete_data_gen_rust_writes_java_readable_table() {
     let Some(gen_dir) = delete_data_gen_dir() else {
@@ -1492,16 +1313,10 @@ async fn test_delete_data_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture D comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
-/// Rust reads the JAVA-written delete table and compares to `java_delete_data_rows.json`.
-///
-/// Direction 1 of fixture D: Java's `DeleteFilesDataOracle.generate` wrote the table under
-/// `<dir>/table`, emitting `java_delete_data_rows.json`. Rust loads the SAME table, runs
-/// `scan().to_arrow()`, and asserts the live rows equal the JSON. Correctness point: id=40 absent,
-/// A and C_file rows intact. The partition column is pinned via `expected_delete_categories`.
+/// Direction 1 of fixture D: Rust reads the JAVA-written delete table and asserts the live rows
+/// equal `java_delete_data_rows.json`. Id 40 is absent, A and C_file rows intact.
 #[tokio::test]
 async fn test_rust_reads_java_delete_data_table() {
     let Some(dir) = delete_data_dir() else {
@@ -1579,19 +1394,10 @@ async fn test_rust_reads_java_delete_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture E GEN — Rust writes the replace_partitions data table for Java to verify.
-//
-// Chain: fast_append A(cat=a,10/20/30)+B(cat=b,40) → replace_partitions E_new(cat=a,11,"a'").
-// ALL of partition a is replaced (A deleted); partition b (B) carries forward with EXISTING
-// manifest status. Live set: {(11,"a'"),(40,"d")}.
-// ===========================================================================================
 
-/// Rust performs the SAME chain as Java's `ReplacePartitionsDataOracle.generate`:
-/// fast_append A+B (seq 1) → replace_partitions E_new(cat=a, id=11, data="a'") (seq 2).
-/// A's rows (10,20,30) must be ABSENT; E_new (id=11) and B (id=40) must be PRESENT.
-/// The partition column is pinned: a wrong-partition write of E_new to cat="b" would be
-/// caught by the category assertion but invisible to the `{id,data}` row compare.
+/// Fixture E GEN: the chain of Java's `ReplacePartitionsDataOracle.generate`. A's rows
+/// (10,20,30) must be absent, and E_new (11) plus B (40) present.
 #[tokio::test]
 async fn test_replace_partitions_data_gen_rust_writes_java_readable_table() {
     let Some(gen_dir) = replace_partitions_data_gen_dir() else {
@@ -1699,17 +1505,11 @@ async fn test_replace_partitions_data_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture E comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
-/// Rust reads the JAVA-written replace_partitions table and compares to
-/// `java_replace_partitions_rows.json`.
-///
-/// Direction 1 of fixture E: Java's `ReplacePartitionsDataOracle.generate` wrote the table under
-/// `<dir>/table`, emitting `java_replace_partitions_rows.json`. Rust loads the SAME table, runs
-/// `scan().to_arrow()`, and asserts the live rows equal the JSON. Correctness point: A's ids
-/// (10,20,30) absent; E_new (id=11) and B (id=40) present. The partition column is pinned.
+/// Direction 1 of fixture E: Rust reads the JAVA-written replace_partitions table and asserts the
+/// live rows equal `java_replace_partitions_rows.json`. Ids 10/20/30 are absent, 11 and 40
+/// present.
 #[tokio::test]
 async fn test_rust_reads_java_replace_partitions_data_table() {
     let Some(dir) = replace_partitions_data_dir() else {
@@ -1800,20 +1600,11 @@ async fn test_rust_reads_java_replace_partitions_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture F GEN — Rust writes the partitioned rewrite_files table for Java to verify.
-//
-// Chain: fast_append A(cat=a,10/20/30)+B(cat=b,40) → row_delta eq-delete(cat=a, id=20, seq 2)
-// → rewrite {A}→{A'} data_seq=1 (seq 3). Eq-delete still applies to A' (1 < 2). B untouched.
-// Live set: {(10,"a"),(30,"c"),(40,"d")}.
-// ===========================================================================================
 
-/// Rust performs the SAME chain as Java's `PartitionedRewriteFilesDataOracle.generate`:
-/// fast_append A+B (seq 1) → row_delta eq-delete(cat=a, id=20) (seq 2) →
-/// rewrite {A}→{A'} with `data_sequence_number(1)` (seq 3).
-/// Correctness point: A' has data_seq=1 < eq_del.seq=2, so id=20 STILL DELETED after the rewrite.
-/// B (id=40, cat=b) is untouched by both the eq-delete (scoped to cat=a) and the rewrite.
-/// Live rows = {(10,a),(30,c),(40,d)}.
+/// Fixture F GEN: the chain of Java's `PartitionedRewriteFilesDataOracle.generate`. A' carries
+/// `data_seq=1 < eq_del.seq=2`, so id 20 stays deleted after the rewrite. B (40, cat=b) is
+/// untouched by the partition-scoped eq-delete and by the rewrite.
 #[tokio::test]
 async fn test_partitioned_rewrite_data_gen_rust_writes_java_readable_table() {
     let Some(gen_dir) = partitioned_rewrite_data_gen_dir() else {
@@ -1876,9 +1667,8 @@ async fn test_partitioned_rewrite_data_gen_rust_writes_java_readable_table() {
         .expect("apply row_delta eq-delete scoped to partition a");
     let table = tx.commit(&catalog).await.expect("commit f2 row_delta");
 
-    // f3 rewrite_files {A}→{A'} preserving data_sequence_number=1. The transaction is created AFTER
-    // the row_delta commit, so its tx-captured starting snapshot IS f2 — the semantic twin of
-    // Java's explicit `validateFromSnapshot(rowDeltaSnapshotId)`. A' carries data_seq=1 < 2.
+    // f3 rewrite_files {A}→{A'} keeps data_sequence_number=1. The transaction starts after the
+    // row_delta commit, so its captured snapshot is f2.
     let tx = Transaction::new(&table);
     let tx = tx
         .rewrite_files(vec![file_a], vec![file_a_prime])
@@ -1941,18 +1731,11 @@ async fn test_partitioned_rewrite_data_gen_rust_writes_java_readable_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture F comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
-/// Rust reads the JAVA-written partitioned-rewrite table and compares to
-/// `java_partitioned_rewrite_rows.json`.
-///
-/// Direction 1 of fixture F: Java's `PartitionedRewriteFilesDataOracle.generate` wrote the table
-/// under `<dir>/table`, emitting `java_partitioned_rewrite_rows.json`. Rust loads the SAME table,
-/// runs `scan().to_arrow()`, and asserts the live rows equal the JSON. Correctness point: id=20
-/// absent (eq-delete at seq 2 applied to A' at data_seq 1); ids {10,30,40} present. Partition
-/// column pinned.
+/// Direction 1 of fixture F: Rust reads the JAVA-written partitioned-rewrite table and asserts
+/// the live rows equal `java_partitioned_rewrite_rows.json`. Id 20 is absent, because the
+/// eq-delete at seq 2 applies to A' at data_seq 1. Ids 10/30/40 are present.
 #[tokio::test]
 async fn test_rust_reads_java_partitioned_rewrite_data_table() {
     let Some(dir) = partitioned_rewrite_data_dir() else {
@@ -2036,26 +1819,11 @@ async fn test_rust_reads_java_partitioned_rewrite_data_table() {
     );
 }
 
-// ===========================================================================================
 // Fixture G GEN — Rust writes the multi-bin merge_append table for Java to verify.
-//
-// Chain: 4 separate fast_appends (each in its own commit → 4 manifests m1..m4):
-//   fast_append A(cat=a,10/20/30) → m1 (seq 1)
-//   fast_append B(cat=b,40)       → m2 (seq 2)
-//   fast_append C1(cat=a,50)      → m3 (seq 3)
-//   fast_append C2(cat=b,55)      → m4 (seq 4)
-// Measure manifest lengths → set target-size-bytes = max_len*2+1 + min-count=2 (no snapshot).
-// merge_append G(cat=a,60) → pack_end yields ≥2 bins of 2 → ≥2 merged manifests (seq 5).
-// All 7 rows survive: A(10/20/30)+B(40)+C1(50)+C2(55)+G(60).
-// ===========================================================================================
 
-/// Rust performs the SAME chain as Java's `MultiBinMergeAppendDataOracle.generate`:
-/// four separate fast_appends → measure manifest sizes → set target-size-bytes=max*2+1 +
-/// min-count=2 → merge_append G, landing `final.metadata.json` for the Java verify step.
-///
-/// Correctness point: all 7 rows survive. The bin-count assertion (≥2 manifests with
-/// existing_files_count > 0) proves the multi-bin merge path fired, not just the single-bin
-/// path covered by fixture A.
+/// Fixture G GEN: the chain of Java's `MultiBinMergeAppendDataOracle.generate`. All 7 rows must
+/// survive. The bin-count assertion (at least 2 manifests with `existing_files_count > 0`) proves
+/// the multi-bin merge path fired, and not the single-bin path fixture A already covers.
 #[tokio::test]
 async fn test_multi_bin_merge_append_data_gen_rust_writes_java_readable_table() {
     let Some(gen_dir) = multi_bin_merge_data_gen_dir() else {
@@ -2091,8 +1859,7 @@ async fn test_multi_bin_merge_append_data_gen_rust_writes_java_readable_table() 
     let file_c2 = write_data_file(&table, &pk_b, "b", vec![55], vec!["f"]).await;
     let file_g = write_data_file(&table, &pk_a, "a", vec![60], vec!["g"]).await;
 
-    // Four SEPARATE fast_appends — each in its own commit — so each produces its own manifest file.
-    // This creates 4 existing manifests m1..m4 that the merge_append G step will bin-pack.
+    // Each fast_append commits separately, so each writes its own manifest for G to bin-pack.
     let tx = Transaction::new(&table);
     let tx = tx
         .fast_append()
@@ -2125,9 +1892,8 @@ async fn test_multi_bin_merge_append_data_gen_rust_writes_java_readable_table() 
         .expect("apply fast_append C2");
     let table = tx.commit(&catalog).await.expect("commit g4 fast_append C2");
 
-    // Measure actual manifest sizes from the manifest-list. The target-size-bytes is set to
-    // max_manifest_size * 2 + 1 so that pack_end fits exactly 2 manifests per bin. With 4
-    // existing manifests, this yields 2 bins of 2, both satisfying min-count=2 → BOTH MERGE.
+    // `target-size-bytes` of `max_manifest_size * 2 + 1` makes a bin hold exactly 2 manifests. Four
+    // manifests then give 2 bins of 2, and both meet min-count=2, so both merge.
     let snapshot = table
         .metadata()
         .current_snapshot()
@@ -2178,9 +1944,8 @@ async fn test_multi_bin_merge_append_data_gen_rust_writes_java_readable_table() 
         .expect("apply merge_append G");
     let table = tx.commit(&catalog).await.expect("commit g6 merge_append G");
 
-    // Assert ≥2 merged manifests (manifests with existing_files_count > 0 in the manifest-list).
-    // This is the BIN-COUNT PROOF: only a multi-bin merge produces multiple manifests with Existing
-    // entries. A single-bin merge (fixture A) produces exactly ONE such manifest.
+    // The bin-count proof: only a multi-bin merge leaves more than one manifest with Existing
+    // entries. The single-bin merge of fixture A leaves exactly one.
     let final_snapshot = table
         .metadata()
         .current_snapshot()
@@ -2257,18 +2022,11 @@ async fn test_multi_bin_merge_append_data_gen_rust_writes_java_readable_table() 
     );
 }
 
-// ===========================================================================================
 // Fixture G comparison — Rust reads Java's ground-truth rows.
-// ===========================================================================================
 
-/// Rust reads the JAVA-written multi-bin merge-append table and compares to
-/// `java_multi_bin_merge_append_rows.json`.
-///
-/// Direction 1 of fixture G: Java's `MultiBinMergeAppendDataOracle.generate` wrote the table
-/// under `<dir>/table`, emitting `java_multi_bin_merge_append_rows.json`. Rust loads the SAME
-/// table, runs `scan().to_arrow()`, and asserts the live rows equal the JSON. Correctness point:
-/// all 7 ids must be present; ≥2 merged manifests each with Existing entries. The partition
-/// column is pinned via `expected_multi_bin_merge_append_categories`.
+/// Direction 1 of fixture G: Rust reads the JAVA-written multi-bin merge-append table and asserts
+/// the live rows equal `java_multi_bin_merge_append_rows.json`. All 7 ids must be present, over
+/// at least 2 merged manifests that each carry Existing entries.
 #[tokio::test]
 async fn test_rust_reads_java_multi_bin_merge_append_data_table() {
     let Some(dir) = multi_bin_merge_data_dir() else {

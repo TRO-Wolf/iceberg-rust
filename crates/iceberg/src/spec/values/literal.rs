@@ -41,17 +41,11 @@ use crate::{Error, ErrorKind};
 pub enum Literal {
     /// A primitive value
     Primitive(PrimitiveLiteral),
-    /// A struct is a tuple of typed values. Each field in the tuple is named and has an integer id that is unique in the table schema.
-    /// Each field can be either optional or required, meaning that values can (or cannot) be null. Fields may be any type.
-    /// Fields may have an optional comment or doc string. Fields can have default values.
+    /// A tuple of typed values. Each field has a name and a schema-unique integer id.
     Struct(Struct),
-    /// A list is a collection of values with some element type.
-    /// The element field has an integer id that is unique in the table schema.
-    /// Elements can be either optional or required. Element types may be any type.
+    /// A collection of values of one element type.
     List(Vec<Option<Literal>>),
-    /// A map is a collection of key-value pairs with a key type and a value type.
-    /// Both the key field and value field each have an integer id that is unique in the table schema.
-    /// Map keys are required and map values can be either optional or required. Both map keys and map values may be any type, including nested types.
+    /// A collection of key-value pairs. Keys are required, values may be optional.
     Map(Map),
 }
 
@@ -499,10 +493,8 @@ impl Literal {
                 (PrimitiveType::Uuid, JsonValue::String(s)) => Ok(Some(Literal::Primitive(
                     PrimitiveLiteral::UInt128(Uuid::parse_str(&s)?.as_u128()),
                 ))),
-                // Java 1.10.0 `SingleValueParser.fromJson` FIXED (L157-170): the hex STRING
-                // length is checked against `2 * fixed length` BEFORE decoding, then
-                // `BaseEncoding.base16().decode(text.toUpperCase(Locale.ROOT))` — mixed-case
-                // input is accepted; odd-length / non-hex input is rejected.
+                // Java `SingleValueParser.fromJson` checks the hex length before it decodes.
+                // Mixed case is accepted. Odd-length or non-hex input is rejected.
                 (PrimitiveType::Fixed(len), JsonValue::String(s)) => {
                     if usize::try_from(*len).ok().and_then(|l| l.checked_mul(2)) != Some(s.len()) {
                         return Err(Error::new(
@@ -517,18 +509,13 @@ impl Literal {
                         hex_str_to_bytes(&s)?,
                     ))))
                 }
-                // Java 1.10.0 `SingleValueParser.fromJson` BINARY (L171-176): same base16
-                // decode, no length constraint.
+                // Java `SingleValueParser.fromJson` applies no length constraint to binary.
                 (PrimitiveType::Binary, JsonValue::String(s)) => Ok(Some(Literal::Primitive(
                     PrimitiveLiteral::Binary(hex_str_to_bytes(&s)?),
                 ))),
-                // Java 1.10.0 `SingleValueParser.fromJson` DECIMAL arm: `isTextual` check, then
-                // `new BigDecimal(text)`, then ONE further precondition —
-                // `bigDecimal.scale() == decimalType.scale()` ("the scale doesn't match", constant
-                // pool #129). There is NO precision check and no re-validation of the type, so a
-                // default/partition value must not be gated on either here. (The fork rescales
-                // instead of requiring an exact scale match; that pre-existing divergence is
-                // tracked separately and is not touched by this change.)
+                // Java `SingleValueParser.fromJson` requires an exact scale match. It applies
+                // no precision check, so do not add one here. The fork rescales instead of
+                // rejecting a scale mismatch. That divergence is tracked in the matrix.
                 (PrimitiveType::Decimal { scale, .. }, JsonValue::String(s)) => {
                     let decimal = decimal_from_str_exact(&s)?;
                     let rescaled = decimal_rescale(decimal, *scale);
@@ -610,9 +597,8 @@ impl Literal {
                     ))
                 }
             }
-            // Java 1.10.0 `SingleValueParser.fromJson` returns null for a null/absent node (any
-            // type), and its switch has no VARIANT case — a non-null variant default falls to the
-            // default branch's `UnsupportedOperationException("Type: %s is not supported")`.
+            // Java `SingleValueParser.fromJson` reads a null node as null for every type. It
+            // has no variant case, so a non-null variant value is unsupported.
             Type::Variant => {
                 if value.is_null() {
                     Ok(None)
@@ -662,9 +648,8 @@ impl Literal {
                     })?;
                     Ok(JsonValue::String(date.to_string()))
                 }
-                // The temporal converters return `None` for an out-of-range stored value; in this
-                // fallible JSON path that is a `DataInvalid` error (never a panic), unlike the
-                // infallible `Display` path which renders a placeholder. Valid values are unchanged.
+                // An out-of-range stored value fails loudly here with `DataInvalid`. The
+                // infallible `Display` path renders a placeholder instead.
                 (PrimitiveType::Time, PrimitiveLiteral::Long(val)) => {
                     let time = time::microseconds_to_time(val).ok_or_else(|| {
                         Error::new(
@@ -718,11 +703,9 @@ impl Literal {
                 (_, PrimitiveLiteral::UInt128(val)) => {
                     Ok(JsonValue::String(Uuid::from_u128(val).to_string()))
                 }
-                // Java 1.10.0 `SingleValueParser.toJson` FIXED (L328-340): the value byte
-                // length is checked against the fixed length, then encoded with
-                // `BaseEncoding.base16().encode(..)` — UPPERCASE, two hex digits per byte.
-                // (The previous catch-all emitted `{x:x}` — lowercase AND unpadded: byte
-                // 0x0A became "a", which no Java reader can decode.)
+                // Java `SingleValueParser.toJson` checks the byte length, then emits UPPERCASE
+                // base16. Two hex digits per byte. Lowercase or unpadded output is unreadable
+                // to Java.
                 (PrimitiveType::Fixed(len), PrimitiveLiteral::Binary(val)) => {
                     if usize::try_from(*len).ok() != Some(val.len()) {
                         return Err(Error::new(
@@ -735,14 +718,12 @@ impl Literal {
                     }
                     Ok(JsonValue::String(bytes_to_hex_str(&val)))
                 }
-                // Java 1.10.0 `SingleValueParser.toJson` BINARY (L341-345): same UPPERCASE
-                // base16 encode, no length constraint.
+                // Java `SingleValueParser.toJson` applies no length constraint to binary.
                 (PrimitiveType::Binary, PrimitiveLiteral::Binary(val)) => {
                     Ok(JsonValue::String(bytes_to_hex_str(&val)))
                 }
-                // Java 1.10.0 `SingleValueParser.toJson` DECIMAL arm writes
-                // `value.toString()` unconditionally — no precision or metadata gate — so the
-                // reverse of the read above stays gate-free too.
+                // Java `SingleValueParser.toJson` writes the decimal unconditionally. Add no
+                // precision gate here, to stay the reverse of the read above.
                 (PrimitiveType::Decimal { scale, .. }, PrimitiveLiteral::Int128(val)) => {
                     let decimal = try_decimal_from_i128_with_scale(val, *scale)?;
                     Ok(JsonValue::String(decimal.to_string()))
@@ -817,13 +798,8 @@ impl Literal {
     }
 }
 
-/// Decode a JSON single-value hex string (spec Appendix D `fixed(L)` / `binary`) to bytes.
-///
-/// Matches Java 1.10.0 `SingleValueParser.fromJson`, which decodes with
-/// `BaseEncoding.base16().decode(text.toUpperCase(Locale.ROOT))` — mixed case is accepted;
-/// odd-length or non-hex input fails closed with `DataInvalid` (Java throws
-/// `IllegalArgumentException` from the strict base16 decoder). A sibling decoder for the
-/// expression wire format lives in `crate::expr::expression_parser::hex_to_bytes`.
+/// Decode a JSON single-value hex string (spec Appendix D `fixed(L)` / `binary`) to bytes. Matches
+/// Java `SingleValueParser.fromJson`. Mixed case is accepted.
 fn hex_str_to_bytes(s: &str) -> Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return Err(Error::new(
@@ -850,8 +826,7 @@ fn hex_str_to_bytes(s: &str) -> Result<Vec<u8>> {
 
 /// Encode bytes as the JSON single-value hex string (spec Appendix D `fixed(L)` / `binary`).
 ///
-/// Matches Java 1.10.0 `SingleValueParser.toJson`, which encodes with
-/// `BaseEncoding.base16().encode(..)` — UPPERCASE, exactly two hex digits per byte.
+/// Matches Java `SingleValueParser.toJson`: UPPERCASE, two hex digits per byte.
 fn bytes_to_hex_str(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {

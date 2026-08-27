@@ -53,21 +53,18 @@ pub(crate) struct CachingDeleteFileLoader {
 enum DeleteFileContext {
     ExistingEqDel,
     ExistingPosDel,
-    /// A positional delete file THIS task claimed. `guard` is that claim: it publishes the file's
-    /// terminal load state and wakes the waiters, on the success path via `publish_loaded` and on
-    /// every failure path (an early `?`, a sibling task's error tearing the stream down, an
-    /// unwind, a runtime shutdown) via its `Drop`. It travels with the context so the claim can
-    /// never outlive the task that made it.
+    /// A positional delete file this task claimed. `guard` is that claim. It publishes the terminal
+    /// load state and wakes the waiters: on success through `publish_loaded`, and on every failure
+    /// path through its `Drop`. It travels with the context, so the claim never outlives its task.
     PosDels {
         guard: PosDelLoadGuard,
         file_path: String,
         stream: ArrowRecordBatchStream,
     },
-    /// A freshly loaded + decoded Puffin deletion vector. The load was claimed under the loader's
-    /// dedup/notify key (`{puffin path}@{blob offset}` — one Puffin file holds many DV blobs, so
-    /// the bare file path would wrongly mark every later blob "already loaded"), which `guard`
-    /// carries; `referenced_data_file` is the data file the vector applies to and the key it is
-    /// installed under in the [`DeleteFilter`].
+    /// A freshly loaded and decoded Puffin deletion vector. `guard` carries the dedup key
+    /// `{puffin path}@{blob offset}`. One Puffin file holds many blobs, so a bare file-path key would
+    /// wrongly mark every later blob loaded. `referenced_data_file` is the data file the vector applies
+    /// to, and the key it is installed under in the [`DeleteFilter`].
     FreshDeletionVector {
         guard: PosDelLoadGuard,
         referenced_data_file: String,
@@ -100,40 +97,22 @@ impl CachingDeleteFileLoader {
         }
     }
 
-    /// Initiates loading of all deletes for all the specified tasks
+    /// Start loading every delete for the given tasks.
     ///
-    /// Returned future completes once all positional deletes and delete vectors
-    /// have loaded. EQ deletes are not waited for in this method but the returned
-    /// DeleteFilter will await their loading when queried for them.
+    /// # Notes
     ///
-    ///  * Create a single stream of all delete file tasks irrespective of type,
-    ///    so that we can respect the combined concurrency limit
-    ///  * We then process each in two phases: load and parse.
-    ///  * for positional deletes the load phase instantiates an ArrowRecordBatchStream to
-    ///    stream the file contents out
-    ///  * for eq deletes, we first check if the EQ delete is already loaded or being loaded by
-    ///    another concurrently processing data file scan task. If it is, we skip it.
-    ///    If not, the DeleteFilter is updated to contain a notifier to prevent other data file
-    ///    tasks from starting to load the same equality delete file. We spawn a task to load
-    ///    the EQ delete's record batch stream, convert it to a predicate, update the delete filter,
-    ///    and notify any task that was waiting for it.
-    ///  * a positional delete in PUFFIN format is a DELETION VECTOR: the load phase does one
-    ///    ranged read of the `deletion-vector-v1` blob (at the manifest's content_offset /
-    ///    content_size_in_bytes) and decodes it; the same notify machinery dedups concurrent
-    ///    loads of one blob under the key `{path}@{offset}`.
-    ///  * The parse phase parses each record batch stream according to its associated data type.
-    ///    The result of this is a map of data file paths to delete vectors for the positional
-    ///    delete tasks (a decoded deletion vector contributes a single entry keyed by its
-    ///    referenced data file). For equality delete file tasks, this results in an unbound
-    ///    Predicate.
-    ///  * The unbound Predicates resulting from equality deletes are sent to their associated oneshot
-    ///    channel to store them in the right place in the delete file managers state.
-    ///  * The results of all of these futures are awaited on in parallel with the specified
-    ///    level of concurrency. Each positional source's parsed map is installed in the state
-    ///    PER SOURCE, under its claim key — NOT merged into one shared data-file-keyed map —
-    ///    so `DeleteFilter::resolve_delete_vector` can scope application to each task's own
-    ///    delete files (Java's per-task `DeleteFilter` over `task.deletes()`).
+    /// The returned future completes once all positional deletes and deletion vectors have loaded.
+    /// This method does not wait for equality deletes. The returned [`DeleteFilter`] awaits those when
+    /// a caller queries them.
     ///
+    /// One stream carries every delete file task, whatever its type, so one concurrency limit covers
+    /// them all. A notifier stops two data-file tasks from loading the same equality delete. A
+    /// positional delete in PUFFIN format is a deletion vector, and its `{path}@{offset}` key dedups
+    /// concurrent loads of one blob.
+    ///
+    /// Each positional source's parsed map installs per source, under its claim key. It never merges
+    /// into one shared data-file-keyed map, so `DeleteFilter::resolve_delete_vector` scopes application
+    /// to each task's own delete files. Java builds one `DeleteFilter` per task.
     ///
     ///  Conceptually, the data flow is like this:
     /// ```none
@@ -173,12 +152,10 @@ impl CachingDeleteFileLoader {
     ) -> Receiver<Result<DeleteFilter>> {
         let (tx, rx) = channel();
 
-        // A data file must carry AT MOST ONE deletion vector. Java rejects the duplicate at
-        // index-build time (`DeleteFileIndex.Builder.add`, DeleteFileIndex.java L528-535:
-        // "Can't index multiple DVs for %s"); the Rust index lookup is infallible by signature,
-        // so the same invalid state is rejected fail-loud HERE, at the load door, before any
-        // vector is installed (silently unioning two DVs would over-delete; keeping one would
-        // resurrect rows).
+        // A data file must carry at most one deletion vector. Java rejects a duplicate in
+        // `DeleteFileIndex.Builder.add`. The Rust index lookup is infallible by signature, so this
+        // load door rejects the same invalid state before any vector is installed. Unioning two
+        // vectors would over-delete, and keeping one would resurrect rows.
         let mut deletion_vector_targets = HashSet::new();
         for entry in delete_file_entries {
             if entry.file_type == DataContentType::PositionDeletes
@@ -231,16 +208,14 @@ impl CachingDeleteFileLoader {
                 while let Some(item) = results_stream.next().await {
                     let item = item?;
                     if let ParsedDeleteFileContext::DelVecs { guard, results } = item {
-                        // Install this source's parsed contribution map UNDER ITS CLAIM KEY —
-                        // kept per source, not merged into shared per-data-file state, so delete
-                        // APPLICATION can scope to each task's own delete files (Java builds one
-                        // `DeleteFilter` per task over `task.deletes()` only; merging here let a
-                        // source loaded for one task delete rows from another task's file).
+                        // Install this source's map under its claim key, not merged into shared
+                        // per-data-file state. Delete application then scopes to each task's own
+                        // delete files. Merging here lets a source loaded for one task delete rows
+                        // from another task's file.
                         del_filter.install_pos_del_contribution(&guard, results);
-                        // Mark the positional delete file as fully loaded so waiters can proceed.
-                        // AFTER the install, and in the same await-free block: a woken waiter
-                        // resolves the contribution synchronously, so publishing first (or being
-                        // cancelled in between) would hand it an absent result.
+                        // Mark the file loaded so waiters proceed. This must come after the install,
+                        // in the same await-free block. A woken waiter resolves the contribution
+                        // synchronously, so publishing first would hand it an absent result.
                         guard.publish_loaded();
                     }
                 }
@@ -262,9 +237,8 @@ impl CachingDeleteFileLoader {
         schema: SchemaRef,
     ) -> Result<DeleteFileContext> {
         match task.file_type {
-            // A position delete in PUFFIN format is a DELETION VECTOR (Java
-            // `ContentFileUtil.isDV`: `format() == FileFormat.PUFFIN`) — it must be routed to
-            // the DV blob loader; handing it to the parquet reader misparses it.
+            // A position delete in PUFFIN format is a deletion vector. It must reach the blob loader.
+            // The parquet reader misparses it.
             DataContentType::PositionDeletes if task.file_format == DataFileFormat::Puffin => {
                 Self::load_deletion_vector_for_task(task, &basic_delete_file_loader, &del_filter)
                     .await
@@ -284,13 +258,10 @@ impl CachingDeleteFileLoader {
                         Ok(DeleteFileContext::ExistingPosDel)
                     }
                     PosDelLoadAction::Load(mut guard) => {
-                        // `guard` is a local: an `Err` from the stream open below returns early and
+                        // `guard` is a local. An `Err` from the stream open below returns early and
                         // drops it, publishing the terminal failed state to every waiter.
-                        // `note_failure` hands that error to the guard first, so the waiters'
-                        // typed error names the cause and not just the file.
-                        //
-                        // Wave B: project only the reserved `file_path` + `pos` columns (falls
-                        // back to a full read if the ProjectionMask cannot be built safely).
+                        // `note_failure` hands the error to the guard first, so the waiters' typed
+                        // error names the cause and not just the file.
                         let stream = basic_delete_file_loader
                             .parquet_positional_delete_batch_stream(
                                 &task.file_path,
@@ -316,15 +287,9 @@ impl CachingDeleteFileLoader {
                 guard.spawn_publisher(receiver);
 
                 // Per the Iceberg spec, evolve schema for equality deletes but only for the
-                // equality_ids columns, not all table columns.
-                //
-                // A malformed or foreign eq-delete task can arrive with `equality_ids: None`
-                // (corrupt/foreign metadata, or a task deserialized from an older shape). Fail
-                // loud with a typed error naming the file rather than `unwrap`-panicking the scan
-                // — Java's `DeleteLoader` likewise throws on malformed delete metadata instead of
-                // crashing. The early return drops `sender`; the eq-delete receiver task turns that
-                // dropped sender into a terminal `EqDelState::Failed` (see
-                // `EqDelLoadGuard::spawn_publisher`), so no waiter is left stranded.
+                // equality_ids columns, not all table columns. A malformed or foreign eq-delete
+                // task can arrive with `equality_ids: None`. Fail loud with a typed error naming
+                // the file, rather than panic the scan on `unwrap`.
                 let Some(equality_ids_vec) = task.equality_ids.clone() else {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
@@ -335,8 +300,8 @@ impl CachingDeleteFileLoader {
                         ),
                     ));
                 };
-                // Wave B: project only the equality_ids key columns from the eq-delete file
-                // (falls back to a full read if the ProjectionMask cannot be built safely).
+                // Project only the equality_ids key columns. The read falls back to a full read when
+                // the ProjectionMask cannot be built safely.
                 let evolved_stream = BasicDeleteFileLoader::evolve_schema(
                     basic_delete_file_loader
                         .parquet_to_batch_stream_with_projection(
@@ -367,12 +332,9 @@ impl CachingDeleteFileLoader {
     /// Loads + decodes one deletion vector blob, deduplicating concurrent loads of the SAME blob
     /// through the positional-delete notify machinery under the key `{puffin path}@{offset}`.
     ///
-    /// Mirrors Java's scan-time DV read (`BaseDeleteLoader.readDV`, BaseDeleteLoader.java
-    /// L171-183): ONE ranged read at `content_offset` of `content_size_in_bytes` bytes — not a
-    /// Puffin footer round-trip (the footer route costs 3+ requests; the manifest already names
-    /// the exact blob range, see the doc comment at L143-147) — then the `deletion-vector-v1`
-    /// deserialization. Metadata validations mirror `BaseDeleteLoader.validateDV` (L266-283) and
-    /// the cardinality check mirrors `BitmapPositionDeleteIndex.deserializeBitmap` (L203-209).
+    /// This mirrors Java's `BaseDeleteLoader.readDV`. It does one ranged read at `content_offset` of
+    /// `content_size_in_bytes` bytes, then the `deletion-vector-v1` deserialization. A Puffin footer
+    /// round-trip costs three or more requests, and the manifest already names the exact blob range.
     async fn load_deletion_vector_for_task(
         task: &FileScanTaskDeleteFile,
         basic_delete_file_loader: &BasicDeleteFileLoader,
@@ -381,11 +343,9 @@ impl CachingDeleteFileLoader {
         let (referenced_data_file, content_offset, content_size_in_bytes) =
             Self::validate_deletion_vector_task(task)?;
 
-        // Claim under the SHARED key derivation (`pos_del_claim_key`) so the key this blob is
-        // loaded + installed under is byte-identical to the key `resolve_delete_vector` looks up
-        // at application time — key drift between the two sides would silently drop the vector.
-        // Validation above guarantees the offset is present and non-negative, so the derivation
-        // cannot fail here; the error arm is defensive, never a panic.
+        // Claim under the shared `pos_del_claim_key` derivation, so the load key is byte-identical to
+        // the key `resolve_delete_vector` looks up. Key drift silently drops the vector. The
+        // validation above guarantees a present, non-negative offset, so the error arm is defensive.
         let cache_key = pos_del_claim_key(task).ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -417,9 +377,8 @@ impl CachingDeleteFileLoader {
                 let delete_vector = DeleteVector::deserialize_deletion_vector_v1(&blob)
                     .map_err(|error| guard.note_failure(error))?;
 
-                // Java validates the decoded cardinality against the DeleteFile's recordCount
-                // (`deserializeBitmap`: "Invalid cardinality: %s, expected %s") — a mismatch
-                // means the manifest and the blob disagree about how many rows are deleted.
+                // Java validates the decoded cardinality against the DeleteFile's recordCount. A
+                // mismatch means the manifest and the blob disagree on how many rows are deleted.
                 if let Some(expected_cardinality) = task.record_count
                     && delete_vector.len() != expected_cardinality
                 {
@@ -443,13 +402,10 @@ impl CachingDeleteFileLoader {
         }
     }
 
-    /// Validates a delete-file task's DV metadata, returning
-    /// `(referenced_data_file, content_offset, content_size_in_bytes)`.
-    ///
-    /// # Notes
-    ///
-    /// The rules live in [`validate_delete_vector_coordinates`] so this path and the public
-    /// writer-side loader cannot drift apart.
+    /// Validates a delete-file task's DV metadata, returning `(referenced_data_file,
+    /// content_offset, content_size_in_bytes)`. # Notes The rules live in
+    /// [`validate_delete_vector_coordinates`] so this path and the public writer-side loader cannot
+    /// drift apart.
     fn validate_deletion_vector_task(task: &FileScanTaskDeleteFile) -> Result<(String, u64, u64)> {
         let coordinates = validate_delete_vector_coordinates(
             &task.file_path,
@@ -486,12 +442,11 @@ impl CachingDeleteFileLoader {
                     results: del_vecs,
                 })
             }
-            // The decoded deletion vector is installed under the DATA FILE it references (the
-            // DV's referenced_data_file) — NOT under the Puffin file's own path: the DeleteFilter
-            // hands a scan task its delete vector by data-file-path lookup, so keying by the
-            // Puffin path would orphan the vector and silently resurrect every deleted row.
-            // `guard` carries the loader's `{path}@{offset}` cache key so the notify machinery
-            // marks the right blob loaded.
+            // Install the decoded vector under the data file it references, never under the Puffin
+            // file's own path. The DeleteFilter hands a scan task its vector by data-file-path
+            // lookup, so a Puffin-path key orphans the vector and resurrects every deleted row.
+            // `guard` carries the `{path}@{offset}` cache key, so the notify machinery marks the
+            // right blob loaded.
             DeleteFileContext::FreshDeletionVector {
                 guard,
                 referenced_data_file,
@@ -521,23 +476,9 @@ impl CachingDeleteFileLoader {
         }
     }
 
-    /// Checked conversion of one position-delete row's `pos` value (untrusted i64 from the
-    /// delete file) into a bitmap position.
-    ///
-    /// A corrupt delete file can carry a negative position; the old `pos as u64` wrapped it to
-    /// a huge position that matches no row, so the delete silently failed OPEN (deleted rows
-    /// resurrect) — the highest-severity silent-corruption class. Java fails loud on the same
-    /// input: `BitmapPositionDeleteIndex.delete(long)` (BitmapPositionDeleteIndex.java L66-68)
-    /// → `RoaringPositionBitmap.set(long)` (L73-74) → `validatePosition`
-    /// (RoaringPositionBitmap.java L311-316), which throws `IllegalArgumentException`
-    /// ("Bitmap supports positions that are >= 0 and <= %s: %s"). Parity nuance: Java's upper
-    /// bound `MAX_POSITION` (0x7FFF_FFFE_8000_0000, a roaring 32-bit key-space limit below
-    /// `i64::MAX`) is NOT mirrored — Rust's `RoaringTreemap` supports the full u64 position
-    /// range, so only the negative bound applies here.
-    ///
-    /// `delete_file_path` is the position-delete file being parsed; `data_file_path` is the
-    /// data file the row points at — both are named in the error so the corrupt file is
-    /// identifiable from logs alone.
+    /// Convert one position-delete row's untrusted `pos` value into a bitmap position. # Errors
+    /// Fails on a negative position. A `pos as u64` cast wraps it to a huge position that matches
+    /// no row, so the delete fails open and the deleted rows resurrect.
     fn checked_delete_position(
         delete_file_path: &str,
         data_file_path: &str,
@@ -568,11 +509,9 @@ impl CachingDeleteFileLoader {
             let batch = batch?;
             let columns = batch.columns();
 
-            // This reader takes the two spec-required columns POSITIONALLY (`file_path` then
-            // `pos` — Java `MetadataColumns.DELETE_FILE_PATH` / `DELETE_FILE_POS`). A delete
-            // file is untrusted input read from object storage, so a batch with fewer than two
-            // columns must fail closed with a typed error naming the file: indexing it would
-            // abort the scan task's process, and a `panic` is not a diagnosis.
+            // This reader takes the two spec-required columns positionally: `file_path`, then `pos`. A
+            // delete file is untrusted input, so a batch with fewer than two columns fails closed with
+            // a typed error naming the file. An index panic here aborts the scan task's process.
             let [file_paths, positions, ..] = columns else {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -597,21 +536,15 @@ impl CachingDeleteFileLoader {
                 ));
             };
 
-            // Position-delete files are sorted by (path, pos), so equal paths arrive in CONTIGUOUS
-            // runs. Cache the delete vector for the LAST-SEEN path and only re-resolve the map entry
-            // (allocating an owned `String` key) when the path changes — instead of allocating a
-            // `String` and hashing the map for EVERY row. The resulting map is identical to the
-            // per-row form: same keys, same positions inserted in the same order (a sorted file has
-            // one run per path; an unsorted file still lands every position in the right entry, it
-            // just re-resolves on each path change). `current` holds the path string and its vector;
-            // we splice the vector back into the map on each change and at end-of-batch.
+            // Position-delete files sort by (path, pos), so equal paths arrive in contiguous runs.
+            // `current` caches the last-seen path and its vector, and the code re-resolves the map
+            // entry only when the path changes. The resulting map matches the per-row form exactly.
+            // An unsorted file still lands every position in the right entry; it only re-resolves more
+            // often. The vector splices back into the map on each change and at end-of-batch.
             let mut current: Option<(&str, DeleteVector)> = None;
             for (file_path, pos) in file_paths.iter().zip(positions.iter()) {
-                // Both columns are REQUIRED by the spec (Java `MetadataColumns.DELETE_FILE_POS`,
-                // MetadataColumns.java L70-74, is `NestedField.required`; Java's read path NPEs
-                // unboxing a null — `Deletes.toPositionIndexes`, Deletes.java L146). A null in
-                // either column is corrupt input: fail closed with a typed error naming the
-                // delete file, never panic and never skip the row.
+                // The spec requires both columns. A null in either is corrupt input. Fail closed with
+                // a typed error naming the delete file. Never panic, and never skip the row.
                 let Some(file_path) = file_path else {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,
@@ -640,9 +573,8 @@ impl CachingDeleteFileLoader {
                         )?);
                     }
                     _ => {
-                        // Flush the previous run's vector back into the map (merging if the path
-                        // recurs in a later, non-contiguous run), then start the new path's run from
-                        // whatever positions the map already holds for it.
+                        // Flush the previous run's vector into the map, merging when the path recurs in
+                        // a later run. Then start the new run from the positions the map already holds.
                         if let Some((path, vector)) = current.take() {
                             *result.entry(path.to_string()).or_default() |= vector;
                         }
@@ -665,10 +597,12 @@ impl CachingDeleteFileLoader {
         Ok(result)
     }
 
-    /// Parse an equality-delete file's record-batch stream into its SURVIVAL [`Predicate`] — a row that
-    /// does NOT match any of the file's delete tuples (so a row the eq-delete DELETES makes this
-    /// predicate false). `pub(crate)` so the `ConvertEqualityDeleteFiles` maintenance action can reuse
-    /// the exact read-side parse to build the same predicate it inverts to find matching positions.
+    /// Parse an equality-delete file's record-batch stream into its survival [`Predicate`]. The
+    /// predicate is false for a row the equality delete removes.
+    ///
+    /// # Notes
+    ///
+    /// It is `pub(crate)` so `ConvertEqualityDeleteFiles` reuses the exact read-side parse.
     pub(crate) async fn parse_equality_deletes_record_batch_stream(
         stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
@@ -680,14 +614,11 @@ impl CachingDeleteFileLoader {
         )
     }
 
-    /// Like [`parse_equality_deletes_record_batch_stream`], but ALSO returns the hashed
-    /// [`EqDeleteKeySet`] accelerator when (and only when) every key column's type is eligible for
-    /// the O(R) set fast path (`EqDeleteKeySet::is_eligible_type`). The predicate is built EXACTLY as
-    /// before — it remains the authoritative oracle and the fallback — so a `None` set simply means
-    /// "apply via the predicate path." The set's delete tuples and the predicate's per-row leaves are
-    /// produced from the SAME decoded [`Datum`]s, so they encode the identical delete condition.
-    ///
-    /// [`parse_equality_deletes_record_batch_stream`]: Self::parse_equality_deletes_record_batch_stream
+    /// Like [`parse_equality_deletes_record_batch_stream`], but it also returns the hashed
+    /// [`EqDeleteKeySet`] accelerator when every key column type is eligible for the set fast path.
+    /// The predicate stays the authoritative oracle and the fallback, so a `None` set means "apply
+    /// through the predicate path". The set's tuples and the predicate's leaves come from the same
+    /// decoded [`Datum`]s, so they encode the identical delete condition.
     #[allow(clippy::type_complexity)]
     pub(crate) async fn parse_equality_deletes_with_keyset(
         mut stream: ArrowRecordBatchStream,
@@ -720,11 +651,10 @@ impl CachingDeleteFileLoader {
                 }
             };
 
-            // Push every struct's validity down into its fields BEFORE the visit: the processor
-            // below collects each key column as a STANDALONE array, so a key nested under a NULL
-            // struct would otherwise decode to whatever bytes happen to sit in the child buffer
-            // (Arrow does not require a null struct to mask its children) and produce
-            // `= <stale value>` instead of `IS NULL`.
+            // Push every struct's validity down into its fields before the visit. The processor below
+            // collects each key column as a standalone array. Arrow does not require a null struct to
+            // mask its children, so a key under a null struct would otherwise decode to stale child
+            // bytes and produce `= <stale value>` instead of `IS NULL`.
             let root_array: ArrayRef = propagate_struct_validity(
                 &(Arc::new(StructArray::from(record_batch)) as ArrayRef),
             )?;
@@ -751,11 +681,9 @@ impl CachingDeleteFileLoader {
                 key_columns = Some(columns);
             }
 
-            // Process the collected columns in lockstep.
-            // FK1: when every key column is set-eligible, skip per-row survival-predicate
-            // construction during the stream (the Θ(E) tree is built once after, from the
-            // collected tuples, and only because the null-batch fallback still needs it).
-            // When ineligible, collect predicates only (no set tuples).
+            // Process the collected columns in lockstep. When every key column is set-eligible, skip
+            // per-row predicate construction during the stream. The tree is built once afterwards,
+            // only because the null-batch fallback needs it. When ineligible, collect predicates only.
             #[allow(clippy::len_zero)]
             while datum_columns_with_names[0].0.len() > 0 {
                 if set_eligible {
@@ -786,12 +714,11 @@ impl CachingDeleteFileLoader {
             }
         }
 
-        // Build the set accelerator iff every key column was eligible. `try_build` re-checks the
-        // gate (defence in depth) and returns `None` for an empty / ineligible key schema.
+        // Build the set accelerator only when every key column was eligible. `try_build` re-checks the
+        // gate and returns `None` for an empty or ineligible key schema.
         let key_set = if set_eligible {
-            // Rebuild the survival predicate from the same tuples the set encodes — needed for
-            // null-batch fallback (delete_mask → None). Distinct from the old path only in that
-            // intermediate per-row Predicate objects were not allocated during the stream.
+            // Rebuild the survival predicate from the same tuples the set encodes. The null-batch
+            // fallback needs it.
             if let Some(columns) = key_columns.as_ref() {
                 for tuple in &delete_tuples {
                     let mut row_predicate = AlwaysTrue;
@@ -837,11 +764,10 @@ impl CachingDeleteFileLoader {
 struct EqDelColumnProcessor<'a> {
     equality_ids: &'a HashSet<i32>,
     collected_columns: Vec<(ArrayRef, i32, String, Type)>,
-    /// The names of the struct fields currently being descended through, outermost first. A
-    /// collected key's [`Reference`] name must be the FULL dotted path (`outer.inner`) because
-    /// that is what `Schema::name_to_id` indexes and therefore the only form
-    /// [`crate::expr::Bind`] can resolve — a leaf-only name either fails to bind or, when a
-    /// top-level column shares the leaf name, binds to the wrong column.
+    /// The struct field names currently being descended through, outermost first. A collected key's
+    /// [`Reference`] name must be the full dotted path, because `Schema::name_to_id` indexes that form
+    /// and [`crate::expr::Bind`] resolves only that form. A leaf-only name either fails to bind, or
+    /// binds to the wrong column when a top-level column shares the leaf name.
     field_path: Vec<String>,
 }
 
@@ -915,9 +841,8 @@ impl SchemaWithPartnerVisitor<ArrayRef> for EqDelColumnProcessor<'_> {
         Ok(())
     }
 
-    /// `before_struct_field` / `after_struct_field` bracket the visit of ONE struct field, so
-    /// pushing here and popping there leaves [`Self::field_path`] holding exactly the ANCESTORS of
-    /// the field `field()` is called with (the visitor calls `after_struct_field` before `field`).
+    /// `before_struct_field` and `after_struct_field` bracket the visit of one struct field. Pushing
+    /// here and popping there leaves [`Self::field_path`] holding exactly that field's ancestors.
     fn before_struct_field(&mut self, field: &NestedFieldRef, _partner: &ArrayRef) -> Result<()> {
         self.field_path.push(field.name.clone());
         Ok(())
@@ -1077,18 +1002,16 @@ mod tests {
         .expect("error parsing batch stream");
         println!("{parsed_eq_delete}");
 
-        // `sa` (field id 6) lives inside the struct column `s` (field id 5), so its reference is
-        // `s.sa` — the form `Schema::name_to_id` indexes and the only one `Bind` can resolve. This
-        // expectation previously read a leaf-only `sa`, which is unbindable (WG5 (b)).
+        // `sa` lives inside the struct column `s`, so its reference is `s.sa`. That is the form
+        // `Schema::name_to_id` indexes, and the only one `Bind` resolves.
         let expected = "(((((y != 1) OR (z != 100)) OR (a != \"HELP\")) OR (s.sa != 4)) OR (b != 62696E6172795F64617461)) AND (((((y != 2) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR (s.sa != 5)) OR (b IS NOT NULL))".to_string();
 
         assert_eq!(parsed_eq_delete.to_string(), expected);
     }
 
-    /// Build an in-memory equality-delete batch whose key column is NESTED:
-    /// `struct<1: id required int, 2: nested optional struct<3: k optional int>>`, with
-    /// `nested` NULL on row 0 while the `k` slot underneath still holds a live `7` (Arrow does not
-    /// require a null struct to mask its children). Row 1 is fully live with `k = 9`.
+    /// Build an in-memory equality-delete batch whose key column is nested. Row 0's `nested` struct is
+    /// null while the `k` slot underneath still holds a live `7`, because Arrow does not require a null
+    /// struct to mask its children. Row 1 is fully live with `k = 9`.
     fn nested_key_equality_delete_batch() -> RecordBatch {
         let k_field = Arc::new(simple_field("k", DataType::Int32, true, "3"));
         let k_values = Arc::new(Int32Array::from(vec![Some(7), Some(9)])) as ArrayRef;
@@ -1127,13 +1050,11 @@ mod tests {
             .expect("nested key table schema")
     }
 
-    /// WG5 (b): a nested equality-delete key must decode as the value the ROW logically holds.
-    /// Row 0's `nested` struct is NULL, so its key is NULL — Java's delete set compares
-    /// `StructLike`s, where a null parent yields a null key and matches only other NULLs. Handing
-    /// the `k` child back detached from its parent turns that into an equality against the stale
-    /// `7` that happens to sit in the child buffer: the delete then removes rows that hold 7 and
-    /// misses the rows it was written for. It also pins the reference NAME: `Schema::name_to_id`
-    /// indexes nested fields by their FULL dotted path, so a leaf-only `k` cannot bind.
+    /// A nested equality-delete key must decode as the value the row logically holds. Row 0's `nested`
+    /// struct is null, so its key is null, and a null key matches only other nulls. Handing the `k`
+    /// child back detached from its parent turns that into an equality against the stale `7` in the
+    /// child buffer. The delete then removes rows holding 7 and misses the rows it was written for.
+    /// This also pins the reference name: a leaf-only `k` cannot bind.
     #[tokio::test]
     async fn test_nested_equality_delete_key_uses_parent_validity_and_full_name() {
         use futures::stream;
@@ -1156,10 +1077,9 @@ mod tests {
         );
     }
 
-    /// The consequence of the name half of the test above: the parsed predicate is bound against
-    /// the TABLE schema at `DeleteFilter::build_equality_delete_predicate`. A leaf-only reference
-    /// either fails to bind outright or — when a top-level column shares the leaf name — binds to
-    /// the WRONG column and deletes silently wrong rows.
+    /// The name half of the test above. `DeleteFilter::build_equality_delete_predicate` binds the
+    /// parsed predicate against the table schema. A leaf-only reference either fails to bind, or binds
+    /// to the wrong column when a top-level column shares the leaf name, and deletes wrong rows.
     #[tokio::test]
     async fn test_nested_equality_delete_predicate_binds_to_table_schema() {
         use futures::stream;
@@ -1183,13 +1103,12 @@ mod tests {
         );
     }
 
-    /// Risk pinned (audit BUG-004): an equality-delete task with `equality_ids: None` — corrupt or
-    /// foreign metadata, or a task deserialized from an older shape — must surface a typed
-    /// `DataInvalid` error naming the delete file, NOT panic the scan on `Option::unwrap`. A REAL
-    /// eq-delete parquet file is used so the ONLY defect is the missing equality_ids (the guard
-    /// fires before the file is opened). MUTATION: restoring `task.equality_ids.clone().unwrap()`
-    /// panics the load task, which drops the result sender; the loader channel then yields
-    /// `RecvError` and the `.expect("loader channel ...")` below fails RED.
+    /// An equality-delete task with `equality_ids: None` must surface a typed `DataInvalid` error
+    /// naming the delete file, not panic the scan on `Option::unwrap`. The fixture uses a real
+    /// eq-delete parquet file, so the missing equality_ids is the only defect.
+    ///
+    /// Mutation: restore `task.equality_ids.clone().unwrap()` and the load task panics, dropping the
+    /// result sender. The loader channel then yields `RecvError` and the `.expect` below fails red.
     #[tokio::test]
     async fn test_eq_delete_missing_equality_ids_yields_typed_error_not_panic() {
         let tmp_dir = TempDir::new().expect("tempdir");
@@ -1235,12 +1154,10 @@ mod tests {
         );
     }
 
-    /// M5 equivalence: the interned `parse_positional_deletes_record_batch_stream` must build the
-    /// EXACT same `HashMap<path, DeleteVector>` as a straightforward per-row reference, including the
-    /// edge cases the run-cache must get right: contiguous runs of one path, MULTIPLE positions for a
-    /// path, a path that RECURS in a later non-contiguous run (forcing the merge-back branch), and
-    /// positions split across two batches. A `DeleteVector` is a set, so duplicate positions collapse
-    /// — both paths must agree on the final position set per file.
+    /// The run-cached parse must build the same `HashMap<path, DeleteVector>` as a per-row reference.
+    /// The fixture covers the edge cases the run cache must get right: contiguous runs of one path,
+    /// several positions for one path, a path that recurs in a later non-contiguous run, and positions
+    /// split across two batches. A `DeleteVector` is a set, so duplicate positions collapse.
     #[tokio::test]
     async fn test_parse_positional_deletes_interning_matches_per_row_reference() {
         use futures::stream;
@@ -1282,9 +1199,8 @@ mod tests {
             .unwrap()
         };
 
-        // Batch 1: a, b, a, b, a — "a" and "b" each RECUR in non-contiguous runs, so the SECOND
-        // flush of each merges onto a map entry that is already non-empty (exercises the `|=`
-        // merge-back, not just insert-into-empty). Includes a duplicate position for "a".
+        // Batch 1 is a, b, a, b, a. Both paths recur in non-contiguous runs, so the second flush of
+        // each merges onto a non-empty map entry. It also includes a duplicate position for "a".
         let b1 = mk(
             vec![
                 "a.parquet",
@@ -1327,10 +1243,9 @@ mod tests {
         assert_eq!(expected.get("c.parquet").unwrap().as_slice(), &[1, 2]);
     }
 
-    /// Write a REAL positional-delete parquet file with the spec's `file_path`/`pos` columns
-    /// (reserved field ids 2147483546 / 2147483545). `pos` is written as a NULLABLE Int64 so
-    /// corrupt fixtures (null positions) are expressible; conforming writers never emit nulls
-    /// there (the column is required by the spec).
+    /// Write a real positional-delete parquet file with the spec's `file_path` and `pos` columns.
+    /// `pos` is nullable here so corrupt fixtures are expressible. The spec requires the column, so a
+    /// conforming writer never emits a null there.
     fn write_pos_del_parquet(
         dir: &std::path::Path,
         file_name: &str,
@@ -1401,9 +1316,8 @@ mod tests {
         }
     }
 
-    /// Production `load_deletes` path projects path+pos (Wave B) and must
-    /// still install correct positions when the on-disk file carries the optional third `row`
-    /// column. Pins the CachingDeleteFileLoader → projection → parse seam (not just in-memory parse).
+    /// The `load_deletes` path projects path and pos. It must still install correct positions when the
+    /// file carries the optional third `row` column. This pins the loader, projection, and parse seam.
     #[tokio::test]
     async fn test_load_deletes_pos_delete_with_row_column_projects_and_applies() {
         let tmp_dir = TempDir::new().expect("tempdir");
@@ -1464,18 +1378,10 @@ mod tests {
         );
     }
 
-    /// Risk pinned (audit BUG-005, run-continuation insert site): a NEGATIVE position in a
-    /// position-delete file must fail CLOSED with a typed `DataInvalid` error naming the
-    /// delete file and the offending position — the pre-change `pos as u64` wrapped -1 to
-    /// u64::MAX, which matches no row, so the delete silently failed OPEN and the deleted row
-    /// RESURRECTED. The negative row is the SECOND row of a same-path run, so it is converted
-    /// by the run-continuation branch (restoring `pos as u64` at that site turns exactly this
-    /// test RED via a successful load). Java parity: `BitmapPositionDeleteIndex.delete(long)`
-    /// → `RoaringPositionBitmap.set` → `validatePosition` (RoaringPositionBitmap.java
-    /// L311-316, 1.10.0) throws IllegalArgumentException for pos < 0 — fail-loud in both
-    /// implementations. Named divergence: Java's upper bound MAX_POSITION
-    /// (0x7FFF_FFFE_8000_0000, a roaring key-space limit) is NOT mirrored; Rust's
-    /// RoaringTreemap supports the full u64 position range.
+    /// A negative position must fail closed with a typed `DataInvalid` error naming the delete file
+    /// and the position. A `pos as u64` cast wraps -1 to `u64::MAX`, which matches no row, so the
+    /// delete fails open and the deleted row resurrects. Java's
+    /// `RoaringPositionBitmap.validatePosition` also throws below zero.
     #[tokio::test]
     async fn test_negative_position_in_run_fails_closed_with_data_invalid() {
         let tmp_dir = TempDir::new().expect("tempdir");
@@ -1508,10 +1414,8 @@ mod tests {
         );
     }
 
-    /// Risk pinned (audit BUG-005, new-path-run insert site): the same fail-closed bar when
-    /// the negative position is the FIRST row of a path's run, which is converted by the
-    /// new-path branch of the run cache (restoring `pos as u64` at that site turns exactly
-    /// this test RED, independently of the run-continuation site).
+    /// The same fail-closed bar when the negative position is the first row of a path's run, which the
+    /// new-path branch converts. Restoring `pos as u64` at that site alone turns this test red.
     #[tokio::test]
     async fn test_negative_first_position_of_path_run_fails_closed() {
         let tmp_dir = TempDir::new().expect("tempdir");
@@ -1544,12 +1448,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned (audit BUG-005): a NULL position reaching the production loader path must
-    /// surface as a typed `DataInvalid` error naming the delete file — never a panic and
-    /// never a silently skipped row. The `pos` column is REQUIRED by the spec (Java
-    /// `MetadataColumns.DELETE_FILE_POS`, MetadataColumns.java L70-74 is
-    /// `NestedField.required`); Java's reader fails loud unboxing the null
-    /// (`Deletes.toPositionIndexes`, Deletes.java L146 — NPE), typed here.
+    /// A null position reaching the loader must surface as a typed `DataInvalid` error naming the
+    /// delete file. It must never panic, and never skip the row. The spec requires the `pos` column,
+    /// and Java's `Deletes.toPositionIndexes` also fails loud on a null there.
     #[tokio::test]
     async fn test_null_position_yields_typed_error_not_panic() {
         let tmp_dir = TempDir::new().expect("tempdir");
@@ -1580,14 +1481,12 @@ mod tests {
         );
     }
 
-    /// Risk pinned: a position-delete batch with FEWER than the two columns this reader takes
-    /// positionally fails closed with a typed error naming the delete file, instead of
-    /// panicking on `columns[0]` / `columns[1]`.
+    /// A position-delete batch with fewer than two columns fails closed with a typed error naming the
+    /// delete file, instead of panicking on `columns[0]` or `columns[1]`.
     ///
-    /// Both arities are exercised separately because they are two distinct unchecked indexes:
-    /// a one-column batch only reaches `columns[1]`, and a zero-column batch only reaches
-    /// `columns[0]`. A delete file is untrusted input read from object storage, and this parse
-    /// runs inside a long-running engine's scan task, where an index panic aborts the process.
+    /// Both arities run separately, because they are two distinct unchecked indexes. A one-column batch
+    /// reaches only `columns[1]`, and a zero-column batch reaches only `columns[0]`. A delete file is
+    /// untrusted input, and an index panic in a scan task aborts the engine process.
     #[tokio::test]
     async fn test_short_column_arity_yields_typed_error_not_panic() {
         use arrow_array::RecordBatchOptions;
@@ -1634,15 +1533,12 @@ mod tests {
         }
     }
 
-    /// Over-firing CONTROL for the arity guard: a position-delete batch with MORE than two
-    /// columns must still parse from the first two.
+    /// The over-firing control for the arity guard. A batch with more than two columns must still parse
+    /// from the first two.
     ///
-    /// This is not hypothetical. The spec's position-delete schema has an optional third
-    /// column, `row` (Java `MetadataColumns.DELETE_FILE_ROW_FIELD_NAME`), which Java writes
-    /// whenever the writer is configured to keep the deleted row, and `parquet_to_batch_stream`
-    /// applies NO projection — every column in the file reaches this parse. A guard demanding
-    /// exactly two columns would reject those Java-written files, so the `..` in the arity
-    /// pattern is load-bearing and this test is what holds it.
+    /// The spec's position-delete schema has an optional third `row` column, which Java writes when the
+    /// writer keeps the deleted row. A guard demanding exactly two columns rejects those files, so the
+    /// `..` in the arity pattern is load-bearing and this test holds it.
     #[tokio::test]
     async fn test_position_delete_batch_with_a_trailing_row_column_still_parses() {
         use futures::stream;
@@ -1678,10 +1574,9 @@ mod tests {
         assert!(!deletes.contains(4), "position 4 must NOT be deleted");
     }
 
-    /// Risk pinned: a NULL file_path row fails closed with a typed error naming the delete
-    /// file — the sibling required column of the null-position case (replacing the guard
-    /// with an unwrap panics this test). Built as an in-memory batch because the parquet
-    /// fixture writer declares file_path non-nullable.
+    /// A null `file_path` row fails closed with a typed error naming the delete file. Replacing the
+    /// guard with an unwrap panics this test. The fixture is an in-memory batch, because the parquet
+    /// fixture writer declares `file_path` non-nullable.
     #[tokio::test]
     async fn test_null_file_path_yields_typed_error_not_panic() {
         use futures::stream;
@@ -1715,11 +1610,9 @@ mod tests {
         );
     }
 
-    /// Happy-path CONTROL for the fail-closed guards (over-broaden direction): the SAME
-    /// fixture shape with valid positions — including the BOUNDARY pos = 0, the smallest
-    /// legal position — must load and apply the delete correctly. An over-broadened guard
-    /// (e.g. rejecting `pos <= 0` instead of `pos < 0`) turns this test RED; the negative
-    /// tests alone cannot catch an over-firing guard.
+    /// The happy-path control for the fail-closed guards. The same fixture shape with valid positions,
+    /// including the boundary `pos = 0`, must load and apply correctly. An over-broadened guard that
+    /// rejects `pos <= 0` turns this test red. The negative tests alone cannot catch that.
     #[tokio::test]
     async fn test_valid_positions_including_zero_boundary_still_apply() {
         let tmp_dir = TempDir::new().expect("tempdir");
@@ -1866,11 +1759,9 @@ mod tests {
         assert!(result.is_none()); // no pos dels for file 3
     }
 
-    /// Verifies that evolve_schema on partial-schema equality deletes works correctly
-    /// when only equality_ids columns are evolved, not all table columns.
-    ///
-    /// Per the [Iceberg spec](https://iceberg.apache.org/spec/#equality-delete-files),
-    /// equality delete files can contain only a subset of columns.
+    /// `evolve_schema` must evolve only the equality_ids columns, not every table column. Per the
+    /// [Iceberg spec](https://iceberg.apache.org/spec/#equality-delete-files), an equality delete file
+    /// may hold a subset of the columns.
     #[tokio::test]
     async fn test_partial_schema_equality_deletes_evolve_succeeds() {
         let tmp_dir = TempDir::new().unwrap();
@@ -1964,8 +1855,7 @@ mod tests {
         assert_eq!(data_col.value(2), "g");
     }
 
-    /// Test loading a FileScanTask with BOTH positional and equality deletes.
-    /// Verifies the fix for the inverted condition that caused "Missing predicate for equality delete file" errors.
+    /// Load a FileScanTask carrying both positional and equality deletes.
     #[tokio::test]
     async fn test_load_deletes_with_mixed_types() {
         use crate::scan::FileScanTask;
@@ -2086,9 +1976,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Verify both delete types can be processed together. BOUNDED: this call can reach the
-        // eq-delete wait path (the publisher runs on its own task), so a lost-wakeup regression
-        // would hang the test binary forever instead of failing it.
+        // This call is bounded on purpose. It can reach the eq-delete wait path, so a lost-wakeup
+        // regression would hang the test binary forever instead of failing it.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             delete_filter.build_equality_delete_predicate(&file_scan_task),
@@ -2149,10 +2038,9 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// Write a REAL Puffin file containing one `deletion-vector-v1` blob for
-    /// `referenced_data_file` with the given deleted positions, and return
-    /// `(puffin_path, content_offset, content_size_in_bytes)` read back from the Puffin footer
-    /// (the same coordinates a manifest's `DeleteFile` would carry).
+    /// Write a real Puffin file holding one `deletion-vector-v1` blob for `referenced_data_file`, and
+    /// return the blob coordinates read back from the footer. A manifest's `DeleteFile` carries the
+    /// same coordinates.
     async fn write_dv_puffin_file(
         file_io: &FileIO,
         dir: &std::path::Path,
@@ -2195,8 +2083,7 @@ mod tests {
             .expect("add DV blob");
         writer.close().await.expect("close puffin writer");
 
-        // Read the blob coordinates back from the footer — exactly what BaseDVFileWriter records
-        // into the DeleteFile's content_offset / content_size_in_bytes.
+        // Read the blob coordinates back from the footer. `BaseDVFileWriter` records the same values.
         let input_file = file_io.new_input(&puffin_path).expect("new input");
         let puffin_reader = PuffinReader::new(input_file);
         let footer = puffin_reader.file_metadata().await.expect("read footer");
@@ -2208,9 +2095,8 @@ mod tests {
         )
     }
 
-    /// Write a REAL Puffin file containing MULTIPLE `deletion-vector-v1` blobs (one per
-    /// `(referenced_data_file, positions)` pair, in order) and return
-    /// `(puffin_path, vec![(content_offset, content_size_in_bytes)])` read back from the footer.
+    /// Write a real Puffin file holding one `deletion-vector-v1` blob per input pair, in order, and
+    /// return the blob coordinates read back from the footer.
     async fn write_multi_dv_puffin_file(
         file_io: &FileIO,
         dir: &std::path::Path,
@@ -2292,11 +2178,9 @@ mod tests {
         }
     }
 
-    /// Risk pinned: the loader DISPATCH — a position delete in PUFFIN format must be routed to
-    /// the DV blob decoder, not `parquet_to_batch_stream` (which would fail on Puffin bytes —
-    /// the pre-change behavior). The decoded positions must be installed under the REFERENCED
-    /// data file and ONLY there: not under the Puffin file's own path (the mutation-(b)
-    /// sentinel) and not under a sibling data file.
+    /// The loader dispatch. A position delete in PUFFIN format must reach the blob decoder, not
+    /// `parquet_to_batch_stream`, which fails on Puffin bytes. The decoded positions must land under
+    /// the referenced data file and nowhere else, neither the Puffin path nor a sibling data file.
     #[tokio::test]
     async fn test_dv_routes_to_dv_loader_and_keys_by_referenced_data_file() {
         let tmp_dir = TempDir::new().unwrap();
@@ -2338,8 +2222,8 @@ mod tests {
         );
     }
 
-    /// Risk pinned: cache-hit semantics — loading the same DV blob twice through one loader must
-    /// reuse the first decoded vector (`{path}@{offset}` dedup), not decode + union a second copy.
+    /// Cache-hit semantics. Loading one blob twice through one loader reuses the first decoded vector
+    /// under the `{path}@{offset}` dedup, instead of decoding and unioning a second copy.
     #[tokio::test]
     async fn test_dv_second_load_reuses_cached_vector() {
         let tmp_dir = TempDir::new().unwrap();
@@ -2382,9 +2266,9 @@ mod tests {
             3,
             "re-loading must not union a second copy into the vector"
         );
-        // The dedup that makes reuse structural: after the first load the blob's claim key is
-        // terminally `Loaded`, so a re-load can only take the `AlreadyLoaded` arm — the sole path
-        // to a second decode is a fresh `Load` claim, which no longer exists for this key.
+        // After the first load the blob's claim key is terminally `Loaded`, so a re-load can only take
+        // the `AlreadyLoaded` arm. A second decode needs a fresh `Load` claim, which this key no
+        // longer offers.
         assert!(
             matches!(
                 loader
@@ -2397,11 +2281,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned (reviewer, 2026-06-10): TWO deletion vectors in ONE Puffin file (different
-    /// offsets, different referenced data files) — the exact case the `{path}@{offset}` cache
-    /// key exists for. A bare-file-path key would mark blob 2 "already loaded" when blob 1
-    /// finishes, silently dropping B's vector and resurrecting its deleted rows. Both blobs must
-    /// load, and each must land under its own referenced data file.
+    /// Two deletion vectors in one Puffin file, at different offsets and referencing different data
+    /// files. This is the case the `{path}@{offset}` cache key exists for. A bare-file-path key marks
+    /// blob 2 already loaded when blob 1 finishes, which drops its vector and resurrects its rows.
     #[tokio::test]
     async fn test_two_dvs_in_one_puffin_file_both_load_under_own_data_file() {
         let tmp_dir = TempDir::new().unwrap();
@@ -2457,10 +2339,9 @@ mod tests {
         assert_eq!(positions_b, vec![0, 2, 4]);
     }
 
-    /// Risk pinned: TWO deletion vectors claiming the same data file is an invalid table state
-    /// Java rejects at index-build ("Can't index multiple DVs for %s", DeleteFileIndex.java
-    /// L528-535); the Rust loader rejects it at the load door — silently unioning would
-    /// over-delete, keeping one would resurrect rows.
+    /// Two deletion vectors claiming one data file is an invalid table state. Java rejects it at
+    /// index-build time, and the fork rejects it at the load door. Unioning them would over-delete, and
+    /// keeping one would resurrect rows.
     #[tokio::test]
     async fn test_multiple_dvs_for_one_data_file_rejected() {
         let tmp_dir = TempDir::new().unwrap();
@@ -2505,10 +2386,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned: the metadata validations at the DV load door (Java
-    /// `BaseDeleteLoader.validateDV`) — missing offset, out-of-range size, and a missing
-    /// referenced data file each reject cleanly BY NAME, never panic or fall through to the
-    /// parquet reader.
+    /// The metadata validations at the load door, mirroring Java's `BaseDeleteLoader.validateDV`. A
+    /// missing offset, an out-of-range size, and a missing referenced data file each reject by name.
+    /// None of them panics, and none falls through to the parquet reader.
     #[tokio::test]
     async fn test_dv_invalid_metadata_rejected_cleanly() {
         let tmp_dir = TempDir::new().unwrap();
@@ -2560,9 +2440,8 @@ mod tests {
         );
     }
 
-    /// Risk pinned: the manifest's record_count is the DV's cardinality; a decoded bitmap whose
-    /// cardinality disagrees means the manifest and the blob diverge (Java `deserializeBitmap`:
-    /// "Invalid cardinality: %s, expected %s") — silent acceptance would hide corruption.
+    /// The manifest's record_count is the vector's cardinality. A decoded bitmap that disagrees means
+    /// the manifest and the blob diverge. Silent acceptance would hide the corruption.
     #[tokio::test]
     async fn test_dv_cardinality_mismatch_rejected() {
         let tmp_dir = TempDir::new().unwrap();
@@ -2646,11 +2525,11 @@ mod tests {
         }
     }
 
-    /// Risk pinned (scan-level): a deletion vector applied during a REAL Arrow read — the rows
-    /// at the DV's positions are ABSENT from the data file it references while a SIBLING data
-    /// file in the same scan is untouched. This is the read-machinery proof that the decoded
-    /// vector flows loader → DeleteFilter → ArrowReader row selection; under the
-    /// key-by-DV-file-path mutation the deleted rows resurrect and this test fails.
+    /// A deletion vector applied during a real Arrow read. The rows at the vector's positions are
+    /// absent from the file it references, and a sibling file in the same scan is untouched. This
+    /// proves the decoded vector reaches the reader's row selection.
+    ///
+    /// Mutation: key the vector by the Puffin file path and the deleted rows resurrect here.
     #[tokio::test]
     async fn test_scan_with_dv_masks_positions_and_spares_sibling_file() {
         use futures::TryStreamExt;
@@ -2757,27 +2636,9 @@ mod tests {
         assert!(Arc::ptr_eq(&dv1, &dv2));
     }
 
-    /// THE R117 REPRODUCTION (S1 read correctness) — a delete file loaded for ONE task must not
-    /// contribute deletions to ANOTHER task's data file.
-    ///
-    /// Fixture: tasks A and B share one loader (one scan). `foreign.parquet` is listed ONLY by
-    /// task B (the shape of a partition-scoped delete attached to B's partition) but its rows name
-    /// data file A — a delete pointing outside its own bucket. Task A has one delete of its own,
-    /// so it consults the loader's shared state. Task B is loaded FIRST, which lands `foreign`'s
-    /// parsed positions in that state deterministically before task A resolves — the same leak the
-    /// interop fixture (`run-interop-file-scoped-deletes.sh`, control stamped `category=b`) hits
-    /// racily through the concurrent scan.
-    ///
-    /// Java scope (1.10.0, bytecode): one `data.DeleteFilter` per task over `task.deletes()` only
-    /// (constructor partitions the GIVEN list, offsets 51-208), and `deletedRowPositions()` merges
-    /// exactly `loadPositionDeletes(this.posDeletes, this.filePath)` (offsets 19-37) — `foreign`
-    /// is not in task A's list, so its `(A, 2)` row can never reach task A. Pre-fix Rust merged
-    /// every parsed row into ONE shared data-file-keyed map, so task A's vector read `{1, 2}` and
-    /// id 30 (position 2 of file A) was WRONGLY deleted.
-    ///
-    /// MUTATION (the shared-state revert): unioning ALL installed contributions in
-    /// `resolve_delete_vector` regardless of the task's delete list turns exactly this test RED
-    /// (`[1, 2]` instead of `[1]`).
+    /// A delete file loaded for one task must not delete rows from another task's data file. Tasks
+    /// A and B share one loader. Task B alone lists `foreign.parquet`, yet its rows name data file
+    /// A.
     #[tokio::test]
     async fn test_cross_task_pos_delete_does_not_leak_into_other_tasks_files() {
         let tmp_dir = TempDir::new().expect("tempdir");
@@ -2842,21 +2703,10 @@ mod tests {
         );
     }
 
-    /// The LEGITIMATE-SHARE control for the per-task scoping (kills the over-scope direction): one
-    /// delete file listed by TWO tasks — a partition-scoped delete over a multi-file partition —
-    /// must still apply in BOTH, each task receiving exactly the positions the file names for ITS
-    /// data file. Per-task scoping restricts application to the task's OWN delete list; it must
-    /// not drop a file that IS in both lists, and must not broadcast one file's positions onto the
-    /// other.
-    ///
-    /// Also pins that the parse cache SURVIVES the scoping: the second task's load observes the
-    /// first's terminal `Loaded` claim (`AlreadyLoaded` — the only path to a re-parse is a fresh
-    /// `Load` claim, which no longer exists for this key), mirroring Java's per-delete-file cache
-    /// (`BaseDeleteLoader.getOrReadPosDeletes` caches `readPosDeletes(deleteFile)` under
-    /// `deleteFile.location()`, 1.10.0 bytecode offsets 22-39) under per-task application.
-    ///
-    /// MUTATION (over-scope): restricting a source's contribution to tasks whose data file is the
-    /// ONLY file it names — or skipping sources listed by more than one task — turns this RED.
+    /// The legitimate-share control for per-task scoping. One delete file listed by two tasks must
+    /// still apply in both, and each task must receive only the positions the file names for its
+    /// own data file. Scoping must not drop a file that is in both lists, and must not broadcast
+    /// one file's positions onto the other.
     #[tokio::test]
     async fn test_pos_delete_shared_by_two_tasks_applies_in_both() {
         let tmp_dir = TempDir::new().expect("tempdir");
@@ -2928,15 +2778,10 @@ mod tests {
         );
     }
 
-    /// Risk pinned (the production shape of the positional-delete lost-wakeup class): a delete
-    /// file whose load DIES after claiming it — here an unreadable file, the same shape as a
-    /// corrupt one or a sibling task's error tearing the shared stream down — must not strand the
-    /// NEXT `load_deletes` call on the same (result-caching) loader. Before the loading guard
-    /// existed, the failed claim stayed `Loading` forever and the second call parked on a notifier
-    /// that could never fire: the scan hung with no error, no timeout and no log line.
-    ///
-    /// MUTATION: disarming the guard before it drops (no `Failed` publish) makes the second load
-    /// hang and the timeout below fires (RED — verified on the pre-fix tree: `Elapsed(())`).
+    /// The positional-delete lost-wakeup class. A delete file whose load dies after claiming it
+    /// must not strand the next `load_deletes` call on the same loader. Without the guard the
+    /// failed claim stays `Loading` forever, and the second call parks on a notifier that can never
+    /// fire.
     #[tokio::test]
     async fn test_failed_pos_del_load_does_not_strand_the_next_load() {
         let tmp_dir = TempDir::new().unwrap();
@@ -2978,29 +2823,17 @@ mod tests {
             error.to_string().contains(&missing),
             "the error must name the delete file, got: {error}"
         );
-        // The claiming task's own error is recorded into the terminal state, so this later caller
-        // learns WHY the load died and not just THAT it did (`PosDelLoadGuard::note_failure` on the
-        // delete-file open path).
+        // The claiming task records its own error into the terminal state, so this later caller learns
+        // why the load died, not only that it died.
         assert!(
             error.to_string().contains(&first.to_string()),
             "the later caller's error must carry the original cause '{first}', got: {error}"
         );
     }
 
-    /// Risk pinned (the DELETION-VECTOR half of the same class — the second production call site
-    /// the guard machinery rewrote): a DV blob whose load DIES after claiming it — here an
-    /// unreadable Puffin file, the same shape as a corrupt blob or a sibling task's error tearing
-    /// the shared stream down — must publish the terminal `PosDelState::Failed` under the
-    /// `{puffin path}@{offset}` claim key, so the NEXT `load_deletes` on the same (result-caching)
-    /// loader errors instead of parking on a notifier that can never fire.
-    ///
-    /// Keyed-claim coverage matters here specifically: the DV path claims under a COMPOSITE key,
-    /// so a guard that published under the bare file path would leave the real entry `Loading`.
-    ///
-    /// MUTATION: leaking the claim on the DV read-failure path (`std::mem::forget(guard)` in place
-    /// of the `?`) makes the second load hang and the timeout below fires (RED — `Elapsed(())`);
-    /// every other test in the crate stays green. Disarming `PosDelLoadGuard::drop` REDs it the
-    /// same way.
+    /// The deletion-vector half of the same class. A blob whose load dies after claiming it must
+    /// publish the terminal `PosDelState::Failed` under the `{puffin path}@{offset}` claim key. The
+    /// next `load_deletes` then errors instead of parking on a notifier that can never fire.
     #[tokio::test]
     async fn test_failed_dv_load_does_not_strand_the_next_load() {
         let tmp_dir = TempDir::new().expect("temp dir for the DV fixture");
@@ -3046,30 +2879,17 @@ mod tests {
             error.to_string().contains("@4"),
             "the error must name the blob claim key, got: {error}"
         );
-        // As on the parquet path: the blob-read error is recorded into the terminal state
-        // (`PosDelLoadGuard::note_failure`), so the later caller sees the cause.
+        // As on the parquet path, the terminal state records the blob-read error, so the later caller
+        // sees the cause.
         assert!(
             error.to_string().contains(&first.to_string()),
             "the later caller's error must carry the original cause '{first}', got: {error}"
         );
     }
 
-    /// Risk pinned: the DV `WaitFor` arm must consult the SAME `{puffin path}@{offset}` key it
-    /// claimed under. Two concurrent `load_deletes` calls for one DV drive the real production
-    /// wait path (`DeleteFilter::wait_for_pos_del_load`, reached from
-    /// `load_deletion_vector_for_task`); one of them waits, and both must end on the one shared
-    /// vector rather than a spurious error.
-    ///
-    /// Scope: because both loads are read AFTER they have joined, this test cannot see WHEN the
-    /// waiter returned — a waiter that returned too early would still read the by-then-published
-    /// vector here. That ordering property has its own pin
-    /// (`test_dv_waiter_does_not_return_before_the_vector_is_installed`), which parks the wait
-    /// deterministically instead of racing.
-    ///
-    /// MUTATION: looking the state up under `&task.file_path` instead of `&cache_key` in that arm
-    /// — a one-token copy-paste slip — makes the waiter miss the terminal state and fail a HEALTHY
-    /// scan with the defensive "notified its waiters without reaching a terminal load state" error
-    /// (RED); every other test in the crate stays green.
+    /// The `WaitFor` arm must consult the same `{puffin path}@{offset}` key it claimed under. Two
+    /// concurrent `load_deletes` calls drive the real wait path. One waits, and both must end on
+    /// the one shared vector rather than a spurious error.
     #[tokio::test]
     async fn test_concurrent_dv_loads_share_one_claim() {
         let tmp_dir = TempDir::new().expect("temp dir for the DV fixture");
@@ -3116,22 +2936,9 @@ mod tests {
         );
     }
 
-    /// Risk pinned: the terminal `PosDelState::Failed` must carry the CAUSE, on EVERY failure path
-    /// that has one. Only the task that claimed the file ever sees its own error; every later
-    /// consumer reads the state instead, so without the recorded cause an operator learns THAT a
-    /// delete load died but never WHY — on a long-running engine that is the difference between an
-    /// actionable failure and a hunt.
-    ///
-    /// Three claim-then-die paths, each on its own loader (the terminal state is cached per
-    /// loader) and each with a deterministic message: the DV cardinality check, the DV blob
-    /// decoder (reached with a deliberately shifted blob range), and the position-delete parser.
-    /// The two remaining paths — opening the delete file, and the ranged blob read — are pinned by
-    /// the "must carry the original cause" assertions in
-    /// `test_failed_pos_del_load_does_not_strand_the_next_load` and
-    /// `test_failed_dv_load_does_not_strand_the_next_load`.
-    ///
-    /// MUTATION: dropping any one of the three `note_failure` calls leaves that case's second load
-    /// reporting only the generic "no cause was recorded" reason, and its assertion fails (RED).
+    /// The terminal `PosDelState::Failed` must carry the cause on every failure path that has one.
+    /// Only the claiming task sees its own error. Every later consumer reads the state, so without
+    /// the recorded cause an operator learns that a delete load died but never why.
     #[tokio::test]
     async fn test_failed_pos_del_load_reports_the_cause_to_later_callers() {
         let tmp_dir = TempDir::new().expect("temp dir for the fixtures");
@@ -3208,13 +3015,11 @@ mod tests {
         }
     }
 
-    /// Claim `key` on the loader's OWN delete filter, so the loader's next load of that file
-    /// necessarily takes the `WaitFor` arm. Returns the claim guard: publish it to release the
-    /// waiter, or drop it to kill the claim under it.
+    /// Claim `key` on the loader's own delete filter, so its next load of that file takes the `WaitFor`
+    /// arm. Publish the returned guard to release the waiter, or drop it to kill the claim.
     ///
-    /// Driving the wait this way rather than by racing two loads is what makes the two properties
-    /// below observable at all — a race can only be read after both loads have finished, by which
-    /// point the claimant has published either way.
+    /// Driving the wait this way makes the two properties below observable. A race can only be read
+    /// after both loads finish, by which point the claimant has published either way.
     fn claim_pos_del(loader: &CachingDeleteFileLoader, key: &str) -> PosDelLoadGuard {
         match loader
             .delete_filter
@@ -3226,8 +3031,7 @@ mod tests {
         }
     }
 
-    /// Assert that an in-flight `load_deletes` really is PARKED on the claim above — i.e. it took
-    /// the `WaitFor` arm — and hand it back still pending.
+    /// Assert that an in-flight `load_deletes` is parked on the claim above, and hand it back pending.
     async fn assert_parked_on_claim(waiting: &mut Receiver<Result<DeleteFilter>>, why: &str) {
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
@@ -3237,15 +3041,10 @@ mod tests {
         );
     }
 
-    /// Risk pinned (the ORDERING half of the deletion-vector wait contract): a `load_deletes` that
-    /// finds the blob ALREADY CLAIMED must not return until the claiming task has installed the
-    /// vector. `DeleteFilter::get_delete_vector` is synchronous, so a waiter that returns early
-    /// hands the reader an ABSENT delete vector and every row that vector deletes RESURRECTS — the
-    /// silent under-delete class, not a hang.
-    ///
-    /// MUTATION: dropping the `wait_for_pos_del_load` await on the DV path (`drop(notified);` in
-    /// its place) makes the load resolve immediately with no delete vector — RED here, while every
-    /// other lib test stays green. The parquet analogue has its own pin below.
+    /// The ordering half of the deletion-vector wait contract. A `load_deletes` that finds the blob
+    /// already claimed must not return until the claiming task installs the vector.
+    /// `DeleteFilter::get_delete_vector` is synchronous, so an early return hands the reader an
+    /// absent vector, and every row that vector deletes resurrects.
     #[tokio::test]
     async fn test_dv_waiter_does_not_return_before_the_vector_is_installed() {
         let tmp_dir = TempDir::new().expect("temp dir for the DV fixture");
@@ -3298,20 +3097,10 @@ mod tests {
         );
     }
 
-    /// Risk pinned (the FAIL-LOUD half of the same contract, on the DV path): when the task that
-    /// claimed a deletion-vector blob dies without publishing, the load WAITING on it must surface
-    /// the typed error — not proceed as though the deletes had loaded. Swallowing the wait result
-    /// (`let _ = ... .await;` in place of the `?`) is a one-token slip that returns a
-    /// `DeleteFilter` with NO vector for the data file, so every row it deletes RESURRECTS.
-    ///
-    /// Also pins the CAUSE across the post-wake arm: `wait_for_pos_del_load` must render the
-    /// reason the dead claimant recorded (`PosDelLoadGuard::note_failure`), not a generic one —
-    /// the claim-time arm is pinned by
-    /// `test_failed_pos_del_load_reports_the_cause_to_later_callers`, this is the other arm.
-    ///
-    /// MUTATIONS: `let _ = del_filter.wait_for_pos_del_load(&cache_key, notified).await;` — RED,
-    /// with every other lib test green. Hard-coding the post-wake `Failed` reason instead of
-    /// carrying `reason` — RED on the cause assertion only.
+    /// The fail-loud half of the same contract. When the claiming task dies without publishing, the
+    /// waiting load must surface the typed error, not proceed as though the deletes had loaded.
+    /// Swallowing the wait result returns a `DeleteFilter` with no vector, so every row it deletes
+    /// resurrects.
     #[tokio::test]
     async fn test_dv_waiter_surfaces_a_dead_claimants_error_instead_of_dropping_the_deletes() {
         let tmp_dir = TempDir::new().expect("temp dir for the DV fixture");
@@ -3330,9 +3119,8 @@ mod tests {
         let mut guard = claim_pos_del(&loader, &cache_key);
 
         let mut waiting = loader.load_deletes(&tasks, schema);
-        // Park the load ON THE NOTIFIER first. Without this the guard could already be dropped
-        // when the loader claims, and it would take the claim-time `Failed` arm instead — a
-        // different path, and the one this test is NOT about.
+        // Park the load on the notifier first. Otherwise the guard may already be dropped when the
+        // loader claims, and the load takes the claim-time `Failed` arm, which is a different path.
         assert_parked_on_claim(
             &mut waiting,
             "the load must be parked on the claim's notifier before the claimant dies",
@@ -3372,14 +3160,10 @@ mod tests {
         );
     }
 
-    /// The parquet positional-delete analogue of
-    /// `test_dv_waiter_does_not_return_before_the_vector_is_installed` — the OTHER production call
-    /// site the guard machinery rewrote, claiming under the bare delete-file path. Same silent
-    /// under-delete consequence, same deterministic parking.
+    /// The parquet analogue of `test_dv_waiter_does_not_return_before_the_vector_is_installed`. This
+    /// call site claims under the bare delete-file path, with the same under-delete consequence.
     ///
-    /// MUTATION: `drop(notified);` in place of the `wait_for_pos_del_load` await on the parquet
-    /// path — RED here. (Three `maintenance::*` tests also catch that one incidentally; this pins
-    /// it locally, where the contract lives.)
+    /// Mutation: drop the `wait_for_pos_del_load` await on the parquet path.
     #[tokio::test]
     async fn test_parquet_pos_del_waiter_does_not_return_before_the_deletes_are_installed() {
         let tmp_dir = TempDir::new().expect("temp dir for the positional-delete fixture");
@@ -3428,12 +3212,11 @@ mod tests {
         );
     }
 
-    /// The parquet positional-delete analogue of
-    /// `test_dv_waiter_surfaces_a_dead_claimants_error_instead_of_dropping_the_deletes`: the second
-    /// rewritten call site must PROPAGATE the wait error too.
+    /// The parquet analogue of
+    /// `test_dv_waiter_surfaces_a_dead_claimants_error_instead_of_dropping_the_deletes`. This call site
+    /// must propagate the wait error too.
     ///
-    /// MUTATION: `let _ = del_filter.wait_for_pos_del_load(&task.file_path, notified).await;` —
-    /// RED here, and green across every other lib test.
+    /// Mutation: swallow the `wait_for_pos_del_load` result on the parquet path.
     #[tokio::test]
     async fn test_parquet_pos_del_waiter_surfaces_a_dead_claimants_error() {
         let tmp_dir = TempDir::new().expect("temp dir for the positional-delete fixture");

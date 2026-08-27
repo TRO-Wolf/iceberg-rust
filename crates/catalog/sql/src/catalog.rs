@@ -53,10 +53,8 @@ static CATALOG_FIELD_METADATA_LOCATION_PROP: &str = "metadata_location";
 static CATALOG_FIELD_PREVIOUS_METADATA_LOCATION_PROP: &str = "previous_metadata_location";
 static CATALOG_FIELD_RECORD_TYPE: &str = "iceberg_type";
 static CATALOG_FIELD_TABLE_RECORD_TYPE: &str = "TABLE";
-// Views share the `iceberg_tables` table with tables, discriminated by `iceberg_type = 'VIEW'`.
-// Mirrors Java `JdbcUtil.VIEW_RECORD_TYPE`. Unlike `TABLE` (which tolerates a NULL `iceberg_type`
-// for V0-schema backward compatibility), views are a V1-schema-only feature, so view SQL matches
-// `iceberg_type = 'VIEW'` exactly (Java `JdbcViewOperations` always uses `SchemaVersion.V1`).
+// Views share the `iceberg_tables` table, discriminated by `iceberg_type = 'VIEW'`. Unlike `TABLE`,
+// which tolerates a NULL for V0 compatibility, views are V1-only, so view SQL matches exactly.
 static CATALOG_FIELD_VIEW_RECORD_TYPE: &str = "VIEW";
 
 static NAMESPACE_TABLE_NAME: &str = "iceberg_namespace_properties";
@@ -93,37 +91,25 @@ impl Default for SqlCatalogBuilder {
 }
 
 impl SqlCatalogBuilder {
-    /// Configure the database URI
-    ///
-    /// If `SQL_CATALOG_PROP_URI` has a value set in `props` during `SqlCatalogBuilder::load`,
-    /// that value takes precedence, and the value specified by this method will not be used.
+    /// Configures the database URI. A `SQL_CATALOG_PROP_URI` value in `load`'s `props` wins.
     pub fn uri(mut self, uri: impl Into<String>) -> Self {
         self.config.uri = uri.into();
         self
     }
 
-    /// Configure the warehouse location
-    ///
-    /// If `SQL_CATALOG_PROP_WAREHOUSE` has a value set in `props` during `SqlCatalogBuilder::load`,
-    /// that value takes precedence, and the value specified by this method will not be used.
+    /// Configures the warehouse location. A `SQL_CATALOG_PROP_WAREHOUSE` value in `props` wins.
     pub fn warehouse_location(mut self, location: impl Into<String>) -> Self {
         self.config.warehouse_location = location.into();
         self
     }
 
-    /// Configure the bound SQL Statement
-    ///
-    /// If `SQL_CATALOG_PROP_BIND_STYLE` has a value set in `props` during `SqlCatalogBuilder::load`,
-    /// that value takes precedence, and the value specified by this method will not be used.
+    /// Configures the bind style. A `SQL_CATALOG_PROP_BIND_STYLE` value in `props` wins.
     pub fn sql_bind_style(mut self, sql_bind_style: SqlBindStyle) -> Self {
         self.config.sql_bind_style = sql_bind_style;
         self
     }
 
-    /// Configure the any properties
-    ///
-    /// If the same key has values set in `props` during `SqlCatalogBuilder::load`,
-    /// those values will take precedence.
+    /// Configures arbitrary properties. A value for the same key in `load`'s `props` wins.
     pub fn props(mut self, props: HashMap<String, String>) -> Self {
         for (k, v) in props {
             self.config.props.insert(k, v);
@@ -131,12 +117,8 @@ impl SqlCatalogBuilder {
         self
     }
 
-    /// Set a new property on the property to be configured.
-    /// When multiple methods are executed with the same key,
-    /// the later-set value takes precedence.
-    ///
-    /// If the same key has values set in `props` during `SqlCatalogBuilder::load`,
-    /// those values will take precedence.
+    /// Sets one property. The later call wins between builder calls, and a value for the same key
+    /// in `load`'s `props` wins over both.
     pub fn prop(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.config.props.insert(key.into(), value.into());
         self
@@ -204,14 +186,10 @@ impl CatalogBuilder for SqlCatalogBuilder {
     }
 }
 
-/// A struct representing the SQL catalog configuration.
+/// SQL catalog configuration: the database URI, the warehouse location, and the file I/O.
 ///
-/// This struct contains various parameters that are used to configure a SQL catalog,
-/// such as the database URI, warehouse location, and file I/O settings.
-/// You are required to provide a `SqlBindStyle`, which determines how SQL statements will be bound to values in the catalog.
-/// The options available for this parameter include:
-/// - `SqlBindStyle::DollarNumeric`: Binds SQL statements using `$1`, `$2`, etc., as placeholders. This is for PostgreSQL databases.
-/// - `SqlBindStyle::QuestionMark`: Binds SQL statements using `?` as a placeholder. This is for MySQL and SQLite databases.
+/// The required `SqlBindStyle` selects the placeholder dialect. `DollarNumeric` binds `$1`, `$2`
+/// for PostgreSQL; `QuestionMark` binds `?` for MySQL and SQLite.
 struct SqlCatalogConfig {
     uri: String,
     name: String,
@@ -220,61 +198,13 @@ struct SqlCatalogConfig {
     props: HashMap<String, String>,
 }
 
-/// Redact the password in a database DSN so it can be printed in a `Debug`/`tracing` view.
+/// Mask the password in a DSN so [`SqlCatalogConfig::uri`] can reach a `Debug` sink.
 ///
-/// A JDBC/libpq-style DSN embeds credentials in the authority's userinfo —
-/// `postgres://user:PASSWORD@host:5432/db` — and the whole string is stored in
-/// [`SqlCatalogConfig::uri`]. This masks the DSN password with `***` before the string can reach a
-/// `Debug` sink, keeping the surrounding text visible for diagnostics.
-///
-/// # Mechanism (a provably sound coarse rule)
-///
-/// The leading `<scheme>://` is stripped ONLY when the bytes before the first `://`, from position
-/// 0, form a valid URI scheme `[A-Za-z][A-Za-z0-9+.-]*` (which by construction holds no `:`, `@`,
-/// or `/`); otherwise nothing is stripped. This anchoring is load-bearing: a bare `find("://")`
-/// would treat a `://` sitting INSIDE a password (`user:pass://x@host`) as a scheme separator, push
-/// the scan past the userinfo `:`, and return the DSN unmasked. Let `rest` be the remainder. If
-/// `rest` contains a `:` AND at least one `@` lies strictly after that FIRST `:`, replace the span
-/// from that first `:` (exclusive) through the LAST `@` in `rest` (exclusive) with `***`, yielding
-/// `<before-colon>:***@<after-last-@>`. Otherwise the input is returned unchanged — no `:`, or no
-/// `@` after it, means there is no userinfo password to mask.
-///
-/// # Soundness — no password byte can survive, for ANY input
-///
-/// The anchored scheme strip (above) guarantees `authority_start` is either 0 or the index just
-/// past a genuine leading scheme — it can never land in the middle of the userinfo, so `rest`
-/// always begins at or before the userinfo `:` (the premise the rest of this proof rests on).
-/// Given that, when a userinfo password exists it lies strictly between the first userinfo `:` and
-/// its boundary `@`. That boundary `@` is one of the `@`s in `rest`, so it is at or before the LAST
-/// `@`. The masked span `[first ':' , last '@']` therefore always covers the entire password —
-/// regardless of how malformed the DSN is, and regardless of extra `/`, `?`, `#`, `:`, `@`, or even
-/// `://` bytes inside the password. Under-redaction (a surviving password byte) is impossible whenever a
-/// password is present. Two earlier precise-parsing attempts each leaked one layer deeper —
-/// `p@x/y@host`, `SECRET1@junk/SECRET2@host` — because they tried to locate the *exact* boundary;
-/// this rule does not compute a boundary, so there is no boundary to get wrong.
-///
-/// # Over-redaction envelope (the price of soundness, paid honestly)
-///
-/// The cost is over-redaction on DSNs where a non-userinfo `:` (e.g. a host port) precedes a
-/// non-userinfo `@` (e.g. one inside a query or fragment): the mask span then swallows host/path
-/// bytes. Examples:
-///
-/// * `postgres://user:PWQ@host/db?param=a@b` → `postgres://user:***@b` (the query `@` is the last
-///   `@`, so `host/db?param=a` is masked along with the password).
-/// * `postgres://host:5432/db?x=a@b` → `postgres://host:***@b` (the port `:` reads as a password
-///   separator).
-///
-/// The guarantee is directional: masked-but-visible components may include NON-secrets, but a
-/// visible component never includes a secret. DSNs with no `:` before any `@`
-/// (`postgres://host/db?param=a@b`, `postgres://user@host/db`) and DSNs with no `@` after the
-/// first `:` (`host:5432/db`, `user@host:5432/db`) are left untouched.
+/// Strip `<scheme>://` only after a valid URI scheme, then mask first `:` to last `@`.
+/// A bare `find("://")` treats `://` inside a password as the scheme and leaks the DSN.
+/// Over-redaction of host bytes is accepted. A visible component never holds a secret.
 fn redact_dsn_password(uri: &str) -> String {
-    // Anchor the scheme strip: treat `://` as a scheme separator ONLY when the bytes before the
-    // first `://`, from position 0, form a valid URI scheme `[A-Za-z][A-Za-z0-9+.-]*`. A valid
-    // scheme token contains no `:`, `@`, or `/`, so this both anchors position 0 and rejects a
-    // `://` sitting INSIDE a password (`user:pass://x@host`) that a bare `find("://")` would treat
-    // as a scheme separator — shoving `authority_start` past the userinfo `:` and leaking the DSN.
-    // Any non-scheme prefix falls through to `authority_start = 0`.
+    // A `://` is a scheme separator ONLY after a valid URI scheme; see the fn doc.
     let authority_start = match uri.find("://") {
         Some(i)
             if uri[..i].starts_with(|c: char| c.is_ascii_alphabetic())
@@ -292,9 +222,7 @@ fn redact_dsn_password(uri: &str) -> String {
     let Some(colon_rel) = rest.find(':') else {
         return uri.to_string();
     };
-    // Its boundary '@' is at or before the LAST '@'. Require at least one '@' strictly after the
-    // first ':' — equivalently, that the last '@' is after that ':'. With none, there is no
-    // userinfo password to mask.
+    // With no '@' after the first ':' there is no userinfo password to mask.
     let Some(last_at_rel) = rest.rfind('@') else {
         return uri.to_string();
     };
@@ -313,12 +241,8 @@ fn redact_dsn_password(uri: &str) -> String {
 }
 
 impl std::fmt::Debug for SqlCatalogConfig {
-    /// Hand-written so the two secret-bearing fields cannot leak: the `uri` DSN can embed a
-    /// password in its userinfo (`postgres://user:pass@host`), and the raw `props` map may carry
-    /// storage credentials. The DSN password is masked by [`redact_dsn_password`] (scheme/host/db
-    /// stay visible); prop values are masked with the canonical needle test
-    /// `iceberg::io::is_secret_prop_key` (`crates/iceberg/src/io/storage/config/mod.rs`), the same
-    /// superset `StorageConfig` uses (#159), so the list cannot drift per catalog.
+    /// Hand-written, because two fields carry secrets: the DSN and the raw `props` map. Prop
+    /// values use the canonical `is_secret_prop_key` test, so the list cannot drift per catalog.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let redacted_props: HashMap<&str, &str> = self
             .props
@@ -353,13 +277,8 @@ pub struct SqlCatalog {
 }
 
 impl std::fmt::Debug for SqlCatalog {
-    /// Hand-written so the raw `properties` map cannot leak storage credentials (the same #159
-    /// class as the config types — a plain-derived `Debug` prints its secret VALUES in clear).
-    /// `connection`'s `Debug` renders only pool sizing options — sqlx keeps the DSN in a separate
-    /// `connect_options` field it does NOT print — and `fileio` is already redacted (#159), so
-    /// those two compose safely and are passed through. Prop values are masked with the canonical
-    /// needle test `iceberg::io::is_secret_prop_key`
-    /// (`crates/iceberg/src/io/storage/config/mod.rs`).
+    /// Hand-written, because a derived `Debug` prints the raw `properties` values in clear. The
+    /// `connection` and `fileio` fields hide their own secrets, so both pass through.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let redacted_properties: HashMap<&str, &str> = self
             .properties
@@ -408,9 +327,8 @@ impl SqlCatalog {
         let fileio = FileIOBuilder::new(factory).build();
 
         install_default_drivers();
-        // Operator-supplied pool config is untrusted: a malformed value (e.g. "ten") must surface a
-        // typed `DataInvalid` error carrying the parse failure as its source, never a bare-unwrap
-        // panic. An absent key keeps the default.
+        // Operator-supplied pool config is untrusted: a malformed value must surface a typed
+        // `DataInvalid`, never a panic. An absent key keeps the default.
         let max_connections: u32 = config
             .props
             .get("pool.max-connections")
@@ -543,12 +461,8 @@ impl SqlCatalog {
             .await
     }
 
-    /// [`Self::execute`] with a caller-chosen sqlx-error mapping for the STATEMENT execution and
-    /// the wrapping SQL-transaction `COMMIT` (the post-send window). Acquiring the connection /
-    /// `begin()` stays on [`from_sqlx_error`]: a failure there provably happened before anything
-    /// was sent, so no unknown-outcome classification may apply. The commit paths
-    /// (`update_table` / `update_view`) pass [`from_sqlx_commit_error`] (GAP_MATRIX row R157);
-    /// everything else goes through [`Self::execute`].
+    /// [`Self::execute`] with a caller-chosen error mapping for the post-send window. Acquiring
+    /// the connection stays on [`from_sqlx_error`]: that failure precedes any send.
     async fn execute_mapping_errors(
         &self,
         query: &str,
@@ -568,11 +482,8 @@ impl SqlCatalog {
             None => {
                 // Pre-send: nothing has been handed to the database yet.
                 let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
-                // Post-send: both the statement and the SQL-transaction `COMMIT` may have
-                // reached the database. A failed statement propagates first (dropping `tx`
-                // rolls back); a failed `COMMIT` now propagates too — it used to be silently
-                // DISCARDED (`let _ = tx.commit()...;`), reporting success for a transaction
-                // the database may have rolled back (a false green on the commit CAS).
+                // Post-send: a failed `COMMIT` must propagate. Discarding it reports success for
+                // a transaction the database may have rolled back.
                 let result = sqlx_query.execute(&mut *tx).await.map_err(map_sqlx_error)?;
                 tx.commit().await.map_err(map_sqlx_error)?;
                 Ok(result)
@@ -581,30 +492,11 @@ impl SqlCatalog {
     }
 }
 
-/// Resolves the metadata location to bind into the SQL CAS (`... AND metadata_location = ?`) and
-/// performs Java's `validateMetadataLocation` pre-check, shared by `update_table` and `update_view`.
-///
-/// Mirrors Java `JdbcTableOperations`/`JdbcViewOperations.doCommit` (iceberg-core 1.10.0): the CAS
-/// binds the COMMIT'S BASE location (`base.metadataFileLocation()`), not the freshly-loaded current
-/// location, so a strictly-sequential stale commit (built from a superseded base) is rejected — not
-/// just a commit racing inside the load→UPDATE window.
-///
-/// * `base_metadata_location` — `commit.base_metadata_location()`, captured before `apply` consumes
-///   the commit. `None` models Java's create edge (`base == null`); the caller then falls back to
-///   the freshly-loaded current location (conservative: `None` never equals a stale stored value, so
-///   no real conflict is silenced). (The O1 `MemoryCatalog` CAS takes the opposite `None` posture —
-///   it treats `None` as a conflict — but both are safe: `None` is unreachable on the real update
-///   paths, where every commit threads a persisted entity's always-`Some` `metadata_location`.)
-/// * `current_metadata_location` — the location the catalog just loaded for the entity.
-/// * `entity_description` — the entity, already formatted (e.g. `"table ns.tbl"` / `"view ns.v1"`),
-///   for the conflict message.
-///
-/// Returns the location to bind into the SQL CAS, or a retryable `CatalogCommitConflicts` error when
-/// the commit's base differs from the stored location (stale commit).
-///
-/// This is the single CAS code path both `update_table` and `update_view` flow through, so the view
-/// stale-commit tests exercise the exact resolution the table path runs (the table commit cannot be
-/// built stale from an external crate: `TableCommit::builder().build()` is `pub(crate)`).
+/// Resolves the location to bind into the SQL CAS, and runs Java's `validateMetadataLocation`
+/// pre-check. The CAS binds the COMMIT'S BASE location, not the freshly-loaded current one, so a
+/// strictly sequential stale commit is rejected, not only one racing the load-to-UPDATE window. A
+/// `None` base models Java's create edge and falls back to the loaded location, which never equals
+/// a stale stored value.
 fn resolve_commit_cas_location(
     base_metadata_location: Option<&str>,
     current_metadata_location: &str,
@@ -846,17 +738,9 @@ impl Catalog for SqlCatalog {
                 }
             }
 
-            // NOTE (named follow-up): this is NOT a faithful full-replace — keys present in
-            // `existing_properties` but absent from `properties` are NOT deleted, so a partial
-            // remove composed over this primitive (`Catalog::update_namespace_properties`) does
-            // not take effect on the SQL catalog. The naive fix (issue a DELETE for absent keys)
-            // is unsafe here: this catalog uses an `exists=true` sentinel property ROW to
-            // represent namespace existence (see `create_namespace` / `namespace_exists`), so
-            // blindly deleting absent keys would delete that anchor and make the namespace vanish
-            // on an empty/full replace. A correct fix must preserve the `exists` sentinel (or
-            // migrate to a dedicated namespace-existence row). Tracked as a SQL-catalog divergence
-            // from the Java full-replace contract; the partial-property tests are confined to the
-            // memory catalog until this is addressed.
+            // This is NOT a faithful full-replace: an absent key is not deleted, so a partial
+            // remove does not take effect. Deleting absent keys would delete the `exists=true`
+            // sentinel ROW this catalog uses for existence, and the namespace would vanish.
             let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
             let update_stmt = format!(
                 "UPDATE {NAMESPACE_TABLE_NAME} SET {NAMESPACE_FIELD_PROPERTY_VALUE} = ?
@@ -1091,8 +975,7 @@ impl Catalog for SqlCatalog {
             return table_already_exists_err(&tbl_ident);
         }
 
-        // Tables and views share one name space (Java `JdbcCatalog$ViewAwareTableBuilder`): a table
-        // cannot shadow a view of the same name.
+        // Tables and views share one name space: a table cannot shadow a view of the same name.
         if self.view_exists(&tbl_ident).await? {
             return view_with_same_name_err(&tbl_ident);
         }
@@ -1100,8 +983,7 @@ impl Catalog for SqlCatalog {
         let (tbl_creation, location) = match creation.location.clone() {
             Some(location) => (creation, location),
             None => {
-                // fall back to namespace-specific location
-                // and then to warehouse location
+                // Fall back to the namespace location, then to the warehouse location.
                 let nsp_properties = self.get_namespace(namespace).await?.properties().clone();
                 let nsp_location = match nsp_properties.get(NAMESPACE_LOCATION_PROPERTY_KEY) {
                     Some(location) => location.clone(),
@@ -1228,34 +1110,18 @@ impl Catalog for SqlCatalog {
 
     /// Updates an existing table within the SQL catalog.
     ///
-    /// Mirrors Java `JdbcTableOperations.doCommit` (1.10.0) in both its pre-check and its SQL CAS:
-    ///
-    /// 1. **Pre-check** (`validateMetadataLocation`): loads the stored row and calls
-    ///    `validateMetadataLocation(loadedRow, base)`, which compares the stored location against
-    ///    `base.metadataFileLocation()` — the COMMIT'S BASE, not whatever was just freshly loaded.
-    ///    Throws `CommitFailedException` on mismatch.
-    /// 2. **SQL CAS** (`updateTable`): the `UPDATE ... AND metadata_location = ?` clause is also
-    ///    bound to `base.metadataFileLocation()` (bytecode: `aload_1.metadataFileLocation()` stored
-    ///    as `var6`, passed to `updateTable(newLoc, var6)`). This guards the write against a
-    ///    concurrent commit that arrived between the pre-check and the UPDATE.
-    ///
-    /// In this Rust port both steps collapse into `resolve_commit_cas_location`: it rejects a
-    /// strictly-sequential stale commit when the commit's base differs from the freshly-loaded
-    /// location (Java's `validateMetadataLocation`), then returns the validated location to bind into
-    /// the SQL `AND metadata_location = ?` CAS, which still guards the load→UPDATE window.  When
-    /// `commit.base_metadata_location()` is `None` (create-edge), we fall back to the freshly-loaded
-    /// location (conservative: `None` never equals a stale stored value, so no conflict is silenced).
+    /// Java `JdbcTableOperations.doCommit` runs two guards, and both bind the COMMIT'S BASE
+    /// location: the `validateMetadataLocation` pre-check and the SQL CAS. Both collapse into
+    /// `resolve_commit_cas_location`.
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
         // Capture the commit's base location BEFORE `apply` consumes it.
-        // Java `JdbcTableOperations.doCommit` offset 50-54: `aload_1.metadataFileLocation()`.
         let base_metadata_location = commit.base_metadata_location().map(str::to_string);
 
         let current_table = self.load_table(&table_ident).await?;
         let current_metadata_location = current_table.metadata_location_result()?.to_string();
 
-        // Belt: Java's `validateMetadataLocation` pre-check + the BASE-bound SQL CAS, shared with
-        // `update_view` via `resolve_commit_cas_location` so both arms run one code path.
+        // Both arms run one code path, so a knockout of it fails the view tests as well.
         let cas_location = resolve_commit_cas_location(
             base_metadata_location.as_deref(),
             current_metadata_location.as_str(),
@@ -1270,11 +1136,7 @@ impl Catalog for SqlCatalog {
             .write_to(staged_table.file_io(), &staged_metadata_location)
             .await?;
 
-        // SQL CAS bound to the BASE location (Java `JdbcUtil.updateTable` / `V1_DO_COMMIT_TABLE_SQL`:
-        // `AND metadata_location = ?` with `base.metadataFileLocation()` as the bind value).
-        // Sqlx errors on this statement classify sent-vs-unsent via `from_sqlx_commit_error`:
-        // a connection-level failure after the CAS was handed to the database maps to
-        // `CommitStateUnknown` (GAP_MATRIX row R157).
+        // SQL CAS bound to the BASE location; a post-send failure maps to `CommitStateUnknown`.
         let update_result = self
             .execute_mapping_errors(
                 &format!(
@@ -1313,12 +1175,8 @@ impl Catalog for SqlCatalog {
         Ok(staged_table)
     }
 
-    // ========================================================================
-    // View surface — Java `JdbcCatalog`/`JdbcViewOperations` (1.10.0). Views live in the SAME
-    // `iceberg_tables` table, discriminated by `iceberg_type = 'VIEW'` (exact match — views are a
-    // V1-schema-only feature; the Rust catalog always creates the V1 schema with the
-    // `iceberg_type` column). Tables and views share one name space (collision-guarded).
-    // ========================================================================
+    // View surface. Views live in the SAME `iceberg_tables` table, discriminated by an exact
+    // `iceberg_type = 'VIEW'`, and share one name space with tables.
 
     async fn list_views(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
         if !self.namespace_exists(namespace).await? {
@@ -1391,8 +1249,7 @@ impl Catalog for SqlCatalog {
             return view_already_exists_err(&view_ident);
         }
 
-        // Tables and views share one name space (Java `JdbcViewOperations.doCommit` checks
-        // `tableExists`): a view cannot shadow a table of the same name.
+        // Tables and views share one name space: a view cannot shadow a table of the same name.
         if self.table_exists(&view_ident).await? {
             return table_with_same_name_err(&view_ident);
         }
@@ -1501,8 +1358,7 @@ impl Catalog for SqlCatalog {
             return view_already_exists_err(dest);
         }
 
-        // Tables and views share one name space: a view cannot be renamed onto a table's name
-        // (Java `JdbcCatalog.renameView` cross-checks `tableExists`).
+        // Tables and views share one name space: a view cannot be renamed onto a table's name.
         if self.table_exists(dest).await? {
             return table_with_same_name_err(dest);
         }
@@ -1531,21 +1387,9 @@ impl Catalog for SqlCatalog {
         Ok(())
     }
 
-    /// Updates an existing view within the SQL catalog.
-    ///
-    /// Mirrors Java `JdbcViewOperations.doCommit` (1.10.0) in both its pre-check and its SQL CAS:
-    ///
-    /// 1. **Pre-check** (`validateMetadataLocation`): compares the stored location against
-    ///    `base.currentMetadataLocation()` — the COMMIT'S BASE, not the freshly-loaded current.
-    ///    Throws `CommitFailedException("Cannot commit %s: metadata location %s has changed from %s")`.
-    /// 2. **SQL CAS** (`JdbcUtil.updateView` / `V1_DO_COMMIT_VIEW_SQL`): the
-    ///    `AND metadata_location = ?` bind is also the BASE location.
-    ///
-    /// In this Rust port both steps collapse into `resolve_commit_cas_location` (shared with
-    /// `update_table`): it rejects a strictly-sequential stale commit when the commit's base differs
-    /// from the freshly-loaded location, then returns the validated location to bind into the SQL CAS.
-    /// When `commit.base_metadata_location()` is `None`, we fall back to the freshly-loaded location
-    /// (conservative: `None` never silences a real conflict).
+    /// Updates an existing view within the SQL catalog. Both of Java
+    /// `JdbcViewOperations.doCommit`'s guards bind the COMMIT'S BASE location, and both collapse
+    /// into `resolve_commit_cas_location`, shared with `update_table`.
     async fn update_view(&self, commit: ViewCommit) -> Result<View> {
         let view_ident = commit.identifier().clone();
         // Capture the commit's base location BEFORE `apply` consumes it.
@@ -1554,8 +1398,7 @@ impl Catalog for SqlCatalog {
         let current_view = self.load_view(&view_ident).await?;
         let current_metadata_location = current_view.metadata_location_result()?.to_string();
 
-        // Belt: Java's `validateMetadataLocation` pre-check + the BASE-bound SQL CAS, shared with
-        // `update_table` via `resolve_commit_cas_location` so both arms run one code path.
+        // Both arms run one code path, so these view tests pin the table arm too.
         let cas_location = resolve_commit_cas_location(
             base_metadata_location.as_deref(),
             current_metadata_location.as_str(),
@@ -1570,9 +1413,8 @@ impl Catalog for SqlCatalog {
             .write_to(staged_view.file_io(), &staged_metadata_location)
             .await?;
 
-        // Java `JdbcUtil.V1_DO_COMMIT_VIEW_SQL` — SQL CAS bound to the BASE location. Post-send
-        // connection-level failures classify to `CommitStateUnknown` exactly like the
-        // table-side CAS (GAP_MATRIX row R157).
+        // SQL CAS bound to the BASE location. A post-send failure classifies to
+        // `CommitStateUnknown`, exactly like the table-side CAS.
         let update_result = self
             .execute_mapping_errors(
                 &format!(
@@ -1792,8 +1634,7 @@ mod tests {
         assert!(catalog.sql_bind_style == SqlBindStyle::QMark);
     }
 
-    /// Overwriting an sqlite database with a non-existent path causes
-    /// catalog generation to fail
+    /// Overwriting an sqlite database with a non-existent path must fail.
     #[tokio::test]
     async fn test_builder_props_non_existent_path_fails() {
         let sql_lite_uri = format!("sqlite:{}", temp_path());
@@ -1839,9 +1680,7 @@ mod tests {
         );
     }
 
-    /// Even when an invalid URI is specified in a builder method,
-    /// it can be successfully overridden with a valid URI in props
-    /// for catalog generation to succeed.
+    /// A valid URI in `props` overrides an invalid one set through a builder method.
     #[tokio::test]
     async fn test_builder_props_set_valid_uri() {
         let sql_lite_uri = format!("sqlite:{}", temp_path());
@@ -2395,10 +2234,8 @@ mod tests {
         assert!(!catalog.namespace_exists(&namespace_ident).await.unwrap())
     }
 
-    /// Dropping a namespace that still contains a table must fail with the typed
-    /// `NamespaceNotEmpty` kind (mirrors Java `NamespaceNotEmptyException`), not the old
-    /// `Unexpected`. The message content is preserved so existing log/UX expectations hold, and the
-    /// namespace must remain (drop is refused, not partially applied).
+    /// Dropping a namespace that still holds a table must fail with the typed `NamespaceNotEmpty`
+    /// kind, not `Unexpected`, and the namespace must remain: the drop is refused, not partial.
     #[tokio::test]
     async fn test_drop_namespace_throws_error_if_namespace_not_empty() {
         let warehouse_loc = temp_path();
@@ -3090,7 +2927,6 @@ mod tests {
         let warehouse_loc = temp_path();
         let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
 
-        // Create a test namespace and table
         let namespace_ident = NamespaceIdent::new("ns1".into());
         create_namespace(&catalog, &namespace_ident).await;
         let table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
@@ -3098,10 +2934,8 @@ mod tests {
 
         let table = catalog.load_table(&table_ident).await.unwrap();
 
-        // Store the original metadata location for comparison
         let original_metadata_location = table.metadata_location().unwrap().to_string();
 
-        // Create a transaction to update the table
         let tx = Transaction::new(&table);
         let tx = tx
             .update_table_properties()
@@ -3109,24 +2943,19 @@ mod tests {
             .apply(tx)
             .unwrap();
 
-        // Commit the transaction to the catalog
         let updated_table = tx.commit(&catalog).await.unwrap();
 
-        // Verify the update was successful
         assert_eq!(
             updated_table.metadata().properties().get("test_property"),
             Some(&"test_value".to_string())
         );
-        // Verify the metadata location has been updated
         assert_ne!(
             updated_table.metadata_location().unwrap(),
             original_metadata_location.as_str()
         );
 
-        // Load the table again from the catalog to verify changes were persisted
         let reloaded = catalog.load_table(&table_ident).await.unwrap();
 
-        // Verify the reloaded table matches the updated table
         assert_eq!(
             reloaded.metadata().properties().get("test_property"),
             Some(&"test_value".to_string())
@@ -3137,10 +2966,7 @@ mod tests {
         );
     }
 
-    // ========================================================================
-    // View CRUD lifecycle tests (the SQL catalog view surface — ported from the U1 MemoryCatalog
-    // e2e, plus the SQL-specific location-CAS conflict test).
-    // ========================================================================
+    // View CRUD lifecycle tests, plus the SQL-specific location-CAS conflict test.
 
     fn simple_view_schema() -> Schema {
         Schema::builder()
@@ -3182,8 +3008,7 @@ mod tests {
             .unwrap()
     }
 
-    // RISK: a view must round-trip through the SQL store (the `iceberg_type = 'VIEW'` discriminator
-    // row + the metadata FileIO write/read) and be listed/loaded back by identity.
+    // RISK: a view must round-trip through the SQL store and load back by identity.
     #[tokio::test]
     async fn test_view_create_load_and_list() {
         let warehouse_loc = temp_path();
@@ -3205,8 +3030,7 @@ mod tests {
         assert_eq!(views, vec![view_ident]);
     }
 
-    // RISK: creating a view that already exists must fail loudly (Java AlreadyExistsException),
-    // never silently overwrite the existing view's metadata pointer.
+    // RISK: creating a view that exists must fail loudly, never overwrite its metadata pointer.
     #[tokio::test]
     async fn test_view_create_duplicate_fails() {
         let warehouse_loc = temp_path();
@@ -3233,9 +3057,8 @@ mod tests {
         assert_eq!(error.kind(), iceberg::ErrorKind::ViewAlreadyExists);
     }
 
-    // RISK: the full create→update→load→rename→drop lifecycle — a replace must flip the current
-    // version, append the version log, and KEEP the old version intact; rename must move the row;
-    // drop must remove it. This is the load-bearing catalog-CRUD e2e (ported from U1).
+    // RISK: a replace must flip the current version, append the version log, and KEEP the old
+    // version intact. Rename must move the row, and drop must remove it.
     #[tokio::test]
     async fn test_view_full_lifecycle_replace_rename_drop() {
         let warehouse_loc = temp_path();
@@ -3248,7 +3071,6 @@ mod tests {
         let original_uuid = view.metadata().uuid();
         let original_location = view.metadata_location().unwrap().to_string();
 
-        // Replace the version with a genuinely different query.
         let commit = view
             .replace_version()
             .with_query("spark", "SELECT 2 AS event_count")
@@ -3277,7 +3099,6 @@ mod tests {
             vec![1, 2]
         );
 
-        // Rename the view, then confirm the source is gone and the destination loads.
         let renamed_ident = TableIdent::new(namespace_ident.clone(), "v2".into());
         catalog
             .rename_view(&view_ident, &renamed_ident)
@@ -3289,7 +3110,6 @@ mod tests {
         assert_eq!(renamed.metadata().uuid(), original_uuid);
         assert_eq!(renamed.metadata().current_version_id(), 2);
 
-        // Drop the view; it is then gone and a re-load fails.
         catalog.drop_view(&renamed_ident).await.unwrap();
         assert!(!catalog.view_exists(&renamed_ident).await.unwrap());
         let error = catalog.load_view(&renamed_ident).await.unwrap_err();
@@ -3321,8 +3141,7 @@ mod tests {
         );
     }
 
-    // RISK: committing the SAME version twice through the catalog must REUSE the existing version —
-    // Java reuses rather than minting a new id, so the version count stays constant.
+    // RISK: committing the SAME version twice must REUSE it, so the version count stays constant.
     #[tokio::test]
     async fn test_view_replace_identical_version_reuses() {
         let warehouse_loc = temp_path();
@@ -3347,8 +3166,7 @@ mod tests {
         assert_eq!(loaded.metadata().current_version_id(), 1);
     }
 
-    // RISK: loading a non-existent view must error ViewNotFound (not the FeatureUnsupported default)
-    // — proving the SqlCatalog override is wired and uses the VIEW discriminator.
+    // RISK: loading a missing view must error ViewNotFound, not the FeatureUnsupported default.
     #[tokio::test]
     async fn test_view_load_missing_errors_view_not_found() {
         let warehouse_loc = temp_path();
@@ -3362,10 +3180,8 @@ mod tests {
         assert!(!catalog.view_exists(&view_ident).await.unwrap());
     }
 
-    // RISK: tables and views share ONE name space (Java JdbcCatalog). Creating a view where a TABLE
-    // already exists — or a table where a VIEW exists — must be REJECTED, not silently coexist in
-    // the shared `iceberg_tables` table (a shadowing pair would let a later load resolve the wrong
-    // kind, and the discriminator-scoped queries would skip the shadowed row).
+    // RISK: tables and views share ONE name space. A shadowing pair would let a later load resolve
+    // the wrong kind, and the discriminator-scoped queries would skip the shadowed row.
     #[tokio::test]
     async fn test_view_and_table_name_collision_rejected_both_directions() {
         let warehouse_loc = temp_path();
@@ -3416,8 +3232,7 @@ mod tests {
         assert!(!catalog.table_exists(&view_ident).await.unwrap());
     }
 
-    // RISK: a rename must also respect the shared name space — renaming a view onto a name a TABLE
-    // already holds must be rejected (Java JdbcCatalog.renameView cross-checks `tableExists`).
+    // RISK: renaming a view onto a name a TABLE holds must be rejected.
     #[tokio::test]
     async fn test_rename_view_onto_existing_table_rejected() {
         let warehouse_loc = temp_path();
@@ -3440,11 +3255,8 @@ mod tests {
         assert!(catalog.table_exists(&table_ident).await.unwrap());
     }
 
-    // RISK: the `iceberg_type = 'VIEW'` discriminator must scope `rename_view` to VIEWS only —
-    // passing a TABLE identifier as the source must be rejected as ViewNotFound and must NOT move
-    // the table's row (Java `JdbcUtil.RENAME_VIEW_SQL` filters `iceberg_type = 'VIEW'`, and
-    // `JdbcCatalog.renameView` operates on a `JdbcViewOperations` that only loads views). Without
-    // the discriminator a `rename_view` would silently relocate a table.
+    // RISK: the `iceberg_type = 'VIEW'` discriminator must scope `rename_view` to VIEWS. A TABLE
+    // source must be rejected as ViewNotFound, or a `rename_view` silently relocates a table.
     #[tokio::test]
     async fn test_rename_view_rejects_table_source() {
         let warehouse_loc = temp_path();
@@ -3462,16 +3274,14 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), iceberg::ErrorKind::ViewNotFound);
-        // The table did not move: it is still resolvable at its original name, and nothing was
-        // created at the destination (neither as a view nor as a table).
+        // The table did not move, and nothing was created at the destination.
         assert!(catalog.table_exists(&table_ident).await.unwrap());
         assert!(!catalog.view_exists(&dest_ident).await.unwrap());
         assert!(!catalog.table_exists(&dest_ident).await.unwrap());
     }
 
-    // RISK: list_views must be namespace-scoped — a view in namespace `a` must NOT appear in the
-    // listing for namespace `b`, and tables sharing the catalog table must NOT leak into the view
-    // listing (the `iceberg_type = 'VIEW'` discriminator scopes both).
+    // RISK: `list_views` must be namespace-scoped, and tables sharing the catalog table must not
+    // leak into the view listing.
     #[tokio::test]
     async fn test_list_views_is_namespace_scoped_and_excludes_tables() {
         let warehouse_loc = temp_path();
@@ -3494,12 +3304,9 @@ mod tests {
         assert_eq!(listed_b, vec![view_b]);
     }
 
-    // RISK: the location-CAS commit (Java `JdbcViewOperations.doCommit` / `V1_DO_COMMIT_VIEW_SQL`).
-    // Two CONCURRENT view commits both prepared against the SAME stored metadata_location: the SQL
-    // store serializes each UPDATE statement, the first wins, and the second's `WHERE
-    // metadata_location = <stale>` now matches 0 rows and must FAIL with CatalogCommitConflicts —
-    // never silently last-write-win over the winner. Without the CAS (`AND metadata_location = ?`),
-    // the loser would overwrite the winner's metadata pointer, losing the first commit.
+    // RISK: two CONCURRENT view commits prepared against the SAME stored metadata_location. The
+    // store serializes the two updates, so the second matches 0 rows and must FAIL with
+    // CatalogCommitConflicts. Without the CAS the loser overwrites the winner's pointer.
     #[tokio::test]
     async fn test_view_concurrent_commits_second_conflicts_via_location_cas() {
         let warehouse_loc = temp_path();
@@ -3510,9 +3317,8 @@ mod tests {
 
         create_view(catalog.as_ref(), &view_ident, "SELECT 1 AS event_count").await;
 
-        // Each task loads the view, then waits on a barrier so BOTH observe the SAME base
-        // metadata_location before either commits (forcing the stale-base race deterministically),
-        // then builds a distinct replace commit and races the commit. The CAS makes exactly one win.
+        // The barrier makes BOTH tasks observe the same base location, so the race is
+        // deterministic. The CAS then makes exactly one of them win.
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
         let task_a = tokio::spawn(race_replace_view(
@@ -3558,9 +3364,8 @@ mod tests {
         assert_eq!(loaded_sql, current_view_sql(&winner));
     }
 
-    /// Load the view, wait on the barrier (so both racers share a base), build a replace commit
-    /// for `sql`, and commit it. Returns the commit `Result` so the caller can assert exactly one
-    /// winner. Used by `test_view_concurrent_commits_second_conflicts_via_location_cas`.
+    /// Loads the view, waits on the barrier so both racers share a base, then commits a replace.
+    /// It returns the `Result`, so the caller can assert exactly one winner.
     async fn race_replace_view<C: Catalog>(
         catalog: Arc<C>,
         barrier: Arc<tokio::sync::Barrier>,
@@ -3592,37 +3397,17 @@ mod tests {
             .collect()
     }
 
-    // ========================================================================
-    // Base-location CAS tests — Java `JdbcTableOperations/JdbcViewOperations.doCommit` parity.
+    // Base-location CAS tests. Binding the CAS to the freshly loaded location guards only the
+    // load-to-UPDATE window: a strictly sequential stale commit re-loads the winner's location,
+    // CAS's against it, and silently overwrites the winner. Java binds the commit's BASE instead.
     //
-    // The old SQL `update_table` / `update_view` bound the SQL `AND metadata_location = ?` CAS
-    // against the freshly-loaded current location, guarding only the load→UPDATE TOCTOU window.
-    // A strictly-sequential stale commit (built from a superseded base, applied after the winner
-    // had already advanced the pointer) would re-load the winner's location, CAS against it, and
-    // PASS — silently overwriting the winner (last-write-win).
-    //
-    // Java `JdbcTableOperations.doCommit` (bytecode: offset 50-55) stores
-    // `base.metadataFileLocation()` from arg1 (the BASE argument, not a fresh load) and passes it
-    // as the SQL `AND metadata_location = ?` bind value (`JdbcUtil.updateTable(newLoc, baseFileLoc)`).
-    // The fix mirrors that: use `commit.base_metadata_location()` as the CAS value when present.
-    //
-    // Note on `TableCommit` construction: `TableCommit::builder().build()` is `pub(crate)` so a
-    // stale `TableCommit` cannot be built in this (external) test crate, and `Transaction::do_commit`
-    // reloads the base before building the commit, so the stale-table path is unreachable from the
-    // public API here.  The sequential stale scenario is therefore exercised on the VIEW path (where
-    // `view.replace_version().to_commit()` is a fully public API).  To make the view tests a genuine
-    // pin for the table path, `update_table` and `update_view` resolve the CAS location through ONE
-    // shared free function (`resolve_commit_cas_location`) — not duplicated inline blocks — so a
-    // knockout of that single CAS code path fails these view tests AND would have broken the table
-    // arm.  (R1 REVIEWER: before unification the table arm was structurally independent and a
-    // table-arm CAS knockout left every test green; the shared helper closes that hole.)
-    // ========================================================================
+    // A stale `TableCommit` cannot be built from this external crate, so the scenario runs on the
+    // VIEW path. Both paths resolve the CAS through ONE shared function, so a knockout of it fails
+    // these view tests and would have broken the table arm. Before that unification a table-arm
+    // knockout left every test green.
 
-    // RISK: a sequential stale VIEW commit (built from a superseded base, committed AFTER a winner
-    // has advanced the stored location) must be rejected with a retryable CatalogCommitConflicts
-    // error, not silently accepted as last-write-win.  The bug: the old code re-loaded the current
-    // location inside `update_view` and CAS'd against that, so a stale second commit always saw the
-    // winner's location and passed.  The fix: CAS against `commit.base_metadata_location()`.
+    // RISK: a sequential stale VIEW commit, made after a winner advanced the stored location, must
+    // be rejected as a retryable CatalogCommitConflicts, never accepted as last-write-win.
     #[tokio::test]
     async fn test_view_stale_sequential_commit_rejected_by_base_location_cas() {
         let warehouse_loc = temp_path();
@@ -3632,8 +3417,7 @@ mod tests {
         let view_ident = TableIdent::new(namespace_ident.clone(), "v1".into());
         let view = create_view(&catalog, &view_ident, "SELECT 1 AS event_count").await;
 
-        // Build TWO commits from the SAME base view object.  Both carry the original
-        // `base_metadata_location` (the view's metadata_location at creation time).
+        // TWO commits from the SAME base view, so both carry the original location.
         let first_commit = view
             .replace_version()
             .with_query("spark", "SELECT 2 AS event_count")
@@ -3649,13 +3433,11 @@ mod tests {
             .to_commit()
             .unwrap();
 
-        // First commit lands; the stored location advances from L0 to L1.
         let winner = catalog.update_view(first_commit).await.unwrap();
         assert_eq!(winner.metadata().current_version_id(), 2);
 
-        // Second commit is STALE: its base_metadata_location == L0 but the store now holds L1.
-        // Before the fix, update_view re-loaded L1 and CAS'd against L1 → passed (wrong).
-        // After the fix, update_view CAS's against the COMMIT'S base (L0) → no match → rejected.
+        // The second commit is STALE: its base is L0, but the store now holds L1. Re-loading L1
+        // and CAS'ing against it would pass; CAS'ing against the COMMIT'S base rejects it.
         let error = catalog.update_view(second_commit).await.unwrap_err();
         assert_eq!(error.kind(), iceberg::ErrorKind::CatalogCommitConflicts);
         assert!(error.retryable());
@@ -3680,8 +3462,7 @@ mod tests {
         assert_eq!(loaded.metadata_location(), winner.metadata_location());
     }
 
-    // RISK: the base-location CAS must not break the HAPPY PATH — a single non-stale commit (built
-    // from the current base) must still succeed after the fix.
+    // RISK: the base-location CAS must not break the HAPPY PATH of a single non-stale commit.
     #[tokio::test]
     async fn test_view_non_stale_commit_succeeds_with_base_location_cas() {
         let warehouse_loc = temp_path();
@@ -3705,9 +3486,8 @@ mod tests {
         assert_ne!(updated.metadata_location().unwrap(), original_location);
     }
 
-    // RISK: stale → reload → rebuild → retry must SUCCEED end-to-end for views.  Simulates a
-    // retry loop: first commit fails (stale), caller reloads and rebuilds a fresh commit, which
-    // succeeds because its base now matches the stored location.
+    // RISK: stale, reload, rebuild, retry must succeed end to end. The rebuilt commit's base now
+    // matches the stored location.
     #[tokio::test]
     async fn test_view_stale_then_reload_and_retry_succeeds() {
         let warehouse_loc = temp_path();
@@ -3717,7 +3497,6 @@ mod tests {
         let view_ident = TableIdent::new(namespace_ident.clone(), "v1".into());
         let view_v0 = create_view(&catalog, &view_ident, "SELECT 1 AS event_count").await;
 
-        // Build and commit the winner, advancing the pointer.
         let winner_commit = view_v0
             .replace_version()
             .with_query("spark", "SELECT 2 AS event_count")
@@ -3727,7 +3506,6 @@ mod tests {
             .unwrap();
         let _winner = catalog.update_view(winner_commit).await.unwrap();
 
-        // Build a stale commit from the OLD base — must fail.
         let stale_commit = view_v0
             .replace_version()
             .with_query("spark", "SELECT 3 AS event_count")
@@ -3739,7 +3517,6 @@ mod tests {
         assert_eq!(err.kind(), iceberg::ErrorKind::CatalogCommitConflicts);
         assert!(err.retryable());
 
-        // Reload the current view (refresh) and build a fresh commit — must succeed.
         let view_current = Catalog::load_view(&catalog, &view_ident).await.unwrap();
         let fresh_commit = view_current
             .replace_version()
@@ -3752,14 +3529,8 @@ mod tests {
         assert_eq!(final_view.metadata().current_version_id(), 3);
     }
 
-    // RISK: the base-location CAS fix must not break the TABLE HAPPY PATH — a Transaction-based
-    // property commit must still succeed.  Note: `TableCommit::builder().build()` is `pub(crate)`,
-    // so a stale `TableCommit` cannot be constructed from this external crate.  The sequential stale
-    // TABLE behavior is structurally identical to the VIEW fix (both paths use the same
-    // `commit.base_metadata_location()` field and the same SQL CAS structure) and is fully covered
-    // by `test_view_stale_sequential_commit_rejected_by_base_location_cas`.
-    // The SQL-level table CAS is additionally exercised by `test_update_table` (the existing happy
-    // path test) and by the MemoryCatalog stale-commit tests in `crates/iceberg`.
+    // RISK: the base-location CAS must not break the TABLE HAPPY PATH. The stale table behavior is
+    // structurally identical to the view fix and is covered by the view test above.
     #[tokio::test]
     async fn test_table_happy_path_unchanged_with_base_location_cas() {
         let warehouse_loc = temp_path();
@@ -3772,8 +3543,7 @@ mod tests {
         let table = catalog.load_table(&table_ident).await.unwrap();
         let original_metadata_location = table.metadata_location().unwrap().to_string();
 
-        // A non-stale Transaction commit: do_commit reloads, sets base_metadata_location to the
-        // current location, and the SQL CAS should pass.
+        // `do_commit` reloads and sets the base to the current location, so the CAS passes.
         let tx = Transaction::new(&table);
         let tx = tx
             .update_table_properties()
@@ -3788,21 +3558,14 @@ mod tests {
             original_metadata_location.as_str()
         );
 
-        // Load again to confirm persistence.
         let reloaded = catalog.load_table(&table_ident).await.unwrap();
         assert_eq!(reloaded.metadata().properties().get("k").unwrap(), "v");
     }
 
-    // RISK (accessibility / public-API-surface regression): every type an out-of-crate catalog
-    // implementation needs to build a view and drive create→replace→drop must be constructible
-    // through ONLY the public `iceberg` API. The original gap was `ViewRepresentations` — its tuple
-    // constructor is crate-private, which made `ViewCreation::representations` (and therefore the
-    // entire `create_view` path) unconstructable outside the `iceberg` crate; the fix added
-    // `ViewRepresentations::new`. This is a COMPILE-LEVEL pin: it exercises `ViewRepresentations::
-    // new`, `SqlViewRepresentation { .. }`, `ViewCreation::builder`, `ViewVersion::builder`, the
-    // `View`'s pending-update ops, and references the `ViewUpdate` / `ViewRequirement` public enums
-    // — so if any of these regresses to crate-private, THIS CRATE STOPS COMPILING and the gap class
-    // is caught at build time forever (not just for `ViewRepresentations`).
+    // RISK: every type an out-of-crate catalog needs to drive create-replace-drop must be
+    // constructible through ONLY the public `iceberg` API. `ViewRepresentations` once had a
+    // crate-private constructor, which made the whole `create_view` path unreachable outside the
+    // crate. This is a COMPILE-LEVEL pin: a regression to crate-private stops this crate building.
     #[tokio::test]
     async fn test_public_view_api_is_fully_constructible_out_of_crate() {
         use iceberg::spec::{
@@ -3810,16 +3573,14 @@ mod tests {
         };
         use iceberg::{ViewCreation, ViewRequirement, ViewUpdate};
 
-        // 1. The previously-unconstructable piece: `ViewRepresentations::new` + a public
-        //    `SqlViewRepresentation` literal (all fields `pub`).
+        // The previously unconstructable piece, plus a public `SqlViewRepresentation` literal.
         let representations =
             ViewRepresentations::new(vec![ViewRepresentation::Sql(SqlViewRepresentation {
                 sql: "SELECT 1 AS event_count".to_string(),
                 dialect: "spark".to_string(),
             })]);
 
-        // 2. A full `ViewVersion` assembled purely through its public builder (the REST catalog's
-        //    create path mints this from a `ViewCreation`).
+        // A full `ViewVersion` through its public builder alone.
         let namespace_ident = NamespaceIdent::new("ns".into());
         let _view_version: ViewVersion = ViewVersion::builder()
             .with_version_id(1)
@@ -3838,17 +3599,15 @@ mod tests {
             .representations(representations)
             .build();
 
-        // 4. Reference the public requirement/update enums so a regression to crate-private on
-        //    either is a compile error here as well. (`NotExist` is a unit variant — constructing
-        //    it needs no extra crate; `UuidMatch` / `SetProperties` are referenced by pattern.)
+        // Reference the public requirement and update enums, so a regression to crate-private on
+        // either is a compile error here too.
         let _requirement: ViewRequirement = ViewRequirement::NotExist;
         let _matches_view_enums = |requirement: &ViewRequirement, update: &ViewUpdate| {
             matches!(requirement, ViewRequirement::UuidMatch { .. })
                 && matches!(update, ViewUpdate::SetProperties { .. })
         };
 
-        // 5. Drive create → replace → drop through ONLY the public `Catalog` trait, proving the
-        //    whole lifecycle is reachable out-of-crate.
+        // Drive the whole lifecycle through ONLY the public `Catalog` trait.
         let catalog = new_sql_catalog(temp_path(), Some("iceberg")).await;
         create_namespace(&catalog, &namespace_ident).await;
 
@@ -3884,15 +3643,13 @@ mod tests {
     async fn test_name_returns_configured_name() {
         let warehouse_location = temp_path();
         let catalog = new_sql_catalog(warehouse_location, Some("my_sql_cat")).await;
-        // The accessor returns the name supplied at construction; a stub returning the
-        // sentinel or an empty string would fail.
+        // A stub returning the sentinel or an empty string would fail here.
         assert_eq!(catalog.name(), "my_sql_cat");
     }
 
     #[tokio::test]
     async fn test_properties_returns_retained_props() {
-        // Build a catalog directly so an extra (non-reserved) property survives into the
-        // retained config props (URI/WAREHOUSE/BIND_STYLE are consumed by the builder).
+        // Build directly, so a non-reserved property survives into the retained config props.
         let warehouse_location = temp_path();
         let sql_lite_uri = format!("sqlite:{}", temp_path());
         sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
@@ -3935,19 +3692,12 @@ mod tests {
     /// A DSN password that must never appear in a `Debug` view.
     const DSN_PASSWORD: &str = "hunter2_DO_NOT_LEAK";
 
-    /// CORPUS PIN for [`super::redact_dsn_password`]'s soundness contract: every password-leak
-    /// input surfaced across all three prior review cycles — unencoded `/`,`?`,`#` in the password,
-    /// a `p@ss`-style embedded `@`, multiple `@`s deeper in the userinfo (`SECRET1@junk/SECRET2`,
-    /// `a@b/c@d`), `%40`-encoding, multi-`:`, IPv6, a query-tail secret, and the cycle-3
-    /// `://`-INSIDE-the-password class (`user:pass://x@host`) that a bare `find("://")` mistook for
-    /// a scheme separator — is asserted to leave NO marker byte in the output. The coarse rule masks
-    /// `[first ':' , last '@']`, which provably covers any password once the scheme strip is anchored
-    /// (see the fn doc), so this table can only stay green while the sound rule is in place. Each row
-    /// also pins the exact masked output and proves the marker is genuinely present in the input (no
-    /// false-green from an absent marker).
+    /// CORPUS PIN for [`super::redact_dsn_password`]. Every password-leak input found across three
+    /// review cycles must leave NO marker byte in the output. Only the sound coarse rule keeps this
+    /// table green. Each row also pins the exact masked output, and proves the marker is really in
+    /// the input, so an absent marker cannot produce a false green.
     #[test]
     fn test_redact_dsn_password_leak_corpus_no_marker_survives() {
-        // (input, exact expected output, forbidden marker that must not survive)
         const CORPUS: &[(&str, &str, &str)] = &[
             // Unencoded '/','?','#' in the password (the original slice-off leak).
             (
@@ -3986,8 +3736,8 @@ mod tests {
                 "postgres://user:***@host/db",
                 "x#y",
             ),
-            // Multiple '@'s with a delimiter between them — the cycle-2 acceptance-scan leaked the
-            // tail secret past the first "clean host" it accepted.
+            // Multiple '@'s with a delimiter: an acceptance scan leaked the tail secret past the
+            // first host it accepted.
             (
                 "postgres://user:SECRET1@junk/SECRET2@host/db",
                 "postgres://user:***@host/db",
@@ -4003,7 +3753,6 @@ mod tests {
                 "postgres://user:***@host/db",
                 "SECRET",
             ),
-            // Originals: ':'+'@' in password, '%40'-encoded '@', multi-':'.
             (
                 "postgres://user:p@:ss@host/db",
                 "postgres://user:***@host/db",
@@ -4025,20 +3774,14 @@ mod tests {
                 "postgres://user:***@[::1]:5432/db",
                 "SEKRET",
             ),
-            // `://`-INSIDE-the-password class (cycle-3 residue). A bare `find("://")` locks onto the
-            // password's own `://`, jumps `authority_start` past the userinfo `:`, and returns the
-            // DSN UNMASKED. The anchored scheme strip rejects the non-scheme prefix, keeps
-            // `authority_start = 0`, and the coarse `[first ':' , last '@']` span masks the leak.
-            // Scheme-less DSN whose password embeds `://`.
+            // A bare `find("://")` locks onto the password's own `://`, jumps past the userinfo
+            // `:`, and returns the DSN UNMASKED. The anchored strip keeps `authority_start = 0`.
             ("user:pass://x@host", "user:***@host", "pass://x"),
             // Scheme-less DSN with an embedded `@` AND a `://` after it (last '@' bounds the mask).
             ("user:p@ss://host", "user:***@ss://host", "p@ss"),
-            // Multibyte scheme-less DSN with `://` in the password — mask must stay on char
-            // boundaries and still cover the secret.
+            // Multibyte: the mask must stay on char boundaries and still cover the secret.
             ("usér:p+ø://x@höst", "usér:***@höst", "p+ø"),
-            // Schemeful CONTROL: a valid `postgres` scheme is stripped, and the password's OWN `://`
-            // is then masked by the coarse span. Already sound (masked under both the bare and the
-            // anchored strip) — pinned to prove the anchoring does not regress schemeful DSNs.
+            // Schemeful CONTROL: pinned to prove the anchoring does not regress schemeful DSNs.
             (
                 "postgres://user:pa://ss@host/db",
                 "postgres://user:***@host/db",
@@ -4061,11 +3804,8 @@ mod tests {
         }
     }
 
-    /// UNCHANGED-CASES PIN: inputs with no `:`, or no `@` after the first `:`, carry no userinfo
-    /// password and must be returned byte-identical. Includes the CHECK case
-    /// `user@host:5432/db` (the first ':' is the PORT, after the '@', so there is no '@' after it),
-    /// bare hosts, sqlite paths, an IPv6 hostport, a bare-host query '@' (no ':' before it), and
-    /// the empty string.
+    /// UNCHANGED-CASES PIN: an input with no `:`, or no `@` after the first `:`, carries no
+    /// userinfo password and must come back byte-identical.
     #[test]
     fn test_redact_dsn_password_unchanged_cases() {
         const UNCHANGED: &[&str] = &[
@@ -4091,9 +3831,8 @@ mod tests {
     }
 
     /// EXACT PER-CASE PINS: the canonical masked shapes, including the two deliberate
-    /// OVER-REDACTION cases the sound coarse rule now produces (documented in the fn's
-    /// over-redaction envelope). Over-redaction is safe by construction — masked-but-visible
-    /// bytes may be non-secrets, but no secret is ever left visible.
+    /// OVER-REDACTION cases. Over-redaction is safe: a masked byte may be a non-secret, but no
+    /// secret is ever left visible.
     #[test]
     fn test_redact_dsn_password_exact_shapes() {
         // Well-formed DSNs: password masked, everything else visible.
@@ -4112,32 +3851,28 @@ mod tests {
             "postgres://user:***@host/db"
         );
 
-        // --- Deliberate over-redaction (see fn doc "Over-redaction envelope"). ---
-        // (f) query case: the query '@' is the LAST '@', so host/path is swallowed into the mask.
-        // CHANGED from the prior precise-parser expectation `...@host/db?param=a@b` — this is the
-        // safe direction: `host/db?param=a` is a NON-secret masked, nothing leaks.
+        // --- Deliberate over-redaction (see the fn doc). ---
+        // The query '@' is the LAST '@', so host and path are swallowed into the mask. That is the
+        // safe direction: a non-secret is masked, and nothing leaks.
         assert_eq!(
             super::redact_dsn_password("postgres://user:PWQ@host/db?param=a@b"),
             "postgres://user:***@b"
         );
-        // Bare host with a port ':' and a later query '@': the port reads as a password separator.
+        // The port ':' reads as a password separator.
         assert_eq!(
             super::redact_dsn_password("postgres://host:5432/db?x=a@b"),
             "postgres://host:***@b"
         );
-        // A colon anywhere before a later '@' over-redacts (acceptable): host/path masked, no leak.
+        // Any colon before a later '@' over-redacts: host and path masked, no leak.
         assert_eq!(
             super::redact_dsn_password("postgres://host/db?p=a:b@c"),
             "postgres://host/db?p=a:***@c"
         );
     }
 
-    /// Risk (#159 unit-D residue): `SqlCatalogConfig` holds BOTH a DSN that can embed a password
-    /// (`postgres://user:pass@host`) and a raw prop map that may carry storage credentials, so a
-    /// plain-derived `Debug` prints both in clear. Pins that the DSN password AND secret prop
-    /// values are redacted while the diagnostic parts (user/host/db, prop keys, non-secret values)
-    /// stay visible. Mutation: revert the manual `Debug` to `#[derive(Debug)]` → the raw DSN
-    /// password and the raw secret prop value both print → RED.
+    /// Risk: `SqlCatalogConfig` holds both a DSN that can embed a password and a raw prop map that
+    /// may carry credentials, so a derived `Debug` prints both in clear. The diagnostic parts must
+    /// stay visible. MUTATION: revert the manual `Debug` to `#[derive(Debug)]` and this goes RED.
     #[test]
     fn test_config_debug_redacts_dsn_password_and_secret_props() {
         let config = super::SqlCatalogConfig {
@@ -4174,11 +3909,9 @@ mod tests {
         );
     }
 
-    /// Risk (#159 unit-D residue, composition): `SqlCatalog` holds the raw `properties` map, so its
-    /// `Debug` must redact secret values one level up (the `connection` pool prints only sizing
-    /// options — sqlx keeps the DSN in an unrendered field — and `fileio` is already redacted).
-    /// Builds a real SQLite-backed catalog carrying a secret prop and pins that a `{:?}` of the
-    /// whole catalog does not leak it. Mutation: revert `SqlCatalog`'s manual `Debug` to
+    /// Risk: `SqlCatalog` holds the raw `properties` map, so its `Debug` must redact secret values
+    /// one level up. A real SQLite-backed catalog carrying a secret prop must not leak it under
+    /// `{:?}`. MUTATION: revert `SqlCatalog`'s manual `Debug` to
     /// `#[derive(Debug)]` → the raw prop value prints → RED.
     #[tokio::test]
     async fn test_catalog_debug_redacts_secret_prop_values() {

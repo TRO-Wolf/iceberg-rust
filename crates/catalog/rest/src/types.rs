@@ -29,97 +29,38 @@ use iceberg::{
 };
 use serde_derive::{Deserialize, Serialize};
 
-// ============================================================================
-// Secret redaction for `Debug` (SEC-010)
+// Secret redaction for `Debug`.
 //
-// Several wire types in this module carry live credential material: the OAuth
-// `access_token`, the server-vended storage credentials, and the `String -> String`
-// property/config maps the REST server returns — which the catalog copies straight into
-// the table's `FileIO` props (see `catalog.rs::load_file_io`). A plain `#[derive(Debug)]`
-// prints all of that in clear at any `{:?}` / `tracing` site, including sites in
-// downstream user code this crate does not control, so every secret-bearing type below
-// carries a hand-written `Debug` instead.
+// Wire types here carry live credentials: the OAuth `access_token`, the vended storage
+// credentials, and the property maps the catalog copies into `FileIO` props. A derived `Debug`
+// prints all of it at any `{:?}` site. Every secret-bearing type below hand-writes `Debug`.
 //
-// Property maps are redacted PER KEY through the canonical adapter `iceberg::io::RedactedProps`
-// and its needle test `iceberg::io::is_secret_prop_key`
-// (`crates/iceberg/src/io/storage/config/mod.rs`) — the same superset `StorageConfig`, the core
-// `TableMetadata`/`ViewMetadata` `Debug` impls and the Glue / HMS / S3Tables / SQL config `Debug`
-// impls use — so keys stay visible for diagnostics, only secret VALUES are masked, and there is
-// exactly ONE authoritative needle list to keep current instead of drifting copies. The
-// narrower REST-local exact-match list would miss precisely the vended FileIO credentials
-// this module receives (`s3.secret-access-key`, `s3.session-token`, `gcs.oauth2.token`,
-// `adls.connection-string`). The needle test is deliberately a SUPERSET: a non-secret key
-// whose name merely contains a needle (e.g. `token-refresh-enabled`) renders as `***` too.
-// Over-redaction is the safe direction for a debug view.
+// Property maps redact PER KEY through `iceberg::io::RedactedProps` and `is_secret_prop_key`.
+// Keys stay visible and only values mask. One authoritative needle list serves every crate, so no
+// copy drifts. It is deliberately a superset: over-redaction is the safe direction here.
 //
-// ASSESSED and deliberately left on `#[derive(Debug)]` — no `String -> String` value map
-// and no secret field of their own:
-//   * Identifier / pagination-only shapes: `ListNamespaceResponse`, `ListTablesResponse`,
-//     `RenameTableRequest`, `RegisterTableRequest`, `UpdateNamespacePropertiesResponse`.
+// These keep a derived `Debug`, holding no value map and no secret: `ListNamespaceResponse`,
+// `ListTablesResponse`, `RenameTableRequest`, `RegisterTableRequest`,
+// `UpdateNamespacePropertiesResponse`. So do `ErrorModel`, `ErrorResponse`, and `OAuthError`,
+// whose server-controlled free text `Display` already surfaces verbatim. Key-based redaction
+// cannot mask a secret a server splices into free text.
 //
-// ASSESSED as RESIDUE, not as an all-clear — left on `#[derive(Debug)]` because redacting
-// only `Debug` would be theater while `Display` carries the same values:
-//   * `ErrorModel` / `ErrorResponse` — `message` / `type` / `code` / `stack` are the
-//     server's diagnostic payload, and `From<ErrorModel> for Error` already surfaces them
-//     verbatim. They are server-controlled free text: a hostile or careless server can echo
-//     whatever it likes into `message`, and this is now the one channel by which content from
-//     a token-endpoint / catalog response body still reaches logs, since
-//     `deserialize_catalog_response` stopped attaching raw bodies (SEC-010/F1) and
-//     `deserialize_unexpected_catalog_error` started key-redacting the non-2xx body (SEC-009).
-//     Key-based redaction cannot mask a secret a server splices into free text.
-//   * `OAuthError` — RFC 6749 §5.2 fields (`error` is a fixed error code, `error_description`
-//     is human-readable text, `error_uri` a documentation link), all three already surfaced by
-//     `From<OAuthError> for Error`. `error_description` is likewise server-controlled free
-//     text, so the same residue applies: the SHAPE carries no client secret, but the CONTENT
-//     is the server's to choose.
+// Maps that still print in clear, each reachable from a type in this module:
 //
-// CLOSED 2026-08-09 (SEC-002) — the core-crate property maps this banner used to name as
-// residue now redact through the same adapter:
-//   * `TableMetadata.properties` — reachable via `LoadTableResult.metadata` and
-//     `CommitTableResponse.metadata` (which is why `CommitTableResponse` is NOT in the
-//     all-clear list above: it carries a full `TableMetadata`).
-//   * `ViewMetadata.properties` — reachable via `LoadViewResult.metadata`.
+// | Map | Home | Reached through |
+// |---|---|---|
+// | `ViewVersion.summary` | `spec/view_version.rs` | `CreateViewRequest.view_version` |
+// | `TableUpdate`/`ViewUpdate::SetProperties` | `catalog/mod.rs` | `Commit*Request.updates` |
+// | `EncryptedKey.properties`, `encrypted_key_metadata` | `spec/encrypted_key.rs` | `TableMetadata` |
+// | `Snapshot.summary.additional_properties` | `spec/snapshot.rs` | `TableMetadata` |
+// | `StatisticsFile.key_metadata`, `blob_metadata[*].properties` | `spec/statistic_file.rs` | `TableMetadata` |
 //
-// STILL NAMED RESIDUE (out of scope for this unit) — `String -> String` maps that still derive
-// `Debug` and print in clear. The list spans BOTH crates; whoever closes it must fix both ends,
-// because masking only the core enum leaves the REST request types printing the same map:
-//   * `ViewVersion.summary` (`crates/iceberg`, `spec/view_version.rs`) — reachable via
-//     `CreateViewRequest.view_version` and, nested, through both view-metadata paths.
-//   * `TableUpdate::SetProperties` / `ViewUpdate::SetProperties` (`crates/iceberg`,
-//     `catalog/mod.rs`) — reachable via `CommitTableRequest.updates` / `CommitViewRequest.updates`.
-//     The core enums derive `Debug`, AND so do the REST-side `CommitTableRequest` /
-//     `CommitViewRequest` in THIS module (neither has a hand-written `Debug`; verified by probe —
-//     `{:?}` of a request carrying `SetProperties {"s3.secret-access-key": …}` prints the value in
-//     clear). Closing this means a hand-written `Debug` for both request types routing the maps
-//     through `RedactedProps` as well as redacting the core enums.
-//   * `EncryptedKey.properties` and its wrapped key bytes `encrypted_key_metadata`
-//     (`crates/iceberg`, `spec/encrypted_key.rs`) — `EncryptedKey` derives `Debug`, and
-//     `TableMetadata`'s hand-written `Debug` renders `encryption_keys` through it.
-//   * `Snapshot.summary.additional_properties` (`crates/iceberg`, `spec/snapshot.rs`) — `Summary`
-//     derives `Debug`, and `TableMetadata`'s hand-written `Debug` renders `snapshots` through it,
-//     so it is reachable via `LoadTableResult.metadata` / `CommitTableResponse.metadata` exactly
-//     as `TableMetadata.properties` was.
-//   * `StatisticsFile.key_metadata` and `StatisticsFile.blob_metadata[*].properties`
-//     (`crates/iceberg`, `spec/statistic_file.rs`) — likewise rendered through `statistics`.
-//     `partition_statistics` is clean: `PartitionStatisticsFile` carries neither.
-//
-// The `TableMetadata` half of that list is maintained on the `NAMED RESIDUE` note of
-// `impl std::fmt::Debug for TableMetadata` (`crates/iceberg`, `spec/table_metadata.rs`), which is
-// authoritative; this banner and the `Table` doc in `crates/iceberg/src/table.rs` mirror it.
-//
-// SCOPE OF THIS FIX — the REST server's own credential channels (`config`,
-// `storage-credentials`) are covered at the `Debug` layer AND, as of SEC-001/SEC-009, on the
-// error-rendering paths: `deserialize_catalog_response` (and both token-endpoint parses) attach a
-// sanitized `client.rs::SanitizedJsonError` instead of the raw `serde_json` error, so the
-// container-boundary echo (double-encoded JSON) no longer reaches `Display`/`Debug`, and
-// `deserialize_unexpected_catalog_error` key-redacts the non-2xx body. Pinned by
-// `test_double_encoded_body_does_not_leak_through_error_source`.
-// ============================================================================
+// Closing any `SetProperties` row needs BOTH ends: masking the core enum alone leaves the REST
+// request type printing the same map. The `TableMetadata` rows are maintained authoritatively on
+// `impl Debug for TableMetadata`; this list mirrors it.
 
-/// Marker written in place of a redacted secret value. Its presence also signals that the
-/// field/entry was populated, which is the only thing a debug view legitimately needs. Re-exported
-/// from the core crate so the REST types and the core metadata types cannot drift apart on the
-/// marker they emit.
+/// Marker written in place of a redacted secret value. Its presence also signals a populated
+/// field. It is re-exported from the core crate so no crate drifts on the marker it emits.
 const REDACTED: &str = iceberg::io::REDACTED_PROP_VALUE;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -129,10 +70,7 @@ pub(super) struct CatalogConfig {
 }
 
 impl std::fmt::Debug for CatalogConfig {
-    /// Hand-written: the `GET /v1/config` response's `defaults`/`overrides` are merged into the
-    /// catalog's runtime props and handed to `FileIO`, so they routinely carry vended storage
-    /// credentials (`s3.secret-access-key`, `s3.session-token`, …) as well as `token`. Secret
-    /// VALUES are masked per key; keys and non-secret values stay readable.
+    /// Hand-written: `defaults` and `overrides` reach `FileIO` and carry vended credentials.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CatalogConfig")
             .field("overrides", &RedactedProps(&self.overrides))
@@ -215,13 +153,9 @@ pub(super) struct TokenResponse {
 }
 
 impl std::fmt::Debug for TokenResponse {
-    /// Hand-written: `access_token` is raw bearer-secret material straight off the OAuth token
-    /// endpoint. A derived `Debug` would print it at any `{:?}` / `tracing::error!(?resp)` site.
-    /// The remaining fields (`token_type`, `expires_in`, `issued_token_type`) are non-secret OAuth
-    /// metadata and stay readable so a failing exchange is still diagnosable.
-    ///
-    /// Only presence is signalled (via [`REDACTED`]); the token's LENGTH is deliberately not
-    /// emitted — a length is a weak oracle on secret material and buys nothing here.
+    /// Hand-written: `access_token` is raw bearer-secret material. The other fields stay
+    /// readable, so a failing exchange is diagnosable. [`REDACTED`] signals presence only. The
+    /// token LENGTH is deliberately not emitted: a length is a weak oracle on secret material.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenResponse")
             .field("access_token", &REDACTED)
@@ -243,8 +177,7 @@ pub struct NamespaceResponse {
 }
 
 impl std::fmt::Debug for NamespaceResponse {
-    /// Hand-written: `properties` is a server-returned `String -> String` map whose entries are
-    /// redacted per key (see the module's redaction banner).
+    /// Hand-written: `properties` is a server-returned map. Entries redact per key.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NamespaceResponse")
             .field("namespace", &self.namespace)
@@ -264,8 +197,7 @@ pub struct CreateNamespaceRequest {
 }
 
 impl std::fmt::Debug for CreateNamespaceRequest {
-    /// Hand-written: `properties` may carry credentials an operator set on the namespace; entries
-    /// are redacted per key (see the module's redaction banner).
+    /// Hand-written: `properties` may carry operator-set credentials. Entries redact per key.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreateNamespaceRequest")
             .field("namespace", &self.namespace)
@@ -295,16 +227,12 @@ impl From<NamespaceResponse> for Namespace {
 pub struct ListNamespaceResponse {
     /// List of namespace identifiers returned by the server
     pub namespaces: Vec<NamespaceIdent>,
-    /// Opaque token for pagination. If present, indicates there are more results available.
-    /// Use this value in subsequent requests to retrieve the next page.
+    /// Opaque pagination token. When present, pass it back to fetch the next page.
     pub next_page_token: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-/// Request to update properties on a namespace.
-///
-/// Properties that are not in the request are not modified or removed by this call.
-/// Server implementations are not required to support namespace properties.
+/// Update namespace properties. An absent property is left alone. A server may not support them.
 pub struct UpdateNamespacePropertiesRequest {
     /// List of property keys to remove from the namespace
     pub removals: Option<Vec<String>>,
@@ -314,8 +242,7 @@ pub struct UpdateNamespacePropertiesRequest {
 }
 
 impl std::fmt::Debug for UpdateNamespacePropertiesRequest {
-    /// Hand-written: `updates` carries the property VALUES being written, which may include
-    /// credentials; entries are redacted per key. `removals` is key-only and stays readable.
+    /// Hand-written: `updates` redacts per key. `removals` is key-only and stays readable.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpdateNamespacePropertiesRequest")
             .field("removals", &self.removals)
@@ -331,8 +258,7 @@ pub struct UpdateNamespacePropertiesResponse {
     pub updated: Vec<String>,
     /// List of properties that were removed
     pub removed: Vec<String>,
-    /// List of properties requested for removal that were not found in the namespace's properties.
-    /// Represents a partial success response. Servers do not need to implement this.
+    /// Requested removals the namespace did not hold. A server need not report them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub missing: Option<Vec<String>>,
 }
@@ -343,17 +269,13 @@ pub struct UpdateNamespacePropertiesResponse {
 pub struct ListTablesResponse {
     /// List of table identifiers under the requested namespace
     pub identifiers: Vec<TableIdent>,
-    /// Opaque token for pagination. If present, indicates there are more results available.
-    /// Use this value in subsequent requests to retrieve the next page.
+    /// Opaque pagination token. When present, pass it back to fetch the next page.
     #[serde(default)]
     pub next_page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-/// Request to rename a table from one identifier to another.
-///
-/// It's valid to move a table across namespaces, but the server implementation
-/// is not required to support it.
+/// Request to rename a table. A cross-namespace move is valid, but a server need not support it.
 pub struct RenameTableRequest {
     /// Current table identifier to rename
     pub source: TableIdent,
@@ -363,16 +285,9 @@ pub struct RenameTableRequest {
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-/// Result returned when a table is successfully loaded or created.
-///
-/// The table metadata JSON is returned in the `metadata` field. The corresponding file location
-/// of table metadata should be returned in the `metadata_location` field, unless the metadata
-/// is not yet committed. For example, a create transaction may return metadata that is staged
-/// but not committed.
-///
-/// The `config` map returns table-specific configuration for the table's resources, including
-/// its HTTP client and FileIO. For example, config may contain a specific FileIO implementation
-/// class for the table depending on its underlying storage.
+/// Result returned when a table is loaded or created. A staged create transaction returns
+/// uncommitted `metadata` and no `metadata_location`. `config` carries table-specific
+/// configuration for the table's HTTP client and `FileIO`.
 pub struct LoadTableResult {
     /// May be null if the table is staged as part of a transaction
     pub metadata_location: Option<String>,
@@ -381,20 +296,14 @@ pub struct LoadTableResult {
     /// Table-specific configuration overriding catalog configuration
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub config: HashMap<String, String>,
-    /// Storage credentials for accessing table data. Clients should check this field
-    /// before falling back to credentials in the `config` field.
+    /// Storage credentials for the table data. Prefer these over the `config` credentials.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_credentials: Option<Vec<StorageCredential>>,
 }
 
 impl std::fmt::Debug for LoadTableResult {
-    /// Hand-written: `config` is documented by the REST spec as a place servers vend table
-    /// credentials, and `storage_credentials` is credential material by definition. `config`
-    /// entries are redacted per key; `storage_credentials` renders through [`StorageCredential`]'s
-    /// own redacting `Debug`.
-    ///
-    /// RESIDUE: `metadata` still renders through core's derived `TableMetadata` `Debug`, which
-    /// prints `properties` in clear — see the module's redaction banner.
+    /// Hand-written: the spec lets a server vend credentials through `config`, which redacts
+    /// per key. `storage_credentials` renders through [`StorageCredential`]'s own `Debug`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoadTableResult")
             .field("metadata_location", &self.metadata_location)
@@ -406,11 +315,7 @@ impl std::fmt::Debug for LoadTableResult {
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-/// Storage credential for a specific location prefix.
-///
-/// Indicates a storage location prefix where the credential is relevant. Clients should
-/// choose the most specific prefix (by selecting the longest prefix) if several credentials
-/// of the same type are available.
+/// Storage credential for one location prefix. Choose the longest matching prefix.
 pub struct StorageCredential {
     /// Storage location prefix where this credential is relevant
     pub prefix: String,
@@ -419,9 +324,7 @@ pub struct StorageCredential {
 }
 
 impl std::fmt::Debug for StorageCredential {
-    /// Hand-written: `config` holds the vended credential itself (`s3.access-key-id`,
-    /// `s3.secret-access-key`, `s3.session-token`, …). Values are redacted per key; `prefix` is a
-    /// storage location, not a secret, and stays readable so credential selection is diagnosable.
+    /// Hand-written: `config` IS the credential, so values redact. `prefix` stays readable.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageCredential")
             .field("prefix", &self.prefix)
@@ -432,12 +335,8 @@ impl std::fmt::Debug for StorageCredential {
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-/// Request to create a new table in a namespace.
-///
-/// If `stage_create` is false, the table is created immediately.
-/// If `stage_create` is true, the table is not created, but table metadata is initialized
-/// and returned. The service should prepare as needed for a commit to the table commit
-/// endpoint to complete the create transaction.
+/// Request to create a new table. `stage_create` false creates it at once. True returns
+/// initialized metadata instead, and the commit endpoint completes the create transaction.
 pub struct CreateTableRequest {
     /// Name of the table to create
     pub name: String,
@@ -457,9 +356,7 @@ pub struct CreateTableRequest {
 }
 
 impl std::fmt::Debug for CreateTableRequest {
-    /// Hand-written: `properties` carries the table properties being written, which may include
-    /// FileIO credentials; entries are redacted per key. Everything else is schema/layout metadata
-    /// and stays readable.
+    /// Hand-written: `properties` may carry FileIO credentials, so entries redact per key.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreateTableRequest")
             .field("name", &self.name)
@@ -474,15 +371,9 @@ impl std::fmt::Debug for CreateTableRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-/// Request to commit updates to a table.
-///
-/// Commits have two parts: requirements and updates. Requirements are assertions that will
-/// be validated before attempting to make and commit changes. Updates are changes to make
-/// to table metadata.
-///
-/// Create table transactions that are started by createTable with `stage-create` set to true
-/// are committed using this request. Transactions should include all changes to the table,
-/// including table initialization, like AddSchemaUpdate and SetCurrentSchemaUpdate.
+/// Request to commit updates to a table. Requirements are assertions validated before the
+/// commit. A `stage-create` transaction commits here and must include every change, table
+/// initialization included.
 pub struct CommitTableRequest {
     /// Table identifier to update; must be present for CommitTransactionRequest
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -495,11 +386,7 @@ pub struct CommitTableRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-/// Response returned when a table is successfully updated.
-///
-/// The table metadata JSON is returned in the metadata field. The corresponding file location
-/// of table metadata must be returned in the metadata-location field. Clients can check whether
-/// metadata has changed by comparing metadata locations.
+/// Response returned when a table is updated. Compare `metadata-location` to detect a change.
 pub struct CommitTableResponse {
     /// Location of the updated table metadata file
     pub metadata_location: String,
@@ -519,19 +406,12 @@ pub struct RegisterTableRequest {
     pub overwrite: Option<bool>,
 }
 
-// ============================================================================
-// View request/response shapes — mirror the Iceberg REST OpenAPI view routes
-// (`POST/GET /namespaces/{ns}/views`, `GET/POST/DELETE/HEAD .../views/{view}`,
-// `POST /views/rename`) and Java's `CreateViewRequest` / `LoadViewResponse` /
-// `UpdateTableRequest` (reused for the view replace/commit) wire formats.
-// ============================================================================
+// View shapes mirror the REST OpenAPI view routes and Java's `CreateViewRequest`,
+// `LoadViewResponse`, and `UpdateTableRequest`, which Java reuses for the view commit.
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-/// Request to create a new view in a namespace.
-///
-/// Mirrors Java `org.apache.iceberg.rest.requests.CreateViewRequest` — the wire fields are
-/// `name`, `location`, `view-version` (the initial [`ViewVersion`]), `schema`, and `properties`.
+/// Request to create a new view. Mirrors Java `CreateViewRequest`.
 pub struct CreateViewRequest {
     /// Name of the view to create
     pub name: String,
@@ -548,11 +428,7 @@ pub struct CreateViewRequest {
 }
 
 impl std::fmt::Debug for CreateViewRequest {
-    /// Hand-written: `properties` carries the view properties being written, which may include
-    /// FileIO credentials; entries are redacted per key.
-    ///
-    /// RESIDUE: `view_version` renders through core's derived `ViewVersion` `Debug`, whose
-    /// `summary` is an unredacted `String -> String` map — see the module's redaction banner.
+    /// Hand-written: `properties` redacts per key. `view_version.summary` still prints clear.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreateViewRequest")
             .field("name", &self.name)
@@ -566,10 +442,7 @@ impl std::fmt::Debug for CreateViewRequest {
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-/// Result returned when a view is successfully loaded or created.
-///
-/// Mirrors Java `org.apache.iceberg.rest.responses.LoadViewResponse` — `metadata-location`,
-/// `metadata` (the [`ViewMetadata`] JSON), and a view-specific `config` map.
+/// Result returned when a view is loaded or created. Mirrors Java `LoadViewResponse`.
 pub struct LoadViewResult {
     /// Location of the view metadata file
     pub metadata_location: String,
@@ -581,11 +454,7 @@ pub struct LoadViewResult {
 }
 
 impl std::fmt::Debug for LoadViewResult {
-    /// Hand-written: `config` is the view's server-vended configuration overlay — the same channel
-    /// `LoadTableResult.config` uses to hand back credentials — and is redacted per key.
-    ///
-    /// RESIDUE: `metadata` still renders through core's derived `ViewMetadata` `Debug`, which
-    /// prints `properties` in clear — see the module's redaction banner.
+    /// Hand-written: `config` is the same vended channel as `LoadTableResult.config`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoadViewResult")
             .field("metadata_location", &self.metadata_location)
@@ -597,11 +466,8 @@ impl std::fmt::Debug for LoadViewResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-/// Request to commit updates to a view (the replace/update-properties path).
-///
-/// Java reuses `UpdateTableRequest.create(identifier, requirements, updates)` for the view commit,
-/// so the wire shape is `identifier`, `requirements`, `updates` — but carrying VIEW requirements
-/// and VIEW updates (from `UpdateRequirements.forReplaceView`), not table ones.
+/// Request to commit updates to a view. Java reuses `UpdateTableRequest` here, so the wire shape
+/// is `identifier`, `requirements`, `updates`. Both carry VIEW entries, not table ones.
 pub struct CommitViewRequest {
     /// View identifier to update
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -618,22 +484,16 @@ mod tests {
 
     use super::*;
 
-    // ========================================================================
-    // SEC-010 — `Debug` must never render secret VALUES
+    // `Debug` must never render a secret VALUE.
     //
-    // Every test below feeds an obviously-synthetic sentinel into a secret-bearing field and
-    // asserts the sentinel is absent from `{:?}`, PLUS asserts that a non-secret sibling field
-    // still renders (anti-over-redaction — a `Debug` that prints nothing would pass a
-    // leak-only assertion vacuously). Each is RED-able by reverting the type to
-    // `#[derive(Debug)]`.
-    // ========================================================================
+    // Each test below feeds a synthetic sentinel into a secret field and asserts `{:?}` omits it.
+    // Each also asserts a non-secret sibling still renders: a `Debug` printing nothing would pass
+    // a leak-only assertion vacuously. The mutation each discriminates is named on the test.
 
-    /// Sentinel standing in for secret material. Deliberately not shaped like a real credential
-    /// so it cannot trip a secret scanner.
+    /// Sentinel for secret material. Not shaped like a credential, so no scanner trips on it.
     const SECRET_SENTINEL: &str = "SENTINEL_MUST_NOT_APPEAR_IN_DEBUG";
 
-    /// Minimal but complete v2 table metadata, so `LoadTableResult` can be built without a
-    /// fixture file.
+    /// Minimal complete v2 table metadata, so `LoadTableResult` needs no fixture file.
     fn minimal_table_metadata() -> TableMetadata {
         serde_json::from_value(serde_json::json!({
             "format-version": 2,
@@ -671,9 +531,7 @@ mod tests {
         .expect("minimal schema must parse")
     }
 
-    /// RISK: `TokenResponse.access_token` is raw bearer-secret material off the OAuth token
-    /// endpoint. A derived `Debug` prints it at every `{:?}` / `tracing` site.
-    /// RED-able: restore `#[derive(Debug)]` on `TokenResponse`.
+    /// Risk: `access_token` is bearer-secret material. Mutation: restore the derived `Debug`.
     #[test]
     fn test_token_response_debug_redacts_access_token() {
         let resp = TokenResponse {
@@ -693,7 +551,7 @@ mod tests {
             debug.contains(REDACTED),
             "expected redaction marker: {debug}"
         );
-        // Anti-over-redaction: the non-secret OAuth metadata must stay diagnosable.
+        // The non-secret OAuth metadata must stay diagnosable.
         assert!(
             debug.contains("bearer"),
             "Debug dropped token_type: {debug}"
@@ -701,9 +559,7 @@ mod tests {
         assert!(debug.contains("3600"), "Debug dropped expires_in: {debug}");
     }
 
-    /// RISK: the `GET /v1/config` `defaults`/`overrides` are merged into the runtime props and
-    /// handed to `FileIO`, so they carry vended storage credentials.
-    /// RED-able: restore `#[derive(Debug)]` on `CatalogConfig`.
+    /// Risk: `defaults` and `overrides` reach `FileIO`. Mutation: restore the derived `Debug`.
     #[test]
     fn test_catalog_config_debug_redacts_vended_credentials() {
         let config = CatalogConfig {
@@ -733,7 +589,7 @@ mod tests {
             debug.contains(REDACTED),
             "expected redaction marker: {debug}"
         );
-        // Anti-over-redaction: keys stay visible, and non-secret values still render.
+        // Keys stay visible and non-secret values still render.
         assert!(
             debug.contains("s3.secret-access-key"),
             "Debug dropped the secret KEY (keys are diagnostic, not secret): {debug}"
@@ -745,11 +601,9 @@ mod tests {
         assert!(debug.contains("ws"), "Debug dropped the prefix: {debug}");
     }
 
-    /// RISK (mutation-discriminating): the REST-local needle list used to be an EXACT match on
-    /// `credential` / `token` / `client_secret` only. Every key below is a real vended-credential
-    /// key that such a list would MISS entirely — they are covered only because redaction now
-    /// routes through the canonical superset `iceberg::io::is_secret_prop_key`.
-    /// RED-able: swap `is_secret_prop_key` in `RedactedProps` for the old exact-match list.
+    /// Risk: an exact-match needle list on `credential`, `token`, and `client_secret` misses
+    /// every real vended-credential key below. Only the superset `is_secret_prop_key` covers
+    /// them. Mutation: swap `is_secret_prop_key` in `RedactedProps` for that exact-match list.
     #[test]
     fn test_prop_redaction_uses_canonical_needle_superset() {
         let missed_by_exact_match_list = [
@@ -778,7 +632,7 @@ mod tests {
             assert!(debug.contains(REDACTED), "`{key}` was not masked: {debug}");
         }
 
-        // Anti-over-redaction: keys with no secret needle must render their real value.
+        // A key with no secret needle must render its real value.
         for key in ["s3.endpoint", "region", "prefix", "warehouse"] {
             let props = HashMap::from([(key.to_string(), "plain-value".to_string())]);
             let debug = format!("{:?}", RedactedProps(&props));
@@ -793,8 +647,7 @@ mod tests {
         }
     }
 
-    /// RISK: `StorageCredential.config` IS the vended credential.
-    /// RED-able: restore `#[derive(Debug)]` on `StorageCredential`.
+    /// Risk: `config` IS the vended credential. Mutation: restore the derived `Debug`.
     #[test]
     fn test_storage_credential_debug_redacts_config() {
         let credential = StorageCredential {
@@ -820,7 +673,7 @@ mod tests {
             debug.contains(REDACTED),
             "expected redaction marker: {debug}"
         );
-        // Anti-over-redaction: the prefix drives credential selection and must stay readable.
+        // The prefix drives credential selection and must stay readable.
         assert!(
             debug.contains("s3://bucket/warehouse/default.db/t"),
             "Debug dropped the credential prefix: {debug}"
@@ -831,10 +684,8 @@ mod tests {
         );
     }
 
-    /// RISK: `LoadTableResult` carries BOTH credential channels the REST spec defines — the
-    /// `config` overlay and `storage-credentials`. Both must be masked in one `{:?}`.
-    /// RED-able: restore `#[derive(Debug)]` on `LoadTableResult` (or on `StorageCredential`,
-    /// which this renders through).
+    /// Risk: one `{:?}` must mask both credential channels the spec defines. Mutation: restore
+    /// the derived `Debug` on `LoadTableResult` or on `StorageCredential`.
     #[test]
     fn test_load_table_result_debug_redacts_config_and_storage_credentials() {
         let result = LoadTableResult {
@@ -871,7 +722,7 @@ mod tests {
             debug.contains(REDACTED),
             "expected redaction marker: {debug}"
         );
-        // Anti-over-redaction: location and non-secret config still render.
+        // Location and non-secret config still render.
         assert!(
             debug.contains("00001-abc.metadata.json"),
             "Debug dropped the metadata location: {debug}"
@@ -882,8 +733,7 @@ mod tests {
         );
     }
 
-    /// RISK: `LoadViewResult.config` is the same server-vended overlay channel as the table one.
-    /// RED-able: restore `#[derive(Debug)]` on `LoadViewResult`.
+    /// Risk: `config` is the same vended channel as the table one. Mutation: derive `Debug`.
     #[test]
     fn test_load_view_result_debug_redacts_config() {
         let json = serde_json::json!({
@@ -935,8 +785,7 @@ mod tests {
         );
     }
 
-    /// RISK: `NamespaceResponse.properties` is a server-returned property map.
-    /// RED-able: restore `#[derive(Debug)]` on `NamespaceResponse`.
+    /// Risk: `properties` is a server-returned map. Mutation: restore its derived `Debug`.
     #[test]
     fn test_namespace_response_debug_redacts_secret_properties() {
         let response = NamespaceResponse {
@@ -963,8 +812,7 @@ mod tests {
         );
     }
 
-    /// RISK: the namespace WRITE paths carry the same values in the other direction.
-    /// RED-able: restore `#[derive(Debug)]` on either request type.
+    /// Risk: the write paths carry the same values. Mutation: restore either derived `Debug`.
     #[test]
     fn test_namespace_request_debug_redacts_secret_properties() {
         let create = CreateNamespaceRequest {
@@ -1000,7 +848,7 @@ mod tests {
             update_debug.contains(REDACTED),
             "expected redaction marker: {update_debug}"
         );
-        // Anti-over-redaction: removals are key-only and must stay fully visible.
+        // Removals are key-only and must stay fully visible.
         assert!(
             update_debug.contains("stale-owner"),
             "UpdateNamespacePropertiesRequest Debug dropped removals: {update_debug}"
@@ -1011,9 +859,7 @@ mod tests {
         );
     }
 
-    /// RISK: table/view CREATE requests carry operator-authored properties, which are a documented
-    /// place FileIO credentials get set.
-    /// RED-able: restore `#[derive(Debug)]` on either request type.
+    /// Risk: create requests carry operator-set properties. Mutation: derive either `Debug`.
     #[test]
     fn test_create_table_and_view_request_debug_redact_properties() {
         let table = CreateTableRequest {
@@ -1040,7 +886,7 @@ mod tests {
             table_debug.contains(REDACTED),
             "expected redaction marker: {table_debug}"
         );
-        // Anti-over-redaction: name/location/non-secret properties still render.
+        // Name, location, and non-secret properties still render.
         assert!(
             table_debug.contains("s3://bucket/warehouse/default.db/t"),
             "CreateTableRequest Debug dropped the location: {table_debug}"
@@ -1113,7 +959,6 @@ mod tests {
             json
         );
 
-        // Without properties
         let json_no_props = serde_json::json!({
             "namespace": ["db", "schema"]
         });
@@ -1130,10 +975,8 @@ mod tests {
         );
     }
 
-    // RISK: the LoadViewResult wire shape must match Java's `LoadViewResponse`
-    // (`metadata-location` / `metadata` / `config`). A wrong key (e.g. snake_case `metadata_location`)
-    // would silently fail to deserialize a real server's load-view / create-view response, and the
-    // embedded `metadata` must parse as a full `ViewMetadata` (versions, schemas, version-log).
+    // Risk: the wire shape must match Java `LoadViewResponse`. A snake_case key silently fails
+    // on a real server's response, and `metadata` must parse as a full `ViewMetadata`.
     #[test]
     fn test_load_view_result_serde() {
         let json = serde_json::json!({
@@ -1188,7 +1031,7 @@ mod tests {
         assert_eq!(result.metadata.versions().count(), 1);
         assert_eq!(result.config.get("key"), Some(&"value".to_string()));
 
-        // Round-trips back to a value with the same kebab-case keys.
+        // The round trip keeps the kebab-case keys.
         let reserialized =
             serde_json::to_value(&result).expect("LoadViewResult serialization failed");
         assert!(reserialized.get("metadata-location").is_some());
@@ -1196,10 +1039,8 @@ mod tests {
         assert!(reserialized.get("config").is_some());
     }
 
-    // RISK: the CreateViewRequest wire shape must match Java's `CreateViewRequest`
-    // (`name` / `location` / `view-version` / `schema` / `properties`). The `view-version` field
-    // (kebab-case) carries a full `ViewVersion`; a snake_case `view_version` or a missing field
-    // would be rejected by a real server.
+    // Risk: the wire shape must match Java `CreateViewRequest`. The kebab-case `view-version`
+    // carries a full `ViewVersion`. A snake_case or missing field makes a real server reject.
     #[test]
     fn test_create_view_request_serde() {
         let json = serde_json::json!({
@@ -1244,16 +1085,14 @@ mod tests {
             Some(&"daily".to_string())
         );
 
-        // Round-trip is value-stable (kebab-case `view-version` survives).
+        // The round trip is value-stable and `view-version` survives.
         let reserialized =
             serde_json::to_value(&request).expect("CreateViewRequest serialization failed");
         assert_eq!(reserialized, json);
     }
 
-    // RISK: the CommitViewRequest reuses Java's `UpdateTableRequest` shape
-    // (`identifier` / `requirements` / `updates`) but carries VIEW requirements/updates. The view
-    // requirement tag (`assert-view-uuid`) and the view update action tags must serialize per the
-    // REST spec; a table-requirement leak would make a real server reject the commit.
+    // Risk: the request reuses Java's `UpdateTableRequest` shape but carries VIEW entries.
+    // A table-requirement leak makes a real server reject the commit.
     #[test]
     fn test_commit_view_request_serde() {
         let json = serde_json::json!({
@@ -1281,7 +1120,7 @@ mod tests {
             ViewUpdate::SetProperties { .. }
         ));
 
-        // Round-trip is value-stable (view tags `assert-view-uuid` / `set-properties` survive).
+        // The round trip is value-stable and the view tags survive.
         let reserialized =
             serde_json::to_value(&request).expect("CommitViewRequest serialization failed");
         assert_eq!(reserialized, json);

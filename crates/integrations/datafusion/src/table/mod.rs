@@ -17,13 +17,10 @@
 
 //! Iceberg table providers for DataFusion.
 //!
-//! This module provides two table provider implementations:
+//! Two table provider implementations:
 //!
-//! - [`IcebergTableProvider`]: Catalog-backed provider with automatic metadata refresh.
-//!   Use for write operations and when you need to see the latest table state.
-//!
-//! - [`IcebergStaticTableProvider`]: Static provider for read-only access to a specific
-//!   table snapshot. Use for consistent analytical queries or time-travel scenarios.
+//! - [`IcebergTableProvider`], catalog-backed with metadata refresh. Use it to write.
+//! - [`IcebergStaticTableProvider`], read-only over one snapshot. Use it for time travel.
 
 pub mod metadata_table;
 pub mod table_provider_factory;
@@ -60,56 +57,19 @@ use crate::physical_plan::scan::IcebergTableScan;
 use crate::physical_plan::sort::sort_by_partition;
 use crate::physical_plan::write::IcebergWriteExec;
 
-/// Catalog-backed table provider with automatic metadata refresh.
-///
-/// This provider loads fresh table metadata from the catalog on every scan and write
-/// operation, ensuring you always see the latest table state. Use this when you need
-/// write operations or want to see the most up-to-date data.
-///
-/// For read-only access to a specific snapshot without catalog overhead, use
-/// [`IcebergStaticTableProvider`] instead.
-///
-/// # Schema freshness (BUG-005) — a new INSTANCE, never a mutating one
-///
-/// [`TableProvider::schema`] is synchronous, so it can only ever return a snapshot of the table's
-/// Arrow schema. This provider's snapshot is fixed for the life of the INSTANCE, and that
-/// immutability is load-bearing rather than an oversight: DataFusion resolves a projection to
-/// ORDINALS against `schema()` at planning time and stores them in the logical plan (a view, a
-/// deferred `DataFrame`). A provider whose schema mutates under such a plan makes those ordinals
-/// lie — DataFusion's own `TableScan::try_new` indexes the schema with them and PANICS with
-/// "index out of bounds" when the schema has since shrunk, and silently maps the wrong columns when a
-/// drop-plus-add keeps the length. So the schema an instance advertises never changes.
-///
-/// Freshness therefore comes from a NEW instance, exactly as it does in Java: Spark's `SparkTable`
-/// is built per query by `SparkCatalog.loadTable`, so a plan never sees its table's schema move
-/// underneath it. Two ways to get one:
-///
-/// * the catalog path (the normal one) — `IcebergSchemaProvider::table` builds a provider bound to
-///   freshly loaded metadata on EVERY resolution, so each query plans against the current schema
-///   with no action from the caller;
-/// * [`IcebergTableProvider::refreshed`] — for a provider registered directly with a
-///   `SessionContext`, returns a NEW provider carrying the table's current schema, leaving this one
-///   (and every plan built against it) untouched. Re-register it to pick up the evolution.
-///
-/// DATA is always current regardless: every operation reloads the table from the catalog, so a scan
-/// reads the latest snapshot even when it is advertising an older schema. [`IcebergTableScan`]
-/// reconciles the two by field id — see there.
+/// Catalog-backed table provider. It loads fresh table metadata on every scan and write. For
+/// read-only access to one snapshot, use [`IcebergStaticTableProvider`].
 #[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
-    /// The catalog that manages this table
     catalog: Arc<dyn Catalog>,
-    /// The table identifier (namespace + name)
     table_ident: TableIdent,
-    /// The Arrow schema this instance advertises. FIXED for the life of the instance — DataFusion
-    /// stores projection ordinals resolved against it (see the type docs).
+    /// FIXED for the life of the instance: DataFusion stores ordinals against it.
     schema: ArrowSchemaRef,
 }
 
 impl IcebergTableProvider {
-    /// Creates a new catalog-backed table provider.
-    ///
-    /// Loads the table once to capture the schema this instance will advertise, then keeps the
-    /// catalog reference so every operation can reload the table's data.
+    /// Creates a catalog-backed provider. It loads the table once for the schema this instance
+    /// advertises, then keeps the catalog so every operation reloads the data.
     pub(crate) async fn try_new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
@@ -117,7 +77,6 @@ impl IcebergTableProvider {
     ) -> Result<Self> {
         let table_ident = TableIdent::new(namespace, name.into());
 
-        // Load table once to get initial schema
         let table = catalog.load_table(&table_ident).await?;
         let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
 
@@ -128,13 +87,9 @@ impl IcebergTableProvider {
         })
     }
 
-    /// Returns a NEW provider for the same table, advertising the table's current schema.
-    ///
-    /// This provider is left untouched, so logical plans already built against it stay valid — that
-    /// is the whole point of returning a new instance instead of mutating this one (see the type
-    /// docs). Register the result to plan subsequent queries against the evolved schema; callers
-    /// going through [`crate::IcebergCatalogProvider`] never need this, since each query resolves a
-    /// fresh provider already.
+    /// Returns a NEW provider for the same table, advertising its current schema. This one is left
+    /// untouched, so plans already built against it stay valid. A caller going through
+    /// [`crate::IcebergCatalogProvider`] never needs it: each query resolves a fresh provider.
     pub async fn refreshed(&self) -> Result<Self> {
         let table = self.catalog.load_table(&self.table_ident).await?;
         Ok(IcebergTableProvider {
@@ -144,11 +99,8 @@ impl IcebergTableProvider {
         })
     }
 
-    /// Loads the table's current state from the catalog, with the Arrow form of its CURRENT schema.
-    ///
-    /// The write paths plan against this rather than against [`Self::schema`]: they re-scan and
-    /// commit against the table state they load, so their row filters, assignment indices and
-    /// projections must describe that same state.
+    /// Loads the table's current state, with its CURRENT schema in Arrow form. The write paths plan
+    /// against this, not [`Self::schema`], because they re-scan and commit against what they load.
     async fn load_table_with_current_schema(&self) -> Result<(Table, ArrowSchemaRef)> {
         let table = self.catalog.load_table(&self.table_ident).await?;
         let schema: ArrowSchemaRef =
@@ -160,7 +112,6 @@ impl IcebergTableProvider {
         &self,
         r#type: MetadataTableType,
     ) -> Result<IcebergMetadataTableProvider> {
-        // Load fresh table metadata for metadata table access
         let table = self.catalog.load_table(&self.table_ident).await?;
         IcebergMetadataTableProvider::try_new(table, r#type)
     }
@@ -183,20 +134,15 @@ impl TableProvider for IcebergTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Load fresh table metadata from catalog — the DATA is always current.
+        // The DATA is always current.
         let table = self
             .catalog
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
 
-        // `self.schema` IS the schema DataFusion planned against: `projection` holds ordinals it
-        // resolved against `schema()`, and this instance's schema cannot have moved since (see the
-        // type docs). `IcebergTableScan` binds that schema to the freshly loaded table by FIELD ID,
-        // so the emitted batches match what this plan advertises even when the table has evolved.
-        //
-        // Eager multi-partition plan via plan_tasks (G1): UnknownPartitioning(N) with fixed-T
-        // round-robin assignment. Knobs from session (T/L/off-switch).
+        // `self.schema` IS the schema DataFusion planned against, and it cannot have moved since.
+        // `IcebergTableScan` binds it to the reloaded table by FIELD ID.
         let knobs = crate::physical_plan::scan::scan_knobs_from_context(&state.task_ctx());
         Ok(Arc::new(
             IcebergTableScan::plan(
@@ -216,7 +162,7 @@ impl TableProvider for IcebergTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
+        // One source of truth: the scanner drops the filters it cannot push down.
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
@@ -226,8 +172,7 @@ impl TableProvider for IcebergTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Load fresh table metadata from catalog. The write is planned against the CURRENT schema —
-        // the table state the data files will be written and committed against.
+        // The write plans against the CURRENT schema: the state it commits against.
         let (table, current_schema) = self
             .load_table_with_current_schema()
             .await
@@ -235,14 +180,12 @@ impl TableProvider for IcebergTableProvider {
 
         let partition_spec = table.metadata().default_partition_spec();
 
-        // Step 1: Project partition values for partitioned tables
         let plan_with_partition = if !partition_spec.is_unpartitioned() {
             project_with_partition(input, &table)?
         } else {
             input
         };
 
-        // Step 2: Repartition for parallel processing
         let target_partitions =
             NonZeroUsize::new(state.config().target_partitions()).ok_or_else(|| {
                 DataFusionError::Configuration(
@@ -253,7 +196,6 @@ impl TableProvider for IcebergTableProvider {
         let repartitioned_plan =
             repartition(plan_with_partition, table.metadata_ref(), target_partitions)?;
 
-        // Apply sort node when it's not fanout mode
         let fanout_enabled = table
             .metadata()
             .properties()
@@ -301,23 +243,18 @@ impl TableProvider for IcebergTableProvider {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Load fresh table metadata from the catalog. Everything below — the row filter's binding
-        // schema and the exec's projection base — is derived from THIS state's schema, never from
-        // the cached one: the exec re-scans the table itself, and a projection naming a column the
-        // table no longer has fails the whole DELETE (BUG-005).
+        // The filter's binding schema and the projection base come from THIS state. The exec
+        // re-scans, and a projection naming a dropped column fails the whole DELETE.
         let (table, current_schema) = self
             .load_table_with_current_schema()
             .await
             .map_err(to_datafusion_error)?;
         let mode = WriteMode::from_property(&table, WRITE_DELETE_MODE);
-        // §5 isolation level, resolved at PLAN time like Java's row-level-operation builder
-        // (`SparkRowLevelOperationBuilder` ctor); default serializable (Java's per-op default).
+        // Resolved at PLAN time, as the Java `SparkRowLevelOperationBuilder` constructor does.
         let isolation = IsolationLevel::for_row_level_op(&table, WRITE_DELETE_ISOLATION_LEVEL)?;
 
-        // Build the EXACT row filter as a `PhysicalExpr` (the `WHERE` clause, AND-combined). We
-        // evaluate this ourselves against the scanned rows rather than relying on Iceberg predicate
-        // pushdown, which is INEXACT and would over-delete (see `physical_plan::delete`). An empty
-        // filter set means `DELETE FROM t` — delete every row.
+        // The exec evaluates this EXACT filter itself, because pushdown is INEXACT and would
+        // over-delete. An empty filter set means `DELETE FROM t`.
         let predicate = match filters.into_iter().reduce(Expr::and) {
             None => None,
             Some(combined) => {
@@ -342,26 +279,23 @@ impl TableProvider for IcebergTableProvider {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // As in `delete_from`: the CURRENT schema is the one the row filter, the `SET` assignment
-        // indices and the exec's projection base are all derived from (BUG-005).
+        // As in `delete_from`, everything derives from the CURRENT schema.
         let (table, current_schema) = self
             .load_table_with_current_schema()
             .await
             .map_err(to_datafusion_error)?;
         let mode = WriteMode::from_property(&table, WRITE_UPDATE_MODE);
-        // §5 isolation level, resolved at PLAN time (see `delete_from`); default serializable.
+        // Resolved at PLAN time; see `delete_from`.
         let isolation = IsolationLevel::for_row_level_op(&table, WRITE_UPDATE_ISOLATION_LEVEL)?;
 
         let df_schema = DFSchema::try_from(current_schema.as_ref().clone())?;
 
-        // The WHERE clause as an EXACT `PhysicalExpr` (see `delete_from` on why Iceberg pushdown is
-        // unsafe for a row-level mutation). `None` means update every row.
+        // EXACT; see `delete_from` on why pushdown is unsafe here. `None` updates every row.
         let predicate = match filters.into_iter().reduce(Expr::and) {
             None => None,
             Some(combined) => Some(state.create_physical_expr(combined, &df_schema)?),
         };
 
-        // Resolve each `SET col = expr` to `(table-column index, value PhysicalExpr)`.
         let mut physical_assignments = Vec::with_capacity(assignments.len());
         for (column, expr) in assignments {
             let col_idx = current_schema.index_of(&column).map_err(|e| {
@@ -385,28 +319,18 @@ impl TableProvider for IcebergTableProvider {
     }
 }
 
-/// Static table provider for read-only snapshot access.
-///
-/// This provider holds a cached table instance and does not refresh metadata or support
-/// write operations. Use this for consistent analytical queries, time-travel scenarios,
-/// or when you want to avoid catalog overhead.
-///
-/// For catalog-backed tables with write support and automatic refresh, use
-/// [`IcebergTableProvider`] instead.
+/// Static table provider for read-only snapshot access. It holds a cached table instance and
+/// refreshes no metadata. To write, use [`IcebergTableProvider`].
 #[derive(Debug, Clone)]
 pub struct IcebergStaticTableProvider {
-    /// The static table instance (never refreshed)
+    /// Never refreshed.
     table: Table,
-    /// Optional snapshot ID for this static view
     snapshot_id: Option<i64>,
-    /// A reference-counted arrow `Schema`
     schema: ArrowSchemaRef,
 }
 
 impl IcebergStaticTableProvider {
-    /// Creates a static provider from a table instance.
-    ///
-    /// Uses the table's current snapshot for all queries. Does not support write operations.
+    /// Creates a read-only provider over the table's current snapshot.
     pub async fn try_new_from_table(table: Table) -> Result<Self> {
         let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
         Ok(IcebergStaticTableProvider {
@@ -416,10 +340,7 @@ impl IcebergStaticTableProvider {
         })
     }
 
-    /// Creates a static provider for a specific table snapshot.
-    ///
-    /// Queries the specified snapshot for all operations. Useful for time-travel queries.
-    /// Does not support write operations.
+    /// Creates a read-only provider over one snapshot, for a time-travel query.
     pub async fn try_new_from_table_snapshot(table: Table, snapshot_id: i64) -> Result<Self> {
         let snapshot = table
             .metadata()
@@ -480,7 +401,7 @@ impl TableProvider for IcebergStaticTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
+        // One source of truth: the scanner drops the filters it cannot push down.
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
@@ -641,11 +562,8 @@ mod tests {
         ctx.register_table("mytable", Arc::new(table_provider))
             .unwrap();
 
-        // Attempt to insert into the static provider should fail
         let result = ctx.sql("INSERT INTO mytable VALUES (1, 2, 3)").await;
 
-        // The error should occur during planning or execution
-        // We expect an error indicating write operations are not supported
         assert!(
             result.is_err() || {
                 let df = result.unwrap();
@@ -656,8 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_static_provider_scan() {
-        // Use a real empty table (readable warehouse) — incomplete metadata fixtures that
-        // point at missing object-store paths must fail closed at plan, not demote to N=1.
+        // A real empty table: an incomplete fixture must fail closed at plan time, not demote.
         let (_catalog, _ns, _name, table, _tmp) = get_static_test_table().await;
         let table_provider = IcebergStaticTableProvider::try_new_from_table(table)
             .await
@@ -666,7 +583,6 @@ mod tests {
         ctx.register_table("mytable", Arc::new(table_provider))
             .unwrap();
 
-        // Test that scan operations work correctly
         let df = ctx.sql("SELECT count(*) FROM mytable").await.unwrap();
         let physical_plan = df.create_physical_plan().await;
         assert!(physical_plan.is_ok());
@@ -678,13 +594,11 @@ mod tests {
     async fn test_catalog_backed_provider_creation() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
 
-        // Test creating a catalog-backed provider
         let provider =
             IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
                 .await
                 .unwrap();
 
-        // Verify the schema is loaded correctly
         let schema = provider.schema();
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "id");
@@ -704,10 +618,8 @@ mod tests {
         ctx.register_table("test_table", Arc::new(provider))
             .unwrap();
 
-        // Test that scan operations work correctly
         let df = ctx.sql("SELECT * FROM test_table").await.unwrap();
 
-        // Verify the schema in the query result
         let df_schema = df.schema();
         assert_eq!(df_schema.fields().len(), 2);
         assert_eq!(df_schema.field(0).name(), "id");
@@ -730,17 +642,13 @@ mod tests {
         ctx.register_table("test_table", Arc::new(provider))
             .unwrap();
 
-        // Test that insert operations work correctly
         let result = ctx.sql("INSERT INTO test_table VALUES (1, 'test')").await;
 
-        // Insert should succeed (or at least not fail during planning)
         assert!(result.is_ok());
 
-        // Try to execute the insert plan
         let df = result.unwrap();
         let execution_result = df.collect().await;
 
-        // The execution should succeed
         assert!(execution_result.is_ok());
     }
 
@@ -982,17 +890,13 @@ mod tests {
         ctx.register_table("test_table", Arc::new(provider))
             .unwrap();
 
-        // Create a query plan
         let df = ctx.sql("SELECT id, name FROM test_table").await.unwrap();
 
-        // Get logical schema before consuming df
         let logical_schema = df.schema().clone();
 
-        // Get physical plan (this consumes df)
         let physical_plan = df.create_physical_plan().await.unwrap();
         let physical_schema = physical_plan.schema();
 
-        // Verify that logical and physical schemas are consistent
         assert_eq!(
             logical_schema.fields().len(),
             physical_schema.fields().len()
@@ -1075,7 +979,6 @@ mod tests {
         )
     }
 
-    /// Helper to check if a plan contains a SortExec node
     fn plan_contains_sort(plan: &Arc<dyn ExecutionPlan>) -> bool {
         if plan.name() == "SortExec" {
             return true;
@@ -1094,7 +997,6 @@ mod tests {
         use datafusion::logical_expr::dml::InsertOp;
         use datafusion::physical_plan::empty::EmptyExec;
 
-        // When fanout is enabled (default), no sort node should be added
         let (catalog, namespace, table_name, _temp_dir) =
             get_partitioned_test_catalog_and_table(Some(true)).await;
 
@@ -1113,7 +1015,6 @@ mod tests {
             .await
             .unwrap();
 
-        // With fanout enabled, there should be no SortExec in the plan
         assert!(
             !plan_contains_sort(&insert_plan),
             "Plan should NOT contain SortExec when fanout is enabled"
@@ -1126,7 +1027,6 @@ mod tests {
         use datafusion::logical_expr::dml::InsertOp;
         use datafusion::physical_plan::empty::EmptyExec;
 
-        // When fanout is disabled, a sort node should be added
         let (catalog, namespace, table_name, _temp_dir) =
             get_partitioned_test_catalog_and_table(Some(false)).await;
 
@@ -1145,7 +1045,6 @@ mod tests {
             .await
             .unwrap();
 
-        // With fanout disabled, there should be a SortExec in the plan
         assert!(
             plan_contains_sort(&insert_plan),
             "Plan should contain SortExec when fanout is disabled"
@@ -1174,18 +1073,15 @@ mod tests {
         let ctx = SessionContext::new();
         let state = ctx.state();
 
-        // Test scan with limit
         let scan_plan = table_provider
             .scan(&state, None, &[], Some(10))
             .await
             .unwrap();
 
-        // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 
-        // Verify the limit is set
         assert_eq!(
             iceberg_scan.limit(),
             Some(10),
@@ -1207,15 +1103,12 @@ mod tests {
         let ctx = SessionContext::new();
         let state = ctx.state();
 
-        // Test scan with limit
         let scan_plan = provider.scan(&state, None, &[], Some(5)).await.unwrap();
 
-        // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 
-        // Verify the limit is set
         assert_eq!(
             iceberg_scan.limit(),
             Some(5),
@@ -1223,31 +1116,26 @@ mod tests {
         );
     }
 
-    // Live-schema regressions (BUG-005 / BUG-011)
+    // ===== Live-schema regressions =====
     //
-    // These pin the two halves of the "frozen schema" defect class:
-    //   * BUG-005 — the provider cached the Arrow schema at construction, so a long-lived provider
-    //     (the `IcebergSchemaProvider` caches one FOREVER) planned every later query against a
-    //     schema that no longer described the table.
-    //   * BUG-011 — the scan reloaded the table but the stream adapter still advertised the
-    //     construction-time schema, so the emitted batches could not match the advertised schema.
+    // Two halves of one defect class. A provider that caches the Arrow schema forever plans every
+    // later query against a schema that no longer describes the table. And a scan that reloads the
+    // table while the adapter advertises the construction-time schema emits mismatched batches.
 
-    /// A schema evolution another engine applies out of band. NONE of these create a snapshot, so
-    /// after any of them the table's CURRENT schema and the schema its data is read with (the
-    /// current snapshot's) disagree — which is the whole point.
+    /// An out-of-band schema evolution. None of these creates a snapshot, so the CURRENT schema
+    /// and the schema the data is read with disagree.
     enum SchemaOp<'a> {
         /// `ALTER TABLE ADD COLUMN <name> int` (optional).
         AddOptionalInt(&'a str),
-        /// `ALTER TABLE RENAME COLUMN <from> TO <to>` — keeps the field id, changes only the name.
+        /// `ALTER TABLE RENAME COLUMN <from> TO <to>`, which keeps the field id.
         Rename(&'a str, &'a str),
-        /// `ALTER TABLE ALTER COLUMN <name> TYPE bigint` — a legal Iceberg int → long promotion.
+        /// `ALTER TABLE ALTER COLUMN <name> TYPE bigint`, a legal int to long promotion.
         PromoteToLong(&'a str),
         /// `ALTER TABLE DROP COLUMN <name>`.
         Drop(&'a str),
     }
 
-    /// Applies an out-of-band schema evolution through a SECOND catalog handle — exactly what
-    /// another engine or writer does. The provider under test never sees this transaction.
+    /// Applies an evolution through a SECOND catalog handle. The provider under test never sees it.
     async fn evolve_schema(catalog: &Arc<dyn Catalog>, ident: &TableIdent, op: SchemaOp<'_>) {
         use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
@@ -1271,7 +1159,6 @@ mod tests {
             .expect("commit the out-of-band schema evolution");
     }
 
-    /// Registers `provider` in a fresh session and runs `sql`, returning the batches.
     async fn query_through(
         provider: Arc<dyn TableProvider>,
         sql: &str,
@@ -1305,8 +1192,7 @@ mod tests {
         assert!(!batches.is_empty(), "a write must report its row count");
     }
 
-    /// BUG-005 + S1-2: an instance's advertised schema is STABLE — DataFusion stores projection
-    /// ordinals resolved against it — and freshness comes from a NEW instance via `refreshed()`.
+    /// An advertised schema is STABLE, and freshness comes from `refreshed()`.
     #[tokio::test]
     async fn test_provider_schema_is_stable_and_refreshed_serves_the_current_schema() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -1320,8 +1206,7 @@ mod tests {
 
         evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("extra")).await;
 
-        // An ordinary operation must NOT move the advertised schema: plans already hold ordinals
-        // resolved against it.
+        // An ordinary operation must NOT move the advertised schema.
         let ctx = SessionContext::new();
         let state = ctx.state();
         provider
@@ -1334,7 +1219,7 @@ mod tests {
             "an instance's advertised schema must not move under the plans built on it"
         );
 
-        // A NEW instance carries the current schema; the original is untouched.
+        // A NEW instance carries the current schema.
         let refreshed = provider
             .refreshed()
             .await
@@ -1353,9 +1238,8 @@ mod tests {
         );
     }
 
-    /// BUG-005 on the SHIPPING path: queries that go through the catalog resolve a provider per
-    /// planning round (Java: `SparkCatalog.loadTable` per query), so a session sees an out-of-band
-    /// evolution on its very next query without any refresh call.
+    /// A catalog query resolves a provider per planning round, as `SparkCatalog.loadTable` does,
+    /// so the next query sees an evolution with no refresh call.
     #[tokio::test]
     async fn test_catalog_resolves_a_fresh_provider_per_query() {
         use datafusion::catalog::SchemaProvider;
@@ -1396,16 +1280,14 @@ mod tests {
         );
     }
 
-    /// BUG-011, the same-instant case: `ADD COLUMN` does not create a snapshot, so the table's
-    /// CURRENT schema (what the provider advertises) has a column the scanned snapshot's schema
-    /// does not. The scan must still emit batches that match what it advertised — the added column
-    /// read as NULL, per Java (readers project the table schema and null-fill absent fields).
+    /// `ADD COLUMN` creates no snapshot, so the advertised schema has a column the scanned one
+    /// lacks. The batches must still match it, with that column read as NULL, as Java null-fills.
     #[tokio::test]
     async fn test_scan_batches_match_advertised_schema_after_add_column() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
         let ident = TableIdent::new(namespace.clone(), table_name.clone());
 
-        // One committed row, so the table has a snapshot whose schema is the 2-column original.
+        // One committed row, so the snapshot schema is the 2-column original.
         {
             let provider = IcebergTableProvider::try_new(
                 catalog.clone(),
@@ -1468,10 +1350,8 @@ mod tests {
         }
     }
 
-    /// BUG-011, the stale-provider case: a provider built before an evolution advertises the OLD
-    /// schema at planning time, while the scan reloads the table and would otherwise `select_all()`
-    /// the NEW column set. The emitted batches must match the schema the plan advertised — and the
-    /// provider must then self-heal, so the next query sees the evolved schema.
+    /// A provider built before an evolution advertises the OLD schema, while the scan reloads the
+    /// table and would otherwise `select_all()` the NEW column set.
     #[tokio::test]
     async fn test_stale_provider_scan_is_self_consistent() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -1483,8 +1363,7 @@ mod tests {
                 .expect("construct the provider BEFORE the evolution"),
         );
 
-        // Out-of-band: add a column AND write a row through it, so the table's current snapshot
-        // carries the 3-column schema while `stale_provider` still advertises 2 columns.
+        // The current snapshot carries 3 columns while `stale_provider` advertises 2.
         evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("extra")).await;
         {
             let fresh = IcebergTableProvider::try_new(
@@ -1531,9 +1410,8 @@ mod tests {
             );
         }
 
-        // And it stays that way: the instance's advertised schema does not move, so a second query
-        // through the SAME provider is planned and answered identically (freshness comes from a new
-        // instance — see `test_catalog_resolves_a_fresh_provider_per_query`).
+        // The advertised schema does not move, so a second query through the SAME provider is
+        // planned and answered identically.
         assert_eq!(
             stale_provider.schema().fields().len(),
             2,
@@ -1551,11 +1429,8 @@ mod tests {
         }
     }
 
-    /// BUG-011's silent path: with NO projection the scan used to ask the (reloaded) table for
-    /// `select_all()` — whatever column set it has NOW — while the stream adapter still advertised
-    /// the planning-time schema. DataFusion addresses batch columns by ordinal against the schema
-    /// its child advertised, so an extra or reordered column there is silent corruption. Whatever
-    /// the plan advertises, the batches must match it exactly.
+    /// The silent path: with NO projection the scan once asked the reloaded table for
+    /// `select_all()`. DataFusion addresses batch columns by ordinal, so an extra one corrupts.
     #[tokio::test]
     async fn test_unprojected_scan_advertises_the_schema_it_emits() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -1588,7 +1463,7 @@ mod tests {
 
         let ctx = SessionContext::new();
         let state = ctx.state();
-        // `projection: None` — the path that used to become `select_all()`.
+        // `projection: None` is the path that once became `select_all()`.
         let plan = stale_provider
             .scan(&state, None, &[], None)
             .await
@@ -1614,9 +1489,8 @@ mod tests {
         }
     }
 
-    /// Builds a table with an out-of-band-added `extra` column AND a row written through it, so the
-    /// table's current snapshot carries the 3-column schema, and returns a provider that was
-    /// constructed BEFORE the evolution (its cache still says 2 columns).
+    /// Builds a table whose snapshot carries an out-of-band `extra` column, plus a provider
+    /// constructed BEFORE that evolution.
     async fn stale_provider_over_evolved_table(
         catalog: &Arc<dyn Catalog>,
         namespace: &NamespaceIdent,
@@ -1653,7 +1527,6 @@ mod tests {
         stale_provider
     }
 
-    /// Sums the `count` column of a DML result.
     fn dml_row_count(batches: &[datafusion::arrow::array::RecordBatch]) -> u64 {
         batches
             .iter()
@@ -1668,9 +1541,8 @@ mod tests {
             .sum()
     }
 
-    /// The DML half (BUG-005): `delete_from` must bind its row filter — and the projection base the
-    /// exec re-scans with — to the table's CURRENT schema, not the provider's cached one. A filter
-    /// over a column added out of band cannot even be bound against the cached schema.
+    /// `delete_from` binds its row filter and projection base to the CURRENT schema. A filter over
+    /// a column added out of band cannot bind against the cached one.
     #[tokio::test]
     async fn test_delete_binds_to_current_schema_not_the_cached_one() {
         use datafusion::prelude::{col, lit};
@@ -1695,9 +1567,8 @@ mod tests {
         );
     }
 
-    /// The DML half (BUG-005), assignment side: `update` resolves each `SET` target against the
-    /// CURRENT schema, so the assignment's column index and the exec's projection base describe the
-    /// same table state. Against the cached schema, a column added out of band is "unknown".
+    /// `update` resolves each `SET` target against the CURRENT schema, so the column index and the
+    /// projection base describe one state. The cached schema calls a new column unknown.
     #[tokio::test]
     async fn test_update_binds_to_current_schema_not_the_cached_one() {
         use datafusion::prelude::{col, lit};
@@ -1724,10 +1595,8 @@ mod tests {
         );
     }
 
-    /// S1-1: `RENAME COLUMN` keeps the field id, rewrites the name and creates NO snapshot, so the
-    /// advertised (current) name and the scanned snapshot's name for the SAME column differ. Binding
-    /// by name would null-fill over live data — losing the value silently. Binding by field id
-    /// returns the value under its new name.
+    /// `RENAME COLUMN` keeps the field id and creates NO snapshot, so the advertised name and the
+    /// snapshot's name differ. Name binding null-fills over live data; field-id binding does not.
     #[tokio::test]
     async fn test_rename_preserves_values_under_the_new_name() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -1742,7 +1611,7 @@ mod tests {
         )
         .await;
 
-        // The rename lands AFTER the write, so the data is stored under the old name/id.
+        // The rename lands AFTER the write, so the data sits under the old name.
         evolve_schema(&catalog, &ident, SchemaOp::Rename("opt", "opt2")).await;
 
         let provider =
@@ -1778,8 +1647,7 @@ mod tests {
         assert_eq!(seen, 1, "the seeded row must be readable");
     }
 
-    /// S1-1, the REQUIRED-column case: a renamed required column has no null-fill escape hatch, so
-    /// name-binding would fail the query outright. Field-id binding returns the values.
+    /// A renamed REQUIRED column has no null-fill escape, so name binding fails the query outright.
     #[tokio::test]
     async fn test_required_column_rename_preserves_values() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -1818,10 +1686,8 @@ mod tests {
         assert_eq!(seen, 1, "the seeded row must be readable");
     }
 
-    /// S1-2 (probe F): a VIEW captures the provider and its projection ORDINALS. If the provider's
-    /// advertised schema shrank under it, DataFusion's own `TableScan::try_new` would index the
-    /// shorter schema with a stale ordinal and PANIC. Two rounds, with a column dropped out of band
-    /// in between, must both answer normally.
+    /// A VIEW captures the provider and its projection ORDINALS. A schema that shrank under it
+    /// makes `TableScan::try_new` index it with a stale ordinal and PANIC.
     #[tokio::test]
     async fn test_view_survives_an_out_of_band_column_drop() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -1849,10 +1715,8 @@ mod tests {
             .await
             .expect("create the view");
 
-        // The out-of-band drop that used to make the stored ordinals lie. It lands BEFORE the first
-        // round, so a provider that republished its schema during round 1 would leave round 2's
-        // re-plan indexing a SHORTER schema with round-1's ordinals — DataFusion's own
-        // `TableScan::try_new` panics with "index out of bounds" when that happens.
+        // The drop lands BEFORE round 1, so a provider that republished its schema there leaves
+        // round 2 indexing a SHORTER schema with round-1 ordinals, which panics.
         evolve_schema(&catalog, &ident, SchemaOp::Drop("id")).await;
 
         let round1 = ctx
@@ -1882,8 +1746,7 @@ mod tests {
         }
     }
 
-    /// S1-2 (probe C): a DataFrame built before an evolution and collected after it must not panic
-    /// either — its plan holds ordinals against the schema it was planned with.
+    /// A DataFrame collected after an evolution holds planning-time ordinals, and must not panic.
     #[tokio::test]
     async fn test_deferred_dataframe_survives_an_out_of_band_evolution() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -1905,14 +1768,12 @@ mod tests {
         ctx.register_table("t", Arc::new(provider))
             .expect("register the table");
 
-        // Plan now...
         let df = ctx.sql("SELECT name FROM t").await.expect("plan the query");
 
-        // ...evolve out of band...
         evolve_schema(&catalog, &ident, SchemaOp::Drop("id")).await;
 
-        // ...and only then execute — twice, because the second physical-planning round is what
-        // re-indexes the (possibly moved) provider schema with the plan's stored ordinals.
+        // Execute twice: the second physical-planning round re-indexes the provider schema with
+        // the plan's stored ordinals.
         let first = df
             .clone()
             .collect()
@@ -1929,8 +1790,8 @@ mod tests {
         }
     }
 
-    /// S2-3: `int` → `long` is a LEGAL Iceberg promotion and creates no snapshot, so the scanned
-    /// data is still `int` while the plan advertises `long`. The values must be read, widened.
+    /// `int` to `long` is a legal promotion and creates no snapshot, so the scanned data is still
+    /// `int` while the plan advertises `long`. The values must be read, widened.
     #[tokio::test]
     async fn test_legal_int_to_long_promotion_reads_widened_values() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -1976,10 +1837,9 @@ mod tests {
         assert_eq!(seen, 1, "the seeded row must be readable");
     }
 
-    /// LOW-5 (measured, then pinned): in the steady state the scanned batch's schema is IDENTICAL to
-    /// the advertised one — same fields, same `PARQUET:field_id` metadata — so `conform_batch`'s
-    /// equality fast path hits and no batch is rebuilt. A reader change that broke that identity
-    /// would silently move every scan onto the rebuild path; this catches it.
+    /// In the steady state the scanned batch's schema is IDENTICAL to the advertised one, metadata
+    /// included, so `conform_batch` rebuilds nothing. A reader change would move every scan onto
+    /// the rebuild path.
     #[tokio::test]
     async fn test_steady_state_batch_schema_is_identical_to_the_advertised_schema() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -2015,8 +1875,8 @@ mod tests {
         }
     }
 
-    /// A table `(id int, s struct<a int>)` — the nested-evolution fixture. `s.a` is field 3, so an
-    /// added `s.b` takes field 4, matching the shape Iceberg assigns.
+    /// The nested-evolution fixture `(id int, s struct<a int>)`. `s.a` is field 3, so an added
+    /// `s.b` takes field 4, as Iceberg assigns.
     async fn get_test_catalog_and_struct_table()
     -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
         use iceberg::spec::StructType;
@@ -2102,9 +1962,8 @@ mod tests {
             .expect("commit the nested add-column");
     }
 
-    /// S2-2: `ADD COLUMN s.b` creates no snapshot, so the scanned struct has only `a` while the
-    /// plan advertises `{a, b}`. Java/Spark reads `{a: 5, b: null}`; conforming must recurse into
-    /// the struct rather than treating the whole column as an illegal type change.
+    /// `ADD COLUMN s.b` creates no snapshot, so the scanned struct holds only `a` while the plan
+    /// advertises `{a, b}`. Conforming must recurse into the struct, as Spark does.
     #[tokio::test]
     async fn test_nested_add_column_reads_null_for_the_new_field() {
         use datafusion::arrow::array::{Array, Int32Array, StructArray};
@@ -2177,8 +2036,7 @@ mod tests {
             .expect("commit the rename");
     }
 
-    /// S2-2, the nested rename: the child keeps its field id, so its value must come back under the
-    /// new child name — the nested analogue of `test_rename_preserves_values_under_the_new_name`.
+    /// The nested rename: the child keeps its field id, so its value comes back under the new name.
     #[tokio::test]
     async fn test_nested_rename_preserves_values() {
         use datafusion::arrow::array::{Array, Int32Array, StructArray};
@@ -2228,14 +2086,13 @@ mod tests {
         assert_eq!(seen, 1, "the seeded row must be readable");
     }
 
-    // Pushed-down-filter rebinding (S2-1)
+    // ===== Pushed-down-filter rebinding =====
     //
-    // A pushed filter PRUNES rows before DataFusion sees them, and `Inexact` pushdown only lets
-    // DataFusion discard false positives — never resurrect a row the scan dropped. These three pin
-    // the ways a name-keyed filter goes wrong once names and field ids disagree.
+    // A pushed filter PRUNES rows before DataFusion sees them, and `Inexact` pushdown only discards
+    // false positives. These three pin how a name-keyed filter fails once names and ids disagree.
 
-    /// A table `(a int, b int)` for the name-swap case, where both columns share a type so a filter
-    /// bound to the wrong one still type-checks — and silently returns the wrong rows.
+    /// A table `(a int, b int)` for the name-swap case: one shared type, so a filter bound to the
+    /// wrong column type-checks and returns the wrong rows.
     async fn get_test_catalog_and_two_int_table()
     -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -2283,9 +2140,8 @@ mod tests {
         )
     }
 
-    /// S2-1: after a plain rename, a filter over the NEW name has to be pushed under the name the
-    /// scanned snapshot uses. Pushing the advertised name fails to bind at all
-    /// ("Field opt2 not found in schema") — the query dies rather than returning the row.
+    /// After a rename, a filter over the NEW name must go down under the snapshot's name. The
+    /// advertised name fails to bind, so the query dies instead of returning the row.
     #[tokio::test]
     async fn test_pushdown_after_a_rename_binds_the_snapshot_name() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -2313,10 +2169,8 @@ mod tests {
         );
     }
 
-    /// S2-1: after DROP + re-ADD, the advertised column has a FRESH field id that the scanned
-    /// snapshot knows nothing about — every row reads NULL for it. Pushing the filter under the old
-    /// name evaluates it against the OLD column's live data and prunes both rows; DataFusion can
-    /// never get them back.
+    /// After DROP and re-ADD the advertised column has a FRESH field id the snapshot lacks, so
+    /// every row reads NULL. Pushing under the old name prunes rows DataFusion cannot get back.
     #[tokio::test]
     async fn test_pushdown_after_drop_and_readd_keeps_the_rows() {
         let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -2345,8 +2199,8 @@ mod tests {
         );
     }
 
-    /// S2-1, the silent one: swap two columns' names. A filter pushed under the advertised name
-    /// binds to the OTHER column's data — same type, no error, wrong rows.
+    /// The silent one: swap two names, and a filter pushed under the advertised name binds to the
+    /// OTHER column's data. Same type, no error, wrong rows.
     #[tokio::test]
     async fn test_pushdown_after_a_name_swap_filters_the_right_column() {
         let (catalog, namespace, table_name, _temp_dir) =
@@ -2370,8 +2224,8 @@ mod tests {
             IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
                 .await
                 .expect("construct a provider on the swapped table");
-        // Positions are unchanged; only the NAMES moved. The column now advertised as `a` is field
-        // id 2 — the one the snapshot still calls `b`, holding the value 2.
+        // Only the NAMES moved. The column advertised as `a` is field id 2, which the snapshot
+        // still calls `b`, holding the value 2.
         assert_eq!(provider.schema().field(0).name(), "b");
         assert_eq!(provider.schema().field(1).name(), "a");
 
@@ -2383,10 +2237,10 @@ mod tests {
         );
     }
 
-    /// S3-4: the scan must read ONLY the projected column. This drives the very function the plan
-    /// executes ([`crate::physical_plan::scan::get_batch_stream`]) with the column set the plan
-    /// resolved, so a revert to `select_all()` widens the pre-conform batch and goes RED here —
-    /// `conform_batch` would otherwise hide it, since it narrows the batch back down afterwards.
+    /// The scan must read ONLY the projected column. It drives
+    /// [`crate::physical_plan::scan::get_batch_stream`] with the resolved column set, so a revert
+    /// to `select_all()` widens the pre-conform batch and REDs here. `conform_batch` would
+    /// otherwise hide it, because it narrows the batch again.
     #[tokio::test]
     async fn test_scan_reads_only_the_projected_column() {
         use futures::TryStreamExt;
@@ -2443,15 +2297,12 @@ mod tests {
         let ctx = SessionContext::new();
         let state = ctx.state();
 
-        // Test scan without limit
         let scan_plan = table_provider.scan(&state, None, &[], None).await.unwrap();
 
-        // Verify that the scan plan is an IcebergTableScan
         let iceberg_scan = scan_plan
             .downcast_ref::<IcebergTableScan>()
             .expect("Expected IcebergTableScan");
 
-        // Verify the limit is None
         assert_eq!(
             iceberg_scan.limit(),
             None,
@@ -2459,8 +2310,7 @@ mod tests {
         );
     }
 
-    /// G1 fail-closed: incomplete metadata (snapshot → missing object-store paths) must
-    /// surface a planning error, not silently demote to UnknownPartitioning(1).
+    /// Incomplete metadata must surface a planning error, not demote to `UnknownPartitioning(1)`.
     #[tokio::test]
     async fn test_plan_tasks_failure_fail_closed_not_n1_demote() {
         use datafusion::datasource::TableProvider;

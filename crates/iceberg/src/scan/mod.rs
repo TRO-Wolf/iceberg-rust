@@ -95,23 +95,19 @@ pub struct TableScanBuilder<'a> {
     batch_size: Option<usize>,
     case_sensitive: bool,
     filter: Option<Predicate>,
-    /// When true, [`filter`](Self::filter) is used only for planning-time file / manifest
-    /// pruning (partition summaries + inclusive metrics). Surviving files return **all** rows:
-    /// no residual is attached to [`FileScanTask`] and therefore no row-group / per-row residual
-    /// filtering is applied. Required for copy-on-write MERGE target scans that must keep
-    /// co-located survivor rows. Set by [`with_file_prune_only`](Self::with_file_prune_only);
-    /// cleared by [`with_filter`](Self::with_filter).
+    /// When true, [`filter`](Self::filter) prunes files and manifests only. A surviving file
+    /// returns every row, because no residual reaches [`FileScanTask`]. Copy-on-write MERGE
+    /// target scans need this, to keep co-located survivor rows.
     file_prune_only: bool,
     concurrency_limit_data_files: usize,
     concurrency_limit_manifest_entries: usize,
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
-    /// When true (default) and [`concurrency_limit_data_files`](Self::concurrency_limit_data_files)
-    /// is greater than 1, [`TableScan::to_arrow`] expands whole-file tasks that carry Parquet
-    /// `split_offsets` into per-row-group sub-tasks so concurrent readers issue parallel ranged
-    /// GETs inside a single data file (RePark within-file parallel reads). Disabled when the
-    /// scan projects `_pos` (absolute ordinals require whole-file sequential decode).
+    /// When true, and the data-file concurrency limit exceeds 1, [`TableScan::to_arrow`] expands
+    /// a whole-file task carrying `split_offsets` into per-row-group sub-tasks, so one data file
+    /// issues parallel ranged GETs. A `_pos` projection disables it, because absolute ordinals
+    /// need a whole-file sequential decode.
     within_file_read_parallelism: bool,
     /// Override for Parquet coalesced range-fetch concurrency (column-chunk / footer ranges).
     /// `None` ⇒ ArrowReader default (10).
@@ -161,10 +157,8 @@ impl<'a> TableScanBuilder<'a> {
     /// Overrides the split target size (bytes) used by [`TableScan::plan_tasks`], mirroring Java's
     /// scan-time `option(TableProperties.SPLIT_SIZE, ...)`.
     ///
-    /// When unset, [`plan_tasks`](TableScan::plan_tasks) reads the table property
-    /// `read.split.target-size`, defaulting to 128 MiB (Java `SPLIT_SIZE_DEFAULT`). The override
-    /// wins over the table property, which wins over the default — exactly Java's
-    /// `BaseScan.targetSplitSize()`.
+    /// When unset, [`plan_tasks`](TableScan::plan_tasks) reads `read.split.target-size`,
+    /// defaulting to 128 MiB. The override wins over the property, which wins over the default.
     pub fn with_split_size(mut self, split_size: u64) -> Self {
         self.split_size = Some(split_size);
         self
@@ -203,19 +197,9 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
-    /// Specifies a predicate to use as a filter
-    ///
-    /// The predicate is applied at **plan time** (manifest / partition / inclusive-metrics
-    /// pruning) **and** as a residual row filter on each surviving [`FileScanTask`] (and
-    /// therefore as row-group filtering when enabled). This matches Java `Scan.filter`.
-    ///
-    /// **COW MERGE footgun:** this applies a residual that drops co-located non-matching
-    /// rows inside surviving files. For copy-on-write MERGE target scans that need file pruning
-    /// without dropping survivors, use [`with_file_prune_only`](Self::with_file_prune_only)
-    /// instead — never this method.
-    ///
-    /// Calling this clears any prior [`with_file_prune_only`](Self::with_file_prune_only) mode
-    /// (last call wins).
+    /// Specifies a predicate to use as a filter The predicate prunes manifests and files at plan
+    /// time, and stays as a residual row filter on each surviving [`FileScanTask`]. Matches Java
+    /// `Scan.filter`. The residual drops co-located non-matching rows inside a surviving file.
     pub fn with_filter(mut self, predicate: Predicate) -> Self {
         // calls rewrite_not to remove Not nodes, which must be absent
         // when applying the manifest evaluator
@@ -224,19 +208,9 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
-    /// Specifies a predicate used **only** for planning-time file / manifest pruning.
-    ///
-    /// Manifests and data files are still pruned via partition summaries and inclusive column
-    /// metrics exactly as with [`with_filter`](Self::with_filter), but surviving files return
-    /// **every row** — no residual is attached to [`FileScanTask`], so residual row filters and
-    /// predicate-driven row-group filtering do not run. This is the mode COW MERGE needs: prune
-    /// files that cannot contain any ON-clause match, then rewrite whole surviving files
-    /// including unmatched co-located survivors.
-    ///
-    /// Spark's MERGE target planning applies a runtime file filter while keeping full file
-    /// contents for the rewrite (`SparkCopyOnWrite` scan-task filtering).
-    ///
-    /// Calling this replaces any prior [`with_filter`](Self::with_filter) (last call wins).
+    /// Specifies a predicate used **only** for planning-time file / manifest pruning. Pruning works
+    /// as in [`with_filter`](Self::with_filter), but a surviving file returns every row. No
+    /// residual reaches [`FileScanTask`], so no row filter and no row-group filter runs.
     pub fn with_file_prune_only(mut self, predicate: Predicate) -> Self {
         self.filter = Some(predicate.rewrite_not());
         self.file_prune_only = true;
@@ -279,21 +253,9 @@ impl<'a> TableScanBuilder<'a> {
         self.table
     }
 
-    /// Scan the snapshot that a branch or tag reference points to.
-    ///
-    /// Mirrors Java `TableScan.useRef(String ref)`: the named reference is
-    /// resolved to its snapshot at [`build`](Self::build) time. The `"main"`
-    /// branch resolves to the table's current snapshot, matching Java's
-    /// `useRef(MAIN_BRANCH)` returning the table default.
-    ///
-    /// Combining `use_ref` with [`snapshot_id`](Self::snapshot_id) is rejected
-    /// at `build` time — a reference and an explicit snapshot id are
-    /// contradictory selectors (Java "Cannot override ref, already set snapshot
-    /// id"). An unknown reference name is also rejected at `build` time.
-    ///
-    /// # Arguments
-    ///
-    /// * `ref_name` - the branch or tag name to resolve.
+    /// Scan the snapshot that a branch or tag reference points to. Mirrors Java `TableScan.useRef`.
+    /// [`build`](Self::build) resolves the name, and rejects both an unknown name and a
+    /// [`snapshot_id`](Self::snapshot_id) set alongside it.
     pub fn use_ref(mut self, ref_name: impl Into<String>) -> Self {
         self.snapshot_ref = Some(ref_name.into());
         self
@@ -314,15 +276,10 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
-    /// Enable or disable within-file read parallelism for [`TableScan::to_arrow`].
-    ///
-    /// When enabled (default) and the data-file concurrency limit is greater than 1, whole-file
-    /// tasks that carry Parquet row-group `split_offsets` are expanded into per-offset sub-tasks
-    /// and read under the same concurrency budget as cross-file tasks. That turns a monolithic
-    /// multi-row-group file into concurrent ranged GETs (the RePark MERGE target-scan lever).
-    ///
-    /// Batch order across sub-tasks of one file is **not** preserved (same as multi-file
-    /// concurrent reads). Automatically suppressed when the scan projects `_pos`.
+    /// Enable or disable within-file read parallelism for [`TableScan::to_arrow`]. When enabled,
+    /// and the data-file concurrency limit exceeds 1, a whole-file task that carries row-group
+    /// `split_offsets` expands into per-offset sub-tasks. They read under the same concurrency
+    /// budget as cross-file tasks.
     pub fn with_within_file_read_parallelism(mut self, enabled: bool) -> Self {
         self.within_file_read_parallelism = enabled;
         self
@@ -348,62 +305,40 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
-    /// Determines whether to enable row group filtering.
-    /// When enabled, if a read is performed with a filter predicate,
-    /// then the metadata for each row group in the parquet file is
-    /// evaluated against the filter predicate and row groups
-    /// that cant contain matching rows will be skipped entirely.
+    /// Enable or disable row-group filtering. When enabled, a read with a filter predicate skips
+    /// each Parquet row group whose metadata cannot match.
     ///
-    /// Defaults to enabled, as it generally improves performance or
-    /// keeps it the same, with performance degradation unlikely.
+    /// Default on. It usually improves performance and rarely hurts it.
     pub fn with_row_group_filtering_enabled(mut self, row_group_filtering_enabled: bool) -> Self {
         self.row_group_filtering_enabled = row_group_filtering_enabled;
         self
     }
 
-    /// Determines whether to enable row selection.
-    /// When enabled, if a read is performed with a filter predicate,
-    /// then (for row groups that have not been skipped) the page index
-    /// for each row group in a parquet file is parsed and evaluated
-    /// against the filter predicate to determine if ranges of rows
-    /// within a row group can be skipped, based upon the page-level
-    /// statistics for each column.
+    /// Enable or disable row selection. When enabled, a read with a filter predicate parses the
+    /// page index of each surviving row group, and skips row ranges the page statistics exclude.
     ///
-    /// Defaults to being disabled. Enabling requires parsing the parquet page
-    /// index, which can be slow enough that parsing the page index outweighs any
-    /// gains from the reduced number of rows that need scanning.
-    /// It is recommended to experiment with partitioning, sorting, row group size,
-    /// page size, and page row limit Iceberg settings on the table being scanned in
-    /// order to get the best performance from using row selection.
+    /// Default off. Parsing the page index can cost more than the rows it saves. Tune the table's
+    /// partitioning, sorting, row-group size, page size and page row limit before you enable it.
     pub fn with_row_selection_enabled(mut self, row_selection_enabled: bool) -> Self {
         self.row_selection_enabled = row_selection_enabled;
         self
     }
 
-    /// Configures a [`MetricsReporter`] to receive a [`ScanReport`] once the scan's
-    /// [`FileScanTask`] stream has been fully consumed.
+    /// Configures a [`MetricsReporter`] to receive a [`ScanReport`] once the
+    /// [`FileScanTask`] stream is fully consumed. Mirrors Java
+    /// `TableScanContext.metricsReporter`.
     ///
-    /// Mirrors Java `TableScanContext.metricsReporter` (set via `Catalog`/`TableScan`
-    /// configuration). When set, [`plan_files`](TableScan::plan_files) collects the
-    /// scan-planning metrics — manifest-list totals, scanned/skipped manifests, produced
-    /// data/delete file counts and sizes, and the total planning duration — and reports a
-    /// single [`MetricsReport::Scan`] when the returned stream completes (the analogue of
-    /// Java's `CloseableIterable.whenComplete(...)` close hook).
-    ///
-    /// **Opt-in.** When this is not called, planning installs no collector, no timer, and
-    /// no stream wrapper: the scan path is byte-for-byte the un-instrumented path (Java's
-    /// `ScanMetrics.noop()` when no reporter is configured).
+    /// Opt-in. Without a reporter, planning installs no collector, no timer and no stream
+    /// wrapper, so the scan path stays un-instrumented.
     pub fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
         self.metrics_reporter = Some(reporter);
         self
     }
 
-    /// Resolves the split planning config (target / lookback / open-file-cost) at `build` time,
-    /// porting Java `BaseScan.targetSplitSize()` / `splitLookback()` / `splitOpenFileCost()`:
-    /// read the table property (defaulting to the hard-coded Java default), then let the scan-time
-    /// override win over the SAME key. Validation (target > 0, lookback > 0, open-file-cost >= 0)
-    /// is enforced at [`plan_tasks`](TableScan::plan_tasks) time, matching Java's
-    /// `TableScanUtil.validatePlanningArguments`.
+    /// Resolves the split planning config at `build` time, as Java `BaseScan` does. Read the
+    /// table property, then let the scan-time override for the same key win.
+    ///
+    /// [`plan_tasks`](TableScan::plan_tasks) validates the result, as Java does.
     fn resolve_split_config(&self) -> SplitConfig {
         let props = self.table.metadata().properties();
 
@@ -442,13 +377,9 @@ impl<'a> TableScanBuilder<'a> {
         // the normal `TableScan` carry it.
         let table_name = self.table.identifier().to_string();
 
-        // Resolve a branch/tag reference (`use_ref`) to a concrete snapshot id,
-        // honoring BOTH selectors (Java `SnapshotScan.useRef` L116-128):
-        //   - a ref AND an explicit snapshot id are contradictory selectors
-        //     (Java "Cannot override ref, already set snapshot id");
-        //   - an unknown ref name is rejected (Java "Cannot find ref %s").
-        // `snapshot_for_ref("main")` resolves to the current snapshot, matching
-        // Java's `useRef(MAIN_BRANCH)` returning the table default.
+        // Resolve a branch or tag reference to a snapshot id, as Java `SnapshotScan.useRef`
+        // does. A ref together with a snapshot id is a contradiction, and an unknown ref name is
+        // an error. `"main"` resolves to the current snapshot.
         let snapshot_id = match (self.snapshot_id, self.snapshot_ref.as_ref()) {
             (Some(_), Some(ref_name)) => {
                 return Err(Error::new(
@@ -488,10 +419,9 @@ impl<'a> TableScanBuilder<'a> {
                 .clone(),
             None => {
                 let Some(current_snapshot_id) = self.table.metadata().current_snapshot() else {
-                    // No snapshot ⇒ an empty scan with no rows. Java
-                    // `SnapshotScan.planFiles` returns `CloseableIterable.empty()` BEFORE
-                    // the timer/report block, so NO `ScanReport` is emitted for a
-                    // snapshotless table — match that by leaving `metrics: None`.
+                    // No snapshot means an empty scan. Java returns early, before its timer and
+                    // report block, so a snapshotless table emits no `ScanReport`. `metrics:
+                    // None` matches that.
                     return Ok(TableScan {
                         batch_size: self.batch_size,
                         column_names: self.column_names,
@@ -572,23 +502,17 @@ impl<'a> TableScanBuilder<'a> {
         }
 
         let snapshot_bound_predicate = if let Some(ref predicates) = self.filter {
-            // Honor the builder's case-sensitivity for plan-time metrics prune (and residual
-            // construction when apply_residual_filter is true). Partition-filter rebinding in
-            // PlanContext already used `case_sensitive`; binding with a hardcoded `true` here
-            // made InclusiveMetricsEvaluator disagree with partition prune under
-            // `.with_case_sensitive(false)`.
+            // Bind with the builder's case sensitivity. `PlanContext` already rebinds the
+            // partition filter that way, so a hardcoded `true` here made
+            // `InclusiveMetricsEvaluator` disagree with the partition prune.
             Some(predicates.bind(schema.clone(), self.case_sensitive)?)
         } else {
             None
         };
 
-        // Build the opt-in metrics context (collector + report inputs) ONLY when a
-        // reporter was configured. When `None`, no collector is threaded into planning, so
-        // the scan path is byte-for-byte unchanged. The report inputs mirror exactly what
-        // Java `SnapshotScan.planFiles` reads to build its `ImmutableScanReport`:
-        // schema id, projected field ids + their column names, table name, snapshot id,
-        // and the filter (defaulting to `alwaysTrue` when the scan has no filter, like
-        // Java `BaseScan.filter()`).
+        // Build the metrics context only when a reporter is configured, so the un-instrumented
+        // scan path stays unchanged. The inputs mirror what Java `SnapshotScan.planFiles` reads
+        // to build its `ImmutableScanReport`.
         let field_ids = Arc::new(field_ids);
         let metrics = self.metrics_reporter.clone().map(|reporter| {
             let projected_field_names = field_ids
@@ -612,10 +536,9 @@ impl<'a> TableScanBuilder<'a> {
             }
         });
 
-        // Parse the table's default name mapping (property `schema.name-mapping.default`) ONCE per
-        // plan (Java `NameMappingParser.fromJson`); the shared `Arc` is threaded onto every
-        // produced `FileScanTask` so the arrow reader can resolve field ids by column name for
-        // id-less data files. An unparsable value is a loud typed error naming the property.
+        // Parse the table's default name mapping once per plan. Every `FileScanTask` shares the
+        // `Arc`, so the arrow reader can resolve field ids by name for an id-less data file. An
+        // unparsable value is a loud typed error that names the property.
         let name_mapping = parse_name_mapping(self.table.metadata())?;
 
         let plan_context = PlanContext {
@@ -674,10 +597,8 @@ pub struct TableScan {
     ///
     /// If this is None, then the scan contains no rows.
     plan_context: Option<PlanContext>,
-    /// The fully-qualified table name (`identifier().to_string()`), captured at
-    /// [`build`](TableScanBuilder::build) time. Threaded in solely so [`plan_files`] can
-    /// construct the [`ScanEvent`] without re-deriving it (Java `SnapshotScan` reads
-    /// `table().name()`). `TableScan` no longer holds the `Table` itself.
+    /// The fully-qualified table name, captured at [`build`](TableScanBuilder::build) time.
+    /// [`plan_files`] needs it for the [`ScanEvent`], and `TableScan` does not hold the `Table`.
     table_name: String,
     batch_size: Option<usize>,
     file_io: FileIO,
@@ -712,14 +633,9 @@ pub struct TableScan {
 }
 
 /// The reporter, the shared counter collector, and the immutable inputs needed to build a
-/// [`ScanReport`] at stream-completion time.
-///
-/// Bundled so the opt-in is a single `Option` on [`TableScan`]: when it is `None`,
-/// [`TableScan::plan_files`] installs no collector, no timer, and no stream wrapper, and
-/// the planning path is byte-for-byte the un-instrumented path. The report metadata
-/// (table name / snapshot id / schema id / projected ids+names / filter) is captured once
-/// at [`build`](TableScanBuilder::build) time — exactly the values Java's
-/// `SnapshotScan.planFiles` reads to build its `ImmutableScanReport`.
+/// [`ScanReport`] at stream-completion time. Bundled so the opt-in is one `Option` on
+/// [`TableScan`]. When it is `None`, [`TableScan::plan_files`] installs no collector, no timer and
+/// no stream wrapper.
 #[derive(Clone)]
 struct ScanMetricsContext {
     reporter: Arc<dyn MetricsReporter>,
@@ -755,12 +671,9 @@ impl TableScan {
             return Ok(Box::pin(futures::stream::empty()));
         };
 
-        // Fire the `ScanEvent` (Java `SnapshotScan.planFiles` fires it when `snapshot != null`,
-        // before `doPlanFiles`). Placed AFTER the snapshotless guard above, so an empty scan
-        // fires nothing. The filter is the UNBOUND row filter (Java fires `context.rowFilter()`,
-        // the unbound expression — NOT the snapshot-bound one), defaulting to `AlwaysTrue` when
-        // the scan has no filter. Like Java, the call is unguarded: a panicking listener
-        // propagates out of `plan_files`.
+        // Fire the `ScanEvent`, as Java does before it plans. It sits after the snapshotless
+        // guard, so an empty scan fires nothing. The filter is the UNBOUND row filter, matching
+        // Java. Like Java, the call is unguarded: a panicking listener propagates out.
         events::notify_all(&ScanEvent::new(
             self.table_name.clone(),
             plan_context.snapshot.snapshot_id(),
@@ -772,10 +685,8 @@ impl TableScan {
             plan_context.snapshot_schema.clone(),
         ));
 
-        // Start the planning timer when (and only when) metrics are enabled — Java
-        // `SnapshotScan.planFiles` starts `scanMetrics().totalPlanningDuration()` before
-        // `doPlanFiles()`. When `self.metrics` is `None` this stays `None` and nothing
-        // below is instrumented (the opt-in / byte-unchanged path).
+        // Start the planning timer only when metrics are enabled, as Java does. `None` here
+        // leaves everything below un-instrumented.
         let planning_started_at = self.metrics.as_ref().map(|_| Instant::now());
 
         let concurrency_limit_manifest_files = self.concurrency_limit_manifest_files;
@@ -794,10 +705,8 @@ impl TableScan {
 
         let manifest_list = plan_context.get_manifest_list().await?;
 
-        // Count the manifest-list entries by content type — Java
-        // `DataTableScan.doPlanFiles` increments `totalDataManifests`/`totalDeleteManifests`
-        // by `dataManifests.size()`/`deleteManifests.size()` of the snapshot's list. A
-        // no-op when no collector is configured.
+        // Count the manifest-list entries by content type, as Java `DataTableScan.doPlanFiles`
+        // does. A no-op when no collector is configured.
         if let Some(metrics) = self.metrics.as_ref() {
             let (data_manifests, delete_manifests) =
                 manifest_list
@@ -840,29 +749,12 @@ impl TableScan {
         let mut channel_for_data_manifest_entry_error = file_scan_task_tx.clone();
         let mut channel_for_delete_manifest_entry_error = file_scan_task_tx.clone();
 
-        // Process delete-file and data-file [`ManifestEntry`] streams CONCURRENTLY (FK2.2 /
-        // scout #14). The previous barrier (awaiting all delete entries before starting data
-        // processing) was not correctness-required: `DeleteFileIndex::get_deletes_for_data_file`
-        // already parks on `Notify` until the index is published (all delete senders drop →
-        // populate task collects → `PopulateGuard::publish` → `notify_waiters`). Overlapping the
-        // two streams lets plan latency approach max(T_del, T_data) instead of T_del + T_data.
+        // Process the delete and data entry streams concurrently. No barrier is needed:
+        // `get_deletes_for_data_file` parks on `Notify` until the index publishes.
         //
-        // Hang classes (lost-wakeup after publish; failed-populate leaving state stranded at
-        // `Populating`) are pinned by inject-only deterministic tests in `delete_file_index.rs`
-        // with generous bounded timeouts — no loom, no stress harness.
-        //
-        // Entry work runs inline under `try_for_each_concurrent` — a nested per-entry `spawn`
-        // only added task overhead without extra parallelism beyond the concurrent limit.
-        // Review rider (2026-08-03): a delete-entry error must FAIL the index, never let a
-        // PARTIAL delete set publish as `Populated`. Under FK2.2's concurrency, data tasks can
-        // stream before the `Err` reaches the consumer; if the senders dropped on the error
-        // short-circuit, the populate task would see a normal end-of-channel and publish the
-        // partial index — silent row resurrection for an early-terminating (LIMIT-k) consumer.
-        // `tx_keepalive` holds the delete channel open past the error check, so `mark_failed`
-        // is GUARANTEED to land while the state is still `Populating`; the populate task's
-        // later publish finds a terminal state and leaves it (respect-terminal). Pre-FK2.2 the
-        // barrier made a delete error precede every data task (Java plans deletes first); this
-        // restores that fail-before-results property under concurrent planning.
+        // A delete-entry error must FAIL the index. A partial delete set published as
+        // `Populated` would silently resurrect rows. `tx_keepalive` holds the delete channel
+        // open past the error check, so `mark_failed` lands while the state is `Populating`.
         let delete_index_for_failure = delete_file_idx.clone();
         let tx_keepalive = delete_file_tx.clone();
         spawn(async move {
@@ -908,11 +800,9 @@ impl TableScan {
             }
         });
 
-        // When metrics are enabled, wrap the result stream so each produced task is counted
-        // as it is yielded (Java `ScanMetricsUtil.fileTask` in the lazy `createFileScanTasks`
-        // transform) and a single `ScanReport` is emitted when the stream is fully consumed
-        // (Java's `CloseableIterable.whenComplete` close hook). When `self.metrics` is
-        // `None`, return the inner stream verbatim — byte-for-byte the un-instrumented path.
+        // With metrics on, wrap the stream so each task is counted as it is yielded, and one
+        // `ScanReport` is emitted at exhaustion. Java does both the same way. Without metrics,
+        // return the inner stream verbatim.
         match (self.metrics.clone(), planning_started_at) {
             (Some(metrics), Some(planning_started_at)) => {
                 Ok(Box::pin(MetricsReportingFileScanTaskStream::new(
@@ -925,31 +815,9 @@ impl TableScan {
         }
     }
 
-    /// Plans the scan into [`CombinedScanTask`] GROUPS — split + bin-packed — porting Java
-    /// `Scan.planTasks()` (1.10.0).
-    ///
-    /// This is the split-and-group layer that sits ABOVE [`plan_files`](Self::plan_files): it
-    /// drives `plan_files()` UNCHANGED (no reporter side effects, the byte-for-byte path), splits
-    /// each produced [`FileScanTask`] at the split target ([`FileScanTask::split`], Java
-    /// `TableScanUtil.splitFiles`), then bin-packs the resulting sub-tasks into groups with the
-    /// `largestBinFirst` packer (Java `TableScanUtil.planTasks` →
-    /// `BinPacking.PackingIterable(..., largestBinFirst = true)`).
-    ///
-    /// The arguments come from the resolved [`SplitConfig`] captured at build time (table property
-    /// then scan-time override then the Java default — see
-    /// [`with_split_size`](TableScanBuilder::with_split_size) etc.). They are validated exactly as
-    /// Java `TableScanUtil.validatePlanningArguments`: `target > 0`, `lookback > 0`,
-    /// `open_file_cost >= 0` (always true for a `u64`). The weight of each task is
-    /// [`FileScanTask::weight`] — `max(length + deleteBytes, (1 + #deletes) * openFileCost)`.
-    ///
-    /// The returned stream yields one [`CombinedScanTask`] per emitted bin, in the bin-packer's
-    /// emission order. This is the plain data-file group path: each [`CombinedScanTask`] carries NO
-    /// grouping key and the tasks are NOT merged (Java's partition-aware
-    /// `planTaskGroups(groupingKeyType)` overload is out of scope).
-    ///
-    /// Because the packer is order-sensitive (FIFO bin selection + largest-bin eviction), the
-    /// FileScanTask stream is COLLECTED in arrival order before packing — matching Java, which
-    /// drives the packer over the in-order `splitFiles(planFiles())` iterable.
+    /// Plans the scan into split and bin-packed [`CombinedScanTask`] groups. Ports Java
+    /// `Scan.planTasks()`. This layer drives [`plan_files`](Self::plan_files) unchanged, splits
+    /// each task at the build-time [`SplitConfig`] target, then packs with `largestBinFirst`.
     pub async fn plan_tasks(&self) -> Result<CombinedScanTaskStream> {
         let SplitConfig {
             split_size,
@@ -976,24 +844,12 @@ impl TableScan {
         // order-sensitive; Java drives the bin-packer over the in-order splitFiles(planFiles())).
         let file_scan_tasks: Vec<FileScanTask> = self.plan_files().await?.try_collect().await?;
 
-        // FORK-LOCAL: a scan projecting `_pos` must NOT be split. The `_pos` read path decodes the
-        // whole file in physical order with ordinals from 0, so it rejects every ranged task with a
-        // typed error (`arrow::reader`'s `_pos` guard) — which means an unconditional split here
-        // manufactures exactly the shape the next layer refuses, and a `_pos` scan that
-        // `to_arrow()` serves correctly becomes a total outage on the `plan_tasks` /
-        // `PartitionWork` seam. `to_arrow`'s `expand_within_file_parallel_tasks` already suppresses
-        // itself the same way; this is the same rule at the other split site. Java has no such case
-        // (`_pos` is a Spark-side metadata column there, and its readers carry the row-group start
-        // ordinal into a split). Cost: whole-file tasks — parallelism, never rows. (U3 cycle 5 / F7.)
+        // Fork-local: a scan projecting `_pos` or `_row_id` must not be split. Both read paths
+        // number rows from zero over the whole file, so they reject every ranged task. Splitting
+        // here would turn a working scan into a total outage. The cost is parallelism, never rows.
         //
-        // Since U3 cycle 6 this guard is DEFENSIVE-but-redundant: `FileScanTask::split` carries the
-        // `_pos` rule itself (branch 1c), because `split` is `pub` and reachable without this
-        // caller. It stays for the same reason `expand_within_file_parallel_tasks`'s
-        // `task.start == 0` clause does — a local statement of the precondition this path relies on
-        // — and because it reads the SCAN's projection, which is the authority here even if a
-        // task's own `project_field_ids` were ever to drift from it.
-        // `_row_id` suppresses splitting exactly as `_pos` does; both need whole-file ordinals. A
-        // defensive restatement — `split` branch 1c already returns the whole-file task.
+        // `FileScanTask::split` branch (1c) carries the same rule, so this guard looks redundant.
+        // It stays because it reads the SCAN's projection, which is the authority here.
         let projects_pos = {
             use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
             self.plan_context
@@ -1033,11 +889,10 @@ impl TableScan {
 
     /// Returns an [`ArrowRecordBatchStream`].
     ///
-    /// When [`within_file_read_parallelism`](TableScanBuilder::with_within_file_read_parallelism)
-    /// is enabled (default), the data-file concurrency limit is greater than 1, and the scan does
-    /// not project `_pos`, whole-file tasks with Parquet `split_offsets` are expanded into
-    /// per-row-group sub-tasks before concurrent read — so a single multi-row-group file can issue
-    /// multiple ranged GETs in parallel under the same concurrency budget as cross-file reads.
+    /// With [`within_file_read_parallelism`](TableScanBuilder::with_within_file_read_parallelism)
+    /// on, a concurrency limit above 1, and no `_pos` projection, a whole-file task carrying
+    /// `split_offsets` expands into per-row-group sub-tasks. One multi-row-group file then issues
+    /// several ranged GETs in parallel.
     pub async fn to_arrow(&self) -> Result<ArrowRecordBatchStream> {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
@@ -1091,33 +946,10 @@ impl TableScan {
         Ok(Box::pin(
             tasks
                 .and_then(move |task| async move {
-                    // Only expand whole-file Parquet tasks whose split_offsets are the
-                    // offsets-aware (strictly ascending) row-group grid, so each sub-task lines up
-                    // with exactly one row group. The fixed-size fallback in FileScanTask::split
-                    // is deliberately NOT used from this path: its windows are byte-arbitrary, so
-                    // a sub-task can end up empty (row-group selection is midpoint-based — see
-                    // `ArrowReader::filter_row_groups_by_byte_range`), which is wasted parallelism
-                    // rather than useful work. Row DUPLICATION is no longer a reason: the midpoint
-                    // rule assigns each row group to exactly one window, and the overlap rule that
-                    // could duplicate is gone.
-                    // Exactly ONE of the three conjuncts is load-bearing here — the `split_offsets`
-                    // one. The other two are DEFENSIVE restatements of preconditions
-                    // `FileScanTask::split` already enforces itself, so dropping either is a
-                    // provable no-op (the `else` branch below produces the same `vec![task]` that
-                    // `split` would return):
-                    //   * `task.start == 0` — since U3 cycle 5 `split` returns `[self]` for an
-                    //     already-ranged parent rather than relocating its window to 0 (and since
-                    //     cycle 6 for a partial-length parent too).
-                    //   * `data_file_format == Parquet` — since U3 cycle 3 `split`'s branch (1)
-                    //     declines AVRO and ORC via `reader_honors_byte_range`, and Puffin via
-                    //     `is_splittable`, so Parquet is the only format `split` ever splits.
-                    // They stay as a local statement of the preconditions this path relies on.
-                    //
-                    // The `offsets.len() > 1` clause IS load-bearing and deliberately STRICTER
-                    // than `split`'s own `!offsets.is_empty()` gate — see
-                    // `test_within_file_parallel_declines_a_single_split_offset` and
-                    // `scan::task::tests::split_single_offset_takes_the_offsets_aware_branch` for
-                    // why the two sites differ on purpose.
+                    // Expand only a whole-file Parquet task whose split offsets are the strictly
+                    // ascending row-group grid, so each sub-task covers one row group. The
+                    // fixed-size fallback is byte-arbitrary and can leave a sub-task empty. Only
+                    // the `split_offsets` conjuncts are load-bearing.
                     let can_expand = task.start == 0
                         && task.data_file_format == DataFileFormat::Parquet
                         && task.split_offsets.as_ref().is_some_and(|offsets| {
@@ -1266,10 +1098,7 @@ impl ScanMetricsContext {
     /// Snapshots the collector, stamps the planning duration, builds the [`ScanReport`],
     /// and reports it to the configured [`MetricsReporter`] exactly once.
     ///
-    /// Mirrors the close hook of Java `SnapshotScan.planFiles`: stop the planning timer,
-    /// build an `ImmutableScanReport` from the captured table name / snapshot id / schema
-    /// id / projected ids+names / filter and the collected `ScanMetricsResult`, then call
-    /// `metricsReporter().report(scanReport)`.
+    /// Mirrors the close hook of Java `SnapshotScan.planFiles`.
     fn emit_report(&self, planning_started_at: Instant) {
         let elapsed = planning_started_at.elapsed();
         let mut scan_metrics = self.collector.snapshot();
@@ -1297,11 +1126,9 @@ impl ScanMetricsContext {
 /// A [`FileScanTaskStream`] that records each yielded task in its collector and reports a
 /// single [`ScanReport`] when the inner stream is fully consumed.
 ///
-/// This is the Rust analogue of Java's `CloseableIterable.whenComplete(doPlanFiles(), ...)`
-/// in `SnapshotScan.planFiles`: per-task accounting happens lazily as each task is pulled
-/// (Java's `createFileScanTasks` transform), and the report is emitted exactly ONCE, on the
-/// transition to stream exhaustion (Java's close hook). It is only ever constructed when a
-/// reporter was configured, so it adds no overhead to the un-instrumented scan path.
+/// The Rust analogue of Java's `CloseableIterable.whenComplete` in `SnapshotScan.planFiles`.
+/// Accounting happens lazily as each task is pulled. The report is emitted exactly once, on
+/// stream exhaustion. It is built only when a reporter is configured.
 struct MetricsReportingFileScanTaskStream {
     inner: futures::channel::mpsc::Receiver<Result<FileScanTask>>,
     metrics: ScanMetricsContext,
@@ -1408,13 +1235,12 @@ pub mod tests {
         env.render_str(template, ctx).unwrap()
     }
 
-    /// Decodes a scan-output column to a flat [`Int64Array`], transparently
-    /// expanding the run-end-encoded constant array the reader produces for an
-    /// identity-partitioned column (Java `PartitionUtil.constantsMap`). A plain
-    /// `Int64Array` passes through unchanged. Used by the read tests so they assert
-    /// on logical values regardless of whether a column is a materialized partition
-    /// constant or read from the data file. `pub` because the incremental-scan
-    /// read pins (`incremental.rs`) reuse it.
+    /// Decodes a scan-output column to a flat [`Int64Array`], expanding the run-end-encoded
+    /// constant array the reader produces for an identity-partitioned column. A plain
+    /// `Int64Array` passes through.
+    ///
+    /// The read tests use it to assert on logical values, whether the column is a partition
+    /// constant or read from the data file.
     pub fn decode_int64_column(column: &ArrayRef) -> Int64Array {
         arrow_cast::cast::cast(column, &arrow_schema::DataType::Int64)
             .expect("column is castable to Int64")
@@ -1549,12 +1375,10 @@ pub mod tests {
             }
         }
 
-        /// Builds an UNPARTITIONED V2 fixture (schema `x,y,z,a,dbl,i32,i64,bool`, ids 1..8) with the
-        /// `schema.name-mapping.default` property set to `name_mapping_json`. Used by the name-mapping
-        /// scan-wiring pins: an unpartitioned base is required so the reader does NOT materialize
-        /// identity-partition columns as constants (which would bypass the file for `x`), and the
-        /// property drives [`parse_name_mapping`] during `build()`. Pass a deliberately-invalid JSON
-        /// to pin the loud-failure path.
+        /// An unpartitioned V2 fixture with the `schema.name-mapping.default` property set.
+        ///
+        /// The base must be unpartitioned, so the reader does not materialize `x` as a partition
+        /// constant and bypass the file. Pass invalid JSON to pin the loud-failure path.
         pub fn new_with_name_mapping_property(name_mapping_json: &str) -> Self {
             let tmp_dir = TempDir::new().unwrap();
             let table_location = tmp_dir.path().join("table1");
@@ -1607,11 +1431,11 @@ pub mod tests {
             }
         }
 
-        /// Builds an UNPARTITIONED fixture whose current schema (id 1) is EXTENDED with two
-        /// optional float columns — `dbl_nan` (id 9, double) and `flt_nan` (id 10, float) — for
-        /// the full-path `is_nan`/`not_nan` pins (audit BUG-001). Unpartitioned so `x` stays a
-        /// file column (no identity-partition constants) and no partition value is needed for
-        /// the new fields. Pair with [`Self::setup_nan_manifest_files`].
+        /// An unpartitioned fixture whose schema adds the optional float columns `dbl_nan` and
+        /// `flt_nan`, for the `is_nan` and `not_nan` pins.
+        ///
+        /// Unpartitioned, so `x` stays a file column and the new fields need no partition value.
+        /// Pair with [`Self::setup_nan_manifest_files`].
         pub fn new_nan_floats() -> Self {
             let tmp_dir = TempDir::new().unwrap();
             let table_location = tmp_dir.path().join("table1");
@@ -1685,10 +1509,8 @@ pub mod tests {
             }
         }
 
-        /// Builds a fixture partitioned by `truncate(x, 100)` over the same schema
-        /// and data as [`Self::new`]. Used to prove the residual wiring on a
-        /// NON-identity (transform) partition: the parquet `x` column is `[1; 1024]`,
-        /// so every row lands in `truncate(1, 100) == 0`.
+        /// A fixture partitioned by `truncate(x, 100)` over the same data as [`Self::new`]. It
+        /// proves the residual wiring on a non-identity partition. Every row lands in bucket 0.
         pub fn new_truncate_partitioned() -> Self {
             let tmp_dir = TempDir::new().unwrap();
             let table_location = tmp_dir.path().join("table1");
@@ -1806,13 +1628,11 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
-        /// Builds a fixture whose table metadata has TWO partition specs: the
-        /// template's `identity(x)` (spec id 0) and an UNPARTITIONED spec (id 1) set
-        /// as the table DEFAULT. The live data file is written under the NON-default
-        /// spec 0. This isolates the "file's own spec vs the table default spec"
-        /// choice: the residual must be computed from spec 0 (the file's), not the
-        /// default spec 1 — a manifest written under an older spec is exactly what
-        /// partition evolution produces.
+        /// A fixture with two partition specs: `identity(x)` (spec 0) and an unpartitioned
+        /// default (spec 1). The live data file is written under the non-default spec 0.
+        ///
+        /// This isolates the file's own spec from the table default. The residual must come from
+        /// spec 0. Partition evolution produces exactly this shape.
         pub fn new_with_evolved_default_spec() -> Self {
             let tmp_dir = TempDir::new().unwrap();
             let table_location = tmp_dir.path().join("table1");
@@ -1864,13 +1684,12 @@ pub mod tests {
             }
         }
 
-        /// Builds a fixture whose metadata carries TWO identity specs over DIFFERENT
-        /// source columns: the template's `identity(x)` (spec 0) and a new `identity(y)`
-        /// (spec 1, set as the table default). Used by the multi-spec scan test together
-        /// with [`Self::setup_two_identity_spec_manifests`]: each data file is written in
-        /// its OWN manifest under its OWN spec, so the scan must materialize each file's
-        /// identity-partition constant under that file's spec (Java `file.spec()` per
-        /// `ManifestFile.partition_spec_id`), not under one shared/default spec.
+        /// A fixture with two identity specs over different columns: `identity(x)` (spec 0) and
+        /// `identity(y)` (spec 1, the default).
+        ///
+        /// Pairs with [`Self::setup_two_identity_spec_manifests`]. Each data file sits in its own
+        /// manifest under its own spec, so the scan must materialize each file's partition
+        /// constant under that file's spec, not under one shared spec.
         pub fn new_with_two_identity_specs() -> Self {
             let tmp_dir = TempDir::new().unwrap();
             let table_location = tmp_dir.path().join("table1");
@@ -1933,14 +1752,15 @@ pub mod tests {
             }
         }
 
-        /// Writes two live data files for the multi-spec scan test, each in its OWN
-        /// manifest under its OWN spec, with a partition value that DIFFERS from the
-        /// parquet data so the constant source is observable:
-        ///  * 1.parquet under `identity(x)` (spec 0), partition `x == 777` (file x is `1`).
-        ///  * 2.parquet under `identity(y)` (spec 1), partition `y == 888` (file y starts `2`).
+        /// Writes two live data files, each in its own manifest under its own spec. Each
+        /// partition value differs from the parquet data, so the constant source is observable.
         ///
-        /// A correct multi-spec scan returns x=777 for the first file's rows and y=888 for
-        /// the second file's rows — each under that file's own spec.
+        /// | File | Spec | Partition | File data |
+        /// |---|---|---|---|
+        /// | 1.parquet | `identity(x)`, spec 0 | `x == 777` | `x` is `1` |
+        /// | 2.parquet | `identity(y)`, spec 1 | `y == 888` | `y` starts at `2` |
+        ///
+        /// A correct multi-spec scan returns 777 and 888, each under that file's own spec.
         pub async fn setup_two_identity_spec_manifests(&mut self) {
             let current_snapshot = self.table.metadata().current_snapshot().unwrap();
             let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
@@ -2098,13 +1918,11 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
-        /// Writes a single live data file (1.parquet) under `identity(x)` (spec 0) whose
-        /// manifest partition value (`x == 999`) DELIBERATELY DIFFERS from the parquet `x`
-        /// column (`[1; 1024]`). This makes the scan output observably distinguish the two
-        /// sources: with the identity-partition constants map ACTIVE the scan returns the
-        /// PARTITION value (999, Java `PartitionUtil.constantsMap`); a reader that read `x`
-        /// from the file would return 1. The metadata value is authoritative for an
-        /// identity-partition column.
+        /// Writes one live data file under `identity(x)` whose manifest partition value
+        /// (`x == 999`) differs from the parquet `x` column (`[1; 1024]`).
+        ///
+        /// The metadata value is authoritative for an identity-partition column, so the scan must
+        /// return 999. A reader that read `x` from the file would return 1.
         pub async fn setup_manifest_files_partition_value_differs(&mut self) {
             let current_snapshot = self.table.metadata().current_snapshot().unwrap();
             let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
@@ -2158,12 +1976,10 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
-        /// Writes a single live data file (1.parquet) under `identity(x)` (spec 0) whose
-        /// manifest partition value is NULL. With the constants map active, the
-        /// identity-partition `x` column materializes as all-null (Iceberg column-projection
-        /// rule #4 — a null partition value is not added to the constants map, so the column
-        /// resolves to null), rather than erroring. Companion to
-        /// [`Self::setup_manifest_files_partition_value_differs`].
+        /// Writes one live data file under `identity(x)` whose manifest partition value is NULL.
+        ///
+        /// Column-projection rule 4 keeps a null partition value out of the constants map, so
+        /// `x` resolves to null rather than erroring.
         pub async fn setup_manifest_files_null_partition(&mut self) {
             let current_snapshot = self.table.metadata().current_snapshot().unwrap();
             let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
@@ -2259,11 +2075,9 @@ pub mod tests {
                                 .file_format(DataFileFormat::Parquet)
                                 .file_size_in_bytes(parquet_file_size)
                                 .record_count(1)
-                                // The table is `identity(x)`-partitioned and the reader now
-                                // materializes identity-partition columns from this metadata
-                                // value (Java `PartitionUtil.constantsMap`). The parquet `x`
-                                // column is `[1; 1024]`, so the partition value MUST be 1 to keep
-                                // the fixture internally consistent.
+                                // The reader materializes an identity-partition column from this
+                                // metadata value. The parquet `x` column is `[1; 1024]`, so the
+                                // partition value must be 1 to keep the fixture consistent.
                                 .partition(Struct::from_iter([Some(Literal::long(1))]))
                                 .key_metadata(None)
                                 .build()
@@ -2338,19 +2152,17 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
-        /// Builds a planning fixture for `plan_tasks` (split + bin-pack): writes ONE real parquet
-        /// payload to `1.parquet`, then declares FOUR live data file entries pointing at it whose
-        /// manifest-entry `file_size_in_bytes` (and, for one, `split_offsets`) are HAND-SET so the
-        /// split + bin-pack behavior is deterministic and independent of the real parquet byte size.
+        /// A planning fixture for `plan_tasks`. It writes one parquet payload, then declares four
+        /// data file entries pointing at it with hand-set sizes and offsets.
         ///
-        /// The planning path reads only `file_size_in_bytes` (→ `length`), `data_file_format`,
-        /// `split_offsets`, and the delete attachments — never the file bytes — so a single shared
-        /// payload with overridden declared sizes is a faithful planning fixture. The four entries:
-        ///   * `big` 1000 bytes, split offsets `[0, 400, 800]`  (offsets-aware split target)
-        ///   * `mid` 600 bytes,  no offsets                     (fixed-size split on a small target)
-        ///   * `small_a` 100 bytes, `small_b` 100 bytes         (pack together)
+        /// The planning path never reads the file bytes, so the declared sizes make the split and
+        /// pack behaviour deterministic. All four sit in partition `x == 1`.
         ///
-        /// All four are partition `x == 1` (consistent with the real `x = [1;1024]` payload).
+        /// | Entry | Size | Offsets | Exercises |
+        /// |---|---|---|---|
+        /// | `big` | 1000 | `[0, 400, 800]` | the offsets-aware split |
+        /// | `mid` | 600 | none | the fixed-size split |
+        /// | `small_a`, `small_b` | 100 each | none | packing together |
         pub async fn setup_manifest_for_planning(&mut self) {
             let current_snapshot = self.table.metadata().current_snapshot().unwrap();
             let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
@@ -2696,12 +2508,10 @@ pub mod tests {
         }
 
         /// Writes the two data files for the NaN pins (see [`Self::new_nan_floats`]) and returns
-        /// their byte sizes:
-        ///   * `1.parquet` — `x = [1, 2, 3, 4]` with `dbl_nan = [NaN, 100.5, NULL, -7.25]` and
-        ///     `flt_nan = [NaN, 3.5, NULL, 8.75]` (a {NaN, finite, NULL} truth table per float
-        ///     width);
-        ///   * `2.parquet` — ONLY `x = [100, 200]`, a file written BEFORE the float columns
-        ///     existed (the schema-evolution missing-column arm).
+        /// their byte sizes.
+        ///
+        /// `1.parquet` holds a NaN, finite and NULL truth table per float width. `2.parquet`
+        /// holds only `x`, the file written before the float columns existed.
         fn write_nan_parquet_files(&self) -> (u64, u64) {
             std::fs::create_dir_all(&self.table_location).unwrap();
 
@@ -2823,13 +2633,11 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
-        /// Writes `1.parquet` as an ID-LESS parquet (no `PARQUET:field_id` field metadata — the
-        /// `add_files` migration shape) whose PHYSICAL column order is REVERSED relative to the
-        /// table schema: physical column 0 is `y`, column 1 is `x`, both `Int64`. Values are
-        /// `x = [1, 1, 1, 1]` and `y = [20, 30, 40, 50]`, chosen so the two columns are trivially
-        /// distinguishable. A position-based fallback (which assigns physical col 0 → field id 1 =
-        /// `x`) would read `y`'s values into `x` — provably WRONG; only the name mapping (`x`→1,
-        /// `y`→2) recovers the correct columns. Returns the file size for the manifest entry.
+        /// Writes `1.parquet` with no field-id metadata, the `add_files` migration shape, and
+        /// with the physical column order reversed against the table schema.
+        ///
+        /// A position-based fallback would read `y`'s values into `x`. Only the name mapping
+        /// recovers the correct columns. Returns the file size for the manifest entry.
         fn write_id_less_reversed_parquet(&self) -> u64 {
             std::fs::create_dir_all(&self.table_location).unwrap();
 
@@ -3005,15 +2813,11 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
-        /// Writes TWO data manifests in DISTINCT identity(x) partitions — one file in
-        /// partition `x == 1` (`p1.parquet`) and one in partition `x == 2` (`p2.parquet`),
-        /// each in its own manifest with a distinct, asserted file size. A scan filtered to
-        /// `x == 1` PRUNES the `x == 2` manifest (its file must not appear in the result),
-        /// which is exactly the `skipped_data_manifests` path. The parquet files are never
-        /// read by `plan_files`, so only the manifest metadata matters here.
+        /// Writes two data manifests in distinct `identity(x)` partitions, each with a distinct
+        /// file size. A scan filtered to `x == 1` prunes the other manifest, which is the
+        /// `skipped_data_manifests` path.
         ///
-        /// Returns `(size_partition_one, size_partition_two)` — the per-manifest data file
-        /// sizes, so a test can assert `total_file_size_in_bytes` exactly.
+        /// Returns both sizes, so a test can assert `total_file_size_in_bytes` exactly.
         pub async fn setup_two_data_manifests_distinct_partitions(&mut self) -> (u64, u64) {
             let current_snapshot = self.table.metadata().current_snapshot().unwrap();
             let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
@@ -3154,9 +2958,8 @@ pub mod tests {
         );
     }
 
-    // The shared `example_table_metadata_v2.json` fixture carries two snapshots
-    // and a `test` TAG pointing at the OLDER one — exactly the setup needed to
-    // prove `use_ref` resolves a reference to a specific (non-current) snapshot.
+    // The shared metadata fixture carries two snapshots and a `test` tag on the older one, so
+    // `use_ref` can be proved against a non-current snapshot.
     /// Current snapshot id (also what the auto-injected `main` ref points at).
     const CURRENT_SNAPSHOT_ID: i64 = 3055729675574597004;
     /// Older snapshot id the `test` tag references.
@@ -3284,14 +3087,12 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_plan_files_use_non_main_ref_plans_referenced_snapshot() {
-        // RISK: a NON-main ref's resolved snapshot must flow through the FULL
-        // planning pipeline, not just snapshot-id resolution. Guards against any
-        // future special-casing of "main" in build()/planning — a custom `tag`
-        // pointing at the current snapshot must plan the same files as the
-        // default scan. (The fixture's `test` tag points at the OLDER snapshot,
-        // whose manifest list isn't written, so it can't be planned directly;
-        // here we add a tag at the CURRENT snapshot, whose manifest list IS
-        // written by `setup_manifest_files`.)
+        // A non-main ref's snapshot must flow through the full planning pipeline, not only
+        // snapshot-id resolution. A tag at the current snapshot must plan the same files as the
+        // default scan.
+        //
+        // The fixture's `test` tag points at the older snapshot, whose manifest list is never
+        // written, so this test adds its own tag at the current snapshot.
         let mut fixture = TableTestFixture::new();
 
         // Add a non-main tag pointing at the current snapshot, then rebuild the
@@ -3444,9 +3245,7 @@ pub mod tests {
         );
     }
 
-    // =======================================================================================
     // plan_tasks() — split + bin-pack grouping (Java Scan.planTasks()).
-    // =======================================================================================
 
     /// The total byte length across all sub-tasks of all groups — the conservation quantity that
     /// must equal the sum of the source files' declared sizes (the split tiles every file with no
@@ -3709,11 +3508,10 @@ pub mod tests {
         );
     }
 
-    /// Risk (TEST 1 / mutation d, STRUCTURAL): the opt-in is broken — a collector (and its
-    /// per-manifest/per-task counting overhead) is installed even when NO reporter is
-    /// configured. Pins that a default scan threads `None` into the plan context (no
-    /// collector) and `Some` only when a reporter is set. This is the perf/scope guard the
-    /// task-set test alone cannot catch (counting does not change which tasks are planned).
+    /// A default scan must thread `None` into the plan context, and `Some` only with a reporter.
+    ///
+    /// Mutation this catches: installing a collector unconditionally. Counting does not change
+    /// which tasks are planned, so the task-set tests cannot see it.
     #[tokio::test]
     async fn test_no_reporter_means_no_collector_installed() {
         let fixture = TableTestFixture::new();
@@ -3834,10 +3632,9 @@ pub mod tests {
         assert_eq!(timer.count, 1);
     }
 
-    /// Risk (TEST 3 / mutation a): a pruned manifest is miscounted (as scanned instead of
-    /// skipped), or its file leaks into the result. Pins a filtered scan that PRUNES the
-    /// `x == 2` manifest: `skipped_data_manifests >= 1`, the pruned file is absent, and the
-    /// surviving file's bytes are the ONLY bytes summed.
+    /// A pruned manifest must count as skipped, and its file must not leak into the result.
+    ///
+    /// Mutation this catches: counting a pruned manifest as scanned, or summing its bytes.
     #[tokio::test]
     async fn test_filtered_scan_reports_pruned_manifest_as_skipped() {
         let mut fixture = TableTestFixture::new();
@@ -3895,10 +3692,10 @@ pub mod tests {
         );
     }
 
-    /// Risk (TEST 4 / mutation b): delete manifests and delete-file references are
-    /// miscounted (e.g. delete files folded into `result_data_files`, or the delete
-    /// manifest not counted). Pins a fixture with a DELETE manifest: `total_delete_manifests`
-    /// and `result_delete_files` are counted, and `result_data_files` excludes them.
+    /// Delete manifests and delete files must be counted separately from data files.
+    ///
+    /// Mutation this catches: folding delete files into `result_data_files`, or never counting
+    /// the delete manifest.
     #[tokio::test]
     async fn test_delete_manifest_fixture_counts_delete_files_separately() {
         let mut fixture = TableTestFixture::new();
@@ -3943,10 +3740,10 @@ pub mod tests {
         );
     }
 
-    /// Risk (TEST 5 / mutation c): the report is emitted PER-TASK (or never). Pins that
-    /// fully consuming the stream produces EXACTLY ONE report — by snapshotting the last
-    /// report, then confirming a fresh reporter observes the same single emission and that
-    /// re-polling the exhausted stream does not re-report.
+    /// Fully consuming the stream must produce exactly one report. Re-polling the exhausted
+    /// stream must not report again.
+    ///
+    /// Mutation this catches: reporting per task, or never reporting.
     #[tokio::test]
     async fn test_scan_report_emitted_exactly_once() {
         let mut fixture = TableTestFixture::new();
@@ -4000,12 +3797,11 @@ pub mod tests {
         );
     }
 
-    /// Risk (EMISSION / early-drop): the report fires with PARTIAL counts when the consumer
-    /// abandons the stream before exhausting it — Java only reports on the iterable's CLOSE
-    /// after full consumption, and this wrapper emits ONLY on the `Ready(None)` transition.
-    /// Pins that pulling a few tasks and then DROPPING the stream emits NO report (the
-    /// `Ready(None)` arm is never reached) and does not hang — the spawned planning tasks
-    /// must not deadlock when the receiver is dropped early.
+    /// A consumer that abandons the stream must get no report, and must not hang. Java reports
+    /// only on close after full consumption, and this wrapper emits only at exhaustion.
+    ///
+    /// Mutation this catches: reporting partial counts on an early drop. It also pins that the
+    /// spawned planning tasks do not deadlock when the receiver drops early.
     #[tokio::test]
     async fn test_partial_consume_then_drop_emits_no_report() {
         let mut fixture = TableTestFixture::new();
@@ -4126,10 +3922,8 @@ pub mod tests {
 
     // ---- name-mapping scan wiring (C-5) ----
 
-    /// The mapping used by the name-mapping pins: `x`→field id 1, `y`→field id 2, matching the
-    /// unpartitioned fixture schema. Kebab-case JSON, exactly as Java `NameMappingParser` emits.
-    /// `pub` because the incremental-scan pins (`incremental.rs`) reuse it against the same
-    /// fixture rather than duplicating the literal.
+    /// The mapping used by the name-mapping pins: `x` to field id 1, `y` to field id 2. Written
+    /// in the kebab-case JSON Java `NameMappingParser` emits.
     pub const NAME_MAPPING_X1_Y2: &str =
         r#"[{"field-id":1,"names":["x"]},{"field-id":2,"names":["y"]}]"#;
 
@@ -4195,11 +3989,11 @@ pub mod tests {
         }
     }
 
-    /// C-5(c) / C-3: an unparsable name-mapping property is a LOUD typed error that NAMES the
-    /// property — never a silent `None`. Each partition element Java rejects is pinned: malformed
-    /// JSON, an EMPTY value, and a WHITESPACE-only value. Java `NameMappingParser.fromJson(String)`
-    /// delegates to `ObjectMapper.readValue`, which throws (wrapped as `UncheckedIOException`) on
-    /// all three — Jackson reports "no content" for empty/whitespace — so Rust must fail loud too.
+    /// An unparsable name-mapping property must be a loud typed error that names the property,
+    /// never a silent `None`.
+    ///
+    /// Java `NameMappingParser.fromJson` throws on malformed JSON, an empty value and a
+    /// whitespace-only value. This pins all three.
     #[tokio::test]
     async fn test_invalid_name_mapping_property_is_loud_typed_error() {
         // `build()` parses the property (once per plan), so an unparsable value errors there.
@@ -4221,11 +4015,11 @@ pub mod tests {
         }
     }
 
-    /// C-5(d): END-TO-END. An ID-less parquet whose physical column order is REVERSED relative to
-    /// the schema scans to the CORRECT columns via the name mapping. This exercises the full
-    /// `TableScan` → plan → arrow-read path (not just the reader-level unit), and the mapping is
-    /// NON-trivial: a positional fallback would read `y`'s values into `x`, so the exact-value
-    /// asserts below go RED if the wiring re-hardcodes `name_mapping: None`.
+    /// An id-less parquet with reversed physical column order must scan to the correct columns
+    /// through the name mapping. This drives the full plan and read path.
+    ///
+    /// Mutation this catches: hardcoding `name_mapping: None`. A positional fallback then reads
+    /// `y`'s values into `x`.
     #[tokio::test]
     async fn test_scan_applies_name_mapping_to_id_less_parquet() {
         let mut fixture = TableTestFixture::new_with_name_mapping_property(NAME_MAPPING_X1_Y2);
@@ -4275,11 +4069,11 @@ pub mod tests {
         );
     }
 
-    /// C-5(d), subset projection. Projecting ONLY `x` out of the reversed ID-less parquet must
-    /// still read the physical `x` column (all 1s), not physical column 0 (`y`). This pins the
-    /// FIELD-ID-based projection mask: a positional projection would select physical column 0 by
-    /// `field_id - 1`, reading `y` (or, after the transformer reorders by id, producing a NULL
-    /// `x`) — so this asserts the reader's projection resolves the subset by field id.
+    /// Projecting only `x` out of the reversed id-less parquet must still read the physical `x`
+    /// column, not physical column 0.
+    ///
+    /// Mutation this catches: a positional projection mask. It would select physical column 0 by
+    /// `field_id - 1` and read `y`.
     #[tokio::test]
     async fn test_scan_name_mapping_subset_projection_reads_correct_physical_column() {
         let mut fixture = TableTestFixture::new_with_name_mapping_property(NAME_MAPPING_X1_Y2);
@@ -4342,18 +4136,9 @@ pub mod tests {
         assert_eq!(batches[0].num_rows(), 1024);
     }
 
-    /// The load-bearing semantic of the identity-partition constants map: the value of
-    /// an identity-partition column comes from PARTITION METADATA, not the data file.
-    ///
-    /// The fixture writes a data file whose parquet `x` column is `[1; 1024]` but whose
-    /// manifest partition value is `x == 999`. A scan must return 999 (the partition
-    /// metadata constant, Java `PartitionUtil.constantsMap`), NOT 1 (the file bytes).
-    /// This is the test the whole feature exists for, and the activation MUTATION
-    /// (`task.partition_spec = None`) makes it fail by reading 1 from the file.
-    ///
-    /// The output `x` is also asserted to be a PLAIN `Int64Array` (declared `Int64`,
-    /// not RunEndEncoded) — pinning the bug-(a) schema-equality fix end-to-end through
-    /// the reader, not only at the transformer unit level.
+    /// An identity-partition column's value comes from partition metadata, not from the data file.
+    /// The fixture's parquet `x` is `[1; 1024]` and its partition value is 999, so the scan must
+    /// return 999. The output must also be a plain `Int64Array`, not run-end-encoded.
     #[tokio::test]
     async fn test_identity_partition_column_value_comes_from_metadata_not_file() {
         let mut fixture = TableTestFixture::new();
@@ -4395,18 +4180,17 @@ pub mod tests {
         }
     }
 
-    /// Multi-spec interaction (this increment sits on top of the multi-spec WRITE
-    /// increment): each data file's identity-partition constants are materialized under
-    /// THAT file's own spec, resolved from its manifest's `partition_spec_id`.
+    /// Each data file's identity-partition constants must be materialized under that file's own
+    /// spec, resolved from its manifest's `partition_spec_id`.
     ///
-    /// The fixture writes 1.parquet under `identity(x)` (spec 0, partition `x == 777`)
-    /// and 2.parquet under `identity(y)` (spec 1, partition `y == 888`), each in its own
-    /// manifest. Both files share the same parquet bytes (`x == 1`, `y` starting at `2`).
-    /// A correct scan returns, per file:
-    ///  * spec-0 file: x = 777 (constant from spec 0), y read from file (= 2)
-    ///  * spec-1 file: y = 888 (constant from spec 1), x read from file (= 1)
+    /// Both files share the same parquet bytes, so a correct scan returns:
     ///
-    /// A single-spec scan (using one shared spec for both files) cannot produce this.
+    /// | File | Constant | Read from file |
+    /// |---|---|---|
+    /// | spec 0 | `x = 777` | `y = 2` |
+    /// | spec 1 | `y = 888` | `x = 1` |
+    ///
+    /// A scan that used one shared spec for both files cannot produce this.
     #[tokio::test]
     async fn test_multispec_scan_materializes_each_file_constant_under_its_own_spec() {
         let mut fixture = TableTestFixture::new_with_two_identity_specs();
@@ -4451,17 +4235,10 @@ pub mod tests {
         );
     }
 
-    /// Null identity-partition value, end-to-end through the scan/reader path.
-    ///
-    /// Per Iceberg column-projection rule #4 (`constants_map` skips a null partition value,
-    /// Java `PartitionUtil.constantsMap` only puts non-null converted values), a null
-    /// partition value does NOT enter the constants map, so it does not override anything.
-    /// In THIS fixture the data file physically contains `x` (`[1; 1024]`), so the column
-    /// resolves to the FILE value (1), not an error — the absence of an override is the
-    /// behavior under test. (When the file LACKS the column, the same null path yields a
-    /// null column — pinned by the transformer unit test `null_identity_partition_value`.)
-    /// The point here is that a null partition value is handled WITHOUT erroring and the
-    /// column keeps its plain declared scan-schema type.
+    /// A null identity-partition value, end-to-end through the scan and reader path.
+    /// Column-projection rule 4 keeps a null partition value out of the constants map, so it
+    /// overrides nothing. This fixture's file holds `x`, so the column resolves to the file value
+    /// and does not error, and it keeps its declared scan-schema type.
     #[tokio::test]
     async fn test_identity_partition_null_value_does_not_override_and_does_not_error() {
         let mut fixture = TableTestFixture::new();
@@ -4520,16 +4297,12 @@ pub mod tests {
         assert_eq!(int64_arr.value(0), 2);
     }
 
-    /// Full-path pins for audit BUG-001 (constant-truth NaN residuals): `TableScan::to_arrow`
-    /// with `is_nan` / `not_nan` filters over BOTH float widths, content-asserted by the `x`
-    /// row set. `1.parquet` carries the {NaN, finite, NULL} truth table (x = 1/2·4/3):
-    ///   * `is_nan` must return ONLY the NaN row (pre-fix: constant `true` returned finite and
-    ///     NULL rows as if NaN);
-    ///   * `not_nan` must KEEP finite AND NULL rows (pre-fix: constant `false` silently dropped
-    ///     EVERY row — the corruption class), NULL kept per Java `NaNUtil.isNaN(null) == false`.
-    /// `2.parquet` (x = 100/200, written BEFORE the float columns existed) pins the
-    /// missing-column arms inside the same scans: its rows must NEVER surface under `is_nan`
-    /// and must ALL surface under `not_nan`.
+    /// Full-path pins for `is_nan` and `not_nan` over both float widths, asserted by the `x` row
+    /// set. `is_nan` must return only the NaN row. `not_nan` must keep the finite and the NULL
+    /// rows, because Java `NaNUtil.isNaN(null)` is false.
+    ///
+    /// `2.parquet` was written before the float columns existed, so it pins the missing-column
+    /// arms. Its rows must never surface under `is_nan`, and must all surface under `not_nan`.
     #[tokio::test]
     async fn test_filter_on_arrow_is_nan_not_nan_full_path() {
         let mut fixture = TableTestFixture::new_nan_floats();
@@ -4606,17 +4379,9 @@ pub mod tests {
         }
     }
 
-    /// Full-path pins for the null-semantics family (audit BUG-002/BUG-003): `TableScan::
-    /// to_arrow` under Java's nulls-first total order over the A1 fixture — `1.parquet` has
-    /// `dbl_nan = [NaN, 100.5, NULL, -7.25]` at `x = [1, 2, 3, 4]`; `2.parquet` (`x = [100,
-    /// 200]`) was written BEFORE `dbl_nan` existed (the column is ABSENT — a NULL column).
-    ///
-    ///   * `!=` KEEPS the NULL cell (x = 3) and the whole schema-evolved file (x = 100/200) —
-    ///     the BUG-003 and BUG-002 headlines: pre-fix the RowFilter dropped the NULL row and
-    ///     the missing-column arm compiled to always-false (ZERO rows from `2.parquet`);
-    ///   * `<` / `<=` KEEP the NULL cell and the schema-evolved file (compare(null, lit) == -1
-    ///     under `Comparators.nullsFirst()`); the NaN row (x = 1) is excluded by BOTH engines
-    ///     (Java `Double.compare(NaN, lit) == +1`, arrow `lt(NaN, lit) == false`).
+    /// Full-path pins for the null-semantics family under Java's nulls-first total order.
+    /// `2.parquet` was written before `dbl_nan` existed, so that column is absent there. `!=` must
+    /// keep the NULL cell and the whole schema-evolved file.
     #[tokio::test]
     async fn test_filter_on_arrow_nulls_first_neq_lt_lteq_full_path() {
         let mut fixture = TableTestFixture::new_nan_floats();
@@ -4951,10 +4716,8 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_task_predicate_is_partition_reduced_residual_not_full_filter() {
-        // Filter `x == 1 AND y > 0`: the `x == 1` leaf is fully implied by the
-        // identity partition (x == 1) for every live file, so the residual must
-        // drop it, leaving ONLY `y > 0`. The full filter would still carry the
-        // `x == 1` leaf — leaving `predicate` as the full filter fails this.
+        // The identity partition implies the `x == 1` leaf for every live file, so the residual
+        // must drop it and leave only `y > 0`. Leaving `predicate` as the full filter fails.
         let filter = Reference::new("x")
             .equal_to(Datum::long(1))
             .and(Reference::new("y").greater_than(Datum::long(0)));
@@ -5013,19 +4776,12 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_residual_uses_files_own_spec_not_the_table_default_spec() {
-        // RISK (silent scan-hot-path data bug): after partition evolution, an older
-        // manifest's `partition_spec_id` differs from the table's DEFAULT spec. The
-        // residual + threaded spec MUST come from the FILE's own spec
-        // (`manifest_file.partition_spec_id`), NOT the table default. Here the live
-        // file is written under spec 0 (`identity(x)`) while the table default is the
-        // unpartitioned spec 1.
+        // After partition evolution an older manifest's spec id differs from the table default.
+        // The residual and the threaded spec must come from the file's own spec. Here the file
+        // sits under `identity(x)` while the default is unpartitioned.
         //
-        // With filter `x == 1`:
-        //   - file's own spec (0, identity(x)) → `x == 1` is partition-implied →
-        //     residual reduces to `AlwaysTrue`, and `task.partition_spec` is spec 0.
-        //   - table default (1, unpartitioned) → NO reduction → residual stays the
-        //     full `x == 1`, and the spec would be id 1.
-        // Using the default spec instead of the file's own fails BOTH assertions.
+        // Under filter `x == 1` the file's own spec reduces the residual to `AlwaysTrue`. The
+        // default spec reduces nothing. Using the default fails both assertions.
         let mut fixture = TableTestFixture::new_with_evolved_default_spec();
         fixture.setup_manifest_files_under_spec_zero().await;
 
@@ -5042,10 +4798,8 @@ pub mod tests {
         assert_eq!(tasks.len(), 1);
         let task = &tasks[0];
 
-        // The residual was reduced by the FILE's identity(x) spec → AlwaysTrue. Using
-        // the table default (unpartitioned) spec instead would leave the residual as the
-        // full `x == 1` (no reduction), so this predicate assertion pins that the residual
-        // is computed from the FILE's own `partition_spec_id`, not the table default.
+        // The file's own `identity(x)` spec reduces the residual to `AlwaysTrue`. The
+        // unpartitioned default would reduce nothing, so this assertion pins which spec is used.
         assert_eq!(
             task.predicate.as_deref(),
             Some(&BoundPredicate::AlwaysTrue),
@@ -5056,14 +4810,12 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_residual_scan_result_equivalent_to_full_filter_identity_partition() {
-        // RESULT-EQUIVALENCE on the identity-partitioned table. Filter mixes a
-        // partition-implied leaf (`x == 1`) with a data-column leaf (`y < 3`). The
-        // residual drops `x == 1` (always true for the x==1 files) and keeps
-        // `y < 3`. The rows returned must EXACTLY equal the known-correct set the
-        // full `x == 1 AND y < 3` filter selects: x == 1 holds for every row (the
-        // partition constant), so the two filters are equivalent — `y < 3` selects
-        // the 512 `y == 2` rows in EACH of the two live files (1.parquet, 3.parquet
-        // carry identical data), 1024 rows total.
+        // Result-equivalence on the identity-partitioned table. The filter mixes a
+        // partition-implied leaf with a data-column leaf, so the residual drops `x == 1` and
+        // keeps `y < 3`.
+        //
+        // `x == 1` holds for every row, so the two filters are equivalent. `y < 3` selects 512
+        // rows in each of the two live files, 1024 in total.
         let filter = Reference::new("x")
             .equal_to(Datum::long(1))
             .and(Reference::new("y").less_than(Datum::long(3)));
@@ -5175,9 +4927,8 @@ pub mod tests {
 
     /// COW MERGE target-scan mode: plan-time prune only, no residual on tasks.
     ///
-    /// Pins the RePark R-PERF-MERGE-PRUNE STOP: `with_filter` would attach a residual that
-    /// drops co-located survivors; `with_file_prune_only` must prune the same files while
-    /// leaving `FileScanTask.predicate = None`.
+    /// `with_filter` would attach a residual that drops co-located survivors.
+    /// `with_file_prune_only` must prune the same files and leave `predicate` as `None`.
     #[tokio::test]
     async fn test_file_prune_only_prunes_files_but_attaches_no_residual() {
         let mut fixture = TableTestFixture::new();
@@ -5375,12 +5126,11 @@ pub mod tests {
         );
     }
 
-    /// Mutation pin for inclusive-metrics under prune-only: two unpartitioned files with
-    /// disjoint `y` bounds; prune-only on `y == 2` must drop the y∈[10,20] file via metrics
-    /// (not partition), keep the y∈[1,3] file, and attach no residual.
+    /// Prune-only must still prune by inclusive metrics. Two unpartitioned files carry disjoint
+    /// `y` bounds, so `y == 2` must drop one by metrics, keep the other, and attach no residual.
     ///
-    /// If residual-skip incorrectly cleared `bound_predicates` / skipped
-    /// InclusiveMetricsEvaluator, both files would survive and this test would RED.
+    /// Mutation this catches: clearing `bound_predicates` on the residual-skip path. Both files
+    /// would then survive.
     #[tokio::test]
     async fn test_file_prune_only_still_applies_inclusive_metrics_prune() {
         let fixture = TableTestFixture::new_unpartitioned();
@@ -5576,10 +5326,9 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_filter_excluding_the_partition_prunes_the_file_entirely() {
-        // Filter `x == 999`: no live file is in partition x == 999, so the
-        // inclusive projection is false for every file and they are all pruned
-        // (manifest + expression evaluators) — zero tasks. This is the partition
-        // mismatch the residual's AlwaysFalse case corresponds to at planning time.
+        // No live file sits in partition `x == 999`, so the inclusive projection is false for
+        // every file and all are pruned. This is the planning-time face of an `AlwaysFalse`
+        // residual.
         let filter = Reference::new("x").equal_to(Datum::long(999));
         let tasks = plan_filtered_tasks(filter).await;
         assert!(
@@ -5590,11 +5339,9 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_task_predicate_residual_reduced_on_transform_truncate_partition() {
-        // TRANSFORM partition (`truncate(x, 100)`), file in partition bucket 0
-        // (x in 0..=99). Filter `x < 100 AND y > 0`: the truncate-0 partition's
-        // STRICT projection of `x < 100` is true (every x in 0..=99 is < 100), so
-        // the residual drops the `x < 100` leaf, leaving only `y > 0` — proving the
-        // wiring reduces a NON-identity partition predicate, not just identity.
+        // The file sits in the `truncate(x, 100)` bucket 0, so the strict projection of
+        // `x < 100` is true and the residual drops that leaf. This proves the wiring reduces a
+        // non-identity partition predicate too.
         let mut fixture = TableTestFixture::new_truncate_partitioned();
         fixture.setup_truncate_manifest_files().await;
 
@@ -5624,12 +5371,9 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_residual_scan_result_equivalent_to_full_filter_truncate_partition() {
-        // RESULT-EQUIVALENCE on the truncate-partitioned table. Filter
-        // `x < 100 AND y >= 4`: truncate(x,100)==0 implies x < 100 for every row, so
-        // the residual `y >= 4` selects the SAME rows as the full filter. The data
-        // has y >= 4 for 312 rows (300 of y==4 + 12 of y==5). Because the truncate
-        // transform is NON-identity, `x` is read from the parquet file (= 1), so the
-        // full-filter leaf `x < 100` is also true for every row — equivalence holds.
+        // Result-equivalence on the truncate-partitioned table. Bucket 0 implies `x < 100` for
+        // every row, so the residual `y >= 4` selects the same 312 rows as the full filter.
+        // The truncate transform is non-identity, so `x` is read from the file.
         let mut fixture = TableTestFixture::new_truncate_partitioned();
         fixture.setup_truncate_manifest_files().await;
 
@@ -6159,12 +5903,8 @@ pub mod tests {
         let mut fixture = TableTestFixture::new();
         fixture.setup_deadlock_manifests().await;
 
-        // Create table scan with concurrency limit 1
-        // This sets channel size to 1.
-        // Data manifest has 10 entries -> will block producer.
-        // Delete manifest is 2nd in list -> won't be processed.
-        // Consumer 2 (Data) not started -> blocked.
-        // Consumer 1 (Delete) waiting -> blocked.
+        // A concurrency limit of 1 sets the channel size to 1. The data manifest has 10 entries,
+        // so it blocks the producer, and the delete manifest is never reached.
         let table_scan = fixture
             .table
             .scan()
@@ -6188,7 +5928,6 @@ pub mod tests {
         assert!(result.is_ok(), "Scan timed out - deadlock detected");
     }
 
-    // =======================================================================================
     // BatchScan (Java BatchScan / BatchScanAdapter) — the typed adapter over the SAME pipeline.
     //
     // The contract: `table.batch_scan()` is a thin typed wrapper whose plan_files()/plan_tasks()
@@ -6197,7 +5936,6 @@ pub mod tests {
     // first-wins mutual exclusion). The fixture's snapshot LOG is
     //   {id 3051729675574597004 @ 1515100955770} then {id 3055729675574597004 @ 1555100955770}
     // with current = 3055729675574597004 and a `test` tag → 3051729675574597004.
-    // =======================================================================================
 
     /// Older snapshot-log entry's timestamp (id 3051729675574597004).
     const SNAP1_TS: i64 = 1515100955770;
@@ -6391,12 +6129,11 @@ pub mod tests {
         );
     }
 
-    /// `as_of_time` BOUNDARY — the inclusive `<=` over the snapshot LOG (Java
-    /// `SnapshotUtil.snapshotIdAsOfTime`):
-    ///   * EXACTLY at snap2's timestamp ⇒ snap2 (== current). MUTATION BAIT: a `<` boundary would
-    ///     wrongly pick snap1; a "pick the earliest <=" bug would also pick snap1.
-    ///   * 1ms BEFORE snap2 ⇒ snap1 (the greatest `<=` is snap1).
-    ///   * EXACTLY at snap1's timestamp ⇒ snap1.
+    /// `as_of_time` resolves to the greatest snapshot at or before the time, as Java
+    /// `SnapshotUtil.snapshotIdAsOfTime` does. This pins all three boundary points.
+    ///
+    /// Mutation this catches: a `<` boundary, or picking the earliest match. Both pick snap1
+    /// exactly at snap2's timestamp.
     #[tokio::test]
     async fn test_batch_scan_as_of_time_boundary_is_inclusive() {
         let table = TableTestFixture::new().table;
@@ -6605,10 +6342,10 @@ pub mod tests {
         }
     }
 
-    /// Risk: the `ScanEvent` emit is wired but never actually fires on a real plan (a registry
-    /// nothing fires is only a partial port). Pins that running `plan_files` over a REAL fixture
-    /// table fires exactly one `ScanEvent` carrying the scanned snapshot id, the UNBOUND filter,
-    /// the table name, and the projection schema id.
+    /// `plan_files` over a real table must fire exactly one `ScanEvent`, carrying the snapshot
+    /// id, the unbound filter, the table name and the projection schema id.
+    ///
+    /// Mutation this catches: a registry that is wired but never fires.
     #[tokio::test]
     async fn test_real_scan_fires_scan_event() {
         let _guard = crate::events::test_support::lock();
@@ -6871,21 +6608,12 @@ pub mod tests {
         assert_eq!(expanded.len(), 1, "Avro must not expand");
     }
 
-    /// A SINGLE split offset must not expand: `can_expand` requires `offsets.len() > 1`, which is
-    /// deliberately STRICTER than `FileScanTask::split`'s own `!offsets.is_empty()` gate.
+    /// A single split offset must not expand. `can_expand` requires `offsets.len() > 1`,
+    /// deliberately stricter than `FileScanTask::split`'s own gate.
     ///
-    /// The clause is load-bearing. `split` ports Java, whose offsets-aware branch accepts a
-    /// one-element offsets array and emits one window running from that offset to the end of the
-    /// file — so a hostile `[585]` on a 1170-byte file yields `(585, 585)`, and every row before
-    /// byte 585 is in NO sub-task. That is Java-faithful (Java loses the same rows on the same
-    /// input) and honest manifests never produce it (`offsets[0] == 4`, and a splittable file has
-    /// more than one row group), so `split` must NOT be "fixed". But this path is a fork-local
-    /// `to_arrow` optimisation with no Java counterpart: expanding here would make `to_arrow()` and
-    /// a whole-file read disagree on the same file, silently, for zero parallelism gain. Declining
-    /// is the only answer that keeps the two seams in agreement.
-    ///
-    /// Behaviour pin only. Companion:
-    /// `scan::task::tests::split_single_offset_takes_the_offsets_aware_branch`. (U3 cycle 6 / R5.)
+    /// `split` ports Java, which accepts a one-element array and loses every row before that
+    /// offset. This path is fork-local, so expanding here would make `to_arrow()` disagree with
+    /// a whole-file read, silently, for no parallelism gain.
     #[tokio::test]
     async fn test_within_file_parallel_declines_a_single_split_offset() {
         let mut fixture = TableTestFixture::new();
@@ -6995,15 +6723,12 @@ pub mod tests {
         );
     }
 
-    /// U3 cycle 5 / F7 — `plan_tasks` must ALSO suppress splitting under a `_pos` projection.
+    /// `plan_tasks` must suppress splitting under a `_pos` projection, as the `to_arrow` seam
+    /// does.
     ///
-    /// `expand_within_file_parallel_tasks` (the `to_arrow` seam) has always suppressed itself under
-    /// `_pos`, but `plan_tasks` used to split unconditionally — and the reader's `_pos` guard
-    /// rejects every `start != 0` task with `FeatureUnsupported`. So one layer manufactured exactly
-    /// the shape the next refuses: a `_pos` scan that `to_arrow()` serves correctly was a total
-    /// outage on the `plan_tasks` / `PartitionWork` seam (measured: 0 rows and two typed errors),
-    /// and the error told the caller to "plan without splitting" when the caller never asked to
-    /// split.
+    /// Mutation this catches: splitting unconditionally here. The reader's `_pos` guard then
+    /// rejects every ranged task, so a scan `to_arrow()` serves correctly returns zero rows and
+    /// two typed errors on this seam.
     #[tokio::test]
     async fn test_plan_tasks_does_not_split_when_pos_is_projected() {
         let mut fixture = TableTestFixture::new();

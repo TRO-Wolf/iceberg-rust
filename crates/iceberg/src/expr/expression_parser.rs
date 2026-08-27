@@ -15,63 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Canonical expression-JSON codec — a 1:1 port of Java `iceberg-core`
-//! `org.apache.iceberg.expressions.ExpressionParser` (and its `$JsonGeneratorVisitor`) over the
-//! Rust [`Predicate`] tree.
+//! Canonical expression-JSON codec: a 1:1 port of Java `ExpressionParser` over the Rust
+//! [`Predicate`] tree.
 //!
-//! # Wire format (bytecode-confirmed against `iceberg-core-1.10.0`)
+//! | Node | Wire form |
+//! |---|---|
+//! | literal predicate | `{"type":<op>,"term":<term>,"value":<single-value>}` |
+//! | set predicate (`in`/`not-in`) | `{"type":<op>,"term":<term>,"values":[<single-value>,...]}` |
+//! | unary predicate | `{"type":<op>,"term":<term>}` |
+//! | `and`/`or` | `{"type":"and"\|"or","left":<expr>,"right":<expr>}` |
+//! | `not` | `{"type":"not","child":<expr>}` |
+//! | `AlwaysTrue`/`AlwaysFalse` | the bare JSON booleans `true`/`false`, NOT an object |
+//! | term | a bare JSON string holding the column name |
+//! | op name | `Operation.toString()` with `_` mapped to `-`, lowercased |
+//! | int, long, boolean | a JSON number or boolean |
+//! | float, double | a JSON number whose TEXT is Java `Float.toString`/`Double.toString` |
+//! | date, time, timestamp, timestamptz | an ISO-8601 string |
+//! | decimal, uuid, binary, fixed | a string: plain decimal, lowercase uuid, uppercase base-16 |
 //!
-//! - **Predicate** (literal): `{"type":<op>,"term":<term>,"value":<single-value>}`.
-//! - **Predicate** (set, `in`/`not-in`): `{"type":<op>,"term":<term>,"values":[<single-value>,...]}`.
-//! - **Predicate** (unary, `is-null`/`not-null`/`is-nan`/`not-nan`): `{"type":<op>,"term":<term>}`.
-//! - **Logical** `and`/`or`: `{"type":"and"|"or","left":<expr>,"right":<expr>}`.
-//! - **Logical** `not`: `{"type":"not","child":<expr>}`.
-//! - **Constants** — `AlwaysTrue` serializes to the bare JSON boolean `true`; `AlwaysFalse` to
-//!   `false` (Java `JsonGenerator.writeBoolean`, NOT a `{"type":...}` object).
-//! - **term** — a bare JSON string holding the column name (`Reference`). Java additionally emits
-//!   `{"type":"transform",...}` objects for transform/aggregate terms; those are not constructible
-//!   on the Rust write side ([`Reference`] is name-only) and are rejected on the read side.
-//! - **op name** — `Operation.toString().replaceAll("_","-").toLowerCase(Locale.ENGLISH)`
-//!   (`is_null` → `is-null`, `not_eq` → `not-eq`, `lt_eq` → `lt-eq`, `not_in` → `not-in`,
-//!   `starts_with` → `starts-with`); the read side reverses (`-` → `_`).
-//! - **value** — Java `SingleValueParser.toJson`: `int`/`long` → a JSON number;
-//!   `float`/`double` → a JSON number whose text is Java `Float.toString`/`Double.toString`
-//!   (see the float/double residue below); `boolean` → a JSON boolean;
-//!   `date`/`time`/`timestamp`/`timestamptz` → an ISO-8601 **string**;
-//!   `decimal` → `BigDecimal.toPlainString()` (a string, scale preserved); `uuid` → a lowercase
-//!   string; `binary`/`fixed` → an uppercase base-16 **string**.
+//! Java also emits `{"type":"transform",...}` terms. [`Reference`] is name-only, so this port
+//! cannot write one and rejects one on the read side.
 //!
-//! ## Float / double value formatting — what matches, and the named residue
+//! The float text is NOT byte-for-byte 1:1. The JDK 11 `FloatingDecimal` is non-minimal and prints
+//! more digits than the shortest round trip for some long-mantissa values, where Rust prints the
+//! minimal form. JDK 19 adopted that minimal form. [`float_residue_is_jdk_nonminimal`] pins it.
 //!
-//! Java emits a float/double literal as the verbatim text of `Float.toString`/`Double.toString`
-//! (an uppercase-`E` scientific form when the decimal exponent is `>= 7` or `<= -4`, otherwise a
-//! fixed decimal with at least one fractional digit — e.g. `1e10` → `1.0E10`, `1e-4` → `1.0E-4`,
-//! `1234.5` → `1234.5`, `1.0` → `1.0`). [`format_java_float`] reproduces this rule from Rust's
-//! own shortest-round-trip digits (`{:e}`), so the **fixed/scientific placement and the digit
-//! sequence match Java for the overwhelming majority of values**, including every typical-magnitude
-//! literal and the entire interop battery.
-//!
-//! **Residue (NOT byte-for-byte 1:1, scoped out of the ✅):** the JDK 11 `FloatingDecimal` that
-//! backs `Double.toString`/`Float.toString` is *non-minimal* — for some large-magnitude / long-
-//! mantissa values it prints MORE significant digits than the true shortest round-trip (e.g. JDK 11
-//! prints `6.0372357323402578E18` where the shortest is `6.037235732340258E18`; the `1e15f`/`1e16f`
-//! float quirks `9.9999999E14` / `1.00000003E16` are the same effect). Rust's shortest-digits
-//! formatter prints the *minimal* form, so for that narrow class of values the bytes differ. This
-//! was fixed in JDK 19 (Ryū-based rewrite) to the minimal form Rust already produces, so Rust is
-//! aligned with modern Java but diverges from the JDK 11 oracle on these. Non-finite values
-//! (`Infinity`/`-Infinity`, which Java emits as quoted strings; `NaN`, which Java rejects as a
-//! literal) are also out of scope and rejected with [`ErrorKind::FeatureUnsupported`].
-//! [`float_residue_is_jdk_nonminimal`] pins the known-divergent shape so it stays visible.
-//!
-//! # The typed-vs-untyped read contract
-//!
-//! The Rust [`Predicate`] always carries a typed [`Datum`]; Java's schema-less `fromJson(String)`
-//! is untyped (it collapses temporal/decimal literals to `Long`/`String`/`Double`/`Boolean`). To
-//! reconstruct the correct [`Datum`] the read API therefore *requires* a [`Schema`]:
-//! [`from_json`] looks up each predicate's bound field and builds the typed [`Datum`] from the
-//! JSON value using that field's [`PrimitiveType`]. This mirrors Java's
-//! `ExpressionParser.fromJson(String, Schema)` followed by a `Binder.bind`, which is the only
-//! round-trip that preserves date/time/timestamp/decimal literals byte-for-byte.
+//! A Rust [`Predicate`] always carries a typed [`Datum`], but Java's schema-less `fromJson(String)`
+//! collapses temporal and decimal literals. So [`from_json`] REQUIRES a [`Schema`]: it rebuilds
+//! each literal from its bound field's type, the only round trip that preserves them.
 
 use std::fmt::Write as _;
 
@@ -85,9 +56,7 @@ use crate::expr::{
 use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType, Schema};
 use crate::{Error, ErrorKind, Result};
 
-/// Maximum recursion depth for the JSON expression tree. Malformed deeply-nested input must not
-/// overflow the thread stack (house rule); Java has no explicit limit but a real ScanReport
-/// filter is shallow, so this is generous.
+/// Maximum JSON nesting: malformed deep input must not overflow the stack. Java has no limit.
 const MAX_DEPTH: u32 = 100;
 
 // JSON field names — mirror the private `String` constants in Java `ExpressionParser`.
@@ -100,9 +69,7 @@ const RIGHT: &str = "right";
 const CHILD: &str = "child";
 const TRANSFORM: &str = "transform";
 
-/// Serialize a [`Predicate`] to its canonical Java-`ExpressionParser` JSON string.
-///
-/// # Example
+/// Serializes a [`Predicate`] to its canonical `ExpressionParser` JSON string.
 ///
 /// ```rust
 /// use iceberg::expr::Reference;
@@ -119,23 +86,14 @@ const TRANSFORM: &str = "transform";
 /// );
 /// ```
 pub fn to_json(predicate: &Predicate) -> Result<String> {
-    // Build the output by hand to preserve Java's field-insertion order (`type` before `term`
-    // before `value`). `serde_json::Map` without the `preserve_order` feature is a `BTreeMap`
-    // that alphabetizes keys, which would break byte-parity; only leaf scalar values go through
-    // `serde_json` (order-independent), via [`datum_to_value`].
+    // Built by hand to keep Java's field order: a `serde_json::Map` alphabetizes its keys here.
     let mut out = String::new();
     write_predicate(&mut out, predicate)?;
     Ok(out)
 }
 
-/// Parse a canonical Java-`ExpressionParser` JSON string into a [`Predicate`], recovering each
-/// literal's type from the supplied [`Schema`].
-///
-/// A [`Schema`] is required: the Rust [`Predicate`] carries a typed [`Datum`], but the wire form
-/// encodes only the JSON value, so the literal's type is recovered from the bound field. Transform
-/// and aggregate terms are rejected with [`ErrorKind::FeatureUnsupported`].
-///
-/// # Example
+/// Parses a canonical `ExpressionParser` JSON string, recovering each literal's type from the
+/// bound field of `schema`. Transform and aggregate terms are rejected.
 ///
 /// ```rust
 /// use std::sync::Arc;
@@ -161,17 +119,10 @@ pub fn from_json(json: &str, schema: &Schema) -> Result<Predicate> {
     value_to_predicate(&value, Some(schema), 0)
 }
 
-/// Parse a canonical Java-`ExpressionParser` JSON string into a [`Predicate`] WITHOUT a schema,
-/// mirroring Java's schema-less `ExpressionParser.fromJson(String)`.
-///
-/// Java's schema-less path is untyped: it reads a JSON integral number as a `Long`, a floating
-/// number as a `Double`, a string as a `String`, and a boolean as a `Boolean` (`asObject`), so it
-/// CANNOT recover the original date/time/timestamp/decimal type — those literals collapse. This
-/// function reproduces that exact behavior, building [`Datum::long`]/[`Datum::double`]/
-/// [`Datum::string`]/[`Datum::bool`] accordingly. It is the deserialize half of the
-/// `ScanReport.filter` wire contract, which Java also serializes/deserializes via the untyped path.
-///
-/// Prefer [`from_json`] whenever a schema is available — it preserves literal types.
+/// Parses a canonical `ExpressionParser` JSON string WITHOUT a schema, mirroring Java's untyped
+/// `fromJson(String)`: an integral number becomes a `Long`, a floating number a `Double`. Date,
+/// time, timestamp and decimal literals therefore COLLAPSE. It is the deserialize half of the
+/// `ScanReport.filter` wire contract. Prefer [`from_json`] whenever a schema is available.
 pub fn from_json_untyped(json: &str) -> Result<Predicate> {
     let value: JsonValue = serde_json::from_str(json).map_err(|e| {
         Error::new(ErrorKind::DataInvalid, "Failed to parse expression JSON").with_source(e)
@@ -179,9 +130,7 @@ pub fn from_json_untyped(json: &str) -> Result<Predicate> {
     value_to_predicate(&value, None, 0)
 }
 
-// =====================================================================================
-// Write side — Predicate → serde_json::Value (mirrors `$JsonGeneratorVisitor`).
-// =====================================================================================
+// Write side — Predicate to JSON (mirrors Java `$JsonGeneratorVisitor`).
 
 /// Render the hyphenated lowercase op name (Java `operationType`).
 fn op_type(op: PredicateOperator) -> &'static str {
@@ -203,10 +152,9 @@ fn op_type(op: PredicateOperator) -> &'static str {
     }
 }
 
-/// Append a JSON string literal (Java `JsonGenerator.writeString` / `writeStringField`) using
-/// serde_json's escaping so control characters and quotes match Jackson's output.
+/// Appends a JSON string literal, escaped by serde_json so it matches Jackson's output.
 fn write_json_string(out: &mut String, s: &str) {
-    // `serde_json::to_string` on a string never fails and yields a quoted, escaped JSON string.
+    // `to_string` on a `str` never fails, so the fallback is unreachable, not dead.
     let encoded = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
     out.push_str(&encoded);
 }
@@ -234,14 +182,12 @@ fn write_predicate(out: &mut String, predicate: &Predicate) -> Result<()> {
     Ok(())
 }
 
-/// Append `"<key>":` (a JSON field name).
 fn write_field_name(out: &mut String, key: &str) {
     out.push('"');
     out.push_str(key);
     out.push_str("\":");
 }
 
-/// Append `"type":"<op>",` (the leading type field common to every predicate object).
 fn write_type_field(out: &mut String, ty: &str) {
     write_field_name(out, TYPE);
     write_json_string(out, ty);
@@ -299,13 +245,8 @@ fn write_set(out: &mut String, expr: &SetExpression<Reference>) -> Result<()> {
     Ok(())
 }
 
-/// Append a single value (Java `SingleValueParser.toJson`) — a scalar, so serde_json ordering is
-/// irrelevant.
-///
-/// Float and double take a bespoke path: their JSON-number *text* must be Java
-/// `Float.toString`/`Double.toString` (see [`format_java_float`]), which `serde_json::Number`
-/// cannot represent (it has no way to hold the token `1.0E10`), so the token is appended raw. Every
-/// other type round-trips through [`datum_to_value`] + `serde_json::to_string`.
+/// Appends a single value (Java `SingleValueParser.toJson`). Float and double take a bespoke
+/// path: `serde_json::Number` cannot hold a token like `1.0E10`, so the token is appended raw.
 fn write_value(out: &mut String, datum: &Datum) -> Result<()> {
     match datum.literal() {
         PrimitiveLiteral::Float(v) => {
@@ -326,11 +267,8 @@ fn write_value(out: &mut String, datum: &Datum) -> Result<()> {
     Ok(())
 }
 
-// =====================================================================================
-// Value codec — Datum → serde_json::Value, byte-matching Java `SingleValueParser.toJson`.
-// =====================================================================================
+// Value codec — Datum to JSON, byte-matching Java `SingleValueParser.toJson`.
 
-/// Render a [`Datum`] to its `SingleValueParser`-shaped JSON value.
 fn datum_to_value(datum: &Datum) -> Result<JsonValue> {
     let value = match (datum.data_type(), datum.literal()) {
         (_, PrimitiveLiteral::Boolean(v)) => JsonValue::Bool(*v),
@@ -340,10 +278,7 @@ fn datum_to_value(datum: &Datum) -> Result<JsonValue> {
         (_, PrimitiveLiteral::Long(v)) if matches!(datum.data_type(), PrimitiveType::Long) => {
             JsonValue::Number((*v).into())
         }
-        // Float/Double are emitted directly by `write_value` (their JSON-number text is Java
-        // `Float.toString`/`Double.toString`, which `serde_json::Number` cannot hold). Reaching
-        // them here means a value was routed around `write_value` — fail loudly rather than emit a
-        // serde-shaped number that would not byte-match Java.
+        // `write_value` emits floats itself, so reaching here means a value bypassed it.
         (_, lit @ PrimitiveLiteral::Float(_)) | (_, lit @ PrimitiveLiteral::Double(_)) => {
             return Err(Error::new(
                 ErrorKind::Unexpected,
@@ -364,8 +299,7 @@ fn datum_to_value(datum: &Datum) -> Result<JsonValue> {
         (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(v)) => {
             JsonValue::String(format_iso_timestamp(*v, true, true))
         }
-        // string, uuid, decimal, binary/fixed — Datum Display already byte-matches Java
-        // (uppercase hex for bytes, lowercase uuid, plain-string decimal with scale preserved).
+        // `Datum`'s Display already byte-matches Java for string, uuid, decimal and binary.
         (_, PrimitiveLiteral::String(v)) => JsonValue::String(v.clone()),
         (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(_)) => JsonValue::String(datum.to_string()),
         (_, PrimitiveLiteral::Binary(_)) => JsonValue::String(datum.to_string()),
@@ -382,15 +316,9 @@ fn datum_to_value(datum: &Datum) -> Result<JsonValue> {
     Ok(value)
 }
 
-/// Format a finite float/double as the JSON-number token Java `SingleValueParser.toJson` would
-/// emit — the verbatim text of `Float.toString`/`Double.toString`. When `is_float`, the value is a
-/// widened `f32` and the shortest digits are taken from the `f32` (not the widened `f64`), so the
-/// mantissa matches `Float.toString`, not `Double.toString`.
-///
-/// The fixed/scientific rule and digit sequence match Java for the overwhelming majority of values
-/// (see the module-level "Float / double value formatting" note for the JDK 11 non-minimal
-/// residue). Non-finite values are rejected — Java emits `Infinity`/`-Infinity` as quoted strings
-/// and rejects `NaN` as a literal; both are out of scope here.
+/// Formats a finite float as the verbatim text of Java `Float.toString`/`Double.toString`. With
+/// `is_float` the digits come from the `f32`, so the mantissa matches `Float.toString`. See the
+/// module residue note. Non-finite values are rejected: Java quotes them or rejects them.
 fn format_java_float(v: f64, is_float: bool) -> Result<String> {
     if !v.is_finite() {
         return Err(Error::new(
@@ -407,9 +335,7 @@ fn format_java_float(v: f64, is_float: bool) -> Result<String> {
         });
     }
 
-    // Rust's `{:e}` yields the SHORTEST round-trip digits in scientific form, e.g. `1.2345e3`,
-    // `1e7`, `5e-1`. Take the digits + decimal exponent from the right-typed value (f32 for floats)
-    // and reformat per Java's fixed/scientific placement rule.
+    // Rust's `{:e}` yields the SHORTEST round-trip digits; Java's placement rule is applied below.
     let neg = v < 0.0;
     let sci = if is_float {
         format!("{:e}", (v as f32).abs())
@@ -429,8 +355,7 @@ fn format_java_float(v: f64, is_float: bool) -> Result<String> {
         )
         .with_source(e)
     })?;
-    // `digits` = the significant digits, decimal point removed. `exp` is the power of ten of the
-    // FIRST digit (so the value is `digits[0].digits[1..] * 10^exp`).
+    // `exp` is the power of ten of the FIRST digit: the value is `digits[0].digits[1..] * 10^exp`.
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
     let ndigits = digits.len();
 
@@ -438,8 +363,7 @@ fn format_java_float(v: f64, is_float: bool) -> Result<String> {
     if neg {
         out.push('-');
     }
-    // Java `FloatingDecimal`: scientific form when the leading digit's power is `>= 7` or `<= -4`
-    // (equivalently the count of integer-part digits is `> 7` or `<= -3`); fixed decimal otherwise.
+    // Java `FloatingDecimal`: scientific when the leading digit's power is `>= 7` or `<= -4`.
     if exp >= 7 || exp <= -4 {
         out.push_str(&digits[..1]);
         out.push('.');
@@ -475,8 +399,7 @@ fn format_java_float(v: f64, is_float: bool) -> Result<String> {
     Ok(out)
 }
 
-/// Format `micros`-since-midnight as Java `DateTimeUtil.microsToIsoTime` (JDK `ISO_LOCAL_TIME`:
-/// `HH:MM:SS` with a trailing-zero-trimmed fractional part).
+/// Formats `micros`-since-midnight as Java `DateTimeUtil.microsToIsoTime`, trailing zeros trimmed.
 fn format_iso_time(micros: i64) -> String {
     let secs_total = micros / 1_000_000;
     let frac_micros = micros % 1_000_000;
@@ -488,9 +411,7 @@ fn format_iso_time(micros: i64) -> String {
     out
 }
 
-/// Format an epoch `value` (micros, or nanos when `nanos`) as Java
-/// `DateTimeUtil.microsToIsoTimestamp[tz]` / `nanosToIsoTimestamp[tz]`: an `ISO_LOCAL_DATE_TIME`
-/// (`yyyy-MM-ddTHH:mm:ss[.fraction]`) with a `+00:00` zone suffix when `tz`.
+/// Formats an epoch `value` as `yyyy-MM-ddTHH:mm:ss[.fraction]`, with `+00:00` when `tz`.
 fn format_iso_timestamp(value: i64, tz: bool, nanos: bool) -> String {
     let (unit_per_sec, frac_width) = if nanos {
         (1_000_000_000i64, 9)
@@ -500,12 +421,11 @@ fn format_iso_timestamp(value: i64, tz: bool, nanos: bool) -> String {
     // Floor division so the sub-second remainder is always non-negative (pre-epoch instants).
     let mut secs = value.div_euclid(unit_per_sec);
     let frac = value.rem_euclid(unit_per_sec);
-    // chrono renders the date + clock; we render the fraction ourselves to match the JDK trimming.
+    // The fraction is rendered here, not by chrono, to match the JDK's trimming.
     let naive = chrono::DateTime::from_timestamp(secs, 0)
         .map(|dt| dt.naive_utc())
         .unwrap_or_else(|| {
-            // Saturate defensively; from_timestamp only returns None far outside the supported
-            // calendar range, which a real literal never reaches. The epoch is infallible.
+            // Defensive: `from_timestamp` returns None only far outside the calendar range.
             secs = 0;
             chrono::DateTime::UNIX_EPOCH.naive_utc()
         });
@@ -517,8 +437,7 @@ fn format_iso_timestamp(value: i64, tz: bool, nanos: bool) -> String {
     out
 }
 
-/// Append a JDK-style fractional-seconds suffix: format `frac` to exactly `width` digits, strip
-/// trailing zeros, and omit the dot entirely when the fraction is zero.
+/// Appends a JDK-style fraction: `width` digits, trailing zeros stripped, no dot when zero.
 fn append_fraction(out: &mut String, frac: u64, width: usize) {
     if frac == 0 {
         return;
@@ -530,9 +449,7 @@ fn append_fraction(out: &mut String, frac: u64, width: usize) {
     let _ = write!(out, ".{digits}");
 }
 
-// =====================================================================================
-// Read side — serde_json::Value → Predicate (mirrors `fromJson`/`predicateFromJson`).
-// =====================================================================================
+// Read side — JSON to Predicate (mirrors Java `fromJson`/`predicateFromJson`).
 
 fn value_to_predicate(value: &JsonValue, schema: Option<&Schema>, depth: u32) -> Result<Predicate> {
     if depth > MAX_DEPTH {
@@ -590,8 +507,7 @@ fn predicate_from_obj(
     schema: Option<&Schema>,
 ) -> Result<Predicate> {
     let op = op_from_type(ty)?;
-    // `field_type` is `Some` only when a schema is supplied; in the untyped path the literal is
-    // reconstructed from the JSON value's own shape (Java schema-less `asObject`).
+    // Without a schema, `field_type` is `None` and the literal follows the JSON value's own shape.
     let (field_name, field_type) = read_term(obj, schema)?;
     let reference = Reference::new(field_name);
 
@@ -622,7 +538,6 @@ fn predicate_from_obj(
             .collect::<Result<FnvHashSet<Datum>>>()?;
         Ok(Predicate::Set(SetExpression::new(op, reference, literals)))
     } else {
-        // binary / literal predicate
         let value = get_field(obj, VALUE).map_err(|_| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -636,8 +551,7 @@ fn predicate_from_obj(
     }
 }
 
-/// Read the `term` field, rejecting transform/aggregate terms, and (when a schema is supplied)
-/// resolve the bound field's primitive type. Returns `None` for the field type in the untyped path.
+/// Reads the `term` field, rejecting transform terms, and resolves the bound field's type.
 fn read_term(
     obj: &JsonMap<String, JsonValue>,
     schema: Option<&Schema>,
@@ -646,9 +560,7 @@ fn read_term(
     let name = match term {
         JsonValue::String(s) => s.clone(),
         JsonValue::Object(t) => {
-            // Java accepts `{"type":"transform","transform":<name>,"term":<ref>}` here and builds an
-            // UnboundTransform. The Rust Predicate cannot hold a transform term, so reject it
-            // explicitly rather than silently dropping the transform.
+            // A Rust `Predicate` cannot hold Java's UnboundTransform, so reject it, never drop it.
             if t.contains_key(TRANSFORM) {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
@@ -716,9 +628,7 @@ fn op_from_type(ty: &str) -> Result<PredicateOperator> {
     })
 }
 
-/// Build a [`Datum`] from a JSON value. With `Some(field_type)` this is the schema-aware inverse of
-/// [`datum_to_value`] (Java `SingleValueParser.fromJson(Type, JsonNode)`); with `None` it mirrors
-/// Java's untyped `asObject` (integral→`Long`, floating→`Double`, string→`String`, bool→`Boolean`).
+/// Builds a [`Datum`]: with `Some(field_type)` typed, with `None` Java's untyped `asObject`.
 fn value_to_datum(value: &JsonValue, field_type: Option<&PrimitiveType>) -> Result<Datum> {
     let Some(field_type) = field_type else {
         return value_to_datum_untyped(value);
@@ -748,8 +658,7 @@ fn value_to_datum(value: &JsonValue, field_type: Option<&PrimitiveType>) -> Resu
         PrimitiveType::Time => Datum::time_from_str(as_str(value)?)?,
         PrimitiveType::Timestamp => Datum::timestamp_from_str(as_str(value)?)?,
         PrimitiveType::Timestamptz => Datum::timestamptz_from_str(as_str(value)?)?,
-        // No `*_nanos_from_str` constructor exists; parse the ISO string to nanos directly,
-        // mirroring Java `DateTimeUtil.isoTimestampToNanos` / `isoTimestamptzToNanos`.
+        // No `*_nanos_from_str` constructor exists, so parse the ISO string to nanos directly.
         PrimitiveType::TimestampNs => Datum::timestamp_nanos(iso_to_nanos(&as_str(value)?, false)?),
         PrimitiveType::TimestamptzNs => {
             Datum::timestamptz_nanos(iso_to_nanos(&as_str(value)?, true)?)
@@ -769,10 +678,8 @@ fn value_to_datum(value: &JsonValue, field_type: Option<&PrimitiveType>) -> Resu
     })
 }
 
-/// Build a [`Datum`] from a JSON value with no type context, mirroring Java's schema-less
-/// `ExpressionParser.asObject`: an integral number becomes a `Long`, a floating number a `Double`,
-/// a string a `String`, and a boolean a `Boolean`. Temporal/decimal/binary types CANNOT be
-/// recovered here — exactly as in Java's untyped path.
+/// Builds a [`Datum`] with no type context. Temporal, decimal and binary types CANNOT be
+/// recovered here, exactly as in Java's untyped `asObject`.
 fn value_to_datum_untyped(value: &JsonValue) -> Result<Datum> {
     match value {
         JsonValue::Bool(b) => Ok(Datum::bool(*b)),
@@ -796,8 +703,7 @@ fn value_to_datum_untyped(value: &JsonValue) -> Result<Datum> {
     }
 }
 
-/// Decode an uppercase (Java `BaseEncoding.base16()`) hex string to bytes. Accepts mixed case for
-/// robustness; rejects odd-length or non-hex input.
+/// Decodes a base-16 string to bytes. Mixed case is accepted; odd-length or non-hex is rejected.
 fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return Err(Error::new(
@@ -824,9 +730,7 @@ fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Parse an ISO-8601 timestamp string to nanoseconds since the Unix epoch. When `tz`, the input is
-/// a zoned RFC-3339 timestamp; otherwise it is a local date-time. Mirrors Java
-/// `DateTimeUtil.isoTimestampToNanos` / `isoTimestamptzToNanos`.
+/// Parses an ISO-8601 timestamp to nanos since the epoch; with `tz` the input is zoned.
 fn iso_to_nanos(s: &str, tz: bool) -> Result<i64> {
     let parse_err = |e: chrono::ParseError| {
         Error::new(
@@ -855,9 +759,7 @@ fn iso_to_nanos(s: &str, tz: bool) -> Result<i64> {
         })
 }
 
-// =====================================================================================
 // JSON object helpers.
-// =====================================================================================
 
 fn get_field<'a>(obj: &'a JsonMap<String, JsonValue>, key: &str) -> Result<&'a JsonValue> {
     obj.get(key).ok_or_else(|| {
@@ -955,8 +857,7 @@ mod tests {
                     "f",
                     Type::Primitive(PrimitiveType::Float),
                 )),
-                // `x`/`y` are nullable Int columns used by the unary/logical fixtures: Java's
-                // `predicateFromJson` always binds the term, so the field must exist in the schema.
+                // Java's `predicateFromJson` always binds the term, so `x`/`y` must exist here.
                 Arc::new(NestedField::optional(
                     14,
                     "x",
@@ -985,8 +886,7 @@ mod tests {
         assert_eq!(back, pred, "from_json round-trip");
     }
 
-    // ---- Hand-pinned Java-shape fixtures (anti-circular: these match the REAL Java
-    // ExpressionParser.toJson output captured from iceberg-core-1.10.0). ----
+    // Hand-pinned fixtures: the REAL Java output, so the test cannot be circular.
 
     #[test]
     fn pinned_is_null() {
@@ -1006,7 +906,6 @@ mod tests {
 
     #[test]
     fn pinned_is_nan_not_nan() {
-        // x not in the schema is fine for unary terms only if present; use "f" (float).
         assert_roundtrip(
             Reference::new("f").is_nan(),
             r#"{"type":"is-nan","term":"f"}"#,
@@ -1079,7 +978,6 @@ mod tests {
 
     #[test]
     fn pinned_temporal_values() {
-        // These strings are the EXACT Java SingleValueParser output (DateTimeUtil ISO forms).
         assert_roundtrip(
             Reference::new("d").equal_to(Datum::date_from_str("2017-11-16").unwrap()),
             r#"{"type":"eq","term":"d","value":"2017-11-16"}"#,
@@ -1102,7 +1000,6 @@ mod tests {
 
     #[test]
     fn iso_fraction_trimming_matches_jdk() {
-        // Whole second -> no fractional part.
         assert_eq!(
             to_json(&Reference::new("ts").equal_to(Datum::timestamp_micros(1_510_841_716_000_000)))
                 .unwrap(),
@@ -1113,7 +1010,6 @@ mod tests {
             to_json(&Reference::new("t").equal_to(Datum::time_micros(500_000).unwrap())).unwrap(),
             r#"{"type":"eq","term":"t","value":"00:00:00.5"}"#
         );
-        // tstz at epoch -> "+00:00" suffix, no fraction.
         assert_eq!(
             to_json(&Reference::new("tstz").equal_to(Datum::timestamptz_micros(0))).unwrap(),
             r#"{"type":"eq","term":"tstz","value":"1970-01-01T00:00:00+00:00"}"#
@@ -1126,7 +1022,6 @@ mod tests {
             Reference::new("dec").equal_to(Datum::decimal_from_str("12.34").unwrap()),
             r#"{"type":"eq","term":"dec","value":"12.34"}"#,
         );
-        // scale-preserving decimal (Java toPlainString).
         assert_roundtrip(
             Reference::new("dec").equal_to(Datum::decimal_from_str("12.30").unwrap()),
             r#"{"type":"eq","term":"dec","value":"12.30"}"#,
@@ -1148,11 +1043,7 @@ mod tests {
 
     #[test]
     fn pinned_float_double_values() {
-        // EXACT Java SingleValueParser output (Double.toString / Float.toString) captured from
-        // iceberg-core-1.10.0 (ExpressionParser.toJson over a bound `equal` predicate). These are
-        // the values the codec is claimed-✅ for: typical magnitudes + the scientific-notation arm.
-        //
-        // double: plain decimal in [-3, 7) decimal-exponent, uppercase-E scientific outside it.
+        // EXACT Java output: plain decimal inside a [-3, 7) exponent, scientific outside it.
         assert_roundtrip(
             Reference::new("dbl").equal_to(Datum::double(1234.5)),
             r#"{"type":"eq","term":"dbl","value":1234.5}"#,
@@ -1165,7 +1056,6 @@ mod tests {
             Reference::new("dbl").equal_to(Datum::double(0.001)),
             r#"{"type":"eq","term":"dbl","value":0.001}"#,
         );
-        // |x| >= 1e7 -> scientific with uppercase E, no '+' on the exponent.
         assert_roundtrip(
             Reference::new("dbl").equal_to(Datum::double(1e10)),
             r#"{"type":"eq","term":"dbl","value":1.0E10}"#,
@@ -1174,7 +1064,6 @@ mod tests {
             Reference::new("dbl").equal_to(Datum::double(1e16)),
             r#"{"type":"eq","term":"dbl","value":1.0E16}"#,
         );
-        // 0 < |x| < 1e-3 -> scientific with a negative exponent.
         assert_roundtrip(
             Reference::new("dbl").equal_to(Datum::double(1e-4)),
             r#"{"type":"eq","term":"dbl","value":1.0E-4}"#,
@@ -1183,7 +1072,6 @@ mod tests {
             Reference::new("dbl").equal_to(Datum::double(0.0005)),
             r#"{"type":"eq","term":"dbl","value":5.0E-4}"#,
         );
-        // float: same rule, but the digits come from the f32 value.
         assert_roundtrip(
             Reference::new("f").equal_to(Datum::float(2.5f32)),
             r#"{"type":"eq","term":"f","value":2.5}"#,
@@ -1192,7 +1080,6 @@ mod tests {
             Reference::new("f").equal_to(Datum::float(1e10f32)),
             r#"{"type":"eq","term":"f","value":1.0E10}"#,
         );
-        // signed zero is preserved on the write side.
         assert_eq!(
             to_json(&Reference::new("dbl").equal_to(Datum::double(-0.0))).unwrap(),
             r#"{"type":"eq","term":"dbl","value":-0.0}"#,
@@ -1201,14 +1088,9 @@ mod tests {
 
     #[test]
     fn float_residue_is_jdk_nonminimal() {
-        // NAMED RESIDUE GUARD (scoped OUT of row R149 ✅): JDK 11 `Double.toString` is non-minimal —
-        // for some large-magnitude / long-mantissa values it prints MORE significant digits than
-        // the true shortest round-trip. Rust prints the MINIMAL form (matching JDK 19+), so the
-        // bytes differ from the JDK 11 oracle for this narrow class. This test PINS Rust's
-        // (minimal) output and documents the divergence so it stays visible and regression-guarded.
-        //
-        // bits 0x43d4f2247a5cdbed: JDK 11 prints `6.0372357323402578E18` (17 sig digits); Rust's
-        // shortest form is `6.037235732340258E18` (16 sig digits). Both round-trip to the same f64.
+        // NAMED RESIDUE GUARD. JDK 11 `Double.toString` is non-minimal, so its bytes differ from
+        // Rust's minimal form for a narrow class of values. For bits 0x43d4f2247a5cdbed it prints
+        // 17 significant digits and Rust prints 16. Both round-trip to the same f64.
         let v = f64::from_bits(0x43d4f2247a5cdbed);
         let json = to_json(&Reference::new("dbl").equal_to(Datum::double(v))).unwrap();
         assert_eq!(
@@ -1216,13 +1098,11 @@ mod tests {
             "Rust emits the minimal shortest-round-trip form (JDK 19+); the JDK 11 oracle would \
              emit the non-minimal 6.0372357323402578E18 — this is the named residue, not parity",
         );
-        // The minimal value still parses back to the identical f64 (so the divergence is purely
-        // textual, never semantic).
+        // The minimal text parses back to the identical f64: the divergence is textual only.
         let back = from_json(&json, &test_schema()).unwrap();
         assert_eq!(back, Reference::new("dbl").equal_to(Datum::double(v)));
 
-        // The f32 quirk is the same effect: JDK 11 `Float.toString(1e16f)` = `1.00000003E16`;
-        // Rust's minimal f32 form is `1.0E16`.
+        // The f32 quirk is the same effect: JDK 11 prints `1.00000003E16`, Rust `1.0E16`.
         let json = to_json(&Reference::new("f").equal_to(Datum::float(1e16f32))).unwrap();
         assert_eq!(
             json, r#"{"type":"eq","term":"f","value":1.0E16}"#,
@@ -1232,8 +1112,7 @@ mod tests {
 
     #[test]
     fn non_finite_float_rejected() {
-        // Java emits Infinity/-Infinity as quoted strings and rejects NaN as a literal; both are
-        // out of scope here and must fail loudly (never silently emit a divergent token).
+        // Both are out of scope here and must fail loudly, never emit a divergent token.
         let err =
             to_json(&Reference::new("dbl").equal_to(Datum::double(f64::INFINITY))).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
@@ -1274,7 +1153,6 @@ mod tests {
 
     #[test]
     fn set_predicates_in_not_in() {
-        // Sets are unordered; assert via parse + re-serialize equality on the parsed value set.
         let pred = Predicate::Set(SetExpression::new(
             PredicateOperator::In,
             Reference::new("i"),
@@ -1285,7 +1163,6 @@ mod tests {
         let json = to_json(&pred).unwrap();
         let back = from_json(&json, &test_schema()).unwrap();
         assert_eq!(back, pred);
-        // The shape is correct (in + values array of 3).
         let v: JsonValue = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "in");
         assert_eq!(v["term"], "i");
@@ -1304,7 +1181,6 @@ mod tests {
 
     #[test]
     fn parse_pinned_fixtures_exactly() {
-        // The exact hand-written fixtures from the task brief.
         let p = from_json(r#"{"type":"is-null","term":"x"}"#, &test_schema()).unwrap();
         assert_eq!(p, Reference::new("x").is_null());
         let p = from_json(
@@ -1320,7 +1196,6 @@ mod tests {
 
     #[test]
     fn deeply_nested_tree_round_trips_within_limit() {
-        // Build a left-leaning AND chain of moderate depth; must round-trip.
         let mut pred = Reference::new("i").equal_to(Datum::int(0));
         for n in 1..30 {
             pred = Predicate::And(LogicalExpression::new([
@@ -1372,8 +1247,7 @@ mod tests {
 
     #[test]
     fn mutation_wrong_op_hyphen_fails_byte_assert() {
-        // A regression guard: if op_type ever emitted "is_null" (underscore) the pinned assert
-        // would catch it. Assert the hyphenated form directly.
+        // Assert the hyphenated form directly: `is_null` with an underscore must fail here.
         assert_eq!(op_type(PredicateOperator::IsNull), "is-null");
         assert_eq!(op_type(PredicateOperator::NotEq), "not-eq");
         assert_eq!(op_type(PredicateOperator::LessThanOrEq), "lt-eq");

@@ -15,14 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A factory surface mirroring Java's `org.apache.iceberg.actions.ActionsProvider` (1.10.0) — the
-//! per-engine entry point that hands out the table-maintenance action builders.
+//! A factory surface that mirrors Java `org.apache.iceberg.actions.ActionsProvider` (1.10.0).
+//! It hands out the table-maintenance action builders.
 //!
-//! # The Java contract this mirrors
-//!
-//! Java `ActionsProvider` is an interface whose every method is a `default` that throws
-//! `UnsupportedOperationException` unless a concrete engine factory (`SparkActions`,
-//! `FlinkActions`, …) overrides it. The twelve methods are:
+//! In Java every method is a `default` that throws `UnsupportedOperationException`. A concrete
+//! engine factory overrides the ones it supports. The twelve methods map as follows:
 //!
 //! | Java method | arg | this crate |
 //! |---|---|---|
@@ -39,36 +36,13 @@
 //! | `rewriteTablePath(Table)` | table | [`Actions::rewrite_table_path`] |
 //! | `removeDanglingDeleteFiles(Table)` | table | [`Actions::remove_dangling_delete_files`] |
 //!
-//! # Two construction idioms, one factory
+//! A maintenance action binds the table at `X::new(table)`, then runs with `.execute(..)`. A
+//! transaction-seam action binds no table at construction. It binds at commit time. The factory
+//! still takes a `Table` to keep the Java shape, then discards it. The caller applies that action
+//! onto a `Transaction::new(&table)`.
 //!
-//! The Rust actions this factory hands out are built two different ways, and the factory bridges
-//! both honestly:
-//!
-//! - **Maintenance idiom** — [`DeleteOrphanFiles`], [`RewriteDataFiles`], [`ComputeTableStats`],
-//!   [`RemoveDanglingDeleteFiles`] are constructed `X::new(table)` and run with
-//!   `.execute(..)` directly against a [`Catalog`](crate::Catalog) (or, for
-//!   `DeleteOrphanFiles`, with no catalog). The factory returns the fully-built action; the caller
-//!   configures it with its builder methods and calls `.execute`.
-//! - **Transaction-seam idiom** — [`ExpireSnapshotsAction`](crate::transaction::ExpireSnapshotsAction)
-//!   and [`RewriteManifestsAction`](crate::transaction::RewriteManifestsAction) are *stateless*
-//!   builders that do not bind a table at construction; they bind at commit time through the
-//!   [`transaction`](crate::transaction) seam. Java's `expireSnapshots(Table)` /
-//!   `rewriteManifests(Table)` take a `Table`, so the factory methods do too — but because the Rust
-//!   action runs through a [`Transaction`](crate::transaction::Transaction), the factory returns the
-//!   bare action and the caller applies it via
-//!   [`ApplyTransactionAction::apply`](crate::transaction::ApplyTransactionAction) onto a
-//!   `Transaction::new(&table)`. See each method's doc for the exact run recipe.
-//!
-//! # Unsupported actions — surfaced honestly, never faked
-//!
-//! Two Java methods have no Rust action behind them (`snapshotTable`, `migrateTable` — both require an
-//! external source table this engine-agnostic library has no surface for). Rather than fabricate them,
-//! the [`ActionsProvider`] trait mirrors Java's *throw-by-default* shape: each unsupported method has a
-//! default that returns a typed
-//! [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported) error naming the gap (the
-//! Rust analog of Java's `UnsupportedOperationException`). The concrete [`Actions`] factory overrides
-//! exactly the ten methods Rust can actually run, and leaves the rest at the unsupported default. The
-//! gap is tracked in `docs/parity/GAP_MATRIX.md` row R153.
+//! `snapshotTable` and `migrateTable` need an external source table, which this library cannot
+//! supply. Both keep the trait default, which returns `FeatureUnsupported`.
 
 use crate::Result;
 use crate::error::Error;
@@ -79,65 +53,50 @@ use crate::maintenance::{
 use crate::table::Table;
 use crate::transaction::{ExpireSnapshotsAction, RewriteManifestsAction};
 
-/// The Rust analog of Java's `org.apache.iceberg.actions.ActionsProvider` (1.10.0): a factory that
-/// hands out table-maintenance action builders.
+/// The Rust analog of Java `org.apache.iceberg.actions.ActionsProvider` (1.10.0).
 ///
-/// Like the Java interface, every method has a default that signals *unsupported* — here a typed
-/// [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported) error rather than Java's
-/// thrown `UnsupportedOperationException`. The concrete [`Actions`] implementation overrides exactly
-/// the subset of methods this crate has actions for. Method names mirror Java in `snake_case`; the
-/// argument shape (`Table` vs `&str`) mirrors Java's `Table` vs `String`.
-///
-/// **Returning a `Result`** (rather than the bare action) is the deliberate adaptation that lets one
-/// trait surface both the supported actions *and* the unsupported defaults without a separate
-/// throwing path: a supported method returns `Ok(action)`, an unsupported one returns
-/// `Err(FeatureUnsupported)`.
+/// Every method defaults to a typed
+/// [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported) error, and [`Actions`]
+/// overrides the supported ones. The `Result` return carries both cases in one trait, in place of
+/// Java's throwing path.
 pub trait ActionsProvider {
-    /// Mirrors Java `snapshotTable(String)`. **Unsupported in this crate** (no Rust `SnapshotTable`
-    /// action): returns [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported).
+    /// Mirrors Java `snapshotTable(String)`. Unsupported: this crate has no `SnapshotTable` action.
     fn snapshot_table(&self, source_table_name: &str) -> Result<NoAction> {
         let _ = source_table_name;
         Err(unsupported("snapshot_table", "SnapshotTable"))
     }
 
-    /// Mirrors Java `migrateTable(String)`. **Unsupported in this crate** (no Rust `MigrateTable`
-    /// action): returns [`ErrorKind::FeatureUnsupported`](crate::ErrorKind::FeatureUnsupported).
+    /// Mirrors Java `migrateTable(String)`. Unsupported: this crate has no `MigrateTable` action.
     fn migrate_table(&self, table_name: &str) -> Result<NoAction> {
         let _ = table_name;
         Err(unsupported("migrate_table", "MigrateTable"))
     }
 
-    /// Mirrors Java `deleteOrphanFiles(Table)`. **Unsupported by default**; the concrete [`Actions`]
-    /// factory overrides it to return [`DeleteOrphanFiles::new`].
+    /// Mirrors Java `deleteOrphanFiles(Table)`. [`Actions`] returns [`DeleteOrphanFiles::new`].
     fn delete_orphan_files(&self, table: Table) -> Result<DeleteOrphanFiles> {
         let _ = table;
         Err(unsupported("delete_orphan_files", "DeleteOrphanFiles"))
     }
 
-    /// Mirrors Java `rewriteManifests(Table)`. **Unsupported by default**; the concrete [`Actions`]
-    /// factory overrides it to return a [`RewriteManifestsAction`](crate::transaction::RewriteManifestsAction).
+    /// Mirrors Java `rewriteManifests(Table)`. [`Actions`] returns a `RewriteManifestsAction`.
     fn rewrite_manifests(&self, table: Table) -> Result<RewriteManifestsAction> {
         let _ = table;
         Err(unsupported("rewrite_manifests", "RewriteManifests"))
     }
 
-    /// Mirrors Java `rewriteDataFiles(Table)`. **Unsupported by default**; the concrete [`Actions`]
-    /// factory overrides it to return [`RewriteDataFiles::new`].
+    /// Mirrors Java `rewriteDataFiles(Table)`. [`Actions`] returns [`RewriteDataFiles::new`].
     fn rewrite_data_files(&self, table: Table) -> Result<RewriteDataFiles> {
         let _ = table;
         Err(unsupported("rewrite_data_files", "RewriteDataFiles"))
     }
 
-    /// Mirrors Java `expireSnapshots(Table)`. **Unsupported by default**; the concrete [`Actions`]
-    /// factory overrides it to return an [`ExpireSnapshotsAction`](crate::transaction::ExpireSnapshotsAction).
+    /// Mirrors Java `expireSnapshots(Table)`. [`Actions`] returns an `ExpireSnapshotsAction`.
     fn expire_snapshots(&self, table: Table) -> Result<ExpireSnapshotsAction> {
         let _ = table;
         Err(unsupported("expire_snapshots", "ExpireSnapshots"))
     }
 
-    /// Mirrors Java `deleteReachableFiles(String)`. **Unsupported by default**; the concrete
-    /// [`Actions`] factory overrides it to return [`DeleteReachableFiles::new`]. The argument is the
-    /// table's `metadata.json` LOCATION (Java's `String`), not a [`Table`].
+    /// Mirrors Java `deleteReachableFiles(String)`. The argument is the `metadata.json` location.
     fn delete_reachable_files(&self, metadata_location: &str) -> Result<DeleteReachableFiles> {
         let _ = metadata_location;
         Err(unsupported(
@@ -146,8 +105,7 @@ pub trait ActionsProvider {
         ))
     }
 
-    /// Mirrors Java `rewritePositionDeletes(Table)`. **Unsupported by default**; the concrete [`Actions`]
-    /// factory overrides it to return [`RewritePositionDeleteFiles::new`].
+    /// Mirrors Java `rewritePositionDeletes(Table)`. [`Actions`] returns a built action.
     fn rewrite_position_deletes(&self, table: Table) -> Result<RewritePositionDeleteFiles> {
         let _ = table;
         Err(unsupported(
@@ -156,15 +114,13 @@ pub trait ActionsProvider {
         ))
     }
 
-    /// Mirrors Java `computeTableStats(Table)`. **Unsupported by default**; the concrete [`Actions`]
-    /// factory overrides it to return [`ComputeTableStats::new`].
+    /// Mirrors Java `computeTableStats(Table)`. [`Actions`] returns [`ComputeTableStats::new`].
     fn compute_table_stats(&self, table: Table) -> Result<ComputeTableStats> {
         let _ = table;
         Err(unsupported("compute_table_stats", "ComputeTableStats"))
     }
 
-    /// Mirrors Java `computePartitionStats(Table)`. **Unsupported by default**; the concrete
-    /// [`Actions`] factory overrides it to return [`ComputePartitionStats::new`].
+    /// Mirrors Java `computePartitionStats(Table)`. [`Actions`] returns a built action.
     fn compute_partition_stats(&self, table: Table) -> Result<ComputePartitionStats> {
         let _ = table;
         Err(unsupported(
@@ -173,18 +129,13 @@ pub trait ActionsProvider {
         ))
     }
 
-    /// Mirrors Java `rewriteTablePath(Table)`. **Unsupported by default**; the concrete [`Actions`]
-    /// factory overrides it to return [`RewriteTablePath::new`]. Configure it with
-    /// [`RewriteTablePath::rewrite_location_prefix`] / [`RewriteTablePath::staging_location`] and run it
-    /// with [`RewriteTablePath::execute`] — it stages the rewritten metadata graph and returns the
-    /// `(source, target)` copy-plan (FULL-rewrite mode).
+    /// Mirrors Java `rewriteTablePath(Table)`. [`Actions`] returns [`RewriteTablePath::new`].
     fn rewrite_table_path(&self, table: Table) -> Result<RewriteTablePath> {
         let _ = table;
         Err(unsupported("rewrite_table_path", "RewriteTablePath"))
     }
 
-    /// Mirrors Java `removeDanglingDeleteFiles(Table)`. **Unsupported by default**; the concrete
-    /// [`Actions`] factory overrides it to return [`RemoveDanglingDeleteFiles::new`].
+    /// Mirrors Java `removeDanglingDeleteFiles(Table)`. [`Actions`] returns a built action.
     fn remove_dangling_delete_files(&self, table: Table) -> Result<RemoveDanglingDeleteFiles> {
         let _ = table;
         Err(unsupported(
@@ -194,18 +145,12 @@ pub trait ActionsProvider {
     }
 }
 
-/// An uninhabited placeholder for the return type of an *unsupported* factory method.
-///
-/// A method that cannot hand out an action declares `Result<NoAction>`; because it always returns
-/// `Err`, the `Ok` arm is unreachable and `NoAction` is never constructed. This keeps the trait's
-/// unsupported methods typed (no `()` masquerading as an action) and makes "you cannot get an action
-/// here" legible at the call site.
+/// An uninhabited placeholder for the return type of an unsupported factory method. The `Ok` arm
+/// is unreachable, so nothing constructs a `NoAction`.
 #[derive(Debug)]
 pub enum NoAction {}
 
-/// Build the typed `FeatureUnsupported` error for an unsupported factory method, naming both the Rust
-/// method and the Java action it would mirror. Centralized so every unsupported arm reports the same
-/// shape (the Rust analog of Java's `UnsupportedOperationException`).
+/// Builds the `FeatureUnsupported` error for an unsupported method, named after the Java action.
 fn unsupported(method: &str, java_action: &str) -> Error {
     Error::new(
         crate::ErrorKind::FeatureUnsupported,
@@ -216,13 +161,8 @@ fn unsupported(method: &str, java_action: &str) -> Error {
     )
 }
 
-/// The engine-agnostic concrete [`ActionsProvider`] for this crate: a zero-state factory that hands
-/// out the ten table-maintenance actions Rust has built, leaving the other two Java methods
-/// (`snapshot_table` / `migrate_table`) at their unsupported default.
-///
-/// This is the Rust analog of a Java engine's `ActionsProvider` implementation
-/// (`SparkActions.get()` / `FlinkActions.get()`), minus any engine binding — these actions are
-/// engine-agnostic, so the factory carries no state.
+/// The concrete [`ActionsProvider`] for this crate, the analog of Java `SparkActions.get()`. These
+/// actions are engine-agnostic, so the factory carries no state.
 ///
 /// ```
 /// use iceberg::maintenance::{Actions, ActionsProvider};
@@ -237,105 +177,72 @@ fn unsupported(method: &str, java_action: &str) -> Error {
 pub struct Actions;
 
 impl Actions {
-    /// Returns the engine-agnostic actions factory. Mirrors a Java engine's `Actions.get()` entry
-    /// point (e.g. `SparkActions.get()`), minus the engine binding.
+    /// Returns the actions factory. Mirrors a Java engine's `Actions.get()` entry point.
     pub fn get() -> Self {
         Actions
     }
 }
 
 impl ActionsProvider for Actions {
-    /// Returns a [`DeleteOrphanFiles`] action for `table` (Java `deleteOrphanFiles(Table)`). Configure
-    /// it with the builder methods and run it with [`DeleteOrphanFiles::execute`] (no catalog — it
-    /// lists storage and deletes orphans directly). **This action deletes files.**
+    /// Returns a [`DeleteOrphanFiles`] action. Its `execute` needs no catalog. **It deletes files.**
     fn delete_orphan_files(&self, table: Table) -> Result<DeleteOrphanFiles> {
         Ok(DeleteOrphanFiles::new(table))
     }
 
-    /// Returns a [`DeleteReachableFiles`] action for the table whose current metadata is at
-    /// `metadata_location` (Java `deleteReachableFiles(String)` — the engine behind
-    /// `DROP TABLE PURGE`). Configure it with [`DeleteReachableFiles::io`] /
-    /// [`DeleteReachableFiles::delete_with`] and run it with [`DeleteReachableFiles::execute`] (no
-    /// catalog — it loads the metadata directly and deletes the table's whole reachable footprint).
-    /// **This action deletes the whole table.**
+    /// Returns a [`DeleteReachableFiles`] action for the table at `metadata_location`. This is the
+    /// engine behind `DROP TABLE PURGE`. **This action deletes the whole table.**
     fn delete_reachable_files(&self, metadata_location: &str) -> Result<DeleteReachableFiles> {
         Ok(DeleteReachableFiles::new(metadata_location))
     }
 
-    /// Returns a [`RewriteManifestsAction`](crate::transaction::RewriteManifestsAction) (Java
-    /// `rewriteManifests(Table)`). Because this is a transaction-seam action it does not bind `table`
-    /// at construction; run it by applying it onto a transaction:
-    /// `action.apply(Transaction::new(&table))?.commit(catalog).await`.
+    /// Returns a [`RewriteManifestsAction`](crate::transaction::RewriteManifestsAction). Run it
+    /// with `action.apply(Transaction::new(&table))?.commit(catalog).await`.
     fn rewrite_manifests(&self, table: Table) -> Result<RewriteManifestsAction> {
-        // `table` is accepted to mirror Java's `rewriteManifests(Table)` shape; the seam action binds
-        // the table at `apply`/`commit` time, so it is intentionally not stored here.
+        // The arg keeps Java's shape. The seam binds the table at commit time, so do not store it.
         let _ = table;
         Ok(RewriteManifestsAction::new())
     }
 
-    /// Returns a [`RewriteDataFiles`] bin-pack action for `table` (Java `rewriteDataFiles(Table)`).
-    /// Configure it with the builder methods and run it with [`RewriteDataFiles::execute`]. **This
-    /// action rewrites data.**
+    /// Returns a [`RewriteDataFiles`] bin-pack action. **This action rewrites data.**
     fn rewrite_data_files(&self, table: Table) -> Result<RewriteDataFiles> {
         Ok(RewriteDataFiles::new(table))
     }
 
-    /// Returns an [`ExpireSnapshotsAction`](crate::transaction::ExpireSnapshotsAction) (Java
-    /// `expireSnapshots(Table)`). Because this is a transaction-seam action it does not bind `table` at
-    /// construction; run it by applying it onto a transaction:
+    /// Returns an [`ExpireSnapshotsAction`](crate::transaction::ExpireSnapshotsAction). Run it with
     /// `action.apply(Transaction::new(&table))?.commit(catalog).await`. **This action never deletes
-    /// files** (see [`ExpireSnapshotsCleanup`](crate::transaction::ExpireSnapshotsCleanup) for the
-    /// explicit cleanup step).
+    /// files.** [`ExpireSnapshotsCleanup`](crate::transaction::ExpireSnapshotsCleanup) does that.
     fn expire_snapshots(&self, table: Table) -> Result<ExpireSnapshotsAction> {
-        // `table` is accepted to mirror Java's `expireSnapshots(Table)` shape; the seam action binds
-        // the table at `apply`/`commit` time, so it is intentionally not stored here.
+        // The arg keeps Java's shape. The seam binds the table at commit time, so do not store it.
         let _ = table;
         Ok(ExpireSnapshotsAction::new())
     }
 
-    /// Returns a [`ComputeTableStats`] action for `table` (Java `computeTableStats(Table)`). Configure
-    /// it with the builder methods and run it with [`ComputeTableStats::execute`].
+    /// Returns a [`ComputeTableStats`] action for `table`.
     fn compute_table_stats(&self, table: Table) -> Result<ComputeTableStats> {
         Ok(ComputeTableStats::new(table))
     }
 
-    /// Returns a [`ComputePartitionStats`] action for `table` (Java `computePartitionStats(Table)`).
-    /// Configure it with [`ComputePartitionStats::snapshot_id`] and run it with
-    /// [`ComputePartitionStats::execute`] — it computes + writes + registers a partition-stats file
-    /// through the `UpdatePartitionStatistics` seam.
+    /// Returns a [`ComputePartitionStats`] action. Its `execute` registers the stats file.
     fn compute_partition_stats(&self, table: Table) -> Result<ComputePartitionStats> {
         Ok(ComputePartitionStats::new(table))
     }
 
-    /// Returns a [`RemoveDanglingDeleteFiles`] action for `table` (Java
-    /// `removeDanglingDeleteFiles(Table)`). Run it with [`RemoveDanglingDeleteFiles::execute`].
-    /// **This action removes delete files.**
+    /// Returns a [`RemoveDanglingDeleteFiles`] action. **This action removes delete files.**
     fn remove_dangling_delete_files(&self, table: Table) -> Result<RemoveDanglingDeleteFiles> {
         Ok(RemoveDanglingDeleteFiles::new(table))
     }
 
-    /// Returns a [`RewritePositionDeleteFiles`] action for `table` (Java
-    /// `rewritePositionDeletes(Table)`). Configure it with [`RewritePositionDeleteFiles::filter`] plus
-    /// the five ported size / count options —
-    /// [`target_file_size_bytes`](RewritePositionDeleteFiles::target_file_size_bytes),
-    /// [`min_file_size_bytes`](RewritePositionDeleteFiles::min_file_size_bytes),
-    /// [`max_file_size_bytes`](RewritePositionDeleteFiles::max_file_size_bytes),
-    /// [`min_input_files`](RewritePositionDeleteFiles::min_input_files) and
-    /// [`max_file_group_size_bytes`](RewritePositionDeleteFiles::max_file_group_size_bytes) — and run it
-    /// with [`RewritePositionDeleteFiles::execute`]. It bin-packs the CANDIDATE PARQUET position-delete files
-    /// of each `(spec, partition)` group and rewrites every bin Java's three-clause admission gate
-    /// admits, preserving the masked row set. The file-count floor is `min_input_files`, DEFAULT FIVE.
-    /// **This action rewrites delete files.**
+    /// Returns a [`RewritePositionDeleteFiles`] action. It bin-packs the candidate Parquet
+    /// position-delete files of each `(spec, partition)` group. It rewrites every bin that Java's
+    /// three-clause admission gate admits, and preserves the masked row set. The file-count floor
+    /// is `min_input_files`, default five. **This action rewrites delete files.**
     fn rewrite_position_deletes(&self, table: Table) -> Result<RewritePositionDeleteFiles> {
         Ok(RewritePositionDeleteFiles::new(table))
     }
 
-    /// Returns a [`RewriteTablePath`] action for `table` (Java `rewriteTablePath(Table)`). Configure it
-    /// with [`RewriteTablePath::rewrite_location_prefix`] (the source → target absolute path prefixes)
-    /// and [`RewriteTablePath::staging_location`] (where the rewritten metadata graph is staged), and run
-    /// it with [`RewriteTablePath::execute`] — it stages the rewritten metadata + emits the `(source,
-    /// target)` copy-plan (FULL-rewrite mode). **This action STAGES rewritten metadata + emits a
-    /// copy-plan; it does NOT physically copy data files.**
+    /// Returns a [`RewriteTablePath`] action. Set [`RewriteTablePath::rewrite_location_prefix`] and
+    /// [`RewriteTablePath::staging_location`] first. **It stages the rewritten metadata and emits a
+    /// `(source, target)` copy-plan. It does NOT copy data files.**
     fn rewrite_table_path(&self, table: Table) -> Result<RewriteTablePath> {
         Ok(RewriteTablePath::new(table))
     }
@@ -358,10 +265,7 @@ mod tests {
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation};
 
-    /// The exact set of factory methods the concrete [`Actions`] supports (overrides off the
-    /// unsupported default). Pins the supported surface so a wiring that silently drops or adds an
-    /// override fails this test. The ten map 1:1 to Java `ActionsProvider` methods with a built
-    /// Rust action.
+    /// The methods [`Actions`] overrides. A wiring that drops or adds one fails the test below.
     const SUPPORTED_METHODS: [&str; 10] = [
         "delete_orphan_files",
         "delete_reachable_files",
@@ -375,14 +279,12 @@ mod tests {
         "rewrite_table_path",
     ];
 
-    /// The Java `ActionsProvider` methods with NO Rust action behind them — the factory honestly
-    /// reports these as unsupported.
+    /// The Java `ActionsProvider` methods with no Rust action behind them.
     const UNSUPPORTED_METHODS: [&str; 2] = ["snapshot_table", "migrate_table"];
 
-    // ---- self-contained test fixtures (a local-fs MemoryCatalog) ------------------------------
+    // ---- fixtures ------------------------------------------------------------------------------
 
-    /// A `MemoryCatalog` backed by a real local filesystem under a `TempDir`, plus a matching
-    /// `FileIO` for planting/inspecting files. Returns the temp-dir guard (kept alive by the caller).
+    /// A `MemoryCatalog` on a real local filesystem. The caller must hold the temp-dir guard alive.
     async fn local_fs_catalog() -> (impl Catalog, FileIO, tempfile::TempDir) {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let warehouse = temp_dir
@@ -444,8 +346,7 @@ mod tests {
             .expect("create table")
     }
 
-    /// Create a table partitioned by `identity(x)` (spec 0, field id 1000) under a fresh namespace —
-    /// for the `compute_partition_stats` smoke test (which requires a partitioned table).
+    /// Creates a table partitioned by `identity(x)`. `compute_partition_stats` needs one.
     async fn create_x_partitioned_table(catalog: &impl Catalog) -> Table {
         let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
         catalog
@@ -499,8 +400,7 @@ mod tests {
             .expect("write file");
     }
 
-    /// A real data file: write `content` to `path` on disk, then build a metadata-consistent
-    /// unpartitioned [`DataFile`].
+    /// Writes `content` to `path`, then builds a matching unpartitioned [`DataFile`].
     async fn real_data_file(file_io: &FileIO, path: &str, content: &[u8]) -> DataFile {
         write_real_file(file_io, path, content).await;
         DataFileBuilder::default()
@@ -535,7 +435,7 @@ mod tests {
 
     #[test]
     fn supported_and_unsupported_partition_the_twelve_java_methods() {
-        // The two sets are disjoint and together cover all twelve Java `ActionsProvider` methods.
+        // The two sets are disjoint and cover all twelve Java methods.
         let supported: HashSet<&str> = SUPPORTED_METHODS.into_iter().collect();
         let unsupported: HashSet<&str> = UNSUPPORTED_METHODS.into_iter().collect();
         assert!(
@@ -555,7 +455,7 @@ mod tests {
         let table = create_unpartitioned_table(&catalog).await;
         let actions = Actions::get();
 
-        // Every supported method must hand out an action (Ok), proving the override is wired.
+        // Every supported method must hand out an action, which proves the override is wired.
         assert!(actions.delete_orphan_files(table.clone()).is_ok());
         assert!(
             actions
@@ -580,9 +480,7 @@ mod tests {
         let _table = create_unpartitioned_table(&catalog).await;
         let actions = Actions::get();
 
-        // The only two unsupported methods left are the String-arg `snapshot_table` / `migrate_table`
-        // (both need an external source table this engine-agnostic library has no surface for). After
-        // `rewrite_table_path` flipped to supported, NO Table-arg method is unsupported.
+        // Only the String-arg methods stay unsupported. Both need an external source table.
         for err in [
             actions.snapshot_table("db.src").unwrap_err(),
             actions.migrate_table("db.src").unwrap_err(),
@@ -591,16 +489,14 @@ mod tests {
         }
     }
 
-    /// Smoke test: a `DeleteOrphanFiles` handed out by the factory actually RUNS (deletes a planted
-    /// orphan, spares the live file) — proving the wiring is live, not a stub. A broken
-    /// `delete_orphan_files` override (e.g. one that ignored the table) fails here.
+    /// The factory-built action deletes a planted orphan and spares the live file.
     #[tokio::test]
     async fn delete_orphan_files_from_factory_executes_live() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
         let table = create_unpartitioned_table(&catalog).await;
         let location = table.metadata().location().to_string();
 
-        // A live data file (committed) and an orphan file (never referenced).
+        // One committed data file, and one orphan that nothing references.
         let live =
             real_data_file(&file_io, &format!("{location}/data/live.parquet"), b"live").await;
         let table = append(&catalog, &table, vec![live]).await;
@@ -610,7 +506,7 @@ mod tests {
         let result = Actions::get()
             .delete_orphan_files(table)
             .expect("factory returns delete-orphan-files action")
-            // grace must be in the future so the just-written orphan is eligible.
+            // The grace bound must be in the future, or the new orphan is not eligible.
             .older_than(i64::MAX)
             .execute()
             .await
@@ -629,17 +525,15 @@ mod tests {
         );
     }
 
-    /// Smoke test: a `DeleteReachableFiles` handed out by the factory actually RUNS (purges a real
-    /// committed table — the metadata.json + manifest list + manifest + data file all gone), proving
-    /// the override is live, not a stub. A broken override (e.g. one that ignored the location) fails
-    /// here. **This deletes a THROWAWAY local-fs MemoryCatalog table — never a shared/live catalog.**
+    /// The factory-built action purges the metadata.json, manifest list, manifest and data file.
+    /// **The table is a throwaway local-fs `MemoryCatalog` table, never a live catalog.**
     #[tokio::test]
     async fn delete_reachable_files_from_factory_executes_live() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
         let table = create_unpartitioned_table(&catalog).await;
         let location = table.metadata().location().to_string();
 
-        // A live, committed data file (reachable from the snapshot).
+        // A committed data file, reachable from the snapshot.
         let data = real_data_file(&file_io, &format!("{location}/data/d.parquet"), b"data").await;
         let table = append(&catalog, &table, vec![data]).await;
         let metadata_location = table
@@ -667,7 +561,7 @@ mod tests {
             result.deleted_other_files_count >= 1,
             "the metadata.json is purged"
         );
-        // The metadata.json is physically gone — the table no longer loadable from disk.
+        // The metadata.json is gone, so the table no longer loads from disk.
         assert!(
             !exists(&file_io, &metadata_location).await,
             "the table metadata.json must be physically gone after a reachable-files purge"
@@ -678,8 +572,7 @@ mod tests {
         );
     }
 
-    /// Smoke test: a `RewriteDataFiles` handed out by the factory actually RUNS (no-op on a tiny
-    /// table, but the execute path is exercised end-to-end), proving the override is live.
+    /// The factory-built `RewriteDataFiles` runs end to end. The rewrite itself is a no-op here.
     #[tokio::test]
     async fn rewrite_data_files_from_factory_executes_live() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
@@ -688,8 +581,7 @@ mod tests {
         let f = real_data_file(&file_io, &format!("{location}/data/a.parquet"), b"a").await;
         let table = append(&catalog, &table, vec![f]).await;
 
-        // A single small file is below `min_input_files`, so this is a no-op rewrite — but it
-        // exercises the factory → action → execute path and must not error.
+        // One small file is below `min_input_files`, so the rewrite is a no-op. It must not error.
         let result = Actions::get()
             .rewrite_data_files(table)
             .expect("factory returns rewrite-data-files action")
@@ -702,8 +594,7 @@ mod tests {
         );
     }
 
-    /// Smoke test: a `RemoveDanglingDeleteFiles` handed out by the factory actually RUNS (no-op on an
-    /// unpartitioned single-spec table — Java's early return — but the override is exercised live).
+    /// The factory-built action runs. An unpartitioned single-spec table hits Java's early return.
     #[tokio::test]
     async fn remove_dangling_delete_files_from_factory_executes_live() {
         let (catalog, _file_io, _tmp) = local_fs_catalog().await;
@@ -721,10 +612,7 @@ mod tests {
         );
     }
 
-    /// Smoke test: a `RewritePositionDeleteFiles` handed out by the factory actually RUNS (no-op on a
-    /// table with no position-delete files — nothing to compact — but the override is exercised live).
-    /// A broken `rewrite_position_deletes` override (e.g. one that returned the unsupported default)
-    /// would fail at `.expect(...)`.
+    /// The factory-built action runs with nothing to compact.
     #[tokio::test]
     async fn rewrite_position_deletes_from_factory_executes_live() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
@@ -746,8 +634,7 @@ mod tests {
         assert_eq!(result.added_delete_files_count, 0);
     }
 
-    /// Smoke test: an `ExpireSnapshotsAction` handed out by the factory is a real transaction-seam
-    /// action that applies onto a transaction and commits, proving the seam-idiom bridge is live.
+    /// The factory-built `ExpireSnapshotsAction` applies onto a transaction and commits.
     #[tokio::test]
     async fn expire_snapshots_from_factory_applies_through_transaction() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
@@ -759,8 +646,7 @@ mod tests {
         let action = Actions::get()
             .expire_snapshots(table.clone())
             .expect("factory returns expire-snapshots action");
-        // The seam action applies onto a transaction and commits without error (retain-all default
-        // expires nothing on a single-snapshot table — the wiring, not the retention, is under test).
+        // The retain-all default expires nothing here. The wiring is under test, not the retention.
         let tx = action
             .apply(Transaction::new(&table))
             .expect("apply expire snapshots onto transaction");
@@ -771,8 +657,7 @@ mod tests {
         );
     }
 
-    /// Smoke test: a `RewriteManifestsAction` handed out by the factory is a real transaction-seam
-    /// action that applies onto a transaction and commits a no-op rewrite, proving the seam bridge.
+    /// The factory-built `RewriteManifestsAction` applies onto a transaction and commits.
     #[tokio::test]
     async fn rewrite_manifests_from_factory_applies_through_transaction() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
@@ -794,17 +679,14 @@ mod tests {
         );
     }
 
-    /// Smoke test: a `ComputePartitionStats` handed out by the factory actually RUNS (computes +
-    /// writes + registers a partition-stats file on a partitioned table), proving the override is
-    /// live, not a stub. A broken override (e.g. one that ignored the table) fails here. **This
-    /// computes over a THROWAWAY local-fs MemoryCatalog table — never a shared/live catalog.**
+    /// The factory-built action writes and registers a partition-stats file.
     #[tokio::test]
     async fn compute_partition_stats_from_factory_executes_live() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
         let table = create_x_partitioned_table(&catalog).await;
         let location = table.metadata().location().to_string();
 
-        // Two partitions so the computed collection is non-empty (the action errors on an empty one).
+        // Two partitions keep the computed collection non-empty. The action errors on an empty one.
         let table = append(&catalog, &table, vec![
             partitioned_data_file(
                 &file_io,
@@ -833,7 +715,7 @@ mod tests {
 
         assert_eq!(result.statistics_file.snapshot_id, snapshot_id);
         assert!(result.statistics_file.file_size_in_bytes > 0);
-        // The registered file lands in the refreshed metadata (the seam commit fired).
+        // The registered file lands in the refreshed metadata, so the seam commit fired.
         let registered = result
             .table
             .metadata()
@@ -843,7 +725,7 @@ mod tests {
             registered.statistics_path,
             result.statistics_file.statistics_path
         );
-        // The file physically exists on disk.
+        // The file exists on disk.
         assert!(
             exists(&file_io, &result.statistics_file.statistics_path).await,
             "the partition-stats file must be written to disk"

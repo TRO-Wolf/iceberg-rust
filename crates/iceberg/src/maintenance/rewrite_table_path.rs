@@ -15,90 +15,55 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `RewriteTablePath` (FULL-rewrite mode) — the engine-agnostic maintenance action that REWRITES every
-//! absolute path prefix in a table's metadata graph from `source` to `target`, STAGING the rewritten
-//! metadata (metadata.json + manifest-lists + manifests + position-delete CONTENT) at a caller-chosen
-//! staging location and emitting a `(source, target)` COPY-PLAN for the caller to physically copy. The
-//! Rust port of Java 1.10.0's engine-agnostic core `org.apache.iceberg.RewriteTablePathUtil`
-//! (`replacePaths` / `rewriteManifestList` / `rewriteDataManifest` / `rewriteDeleteManifest` /
-//! `rewritePositionDeleteFile`), the bytecode-verified iceberg-CORE surface behind the Spark
-//! `RewriteTablePath` action.
+//! `RewriteTablePath` in FULL-rewrite mode. It rewrites every absolute path prefix in a table's
+//! metadata graph from `source` to `target`, stages the rewritten metadata, and returns a
+//! `(from, to)` copy plan. Rust port of Java 1.10.0 `org.apache.iceberg.RewriteTablePathUtil`.
 //!
-//! **This action does NOT physically copy data files.** It STAGES the rewritten metadata graph and
-//! returns the copy-plan; the caller (or an external copier) is responsible for performing the copies
-//! the plan names. The only payloads physically rewritten in place are position-delete CONTENT files
-//! (their `file_path` column is path-rewritten, so they cannot be a verbatim copy) — these are written
-//! into the staging location.
+//! The action never copies a data file. The caller performs every copy the plan names.
+//! Position-delete content is the only payload rewritten in place, because its `file_path` column
+//! holds a path.
 //!
-//! # The Java contract this mirrors (javap-verified against `iceberg-core` 1.10.0)
+//! # What `replace_paths` rewrites in metadata.json
 //!
-//! `RewriteTablePathUtil` is a static utility, NOT a Spark class — so this is a faithful CORE port, not
-//! a Spark-surface approximation. The load-bearing methods:
+//! | field | rewrite |
+//! |---|---|
+//! | `location` | `String.replaceFirst` regex semantics, not `newPath` (see [`replace_first_prefix`]) |
+//! | snapshot `manifest_list` | `newPath`; every other snapshot field verbatim |
+//! | metadata-log `.file` | `newPath`; timestamp preserved |
+//! | `write.{object-storage,folder-storage,data,metadata}.path` | `newPath` if present; other properties untouched |
+//! | `statisticsFiles.path` | `newPath` |
+//! | `partitionStatisticsFiles` | not rewritten in 1.10.0; the fork mirrors that |
+//! | `encryptionKeys`, `refs`, `schemas`, `specs`, `sortOrders` | verbatim |
 //!
-//! - `replacePaths(TableMetadata, source, target) -> TableMetadata` — rewrites the metadata.json fields:
-//!   1. `location` via `String.replaceFirst(source, target)` — REGEX semantics, the ONLY field NOT
-//!      using `newPath` (this asymmetry is mirrored EXACTLY: see [`replace_first_prefix`]).
-//!   2. each snapshot: ONLY `manifest_list` via `newPath`; every other snapshot field verbatim.
-//!   3. metadata-log entries `.file` via `newPath` (timestamp preserved).
-//!   4. EXACTLY four properties IF present — `write.object-storage.path` / `write.folder-storage.path`
-//!      / `write.data.path` / `write.metadata.path` — via `newPath`; all other properties untouched.
-//!   5. `statisticsFiles` (Puffin) `.path` via `newPath`.
-//!   6. DIVERGENCES MIRRORED EXACTLY: `partitionStatisticsFiles` is PASSED THROUGH UN-REWRITTEN in
-//!      1.10.0 (verified at bytecode offset 142 — `partitionStatisticsFiles()` flows to the ctor
-//!      unmodified); `encryptionKeys` / `refs` / `schemas` / `specs` / `sortOrders` verbatim; the
-//!      rewritten metadata's `metadataFileLocation` is left null (the caller names the new file);
-//!      `currentSnapshotId` carried.
-//! - `rewriteManifestList(snapshot, io, metadata, manifestsToRewrite, source, target, staging, out)` —
-//!   writes a NEW manifest-list in staging; each `ManifestFile` is copied then its `manifest_path` is
-//!   set to `newPath` (pointing at TARGET). For each rewritten manifest, the copy-plan entry is
-//!   `(stagingPath(origPath, source, staging), newPath(origPath, source, target))` — STAGED files copy
-//!   FROM the staging location.
-//! - DATA manifest (`writeDataFileEntry`): a [`DataFile`] whose location does NOT start with `source`
-//!   is a precondition violation ("Encountered data file %s not under the source prefix %s"); otherwise
-//!   `copy(df).withPath(newPath(loc))` preserves all other metadata. The copy-plan entry (live + in the
-//!   snapshot set) is `(originalSourceLocation, newPath target)` — VERBATIM data copies FROM the source.
-//! - DELETE manifest (`writeDeleteFileEntry`): POSITION_DELETES → path via `newPath`, bounds via
-//!   `replacePathBounds` (the file_path-column lower/upper bound metrics are rewritten), the content is
-//!   ADDED to `toRewrite` (physically rewritten), and the copy-plan entry is `(stagingPath(origLoc),
-//!   newLoc)` — STAGED. EQUALITY_DELETES → path via `newPath`, content VERBATIM (NO content rewrite),
-//!   copy-plan `(originalSourceLocation, newLoc)` — VERBATIM. Any other content → unsupported.
-//! - POSITION-DELETE CONTENT (`rewritePositionDeleteFile`): physically read each pos-delete record,
-//!   rewrite column 0 (`file_path`) via `newPath`, preserve column 1 (`pos`), write a new file into
-//!   staging. The ONLY content-rewritten payload.
-//! - `referenced_data_file` (the pos-delete / DV back-reference) is ALSO a path and is rewritten when
-//!   present (a position-delete's `DataFile.referenced_data_file`).
+//! The rewritten metadata leaves `metadataFileLocation` null. Java lets the caller name the new file.
 //!
-//! # The copy-plan direction, by class (the load-bearing asymmetry)
+//! # The copy-plan direction, by class
 //!
-//! The plan is a set of `(sourceToCopyFrom, targetToCopyTo)` pairs. The `sourceToCopyFrom` differs by
-//! whether the payload was content-rewritten (STAGED) or carried verbatim:
+//! A staged entry copies FROM the staging location, where this action wrote the rewritten bytes. A
+//! verbatim entry copies FROM the original source. Reverse the two and the copier reads the wrong
+//! bytes. The offline tests and the interop oracle assert the direction directly.
 //!
 //! | class | content rewritten? | copy FROM | copy TO |
 //! |---|---|---|---|
-//! | manifest-list / manifest / position-delete | YES (staged) | `stagingPath(orig, source, staging)` | `newPath(orig, source, target)` |
-//! | data file | no (verbatim) | `originalSourceLocation` | `newPath(orig, source, target)` |
-//! | equality-delete | no (verbatim) | `originalSourceLocation` | `newPath(orig, source, target)` |
+//! | manifest-list / manifest / position-delete | yes, staged | `stagingPath(orig, source, staging)` | `newPath(orig, source, target)` |
+//! | data file | no | `originalSourceLocation` | `newPath(orig, source, target)` |
+//! | equality-delete | no | `originalSourceLocation` | `newPath(orig, source, target)` |
 //!
-//! So STAGED entries copy FROM the staging location (where this action wrote the rewritten bytes);
-//! VERBATIM entries copy FROM the original source. Get this backwards and the copier reads the wrong
-//! bytes — hence it is asserted directly in the offline tests and the interop oracle.
+//! A data file not under `source` is a precondition violation. A delete manifest also rewrites the
+//! position-delete `file_path` bounds and the `referenced_data_file` back-reference. Any other
+//! content type in a delete manifest is unsupported.
 //!
 //! # On-disk format stability
 //!
-//! Only path STRINGS change. The metadata.json is re-serialized through the SAME
-//! [`TableMetadata::write_to`] codec; manifests/lists are re-emitted through the SAME
-//! [`ManifestWriter`](crate::spec::ManifestWriter) / [`ManifestListWriter`](crate::spec::ManifestListWriter)
-//! preserving every entry's status / sequence number / snapshot id (via [`reemit_entry`], which
-//! dispatches on the original entry status exactly like Java's `appendEntryWithFile`); the
-//! `format_version` is threaded from the source metadata. No encoding/format drift.
+//! Only path strings change. The metadata.json, manifest lists, and manifests re-serialize through
+//! the same codecs, with the format version threaded from the source metadata. [`reemit_entry`]
+//! preserves each entry's status, sequence number, and snapshot id.
 //!
-//! # Deferred (loudly — additive later)
+//! # Deferred
 //!
-//! - **Incremental mode** (Java `startVersion`/`endVersion` + the version-diff walk + the version-hint
-//!   write): this port is FULL rewrite only (endVersion = current, all live files, no snapshot-id Set
-//!   filter). The incremental version-diff is a Spark-shell concern.
-//! - **The CSV file-list output**: Java's Spark layer writes a CSV; the CORE plan is `Set<(from, to)>`,
-//!   returned here as [`RewriteTablePathResult::copy_plan`] (a `Vec<(String, String)>`).
+//! Incremental mode (Java `startVersion`/`endVersion` and the version-diff walk) is a Spark-shell
+//! concern; this port is full rewrite only. Java's Spark layer writes a CSV file list; the core plan
+//! is [`RewriteTablePathResult::copy_plan`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -126,12 +91,10 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
-/// The platform file separator Java's `RewriteTablePathUtil.FILE_SEPARATOR` uses — always `/` for
-/// object-store / table-format paths (NOT the OS separator).
+/// Java `RewriteTablePathUtil.FILE_SEPARATOR`. Table paths always use `/`, never the OS separator.
 const FILE_SEPARATOR: &str = "/";
 
-/// The four object-storage / folder-storage property keys Java's `updateProperties` path-rewrites IF
-/// PRESENT (javap-verified literal order: object-storage, folder-storage, data, metadata). Every other
+/// The only property keys Java's `updateProperties` path-rewrites, in Java's order. Every other
 /// property is left untouched.
 const PATH_PROPERTY_KEYS: [&str; 4] = [
     "write.object-storage.path",
@@ -140,38 +103,28 @@ const PATH_PROPERTY_KEYS: [&str; 4] = [
     "write.metadata.path",
 ];
 
-/// The outcome of a [`RewriteTablePath::execute`] run — the Rust analog of Java's
-/// `RewriteTablePathUtil$RewriteResult` (the copy-plan) plus the staging location and the rewritten
-/// metadata's logical version.
+/// The outcome of a [`RewriteTablePath::execute`] run. Java's
+/// `RewriteTablePathUtil$RewriteResult` plus the staging location and the logical version.
 ///
-/// The action STAGES the rewritten metadata graph at [`Self::staging_location`] and returns the
-/// [`Self::copy_plan`]; it does NOT physically copy data files.
+/// The action stages the rewritten metadata graph and returns the plan. It copies no data file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewriteTablePathResult {
-    /// The staging directory the rewritten metadata graph was written under (the
-    /// content-rewritten manifests / manifest-lists / position-deletes live here; the new
-    /// metadata.json is at [`Self::staged_metadata_location`]).
+    /// The directory the rewritten manifests, manifest lists, and position deletes were written
+    /// under.
     pub staging_location: String,
-    /// The location of the newly-staged rewritten metadata.json (under the staging location). Java
-    /// leaves `metadataFileLocation` null and the caller names the file; this port names it for the
-    /// caller and reports the chosen location.
+    /// The staged rewritten metadata.json. Java leaves `metadataFileLocation` null for the caller
+    /// to name. This port names the file and reports the location it chose.
     pub staged_metadata_location: String,
-    /// The `(sourceToCopyFrom, targetToCopyTo)` copy-plan — the Rust analog of Java
-    /// `RewriteResult.copyPlan()`. Deterministically sorted. The caller (or an external copier) copies
-    /// each `from` → `to`; this action does NOT perform the copies. See the module docs for the
-    /// per-class direction.
+    /// The sorted `(from, to)` copy plan (Java `RewriteResult.copyPlan()`). The caller performs
+    /// each copy. The module docs give the direction per class.
     pub copy_plan: Vec<(String, String)>,
-    /// The logical version of the rewritten metadata (the current snapshot id, or -1 for an empty
-    /// table) — Java's FULL rewrite endVersion = current.
+    /// The current snapshot id, or -1 for an empty table. Java's full-rewrite `endVersion`.
     pub latest_version: i64,
 }
 
-/// The `RewriteTablePath` maintenance action (FULL-rewrite mode). Build it with [`Self::new`], set the
-/// prefixes with [`Self::rewrite_location_prefix`] and the staging directory with
-/// [`Self::staging_location`], then run it with [`Self::execute`].
-///
-/// See the module docs for the full Java contract, the divergences mirrored, and the copy-plan
-/// direction by class.
+/// The `RewriteTablePath` maintenance action, in full-rewrite mode. Build it with [`Self::new`],
+/// set [`Self::rewrite_location_prefix`] and [`Self::staging_location`], then call
+/// [`Self::execute`]. The module docs carry the Java contract and the copy-plan direction.
 pub struct RewriteTablePath {
     table: Table,
     source_prefix: Option<String>,
@@ -180,9 +133,8 @@ pub struct RewriteTablePath {
 }
 
 impl RewriteTablePath {
-    /// Create a `RewriteTablePath` action for `table`. The source/target prefixes
-    /// ([`Self::rewrite_location_prefix`]) and the staging location ([`Self::staging_location`]) MUST be
-    /// set before [`Self::execute`].
+    /// Creates the action for `table`. [`Self::rewrite_location_prefix`] and
+    /// [`Self::staging_location`] must be set before [`Self::execute`].
     pub fn new(table: Table) -> Self {
         Self {
             table,
@@ -192,8 +144,7 @@ impl RewriteTablePath {
         }
     }
 
-    /// Set the absolute path prefixes to rewrite: every path starting with `source` is rewritten to
-    /// start with `target` (Java's `sourcePrefix` / `targetPrefix`). REQUIRED.
+    /// Sets the absolute path prefixes to rewrite (Java `sourcePrefix` / `targetPrefix`). Required.
     pub fn rewrite_location_prefix(
         mut self,
         source: impl Into<String>,
@@ -204,20 +155,16 @@ impl RewriteTablePath {
         self
     }
 
-    /// Set the staging directory the rewritten metadata graph is written under (Java's
-    /// `stagingLocation`). The content-rewritten manifests / manifest-lists / position-deletes and the
-    /// new metadata.json land here. REQUIRED.
+    /// Sets the directory the rewritten metadata graph is written under (Java `stagingLocation`).
+    /// Required.
     pub fn staging_location(mut self, dir: impl Into<String>) -> Self {
         self.staging_location = Some(dir.into());
         self
     }
 
-    /// Run the FULL rewrite: rewrite the metadata graph into the staging location with every absolute
-    /// path prefix swapped `source` → `target`, and return the [`RewriteTablePathResult`] (the staging
-    /// location + the `(source, target)` copy-plan). Does NOT physically copy data files.
-    ///
-    /// Returns `Err` (without staging anything) when the prefixes / staging location are unset, or when
-    /// a referenced data file is not under the source prefix (the Java precondition).
+    /// Runs the full rewrite and returns the staging location and the copy plan. It copies no data
+    /// file. # Errors Fails when the prefixes or the staging location are unset, or when a
+    /// referenced data file is not under the source prefix.
     pub async fn execute(self, file_io: &FileIO) -> Result<RewriteTablePathResult> {
         let source = self.source_prefix.as_deref().ok_or_else(|| {
             Error::new(
@@ -242,15 +189,11 @@ impl RewriteTablePath {
 
         let mut copy_plan: Vec<(String, String)> = Vec::new();
 
-        // (1) Rewrite each snapshot's manifest list + every manifest it references into staging,
-        //     accumulating the copy-plan for manifest-lists / manifests / data / delete files +
-        //     physically rewriting position-delete content.
         for snapshot in metadata.snapshots() {
             self.rewrite_snapshot(snapshot, file_io, source, target, staging, &mut copy_plan)
                 .await?;
         }
 
-        // (2) Rewrite the metadata.json fields (replace_paths) and stage the new metadata.json.
         let rewritten_metadata = replace_paths(metadata, source, target)?;
         let staged_metadata_location = combine_paths(
             staging,
@@ -271,10 +214,8 @@ impl RewriteTablePath {
         })
     }
 
-    /// Rewrite ONE snapshot: stage a new manifest-list (every manifest path rewritten), and for each
-    /// manifest stage a rewritten manifest (data or delete) — accumulating the copy-plan and physically
-    /// rewriting position-delete content. Mirrors Java's per-snapshot `rewriteManifestList` +
-    /// `rewriteDataManifest` / `rewriteDeleteManifest` composition for the FULL case.
+    /// Rewrites one snapshot: a staged manifest list, plus a staged manifest per entry. Mirrors
+    /// Java `rewriteManifestList` over `rewriteDataManifest` / `rewriteDeleteManifest`.
     async fn rewrite_snapshot(
         &self,
         snapshot: &Snapshot,
@@ -288,8 +229,7 @@ impl RewriteTablePath {
         let format_version = metadata.format_version();
         let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
 
-        // The rewritten manifest-list is staged at stagingPath(origManifestListPath). The new
-        // manifest-list ENTRIES point manifest_path at the TARGET location (newPath).
+        // The list is staged at stagingPath, but its entries point at the target.
         let orig_manifest_list = snapshot.manifest_list();
         let staged_manifest_list = staging_path(orig_manifest_list, source, staging)?;
         let manifest_list_output = file_io.new_output(&staged_manifest_list)?;
@@ -307,9 +247,6 @@ impl RewriteTablePath {
         for manifest_file in manifest_list.entries() {
             let orig_manifest_path = manifest_file.manifest_path.clone();
 
-            // Stage the rewritten manifest at stagingPath(origManifestPath); its entries' file paths
-            // point at TARGET. Returns the rewritten ManifestFile (with manifest_path = TARGET) for the
-            // manifest-list, and the per-content-file copy-plan entries it produced.
             let rewritten = self
                 .rewrite_manifest(
                     manifest_file,
@@ -323,7 +260,7 @@ impl RewriteTablePath {
                 .await?;
             rewritten_manifest_files.push(rewritten);
 
-            // The manifest itself is a STAGED (content-rewritten) file: copy FROM staging TO target.
+            // The manifest is content-rewritten, so it copies from staging.
             copy_plan.push((
                 staging_path(&orig_manifest_path, source, staging)?,
                 new_path(&orig_manifest_path, source, target)?,
@@ -333,7 +270,7 @@ impl RewriteTablePath {
         list_writer.add_manifests(rewritten_manifest_files.into_iter())?;
         list_writer.close().await?;
 
-        // The manifest-list itself is a STAGED file: copy FROM staging TO target.
+        // The manifest list is content-rewritten, so it copies from staging.
         copy_plan.push((
             staged_manifest_list,
             new_path(orig_manifest_list, source, target)?,
@@ -342,10 +279,8 @@ impl RewriteTablePath {
         Ok(())
     }
 
-    /// Rewrite ONE manifest into staging (data or delete) and return the rewritten [`ManifestFile`]
-    /// (with `manifest_path` = TARGET) for inclusion in the staged manifest-list. Accumulates the
-    /// per-content-file copy-plan entries into `copy_plan` and physically rewrites position-delete
-    /// content. Mirrors Java's `rewriteDataManifest` / `rewriteDeleteManifest`.
+    /// Rewrites one manifest into staging and returns it with `manifest_path` set to the target,
+    /// for the staged manifest list. Mirrors Java `rewriteDataManifest` / `rewriteDeleteManifest`.
     #[allow(clippy::too_many_arguments)]
     async fn rewrite_manifest(
         &self,
@@ -365,9 +300,8 @@ impl RewriteTablePath {
         let partition_spec = manifest_metadata.partition_spec().clone();
         let content = *manifest_metadata.content();
 
-        // Stage the rewritten manifest at stagingPath(origManifestPath); its added entries reference
-        // TARGET paths. We use the source manifest's snapshot id as the writer's snapshot id (it is
-        // only the fallback for entries with no explicit snapshot id; re-emitted entries carry theirs).
+        // The writer's snapshot id is only the fallback for an entry that carries none. Every
+        // re-emitted entry carries its own.
         let staged_manifest_path = staging_path(&manifest_file.manifest_path, source, staging)?;
         let output = file_io.new_output(&staged_manifest_path)?;
         let mut writer = build_manifest_writer(
@@ -384,8 +318,8 @@ impl RewriteTablePath {
                 ManifestContentType::Data => {
                     let rewritten_file = rewrite_data_file_path(entry.data_file(), source, target)?;
                     reemit_entry(&mut writer, entry, rewritten_file)?;
-                    // Data files are VERBATIM: copy FROM the ORIGINAL SOURCE location TO target. Java
-                    // adds the plan entry only for LIVE entries in the snapshot set (FULL ⇒ all).
+                    // A data file is verbatim, so it copies from the source. Java plans only live
+                    // entries.
                     if entry.is_alive() {
                         copy_plan.push((
                             entry.data_file().file_path().to_string(),
@@ -409,8 +343,7 @@ impl RewriteTablePath {
         }
 
         let mut rewritten_manifest_file = writer.write_manifest_file().await?;
-        // Java copies the ManifestFile and sets manifest_path = newPath(origPath) for the manifest-list
-        // entry; the manifest-list entry must point at the TARGET, not the staging path.
+        // The manifest-list entry must point at the target, not at the staging path.
         rewritten_manifest_file.manifest_path =
             new_path(&manifest_file.manifest_path, source, target)?;
         let _ = metadata; // metadata is the action's; kept for symmetry with the data-manifest path.
@@ -418,9 +351,8 @@ impl RewriteTablePath {
         Ok(rewritten_manifest_file)
     }
 
-    /// Rewrite ONE delete-manifest entry: POSITION_DELETES → path + bounds rewritten, content physically
-    /// rewritten into staging, copy-plan STAGED; EQUALITY_DELETES → path rewritten, content verbatim,
-    /// copy-plan from SOURCE. Mirrors Java's `writeDeleteFileEntry`.
+    /// Rewrites one delete-manifest entry. Java `writeDeleteFileEntry`. A position delete has its
+    /// content rewritten into staging; an equality delete is verbatim.
     #[allow(clippy::too_many_arguments)]
     async fn rewrite_delete_entry(
         &self,
@@ -436,15 +368,13 @@ impl RewriteTablePath {
         match delete_file.content_type() {
             DataContentType::PositionDeletes => {
                 let orig_location = delete_file.file_path().to_string();
-                // Path via newPath + bounds via replacePathBounds + referenced_data_file via newPath.
                 let rewritten_file =
                     rewrite_position_delete_file_metadata(delete_file, source, target)?;
                 let new_location = rewritten_file.file_path().to_string();
 
-                // Physically rewrite the position-delete CONTENT (column 0 file_path) into staging.
-                // The content is the ONLY rewritten payload. A Puffin deletion vector cannot be
-                // record-rewritten by the parquet pos-delete writer; defer it loudly. Returns the EXACT
-                // staged location the content landed at (the copy-plan's "from" for this STAGED file).
+                // The parquet pos-delete writer cannot rewrite a Puffin deletion vector record by
+                // record, so a non-parquet delete fails loudly here. The returned path is the copy
+                // plan's `from` for this staged file.
                 let staged_content_path = if delete_file.file_format() == DataFileFormat::Parquet {
                     self.rewrite_position_delete_content(
                         delete_file,
@@ -468,27 +398,24 @@ impl RewriteTablePath {
 
                 reemit_entry(writer, entry, rewritten_file)?;
 
-                // POSITION_DELETES are STAGED (content-rewritten): copy FROM the staged content
-                // location TO newLoc. Java adds the plan entry only for LIVE entries in the snapshot
-                // set (FULL ⇒ all).
+                // A position delete is content-rewritten, so it copies from staging. Java plans
+                // only live entries.
                 if entry.is_alive() {
                     copy_plan.push((staged_content_path, new_location));
                 }
             }
             DataContentType::EqualityDeletes => {
                 let orig_location = delete_file.file_path().to_string();
-                // Path via newPath; CONTENT VERBATIM (no rewrite).
                 let rewritten_file = rewrite_data_file_path(delete_file, source, target)?;
                 let new_location = rewritten_file.file_path().to_string();
                 reemit_entry(writer, entry, rewritten_file)?;
-                // EQUALITY_DELETES are VERBATIM: copy FROM the ORIGINAL SOURCE location TO newLoc.
+                // An equality delete is verbatim, so it copies from the source.
                 if entry.is_alive() {
                     copy_plan.push((orig_location, new_location));
                 }
             }
             DataContentType::Data => {
-                // Java's writeDeleteFileEntry default arm throws UnsupportedOperationException — a Data
-                // entry in a DELETE manifest is malformed.
+                // A data entry in a delete manifest is malformed. Java throws here too.
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
@@ -502,11 +429,9 @@ impl RewriteTablePath {
         Ok(())
     }
 
-    /// Physically rewrite a parquet position-delete file's CONTENT into `staged_content_path`: read each
-    /// `(file_path, pos)` record, rewrite `file_path` via `newPath`, preserve `pos`, and write a new
-    /// parquet position-delete file. Mirrors Java's `rewritePositionDeleteFile` + `newPositionDeleteRecord`
-    /// (the ONLY content-rewritten payload). The row column (Java col 2) is not carried (this fork's
-    /// pos-delete writer is `(file_path, pos)`).
+    /// Rewrites a parquet position-delete file's content into staging. Java
+    /// `rewritePositionDeleteFile`. This fork's writer emits `(file_path, pos)` only, so Java's
+    /// third `row` column is not carried.
     async fn rewrite_position_delete_content(
         &self,
         delete_file: &DataFile,
@@ -515,7 +440,6 @@ impl RewriteTablePath {
         target: &str,
         staging: &str,
     ) -> Result<String> {
-        // Read the original (file_path, pos) pairs and rewrite each file_path.
         let loader = BasicDeleteFileLoader::new(file_io.clone());
         let mut stream = loader
             .parquet_to_batch_stream(delete_file.file_path(), delete_file.file_size_in_bytes)
@@ -542,16 +466,13 @@ impl RewriteTablePath {
             }
         }
 
-        // Write the rewritten records into the staging location and return the EXACT location the
-        // content landed at (the copy-plan's "from" for this STAGED file).
         self.write_position_delete_content(delete_file, &rewritten_pairs, source, staging)
             .await
     }
 
-    /// Write the rewritten `(file_path, pos)` pairs into a parquet position-delete file UNDER the
-    /// staging location (mirroring the source file's source-relative directory), returning the EXACT
-    /// location the content landed at. The returned path is the copy-plan's "from" for this STAGED file
-    /// and is the location the rewritten content is read from by the copier.
+    /// Writes the rewritten pairs into a parquet position-delete file under the staging location,
+    /// at the source-relative path. The returned location is the copy plan's `from`, which the
+    /// copier reads.
     async fn write_position_delete_content(
         &self,
         delete_file: &DataFile,
@@ -561,10 +482,9 @@ impl RewriteTablePath {
     ) -> Result<String> {
         let config = PositionDeleteWriterConfig::new()?;
 
-        // The staged content lands at EXACTLY stagingPath(origLoc) — the SAME source-relative path under
-        // the staging location that Java's `RewriteTablePathUtil` uses (so the copy-plan's "from" tag is
-        // deterministic + cross-engine-comparable). The location generator returns that exact path and
-        // ignores the writer's generated file name; a dummy name generator satisfies the writer API.
+        // The content must land at exactly stagingPath(origLoc), the layout Java uses, so the copy
+        // plan is comparable across engines. The location generator forces that path and ignores
+        // the generated file name.
         let staged_content_path = staging_path(delete_file.file_path(), source, staging)?;
         let location_gen = StagedLocationGenerator {
             exact_path: staged_content_path,
@@ -574,9 +494,8 @@ impl RewriteTablePath {
             None,
             DataFileFormat::Parquet,
         );
-        // The rewritten position-delete content keeps `file_path`/`pos` bounds FULL (Java
-        // `MetricsConfig.forPositionDelete`) so delete-file path pruning stays precise — the default
-        // `truncate(16)` would widen the path range.
+        // Full bounds keep delete-file path pruning precise (Java
+        // `MetricsConfig.forPositionDelete`). The default `truncate(16)` widens the path range.
         let parquet_builder =
             ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
                 .with_metrics_config(MetricsConfig::for_position_delete());
@@ -586,8 +505,7 @@ impl RewriteTablePath {
             location_gen,
             file_name_gen,
         );
-        // Position deletes carry their partition in the manifest entry (not the parquet rows), so the
-        // content file needs no partition key.
+        // A position delete carries its partition in the manifest entry, not in the rows.
         let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
             .build(None)
             .await?;
@@ -617,28 +535,20 @@ impl RewriteTablePath {
     }
 }
 
-/// ============================================================================================
-/// `replace_paths` — the metadata.json field rewrite (Java `RewriteTablePathUtil.replacePaths`).
-/// ============================================================================================
-///
-/// Rewrites `location` (regex `replaceFirst`), each snapshot's `manifest_list` (newPath), metadata-log
-/// `.file` (newPath), the four path PROPERTIES (newPath), and `statisticsFiles.path` (newPath). Passes
-/// `partition_statistics` through UN-REWRITTEN (the 1.10.0 divergence), and carries everything else
-/// (`refs`, `schemas`, `specs`, `sortOrders`, `encryption_keys`, ids, sequence numbers) verbatim.
+/// The metadata.json field rewrite (Java `RewriteTablePathUtil.replacePaths`). The module docs
+/// table names every field this touches and every field it carries verbatim.
 pub(crate) fn replace_paths(
     metadata: &TableMetadata,
     source: &str,
     target: &str,
 ) -> Result<TableMetadata> {
-    // Clone the whole metadata, then mutate ONLY the path-bearing fields. Cloning preserves every
-    // verbatim field exactly (refs/schemas/specs/sortOrders/encryptionKeys/ids/seqs) — the conservative
-    // mirror of Java's reconstruct-with-most-fields-carried.
+    // Clone, then mutate only the path-bearing fields. A clone carries every verbatim field
+    // exactly, where Java's reconstruct-and-carry could drop a new one.
     let mut rewritten = metadata.clone();
 
-    // (1) location via String.replaceFirst (REGEX) — the ONLY field NOT using newPath. Mirror exactly.
+    // `location` is the only field Java rewrites by regex, not by newPath.
     rewritten.location = replace_first_prefix(&metadata.location, source, target);
 
-    // (2) snapshots: ONLY manifest_list via newPath; every other snapshot field verbatim.
     let mut new_snapshots = HashMap::with_capacity(metadata.snapshots.len());
     for (id, snapshot) in &metadata.snapshots {
         let mut s = snapshot.as_ref().clone();
@@ -647,12 +557,10 @@ pub(crate) fn replace_paths(
     }
     rewritten.snapshots = new_snapshots;
 
-    // (3) metadata-log entries .file via newPath (timestamp preserved).
     for entry in rewritten.metadata_log.iter_mut() {
         entry.metadata_file = new_path(&entry.metadata_file, source, target)?;
     }
 
-    // (4) EXACTLY four properties IF present — via newPath; all other properties untouched.
     for key in PATH_PROPERTY_KEYS {
         if let Some(value) = rewritten.properties.get(key) {
             let rewritten_value = new_path(value, source, target)?;
@@ -662,20 +570,16 @@ pub(crate) fn replace_paths(
         }
     }
 
-    // (5) statisticsFiles (Puffin) .path via newPath.
     for stats in rewritten.statistics.values_mut() {
         stats.statistics_path = new_path(&stats.statistics_path, source, target)?;
     }
 
-    // DIVERGENCE: partition_statistics PASSED THROUGH UN-REWRITTEN (the 1.10.0 behavior). The clone
-    // already carried them verbatim — do NOT touch them.
+    // Java 1.10.0 does not rewrite partition_statistics. The clone carried them. Leave them.
 
     Ok(rewritten)
 }
 
-// ============================================================================================
 // Path helpers — faithful ports of Java's `RewriteTablePathUtil` path math.
-// ============================================================================================
 
 /// `newPath(path, sourcePrefix, targetPrefix)` = `combinePaths(target, relativize(path, source))`.
 /// Errors (Java throws `IllegalArgumentException`) if `path` does not start with `source`.
@@ -684,8 +588,7 @@ fn new_path(path: &str, source: &str, target: &str) -> Result<String> {
     Ok(combine_paths(target, &rel))
 }
 
-/// `relativize(path, prefix)` = `path.substring(maybeAppendFileSeparator(prefix).length())`. Errors if
-/// `path` does not start with the separator-appended prefix (Java's "Path %s does not start with %s").
+/// `relativize(path, prefix)`. Errors if `path` does not start with the separator-appended prefix.
 fn relativize(path: &str, prefix: &str) -> Result<String> {
     let with_sep = maybe_append_file_separator(prefix);
     path.strip_prefix(&with_sep)
@@ -712,25 +615,19 @@ fn maybe_append_file_separator(prefix: &str) -> String {
     }
 }
 
-/// `stagingPath(origPath, sourcePrefix, stagingDir)` (the 3-arg form) =
-/// `combinePaths(stagingDir, relativize(origPath, sourcePrefix))`. The staged location of a
-/// content-rewritten file mirrors its source-relative path under the staging dir.
+/// `stagingPath(origPath, sourcePrefix, stagingDir)`. A content-rewritten file stages at its
+/// source-relative path under the staging directory.
 fn staging_path(orig_path: &str, source: &str, staging_dir: &str) -> Result<String> {
     let rel = relativize(orig_path, source)?;
     Ok(combine_paths(staging_dir, &rel))
 }
 
-/// `String.replaceFirst(sourcePrefix, targetPrefix)` on `location` — Java REGEX semantics, the ONLY
-/// field of `replacePaths` that does NOT use `newPath`. This asymmetry (regex-replace-first vs the
-/// path-aware `newPath` everywhere else) is mirrored EXACTLY: the FIRST occurrence of `source` in
-/// `location` is replaced once by `target`.
+/// `String.replaceFirst(sourcePrefix, targetPrefix)` on `location`. This is the only field of
+/// `replacePaths` that does not use `newPath`, and the asymmetry is deliberate.
 ///
-/// Java's `source` is a REGEX. The action's `source` is always an absolute PATH PREFIX, which contains
-/// no regex metacharacters in practice, so for these inputs `String.replaceFirst` is exactly a literal
-/// first-occurrence replace — implemented directly here (the `regex` crate is a dev-only dependency and
-/// MUST NOT be pulled into the library surface). Regex metacharacters in a path prefix are not a
-/// supported input (Java would interpret them as a pattern; the precondition that data files start with
-/// the literal `source` is enforced by `newPath`/`relativize` everywhere else, which would reject them).
+/// Java treats `source` as a regex. An absolute path prefix carries no metacharacter in practice, so
+/// a literal first-occurrence replace matches Java for every supported input. That avoids pulling
+/// `regex`, a dev-only dependency, into the library. A prefix with metacharacters is unsupported.
 fn replace_first_prefix(location: &str, source: &str, target: &str) -> String {
     match location.find(source) {
         Some(idx) => {
@@ -744,13 +641,10 @@ fn replace_first_prefix(location: &str, source: &str, target: &str) -> String {
     }
 }
 
-// ============================================================================================
 // DataFile / DeleteFile path rewrite helpers.
-// ============================================================================================
 
-/// Rebuild a [`DataFile`] with `file_path` rewritten via `newPath` and ALL other metadata preserved
-/// (Java's `copy(df).withPath(newPath(loc))`). Used for DATA files and (path-only) EQUALITY deletes.
-/// Errors if the file location is not under the source prefix (Java's precondition).
+/// Rebuilds a [`DataFile`] with `file_path` rewritten and all other metadata preserved (Java
+/// `copy(df).withPath(newPath(loc))`). Errors if the location is not under the source prefix.
 fn rewrite_data_file_path(data_file: &DataFile, source: &str, target: &str) -> Result<DataFile> {
     if !data_file.file_path().starts_with(source) {
         return Err(Error::new(
@@ -763,33 +657,28 @@ fn rewrite_data_file_path(data_file: &DataFile, source: &str, target: &str) -> R
     }
     let mut rewritten = data_file.clone();
     rewritten.file_path = new_path(data_file.file_path(), source, target)?;
-    // referenced_data_file is ALSO a path — rewrite it when present (the pos-delete / DV back-reference).
+    // referenced_data_file is a path too.
     if let Some(referenced) = &data_file.referenced_data_file {
         rewritten.referenced_data_file = Some(new_path(referenced, source, target)?);
     }
     Ok(rewritten)
 }
 
-/// Rebuild a POSITION-DELETE [`DataFile`] with: `file_path` rewritten via `newPath`; the
-/// `referenced_data_file` back-reference rewritten via `newPath` when present; and the file_path-column
-/// lower/upper BOUNDS rewritten via `replacePathBounds`. Java's POSITION_DELETES branch of
-/// `writeDeleteFileEntry`. Errors if the location is not under the source prefix.
+/// Rebuilds a position-delete [`DataFile`] with its path, its `referenced_data_file`, and its
+/// file_path-column bounds rewritten. Java's POSITION_DELETES branch of `writeDeleteFileEntry`.
 fn rewrite_position_delete_file_metadata(
     delete_file: &DataFile,
     source: &str,
     target: &str,
 ) -> Result<DataFile> {
-    // path + referenced_data_file via newPath (also asserts the source-prefix precondition).
     let mut rewritten = rewrite_data_file_path(delete_file, source, target)?;
     replace_path_bounds(&mut rewritten, source, target)?;
     Ok(rewritten)
 }
 
-/// `ContentFileUtil.replacePathBounds(deleteFile, source, target)` — rewrites the file_path-column
-/// (reserved field id [`RESERVED_FIELD_ID_DELETE_FILE_PATH`]) lower/upper bound metrics. If either
-/// bound is absent, or the lower != upper bound (the delete references MORE than one data file), the
-/// bounds are CLEARED (Java's `metricsWithoutPathBounds`). Only when lower == upper (a single
-/// referenced data file) are both rewritten to `newPath(decoded)`.
+/// Java `ContentFileUtil.replacePathBounds`. It rewrites the file_path-column bound metrics only
+/// when lower equals upper, which means one referenced data file. Otherwise it clears both bounds,
+/// because a rewritten range would no longer bound the paths it covers.
 fn replace_path_bounds(delete_file: &mut DataFile, source: &str, target: &str) -> Result<()> {
     let lower = delete_file
         .lower_bounds
@@ -799,7 +688,7 @@ fn replace_path_bounds(delete_file: &mut DataFile, source: &str, target: &str) -
         .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH);
 
     let (Some(lower), Some(upper)) = (lower, upper) else {
-        // Java: if either bound is null, return metricsWithoutPathBounds — drop the path bounds.
+        // Java returns metricsWithoutPathBounds when either bound is null.
         delete_file
             .lower_bounds
             .remove(&RESERVED_FIELD_ID_DELETE_FILE_PATH);
@@ -814,7 +703,6 @@ fn replace_path_bounds(delete_file: &mut DataFile, source: &str, target: &str) -
 
     match (lower_str, upper_str) {
         (Some(l), Some(u)) if l == u => {
-            // Single referenced data file — rewrite both bounds to newPath(decoded).
             let rewritten = new_path(&l, source, target)?;
             delete_file.lower_bounds.insert(
                 RESERVED_FIELD_ID_DELETE_FILE_PATH,
@@ -826,8 +714,7 @@ fn replace_path_bounds(delete_file: &mut DataFile, source: &str, target: &str) -
             );
         }
         _ => {
-            // lower != upper (spans multiple files) or non-string bounds — drop the path bounds
-            // (Java's metricsWithoutPathBounds).
+            // The range spans several files, or the bounds are not strings.
             delete_file
                 .lower_bounds
                 .remove(&RESERVED_FIELD_ID_DELETE_FILE_PATH);
@@ -839,7 +726,7 @@ fn replace_path_bounds(delete_file: &mut DataFile, source: &str, target: &str) -
     Ok(())
 }
 
-/// Decode a [`Datum`]'s string value (the file_path bound is a string). Returns `None` for a non-string.
+/// Decodes a [`Datum`]'s string value. Returns `None` for a non-string.
 fn datum_as_string(datum: &Datum) -> Option<String> {
     match datum.literal() {
         PrimitiveLiteral::String(value) => Some(value.clone()),
@@ -847,14 +734,11 @@ fn datum_as_string(datum: &Datum) -> Option<String> {
     }
 }
 
-// ============================================================================================
 // Identity-preserving manifest entry re-emission (Java `appendEntryWithFile`).
-// ============================================================================================
 
-/// Re-emit `entry` (with its `data_file` swapped for `new_file`) into `writer`, DISPATCHING on the
-/// original entry status exactly like Java's `appendEntryWithFile`: ADDED → `add_file`, EXISTING →
-/// `add_existing_file` (preserving snapshot id + seq), DELETED → `add_delete_file` (preserving seq). The
-/// status / sequence numbers / snapshot ids survive the rewrite — only the path changed.
+/// Re-emits `entry` with `new_file`, dispatching on the original status like Java
+/// `appendEntryWithFile`. Status, sequence numbers, and snapshot ids must survive the rewrite,
+/// because only the path changed.
 fn reemit_entry(
     writer: &mut crate::spec::ManifestWriter,
     entry: &ManifestEntry,
@@ -862,8 +746,7 @@ fn reemit_entry(
 ) -> Result<()> {
     match entry.status() {
         ManifestStatus::Added => {
-            // Java's writer.add() — the data sequence number is assigned at commit; a live ADDED entry
-            // carries its post-inheritance seq, which we preserve via add_file.
+            // A live ADDED entry already carries its inherited sequence number. Preserve it.
             let seq = entry.sequence_number().unwrap_or(0);
             writer.add_file(new_file, seq)?;
         }
@@ -895,9 +778,7 @@ fn reemit_entry(
     Ok(())
 }
 
-// ============================================================================================
 // Manifest / manifest-list writer construction (format-version-threaded).
-// ============================================================================================
 
 /// Build a [`ManifestListWriter`] for `format_version`, threading the snapshot identity.
 fn build_manifest_list_writer(
@@ -943,9 +824,8 @@ fn build_manifest_writer(
     }
 }
 
-/// Locate the `file_path` (string) and `pos` (int64) columns of a position-delete record batch by their
-/// RESERVED FIELD IDs (`PARQUET_FIELD_ID_META_KEY` metadata), not by name. Mirrors the same helper in
-/// [`crate::maintenance::RewritePositionDeleteFiles`].
+/// Locates the `file_path` and `pos` columns of a position-delete batch by reserved field id, not by
+/// name. [`crate::maintenance::RewritePositionDeleteFiles`] carries the same helper.
 fn locate_reserved_columns<'a>(
     batch: &'a RecordBatch,
     file_path: &str,
@@ -1015,11 +895,9 @@ fn locate_reserved_columns<'a>(
     Ok((path_col, pos_col))
 }
 
-/// A [`LocationGenerator`](crate::writer::file_writer::location_generator::LocationGenerator) that emits
-/// a FIXED, EXACT path (`stagingPath(origLoc)`), so the rewritten position-delete content lands at the
-/// precise staged location the copy-plan + the staged manifest reference — IGNORING the writer's
-/// generated file name. This keeps the staged path deterministic and cross-engine-comparable (Java uses
-/// the same `stagingPath` layout).
+/// A [`LocationGenerator`](crate::writer::file_writer::location_generator::LocationGenerator) that
+/// emits one fixed path and ignores the generated file name. The rewritten content must land at the
+/// exact location the copy plan and the staged manifest name.
 #[derive(Clone)]
 struct StagedLocationGenerator {
     exact_path: String,

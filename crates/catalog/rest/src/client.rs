@@ -15,31 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! REST catalog HTTP client, including OAuth2 credential exchange and automatic token refresh.
-//!
-//! # DEVIATIONS from Java `iceberg-core` 1.10.0 OAuth2 (GAP_MATRIX R159)
-//!
-//! The refresh *trigger* is faithful: [`TokenState::from_expires_in`] reproduces Java
-//! `OAuth2Util$AuthSession.scheduleTokenRefresh` exactly (`refreshWindow = min(ttl/10, 5min)`,
-//! `wait = max(ttl - refreshWindow, 10ms)`), and defaults match
-//! (`token-refresh-enabled` = true). Two intentional divergences:
-//!
-//! 1. **Refresh grant type.** Java refreshes a *still-valid* token with the OAuth token-exchange
-//!    grant (`grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, current token as
-//!    `subject_token`) and only re-fetches with the credential once the token has *expired*. This
-//!    fork has no token-exchange machinery; it always refreshes through the existing
-//!    `client_credentials` exchange to the SAME `get_token_endpoint()`. Observably equivalent for a
-//!    credential-bearing client (a fresh valid token arrives before expiry); the wire grant differs.
-//! 2. **Token-only clients (no credential) are not refreshed.** Java can keep a token-only session
-//!    alive by token-exchanging the current token against itself. Without a credential this fork has
-//!    nothing to exchange (and no token-exchange path), so a configured-`token`-only client behaves
-//!    as today: the token is used until it expires. Note Java also cannot refresh a token-only
-//!    session once the token is actually *expired* (`refreshExpiredToken` returns null when the
-//!    credential is null) — the gap is limited to the *proactive* pre-expiry window.
-//!
-//! Recommendation: closing divergence (1)/(2) requires implementing the OAuth token-exchange grant
-//! (`subject_token`/`subject_token_type`), a larger surface than this refresh adaptation and a
-//! separate GAP_MATRIX item; it is out of scope here.
+//! REST catalog HTTP client, including OAuth2 credential exchange and automatic token refresh. #
+//! Notes The refresh trigger matches Java `OAuth2Util$AuthSession.scheduleTokenRefresh`. Two
+//! divergences remain, both from the missing token-exchange grant (GAP_MATRIX row R159).
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -60,30 +38,25 @@ use crate::types::{ErrorResponse, TokenResponse};
 /// refresh window is capped at 5 minutes. A token is refreshed no earlier than `expiresAt - 5min`
 /// even when a proportional (`ttl/10`) window would be larger.
 const MAX_REFRESH_WINDOW_MILLIS: u64 = 300_000;
-/// Java oracle (`OAuth2Util$AuthSession.MIN_REFRESH_WAIT_MILLIS`): the scheduled wait before a
-/// refresh never drops below 10ms, so a near-zero-lifetime token still gets a tiny grace window
-/// rather than refreshing in a tight loop.
+/// Java `OAuth2Util$AuthSession.MIN_REFRESH_WAIT_MILLIS`. Floors the wait so a near-expired
+/// token cannot refresh in a tight loop.
 const MIN_REFRESH_WAIT_MILLIS: u64 = 10;
 
 /// A cached OAuth access token together with the monotonic instant at which it becomes due for a
 /// proactive refresh.
 ///
-/// SECURITY: `token` is bearer-secret material. This type deliberately does NOT derive `Debug`;
-/// [`HttpClient`]'s `Debug` never renders it, and no error/log path on the refresh code touches it.
+/// `token` is bearer-secret material, so this type deliberately does not derive `Debug`.
 #[derive(Clone)]
 struct TokenState {
     /// The bearer access token.
     token: String,
-    /// Monotonic instant at which the token enters Java's refresh window (`expiresAt -
-    /// refreshWindow`). `None` means "never proactively refresh": the token carried no
-    /// `expires_in`, mirroring Java leaving `expiresAtMillis` null and scheduling no refresh.
+    /// Monotonic instant at which the token enters Java's refresh window. `None` means never
+    /// refresh, as Java does when the response carries no `expires_in`.
     refresh_at: Option<Instant>,
 }
 
 impl TokenState {
-    /// A token with no known expiry — a config-provided `token`, or a token response without
-    /// `expires_in`. Never proactively refreshed, mirroring Java `fromAccessToken` /
-    /// `fromTokenResponse` leaving `expiresAtMillis` null so no refresh is scheduled.
+    /// A token with no known expiry. Never proactively refreshed, as in Java `fromAccessToken`.
     fn without_expiry(token: String) -> Self {
         Self {
             token,
@@ -91,18 +64,11 @@ impl TokenState {
         }
     }
 
-    /// Derive the refresh instant from an `expires_in` (seconds), reproducing Java's
-    /// `OAuth2Util$AuthSession.scheduleTokenRefresh` arithmetic exactly:
+    /// Derive the refresh instant from `expires_in`, reproducing Java
+    /// `OAuth2Util$AuthSession.scheduleTokenRefresh`.
     ///
-    /// ```text
-    /// ttl            = expires_in
-    /// refreshWindow  = min(ttl / 10, MAX_REFRESH_WINDOW_MILLIS)   // min(10% of ttl, 5min)
-    /// wait           = max(ttl - refreshWindow, MIN_REFRESH_WAIT_MILLIS)
-    /// refreshAt      = now + wait
-    /// ```
-    ///
-    /// All millisecond math is saturating on `u64`; the final `Instant` add is checked, so an
-    /// absurd `expires_in` can never panic — it falls back to "never refresh" (`None`).
+    /// The math saturates and the `Instant` add is checked, so an absurd `expires_in` yields
+    /// `None` instead of a panic.
     fn from_expires_in(now: Instant, token: String, expires_in_secs: Option<u64>) -> Self {
         let refresh_at = expires_in_secs.and_then(|secs| {
             let ttl_ms = secs.saturating_mul(1000);
@@ -130,14 +96,11 @@ pub(crate) struct HttpClient {
     ///
     /// It's possible to fetch the token from the server while needed.
     token: Mutex<Option<TokenState>>,
-    /// Single-flight gate for token acquisition/refresh. Concurrent requests that all observe a
-    /// stale token serialize here so exactly ONE token-endpoint exchange happens (Java serializes
-    /// refresh on its scheduler thread; the lazy adaptation serializes on this gate instead).
+    /// Single-flight gate for token acquisition. Concurrent requests that see a stale token
+    /// serialize here, so exactly one token-endpoint exchange happens.
     ///
-    /// Lock order: on the acquisition path, `refresh_gate` is acquired BEFORE `token`. The `token`
-    /// mutex is only ever held for brief, non-`await` critical sections (clone-out / store-back),
-    /// so the two locks never deadlock and no lock is held across the HTTP `await` except the
-    /// `refresh_gate` itself — which is the single-flight mechanism and is bounded to one exchange.
+    /// Lock order: acquire `refresh_gate` before `token`. The `token` mutex is held only for
+    /// brief non-`await` sections, so the HTTP `await` holds `refresh_gate` alone.
     refresh_gate: Mutex<()>,
     /// Whether proactive token refresh is enabled (`token-refresh-enabled`; Java default `true`).
     /// When `false`, behavior is exactly today's: exchange once, cache forever, never refresh.
@@ -156,13 +119,9 @@ pub(crate) struct HttpClient {
 
 impl Debug for HttpClient {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        // SEC-008: `extra_headers` carries any `header.*`-configured request headers, including
-        // auth (`header.authorization`, `header.x-api-key`, …). Printing the `HeaderMap` raw
-        // would leak those values into any `{:?}`/`tracing` of the client (or a struct embedding
-        // it). Render it through the same `SENSITIVE_HEADERS` policy the error-log path uses,
-        // ALWAYS redacting here regardless of `disable_header_redaction` (that opt-out is scoped
-        // to error logs, not to `Debug`). The wrapper writes the redacted map verbatim so the
-        // field renders cleanly instead of as an escaped string.
+        // `extra_headers` carries `header.*`-configured request headers, auth among them.
+        // Render through the `SENSITIVE_HEADERS` policy, and redact here even when
+        // `disable_header_redaction` is set: that opt-out covers error logs, not `Debug`.
         struct RedactedHeaders<'a>(&'a HeaderMap);
         impl Debug for RedactedHeaders<'_> {
             fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -294,12 +253,9 @@ impl HttpClient {
                 .await
                 .map_err(|err| err.with_url(auth_url.clone()))?;
             Ok(serde_json::from_slice(&text).map_err(|e| {
-                // SECURITY: the token-endpoint 200-OK body contains the OAuth
-                // `access_token`. Never attach the raw body to the error context — it
-                // would be rendered by `Error`'s `Display` and leak the token into any
-                // `tracing::error!(?e)` / `{e}` log. Attach only the safe byte length.
-                // SEC-001: the `source` is the same channel — `serde`'s message echoes the
-                // value at the failure position — so it is reduced to `SanitizedJsonError`.
+                // The 200-OK body holds the `access_token`, so attach only its byte length.
+                // `Error` renders both the context and the source verbatim, so the source is
+                // reduced to `SanitizedJsonError` as well.
                 Error::new(
                     ErrorKind::Unexpected,
                     "Failed to parse response from rest catalog server!",
@@ -316,11 +272,8 @@ impl HttpClient {
                 .await
                 .map_err(|err| err.with_url(auth_url.clone()))?;
             let e: ErrorResponse = serde_json::from_slice(&text).map_err(|e| {
-                // SECURITY: this is still the token endpoint — a non-2xx body may echo
-                // submitted credentials or a partial grant. Keep the token path airtight
-                // by never attaching the raw body; surface only its byte length. SEC-001:
-                // the `source` echoes the value at the failure position, so it too is
-                // reduced to `SanitizedJsonError`.
+                // A non-2xx token-endpoint body can echo the submitted credential, so attach
+                // only its byte length and reduce the source to `SanitizedJsonError`.
                 Error::new(ErrorKind::Unexpected, "Received unexpected response")
                     .with_context("code", code.to_string())
                     .with_context("operation", "auth")
@@ -340,12 +293,12 @@ impl HttpClient {
         Ok(())
     }
 
-    /// Invalidate the current token and set a new one. Generates a new token before invalidating
-    /// the current token, meaning the old token will be used until this function acquires the lock
-    /// and overwrites the token.
+    /// Invalidate the current token and set a new one. The new token is fetched before the lock
+    /// is taken, so callers keep using the old token until the swap.
     ///
-    /// If credential is invalid, or the request fails, this method will return an error and leave
-    /// the current token unchanged.
+    /// # Errors
+    ///
+    /// A bad credential or a failed request leaves the current token unchanged.
     pub(crate) async fn regenerate_token(&self) -> Result<()> {
         let (new_token, expires_in) = self.exchange_credential_for_token().await?;
         let state = TokenState::from_expires_in(Instant::now(), new_token, expires_in);
@@ -353,35 +306,8 @@ impl HttpClient {
         Ok(())
     }
 
-    /// Authenticates the request by adding a bearer token to the authorization header.
-    ///
-    /// This method supports three authentication modes:
-    ///
-    /// 1. **No authentication** - Skip authentication when both `credential` and `token` are missing.
-    /// 2. **Token authentication** - Use the provided `token` directly for authentication.
-    /// 3. **OAuth authentication** - Exchange `credential` for a token, cache it, then use it for authentication.
-    ///
-    /// When both `credential` and `token` are present, `token` takes precedence.
-    ///
-    /// ## Automatic token refresh (GAP_MATRIX R159)
-    ///
-    /// When `token-refresh-enabled` is on (Java default) and a `credential` is configured, a cached
-    /// token that has entered its refresh window (see [`TokenState::from_expires_in`], which mirrors
-    /// Java `OAuth2Util$AuthSession.scheduleTokenRefresh`) or has already expired is refreshed
-    /// *before use*, so no request is ever sent with a known-expired bearer token. Concurrent
-    /// requests that all observe a stale token collapse to a single token-endpoint exchange via
-    /// [`Self::obtain_token_single_flight`]. When refresh is disabled, behavior is exactly the
-    /// legacy one: exchange once, cache forever.
-    ///
-    /// SANCTIONED ADAPTATION: Java runs a background scheduler thread and, for a still-valid token,
-    /// refreshes via the OAuth *token-exchange* grant (current token as `subject_token`); only an
-    /// already-expired token is re-fetched with the `credential`. This async-Rust library has no
-    /// token-exchange machinery and no background task, so it refreshes *lazily, before use*, always
-    /// through the existing `client_credentials` exchange ([`Self::exchange_credential_for_token`],
-    /// which POSTs to `get_token_endpoint()` — the SAME endpoint and credential location as the
-    /// initial exchange). The observable contract still holds for credential-bearing clients: no
-    /// known-expired token is sent, and tokens refresh proactively near expiry. The divergence for
-    /// token-only clients (no credential) is recorded in the module's DEVIATIONS note.
+    /// Authenticates the request by adding a bearer token to the authorization header. A missing
+    /// `credential` and `token` skip authentication. `token` wins over `credential`.
     async fn authenticate(&self, req: &mut Request) -> Result<()> {
         // Clone the current token state without holding the lock across any await.
         let snapshot = self.token.lock().await.clone();
@@ -427,24 +353,9 @@ impl HttpClient {
     }
 
     /// Acquire a usable token under the single-flight [`Self::refresh_gate`], collapsing a stampede
-    /// of concurrent stale requests into ONE token-endpoint exchange.
-    ///
-    /// `prev` is the caller's pre-gate snapshot: `None` means there is no cached token yet (initial
-    /// acquisition), `Some` means a refresh of an existing (now-stale) token. This distinction
-    /// controls the failure policy, mirroring Java's two paths:
-    ///
-    /// - **Initial acquisition failure propagates.** With no token to fall back on, an exchange
-    ///   error is returned to the caller (as the legacy code did, and as Java's initial `fetchToken`
-    ///   does at session creation).
-    /// - **Refresh failure is suppressed, keeping the old token.** Java runs the scheduled refresh
-    ///   under `Tasks…suppressFailureWhenFinished().retry(...)`; on exhausted retries the failure is
-    ///   swallowed and the previous token stays in use rather than erroring the in-flight request.
-    ///   The lazy adaptation matches that observable behavior: it keeps serving the prior token.
-    ///
-    /// Lock order (documented on the fields): `refresh_gate` is taken first; `token` is then locked
-    /// only for brief, non-`await` sections. The single HTTP exchange awaits while holding
-    /// `refresh_gate` (the single-flight mechanism) — bounded to one round-trip — and never while
-    /// holding the `token` mutex.
+    /// of concurrent stale requests into ONE token-endpoint exchange. `prev` is the caller's
+    /// pre-gate snapshot, and it selects the failure policy as Java does. `None` propagates the
+    /// exchange error, because no token can serve.
     async fn obtain_token_single_flight(&self, prev: Option<TokenState>) -> Result<String> {
         let _gate = self.refresh_gate.lock().await;
 
@@ -504,14 +415,10 @@ impl HttpClient {
         self.execute(request).await
     }
 
-    /// [`Self::query_catalog`] for COMMIT requests (table / view update): transport failures
-    /// are classified sent-vs-unsent.
-    ///
-    /// A failure that may have occurred AFTER the request reached the service (timeout awaiting
-    /// the response, connection reset mid-response) maps to [`ErrorKind::CommitStateUnknown`] —
-    /// the commit may have durably landed, so retrying could apply it twice. A request that
-    /// provably never left the client (pre-send authentication failure, connect failure) keeps
-    /// today's terminal mapping. See [`commit_transport_failure_may_have_reached_service`].
+    /// [`Self::query_catalog`] for COMMIT requests (table / view update): transport failures are
+    /// classified sent-vs-unsent. A failure that may have happened after the request reached the
+    /// service maps to [`ErrorKind::CommitStateUnknown`], because a retry could apply the commit
+    /// twice. A request that provably never left the client keeps the terminal mapping.
     pub async fn query_catalog_for_commit(&self, mut request: Request) -> Result<Response> {
         // Pre-send: an authentication failure means the commit request was never sent — the
         // existing (non-unknown) mapping stands.
@@ -538,21 +445,10 @@ impl HttpClient {
     }
 }
 
-/// True when a transport-level failure on a COMMIT request may have occurred AFTER the request
-/// reached the service — a timeout awaiting the response, a connection reset mid-response, a
-/// lost/truncated body. False only when the request provably never left the client: the request
-/// could not be BUILT, or the CONNECTION could not be established (connect refused / connect
-/// timeout — reqwest reports connect-phase timeouts with `is_connect()`).
-///
-/// Java analogue: once a response arrives, `ErrorHandlers$CommitErrorHandler` (iceberg-core
-/// 1.10.0, `ErrorHandlers.java` L88-104) classifies by HTTP status — 409 →
-/// `CommitFailedException` (retryable), 500/502/503/504 → `CommitStateUnknownException`. For
-/// CLIENT-side transport failures Java's `HTTPClient.execute` (L358-359) collapses everything
-/// into `RESTException` (with an acknowledged `TODO` in `RESTTableOperations.commit` to feed
-/// client errors to the error handler), which `SnapshotProducer.commit()` then neither retries
-/// nor cleans up. This fork names the post-send ambiguity explicitly as
-/// [`ErrorKind::CommitStateUnknown`] — the same observable no-retry / no-cleanup / surfaced
-/// semantics, with the unknown outcome distinguishable by the caller.
+/// True when a transport failure on a commit request may have happened after the request reached
+/// the service. False only when the request provably never left the client: it could not be built,
+/// or the connection could not be established. Java collapses every client-side transport failure
+/// into `RESTException`, which `SnapshotProducer.commit` neither retries nor cleans up.
 pub(crate) fn commit_transport_failure_may_have_reached_service(error: &reqwest::Error) -> bool {
     !(error.is_builder() || error.is_connect())
 }
@@ -563,33 +459,9 @@ pub(crate) fn commit_transport_failure_may_have_reached_service(error: &reqwest:
 const REDACTED_VALUE: &str = "***";
 
 /// A `serde_json` parse failure reduced to the facts that provably cannot carry payload.
-///
-/// SECURITY (SEC-001): `iceberg::Error` renders its `source` VERBATIM — `, source: {source}` in
-/// `Display` and `Source: {source:#}` in `Debug` (`crates/iceberg/src/error.rs`) — and
-/// `serde_json`'s message echoes the value AT THE FAILURE POSITION. The size of that value is NOT
-/// bounded to a scalar: when the type mismatch sits at a CONTAINER boundary, `serde` renders the
-/// offending value through `Unexpected::Str` and emits an entire sub-document inline. The
-/// load-bearing case is a well-known bug class rather than a contrivance — a server or API gateway
-/// that emits a nested object as a JSON *string* (`writeValueAsString` over a sub-map, a proxy
-/// integration stringifying the body) turns `config` into a string whose CONTENT is the whole
-/// vended-credential map, and `serde` reports `invalid type: string "…", expected a map` with those
-/// credentials inline. Attaching such an error as the `source` of a REST parse failure put live
-/// credentials into every `{e}` / `tracing::error!(?e)` site.
-///
-/// The chain is NOT deleted — AGENTS.md requires a wrapped cause to stay reachable through
-/// `Error::source()`, and it does: this type IS the source. What is dropped is `serde_json`'s free
-/// text, because it is the only part of the error whose content comes from the response body.
-/// Everything retained here is structural — a fixed category word plus two integers — so it is
-/// *incapable* of echoing the payload, rather than merely unlikely to. That is a deliberate choice
-/// of a provable rule over a message sanitizer: any attempt to scrub the free text would have to
-/// out-guess every `Unexpected` rendering (`string "…"`, `integer …`, `Other(…)`) forever.
-///
-/// What survives is still enough to act on: the failure CLASS (a syntax error means a malformed
-/// body / wrong content-type; a data error means version skew or a type mismatch; `eof` means a
-/// truncated response) and the exact position, alongside the caller-attached status, URL and body
-/// length. Operators who need the payload itself can capture it at the HTTP layer (a proxy or a
-/// `reqwest` middleware), where the exposure is a deliberate choice rather than an unconditional
-/// log write.
+/// `iceberg::Error` renders its `source` verbatim, and `serde_json` echoes the value at the failure
+/// position. At a container boundary that value is a whole sub-document, so a stringified nested
+/// object puts vended credentials into every `{e}` site.
 #[derive(Debug)]
 pub(crate) struct SanitizedJsonError {
     /// `serde_json`'s failure category, as a fixed word from a closed set.
@@ -632,18 +504,14 @@ impl std::error::Error for SanitizedJsonError {}
 
 /// Depth cap for [`redact_secret_values`]'s walk over a server-supplied JSON document.
 ///
-/// `serde_json`'s parser already rejects documents nested deeper than its own recursion limit, so
-/// a value that reaches this walk is already bounded; the cap is nonetheless explicit because
-/// AGENTS.md requires every user-influenced tree walk to carry one. Replacing a too-deep subtree
-/// wholesale is fail-closed — nothing from below the cap is rendered.
+/// `serde_json` already bounds nesting, but AGENTS.md requires an explicit cap on every
+/// user-influenced walk. A too-deep subtree is replaced wholesale, so nothing below it renders.
 const MAX_BODY_REDACTION_DEPTH: u32 = 64;
 
 /// Replaces, in place, every object value whose KEY is secret-bearing with [`REDACTED_VALUE`].
 ///
-/// Redaction is PER KEY through the canonical needle test [`is_secret_prop_key`] — the same
-/// (deliberately superset) test the wire types' `Debug` impls in `types.rs`, `StorageConfig`, and
-/// the Glue / HMS / S3Tables / SQL config `Debug` impls use — so keys stay visible for diagnostics,
-/// only secret VALUES are masked, and there is exactly ONE authoritative needle list.
+/// Redaction runs per key through the canonical needle test [`is_secret_prop_key`], the one the
+/// other config `Debug` impls use. Keys stay visible; only secret values are masked.
 fn redact_secret_values(value: &mut serde_json::Value, depth: u32) {
     if depth >= MAX_BODY_REDACTION_DEPTH {
         *value = serde_json::Value::String(format!("{REDACTED_VALUE} (nesting cap reached)"));
@@ -669,18 +537,10 @@ fn redact_secret_values(value: &mut serde_json::Value, depth: u32) {
     }
 }
 
-/// Renders a non-2xx response body for attachment to an error, with secret-keyed values masked.
-///
-/// SECURITY (SEC-009): a JSON body is re-emitted with [`redact_secret_values`] applied, which keeps
-/// the whole diagnostic shape — including the Iceberg `ErrorResponse` `message` Java surfaces to
-/// the caller — while masking any property map the server echoed back from a WRITE request
-/// (`create_table`, `create_namespace`, `update_namespace_properties`, `create_view`), which is the
-/// channel by which submitted credentials can come back.
-///
-/// A body that is not JSON cannot be key-redacted at all, so it is withheld and only its byte
-/// length is reported: over-redaction is the safe direction, and the alternative is echoing
-/// arbitrary server text that may itself quote the submitted request. Status and (redacted)
-/// headers are attached separately by the caller, so the content-type remains visible.
+/// Renders a non-2xx response body for attachment to an error, with secret-keyed values masked. A
+/// JSON body keeps its diagnostic shape, including the `ErrorResponse` `message`, but every
+/// secret-keyed value is masked. A write route can echo the submitted property map back, and that
+/// is how a credential returns.
 fn redacted_response_body(bytes: &[u8]) -> String {
     match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(mut body) => {
@@ -691,42 +551,8 @@ fn redacted_response_body(bytes: &[u8]) -> String {
     }
 }
 
-/// Deserializes a catalog response into the given [`DeserializedOwned`] type.
-///
-/// Returns an error if unable to parse the response bytes.
-///
-/// SECURITY (SEC-010): this is the SUCCESS (2xx) body path, so the bytes in hand are a
-/// credential-bearing payload — `CatalogConfig` (`defaults`/`overrides`, which the catalog merges
-/// into its runtime props and hands to `FileIO`), `LoadTableResult` (`config` plus the vended
-/// `storage-credentials`), `LoadViewResult` (`config`), and `NamespaceResponse` (`properties`) all
-/// deserialize through here. Attaching the raw body to the error context — as this function used to
-/// — put those secrets into `Error`'s context, which `iceberg::Error` renders VERBATIM in both
-/// `Display` and `Debug` (`crates/iceberg/src/error.rs`), so a single parse failure leaked live
-/// credentials into every `{e}` / `tracing::error!(?e)` site. The trigger is entirely realistic: a
-/// server returning a payload this parser rejects (an unknown V3 field, a version skew) hands back
-/// the SAME body that carries the vended `s3.session-token`.
-///
-/// So: never attach the raw body. Only non-secret diagnostics are attached — the HTTP status, the
-/// request URL, and the body's byte LENGTH — mirroring the token-endpoint paths in
-/// [`HttpClient::exchange_credential_for_token`], which have withheld the body since the SEC-fix
-/// series. This costs parse-failure debuggability; operators who need the payload can capture it at
-/// the HTTP layer (a proxy or a `reqwest` middleware), where the exposure is a deliberate choice
-/// rather than an unconditional log write.
-///
-/// SEC-001 — the `source` channel is closed too, and it is closed by SANITIZING rather than by
-/// dropping the chain. The earlier fix kept `.with_source(e)` on the raw `serde_json::Error`, which
-/// left a second, unbounded copy of the body reachable: `iceberg::Error` renders its source
-/// VERBATIM in both `Display` and `Debug`, and `serde`'s message echoes the value at the failure
-/// position — an entire sub-document when the mismatch is at a container boundary. The source is
-/// now a [`SanitizedJsonError`], which carries the failure category and line/column and nothing
-/// derived from the body; see that type for why a structural reduction is preferred over scrubbing
-/// serde's free text.
-///
-/// All three shapes are pinned in `catalog.rs`: the scalar-mismatch shape by
-/// `test_config_parse_failure_does_not_leak_body` /
-/// `test_load_table_parse_failure_does_not_leak_vended_credentials`, and the container-boundary
-/// (double-encoded) shape by `test_double_encoded_body_does_not_leak_through_error_source` — the
-/// inverted form of the former known-residue pin, which asserted the leak.
+/// Deserializes a catalog response into the given [`DeserializedOwned`] type. # Errors Fails when
+/// the response bytes do not parse. # Notes This is the 2xx path, so the bytes carry credentials.
 pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
     response: Response,
 ) -> Result<R> {
@@ -790,41 +616,10 @@ fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> Stri
     format!("{redacted:?}")
 }
 
-/// Deserializes a unexpected catalog response into an error.
-///
-/// SEC-010 scope note: unlike [`deserialize_catalog_response`], this is the NON-2xx path, and it
-/// deliberately still attaches the body. The exposure here is NOT symmetric with the success path,
-/// and both directions must be stated:
-///
-/// * RESPONSE direction — safe. A non-2xx means the request FAILED, so no table was loaded and
-///   neither a `config` overlay nor vended `storage-credentials` were issued. The server has no
-///   credential to hand back.
-/// * REQUEST-ECHO direction — NOT credential-free. This function is the fallthrough for the WRITE
-///   routes (`create_table`, `create_namespace`, `update_namespace_properties`, `create_view`),
-///   whose request types carry operator property maps — the very maps redacted in `types.rs`
-///   precisely because they can hold credentials. A validation failure that echoes the offending
-///   request back in its error payload (a common server pattern) therefore puts those submitted
-///   values into this error context.
-///
-/// The body is nonetheless retained rather than withheld: it is an `ErrorResponse` whose `message`
-/// is the whole diagnostic value, and Java surfaces exactly this to the caller (`ErrorHandlers`
-/// parse the payload and rethrow `ErrorResponse.message`), so dropping it would cost real
-/// debuggability and diverge from Java. The one non-2xx body that reliably carries submitted
-/// credentials — the token endpoint's — is handled separately in
-/// [`HttpClient::exchange_credential_for_token`], which withholds it entirely.
-///
-/// SEC-009 — what changed: the body is no longer attached RAW. It goes through
-/// [`redacted_response_body`], which re-emits the JSON with every secret-keyed value masked per
-/// [`is_secret_prop_key`], and withholds a non-JSON body (which cannot be key-redacted) down to its
-/// byte length. That closes the request-echo direction — the property maps `types.rs` already masks
-/// in `Debug` are now masked here too — while keeping `message`, `type`, `code` and the rest of the
-/// diagnostic shape intact.
-///
-/// RESIDUE: key-based redaction cannot mask a secret a server splices into FREE TEXT (an
-/// `ErrorResponse.message` reading `invalid property s3.secret-access-key=AKIA…`). That channel is
-/// the `ErrorModel`/`ErrorResponse` residue already named in the `types.rs` redaction banner: the
-/// content is the server's to choose, `From<ErrorModel> for Error` surfaces it verbatim, and the
-/// exposure is parity-shared with Java.
+/// Deserializes a unexpected catalog response into an error. # Notes Unlike
+/// [`deserialize_catalog_response`] this non-2xx path keeps the body, because Java surfaces
+/// `ErrorResponse.message` to the caller. [`redacted_response_body`] masks every secret-keyed value
+/// first: a write route can echo the submitted property map back.
 pub(crate) async fn deserialize_unexpected_catalog_error(
     response: Response,
     disable_header_redaction: bool,
@@ -854,16 +649,10 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
 mod tests {
     use super::*;
 
-    /// SECURITY (SEC-001), unit level: pins that the sanitized source DROPS `serde_json`'s message
-    /// — the only part of a parse error whose content comes from the response body — while keeping
-    /// the failure category and position that make the error actionable.
-    ///
-    /// The precondition assertion is the load-bearing half: it proves `serde` really does echo the
-    /// whole sub-document at a container boundary, so the test cannot pass vacuously against a
-    /// shape that never leaked.
-    ///
-    /// MUTATION: render `error.to_string()` from `SanitizedJsonError::new` (i.e. keep serde's
-    /// message) → RED.
+    /// Pins that the sanitized source drops `serde_json`'s message but keeps the category and
+    /// position. The precondition assertion proves `serde` does echo the whole sub-document at a
+    /// container boundary, so the test cannot pass vacuously. Discriminates the mutation that
+    /// renders `error.to_string()` inside `SanitizedJsonError::new`.
     #[test]
     fn test_sanitized_json_error_withholds_the_serde_message() {
         const SENTINEL: &str = "SENTINEL_INSIDE_A_DOUBLE_ENCODED_SUBDOCUMENT";
@@ -928,13 +717,9 @@ mod tests {
         assert_eq!(SanitizedJsonError::new(&data).category, "data");
     }
 
-    /// SECURITY (SEC-009), unit level: a non-2xx body is key-redacted, not dropped. The secret
-    /// VALUE is masked wherever it sits — including nested inside arrays, the shape the vended
-    /// `storage-credentials` list uses — while the server's diagnostic message, the secret KEY and
-    /// every non-secret value survive.
-    ///
-    /// MUTATION: return `String::from_utf8_lossy(bytes).to_string()` from
-    /// `redacted_response_body` → RED.
+    /// A non-2xx body is key-redacted, not dropped. The secret value is masked wherever it sits,
+    /// arrays included, while the message, the key and every non-secret value survive.
+    /// Discriminates returning `String::from_utf8_lossy(bytes)` from `redacted_response_body`.
     #[test]
     fn test_redacted_response_body_masks_secret_keys_only() {
         const SENTINEL: &str = "SENTINEL_ECHOED_PROPERTY_VALUE";
@@ -998,14 +783,9 @@ mod tests {
         );
     }
 
-    /// AGENTS.md recursion safety: the redaction walk runs over a SERVER-supplied document, so it
-    /// carries an explicit depth cap and a too-deep subtree is replaced wholesale (fail-closed —
-    /// nothing below the cap is rendered).
-    ///
-    /// The sentinel sits under a NON-secret key, so only the depth cap can remove it; a
-    /// key-redaction-only implementation would leak it.
-    ///
-    /// MUTATION: remove the `depth >= MAX_BODY_REDACTION_DEPTH` guard → RED.
+    /// The redaction walk runs over a server-supplied document, so a too-deep subtree is
+    /// replaced wholesale. The sentinel sits under a non-secret key, so only the depth cap can
+    /// remove it. Discriminates removing the `depth >= MAX_BODY_REDACTION_DEPTH` guard.
     #[test]
     fn test_redact_secret_values_is_depth_bounded() {
         const SENTINEL: &str = "SENTINEL_BELOW_THE_NESTING_CAP";
@@ -1039,11 +819,9 @@ mod tests {
         );
     }
 
-    /// Risk (GAP_MATRIX row R157): a NEVER-SENT transport failure (connection refused — the TCP
-    /// connection was never established, so the commit request cannot have reached the service)
-    /// is classified as unknown-outcome, sending the caller into needless commit reconciliation
-    /// on every transient connectivity blip. Pins the sent-vs-unsent split's UNSENT side with a
-    /// real reqwest connect error.
+    /// A refused connection never reached the service, so it must not read as unknown-outcome,
+    /// or every connectivity blip sends the caller into commit reconciliation (row R157).
+    /// Pins the unsent side of the split with a real reqwest connect error.
     #[tokio::test]
     async fn test_connect_refused_commit_failure_is_not_post_send() {
         // Bind to an ephemeral port, then drop the listener: connecting to it is refused.
@@ -1071,11 +849,9 @@ mod tests {
         );
     }
 
-    /// Risk (GAP_MATRIX row R157): a connection reset AFTER the commit request was written —
-    /// the server read the request and died before responding, so the commit MAY have durably
-    /// landed — is classified as never-sent/terminal, letting a caller (or an outer loop)
-    /// re-run the commit and duplicate its changes. Pins the sent-vs-unsent split's SENT side
-    /// with a real mid-exchange connection drop.
+    /// A reset after the request was written may still have landed the commit, so it must not
+    /// read as terminal, or a caller re-runs it and duplicates the changes (row R157).
+    /// Pins the sent side of the split with a real mid-exchange connection drop.
     #[tokio::test]
     async fn test_connection_reset_after_send_is_post_send_ambiguous() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1265,12 +1041,9 @@ mod tests {
         assert!(!result.contains("[REDACTED]"));
     }
 
-    /// Risk (SEC-008): `HttpClient`'s `Debug` prints `extra_headers`, which carries any
-    /// `header.*`-configured request headers — including auth headers like `header.authorization`.
-    /// A raw `HeaderMap` dump leaks those secret VALUES into any `{:?}`/`tracing` of the client
-    /// (or a struct embedding it). Pins that a sensitive header value is redacted while the header
-    /// NAME stays visible, and a non-sensitive header keeps its value. Mutation: revert the Debug
-    /// impl to `.field("extra_headers", &self.extra_headers)` → RED.
+    /// `HttpClient`'s `Debug` prints `extra_headers`, which can carry auth headers. Pins that a
+    /// sensitive value is redacted, its name stays visible, and other values survive.
+    /// Discriminates reverting to `.field("extra_headers", &self.extra_headers)`.
     #[tokio::test]
     async fn test_http_client_debug_redacts_sensitive_extra_header() {
         const HEADER_SECRET: &str = "SUPER_SECRET_AUTH_HEADER_DO_NOT_LEAK";
@@ -1316,9 +1089,7 @@ mod tests {
         );
     }
 
-    // ========================================================================
     // GAP_MATRIX R159 — automatic OAuth token refresh (lazy refresh-before-use)
-    // ========================================================================
 
     use std::sync::Arc;
 
@@ -1378,11 +1149,9 @@ mod tests {
             .map(str::to_string)
     }
 
-    /// Pins that the refresh instant reproduces Java `OAuth2Util$AuthSession.scheduleTokenRefresh`
-    /// (`refreshWindow = min(ttl/10, 5min)`, `wait = max(ttl - refreshWindow, 10ms)`) and that a
-    /// missing `expires_in` yields NO refresh instant (Java schedules none). Mutation: changing the
-    /// window formula (e.g. dropping the `min(_, MAX_REFRESH_WINDOW_MILLIS)` cap) shifts these
-    /// instants → RED.
+    /// Pins the refresh instant against Java `OAuth2Util$AuthSession.scheduleTokenRefresh`, and
+    /// pins that a missing `expires_in` schedules no refresh. Discriminates dropping the
+    /// `min(_, MAX_REFRESH_WINDOW_MILLIS)` cap.
     #[test]
     fn test_refresh_at_matches_java_schedule_rule() {
         let now = Instant::now();
@@ -1431,11 +1200,9 @@ mod tests {
         );
     }
 
-    /// Single-flight pin: N concurrent requests that all observe a token inside its refresh window
-    /// trigger EXACTLY ONE token-endpoint exchange, and every request ends up with the refreshed
-    /// token. Mutation A (drop the `refresh_gate` in `obtain_token_single_flight`) → the stampede
-    /// hits the endpoint N times → the `expect(1)` mock assertion goes RED. Mutation B (disable the
-    /// `is_due_for_refresh` check) → zero refreshes → the `Bearer refreshed` assertion goes RED.
+    /// N concurrent requests inside the refresh window trigger exactly one exchange, and all of
+    /// them get the refreshed token. Discriminates two mutations: dropping the `refresh_gate`
+    /// makes the mock see N requests, and disabling `is_due_for_refresh` makes it see none.
     #[tokio::test]
     async fn test_near_expiry_single_flight_refresh_under_concurrency() {
         let mut server = Server::new_async().await;
@@ -1539,11 +1306,9 @@ mod tests {
         mock.assert_async().await; // exactly one (the initial fetch)
     }
 
-    /// Refresh FAILURE is suppressed and the previously cached token is kept (Java runs the refresh
-    /// under `Tasks…suppressFailureWhenFinished()` and keeps the old token on exhausted retries).
-    /// The in-flight request must NOT error; it proceeds with the prior token. Mutation: propagating
-    /// the refresh error instead of falling back would make `authenticate` return `Err` → the
-    /// `expect("authenticate must succeed")` in `authenticated_bearer` goes RED.
+    /// A refresh failure is suppressed and the cached token is kept, as Java's
+    /// `suppressFailureWhenFinished` refresh does. The in-flight request proceeds.
+    /// Discriminates propagating the refresh error, which makes `authenticate` return `Err`.
     #[tokio::test]
     async fn test_refresh_failure_keeps_previous_token() {
         let mut server = Server::new_async().await;
@@ -1598,7 +1363,6 @@ mod tests {
         mock.assert_async().await;
     }
 
-    // ========================================================================
     // SEC-001 — the TOKEN endpoint's two parse sites, end to end
     //
     // `test_sanitized_json_error_withholds_the_serde_message` above pins the adapter, and
@@ -1607,7 +1371,6 @@ mod tests {
     // non-2xx arms inside `exchange_credential_for_token` — which are the highest-value payload
     // in the crate: the 200-OK body IS the document carrying `access_token`. They reuse the
     // `refresh_client` helper above to aim the client's token endpoint at a mock server.
-    // ========================================================================
 
     /// The shared shape both arms below exercise: an API gateway that stringifies the body, so the
     /// document arrives DOUBLE-ENCODED and the type mismatch lands at the STRUCT boundary. `serde`
@@ -1648,12 +1411,9 @@ mod tests {
         );
     }
 
-    /// SECURITY (SEC-001), 200-OK arm: a 200 body that fails to deserialize into `TokenResponse` at
-    /// a container boundary makes `serde` echo the whole document — here the one holding
-    /// `access_token`. Nothing of it may reach the caller's error.
-    ///
-    /// MUTATION: in `exchange_credential_for_token`'s 200-OK arm, `.with_source(SanitizedJsonError
-    /// ::new(&e))` → `.with_source(e)` → RED.
+    /// A 200 body that fails to deserialize at a container boundary makes `serde` echo the whole
+    /// document, here the one holding `access_token`. Discriminates replacing
+    /// `.with_source(SanitizedJsonError::new(&e))` with `.with_source(e)` in the 200-OK arm.
     #[tokio::test]
     async fn test_token_endpoint_ok_body_does_not_leak_through_error_source() {
         const SENTINEL: &str = "SENTINEL_OAUTH_ACCESS_TOKEN_VALUE";
@@ -1687,12 +1447,9 @@ mod tests {
         mock.assert_async().await;
     }
 
-    /// SECURITY (SEC-001), non-2xx arm: the token endpoint's error body can echo submitted
-    /// credentials or a partial grant. When it fails to deserialize into `ErrorResponse`, the same
-    /// container-boundary echo applies and must be sanitized too.
-    ///
-    /// MUTATION: in `exchange_credential_for_token`'s non-2xx arm, `.with_source(SanitizedJsonError
-    /// ::new(&e))` → `.with_source(e)` → RED.
+    /// The token endpoint's error body can echo the submitted credential, and the same
+    /// container-boundary echo applies. Discriminates replacing
+    /// `.with_source(SanitizedJsonError::new(&e))` with `.with_source(e)` in the non-2xx arm.
     #[tokio::test]
     async fn test_token_endpoint_error_body_does_not_leak_through_error_source() {
         const SENTINEL: &str = "SENTINEL_ECHOED_CLIENT_SECRET";

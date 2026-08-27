@@ -43,8 +43,7 @@ use utils::from_opendal_error;
 
 /// Per-operator concurrent request cap applied once when an Operator is first cached.
 ///
-/// Each cached Operator gets its own [`ConcurrentLimitLayer`] (independent semaphore).
-/// Chosen as a conservative default; not a global process-wide limit.
+/// Each cached Operator owns its semaphore, so this is not a process-wide limit.
 const OPERATOR_CONCURRENT_LIMIT: usize = 64;
 
 /// Parse [`CLIENT_LIST_STAT_CONCURRENCY`] from FileIO props.
@@ -63,11 +62,8 @@ fn parse_list_stat_concurrency(props: &HashMap<String, String>) -> usize {
 
 /// Convert OpenDAL [`opendal::Buffer`] to contiguous [`Bytes`].
 ///
-/// Prefers the zero-copy path: [`opendal::Buffer::to_bytes`] clones the inner
-/// `Bytes` when the buffer is already contiguous (or a single part). Multi-part
-/// non-contiguous buffers must consolidate into one `Bytes` — unavoidable for
-/// the Iceberg `FileRead` / `Storage::read` API, which returns a single
-/// contiguous buffer.
+/// [`opendal::Buffer::to_bytes`] is zero-copy for a contiguous buffer. A multi-part buffer must
+/// consolidate, because the Iceberg `FileRead` API returns one contiguous buffer.
 #[inline]
 fn buffer_to_bytes(buf: opendal::Buffer) -> Bytes {
     buf.to_bytes()
@@ -100,8 +96,7 @@ fn list_stat_task(
 
 /// Run `stat` for incomplete list entries with a bounded concurrency window.
 ///
-/// Results are applied into `ready_meta[slot_idx]`. Order of the parent list is
-/// preserved by slot index (not by completion order).
+/// The slot index preserves the parent list order, not the completion order.
 async fn stat_incomplete_list_entries(
     op: &Operator,
     need_stat: &[(usize, String)],
@@ -113,10 +108,9 @@ async fn stat_incomplete_list_entries(
     }
     let concurrency = concurrency.max(1);
     let mut tasks = ConcurrentTasks::new(Executor::new(), concurrency, concurrency, list_stat_task);
-    // Fail-closed: any stat error fails the whole list. OpenDAL's RetryLayer on
-    // the Operator already retried transport blips; do **not** outer-loop on
-    // `is_temporary` here — ConcurrentTasks re-queues temporary failures and an
-    // unbounded continue would hang orphan/GC list forever (C1-Q-001 / C1-L-001).
+    // Fail-closed: any stat error fails the whole list. The Operator `RetryLayer` already
+    // retried transport blips. Never outer-loop on `is_temporary` here: `ConcurrentTasks`
+    // re-queues temporary failures, so an unbounded continue hangs the list forever.
     for &(slot_idx, ref path) in need_stat {
         tasks
             .execute((op.clone(), path.clone(), slot_idx))
@@ -143,9 +137,7 @@ async fn stat_incomplete_list_entries(
 
 /// Apply transport layers once at Operator construction / cache insertion.
 ///
-/// Layers are **not** re-applied on cache hits — stacking `RetryLayer` on every
-/// `create_operator` call would multiply retries and allocate a new Operator wrapper
-/// per I/O.
+/// Never re-apply on a cache hit: a stacked `RetryLayer` multiplies retries.
 fn finish_operator(op: Operator) -> Operator {
     op.layer(RetryLayer::new())
         .layer(ConcurrentLimitLayer::new(OPERATOR_CONCURRENT_LIMIT))
@@ -154,15 +146,9 @@ fn finish_operator(op: Operator) -> Operator {
 /// Thread-safe cache of finished OpenDAL [`Operator`]s, keyed by backend name
 /// (S3/GCS/OSS bucket, AzDLS filesystem, or a fixed key for FS / Memory).
 ///
-/// Cloning shares the map via [`Arc`] so `OpenDalStorage` clones (e.g. per
-/// `InputFile` / `OutputFile`) reuse Operators.
-///
-/// Also carries list-path tuning ([`OperatorCache::list_stat_concurrency`]) set
-/// once at storage construction from FileIO props — every [`OpenDalStorage`]
-/// variant holds a cache, so this avoids duplicating the knob on each arm.
-///
-/// Public only because it appears on [`OpenDalStorage`] enum fields (serde +
-/// construction); the map itself is an implementation detail.
+/// Cloning shares the map through [`Arc`], so per-file `OpenDalStorage` clones reuse Operators.
+/// It also carries [`OperatorCache::list_stat_concurrency`], because every variant holds a
+/// cache. Public only because it appears on enum fields.
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct OperatorCache {
@@ -229,10 +215,8 @@ fn operator_cache_from_config(config: &StorageConfig) -> OperatorCache {
 
 /// Convert an OpenDAL last-modified timestamp into milliseconds since the Unix epoch.
 ///
-/// Mirrors how Java's object-store `FileIO` implementations populate `FileInfo.createdAtMillis`
-/// from the object's last-modified time. Converts through `std::time::SystemTime` (an
-/// infallible OpenDAL conversion) so no extra time-library dependency is needed. A timestamp at
-/// or before the epoch clamps to `0` so the reported value stays non-negative.
+/// Mirrors how Java's object-store `FileIO` fills `FileInfo.createdAtMillis`. A timestamp at or
+/// before the epoch clamps to `0`, so the reported value stays non-negative.
 fn opendal_timestamp_to_millis(timestamp: opendal::raw::Timestamp) -> i64 {
     let system_time: std::time::SystemTime = timestamp.into();
     match system_time.duration_since(std::time::UNIX_EPOCH) {
@@ -241,29 +225,16 @@ fn opendal_timestamp_to_millis(timestamp: opendal::raw::Timestamp) -> i64 {
     }
 }
 
-/// Whether list-entry metadata is complete enough to skip a per-file `stat`.
-///
-/// **Rule:** use list metadata only when the backend reported a **positive**
-/// `content_length`. OpenDAL's public `content_length()` returns `0` both when
-/// size was never set (`None`) and when the object is legitimately empty
-/// (`Some(0)`), so a zero length is **never** treated as complete — empty and
-/// unknown entries always fall back to `stat` (one HEAD; correct size 0).
-///
-/// Do **not** treat `last_modified` alone as proof of size: backends can set
-/// mtime without size (e.g. S3/OSS delete markers under `list_with_deleted`),
-/// which would otherwise be reported as empty files without `stat`.
-///
-/// Some backends (e.g. in-memory OpenDAL, local FS list) never populate list
-/// size — those paths always `stat`. Object-store LIST responses that carry a
-/// non-zero Size skip the N HEAD round-trips for real data files.
+/// Whether list-entry metadata is complete enough to skip a per-file `stat`. Trust list metadata
+/// only when `content_length` is positive. OpenDAL returns `0` both for an unset size and for a
+/// genuinely empty object, so a zero length always falls back to `stat`.
 fn list_entry_metadata_complete(meta: &opendal::Metadata) -> bool {
     !meta.is_deleted() && meta.content_length() > 0
 }
 
 /// Size + created-at millis taken from a **complete** list entry (no `stat`).
 ///
-/// Call only when [`list_entry_metadata_complete`] is true. Missing
-/// `last_modified` becomes `created_at_millis = 0`.
+/// Call only when [`list_entry_metadata_complete`] is true.
 fn file_meta_from_complete_list_entry(meta: &opendal::Metadata) -> (u64, i64) {
     let size = meta.content_length();
     let created_at_millis = meta
@@ -322,8 +293,7 @@ cfg_if! {
 
 /// OpenDAL-based storage factory.
 ///
-/// Maps scheme to the corresponding OpenDalStorage storage variant.
-/// Use this factory with `FileIOBuilder::new(factory)` to create FileIO instances.
+/// Maps a scheme to its [`OpenDalStorage`] variant. Pass it to `FileIOBuilder::new`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OpenDalStorageFactory {
     /// Memory storage factory.
@@ -472,10 +442,8 @@ pub enum OpenDalStorage {
         #[serde(skip, default)]
         operator_cache: OperatorCache,
     },
-    /// Azure Data Lake Storage variant.
-    /// Expects paths of the form
-    /// `abfs[s]://<filesystem>@<account>.dfs.<endpoint-suffix>/<path>` or
-    /// `wasb[s]://<container>@<account>.blob.<endpoint-suffix>/<path>`.
+    /// Azure Data Lake Storage variant. Expects `abfs[s]://<filesystem>@<account>.dfs.<suffix>/`
+    /// or `wasb[s]://<container>@<account>.blob.<suffix>/` paths.
     #[cfg(feature = "opendal-azdls")]
     #[allow(private_interfaces)]
     Azdls {
@@ -519,18 +487,10 @@ impl OpenDalStorage {
         }
     }
 
-    /// Creates operator from path.
+    /// Creates an operator from `path`, plus the path relative to that operator's root.
     ///
-    /// # Arguments
-    ///
-    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`](iceberg::io::FileIO).
-    ///
-    /// # Returns
-    ///
-    /// The return value consists of two parts:
-    ///
-    /// * An [`opendal::Operator`] instance used to operate on file.
-    /// * Relative path to the root uri of [`opendal::Operator`].
+    /// `path` must be absolute and start with the scheme that built the
+    /// [`FileIO`](iceberg::io::FileIO).
     #[allow(unreachable_code, unused_variables)]
     pub(crate) fn create_operator<'a>(
         &self,
@@ -584,11 +544,9 @@ impl OpenDalStorage {
                     )
                 })?;
 
-                // `s3`, `s3a`, and `s3n` are aliases of the same object store
-                // (Java `S3FileIO` parity): a location for this bucket resolves
-                // under ANY alias, regardless of which alias the storage was
-                // configured with. The relative key is stripped using the matched
-                // alias's prefix length (see `s3_relative_path`).
+                // `s3`, `s3a` and `s3n` are aliases of one object store, as in Java
+                // `S3FileIO`. A location resolves under any alias, whichever one the
+                // storage was configured with.
                 let relative_path = match s3_relative_path(path, bucket) {
                     Some(relative_path) => relative_path,
                     None => {
@@ -762,38 +720,15 @@ impl Storage for OpenDalStorage {
         Ok(op.remove_all(&path).await.map_err(from_opendal_error)?)
     }
 
-    /// Recursively list every file under `prefix`.
-    ///
-    /// # Prefix semantics: object-store / recursive
-    ///
-    /// OpenDAL's lister with `recursive(true)` walks every entry under the prefix, mirroring
-    /// Java's object-store `FileIO` implementations (which list keys under a prefix) and the
-    /// recursive `HadoopFileIO.listPrefix`. Only file entries are reported; directory markers
-    /// are skipped. The prefix is normalized to a trailing-`/` directory boundary (the same
-    /// shape `delete_prefix` removes), so a sibling key `ab2/...` is not reported for prefix
-    /// `ab`.
-    ///
-    /// # Metadata source
-    ///
-    /// Prefer size + last-modified from the list entry when
-    /// [`list_entry_metadata_complete`] (positive `content_length`, not deleted).
-    /// Only `stat` when list metadata is incomplete (zero/unknown size, or a
-    /// deleted marker). Incomplete backends (e.g. OpenDAL memory, FS list) pay
-    /// one `stat` per file; object-store LIST responses that already carry a
-    /// non-zero Size skip the N HEAD round-trips for data files. Empty objects
-    /// always `stat` so size 0 is authoritative. A file with no last-modified
-    /// is reported with `created_at_millis = 0`.
-    ///
-    /// Incomplete-entry `stat`s run concurrently with a bound of
-    /// [`CLIENT_LIST_STAT_CONCURRENCY`] (default
-    /// [`DEFAULT_LIST_STAT_CONCURRENCY`] = 16). Raising the knob amplifies HEAD
-    /// QPS and can hit object-store rate limits; the outer
-    /// [`ConcurrentLimitLayer`] (64) still caps total in-flight ops per Operator.
+    /// Recursively list every file under `prefix`, as Java `HadoopFileIO.listPrefix` does. # Notes
+    /// The prefix is normalized to a trailing `/`, so prefix `ab` never reports a sibling key
+    /// `ab2/...`. Size and last-modified come from the list entry when
+    /// [`list_entry_metadata_complete`] allows it, and from `stat` otherwise, so size 0 stays
+    /// authoritative.
     async fn list(&self, path: &str) -> Result<Vec<FileInfo>> {
         let (op, relative_path) = self.create_operator(&path)?;
-        // The base is the part of the caller-supplied `path` that precedes the
-        // operator-relative portion, so the entry's relative path can be re-prefixed back
-        // into the scheme-qualified location the caller knows.
+        // The base re-prefixes each entry back into the scheme-qualified location the
+        // caller knows.
         let base = &path[..path.len() - relative_path.len()];
 
         let list_root = if relative_path.is_empty() || relative_path.ends_with('/') {
@@ -808,9 +743,8 @@ impl Storage for OpenDalStorage {
             .await
             .map_err(from_opendal_error)?;
 
-        // Slot-oriented pass: complete list meta is ready immediately; incomplete
-        // entries collect a concurrent `stat` job keyed by slot index so order is
-        // preserved regardless of HEAD completion order.
+        // Incomplete entries queue a `stat` keyed by slot index, so the result order does
+        // not follow HEAD completion order.
         let mut locations: Vec<String> = Vec::with_capacity(entries.len());
         let mut ready_meta: Vec<Option<(u64, i64)>> = Vec::with_capacity(entries.len());
         let mut need_stat: Vec<(usize, String)> = Vec::new();
@@ -866,9 +800,8 @@ impl Storage for OpenDalStorage {
     }
 }
 
-// Newtype wrappers for opendal types to satisfy orphan rules.
-// We can't implement iceberg's FileRead/FileWrite traits directly on opendal's
-// Reader/Writer since neither trait nor type is defined in this crate.
+// Newtype wrappers, because the orphan rule forbids implementing `FileRead`/`FileWrite`
+// directly on OpenDAL types.
 
 /// Wrapper around `opendal::Reader` that implements `FileRead`.
 pub(crate) struct OpenDalReader(pub(crate) opendal::Reader);
@@ -923,10 +856,8 @@ mod tests {
         }
     }
 
-    /// Risk: the OpenDAL listing must return the exact recursive file set, with the right
-    /// scheme-qualified locations and sizes, and must never report a sibling key outside the
-    /// prefix (over-listing is over-deletion in the orphan-file action). Smoke test over the
-    /// in-memory service.
+    /// The listing must return the exact recursive file set and never a sibling key outside
+    /// the prefix. Over-listing becomes over-deletion in the orphan-file action.
     #[cfg(feature = "opendal-memory")]
     #[tokio::test]
     async fn test_opendal_memory_list_recursive_and_prefix_bounded() {
@@ -978,10 +909,8 @@ mod tests {
 
     /// Pins the list-metadata completeness rule used to skip `stat`.
     ///
-    /// OpenDAL's public `content_length()` is 0 when unset **and** when the object
-    /// is empty, so only a **positive** size is complete. Mtime alone must not
-    /// skip stat (would report size 0 for unset length). Deleted markers are
-    /// never complete.
+    /// `content_length()` is 0 both when unset and when the object is empty, so only a positive
+    /// size counts as complete. Mtime alone must not skip `stat`, and a delete marker never can.
     #[test]
     fn test_list_entry_metadata_complete_rule() {
         use opendal::{EntryMode, Metadata};
@@ -1420,10 +1349,8 @@ mod tests {
         );
     }
 
-    /// Serde skips `operator_cache` (`#[serde(skip, default)]`). Simulate the
-    /// post-deserialize state with a fresh empty cache sharing the same config:
-    /// create_operator must rebuild Operators, and clones must share that new cache
-    /// without retaining the pre-skip Operator identity.
+    /// Serde skips `operator_cache`, so a deserialized storage starts with an empty one.
+    /// `create_operator` must rebuild the Operators, and clones must share the new cache.
     #[cfg(feature = "opendal-s3")]
     #[test]
     fn test_operator_cache_empty_after_serde_skip_rebuilds() {
@@ -1734,10 +1661,8 @@ mod tests {
         );
     }
 
-    /// FK4.2 cheap 10k-key list: every incomplete entry stats; all sizes correct.
-    ///
-    /// Memory LIST never carries size, so this is an N-HEAD workload (HEAD-count = N).
-    /// Concurrent window defaults to 16; pin proves no dropped/duplicated keys under load.
+    /// Memory LIST never carries a size, so a 10k-key list stats every entry.
+    /// Pins that the bounded window drops and duplicates no key under load.
     #[cfg(feature = "opendal-memory")]
     #[tokio::test]
     async fn test_fk4_2_list_10k_keys_incomplete_stat_all_sizes() {
@@ -1955,10 +1880,8 @@ mod tests {
         );
     }
 
-    /// Risk: a wrong epoch base or a secs/millis mix-up in the OpenDAL last-modified conversion
-    /// would feed A2 nonsense timestamps. Pins the conversion at exact boundaries: epoch -> 0,
-    /// 1 ms -> 1, a pre-epoch instant clamps to 0 (never negative), and a known recent
-    /// millisecond value round-trips exactly (proving milliseconds-since-epoch, not seconds).
+    /// Pins the last-modified conversion at its boundaries: epoch to 0, 1 ms to 1, a pre-epoch
+    /// instant to 0. A recent value round-trips exactly, which discriminates a seconds mix-up.
     #[test]
     fn test_opendal_timestamp_conversion_is_exact_milliseconds_and_clamps_pre_epoch() {
         let epoch = opendal::raw::Timestamp::from_millisecond(0).unwrap();
@@ -1983,10 +1906,8 @@ mod tests {
         );
     }
 
-    /// S3 scheme aliasing (F-A2-1): `s3`/`s3a`/`s3n` are aliases of the same
-    /// storage (Java `S3FileIO` parity). Every pin builds an `OpenDalStorage::S3`
-    /// offline — a fixed region with ambient config/EC2 loads disabled — so the
-    /// opendal operator is constructed without any AWS contact.
+    /// `s3`, `s3a` and `s3n` are aliases of one storage, as in Java `S3FileIO`. Every pin
+    /// builds the storage offline, so no test makes AWS contact.
     #[cfg(feature = "opendal-s3")]
     mod s3_scheme_alias {
         use std::sync::Arc;
@@ -2127,10 +2048,8 @@ mod tests {
             );
         }
 
-        /// Element 9 (end-to-end): the Glue catalog's default FileIO factory
-        /// (`configured_scheme: "s3a"`) composes with a real `s3://` metadata
-        /// location. Proves the catalog default + canonical metadata locations now
-        /// resolve together at the single funnel every `Storage` I/O routes through.
+        /// The Glue catalog default (`s3a`) must resolve a real `s3://` metadata location,
+        /// because every `Storage` I/O funnels through this call.
         #[test]
         fn test_glue_default_factory_composes_with_s3_metadata_location() {
             // The Glue default, built through the real factory + StorageConfig path.
@@ -2143,9 +2062,8 @@ mod tests {
                 .build(&config)
                 .expect("Glue-default S3 factory must build from Glue-shaped props");
 
-            // `factory.build` yields an `Arc<dyn Storage>` (create_operator is not on
-            // the trait); the concrete store below is byte-identical to what the S3
-            // factory arm constructs, so the location is resolved on it.
+            // `create_operator` is not on the `Storage` trait, so the location resolves on
+            // the concrete store, which the S3 factory arm builds identically.
             let storage = s3_storage("s3a");
             let location = "s3://warehouse-bucket/db/tbl/metadata/00001-1a2b-uuid.metadata.json";
             let (op, relative_path) = storage

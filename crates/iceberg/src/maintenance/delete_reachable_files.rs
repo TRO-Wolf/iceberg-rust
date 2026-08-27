@@ -15,103 +15,41 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `DeleteReachableFiles` — given a table METADATA LOCATION, delete EVERY file reachable from it.
-//! That set is all snapshots' manifest lists, all manifests, all data plus position-delete plus
-//! equality-delete files plus deletion vectors, the current AND all previous `metadata.json`, the
-//! version-hint, and all statistics plus partition-statistics files. The Rust port of Java's
-//! `org.apache.iceberg.actions.DeleteReachableFiles` (api 1.10.0) /
-//! `DeleteReachableFilesSparkAction` — the action behind `DROP TABLE PURGE` — minus the Spark
-//! distribution layer.
+//! `DeleteReachableFiles` deletes every file that a table metadata location reaches. It ports Java
+//! `DeleteReachableFiles` (api 1.10.0) and `DeleteReachableFilesSparkAction`, the action behind
+//! `DROP TABLE PURGE`.
 //!
-//! **THIS ACTION DELETES THE WHOLE TABLE.** It is the destructive COMPLEMENT of
-//! [`DeleteOrphanFiles`](crate::maintenance::DeleteOrphanFiles): orphan-deletion lists storage and
-//! removes files that *no* snapshot references (biasing toward UNDER-deletion to never touch live
-//! data); reachable-deletion removes the reachable set ITSELF — the entire on-disk footprint of the
-//! table. The two corruption classes are reversed: an OMISSION here leaks a file (an orphan left
-//! behind after the table is gone), and any path computed here that does NOT belong to the table is
-//! catastrophic over-deletion. Because the inputs are the table's own metadata (not a storage
-//! listing), the reachable set is exact: it is precisely the set the table's metadata points at.
+//! **THIS ACTION DELETES THE WHOLE TABLE.** It is the destructive complement of
+//! [`DeleteOrphanFiles`](crate::maintenance::DeleteOrphanFiles), and the corruption classes
+//! reverse. An omission here only leaks a file. Any path in the set that does not belong to the
+//! table is catastrophic over-deletion. The input is the table's own metadata, never a storage
+//! listing, so the reachable set is exact.
 //!
-//! # Java provenance and the 1.10.0 pin
+//! The set covers ALL snapshots, because a Java purge covers every snapshot. Each bucket maps 1:1
+//! to a Java `DeleteReachableFiles$Result` count:
 //!
-//! The action interface + its result shape are `iceberg-api` 1.10.0 (javap-verified):
+//! | Bucket | Contents |
+//! |---|---|
+//! | `deletedManifestListsCount` | one manifest list per snapshot |
+//! | `deletedManifestsCount` | every manifest of every snapshot |
+//! | `deletedDataFilesCount` | every `Data` entry, DELETED tombstones included |
+//! | `deletedPositionDeleteFilesCount` | every `PositionDeletes` entry, deletion vectors included |
+//! | `deletedEqualityDeleteFilesCount` | every `EqualityDeletes` entry |
+//! | `deletedOtherFilesCount` | current + previous `metadata.json`, version-hint, statistics files |
 //!
-//! - `DeleteReachableFiles` (api 1.10.0) extends `Action<DeleteReachableFiles, Result>` with
-//!   `deleteWith(Consumer<String>)`, `executeDeleteWith(ExecutorService)`, and `io(FileIO)`. The
-//!   entry point (`SparkActions.deleteReachableFiles(String metadataLocation)`) takes the metadata
-//!   LOCATION as a `String` — mirrored here as [`DeleteReachableFiles::new`]'s `&str`.
-//! - `DeleteReachableFiles$Result` (api 1.10.0, javap-verified) is the six `long` counts mirrored
-//!   1:1 by [`DeleteReachableFilesResult`]: `deletedDataFilesCount`,
-//!   `deletedEqualityDeleteFilesCount`, `deletedPositionDeleteFilesCount`, `deletedManifestsCount`,
-//!   `deletedManifestListsCount`, `deletedOtherFilesCount`.
-//! - The reachable-file universe is `ReachableFileUtil` (core 1.10.0, javap-verified) —
-//!   `metadataFileLocations(table, recursive)` (current + previous `metadata.json`),
-//!   `manifestListLocations(table)`, `statisticsFilesLocations(table)`, `versionHintLocation(table)`
-//!   — PLUS a scan of every snapshot's `allManifests` for the data/delete file paths (Java
-//!   `DeleteReachableFilesSparkAction` composes `contentFileDS ∪ manifestDS ∪ manifestListDS ∪
-//!   allReachableOtherMetadataFileDS`). The content-file walk reads EVERY manifest entry (incl.
-//!   `DELETED` tombstones) of EVERY snapshot — a tombstoned file is still a physical file the table
-//!   wrote, so it is reachable and must be deleted.
+//! A tombstoned file is still a physical file the table wrote, so the walk reads every manifest
+//! entry, not the live entries alone. A count is the size of the planned set, not of the delete
+//! outcome, as in Java. `TableMetadata::metadata_log()` already holds the whole previous-metadata
+//! chain, so iterating it is Java's recursive `metadataFileLocations(table, true)` walk.
 //!
-//! The action CLASS itself lives in the Spark module (no 1.10.0 Spark bytecode is available
-//! locally), so the categorization-into-counts and the metadata-location entry shape are pinned to
-//! the tagless `DeleteReachableFilesSparkAction.java` MAIN source; every load-bearing helper it
-//! delegates to (above) is the bytecode-verified `iceberg-core` / `iceberg-api` 1.10.0 surface. This
-//! mirrors [`DeleteOrphanFiles`](crate::maintenance::DeleteOrphanFiles)'s provenance split exactly.
+//! Java deletes under `suppressFailureWhenFinished()` and logs each per-file failure. This port
+//! collects them in [`DeleteReachableFilesResult::delete_failures`], because the crate has no
+//! logging facade and a silent swallow is unacceptable for a deletion sweep. A planning-stage
+//! failure returns `Err` before any deletion, so a read error cannot strand a half-deleted table.
 //!
-//! # The reachable set (Java `ReachableFileUtil` + the `allManifests` content scan)
-//!
-//! Collected across **ALL** snapshots (Java purge covers every snapshot, not just the current one):
-//!
-//! 1. **Manifest lists** — one per snapshot (`snapshot.manifest_list()` /
-//!    `ReachableFileUtil.manifestListLocations`).
-//! 2. **Manifests** — every manifest of every snapshot (the manifest-list entries).
-//! 3. **Data files** — every `Data`-content manifest entry of every snapshot, incl. DELETED
-//!    tombstones.
-//! 4. **Position-delete files + deletion vectors** — every `PositionDeletes`-content manifest entry
-//!    (a Puffin DV is `PositionDeletes` content; Java's count folds DVs into the position-delete
-//!    bucket — the count is content-type-keyed, not format-keyed).
-//! 5. **Equality-delete files** — every `EqualityDeletes`-content manifest entry.
-//! 6. **"Other" metadata** — the current `metadata.json` (the entry-point location), all PREVIOUS
-//!    `metadata.json` files (the metadata-log entries — Java `metadataFileLocations(table, true)`),
-//!    the version-hint location, and every statistics + partition-statistics file. Java's
-//!    `deletedOtherFilesCount` is this bucket.
-//!
-//! `metadataFileLocations(table, recursive=true)` walks the previous-metadata chain transitively; in
-//! this fork `TableMetadata::metadata_log()` already holds the full previous-files list (the
-//! recursion is pre-materialized by the metadata writer), so iterating it is the recursive walk.
-//!
-//! # Categorization → the six Java counts
-//!
-//! Each reachable file is bucketed exactly once (a `HashSet` per bucket dedups; a path appearing in
-//! two snapshots' manifests is one file, one deletion, one count). The buckets map 1:1 to the Java
-//! `Result` counts. A delete failure does NOT decrement a count — Java counts the files it
-//! IDENTIFIED for deletion (the count is the size of the reachable set), and per-file delete
-//! failures are collected separately (the [`DeleteReachableFiles`] failure posture below), matching
-//! the [`DeleteOrphanFiles`] posture.
-//!
-//! # Failure posture (Java parity)
-//!
-//! Java's `DeleteReachableFilesSparkAction` deletes via
-//! `Tasks.foreach(...).suppressFailureWhenFinished()` — a per-file delete failure is logged and the
-//! sweep continues; the returned counts come from the planned reachable set, not the delete outcome.
-//! This port mirrors that: per-file delete failures are **collected** in
-//! [`DeleteReachableFilesResult::delete_failures`] (the `iceberg` crate has no logging facade, and
-//! silent swallowing is unacceptable for a deletion sweep) and the sweep continues; the six counts
-//! always reflect the full reachable set.
-//!
-//! A **planning-stage** failure (an unreadable `metadata.json`, manifest list, or manifest) returns
-//! `Err` BEFORE any deletion — the reachable set is computed in full first, so a read error can
-//! never strand a half-deleted table.
-//!
-//! # Deferred (loudly)
-//!
-//! - **Executor parallelism** (Java `executeDeleteWith(ExecutorService)`): the sweep is SEQUENTIAL.
-//! - **Bulk deletes** (`SupportsBulkOperations.deleteFiles`): the fork's [`FileIO`] has no bulk
-//!   surface; deletes go one-by-one.
-//! - **A `gc.enabled` gate:** Java's `DeleteReachableFiles` does NOT gate on `gc.enabled` (unlike
-//!   `DeleteOrphanFiles`) — `DROP TABLE PURGE` removes a table the operator is explicitly dropping —
-//!   so this port has no GC gate either.
+//! The sweep is sequential: [`FileIO`] has no bulk-delete surface, and there is no port of
+//! `executeDeleteWith(ExecutorService)`. Java does not gate this action on `gc.enabled`, unlike
+//! `DeleteOrphanFiles`, so this port has no GC gate either.
 
 use std::collections::HashSet;
 
@@ -123,42 +61,34 @@ use crate::spec::{DataContentType, TableMetadata};
 use crate::table::Table;
 use crate::{Error, TableIdent};
 
-/// The injected delete function (Java `deleteWith(Consumer<String>)`): receives a file location,
-/// resolves to a deletion outcome. The default deletes through [`FileIO::delete`].
+/// The injected delete function (Java `deleteWith`). The default deletes through [`FileIO::delete`].
 pub type ReachableDeleteFunction = dyn Fn(String) -> BoxFuture<'static, Result<()>> + Send + Sync;
 
-/// The six removed-file counts of a [`DeleteReachableFiles::execute`] sweep — a 1:1 mirror of Java's
-/// `DeleteReachableFiles$Result` (api 1.10.0, javap-verified): six `long` accessors.
+/// The six removed-file counts of a sweep. It mirrors Java `DeleteReachableFiles$Result` (1.10.0).
 ///
-/// Each count is the SIZE of its reachable-file bucket (the files identified for deletion), NOT the
-/// number successfully deleted — Java derives the counts from the planned set and logs-and-continues
-/// on per-file delete failure (collected here in [`Self::delete_failures`]).
+/// Each count is the size of its bucket: the files identified for deletion, not the files deleted.
+/// [`Self::delete_failures`] carries the per-file failures.
 #[derive(Debug, Default)]
 pub struct DeleteReachableFilesResult {
-    /// Java `deletedDataFilesCount()` — every `Data`-content file of every snapshot.
+    /// Java `deletedDataFilesCount()`. Every `Data`-content file of every snapshot.
     pub deleted_data_files_count: u64,
-    /// Java `deletedEqualityDeleteFilesCount()` — every `EqualityDeletes`-content file.
+    /// Java `deletedEqualityDeleteFilesCount()`. Every `EqualityDeletes`-content file.
     pub deleted_equality_delete_files_count: u64,
-    /// Java `deletedPositionDeleteFilesCount()` — every `PositionDeletes`-content file (incl.
-    /// deletion vectors, which are `PositionDeletes` content regardless of Puffin format).
+    /// Java `deletedPositionDeleteFilesCount()`. Every `PositionDeletes` file, deletion vectors too.
     pub deleted_position_delete_files_count: u64,
-    /// Java `deletedManifestsCount()` — every manifest of every snapshot.
+    /// Java `deletedManifestsCount()`. Every manifest of every snapshot.
     pub deleted_manifests_count: u64,
-    /// Java `deletedManifestListsCount()` — every snapshot's manifest list.
+    /// Java `deletedManifestListsCount()`. Every snapshot's manifest list.
     pub deleted_manifest_lists_count: u64,
-    /// Java `deletedOtherFilesCount()` — current + previous `metadata.json`, version-hint, and all
-    /// statistics + partition-statistics files.
+    /// Java `deletedOtherFilesCount()`. Metadata files, the version-hint, and statistics files.
     pub deleted_other_files_count: u64,
-    /// Per-file delete failures collected during the sweep (Java logs-and-continues; this port
-    /// collects). Empty means every reachable file deleted cleanly. NOT part of the Java `Result`
-    /// (Java's logging facade has no equivalent), but the counts above DO match Java regardless of
-    /// these (the counts are the planned-set sizes).
+    /// Per-file delete failures. Empty means every reachable file was deleted. Java has no such
+    /// field, and the counts above still match Java, because a count is a planned-set size.
     pub delete_failures: Vec<ReachableDeleteFailure>,
 }
 
 impl DeleteReachableFilesResult {
-    /// The total reachable-file count (the sum of the six buckets) — the number of files the action
-    /// identified for deletion. Convenience for delete-completeness assertions.
+    /// The sum of the six buckets: the files the action identified for deletion.
     pub fn total_deleted_files_count(&self) -> u64 {
         self.deleted_data_files_count
             + self.deleted_equality_delete_files_count
@@ -169,7 +99,7 @@ impl DeleteReachableFilesResult {
     }
 }
 
-/// One collected, non-aborting delete failure (the Rust replacement for Java's log-and-continue).
+/// One collected delete failure. It does not abort the sweep.
 #[derive(Debug)]
 pub struct ReachableDeleteFailure {
     /// The reachable file whose deletion failed.
@@ -178,8 +108,8 @@ pub struct ReachableDeleteFailure {
     pub error: Error,
 }
 
-/// The categorized reachable-file set: one bucket per Java `Result` count. Each bucket is a
-/// `HashSet` so a file referenced by multiple snapshots is one entry (one deletion, one count).
+/// The reachable-file set, one bucket per Java `Result` count. The `HashSet` keeps a file that
+/// several snapshots share to one entry, one deletion, and one count.
 #[derive(Debug, Default)]
 struct ReachableFiles {
     data_files: HashSet<String>,
@@ -191,7 +121,7 @@ struct ReachableFiles {
 }
 
 impl ReachableFiles {
-    /// Every reachable path across all buckets, deterministically sorted (for the sweep + for tests).
+    /// Every reachable path across all buckets, sorted for a deterministic sweep.
     fn all_sorted(&self) -> Vec<String> {
         let mut all: Vec<String> = self
             .data_files
@@ -208,7 +138,7 @@ impl ReachableFiles {
         all
     }
 
-    /// The result counts derived from the bucket sizes (Java's `Result` counts).
+    /// The result counts, derived from the bucket sizes.
     fn counts(&self) -> DeleteReachableFilesResult {
         DeleteReachableFilesResult {
             deleted_data_files_count: self.data_files.len() as u64,
@@ -222,14 +152,10 @@ impl ReachableFiles {
     }
 }
 
-/// An action that deletes EVERY file reachable from a table metadata location (the Rust port of
-/// Java's `DeleteReachableFiles` — the engine behind `DROP TABLE PURGE`). See the module docs for
-/// the reachable set, the Java provenance, and the failure posture.
+/// An action that deletes every file reachable from a table metadata location.
 ///
-/// **This action deletes the whole table.** Build it with [`DeleteReachableFiles::new`] (passing the
-/// `metadata.json` LOCATION, matching Java's `String` arg), optionally override the
-/// [`FileIO`](Self::io) or the [`delete function`](Self::delete_with), and run it with
-/// [`Self::execute`].
+/// **This action deletes the whole table.** Build it with [`DeleteReachableFiles::new`] and run it
+/// with [`Self::execute`]. The module docs hold the reachable set and the failure posture.
 pub struct DeleteReachableFiles {
     metadata_location: String,
     file_io: Option<FileIO>,
@@ -237,13 +163,8 @@ pub struct DeleteReachableFiles {
 }
 
 impl DeleteReachableFiles {
-    /// Create a `DeleteReachableFiles` action for the table whose current metadata is at
-    /// `metadata_location` (Java `SparkActions.deleteReachableFiles(String metadataLocation)`).
-    ///
-    /// The `FileIO` defaults to a local-filesystem `FileIO` ([`FileIO::new_with_fs`]); set a
-    /// different one with [`Self::io`] (Java's required `io(FileIO)` — for non-local storage the
-    /// caller MUST supply the table's `FileIO`). The delete function defaults to
-    /// [`FileIO::delete`]; override it with [`Self::delete_with`] (Java `deleteWith`).
+    /// Creates the action for the table whose current metadata is at `metadata_location`. The
+    /// `FileIO` defaults to [`FileIO::new_with_fs`], so non-local storage needs [`Self::io`].
     pub fn new(metadata_location: impl Into<String>) -> Self {
         DeleteReachableFiles {
             metadata_location: metadata_location.into(),
@@ -252,16 +173,14 @@ impl DeleteReachableFiles {
         }
     }
 
-    /// Set the [`FileIO`] used to read the metadata + delete files (Java `io(FileIO)`). REQUIRED for
-    /// any non-local-filesystem storage; the default is a local-FS `FileIO`.
+    /// Sets the [`FileIO`] that reads the metadata and deletes the files (Java `io(FileIO)`).
     pub fn io(mut self, file_io: FileIO) -> Self {
         self.file_io = Some(file_io);
         self
     }
 
-    /// Replace the delete function (Java `deleteWith(Consumer<String>)`). The default deletes
-    /// through [`FileIO::delete`]. A custom function receives exactly the reachable set (e.g. to
-    /// collect the set without deleting, or route deletions through an external queue).
+    /// Replaces the delete function. It receives exactly the reachable set, so a caller can collect
+    /// that set without deleting anything.
     pub fn delete_with(
         mut self,
         delete_function: impl Fn(String) -> BoxFuture<'static, Result<()>> + Send + Sync + 'static,
@@ -270,23 +189,21 @@ impl DeleteReachableFiles {
         self
     }
 
-    /// Run the action: compute the full reachable set across all snapshots, then delete every file.
-    /// See the module docs for the reachable set and the failure posture.
+    /// Computes the reachable set across all snapshots, then deletes every file in it.
     ///
-    /// Returns `Err` WITHOUT deleting anything when the metadata, a manifest list, or a manifest
-    /// cannot be read during planning. Per-file delete failures are collected in the returned
-    /// [`DeleteReachableFilesResult`]; the six counts always reflect the full reachable set.
+    /// # Errors
+    ///
+    /// Returns `Err` without deleting anything if planning cannot read the metadata, a manifest
+    /// list, or a manifest. Per-file delete failures instead land in the returned result.
     pub async fn execute(self) -> Result<DeleteReachableFilesResult> {
         let file_io = self.resolve_file_io();
 
-        // Load the table from its metadata location (Java's String arg shape) as a read-only static
-        // table — the reachable walk reads metadata only, no catalog binding.
+        // The walk reads metadata only, so the table is read-only and binds no catalog.
         let metadata = TableMetadata::read_from(&file_io, &self.metadata_location).await?;
         let table = Table::builder()
             .metadata(metadata)
             .metadata_location(self.metadata_location.clone())
-            // A synthetic read-only identity (the action never binds a catalog; the walk reads
-            // metadata only). `TableIdent` requires a non-empty namespace, hence the two components.
+            // A synthetic identity: `TableIdent` rejects an empty namespace, so it needs two parts.
             .identifier(
                 TableIdent::from_strs(["delete_reachable_files", "table"]).map_err(|error| {
                     error.with_context(
@@ -299,11 +216,9 @@ impl DeleteReachableFiles {
             .readonly(true)
             .build()?;
 
-        // 1. The full reachable set across ALL snapshots + metadata (read-only; aborts before any
-        //    deletion on a read error).
+        // A read error here aborts before any file is deleted.
         let reachable = collect_reachable_files(&table).await?;
 
-        // 2. Delete every reachable file (collecting per-file failures), then report the counts.
         let mut result = reachable.counts();
         for path in reachable.all_sorted() {
             let outcome = match &self.delete_function {
@@ -319,31 +234,23 @@ impl DeleteReachableFiles {
         Ok(result)
     }
 
-    /// The configured [`FileIO`], or a local-filesystem default (Java requires `io(FileIO)`; the
-    /// default here mirrors `DeleteOrphanFiles`/`StaticTable`'s local-FS convenience).
+    /// The configured [`FileIO`], or the local-filesystem default that `StaticTable` also uses.
     fn resolve_file_io(&self) -> FileIO {
         self.file_io.clone().unwrap_or_else(FileIO::new_with_fs)
     }
 }
 
-/// Build the categorized reachable-file set for `table` across ALL snapshots (Java's
-/// `ReachableFileUtil` set ∪ the `allManifests` content scan). Shares the SAME walk shape as
-/// [`DeleteOrphanFiles`](crate::maintenance::DeleteOrphanFiles)'s `collect_valid_files` (manifest
-/// lists → manifests → entries; + current/previous metadata.json, version-hint, statistics), but
-/// keeps the files CATEGORIZED so the six Java `Result` counts can be derived. The orphan collector
-/// returns a flat set (it only needs membership); this one needs per-bucket sizes — hence a separate
-/// categorizing collector rather than reusing the flat one (the orphan walk is intentionally left
-/// untouched).
+/// Builds the categorized reachable-file set for `table` across all snapshots.
 ///
-/// A manifest-list or manifest read failure aborts with `Err` BEFORE any deletion (this runs inside
-/// [`DeleteReachableFiles::execute`] strictly before the sweep).
+/// The walk shape matches `DeleteOrphanFiles::collect_valid_files`. That collector returns a flat
+/// set, because it only needs membership. This one keeps the buckets, because the six Java counts
+/// are bucket sizes. A read failure returns `Err` before the caller deletes anything.
 async fn collect_reachable_files(table: &Table) -> Result<ReachableFiles> {
     let metadata = table.metadata();
     let file_io = table.file_io();
     let mut reachable = ReachableFiles::default();
 
     for snapshot in metadata.snapshots() {
-        // The manifest list of this snapshot (Java `manifestListLocations`).
         reachable
             .manifest_lists
             .insert(snapshot.manifest_list().to_string());
@@ -363,14 +270,12 @@ async fn collect_reachable_files(table: &Table) -> Result<ReachableFiles> {
             })?;
 
         for manifest_file in manifest_list.entries() {
-            // The manifest file itself (Java `manifestDS` over ALL_MANIFESTS).
             reachable
                 .manifests
                 .insert(manifest_file.manifest_path.clone());
 
-            // Every content file of every entry — INCLUDING DELETED tombstones (Java reads via
-            // ManifestFiles.read, not liveEntries; a tombstoned file is still a physical file the
-            // table wrote and must be deleted). Bucket by content type for the Java counts.
+            // Read every entry, DELETED tombstones included. Java reads the same way, because a
+            // tombstoned file is still a physical file the table wrote.
             let manifest = manifest_file
                 .load_manifest(file_io)
                 .await
@@ -391,8 +296,7 @@ async fn collect_reachable_files(table: &Table) -> Result<ReachableFiles> {
                         reachable.data_files.insert(path);
                     }
                     DataContentType::PositionDeletes => {
-                        // Position-delete files AND deletion vectors (a DV is PositionDeletes
-                        // content with Puffin format; Java folds DVs into this bucket).
+                        // A deletion vector is `PositionDeletes` content, so it lands here too.
                         reachable.position_delete_files.insert(path);
                     }
                     DataContentType::EqualityDeletes => {
@@ -403,9 +307,7 @@ async fn collect_reachable_files(table: &Table) -> Result<ReachableFiles> {
         }
     }
 
-    // "Other" metadata files (Java `deletedOtherFilesCount`): the current metadata.json, all
-    // PREVIOUS metadata.json (the metadata-log — Java metadataFileLocations(table, recursive=true)),
-    // the version-hint, and all statistics + partition-statistics.
+    // The "other" bucket: current and previous metadata.json, version-hint, and statistics.
     reachable
         .other_files
         .insert(table.metadata_location_result()?.to_string());
@@ -431,9 +333,7 @@ async fn collect_reachable_files(table: &Table) -> Result<ReachableFiles> {
     Ok(reachable)
 }
 
-/// The version-hint file location (Java `ReachableFileUtil.versionHintLocation`:
-/// `<location>/metadata/version-hint.text`). Java always adds it to the reachable set even for
-/// non-Hadoop tables, so a stray hint file is always cleaned by a purge.
+/// The version-hint location. Java adds it even for a non-Hadoop table, so a purge cleans a stray.
 fn version_hint_location(table_location: &str) -> String {
     let trimmed = table_location.strip_suffix('/').unwrap_or(table_location);
     format!("{trimmed}/metadata/version-hint.text")
@@ -457,8 +357,7 @@ mod tests {
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation};
 
-    /// A `MemoryCatalog` backed by a real local filesystem under a `TempDir`, plus a matching
-    /// `FileIO` for planting/inspecting files. Returns the temp-dir guard (kept alive by the caller).
+    /// A `MemoryCatalog` on a real local filesystem. The caller must hold the temp-dir guard alive.
     async fn local_fs_catalog() -> (impl Catalog, FileIO, tempfile::TempDir) {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let warehouse = temp_dir
@@ -478,7 +377,7 @@ mod tests {
         (catalog, file_io, temp_dir)
     }
 
-    /// A minimal two-long-column schema `{1 x long, 2 y long}`.
+    /// A two-long-column schema `{1 x long, 2 y long}`.
     fn two_long_schema() -> Schema {
         Schema::builder()
             .with_fields(vec![
@@ -515,7 +414,7 @@ mod tests {
             .expect("create table")
     }
 
-    /// Write `content` to `path` through `file_io` (creates parent dirs on the local fs).
+    /// Writes `content` to `path` through `file_io`.
     async fn write_real_file(file_io: &FileIO, path: &str, content: &[u8]) {
         file_io
             .new_output(path)
@@ -525,8 +424,7 @@ mod tests {
             .expect("write file");
     }
 
-    /// A real `DataFile` of the given content type: write `content` to `path` on disk, then build a
-    /// metadata-consistent unpartitioned descriptor.
+    /// Writes `content` to `path`, then builds a matching descriptor.
     async fn real_file(
         file_io: &FileIO,
         path: &str,
@@ -544,8 +442,8 @@ mod tests {
             .partition_spec_id(0)
             .partition(Struct::empty());
         if content_type != DataContentType::Data {
-            // Delete files carry a referenced data file / equality ids in real tables; for the
-            // reachable walk only the PATH + content type matter, so the minimal descriptor is fine.
+            // A real delete file also carries a referenced path or equality ids. This walk reads
+            // only the path and the content type.
         }
         builder.build().expect("build data file")
     }
@@ -561,22 +459,21 @@ mod tests {
         tx.commit(catalog).await.expect("commit fast append")
     }
 
-    /// True iff `path` exists on disk through `file_io`.
+    /// True if `path` exists on disk.
     async fn exists(file_io: &FileIO, path: &str) -> bool {
         file_io.exists(path).await.expect("exists check")
     }
 
-    // ---- the reachable-set categorization (mutation-mindset) ----------------------------------
+    // ---- the reachable-set categorization ------------------------------------------------------
 
-    /// A multi-snapshot table with a data file, a previous metadata.json (every commit advances the
-    /// log), and a statistics file: the reachable categories must be exactly right.
+    /// Every reachable category must be exact on a multi-snapshot table with a statistics file.
     #[tokio::test]
     async fn reachable_set_categorizes_every_file_category() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
         let table = create_table(&catalog).await;
         let location = table.metadata().location().to_string();
 
-        // s1: a data file. (Committing advances the metadata log, creating a previous metadata.json.)
+        // s1: a data file. The commit advances the metadata log.
         let d1 = real_file(
             &file_io,
             &format!("{location}/data/d1.parquet"),
@@ -585,7 +482,7 @@ mod tests {
         )
         .await;
         let table = append(&catalog, &table, vec![d1]).await;
-        // s2: a second data file (a second snapshot ⇒ a second manifest list + a second metadata.json).
+        // s2: a second snapshot, so a second manifest list and metadata.json.
         let d2 = real_file(
             &file_io,
             &format!("{location}/data/d2.parquet"),
@@ -595,7 +492,7 @@ mod tests {
         .await;
         let table = append(&catalog, &table, vec![d2]).await;
 
-        // Plant + register a statistics file (the "other" bucket).
+        // A statistics file, for the "other" bucket.
         let stats_path = format!("{location}/metadata/stats.puffin");
         write_real_file(&file_io, &stats_path, b"stats").await;
         let snapshot_id = table
@@ -623,22 +520,19 @@ mod tests {
             .await
             .expect("collect reachable");
 
-        // TWO data files (one per snapshot).
         assert_eq!(reachable.data_files.len(), 2, "two data files reachable");
-        // TWO snapshots ⇒ two manifest lists.
         assert_eq!(
             reachable.manifest_lists.len(),
             2,
             "two manifest lists (one per snapshot)"
         );
-        // At least two manifests (each fast append writes a manifest).
         assert!(
             reachable.manifests.len() >= 2,
             "at least two manifests reachable, got {}",
             reachable.manifests.len()
         );
-        // The "other" bucket: current metadata.json + previous metadata.json(s) + version-hint +
-        // the statistics file. At minimum: current + version-hint + stats + ≥1 previous = ≥4.
+        // The "other" bucket holds the current and one previous metadata.json, the version-hint,
+        // and the statistics file.
         assert!(
             reachable.other_files.contains(&stats_path),
             "the statistics file is in the other bucket"
@@ -660,13 +554,11 @@ mod tests {
             "current + previous metadata.json + version-hint + stats ≥ 4, got {}",
             reachable.other_files.len()
         );
-        // No deletes in this fixture.
         assert_eq!(reachable.position_delete_files.len(), 0);
         assert_eq!(reachable.equality_delete_files.len(), 0);
     }
 
-    /// MUTATION-MINDSET: position-delete and equality-delete entries land in their OWN buckets (a
-    /// walk that dropped the delete categories — or wrongly bucketed them as data — fails here).
+    /// A walk that drops a delete category, or buckets it as data, fails here.
     #[tokio::test]
     async fn reachable_set_buckets_position_and_equality_deletes() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
@@ -695,7 +587,7 @@ mod tests {
         )
         .await;
 
-        // Commit the data, then a row-delta carrying both delete files.
+        // Commit the data, then a row delta that carries both delete files.
         let table = append(&catalog, &table, vec![data]).await;
         let tx = Transaction::new(&table);
         let tx = tx
@@ -719,17 +611,15 @@ mod tests {
             1,
             "one equality-delete file in its own bucket"
         );
-        // The counts mirror the buckets 1:1.
         let counts = reachable.counts();
         assert_eq!(counts.deleted_data_files_count, 1);
         assert_eq!(counts.deleted_position_delete_files_count, 1);
         assert_eq!(counts.deleted_equality_delete_files_count, 1);
     }
 
-    // ---- the delete sweep: completeness + nothing-extra (the two corruption classes) ----------
+    // ---- the delete sweep: both corruption classes ---------------------------------------------
 
-    /// After `execute`, EVERY reachable file is gone from FileIO; the six counts equal the reachable
-    /// bucket sizes; and a file OUTSIDE the reachable set is untouched (over-delete = data loss).
+    /// After `execute` every reachable file is gone, and a file outside the set survives.
     #[tokio::test]
     async fn execute_deletes_every_reachable_file_and_nothing_outside() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
@@ -753,11 +643,11 @@ mod tests {
         .await;
         let table = append(&catalog, &table, vec![d2]).await;
 
-        // A file OUTSIDE the table footprint — must survive (it is not reachable).
+        // A file outside the table footprint. It is not reachable, so it must survive.
         let outsider = format!("{location}/data/not-ours.txt");
         write_real_file(&file_io, &outsider, b"keep me").await;
 
-        // Snapshot the reachable set first (for the completeness assertion), then execute.
+        // Snapshot the reachable set first, for the completeness assertion.
         let metadata_location = table
             .metadata_location_result()
             .expect("metadata location")
@@ -777,19 +667,18 @@ mod tests {
             .await
             .expect("execute delete reachable files");
 
-        // Every reachable file is physically gone.
         for path in &all_reachable {
             assert!(
                 !exists(&file_io, path).await,
                 "reachable file must be deleted: {path}"
             );
         }
-        // The outsider survives (over-delete = data loss).
+        // The outsider survives. Over-deletion is data loss.
         assert!(
             exists(&file_io, &outsider).await,
             "a file outside the reachable set must NOT be deleted"
         );
-        // The counts equal the reachable bucket sizes (no delete failures on a clean local FS).
+        // The counts equal the bucket sizes. A clean local FS fails no delete.
         assert!(
             result.delete_failures.is_empty(),
             "no delete failures expected"
@@ -806,8 +695,7 @@ mod tests {
         );
     }
 
-    /// The `delete_with` consumer receives EXACTLY the reachable set (Java `deleteWith`): a
-    /// collect-only run deletes nothing but reports the full set + counts.
+    /// The `delete_with` consumer receives exactly the reachable set, and may delete nothing.
     #[tokio::test]
     async fn delete_with_collects_exactly_the_reachable_set() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
@@ -852,20 +740,17 @@ mod tests {
             got, reachable_expected,
             "the consumer receives exactly the reachable set"
         );
-        // Nothing was physically deleted (collect-only) — the data file still exists.
         assert!(
             exists(&file_io, &format!("{location}/data/d1.parquet")).await,
             "collect-only deletes nothing"
         );
-        // The counts still reflect the full set.
         assert_eq!(
             result.total_deleted_files_count(),
             reachable_expected.len() as u64
         );
     }
 
-    /// EDGE: a freshly-created table with NO snapshots is still purgeable — its reachable set is the
-    /// metadata.json + version-hint (no manifests/data), and execute removes them cleanly.
+    /// A table with no snapshots is still purgeable: metadata.json plus version-hint.
     #[tokio::test]
     async fn empty_table_purges_metadata_only() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
@@ -905,15 +790,13 @@ mod tests {
             result.deleted_other_files_count >= 1,
             "at least the current metadata.json is removed"
         );
-        // The metadata.json is physically gone.
         assert!(
             !exists(&file_io, &metadata_location).await,
             "the metadata.json must be deleted"
         );
     }
 
-    /// A delete failure on one file does NOT abort the sweep and does NOT change the counts (Java
-    /// logs-and-continues; the counts are the planned-set sizes).
+    /// One failed delete neither aborts the sweep nor changes the counts.
     #[tokio::test]
     async fn delete_failures_are_collected_not_fatal() {
         let (catalog, file_io, _tmp) = local_fs_catalog().await;
@@ -937,7 +820,6 @@ mod tests {
             .all_sorted()
             .len();
 
-        // A delete function that fails for exactly one path but succeeds for the rest.
         let failing = format!("{location}/data/d1.parquet");
         let failing_for_closure = failing.clone();
         let result = DeleteReachableFiles::new(&metadata_location)

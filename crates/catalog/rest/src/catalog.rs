@@ -48,105 +48,10 @@ use crate::types::{
     RenameTableRequest, StorageCredential,
 };
 
-/// REST catalog URI — the base address of the Iceberg REST catalog service.
-///
-/// # Trust model (SEC-011 adjudication, Java parity)
-///
-/// This value and the `oauth2-server-uri` property that overrides the token endpoint (see
-/// [`RestCatalogConfig::get_token_endpoint`]) have **two provenances**, and both are treated as
-/// trusted:
-///
-/// 1. **Operator-supplied** — the properties passed to `load`/the builder.
-/// 2. **Server-overridable** — [`RestCatalogConfig::merge_with_config`] lets the `/v1/config`
-///    response replace `uri` outright (`overrides.uri`) and merges the server's `defaults` /
-///    `overrides` into `props`, from which `oauth2-server-uri` is read. So a compromised catalog
-///    server can redirect subsequent requests, and can point the token POST — which carries the
-///    operator's `client_secret` — at a third-party host.
-///
-/// Provenance (2) is **parity-shared, not a fork defect**. In Java `RESTSessionCatalog.initialize`:
-/// the merged map is `mergedProps = config.merge(props)`
-/// (`core/src/main/java/org/apache/iceberg/rest/RESTSessionCatalog.java:202-211`); the real client is
-/// then rebuilt from it and the catalog auth session is created from it
-/// (`:225-230`); the default client builder derives its base URI as
-/// `.uri(config.get(CatalogProperties.URI))` from whatever map it is handed (`:171-179`, `.uri` at
-/// `:175`); and the auth session reads `oauth2-server-uri` out of those same merged properties —
-/// `OAuth2Manager.catalogSession` calls `AuthConfig.fromProperties(properties)`
-/// (`core/src/main/java/org/apache/iceberg/rest/auth/OAuth2Manager.java:104-109`), which does
-/// `properties.getOrDefault(OAuth2Properties.OAUTH2_SERVER_URI, ResourcePaths.tokens())`
-/// (`core/src/main/java/org/apache/iceberg/rest/auth/AuthConfig.java:84-85`).
-///
-/// The merge order makes this stronger than "the server can contribute": server **`overrides`
-/// OUTRANK user properties**. `ConfigResponse.merge` seeds from `defaults`, then
-/// `merged.putAll(clientProperties)`, then `merged.putAll(overrides)` — last write wins — and the
-/// only filter applied is `Maps.filterValues(merged, Objects::nonNull)`, i.e. drop null VALUES;
-/// there is no key allowlist or denylist, and `ConfigResponse.validate()` is empty
-/// (`core/src/main/java/org/apache/iceberg/rest/responses/ConfigResponse.java:108-119`, `validate`
-/// at `:68`). A client that trusts a catalog server for its endpoint set necessarily trusts it for
-/// the endpoints themselves.
-///
-/// Bootstrap ordering is parity too: Java builds the init client and fetches `/v1/config` with the
-/// PRE-merge `props` and only then rebuilds from `mergedProps` (`:202-211` then `:225`), so the
-/// config fetch itself can never be redirected by the response it is fetching. This fork matches —
-/// [`RestCatalog::context`] does `HttpClient::new(&self.user_config)` and
-/// `load_config(&client, &self.user_config)` before `merge_with_config` and `update_with(&config)`.
-///
-/// **This does not contradict the `disable-header-redaction` strip** in
-/// [`RestCatalogConfig::merge_with_config`], and the distinction is the point: that key is a
-/// *client-only logging control* with no wire meaning, so a server has no legitimate reason to set
-/// it and a malicious one would use it to unmask the `Authorization` header this client already
-/// holds — pure downside, so it is stripped. `uri` and `oauth2-server-uri` are the opposite: server
-/// override is a *documented, functional* part of the REST config protocol (endpoint discovery /
-/// migration), and honoring it is required for correctness. Strip the former, honor the latter — and
-/// where the trust in the server is misplaced, the credential exposure via a redirected token POST is
-/// a risk Java carries identically.
-///
-/// To be precise about what the strip is: **Java has no `disable-header-redaction` analogue and
-/// filters nothing by key** (see the `filterValues`-only merge above). The strip is therefore
-/// fork-local hardening of a fork-local knob, NOT a parity claim — it neither follows Java nor
-/// diverges from it, because the key does not exist there.
-///
-/// Against either provenance the client applies no address filtering: it will connect to whatever
-/// host is named, including loopback, RFC 1918 / link-local addresses, and cluster-internal DNS
-/// names — the normal deployment, since catalog services usually live on a private network.
-///
-/// This deliberately mirrors Java `iceberg-core` 1.10.0, which applies **no** host, IP-range, or
-/// scheme restriction:
-///
-/// * `HTTPClient.Builder.uri(String)` only null-checks and parses:
-///   `Preconditions.checkNotNull(baseUri, …)` then `URI.create(RESTUtil.stripTrailingSlash(baseUri))`,
-///   rethrowing an `IllegalArgumentException` as a `RESTException`. Syntax validity only — no
-///   scheme allowlist, no HTTPS requirement, no address filtering
-///   (`core/src/main/java/org/apache/iceberg/rest/HTTPClient.java:483-491`).
-/// * `RESTSessionCatalog` passes the configured value straight through:
-///   `HTTPClient.builder(config).uri(config.get(CatalogProperties.URI))`
-///   (`core/src/main/java/org/apache/iceberg/rest/RESTSessionCatalog.java:175`).
-/// * `oauth2-server-uri` is taken verbatim from properties, defaulting to the catalog-relative
-///   `ResourcePaths.tokens()`
-///   (`core/src/main/java/org/apache/iceberg/rest/auth/AuthConfig.java:85`); `OAuth2Manager`'s
-///   `warnIfOAuthServerUriNotSet` emits a deprecation WARN only when the key is ABSENT **and** the
-///   client is authenticating — `initToken != null` OR a non-empty `credential`
-///   (`core/src/main/java/org/apache/iceberg/rest/auth/OAuth2Manager.java:275-293`). A log line
-///   under a narrow condition, never a restriction.
-/// * A grep of the entire `core/src/main/java/org/apache/iceberg/rest/` tree finds no loopback /
-///   `InetAddress` / site-local / allowlist logic. TLS is a pluggable operator *extension* point
-///   (`rest.client.tls.configurer-impl`, `HTTPClient.java:98`), not a restriction.
-///
-/// One transport-layer nuance, for precision: "no restriction" is true of Iceberg's *own* code on
-/// both sides, but the underlying HTTP clients differ, and this fork is the STRICTER of the two.
-/// Iceberg configures no redirect policy anywhere in `core/.../rest/`, so Java inherits Apache
-/// HttpClient5's defaults (follow redirects, max 50, no cross-origin header stripping), whereas this
-/// fork inherits `reqwest`'s (follow redirects, max 10, and `Authorization` / `Cookie` /
-/// `Proxy-Authorization` stripped on a cross-origin redirect). Redirect-following is therefore a
-/// smaller credential-forwarding surface here than in Java — a divergence in the safe direction, and
-/// not one to "fix".
-///
-/// SSRF is a concern when a URI arrives from an *untrusted* source (a request parameter, a
-/// user-submitted document). That is not this surface: whoever can set catalog properties — or
-/// operate the catalog server the client was pointed at — can already point the client anywhere and
-/// read whatever it fetches. Adding a private-IP blocklist here would break legitimate
-/// private-endpoint deployments, the majority case, and diverge from Java. Callers that DO accept a
-/// catalog URI from untrusted input must validate it before it reaches this configuration; that
-/// check belongs at their trust boundary, not in this client.
+/// REST catalog URI — the base address of the Iceberg REST catalog service. # Notes The
+/// `/v1/config` response can replace this value and `oauth2-server-uri`; server overrides outrank
+/// operator properties, as in Java `RESTSessionCatalog.initialize`. The config fetch uses pre-merge
+/// properties, so the response cannot redirect the request that fetched it.
 pub const REST_CATALOG_PROP_URI: &str = "uri";
 /// REST catalog warehouse location
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
@@ -157,22 +62,12 @@ const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PATH_V1: &str = "v1";
 
-/// Select the vended storage credential whose `prefix` most specifically covers
-/// `storage_path`, mirroring Java `S3FileIO.clientForStoragePath`.
+/// Select the vended storage credential whose `prefix` most specifically covers `storage_path`.
+/// Mirrors Java `S3FileIO.clientForStoragePath`.
 ///
-/// Java keeps the **strictly-longest** credential prefix that `storage_path.startsWith(prefix)`
-/// (its per-prefix client map is seeded with a default whose key is the shorter scheme string,
-/// and each candidate replaces the current pick only when its prefix is strictly longer). We
-/// mirror that here: among all credentials whose `prefix` prefixes the table's storage path, the
-/// longest wins; on a length tie the first in list order is kept (a strictly-greater replacement
-/// rule never displaces an equal-length incumbent). The equal-length tie-break is the same guard,
-/// not bit-identical: Java iterates its per-prefix `HashMap` in unspecified order, whereas the fork
-/// keeps first-in-list order deterministically. If `storage_path` is `None`, or no credential
-/// prefixes it, the result is `None` — Java's silent fall-back to the un-vended base client, which
-/// raises no error.
-///
-/// The returned credential's `config` is layered onto the `FileIO` props by the caller (see
-/// `load_file_io`); selection here carries no secret material into logs.
+/// The longest matching prefix wins. On a length tie the fork keeps the first in list order;
+/// Java iterates a `HashMap` and picks an arbitrary one. `None` means no credential matches,
+/// which the caller must treat as Java does: fall back to the un-vended client, raise no error.
 fn select_vended_credential<'a>(
     storage_path: Option<&str>,
     storage_credentials: Option<&'a [StorageCredential]>,
@@ -277,19 +172,9 @@ impl RestCatalogBuilder {
 }
 
 /// Returns true if a property key holds a secret value that must be redacted from `Debug`.
-///
-/// SEC-010: this delegates to the canonical needle test `iceberg::io::is_secret_prop_key`
-/// (`crates/iceberg/src/io/storage/config/mod.rs`) instead of keeping a REST-local list. The
-/// previous local list matched only the three EXACT keys `credential` / `token` / `client_secret`,
-/// but [`RestCatalogConfig`]`::props` is exactly the map this catalog clones into the table's
-/// `FileIO` props (see [`RestCatalog::load_file_io`]), so it routinely carries storage credentials
-/// — `s3.secret-access-key`, `s3.session-token`, `gcs.oauth2.token`, `adls.connection-string` —
-/// none of which the exact-match list redacted. One authoritative needle list (shared with
-/// `StorageConfig` and the Glue / HMS / S3Tables / SQL config `Debug` impls) removes that drift.
-///
-/// The canonical test is a deliberate SUPERSET: a non-secret key whose name merely contains a
-/// needle (e.g. `token-refresh-enabled`) is redacted too. Over-redaction is the safe direction for
-/// a debug view.
+/// Delegates to the canonical needle test so this crate cannot drift from the other catalogs.
+/// [`RestCatalogConfig`]`::props` is cloned into the table `FileIO` props, so it carries storage
+/// credentials such as `s3.secret-access-key`; a REST-local exact-match list missed them.
 fn is_secret_prop_key(key: &str) -> bool {
     iceberg::io::is_secret_prop_key(key)
 }
@@ -313,11 +198,8 @@ pub(crate) struct RestCatalogConfig {
 }
 
 impl std::fmt::Debug for RestCatalogConfig {
-    /// Hand-written so that secret-bearing entries in `props` (e.g. the OAuth `credential`
-    /// holding `client_id:client_secret`, and `token`) are redacted to `"***"` instead of
-    /// being printed in clear. Without this, any `tracing`/`{:?}` of the config — or of a
-    /// struct that embeds it and derives `Debug` (e.g. `RestContext`, `RestCatalog`) —
-    /// would leak the credentials.
+    /// Hand-written so secret-bearing `props` entries print as `"***"`. A derived `Debug` would
+    /// leak the OAuth credential through any struct that embeds this config.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let redacted_props: HashMap<&str, &str> = self
             .props
@@ -357,11 +239,8 @@ impl RestCatalogConfig {
     /// The OAuth token endpoint: the operator-configured `oauth2-server-uri` when present,
     /// otherwise the catalog-relative `<uri>/v1/oauth/tokens`.
     ///
-    /// The configured value is used VERBATIM — no scheme, host, or address restriction — matching
-    /// Java `AuthConfig.fromProperties`, which does
-    /// `properties.getOrDefault(OAuth2Properties.OAUTH2_SERVER_URI, ResourcePaths.tokens())`
-    /// (`core/src/main/java/org/apache/iceberg/rest/auth/AuthConfig.java:85`). See the trust-model
-    /// note on [`REST_CATALOG_PROP_URI`] for the SEC-011 adjudication.
+    /// The configured value is used verbatim, with no scheme or address check. Java
+    /// `AuthConfig.fromProperties` does the same. See the trust note on [`REST_CATALOG_PROP_URI`].
     pub(crate) fn get_token_endpoint(&self) -> String {
         if let Some(oauth2_uri) = self.props.get("oauth2-server-uri") {
             oauth2_uri.to_string()
@@ -428,14 +307,9 @@ impl RestCatalogConfig {
         self.props.get("token").cloned()
     }
 
-    /// Get the credentials from the config. The client can use these credentials to fetch a new
-    /// token.
+    /// Get the credentials used to fetch a new token.
     ///
-    /// ## Output
-    ///
-    /// - `None`: No credential is set.
-    /// - `Some(None, client_secret)`: No client_id is set, use client_secret directly.
-    /// - `Some(Some(client_id), client_secret)`: Both client_id and client_secret are set.
+    /// The `credential` property is either `client_secret` or `client_id:client_secret`.
     pub(crate) fn credential(&self) -> Option<(Option<String>, String)> {
         let cred = self.props.get("credential")?;
 
@@ -447,12 +321,8 @@ impl RestCatalogConfig {
         }
     }
 
-    /// Get the extra headers from config, which includes:
-    ///
-    /// - `content-type`
-    /// - `x-client-version`
-    /// - `user-agent`
-    /// - All headers specified by `header.xxx` in props.
+    /// Get the extra headers: `content-type`, `x-client-version`, `user-agent`, and every
+    /// `header.xxx` property.
     pub(crate) fn extra_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::from_iter([
             (
@@ -517,24 +387,19 @@ impl RestCatalogConfig {
 
     /// Whether proactive OAuth token refresh is enabled (`token-refresh-enabled`).
     ///
-    /// Mirrors Java `OAuth2Properties.TOKEN_REFRESH_ENABLED` /
-    /// `TOKEN_REFRESH_ENABLED_DEFAULT = true`: refresh is ON unless the property is explicitly set
-    /// to `false`. When off, the client exchanges the credential once and caches the token forever
-    /// (the legacy behavior).
+    /// Mirrors Java `OAuth2Properties.TOKEN_REFRESH_ENABLED`, which defaults to true. When off,
+    /// the client exchanges the credential once and caches the token forever.
     pub(crate) fn token_refresh_enabled(&self) -> bool {
-        // Java `PropertyUtil.propertyAsBoolean(props, key, true)`: when the key is present the value
-        // is parsed like `Boolean.parseBoolean` (true only for a case-insensitive "true"); when the
-        // key is absent the default is true.
+        // Java `PropertyUtil.propertyAsBoolean` parses only a case-insensitive "true" as true,
+        // and defaults to true when the key is absent.
         self.props
             .get("token-refresh-enabled")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(true)
     }
 
-    /// Check if header redaction is disabled in error logs.
-    ///
-    /// Returns true if the `disable-header-redaction` property is set to "true".
-    /// Defaults to false for security (headers are redacted by default).
+    /// True when `disable-header-redaction` is `"true"`. Defaults to false, so headers are
+    /// redacted unless the operator opts out.
     pub(crate) fn disable_header_redaction(&self) -> bool {
         self.props
             .get(REST_CATALOG_PROP_DISABLE_HEADER_REDACTION)
@@ -548,13 +413,10 @@ impl RestCatalogConfig {
             self.uri = uri;
         }
 
-        // SECURITY: `disable-header-redaction` is a CLIENT-ONLY setting. It controls
-        // whether this client's own outgoing headers (including `Authorization: Bearer …`)
-        // are redacted from error context/logs. The server-supplied `defaults`/`overrides`
-        // come from `/v1/config` and are fully server-controlled; allowing a compromised or
-        // malicious catalog server to set/flip this key would silently disable redaction and
-        // leak the client's credentials. So we strip it from both server maps and let the
-        // user's own value win. (Server overriding `uri` and other props stays intentional.)
+        // `disable-header-redaction` is a client-only logging control with no wire meaning.
+        // A malicious server could set it to unmask the `Authorization` header in error logs.
+        // Strip it from both server maps so the user value wins. Java has no analogue, so this
+        // is fork-local hardening, not a divergence. Other server overrides stay honored.
         let user_redaction = self
             .props
             .get(REST_CATALOG_PROP_DISABLE_HEADER_REDACTION)
@@ -672,29 +534,9 @@ impl RestCatalog {
             props.extend(config);
         }
 
-        // Overlay the vended storage credential for this table's location, mirroring Java
-        // `RESTSessionCatalog.newFileIO(SessionContext, Map, List<Credential>)`: the longest
-        // vended `Credential` prefix that prefixes the storage path wins (S3FileIO's
-        // `clientForStoragePath` keeps the strictly-longest `startsWith` match), and that
-        // credential's config is layered LAST so it beats the catalog/table props on a key
-        // collision (S3FileIO builds the per-prefix client with
-        // `ImmutableMap.builder().putAll(props).putAll(credential.config()).buildKeepingLast()`,
-        // where the last put — the credential — wins). No match ⇒ no overlay (Java falls back to
-        // the base client for the location, silently, with no error). The vended values flow into
-        // the `FileIO`'s `StorageConfig`, whose `Debug` redacts every secret-bearing key
-        // (`s3.access-key-id`/`s3.secret-access-key`/`s3.session-token` all hit the
-        // `is_secret_prop_key` needle list), so this overlay never widens the credential-leak
-        // surface. Expiry/refresh of short-lived vended credentials (Java's
-        // `VendedCredentialsProvider`) is out of scope here — the OpenDAL-backed `FileIO` takes a
-        // static props snapshot; see GAP_MATRIX row R160 residue.
-        //
-        // GRANULARITY adaptation: Java retains the full `List<Credential>` inside `S3FileIO` and
-        // re-selects per accessed file path (`clientForStoragePath` runs on every
-        // `newInputFile`/`newOutputFile`/`deleteFile`). We select ONCE here, at the table's
-        // `metadata_location`, and overlay that single credential into the table's static per-table
-        // `FileIO` props — per-path selection is not expressible in the OpenDAL flat-props `FileIO`
-        // without core storage changes. This diverges for multi-prefix tables (data bucket ≠
-        // metadata bucket); the divergence cases are recorded as residue in GAP_MATRIX row R160.
+        // Overlay the vended storage credential for this table's location. Mirrors Java
+        // `RESTSessionCatalog.newFileIO`. The credential config is layered LAST, so it beats the
+        // catalog and table props on a key collision, as Java's `buildKeepingLast` does.
         if let Some(credential) = select_vended_credential(metadata_location, storage_credentials) {
             props.extend(credential.config.clone());
         }
@@ -732,9 +574,8 @@ impl RestCatalog {
 
     /// Build a [`View`] from a `LoadViewResult` returned by the view load/create/commit endpoints.
     ///
-    /// The view's `config` from the response is merged under the catalog's `user_config` props (the
-    /// local config wins on a key collision, matching the table load/create behavior), and the
-    /// resulting [`FileIO`] is loaded against the view's metadata location.
+    /// The local `user_config` wins over the response `config` on a key collision, as the table
+    /// load path does. The [`FileIO`] loads against the view's metadata location.
     async fn build_view_from_load_result(
         &self,
         view_ident: TableIdent,
@@ -764,12 +605,12 @@ impl RestCatalog {
         self.context().await?.client.invalidate_token().await
     }
 
-    /// Invalidate the current token and set a new one. Generates a new token before invalidating
-    /// the current token, meaning the old token will be used until this function acquires the lock
-    /// and overwrites the token.
+    /// Invalidate the current token and set a new one. The new token is fetched before the lock
+    /// is taken, so callers keep using the old token until the swap.
     ///
-    /// If credential is invalid, or the request fails, this method will return an error and leave
-    /// the current token unchanged.
+    /// # Errors
+    ///
+    /// A bad credential or a failed request leaves the current token unchanged.
     pub async fn regenerate_token(&self) -> Result<()> {
         self.context().await?.client.regenerate_token().await
     }
@@ -779,17 +620,14 @@ impl RestCatalog {
 /// https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml
 #[async_trait]
 impl Catalog for RestCatalog {
-    /// Returns the catalog name supplied at construction (the `name` argument of
-    /// [`CatalogBuilder::load`]), or the [`UNNAMED_CATALOG`] sentinel when none was set.
-    /// Mirrors Java `RESTCatalog.name()`, which returns the configured catalog name.
+    /// Returns the name given to [`CatalogBuilder::load`], or [`UNNAMED_CATALOG`]. Mirrors Java
+    /// `RESTCatalog.name`.
     fn name(&self) -> &str {
         self.user_config.name.as_deref().unwrap_or(UNNAMED_CATALOG)
     }
 
-    /// Returns the user-supplied configuration properties. Mirrors Java
-    /// `RESTCatalog.properties()` — the only Java catalog where `properties()` is a real
-    /// method. These are the as-loaded `user_config` props, not the server-merged runtime
-    /// config (which is only available after the first network round-trip).
+    /// Returns the user-supplied configuration properties. Mirrors Java `RESTCatalog.properties`.
+    /// These are the as-loaded props, not the server-merged runtime config.
     fn properties(&self) -> &HashMap<String, String> {
         &self.user_config.props
     }
@@ -1017,10 +855,7 @@ impl Catalog for RestCatalog {
 
     /// Create a new table inside the namespace.
     ///
-    /// In the resulting table, if there are any config properties that
-    /// are present in both the response from the REST server and the
-    /// config provided when creating this `RestCatalog` instance then
-    /// the value provided locally to the `RestCatalog` will take precedence.
+    /// The local `RestCatalog` config wins over the server response on a property collision.
     async fn create_table(
         &self,
         namespace: &NamespaceIdent,
@@ -1104,9 +939,7 @@ impl Catalog for RestCatalog {
 
     /// Load table from the catalog.
     ///
-    /// If there are any config properties that are present in both the response from the REST
-    /// server and the config provided when creating this `RestCatalog` instance, then the value
-    /// provided locally to the `RestCatalog` will take precedence.
+    /// The local `RestCatalog` config wins over the server response on a property collision.
     async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
         let context = self.context().await?;
 
@@ -1334,9 +1167,8 @@ impl Catalog for RestCatalog {
         let http_response = context.client.query_catalog_for_commit(request).await?;
 
         let response: CommitTableResponse = match http_response.status() {
-            // A 200 means the commit LANDED; if its response body is then lost mid-read or
-            // unparsable, the caller still must not blindly re-run the commit — surface the
-            // unknown-outcome class (the commit is in fact durable server-side).
+            // A 200 means the commit landed. If the body is then unreadable, surface the
+            // unknown-outcome class, so the caller does not re-run a durable commit.
             StatusCode::OK => {
                 deserialize_catalog_response(http_response)
                     .await
@@ -1412,11 +1244,9 @@ impl Catalog for RestCatalog {
             .build()
     }
 
-    // ========================================================================
     // View surface — mirrors the Iceberg REST view routes / Java `RESTSessionCatalog`'s
     // `RESTViewBuilder` + `RESTViewOperations`. Endpoints: `GET/POST /namespaces/{ns}/views`,
     // `GET/POST/DELETE/HEAD /namespaces/{ns}/views/{view}`, `POST /views/rename`.
-    // ========================================================================
 
     async fn list_views(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
         let context = self.context().await?;
@@ -1679,11 +1509,9 @@ impl Catalog for RestCatalog {
                 )
                 .with_retryable(true));
             }
-            // Java `ErrorHandlers$ViewCommitErrorHandler` (1.10.0, ErrorHandlers.java L128-148)
-            // maps 500/502/503/504 to `CommitStateUnknownException` (the commit may or may not
-            // have landed) — distinct from a generic transport error. Mirror the table-side
-            // `update_table` posture exactly so a view commit reports the same
-            // "commit state is unknown" semantics as a table commit.
+            // Java `ErrorHandlers$ViewCommitErrorHandler` maps 5xx to
+            // `CommitStateUnknownException`, not to a generic transport error. The commit may
+            // have landed. Mirror the table-side `update_table` posture.
             StatusCode::INTERNAL_SERVER_ERROR => {
                 return Err(Error::new(
                     ErrorKind::CommitStateUnknown,
@@ -1844,13 +1672,9 @@ mod tests {
         assert_eq!(token, Some("ey000000000000".to_string()));
     }
 
-    /// SECURITY (Fix 1): the OAuth token-endpoint 200-OK body literally contains the
-    /// `access_token`. If the body parse fails, the constructed error must NOT carry the
-    /// raw body in its context — otherwise `{e}` / `tracing::error!(?e)` would leak the
-    /// token. This test feeds a 200 body that contains a token sentinel but is invalid as a
-    /// `TokenResponse` (forcing the parse error path) and asserts the sentinel never appears
-    /// in the rendered error or its debug context. RED-able: reattaching the body to the
-    /// error (the pre-fix `.with_context("json", …)`) makes this fail.
+    /// A 200-OK token body carries the `access_token`, so a parse error must not quote it.
+    /// The test feeds a 200 body that holds a sentinel but is invalid as a `TokenResponse`.
+    /// Discriminates the mutation that reattaches the body with `.with_context("json", …)`.
     #[tokio::test]
     async fn test_oauth_token_body_not_leaked_in_error() {
         const TOKEN_SENTINEL: &str = "SUPER_SECRET_ACCESS_TOKEN_DO_NOT_LEAK";
@@ -1898,13 +1722,9 @@ mod tests {
         );
     }
 
-    /// SECURITY (Fix 1, non-2xx branch): the token endpoint's error path is equally
-    /// sensitive — a non-2xx body may echo submitted credentials or a partial grant. When
-    /// that body fails to parse as an `ErrorResponse`, the constructed error must NOT carry
-    /// the raw body. This drives the `else` (non-200) branch of `exchange_credential_for_token`
-    /// with a 400 whose body is valid JSON but the wrong shape (forcing the parse-error path)
-    /// and a credential sentinel present. RED-able: reattaching the body (`.with_context("json",
-    /// …)`) on that branch makes this fail.
+    /// Same guard on the non-2xx branch of `exchange_credential_for_token`. A 400 body can
+    /// echo the submitted credential, so an `ErrorResponse` parse failure must not quote it.
+    /// Discriminates the mutation that reattaches the body with `.with_context("json", …)`.
     #[tokio::test]
     async fn test_oauth_token_error_body_not_leaked_in_error() {
         const CRED_SENTINEL: &str = "SUBMITTED_CLIENT_SECRET_DO_NOT_LEAK";
@@ -2274,10 +2094,8 @@ mod tests {
         list_ns_mock.assert_async().await;
     }
 
-    /// SECURITY (Fix 2): `disable-header-redaction` is client-only. A malicious/compromised
-    /// catalog server returning it in `/v1/config` `overrides` (or `defaults`) must NOT be
-    /// able to flip the client's redaction OFF. RED-able: dropping the client-only guard in
-    /// `merge_with_config` lets the server `overrides` value win and this fails.
+    /// `disable-header-redaction` is client-only, so a server must not flip redaction off
+    /// through `/v1/config`. Discriminates dropping the guard in `merge_with_config`.
     #[test]
     fn test_server_cannot_disable_header_redaction() {
         // User did NOT opt into disabling redaction (so redaction is ON by default).
@@ -2345,9 +2163,8 @@ mod tests {
         );
     }
 
-    /// SECURITY (Fix 4): `RestCatalogConfig`'s `Debug` must redact secret-bearing props
-    /// (`credential`, `token`) instead of printing them. RED-able: the previous
-    /// `#[derive(Debug)]` printed the raw `props` map and this fails.
+    /// `RestCatalogConfig`'s `Debug` must redact `credential` and `token`.
+    /// Discriminates the mutation that returns to `#[derive(Debug)]`.
     #[test]
     fn test_rest_catalog_config_debug_redacts_credential() {
         const CREDENTIAL_SENTINEL: &str = "client_id_DO_NOT_LEAK:client_secret_DO_NOT_LEAK";
@@ -2382,14 +2199,9 @@ mod tests {
         );
     }
 
-    /// SECURITY (SEC-010, needle-drift fix): `RestCatalogConfig::props` is cloned wholesale into
-    /// the table's `FileIO` props by [`RestCatalog::load_file_io`], so operators put storage
-    /// credentials there. The REST-local redaction list used to be an EXACT match on
-    /// `credential` / `token` / `client_secret` only, which masked NONE of the keys below —
-    /// `RestCatalogConfig`'s own `Debug` printed them in clear. Redaction now routes through the
-    /// canonical superset `iceberg::io::is_secret_prop_key`.
-    ///
-    /// RED-able: restore the exact-match `SECRET_PROP_KEYS` list and this fails on every key.
+    /// [`RestCatalog::load_file_io`] clones `RestCatalogConfig::props` into the `FileIO` props,
+    /// so operators put storage credentials there. `Debug` must redact every key below.
+    /// Discriminates the mutation that restores the exact-match `SECRET_PROP_KEYS` list.
     #[test]
     fn test_rest_catalog_config_debug_redacts_vended_filei_o_credentials() {
         const SENTINEL: &str = "SENTINEL_MUST_NOT_APPEAR_IN_DEBUG";
@@ -2436,17 +2248,12 @@ mod tests {
         }
     }
 
-    /// SECURITY (SEC-010 / F1): redacting the wire types' `Debug` is defeated if the RAW response
-    /// body reaches the error context — `iceberg::Error` renders context VERBATIM in both `Display`
-    /// and `Debug`, so one parse failure printed everything the redaction had just masked.
+    /// `iceberg::Error` renders context verbatim, so a raw response body in the context defeats
+    /// the `Debug` redaction on the wire types. Version skew is the realistic trigger.
     ///
-    /// This is the `/v1/config` path: `defaults` carries a vended credential and `overrides` is
-    /// MISSING, so `CatalogConfig` fails to deserialize while the secret is in the body. The
-    /// realistic trigger is version skew — a server returning a payload this parser rejects hands
-    /// back the same body that carries the credentials.
-    ///
-    /// RED-able: restore `.with_context("json", String::from_utf8_lossy(&bytes))` in
-    /// `deserialize_catalog_response`.
+    /// Here `/v1/config` returns a vended credential in `defaults` and omits `overrides`, so
+    /// `CatalogConfig` fails to deserialize with the secret in the body. Discriminates the
+    /// mutation that restores `.with_context("json", …)` in `deserialize_catalog_response`.
     #[tokio::test]
     async fn test_config_parse_failure_does_not_leak_body() {
         const SENTINEL: &str = "SENTINEL_MUST_NOT_APPEAR_IN_ERROR";
@@ -2496,19 +2303,9 @@ mod tests {
         );
     }
 
-    /// SECURITY (SEC-010 / F1), the higher-value payload: a `load_table` 200 body carries BOTH the
-    /// `config` overlay and the vended `storage-credentials`. Here the body is rejected because
-    /// `metadata` is the wrong JSON type (standing in for an unknown V3 field / version skew) while
-    /// the vended `s3.session-token` sits in the same body.
-    ///
-    /// SCOPE: this pins the SAFE shape only — a scalar type mismatch, where `serde_json`'s message
-    /// echoes just the offending scalar (`invalid type: integer 12345`). It does NOT establish that
-    /// credentials elsewhere in a body are generally unreachable through `source`: when the
-    /// mismatch sits at a CONTAINER boundary the echoed value is an entire sub-document. That leaky
-    /// shape is pinned separately by
-    /// [`test_known_residue_double_encoded_body_leaks_through_error_source`].
-    ///
-    /// RED-able: restore `.with_context("json", …)` in `deserialize_catalog_response`.
+    /// A `load_table` 200 body carries both the `config` overlay and the vended credentials. The
+    /// body here fails to parse because `metadata` has the wrong JSON type. Scope: a scalar
+    /// mismatch only, where `serde_json` echoes just the offending scalar.
     #[tokio::test]
     async fn test_load_table_parse_failure_does_not_leak_vended_credentials() {
         const SENTINEL: &str = "SENTINEL_MUST_NOT_APPEAR_IN_ERROR";
@@ -2571,28 +2368,11 @@ mod tests {
         );
     }
 
-    /// SECURITY (SEC-001) — the INVERTED form of the former
-    /// `test_known_residue_double_encoded_body_leaks_through_error_source`, which asserted the leak
-    /// still happened. The residue it pinned is now closed, so the same shape is asserted SAFE.
-    ///
-    /// Withholding the raw body from the error CONTEXT did not close the `source` channel:
-    /// `deserialize_catalog_response` kept `.with_source(e)` on the raw `serde_json::Error`, and
-    /// `iceberg::Error` renders the source VERBATIM (`, source: {source}` in `Display`,
-    /// `Source: {source:#}` in `Debug` — `crates/iceberg/src/error.rs`). `serde_json`'s message
-    /// echoes the value AT THE FAILURE POSITION, and when the mismatch is at a CONTAINER boundary
-    /// that value is an entire sub-document, echoed in full via `Unexpected::Str`.
-    ///
-    /// The shape below is a real, well-known bug class, not a contrivance: a server or API gateway
-    /// that emits a nested object as a JSON *string* (`writeValueAsString` on a sub-map, a
-    /// proxy-integration stringifying the body) turns `config` into a string whose CONTENT is the
-    /// whole vended-credential map. `serde` then reports `invalid type: string "…", expected a map`
-    /// with the credentials inline.
-    ///
-    /// The chain was NOT deleted to fix it — the source is now a `client.rs::SanitizedJsonError`,
-    /// which carries the failure category and position and nothing derived from the body.
-    ///
-    /// MUTATION (RED against the pre-change code): in `deserialize_catalog_response`, restore
-    /// `.with_source(e)` in place of `.with_source(SanitizedJsonError::new(&e))`.
+    /// `iceberg::Error` renders the `source` verbatim, so withholding the body from the context
+    /// alone leaks nothing only if the source is sanitized too. `serde_json` echoes the value at
+    /// the failure position, which at a container boundary is a whole sub-document. A gateway that
+    /// emits a nested object as a JSON string turns `config` into a string holding the
+    /// vended-credential map.
     #[tokio::test]
     async fn test_double_encoded_body_does_not_leak_through_error_source() {
         const SENTINEL: &str = "SENTINEL_LEAKS_VIA_SERDE_SOURCE_KNOWN_RESIDUE";
@@ -2653,9 +2433,8 @@ mod tests {
             "the double-encoded config leaked through `source` into Debug: {debug}"
         );
 
-        // Anti-vacuity: the chain is SANITIZED, not deleted. A source must still be attached and
-        // must still say what went wrong and where, or this test would pass against an error that
-        // simply dropped `with_source` — which is the fix AGENTS.md forbids.
+        // The chain is sanitized, not deleted. Without this assertion the test would pass
+        // against an error that simply dropped `with_source`.
         let source = std::error::Error::source(&err)
             .expect("the parse failure must still carry a source — the chain may not be deleted");
         let source_text = source.to_string();
@@ -2673,18 +2452,10 @@ mod tests {
         );
     }
 
-    /// SECURITY (SEC-009): `deserialize_unexpected_catalog_error` attached the ENTIRE non-2xx body.
-    /// The response direction is credential-free (a failed request vends nothing), but the
-    /// REQUEST-ECHO direction is not: this function is the fallthrough for the WRITE routes, whose
-    /// request types carry operator property maps, and a validation failure that echoes the
-    /// offending request back is a common server pattern.
-    ///
-    /// Pins that the body is now key-redacted rather than raw: the secret VALUE is masked while the
-    /// server's `message` — the diagnostic Java surfaces to the caller — and every non-secret
-    /// property survive.
-    ///
-    /// MUTATION (RED against the pre-change code): in `deserialize_unexpected_catalog_error`,
-    /// restore `.with_context("json", String::from_utf8_lossy(&bytes))`.
+    /// `deserialize_unexpected_catalog_error` is the fallthrough for the write routes, whose
+    /// request types carry operator property maps. A server that echoes the offending request back
+    /// therefore returns a body with secrets in it. Pins that the attached body is key-redacted:
+    /// the secret value is masked, the server `message` and every non-secret property survive.
     #[tokio::test]
     async fn test_non_2xx_body_masks_echoed_secret_properties() {
         const SENTINEL: &str = "SENTINEL_ECHOED_BACK_BY_THE_SERVER";
@@ -2766,12 +2537,9 @@ mod tests {
         );
     }
 
-    /// SECURITY (SEC-009), the other arm: a body that is not JSON cannot be key-redacted, so it is
-    /// withheld down to its byte length. A gateway/proxy error page can quote the request it
-    /// forwarded, and over-redaction is the safe direction.
-    ///
-    /// MUTATION (RED against the pre-change code): in `deserialize_unexpected_catalog_error`,
-    /// restore `.with_context("json", String::from_utf8_lossy(&bytes))`.
+    /// A non-JSON body cannot be key-redacted, so only its byte length survives. A proxy error
+    /// page can quote the request it forwarded. Discriminates restoring
+    /// `.with_context("json", String::from_utf8_lossy(&bytes))`.
     #[tokio::test]
     async fn test_non_2xx_non_json_body_is_withheld() {
         const SENTINEL: &str = "SENTINEL_IN_A_GATEWAY_ERROR_PAGE";
@@ -2824,19 +2592,12 @@ mod tests {
         );
     }
 
-    /// SEC-011 adjudication guard (Java parity — see the trust-model note on
-    /// [`REST_CATALOG_PROP_URI`]).
+    /// Java applies no host, IP, or scheme restriction to `uri` or `oauth2-server-uri`. A private
+    /// endpoint is the normal deployment, so a private-IP blocklist is rejected. See the trust
+    /// note on [`REST_CATALOG_PROP_URI`].
     ///
-    /// Java `iceberg-core` 1.10.0 applies NO host/IP/scheme restriction to the catalog `uri` or to
-    /// `oauth2-server-uri`: `HTTPClient.Builder.uri` only null-checks and `URI.create`s
-    /// (`HTTPClient.java:483-491`), `RESTSessionCatalog` passes the property straight through
-    /// (`RESTSessionCatalog.java:175`), and `AuthConfig.fromProperties` takes `oauth2-server-uri`
-    /// verbatim (`AuthConfig.java:85`). Reaching a private endpoint is the NORMAL deployment — that
-    /// is where catalog services live — so the audit's proposed private-IP blocklist is rejected as
-    /// a Java divergence that would break legitimate deployments.
-    ///
-    /// This test pins that decision: a loopback / RFC 1918 / link-local endpoint must be accepted
-    /// and used verbatim. RED-able: adding any private-address or scheme blocklist fails it.
+    /// Pins that a loopback, RFC 1918, or link-local endpoint is accepted verbatim.
+    /// Discriminates the mutation that adds any private-address or scheme blocklist.
     #[test]
     fn test_private_and_loopback_uris_are_accepted_java_parity() {
         // Catalog uri: accepted verbatim, no rewriting, no rejection.
@@ -3671,7 +3432,6 @@ mod tests {
         rename_table_mock.assert_async().await;
     }
 
-    // ===================================================================================
     // Vended storage credentials (GAP_MATRIX row R160)
     //
     // Mirrors Java `RESTSessionCatalog.newFileIO(SessionContext, Map, List<Credential>)` +
@@ -3679,7 +3439,6 @@ mod tests {
     // table's storage path, credential config layered LAST (wins on collision), no-match is a
     // silent skip. These pins are RED under the mutations named in the G4 charter (invert the
     // selection to shortest-prefix, swap the overlay order, or drop the wiring entirely).
-    // ===================================================================================
 
     /// Build a `load_table` response body from the shared testdata metadata, injecting a specific
     /// `config` map and (optionally) a `storage-credentials` array.
@@ -3718,9 +3477,8 @@ mod tests {
 
     #[test]
     fn test_select_vended_credential_longest_prefix_wins() {
-        // The table storage path is prefixed by BOTH credentials; the strictly-longer prefix wins
-        // (Java `clientForStoragePath` keeps the longest `startsWith` match). List order is short
-        // then long, so a shortest-prefix mutation would flip the pick — this pins the direction.
+        // Both credentials prefix the storage path, and the longer one wins. List order runs
+        // short then long, so a shortest-prefix mutation flips the pick.
         let short = s3_credential("s3://warehouse/database/table");
         let long = s3_credential("s3://warehouse/database/table/metadata");
         let creds = [short, long];
@@ -3788,9 +3546,8 @@ mod tests {
         let mut server = Server::new_async().await;
         let config_mock = create_config_mock(&mut server).await;
 
-        // Table `config` carries a colliding `s3.access-key-id` and a non-colliding `s3.region`;
-        // the vended credential (whose prefix covers the table location) must WIN the collision
-        // and add its own keys, while the non-colliding table key survives.
+        // The vended credential must win the colliding `s3.access-key-id` and add its own keys,
+        // while the non-colliding `s3.region` survives.
         let body = load_table_body(
             json!({
                 "s3.access-key-id": "FROM_TABLE_CONFIG",
@@ -4375,15 +4132,11 @@ mod tests {
         load_table_mock.assert_async().await
     }
 
-    // RISK (GAP_MATRIX row R157): a 5xx on the commit POST means the REST service may have
-    // applied the update before failing (Java `ErrorHandlers$CommitErrorHandler` maps
-    // 500/502/503/504 → `CommitStateUnknownException`). Classifying it retryable re-applies the
-    // same DataFiles on a base that may already contain them (duplicate rows); classifying it
-    // as a generic terminal error hides may-have-landed from the caller. Pins, through the FULL
-    // `Transaction::commit` stack: the unknown-outcome kind surfaces intact, is not marked
-    // retryable, and the commit POST fires EXACTLY ONCE (`expect(1)`) — a mutation that
-    // reclassifies 502 as retryable, or lets the retry gate retry the unknown kind, hits the
-    // mock more than once and fails the assert.
+    // A 5xx on the commit POST means the service may have applied the update before failing.
+    // Java `ErrorHandlers$CommitErrorHandler` maps it to `CommitStateUnknownException`. A retry
+    // would re-apply the same data files and duplicate rows. Pins through the full
+    // `Transaction::commit` stack that the unknown-outcome kind survives, is not retryable, and
+    // the POST fires exactly once. Discriminates reclassifying 502 as retryable (row R157).
     #[tokio::test]
     async fn test_update_table_502_unknown_outcome_surfaces_without_retry() {
         let mut server = Server::new_async().await;
@@ -4458,15 +4211,11 @@ mod tests {
         update_table_mock.assert_async().await;
     }
 
-    // RISK (GAP_MATRIX row R157): an HTTP 200 means the commit LANDED server-side; if the
-    // response body is then lost or unparsable, folding that into a generic error (Java has no
-    // analogue arm — this is the Rust-side extension of `CommitStateUnknownException`'s
-    // "may have been applied" contract, ErrorHandlers.java L88-104) invites the caller to
-    // blindly re-run a commit that is already durable, duplicating it. Pins, through the FULL
-    // `Transaction::commit` stack: a 200-with-garbage-body surfaces
-    // `ErrorKind::CommitStateUnknown` (a mutation of the `update_table` OK-arm `map_err` kind
-    // to `Unexpected` fails the kind assert), is NOT retryable, and the commit POST fires
-    // EXACTLY ONCE (`expect(1)`).
+    // An HTTP 200 means the commit landed. An unparsable body must not become a generic error,
+    // or the caller re-runs a durable commit and duplicates it. Java has no analogue arm; this
+    // extends `CommitStateUnknownException` (row R157). Pins through the full
+    // `Transaction::commit` stack that the kind is `CommitStateUnknown`, is not retryable, and
+    // the POST fires exactly once. Discriminates mutating the OK-arm kind to `Unexpected`.
     #[tokio::test]
     async fn test_update_table_200_unparsable_body_maps_to_commit_state_unknown() {
         let mut server = Server::new_async().await;
@@ -4761,10 +4510,8 @@ mod tests {
         }
     }
 
-    // ========================================================================
     // View method wiring tests — confirm each view method targets the correct REST route and maps
     // status codes to the right outcome. (Shape-level: a mock server, no real catalog backend.)
-    // ========================================================================
 
     fn view_metadata_body() -> &'static str {
         r#"{
@@ -5044,11 +4791,8 @@ mod tests {
             .with_body(view_metadata_body())
             .create_async()
             .await;
-        // Pin the commit BODY, not just the route: the wire shape is Java's `UpdateTableRequest`
-        // reused for views (`identifier` / `requirements` / `updates`), carrying the VIEW
-        // requirement tag `assert-view-uuid` and the VIEW update tag `set-properties` — a table
-        // requirement/update leak (or a wrong key) must NOT match this mock, which would surface as
-        // an unmatched-request error instead of the expected 409 conflict.
+        // Pin the commit body, not just the route. A table requirement or update tag leaking
+        // into the view request must fail to match this mock.
         let commit_mock = server
             .mock("POST", "/v1/namespaces/ns1/views/view1")
             .match_body(mockito::Matcher::AllOf(vec![
@@ -5091,10 +4835,8 @@ mod tests {
         commit_mock.assert_async().await;
     }
 
-    // RISK: a view commit that returns a 5xx must surface a "commit state is unknown" error (Java
-    // `ViewCommitErrorHandler` maps 500/502/503/504 → `CommitStateUnknownException`), NOT be folded
-    // into the generic transport-error default arm — and it must NOT be marked retryable (re-issuing
-    // a possibly-applied commit is unsafe). Mirrors the table-side `update_table` posture.
+    // A 5xx view commit must surface `CommitStateUnknown`, not the generic transport arm, and
+    // must not be retryable. Re-issuing a possibly-applied commit is unsafe.
     #[tokio::test]
     async fn test_update_view_5xx_maps_to_commit_state_unknown() {
         let mut server = Server::new_async().await;
@@ -5140,10 +4882,8 @@ mod tests {
         commit_mock.assert_async().await;
     }
 
-    // RISK (GAP_MATRIX row R157): a view commit returning HTTP 200 LANDED; if the LoadViewResult
-    // body is then lost/unparsable, a generic error kind invites a blind re-run of a durable
-    // commit. Pins the `update_view` OK-arm `map_err`: kind is `CommitStateUnknown` (mutating it
-    // to `Unexpected` fails the kind assert), not retryable, POST fires exactly once.
+    // A view commit returning 200 landed, so an unparsable body must not read as retryable
+    // (row R157). Pins kind, retryability, and one POST. Discriminates mutating the OK-arm kind.
     #[tokio::test]
     async fn test_update_view_200_unparsable_body_maps_to_commit_state_unknown() {
         let mut server = Server::new_async().await;

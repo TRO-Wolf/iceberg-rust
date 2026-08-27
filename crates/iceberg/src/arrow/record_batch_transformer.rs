@@ -39,20 +39,8 @@ use crate::spec::{
 };
 use crate::{Error, ErrorKind, Result};
 
-/// Build a map of field ID to constant value (as Datum) for identity-partitioned fields.
-///
-/// Implements Iceberg spec "Column Projection" rule #1: use partition metadata constants
-/// only for identity-transformed fields. Non-identity transforms (bucket, truncate, year, etc.)
-/// store derived values in partition metadata, so source columns must be read from data files.
-///
-/// Example: For `bucket(4, id)`, partition metadata has `id_bucket = 2` (bucket number),
-/// but the actual `id` values (100, 200, 300) are only in the data file.
-///
-/// Matches Java's `PartitionUtil.constantsMap()` which filters `if (field.transform().isIdentity())`.
-///
-/// # References
-/// - Spec: https://iceberg.apache.org/spec/#column-projection
-/// - Java: core/src/main/java/org/apache/iceberg/util/PartitionUtil.java:constantsMap()
+/// Builds the field id to constant map for identity-partitioned fields. Java
+/// `PartitionUtil.constantsMap`. # Notes Only identity transforms qualify.
 fn constants_map(
     partition_spec: &PartitionSpec,
     partition_data: &Struct,
@@ -61,15 +49,12 @@ fn constants_map(
     let mut constants = HashMap::new();
 
     for (pos, field) in partition_spec.fields().iter().enumerate() {
-        // Only identity transforms should use constant values from partition metadata
         if matches!(field.transform, Transform::Identity) {
-            // Get the field from schema to extract its type
             let iceberg_field = schema.field_by_id(field.source_id).ok_or(Error::new(
                 ErrorKind::Unexpected,
                 format!("Field {} not found in schema", field.source_id),
             ))?;
 
-            // Ensure the field type is primitive
             let prim_type = match &*iceberg_field.field_type {
                 crate::spec::Type::Primitive(prim_type) => prim_type,
                 _ => {
@@ -83,17 +68,10 @@ fn constants_map(
                 }
             };
 
-            // Get the partition value for this field.
-            //
-            // The tuple can be SHORTER than the spec — corrupt metadata, or a file's tuple
-            // paired with a different spec. Java resolves that to null rather than failing:
-            // `PartitionUtil.constantsMap` reads `partitionData.get(pos)`, and
-            // `PartitionData.get(int)` opens with `if (pos >= data.length) { return null; }`
-            // (iceberg-core 1.10.0, decoded from the shipped jar), after which
-            // `IdentityPartitionConverters.convertConstant` maps a null value back to null.
-            // Match that — warn, then fall through to the same "absent from the constants map"
-            // resolution the explicit-null case uses — instead of indexing past the end and
-            // aborting the scan task.
+            // The tuple can be SHORTER than the spec, from corrupt metadata or a tuple paired
+            // with a different spec. Java `PartitionData.get` returns null past the end, so match
+            // that. Warn and leave the field out of the map, which resolves it as null. Indexing
+            // past the end would abort the scan task.
             let Some(partition_value) = partition_data.fields().get(pos) else {
                 tracing::warn!(
                     source_id = field.source_id,
@@ -107,28 +85,17 @@ fn constants_map(
                 continue;
             };
 
-            // Handle both None (null) and Some(Literal::Primitive) cases
             match partition_value {
                 None => {
-                    // Skip null partition values - they will be resolved as null per Iceberg spec rule #4.
-                    // When a partition value is null, we don't add it to the constants map,
-                    // allowing downstream column resolution to handle it correctly.
+                    // A field absent from the constants map resolves as null downstream.
                     continue;
                 }
                 Some(Literal::Primitive(value)) => {
-                    // Build the constant from the partition value, COERCED to the source field's
-                    // Iceberg type. The partition tuple can carry a literal whose in-memory variant
-                    // is NARROWER than the (possibly type-promoted) column — e.g. an `Int(i32)`
-                    // partition value for a column promoted to `Long`. Without coercion the array
-                    // builder sees `(Int64, Int(19))` and errors ("Unsupported constant type
-                    // combination: Int64 with Some(Int(19))", `test_evolved_schema`).
-                    //
-                    // `Datum::to(field_type)` is the canonical Iceberg coercion (the same table used
-                    // throughout `arrow/`): `Int->Long`, `Int->Date`, `Long->Timestamp/Timestamptz`,
-                    // with equal types passing through. This mirrors Java
-                    // `IdentityPartitionConverters.convertConstant(partitionType.field(pos).type(),
-                    // value)`, where the TYPE comes from the (schema-derived) partition type, not the
-                    // literal's stored representation.
+                    // Coerce the value to the FIELD's Iceberg type, like Java
+                    // `IdentityPartitionConverters.convertConstant`. A partition tuple can carry a
+                    // literal narrower than a type-promoted column, such as `Int(i32)` for a
+                    // column promoted to `Long`. Without the coercion the array builder sees
+                    // `(Int64, Int(19))` and errors.
                     let datum = Datum::new(prim_type.clone(), value.clone())
                         .to(&iceberg_field.field_type)
                         .map_err(|e| {
@@ -159,97 +126,71 @@ fn constants_map(
     Ok(constants)
 }
 
-/// Indicates how a particular column in a processed RecordBatch should
-/// be sourced.
+/// How a column in a processed RecordBatch is sourced.
 #[derive(Debug)]
 pub(crate) enum ColumnSource {
-    // signifies that a column should be passed through unmodified
-    // from the file's RecordBatch
+    // Pass the file's column through unmodified.
     PassThrough {
         source_index: usize,
     },
 
-    // signifies that a column from the file's RecordBatch has undergone
-    // type promotion so the source column with the given index needs
-    // to be promoted to the specified type
+    /// Promote the file's column to the type the table schema now declares.
     Promote {
         target_type: DataType,
         source_index: usize,
     },
 
-    // Signifies that a new column has been inserted before the column
-    // with index `index`. (we choose "before" rather than "after" so
-    // that we can use usize; if we insert after, then we need to
-    // be able to store -1 here to signify that a new
-    // column is to be added at the front of the column list).
-    // If multiple columns need to be inserted at a given
-    // location, they should all be given the same index, as the index
-    // here refers to the original RecordBatch, not the interim state after
-    // a preceding operation.
+    /// Insert a new constant column that the file does not carry.
     Add {
         target_type: DataType,
         value: Option<PrimitiveLiteral>,
     },
 
-    // The reserved `_pos` metadata column: a new Int64 column holding each row's absolute
-    // physical ordinal in the data file (0-based). The values are threaded from the read
-    // position by `process_record_batch`, not read from the file, so the read path MUST feed
-    // batches in file order with no rows skipped (no Parquet `RowSelection` / row-group pruning)
-    // for the positions to be correct — enforced by the callers that project `_pos`.
+    /// The reserved `_pos` column: each row's 0-based physical ordinal in the data file.
+    ///
+    /// `process_record_batch` threads the value from the read position. The read path MUST
+    /// therefore feed batches in file order with no rows skipped, so no Parquet `RowSelection`
+    /// and no row-group pruning. The callers that project `_pos` enforce that.
     RowPosition,
 
-    // The reserved `_row_id` column when the file does NOT carry one: `first_row_id + physical
-    // ordinal` (Java `ValueReaders$RowIdReader`). Shares `RowPosition`'s in-order, no-skip decode
-    // requirement, since it is computed from the ordinal.
+    // The reserved `_row_id` column when the file does NOT carry one. Java
+    // `ValueReaders$RowIdReader`. Computed from the ordinal, so it shares `RowPosition`'s
+    // in-order, no-skip decode requirement.
     RowId {
         first_row_id: i64,
     },
 
-    // The reserved `_row_id` column when the file DOES carry one: stored value, NULLs filled with
-    // `first_row_id + physical ordinal` (Java `ValueReaders$RowIdReader.read`).
+    /// The reserved `_row_id` column when the file DOES carry one. The stored value wins, and a
+    /// NULL falls back to `first_row_id + ordinal`. Java `ValueReaders$RowIdReader.read`.
     RowIdFromFile {
         source_index: usize,
         first_row_id: i64,
     },
 
-    // The reserved `_last_updated_sequence_number` column when the file carries one: stored value,
-    // NULLs filled with the file's own sequence number (Java `ValueReaders$LastUpdatedSeqReader`).
+    /// The reserved `_last_updated_sequence_number` column when the file carries one. The stored
+    /// value wins, and a NULL falls back to the file's sequence number.
     LastUpdatedSeqFromFile {
         source_index: usize,
         file_sequence_number: i64,
     },
-    // The iceberg spec refers to other permissible schema evolution actions
-    // (see https://iceberg.apache.org/spec/#schema-evolution):
-    // renaming fields, deleting fields and reordering fields.
-    // Renames only affect the schema of the RecordBatch rather than the
-    // columns themselves, so a single updated cached schema can
-    // be re-used and no per-column actions are required.
-    // Deletion and Reorder can be achieved without needing this
-    // post-processing step by using the projection mask.
+    // A rename, a delete, and a reorder need no variant here. A rename only changes the batch
+    // schema, and the projection mask already handles a delete and a reorder.
 }
 
 #[derive(Debug)]
 enum BatchTransform {
-    // Indicates that no changes need to be performed to the RecordBatches
-    // coming in from the stream and that they can be passed through
-    // unmodified
+    /// The incoming batches already match. Pass them through.
     PassThrough,
 
     Modify {
-        // Every transformed RecordBatch will have the same schema. We create the
-        // target just once and cache it here. Helpfully, Arc<Schema> is needed in
-        // the constructor for RecordBatch, so we don't need an expensive copy
-        // each time we build a new RecordBatch
+        // Every transformed batch shares this schema, so build it once and cache it.
         target_schema: Arc<ArrowSchema>,
 
-        // Indicates how each column in the target schema is derived.
         operations: Vec<ColumnSource>,
     },
 
-    // Sometimes only the schema will need modifying, for example when
-    // the column names have changed vs the file, but not the column types.
-    // we can avoid a heap allocation per RecordBach in this case by retaining
-    // the existing column Vec.
+    // Only the schema changes, such as a rename. Keep the existing column `Vec` and save a heap
+    // allocation per batch.
     ModifySchema {
         target_schema: Arc<ArrowSchema>,
     },
@@ -262,10 +203,10 @@ enum SchemaComparison {
     Different,
 }
 
-/// Builder for RecordBatchTransformer to improve ergonomics when constructing with optional parameters.
+/// Builds a [`RecordBatchTransformer`] from its optional parameters.
 ///
-/// Constant fields are pre-computed for both virtual/metadata fields (like _file) and
-/// identity-partitioned fields to avoid duplicate work during batch processing.
+/// The constant fields are pre-computed once, for both metadata fields such as `_file` and
+/// identity-partitioned fields, so batch processing does not repeat the work.
 #[derive(Debug)]
 pub(crate) struct RecordBatchTransformerBuilder {
     snapshot_schema: Arc<IcebergSchema>,
@@ -291,12 +232,7 @@ impl RecordBatchTransformerBuilder {
         }
     }
 
-    /// Add a constant value for a specific field ID.
-    /// This is used for virtual/metadata fields like _file that have constant values per batch.
-    ///
-    /// # Arguments
-    /// * `field_id` - The field ID to associate with the constant
-    /// * `datum` - The constant value (with type) for this field
+    /// Adds the constant `datum` for `field_id`. Metadata fields such as `_file` use it.
     pub(crate) fn with_constant(mut self, field_id: i32, datum: Datum) -> Self {
         self.constant_fields.insert(field_id, datum);
         self
@@ -316,21 +252,17 @@ impl RecordBatchTransformerBuilder {
         self
     }
 
-    /// Set partition spec and data together for identifying identity-transformed partition columns.
-    ///
-    /// Both partition_spec and partition_data must be provided together since the spec defines
-    /// which fields are identity-partitioned, and the data provides their constant values.
-    /// This method computes the partition constants and merges them into constant_fields.
+    /// Sets the partition spec and its tuple, then merges the identity-partition constants into
+    /// the constant fields. The spec names the identity fields, and the tuple holds their values,
+    /// so the two arrive together.
     pub(crate) fn with_partition(
         mut self,
         partition_spec: Arc<PartitionSpec>,
         partition_data: Struct,
     ) -> Result<Self> {
-        // Compute partition constants for identity-transformed fields (already returns Datum)
         let partition_constants =
             constants_map(&partition_spec, &partition_data, &self.snapshot_schema)?;
 
-        // Add partition constants to constant_fields
         for (field_id, datum) in partition_constants {
             self.constant_fields.insert(field_id, datum);
         }
@@ -351,57 +283,39 @@ impl RecordBatchTransformerBuilder {
     }
 }
 
-/// Transforms RecordBatches from Parquet files to match the Iceberg table schema.
+/// Transforms a data file's RecordBatches to match the Iceberg table schema. It handles schema
+/// evolution, column reordering, type promotion, and the spec's Column Projection rules.
 ///
-/// Handles schema evolution, column reordering, type promotion, and implements the Iceberg spec's
-/// "Column Projection" rules for resolving field IDs "not present" in data files:
-/// 1. Return the value from partition metadata if an Identity Transform exists
-/// 2. Use schema.name-mapping.default metadata to map field id to columns without field id (applied in ArrowReader)
-/// 3. Return the default value if it has a defined initial-default
-/// 4. Return null in all other cases
+/// | Rule | Source for a field id the file does not carry |
+/// |---|---|
+/// | 1 | the partition metadata constant, for an identity transform |
+/// | 2 | the name mapping, applied earlier by `ArrowReader` |
+/// | 3 | the field's `initial-default` |
+/// | 4 | null |
 ///
-/// # Field ID Resolution
+/// # Notes
 ///
-/// Field ID resolution happens in ArrowReader before data is read (matching Java's ReadConf):
-/// - If file has embedded field IDs: trust them (ParquetSchemaUtil.hasIds() = true)
-/// - If file lacks IDs and name_mapping exists: apply name mapping (ParquetSchemaUtil.applyNameMapping())
-/// - If file lacks IDs and no name_mapping: use position-based fallback (ParquetSchemaUtil.addFallbackIds())
+/// `ArrowReader` resolves every field id before the read, like Java `ReadConf`, so the ids here
+/// are already trustworthy. This transformer applies rules 1, 3, and 4 only.
 ///
-/// By the time RecordBatchTransformer processes data, all field IDs are trustworthy.
-/// This transformer only handles remaining projection rules (#1, #3, #4) for fields still "not present".
-///
-/// # Partition Spec and Data
-///
-/// **Bucket partitioning**: Distinguish identity transforms (use partition metadata constants)
-/// from non-identity transforms like bucket (read from data file) to enable runtime filtering on
-/// bucket-partitioned columns. For example, `bucket(4, id)` stores only the bucket number in
-/// partition metadata, so actual `id` values must be read from the data file.
-///
-/// # References
-/// - Spec: https://iceberg.apache.org/spec/#column-projection
-/// - Java: parquet/src/main/java/org/apache/iceberg/parquet/ReadConf.java (field ID resolution)
-/// - Java: core/src/main/java/org/apache/iceberg/util/PartitionUtil.java (partition constants)
+/// A non-identity transform stores a derived value, so its source column comes from the data file.
+/// `bucket(4, id)` stores the bucket number, and runtime filtering on `id` needs the real values.
 #[derive(Debug)]
 pub(crate) struct RecordBatchTransformer {
     snapshot_schema: Arc<IcebergSchema>,
     projected_iceberg_field_ids: Vec<i32>,
-    // Pre-computed constant field information: field_id -> Datum
-    // Includes both virtual/metadata fields (like _file) and identity-partitioned fields
-    // Datum holds both the Iceberg type and the value
+    // Metadata fields such as `_file`, plus the identity-partitioned fields.
     constant_fields: HashMap<i32, Datum>,
 
-    // V3 row lineage inputs for the data file being read (see
-    // `RecordBatchTransformerBuilder::with_row_lineage`).
+    // See `RecordBatchTransformerBuilder::with_row_lineage`.
     first_row_id: Option<i64>,
     file_sequence_number: Option<i64>,
 
-    // BatchTransform gets lazily constructed based on the schema of
-    // the first RecordBatch we receive from the file
+    // Built lazily from the first batch's schema.
     batch_transform: Option<BatchTransform>,
 
-    // The absolute physical row position (0-based) of the NEXT row to process, advanced by each
-    // batch's row count. Sourced into the reserved `_pos` column (`ColumnSource::RowPosition`)
-    // when projected. Correct only under an in-order, no-skip decode — see that variant.
+    // The 0-based physical position of the NEXT row. It feeds `ColumnSource::RowPosition`, and it
+    // is correct only under an in-order, no-skip decode. See that variant.
     next_row_position: u64,
 }
 
@@ -434,8 +348,7 @@ impl RecordBatchTransformer {
             self.batch_transform = Some(transform);
         }
 
-        // The absolute physical position of this batch's first row (for `_pos`), captured before
-        // the immutable borrow of `batch_transform` below.
+        // Captured before the immutable borrow of `batch_transform` below.
         let start_row_position = self.next_row_position;
         let row_count = record_batch.num_rows();
 
@@ -475,20 +388,15 @@ impl RecordBatchTransformer {
             }
         };
 
-        // Advance the running position by the FULL batch (before any later delete / predicate mask
-        // filters rows out) so the next batch's `_pos` continues from the correct physical ordinal.
+        // Advance by the FULL batch, before any later delete or predicate mask drops rows, so the
+        // next batch's `_pos` continues from the correct physical ordinal.
         self.next_row_position = self.next_row_position.saturating_add(row_count as u64);
 
         Ok(result)
     }
 
-    // Compare the schema of the incoming RecordBatches to the schema of
-    // the Iceberg snapshot to determine what, if any, transformation
-    // needs to be applied. If the schemas match, we return BatchTransform::PassThrough
-    // to indicate that no changes need to be made. Otherwise, we return a
-    // BatchTransform::Modify containing the target RecordBatch schema and
-    // the list of `ColumnSource`s that indicate how to source each column in
-    // the resulting RecordBatches.
+    /// Compares the incoming batch schema with the snapshot schema and picks the transform to
+    /// apply.
     fn generate_batch_transform(
         source_schema: &ArrowSchemaRef,
         snapshot_schema: &IcebergSchema,
@@ -501,17 +409,12 @@ impl RecordBatchTransformer {
         let field_id_to_mapped_schema_map =
             Self::build_field_id_to_arrow_schema_map(&mapped_unprojected_arrow_schema)?;
 
-        // Create a new arrow schema by selecting fields from mapped_unprojected,
-        // in the order of the field ids in projected_iceberg_field_ids
+        // Select fields in the order of `projected_iceberg_field_ids`.
         let fields: Result<Vec<_>> = projected_iceberg_field_ids
             .iter()
             .map(|field_id| {
-                // Check if this is a constant field
                 if constant_fields.contains_key(field_id) {
-                    // For metadata/virtual fields (like _file), get name from metadata_columns
-                    // For partition fields, get name from schema (they exist in schema)
                     if let Ok(iceberg_field) = get_metadata_field(*field_id) {
-                        // This is a metadata/virtual field - convert Iceberg field to Arrow
                         let datum = constant_fields.get(field_id).ok_or(Error::new(
                             ErrorKind::Unexpected,
                             "constant field not found",
@@ -525,16 +428,10 @@ impl RecordBatchTransformer {
                                 )]));
                         Ok(Arc::new(arrow_field))
                     } else {
-                        // This is an identity-partition constant field. It EXISTS in the table
-                        // schema, so its declared scan-schema field (plain Arrow type, nullability
-                        // and field-id metadata) is authoritative — the materialized constant must
-                        // match it EXACTLY, not a Run-End-Encoded variant. Emitting REE here is the
-                        // bug that broke `test_insert_into_partitioned` ("expected Utf8 but found
-                        // RunEndEncoded"): the output batch schema would declare REE where the
-                        // projected scan schema (and DataFusion) require a plain `Utf8`/`Int64`.
-                        // Java's `PartitionUtil.constantsMap` is encoding-agnostic; REE was a
-                        // Rust-only storage optimization that violated the schema contract for
-                        // columns the reader must hand back in their declared physical type.
+                        // An identity-partition field EXISTS in the table schema, so its declared
+                        // scan-schema field is authoritative. The constant must match that field
+                        // exactly, never a Run-End-Encoded variant. REE here makes the output
+                        // schema declare REE where the scan schema requires a plain `Utf8`.
                         Ok(field_id_to_mapped_schema_map
                             .get(field_id)
                             .ok_or(Error::new(ErrorKind::Unexpected, "field not found"))?
@@ -544,9 +441,8 @@ impl RecordBatchTransformer {
                 } else if *field_id == RESERVED_FIELD_ID_ROW_ID
                     || *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
                 {
-                    // V3 row-lineage columns are absent from the table schema, like `_pos`, so
-                    // their Arrow field comes from the reserved-column definition (Iceberg `long`
-                    // => Arrow Int64).
+                    // Row-lineage columns are absent from the table schema, like `_pos`, so the
+                    // field comes from the reserved-column definition.
                     let meta = get_metadata_field(*field_id)?;
                     Ok(Arc::new(
                         Field::new(&meta.name, DataType::Int64, !meta.required).with_metadata(
@@ -557,10 +453,8 @@ impl RecordBatchTransformer {
                         ),
                     ))
                 } else if *field_id == RESERVED_FIELD_ID_POS {
-                    // `_pos` reserved metadata column: not a value constant and absent from the
-                    // table schema (so the regular lookup below would fail). Build its Arrow field
-                    // from the reserved-column definition (Iceberg `long` => Arrow Int64); the
-                    // values are synthesized from the read position by `ColumnSource::RowPosition`.
+                    // `_pos` is absent from the table schema, so the lookup below would fail.
+                    // `ColumnSource::RowPosition` synthesizes the values from the read position.
                     let pos_meta = get_metadata_field(*field_id)?;
                     Ok(Arc::new(
                         Field::new(&pos_meta.name, DataType::Int64, !pos_meta.required)
@@ -570,7 +464,6 @@ impl RecordBatchTransformer {
                             )])),
                     ))
                 } else {
-                    // Regular field - use schema as-is
                     Ok(field_id_to_mapped_schema_map
                         .get(field_id)
                         .ok_or(Error::new(ErrorKind::Unexpected, "field not found"))?
@@ -582,14 +475,9 @@ impl RecordBatchTransformer {
 
         let target_schema = Arc::new(ArrowSchema::new(fields?));
 
-        // A constant field (identity-partition or metadata/virtual) is AUTHORITATIVE and
-        // must OVERRIDE any column of the same field id physically present in the data file
-        // (Java: partition metadata wins over file data; `BaseParquetReaders` consults
-        // `idToConstant` before the file column). If such a field is also in the source
-        // file, the `PassThrough` / `ModifySchema` fast paths would hand back the FILE
-        // value instead of the constant — so we must take the column-rebuilding `Modify`
-        // path. (In the common Hive-migration case the partition column is NOT in the file,
-        // and `compare_schemas` already reports `Different` because the field is missing.)
+        // A constant field is AUTHORITATIVE and must override a file column of the same field id,
+        // as in Java `BaseParquetReaders`. The `PassThrough` and `ModifySchema` fast paths would
+        // hand back the FILE value, so force the column-rebuilding `Modify` path.
         let constant_overrides_file_column = !constant_fields.is_empty() && {
             let source_field_ids = Self::build_field_id_to_arrow_schema_map(source_schema)?;
             constant_fields
@@ -621,18 +509,13 @@ impl RecordBatchTransformer {
         }
     }
 
-    /// Compares the source and target schemas
-    /// Determines if they have changed in any meaningful way:
-    ///  * If they have different numbers of fields, then we need to modify
-    ///    the incoming RecordBatch schema AND columns
-    ///  * If they have the same number of fields, but some of them differ in
-    ///    either data type or nullability, then we need to modify the
-    ///    incoming RecordBatch schema AND columns
-    ///  * If the schemas differ only in the column names, then we need
-    ///    to modify the RecordBatch schema BUT we can keep the
-    ///    original column data unmodified
-    ///  * If the schemas are identical (or differ only in inconsequential
-    ///    ways) then we can pass through the original RecordBatch unmodified
+    /// Compares the source and target schemas.
+    ///
+    /// | Difference | Result |
+    /// |---|---|
+    /// | field count, data type, or nullability | `Different`: rebuild schema and columns |
+    /// | column names only | `NameChangesOnly`: rebuild the schema, keep the columns |
+    /// | none | `Equivalent`: pass the batch through |
     fn compare_schemas(
         source_schema: &ArrowSchemaRef,
         target_schema: &ArrowSchemaRef,
@@ -654,14 +537,10 @@ impl RecordBatchTransformer {
                 return SchemaComparison::Different;
             }
 
-            // A positional FIELD-ID mismatch means the file's physical column order differs from
-            // the projected (target) order — e.g. a name-mapped `add_files` file whose columns
-            // are stored in a different order than the table schema, or a projection that reads a
-            // subset out of physical order. The `NameChangesOnly` / `Equivalent` fast paths relabel
-            // or pass columns THROUGH by position, which would MISLABEL them (hand back the wrong
-            // column under a field's name — the wrong-column class). When both fields carry a
-            // parseable field id and they differ, force the field-id-based `Modify` path
-            // (`generate_transform_operations`), which sources each output column by field id.
+            // A positional field-id mismatch means the file's column order differs from the
+            // projected order. The fast paths relabel or pass columns through BY POSITION, which
+            // hands back the wrong column under a field's name. Force the `Modify` path, which
+            // sources each output column by field id.
             if let (Some(source_id), Some(target_id)) = (
                 Self::field_id_of(source_field),
                 Self::field_id_of(target_field),
@@ -670,9 +549,9 @@ impl RecordBatchTransformer {
                 return SchemaComparison::Different;
             }
 
-            // A V3 row-lineage column is never a pass-through: its value is stored-else-fallback
-            // PER ROW, so force the field-id-based `Modify` path. The source half is defensive; the
-            // target half alone decides every case reachable today.
+            // A row-lineage column is never a pass-through. Its value is stored-else-fallback per
+            // ROW, so force the `Modify` path. The source half is defensive: the target half alone
+            // decides every case reachable today.
             if Self::field_id_of(source_field).is_some_and(is_row_lineage_field)
                 || Self::field_id_of(target_field).is_some_and(is_row_lineage_field)
             {
@@ -706,21 +585,12 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids
             .iter()
             .map(|field_id| {
-                // Check if this is a constant field (metadata/virtual or identity-partitioned)
-                // Constant fields always use their pre-computed constant values, regardless of whether
-                // they exist in the Parquet file. This is per Iceberg spec rule #1: partition metadata
-                // is authoritative and should be preferred over file data.
+                // A constant field wins over a file column of the same id, per spec rule 1.
                 if let Some(datum) = constant_fields.get(field_id) {
-                    // The column's physical Arrow type MUST equal what the target schema declares
-                    // for it (built in `generate_batch_transform` above), or the produced batch
-                    // fails `RecordBatch::try_new` against that schema.
-                    //
-                    //  * Metadata/virtual fields (`_file`, ...) have no entry in the table schema,
-                    //    so the target schema declares them Run-End-Encoded — keep REE here.
-                    //  * Identity-partition fields EXIST in the table schema; the target schema
-                    //    declares their plain physical type (e.g. `Int64`/`Utf8`), so the constant
-                    //    is a PLAIN repeated array of that type. Emitting REE for these is the bug
-                    //    that broke `test_insert_into_partitioned`.
+                    // The physical Arrow type MUST equal what the target schema declares, or
+                    // `RecordBatch::try_new` rejects the batch. A metadata field has no table
+                    // schema entry, so the target declares it Run-End-Encoded. An
+                    // identity-partition field has one, so the target declares its plain type.
                     let target_type = if get_metadata_field(*field_id).is_ok() {
                         datum_to_arrow_type_with_ree(datum)?
                     } else {
@@ -740,10 +610,9 @@ impl RecordBatchTransformer {
                     });
                 }
 
-                // `_pos` reserved metadata column. Absent from the table schema, so the lookup
-                // below would fail. If the file carries `_pos` (the Avro reader emits it as a
-                // running counter) pass it through; otherwise (Parquet / ORC) synthesize it from
-                // the read position via `RowPosition`.
+                // `_pos` is absent from the table schema, so the lookup below would fail. The
+                // Avro reader emits `_pos` as a running counter, so pass a stored column through.
+                // Parquet and ORC have none, so synthesize it from the read position.
                 if *field_id == RESERVED_FIELD_ID_POS {
                     return Ok(match field_id_to_source_schema_map.get(field_id) {
                         Some((_, source_index)) => ColumnSource::PassThrough {
@@ -754,11 +623,10 @@ impl RecordBatchTransformer {
                 }
 
                 // Java `ValueReaders.fileFieldReader` dispatches on whether the FILE carries the
-                // field: present gets a per-row fallback reader, absent gets the computed or
-                // constant value.
+                // field. Present gets a per-row fallback reader, absent gets a computed value.
                 if *field_id == RESERVED_FIELD_ID_ROW_ID {
-                    // No assigned range => an all-NULL column, as in Java's
-                    // `ValueReaders.rowIds(null, reader)`. A V1/V2 file has no row identity.
+                    // No assigned range gives an all-NULL column, as in Java
+                    // `ValueReaders.rowIds(null, reader)`. A V1 or V2 file has no row identity.
                     let Some(first_row_id) = first_row_id else {
                         return Ok(ColumnSource::Add {
                             target_type: DataType::Int64,
@@ -775,9 +643,8 @@ impl RecordBatchTransformer {
                 }
 
                 if *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER {
-                    // Java gates this column on BOTH inputs, so a V1/V2 file reports NULL. Gating
-                    // on the sequence number alone fabricates a value for every row of every pre-V3
-                    // table.
+                    // Java gates this column on BOTH inputs, so a V1 or V2 file reports NULL.
+                    // The sequence number alone fabricates a value for every pre-V3 row.
                     let (Some(_), Some(file_sequence_number)) =
                         (first_row_id, file_sequence_number)
                     else {
@@ -813,24 +680,12 @@ impl RecordBatchTransformer {
                     "Field not found in snapshot schema",
                 ))?;
 
-                // Iceberg spec's "Column Projection" rules (https://iceberg.apache.org/spec/#column-projection).
-                // For fields "not present" in data files:
-                // 1. Use partition metadata (identity transforms only)
-                // 2. Use name mapping
-                // 3. Use initial_default
-                // 4. Return null
-                //
-                // Why check partition constants before Parquet field IDs (Java: BaseParquetReaders.java:299):
-                // In add_files scenarios, partition columns may exist in BOTH Parquet AND partition metadata.
-                // Partition metadata is authoritative - it defines which partition this file belongs to.
+                // A constant field wins over a file column of the same id, per spec rule 1.
+                // `generate_batch_transform` already handled that above.
 
-                // Field ID resolution now happens in ArrowReader via:
-                // 1. Embedded field IDs (ParquetSchemaUtil.hasIds() = true) - trust them
-                // 2. Name mapping (ParquetSchemaUtil.applyNameMapping()) - applied upfront
-                // 3. Position-based fallback (ParquetSchemaUtil.addFallbackIds()) - applied upfront
-                //
-                // At this point, all field IDs in the source schema are trustworthy.
-                // No conflict detection needed - schema resolution happened in reader.rs.
+                // Every field id in the source schema is already resolved and trustworthy.
+                // `reader.rs` applied the embedded ids, the name mapping, or the position
+                // fallback, so no conflict detection is needed here.
                 let field_by_id = field_id_to_source_schema_map.get(field_id).map(
                     |(source_field, source_index)| {
                         if source_field.data_type().equals_datatype(target_type) {
@@ -846,15 +701,10 @@ impl RecordBatchTransformer {
                     },
                 );
 
-                // Apply spec's fallback steps for "not present" fields.
-                // Rule #1 (constants) is handled at the beginning of this function
                 let column_source = if let Some(source) = field_by_id {
                     source
                 } else {
-                    // Rules #2, #3 and #4:
-                    // Rule #2 (name mapping) was already applied in reader.rs if needed.
-                    // If field_id is still not found, the column doesn't exist in the Parquet file.
-                    // Fall through to rule #3 (initial_default) or rule #4 (null).
+                    // The file has no such column, so fall to rule 3 then rule 4.
                     let default_value = iceberg_field.initial_default.as_ref().and_then(|lit| {
                         if let Literal::Primitive(prim) = lit {
                             Some(prim.clone())
@@ -889,7 +739,6 @@ impl RecordBatchTransformer {
     ) -> Result<HashMap<i32, (FieldRef, usize)>> {
         let mut field_id_to_source_schema = HashMap::new();
         for (source_field_idx, source_field) in source_schema.fields.iter().enumerate() {
-            // Check if field has a field ID in metadata
             if let Some(field_id_str) = source_field.metadata().get(PARQUET_FIELD_ID_META_KEY) {
                 let this_field_id = field_id_str.parse().map_err(|e| {
                     Error::new(
@@ -901,15 +750,18 @@ impl RecordBatchTransformer {
                 field_id_to_source_schema
                     .insert(this_field_id, (source_field.clone(), source_field_idx));
             }
-            // If field doesn't have a field ID, skip it - name mapping will handle it
+            // A field with no field id is left to the name mapping.
         }
 
         Ok(field_id_to_source_schema)
     }
 
-    /// `first_row_id + physical ordinal` for `num_rows` rows from `start_row_position` — the
-    /// fallback arm of Java `ValueReaders$RowIdReader`. Fails on `i64` overflow; Java wraps, but a
-    /// wrapped id aliases another live row's identity.
+    /// `first_row_id + physical ordinal` for `num_rows` rows from `start_row_position`. The
+    /// fallback arm of Java `ValueReaders$RowIdReader`.
+    ///
+    /// # Errors
+    ///
+    /// On `i64` overflow. Java wraps, but a wrapped id aliases another live row's identity.
     fn row_ids_from_positions(
         first_row_id: i64,
         start_row_position: u64,
@@ -920,16 +772,16 @@ impl RecordBatchTransformer {
         }
         let overflow = || row_id_overflow(first_row_id, start_row_position, num_rows);
 
-        // Ids are monotonic in position, so the LAST row covers the batch. Its offset is `start +
-        // num_rows - 1`; `start + num_rows` would reject a batch ending exactly at `i64::MAX`.
+        // Ids rise with position, so the LAST row bounds the batch. Its offset is
+        // `start + num_rows - 1`. `start + num_rows` would reject a batch ending at `i64::MAX`.
         let first = first_row_id
             .checked_add(i64::try_from(start_row_position).map_err(|_| overflow())?)
             .ok_or_else(overflow)?;
         let last_offset = i64::try_from(num_rows - 1).map_err(|_| overflow())?;
         first.checked_add(last_offset).ok_or_else(overflow)?;
 
-        // Every id in `[first, first + num_rows - 1]` is now proven representable, so the
-        // per-row addition below cannot overflow.
+        // Every id in `[first, first + num_rows - 1]` is proven representable, so the per-row
+        // addition below cannot overflow.
         Ok(Int64Array::from_iter_values(
             (0..last_offset + 1).map(|offset| first + offset),
         ))
@@ -957,7 +809,6 @@ impl RecordBatchTransformer {
                     }
 
                     ColumnSource::RowPosition => {
-                        // Each row's absolute physical ordinal: [start, start + num_rows).
                         let end = start_row_position.saturating_add(num_rows as u64);
                         Arc::new(Int64Array::from_iter_values(
                             (start_row_position..end).map(|p| p as i64),
@@ -965,8 +816,7 @@ impl RecordBatchTransformer {
                     }
 
                     ColumnSource::RowId { first_row_id } => {
-                        // Java `ValueReaders$RowIdReader` with no stored column: every row is
-                        // `firstRowId + pos`, computed over the physical ordinal.
+                        // No stored column, so every row is `firstRowId + pos`.
                         Arc::new(Self::row_ids_from_positions(
                             *first_row_id,
                             start_row_position,
@@ -978,8 +828,8 @@ impl RecordBatchTransformer {
                         source_index,
                         first_row_id,
                     } => {
-                        // Java `ValueReaders$RowIdReader.read`: the stored id wins; only a NULL
-                        // falls back to `firstRowId + pos`.
+                        // Java `ValueReaders$RowIdReader.read`: the stored id wins, and only a
+                        // NULL falls back to `firstRowId + pos`.
                         let stored = columns[*source_index].as_ref();
                         let stored =
                             stored
@@ -1013,8 +863,8 @@ impl RecordBatchTransformer {
                         source_index,
                         file_sequence_number,
                     } => {
-                        // Java `ValueReaders$LastUpdatedSeqReader.read`: the stored value wins;
-                        // only a NULL falls back to the file's own sequence number.
+                        // Java `ValueReaders$LastUpdatedSeqReader.read`: the stored value wins,
+                        // and only a NULL falls back to the file's own sequence number.
                         let stored = columns[*source_index].as_ref();
                         let stored = stored.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                             Error::new(
@@ -1045,9 +895,7 @@ impl RecordBatchTransformer {
         prim_lit: &Option<PrimitiveLiteral>,
         num_rows: usize,
     ) -> Result<ArrayRef> {
-        // Check if this is a RunEndEncoded type (for constant fields)
         if let DataType::RunEndEncoded(_, values_field) = target_type {
-            // Helper to create a Run-End Encoded array
             let create_ree_array = |values_array: ArrayRef| -> Result<ArrayRef> {
                 let run_ends = if num_rows == 0 {
                     Int32Array::from(Vec::<i32>::new())
@@ -1065,14 +913,11 @@ impl RecordBatchTransformer {
                 ))
             };
 
-            // Create the values array using the helper function
             let values_array =
                 create_primitive_array_single_element(values_field.data_type(), prim_lit)?;
 
-            // Wrap in Run-End Encoding
             create_ree_array(values_array)
         } else {
-            // Non-REE type (simple arrays for non-constant fields)
             create_primitive_array_repeated(target_type, prim_lit, num_rows)
         }
     }
@@ -1099,8 +944,7 @@ mod test {
     };
     use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Type};
 
-    /// Helper to extract string values from either StringArray or RunEndEncoded<StringArray>
-    /// Returns empty string for null values
+    /// Reads a string from a `StringArray` or a run-end-encoded one. A null gives `""`.
     fn get_string_value(array: &dyn Array, index: usize) -> String {
         if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
             if string_array.is_null(index) {
@@ -1117,7 +961,7 @@ mod test {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("REE values should be StringArray");
-            // For REE, all rows have the same value (index 0 in the values array)
+            // Every row of an REE constant column shares the value at index 0.
             if string_values.is_null(0) {
                 String::new()
             } else {
@@ -1128,7 +972,7 @@ mod test {
         }
     }
 
-    /// Helper to extract int values from either Int32Array or RunEndEncoded<Int32Array>
+    /// Reads an int from an `Int32Array` or a run-end-encoded one.
     fn get_int_value(array: &dyn Array, index: usize) -> i32 {
         if let Some(int_array) = array.as_any().downcast_ref::<Int32Array>() {
             int_array.value(index)
@@ -1201,9 +1045,7 @@ mod test {
 
     #[test]
     fn schema_evolution_adds_date_column_with_nulls() {
-        // Reproduces TestSelect.readAndWriteWithBranchAfterSchemaChange from iceberg-spark.
-        // When reading old snapshots after adding a DATE column, the transformer must
-        // populate the new column with NULL values since old files lack this field.
+        // A DATE column added after the file was written must materialize as NULLs.
         let snapshot_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
@@ -1270,9 +1112,8 @@ mod test {
 
     #[test]
     fn row_position_metadata_column_counts_physical_ordinal_across_batches() {
-        // Projecting the reserved `_pos` column must inject an Int64 column of each row's absolute
-        // physical ordinal in the data file (0-based), and the counter must CONTINUE across batches
-        // — it is the contract a downstream engine relies on to write position deletes.
+        // Risk pinned: the `_pos` counter must CONTINUE across batches. A downstream engine
+        // writes position deletes against it.
         use arrow_array::Int64Array;
 
         let snapshot_schema = Arc::new(
@@ -1298,7 +1139,7 @@ mod test {
             "1",
         )]));
 
-        // First batch (3 rows) => _pos 0, 1, 2.
+        // First batch of 3 rows gives _pos 0, 1, 2.
         let batch1 =
             RecordBatch::try_new(file_schema.clone(), vec![Arc::new(Int32Array::from(vec![
                 10, 20, 30,
@@ -1315,7 +1156,7 @@ mod test {
             &[0, 1, 2]
         );
 
-        // Second batch (2 rows) => _pos 3, 4 — the counter continues, it does NOT restart.
+        // Second batch of 2 rows gives _pos 3, 4. The counter does NOT restart.
         let batch2 =
             RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![40, 50]))])
                 .unwrap();
@@ -1332,10 +1173,7 @@ mod test {
 
     #[test]
     fn schema_evolution_adds_struct_column_with_nulls() {
-        // Test that when a struct column is added after data files are written,
-        // the transformer can materialize the missing struct column with null values.
-        // This reproduces the scenario from Iceberg 1.10.0 TestSparkReaderDeletes tests
-        // where binaryData and structData columns were added to the schema.
+        // A struct column added after the data files were written must materialize as nulls.
         let snapshot_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(1)
@@ -1519,28 +1357,14 @@ mod test {
         )]))
     }
 
-    /// Test for add_files with Parquet files that have NO field IDs (Hive tables).
+    /// `add_files` over a Hive-style Parquet file with no field ids. `ArrowReader` has already
+    /// applied the name mapping, so `name` and `subdept` arrive with ids 2 and 4.
     ///
-    /// This reproduces the scenario from Iceberg spec where:
-    /// - Hive-style partitioned Parquet files are imported via add_files procedure
-    /// - Parquet files originally DO NOT have field IDs (typical for Hive tables)
-    /// - ArrowReader applies name mapping to assign correct Iceberg field IDs
-    /// - Iceberg schema assigns field IDs: id (1), name (2), dept (3), subdept (4)
-    /// - Partition columns (id, dept) have initial_default values
-    ///
-    /// Per the Iceberg spec (https://iceberg.apache.org/spec/#column-projection),
-    /// this scenario requires `schema.name-mapping.default` from table metadata
-    /// to correctly map Parquet columns by name to Iceberg field IDs.
-    /// This mapping is now applied in ArrowReader before data is processed.
-    ///
-    /// Expected behavior:
-    /// 1. id=1 (from initial_default) - spec rule #3
-    /// 2. name="John Doe" (from Parquet with field_id=2 assigned by reader) - found by field ID
-    /// 3. dept="hr" (from initial_default) - spec rule #3
-    /// 4. subdept="communications" (from Parquet with field_id=4 assigned by reader) - found by field ID
+    /// Risk pinned: the partition columns `id` and `dept` are absent from the file and must come
+    /// from `initial_default`, spec rule 3. The two mapped columns must come from the file.
     #[test]
     fn add_files_with_name_mapping_applied_in_reader() {
-        // Iceberg schema after add_files: id (partition), name, dept (partition), subdept
+        // Schema after add_files: id (partition), name, dept (partition), subdept.
         let snapshot_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(0)
@@ -1559,11 +1383,8 @@ mod test {
                 .unwrap(),
         );
 
-        // Simulate ArrowReader having applied name mapping:
-        // Original Parquet: name, subdept (NO field IDs)
-        // After reader.rs applies name mapping: name (field_id=2), subdept (field_id=4)
-        //
-        // Note: Partition columns (id, dept) are NOT in the Parquet file - they're in directory paths
+        // The file held name and subdept with no ids. `reader.rs` mapped them to 2 and 4. The
+        // partition columns id and dept live in the directory path, not the file.
         use std::collections::HashMap;
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
@@ -1581,7 +1402,7 @@ mod test {
         let mut transformer =
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids).build();
 
-        // Create a Parquet RecordBatch with data for: name="John Doe", subdept="communications"
+        // The file's two columns.
         let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
             Arc::new(StringArray::from(vec!["John Doe"])),
             Arc::new(StringArray::from(vec!["communications"])),
@@ -1590,11 +1411,7 @@ mod test {
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
 
-        // Verify the transformed RecordBatch has:
-        // - id=1 (from initial_default, not from Parquet)
-        // - name="John Doe" (from Parquet with correct field_id=2)
-        // - dept="hr" (from initial_default, not from Parquet)
-        // - subdept="communications" (from Parquet with correct field_id=4)
+        // id and dept come from initial_default, name and subdept from the file.
         assert_eq!(result.num_columns(), 4);
         assert_eq!(result.num_rows(), 1);
 
@@ -1627,50 +1444,16 @@ mod test {
         assert_eq!(subdept_column.value(0), "communications");
     }
 
-    /// Test for bucket partitioning where source columns must be read from data files.
-    ///
-    /// This test verifies correct implementation of the Iceberg spec's "Column Projection" rules:
-    /// > "Return the value from partition metadata if an **Identity Transform** exists for the field"
-    ///
-    /// # Why this test is critical
-    ///
-    /// The key insight is that partition metadata stores TRANSFORMED values, not source values:
-    /// - For `bucket(4, id)`, partition metadata has `id_bucket = 2` (the bucket number)
-    /// - The actual `id` column values (100, 200, 300) are ONLY in the data file
-    ///
-    /// If iceberg-rust incorrectly treated bucket-partitioned fields as constants, it would:
-    /// 1. Replace all `id` values with the constant `2` from partition metadata
-    /// 2. Break runtime filtering (e.g., `WHERE id = 100` would match no rows)
-    /// 3. Return incorrect query results
-    ///
-    /// # What this test verifies
-    ///
-    /// - Bucket-partitioned fields (e.g., `bucket(4, id)`) are read from the data file
-    /// - The source column `id` contains actual values (100, 200, 300), not constants
-    /// - Java's `PartitionUtil.constantsMap()` behavior is correctly replicated:
-    ///   ```java
-    ///   if (field.transform().isIdentity()) {  // FALSE for bucket transforms
-    ///       idToConstant.put(field.sourceId(), converted);
-    ///   }
-    ///   ```
-    ///
-    /// # Real-world impact
-    ///
-    /// This reproduces the failure scenario from Iceberg Java's TestRuntimeFiltering:
-    /// - Tables partitioned by `bucket(N, col)` are common for load balancing
-    /// - Queries filter on the source column: `SELECT * FROM tbl WHERE col = value`
-    /// - Runtime filtering pushes predicates down to Iceberg file scans
-    /// - Without this fix, the filter would match against constant partition values instead of data
-    ///
-    /// # References
-    /// - Iceberg spec: format/spec.md "Column Projection" + "Partition Transforms"
-    /// - Java impl: core/src/main/java/org/apache/iceberg/util/PartitionUtil.java
-    /// - Java test: spark/src/test/java/.../TestRuntimeFiltering.java
+    /// Risk pinned: treating a bucket-partitioned field as a constant. Partition metadata holds
+    /// `id_bucket = 2`, while the real `id` values 100, 200, 300 live only in the data file.
+    /// Replacing the column with the bucket number breaks runtime filtering, so `WHERE id = 100`
+    /// would match no rows. Java `PartitionUtil.constantsMap` filters on `isIdentity()`, which is
+    /// false for a bucket transform.
     #[test]
     fn bucket_partitioning_reads_source_column_from_file() {
         use crate::spec::{Struct, Transform};
 
-        // Table schema: id (data column), name (data column), id_bucket (partition column)
+        // Schema: id and name are data columns, id_bucket is the partition column.
         let snapshot_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(0)
@@ -1682,7 +1465,7 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition spec: bucket(4, id) - the id field is bucketed
+        // Partition spec: bucket(4, id).
         let partition_spec = Arc::new(
             crate::spec::PartitionSpec::builder(snapshot_schema.clone())
                 .with_spec_id(0)
@@ -1692,11 +1475,10 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition data: bucket value is 2
-        // In Iceberg, partition data is a Struct where each field corresponds to a partition field
+        // Partition tuple: bucket value 2.
         let partition_data = Struct::from_iter(vec![Some(Literal::int(2))]);
 
-        // Parquet file contains both id and name columns
+        // The file carries both id and name.
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             simple_field("id", DataType::Int32, false, "1"),
             simple_field("name", DataType::Utf8, true, "2"),
@@ -1710,8 +1492,7 @@ mod test {
                 .expect("Failed to add partition constants")
                 .build();
 
-        // Create a Parquet RecordBatch with actual data
-        // The id column MUST be read from here, not treated as a constant
+        // The id column MUST be read from here, not treated as a constant.
         let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
             Arc::new(Int32Array::from(vec![100, 200, 300])),
             Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
@@ -1720,8 +1501,7 @@ mod test {
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
 
-        // Verify the transformed RecordBatch correctly reads id from the file
-        // (NOT as a constant from partition metadata)
+        // id must come from the file, not from partition metadata.
         assert_eq!(result.num_columns(), 2);
         assert_eq!(result.num_rows(), 3);
 
@@ -1730,7 +1510,7 @@ mod test {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        // These values MUST come from the Parquet file, not be replaced by constants
+        // These values MUST come from the file, not from a constant.
         assert_eq!(id_column.value(0), 100);
         assert_eq!(id_column.value(1), 200);
         assert_eq!(id_column.value(2), 300);
@@ -1745,53 +1525,14 @@ mod test {
         assert_eq!(name_column.value(2), "Charlie");
     }
 
-    /// Test that identity-transformed partition fields ARE treated as constants.
-    ///
-    /// This is the complement to `bucket_partitioning_reads_source_column_from_file`,
-    /// verifying that constants_map() correctly identifies identity-transformed
-    /// partition fields per the Iceberg spec.
-    ///
-    /// # Spec requirement (format/spec.md "Column Projection")
-    ///
-    /// > "Return the value from partition metadata if an Identity Transform exists for the field
-    /// >  and the partition value is present in the `partition` struct on `data_file` object
-    /// >  in the manifest. This allows for metadata only migrations of Hive tables."
-    ///
-    /// # Why identity transforms use constants
-    ///
-    /// Unlike bucket/truncate/year/etc., identity transforms don't modify the value:
-    /// - `identity(dept)` stores the actual `dept` value in partition metadata
-    /// - Partition metadata has `dept = "engineering"` (the real value, not a hash/bucket)
-    /// - This value can be used directly without reading the data file
-    ///
-    /// # Performance benefit
-    ///
-    /// For Hive migrations where partition columns aren't in data files:
-    /// - Partition metadata provides the column values
-    /// - No need to read from data files (metadata-only query optimization)
-    /// - Common pattern: `dept=engineering/subdept=backend/file.parquet`
-    ///   - `dept` and `subdept` are in directory structure, not in `file.parquet`
-    ///   - Iceberg populates these from partition metadata as constants
-    ///
-    /// # What this test verifies
-    ///
-    /// - Identity-partitioned fields use constants from partition metadata
-    /// - The `dept` column is populated with `"engineering"` (not read from file)
-    /// - Java's `PartitionUtil.constantsMap()` behavior is matched:
-    ///   ```java
-    ///   if (field.transform().isIdentity()) {  // TRUE for identity
-    ///       idToConstant.put(field.sourceId(), converted);
-    ///   }
-    ///   ```
-    ///
-    /// # References
-    /// - Iceberg spec: format/spec.md "Column Projection"
-    /// - Java impl: core/src/main/java/org/apache/iceberg/util/PartitionUtil.java
+    /// The complement to `bucket_partitioning_reads_source_column_from_file`. An identity
+    /// transform stores the real value, so `dept = "engineering"` comes from partition metadata
+    /// and the file is never consulted. This is what makes a metadata-only Hive migration work.
     #[test]
     fn identity_partition_uses_constant_from_metadata() {
         use crate::spec::{Struct, Transform};
 
-        // Table schema: id (data column), dept (partition column), name (data column)
+        // Schema: id and name are data columns, dept is the partition column.
         let snapshot_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(0)
@@ -1804,7 +1545,7 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition spec: identity(dept) - the dept field uses identity transform
+        // Partition spec: identity(dept).
         let partition_spec = Arc::new(
             crate::spec::PartitionSpec::builder(snapshot_schema.clone())
                 .with_spec_id(0)
@@ -1814,10 +1555,10 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition data: dept="engineering"
+        // Partition tuple: dept="engineering".
         let partition_data = Struct::from_iter(vec![Some(Literal::string("engineering"))]);
 
-        // Parquet file contains only id and name (dept is in partition path)
+        // The file carries only id and name. dept lives in the partition path.
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             simple_field("id", DataType::Int32, false, "1"),
             simple_field("name", DataType::Utf8, true, "3"),
@@ -1839,15 +1580,14 @@ mod test {
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
 
-        // Verify the dept column is populated with the constant from partition metadata
+        // dept must carry the partition-metadata constant.
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.num_rows(), 2);
 
-        // Use helpers to handle both simple and REE arrays
         assert_eq!(get_int_value(result.column(0).as_ref(), 0), 100);
         assert_eq!(get_int_value(result.column(0).as_ref(), 1), 200);
 
-        // dept column comes from partition metadata (constant) - will be REE
+        // dept comes from partition metadata, so it is REE.
         assert_eq!(
             get_string_value(result.column(1).as_ref(), 0),
             "engineering"
@@ -1857,24 +1597,14 @@ mod test {
             "engineering"
         );
 
-        // name column comes from file
+        // name comes from the file.
         assert_eq!(get_string_value(result.column(2).as_ref(), 0), "Alice");
         assert_eq!(get_string_value(result.column(2).as_ref(), 1), "Bob");
     }
 
-    /// A partition tuple SHORTER than its partition spec must not abort the read.
-    ///
-    /// `constants_map` walks the spec's fields by position and reads the tuple at that position.
-    /// A tuple that is too short — corrupt metadata, or a file's tuple paired with a different
-    /// spec (the shape `SnapshotProducer::summary` produces on the commit path) — used to index
-    /// past the end of `Struct` and panic, killing the scan task.
-    ///
-    /// Java resolves the same input to null: `PartitionUtil.constantsMap` reads
-    /// `partitionData.get(pos)`, and `PartitionData.get(int)` opens with
-    /// `if (pos >= data.length) { return null; }` (iceberg-core 1.10.0, decoded from the shipped
-    /// jar), after which `IdentityPartitionConverters.convertConstant` returns null for a null
-    /// value. Leaving the field out of the constants map is how this module represents "resolve
-    /// as null" — the same path the explicit-null case takes.
+    /// Risk pinned: a partition tuple SHORTER than its spec used to index past the end of
+    /// `Struct` and panic, which killed the scan task. Java `PartitionData.get` returns null past
+    /// the end, so the field must instead stay out of the constants map and resolve as null.
     #[test]
     fn constants_map_tolerates_a_partition_tuple_shorter_than_the_spec() {
         use crate::spec::{Datum, PartitionSpec, Struct, Transform};
@@ -1892,7 +1622,7 @@ mod test {
                 .expect("build snapshot schema"),
         );
 
-        // Two identity partition fields...
+        // Two identity partition fields.
         let partition_spec = PartitionSpec::builder(snapshot_schema.clone())
             .with_spec_id(0)
             .add_partition_field("dept", "dept", Transform::Identity)
@@ -1902,7 +1632,7 @@ mod test {
             .build()
             .expect("build partition spec");
 
-        // ... but a tuple carrying only the first value.
+        // A tuple carrying only the first value.
         let partition_data = Struct::from_iter(vec![Some(Literal::string("engineering"))]);
 
         let constants = constants_map(&partition_spec, &partition_data, &snapshot_schema)
@@ -1920,45 +1650,16 @@ mod test {
         );
     }
 
-    /// Test bucket partitioning with renamed source column.
+    /// The bucket case after `RENAME COLUMN id TO row_id`. The file still names the column `id`,
+    /// and both sides keep field id 1.
     ///
-    /// This verifies correct behavior for TestRuntimeFiltering.testRenamedSourceColumnTable() in Iceberg Java.
-    /// When a source column is renamed after partitioning is established, field-ID-based mapping
-    /// must still correctly identify the column in Parquet files.
-    ///
-    /// # Scenario
-    ///
-    /// 1. Table created with `bucket(4, id)` partitioning
-    /// 2. Data written to Parquet files (field_id=1, name="id")
-    /// 3. Column renamed: `ALTER TABLE ... RENAME COLUMN id TO row_id`
-    /// 4. Iceberg schema now has: field_id=1, name="row_id"
-    /// 5. Parquet files still have: field_id=1, name="id"
-    ///
-    /// # Expected Behavior Per Iceberg Spec
-    ///
-    /// Per the Iceberg spec "Column Projection" section and Java's PartitionUtil.constantsMap():
-    /// - Bucket transforms are NON-identity, so partition metadata stores bucket numbers (0-3), not source values
-    /// - Source columns for non-identity transforms MUST be read from data files
-    /// - Field-ID-based mapping should find the column by field_id=1 (ignoring name mismatch)
-    /// - Runtime filtering on `row_id` should work correctly
-    ///
-    /// # What This Tests
-    ///
-    /// This test ensures that when FileScanTask provides partition_spec and partition_data:
-    /// - constants_map() correctly identifies that bucket(4, row_id) is NOT an identity transform
-    /// - The source column (field_id=1) is NOT added to constants_map
-    /// - Field-ID-based mapping reads actual values from the Parquet file
-    /// - Values [100, 200, 300] are read, not replaced with bucket constant 2
-    ///
-    /// # References
-    /// - Java test: spark/src/test/java/.../TestRuntimeFiltering.java::testRenamedSourceColumnTable
-    /// - Java impl: core/src/main/java/org/apache/iceberg/util/PartitionUtil.java::constantsMap()
-    /// - Iceberg spec: format/spec.md "Column Projection" section
+    /// Risk pinned: the lookup must match on field id, not on name, and must still read 100, 200,
+    /// 300 from the file rather than the bucket constant 2.
     #[test]
     fn test_bucket_partitioning_with_renamed_source_column() {
         use crate::spec::{Struct, Transform};
 
-        // Iceberg schema after rename: row_id (was id), name
+        // Schema after the rename: row_id, name.
         let snapshot_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(0)
@@ -1970,7 +1671,7 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition spec: bucket(4, row_id) - but source_id still points to field_id=1
+        // Partition spec: bucket(4, row_id), with source_id still 1.
         let partition_spec = Arc::new(
             crate::spec::PartitionSpec::builder(snapshot_schema.clone())
                 .with_spec_id(0)
@@ -1980,11 +1681,10 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition data: bucket value is 2
+        // Partition tuple: bucket value 2.
         let partition_data = Struct::from_iter(vec![Some(Literal::int(2))]);
 
-        // Parquet file has OLD column name "id" but SAME field_id=1
-        // Field-ID-based mapping should find this despite name mismatch
+        // The file keeps the OLD name "id" and the SAME field id 1.
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             simple_field("id", DataType::Int32, false, "1"),
             simple_field("name", DataType::Utf8, true, "2"),
@@ -1998,8 +1698,7 @@ mod test {
                 .expect("Failed to add partition constants")
                 .build();
 
-        // Create a Parquet RecordBatch with actual data
-        // Despite column rename, data should be read via field_id=1
+        // The data must be read through field id 1.
         let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
             Arc::new(Int32Array::from(vec![100, 200, 300])),
             Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
@@ -2008,7 +1707,7 @@ mod test {
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
 
-        // Verify the transformed RecordBatch correctly reads data despite name mismatch
+        // The name mismatch must not change the result.
         assert_eq!(result.num_columns(), 2);
         assert_eq!(result.num_rows(), 3);
 
@@ -2017,8 +1716,7 @@ mod test {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        // These values MUST come from the Parquet file via field_id=1,
-        // not be replaced by the bucket constant (2)
+        // These values MUST come from the file through field id 1, not from the bucket constant.
         assert_eq!(row_id_column.value(0), 100);
         assert_eq!(row_id_column.value(1), 200);
         assert_eq!(row_id_column.value(2), 300);
@@ -2033,40 +1731,34 @@ mod test {
         assert_eq!(name_column.value(2), "Charlie");
     }
 
-    /// Comprehensive integration test that verifies all 4 Iceberg spec rules work correctly.
+    /// All four Column Projection rules in one batch.
     ///
-    /// Per the Iceberg spec (https://iceberg.apache.org/spec/#column-projection),
-    /// "Values for field ids which are not present in a data file must be resolved
-    /// according the following rules:"
-    ///
-    /// This test creates a scenario where each rule is exercised:
-    /// - Rule #1: dept (identity-partitioned) -> constant from partition metadata
-    /// - Rule #2: data (via name mapping) -> read from Parquet file by name
-    /// - Rule #3: category (initial_default) -> use default value
-    /// - Rule #4: notes (no default) -> return null
-    ///
-    /// # References
-    /// - Iceberg spec: format/spec.md "Column Projection" section
+    /// | Column | Rule | Source |
+    /// |---|---|---|
+    /// | dept | 1 | the identity-partition constant |
+    /// | data | 2 | the file, through the name mapping |
+    /// | category | 3 | `initial_default` |
+    /// | notes | 4 | null |
     #[test]
     fn test_all_four_spec_rules() {
         use crate::spec::Transform;
 
-        // Iceberg schema with columns designed to exercise each spec rule
+        // One column per spec rule.
         let snapshot_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(0)
                 .with_fields(vec![
-                    // Field in Parquet by field ID (normal case)
+                    // The normal case: found in the file by field id.
                     NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                    // Rule #1: Identity-partitioned field - should use partition metadata
+                    // Rule 1: identity-partitioned.
                     NestedField::required(2, "dept", Type::Primitive(PrimitiveType::String)).into(),
-                    // Rule #2: Field resolved by name mapping (ArrowReader already applied)
+                    // Rule 2: resolved by the name mapping.
                     NestedField::required(3, "data", Type::Primitive(PrimitiveType::String)).into(),
-                    // Rule #3: Field with initial_default
+                    // Rule 3: has an initial_default.
                     NestedField::optional(4, "category", Type::Primitive(PrimitiveType::String))
                         .with_initial_default(Literal::string("default_category"))
                         .into(),
-                    // Rule #4: Field with no default - should be null
+                    // Rule 4: no default, so null.
                     NestedField::optional(5, "notes", Type::Primitive(PrimitiveType::String))
                         .into(),
                 ])
@@ -2074,7 +1766,7 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition spec: identity transform on dept
+        // Partition spec: identity(dept).
         let partition_spec = Arc::new(
             crate::spec::PartitionSpec::builder(snapshot_schema.clone())
                 .with_spec_id(0)
@@ -2084,12 +1776,11 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition data: dept="engineering"
+        // Partition tuple: dept="engineering".
         let partition_data = Struct::from_iter(vec![Some(Literal::string("engineering"))]);
 
-        // Parquet schema: simulates post-ArrowReader state where name mapping already applied
-        // Has id (field_id=1) and data (field_id=3, assigned by ArrowReader via name mapping)
-        // Missing: dept (in partition), category (has default), notes (no default)
+        // The post-ArrowReader file schema: id (1) and data (3). dept, category, and notes are
+        // absent.
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             simple_field("id", DataType::Int32, false, "1"),
             simple_field("data", DataType::Utf8, false, "3"),
@@ -2114,14 +1805,13 @@ mod test {
         assert_eq!(result.num_columns(), 5);
         assert_eq!(result.num_rows(), 2);
 
-        // Verify each column demonstrates the correct spec rule:
+        // Each column below demonstrates one spec rule.
 
-        // Normal case: id from Parquet by field ID
-        // Use helpers to handle both simple and REE arrays
+        // The normal case: id from the file by field id.
         assert_eq!(get_int_value(result.column(0).as_ref(), 0), 100);
         assert_eq!(get_int_value(result.column(0).as_ref(), 1), 200);
 
-        // Rule #1: dept from partition metadata (identity transform) - will be REE
+        // Rule 1: dept from partition metadata, so REE.
         assert_eq!(
             get_string_value(result.column(1).as_ref(), 0),
             "engineering"
@@ -2131,11 +1821,11 @@ mod test {
             "engineering"
         );
 
-        // Rule #2: data from Parquet via name mapping - will be regular array
+        // Rule 2: data from the file, so a plain array.
         assert_eq!(get_string_value(result.column(2).as_ref(), 0), "value1");
         assert_eq!(get_string_value(result.column(2).as_ref(), 1), "value2");
 
-        // Rule #3: category from initial_default - will be REE
+        // Rule 3: category from initial_default, so REE.
         assert_eq!(
             get_string_value(result.column(3).as_ref(), 0),
             "default_category"
@@ -2145,17 +1835,13 @@ mod test {
             "default_category"
         );
 
-        // Rule #4: notes is null (no default, not in Parquet, not in partition) - will be REE with null
-        // For null REE arrays, we still use the helper which handles extraction
+        // Rule 4: notes is a null REE column.
         assert_eq!(get_string_value(result.column(4).as_ref(), 0), "");
         assert_eq!(get_string_value(result.column(4).as_ref(), 1), "");
     }
 
-    /// Test handling of null values in identity-partitioned columns.
-    ///
-    /// Reproduces TestPartitionValues.testNullPartitionValue() from iceberg-java, which
-    /// writes records where the partition column has null values. Before the fix in #1922,
-    /// this would error with "Partition field X has null value for identity transform".
+    /// Risk pinned: a null value in an identity-partitioned column used to error. It must
+    /// materialize as a null column.
     #[test]
     fn null_identity_partition_value() {
         use crate::spec::{Struct, Transform};
@@ -2180,7 +1866,7 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition has null value for the data column
+        // The partition tuple holds a null.
         let partition_data = Struct::from_iter(vec![None]);
 
         let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
@@ -2213,26 +1899,19 @@ mod test {
             .unwrap();
         assert_eq!(id_col.values(), &[1, 2, 3]);
 
-        // Partition column with null value should produce nulls
+        // The partition column must produce nulls.
         let data_col = result.column(1);
         assert!(data_col.is_null(0));
         assert!(data_col.is_null(1));
         assert!(data_col.is_null(2));
     }
 
-    /// Regression pin for the REE-leak bug that triggered the 2026-06-08 revert
-    /// (`test_insert_into_partitioned` — "expected Utf8 but found RunEndEncoded").
+    /// Risk pinned: the REE leak. An identity-partition column exists in the table schema, so the
+    /// output batch must declare its plain physical type, `Utf8` here, never `RunEndEncoded`.
+    /// Materializing the constant as REE made the output schema disagree with the scan schema.
     ///
-    /// An identity-partition column EXISTS in the table schema, so the transformer's
-    /// output batch schema must declare it with the SAME plain physical Arrow type the
-    /// scan schema declares (`Utf8` here) — NOT a `RunEndEncoded` variant. Materializing
-    /// the constant as REE made the output schema disagree with the projected scan schema,
-    /// and DataFusion (and `RecordBatch::try_new` against the declared schema) rejected it.
-    ///
-    /// This test asserts the EXACT physical type (plain `StringArray`, declared `Utf8`),
-    /// not just the value — a `get_string_value`-style helper would pass under REE too.
-    /// Java's `PartitionUtil.constantsMap` is encoding-agnostic; the column is handed back
-    /// in its declared type.
+    /// The test asserts the EXACT physical type, not just the value. A `get_string_value` helper
+    /// would pass under REE too.
     #[test]
     fn identity_partition_constant_is_plain_array_not_run_end_encoded() {
         use arrow_schema::DataType;
@@ -2262,7 +1941,7 @@ mod test {
 
         let partition_data = Struct::from_iter(vec![Some(Literal::string("electronics"))]);
 
-        // The parquet file lacks the partition column (Hive-style migration): only `id`.
+        // The file lacks the partition column, as in a Hive migration. It carries only `id`.
         let parquet_schema = Arc::new(ArrowSchema::new(vec![simple_field(
             "id",
             DataType::Int32,
@@ -2286,15 +1965,14 @@ mod test {
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
 
-        // The output batch's declared schema field for `category` must be PLAIN Utf8,
-        // matching the table schema — never RunEndEncoded.
+        // The declared field for `category` must be plain Utf8, never RunEndEncoded.
         assert_eq!(
             result.schema().field(1).data_type(),
             &DataType::Utf8,
             "identity-partition constant must declare its plain scan-schema type, not REE"
         );
 
-        // And the materialized column must be a plain StringArray (not a RunArray).
+        // The materialized column must be a plain StringArray, not a RunArray.
         let category = result
             .column(1)
             .as_any()
@@ -2305,25 +1983,17 @@ mod test {
         assert_eq!(category.value(2), "electronics");
     }
 
-    /// Regression pin for the int->long widening bug that triggered the 2026-06-08 revert
-    /// (`test_evolved_schema` — "Unsupported constant type combination: Int64 with Some(Int(19))").
-    ///
-    /// A partition tuple can carry a literal whose in-memory variant is NARROWER than the
-    /// (type-promoted) column: an `Int(i32)` partition value for a column whose Iceberg type
-    /// is `Long`. The constant must be materialized into an `Int64` (`Long`) column by
-    /// coercing the value to the FIELD's Iceberg type via `Datum::to` — the same coercion
-    /// Java applies in `IdentityPartitionConverters.convertConstant(partitionType.field(pos)
-    /// .type(), value)`, where the type comes from the schema-derived partition type, not the
-    /// literal's stored representation. Without the coercion the array builder sees
-    /// `(Int64, Int(19))` and errors.
+    /// Risk pinned: the int-to-long widening bug. A partition tuple can carry a literal narrower
+    /// than a type-promoted column, such as `Int(19)` for a `Long` column. `Datum::to` must
+    /// coerce the value to the FIELD's type, like Java `IdentityPartitionConverters
+    /// .convertConstant`. Without it the array builder sees `(Int64, Int(19))` and errors.
     #[test]
     fn identity_partition_widens_int_literal_to_long_column() {
         use arrow_schema::DataType;
 
         use crate::spec::Transform;
 
-        // Column `p` has Iceberg type Long (e.g. promoted from Int) but the partition
-        // tuple still stores the value as the narrower Int(19) variant.
+        // Column `p` is Long, but the tuple still stores the narrower Int(19) variant.
         let snapshot_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(0)
@@ -2344,7 +2014,7 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition value stored as the NARROW Int(19) variant (the revert's exact case).
+        // The partition value in its NARROW Int(19) form.
         let partition_data = Struct::from_iter(vec![Some(Literal::int(19))]);
 
         let parquet_schema = Arc::new(ArrowSchema::new(vec![simple_field(
@@ -2368,7 +2038,7 @@ mod test {
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
 
-        // The materialized `p` column must be a plain Int64 column carrying the widened value.
+        // `p` must materialize as a plain Int64 column with the widened value.
         assert_eq!(result.schema().field(1).data_type(), &DataType::Int64);
         let p_col = result
             .column(1)
@@ -2379,27 +2049,18 @@ mod test {
         assert_eq!(p_col.value(1), 19);
     }
 
-    /// Schema-contract pin (reviewer-added): a projection that REORDERS and SUBSETS the
-    /// columns — the identity-partition constant column projected FIRST and a non-partition
-    /// data column SECOND, while a third schema column is dropped — must produce an output
-    /// batch whose schema EXACTLY equals the declared projection (field names, plain physical
-    /// types, nullability, AND order), with the constant column a plain array (never REE) and
-    /// carrying the PARTITION value (overriding the differing file value).
-    ///
-    /// Scope note: the reordered/subset shape already forces the column-rebuilding `Modify`
-    /// path (source has 3 fields, target 2), so this test does NOT isolate the
-    /// `constant_overrides_file_column` flag — the constant-vs-file OVERRIDE in isolation is
-    /// pinned by the scan test `test_identity_partition_column_value_comes_from_metadata_not_file`
-    /// (in-order full projection, where only the override forces `Modify`). What this pin adds
-    /// is that the OVERRIDE-path schema build emits the declared plain physical type in the
-    /// requested column ORDER for a reordered/subset projection.
+    /// Risk pinned: a REORDERED and SUBSET projection must give an output schema exactly equal to
+    /// the declared projection, in names, plain physical types, nullability, AND order. The
+    /// constant column must be a plain array carrying the PARTITION value. The reordered shape
+    /// already forces the `Modify` path, so this does not isolate the
+    /// `constant_overrides_file_column` flag.
     #[test]
     fn identity_partition_reordered_subset_projection_matches_declared_schema() {
         use arrow_schema::DataType;
 
         use crate::spec::Transform;
 
-        // Schema order: id(1, Int), category(2, String, identity-partition), extra(3, Long).
+        // Schema order: id(1, Int), category(2, String, partitioned), extra(3, Long).
         let snapshot_schema = Arc::new(
             Schema::builder()
                 .with_schema_id(0)
@@ -2422,18 +2083,17 @@ mod test {
                 .unwrap(),
         );
 
-        // Partition value DIFFERS from the file `category` so the override is observable.
+        // The partition value DIFFERS from the file's, so the override is observable.
         let partition_data = Struct::from_iter(vec![Some(Literal::string("books"))]);
 
-        // The file physically carries ALL THREE columns (add_files style), including the
-        // partition column with a DIFFERENT value ("ignored_file_value").
+        // The file carries ALL THREE columns, add_files style, with a different `category`.
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             simple_field("id", DataType::Int32, false, "1"),
             simple_field("category", DataType::Utf8, false, "2"),
             simple_field("extra", DataType::Int64, true, "3"),
         ]));
 
-        // Project REORDERED + SUBSET: category(2) FIRST, id(1) SECOND, drop extra(3).
+        // Project category(2) first, id(1) second, and drop extra(3).
         let projected_field_ids = [2, 1];
 
         let mut transformer =
@@ -2454,7 +2114,7 @@ mod test {
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
 
-        // Output schema must be exactly [category: Utf8 (non-null), id: Int32 (non-null)].
+        // The output schema must be exactly [category: Utf8, id: Int32], both non-null.
         assert_eq!(result.num_columns(), 2);
         let sch = result.schema();
         assert_eq!(sch.field(0).name(), "category");
@@ -2464,7 +2124,7 @@ mod test {
         assert_eq!(sch.field(1).data_type(), &DataType::Int32);
         assert!(!sch.field(1).is_nullable());
 
-        // category is the constant (plain StringArray), OVERRIDING the file value.
+        // category is the constant plain StringArray, and it OVERRIDES the file value.
         let category = result
             .column(0)
             .as_any()
@@ -2473,7 +2133,7 @@ mod test {
         assert_eq!(category.value(0), "books");
         assert_eq!(category.value(1), "books");
 
-        // id is read from the file unchanged.
+        // id comes from the file unchanged.
         let id = result
             .column(1)
             .as_any()
@@ -2483,10 +2143,10 @@ mod test {
         assert_eq!(id.value(1), 11);
     }
 
-    // ---- V3 row lineage: `_row_id` / `_last_updated_sequence_number` (F-13 V2) ----------------
+    // ---- V3 row lineage: `_row_id` / `_last_updated_sequence_number` -------------------------
     //
     // Java dispatches on whether the FILE carries the field, then per ROW on whether the stored
-    // value is null. Both axes are pinned below; the mixed-null cells discriminate.
+    // value is null. Both axes are pinned below, and the mixed-null cells discriminate.
     //
     // | | file lacks the column | file has it, no nulls | file has it, some nulls |
     // |---|---|---|---|
@@ -2505,7 +2165,7 @@ mod test {
         )
     }
 
-    /// A file batch of `id` values, optionally carrying a reserved row-lineage column.
+    /// A batch of `id` values, optionally carrying a reserved row-lineage column.
     fn row_lineage_batch(
         ids: Vec<i64>,
         extra: Option<(i32, &str, Vec<Option<i64>>)>,
@@ -2553,8 +2213,7 @@ mod test {
             .unwrap();
         assert_eq!(int64_col(&first, 1), vec![Some(100), Some(101), Some(102)]);
 
-        // The position counter CONTINUES across batches — it does not restart, or every batch
-        // after the first would repeat the same row ids.
+        // The counter CONTINUES across batches. A restart repeats the same row ids.
         let second = transformer
             .process_record_batch(row_lineage_batch(vec![4, 5], None))
             .unwrap();
@@ -2613,8 +2272,8 @@ mod test {
         );
     }
 
-    /// Java returns an all-NULL column here, not an error. Erroring would make `SELECT _row_id`
-    /// unusable on any mixed-version table.
+    /// Java returns an all-NULL column here, not an error. An error would make `SELECT _row_id`
+    /// unusable on a mixed-version table.
     #[test]
     fn projecting_row_id_without_an_assigned_range_yields_nulls() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];
@@ -2670,8 +2329,8 @@ mod test {
         );
     }
 
-    /// The discriminating cell for the absent-range arm: the stored column is IGNORED, not
-    /// preferred, because the arm is chosen before the file is consulted.
+    /// The discriminating cell for the absent-range arm. The stored column is IGNORED, because
+    /// the arm is chosen before the file is consulted.
     #[test]
     fn a_stored_row_id_is_discarded_when_there_is_no_assigned_range() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];
@@ -2722,8 +2381,8 @@ mod test {
         );
     }
 
-    /// Java gates `_last_updated_sequence_number` on BOTH inputs, so a V1/V2 file reports NULL.
-    /// Gating on the sequence number alone fabricates a value for every pre-V3 row.
+    /// Java gates `_last_updated_sequence_number` on BOTH inputs, so a V1 or V2 file reports
+    /// NULL. The sequence number alone fabricates a value for every pre-V3 row.
     #[test]
     fn last_updated_sequence_number_is_null_without_a_first_row_id() {
         let projected = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
@@ -2755,8 +2414,8 @@ mod test {
         assert_eq!(int64_col(&batch, 1), vec![None]);
     }
 
-    /// The `num_rows == 0` guard in `row_ids_from_positions` is load-bearing: without it
-    /// `num_rows - 1` underflows on an ordinary empty batch. It had no coverage.
+    /// The `num_rows == 0` guard in `row_ids_from_positions` is load-bearing. Without it
+    /// `num_rows - 1` underflows on an ordinary empty batch.
     #[test]
     fn an_empty_batch_yields_an_empty_row_id_column() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];
@@ -2770,7 +2429,7 @@ mod test {
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(int64_col(&batch, 1), Vec::<Option<i64>>::new());
 
-        // And the counter is unmoved, so the NEXT batch still starts at the range's first id.
+        // The counter is unmoved, so the NEXT batch starts at the range's first id.
         let next = transformer
             .process_record_batch(row_lineage_batch(vec![1, 2], None))
             .expect("second batch");
@@ -2778,7 +2437,7 @@ mod test {
     }
 
     /// The boundary the overflow check must NOT reject: a batch whose last id is exactly
-    /// `i64::MAX`. Checking `start + num_rows` instead of `start + num_rows - 1` fails only here.
+    /// `i64::MAX`. Only here does `start + num_rows` differ from `start + num_rows - 1`.
     #[test]
     fn a_row_id_of_exactly_i64_max_is_allowed() {
         let projected = [1, RESERVED_FIELD_ID_ROW_ID];

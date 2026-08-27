@@ -80,15 +80,11 @@ mod _decimal {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-/// All data types are either primitives or nested types, which are maps, lists, or structs —
-/// plus `variant`, which is its own category.
+/// A data type: a primitive, a nested type (map, list, struct), or `variant`.
 ///
-/// `Variant` mirrors Java 1.10.0 `org.apache.iceberg.types.Types.VariantType`, which implements
-/// the `Type` interface directly: it is **neither** a `Type.PrimitiveType` **nor** a
-/// `Type.NestedType` (`isPrimitiveType()` and `isNestedType()` are both false). Placing it as its
-/// own `Type` variant (not a `PrimitiveType`) preserves every Java non-primitive door for free:
-/// variant is rejected as a partition source, sort key, and identifier field by the same
-/// `is_primitive()` checks Java uses.
+/// Java `Types.VariantType` is neither a primitive nor a nested type. `Variant` is therefore a
+/// top-level arm here, not a [`PrimitiveType`]. That keeps every `is_primitive()` door closed to
+/// variant: partition source, sort key, and identifier field.
 pub enum Type {
     /// Primitive types
     Primitive(PrimitiveType),
@@ -186,21 +182,10 @@ impl Type {
         Ok(REQUIRED_LENGTH[precision as usize - 1])
     }
 
-    /// Creates a decimal type.
-    ///
-    /// This is the **construction** door and it is deliberately STRICTER than Java's
-    /// `Types$DecimalType.<init>`, which only checks `precision <= 38` (iceberg-api 1.10.0
-    /// bytecode: `iload_1; bipush 38; if_icmpgt 14` →
-    /// `Preconditions.checkArgument(.., "Decimals with precision larger than 38 are not
-    /// supported: %s")`). A live run against the 1.10.0 jars accepts `DecimalType.of(0,0)`,
-    /// `of(1,2)` and `of(10,11)`. This constructor additionally requires `precision >= 1` (a
-    /// zero-precision decimal has no byte width — [`Type::decimal_required_bytes`] cannot serve
-    /// it) and `scale <= precision` (Arrow `Decimal128`, the fork's in-memory currency, rejects
-    /// anything else), so every type this constructor yields is representable end to end.
-    ///
-    /// Metadata READ paths must NOT route through here: a table Java can open must stay openable.
-    /// The `decimal(P,S)` type-string deserializer therefore applies Java's rule directly — see
-    /// `ensure_java_decimal_precision` in this module.
+    /// Creates a decimal type. This construction door is stricter than Java `Types$DecimalType`,
+    /// which checks only `precision <= 38`. It also requires `precision >= 1`, because a
+    /// zero-precision decimal has no byte width, and `scale <= precision`, because Arrow
+    /// `Decimal128` rejects anything else.
     #[inline(always)]
     pub fn decimal(precision: u32, scale: u32) -> Result<Self> {
         ensure_data_valid!(
@@ -292,18 +277,8 @@ pub enum PrimitiveType {
     /// Arbitrary-length byte array.
     Binary,
     /// Unknown type (format version 3+): a column whose values are always null and that has no
-    /// physical storage.
-    ///
-    /// Mirrors Java 1.10.0 `org.apache.iceberg.types.Types.UnknownType`, which (unlike
-    /// [`Type::Variant`]) **extends `Type.PrimitiveType`** — so it is a Rust `PrimitiveType` arm,
-    /// not a top-level [`Type`] variant. It is a singleton (`UnknownType.get()`), its `toString()`
-    /// is the bare string `"unknown"` (so the `rename_all = "lowercase"` serde gives the JSON
-    /// `"unknown"` for free), and `Schema.MIN_FORMAT_VERSIONS` gates it at format version 3.
-    ///
-    /// `unknown` has no [`PrimitiveLiteral`](crate::spec::PrimitiveLiteral) form — its values are
-    /// always null — so the datum/literal layer rejects it rather than carrying a value, and Java
-    /// `TypeToMessageType` returns `null` for it (no physical parquet column). Data-file
-    /// always-null write/read I/O is deferred (see the writer/value paths, which fail loudly).
+    /// physical storage. Java `Types.UnknownType` extends `Type.PrimitiveType`, unlike
+    /// [`Type::Variant`]. So this is a `PrimitiveType` arm, not a top-level [`Type`] variant.
     Unknown,
 }
 
@@ -344,15 +319,9 @@ impl<'de> Deserialize<'de> for Type {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where D: Deserializer<'de> {
         let type_serde = _serde::SerdeType::deserialize(deserializer)?;
-        // Java `SchemaParser.typeFromJson` matches the object WRAPPER names with `String.equals`
-        // (1.10.0 bytecode, offsets 41/55/69) — CASE-SENSITIVE: `{"type":"STRUCT"/"LIST"/"MAP"}`
-        // falls through to `IllegalArgumentException("Cannot parse type from json: ...")`. The
-        // untagged [`_serde::SerdeType`] matches a wrapper STRUCTURALLY (by its `fields` /
-        // `element` / `key`+`value` shape) and ignores the `type` string, so without this guard
-        // Rust would ACCEPT a wrong-cased or wrong wrapper name that Java rejects (a read-leniency
-        // divergence found by the O3 REVIEWER). Re-assert Java's exact `String.equals` here so the
-        // accepted set matches; Rust's own writer always emits the lowercase name, so this never
-        // rejects a self-round-trip.
+        // Java `SchemaParser.typeFromJson` matches the wrapper names case-sensitively. The
+        // untagged `_serde::SerdeType` matches a wrapper by its field shape and ignores the
+        // `type` string, so without this guard Rust accepts names Java rejects.
         if let Some((actual, expected)) = type_serde.wrapper_type_mismatch() {
             return Err(serde::de::Error::custom(format!(
                 "Cannot parse type from json: expected wrapper type '{expected}', got '{actual}'"
@@ -365,18 +334,12 @@ impl<'de> Deserialize<'de> for Type {
 impl<'de> Deserialize<'de> for PrimitiveType {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where D: Deserializer<'de> {
-        // Case-fold the type NAME before matching, exactly like Java 1.10.0
-        // `Types.fromTypeName(name)` does `name.toLowerCase(Locale.ROOT)` before consulting the
-        // primitive-name map and the `fixed[..]` / `decimal(..)` regexes (1.10.0 bytecode:
-        // `fromTypeName` offsets 0-7 lowercase, then the TYPES map / FIXED / DECIMAL all match the
-        // lowercased string). So `"BOOLEAN"`, `"Decimal(9,2)"`, `"FIXED[16]"` all parse. The object
-        // WRAPPER names (`struct`/`list`/`map`) are NOT folded by Java (`SchemaParser.typeFromJson`
-        // matches them with `String.equals`) and are handled structurally by the untagged
-        // [`_serde::SerdeType`], so this lowercasing is scoped to primitive names only.
+        // Java `Types.fromTypeName` lowercases the name before it matches, so `"BOOLEAN"` and
+        // `"FIXED[16]"` parse. Java does not fold the wrapper names, so this fold stays scoped to
+        // primitive names.
         //
-        // `to_lowercase` here is `char::to_lowercase` (Unicode), a superset of Java's
-        // `Locale.ROOT` ASCII fold for the only inputs that can collide with a type name (ASCII
-        // letters); every real type name is ASCII, so the two agree on every accepted input.
+        // Rust folds by Unicode, Java by `Locale.ROOT`. Every real type name is ASCII, so the
+        // two agree on every accepted input.
         let s = String::deserialize(deserializer)?.to_lowercase();
         if s.starts_with("decimal") {
             deserialize_decimal(s.into_deserializer())
@@ -401,22 +364,9 @@ impl Serialize for PrimitiveType {
     }
 }
 
-/// The ONLY invariant Java's `Types$DecimalType.<init>` enforces (iceberg-api 1.10.0).
-///
-/// Bytecode: `iload_1; bipush 38; if_icmpgt 14; iconst_1; goto 15; iconst_0` feeding
-/// `Preconditions.checkArgument(boolean, "Decimals with precision larger than 38 are not
-/// supported: %s", precision)`. There is NO `precision > 0` branch and NO `scale <= precision`
-/// branch. Live confirmation against iceberg-api-1.10.0 + iceberg-core-1.10.0:
-///
-/// ```text
-/// Types.fromPrimitiveString("decimal(0,0)")   -> decimal(0, 0)
-/// Types.fromPrimitiveString("decimal(1,2)")   -> decimal(1, 2)
-/// Types.fromPrimitiveString("decimal(10,11)") -> decimal(10, 11)
-/// Types.fromPrimitiveString("decimal(39,0)")  -> IllegalArgumentException
-/// ```
-///
-/// Every metadata READ path must use this rule, not [`Type::decimal`]: routing schema JSON
-/// through the stricter constructor makes a table Java can open completely unopenable here.
+/// The only invariant Java `Types$DecimalType` enforces: `precision <= 38`. Java has no `precision
+/// > 0` check and no `scale <= precision` check. # Notes Every metadata READ path must use this
+/// rule, not [`Type::decimal`].
 pub(crate) fn ensure_java_decimal_precision(precision: u32) -> Result<()> {
     ensure_data_valid!(
         precision <= MAX_DECIMAL_PRECISION,
@@ -893,17 +843,10 @@ pub(super) mod _serde {
         ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, StructType, Type,
     };
 
-    /// Marker that deserializes the JSON string `"variant"` (case-insensitively) and serializes
-    /// the lowercase `"variant"`.
-    ///
-    /// Java `SchemaParser.toJson` writes variant the same way it writes primitives — as the bare
-    /// string `type.toString()` (`"variant"`) — and `typeFromJson` parses any textual node through
-    /// `Types.fromTypeName`, which LOWERCASES its input (`toLowerCase(Locale.ROOT)`, 1.10.0
-    /// bytecode) before consulting the TYPES map whose key is `"variant" -> VariantType`. So Java
-    /// reads `"Variant"`/`"VARIANT"` as the variant type too; this marker matches case-insensitively
-    /// to stay at parity with the primitive-name case fold (see [`PrimitiveType`]'s deserializer).
-    /// It rejects every non-`variant` string so the untagged [`SerdeType`] falls through to
-    /// [`SerdeType::Primitive`] for real primitive names.
+    /// Marker that deserializes the JSON string `"variant"` (case-insensitively) and serializes the
+    /// lowercase `"variant"`. Java `SchemaParser` writes variant as the bare string `"variant"` and
+    /// reads it through `Types.fromTypeName`, which lowercases first. So this marker folds case
+    /// too.
     pub(super) struct VariantTypeName;
 
     impl serde::Serialize for VariantTypeName {
@@ -976,14 +919,10 @@ pub(super) mod _serde {
 
     impl SerdeType<'_> {
         /// Returns `Some((actual, expected))` when a wrapper arm's `type` string is not Java's
-        /// exact lowercase wrapper name, else `None`.
-        ///
-        /// Java `SchemaParser.typeFromJson` selects the wrapper handler with
-        /// `String.equals("struct"/"list"/"map")` (1.10.0 bytecode) — case-sensitive — so a
-        /// wrong-cased name (`"STRUCT"`) is rejected. The untagged enum here matches a wrapper by its
-        /// field shape and never inspects the `type` string, so [`Type`]'s deserializer calls this
-        /// to re-impose Java's check. Primitive/variant arms carry no wrapper `type` and return
-        /// `None` (they are validated by their own deserializers).
+        /// exact lowercase wrapper name, else `None`. Java `SchemaParser.typeFromJson` selects the
+        /// wrapper handler case-sensitively, so it rejects `"STRUCT"`. The untagged enum here
+        /// matches a wrapper by its field shape and never reads the `type` string, so [`Type`]'s
+        /// deserializer calls this to re-impose the check.
         pub(super) fn wrapper_type_mismatch(&self) -> Option<(&str, &'static str)> {
             let (actual, expected) = match self {
                 SerdeType::List { r#type, .. } => (r#type.as_str(), "list"),
@@ -1487,17 +1426,11 @@ mod tests {
         }
     }
 
-    /// Java-legal decimal metadata must survive a full JSON round trip.
-    ///
-    /// Live against iceberg-api-1.10.0 + iceberg-core-1.10.0:
-    /// `Types.fromPrimitiveString("decimal(0,0)")`, `("decimal(1,2)")`, `("decimal(10,11)")` and
-    /// `("decimal(38,38)")` all return a `DecimalType`; only `("decimal(39,0)")` throws
-    /// `IllegalArgumentException: Decimals with precision larger than 38 are not supported: 39`.
-    /// Routing this path through the stricter [`Type::decimal`] constructor (as the first pass of
-    /// this hardening did) makes such a table completely unopenable.
+    /// Java-legal decimal metadata must survive a full JSON round trip. Java accepts
+    /// `decimal(0,0)`, `(1,2)`, `(10,11)` and `(38,38)`, and rejects only `(39,0)`.
     ///
     /// Mutation this catches: swapping `ensure_java_decimal_precision` back to
-    /// `Type::decimal(precision, scale)` in either `deserialize_decimal` or `serialize_decimal`.
+    /// `Type::decimal(precision, scale)` in `deserialize_decimal` or `serialize_decimal`.
     #[test]
     fn java_legal_decimal_type_strings_still_deserialize() {
         for (text, precision, scale) in [
@@ -1785,14 +1718,11 @@ mod tests {
         );
     }
 
-    // RISK (case posture, 1.10.0-bytecode-derived): Java `Types.fromTypeName(name)` does
-    // `name.toLowerCase(Locale.ROOT)` BEFORE consulting the primitive-name map and the
-    // `fixed[..]` / `decimal(..)` regexes, so `SchemaParser` reads `"BOOLEAN"`/`"Decimal(9,2)"`/
-    // `"FIXED[16]"`/`"Variant"` exactly as their lowercase forms. Rust used to be lowercase-exact
-    // and REJECTED every mixed-case name Java accepts — a read-tolerance divergence. The fix folds
-    // the primitive name (incl. the parameterized forms) and the variant marker; this pins the
-    // accepted set. Self-mutation: removing the `.to_lowercase()` in `PrimitiveType::deserialize`
-    // (and the variant marker's `eq_ignore_ascii_case`) makes every assertion below fail.
+    // Java `Types.fromTypeName` lowercases the name first, so it reads `"BOOLEAN"`,
+    // `"Decimal(9,2)"`, `"FIXED[16]"` and `"Variant"`. This pins the accepted set.
+    //
+    // Mutation this catches: removing the `.to_lowercase()` in `PrimitiveType::deserialize`, or
+    // the variant marker's `eq_ignore_ascii_case`.
     #[test]
     fn primitive_type_names_parse_case_insensitively_like_java_from_type_name() {
         // Plain primitive names — upper, mixed, and lowercase all reach the same type.
@@ -1851,14 +1781,11 @@ mod tests {
         }
     }
 
-    // RISK (scope pin, 1.10.0-bytecode-derived): Java folds case ONLY for primitive names.
-    // `SchemaParser.typeFromJson` matches the object WRAPPER names `struct`/`list`/`map` with
-    // `String.equals` (CASE-SENSITIVE), so `{"type":"STRUCT", ...}` FAILS in Java
-    // (`IllegalArgumentException`). The dedicated `StructType` deserializer already enforced this;
-    // the production `Type` route did NOT until the O3 REVIEWER added `wrapper_type_mismatch`
-    // (pinned end-to-end in `wrapper_type_names_are_case_sensitive_via_the_type_path_like_java_schema_parser`).
-    // This pin documents that the primitive case fold did not leak into the wrappers (a lowercased
-    // `struct` is still required) AND that the `StructType` deserializer stays case-sensitive.
+    // Java folds case only for primitive names. It matches the wrapper names `struct`, `list`
+    // and `map` case-sensitively, so `{"type":"STRUCT", ...}` fails.
+    //
+    // This pins that the primitive case fold did not leak into the wrappers, and that the
+    // `StructType` deserializer stays case-sensitive.
     #[test]
     fn wrapper_type_names_are_not_folded_by_the_primitive_case_fix() {
         // The lowercase wrapper parses (baseline, unchanged).
@@ -1949,16 +1876,11 @@ mod tests {
         );
     }
 
-    // RISK (item O3(a) parameterized parse fidelity, 1.10.0-bytecode + live-Java-probed by the
-    // O3 REVIEWER): Java `Types.fromTypeName` matches `fixed\[\s*(\d+)\s*\]` and
-    // `decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)` (anchored `matches()`) against the lowercased name.
-    // `\s*` allows whitespace INSIDE the brackets/parens, and the anchors REQUIRE the close
-    // bracket/paren. The Rust helpers previously used `trim_end_matches` (a no-op when the close
-    // char is absent) and never trimmed the inner content, so they DIVERGED from Java two ways:
-    //   - too LENIENT: `fixed[16` / `decimal(38,2` (no close) parsed in Rust, Java rejects;
-    //   - too STRICT: `fixed[ 16 ]` (inner whitespace) was rejected in Rust, Java accepts.
-    // The REVIEWER fix (strip-prefix-and-suffix + trim) restores 1:1. This pins BOTH arms against
-    // a live `Types.fromTypeName` oracle (every case below was probed in Java 1.10.0).
+    // Java `Types.fromTypeName` matches `fixed[..]` and `decimal(..)` with anchored regexes.
+    // They allow whitespace inside the brackets and require the closing bracket.
+    //
+    // So `fixed[ 16 ]` must parse and `fixed[16` must not. This pins both arms against a live
+    // `Types.fromTypeName` oracle.
     #[test]
     fn parameterized_type_parse_matches_java_fixed_and_decimal_regex() {
         // Inner whitespace ACCEPTED (Java `\s*`), folding case too.
@@ -2018,17 +1940,12 @@ mod tests {
         }
     }
 
-    // RISK (item O3(a) wrapper read-leniency, 1.10.0-bytecode + live-Java-probed by the O3
-    // REVIEWER): Java `SchemaParser.typeFromJson` selects the wrapper handler with
-    // `String.equals("struct"/"list"/"map")` (1.10.0 bytecode offsets 41/55/69) — CASE-SENSITIVE —
-    // so `{"type":"STRUCT"/"LIST"/"MAP"}` raises `IllegalArgumentException` (live-probed: lowercase
-    // `struct` OK, `STRUCT`/`LIST`/`MAP` all ERR). The untagged `_serde::SerdeType` matches a
-    // wrapper by its field SHAPE and ignores the `type` string, so the `Type` deserializer USED TO
-    // accept a wrong-cased wrapper Java rejects — a read-leniency divergence the builder documented
-    // but did not close (its scope test exercised the `StructType` deserializer, a path the `Type`
-    // route never takes). The REVIEWER added `SerdeType::wrapper_type_mismatch` re-imposing Java's
-    // `String.equals`. This pins BOTH arms via the production `Type` path. Self-mutation: removing
-    // the `wrapper_type_mismatch` guard in `Type::deserialize` makes every upper-case case parse.
+    // Java `SchemaParser.typeFromJson` selects the wrapper handler case-sensitively, so
+    // `{"type":"STRUCT"}` fails. The untagged `_serde::SerdeType` matches a wrapper by its field
+    // shape, so `SerdeType::wrapper_type_mismatch` re-imposes the check. This pins both arms
+    // through the production `Type` path.
+    //
+    // Mutation this catches: removing the `wrapper_type_mismatch` guard in `Type::deserialize`.
     #[test]
     fn wrapper_type_names_are_case_sensitive_via_the_type_path_like_java_schema_parser() {
         // Lowercase wrapper names parse (baseline) through the production `Type` route.

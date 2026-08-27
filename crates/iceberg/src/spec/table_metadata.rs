@@ -137,37 +137,9 @@ pub struct TableMetadata {
 }
 
 impl std::fmt::Debug for TableMetadata {
-    /// Hand-written instead of derived so that `properties` renders through [`RedactedProps`].
-    ///
-    /// SECURITY (SEC-002): `properties` is an operator-controlled `String -> String` map, and
-    /// operators do store credentials in table properties. It reaches `Debug` from more places
-    /// than the type's own call sites — `Table` embeds a `TableMetadataRef` and derives `Debug`,
-    /// the REST `LoadTableResult` / `CommitTableResponse` carry a whole `TableMetadata`, and any
-    /// downstream struct that derives `Debug` around a table does too — so a single
-    /// `tracing::info!(?table)` in code this crate does not control printed them in clear. The
-    /// catalog and `FileIO` property maps were already redacted; this closes the table half.
-    ///
-    /// Every other field is rendered exactly as the derive did, in declaration order, so the view
-    /// stays useful. `Display` is unaffected (this type has none) and serde is unaffected (it goes
-    /// through `TableMetadataEnum`), so the on-disk format is untouched.
-    ///
-    /// NAMED RESIDUE, deliberately NOT masked here. `properties` is the ONLY map this impl
-    /// redacts; three nested maps owned by other spec types still print in clear through their
-    /// own derived `Debug`. Masking them only when nested under `TableMetadata` would be half a
-    /// fix — each belongs to a follow-up that gives its owning type its own `Debug`:
-    ///
-    /// * `snapshots[*].summary.additional_properties` — `Summary` in `spec/snapshot.rs` derives
-    ///   `Debug` over a `String -> String` map fed by the writing engine.
-    /// * `encryption_keys[*].properties`, plus the wrapped key bytes `encrypted_key_metadata` —
-    ///   [`EncryptedKey`](super::EncryptedKey) in `spec/encrypted_key.rs`.
-    /// * `statistics[*].blob_metadata[*].properties` and `statistics[*].key_metadata` —
-    ///   `StatisticsFile` / `BlobMetadata` in `spec/statistic_file.rs`. `partition_statistics` is
-    ///   clean: `PartitionStatisticsFile` carries neither.
-    ///
-    /// This is the authoritative ledger for the `TableMetadata` render path; the `Table` doc in
-    /// `table.rs` and the redaction banner in `crates/catalog/rest/src/types.rs` mirror it and
-    /// must be updated with it. Pinned as residue by
-    /// `test_named_residue_table_metadata_debug_renders_nested_property_maps`.
+    /// Hand-written so `properties` renders through [`RedactedProps`]. Operators store credentials
+    /// there. Named residue: snapshot summaries, encryption keys, and statistics blobs still print
+    /// in clear. Update this, `table.rs`, and REST types together.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableMetadata")
             .field("format_version", &self.format_version)
@@ -199,12 +171,10 @@ impl std::fmt::Debug for TableMetadata {
 }
 
 impl TableMetadata {
-    /// Convert this Table Metadata into a builder for modification.
+    /// Convert this table metadata into a builder for modification.
     ///
-    /// `current_file_location` is the location where the current version
-    /// of the metadata file is stored. This is used to update the metadata log.
-    /// If `current_file_location` is `None`, the metadata log will not be updated.
-    /// This should only be used to stage-create tables.
+    /// `current_file_location` is where the current metadata file is stored, and it updates the
+    /// metadata log. Pass `None` only to stage-create a table; the log is then not updated.
     #[must_use]
     pub fn into_builder(self, current_file_location: Option<String>) -> TableMetadataBuilder {
         TableMetadataBuilder::new_from_metadata(self, current_file_location)
@@ -250,10 +220,8 @@ impl TableMetadata {
         self.last_sequence_number
     }
 
-    /// Returns the next sequence number for the table.
-    ///
-    /// For format version 1, it always returns the initial sequence number.
-    /// For other versions, it returns the last sequence number incremented by 1.
+    /// Returns the next sequence number for the table. Format version 1 always returns the initial
+    /// sequence number. Any other version returns the last sequence number plus 1.
     #[inline]
     pub fn next_sequence_number(&self) -> i64 {
         match self.format_version {
@@ -536,13 +504,9 @@ impl TableMetadata {
             .await
     }
 
-    /// Normalize this partition spec.
-    ///
-    /// This is an internal method
-    /// meant to be called after constructing table metadata from untrusted sources.
-    /// We run this method after json deserialization.
-    /// All constructors for `TableMetadata` which are part of `iceberg-rust`
-    /// should return normalized `TableMetadata`.
+    /// Normalize this table metadata. Internal: call it after constructing table metadata from an
+    /// untrusted source, which this crate does after JSON deserialization. Every `iceberg-rust`
+    /// constructor for `TableMetadata` returns normalized metadata.
     pub(super) fn try_normalize(&mut self) -> Result<&mut Self> {
         self.validate_current_schema()?;
         self.normalize_current_snapshot()?;
@@ -589,15 +553,11 @@ impl TableMetadata {
         }
 
         if let Some(default_sort_order) = self.sort_order_by_id(self.default_sort_order_id) {
-            // Bind-time validation of the DEFAULT sort order against the current schema, matching
-            // Java 1.10.0: `TableMetadataParser.fromJson` → `SortOrderParser.fromJson(schema, node,
-            // defaultId)` binds the unbound order via `bind` (→ `SortOrder.Builder.build()` →
-            // `SortOrder.checkCompatibility`) ONLY when its order id equals the default sort order
-            // id; every OTHER order is bound with `bindUnchecked` (no compatibility check). So a
-            // metadata doc whose DEFAULT sort field references a missing/non-primitive/wrongly
-            // transformed source column fails to parse, while a non-default order is read
-            // leniently. The schema is the current schema (Java binds against `schema` = the
-            // current-schema-id schema; `validate_current_schema` already ran in `try_normalize`).
+            // Java 1.10.0 binds ONLY the default sort order against the current schema
+            // (`SortOrderParser.fromJson(schema, node, defaultId)` -> `checkCompatibility`); every
+            // other order uses `bindUnchecked`. So a metadata doc whose DEFAULT sort field names a
+            // missing, non-primitive or wrongly transformed column fails to parse, while a
+            // non-default order reads leniently. `validate_current_schema` already ran.
             SortOrderBuilder::check_compatibility(
                 default_sort_order.as_ref().clone(),
                 self.current_schema(),
@@ -725,8 +685,7 @@ impl TableMetadata {
     fn validate_chronological_snapshot_logs(&self) -> Result<()> {
         for window in self.snapshot_log.windows(2) {
             let (prev, curr) = (&window[0], &window[1]);
-            // commits can happen concurrently from different machines.
-            // A tolerance helps us avoid failure for small clock skew
+            // A tolerance absorbs small clock skew between machines that commit concurrently.
             if curr.timestamp_ms - prev.timestamp_ms < -ONE_MINUTE_MS {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -736,8 +695,7 @@ impl TableMetadata {
         }
 
         if let Some(last) = self.snapshot_log.last() {
-            // commits can happen concurrently from different machines.
-            // A tolerance helps us avoid failure for small clock skew
+            // A tolerance absorbs small clock skew between machines that commit concurrently.
             if self.last_updated_ms - last.timestamp_ms < -ONE_MINUTE_MS {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -754,8 +712,7 @@ impl TableMetadata {
     fn validate_chronological_metadata_logs(&self) -> Result<()> {
         for window in self.metadata_log.windows(2) {
             let (prev, curr) = (&window[0], &window[1]);
-            // commits can happen concurrently from different machines.
-            // A tolerance helps us avoid failure for small clock skew
+            // A tolerance absorbs small clock skew between machines that commit concurrently.
             if curr.timestamp_ms - prev.timestamp_ms < -ONE_MINUTE_MS {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -765,8 +722,7 @@ impl TableMetadata {
         }
 
         if let Some(last) = self.metadata_log.last() {
-            // commits can happen concurrently from different machines.
-            // A tolerance helps us avoid failure for small clock skew
+            // A tolerance absorbs small clock skew between machines that commit concurrently.
             if self.last_updated_ms - last.timestamp_ms < -ONE_MINUTE_MS {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -784,15 +740,10 @@ impl TableMetadata {
 
 pub(super) mod _serde {
     use std::borrow::BorrowMut;
-    /// This is a helper module that defines types to help with serialization/deserialization.
-    /// For deserialization the input first gets read into either the [TableMetadataV1] or [TableMetadataV2] struct
-    /// and then converted into the [TableMetadata] struct. Serialization works the other way around.
-    /// [TableMetadataV1] and [TableMetadataV2] are internal struct that are only used for serialization and deserialization.
+    /// Deserialization reads the input into [TableMetadataV1] or [TableMetadataV2] and then
+    /// converts it into [TableMetadata]. Serialization runs the other way. Both structs are
+    /// internal to this module.
     use std::collections::HashMap;
-    /// This is a helper module that defines types to help with serialization/deserialization.
-    /// For deserialization the input first gets read into either the [TableMetadataV1] or [TableMetadataV2] struct
-    /// and then converted into the [TableMetadata] struct. Serialization works the other way around.
-    /// [TableMetadataV1] and [TableMetadataV2] are internal struct that are only used for serialization and deserialization.
     use std::sync::Arc;
 
     use serde::{Deserialize, Serialize};
@@ -839,17 +790,11 @@ pub(super) mod _serde {
     pub(super) struct TableMetadataV2V3Shared {
         pub table_uuid: Uuid,
         pub location: String,
-        /// `last-sequence-number` is REQUIRED on a V2/V3 document — deliberately NOT
-        /// `#[serde(default)]`. The spec gives readers latitude here (`format/spec.md` line 179:
-        /// "a v2 table that is missing `last-sequence-number` can throw an exception"); the
-        /// "default to 0" rule at `format/spec.md` line 1978 applies only to reading a **V1**
-        /// document as V2 (a V1 doc has no sequence numbers — handled by `TableMetadataV1`, whose
-        /// conversion sets `last_sequence_number = 0`). Java 1.10.0 is strict for V2+:
-        /// `TableMetadataParser.fromJson` (bytecode) does `if (formatVersion <= 1) → 0` else
-        /// `JsonUtil.getLong("last-sequence-number")`, and `JsonUtil.getLong` throws
-        /// `IllegalArgumentException("Cannot parse missing long: last-sequence-number")` when the
-        /// field is absent. Making this lenient would accept malformed V2 metadata that Java
-        /// rejects — a parity divergence, not a fix. (Settled Arc G, 2026-06-11.)
+        /// `last-sequence-number` is REQUIRED on a V2 or V3 document, so it is deliberately NOT
+        /// `#[serde(default)]`. The spec's "default to 0" rule applies only to reading a V1
+        /// document, which `TableMetadataV1` handles by seeding 0. Java 1.10.0 is strict for V2+:
+        /// `JsonUtil.getLong` throws when the field is absent. Leniency here would accept malformed
+        /// V2 metadata that Java rejects, which is a parity divergence, not a fix.
         pub last_sequence_number: i64,
         pub last_updated_ms: i64,
         pub last_column_id: i32,
@@ -1681,18 +1626,12 @@ mod tests {
         serde_json::from_str(&metadata).unwrap()
     }
 
-    /// SECURITY (SEC-002): `TableMetadata` used to `#[derive(Debug)]`, printing its
-    /// operator-controlled `properties` map in clear at every `{:?}` / `tracing` site — including
-    /// sites in downstream code this crate does not control, and including the REST
-    /// `LoadTableResult` / `CommitTableResponse` that carry a whole `TableMetadata`. Operators do
-    /// store credentials in table properties.
+    /// SECURITY (SEC-002): `TableMetadata` used to derive `Debug`, printing its
+    /// operator-controlled `properties` map in clear at every `{:?}` and `tracing` site, including
+    /// sites in downstream code this crate does not control. Operators do store credentials there.
     ///
-    /// Pins that secret VALUES are masked per key through the canonical needle test while KEYS,
-    /// non-secret values, and every other field stay readable — an unusable `Debug` would be its
-    /// own defect.
-    ///
-    /// MUTATION (RED against the pre-change code): put `Debug` back in the `derive` list on
-    /// `TableMetadata` and delete the hand-written `impl std::fmt::Debug for TableMetadata`.
+    /// Pins that secret VALUES are masked per key, while keys, non-secret values and every other
+    /// field stay readable. MUTATION: restore `Debug` in the derive list and delete the impl.
     #[test]
     fn test_table_metadata_debug_redacts_secret_properties() {
         const SENTINEL: &str = "SENTINEL_TABLE_PROPERTY_MUST_NOT_LEAK";
@@ -1739,13 +1678,12 @@ mod tests {
         );
     }
 
-    /// Guards the "Debug only" claim of [`test_table_metadata_debug_redacts_secret_properties`]:
-    /// the redaction must NOT reach the serde output, or every table this fork writes would ship
-    /// `***` in place of its properties — an on-disk-format corruption. `TableMetadata` has no
+    /// Guards the "Debug only" claim of [`test_table_metadata_debug_redacts_secret_properties`].
+    /// The redaction must NOT reach the serde output, or every table this fork writes ships `***`
+    /// in place of its properties, which corrupts the on-disk format. `TableMetadata` has no
     /// `Display`, so `Debug` is the only render path that changed.
     ///
-    /// MUTATION: redacting inside `TableMetadataEnum`'s serialization (rather than in `Debug`)
-    /// → RED.
+    /// MUTATION: redact inside `TableMetadataEnum`'s serialization instead of in `Debug`.
     #[test]
     fn test_table_metadata_redaction_does_not_reach_serde() {
         const SENTINEL: &str = "SENTINEL_TABLE_PROPERTY_MUST_NOT_LEAK";
@@ -1766,17 +1704,12 @@ mod tests {
         assert_eq!(round_tripped, metadata);
     }
 
-    /// KNOWN-RESIDUE PIN for the `NAMED RESIDUE` ledger on `impl std::fmt::Debug for
-    /// TableMetadata`. SEC-002 closed `properties` and NOTHING else: three nested
-    /// `String -> String` maps owned by other spec types still render in clear, so a
-    /// `tracing::info!(?table)` is not wholesale credential-safe and the docs must not claim it
-    /// is. Asserting the residue EXISTS makes the ledger self-enforcing — whoever closes any of
-    /// these three paths turns this test RED and is forced to update all three doc blocks
-    /// (`TableMetadata`'s `Debug`, `Table` in `table.rs`, the banner in
-    /// `crates/catalog/rest/src/types.rs`) in the same change.
-    ///
-    /// MUTATION (each independently RED): route `snapshots`, `encryption_keys` or `statistics`
-    /// through a redacting adapter in the `Debug` impl above without updating the ledger.
+    /// KNOWN-RESIDUE PIN for the NAMED RESIDUE ledger on `impl Debug for TableMetadata`. SEC-002
+    /// closed `properties` and nothing else: three nested `String -> String` maps still render in
+    /// clear, so `tracing::info!(?table)` is not wholesale credential-safe. Asserting the residue
+    /// EXISTS makes the ledger self-enforcing: closing any of the three paths turns this test RED
+    /// and forces an update of all three doc blocks in the same change. MUTATION (each
+    /// independently RED): redact `snapshots`, `encryption_keys` or `statistics` without the ledger.
     #[test]
     fn test_named_residue_table_metadata_debug_renders_nested_property_maps() {
         const SNAPSHOT_SUMMARY_SECRET: &str = "RESIDUE_SNAPSHOT_SUMMARY_VALUE";
@@ -3669,14 +3602,11 @@ mod tests {
         )
     }
 
-    /// Risk pinned: a non-Java reader-robustness "fix" (`#[serde(default)]` on
-    /// `last_sequence_number`) would silently accept a V2 document Java 1.10.0 REJECTS, drifting from
-    /// parity. Java's `TableMetadataParser.fromJson` reads `last-sequence-number` for `formatVersion >
-    /// 1` via `JsonUtil.getLong`, which throws `IllegalArgumentException("Cannot parse missing long:
-    /// last-sequence-number")` when absent (`format/spec.md` line 179). Rust must stay strict: a V2 doc
-    /// missing `last-sequence-number` must FAIL to parse. The JSON below is `TableMetadataV2ValidMinimal`
-    /// with ONLY `last-sequence-number` removed, so this isolates that field (remove `last_sequence_number`
-    /// from the serde struct's required set and this test fails: the doc parses with seq 0).
+    /// Risk pinned: `#[serde(default)]` on `last_sequence_number` would silently accept a V2
+    /// document Java 1.10.0 REJECTS. Java reads the field for `formatVersion > 1` through
+    /// `JsonUtil.getLong`, which throws when it is absent. Rust must stay strict. The JSON below is
+    /// `TableMetadataV2ValidMinimal` with ONLY `last-sequence-number` removed, so it isolates that
+    /// field: make the field optional and this test fails, because the doc parses with seq 0.
     #[test]
     fn test_table_metadata_v2_missing_last_sequence_number_rejected() {
         let metadata = r#"
@@ -3708,13 +3638,10 @@ mod tests {
         )
     }
 
-    /// Risk pinned: a V1 document has no sequence numbers (`last-sequence-number` is never written for
-    /// V1). The spec mandates default-to-0 when reading V1 metadata (`format/spec.md` line 1978); Java
-    /// 1.10.0 handles this with `if (formatVersion <= 1) → 0` (never reads the field). The Rust
-    /// `TableMetadataV1` serde struct has no `last_sequence_number` field and its conversion seeds 0 — so
-    /// a V1 doc (here `TableMetadataV1Valid.json`, which carries no `last-sequence-number`) must read back
-    /// with `last_sequence_number == 0`, matching Java. This is the V1 side of the read contract; together
-    /// with the V2-strict test above it covers both spec branches.
+    /// Risk pinned: a V1 document never carries `last-sequence-number`. The spec mandates
+    /// default-to-0 when reading V1, and Java 1.10.0 never reads the field for V1. The Rust
+    /// `TableMetadataV1` struct has no such field and seeds 0, so `TableMetadataV1Valid.json` must
+    /// read back with `last_sequence_number == 0`. This is the V1 side of the read contract.
     #[test]
     fn test_table_metadata_v1_last_sequence_number_defaults_to_zero() {
         let metadata =
@@ -3731,13 +3658,10 @@ mod tests {
         );
     }
 
-    /// Risk pinned: the WRITE side must ALWAYS emit `last-sequence-number` for V2+ (Java
-    /// `TableMetadataParser.toJson` line 173: `if (formatVersion() > 1) writeNumberField(LAST_SEQUENCE_
-    /// NUMBER, ...)`), even when it is 0 — because the V2 READ side (above) requires it. Were the field
-    /// `skip_serializing_if`-omitted when 0, a Rust-written brand-new V2 table (seq 0) would emit metadata
-    /// neither Rust nor Java could re-read. This serializes a real V2 metadata and asserts the raw JSON
-    /// carries `last-sequence-number`, then round-trips it back. (`skip_serializing_if` on the field would
-    /// fail the raw-JSON assertion; the field has none.)
+    /// Risk pinned: the WRITE side must ALWAYS emit `last-sequence-number` for V2+, even when it is
+    /// 0, because the V2 READ side requires it. Java `TableMetadataParser.toJson` writes it for
+    /// `formatVersion() > 1`. Omitting it at 0 would make a brand-new V2 table unreadable by both
+    /// Rust and Java. This asserts the raw JSON carries the field, then round-trips it.
     #[test]
     fn test_table_metadata_v2_write_always_emits_last_sequence_number() {
         // A V2 table whose last_sequence_number is 0 — the value most at risk of being skipped on write.
@@ -4570,10 +4494,9 @@ mod tests {
         )
     }
 
-    // RISK (item O3(b), 1.10.0-bytecode-derived): Java `TableMetadataParser.fromJson` binds the
-    // DEFAULT sort order against the current schema with `SortOrderParser.fromJson(schema, node,
-    // defaultId)` → `bind` → `SortOrder.checkCompatibility`. A default sort order whose source
-    // column EXISTS, is PRIMITIVE, and accepts its transform must parse. Pins the happy arm.
+    // RISK (item O3(b)): Java binds the DEFAULT sort order against the current schema through
+    // `checkCompatibility`. A default order whose source column exists, is primitive, and accepts
+    // its transform must parse. Pins the happy arm.
     #[test]
     fn metadata_with_valid_default_sort_order_binds_and_parses() {
         let json = sort_order_metadata_json(
@@ -4588,10 +4511,9 @@ mod tests {
         assert_eq!(metadata.default_sort_order().fields.len(), 1);
     }
 
-    // RISK (item O3(b)): the DEFAULT sort order is bound with `checkCompatibility`, so a default
-    // sort field referencing a MISSING source column id fails at parse — Java's "Cannot find
-    // source column for sort field: %s" (`ValidationException`). Self-mutation: dropping the
-    // `SortOrderBuilder::check_compatibility` call in `try_normalize_sort_order` makes this parse.
+    // RISK (item O3(b)): a default sort field naming a MISSING source column must fail at parse,
+    // like Java's "Cannot find source column for sort field". Self-mutation: drop the
+    // `check_compatibility` call in `try_normalize_sort_order` and this parses.
     #[test]
     fn metadata_with_default_sort_order_on_missing_source_id_fails_at_parse() {
         let json = sort_order_metadata_json(
@@ -4630,10 +4552,9 @@ mod tests {
         );
     }
 
-    // RISK (item O3(b)): a NON-DEFAULT sort order is bound with `bindUnchecked` (no
-    // checkCompatibility) — so even a NON-DEFAULT order referencing a missing source id parses,
-    // exactly like Java. The default (id 0, unsorted) is the only one validated. This is the
-    // "no stricter than Java" half — over-validating every order would diverge.
+    // RISK (item O3(b)): a NON-DEFAULT sort order uses `bindUnchecked`, so one that references a
+    // missing source id still parses, exactly like Java. This is the "no stricter than Java" half;
+    // over-validating every order would diverge.
     #[test]
     fn metadata_with_non_default_sort_order_on_missing_source_id_still_parses() {
         let json = sort_order_metadata_json(

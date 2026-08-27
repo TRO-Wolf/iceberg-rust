@@ -66,13 +66,9 @@ struct S3TablesCatalogConfig {
 }
 
 impl std::fmt::Debug for S3TablesCatalogConfig {
-    /// Hand-written so secret-bearing entries in the raw `props` map — the AWS
-    /// `aws_secret_access_key` / `aws_session_token` credentials flow through here into the
-    /// `FileIO` this config backs — are redacted to `"***"` instead of printed in clear. Keys stay
-    /// visible for diagnostics; the pre-built SDK `client` is rendered as a presence flag only.
-    /// Redaction uses the canonical needle test `iceberg::io::is_secret_prop_key`
-    /// (`crates/iceberg/src/io/storage/config/mod.rs`), the same superset `StorageConfig` uses
-    /// (#159), so the list cannot drift per catalog.
+    /// Redact secret prop values. The AWS credentials in `props` flow into the `FileIO` this
+    /// config backs, so a derived `Debug` prints them in clear. Redaction uses the canonical
+    /// `iceberg::io::is_secret_prop_key`, so the secret-key list cannot drift per catalog.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let redacted_props: HashMap<&str, &str> = self
             .props
@@ -123,12 +119,7 @@ impl Default for S3TablesCatalogBuilder {
 impl S3TablesCatalogBuilder {
     /// Configure the catalog with a custom endpoint URL (useful for local testing/mocking).
     ///
-    /// # Behavior with Properties
-    ///
-    /// If both this method and the `endpoint_url` property are provided during catalog loading,
-    /// the property value will take precedence and overwrite the value set by this method.
-    /// This follows the general pattern where properties specified in the `load()` method
-    /// have higher priority than builder method configurations.
+    /// The `endpoint_url` property passed to `load()` overrides this value.
     pub fn with_endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
         self.config.endpoint_url = Some(endpoint_url.into());
         self
@@ -142,12 +133,7 @@ impl S3TablesCatalogBuilder {
 
     /// Configure the catalog with a table bucket ARN.
     ///
-    /// # Behavior with Properties
-    ///
-    /// If both this method and the `table_bucket_arn` property are provided during catalog loading,
-    /// the property value will take precedence and overwrite the value set by this method.
-    /// This follows the general pattern where properties specified in the `load()` method
-    /// have higher priority than builder method configurations.
+    /// The `table_bucket_arn` property passed to `load()` overrides this value.
     pub fn with_table_bucket_arn(mut self, table_bucket_arn: impl Into<String>) -> Self {
         self.config.table_bucket_arn = table_bucket_arn.into();
         self
@@ -181,7 +167,6 @@ impl CatalogBuilder for S3TablesCatalogBuilder {
             self.config.endpoint_url = props.get(S3TABLES_CATALOG_PROP_ENDPOINT_URL).cloned();
         }
 
-        // Collect other remaining properties
         self.config.props = props
             .into_iter()
             .filter(|(k, _)| {
@@ -229,7 +214,6 @@ impl S3TablesCatalog {
             aws_sdk_s3tables::Client::new(&aws_config)
         };
 
-        // Use provided factory or default to OpenDalStorageFactory::S3
         let factory = storage_factory.unwrap_or_else(|| {
             Arc::new(OpenDalStorageFactory::S3 {
                 configured_scheme: "s3".to_string(),
@@ -247,8 +231,7 @@ impl S3TablesCatalog {
         })
     }
 
-    /// S3 Tables GetTable for the service metadata pointer + version_token, without reading
-    /// TableMetadata from object storage.
+    /// GetTable for the service metadata pointer and version_token. Reads no object storage.
     async fn get_table_pointer(
         &self,
         table_ident: &TableIdent,
@@ -293,8 +276,8 @@ impl S3TablesCatalog {
         Ok((table, version_token))
     }
 
-    /// Resolve the base table for a commit: GetTable for the pointer + version_token, then either
-    /// reuse a pre-loaded base (skip S3 metadata parse), conflict early, or full-load metadata.
+    /// Resolve the base table for a commit. Reuses a pre-loaded base when the service pointer
+    /// still matches, which skips the S3 metadata parse.
     async fn resolve_commit_base(
         &self,
         table_ident: &TableIdent,
@@ -349,8 +332,7 @@ impl S3TablesCatalog {
 
 #[async_trait]
 impl Catalog for S3TablesCatalog {
-    /// Returns the catalog name supplied at construction (the `name` argument of
-    /// [`CatalogBuilder::load`]), or the [`UNNAMED_CATALOG`] sentinel when none was set.
+    /// Returns the catalog name given to [`CatalogBuilder::load`], or [`UNNAMED_CATALOG`].
     fn name(&self) -> &str {
         self.config.name.as_deref().unwrap_or(UNNAMED_CATALOG)
     }
@@ -362,8 +344,7 @@ impl Catalog for S3TablesCatalog {
 
     /// List namespaces from s3tables catalog.
     ///
-    /// S3Tables doesn't support nested namespaces. If parent is provided, it will
-    /// return an empty list.
+    /// S3Tables has no nested namespaces, so a `parent` always returns an empty list.
     async fn list_namespaces(
         &self,
         parent: Option<&NamespaceIdent>,
@@ -394,22 +375,10 @@ impl Catalog for S3TablesCatalog {
         Ok(result)
     }
 
-    /// Creates a new namespace with the given identifier and properties.
+    /// Creates a new namespace. The `properties` parameter is ignored.
     ///
-    /// Attempts to create a namespace defined by the `namespace`. The `properties`
-    /// parameter is ignored.
-    ///
-    /// The following naming rules apply to namespaces:
-    ///
-    /// - Names must be between 3 (min) and 63 (max) characters long.
-    /// - Names can consist only of lowercase letters, numbers, and underscores (_).
-    /// - Names must begin and end with a letter or number.
-    /// - Names must not contain hyphens (-) or periods (.).
-    ///
-    /// This function can return an error in the following situations:
-    ///
-    /// - Errors from the underlying database creation process, converted using
-    /// `from_aws_sdk_error`.
+    /// S3Tables namespace names are 3 to 63 characters long. They use only lowercase letters,
+    /// numbers, and underscores. They start and end with a letter or number.
     async fn create_namespace(
         &self,
         namespace: &NamespaceIdent,
@@ -428,14 +397,6 @@ impl Catalog for S3TablesCatalog {
     }
 
     /// Retrieves a namespace by its identifier.
-    ///
-    /// Validates the given namespace identifier and then queries the
-    /// underlying database client to fetch the corresponding namespace data.
-    /// Constructs a `Namespace` object with the retrieved data and returns it.
-    ///
-    /// This function can return an error in any of the following situations:
-    /// - If there is an error querying the database, returned by
-    /// `from_aws_sdk_error`.
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
         let req = self
             .s3tables_client
@@ -452,16 +413,7 @@ impl Catalog for S3TablesCatalog {
 
     /// Checks if a namespace exists within the s3tables catalog.
     ///
-    /// Validates the namespace identifier by querying the s3tables catalog
-    /// to determine if the specified namespace exists.
-    ///
-    /// # Returns
-    /// A `Result<bool>` indicating the outcome of the check:
-    /// - `Ok(true)` if the namespace exists.
-    /// - `Ok(false)` if the namespace does not exist, identified by a specific
-    /// `IsNotFoundException` variant.
-    /// - `Err(...)` if an error occurs during validation or the s3tables catalog
-    /// query, with the error encapsulating the issue.
+    /// A service `IsNotFoundException` returns `Ok(false)`. Every other failure returns `Err`.
     async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
         let req = self
             .s3tables_client
@@ -480,10 +432,7 @@ impl Catalog for S3TablesCatalog {
         }
     }
 
-    /// Updates the properties of an existing namespace.
-    ///
-    /// S3Tables doesn't support updating namespace properties, so this function
-    /// will always return an error.
+    /// Always fails. S3Tables does not support namespace properties.
     async fn update_namespace(
         &self,
         _namespace: &NamespaceIdent,
@@ -496,13 +445,6 @@ impl Catalog for S3TablesCatalog {
     }
 
     /// Drops an existing namespace from the s3tables catalog.
-    ///
-    /// Validates the namespace identifier and then deletes the corresponding
-    /// namespace from the s3tables catalog.
-    ///
-    /// This function can return an error in the following situations:
-    /// - Errors from the underlying database deletion process, converted using
-    /// `from_aws_sdk_error`.
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
         let req = self
             .s3tables_client
@@ -514,13 +456,6 @@ impl Catalog for S3TablesCatalog {
     }
 
     /// Lists all tables within a given namespace.
-    ///
-    /// Retrieves all tables associated with the specified namespace and returns
-    /// their identifiers.
-    ///
-    /// This function can return an error in the following situations:
-    /// - Errors from the underlying database query process, converted using
-    /// `from_aws_sdk_error`.
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
         let mut result = Vec::new();
         let mut continuation_token = None;
@@ -550,18 +485,8 @@ impl Catalog for S3TablesCatalog {
 
     /// Creates a new table within a specified namespace.
     ///
-    /// Attempts to create a table defined by the `creation` parameter. The metadata
-    /// location is generated by the s3tables catalog, looks like:
-    ///
-    /// s3://{RANDOM WAREHOUSE LOCATION}/metadata/{VERSION}-{UUID}.metadata.json
-    ///
-    /// We have to get this random warehouse location after the table is created.
-    ///
-    /// This function can return an error in the following situations:
-    /// - If the location of the table is set by user, identified by a specific
-    /// `DataInvalid` variant.
-    /// - Errors from the underlying database creation process, converted using
-    /// `from_aws_sdk_error`.
+    /// The s3tables catalog picks the warehouse location, so the caller must not set one.
+    /// The location is only readable after the create call returns.
     async fn create_table(
         &self,
         namespace: &NamespaceIdent,
@@ -569,7 +494,6 @@ impl Catalog for S3TablesCatalog {
     ) -> Result<Table> {
         let table_ident = TableIdent::new(namespace.clone(), creation.name.clone());
 
-        // create table
         let create_resp: CreateTableOutput = self
             .s3tables_client
             .create_table()
@@ -581,8 +505,8 @@ impl Catalog for S3TablesCatalog {
             .await
             .map_err(from_aws_sdk_error)?;
 
-        // prepare table location. the warehouse location is generated by s3tables catalog,
-        // which looks like: s3://e6c9bf20-991a-46fb-kni5xs1q2yxi3xxdyxzjzigdeop1quse2b--table-s3
+        // The s3tables catalog generates the warehouse location, for example
+        // s3://e6c9bf20-991a-46fb-kni5xs1q2yxi3xxdyxzjzigdeop1quse2b--table-s3
         let table_location = match &creation.location {
             Some(_) => {
                 return Err(Error::new(
@@ -604,7 +528,6 @@ impl Catalog for S3TablesCatalog {
             }
         };
 
-        // write metadata to file
         creation.location = Some(table_location.clone());
         let metadata = TableMetadataBuilder::from_table_creation(creation)?
             .build()?
@@ -613,7 +536,6 @@ impl Catalog for S3TablesCatalog {
             MetadataLocation::new_with_table_location(table_location).to_string();
         metadata.write_to(&self.file_io, &metadata_location).await?;
 
-        // update metadata location
         self.s3tables_client
             .update_table_metadata_location()
             .table_bucket_arn(self.config.table_bucket_arn.clone())
@@ -636,26 +558,12 @@ impl Catalog for S3TablesCatalog {
 
     /// Loads an existing table from the s3tables catalog.
     ///
-    /// Retrieves the metadata location of the specified table and constructs a
-    /// `Table` object with the retrieved metadata.
-    ///
-    /// This function can return an error in the following situations:
-    /// - If the table does not have a metadata location, identified by a specific
-    /// `Unexpected` variant.
-    /// - Errors from the underlying database query process, converted using
-    /// `from_aws_sdk_error`.
+    /// A table with no metadata location fails with `Unexpected`.
     async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
         Ok(self.load_table_with_version_token(table_ident).await?.0)
     }
 
     /// Drops an existing table from the s3tables catalog.
-    ///
-    /// Validates the table identifier and then deletes the corresponding
-    /// table from the s3tables catalog.
-    ///
-    /// This function can return an error in the following situations:
-    /// - Errors from the underlying database deletion process, converted using
-    /// `from_aws_sdk_error`.
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
         let req = self
             .s3tables_client
@@ -669,16 +577,7 @@ impl Catalog for S3TablesCatalog {
 
     /// Checks if a table exists within the s3tables catalog.
     ///
-    /// Validates the table identifier by querying the s3tables catalog
-    /// to determine if the specified table exists.
-    ///
-    /// # Returns
-    /// A `Result<bool>` indicating the outcome of the check:
-    /// - `Ok(true)` if the table exists.
-    /// - `Ok(false)` if the table does not exist, identified by a specific
-    /// `IsNotFoundException` variant.
-    /// - `Err(...)` if an error occurs during validation or the s3tables catalog
-    /// query, with the error encapsulating the issue.
+    /// A service `IsNotFoundException` returns `Ok(false)`. Every other failure returns `Err`.
     async fn table_exists(&self, table_ident: &TableIdent) -> Result<bool> {
         let req = self
             .s3tables_client
@@ -699,13 +598,6 @@ impl Catalog for S3TablesCatalog {
     }
 
     /// Renames an existing table within the s3tables catalog.
-    ///
-    /// Validates the source and destination table identifiers and then renames
-    /// the source table to the destination table.
-    ///
-    /// This function can return an error in the following situations:
-    /// - Errors from the underlying database renaming process, converted using
-    /// `from_aws_sdk_error`.
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
         let req = self
             .s3tables_client
@@ -734,8 +626,8 @@ impl Catalog for S3TablesCatalog {
     async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
         let table_namespace = table_ident.namespace();
-        // GetTable for version_token + pointer; skip the second full S3 metadata parse when the
-        // service pointer still matches the commit base and Transaction supplied a base table.
+        // Skip the second full S3 metadata parse when the service pointer still matches the
+        // commit base and the Transaction supplied a base table.
         let (current_table, version_token) =
             self.resolve_commit_base(&table_ident, &mut commit).await?;
 
@@ -758,17 +650,11 @@ impl Catalog for S3TablesCatalog {
         Ok(staged_table)
     }
 
-    /// Atomically publish a fully staged **replace** (metadata-pointer CAS).
-    ///
-    /// QE / RePark A2 OR-REPLACE: `CREATE OR REPLACE TABLE … AS SELECT` against S3 Tables
-    /// stages files under the existing table location, then calls this to swap the catalog
-    /// pointer via `UpdateTableMetadataLocation` (same API as [`Catalog::update_table`]).
-    ///
-    /// Optimistic concurrency: if `expected_base_metadata_location` is `Some` and does not
-    /// match the service-current pointer, returns a retryable
-    /// [`ErrorKind::CatalogCommitConflicts`] before sending the update.
-    ///
-    /// Only the service pointer + version_token are needed — no full TableMetadata S3 parse.
+    /// Atomically publish a fully staged replace through a metadata-pointer CAS. `CREATE OR REPLACE
+    /// TABLE ... AS SELECT` stages files under the existing table location, then calls this to swap
+    /// the catalog pointer. # Errors A `Some(expected_base_metadata_location)` that does not match
+    /// the service-current pointer returns a retryable [`ErrorKind::CatalogCommitConflicts`] before
+    /// any update.
     async fn publish_replace_table(
         &self,
         table: Table,
@@ -776,8 +662,7 @@ impl Catalog for S3TablesCatalog {
     ) -> Result<Table> {
         let table_ident = table.identifier().clone();
         let table_namespace = table_ident.namespace();
-        // Pointer-only GetTable: publish_replace only needs metadata_location + version_token
-        // for the location check and CAS — never the full metadata JSON.
+        // Pointer-only GetTable. The location check and the CAS never need the metadata JSON.
         let (stored, version_token) = self.get_table_pointer(&table_ident).await?;
 
         if let Some(expected) = expected_base_metadata_location.as_deref()
@@ -794,8 +679,7 @@ impl Catalog for S3TablesCatalog {
         }
 
         let new_metadata_location = table.metadata_location_result()?.to_string();
-        // Staged replace materializes the new metadata file before publish; only the
-        // service-side pointer CAS remains.
+        // The staged replace already wrote the new metadata file. Only the pointer CAS remains.
         self.cas_update_metadata_location(
             &table_ident,
             table_namespace,
@@ -826,12 +710,9 @@ impl S3TablesCatalog {
             .version_token(version_token)
             .metadata_location(metadata_location);
 
-        // Sent-vs-unsent classification of the commit call (GAP_MATRIX row R157): a failure
-        // that may have occurred AFTER the request reached S3 Tables maps to
-        // `CommitStateUnknown`; a never-sent failure keeps the terminal mapping; a modeled
-        // service response classifies per `map_update_table_metadata_location_service_error`.
-        // S3 Tables runs service-side maintenance that commits concurrently with any writer,
-        // so ambiguous outcomes here are not rare — blindly retrying one duplicates rows.
+        // S3 Tables maintenance commits concurrently with every writer, so an ambiguous
+        // outcome here is common. A retry of an applied commit duplicates rows. So a failure
+        // that may have reached the service maps to `CommitStateUnknown` (row R157).
         let _ = builder
             .send()
             .await
@@ -874,30 +755,24 @@ where T: std::fmt::Debug {
     )
 }
 
-/// Where a failed AWS SDK COMMIT call stopped, classified sent-vs-unsent (GAP_MATRIX row R157).
-/// Same doctrine as the Glue catalog's classifier (`iceberg-catalog-glue::error`): the two AWS
-/// SDK crates re-export the same smithy `SdkError` shape but share no common crate to host one
-/// copy.
+/// Where a failed AWS SDK commit call stopped, classified sent-vs-unsent (row R157).
+///
+/// The Glue catalog holds a copy of this classifier. The two AWS SDK crates share no common
+/// crate that can host one copy.
 enum CommitSendDisposition {
-    /// The request provably never left the client — the failure keeps its terminal mapping.
+    /// The request never left the client. The failure keeps its terminal mapping.
     NeverSent,
-    /// The request MAY have reached the service: the commit outcome is ambiguous.
+    /// The request may have reached the service. The commit outcome is ambiguous.
     MaybeSent,
     /// The service definitively responded with a modeled error.
     ResponseReceived,
 }
 
-/// Classify the transport layer of a failed SDK call on the COMMIT path
-/// (`update_table_metadata_location`).
+/// Classify the transport layer of a failed SDK call on the commit path.
 ///
-/// Java analogue: `CommitStateUnknownException` (iceberg-api 1.10.0) is surfaced whenever a
-/// commit failure cannot be confirmed as not-applied (`BaseMetastoreTableOperations.
-/// checkCommitStatus` → `CommitStatus.UNKNOWN`); `SnapshotProducer.commit()` then neither
-/// retries nor cleans up. An `is_user()`/`is_other()` dispatch failure is client-side setup
-/// (never sent); `is_io()`/`is_timeout()` dispatch failures, operation timeouts, and
-/// unparsable responses may have reached the service (the SDK cannot distinguish
-/// connect-refused from reset-after-send, so the ambiguous side is chosen — needless
-/// reconciliation is safe, a duplicate commit is not).
+/// Java `BaseMetastoreTableOperations.checkCommitStatus` reports `UNKNOWN` for the same class
+/// of failure. The SDK cannot tell connect-refused from reset-after-send, so this function
+/// picks the ambiguous side. A needless reconciliation is safe. A duplicate commit is not.
 fn classify_commit_send_disposition<E, R>(
     error: &aws_sdk_s3tables::error::SdkError<E, R>,
 ) -> CommitSendDisposition {
@@ -912,12 +787,11 @@ fn classify_commit_send_disposition<E, R>(
     }
 }
 
-/// Map a modeled S3 Tables `UpdateTableMetadataLocationError` (the service RESPONDED) on the
-/// commit path. `ConflictException` is the version-token CAS conflict → retryable
-/// `CatalogCommitConflicts` (Java's `CommitFailedException` class); `InternalServerErrorException`
-/// is the 5xx class → the update may have been applied before the failure →
-/// `CommitStateUnknown` (Java `ErrorHandlers$CommitErrorHandler` maps 500 →
-/// `CommitStateUnknownException`); definite rejections keep their terminal mappings.
+/// Map a modeled `UpdateTableMetadataLocationError` on the commit path.
+///
+/// `ConflictException` is the version-token CAS conflict, so it stays retryable.
+/// `InternalServerErrorException` may have applied the update, so it maps to
+/// `CommitStateUnknown`. Java `ErrorHandlers$CommitErrorHandler` maps 500 the same way.
 fn map_update_table_metadata_location_service_error(
     error: UpdateTableMetadataLocationError,
     table_ident: &TableIdent,
@@ -959,11 +833,9 @@ mod tests {
         TableIdent::from_strs(["ns1", "test1"]).expect("build test table ident")
     }
 
-    /// Risk (GAP_MATRIX row R157): the version-token CAS conflict (`ConflictException`) —
-    /// ROUTINE on S3 Tables, whose service-side maintenance commits concurrently with every
-    /// writer — is reclassified unknown-outcome, so the retry loop stops absorbing plain
-    /// concurrency and every maintenance race surfaces to the caller. Pins that the conflict
-    /// stays `CatalogCommitConflicts` + retryable.
+    /// Risk: a reclassified `ConflictException` stops the retry loop from absorbing routine
+    /// concurrency, so every maintenance race reaches the caller. Pins the conflict as
+    /// `CatalogCommitConflicts` and retryable.
     #[test]
     fn test_conflict_exception_stays_retryable_conflict() {
         let error = map_update_table_metadata_location_service_error(
@@ -976,12 +848,9 @@ mod tests {
         assert!(error.retryable(), "a CAS conflict is safely retryable");
     }
 
-    /// Risk (GAP_MATRIX row R157): S3 Tables' 5xx (`InternalServerErrorException`) keeps the
-    /// terminal `Unexpected` mapping — the caller cannot tell may-have-landed from
-    /// safe-to-rerun (Java maps 500 → `CommitStateUnknownException`,
-    /// `ErrorHandlers$CommitErrorHandler`). Pins the unknown-outcome mapping, non-retryable,
-    /// and that a definite rejection (`NotFoundException`) stays terminal (the over-broadening
-    /// direction).
+    /// Risk: a 5xx that keeps a terminal mapping hides may-have-landed from the caller. Pins
+    /// the unknown-outcome mapping as non-retryable. Also pins that `NotFoundException` stays
+    /// terminal, which is the over-broadening direction.
     #[test]
     fn test_internal_server_error_maps_to_unknown_outcome_but_not_found_stays_terminal() {
         let unknown = map_update_table_metadata_location_service_error(
@@ -1005,11 +874,9 @@ mod tests {
         assert_eq!(not_found.kind(), iceberg::ErrorKind::TableNotFound);
     }
 
-    /// Risk (GAP_MATRIX row R157): the transport split misroutes — a post-send ambiguous
-    /// failure (operation timeout, io dispatch failure, unparsable response) classifies
-    /// NeverSent (an outer re-run duplicates an applied commit), or a provably-unsent /
-    /// definitively-answered failure classifies MaybeSent (needless reconciliation). Pins both
-    /// sides of the S3 Tables classifier.
+    /// Risk: a post-send ambiguous failure classifies NeverSent, so an outer re-run duplicates
+    /// an applied commit. The opposite misroute costs a needless reconciliation. Pins both
+    /// sides of the classifier.
     #[test]
     fn test_commit_send_disposition_split() {
         use aws_sdk_s3tables::error::ConnectorError;
@@ -1069,11 +936,9 @@ mod tests {
         }
     }
 
-    /// Risk (#159 unit-D residue): `S3TablesCatalogConfig` holds the raw prop map — the AWS
-    /// `aws_secret_access_key` / `aws_session_token` credentials flow through it into `FileIO` —
-    /// so a plain-derived `Debug` prints live credentials. Pins that secret VALUES redact to
-    /// `"***"` while KEYS and non-secret values stay visible. Mutation: revert the manual `Debug`
-    /// to `#[derive(Debug)]` → RED.
+    /// Risk: the raw prop map holds live AWS credentials, so a derived `Debug` prints them.
+    /// Pins that secret values redact to `"***"` and that keys stay visible.
+    /// Mutation: revert the manual `Debug` to `#[derive(Debug)]` gives RED.
     #[test]
     fn test_config_debug_redacts_secret_prop_values() {
         let config = config_with_secret_props();
@@ -1094,11 +959,9 @@ mod tests {
         );
     }
 
-    /// Risk (#159 unit-D residue, composition): `S3TablesCatalog` derives `Debug`, which renders
-    /// the `config` field through `S3TablesCatalogConfig`'s `Debug`, so the redaction must survive
-    /// one level up. Builds the catalog offline (SDK config resolution is lazy — the same path the
-    /// Glue offline tests exercise) and pins that a `{:?}` of the whole catalog does not leak a
-    /// credential. Mutation: revert the config `Debug` to derived → RED.
+    /// Risk: `S3TablesCatalog` derives `Debug`, so the redaction must survive one level up.
+    /// Pins that a `{:?}` of the whole catalog leaks no credential.
+    /// Mutation: revert the config `Debug` to derived gives RED.
     #[tokio::test]
     async fn test_catalog_debug_redacts_secret_prop_values() {
         let catalog = S3TablesCatalog::new(config_with_secret_props(), None)
@@ -1249,16 +1112,13 @@ mod tests {
             Err(e) => panic!("Error loading catalog: {e}"),
         };
 
-        // Create a test namespace and table
         let namespace = NamespaceIdent::new("test_s3tables_update_table".to_string());
         let table_ident =
             TableIdent::new(namespace.clone(), "test_s3tables_update_table".to_string());
 
-        // Clean up any existing resources from previous test runs
         catalog.drop_table(&table_ident).await.ok();
         catalog.drop_namespace(&namespace).await.ok();
 
-        // Create namespace and table
         catalog
             .create_namespace(&namespace, HashMap::new())
             .await
@@ -1282,39 +1142,31 @@ mod tests {
 
         let table = catalog.create_table(&namespace, creation).await.unwrap();
 
-        // Create a transaction to update the table
         let tx = Transaction::new(&table);
 
-        // Store the original metadata location for comparison
         let original_metadata_location = table.metadata_location();
 
-        // Update table properties using the transaction
         let tx = tx
             .update_table_properties()
             .set("test_property".to_string(), "test_value".to_string())
             .apply(tx)
             .unwrap();
 
-        // Commit the transaction to the catalog
         let updated_table = tx.commit(&catalog).await.unwrap();
 
-        // Verify the update was successful
         assert_eq!(
             updated_table.metadata().properties().get("test_property"),
             Some(&"test_value".to_string())
         );
 
-        // Verify the metadata location has been updated
         assert_ne!(
             updated_table.metadata_location(),
             original_metadata_location,
             "Metadata location should be updated after commit"
         );
 
-        // Load the table again from the catalog to verify changes were persisted
         let reloaded_table = catalog.load_table(&table_ident).await.unwrap();
 
-        // Verify the reloaded table matches the updated table
         assert_eq!(
             reloaded_table.metadata().properties().get("test_property"),
             Some(&"test_value".to_string())
@@ -1430,7 +1282,6 @@ mod tests {
         assert!(result.is_ok());
         let catalog = result.unwrap();
 
-        // Property value should override builder method value
         assert_eq!(
             catalog.config.endpoint_url,
             Some(property_endpoint.to_string())
@@ -1582,9 +1433,8 @@ mod tests {
         }
     }
 
-    /// Offline: constructing an `S3TablesCatalog` builds the SDK client but performs no
-    /// network call, so the `name()`/`properties()` accessors are testable without
-    /// credentials or a live bucket.
+    /// Construction builds the SDK client but makes no network call, so these accessors need
+    /// no credentials and no live bucket.
     #[tokio::test]
     async fn test_name_and_properties_return_config() {
         let config = S3TablesCatalogConfig {
