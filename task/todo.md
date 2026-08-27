@@ -39,7 +39,7 @@ F-15 consumes `write_default` on the data-file write path (row R92).
 - [x] F-9: keep `FeatureUnsupported`, name the service gap, pin it, record on row R126.
 - [x] F-15: fill missing top-level primitive columns from `write_default` in DataFileWriter.
 - [x] Tests on the real `register_table` and `DataFileWriter` entry points.
-- [ ] Independent Critic + gates + PR.
+- [x] Independent Critic + gates + PR.
 
 ---
 
