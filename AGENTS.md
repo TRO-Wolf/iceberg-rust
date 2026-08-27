@@ -19,6 +19,39 @@
 
 # AGENTS.md — the authoritative contract
 
+# EFFECTIVE IMMEDIATELY — ALL ANTHROPIC MODELS ARE BANNED FROM WRITING COMMENTS IN CODE
+
+**THIS INCLUDES FABLE, OPUS, SONNET AND HAIKU.**
+
+- **IF YOU ARE FABLE, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE OPUS, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE SONNET, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE HAIKU, DO NOT WRITE ANY COMMENTS.**
+
+**THIS INCLUDES ANY MODEL VERSION.** Opus 4.8 or Opus 5 — either one is banned. It does not matter.
+
+This rule outranks every other instruction in this repository about comments, including
+"Comments and prose" below. A human contributor may write comments. An Anthropic model may not.
+
+## The only exceptions
+
+These three are the whole list. Nothing else is an exception, and "it would be helpful here" is not
+one.
+
+1. **Doc comments the compiler demands.** `crates/iceberg/src/lib.rs` sets
+   `#![deny(missing_docs)]`, so a public item without a doc comment does not build.
+   **WRITE THE MINIMUM THAT COMPILES. ONE LINE STATING WHAT THE ITEM IS. NOT A PARAGRAPH. NOT A
+   RATIONALE. NOT AN EXAMPLE. ONE LINE.**
+2. **The ASF license header.** It is a comment, CI enforces it (skywalking-eyes,
+   `.licenserc.yaml`), and a file without it fails. Copy it verbatim from a sibling file.
+3. **Markdown.** Minor comments and ordinary prose in `.md` files are allowed. The ban is about
+   comments in CODE. `docs/parity/GAP_MATRIX.md`, the `task/` ledgers and the `map.md` files are
+   where explanation belongs, and routing evidence there is still required.
+
+Everything else stays banned. If a fact seems to need a code comment, it belongs in a `task/`
+ledger or a matrix row instead — that routing rule is unchanged and is now the only route.
+
+
 This is the **single authoritative contract** for this repository, written for **any contributor —
 human or automated agent**, naming no tool or model. It holds the read order, the precedence chain,
 the parity mandate, the navigation contract, the project snapshot and architecture, the build/test
@@ -319,6 +352,7 @@ own unit. Do not raise a finding on a line the diff did not touch.
 | Plain verbs: "use", "read", "fail", "retry". | "leverage", "utilize", "surface", "orchestrate". |
 | Say the thing. | Hedging, apology, or narration of your own reasoning. |
 
+**Applies to human contributors only — see the model comment ban at the top of this file.**
 Every function carries a doc comment stating what it does, its inputs, and its outputs. Use
 `# Errors` and `# Panics` where they apply, and `# Notes` for invariants the caller needs that fit
 no other section. Shape scales with the contract, not with the effort the change cost. A one-line

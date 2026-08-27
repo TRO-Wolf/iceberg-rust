@@ -19,6 +19,40 @@
 
 # CLAUDE.md — the Claude adapter (not authoritative)
 
+# EFFECTIVE IMMEDIATELY — ALL ANTHROPIC MODELS ARE BANNED FROM WRITING COMMENTS IN CODE
+
+**THIS INCLUDES FABLE, OPUS, SONNET AND HAIKU.**
+
+- **IF YOU ARE FABLE, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE OPUS, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE SONNET, DO NOT WRITE ANY COMMENTS.**
+- **IF YOU ARE HAIKU, DO NOT WRITE ANY COMMENTS.**
+
+**THIS INCLUDES ANY MODEL VERSION.** Opus 4.8 or Opus 5 — either one is banned. It does not matter.
+
+You are reading this file because you are a Claude session. The rule applies to you, now, in this
+session. It is stated in full at [AGENTS.md](AGENTS.md), which is the authoritative home; it is
+repeated here only because a Claude session loads this file first and must not miss it.
+
+## The only exceptions
+
+These three are the whole list. Nothing else is an exception, and "it would be helpful here" is not
+one.
+
+1. **Doc comments the compiler demands.** `crates/iceberg/src/lib.rs` sets
+   `#![deny(missing_docs)]`, so a public item without a doc comment does not build.
+   **WRITE THE MINIMUM THAT COMPILES. ONE LINE STATING WHAT THE ITEM IS. NOT A PARAGRAPH. NOT A
+   RATIONALE. NOT AN EXAMPLE. ONE LINE.**
+2. **The ASF license header.** It is a comment, CI enforces it (skywalking-eyes,
+   `.licenserc.yaml`), and a file without it fails. Copy it verbatim from a sibling file.
+3. **Markdown.** Minor comments and ordinary prose in `.md` files are allowed. The ban is about
+   comments in CODE. `docs/parity/GAP_MATRIX.md`, the `task/` ledgers and the `map.md` files are
+   where explanation belongs, and routing evidence there is still required.
+
+Everything else stays banned. If a fact seems to need a code comment, it belongs in a `task/`
+ledger or a matrix row instead — that routing rule is unchanged and is now the only route.
+
+
 **STOP — the authoritative contract is [AGENTS.md](AGENTS.md). Read it first.** This file adds only
 Claude-specific tool mechanics; it states **no rule the spine does not already own**. Every project fact lives in the
 neutral spine, and this adapter only points at it — so it cannot drift, and deleting it would lose
