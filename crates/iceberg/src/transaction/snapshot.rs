@@ -41,29 +41,9 @@ const META_ROOT_PATH: &str = "metadata";
 
 /// A trait that defines how different table operations produce new snapshots.
 ///
-/// `SnapshotProduceOperation` is used by [`SnapshotProducer`] to customize snapshot creation
-/// based on the type of operation being performed (e.g., `Append`, `Overwrite`, `Delete`, etc.).
-/// Each operation type implements this trait to specify:
-/// - Which operation type to record in the snapshot summary
-/// - Which existing manifest files should be included in the new snapshot
-/// - Which manifest entries should be marked as deleted
-///
-/// # When it accomplishes
-///
-/// This trait is used during the snapshot creation process in [`SnapshotProducer::commit()`]:
-///
-/// 1. **Operation Type Recording**: The `operation()` method determines which operation type
-///    (e.g., `Operation::Append`, `Operation::Overwrite`) is recorded in the snapshot summary.
-///    This metadata helps track what kind of change was made to the table.
-///
-/// 2. **Manifest File Selection**: The `existing_manifest()` method determines which existing
-///    manifest files from the current snapshot should be carried forward to the new snapshot.
-///    For example:
-///    - An `Append` operation typically includes all existing manifests plus new ones
-///    - An `Overwrite` operation might exclude manifests for partitions being overwritten
-///
-/// 3. **Delete Entry Processing**: The `delete_entries()` method is intended for future delete
-///    operations to specify which manifest entries should be marked as deleted.
+/// [`SnapshotProducer`] uses it to customize snapshot creation per operation type. Each
+/// implementation states three things: the operation to record in the summary, which existing
+/// manifests carry forward, and which entries are marked deleted.
 pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// Returns the operation type that will be recorded in the snapshot summary.
     ///
@@ -163,49 +143,30 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
-    // DELETE files (position / equality / DV) this snapshot adds, each paired with an OPTIONAL explicit
-    // DATA sequence number — the Rust analogue of Java's `Delegates.PendingDeleteFile` (a delete file
-    // wrapped with a nullable `dataSequenceNumber()`; `MergingSnapshotProducer.add(DeleteFile)` wraps with
-    // `null`, `add(DeleteFile, long)` with the explicit value). `None` ⇒ the entry inherits the new
-    // snapshot's sequence number at read time, exactly like an added data file (so a delete added now
-    // applies to earlier data: `data_seq <= delete_seq`). `Some(seq)` ⇒ the entry is written with that
-    // explicit data seq (Java `writeDeleteFileGroup` calling `writer.add(file, dataSeq)` when the pending
-    // file's `dataSequenceNumber()` is non-null) — the `RewriteFiles.addFile(DeleteFile, long)` path that
-    // re-stamps a rewritten delete file with the seq it must keep so it still applies to its data.
-    //
-    // The merge-on-read write path (`RowDelta`) populates this via [`Self::with_added_delete_files`] (all
-    // `None`); the compaction path (`RewriteFiles`) via [`Self::with_added_delete_files_with_seq`].
-    // Add-only data operations (fast append, overwrite-by-files) leave it empty.
+    // DELETE files this snapshot adds, each paired with an OPTIONAL explicit data sequence number.
+    // Java `Delegates.PendingDeleteFile`. `None` inherits the new snapshot's sequence number at
+    // read time, so a delete added now applies to earlier data. `Some(seq)` writes that explicit
+    // seq, the `RewriteFiles.addFile(DeleteFile, long)` path that re-stamps a rewritten delete file
+    // with the seq it must keep to still apply to its data.
     added_delete_files: Vec<PendingDeleteFile>,
-    // An explicit DATA sequence number to stamp on every ADDED data file (Java
-    // `MergingSnapshotProducer.newDataFilesDataSequenceNumber`). When `Some(seq)`, each added data
-    // entry is written with this explicit data seq instead of inheriting the new snapshot's seq at
-    // read time — the `RewriteFiles.dataSequenceNumber` preservation path that keeps outstanding
-    // equality deletes applying to rewritten data (`data_seq < delete_seq`). `None` (the default for
-    // every other operation) ⇒ the added files inherit the new snapshot's sequence number as usual.
+    // An explicit DATA sequence number stamped on every ADDED data file. Java
+    // `MergingSnapshotProducer.newDataFilesDataSequenceNumber`. It is the `RewriteFiles`
+    // preservation path that keeps outstanding equality deletes applying to rewritten data. `None`
+    // makes the added files inherit the new snapshot's sequence number.
     new_data_files_data_sequence_number: Option<i64>,
     // Data files removed by this snapshot, resolved against the current snapshot at commit time. Held
     // so the snapshot summary can reflect the deleted file/record counts (Java overwrite/delete summary).
     // Empty for add-only operations such as fast append.
     removed_data_files: Vec<DataFile>,
-    // DELETE files (position / equality / DV) removed by this snapshot — the merge-on-read apply-side
-    // removal of superseded delete files (Java `MergingSnapshotProducer.delete(DeleteFile)` →
-    // `deleteFilterManager.delete(file)`). Resolved against the current snapshot's DELETE manifests by
-    // path in `commit()`, then fed to the SAME `process_deletes` rewrite path (which matches by path
-    // across the full manifest list, so a removed delete file's tombstone lands in the rewritten DELETE
-    // manifest) and to the summary's `remove_file` (DV → `removed-dvs`, parquet position →
-    // `removed-position-delete-files`, equality → `removed-equality-delete-files`). Populated by
-    // `RowDelta.removeDeletes`; empty for every operation that does not remove delete files.
+    // DELETE files removed by this snapshot: the apply-side removal of superseded merge-on-read
+    // delete files. Java `MergingSnapshotProducer.delete(DeleteFile)`. Resolved by path against the
+    // current DELETE manifests in `commit()`, then fed to the same `process_deletes` rewrite path
+    // and to the summary's `remove_file`.
     removed_delete_files: Vec<DataFile>,
-    // The write-audit-publish (WAP) staging flag (Java `SnapshotProducer.stageOnly`, declared on the
-    // `SnapshotUpdate` API interface so every snapshot-producing action exposes it). When `true`, the
-    // commit's update set ADDS the new snapshot to table metadata but moves NO ref: it emits
-    // `AddSnapshot` ALONE (no `SetSnapshotRef`), leaving `current-snapshot-id`, the `main` ref, and the
-    // snapshot-log unchanged on disk. The snapshot is staged for later publish via cherry-pick. The new
-    // snapshot still CONSUMES a sequence number exactly like a normal commit — Java's `apply()` computes
-    // `base.nextSequenceNumber()` unconditionally, independent of `stageOnly` (1.10.0 bytecode), which is
-    // load-bearing for the published snapshot's later sequence-number behavior. `false` (the default) ⇒
-    // the normal add-snapshot-and-move-ref commit.
+    // The write-audit-publish staging flag. Java `SnapshotProducer.stageOnly`. When `true` the
+    // commit emits `AddSnapshot` ALONE, with no `SetSnapshotRef`, so `current-snapshot-id`, the
+    // `main` ref and the snapshot log stay unchanged. A cherry-pick publishes it later. The staged
+    // snapshot still CONSUMES a sequence number, exactly like a normal commit.
     stage_only: bool,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
@@ -293,32 +254,27 @@ impl<'a> SnapshotProducer<'a> {
         self
     }
 
-    /// Attach the DELETE files (position / equality / DV) this snapshot REMOVES — the apply-side
-    /// removal of superseded merge-on-read delete files (Java `MergingSnapshotProducer.delete(DeleteFile)`
-    /// → `deleteFilterManager.delete(file)`, the delete-side sibling of `delete(DataFile)`). Used by the
-    /// merge-on-read write path (`RowDelta.removeDeletes`) to drop a delete file the new delete supersedes
-    /// — e.g. removing the OLD deletion vector when a merged super-set DV replaces it.
+    /// Attach the DELETE files this snapshot REMOVES. Java
+    /// `MergingSnapshotProducer.delete(DeleteFile)`. `RowDelta.removeDeletes` uses it to drop a
+    /// delete file the new delete supersedes, such as the old DV a merged super-set DV replaces.
     ///
-    /// The supplied files are resolved against the current snapshot's DELETE manifests by path in
-    /// [`SnapshotProducer::commit`] (a missing path fails loud), then fed to the SAME `process_deletes`
-    /// rewrite path as removed DATA files: `process_deletes` matches each removed file's path against EVERY
-    /// existing manifest (DATA and DELETE), so a removed delete file's tombstone lands in the rewritten
-    /// DELETE manifest while DATA manifests are untouched. The resolved files also reach the summary's
-    /// `remove_file` (DV → `removed-dvs`, parquet position → `removed-position-delete-files`, equality →
-    /// `removed-equality-delete-files`).
+    /// [`SnapshotProducer::commit`] resolves the paths against the current DELETE manifests, and a
+    /// missing path fails loud. `process_deletes` matches by path across EVERY manifest, so the
+    /// tombstone lands in the rewritten DELETE manifest and DATA manifests are untouched.
     pub(crate) fn with_removed_delete_files(mut self, removed_delete_files: Vec<DataFile>) -> Self {
         self.removed_delete_files = removed_delete_files;
         self
     }
 
-    /// Stamp every ADDED data file with an explicit DATA sequence number instead of inheriting the new
-    /// snapshot's sequence number (Java `MergingSnapshotProducer.setNewDataFilesDataSequenceNumber` /
-    /// `RewriteFiles.dataSequenceNumber`). Used by the compaction write path (`RewriteFiles`) to preserve
-    /// the replaced files' data sequence number so any outstanding merge-on-read EQUALITY delete still
-    /// applies to the rewritten data (`data_seq < delete_seq`) — without this, the added files would take a
-    /// fresh, higher sequence number and the old deletes would stop applying, resurrecting deleted rows.
-    /// `seq` must be non-negative (the manifest writer silently strips a negative one back into
-    /// re-inheritance — the caller validates this before calling).
+    /// Stamp every ADDED data file with an explicit DATA sequence number instead of inheriting the
+    /// new snapshot's. Java `MergingSnapshotProducer.setNewDataFilesDataSequenceNumber`. Compaction
+    /// preserves the replaced files' seq so outstanding equality deletes still apply. Without it the
+    /// added files take a higher seq, the old deletes stop applying, and deleted rows return.
+    ///
+    /// # Notes
+    ///
+    /// `seq` must be non-negative. The manifest writer silently strips a negative one back into
+    /// re-inheritance, so the caller validates first.
     pub(crate) fn with_new_data_files_data_sequence_number(mut self, sequence_number: i64) -> Self {
         self.new_data_files_data_sequence_number = Some(sequence_number);
         self
@@ -346,19 +302,12 @@ impl<'a> SnapshotProducer<'a> {
         self.snapshot_properties.extend(properties);
     }
 
-    /// Build a manifest writer for a brand-new (non-filtered) manifest of `content` under
-    /// `partition_spec_id` — the cluster-writer factory shared by [`crate::transaction::rewrite_manifests`],
-    /// [`crate::transaction::merge_append`], and the producer's own per-spec ADDED-manifest grouping
-    /// ([`SnapshotProducer::write_added_manifests`] / [`SnapshotProducer::write_added_delete_manifests`]).
+    /// Build a manifest writer for a brand-new manifest of `content` under `partition_spec_id`.
+    /// Java `BaseRewriteManifests.getWriter`.
     ///
-    /// Keyed by the partition-spec id directly (a cluster writer is created per
-    /// `(cluster_key, partition_spec_id)`, Java `BaseRewriteManifests.getWriter` keyed on `Pair.of(key,
-    /// partitionSpecId)`) rather than off a source [`ManifestFile`] — that is the difference from
-    /// [`SnapshotProducer::new_filtering_manifest_writer`], which keys off a source manifest. The `content`
-    /// axis mirrors Java's `writeDataManifests(files, spec)` vs `writeDeleteManifests(files, spec)`: a DATA
-    /// content yields a data writer, a DELETE content a delete writer. The rewrite/merge callers pass
-    /// `Data` (their entries are pre-existing data entries copied forward via `add_existing_entry`,
-    /// provenance preserved); the producer's added-delete grouping passes `Deletes`.
+    /// It keys on the partition-spec id directly, which is the difference from
+    /// [`SnapshotProducer::new_filtering_manifest_writer`], which keys off a source manifest. The
+    /// `content` axis mirrors Java's `writeDataManifests` against `writeDeleteManifests`.
     pub(crate) fn new_cluster_manifest_writer(
         &mut self,
         partition_spec_id: i32,
@@ -418,24 +367,15 @@ impl<'a> SnapshotProducer<'a> {
     /// it must be added as a row, not a delete), must pass the FORMAT-VERSION gate (see
     /// [`validate_delete_file_for_version`]), and its partition spec must EXIST in the table's specs.
     ///
-    /// **Per-spec (Java parity, NOT default-spec-only):** Java `MergingSnapshotProducer.addInternal`
-    /// (1.10.0 bytecode) resolves `spec(file.specId())` for EACH added delete file and rejects only when
-    /// no such spec exists — `Preconditions.checkArgument(spec != null, "Cannot find partition spec %s
-    /// for delete file: %s", file.specId(), file.location())`. A delete file under an OLDER (non-default)
-    /// partition spec is therefore accepted; the producer writes per-spec DELETE manifest groups
-    /// ([`SnapshotProducer::manifest_file`]). The partition-value compatibility check runs against THAT
-    /// file's own spec's partition type, not the table default's.
+    /// **Per-spec, not default-spec-only.** Java resolves `spec(file.specId())` for EACH added
+    /// delete file and rejects only when no such spec exists. A delete file under an OLDER spec is
+    /// accepted, and the producer writes per-spec DELETE manifest groups. The partition-value
+    /// compatibility check runs against that file's own spec.
     ///
-    /// **Placement (the format-version gate):** Java 1.10.0 runs `validateNewDeleteFile` →
-    /// `validateDeleteFileForVersion` inside `MergingSnapshotProducer.add(DeleteFile)` (bytecode:
-    /// `addInternal` calls `validateNewDeleteFile` first; `apply` does NOT re-validate — the buffered
-    /// re-validation `validateDeleteFilesForVersion(base.formatVersion())` at the top of `apply` is a
-    /// post-1.10.0 MAIN addition guarding a concurrent format upgrade). In this Rust model the action
-    /// builder has no table access at `add_deletes` time, so the gate runs HERE — in the action's
-    /// `commit()` against the REFRESHED base (`do_commit` re-bases before calling `commit`). That is
-    /// exactly MAIN's stronger apply-time placement and subsumes 1.10.0's add-time check: a row delta
-    /// built before a concurrent `upgrade_format_version` commit is re-gated against the upgraded
-    /// version on every retry.
+    /// **Placement of the format-version gate.** Java 1.10.0 gates at add time. This model has no
+    /// table access then, so the gate runs in the action's `commit()` against the REFRESHED base.
+    /// That is Java main's stronger apply-time placement, and it subsumes the add-time check: a row
+    /// delta built before a concurrent format upgrade is re-gated on every retry.
     pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
         let format_version = self.table.metadata().format_version();
         for (delete_file, _explicit_seq) in &self.added_delete_files {
@@ -476,15 +416,15 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
-    /// Resolve the partition TYPE of the spec a freshly-added file claims (`data_file.partition_spec_id`),
-    /// or return Java's exact "Cannot find partition spec %s for {data,delete} file: %s" error when no such
-    /// spec exists — the Rust port of Java's `spec(file.specId())` + `Preconditions.checkArgument(spec !=
-    /// null, ...)` in `MergingSnapshotProducer.add` / `FastAppend.appendFile`.
+    /// Resolve the partition TYPE of the spec a freshly-added file claims. Java
+    /// `MergingSnapshotProducer.add` / `FastAppend.appendFile`.
     ///
-    /// `is_delete_file` selects the message noun ("delete file" vs "data file"), matching Java's two
-    /// distinct precondition messages (`add(DataFile)` L242-247 vs `addInternal(DeleteFile)` L273-278).
-    /// The partition type is computed from that spec against the current schema (Java
-    /// `spec.partitionType()`); it is the type the partition-value compatibility check binds against.
+    /// `is_delete_file` selects the message noun, matching Java's two distinct precondition
+    /// messages. The partition-value compatibility check binds against the returned type.
+    ///
+    /// # Errors
+    ///
+    /// No such spec exists. The message is Java's verbatim.
     fn partition_type_for_added_file(
         &self,
         file: &DataFile,
@@ -553,31 +493,22 @@ impl<'a> SnapshotProducer<'a> {
     /// Return EVERY current manifest — DATA **and** DELETE — from the current snapshot's manifest list,
     /// the complete candidate set a delete-bearing operation's `existing_manifest` hands to the producer.
     ///
-    /// Shared by every delete-bearing operation (`DeleteFiles`, `OverwriteFiles`, `ReplacePartitions`,
-    /// `RewriteFiles`): each exposes the FULL manifest list so the producer's `process_deletes` can decide
-    /// per DATA manifest whether to rewrite (drop the removed/replaced files), carry forward unchanged, or
-    /// drop it, while every DELETE manifest is carried forward UNCHANGED — a delete manifest's entries are
-    /// delete-file paths, which can never appear in a DATA `delete_paths` set, so `process_deletes` leaves
-    /// them alone.
+    /// Shared by every delete-bearing operation. Each exposes the FULL manifest list so
+    /// `process_deletes` can rewrite, carry forward, or drop each DATA manifest. Every DELETE
+    /// manifest carries forward UNCHANGED, because its entries are delete-file paths, which never
+    /// appear in a DATA `delete_paths` set.
     ///
-    /// Carrying delete manifests forward is REQUIRED FOR CORRECTNESS, not an optimization. This mirrors Java
-    /// `MergingSnapshotProducer.apply` (`core/MergingSnapshotProducer.java` L973-1011), which composes BOTH
-    /// `filterManager.filterManifests(dataManifests)` AND `deleteFilterManager.filterManifests(deleteManifests)`
-    /// into the new manifest list. If an action returned DATA manifests only (the old
-    /// `current_data_manifests`), the new snapshot's manifest list would OMIT every delete manifest the
-    /// current snapshot carried — on a merge-on-read table (Java- or Rust-written) that silently drops all
-    /// outstanding position / equality deletes table-wide, resurrecting every deleted row. This helper exists
-    /// to make that whole bug class unrepresentable: all four delete-bearing actions carry the full set.
+    /// Carrying delete manifests forward is REQUIRED FOR CORRECTNESS, not an optimization. Java
+    /// `MergingSnapshotProducer.apply` composes both filtered lists into the new manifest list. An
+    /// action returning DATA manifests only would omit every delete manifest the current snapshot
+    /// carried, which silently drops all outstanding deletes table-wide and resurrects every
+    /// deleted row. This helper makes that bug class unrepresentable.
     ///
-    /// **Conservative dangling-delete posture (documented divergence from Java):** Java's `apply` also drops
-    /// delete files older than the surviving data's minimum sequence number and removes DVs orphaned by the
-    /// data files it deleted (L982-993, `dropDeleteFilesOlderThan` / `removeDanglingDeletesFor`). This port
-    /// deliberately does NOT port that pruning — it carries every delete manifest forward UNCHANGED. That is
-    /// the conservative-safe direction: keeping a delete that no longer applies is harmless (it matches no
-    /// live row), whereas dropping one that still applies resurrects deleted rows. Dangling-delete cleanup is
-    /// a maintenance concern for a future `RemoveDanglingDeleteFiles` action, not a commit-path obligation.
-    ///
-    /// Returns an empty list when the table has no current snapshot.
+    /// **Conservative dangling-delete posture, a documented divergence.** Java's `apply` also drops
+    /// delete files older than the surviving data's minimum sequence number, and removes DVs
+    /// orphaned by the data files it deleted. This port carries every delete manifest forward
+    /// UNCHANGED. Keeping a delete that no longer applies is harmless, while dropping one that still
+    /// applies resurrects rows. Cleanup belongs to `RemoveDanglingDeleteFiles`.
     pub(crate) async fn current_manifests(&self) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = self.table.metadata().current_snapshot() else {
             return Ok(vec![]);
@@ -593,19 +524,15 @@ impl<'a> SnapshotProducer<'a> {
     /// Resolve `delete_paths` against the current snapshot's live data entries, returning the matching
     /// [`DataFile`]s, and fail if any requested path matched no live entry.
     ///
-    /// Shared by `DeleteFiles`, `OverwriteFiles`, and `RowDelta` (`removeRows`). The requested path set
-    /// is only known to the calling operation (the producer downstream sees just the resolved
-    /// `DataFile`s), so the missing-path check (Java `failMissingDeletePaths`) must happen here during
-    /// resolution: a present-and-absent mix errors rather than silently dropping the present file.
+    /// Shared by `DeleteFiles`, `OverwriteFiles`, and `RowDelta`. Only the calling operation knows
+    /// the requested path set, so the missing-path check must happen here. A present-and-absent mix
+    /// errors rather than silently dropping the present file.
     ///
-    /// **Per-caller faithfulness of the missing-path FAIL:** `StreamingDelete` (DeleteFiles) and
-    /// `BaseOverwriteFiles` both call `failMissingDeletePaths()` (1.10.0 bytecode), so the unconditional
-    /// loud failure is Java-faithful for them. Java's `BaseRowDelta` does NOT set the flag for
-    /// `removeRows` (its sole `failMissingDeletePaths()` sits behind `if (validateDeletes)` in
-    /// `validate()`, gating the unrelated `validateDataFilesExist` walk), so for the `RowDelta.removeRows`
-    /// caller this Rust path is STRICTER than Java's silent best-effort default — the same conservative
-    /// posture documented on [`Self::resolve_delete_file_paths`] (the `removeDeletes` sibling) and on
-    /// `transaction/row_delta.rs`'s apply-side note. Returns an empty vector when `delete_paths` is empty.
+    /// **Per-caller faithfulness.** `StreamingDelete` and `BaseOverwriteFiles` both call
+    /// `failMissingDeletePaths()`, so the loud failure is Java-faithful for them. Java's
+    /// `BaseRowDelta` does NOT set the flag for `removeRows`, so this path is STRICTER than Java for
+    /// that caller. It is the same conservative posture as
+    /// [`Self::resolve_delete_file_paths`].
     pub(crate) async fn resolve_delete_paths(
         &self,
         delete_paths: &HashSet<String>,
@@ -656,20 +583,14 @@ impl<'a> SnapshotProducer<'a> {
     /// `MergingSnapshotProducer.delete(DeleteFile)` → `deleteFilterManager.delete(file)` resolved at
     /// `filterManifests` time).
     ///
-    /// Scans every current DELETE manifest (NOT data manifests — a removed delete file's path lives in a
-    /// `ManifestContentType::Deletes` manifest) and collects each live entry whose path is in
-    /// `delete_paths`. The missing-path check mirrors `resolve_delete_paths`' present-and-absent semantics
-    /// (Java `failMissingDeletePaths` / `validateRequiredDeletes`, "Missing required files to delete: %s").
+    /// Scans every current DELETE manifest, never data manifests, and collects each live entry whose
+    /// path is in `delete_paths`. The missing-path check mirrors `resolve_delete_paths`.
     ///
-    /// **Posture note (slightly stricter than Java's `RowDelta.removeDeletes` DEFAULT):** Java's
-    /// `validateRequiredDeletes` only fails on a missing path when `failMissingDeletePaths` is set, which
-    /// `RowDelta` does NOT set (only `StreamingDelete`/overwrite call `failMissingDeletePaths()`). This port
-    /// fails loud on a missing removal path unconditionally — the same conservative posture the Rust
-    /// `process_deletes` already takes for removed DATA files (it never models the `failMissingDeletePaths`
-    /// flag): removing a delete file that is not live is a caller error worth surfacing, not silently
-    /// dropping. One consequence: a commit RETRY whose target delete file was concurrently removed fails
-    /// loud (non-retryable) where Java's silent-ignore default would converge — the safe (loud) direction,
-    /// accepted. Returns an empty vector when `delete_paths` is empty.
+    /// **Posture: stricter than Java's `RowDelta.removeDeletes` default.** Java fails only when
+    /// `failMissingDeletePaths` is set, and `RowDelta` does not set it. This port always fails loud,
+    /// as `process_deletes` already does for removed DATA files. One consequence: a retry whose
+    /// target delete file was concurrently removed fails loud where Java would converge. That is the
+    /// safe direction, and it is accepted.
     pub(crate) async fn resolve_delete_file_paths(
         &self,
         delete_paths: &HashSet<String>,
@@ -717,18 +638,13 @@ impl<'a> SnapshotProducer<'a> {
     /// Resolve a set of `(partition_spec_id, partition)` tuples against the current snapshot's live data
     /// entries, returning every matching [`DataFile`] (the ones a partition-scoped replace removes).
     ///
-    /// This is the by-PARTITION delete-resolution path used by `ReplacePartitions` (dynamic partition
-    /// overwrite), the sibling of the by-PATH [`SnapshotProducer::resolve_delete_paths`]. It scans every
-    /// current data manifest and collects each live entry whose `(partition_spec_id, partition)` is in
-    /// `drop_partitions` — mirroring Java `ManifestFilterManager`'s `dropPartitions.contains(file.specId(),
-    /// file.partition())` test (`filterManifestWithDeletedFiles`). The resolved [`DataFile`]s are then fed
-    /// to the SAME producer rewrite machinery (`process_deletes`, which matches by path), so the
-    /// rewrite/keep/drop + provenance-preservation logic is reused unchanged.
+    /// The by-PARTITION sibling of the by-PATH [`SnapshotProducer::resolve_delete_paths`], used by
+    /// `ReplacePartitions`. Java `ManifestFilterManager.filterManifestWithDeletedFiles`. The
+    /// resolved files feed the same `process_deletes` machinery, so the rewrite and
+    /// provenance-preservation logic is reused unchanged.
     ///
-    /// Unlike `resolve_delete_paths`, there is NO missing-target validation: Java's `failMissingDeletePaths`
-    /// guards only path/file deletes (`validateRequiredDeletes`), never partition drops. Replacing a
-    /// partition that has no existing files is therefore a pure add (no spurious delete, no error). Returns
-    /// an empty vector when `drop_partitions` is empty or the table has no current snapshot.
+    /// There is deliberately NO missing-target validation. Java's `failMissingDeletePaths` guards
+    /// only path deletes, never partition drops, so replacing an empty partition is a pure add.
     pub(crate) async fn resolve_partition_deletes(
         &self,
         drop_partitions: &HashSet<(i32, Struct)>,
@@ -764,45 +680,15 @@ impl<'a> SnapshotProducer<'a> {
         Ok(resolved)
     }
 
-    /// Resolve the LIVE data files this overwrite removes BY ROW PREDICATE, returning every file the
-    /// `predicate` STRICTLY matches (all of its rows match) — the Rust port of Java
-    /// `ManifestFilterManager.manifestHasDeletedFiles` + `PartitionAndMetricsEvaluator`
-    /// (`core/ManifestFilterManager.java` L450-491, L583-627) for the `overwriteByRowFilter` /
-    /// `deleteByRowFilter` mode. The resolved [`DataFile`]s feed the SAME [`process_deletes`] rewrite path
-    /// as [`resolve_partition_deletes`] / [`resolve_delete_paths`], so the matched files drop in the one
-    /// `Operation::Overwrite` snapshot alongside any explicit add/delete.
+    /// Resolve live data files the row predicate strictly matches. Metrics run on the
+    /// per-partition residual, not the full predicate: a partition-column filter with no
+    /// bounds residualizes to `alwaysTrue` and deletes the file.
     ///
-    /// **`PartitionAndMetricsEvaluator` faithfully (Java L604-626):** for each LIVE data file the predicate is
-    /// reduced to its per-partition RESIDUAL via [`ResidualEvaluator::residual_for`] (Java
-    /// `residualEvaluator.residualFor(partition)` — predicates the partition tuple already decides are folded
-    /// to `true`/`false`), then the strict / inclusive METRICS evaluators run on THAT residual against the
-    /// file's column metrics. This is what makes a partition-column predicate (e.g. `x == 0` on `identity(x)`)
-    /// delete a file with no `x` column bounds: for partition `x = 0` the residual is `alwaysTrue`, which the
-    /// strict-metrics evaluator trivially satisfies. Running the metrics on the FULL predicate instead would
-    /// wrongly classify such a file as a partial match (no bounds ⇒ strict false, inclusive true).
-    ///
-    /// **Decision tree per LIVE data file (mirrors Java `manifestHasDeletedFiles` L458-487, with
-    /// `markedForDelete == false` because the by-path / by-partition deletes are resolved separately):**
-    /// 1. **`rowsMightMatch` (KEEP-fast):** [`InclusiveMetricsEvaluator::eval`] on the residual (Java L470,
-    ///    L592-596). If NO rows can match (residual `alwaysFalse`, or metrics exclude) → **KEEP**.
-    /// 2. **`rowsMustMatch` (DELETE):** [`StrictMetricsEvaluator::eval`] on the residual (Java L471,
-    ///    L598-602). If ALL rows must match (`ROWS_MUST_MATCH`, residual `alwaysTrue` is trivially strict) →
-    ///    **DELETE**.
-    /// 3. **PARTIAL ⇒ ERROR:** might-match but NOT strictly all (Java L472-477:
-    ///    `ValidationException.check(allRowsMatch || isDelete, "Cannot delete file where some, but not all,
-    ///    rows match filter %s: %s", deleteExpression, file.location())` — throws for a DATA manifest where
-    ///    `isDelete == false`) → return a NON-retryable [`ErrorKind::DataInvalid`] with that exact message.
-    ///
-    /// **Unpartitioned `alwaysTrue` ⇒ full replace:** with no partition fields the residual is the whole
-    /// `alwaysTrue` filter, which strictly matches every file ⇒ every live data file is deleted (Java
-    /// `deleteByRowFilter(alwaysTrue)` full-replace).
-    ///
-    /// The predicate is bound with the caller-supplied `case_sensitive` flag (Java
-    /// `ManifestFilterManager.caseSensitive`, fed into the `PartitionAndMetricsEvaluator`'s
-    /// `ResidualEvaluator.of(spec, expr, caseSensitive)` and the metrics-evaluator binding; the actions
-    /// default it to `true`, the Iceberg/Java default for column resolution). The residual evaluator is
-    /// cached per partition-spec id (different manifests can carry different spec ids), mirroring Java's
-    /// per-spec `PartitionAndMetricsEvaluator`.
+    /// | eval | action |
+    /// |---|---|
+    /// | inclusive says no rows match | keep |
+    /// | strict says all rows match | delete |
+    /// | partial | non-retryable error |
     pub(crate) async fn resolve_filter_deletes(
         &self,
         predicate: &Predicate,
@@ -979,16 +865,12 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
-    /// Group the added files by their own `partition_spec_id`, returning the groups in a DETERMINISTIC
-    /// order — spec id DESCENDING (the established Rust per-spec convention, Java `groupBySpec` uses a
-    /// `TreeMap(Comparator.reverseOrder())` for manifest merging, and `merge_append` / `rewrite_manifests`
-    /// already reverse-sort their spec groups).
+    /// Group the added files by their own `partition_spec_id`, in spec-id DESCENDING order. Java
+    /// `groupBySpec` uses a reverse-ordered `TreeMap`, and the sibling actions already reverse-sort.
     ///
-    /// Java groups added files into `newDataFilesBySpec` / `newDeleteFilesBySpec` (`HashMap<Integer, ...>`)
-    /// and `forEach`-iterates to write per-spec manifests; HashMap iteration order is undefined, and the
-    /// group order never appears in the spec-canonical metadata view (a manifest list is a SET of manifest
-    /// files, compared by content, not position — same reasoning as the cluster-key lesson 2026-06-10). We
-    /// pick the stable reverse-spec-id order so the on-disk manifest list is reproducible across runs.
+    /// Java's own added-file grouping is a `HashMap`, whose iteration order is undefined. The group
+    /// order never reaches the spec-canonical metadata view, because a manifest list compares as a
+    /// set. A stable order makes the on-disk manifest list reproducible across runs.
     fn group_files_by_spec(files: Vec<DataFile>) -> Vec<(i32, Vec<DataFile>)> {
         let mut groups: HashMap<i32, Vec<DataFile>> = HashMap::new();
         for file in files {
@@ -1056,20 +938,16 @@ impl<'a> SnapshotProducer<'a> {
     /// but uses the `Deletes` cluster writer (Java `MergingSnapshotProducer.newDeleteFilesAsManifests`:
     /// `newDeleteFilesBySpec.forEach((specId, files) -> writeDeleteManifests(files, spec(specId)))`).
     ///
-    /// Each added delete file carries an OPTIONAL explicit DATA sequence number (the
-    /// `Delegates.PendingDeleteFile.dataSequenceNumber()` analogue). Java `writeDeleteFileGroup` branches
-    /// per file (1.10.0 bytecode): a non-null pending seq writes `writer.add(file, dataSeq)` (explicit), a
-    /// null one writes `writer.add(file)` (inherit). This Rust port mirrors that exactly:
-    /// - `None` ⇒ for V2/V3 the entry is `Added` with NO sequence number, so it inherits the new
-    ///   snapshot's sequence number at read time (the merge-on-read default — Java `addFile(DeleteFile)`).
-    /// - `Some(seq)` ⇒ the entry is written with that EXPLICIT data seq (Java
-    ///   `addFile(DeleteFile, long)`), so a rewritten delete file keeps the seq it must retain to still
-    ///   apply to its data (`data_seq < delete_seq`). The FILE sequence number still inherits.
+    /// Each added delete file carries an OPTIONAL explicit DATA sequence number, and Java
+    /// `writeDeleteFileGroup` branches per file:
     ///
-    /// A V1 table has no delete manifests (position/equality deletes are V2+ concepts); the explicit seq
-    /// is ignored there (V1 manifests carry no sequence numbers) and the entry just stamps the snapshot id.
-    /// Each group's writer is built under THAT group's spec, so a delete file under an older spec keeps its
-    /// own spec id / partition type.
+    /// - `None` writes an `Added` entry with no sequence number, so it inherits the new snapshot's
+    ///   at read time. This is the merge-on-read default.
+    /// - `Some(seq)` writes that explicit data seq, so a rewritten delete file keeps the seq it
+    ///   needs to still apply to its data. The FILE sequence number still inherits.
+    ///
+    /// A V1 table has no delete manifests, so the explicit seq is ignored there. Each group's writer
+    /// is built under THAT group's spec, so a delete file under an older spec keeps its own spec.
     async fn write_added_delete_manifests(&mut self) -> Result<Vec<ManifestFile>> {
         let added_delete_files = std::mem::take(&mut self.added_delete_files);
         if added_delete_files.is_empty() {
@@ -1220,19 +1098,17 @@ impl<'a> SnapshotProducer<'a> {
     /// Rewrite the existing manifests to remove `delete_files`, mirroring Java
     /// `ManifestFilterManager.filterManifests` + `MergingSnapshotProducer.apply`'s keep rule.
     ///
-    /// For each existing manifest:
-    /// - if it contains at least one live entry whose path is in `delete_files`, it is rewritten:
-    ///   matching live entries are marked `Deleted` (carrying their existing data file and data/file
-    ///   sequence numbers; the new snapshot id is stamped), every other live entry is copied forward as
-    ///   `Existing` (preserving its snapshot id and both sequence numbers — V2/V3 inheritance);
-    /// - otherwise it is carried forward unchanged (efficiency + fewer files).
+    /// A manifest holding a live entry whose path is in `delete_files` is rewritten. Matching live
+    /// entries become `Deleted`, keeping their data file and both sequence numbers. Every other live
+    /// entry is copied forward as `Existing`, keeping its snapshot id and both sequence numbers.
+    /// Every other manifest carries forward unchanged.
     ///
-    /// A rewritten manifest is kept even when every live entry became `Deleted` (its `added_snapshot_id`
-    /// is the new snapshot id — Java's `snapshotId() == snapshotId()` keep rule). An unrewritten manifest
-    /// with no live files is dropped.
+    /// A rewritten manifest is kept even when every live entry became `Deleted`. An unrewritten
+    /// manifest with no live files is dropped.
     ///
-    /// Errors if any requested delete path matched no live entry in the table (mirrors Java
-    /// `failMissingDeletePaths` / `validateRequiredDeletes`).
+    /// # Errors
+    ///
+    /// A requested delete path matched no live entry. Java `failMissingDeletePaths`.
     async fn process_deletes(
         &mut self,
         existing_manifests: Vec<ManifestFile>,
@@ -1330,19 +1206,11 @@ impl<'a> SnapshotProducer<'a> {
     /// Build a manifest writer for a rewritten (filtered) manifest, using the partition spec of the
     /// source manifest so existing entries keep their spec id and partition type.
     ///
-    /// **Content-keyed (the delete-side extension — read this if you touch it):** the writer's CONTENT
-    /// matches the SOURCE manifest's content. A rewritten DATA manifest gets a DATA writer
-    /// (`build_v2_data`/`build_v3_data`); a rewritten DELETE manifest gets a DELETE writer
-    /// (`build_v2_deletes`/`build_v3_deletes`). This is REQUIRED for the merge-on-read apply-side delete
-    /// removal (`RowDelta.removeDeletes`): when `process_deletes` rewrites a DELETE manifest to tombstone a
-    /// superseded delete file, the rewritten manifest MUST stay a DELETE manifest (content `Deletes`,
-    /// `_file_type` 1) or the manifest list misclassifies it and the read path stops applying its
-    /// surviving deletes (resurrection). Java keys this on the filter manager: `DataFileFilterManager`'s
-    /// `newManifestWriter` calls `newManifestWriter(spec)` (DATA), `DeleteFileFilterManager`'s calls
-    /// `newDeleteManifestWriter(spec)` (DELETE) — `MergingSnapshotProducer.java` L1205/L1274. Mirroring it
-    /// off `source_manifest.content` keeps a single `process_deletes` path serving both, exactly as Java's
-    /// shared `ManifestFilterManager.filterManifest` does. The DATA-side behavior is UNCHANGED (a DATA
-    /// source still gets `build_v2_data`/`build_v3_data`) — its existing rewrite tests are the proof.
+    /// **Content-keyed. Read this if you touch it.** The writer's CONTENT matches the SOURCE
+    /// manifest's. A rewritten DELETE manifest MUST stay a DELETE manifest, or the manifest list
+    /// misclassifies it and the read path stops applying its surviving deletes, which resurrects
+    /// rows. Java keys the same choice on its filter manager. Mirroring it off
+    /// `source_manifest.content` keeps one `process_deletes` path serving both.
     fn new_filtering_manifest_writer(
         &mut self,
         source_manifest: &ManifestFile,
@@ -1397,18 +1265,15 @@ impl<'a> SnapshotProducer<'a> {
         }
     }
 
-    /// Resolve the partition spec a summarized file belongs to (`file.partition_spec_id`), for the
-    /// per-file partition-summary path (Java `SnapshotSummary.Builder` uses `spec(file.specId())`). Falls
-    /// back to the table default spec only if the file's spec is somehow absent — unreachable for the
-    /// ADD path (the added-file validation already proved every spec exists), REACHABLE for the
-    /// `removed_*_files` loops, which are populated from the resolved delete set without running
-    /// `validate_partition_value` (e.g. a live file whose spec was dropped by
-    /// `remove_partition_specs`, which only refuses to drop the DEFAULT spec).
+    /// Resolve the partition spec a summarized file belongs to, for the per-file partition-summary
+    /// path. Java `SnapshotSummary.Builder` uses `spec(file.specId())`. It falls back to the table
+    /// default only when the file's spec is absent. That is unreachable on the ADD path, and
+    /// REACHABLE for the removed-file loops, whose files can name a spec `remove_partition_specs`
+    /// dropped.
     ///
-    /// The substituted spec can therefore have a different arity/type than the file's tuple. That is
-    /// safe ONLY because [`PartitionSpec::partition_to_path`] is total: it renders the unmatched
-    /// fields as `null` and warns (WG3-L2). Before that it aborted mid-commit — this fallback used
-    /// to claim the summary path "never panics", and the claim was false.
+    /// The substituted spec can therefore have a different arity than the file's tuple. That is safe
+    /// ONLY because [`PartitionSpec::partition_to_path`] is total: it renders unmatched fields as
+    /// `null` and warns. Before that it aborted mid-commit.
     fn file_partition_spec(&self, file: &DataFile) -> crate::spec::PartitionSpecRef {
         let metadata = self.table.metadata();
         metadata
@@ -1682,10 +1547,8 @@ pub(crate) fn dv_desc(delete_file: &DataFile) -> String {
     )
 }
 
-/// The format-version gate for an added DELETE file — the Rust port of Java
-/// `MergingSnapshotProducer.validateDeleteFileForVersion` (`core/MergingSnapshotProducer.java`
-/// L295-316; verified against the 1.10.0 BYTECODE, where the switch is inlined into
-/// `validateNewDeleteFile` with cases 1-4):
+/// The format-version gate for an added DELETE file. Java
+/// `MergingSnapshotProducer.validateDeleteFileForVersion`.
 ///
 /// - **V1:** delete files do not exist — `"Deletes are supported in V2 and above"`.
 /// - **V2:** equality deletes OK; a position delete must NOT be a deletion vector
@@ -1694,13 +1557,13 @@ pub(crate) fn dv_desc(delete_file: &DataFile) -> String {
 /// - **V3 (and Java's V4):** equality deletes OK; a position delete MUST be a deletion vector —
 ///   `"Must use DVs for position deletes in V%s: %s"` with the format version + the file location.
 ///
-/// Equality deletes are exempt at EVERY version ≥ 2 (both arms test
-/// `content() == EQUALITY_DELETES` first). A wrongly-gated DV commit corrupts merge-on-read tables
-/// for every engine: a V2 reader cannot load a Puffin DV, and a V3 table mixing fresh parquet
-/// position deletes with DVs breaks the DV-supersedes-position-deletes read precedence.
+/// Equality deletes are exempt at EVERY version >= 2. A wrongly-gated DV commit corrupts
+/// merge-on-read tables for every engine. A V2 reader cannot load a Puffin DV, and a V3 table
+/// mixing fresh parquet position deletes with DVs breaks the read precedence.
 ///
-/// Returns a NON-retryable [`ErrorKind::DataInvalid`] (Java throws `IllegalArgumentException` from
-/// `Preconditions.checkArgument` — also non-retryable), so the commit retry loop stops.
+/// # Errors
+///
+/// A NON-retryable [`ErrorKind::DataInvalid`], so the commit retry loop stops.
 fn validate_delete_file_for_version(
     delete_file: &DataFile,
     format_version: FormatVersion,
@@ -1764,13 +1627,10 @@ fn operation_adds_delete_files(operation: &Operation) -> bool {
 /// REPLACE}`, L84-85; 1.10.0-bytecode-verified: `ImmutableSet.of("overwrite", "delete",
 /// "replace")`).
 ///
-/// NOTE this is STRICTLY WIDER than [`operation_adds_delete_files`] (`{Overwrite, Delete}`): a
-/// REPLACE (compaction) snapshot can rewrite deletion vectors — Java's `RewriteDataFiles` writes
-/// fresh DVs for the compacted data under `DataOperations.REPLACE` — so the DV conflict check must
-/// inspect REPLACE snapshots too. `Operation::Replace` IS representable in Rust (the
-/// `rewrite_files` / `rewrite_manifests` actions record it), so dropping it here would silently
-/// miss a concurrent Java- or future-Rust-written REPLACE snapshot that added a DV for the same
-/// referenced data file.
+/// This is STRICTLY WIDER than [`operation_adds_delete_files`]. A REPLACE compaction snapshot can
+/// rewrite deletion vectors, so the DV conflict check must inspect REPLACE snapshots too. The
+/// fork's own `rewrite_files` records `Operation::Replace`, so dropping it here would silently miss
+/// a concurrent REPLACE snapshot that added a DV for the same referenced data file.
 fn operation_adds_dvs(operation: &Operation) -> bool {
     matches!(
         operation,
@@ -1778,25 +1638,15 @@ fn operation_adds_dvs(operation: &Operation) -> bool {
     )
 }
 
-/// Enumerate the DELETE files ADDED to `table` by snapshots committed AFTER `starting_snapshot_id`,
-/// gated to the operations that can add DELETION VECTORS — the walk behind `RowDelta`'s
-/// `validateAddedDVs` (Java `MergingSnapshotProducer.validateAddedDVs` L835-841 calling
-/// `validationHistory(base, startingSnapshotId, VALIDATE_ADDED_DVS_OPERATIONS,
-/// ManifestContent.DELETES, parent)`).
+/// Enumerate the DELETE files ADDED after `starting_snapshot_id` by operations that can add
+/// DELETION VECTORS. This is the walk behind `RowDelta`'s `validateAddedDVs`.
 ///
-/// Same [`files_after`] walk semantics as [`added_delete_files_after`] (DELETE manifests the
-/// snapshot itself wrote, `ManifestStatus::Added` entries, inclusive of the current snapshot,
-/// exclusive of the starting snapshot) — the ONLY difference is the op set:
-/// [`operation_adds_dvs`] = `{Overwrite, Delete, Replace}` instead of `{Overwrite, Delete}`
-/// (Java's `VALIDATE_ADDED_DVS_OPERATIONS` vs `VALIDATE_ADDED_DELETE_FILES_OPERATIONS`). The
-/// caller filters the result to DVs (`is_deletion_vector`) and applies the conflict test; the
-/// non-DV entries a REPLACE snapshot might carry are returned here but never collide (the caller
-/// skips non-Puffin files), mirroring Java reading the whole delete manifest and testing
-/// `ContentFileUtil.isDV` per entry.
+/// The [`files_after`] walk semantics match [`added_delete_files_after`]. The ONLY difference is
+/// the op set: [`operation_adds_dvs`] adds `Replace`. The caller filters the result to DVs and
+/// applies the conflict test, so the non-DV entries a REPLACE snapshot carries never collide.
 ///
-/// No format-version guard: Java's `validateAddedDVs` has none (the caller's
-/// `dvsByReferencedFile.isEmpty()` self-skip means the walk only ever runs when this operation
-/// adds DVs, which the version gate already restricts to V3+ tables).
+/// There is no format-version guard, because Java's `validateAddedDVs` has none. The caller's
+/// self-skip means the walk runs only when this operation adds DVs.
 pub(crate) async fn added_dv_candidate_delete_files_after(
     table: &Table,
     starting_snapshot_id: Option<i64>,
@@ -1815,17 +1665,13 @@ pub(crate) async fn added_dv_candidate_delete_files_after(
 /// needs to inspect (Java `MergingSnapshotProducer.VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE,
 /// REPLACE, DELETE}`). An `Append` snapshot never removes a live data file, so it is not inspected.
 ///
-/// All THREE Java members are representable in Rust and all three are matched here
-/// (1.10.0-bytecode-verified: the `MergingSnapshotProducer` `static {}` block builds
-/// `VALIDATE_DATA_FILES_EXIST_OPERATIONS` from `ImmutableSet.of("overwrite", "replace", "delete")`).
-/// `Operation::Replace` IS recorded by the Rust write path — [`crate::transaction::rewrite_files`]
-/// always commits `Operation::Replace`, and `RewriteDataFiles` / `RemoveDanglingDeleteFiles` /
-/// `RewritePositionDeleteFiles` all commit through it — so omitting `Replace` would let a concurrent
-/// COMPACTION snapshot's `Deleted` tombstones escape this walk. Matches the same-file
-/// [`operation_adds_dvs`], which includes `Replace` for the same reason.
+/// All three Java members are matched here. `Operation::Replace` is what
+/// [`crate::transaction::rewrite_files`] commits, so omitting it would let a concurrent COMPACTION
+/// snapshot's `Deleted` tombstones escape this walk. [`operation_adds_dvs`] includes `Replace` for
+/// the same reason.
 ///
-/// This is the `skipDeletes == false` variant; see [`operation_removes_data_files_skip_deletes`] for the
-/// `skipDeletes == true` variant Java's `RowDelta` uses by default.
+/// This is the `skipDeletes == false` variant. See
+/// [`operation_removes_data_files_skip_deletes`] for the other.
 fn operation_removes_data_files(operation: &Operation) -> bool {
     matches!(
         operation,
@@ -1837,53 +1683,35 @@ fn operation_removes_data_files(operation: &Operation) -> bool {
 /// remove data files when DELETE-op snapshots are EXCLUDED (Java
 /// `MergingSnapshotProducer.VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS = {OVERWRITE, REPLACE}`).
 ///
-/// Java drops `DELETE` from the set so that a concurrent merge-on-read DELETE-op snapshot (which produces
-/// `Deleted` tombstones for the files it removed) does NOT trip the files-exist check — this is what
-/// `BaseRowDelta` uses by DEFAULT (its `validateDeletes` flag is `false` unless `validateDeletedFiles()` is
-/// called, and it passes `skipDeletes = !validateDeletes = true`). `REPLACE` is NOT dropped: both Java
-/// members are matched here (1.10.0-bytecode-verified — `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS`
-/// is `ImmutableSet.of("overwrite", "replace")`). This is the op set `RowDelta` uses by DEFAULT, so
-/// dropping `Replace` would be the corruption line: a concurrent compaction (`Operation::Replace`, which
-/// the fork's own [`crate::transaction::rewrite_files`] records) removes the data file a position delete
-/// references, the row delta commits anyway, and the deleted rows are live again in the compacted output.
+/// Java drops `DELETE` so a concurrent merge-on-read DELETE snapshot does not trip the files-exist
+/// check. `BaseRowDelta` uses this set by DEFAULT. `REPLACE` is NOT dropped, and dropping it here
+/// would be the corruption line: a concurrent compaction removes the data file a position delete
+/// references, the row delta commits anyway, and the deleted rows are live again in the output.
 fn operation_removes_data_files_skip_deletes(operation: &Operation) -> bool {
     matches!(operation, Operation::Overwrite | Operation::Replace)
 }
 
-/// Enumerate the files of a given manifest `content` that snapshots committed AFTER `starting_snapshot_id`
-/// recorded with status `status_to_keep` — the shared walk behind [`added_data_files_after`] /
-/// [`added_delete_files_after`] (DATA / DELETE manifests, `ManifestStatus::Added` entries) and
-/// [`deleted_data_files_after`] (DATA manifests, `ManifestStatus::Deleted` tombstones).
+/// Enumerate the files of manifest `content` that snapshots committed after `starting_snapshot_id`
+/// recorded with status `status_to_keep`. It is the shared walk behind [`added_data_files_after`],
+/// [`added_delete_files_after`] and [`deleted_data_files_after`].
 ///
-/// This is the Rust port of Java `MergingSnapshotProducer.validationHistory` + the per-check `ManifestGroup`
-/// entry filter (`core/MergingSnapshotProducer.java`): it walks the parent chain of `table`'s current
-/// snapshot (the refreshed base / Java `parent`) back via `parent_snapshot_id`, INCLUSIVE of the current
-/// snapshot and EXCLUSIVE of `starting_snapshot_id` (Java `SnapshotUtil.ancestorsBetween(parent.snapshotId(),
-/// startingSnapshotId)`). For each visited snapshot whose operation passes `operation_filter` (Java's
-/// per-validation operation set — `VALIDATE_ADDED_FILES_OPERATIONS` for added data,
-/// `VALIDATE_ADDED_DELETE_FILES_OPERATIONS` for added deletes, `VALIDATE_DATA_FILES_EXIST_OPERATIONS` for
-/// removed data), it loads that snapshot's manifest list, keeps the manifests of `content` that it WROTE
-/// (`manifest.added_snapshot_id == snapshot.snapshot_id()`, Java `manifest.snapshotId() ==
-/// currentSnapshot.snapshotId()`), and collects every entry whose status equals `status_to_keep`.
+/// The Rust port of Java `MergingSnapshotProducer.validationHistory`. It walks the parent chain of
+/// `table`'s current snapshot, INCLUSIVE of that snapshot and EXCLUSIVE of `starting_snapshot_id`.
+/// For each visited snapshot whose operation passes `operation_filter`, it keeps the manifests of
+/// `content` that snapshot WROTE and collects every entry matching `status_to_keep`.
 ///
 /// The `status_to_keep` axis selects the per-check entry filter:
-/// - `ManifestStatus::Added` ⇒ files ADDED by the concurrent snapshots (Java `ignoreDeleted().ignoreExisting()`
-///   keeping `Status.ADDED`) — the data/delete *conflict* checks.
-/// - `ManifestStatus::Deleted` ⇒ files DELETED by the concurrent snapshots (Java `deletedDataFiles` keeps
-///   `entry.status() == DELETED`, with `ignoreExisting()`) — the `validateDataFilesExist` check.
 ///
-/// A concurrent delete/overwrite records its removals as `Deleted` tombstones in a manifest it itself wrote
-/// (`rewrite_manifest_with_deletes` stamps the new snapshot id as `added_snapshot_id`), so the
-/// `added_snapshot_id == snapshot_id` manifest filter finds those tombstones — exactly as it finds a
-/// snapshot's `Added` entries.
+/// - `ManifestStatus::Added`: files ADDED by concurrent snapshots, for the conflict checks.
+/// - `ManifestStatus::Deleted`: files DELETED by them, for the `validateDataFilesExist` check.
 ///
-/// Both DATA and DELETE files are carried in manifest entries as [`DataFile`]s, distinguished by their
-/// content type.
+/// A concurrent delete or overwrite records its removals as `Deleted` tombstones in a manifest it
+/// wrote itself, so the `added_snapshot_id == snapshot_id` filter finds them.
 ///
-/// `starting_snapshot_id == None` means "validate from the beginning of history" — every ancestor of the
-/// current snapshot is inspected (Java passes a null starting id to `ancestorsBetween`, which walks to the
-/// root). When the current snapshot already IS `starting_snapshot_id` (no concurrent commit landed), the walk
-/// yields nothing. A table with no current snapshot likewise yields nothing.
+/// # Notes
+///
+/// `starting_snapshot_id == None` validates from the beginning of history. The walk yields nothing
+/// when the current snapshot already IS the starting one, or when the table has no snapshot.
 async fn files_after(
     table: &Table,
     starting_snapshot_id: Option<i64>,
@@ -1981,21 +1809,16 @@ pub(crate) async fn added_data_files_after(
 /// Enumerate the DELETE files (position / equality deletes) ADDED to `table` by snapshots committed AFTER
 /// `starting_snapshot_id` — the concurrent commits a `validateNoConflictingDeleteFiles` check must inspect.
 ///
-/// This is the Rust port of Java `MergingSnapshotProducer.addedDeleteFiles`
-/// (`core/MergingSnapshotProducer.java` L601-625): the shared [`files_after`] walk over DELETE
-/// manifests, gated to the operations that can add delete files ([`operation_adds_delete_files`] = Java
-/// `VALIDATE_ADDED_DELETE_FILES_OPERATIONS = {OVERWRITE, DELETE}`), keeping `ManifestStatus::Added` entries.
+/// The Rust port of Java `MergingSnapshotProducer.addedDeleteFiles`: the shared [`files_after`] walk
+/// over DELETE manifests, gated by [`operation_adds_delete_files`], keeping `Added` entries.
 ///
-/// **V2 guard (Java `base.formatVersion() < 2` ⇒ empty `DeleteFileIndex`):** delete files do not exist
-/// before format version 2, so on a V1 table this returns an empty set without walking the history.
+/// Delete files do not exist before format version 2, so a V1 table returns an empty set without
+/// walking the history.
 ///
-/// **Over-scan vs Java (documented):** Java's `addedDeleteFiles` additionally builds a `DeleteFileIndex`
-/// filtered by the operation's `startingSequenceNumber` (a delete file with `sequence_number <
-/// startingSequenceNumber` cannot apply to the rows being committed). This port enumerates the
-/// concurrently-added delete files by the snapshot walk alone; the per-file inclusive-metrics filter is
-/// applied later in [`validate_no_conflicting_added_delete_files`]. Omitting the sequence-number refinement
-/// is a CONSERVATIVE over-scan — it can only consider MORE delete files (over-reject), never fewer
-/// (under-reject) — the same class as the manifest-summary pre-filter deferral elsewhere.
+/// **Documented over-scan.** Java also filters by the operation's `startingSequenceNumber`. This
+/// port walks the snapshots alone and applies the metrics filter later in
+/// [`validate_no_conflicting_added_delete_files`]. Omitting the refinement is CONSERVATIVE: it can
+/// only consider more delete files, never fewer.
 pub(crate) async fn added_delete_files_after(
     table: &Table,
     starting_snapshot_id: Option<i64>,
@@ -2020,22 +1843,14 @@ pub(crate) async fn added_delete_files_after(
 /// `starting_snapshot_id`, PAIRED with each entry's data sequence number — the sequence-preserving sibling
 /// of [`added_delete_files_after`].
 ///
-/// [`added_delete_files_after`] deliberately strips the manifest entry's sequence number (returning bare
-/// [`DataFile`]s), which is all the metrics-only conflict checks need. But Java
-/// `MergingSnapshotProducer.validateNoNewDeletesForDataFiles` builds a `DeleteFileIndex` whose
-/// `forDataFile(startingSequenceNumber, dataFile)` compares each delete's DATA sequence number against the
-/// operation's `startingSequenceNumber` (`DeleteFileIndex.PositionDeletes.filter`/`EqualityDeletes.filter`
-/// keep `data_seq >= startingSequenceNumber`). That comparison needs the sequence number, so this variant
-/// preserves it (`entry.sequence_number()`).
+/// [`added_delete_files_after`] strips the entry's sequence number, which is all the metrics-only
+/// conflict checks need. Java `validateNoNewDeletesForDataFiles` compares each delete's data
+/// sequence number against the operation's starting sequence number, so this variant preserves it.
 ///
-/// Same walk semantics as [`added_delete_files_after`]: the V2 guard (delete files do not exist before
-/// format version 2 — Java `addedDeleteFiles`), the DELETE-manifest walk gated to the operations that can
-/// add delete files ([`operation_adds_delete_files`] = Java `VALIDATE_ADDED_DELETE_FILES_OPERATIONS =
-/// {OVERWRITE, DELETE}`), keeping `ManifestStatus::Added` entries, inclusive of the current snapshot and
-/// exclusive of the starting snapshot. The per-entry `Option<i64>` is the data sequence number a V2/V3
-/// added delete inherits from its committing snapshot (always strictly greater than any pre-start data file's
-/// sequence number, so in practice the partition match is the load-bearing test — but the comparison is
-/// preserved for faithfulness to Java).
+/// The walk semantics match [`added_delete_files_after`]. The per-entry `Option<i64>` is the data
+/// sequence number a V2 or V3 added delete inherits from its committing snapshot. It is always
+/// above any pre-start data file's, so the partition match is the load-bearing test. The comparison
+/// is preserved for faithfulness to Java.
 async fn added_delete_files_with_seq_after(
     table: &Table,
     starting_snapshot_id: Option<i64>,
@@ -2094,13 +1909,9 @@ async fn added_delete_files_with_seq_after(
     Ok(collected)
 }
 
-/// The sequence number of the snapshot the operation started from, or `0` if there is none — the Rust port
-/// of Java `MergingSnapshotProducer.startingSequenceNumber` (`core/MergingSnapshotProducer.java` L741-748).
-///
-/// Java: when `startingSnapshotId` is non-null AND present in the metadata, return that snapshot's sequence
-/// number; otherwise return `TableMetadata.INITIAL_SEQUENCE_NUMBER` (= 0). The `0` literal here IS
-/// `INITIAL_SEQUENCE_NUMBER` (`spec::table_metadata::INITIAL_SEQUENCE_NUMBER`, a `pub(crate)` constant equal
-/// to 0); it is inlined to avoid widening the spec module's export surface.
+/// The sequence number of the snapshot the operation started from, or `0` if there is none. Java
+/// `MergingSnapshotProducer.startingSequenceNumber`. The `0` literal is `INITIAL_SEQUENCE_NUMBER`,
+/// inlined so the spec module's export surface stays narrow.
 fn starting_sequence_number(table: &Table, starting_snapshot_id: Option<i64>) -> i64 {
     match starting_snapshot_id {
         Some(id) => table
@@ -2111,60 +1922,37 @@ fn starting_sequence_number(table: &Table, starting_snapshot_id: Option<i64>) ->
     }
 }
 
-/// Reject the commit if any DELETE file ADDED by a concurrent commit since `starting_snapshot_id` APPLIES to
-/// one of the DATA files this operation REMOVES — the serializable-isolation guard that you cannot drop a
-/// data file out from under a concurrent row-level delete (Java
-/// `MergingSnapshotProducer.validateNoNewDeletesForDataFiles`, `core/MergingSnapshotProducer.java`
-/// L519-551). Shared by `OverwriteFiles` (the `!deletedDataFiles.isEmpty()` branch of
-/// `BaseOverwriteFiles.validate`) and, in a later increment, `RowDelta`.
+/// Reject the commit if a DELETE file added since `starting_snapshot_id` applies to a DATA file this
+/// operation REMOVES. Java `MergingSnapshotProducer.validateNoNewDeletesForDataFiles`. It is the
+/// serializable-isolation guard: you cannot drop a data file out from under a concurrent row-level
+/// delete.
 ///
-/// **V2 guard (Java L526-528):** if there is no current snapshot (`parent == null`) or the table is below
-/// format version 2 (`base.formatVersion() < 2`), no delete files can exist, so this is a no-op `Ok(())`.
+/// No current snapshot, or a table below format version 2, means no delete file can exist, so the
+/// check is a no-op. `bound_conflict_filter` narrows the concurrently-added deletes by metrics; a
+/// `None` filter keeps every one, the conservative default.
 ///
-/// **Enumerate concurrently-added deletes (Java L530):** the concurrently-added DELETE files are gathered via
-/// [`added_delete_files_with_seq_after`] (the DELETE-manifest walk + the V2 guard), then optionally narrowed
-/// by `bound_conflict_filter` with the existing [`InclusiveMetricsEvaluator`] — mirroring Java passing
-/// `dataFilter` into `addedDeleteFiles` (a delete file whose metrics cannot match the filter cannot conflict).
-/// `None` ⇒ no metrics narrowing (every concurrently-added delete is a candidate — the conservative default).
+/// A concurrently-added delete applies to a removed data file when both hold:
 ///
-/// **Starting sequence number (Java L533):** [`starting_sequence_number`] — the sequence number of the
-/// starting snapshot, or 0 when there is none.
+/// 1. Its data sequence number is `>= starting_sequence_number`. An added delete inherits its
+///    snapshot's sequence number, so this is effectively always true. The test below is the
+///    load-bearing one. The comparison is kept for faithfulness.
+/// 2. It matches the data file: partition-scoped position deletes and equality deletes match on
+///    `(spec_id, partition)`; a path-scoped position delete matches only that exact path; a global
+///    equality delete matches ANY data file.
 ///
-/// **Applicability — mirrors Java `DeleteFileIndex.forDataFile(startingSequenceNumber, dataFile)`
-/// (`core/DeleteFileIndex.java` L151-167):** a concurrently-added delete applies to a removed data file iff
-/// 1. its DATA sequence number is `>= startingSequenceNumber` (Java `PositionDeletes.filter(seq)` /
-///    `EqualityDeletes.filter(seq, file)` keep entries at index `findStartIndex(seqs, seq)`, i.e.
-///    `data_seq >= seq`; `seq == startingSequenceNumber` here). A concurrently-ADDED delete inherits its
-///    snapshot's sequence number, so this is effectively always true — the partition test below is the
-///    load-bearing one — but the comparison is kept for faithfulness; AND
-/// 2. it MATCHES the data file by partition: same `partition_spec_id` AND equal partition tuple
-///    (`posDeletesByPartition.get(specId, partition)` / `eqDeletesByPartition.get(specId, partition)`). A
-///    partition-scoped position delete (no `referenced_data_file`) and an equality delete both match by
-///    partition; a path-scoped position delete (`referenced_data_file == Some(path)`) additionally matches
-///    only the data file at that exact path (Java `findPathDeletes` keyed on `dataFile.location()`).
-///    Global (unpartitioned) equality deletes apply to ANY data file (Java `findGlobalDeletes`).
+/// The applicability test is implemented DIRECTLY here rather than through
+/// [`crate::delete_file_index`]. That index keys on SCAN-time semantics and compares against the
+/// data file's OWN sequence number, while this validation compares against the operation's starting
+/// sequence number.
 ///
-/// The applicability test is implemented DIRECTLY here rather than via [`crate::delete_file_index`]'s
-/// `PopulatedDeleteFileIndex`: that index keys on the SCAN-time semantics (it compares against the DATA
-/// file's OWN sequence number and requires `DeleteFileContext`/`ManifestEntry` plumbing the snapshot walk
-/// does not produce), whereas this validation compares against the operation's `startingSequenceNumber`. The
-/// direct test is self-contained and cites the Java `forDataFile` semantics line-for-line above.
+/// `ignore_equality_deletes` makes only POSITION deletes count as a conflict.
+/// `bound_conflict_filter` is bound by the CALLER, so the case sensitivity is the caller's and this
+/// signature stays stable across the three actions.
 ///
-/// **`ignore_equality_deletes` (Java L538-548):** when `true`, only POSITION deletes count as a conflict
-/// (Java keeps the commit unless an applicable delete is a `POSITION_DELETES` — the "found new position
-/// delete for replaced data file" message); when `false`, ANY applicable delete is a conflict (the "found
-/// new delete for replaced data file" message). `OverwriteFiles` passes `false`.
+/// # Errors
 ///
-/// **`bound_conflict_filter` (Java `DeleteFileIndex.Builder.caseSensitive(isCaseSensitive())`):** the metrics
-/// narrowing filter ALREADY bound to the table schema by the caller, so the column-name resolution case
-/// sensitivity is the caller's (`OverwriteFiles`/`RowDelta` bind it with their `case_sensitive(bool)` builder
-/// value, default `true` — the Iceberg/Java default). `RewriteFiles` passes `None` (no narrowing, no builder).
-/// Binding in the caller keeps this shared helper's signature stable across all three actions.
-///
-/// On the FIRST conflicting data file this returns a NON-retryable [`ErrorKind::DataInvalid`] error matching
-/// Java's message ("Cannot commit, found new delete for replaced data file: <path>" /
-/// "...found new position delete..."), so the commit retry loop stops and the error propagates (Java's
-/// non-retryable `ValidationException`).
+/// A NON-retryable [`ErrorKind::DataInvalid`] on the FIRST conflicting data file, carrying Java's
+/// verbatim message, so the commit retry loop stops.
 pub(crate) async fn validate_no_new_deletes_for_data_files(
     table: &Table,
     starting_snapshot_id: Option<i64>,
@@ -2185,11 +1973,8 @@ pub(crate) async fn validate_no_new_deletes_for_data_files(
         return Ok(());
     }
 
-    // Java passes `dataFilter` into `addedDeleteFiles`: a delete whose metrics cannot match the conflict
-    // filter cannot conflict. The filter is bound by the CALLER with its `case_sensitive(bool)` value (Java
-    // `DeleteFileIndex.Builder.caseSensitive(isCaseSensitive())`) so this shared helper's signature stays
-    // stable across `OverwriteFiles` / `RowDelta` / `RewriteFiles` (None ⇒ no narrowing — every added delete
-    // is a candidate).
+    // A delete whose metrics cannot match the conflict filter cannot conflict. The CALLER binds the
+    // filter, so this shared signature stays stable across the three actions.
     let bound_filter = bound_conflict_filter;
 
     // Java L533: the sequence number of the starting snapshot (or 0 if none).
@@ -2247,20 +2032,15 @@ pub(crate) async fn validate_no_new_deletes_for_data_files(
     Ok(())
 }
 
-/// Whether a single concurrently-added delete file APPLIES to `data_file`, mirroring Java
-/// `DeleteFileIndex.forDataFile(starting_sequence_number, data_file)` (`core/DeleteFileIndex.java`
-/// L151-200). See [`validate_no_new_deletes_for_data_files`] for the full citation; the rules are:
+/// Whether a single concurrently-added delete file APPLIES to `data_file`. Java
+/// `DeleteFileIndex.forDataFile`. The rules:
 ///
-/// - **Sequence number (Java `*.filter` `findStartIndex`):** the delete's DATA sequence number must be
-///   `>= starting_sequence_number`. An absent entry sequence number is treated conservatively as applicable
-///   (it has not yet been narrowed out).
-/// - **Global (unpartitioned) equality deletes (Java `findGlobalDeletes`):** an EQUALITY delete with an
-///   empty partition applies to ANY data file (subject to the sequence test) — the spec's "equality delete
-///   files stored with an unpartitioned spec are applied as global deletes".
-/// - **Partition match (Java `findPosPartitionDeletes` / `findEqPartitionDeletes`):** otherwise the delete
-///   matches only a data file with the SAME `partition_spec_id` AND an equal partition tuple.
-/// - **Path-scoped position deletes (Java `findPathDeletes`):** a position delete carrying a
-///   `referenced_data_file` additionally requires that path to equal the data file's path.
+/// | test | rule |
+/// |---|---|
+/// | sequence | delete seq `>= starting_sequence_number`; absent seq applies |
+/// | global equality | empty partition applies to any data file |
+/// | partition | same spec id and tuple |
+/// | path-scoped position | `referenced_data_file` equals the data file path |
 fn delete_applies_to_data_file(
     delete_file: &DataFile,
     delete_sequence_number: Option<i64>,
@@ -2303,36 +2083,23 @@ fn delete_applies_to_data_file(
     }
 }
 
-/// Enumerate the DATA files DELETED from `table` by snapshots committed AFTER `starting_snapshot_id` — the
-/// concurrent removals a `validateDataFilesExist` check must inspect to detect that a file this operation
-/// also needs to delete was already removed by a concurrent commit.
+/// Enumerate the DATA files DELETED after `starting_snapshot_id`. A `validateDataFilesExist` check
+/// inspects these to detect that a concurrent commit already removed a file this operation needs.
 ///
-/// This is the Rust port of Java `MergingSnapshotProducer.validateDataFilesExist` /  `deletedDataFiles`
-/// (`core/MergingSnapshotProducer.java` L695-735, L773-822): the shared [`files_after`] walk over DATA
-/// manifests, keeping `ManifestStatus::Deleted` tombstone entries (Java `entry.status() == DELETED` with
-/// `ignoreExisting()`). See [`files_after`] for the walk semantics.
+/// The Rust port of Java `MergingSnapshotProducer.validateDataFilesExist`: the shared
+/// [`files_after`] walk over DATA manifests, keeping `Deleted` tombstone entries.
 ///
-/// The `skip_deletes` flag selects the operation set, mirroring Java's two `validateDataFilesExist` op sets:
-/// - `skip_deletes == false` ⇒ [`operation_removes_data_files`] = Java
-///   `VALIDATE_DATA_FILES_EXIST_OPERATIONS = {OVERWRITE, REPLACE, DELETE}`.
-///   `DeleteFiles` uses this (its `validate` always includes DELETE-op snapshots).
-/// - `skip_deletes == true` ⇒ [`operation_removes_data_files_skip_deletes`] = Java
-///   `VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS = {OVERWRITE, REPLACE}`.
-///   `RowDelta` uses this by DEFAULT (Java `BaseRowDelta` passes `skipDeletes = !validateDeletes`, and
-///   `validateDeletes` is `false` unless `validateDeletedFiles()` was called) so that a concurrent
-///   merge-on-read DELETE-op snapshot does not trip the referenced-files check.
+/// `skip_deletes` selects the operation set, mirroring Java's two:
 ///
-/// BOTH sets include `REPLACE` (1.10.0-bytecode-verified), so a concurrent COMPACTION snapshot's
-/// `Deleted` tombstones are inspected on both arms — see [`operation_removes_data_files`].
+/// - `false` uses [`operation_removes_data_files`]. `DeleteFiles` uses this arm.
+/// - `true` uses [`operation_removes_data_files_skip_deletes`], which `RowDelta` uses by DEFAULT so a
+///   concurrent merge-on-read DELETE snapshot does not trip the referenced-files check.
 ///
-/// A concurrent delete/overwrite writes the file it removes as a `Deleted` tombstone in a manifest IT wrote
-/// (`rewrite_manifest_with_deletes` stamps the committing snapshot id as the manifest's `added_snapshot_id`),
-/// so the `added_snapshot_id == snapshot_id` manifest filter finds those tombstones — exactly the way Java's
-/// `manifest.snapshotId() == currentSnapshot.snapshotId()` filter does.
+/// BOTH sets include `REPLACE`, so a concurrent COMPACTION snapshot's tombstones are inspected on
+/// both arms.
 ///
-/// The caller intersects these deleted-file paths with the set it requires (the files it is deleting, or the
-/// files its added delete files reference) to decide whether to reject the commit (Java
-/// `requiredDataFiles.contains(entry.file().location())`).
+/// The caller intersects these paths with the set it requires, to decide whether to reject the
+/// commit.
 pub(crate) async fn deleted_data_files_after(
     table: &Table,
     starting_snapshot_id: Option<i64>,
@@ -2359,31 +2126,17 @@ pub(crate) async fn deleted_data_files_after(
 /// the write actions that mirror Java `MergingSnapshotProducer.validateAddedDataFiles`
 /// (`OverwriteFiles.validateNoConflictingData`, `RowDelta.validateNoConflictingDataFiles`).
 ///
-/// This is the Rust port of Java `MergingSnapshotProducer.validateAddedDataFiles`
-/// (`core/MergingSnapshotProducer.java` L391-412): it enumerates the concurrently-added DATA files via
-/// the shared [`added_data_files_after`] walk and throws a non-retryable `ValidationException` ("Found
-/// conflicting files that can contain records matching %s: %s") on the FIRST file whose metrics permit a
-/// match. The per-file "could this added file match the filter?" test is the existing
-/// [`InclusiveMetricsEvaluator`] (Java `ManifestGroup.filterData` = inclusive-metrics evaluation over the
-/// file's bounds / null / nan stats).
+/// Java `MergingSnapshotProducer.validateAddedDataFiles`. Rejects the first concurrently
+/// added DATA file whose metrics match. `current` is the refreshed base. A `None` filter is
+/// `AlwaysTrue`. Default `case_sensitive` is `true`.
 ///
-/// Arguments:
-/// - `current` — the REFRESHED base (Java `parent` metadata); the walk inspects the snapshots it gained.
-/// - `effective_start` — the starting snapshot id (exclusive). `None` ⇒ inspect from the root (validate
-///   every version, Java's null `startingSnapshotId`).
-/// - `conflict_filter` — the conflict-detection predicate. `None` ⇒ bind `AlwaysTrue` (ANY concurrently
-///   added DATA file conflicts — the most conservative serializable check, Java
-///   `dataConflictDetectionFilter()` returning `alwaysTrue()` when no filter is set).
-/// - `case_sensitive` — column-resolution case sensitivity for binding the filter (Java
-///   `isCaseSensitive()`; the actions default this to `true`, the Iceberg/Java default).
+/// One home keeps `OverwriteFiles` and `RowDelta` from drifting on the walk, the bind, the per-file
+/// evaluation, and the error contract.
 ///
-/// Returns `Ok(())` when nothing concurrently-added can match (including when the concurrent-added set is
-/// empty). On the first conflict it returns a NON-retryable [`ErrorKind::DataInvalid`] error naming the
-/// filter + the conflicting file path, so the commit retry loop stops and the error propagates (Java's
-/// non-retryable `ValidationException`).
+/// # Errors
 ///
-/// Sharing this in one place keeps `OverwriteFiles` and `RowDelta` (and any future filter-based check)
-/// from drifting on the load-bearing walk + bind + per-file evaluation + error contract.
+/// A NON-retryable [`ErrorKind::DataInvalid`] naming the filter and the conflicting path, so the
+/// commit retry loop stops.
 pub(crate) async fn validate_no_conflicting_added_data_files(
     current: &Table,
     effective_start: Option<i64>,
@@ -2449,40 +2202,24 @@ pub(crate) async fn validate_no_conflicting_added_delete_files(
 /// commit did not remove data this operation's row filter also targets, mirroring Java
 /// `MergingSnapshotProducer.validateDeletedDataFiles` (the `Expression` variant).
 ///
-/// This is the Rust port of Java `MergingSnapshotProducer.validateDeletedDataFiles`
-/// (`core/MergingSnapshotProducer.java` L636-654, the `dataFilter` overload): it enumerates the
-/// concurrently-DELETED DATA files via the shared [`deleted_data_files_after`] walk (with
-/// `skip_deletes = false` ⇒ the op set `{Overwrite, Replace, Delete}`, Java
-/// `VALIDATE_DATA_FILES_EXIST_OPERATIONS`) and
-/// throws a non-retryable `ValidationException` ("Found conflicting deleted files that can contain records
-/// matching %s: %s") on the FIRST removed file whose metrics permit a match. The per-file "could this deleted
-/// file have contained records matching the filter?" test is the SAME [`first_conflicting_file`] (the
-/// existing [`InclusiveMetricsEvaluator`]) the added-file / added-delete checks use, so the three cannot
-/// drift on the load-bearing bind + per-file evaluation contract.
+/// The Rust port of Java `MergingSnapshotProducer.validateDeletedDataFiles`, the `dataFilter`
+/// overload. It enumerates the concurrently-DELETED DATA files through
+/// [`deleted_data_files_after`] with `skip_deletes = false`, and rejects the FIRST removed file
+/// whose metrics permit a match. The per-file test is the SAME [`first_conflicting_file`] the
+/// added-file check uses, so the two cannot drift.
 ///
-/// Arguments mirror [`validate_no_conflicting_added_delete_files`]. The only differences from the
-/// added-delete check are (1) the DELETED-data-file walk (concurrent removals, not concurrent additions) and
-/// (2) the deleted-files error message — the per-file conflict test is shared.
+/// Arguments mirror [`validate_no_conflicting_added_delete_files`]. Only the walk and the message
+/// differ.
 ///
-/// Arguments:
-/// - `current` — the REFRESHED base (Java `parent` metadata); the walk inspects the snapshots it gained.
-/// - `effective_start` — the starting snapshot id (exclusive). `None` ⇒ inspect from the root (Java's null
-///   `startingSnapshotId`).
-/// - `conflict_filter` — the row/conflict-detection predicate. `None` ⇒ bind `AlwaysTrue` and render the
-///   filter as `true` (any concurrently-deleted DATA file conflicts — the most conservative serializable
-///   check), mirroring the sibling [`validate_no_conflicting_added_delete_files`].
-/// - `case_sensitive` — column-resolution case sensitivity for binding the filter (Java `isCaseSensitive()`;
-///   the actions default this to `true`, the Iceberg/Java default).
+/// **Conservative posture.** [`InclusiveMetricsEvaluator`] over-approximates, so it can only
+/// over-reject, never under-reject. That is safe under serializable isolation. The op set matches
+/// Java member for member, `REPLACE` included, so a concurrent compaction's removals are scanned
+/// here too.
 ///
-/// Returns `Ok(())` when nothing concurrently-deleted can match (including an empty concurrent-removed set).
-/// On the first conflict it returns a NON-retryable [`ErrorKind::DataInvalid`] error naming the filter + the
-/// conflicting file path, so the commit retry loop stops and the error propagates (Java's non-retryable
-/// `ValidationException`).
+/// # Errors
 ///
-/// **Conservative posture (documented):** the per-file [`InclusiveMetricsEvaluator`] over-approximates —
-/// it can only over-REJECT (treat a non-matching deletion as a conflict), never under-reject, so it is safe
-/// under serializable isolation. The walk's op set matches Java member-for-member, `REPLACE` included, so a
-/// concurrent compaction's removals are scanned here too.
+/// A NON-retryable [`ErrorKind::DataInvalid`] naming the filter and the conflicting path, so the
+/// commit retry loop stops.
 pub(crate) async fn validate_deleted_data_files(
     current: &Table,
     effective_start: Option<i64>,
@@ -2546,15 +2283,11 @@ fn first_conflicting_file(
 
 #[cfg(test)]
 mod multispec_tests {
-    //! Multi-spec producer tests (Java `MergingSnapshotProducer` / `FastAppend` per-spec manifest
-    //! groups). Driven end-to-end through the `fast_append` / `row_delta` actions — the realistic path
-    //! that exercises `SnapshotProducer::write_added_manifests` / `write_added_delete_manifests` and the
-    //! lifted `validate_added_data_files` / `validate_added_delete_files`.
+    //! Multi-spec producer tests, driven end to end through the `fast_append` and `row_delta`
+    //! actions so they exercise the real per-spec manifest grouping and validation.
     //!
-    //! Fixtures: a V2 minimal table partitioned by `identity(x)` (spec 0), evolved by `add_field("y")`
-    //! to spec 1 = `identity(x) + identity(y)`. A file under spec 0 carries a 1-field partition `(x)`; a
-    //! file under spec 1 carries a 2-field partition `(x, y)`. Both specs stay resolvable after the
-    //! evolution, so a single commit can add files under both.
+    //! The fixture is a V2 table on `identity(x)` as spec 0, evolved to `identity(x) + identity(y)`
+    //! as spec 1. Both specs stay resolvable, so one commit can add files under both.
 
     use std::collections::HashMap;
 
