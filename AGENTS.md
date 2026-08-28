@@ -93,9 +93,9 @@ capability's *status*, the **GAP_MATRIX** (re-audited against the live base) win
    [.agents/skills/engineering-method/SKILL.md](.agents/skills/engineering-method/SKILL.md), the
    portable agent-agnostic working method (one instruction set for every model tier; it replaced
    the per-tier manuals 2026-08-24); precedence is in `<precedence>` below.
-4. **The SEPMO control plane** — [skills/sepmo/SKILL.md](skills/sepmo/SKILL.md) (the
+4. **The SEPMO control plane** — [.agents/skills/sepmo/SKILL.md](.agents/skills/sepmo/SKILL.md) (the
    lifecycle/governance shell: scope audit + 100% gate, Actor–Critic execution, PR-grouping,
-   delivery, retrospective) and [skills/sepmo/binding-manifest.md](skills/sepmo/binding-manifest.md)
+   delivery, retrospective) and [.agents/skills/sepmo/binding-manifest.md](.agents/skills/sepmo/binding-manifest.md)
    (how it binds to this repo). SEPMO governs *lifecycle*; this file and the engineering method win
    the *engineering contract* and all conflicts (see `<precedence>`).
 5. **[task/lessons.md](task/lessons.md) in full, then [task/todo.md](task/todo.md)** — accumulated
@@ -130,16 +130,17 @@ One chain, highest authority first:
 4. **The engineering method**
    ([.agents/skills/engineering-method/](.agents/skills/engineering-method/map.md)) — the portable
    engineering defaults; this file is repo-specific and wins over it.
-5. **SEPMO** ([skills/sepmo/](skills/sepmo/)) — **lifecycle and orchestration only**.
+5. **SEPMO** ([.agents/skills/sepmo/](.agents/skills/sepmo/)) — **lifecycle and orchestration only**.
 
 SEPMO **cedes the engineering contract** to this file and to the manuals; this file and the manuals
 **cede lifecycle/orchestration** (the scope audit, the gates, the Actor–Critic loop, PR-grouping,
 delivery, retrospective) to SEPMO. When a SEPMO rule conflicts with a higher item, the higher item
 wins and SEPMO is corrected.
 
-**The adapters are not in the chain.** [CLAUDE.md](CLAUDE.md) and [.agents/](.agents/map.md) hold
-tool mechanics only and state no project rule, so they cannot conflict with this chain. A rule found
-in an adapter is a bug: move it here and leave a pointer.
+**The adapters are not in the chain.** [CLAUDE.md](CLAUDE.md) and the adapter entry points under
+[.agents/](.agents/map.md) hold tool mechanics only and state no project rule. The SEPMO package
+under `.agents/skills/` is the lifecycle control plane named at precedence level 5, not an adapter.
+A rule found in an adapter is a bug: move it here and leave a pointer.
 
 </precedence>
 
@@ -521,7 +522,7 @@ relax the rules above.
 - **Tests ship with the change**, plus interop tests where applicable (see the Parity mandate and the
   manuals' §4 Done gate). The testing-discipline contract is [docs/testing.md](docs/testing.md).
 - **Keep `map.md` in lockstep** with the directories that use it (see `<map_md_navigation>`).
-- **Follow the operating manual for your tier** ([skills/](skills/)) — Risk-First, naming, the
+- **Follow the engineering method** ([.agents/skills/engineering-method/](.agents/skills/engineering-method/SKILL.md)) — Risk-First, naming, the
   Rust rules, the debugging protocol, and the verification gate. This file wins on conflict.
 - **Review procedures live as skills, not as a second contract.**
   [.agents/skills/map.md](.agents/skills/map.md) is the roster; each skill points back here for

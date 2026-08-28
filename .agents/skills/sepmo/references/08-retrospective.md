@@ -36,11 +36,11 @@ Its mandate: three steps performed as one scoped change.
 2. **The metrics ledger** — file the quantitative metric set (below) at the location bound by
    `../binding-manifest.md` (`metrics_ledger_location`). T12's guard is "metrics ledger
    complete"; a retrospective without metrics has not run.
-3. **Compaction pass** — run `../../compaction.md` as written.
+3. **Compaction pass** — run `../../compaction/SKILL.md` as written.
 
 The Retrospective is a thin seam. It contributes the feed-forward step; everything else — the
 PROMOTE/KEEP/ARCHIVE triage, the conservation gate, the agentic-pace recency amendment, the archive
-layout, the done gate, the anti-patterns — lives in `../../compaction.md` and is not restated here.
+layout, the done gate, the anti-patterns — lives in `../../compaction/SKILL.md` and is not restated here.
 The binding that makes the connection load-bearing: `../binding-manifest.md` row *Memory /
 lessons* — "Retrospective runs a compaction pass."
 
@@ -66,7 +66,7 @@ missed, or had to escalate is in them.
 Before opening `task/lessons.md`, scan the adversarial artifacts for entries that name a *class* of
 problem — not "this PR-unit had a concurrency bug" but "the Actor consistently mishandled concurrent
 write paths." Class-level observations are PROMOTE candidates per the promotability tests in
-`../../compaction.md`; instance-level observations are ARCHIVE candidates.
+`../../compaction/SKILL.md`; instance-level observations are ARCHIVE candidates.
 
 ### Artifacts to mine
 
@@ -83,7 +83,7 @@ today, and mark it with a provisional verdict (PROMOTE or KEEP).
 ### Feeding the candidates into the compaction pass
 
 Add the drafted lessons to `task/lessons.md` **before** running the triage step of
-`../../compaction.md`. They enter as new entries and are subject to the same PROMOTE/KEEP/ARCHIVE
+`../../compaction/SKILL.md`. They enter as new entries and are subject to the same PROMOTE/KEEP/ARCHIVE
 triage as every existing entry — the feed-forward populates the candidate pool; the compaction pass
 adjudicates verdicts.
 
@@ -159,16 +159,16 @@ incident's mechanism is named in the section body.
 
 ## Step 3 — compaction pass
 
-Run `../../compaction.md` as written. Every rule in that file applies unchanged:
+Run `../../compaction/SKILL.md` as written. Every rule in that file applies unchanged:
 
 - The trigger that fires for a Retrospective pass is typically *phase boundary* (trigger 2 in
-  `../../compaction.md`) — the completed charter set is a natural archive line.
+  `../../compaction/SKILL.md`) — the completed charter set is a natural archive line.
 - The conservation gate, the agentic-pace recency amendment, the archive layout, the promotion
-  mechanics, the done-gate checklist, and the anti-patterns are all owned by `../../compaction.md`.
+  mechanics, the done-gate checklist, and the anti-patterns are all owned by `../../compaction/SKILL.md`.
   Read them there; do not proceed without reading them.
-- Promotion targets are those in `../../compaction.md` *Promotion targets* table — read them there;
+- Promotion targets are those in `../../compaction/SKILL.md` *Promotion targets* table — read them there;
   Retrospective adds none.
-- Run the pass as its own scoped change per `../../compaction.md` *Procedure* step 1.
+- Run the pass as its own scoped change per `../../compaction/SKILL.md` *Procedure* step 1.
 
 ---
 
@@ -198,9 +198,9 @@ RETROSPECTIVE_LOG:
     promotions:
       - lesson: <one-line summary>
         target: >
-          # the lesson's canonical home, per ../../compaction.md *Promotion targets*
+          # the lesson's canonical home, per ../../compaction/SKILL.md *Promotion targets*
   conservation_check: RECONCILED | FAILED
-  # see ../../compaction.md *Procedure* step 7 and *Done gate*
+  # see ../../compaction/SKILL.md *Procedure* step 7 and *Done gate*
   completed_at: <ISO date>
 ```
 
@@ -225,7 +225,7 @@ RETROSPECTIVE_LOG:
 - Updated `task/lessons.md` (feed-forward entries added + KEEP survivors after compaction)
 - New `task/lessons-archive/<scope>.md` (ARCHIVE entries moved verbatim)
 - Promotion edits to each target file named in `promotions` (in the same change, per
-  `../../compaction.md` *Promotion targets*)
+  `../../compaction/SKILL.md` *Promotion targets*)
 
 ---
 
@@ -233,7 +233,7 @@ RETROSPECTIVE_LOG:
 
 The Retrospective is the terminal state (T12), and its exit guard is **metrics ledger
 complete** — learnings without metrics do not exit. When the METRICS section is filed,
-`conservation_check: RECONCILED`, and the compaction done gate (`../../compaction.md`, *Done gate
+`conservation_check: RECONCILED`, and the compaction done gate (`../../compaction/SKILL.md`, *Done gate
 for a compaction pass*) is clean, the run is complete. The charter is fulfilled; the metrics are
 filed; the memory is compacted; the lessons are filed. (An incident retrospective is not
 terminal — it files its section and hands the remediation unit back to the machine.)

@@ -21,12 +21,11 @@
 
 ## Purpose
 
-Tool-neutral and per-tool **adapter** entry points for automated agents. Every file here carries
-**zero authoritative facts** — each is a thin pointer into the authoritative spine
-([AGENTS.md](../AGENTS.md), with [Roadmap.md](../Roadmap.md) for the plan and
-[docs/parity/GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md) for capability status). Adapters cannot
-drift, and deleting any one loses no project knowledge. A rule stated in an adapter is a bug: move
-it to [AGENTS.md](../AGENTS.md) and leave a pointer.
+Tool-neutral **adapter** entry points and agent-facing skills. Adapter files carry zero
+authoritative facts: each points into [AGENTS.md](../AGENTS.md), [Roadmap.md](../Roadmap.md), or
+[docs/parity/GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md). The skills directory also contains the
+SEPMO lifecycle control plane, whose precedence is defined by AGENTS.md. A rule stated in an adapter
+is a bug: move it to AGENTS.md and leave a pointer.
 
 ## Contents
 
@@ -35,7 +34,7 @@ it to [AGENTS.md](../AGENTS.md) and leave a pointer.
 | `common.md` | The shared, tool-neutral start: read AGENTS.md first, then the spine. No rules. |
 | `claude.md` | Points Claude sessions at [../CLAUDE.md](../CLAUDE.md) and the portable working method in [skills/engineering-method/](skills/engineering-method/map.md). |
 | `codex.md`, `cursor.md` | One-line stubs pointing inward; no tool mechanics recorded yet. |
-| `skills/` | Agent-facing skills — the portable engineering method (formerly the per-tier manuals), the lessons-compaction procedure, the Rust code-quality review, and the test-adequacy evidence procedure. Each is a directory with a frontmatter-carrying `SKILL.md`, so it is discoverable rather than merely present, and `../.claude/skills` symlinks here so Claude sessions can invoke them natively. See [skills/map.md](skills/map.md). |
+| `skills/` | Agent-facing skills: the engineering method, lessons compaction, Rust code-quality review, test-adequacy evidence procedure, and SEPMO lifecycle control plane. `../.claude/skills` symlinks here for native discovery. See [skills/map.md](skills/map.md). |
 
 ## I want to...
 
@@ -52,8 +51,7 @@ it to [AGENTS.md](../AGENTS.md) and leave a pointer.
 
 - **Up:** [../AGENTS.md](../AGENTS.md) (there is no repo-root `map.md`; the spine is the top).
 - **Related:** [../CLAUDE.md](../CLAUDE.md) (the Claude adapter), [../.claude/map.md](../.claude/map.md)
-  (Claude's discovery directory), [../skills/map.md](../skills/map.md) (the SEPMO control plane —
-  a separate tree, not part of this one).
+  (Claude's discovery directory), [skills/map.md](skills/map.md) (the skill roster).
 
 ## Debug
 

@@ -19,10 +19,10 @@
 
 # SEPMO metrics ledger
 
-The location bound by [skills/sepmo/binding-manifest.md](../skills/sepmo/binding-manifest.md)
+The location bound by [.agents/skills/sepmo/binding-manifest.md](../.agents/skills/sepmo/binding-manifest.md)
 (`metrics_ledger_location`). **One section per retrospective** — charter-close or incident — in
 the canonical `METRICS` format owned by
-[skills/sepmo/references/08-retrospective.md](../skills/sepmo/references/08-retrospective.md)
+[.agents/skills/sepmo/references/08-retrospective.md](../.agents/skills/sepmo/references/08-retrospective.md)
 (*Step 2 — the metrics ledger*), including `environment_drift_events` (spine v2.1+). Append-only;
 sections are never rewritten, only superseded by later sections.
 
@@ -87,7 +87,7 @@ METRICS:
 
 **Feed-forward filed (asymmetric — bar-raising landed 2026-07-26):** the
 `contingency_mechanics` binding row in
-[skills/sepmo/binding-manifest.md](../skills/sepmo/binding-manifest.md) (additive-only
+[.agents/skills/sepmo/binding-manifest.md](../.agents/skills/sepmo/binding-manifest.md) (additive-only
 contingencies; halt on failed contingency; remove-or-remand for bundle groups) + canon v2.3
 proposal (R11/R12/R13) in the CCR, awaiting user ratification at the master home
 (`~/Desktop/Sepmo`).
@@ -108,7 +108,7 @@ the fork-instance baseline at `a6199ca5` — SKILL.md cmp-identical; the templat
 stripping the fork copy's ASF header, which the master deliberately does not carry) and the kit
 relocated to `~/Desktop/Sepmo-octo-kit/`
 (value preserved; its install script re-pointed). No instance impact — this repo's
-`skills/sepmo/` and the coordination hub were untouched.
+`.agents/skills/sepmo/` and the coordination hub were untouched.
 
 ```yaml
 METRICS:
@@ -142,7 +142,7 @@ this repo bound to the default (the spine's own Critic stage). Lineage reconcili
 as deliberate coexistence**: each version's deltas are applied per lineage in that lineage's own
 wording, neither imported over the other, with only the spine byte-identical — the standing rule
 now lives in the *Debug* list of
-[skills/sepmo/binding-manifest.md](../skills/sepmo/binding-manifest.md). Version-controlling the
+[.agents/skills/sepmo/binding-manifest.md](../.agents/skills/sepmo/binding-manifest.md). Version-controlling the
 master home **DEFERRED by the user** — it stays ungoverned, so a dated pre-change copy
 (`~/Desktop/Sepmo-v2.2-archive` for this one) is the only diff baseline a canon change gets.
 

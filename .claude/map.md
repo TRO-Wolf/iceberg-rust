@@ -23,17 +23,16 @@
 
 Claude Code's discovery directory, and nothing else. It holds **one tracked entry**: `skills`, a
 symlink to `../.agents/skills`. Claude Code loads skills only from `.claude/skills/`, so without the
-symlink the review procedures in [../.agents/skills/](../.agents/skills/map.md) are readable files
+symlink the packages in [../.agents/skills/](../.agents/skills/map.md) are readable files
 that no session can invoke by name.
 
-The symlink is the whole point: the skills keep their single home under `.agents/`, where the
-tool-neutral zero-authoritative-facts contract applies to them, and Claude gains native invocation
-without a copy that could drift. Any other agent tool that wants the same should add its own symlink
-here or in its own discovery directory rather than duplicating a skill.
+The symlink is the whole point: the skills keep their single home under `.agents/`, and Claude gains
+native invocation without a copy that could drift. AGENTS.md defines each skill's authority; SEPMO
+owns lifecycle only. Any other agent tool that wants the same should add its own discovery link
+rather than duplicating a skill.
 
-This directory carries **zero authoritative facts**, the same contract as
-[../.agents/](../.agents/map.md). The rules live in [../AGENTS.md](../AGENTS.md); the Claude tool
-mechanics live in [../CLAUDE.md](../CLAUDE.md).
+This directory adds no authoritative facts. The rules live in [../AGENTS.md](../AGENTS.md); the
+Claude tool mechanics live in [../CLAUDE.md](../CLAUDE.md).
 
 ## Contents
 

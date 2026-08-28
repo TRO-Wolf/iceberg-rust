@@ -19,8 +19,10 @@
 
 # Plan / Todo
 
-The current plan for in-flight work. The operating manuals ([skills/](../skills/)) require this file
-to be written **before** any non-trivial change and kept current as work proceeds.
+The current plan for in-flight work. The operating manuals
+([SEPMO](../.agents/skills/sepmo/SKILL.md) and the
+[engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
+**before** any non-trivial change and kept current as work proceeds.
 
 How to use it (see the manuals' §1):
 
@@ -30,6 +32,29 @@ How to use it (see the manuals' §1):
 - Leave an `Outcome:` / `Done:` note when the work lands.
 
 ---
+
+## ACTIVE (2026-08-28): relocate SEPMO into `.agents/skills/`
+
+Scope ledger: C-001 `PROVEN` — `.agents/skills/` is the canonical agent-skill home and Claude
+discovers it through `.claude/skills`. C-002 `PROVEN` — the complete SEPMO package moves as one
+unit. C-003 `PROVEN` — every legacy SEPMO pointer retargets. C-004 `PROVEN` — package-relative
+links account for the extra directory depth. C-005 `PROVEN` — canon and binding content stay
+unchanged except for paths. C-006 `PROVEN` — validation includes skill, link, stale-pointer, license,
+and repository gates. The user's request is the approval gate for this charter.
+
+- [x] Move the complete SEPMO package to `.agents/skills/sepmo/` and retire the empty `skills/` index.
+  - All 12 package files moved, and the former root `skills/` directory no longer exists.
+- [x] Retarget repository-contract, adapter, license, map, task, and archive pointers.
+  - Repository-wide scans find no pointer to the former root location.
+- [x] Repair depth-sensitive links inside the moved package without changing its governance rules.
+  - The spine and binding template remain byte-identical; only routing paths changed elsewhere.
+- [x] Validate skill structure, every Markdown link, and the absence of stale legacy paths.
+  - All 107 package links and all 125 links added by this change resolve.
+- [x] Run the repository gates and an independent Critic.
+  - The Critic converged with no blocking findings. The full retry passed all 4,509 tests.
+
+Outcome: SEPMO now has one canonical home under `.agents/skills/`. Its governance spine and binding
+template are byte-identical, all changed links resolve, and the former root `skills/` tree is retired.
 
 ## QUEUED (2026-08-28): F-17 shared-Puffin deletion-vector closure
 

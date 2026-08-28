@@ -517,8 +517,8 @@ SEPMO installation (pre-ledger lineage, installed 2026-06-15/25) up to the new m
 LIGHT criteria 1/3 fail; uncertain routes STANDARD anyway). Docs-only: no crate code, no matrix
 row.
 
-- [x] **1. Canon lands verbatim** — `skills/sepmo/SKILL.md` replaced with the v2.2 spine
-      (frontmatter `version: "2.2"`); NEW `skills/sepmo/binding-manifest.template.md` (the
+- [x] **1. Canon lands verbatim** — `.agents/skills/sepmo/SKILL.md` replaced with the v2.2 spine
+      (frontmatter `version: "2.2"`); NEW `.agents/skills/sepmo/binding-manifest.template.md` (the
       portable template; ASF header prepended per the sibling convention — the one sanctioned
       local touch, matching how every references/ file carries it).
       - Caveat, disclosed for the PR: the canon text was transcribed from the user's message,
@@ -526,7 +526,7 @@ row.
         master before merge. Canon defect FILED (manifest Debug): the spine's *Model
         assumption* carries a "For this repo ... single-agent default" instantiation artifact;
         not patched locally, does not bind (manifest + CLAUDE.md win).
-- [x] **2. Manifest re-instantiated** — `skills/sepmo/binding-manifest.md` rebuilt per the
+- [x] **2. Manifest re-instantiated** — `.agents/skills/sepmo/binding-manifest.md` rebuilt per the
       template protocol: role rows all BIND (existing homes), `spine_version: v2.2`, tunables
       bound (two-tier `green_commands` + CI-only exception record + parity-guard-absence
       justification, `severity_floor: S2` raise with provenance, hard-break
@@ -548,7 +548,7 @@ row.
 - [x] **4. New artifacts + navigation** — CREATE `task/sepmo-metrics.md` (the bound metrics
       ledger, ref-08 metric set, no sections yet — first one lands with the first
       retrospective; the 2026-07-11 nightly-interop CI failure is pre-named as the first
-      `environment_drift_events` candidate); refresh `skills/sepmo/map.md` in the same change.
+      `environment_drift_events` candidate); refresh `.agents/skills/sepmo/map.md` in the same change.
       Fixed in passing (in-scope files): two pre-existing broken `../../CLAUDE.md` links in
       the refs 04/05 repo-note boxes (needed three levels up from `references/`).
 - [x] **5. Gate + independent Critic → push** — DONE 2026-07-13: round-2 re-attestation
@@ -1042,5 +1042,4 @@ Phase-4 format exotica) was proposed but is an **open user decision — do not a
   the fork to near-full 1:1 Java parity — recorded in Roadmap.md (decision record item 5 + the
   re-sequenced headline areas). Originating narrative:
   [todo-archive/2026-06_ops-hardening.md](todo-archive/2026-06_ops-hardening.md)._
-
 

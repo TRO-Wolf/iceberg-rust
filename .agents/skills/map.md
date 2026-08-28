@@ -24,13 +24,12 @@
 Agent-facing **skills**: the portable working method plus step-by-step sequences for recurring
 judgement and maintenance work, written for any tool's agent. Each skill is a directory holding a `SKILL.md` with YAML frontmatter (`name`,
 `version`, and a `description` that says when to reach for it **and when not to**) — the same shape
-as [skills/sepmo/SKILL.md](../../skills/sepmo/SKILL.md) — so a skill is discoverable and invocable
+as [sepmo/SKILL.md](sepmo/SKILL.md) — so a skill is discoverable and invocable
 rather than a file an agent has to already know to open.
 
-A skill records a proven *sequence*; it defines no policy and carries no authoritative project fact.
-Every rule it leans on is a pointer into [AGENTS.md](../../AGENTS.md) or the doc each step cites,
-and on any conflict those win. That keeps the `.agents/` zero-authoritative-facts contract intact:
-deleting a skill loses a convenience, never a project truth.
+The procedural skills record proven sequences and define no policy. SEPMO is the explicit exception:
+it is the versioned lifecycle control plane and project binding named at precedence level 5 in
+[AGENTS.md](../../AGENTS.md). The engineering contract still wins every conflict.
 
 **Claude discovers these through a symlink.** [../../.claude/skills](../../.claude/map.md) points at
 this directory (git mode `120000`), because Claude Code loads skills only from `.claude/skills/`.
@@ -49,6 +48,7 @@ here (this file, each skill's `map.md`) carries the ASF header normally.
 | [compaction/](compaction/map.md) | The lessons-compaction procedure for [task/lessons.md](../../task/lessons.md) (and the todo-archival analogue): lifecycle (PROMOTE / KEEP / ARCHIVE), triggers, archive layout, conservation gate. Its own scoped change, interactive-approval-only. Moved 2026-08-24 from `skills/compaction.md`. |
 | [rust-code-quality/](rust-code-quality/map.md) | The Rust review procedure for what the gates cannot catch: on-disk format stability, divergence from Java `iceberg-core`, panics and value-path casts (neither is armed in this workspace), broken error chains, lock discipline, unbounded recursion. Severity ordered for a table-format library — silent corruption of already-written tables outranks everything. Also carries the authoring pass for [AGENTS.md](../../AGENTS.md) "Comments and prose". That pass is why AGENTS.md read order loads this skill for every Actor and every Critic, not for review alone. |
 | [test-adequacy/](test-adequacy/map.md) | The evidence discipline behind a coverage claim: apply the mutation rather than predict it, one knob at a time, and state the population next to every number. Carries the green-vacuity patterns that have each produced a false green here, the sabotage hard-fail rule, and the chained-gate rule. |
+| [sepmo/](sepmo/map.md) | The SEPMO governance-and-orchestration control plane: scope audit, Actor–Critic execution, PR grouping, delivery, retrospective, and the binding manifest that maps its abstract roles to this repo. |
 
 ## I want to...
 
@@ -56,6 +56,7 @@ here (this file, each skill's `map.md`) carries the ASF header normally.
 |---|---|
 | Read the working method before writing or reviewing code | [engineering-method/SKILL.md](engineering-method/SKILL.md) |
 | Compact the lessons file / find an archived lesson | [compaction/SKILL.md](compaction/SKILL.md) |
+| Run the SEPMO lifecycle or Actor–Critic protocol | [sepmo/SKILL.md](sepmo/SKILL.md) |
 | Review a Rust PR or commit | [rust-code-quality/SKILL.md](rust-code-quality/SKILL.md) "Quick start" |
 | Know how much to comment, and in what English | the rule is [AGENTS.md](../../AGENTS.md) "Comments and prose"; the sequence is [rust-code-quality/SKILL.md](rust-code-quality/SKILL.md) "Comment discipline — the authoring pass" |
 | Decide where Java bytecode evidence belongs | [AGENTS.md](../../AGENTS.md) "Comments and prose" — the ledger under [task/](../../task/), never a doc comment |
@@ -69,9 +70,7 @@ here (this file, each skill's `map.md`) carries the ASF header normally.
 
 - **Up:** [../map.md](../map.md)
 - **Related:** [../../AGENTS.md](../../AGENTS.md) (every rule these skills cite),
-  [../../docs/testing.md](../../docs/testing.md) (the testing-discipline contract),
-  [../../skills/map.md](../../skills/map.md) (the SEPMO control plane — a separate tree, deliberately
-  **not** covered by the `.claude/skills` symlink).
+  [../../docs/testing.md](../../docs/testing.md) (the testing-discipline contract).
 
 ## Debug
 
@@ -79,7 +78,7 @@ here (this file, each skill's `map.md`) carries the ASF header normally.
 
 | Symptom | Likely cause |
 |---|---|
-| A skill states a project rule | Bug — move the rule to [../../AGENTS.md](../../AGENTS.md), leave a pointer (`.agents/` contract) |
+| A procedural skill states a project rule | Bug — move the rule to [../../AGENTS.md](../../AGENTS.md) and leave a pointer. SEPMO owns lifecycle only. |
 | A checklist item duplicates an armed gate | Bug — delete the item and cite the gate; a duplicated item is how a real finding gets skimmed past |
 | A skill will not load in a Claude session | `ls -l ../../.claude/skills` must resolve here, and the `SKILL.md` must carry `name` + `description` frontmatter |
 | CI's license-header check reds on a new `SKILL.md` | Its `paths-ignore` entry is missing from [.licenserc.yaml](../../.licenserc.yaml) |
@@ -87,9 +86,9 @@ here (this file, each skill's `map.md`) carries the ASF header normally.
 
 ### First checks
 
-- Did you read [../../AGENTS.md](../../AGENTS.md) first? A skill is a sequence, never a contract.
+- Did you read [../../AGENTS.md](../../AGENTS.md) first? It defines the contract and SEPMO's lifecycle-only precedence.
 
 ### Escalate to
 
 - Conflicts / precedence → [../../AGENTS.md](../../AGENTS.md) `<precedence>`.
-- Lifecycle and the Actor–Critic protocol → [../../skills/sepmo/SKILL.md](../../skills/sepmo/SKILL.md).
+- Lifecycle and the Actor–Critic protocol → [sepmo/SKILL.md](sepmo/SKILL.md).

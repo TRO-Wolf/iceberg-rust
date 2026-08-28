@@ -20,7 +20,7 @@
 # SEPMO canon change request — CCR-2026-08-25 (the Actor dispatch pointer)
 
 **Status: DRAFT — awaiting user ratification.** Canon changes land only by amendment at the master
-home (`~/Desktop/Sepmo/`); this repo's `skills/sepmo/` is an instance bound at `spine_version: v2.3`.
+home (`~/Desktop/Sepmo/`); this repo's `.agents/skills/sepmo/` is an instance bound at `spine_version: v2.3`.
 This CCR **stacks behind CCR-2026-07-26**, whose v2.3 text is itself unratified on
 `infra/sepmo-g4-feedforward`. The repo-side gates listed under *What already landed* are
 bar-raising and are independent of ratification.
@@ -36,7 +36,7 @@ fresh-context Actor. It reads:
 The tier manuals were deleted on 2026-08-24 by #220, which generalized them into
 [.agents/skills/engineering-method/SKILL.md](../.agents/skills/engineering-method/SKILL.md). So the
 prompt directs the Actor to a document that does not exist, and it names none of the three documents
-the *Engineering contract* row of [binding-manifest.md](../skills/sepmo/binding-manifest.md) actually
+the *Engineering contract* row of [binding-manifest.md](../.agents/skills/sepmo/binding-manifest.md) actually
 binds: AGENTS.md, the engineering-method skill, and the `rust-code-quality` skill.
 
 The obligation was never in doubt. AGENTS.md `<read_order>` states "Every Actor and every Critic in
@@ -86,7 +86,7 @@ For 04-actor.md the replacement text is:
 > "outstanding engineering" means, not restated here. Read it and build to it: the priority stack
 > (correctness → clarity → production-readiness), the Risk-First mindset, tests-with-code as a hard
 > gate, and the language-specific rules. The *Engineering contract* row of the binding manifest
-> (`skills/sepmo/binding-manifest.md`) names the exact files; read every one before you edit.
+> (`.agents/skills/sepmo/binding-manifest.md`) names the exact files; read every one before you edit.
 
 The manifest row stays the single home for WHICH files. The prompt gains the one hop that makes it
 resolvable.

@@ -22,7 +22,7 @@
 ## Purpose
 
 Verbatim archive of **completed-increment narratives** moved out of [`../todo.md`](../todo.md) by the
-todo-archival pass (procedure: [`../../skills/compaction.md`](../../skills/compaction.md) §Todo
+todo-archival pass (procedure: [compaction/SKILL.md](../../.agents/skills/compaction/SKILL.md) §Todo
 Archival). One file per Roadmap phase. **Not session-start reading** — the live `todo.md` is the plan;
 these are the shipped history, read on demand (a Carried-forward pointer routes you here, or you are
 reconstructing why a shipped increment did what it did).
@@ -50,7 +50,7 @@ reconstructing why a shipped increment did what it did).
 | why a shipped write action behaves as it does | [phase2.md](phase2.md) (grep the action name) |
 | the residual / inspection / interop increment notes | [phase3.md](phase3.md) |
 | the schema/partition/snapshot evolution increment notes | [phase1.md](phase1.md) |
-| the archival procedure / how to run the next pass | [`../../skills/compaction.md`](../../skills/compaction.md) §Todo Archival |
+| the archival procedure / how to run the next pass | [compaction/SKILL.md](../../.agents/skills/compaction/SKILL.md) §Todo Archival |
 
 ## Pointers
 
@@ -89,7 +89,7 @@ reconstructing why a shipped increment did what it did).
 |---|---|---|
 | A heading seems missing after a pass | a section assigned to no destination, or hand-copied | re-run the conservation check (`grep -c '^## '` / `'^### '` across the live file + all archives vs the pre-pass file); they must reconcile with no duplicates |
 | A `[ ]` item looks "lost" | it was stale (superseded) and archived with its section, not surfaced as live | grep the phase archive for the item; if its work shipped under a renumbered `[x]` increment, it is correctly archived, not lost |
-| The live file is growing again | new completed narratives accumulating since the last pass | run the next pass when `todo.md` passes the size trigger (~500 lines) — see [`../../skills/compaction.md`](../../skills/compaction.md) §Todo Archival |
+| The live file is growing again | new completed narratives accumulating since the last pass | run the next pass when `todo.md` passes the size trigger (~500 lines) — see [compaction/SKILL.md](../../.agents/skills/compaction/SKILL.md) §Todo Archival |
 
 ### First checks
 
@@ -98,5 +98,5 @@ reconstructing why a shipped increment did what it did).
 
 ### Escalate to
 
-[`../../skills/compaction.md`](../../skills/compaction.md) §Todo Archival (the procedure + done gate),
+[compaction/SKILL.md](../../.agents/skills/compaction/SKILL.md) §Todo Archival (the procedure + done gate),
 then [`../../CLAUDE.md`](../../CLAUDE.md) (precedence).
