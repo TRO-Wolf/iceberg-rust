@@ -618,7 +618,7 @@ impl Catalog for S3TablesCatalog {
     ) -> Result<Table> {
         Err(Error::new(
             ErrorKind::FeatureUnsupported,
-            "Registering a table is not supported yet",
+            "S3 Tables has no register-by-metadata-location operation: the Iceberg REST register endpoint is not in the service mapping, and UpdateTableMetadataLocation requires a URI under the table warehouse (GAP_MATRIX row R126)",
         ))
     }
 

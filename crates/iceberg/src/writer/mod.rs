@@ -283,6 +283,7 @@
 pub mod base_writer;
 pub mod file_writer;
 pub mod partitioning;
+pub(crate) mod write_defaults;
 
 use arrow_array::RecordBatch;
 

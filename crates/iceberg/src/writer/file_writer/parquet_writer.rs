@@ -97,14 +97,13 @@ impl ParquetWriterBuilder {
 impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
-    async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
-        // Refuse a variant-bearing schema HERE, before any bytes are written. The conversion below
-        // no longer throws (row R88), which had moved the refusal to `close` — after the flush.
-        reject_variant_write(self.schema.as_ref())?;
+    fn iceberg_schema(&self) -> Option<&crate::spec::SchemaRef> {
+        Some(&self.schema)
+    }
 
-        // Detect once at build time: only run the NaN visitor when the schema has float/double
-        // leaves under a counts-collecting metrics mode. Int/string/timestamp-only tables skip
-        // the full schema walk on every batch.
+    async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
+        // Refuse variant before any bytes land (row R88 conversion no longer throws).
+        reject_variant_write(self.schema.as_ref())?;
         let collect_nan_value_counts =
             schema_needs_nan_value_counts(self.schema.as_ref(), &self.metrics_config);
         Ok(ParquetWriter {
