@@ -31,6 +31,17 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-28): F-14 Hadoop metadata pointer math
+
+Parse and bump Hadoop `vN.metadata.json` on `MetadataLocation`. New GAP_MATRIX row R167.
+
+- [x] Parse `vN.metadata.json` (and gzip names). Next pointer is `v(N+1).metadata.json`.
+- [x] Hive/REST `<version>-<uuid>` is unchanged.
+- [x] `register_table` of a v3 pointer then a commit writes v4.
+- [x] Independent Critic (C1 CONVERGED; C2 F-F14-2 pins + F-F14-1 residue on row R167). Gates + PR.
+
+---
+
 ## ACTIVE (2026-08-27): F-9 S3 Tables register_table + F-15 write_default
 
 One PR. F-9 is a dated service-gap ruling (S3 Tables has no register-by-metadata-location API).

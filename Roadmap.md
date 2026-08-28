@@ -481,7 +481,7 @@ the standing router: one row per item, the matrix row(s) that own it, and the en
 whose flip is the acceptance. **Status lives in the matrix, never here** — a row here says
 where to look and what closes the item, not how far along it is. Each landed batch returns to
 the engine as one repin unit (handoff §5); the engine's RP-2 takes everything landed through
-#233. As of 2026-08-27 only F-14 is open on this side.
+#235.
 
 | Item | The ask, in one line | Owning row(s) | Closes when |
 |---|---|---|---|
@@ -489,7 +489,7 @@ the engine as one repin unit (handoff §5); the engine's RP-2 takes everything l
 | F-7 | row lineage carried through every row rewrite (compaction, COW DML); DV-aware delete maintenance; dangling-DV removal on compaction | R107, R166 (lineage); R135, R136, R137 (maintenance) | landed here in full — U1+U2 lineage (#225, #226, 2026-08-25), U3 `RewritePositionDeleteFiles` on v3 (#227), DV removal accounting (#232, 2026-08-27); what remains is the engine's lift of its `V3-LINEAGE-1` / `V3-COW-1` / `B-MOR-3` guards at repin, measured by Spark read-back |
 | F-9 | S3 Tables `register_table` — implement, or a dated permanent service-gap ruling | R126 | closed: dated service-gap ruling on the row (#233, 2026-08-27); the engine guide cites it at repin |
 | F-13 | Puffin deletion-vector write path, reachable from the DataFusion merge-on-read arm | R114 | landed 2026-08-24 (#219, #221, #222); the engine's v3 MOR pin flips at repin |
-| F-14 | `MetadataLocation` next-pointer math for Hadoop-convention `vN.metadata.json` names (Java `HadoopTableOperations` 1.10.0), or a dated gap ruling | none yet — the unit adds a row (catalog/table-ops area, near R126) | **the next fork unit.** Closes on parse + next-version pointer + a write after `register_table` of a Hadoop-named metadata file, proven offline; Spark Hadoop-catalog interop is the engine pin `call_register_table_of_hadoop_named_metadata_writes_name_the_convention`, retargeted at repin |
+| F-14 | `MetadataLocation` next-pointer math for Hadoop-convention `vN.metadata.json` names (Java `HadoopTableOperations` 1.10.0), or a dated gap ruling | R167 | the engine pin `call_register_table_of_hadoop_named_metadata_writes_name_the_convention` retargets after Spark Hadoop-catalog interop |
 | F-15 | the v3 schema-model delta — `variant`, `geometry`/`geography`, `timestamp_ns`/`timestamptz_ns`, `unknown`, column defaults — through metadata and Parquet IO, one row per type | R88, R89, R90, R91, R92 (the Phase 4 V3 slate) | closed for the engine's purposes: every type has a row that is ✅ or a dated "not yet"; the `write_default` fill landed in `DataFileWriter::write` (#233, 2026-08-27); each row names its own residue. The engine's V3-6 consumes the surface at repin |
 | F-16 | `RewriteDataFiles` delete-RATIO candidate clause (Java `DELETE_RATIO_THRESHOLD_DEFAULT = 0.3`, `tooHighDeleteRatio`) | R135 | landed 2026-08-27 (#232); the engine's MW-7 1e7×50 pin flips at repin |
 
