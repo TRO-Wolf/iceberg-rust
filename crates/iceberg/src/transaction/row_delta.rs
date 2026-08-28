@@ -69,13 +69,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};
+use crate::delete_file_index::is_deletion_vector;
 use crate::error::Result;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::{Bind, Predicate};
-use crate::spec::{
-    DataContentType, DataFile, ManifestContentType, ManifestEntry, ManifestFile, Operation, Struct,
-};
+use crate::spec::{DataContentType, DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
@@ -97,7 +95,8 @@ pub struct RowDeltaAction {
     /// Validated like fast append, and must be `Data` content.
     added_data_files: Vec<DataFile>,
     /// Position or equality deletes. They go into a DELETE manifest.
-    added_delete_files: Vec<DataFile>,
+    /// `Some(seq)` is an explicit data sequence (Java `addFile(DeleteFile, long)`).
+    added_delete_files: Vec<(DataFile, Option<i64>)>,
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
@@ -172,7 +171,21 @@ impl RowDeltaAction {
     /// Java has a separate `DeleteFile` type. Here both kinds are [`DataFile`] and the content type
     /// separates them. Each file must be `PositionDeletes` or `EqualityDeletes` content.
     pub fn add_deletes(mut self, delete_files: impl IntoIterator<Item = DataFile>) -> Self {
-        self.added_delete_files.extend(delete_files);
+        self.added_delete_files
+            .extend(delete_files.into_iter().map(|file| (file, None)));
+        self
+    }
+
+    /// Add a DELETE file with an explicit data sequence number (Java `addFile(DeleteFile, long)`).
+    ///
+    /// A rewritten sibling DV keeps the original data seq so its applicability window is unchanged.
+    pub fn add_delete_file_with_sequence_number(
+        mut self,
+        delete_file: DataFile,
+        sequence_number: i64,
+    ) -> Self {
+        self.added_delete_files
+            .push((delete_file, Some(sequence_number)));
         self
     }
 
@@ -339,7 +352,7 @@ impl RowDeltaAction {
     /// Returns `DataInvalid` when an added DV has no referenced data file.
     fn added_dvs_by_referenced_file(&self) -> Result<HashMap<String, &DataFile>> {
         let mut referenced = HashMap::new();
-        for delete_file in &self.added_delete_files {
+        for (delete_file, _) in &self.added_delete_files {
             if !is_deletion_vector(delete_file) {
                 continue;
             }
@@ -469,142 +482,12 @@ impl RowDeltaAction {
     /// Returns `DataInvalid` when a live delete would be shadowed without being removed.
     async fn validate_fresh_dvs_only(&self, table: &Table) -> Result<()> {
         let added_dvs = self.added_dvs_by_referenced_file()?;
-        if added_dvs.is_empty() {
-            return Ok(());
-        }
-
-        // Shadowing a live position-scoped delete is legal only when this commit removes it. Java keys
-        // `DeleteFileSet` on location, so a removed file matches the live entry by path.
-        let removed_delete_paths: HashSet<&str> = self
-            .removed_delete_files
-            .iter()
-            .map(|file| file.file_path())
-            .collect();
-
-        let Some(snapshot) = table.metadata().current_snapshot() else {
-            return Ok(());
-        };
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), &table.metadata_ref())
-            .await?;
-
-        // Parquet-delete applicability below is decided against the referenced data file's live entry,
-        // not against the added DV's own metadata. Collect spec id, partition, and sequence number.
-        let mut live_data_entry_by_path: HashMap<String, (i32, Struct, Option<i64>)> =
-            HashMap::new();
-        for manifest_file in manifest_list.entries() {
-            if manifest_file.content != ManifestContentType::Data {
-                continue;
-            }
-            let manifest = manifest_file.load_manifest(table.file_io()).await?;
-            for entry in manifest.entries() {
-                if !entry.is_alive() {
-                    continue;
-                }
-                let file = entry.data_file();
-                if added_dvs.contains_key(file.file_path()) {
-                    live_data_entry_by_path.insert(
-                        file.file_path().to_string(),
-                        (
-                            file.partition_spec_id,
-                            file.partition().clone(),
-                            entry.sequence_number(),
-                        ),
-                    );
-                }
-            }
-        }
-
-        for manifest_file in manifest_list.entries() {
-            if manifest_file.content != ManifestContentType::Deletes {
-                continue;
-            }
-            let manifest = manifest_file.load_manifest(table.file_io()).await?;
-            for entry in manifest.entries() {
-                if !entry.is_alive() {
-                    continue;
-                }
-                let existing = entry.data_file();
-                if existing.content_type() != DataContentType::PositionDeletes {
-                    // A DV supersedes position deletes only, so equality deletes coexist with it.
-                    continue;
-                }
-
-                // A delete file this commit removes is superseded on purpose, so it does not block the
-                // new DV. `process_deletes` tombstones it in the rewritten DELETE manifest.
-                if removed_delete_paths.contains(existing.file_path()) {
-                    continue;
-                }
-
-                if is_deletion_vector(existing) {
-                    // A live DV for the same data file would make two DVs for that file.
-                    if let Some(referenced) = existing.referenced_data_file()
-                        && added_dvs.contains_key(&referenced)
-                    {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Cannot commit deletion vector for {}: the current snapshot already \
-                                 carries a live deletion vector for that data file ({}). Read it \
-                                 back with delete_vector::load_delete_vector, merge it through \
-                                 DVFileWriter::with_previous_deletes, and pass the superseded file \
-                                 to RowDelta::remove_deletes_many in THIS commit (Java \
-                                 BaseDVFileWriter.loadPreviousDeletes + RowDelta.removeDeletes). \
-                                 Committing as-is would leave two DVs for one data file, which the \
-                                 scan rejects",
-                                referenced,
-                                dv_desc(existing)
-                            ),
-                        ));
-                    }
-                } else {
-                    // The new DV would silently supersede a legacy parquet position delete at read
-                    // time. The test mirrors the read path against the referenced file's live data
-                    // entry. See this function's doc comment for the rule.
-                    for referenced in added_dvs.keys() {
-                        let Some((data_spec_id, data_partition, data_seq)) =
-                            live_data_entry_by_path.get(referenced)
-                        else {
-                            continue;
-                        };
-                        // Java `ContentFileUtil.referencedDataFile` also derives the data file from
-                        // equal `file_path` bounds. Most Java-written file-granularity position
-                        // deletes leave the field unset. Read the field alone and every one of them
-                        // looks partition-scoped, so one stamped under another spec passes this door.
-                        let scope_matches = match referenced_data_file_location(existing) {
-                            Some(path) => &path == referenced,
-                            None => {
-                                existing.partition_spec_id == *data_spec_id
-                                    && existing.partition() == data_partition
-                            }
-                        };
-                        // The read-path sequence filter. An unknown sequence counts as applying, so
-                        // the door errs toward rejection.
-                        let applies = scope_matches
-                            && match (entry.sequence_number(), *data_seq) {
-                                (Some(delete_seq), Some(data_seq)) => delete_seq >= data_seq,
-                                _ => true,
-                            };
-                        if applies {
-                            return Err(Error::new(
-                                ErrorKind::DataInvalid,
-                                format!(
-                                    "Cannot commit deletion vector for {}: live position delete file \
-                                     {} still applies to that data file and would be silently \
-                                     superseded by the DV at read time. Merging previous deletes into \
-                                     the new DV (Java BaseDVFileWriter.loadPreviousDeletes) is deferred \
-                                     in this port",
-                                    referenced,
-                                    existing.file_path()
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        super::row_delta_fresh_dv::validate_fresh_dvs_only(
+            table,
+            &added_dvs,
+            &self.removed_delete_files,
+        )
+        .await
     }
 
     /// Reject a `Data`-content file in the removed-delete set. Java `RowDelta.removeDeletes` takes
@@ -654,6 +537,19 @@ impl TransactionAction for RowDeltaAction {
         // Java's `removeDeletes` takes a delete file, so a `Data` file here means the caller wanted
         // `removeRows`. Reject before the producer exists, because the producer guards only added files.
         self.validate_removed_delete_files()?;
+        for (_, sequence_number) in &self.added_delete_files {
+            if let Some(sequence_number) = sequence_number
+                && *sequence_number < 0
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot add delete file with negative data sequence number {sequence_number}; \
+                         a negative value would be stripped into sequence-number inheritance"
+                    ),
+                ));
+            }
+        }
 
         let snapshot_producer = SnapshotProducer::new(
             table,
@@ -663,8 +559,21 @@ impl TransactionAction for RowDeltaAction {
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
         )
-        .with_added_delete_files(self.added_delete_files.clone())
         .with_removed_delete_files(self.removed_delete_files.clone());
+        let snapshot_producer = if self
+            .added_delete_files
+            .iter()
+            .any(|(_, sequence)| sequence.is_some())
+        {
+            snapshot_producer.with_added_delete_files_with_seq(self.added_delete_files.clone())
+        } else {
+            snapshot_producer.with_added_delete_files(
+                self.added_delete_files
+                    .iter()
+                    .map(|(file, _)| file.clone())
+                    .collect(),
+            )
+        };
 
         // These run against the REFRESHED base, because `do_commit` re-bases first. A concurrent format
         // upgrade therefore re-gates the buffered files, which is where Java applies the version gate.

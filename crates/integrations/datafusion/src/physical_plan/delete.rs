@@ -25,11 +25,11 @@
 //! The original DataFusion `WHERE` is the contract. Iceberg pushdown is inexact and would over-delete.
 //! Copy-on-write is two-pass: the affected set must be complete before the first survivor is written.
 //! Both passes read one frozen snapshot. Conflict filter is `AlwaysTrue`. A zero-match DML commits nothing.
-//!
 //! | Path | Always validates | Serializable adds |
 //! |---|---|---|
 //! | copy-on-write DELETE and UPDATE | no conflicting deletes | no conflicting data |
-//! | merge-on-read DELETE | referenced data files exist | no conflicting data files |
+//! | merge-on-read DELETE (V2) | referenced data files exist; skip `Operation::Delete` | no conflicting data files |
+//! | merge-on-read DELETE (V3) | every replacement DV reference exists, including copied siblings; `validate_deleted_files` (F-17, named Java skip-delete divergence) | no conflicting data files |
 //! | merge-on-read UPDATE | files exist, deleted files, no conflicting delete files | no conflicting data files |
 
 use std::collections::{HashMap, HashSet};
@@ -51,7 +51,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::TryStreamExt;
 use iceberg::Catalog;
 use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator};
-use iceberg::delete_vector::load_delete_vector;
+use iceberg::delete_vector_container::{DvContainerClose, close_touched_dv_containers};
 use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::spec::{
@@ -61,15 +61,12 @@ use iceberg::spec::{
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::base_writer::deletion_vector_writer::{
-    DVFileWriter, DVWriteResult, PreviousDeletes,
-};
 use iceberg::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
 };
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
+    DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
@@ -333,16 +330,34 @@ async fn write_merge_on_read_deletes(
     table: &Table,
     kind: MergeOnReadDeleteKind,
     pairs: &[(String, i64)],
-) -> DFResult<(Vec<DataFile>, Vec<DataFile>)> {
+) -> DFResult<DvContainerClose> {
     match kind {
-        MergeOnReadDeleteKind::PositionDeletes => {
-            Ok((write_position_deletes(table, pairs).await?, Vec::new()))
-        }
-        MergeOnReadDeleteKind::DeletionVectors => {
-            let result = write_deletion_vectors(table, pairs).await?;
-            Ok((result.delete_files, result.rewritten_delete_files))
-        }
+        MergeOnReadDeleteKind::PositionDeletes => Ok(DvContainerClose {
+            added: write_position_deletes(table, pairs)
+                .await?
+                .into_iter()
+                .map(|file| (file, None))
+                .collect(),
+            removed: Vec::new(),
+        }),
+        MergeOnReadDeleteKind::DeletionVectors => write_deletion_vectors(table, pairs).await,
     }
+}
+
+fn apply_dv_container_close(
+    mut action: iceberg::transaction::RowDeltaAction,
+    close: DvContainerClose,
+) -> iceberg::transaction::RowDeltaAction {
+    for (file, sequence) in close.added {
+        action = match sequence {
+            Some(sequence) => action.add_delete_file_with_sequence_number(file, sequence),
+            None => action.add_deletes([file]),
+        };
+    }
+    if !close.removed.is_empty() {
+        action = action.remove_deletes_many(close.removed);
+    }
+    action
 }
 
 /// Sorts position-delete pairs into the ascending order the Iceberg spec requires. The concurrent
@@ -463,25 +478,30 @@ async fn merge_on_read_delete(
 
     // The §5 `validate_data_files_exist` set. Java arms this for every command, DELETE included: a
     // referenced file rewritten away by a concurrent commit would silently lose these deletes.
-    let referenced_files: HashSet<String> = pairs.iter().map(|(path, _)| path.clone()).collect();
-
-    let (delete_files, superseded_delete_files) =
-        write_merge_on_read_deletes(table, delete_kind, &pairs).await?;
+    let close = write_merge_on_read_deletes(table, delete_kind, &pairs).await?;
+    // V3 container close copies sibling references, so files-exist must cover every replacement.
+    let referenced_files = if close
+        .added
+        .iter()
+        .any(|(file, _)| file.file_format() == DataFileFormat::Puffin)
+    {
+        close.referenced_data_files()
+    } else {
+        pairs.iter().map(|(path, _)| path.clone()).collect()
+    };
 
     // §5 row-delta recipe, MoR DELETE. `AlwaysTrue` is Java-exact because this path pushes no filter
-    // into the scan. DELETE does not arm the deleted-files checks; Java arms those for UPDATE and
-    // MERGE only.
+    // into the scan. V3 shared-Puffin closure arms deleted-files checks (F-17 C-013); V2 keeps
+    // Java's skip-delete default.
     let tx = Transaction::new(table);
     let mut action = tx
         .row_delta()
-        .add_deletes(delete_files)
         .conflict_detection_filter(Predicate::AlwaysTrue)
         .validate_data_files_exist(referenced_files);
-    // A merged DV supersedes the one it absorbed. Leaving that one live would double-count its
-    // positions, and V3 allows only one DV per data file.
-    if !superseded_delete_files.is_empty() {
-        action = action.remove_deletes_many(superseded_delete_files);
+    if delete_kind == MergeOnReadDeleteKind::DeletionVectors {
+        action = action.validate_deleted_files();
     }
+    action = apply_dv_container_close(action, close);
     if let Some(snapshot_id) = scan_snapshot_id {
         action = action.validate_from_snapshot(snapshot_id);
     }
@@ -1097,20 +1117,19 @@ fn legacy_position_delete_applies(
         }
 }
 
-/// Writes the deletion vectors for `pairs` — the V3 merge-on-read delete output. One Puffin file
-/// carries one blob per data file touched, so the writer splits by referenced data file instead of
-/// grouping by partition. Each DV carries its data file's own `PartitionKey`.
-async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFResult<DVWriteResult> {
-    let metadata = table.metadata();
-    let schema = metadata.current_schema();
+/// Writes the deletion vectors for `pairs` — the V3 merge-on-read delete output. Shared Puffins
+/// close as one container so an untouched sibling blob is not tombstoned.
+async fn write_deletion_vectors(
+    table: &Table,
+    pairs: &[(String, i64)],
+) -> DFResult<DvContainerClose> {
     let path_to_partition = live_data_file_partitions(table).await?;
+    let live = live_delete_vectors_by_data_file(table).await?;
 
-    // Resolve every PartitionKey BEFORE opening the Puffin file, so an unresolvable one cannot
-    // leave a fully written, unreferenced Puffin on storage.
-    let mut partition_key_by_path: HashMap<&str, PartitionKey> = HashMap::new();
     let mut resolved: Vec<(&str, i32, Struct, Option<i64>)> = Vec::new();
+    let mut seen = HashSet::new();
     for (path, _) in pairs {
-        if partition_key_by_path.contains_key(path.as_str()) {
+        if !seen.insert(path.as_str()) {
             continue;
         }
         let (spec_id, partition, data_seq) = path_to_partition.get(path).cloned().ok_or_else(|| {
@@ -1118,28 +1137,9 @@ async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFRes
                 "deletion-vector: data file `{path}` is not a live file of the current snapshot, so its partition cannot be resolved"
             ))
         })?;
-        let spec = metadata
-            .partition_spec_by_id(spec_id)
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "deletion-vector: data file references unknown partition spec {spec_id}"
-                ))
-            })?
-            .as_ref()
-            .clone();
-        let partition_key = PartitionKey::new(spec, schema.clone(), partition.clone())
-            .map_err(to_datafusion_error)?;
-        partition_key_by_path.insert(path.as_str(), partition_key);
         resolved.push((path.as_str(), spec_id, partition, data_seq));
     }
 
-    // Java's `loadPreviousDeletes` runs per touched path, so a data file with only previous deletes
-    // and no new position is never visited and keeps its DV.
-    let live = live_delete_vectors_by_data_file(table).await?;
-
-    // Refuse a data file still covered by a Parquet position delete BEFORE the Puffin is opened.
-    // Java unions those positions into the new DV; this port reads DVs only. The commit door also
-    // rejects it, but only after an unreferenced Puffin reached storage.
     for (path, spec_id, partition, data_seq) in &resolved {
         let covered = live.legacy_position_deletes.iter().any(|delete| {
             legacy_position_delete_applies(delete, path, *spec_id, partition, *data_seq)
@@ -1154,47 +1154,19 @@ async fn write_deletion_vectors(table: &Table, pairs: &[(String, i64)]) -> DFRes
         }
     }
 
-    let mut previous_deletes_by_path: HashMap<String, PreviousDeletes> = HashMap::new();
-    for path in partition_key_by_path.keys() {
-        let Some(existing) = live.dv_by_data_file.get(*path) else {
-            continue;
-        };
-        let positions = load_delete_vector(table.file_io(), existing)
-            .await
-            .map_err(to_datafusion_error)?;
-        previous_deletes_by_path.insert(
-            (*path).to_string(),
-            PreviousDeletes::new(positions, vec![existing.clone()]),
-        );
-    }
-
-    let location_gen =
-        DefaultLocationGenerator::new(metadata.clone()).map_err(to_datafusion_error)?;
-    let file_name_gen = DefaultFileNameGenerator::new(
-        "dv".to_string(),
-        Some(uuid::Uuid::now_v7().to_string()),
-        DataFileFormat::Puffin,
-    );
-    // The Puffin file spans every partition this delete touches, so it is not partition-scoped.
-    let location = location_gen.generate_location(None, &file_name_gen.generate_file_name());
-    let output_file = table
-        .file_io()
-        .new_output(&location)
-        .map_err(to_datafusion_error)?;
-
-    let mut writer = DVFileWriter::new(output_file).with_previous_deletes(previous_deletes_by_path);
+    let mut new_positions: HashMap<String, Vec<u64>> = HashMap::new();
     for (path, position) in pairs {
         let position = u64::try_from(*position).map_err(|_| {
             DataFusionError::Internal(format!(
                 "deletion-vector: negative row position {position} for data file `{path}`"
             ))
         })?;
-        writer
-            .delete(path, position, partition_key_by_path.get(path.as_str()))
-            .map_err(to_datafusion_error)?;
+        new_positions
+            .entry(path.clone())
+            .or_default()
+            .push(position);
     }
-    writer
-        .close_with_result()
+    close_touched_dv_containers(table, &new_positions)
         .await
         .map_err(to_datafusion_error)
 }
@@ -1710,32 +1682,33 @@ async fn merge_on_read_update(
         return Ok(0);
     }
 
-    // The §5 `validate_data_files_exist` set, which Java arms unconditionally.
-    let referenced_files: HashSet<String> = pairs.iter().map(|(path, _)| path.clone()).collect();
-
     // Grouping and sorting need the whole pair set up front. Both sides complete BEFORE the single
     // commit below.
     sort_position_delete_pairs(&mut pairs);
-    let (delete_files, superseded_delete_files) =
-        write_merge_on_read_deletes(table, delete_kind, &pairs).await?;
+    let close = write_merge_on_read_deletes(table, delete_kind, &pairs).await?;
+    let referenced_files = if close
+        .added
+        .iter()
+        .any(|(file, _)| file.file_format() == DataFileFormat::Puffin)
+    {
+        close.referenced_data_files()
+    } else {
+        pairs.iter().map(|(path, _)| path.clone()).collect()
+    };
     let data_files = data_writer.finish().await?;
 
     // §5 row-delta recipe, MoR UPDATE. UPDATE arms the deleted-files checks at BOTH levels, because
     // the op READ the rows it rewrote: a concurrent delete of them conflicts. Java arms these for
-    // UPDATE and MERGE only, never DELETE.
+    // UPDATE and MERGE only, never DELETE. V3 also covers sibling references from container close.
     let tx = Transaction::new(table);
     let mut action = tx
         .row_delta()
         .add_data_files(data_files)
-        .add_deletes(delete_files)
         .conflict_detection_filter(Predicate::AlwaysTrue)
         .validate_data_files_exist(referenced_files)
         .validate_deleted_files()
         .validate_no_conflicting_delete_files();
-    // See the MoR DELETE path: a merged DV supersedes the one it absorbed.
-    if !superseded_delete_files.is_empty() {
-        action = action.remove_deletes_many(superseded_delete_files);
-    }
+    action = apply_dv_container_close(action, close);
     if let Some(snapshot_id) = scan_snapshot_id {
         action = action.validate_from_snapshot(snapshot_id);
     }

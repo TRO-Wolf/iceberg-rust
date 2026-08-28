@@ -103,6 +103,7 @@ mod utils;
 pub mod writer;
 
 pub mod delete_vector;
+pub mod delete_vector_container;
 pub mod metadata_columns;
 pub mod puffin;
 pub mod variant;

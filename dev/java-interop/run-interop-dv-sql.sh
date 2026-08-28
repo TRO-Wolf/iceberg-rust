@@ -40,33 +40,65 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TMP="${SCRIPT_DIR}/target/interop-dv-sql"
 
-echo "==> [1/3] Reset the temp dir: ${TMP}"
+echo "==> [1/7] Reset the temp dir: ${TMP}"
 rm -rf "${TMP}"
 mkdir -p "${TMP}"
 
-echo "==> [2/3] Rust: three SQL DELETE statements on a V3 MoR table -> Puffin DVs + final.metadata.json"
+echo "==> [2/7] Rust: sequential DELETE + shared-Puffin DELETE/UPDATE GEN"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_DV_SQL_GEN_DIR="${TMP}" \
     cargo test -p iceberg-datafusion --test interop_dv_sql -- --nocapture
 )
 
-echo "==> [3/3] Java: read the RUST-SQL-COMMITTED V3+DV table with the PRODUCTION scan"
 # The verdict comes from the OUTPUT (success sentinel present, no per-check FAIL line), never from
 # mvn's exit code -- `mvn exec:java` does not propagate System.exit. `|| true` keeps `set -e` from
 # aborting before the diagnostics are echoed.
-VERIFY_OUT="$(
+verify_dv_sql() {
+  local dir="$1"
+  local label="$2"
+  local out
+  out="$(
+    cd "${SCRIPT_DIR}"
+    JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
+      PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:$PATH \
+      /opt/maven/bin/mvn -o -q compile exec:java \
+      -Dexec.args=verify-interop-dv-sql \
+      -Dinterop.dv_sql.dir="${dir}" 2>&1
+  )" || true
+  echo "${out}"
+  if echo "${out}" | grep -q '^FAIL ' || ! echo "${out}" | grep -q 'verify-interop-dv-sql: 0 failures'; then
+    echo "==> FAILED -- Java could not correctly read ${label}."
+    exit 1
+  fi
+}
+
+echo "==> [3/7] Java: read the sequential SQL DELETE table"
+verify_dv_sql "${TMP}" "the sequential SQL DELETE table"
+
+echo "==> [4/7] Java: read the shared-Puffin SQL DELETE table"
+verify_dv_sql "${TMP}/shared_puffin" "the shared-Puffin SQL DELETE table"
+
+echo "==> [5/7] Java: read the shared-Puffin SQL UPDATE table"
+verify_dv_sql "${TMP}/shared_puffin_update" "the shared-Puffin SQL UPDATE table"
+
+echo "==> [6/7] Java: write a shared-Puffin table via BaseDVFileWriter"
+(
   cd "${SCRIPT_DIR}"
   JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
     PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:$PATH \
     /opt/maven/bin/mvn -o -q compile exec:java \
-    -Dexec.args=verify-interop-dv-sql \
-    -Dinterop.dv_sql.dir="${TMP}" 2>&1
-)" || true
-echo "${VERIFY_OUT}"
-if echo "${VERIFY_OUT}" | grep -q '^FAIL ' || ! echo "${VERIFY_OUT}" | grep -q 'verify-interop-dv-sql: 0 failures'; then
-  echo "==> FAILED -- Java could not correctly read the V3 deletion-vector table Rust's SQL DELETE committed."
-  exit 1
-fi
+    -Dexec.args=generate-interop-dv-table \
+    -Dinterop.dv_table.dir="${TMP}/java_shared"
+)
+
+echo "==> [7/7] Rust DELETE against the Java-written shared Puffin; Java reads the result"
+(
+  cd "${REPO_ROOT}"
+  ICEBERG_INTEROP_DV_SQL_JAVA_SHARED="${TMP}/java_shared" \
+    cargo test -p iceberg-datafusion --test interop_dv_sql \
+    test_dv_sql_consume_java_written_shared_puffin -- --exact --nocapture
+)
+verify_dv_sql "${TMP}/java_shared/after_delete" "Rust DELETE of the Java-written shared Puffin"
 
 echo "==> interop-dv-sql PASSED"

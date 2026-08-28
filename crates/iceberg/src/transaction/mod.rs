@@ -35,7 +35,6 @@
 //! // the newly updated `Transaction`.
 //! let tx = action.apply(tx).unwrap();
 //!
-//!
 //! // End the transaction by committing to an `iceberg::Catalog`
 //! // implementation. This will cause a table update to occur.
 //! let table = tx
@@ -93,6 +92,7 @@ mod rewrite_manifests;
 // `Transaction::rewrite_manifests()` and `maintenance::Actions::rewrite_manifests()`.
 pub use rewrite_manifests::RewriteManifestsAction;
 mod row_delta;
+mod row_delta_fresh_dv;
 pub use row_delta::RowDeltaAction;
 mod snapshot;
 mod staged_table;
