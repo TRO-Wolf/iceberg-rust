@@ -31,6 +31,19 @@ How to use it (see the manuals' §1):
 
 ---
 
+## QUEUED (2026-08-28): F-17 shared-Puffin deletion-vector closure
+
+GAP_MATRIX row R114 owns capability status. The detailed scope and evidence gates live in
+[`f17-shared-puffin-dv-closure-ledger.md`](f17-shared-puffin-dv-closure-ledger.md).
+
+- [ ] Freeze the current source base. Prove every scope proposition in the ledger on that base.
+- [ ] Reproduce the two-file shared-Puffin live-row failure through the production reader.
+- [ ] Present the final charter and exact public surface to the owner. Do not write code before approval.
+- [ ] Extract one core-owned container-closure primitive with full output-reference validation and
+      per-entry sequence semantics for maintenance and DataFusion DML.
+- [ ] Pin `DELETE` and `UPDATE` with the full regression matrix, Java read-back, and a red mutation.
+- [ ] Run the repository gates and an independent Critic. Update row R114 only from measured evidence.
+
 ## ACTIVE (2026-08-28): F-14 Hadoop metadata pointer math
 
 Parse and bump Hadoop `vN.metadata.json` on `MetadataLocation`. New GAP_MATRIX row R167.

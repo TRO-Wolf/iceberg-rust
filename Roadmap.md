@@ -344,7 +344,7 @@ detail and live status live in [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRI
 
   | V3 axis | Row | What is left |
   |---|---|---|
-  | Deletion vectors (write, read, commit door, engine MOR) | R114 | F-13 closed 2026-08-24; three engine-facing bounds on the row |
+  | Deletion vectors (write, read, commit door, engine MOR) | R114 | F-17 routes shared-Puffin DML container closure; read status and residues on row R114 |
   | Column default values | R92 | `write_default` is set but consumed nowhere under `writer/` |
   | `timestamp_ns` / `timestamptz_ns` | R90 | nothing on the type itself |
   | `unknown` | R91 | data-file always-null I/O, deferred-loud |
@@ -488,10 +488,11 @@ the engine as one repin unit (handoff §5); the engine's RP-2 takes everything l
 | F-3 | `RewriteDataFiles` drops dangling deletes and reports a true `removed_delete_files_count` | R135, R137 | landed 2026-08-23; the engine stops hard-coding `0` at its next repin |
 | F-7 | row lineage carried through every row rewrite (compaction, COW DML); DV-aware delete maintenance; dangling-DV removal on compaction | R107, R166 (lineage); R135, R136, R137 (maintenance) | landed here in full — U1+U2 lineage (#225, #226, 2026-08-25), U3 `RewritePositionDeleteFiles` on v3 (#227), DV removal accounting (#232, 2026-08-27); what remains is the engine's lift of its `V3-LINEAGE-1` / `V3-COW-1` / `B-MOR-3` guards at repin, measured by Spark read-back |
 | F-9 | S3 Tables `register_table` — implement, or a dated permanent service-gap ruling | R126 | closed: dated service-gap ruling on the row (#233, 2026-08-27); the engine guide cites it at repin |
-| F-13 | Puffin deletion-vector write path, reachable from the DataFusion merge-on-read arm | R114 | landed 2026-08-24 (#219, #221, #222); the engine's v3 MOR pin flips at repin |
+| F-13 | Puffin deletion-vector write path, reachable from the DataFusion merge-on-read arm | R114 | the DataFusion V3 merge-on-read arm writes and commits DVs; F-17 owns shared-container closure before the engine repins |
 | F-14 | `MetadataLocation` next-pointer math for Hadoop-convention `vN.metadata.json` names (Java `HadoopTableOperations` 1.10.0), or a dated gap ruling | R167 | the engine pin `call_register_table_of_hadoop_named_metadata_writes_name_the_convention` retargets after Spark Hadoop-catalog interop |
 | F-15 | the v3 schema-model delta — `variant`, `geometry`/`geography`, `timestamp_ns`/`timestamptz_ns`, `unknown`, column defaults — through metadata and Parquet IO, one row per type | R88, R89, R90, R91, R92 (the Phase 4 V3 slate) | closed for the engine's purposes: every type has a row that is ✅ or a dated "not yet"; the `write_default` fill landed in `DataFileWriter::write` (#233, 2026-08-27); each row names its own residue. The engine's V3-6 consumes the surface at repin |
 | F-16 | `RewriteDataFiles` delete-RATIO candidate clause (Java `DELETE_RATIO_THRESHOLD_DEFAULT = 0.3`, `tooHighDeleteRatio`) | R135 | landed 2026-08-27 (#232); the engine's MW-7 1e7×50 pin flips at repin |
+| F-17 | shared-Puffin deletion-vector container closure for DataFusion V3 merge-on-read `DELETE` and `UPDATE` | R114 | a Spark-written shared-Puffin fixture survives Rust `DELETE` and `UPDATE` with exact Java read-back, and disabling sibling carry-forward makes the regression fail |
 
 ---
 
