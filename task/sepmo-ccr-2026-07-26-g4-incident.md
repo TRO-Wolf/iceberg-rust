@@ -21,14 +21,14 @@
 
 **Status: RATIFIED by the user 2026-07-26.** Canon changes land only by amendment at the master
 home (spine, *Global conventions — versioned canon*). The master home on this machine is
-`~/Desktop/Sepmo/`; this repo's `skills/sepmo/` was an instance bound at `spine_version: v2.2`.
+`~/Desktop/Sepmo/`; this repo's `.agents/skills/sepmo/` was an instance bound at `spine_version: v2.2`.
 The amendment text below landed at the master as **canon v2.3** — spine + changelog + the five
 reference amendments + the template's `critic_engine` row — and this repo re-bound as its own
 SEPMO unit (verbatim spine copy, reference amendments, manifest version bump + instantiation
 checklist) in `infra/sepmo-v2-3-rebind`, the same flow as the 2026-07-13 v2.2 install.
 **Repo-side bar-raising bindings had landed earlier**, under the asymmetric feed-forward rule and
 independent of ratification: the `contingency_mechanics` row in
-[skills/sepmo/binding-manifest.md](../skills/sepmo/binding-manifest.md) (stamped 2026-07-26) and
+[.agents/skills/sepmo/binding-manifest.md](../.agents/skills/sepmo/binding-manifest.md) (stamped 2026-07-26) and
 the first incident section in [task/sepmo-metrics.md](sepmo-metrics.md).
 
 ## The incident (evidence)
@@ -198,7 +198,7 @@ into the adoption protocol below as a deliberate two-lineage reconciliation.
 
 ## What already landed (asymmetric feed-forward, stamped 2026-07-26, ratification-independent)
 
-- `skills/sepmo/binding-manifest.md` — new `contingency_mechanics` tunables row binding this
+- `.agents/skills/sepmo/binding-manifest.md` — new `contingency_mechanics` tunables row binding this
   repo to additive-only contingencies, halt-on-failed-contingency, and the explicit
   remove-or-remand rule for bundles; plus a Debug-section canon-gap filing pointing here.
 - `task/sepmo-metrics.md` — the ledger's first populated section: this incident,

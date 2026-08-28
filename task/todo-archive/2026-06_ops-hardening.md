@@ -60,7 +60,7 @@ highest-judgment interop debt. Decision record + rationale: Roadmap.md §"Operat
 sprint (2026-06-09)".
 
 **Ordering constraints (load-bearing):**
-- [skills/compaction.md](../skills/compaction.md) routes promoted lessons into directory
+- [compaction/SKILL.md](../../.agents/skills/compaction/SKILL.md) routes promoted lessons into directory
   `map.md#debug` sections → **A (maps) must land before B (lessons compaction)**.
 - The terse GAP_MATRIX cells produced by D link to archived increment narratives → **C (todo
   archival) must land before D (de-triplication)**.
@@ -90,8 +90,8 @@ sprint (2026-06-09)".
         Applied the intent (protect in-flight context): all 22 same-day (2026-06-09) entries +
         older entries feeding open work KEPT; landed-and-merged increment narratives archived.
         Codified as the "agentic-pace amendment" in skills/compaction.md.
-      - **Prerequisite discovered:** `skills/Fable.md`, `skills/compaction.md`, and the updated
-        `skills/map.md` from the prior Fable session were never committed — added verbatim from
+      - **Prerequisite discovered:** `skills/Fable.md`, `.agents/skills/compaction/SKILL.md`, and the updated
+        `.agents/skills/map.md` from the prior Fable session were never committed — added verbatim from
         the pasted bundle (separate commit on the same branch so the compaction diff stays pure);
         CLAUDE.md read order now names Fable.md.
 - [ ] **C — todo.md archival (own PR).** First WRITE the procedure (a todo-archival section in
@@ -117,5 +117,3 @@ sprint (2026-06-09)".
 **Explicitly NOT decided:** the "platform cut line" through the GAP_MATRIX (which rows block the
 user's trading platform vs continuous-parity backlog, incl. re-ordering maintenance actions ahead of
 Phase-4 format exotica) was proposed but is an **open user decision — do not assume it.**
-
-

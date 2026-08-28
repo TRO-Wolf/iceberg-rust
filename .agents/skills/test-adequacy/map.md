@@ -56,7 +56,7 @@ win.
 ## Pointers
 
 - **Up:** [../map.md](../map.md)
-- **Related:** [../../../skills/sepmo/references/05-critic.md](../../../skills/sepmo/references/05-critic.md)
+- **Related:** [../sepmo/references/05-critic.md](../sepmo/references/05-critic.md)
   (the Critic stage that must apply these mutations rather than read someone else's arithmetic);
   [../../../AGENTS.md](../../../AGENTS.md) `<subagent_policy>` (why the Critic is independent).
 

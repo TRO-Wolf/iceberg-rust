@@ -17,15 +17,15 @@
   ~ under the License.
 -->
 
-# map.md — skills/sepmo/
+# map.md — .agents/skills/sepmo/
 
 ## Purpose
 
 The **SEPMO control plane**: the portable governance-and-orchestration shell that drives a project
 from idea → audited scope → orchestrated Actor–Critic execution → PR → delivery → retrospective.
 SEPMO governs *lifecycle*; it **cedes the engineering contract** to the engineering-method skill
-([.agents/skills/engineering-method/SKILL.md](../../.agents/skills/engineering-method/SKILL.md))
-and obeys [AGENTS.md](../../AGENTS.md) on every conflict. Read [SKILL.md](SKILL.md)
+([.agents/skills/engineering-method/SKILL.md](../engineering-method/SKILL.md))
+and obeys [AGENTS.md](../../../AGENTS.md) on every conflict. Read [SKILL.md](SKILL.md)
 (the spine) **after** the root `AGENTS.md` and the engineering method; read
 [binding-manifest.md](binding-manifest.md) to see how SEPMO's abstract roles bind to this repo.
 
@@ -54,16 +54,16 @@ and obeys [AGENTS.md](../../AGENTS.md) on every conflict. Read [SKILL.md](SKILL.
 | Port SEPMO to another repo | instantiate [binding-manifest.template.md](binding-manifest.template.md) there |
 | Audit a new brief / plan before any code | [references/01-scope-auditor.md](references/01-scope-auditor.md) |
 | Run the pre-action review | [references/03-self-logic-review.md](references/03-self-logic-review.md) |
-| File retrospective metrics / an incident retrospective | [references/08-retrospective.md](references/08-retrospective.md) → [task/sepmo-metrics.md](../../task/sepmo-metrics.md) |
-| Find the engineering contract (what to build under) | [AGENTS.md](../../AGENTS.md) + the [engineering-method skill](../../.agents/skills/engineering-method/SKILL.md) — SEPMO does not restate it |
-| Find the plan / capability status | [Roadmap.md](../../Roadmap.md) + [docs/parity/GAP_MATRIX.md](../../docs/parity/GAP_MATRIX.md) (via the manifest) |
-| Resolve a SEPMO-vs-repo conflict | [AGENTS.md](../../AGENTS.md) `<precedence>` (it wins) |
+| File retrospective metrics / an incident retrospective | [references/08-retrospective.md](references/08-retrospective.md) → [task/sepmo-metrics.md](../../../task/sepmo-metrics.md) |
+| Find the engineering contract (what to build under) | [AGENTS.md](../../../AGENTS.md) + the [engineering-method skill](../engineering-method/SKILL.md) — SEPMO does not restate it |
+| Find the plan / capability status | [Roadmap.md](../../../Roadmap.md) + [docs/parity/GAP_MATRIX.md](../../../docs/parity/GAP_MATRIX.md) (via the manifest) |
+| Resolve a SEPMO-vs-repo conflict | [AGENTS.md](../../../AGENTS.md) `<precedence>` (it wins) |
 
 ## Pointers
 
-- **Up:** repo root [AGENTS.md](../../AGENTS.md); the skills index [skills/map.md](../map.md).
-- **Related:** the [engineering-method skill](../../.agents/skills/engineering-method/SKILL.md); [task/](../../task/) (plan + lessons);
-  [docs/testing.md](../../docs/testing.md) (the Done gate).
+- **Up:** repo root [AGENTS.md](../../../AGENTS.md); the skills index [.agents/skills/map.md](../map.md).
+- **Related:** the [engineering-method skill](../engineering-method/SKILL.md); [task/](../../../task/) (plan + lessons);
+  [docs/testing.md](../../../docs/testing.md) (the Done gate).
 
 ## Debug
 
@@ -72,14 +72,14 @@ and obeys [AGENTS.md](../../AGENTS.md) on every conflict. Read [SKILL.md](SKILL.
 | Symptom | Likely cause |
 |---|---|
 | A SEPMO reference restates an engineering rule | It should point to AGENTS.md / the engineering-method skill instead — precedence breach; fix the reference. |
-| Following a SEPMO rule that contradicts the repo | `AGENTS.md` / the engineering method win — re-check [AGENTS.md](../../AGENTS.md) `<precedence>`. |
+| Following a SEPMO rule that contradicts the repo | `AGENTS.md` / the engineering method win — re-check [AGENTS.md](../../../AGENTS.md) `<precedence>`. |
 | Unsure whether a change needs the full pipeline | Proportionality: substantial PR-units get full ceremony; trivial changes take the lightweight path ([SKILL.md](SKILL.md)). |
 
 ### First checks
 
-- Did you read root [AGENTS.md](../../AGENTS.md) and your tier manual before this spine?
+- Did you read root [AGENTS.md](../../../AGENTS.md) and your tier manual before this spine?
 
 ### Escalate to
 
-- Conflicts / precedence → [AGENTS.md](../../AGENTS.md) `<precedence>`.
+- Conflicts / precedence → [AGENTS.md](../../../AGENTS.md) `<precedence>`.
 - Unresolved → open an issue.

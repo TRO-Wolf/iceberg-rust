@@ -26,7 +26,7 @@ Source audit: `~/Desktop/IcebergAudits/repo-audit-iceberg-rust-2026-08-08.md` (5
 facet-level findings, 0 Critical / 10 High).
 
 **This file is the artifact for the bundle.** SEPMO's artifact rule
-([binding-manifest.md](../skills/sepmo/binding-manifest.md)) requires every gate to be a checkable
+([binding-manifest.md](../.agents/skills/sepmo/binding-manifest.md)) requires every gate to be a checkable
 record rather than a self-report; its absence for G1 was itself a filed S2 (R-09 below). Nothing in
 this file is taken from an agent's summary — every gate line was re-run, and every Critic verdict
 cited here was produced by a fresh-context agent that reviewed the commit, not the report.

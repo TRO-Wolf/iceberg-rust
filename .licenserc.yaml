@@ -37,7 +37,7 @@ header:
     # Agent skill definitions: YAML frontmatter must be the first line, so an
     # ASF header comment cannot precede it. Companion docs (binding-manifest.md,
     # every map.md, references/*) carry the header normally.
-    - "skills/sepmo/SKILL.md"
+    - ".agents/skills/sepmo/SKILL.md"
     - ".agents/skills/rust-code-quality/SKILL.md"
     - ".agents/skills/test-adequacy/SKILL.md"
     - ".agents/skills/engineering-method/SKILL.md"

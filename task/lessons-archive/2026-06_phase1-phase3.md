@@ -20,7 +20,7 @@
 # Lessons archive — 2026-06 pass 1 (Phase 0 reset through Phase 2/3 increments, 2026-06-07 → 2026-06-09)
 
 Verbatim entries moved out of [../lessons.md](../lessons.md) by the 2026-06-09 compaction pass
-(see [skills/compaction.md](../../skills/compaction.md)). Entries marked with a `_promoted ..._`
+(see [compaction/SKILL.md](../../.agents/skills/compaction/SKILL.md)). Entries marked with a `_promoted ..._`
 stub had their durable rule distilled into the named canonical home; the narrative here is the
 provenance. **Not read by default** — grep on demand.
 

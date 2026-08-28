@@ -74,7 +74,7 @@ CLAUDE.md is not their home. Follow the pointers:
 | Build, test, and gate commands | [AGENTS.md](AGENTS.md) "Build & test commands" |
 | The testing-discipline contract | [docs/testing.md](docs/testing.md) |
 | Directory navigation, and when a `map.md` is owed | [AGENTS.md](AGENTS.md) `<map_md_navigation>` |
-| Lifecycle / process governance | [skills/sepmo/SKILL.md](skills/sepmo/SKILL.md) + [binding-manifest.md](skills/sepmo/binding-manifest.md) |
+| Lifecycle / process governance | [.agents/skills/sepmo/SKILL.md](.agents/skills/sepmo/SKILL.md) + [binding-manifest.md](.agents/skills/sepmo/binding-manifest.md) |
 | Navigation for a directory you will touch | that directory's `map.md` |
 
 ## Claude read order (every session)
@@ -94,11 +94,11 @@ AGENTS.md on turn 1.
 
 `.claude/skills` is a symlink to `../.agents/skills` (git mode `120000`), so every runbook there
 loads natively in a Claude session and can be invoked by name rather than opened by path. The skills
-keep their single home under `.agents/`; that directory adds no second copy and states no rule.
+keep their single home under `.agents/`; the symlink adds no second copy or authority.
 Roster and reasoning: [.agents/skills/map.md](.agents/skills/map.md).
 
-The SEPMO control plane under [skills/](skills/map.md) is a separate tree and is **not** covered by
-that symlink; it is invoked deliberately, not discovered.
+The SEPMO control plane is [another skill in that directory](.agents/skills/sepmo/SKILL.md), so the
+same symlink exposes it without a second copy. Its description limits invocation to governance work.
 
 ## Claude tool mechanics — capability tiers and sub-agents
 

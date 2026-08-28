@@ -61,8 +61,8 @@ mention of the Critic, review, or audit. That omission is a feature, not a gap.
 > **This repo's binding selects the multi-agent path:** the per-PR Critic is a
 > **mandatory independent agent** (fresh context), and a spawned Actor + that Critic
 > **default to Opus** — `OO` = Opus–Opus ([binding-manifest.md](../binding-manifest.md)
-> *Sub-agent / tier policy*; [AGENTS.md](../../../AGENTS.md) `<subagent_policy>` for the neutral
-> rule, [CLAUDE.md](../../../CLAUDE.md) for the Claude-tier mapping). The
+> *Sub-agent / tier policy*; [AGENTS.md](../../../../AGENTS.md) `<subagent_policy>` for the neutral
+> rule, [CLAUDE.md](../../../../CLAUDE.md) for the Claude-tier mapping). The
 > single-agent role-shift below is the **fallback** for trivial work that never reaches
 > a PR, not the default for anything that ships.
 

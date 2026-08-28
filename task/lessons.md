@@ -19,9 +19,9 @@
 
 # Lessons
 
-Accumulated DO / DO NOT lessons. The operating manuals ([skills/](../skills/)) require reading this
-file **in full at the start of every session**, and appending to it after **any** correction from
-the user.
+Accumulated DO / DO NOT lessons. The
+[engineering method](../.agents/skills/engineering-method/SKILL.md) requires reading this file in
+full at the start of every session and appending to it after **any** correction from the user.
 
 How to use it (see the manuals' §2):
 

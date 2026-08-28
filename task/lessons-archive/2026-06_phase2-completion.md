@@ -23,7 +23,7 @@ Entries archived by the second compaction pass (size trigger; agentic-pace amend
 Covers the Phase-2 write-engine completion arc (PR #20), the E-sprint metadata interop, the
 2026-06-08/09 scan + metrics + conflict-validation increments, and the matrix repair. Verbatim
 moves; promoted entries carry a `_promoted_` stub naming the rule's new home. Not session-start
-reading — grep on demand (see [../../skills/compaction.md](../../skills/compaction.md)).
+reading — grep on demand (see [compaction/SKILL.md](../../.agents/skills/compaction/SKILL.md)).
 
 ### 2026-06-07 (Phase 2 Increment 4 — RewriteFiles, REVIEWER Opus)
 - **DECISION (dataSequenceNumber deferral): ADD A GUARD, don't just document.** A data-file rewrite stamps
@@ -825,4 +825,3 @@ _promoted 2026-06-11 → docs/testing.md (vacuous-suppression-test routing rule)
   2026-06-10 by rejoining the strand verbatim in the archive (conservation preserved).
 
 _promoted 2026-06-11 → CLAUDE.md Working conventions (GAP_MATRIX pipe-count audit)_
-

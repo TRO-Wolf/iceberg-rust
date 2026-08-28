@@ -19,8 +19,9 @@
 
 # Testing contract
 
-The authoritative testing rules for this fork. The operating manuals ([skills/](../skills/)) and
-[AGENTS.md](../AGENTS.md) point here; read this **before any code change**. Where this file and
+The authoritative testing rules for this fork. The
+[engineering method](../.agents/skills/engineering-method/SKILL.md) and [AGENTS.md](../AGENTS.md)
+point here; read this **before any code change**. Where this file and
 [AGENTS.md](../AGENTS.md) disagree, AGENTS.md wins.
 
 The north star is **1:1 capability parity with Java `iceberg-core` / `iceberg-api`** (see
@@ -142,7 +143,7 @@ mutations of the production code make it fail.
 ## Verification commands (the Done gate)
 
 Run before declaring any change complete (canonical list in [AGENTS.md](../AGENTS.md) and the
-[skills/](../skills/) manuals):
+[engineering method](../.agents/skills/engineering-method/SKILL.md)):
 
 ```bash
 cargo fmt --all -- --check

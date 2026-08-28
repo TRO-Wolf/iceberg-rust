@@ -28,7 +28,7 @@ Any agent working in this repo starts here, then reads the authoritative spine. 
 - **The plan and the current phase:** [Roadmap.md](../Roadmap.md).
 - **Per-capability status (its only home):** [docs/parity/GAP_MATRIX.md](../docs/parity/GAP_MATRIX.md).
 - **Testing contract (hard block before any code change):** [docs/testing.md](../docs/testing.md).
-- **Per-tier operating manuals + the SEPMO control plane:** [skills/map.md](../skills/map.md).
+- **Agent-facing methods and the SEPMO control plane:** [skills/map.md](skills/map.md).
 
 Tool-specific mechanics (if any) live in the per-tool adapter beside this file. An adapter never
 restates an authoritative fact.

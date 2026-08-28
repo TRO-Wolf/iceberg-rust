@@ -181,7 +181,7 @@ approved a hardening sprint **before further parity work**. Live plan + checkbox
    weaker model's reasoning error cannot survive a bidirectional Java round-trip. Protect
    `dev/java-interop/` above other assets; every 🟡→✅ flip goes through it.
 3. **Doc-mass discipline (sprint increments A–D):** `map.md` coverage for the hot source
-   directories (A); the `skills/compaction.md` pass on lessons.md (B — it is 3–5× over its own
+   directories (A); the `.agents/skills/compaction/SKILL.md` pass on lessons.md (B — it is 3–5× over its own
    trigger); a todo-archival convention + pass (C); then **one home per fact** (D): the GAP_MATRIX
    becomes the only status record with terse cells, this file's current-state section shrinks to
    ~30 lines, and increment narratives live in `task/todo-archive/`. After D, never write the same

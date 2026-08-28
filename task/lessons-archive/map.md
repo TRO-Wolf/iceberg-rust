@@ -21,7 +21,7 @@
 
 ## Purpose
 
-Verbatim archives produced by [skills/compaction.md](../../skills/compaction.md) passes over
+Verbatim archives produced by the [compaction skill](../../.agents/skills/compaction/SKILL.md) passes over
 [../lessons.md](../lessons.md). **Not read by default** — sessions grep here on demand (a past-issue
 smell, a superseded reference, a `_promoted_` stub trail). Nothing is ever deleted: every entry is
 in the active file, in exactly one archive file, or promoted with a stub here.
@@ -47,7 +47,7 @@ in the active file, in exactly one archive file, or promoted with a stub here.
 ## Pointers
 
 - **Up:** [../lessons.md](../lessons.md) (the active file, read every session) ·
-  procedure: [skills/compaction.md](../../skills/compaction.md)
+  procedure: [compaction/SKILL.md](../../.agents/skills/compaction/SKILL.md)
 
 ## Debug
 
@@ -64,4 +64,4 @@ in the active file, in exactly one archive file, or promoted with a stub here.
 
 ### Escalate to
 
-- Procedure questions → [skills/compaction.md](../../skills/compaction.md).
+- Procedure questions → [compaction/SKILL.md](../../.agents/skills/compaction/SKILL.md).
