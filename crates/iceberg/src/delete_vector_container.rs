@@ -91,6 +91,15 @@ pub async fn close_touched_dv_containers(
         return Ok(DvContainerClose::default());
     }
 
+    // SQL DML scans first, then closes here. Tests set this to fail after that scan
+    // and before write_dv_blobs, which is otherwise unreachable from one execute().
+    if std::env::var_os("ICEBERG_FAIL_DV_CONTAINER_BEFORE_WRITE").is_some() {
+        return Err(Error::new(
+            ErrorKind::Unexpected,
+            "injected failure before shared-Puffin replacement write",
+        ));
+    }
+
     let live_dvs = collect_live_dvs(table).await?;
     let data_files = collect_live_data_files(table).await?;
     let mut by_puffin: HashMap<String, Vec<LiveDv>> = HashMap::new();

@@ -40,7 +40,7 @@ GAP_MATRIX row R114 owns capability status. The detailed scope and evidence gate
 - [x] Reproduce the two-file shared-Puffin live-row failure through the production reader (`[3,4,5,6]` vs `[3,4,6]`).
 - [x] C-014 seam: `close_touched_dv_containers` + `add_delete_file_with_sequence_number`. Owner approval is the F-17 goal.
 - [x] Extract one core-owned container-closure primitive with per-entry sequence semantics for maintenance and DataFusion DML.
-- [x] Pin `DELETE` and `UPDATE` on the real SQL path (`shared_puffin_dv.rs`). Java shared-Puffin verify is `run-interop-dv-sql.sh` step 4.
+- [x] Pin `DELETE` and `UPDATE` on the real SQL path (`shared_puffin_dv`). T1–T5 and T8–T23. Java verifies Rust DELETE, Rust UPDATE, and a Java-written shared Puffin after Rust DELETE.
 - [x] Independent Critic + unit gate + PR. Update row R114 from measured evidence.
 
 ## ACTIVE (2026-08-28): F-14 Hadoop metadata pointer math

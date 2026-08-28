@@ -117,8 +117,8 @@ LEDGER:
     proof: "The Required regression matrix defines T1 through T23 as independent assertions."
     enumeration:
       domain: "F-17 regression cases"
-      partition: [T1, T2, T3, T4, T8, T9, T10, T12, T13, T17, T18, T23]
-      residue: [T5, T11, T14, T15, T16, T19, T20, T21, T22]
+      partition: [T1, T2, T3, T4, T5, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22, T23]
+      residue: [T6, T7]
       complete_because: >
         The partition covers DELETE, UPDATE, one and two containers, one and many touched files,
         metadata, live rows, equality coexistence, no-op, the DELETE/UPDATE by Replace/Delete

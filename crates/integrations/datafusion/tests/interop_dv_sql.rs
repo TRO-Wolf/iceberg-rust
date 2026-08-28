@@ -64,6 +64,31 @@ fn dv_sql_gen_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Hadoop `vN.metadata.json` with the highest N. `final.metadata.json` is a copy, not a commit
+/// pointer.
+fn current_hadoop_metadata(meta_dir: &std::path::Path) -> PathBuf {
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in fs::read_dir(meta_dir).expect("java metadata dir") {
+        let path = entry.expect("dirent").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let Some(rest) = name.strip_prefix('v') else {
+            continue;
+        };
+        let Some(digits) = rest.strip_suffix(".metadata.json") else {
+            continue;
+        };
+        let Ok(version) = digits.parse::<u64>() else {
+            continue;
+        };
+        match &best {
+            Some((current, _)) if version <= *current => {}
+            _ => best = Some((version, path)),
+        }
+    }
+    best.map(|(_, path)| path)
+        .expect("Java table writes vN.metadata.json")
+}
+
 async fn run_sql(ctx: &SessionContext, sql: &str) {
     ctx.sql(sql)
         .await
@@ -308,6 +333,173 @@ async fn test_dv_sql_gen_shared_puffin_delete_java_readable() {
         .await
         .expect("write final.metadata.json");
     println!("interop_dv_sql shared-puffin GEN OK → {final_metadata_path}");
+}
+
+/// F-17: Java reads a Rust SQL UPDATE that closed a shared two-blob Puffin.
+#[tokio::test]
+async fn test_dv_sql_gen_shared_puffin_update_java_readable() {
+    let Some(root) = dv_sql_gen_dir() else {
+        println!(
+            "skipping interop_dv_sql shared-puffin UPDATE GEN — set ICEBERG_INTEROP_DV_SQL_GEN_DIR"
+        );
+        return;
+    };
+    let gen_dir = root.join("shared_puffin_update");
+    fs::create_dir_all(&gen_dir).expect("create shared-puffin update interop dir");
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_dv_sql_shared_update",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("catalog");
+    let namespace = NamespaceIdent::new("interop".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("namespace");
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "category", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .expect("schema");
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(3, "category", Transform::Identity)
+        .expect("identity(category)")
+        .build();
+    catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("rust_table".to_string())
+                .location(table_location.clone())
+                .schema(schema)
+                .partition_spec(partition_spec)
+                .format_version(FormatVersion::V3)
+                .properties(HashMap::from([
+                    ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+                    ("write.update.mode".to_string(), "merge-on-read".to_string()),
+                ]))
+                .build(),
+        )
+        .await
+        .expect("create table");
+    let client = Arc::new(catalog);
+    let provider = IcebergCatalogProvider::try_new(client.clone())
+        .await
+        .expect("provider");
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", Arc::new(provider));
+    run_sql(
+        &ctx,
+        "INSERT INTO catalog.interop.rust_table VALUES \
+         (1, 'a', 'electronics'), (2, 'b', 'electronics'), (3, 'c', 'electronics'), \
+         (4, 'd', 'books'), (5, 'e', 'books'), (6, 'f', 'books')",
+    )
+    .await;
+    let ident = TableIdent::new(namespace.clone(), "rust_table".to_string());
+    let table = client.load_table(&ident).await.expect("load after insert");
+    commit_shared_puffin_for_ids(&table, client.as_ref(), 2, 5).await;
+    run_sql(
+        &ctx,
+        "UPDATE catalog.interop.rust_table SET data = 'z' WHERE id = 1",
+    )
+    .await;
+    let table = client.load_table(&ident).await.expect("load after update");
+    let expected_rows = "[\n  {\"id\": 1, \"data\": \"z\"},\n  {\"id\": 3, \"data\": \"c\"},\n  {\"id\": 4, \"data\": \"d\"},\n  {\"id\": 6, \"data\": \"f\"}\n]\n";
+    fs::write(gen_dir.join("expected_rows.json"), expected_rows).expect("expected_rows.json");
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+    println!("interop_dv_sql shared-puffin UPDATE GEN OK → {final_metadata_path}");
+}
+
+/// F-17: Rust SQL DELETE against a Java BaseDVFileWriter shared Puffin; Java reads the result.
+#[tokio::test]
+async fn test_dv_sql_consume_java_written_shared_puffin() {
+    let Some(java_dir) = std::env::var_os("ICEBERG_INTEROP_DV_SQL_JAVA_SHARED")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        println!(
+            "skipping Java-written shared-Puffin consume — set ICEBERG_INTEROP_DV_SQL_JAVA_SHARED"
+        );
+        return;
+    };
+    let metadata_location = current_hadoop_metadata(&java_dir.join("table").join("metadata"));
+    assert!(
+        metadata_location.is_file(),
+        "missing Java Hadoop metadata at {}",
+        metadata_location.display()
+    );
+    let out_dir = java_dir.join("after_delete");
+    fs::create_dir_all(out_dir.join("rust_table").join("metadata")).expect("after_delete dir");
+    let warehouse = java_dir.to_string_lossy().to_string();
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_dv_sql_java_shared",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+        )
+        .await
+        .expect("catalog");
+    let namespace = NamespaceIdent::new("interop".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("namespace");
+    let ident = TableIdent::new(namespace.clone(), "rust_table".to_string());
+    catalog
+        .register_table(&ident, metadata_location.to_string_lossy().to_string())
+        .await
+        .expect("register Java table");
+    let table = catalog.load_table(&ident).await.expect("load Java table");
+    let tx = Transaction::new(&table);
+    tx.update_table_properties()
+        .set("write.delete.mode".to_string(), "merge-on-read".to_string())
+        .set("write.update.mode".to_string(), "merge-on-read".to_string())
+        .apply(tx)
+        .expect("apply MoR properties")
+        .commit(&catalog)
+        .await
+        .expect("commit MoR properties");
+    let client = Arc::new(catalog);
+    let provider = IcebergCatalogProvider::try_new(client.clone())
+        .await
+        .expect("provider");
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", Arc::new(provider));
+    run_sql(&ctx, "DELETE FROM catalog.interop.rust_table WHERE id = 10").await;
+    let table = client.load_table(&ident).await.expect("load after delete");
+    let expected_rows = "[\n  {\"id\": 30, \"data\": \"z\"},\n  {\"id\": 50, \"data\": \"q\"}\n]\n";
+    fs::write(out_dir.join("expected_rows.json"), expected_rows).expect("expected_rows.json");
+    let final_metadata_path = out_dir
+        .join("rust_table")
+        .join("metadata")
+        .join("final.metadata.json");
+    table
+        .metadata()
+        .write_to(
+            table.file_io(),
+            final_metadata_path.to_str().expect("utf8 metadata path"),
+        )
+        .await
+        .expect("write final.metadata.json");
+    println!(
+        "interop_dv_sql Java-written shared-Puffin DELETE GEN OK → {}",
+        final_metadata_path.display()
+    );
 }
 
 fn decode_file_path(col: &ArrayRef, row: usize) -> String {
