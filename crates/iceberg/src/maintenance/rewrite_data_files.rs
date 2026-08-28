@@ -29,7 +29,6 @@
 //! | rewrite | live rows only; one [`RewriteFilesAction`](crate::transaction::Transaction::rewrite_files) per group |
 //!
 //! A non-default-spec file can hold several current partitions, so Java groups it as unpartitioned.
-//! `use_starting_sequence_number` defaults true so outstanding equality deletes still apply.
 //!
 //! # Defaults
 //!
@@ -497,7 +496,7 @@ impl RewriteDataFiles {
 
         // Validate the tuple against the output spec before stamping it onto anything.
         let partition_key = group_partition_tuple(group, &spec)?
-            .map(|partition| PartitionKey::new(spec, schema.clone(), partition))
+            .map(|partition| PartitionKey::new(spec.clone(), schema.clone(), partition))
             .transpose()?;
 
         let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
@@ -518,6 +517,7 @@ impl RewriteDataFiles {
             file_name_generator,
         );
         let mut writer = DataFileWriterBuilder::new(rolling_builder)
+            .with_partition_spec(spec.clone())
             .build(partition_key)
             .await?;
 

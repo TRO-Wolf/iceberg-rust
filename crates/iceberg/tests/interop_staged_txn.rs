@@ -183,6 +183,7 @@ async fn write_real(table: &Table, ids: &[i64], data: &[&str]) -> DataFile {
         file_name_gen,
     );
     let mut writer = DataFileWriterBuilder::new(rolling)
+        .unpartitioned()
         .build(None)
         .await
         .expect("build unpartitioned data file writer");

@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Tests for [`RewritePositionDeleteFiles`]. Read identity plus result counts.
-
+//! Tests for RewritePositionDeleteFiles.
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -249,6 +248,7 @@ async fn write_position_delete_file(
         .expect("PartitionKey::new: valid partition tuple")
     });
     let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .with_partition_spec(table.metadata().default_partition_spec().as_ref().clone())
         .build(partition_key)
         .await
         .unwrap();
@@ -861,7 +861,7 @@ async fn write_deletion_vector(table: &Table, target_path: &str, positions: &[u6
         Struct::from_iter([Some(Literal::long(0))]),
     )
     .expect("PartitionKey::new: valid partition tuple");
-    let mut writer = DVFileWriter::new(output);
+    let mut writer = DVFileWriter::new(output).unpartitioned();
     for &pos in positions {
         writer
             .delete(target_path, pos, Some(&partition_key))
@@ -3992,7 +3992,7 @@ async fn write_deletion_vectors_in_one_puffin(
         Struct::from_iter([Some(Literal::long(part_value))]),
     )
     .expect("PartitionKey::new: valid partition tuple");
-    let mut writer = DVFileWriter::new(output);
+    let mut writer = DVFileWriter::new(output).unpartitioned();
     for (target_path, positions) in targets {
         for &pos in *positions {
             writer

@@ -244,10 +244,11 @@ async fn write_eq_delete_inner(
         )
         .expect("PartitionKey::new: valid partition tuple")
     });
-    let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
-        .build(partition_key)
-        .await
-        .unwrap();
+    let mut builder = EqualityDeleteFileWriterBuilder::new(rolling, config);
+    if partition_key.is_none() {
+        builder = builder.unpartitioned();
+    }
+    let mut writer = builder.build(partition_key).await.unwrap();
 
     let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
     // x is the partition value where partitioned, else 0 (the eq-delete only constrains y=field 2).

@@ -30,8 +30,8 @@ use super::*;
 use crate::io::{FileIOBuilder, LocalFsStorageFactory};
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, NestedField, PartitionSpec,
-    PrimitiveType, Schema, Struct, TableMetadata, Type,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, NestedField,
+    PartitionKey, PartitionSpec, PrimitiveType, Schema, Struct, TableMetadata, Transform, Type,
 };
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::position_delete_writer::{
@@ -788,6 +788,7 @@ async fn write_real_pos_delete(
         file_name_gen,
     );
     let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .unpartitioned()
         .build(None)
         .await
         .expect("build pos delete writer");
@@ -852,4 +853,101 @@ async fn row_delta(catalog: &impl Catalog, table: &Table, deletes: Vec<DataFile>
         .apply(tx)
         .expect("apply row delta");
     tx.commit(catalog).await.expect("commit row delta")
+}
+
+#[tokio::test]
+async fn rewritten_pos_delete_keeps_source_spec_and_partition() {
+    let (catalog, file_io, _tmp) = local_fs_catalog().await;
+    let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("namespace");
+    let schema = two_long_schema();
+    let unbound = crate::spec::UnboundPartitionSpec::builder()
+        .add_partition_field(1, "x_part", Transform::Identity)
+        .expect("add field")
+        .build();
+    let table = catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("t".to_string())
+                .schema(schema.clone())
+                .partition_spec(unbound)
+                .build(),
+        )
+        .await
+        .expect("create table");
+    let spec = table.metadata().default_partition_spec().as_ref().clone();
+    let spec_id = spec.spec_id();
+    assert!(!spec.fields().is_empty(), "fixture: table is partitioned");
+    let location = table.metadata().location().to_string();
+    let partition = Struct::from_iter([Some(Literal::long(7))]);
+    write_real_file(&file_io, &format!("{location}/data/d1.parquet"), b"d1").await;
+    let d1 = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(format!("{location}/data/d1.parquet"))
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(2)
+        .record_count(1)
+        .partition_spec_id(spec_id)
+        .partition(partition.clone())
+        .build()
+        .expect("data file");
+    let table = append(&catalog, &table, vec![d1.clone()]).await;
+
+    let partition_key = PartitionKey::new(
+        spec.clone(),
+        table.metadata().current_schema().clone(),
+        partition.clone(),
+    )
+    .expect("partition key");
+    let config = PositionDeleteWriterConfig::new().expect("config");
+    let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).expect("loc");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "pos-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        config.schema().clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .with_partition_spec(spec)
+        .build(Some(partition_key))
+        .await
+        .expect("build pos delete");
+    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+        Arc::new(StringArray::from(vec![d1.file_path()])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![0_i64])) as ArrayRef,
+    ])
+    .expect("batch");
+    writer.write(batch).await.expect("write");
+    let pos_delete = writer
+        .close()
+        .await
+        .expect("close")
+        .into_iter()
+        .next()
+        .expect("file");
+    assert_eq!(pos_delete.partition_spec_id(), spec_id);
+    let table = row_delta(&catalog, &table, vec![pos_delete]).await;
+
+    let source = location.clone();
+    let target = "s3://bucket/relocated".to_string();
+    let staging = format!("{location}-staging");
+    super::RewriteTablePath::new(table.clone())
+        .rewrite_location_prefix(&source, &target)
+        .staging_location(&staging)
+        .execute(&file_io)
+        .await
+        .expect("execute must stamp the source spec on the rewritten pos-delete");
 }

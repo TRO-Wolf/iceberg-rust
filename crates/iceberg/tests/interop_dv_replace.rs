@@ -234,6 +234,7 @@ async fn write_data_file(table: &Table, rows: &[(i64, &str)]) -> DataFile {
         file_name_gen,
     );
     let mut writer = DataFileWriterBuilder::new(rolling)
+        .unpartitioned()
         .build(None)
         .await
         .expect("build data file writer");
@@ -264,7 +265,7 @@ async fn write_dv(
     let partition_key = unpartitioned_key(schema, spec);
     let dv_path = format!("{}/data/{}", table.metadata().location(), file_name);
     let output_file = table.file_io().new_output(&dv_path).expect("new output");
-    let mut writer = DVFileWriter::new(output_file);
+    let mut writer = DVFileWriter::new(output_file).unpartitioned();
     for pos in positions {
         writer
             .delete(data_file_path, *pos, Some(&partition_key))

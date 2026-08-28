@@ -81,7 +81,7 @@
 //!     );
 //!
 //!     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
-//!     let mut data_file_writer = data_file_writer_builder.build(None).await?;
+//!     let mut data_file_writer = data_file_writer_builder.unpartitioned().build(None).await?;
 //!
 //!     // Write the data using data_file_writer...
 //!

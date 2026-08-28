@@ -61,8 +61,7 @@ pub use values::*;
 pub use view_metadata::*;
 pub use view_version::*;
 
-/// Java `ContentFileUtil.referencedDataFile` — the data file a position delete names, whether by
-/// the `referenced_data_file` field or by equal `file_path` bounds. Re-exported here beside
-/// [`DataFile`] because it is a pure function of a delete file's metadata, and a writer deciding
-/// whether a delete still covers a data file needs the SAME derivation the scan uses.
-pub use crate::delete_file_index::referenced_data_file_location;
+/// Java `ContentFileUtil.referencedDataFile` and `isDV`. Re-exported beside [`DataFile`] so an
+/// engine can apply the same file-scope / DV tests the scan uses, without `pub(crate)`
+/// `delete_file_index`.
+pub use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};

@@ -125,7 +125,7 @@ async fn test_dv_write_gen() {
         .new_output(puffin_path.to_str().expect("utf-8 path"))
         .expect("new output file");
 
-    let mut writer = DVFileWriter::new(output_file);
+    let mut writer = DVFileWriter::new(output_file).unpartitioned();
     for (data_file_path, positions) in fixture_position_sets() {
         for position in positions {
             writer

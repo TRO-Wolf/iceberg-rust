@@ -388,6 +388,7 @@ mod tests {
             file_name_gen,
         );
         let mut writer = DataFileWriterBuilder::new(rolling)
+            .unpartitioned()
             .build(None)
             .await
             .expect("build writer");
@@ -624,6 +625,7 @@ mod tests {
             file_name_gen,
         );
         let mut writer = DataFileWriterBuilder::new(rolling)
+            .unpartitioned()
             .build(None)
             .await
             .expect("build writer");
@@ -680,6 +682,7 @@ mod tests {
             DefaultFileNameGenerator::new("eq".to_string(), None, DataFileFormat::Parquet),
         );
         let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+            .unpartitioned()
             .build(None)
             .await
             .expect("build eq writer");
@@ -734,6 +737,7 @@ mod tests {
             DefaultFileNameGenerator::new("eq2".to_string(), None, DataFileFormat::Parquet),
         );
         let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+            .unpartitioned()
             .build(None)
             .await
             .expect("build eq writer");

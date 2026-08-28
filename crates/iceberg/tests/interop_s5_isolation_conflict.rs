@@ -523,6 +523,7 @@ async fn write_yid_file(table: &Table, ids: Vec<i64>, ys: Vec<i64>) -> DataFile 
     );
 
     let mut writer = DataFileWriterBuilder::new(rolling)
+        .unpartitioned()
         .build(None)
         .await
         .expect("build unpartitioned data file writer");
@@ -569,6 +570,7 @@ async fn write_y_eq_delete_file(table: &Table, lo: i64, hi: i64) -> DataFile {
     );
 
     let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+        .unpartitioned()
         .build(None)
         .await
         .expect("build equality-delete writer (keyed on y)");

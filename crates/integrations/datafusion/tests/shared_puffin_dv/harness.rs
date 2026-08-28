@@ -290,7 +290,7 @@ pub(crate) async fn commit_shared_puffin(
         uuid::Uuid::now_v7()
     );
     let output = table.file_io().new_output(&puffin).expect("puffin output");
-    let mut writer = DVFileWriter::new(output);
+    let mut writer = DVFileWriter::new(output).unpartitioned();
     let schema = table.metadata().current_schema().clone();
     for (path, position) in deletes {
         let data_file = by_path

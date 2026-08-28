@@ -42,7 +42,7 @@ async fn write_deletion_vectors(table: &Table, deletes: &[(&str, &[u64])]) -> Ve
         uuid::Uuid::now_v7()
     );
     let output = table.file_io().new_output(&dv_path).expect("dv output");
-    let mut writer = DVFileWriter::new(output);
+    let mut writer = DVFileWriter::new(output).unpartitioned();
     for (target_path, positions) in deletes {
         let partition_key = PartitionKey::new(
             table.metadata().default_partition_spec().as_ref().clone(),

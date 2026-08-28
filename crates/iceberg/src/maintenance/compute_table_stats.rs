@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `ComputeTableStats` — per-column NDV statistics, written as one
 //! `apache-datasketches-theta-v1` Puffin blob per column. Rust port of Java
 //! `org.apache.iceberg.actions.ComputeTableStats` and `NDVSketchUtil`.
 //!
@@ -557,6 +556,7 @@ mod tests {
             file_name_gen,
         );
         let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+            .unpartitioned()
             .build(None)
             .await
             .expect("build delete writer");

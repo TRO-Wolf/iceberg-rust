@@ -650,7 +650,6 @@ impl RewritePositionDeleteFiles {
             file_name_gen,
         );
 
-        // Always pass a PartitionKey, empty tuples included, so we never fabricate spec_id 0.
         let partition_key = PartitionKey::new(spec, schema.clone(), partition.clone())?;
         let mut writer = PositionDeleteFileWriterBuilder::new(rolling, writer_config.clone())
             .build(Some(partition_key))
@@ -893,7 +892,8 @@ impl RewritePositionDeleteFiles {
         );
         let location =
             location_generator.generate_location(None, &file_name_generator.generate_file_name());
-        let mut writer = DVFileWriter::new(self.table.file_io().new_output(location)?);
+        let mut writer =
+            DVFileWriter::new(self.table.file_io().new_output(location)?).unpartitioned();
 
         for (data_file_path, plan) in plans {
             let data_file = inventory.live_data_file(data_file_path)?;

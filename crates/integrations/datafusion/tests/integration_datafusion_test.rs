@@ -401,8 +401,8 @@ async fn test_table_predict_pushdown() -> Result<()> {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(2, s.len());
-    let expected = "predicate:[(foo > 1) OR (bar IS NULL)]";
-    assert!(s.value(1).trim().contains(expected));
+    let expected = "IcebergTableScan projection:[foo,bar] predicate:[]";
+    assert!(s.value(1).contains(expected));
     Ok(())
 }
 

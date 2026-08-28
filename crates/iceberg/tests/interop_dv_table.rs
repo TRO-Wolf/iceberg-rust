@@ -381,7 +381,7 @@ async fn test_dv_table_gen_rust_writes_java_readable_v3_dv_table() {
         .file_io()
         .new_output(&dv_path)
         .expect("new puffin output");
-    let mut dv_writer = DVFileWriter::new(output_file);
+    let mut dv_writer = DVFileWriter::new(output_file).unpartitioned();
     dv_writer
         .delete(&data_file_a_path, 1, Some(&partition_key_a))
         .expect("record cat=a deleted position");

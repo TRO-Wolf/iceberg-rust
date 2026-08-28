@@ -24,9 +24,7 @@ use std::borrow::Cow;
 
 use arrow_array::RecordBatch;
 
-use crate::spec::{
-    DEFAULT_PARTITION_SPEC_ID, DataContentType, DataFile, PartitionKey, PartitionSpec, SchemaRef,
-};
+use crate::spec::{DataContentType, DataFile, PartitionKey, PartitionSpec, SchemaRef};
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileWriterBuilder};
@@ -43,7 +41,7 @@ use crate::{Error, ErrorKind, Result};
 /// `FileMetadata.Builder(spec)` (`core/.../FileMetadata.java`: `this.specId = spec.specId()`) and
 /// `DataFiles.Builder(spec)` — and stamps `spec.specId()` unconditionally, so a Java-written file
 /// always claims a spec that exists in the table. Rust's `DataFileBuilder` instead *defaults*
-/// `partition_spec_id` to [`DEFAULT_PARTITION_SPEC_ID`] (0), a fabricated value with no table behind
+/// `partition_spec_id` to spec id 0, a fabricated value with no table behind
 /// it. A file stamped 0 by that default is silently wrong whenever the spec it was actually written
 /// under is not spec 0 — see `docs/ENGINE_CONTRACT.md` §7a for the observable outcomes (a same-arity
 /// wrong-spec POSITION delete commits and then never applies; a keyless EQUALITY delete becomes a
@@ -55,10 +53,10 @@ use crate::{Error, ErrorKind, Result};
 ///    *and* the spec that tuple was produced from, so it is authoritative — and a delete file must
 ///    claim the spec of the DATA FILES it deletes from, which is not necessarily the table's current
 ///    spec. A key whose spec differs from `configured_spec` is therefore legal, not an error.
-/// 2. **The spec configured on the builder** (`with_partition_spec`), when there is no key.
-/// 3. **[`DEFAULT_PARTITION_SPEC_ID`] (0)** when neither is given — the legacy path, kept so the
-///    pre-existing builder API stays source-compatible. It is correct only for a table whose current
-///    spec really is spec 0.
+/// 2. **The spec configured on the builder** (`with_partition_spec` / `unpartitioned`), when there
+///    is no key.
+/// 3. **Error** when neither is given. The old path stamped spec 0 silently. Call `unpartitioned()`
+///    for a true unpartitioned table.
 ///
 /// # The partitioned-without-a-key rejection
 ///
@@ -90,7 +88,12 @@ pub(crate) fn resolve_partition_spec_id(
             ),
         )),
         (None, Some(spec)) => Ok(spec.spec_id()),
-        (None, None) => Ok(DEFAULT_PARTITION_SPEC_ID),
+        (None, None) => Err(Error::new(
+            ErrorKind::DataInvalid,
+            "writer was built with neither a PartitionSpec nor a PartitionKey: call \
+             unpartitioned() for an unpartitioned table, or with_partition_spec / a PartitionKey \
+             for a partitioned one",
+        )),
     }
 }
 
@@ -109,14 +112,18 @@ where
 {
     /// Create a new `DataFileWriterBuilder` using a `RollingFileWriterBuilder`.
     ///
-    /// Prefer chaining [`with_partition_spec`](Self::with_partition_spec): without it, a writer built
-    /// with no [`PartitionKey`] falls back to stamping `DEFAULT_PARTITION_SPEC_ID` (0) — see
-    /// `resolve_partition_spec_id`.
+    /// Prefer [`with_partition_spec`](Self::with_partition_spec) or [`unpartitioned`](Self::unpartitioned).
+    /// `build(None)` with no spec now errors; see `resolve_partition_spec_id`.
     pub fn new(inner: RollingFileWriterBuilder<B, L, F>) -> Self {
         Self {
             inner,
             partition_spec: None,
         }
+    }
+
+    /// Stamp [`PartitionSpec::unpartition_spec`] (spec id 0, no fields).
+    pub fn unpartitioned(self) -> Self {
+        self.with_partition_spec(PartitionSpec::unpartition_spec())
     }
 
     /// Set the [`PartitionSpec`] the produced files are written under.
@@ -306,6 +313,7 @@ mod test {
         );
 
         let mut data_file_writer = DataFileWriterBuilder::new(rolling_file_writer_builder)
+            .unpartitioned()
             .build(None)
             .await
             .unwrap();
@@ -717,17 +725,32 @@ mod test {
         Ok(())
     }
 
-    /// LEGACY PATH PIN. With neither a configured spec nor a key the writer still stamps
-    /// `DEFAULT_PARTITION_SPEC_ID` (0) — source-compatible with every pre-existing caller, and
-    /// correct only when the table's current spec really is spec 0. Pinned so that changing it is a
-    /// deliberate (breaking) act. See `docs/ENGINE_CONTRACT.md` §7a.
+    /// Neither spec nor key is now an error. `unpartitioned()` is the opt-in that stamps spec 0.
     #[tokio::test]
-    async fn test_data_file_writer_without_spec_or_key_stamps_default_zero() -> Result<()> {
+    async fn test_data_file_writer_without_spec_or_key_errors() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let schema = stamp_test_schema();
+
+        let err = stamp_writer_builder(&file_io, &temp_dir, &schema)
+            .build(None)
+            .await
+            .expect_err("build(None) with no spec must error");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string().contains("unpartitioned()"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_data_file_writer_unpartitioned_stamps_spec_zero() -> Result<()> {
         let temp_dir = TempDir::new().expect("temp dir");
         let file_io = FileIO::new_with_fs();
         let schema = stamp_test_schema();
 
         let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
+            .unpartitioned()
             .build(None)
             .await?;
         writer.write(stamp_test_batch()).await?;

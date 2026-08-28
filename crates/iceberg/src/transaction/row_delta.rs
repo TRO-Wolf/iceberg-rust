@@ -4675,7 +4675,7 @@ mod tests {
         .expect("PartitionKey::new: valid partition tuple");
         let dv_path = format!("{}/data/deletes-dv.puffin", table.metadata().location());
         let output_file = table.file_io().new_output(&dv_path).unwrap();
-        let mut dv_writer = DVFileWriter::new(output_file);
+        let mut dv_writer = DVFileWriter::new(output_file).unpartitioned();
         dv_writer
             .delete(&data_file_path, 1, Some(&partition_key))
             .unwrap();
@@ -5004,7 +5004,7 @@ mod tests {
         .expect("PartitionKey::new: valid partition tuple");
         let dv_path = format!("{}/data/{}", table.metadata().location(), file_name);
         let output_file = table.file_io().new_output(&dv_path).unwrap();
-        let mut dv_writer = DVFileWriter::new(output_file);
+        let mut dv_writer = DVFileWriter::new(output_file).unpartitioned();
         for pos in positions {
             dv_writer
                 .delete(data_file_path, *pos, Some(&partition_key))

@@ -193,43 +193,11 @@ Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next
 - [ ] R166's other two residues stay open and named: the ORC stored-column arm has no oracle
       (Java's ORC reader is outside `iceberg-core`), and the ranged-split refusal is unreachable
       through `plan_tasks` but reachable through the public `PartitionWork` seam.
-- [ ] **Fork units the engine answer surfaced (not queued, no owner) — THREE, not one.** All are
-      external-engine-only; the in-tree DataFusion arm reaches none of them. See row R114's bounds.
-      - (a) The applicability rule is unreachable: `delete_file_index` is `pub(crate)`, so
-        `referenced_data_file_location` / `is_deletion_vector` need promoting to public core.
-      - (a2) Previous-DV DISCOVERY has no public core equivalent, and promoting (a) does NOT close
-        it: `load_delete_vector` and `PreviousDeletes::new` both need a full `DataFile`, while the
-        public scan surface hands out `FileScanTaskDeleteFile`, a projection. The only public route
-        left is `Manifest::parse_avro`, which R166 records as the seam that BYPASSES `first_row_id`
-        inheritance. Scope this separately from (a).
-      - (c) **A CODE candidate, not a docs one, and the widest of the three.**
-        `resolve_partition_spec_id`'s `(None, None)` arm stamps spec 0 with an empty partition
-        SILENTLY. The helper is shared by ALL FOUR base writers, so this is not a DV property. On a
-        table whose metadata holds a zero-field spec 0 it COMMITS, carrying a `partition_spec_id`
-        that misdescribes the covered data file. On a DV the damage is metadata only — path-keyed
-        lookup, and a zero-field spec projects to `AlwaysTrue` so it escapes pruning. On a
-        PARTITION-scoped position delete it LOSES DELETES: that index is `(spec_id, partition)`-keyed,
-        so the delete silently never applies. R113 documents that failure and pins it with
-        `spec_stamp_e2e_test`, while claiming the id is stamped ALWAYS — the claim this unit
-        corrected. **One in-tree call site reaches the arm**, `maintenance/rewrite_table_path.rs`,
-        and it is harmless there only because that path takes the written file's PATH and discards
-        the `DataFile` carrying the stamp. Any ruling that makes the arm an error MUST migrate that
-        call site in the same change. Options: make the arm an error, or require an explicit
-        `unpartitioned()` opt-in. Needs an owner ruling — it is a BREAKING change to a public
-        writer's default construction, with one in-tree migration plus one public pass-through to
-        audit: `writer/partitioning/unpartitioned_writer.rs` calls `build(None)` UNCONDITIONALLY, so
-        whether the arm fires is decided by its caller. Both in-tree `TaskWriter` constructions
-        chain `with_partition_spec`, so nothing fires today — but the arm sits behind a public API,
-        and an external consumer reaches it without ever writing `build(None)`.
-        **Recommendation: the opt-in, not the error.** Making the arm an error breaks
-        `DataFileWriterBuilder`'s default construction and makes the LEGITIMATE case inexpressible —
-        an unpartitioned table under spec 0 genuinely wants spec 0. An explicit `unpartitioned()`
-        keeps that case expressible and turns every silent path into a compile error at the call
-        site rather than a runtime error in a consumer's job.
-        **File a RED-first test with it:** drive a PARTITION-scoped position delete through the
-        `(None, None)` arm and assert the deletes are lost. R113's `spec_stamp_e2e_test` pins the
-        CONSEQUENCE of a wrong spec; nothing pins this arm as a SOURCE of one, so without that test
-        the fix can regress silently.
+- [x] **Fork units (a)/(a2)/(c) on row R114.** Landed on `parity/h7-p1-r114-dml-prune`
+      (2026-08-28) with H7-P1. (a) `spec::is_deletion_vector` + `referenced_data_file_location`
+      are public. (a2) `live_deletion_vectors_by_data_file` is public; missing referenced path
+      and duplicate path error. (c) `(None, None)` is `DataInvalid`; call `unpartitioned()`.
+      `rewrite_table_path` stamps the source spec. R114 stays 🟡.
 
 ---
 
@@ -755,7 +723,9 @@ Unit 3. Mode A per-unit PRs; SEPMO v2.3 duties. Context at signing: nightly inte
       (`set_statistics_truncate_length` was already on the pinned parquet). R113 stays 🟡 (owes
       the Java-read interop leg on the evolved-DROP shape); R117 note added.
 - [x] **H7-S2** COW streaming. Merged #189 (2026-08-07). `copy_on_write_*` no longer `try_collect`.
-- [ ] **H7-P1** DML pushdown (prune only; `NOT`-over-dropped-conjunct footgun is a precondition).
+- [x] **H7-P1** DML pushdown (prune only; `NOT`-over-dropped-conjunct footgun is a precondition).
+      Iceberg scan uses `with_file_prune_only`; exact `WHERE` stays a DataFusion `PhysicalExpr`.
+      Nested partial AND no longer converts (so `NOT` cannot invert a dropped conjunct).
 
 **Queue state 2026-08-05.** Since signing, the line has also absorbed: QD/QE (#178/#179, the two
 RePark filings — manifest schema tolerance + s3tables replace), the ledger archive (#177), interop
@@ -763,7 +733,7 @@ weekly cadence (#180), perf waves A–E (#181), the 07-31 slate (#182), the FK1�
 (#183), the V0 DF 52→54 churn map (#185), and the **DF 54.1 / arrow 58.4 family bump re-cut
 (#187)** — which moved MSRV 1.92 → 1.94 and toolchain to nightly-2026-03-05.
 
-**Remaining in signed order: Unit 3 (breaking) + QC alongside → H7-P1.**
+**Remaining in signed order: Unit 3 (breaking) + QC alongside.**
 
 Two things now owed that were not at signing:
 
@@ -822,10 +792,8 @@ surfaced two new items. Statuses live ONLY in
 streaming/pushdown** on the DataFusion reference impl (scope converged 2026-06-30; engine-first
 hardening of the #124 DML loop, flips no matrix row). **H7-S1** (MoR DELETE/UPDATE streaming) landed #140.
 **H7-S2** (COW streaming) landed #189.
-**H7-P1** (pushdown pruning) remains: thread the raw `Vec<Expr>` through both exec structs,
-and resolve the `NOT`-over-dropped-conjunct under-delete footgun before any
-`with_filter(convert_filters_to_predicate)`; pushdown may ONLY prune, never replace the exact
-post-scan filter.
+**H7-P1** (pushdown pruning) landed: Iceberg `with_file_prune_only` on DELETE/UPDATE;
+exact `WHERE` stays the DataFusion filter. Nested partial AND is not converted.
 
 PULL-BASED / DEMOTED: unchanged from the Roadmap re-anchor — link, do not restate.
 

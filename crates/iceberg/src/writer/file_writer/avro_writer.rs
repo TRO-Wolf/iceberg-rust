@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The module contains the file writer for the Avro data-file format.
 //!
 //! This mirrors [`super::parquet_writer`] but emits Avro Object Container Files (OCF) instead of
 //! Parquet, slotting into the same writer seam ([`FileWriterBuilder`] / [`FileWriter`]) so an
@@ -982,6 +981,7 @@ mod tests {
             file_name_gen,
         );
         let mut dfw = DataFileWriterBuilder::new(rolling)
+            .unpartitioned()
             .build(None)
             .await
             .unwrap();

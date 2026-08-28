@@ -48,13 +48,15 @@ use metadata_table::IcebergMetadataTableProvider;
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
 use crate::physical_plan::delete::{
-    IcebergDeleteExec, IcebergUpdateExec, IsolationLevel, WRITE_DELETE_ISOLATION_LEVEL,
-    WRITE_DELETE_MODE, WRITE_UPDATE_ISOLATION_LEVEL, WRITE_UPDATE_MODE, WriteMode,
+    IcebergDeleteExec, IsolationLevel, WRITE_DELETE_ISOLATION_LEVEL, WRITE_DELETE_MODE,
+    WRITE_UPDATE_ISOLATION_LEVEL, WRITE_UPDATE_MODE, WriteMode,
 };
+use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
 use crate::physical_plan::sort::sort_by_partition;
+use crate::physical_plan::update::IcebergUpdateExec;
 use crate::physical_plan::write::IcebergWriteExec;
 
 /// Catalog-backed table provider. It loads fresh table metadata on every scan and write. For
@@ -243,18 +245,15 @@ impl TableProvider for IcebergTableProvider {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // The filter's binding schema and the projection base come from THIS state. The exec
-        // re-scans, and a projection naming a dropped column fails the whole DELETE.
         let (table, current_schema) = self
             .load_table_with_current_schema()
             .await
             .map_err(to_datafusion_error)?;
         let mode = WriteMode::from_property(&table, WRITE_DELETE_MODE);
-        // Resolved at PLAN time, as the Java `SparkRowLevelOperationBuilder` constructor does.
         let isolation = IsolationLevel::for_row_level_op(&table, WRITE_DELETE_ISOLATION_LEVEL)?;
 
-        // The exec evaluates this EXACT filter itself, because pushdown is INEXACT and would
-        // over-delete. An empty filter set means `DELETE FROM t`.
+        // Exact PhysicalExpr is the row contract. Iceberg gets prune-only.
+        let prune = convert_filters_to_predicate(&filters);
         let predicate = match filters.into_iter().reduce(Expr::and) {
             None => None,
             Some(combined) => {
@@ -267,6 +266,7 @@ impl TableProvider for IcebergTableProvider {
             table,
             self.catalog.clone(),
             predicate,
+            prune,
             mode,
             isolation,
             current_schema,
@@ -279,18 +279,16 @@ impl TableProvider for IcebergTableProvider {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // As in `delete_from`, everything derives from the CURRENT schema.
         let (table, current_schema) = self
             .load_table_with_current_schema()
             .await
             .map_err(to_datafusion_error)?;
         let mode = WriteMode::from_property(&table, WRITE_UPDATE_MODE);
-        // Resolved at PLAN time; see `delete_from`.
         let isolation = IsolationLevel::for_row_level_op(&table, WRITE_UPDATE_ISOLATION_LEVEL)?;
 
         let df_schema = DFSchema::try_from(current_schema.as_ref().clone())?;
 
-        // EXACT; see `delete_from` on why pushdown is unsafe here. `None` updates every row.
+        let prune = convert_filters_to_predicate(&filters);
         let predicate = match filters.into_iter().reduce(Expr::and) {
             None => None,
             Some(combined) => Some(state.create_physical_expr(combined, &df_schema)?),
@@ -311,6 +309,7 @@ impl TableProvider for IcebergTableProvider {
             table,
             self.catalog.clone(),
             predicate,
+            prune,
             physical_assignments,
             mode,
             isolation,
