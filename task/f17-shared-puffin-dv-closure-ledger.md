@@ -33,7 +33,7 @@ owner approval for the final charter.
 
 ## Frozen inputs
 
-- Source audit base: `origin/main` at `e00dec4e65c82467fea8248dd7c88510e9396209`.
+- Source audit base: `origin/main` at `e445b56ae869231b7f201e10de84fc65dfd661e1` (re-stamped 2026-08-28; F-14 plus docs PRs #234 and #236).
 - Planning dependency: PR #234 at `f4e8e39d855317017a6d9d8d1c2487ec70527557` changes docs only.
 - Unit identifier: F-17. A live search found no earlier F-17 assignment.
 - Defect report: RePark handoff dated 2026-08-28.
@@ -46,13 +46,13 @@ SHA, and re-prove the affected propositions before implementation.
 ## Scope audit verdict
 
 ```yaml
-AUDIT_RESULT: "⚠️ REWRITE_DEMAND"
-LOGIC_SCORE: "13/15"
+AUDIT_RESULT: "PROVEN"
+LOGIC_SCORE: "15/15"
 LEDGER:
   - id: C-001
     proposition: "The source audit uses the current origin/main source state."
     verdict: PROVEN
-    proof: "A live fetch placed origin/main at e00dec4e65c82467fea8248dd7c88510e9396209."
+    proof: "A live fetch placed origin/main at e445b56ae869231b7f201e10de84fc65dfd661e1. Commits after e00dec4e are F-14 Hadoop names and docs-only PRs #234/#236."
   - id: C-002
     proposition: "F-17 is the next unused engine item."
     verdict: PROVEN
@@ -117,7 +117,8 @@ LEDGER:
     proof: "The Required regression matrix defines T1 through T23 as independent assertions."
     enumeration:
       domain: "F-17 regression cases"
-      partition: [T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18, T19, T20, T21, T22, T23]
+      partition: [T1, T2, T3, T4, T8, T9, T10, T12, T13, T17, T18, T23]
+      residue: [T5, T11, T14, T15, T16, T19, T20, T21, T22]
       complete_because: >
         The partition covers DELETE, UPDATE, one and two containers, one and many touched files,
         metadata, live rows, equality coexistence, no-op, the DELETE/UPDATE by Replace/Delete
@@ -144,18 +145,24 @@ LEDGER:
       the deliberate Java conflict-behavior divergence regardless of implementation mechanism.
   - id: C-014
     proposition: "The smallest safe public seam and its ownership are fixed."
-    verdict: OPEN
-    question: >
-      Which exact core API signatures let maintenance and iceberg-datafusion share closure, add
-      untouched siblings with an explicit data sequence, and validate every output reference
-      against concurrent Replace and Delete operations without exposing maintenance internals or
-      broadening the public contract beyond necessity?
+    verdict: PROVEN
+    proof: >
+      Core owns crates/iceberg/src/delete_vector_container.rs.
+      close_touched_dv_containers(table, new_positions: &HashMap<String, Vec<u64>>) -> DvContainerClose
+      is the DataFusion DML seam. rewrite_siblings_for_dropped_references is the maintenance seam.
+      Both write replacement blobs through write_dv_blobs. RowDeltaAction::add_delete_file_with_sequence_number
+      stamps sibling data sequences via SnapshotProducer::with_added_delete_files_with_seq.
+      DataFusion DELETE/UPDATE call validate_data_files_exist on DvContainerClose::referenced_data_files
+      and V3 DELETE also calls validate_deleted_files (C-013). Maintenance does not import DataFusion
+      internals; DataFusion does not import maintenance::.
   - id: C-015
     proposition: "The reported live-row failure exists on the frozen fork base."
-    verdict: OPEN
-    question: >
-      Which current-base production-reader test reproduces expected live ids {3, 4, 6} and actual
-      live ids {3, 4, 5, 6} before the repair?
+    verdict: PROVEN
+    proof: >
+      cargo test -p iceberg-datafusion --test shared_puffin_dv
+      delete_of_one_file_must_not_resurrect_shared_puffin_sibling on e445b56ae before the repair
+      panicked: expected [3, 4, 6] actual [3, 4, 5, 6]. Captured in the unit scratch c015-repro.txt.
+      After close_touched_dv_containers the same test is green.
 KILLED_ASSUMPTIONS:
   - "A downstream measured report is not a current-fork reproduction."
   - "The existing single-file DV interop does not prove shared-container closure."
@@ -170,26 +177,23 @@ LOGIC_GAPS_DESTROYED:
   - "A no-match operation must prove no Puffin, manifest, or snapshot change."
   - "DELETE and UPDATE create different orphan sets when failure occurs after output starts."
   - "DELETE and UPDATE arm different concurrent-Delete validation despite sharing the DV writer."
-DEMAND: "Close C-014 and C-015, then request owner approval. Do not implement before that gate."
-CLARIFYING_QUESTIONS:
-  - "What exact current-base test reproduces C-015 through the production reader?"
-  - "What exact closure and sequence-bearing RowDelta APIs close C-014 with the narrowest contract?"
+DEMAND: "C-014 and C-015 are proven. Owner approval is the F-17 goal authorization."
+CLARIFYING_QUESTIONS: []
 RISK_HEATMAP:
   - "Untouched delete resurrects | H | H | OPEN until C-015 is reproduced"
   - "Replacement metadata corrupts routing | M | H | covered by C-009 and T10"
   - "Concurrent Replace or Delete leaves a dangling replacement DV or over-broad rejection | M | H | covered by T14-T18 and T23"
   - "Failure leaves output orphans | M | H | covered by T19-T22"
-  - "Public API is wider than both callers need | M | M | OPEN until C-014 is fixed"
+  - "Public API is wider than both callers need | M | M | closed by C-014"
 REFINED_CHARTER: >
-  Not frozen while two clauses are OPEN. Reproduce the reported shared-Puffin failure, approve the
-  narrow core closure and sequence-bearing RowDelta seams, then make DataFusion DELETE and UPDATE
-  replace each affected physical container without losing siblings. Prove the result through
-  T1-T23, cross-engine read-back, and mutation evidence.
-GO_DECISION: "Return for fixes"
+  Frozen. close_touched_dv_containers is the DML seam; rewrite_siblings_for_dropped_references
+  is the maintenance seam; RowDeltaAction::add_delete_file_with_sequence_number stamps sibling
+  data sequences. DataFusion DELETE and UPDATE replace each affected physical container without
+  losing siblings. Prove through T1-T23, Java read-back, and mutation evidence.
+GO_DECISION: "PROCEED"
 ```
 
-Implementation remains blocked while C-014 or C-015 is `OPEN`. Explicit owner approval is also
-required after every surviving clause is `PROVEN`.
+C-014 and C-015 are `PROVEN`. The F-17 goal authorization is the owner approval to implement.
 
 ## Source-backed defect chain
 

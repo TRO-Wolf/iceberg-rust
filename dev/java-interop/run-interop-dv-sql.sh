@@ -51,22 +51,31 @@ echo "==> [2/3] Rust: three SQL DELETE statements on a V3 MoR table -> Puffin DV
     cargo test -p iceberg-datafusion --test interop_dv_sql -- --nocapture
 )
 
-echo "==> [3/3] Java: read the RUST-SQL-COMMITTED V3+DV table with the PRODUCTION scan"
+echo "==> [3/4] Java: read the RUST-SQL-COMMITTED V3+DV table with the PRODUCTION scan"
 # The verdict comes from the OUTPUT (success sentinel present, no per-check FAIL line), never from
 # mvn's exit code -- `mvn exec:java` does not propagate System.exit. `|| true` keeps `set -e` from
 # aborting before the diagnostics are echoed.
-VERIFY_OUT="$(
-  cd "${SCRIPT_DIR}"
-  JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
-    PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:$PATH \
-    /opt/maven/bin/mvn -o -q compile exec:java \
-    -Dexec.args=verify-interop-dv-sql \
-    -Dinterop.dv_sql.dir="${TMP}" 2>&1
-)" || true
-echo "${VERIFY_OUT}"
-if echo "${VERIFY_OUT}" | grep -q '^FAIL ' || ! echo "${VERIFY_OUT}" | grep -q 'verify-interop-dv-sql: 0 failures'; then
-  echo "==> FAILED -- Java could not correctly read the V3 deletion-vector table Rust's SQL DELETE committed."
-  exit 1
-fi
+verify_dv_sql() {
+  local dir="$1"
+  local label="$2"
+  local out
+  out="$(
+    cd "${SCRIPT_DIR}"
+    JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 \
+      PATH=/usr/lib/jvm/java-11-openjdk-amd64/bin:$PATH \
+      /opt/maven/bin/mvn -o -q compile exec:java \
+      -Dexec.args=verify-interop-dv-sql \
+      -Dinterop.dv_sql.dir="${dir}" 2>&1
+  )" || true
+  echo "${out}"
+  if echo "${out}" | grep -q '^FAIL ' || ! echo "${out}" | grep -q 'verify-interop-dv-sql: 0 failures'; then
+    echo "==> FAILED -- Java could not correctly read ${label}."
+    exit 1
+  fi
+}
+verify_dv_sql "${TMP}" "the sequential SQL DELETE table"
+
+echo "==> [4/4] Java: read the shared-Puffin SQL DELETE table"
+verify_dv_sql "${TMP}/shared_puffin" "the shared-Puffin SQL DELETE table"
 
 echo "==> interop-dv-sql PASSED"

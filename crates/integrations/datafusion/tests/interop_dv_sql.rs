@@ -40,13 +40,20 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use datafusion::arrow::array::{ArrayRef, Int64Array, RunArray, StringArray};
+use datafusion::arrow::datatypes::Int32Type;
 use datafusion::execution::context::SessionContext;
+use futures::TryStreamExt;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::spec::{
-    DataFileFormat, FormatVersion, ManifestContentType, NestedField, PrimitiveType, Schema,
-    Transform, Type, UnboundPartitionSpec,
+    DataFileFormat, FormatVersion, ManifestContentType, NestedField, PartitionKey, PrimitiveType,
+    Schema, Transform, Type, UnboundPartitionSpec,
 };
+use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::writer::base_writer::deletion_vector_writer::DVFileWriter;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_datafusion::IcebergCatalogProvider;
 
@@ -216,4 +223,203 @@ async fn test_dv_sql_gen_rust_deletes_java_readable_v3_dv_table() {
          final.metadata.json → {final_metadata_path}",
         live_delete_files.len()
     );
+}
+
+/// F-17: Java reads a Rust SQL DELETE that closed a shared two-blob Puffin.
+#[tokio::test]
+async fn test_dv_sql_gen_shared_puffin_delete_java_readable() {
+    let Some(root) = dv_sql_gen_dir() else {
+        println!("skipping interop_dv_sql shared-puffin GEN — set ICEBERG_INTEROP_DV_SQL_GEN_DIR");
+        return;
+    };
+    let gen_dir = root.join("shared_puffin");
+    fs::create_dir_all(&gen_dir).expect("create shared-puffin interop dir");
+    let warehouse = gen_dir.to_string_lossy().to_string();
+    let table_location = format!("{warehouse}/rust_table");
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_dv_sql_shared",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+        )
+        .await
+        .expect("catalog");
+    let namespace = NamespaceIdent::new("interop".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("namespace");
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "category", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .expect("schema");
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(3, "category", Transform::Identity)
+        .expect("identity(category)")
+        .build();
+    catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("rust_table".to_string())
+                .location(table_location.clone())
+                .schema(schema)
+                .partition_spec(partition_spec)
+                .format_version(FormatVersion::V3)
+                .properties(HashMap::from([
+                    ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+                    ("write.update.mode".to_string(), "merge-on-read".to_string()),
+                ]))
+                .build(),
+        )
+        .await
+        .expect("create table");
+    let client = Arc::new(catalog);
+    let provider = IcebergCatalogProvider::try_new(client.clone())
+        .await
+        .expect("provider");
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", Arc::new(provider));
+    run_sql(
+        &ctx,
+        "INSERT INTO catalog.interop.rust_table VALUES \
+         (1, 'a', 'electronics'), (2, 'b', 'electronics'), (3, 'c', 'electronics'), \
+         (4, 'd', 'books'), (5, 'e', 'books'), (6, 'f', 'books')",
+    )
+    .await;
+
+    let ident = TableIdent::new(namespace.clone(), "rust_table".to_string());
+    let table = client.load_table(&ident).await.expect("load after insert");
+    commit_shared_puffin_for_ids(&table, client.as_ref(), 2, 5).await;
+    run_sql(&ctx, "DELETE FROM catalog.interop.rust_table WHERE id = 1").await;
+    let table = client.load_table(&ident).await.expect("load after delete");
+    let expected_rows = "[\n  {\"id\": 3, \"data\": \"c\"},\n  {\"id\": 4, \"data\": \"d\"},\n  {\"id\": 6, \"data\": \"f\"}\n]\n";
+    fs::write(gen_dir.join("expected_rows.json"), expected_rows).expect("expected_rows.json");
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write final.metadata.json");
+    println!("interop_dv_sql shared-puffin GEN OK → {final_metadata_path}");
+}
+
+fn decode_file_path(col: &ArrayRef, row: usize) -> String {
+    if let Some(plain) = col.as_any().downcast_ref::<StringArray>() {
+        return plain.value(row).to_string();
+    }
+    if let Some(run) = col.as_any().downcast_ref::<RunArray<Int32Type>>() {
+        let values = run
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("_file REE values utf8");
+        return values.value(run.get_physical_index(row)).to_string();
+    }
+    panic!("unexpected _file column type: {:?}", col.data_type());
+}
+
+async fn commit_shared_puffin_for_ids(table: &Table, catalog: &dyn Catalog, id_a: i64, id_b: i64) {
+    let mut stream = table
+        .scan()
+        .select([
+            "id".to_string(),
+            RESERVED_COL_NAME_FILE.to_string(),
+            RESERVED_COL_NAME_POS.to_string(),
+        ])
+        .build()
+        .expect("scan")
+        .to_arrow()
+        .await
+        .expect("arrow");
+    let mut deletes = Vec::new();
+    while let Some(batch) = stream.try_next().await.expect("batch") {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id i64");
+        let file_col = batch.column_by_name(RESERVED_COL_NAME_FILE).expect("_file");
+        let pos = batch
+            .column_by_name(RESERVED_COL_NAME_POS)
+            .expect("_pos")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_pos i64");
+        for row in 0..batch.num_rows() {
+            let id = ids.value(row);
+            if id == id_a || id == id_b {
+                deletes.push((
+                    decode_file_path(file_col, row),
+                    u64::try_from(pos.value(row)).expect("pos"),
+                ));
+            }
+        }
+    }
+    assert_eq!(
+        deletes.len(),
+        2,
+        "need two row positions for the shared Puffin"
+    );
+    let data_files = {
+        let mut files = HashMap::new();
+        let snapshot = table.metadata().current_snapshot().expect("snapshot");
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .expect("manifest list");
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != iceberg::spec::ManifestContentType::Data {
+                continue;
+            }
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .expect("data manifest");
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    let file = entry.data_file().clone();
+                    files.insert(file.file_path().to_string(), file);
+                }
+            }
+        }
+        files
+    };
+    let puffin = format!(
+        "{}/data/shared-dv-{}.puffin",
+        table.metadata().location(),
+        uuid::Uuid::now_v7()
+    );
+    let mut writer = DVFileWriter::new(table.file_io().new_output(&puffin).expect("output"));
+    let schema = table.metadata().current_schema().clone();
+    for (path, position) in &deletes {
+        let data_file = data_files.get(path).expect("live data file");
+        let spec = table
+            .metadata()
+            .partition_spec_by_id(data_file.partition_spec_id())
+            .expect("spec")
+            .as_ref()
+            .clone();
+        let key = PartitionKey::new(spec, schema.clone(), data_file.partition().clone())
+            .expect("partition key");
+        writer
+            .delete(path, *position, Some(&key))
+            .expect("record position");
+    }
+    let files = writer.close().await.expect("close shared puffin");
+    let tx = Transaction::new(table);
+    tx.row_delta()
+        .add_deletes(files)
+        .apply(tx)
+        .expect("apply")
+        .commit(catalog)
+        .await
+        .expect("commit shared puffin");
 }
