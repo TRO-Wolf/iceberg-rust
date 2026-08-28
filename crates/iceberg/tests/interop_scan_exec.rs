@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java interop tests for data-level scan execution with merge-on-read deletes. Direction 1 loads a
-//! table the Java oracle wrote and compares against the rows Java emitted.
-
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
@@ -754,6 +751,7 @@ async fn write_pos_delete_from_pairs(table: &Table, pairs: &[(String, i64)]) -> 
         file_name_gen,
     );
     let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .unpartitioned()
         .build(None)
         .await
         .expect("build position-delete writer");
@@ -1304,6 +1302,7 @@ async fn write_equality_delete_for_ids(table: &Table, ids: &[i64]) -> DataFile {
     );
 
     let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+        .unpartitioned()
         .build(None)
         .await
         .expect("build equality-delete writer");

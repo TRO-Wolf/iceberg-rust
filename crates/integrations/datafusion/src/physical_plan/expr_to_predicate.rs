@@ -240,6 +240,9 @@ fn scalar_function_to_iceberg_predicate(func_name: &str, args: &[Expr]) -> Trans
     }
 }
 
+/// Both sides must convert. Dropping one side is a weaker AND at the top level, and
+/// `convert_filters_to_predicate` already drops unconverted top-level conjuncts. Under `NOT`
+/// a dropped side inverts and the prune keeps the wrong files.
 fn to_iceberg_and_predicate(
     left: TransformedResult,
     right: TransformedResult,
@@ -248,8 +251,6 @@ fn to_iceberg_and_predicate(
         (TransformedResult::Predicate(left), TransformedResult::Predicate(right)) => {
             TransformedResult::Predicate(left.and(right))
         }
-        (TransformedResult::Predicate(left), _) => TransformedResult::Predicate(left),
-        (_, TransformedResult::Predicate(right)) => TransformedResult::Predicate(right),
         _ => TransformedResult::NotTransformed,
     }
 }
@@ -530,16 +531,23 @@ mod tests {
     }
 
     #[test]
-    fn test_predicate_conversion_with_one_and_expr_supported() {
+    fn test_predicate_conversion_nested_partial_and_does_not_drop_a_side() {
         let sql = "(foo > 1 and length(bar) = 1 ) or foo < 0 ";
-        let predicate = convert_to_iceberg_predicate(sql).unwrap();
-
-        let inner_predicate = Reference::new("foo").greater_than(Datum::long(1));
-        let expected_predicate = Predicate::or(
-            inner_predicate,
-            Reference::new("foo").less_than(Datum::long(0)),
+        let predicate = convert_to_iceberg_predicate(sql);
+        assert_eq!(
+            predicate, None,
+            "a nested AND with one unconverted side must not become the converted side"
         );
-        assert_eq!(predicate, expected_predicate);
+    }
+
+    #[test]
+    fn test_predicate_conversion_not_over_partial_and_is_not_pushed() {
+        let sql = "NOT (foo > 1 AND length(bar) = 1)";
+        let predicate = convert_to_iceberg_predicate(sql);
+        assert_eq!(
+            predicate, None,
+            "NOT of a partial AND must not push NOT(foo > 1)"
+        );
     }
 
     #[test]

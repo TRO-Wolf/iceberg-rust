@@ -166,7 +166,7 @@ mod tests {
             location_gen,
             file_name_gen,
         );
-        let writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+        let writer_builder = DataFileWriterBuilder::new(rolling_writer_builder).unpartitioned();
 
         let mut writer = UnpartitionedWriter::new(writer_builder);
 

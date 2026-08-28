@@ -15,46 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Deletion-vector (V3 Puffin DV) file writer, [`DVFileWriter`].
-//!
-//! Mirrors Java `BaseDVFileWriter`. The writer accumulates deleted positions per referenced data
-//! file. `close()` writes one Puffin file that holds one uncompressed `deletion-vector-v1` blob
-//! per referenced data file, and returns one [`DeleteFile`](DataFile) entry per referenced file.
-//!
-//! # The on-disk contract Java must read
-//!
-//! | Blob field | Value |
-//! |---|---|
-//! | type | `deletion-vector-v1`, uncompressed |
-//! | `fields` | `[2147483645]`, the reserved `_pos` column id, not the `pos` delete column |
-//! | `snapshot-id`, `sequence-number` | −1, inherited at commit time |
-//! | properties | `referenced-data-file` and `cardinality` |
-//!
-//! Each returned [`DataFile`] carries position-delete content, PUFFIN format, the shared Puffin
-//! path and size, the partition captured for that data file, `referenced_data_file`, the blob's
-//! `content_offset` and `content_size_in_bytes`, and `record_count` = the cardinality.
-//!
-//! # Determinism
-//!
-//! Blobs are written in sorted referenced-data-file-path order, and the returned files keep that
-//! order. Java iterates a `HashMap`, so blob order is not part of the Java contract. The sort
-//! makes two identical writer runs produce byte-identical Puffin files.
-//!
-//! # Previous-deletes merge
-//!
-//! Java `close()` unions each path's previous deletes into the new deletion vector. It collects
-//! the superseded file-scoped delete files for the commit to replace. That keeps exactly one live
-//! DV per data file across overwriting writes.
-//!
-//! [`DVFileWriter::with_previous_deletes`] mirrors it. On
-//! [`close_with_result`](DVFileWriter::close_with_result) the previous positions join the new DV,
-//! and every file-scoped source file comes back in
-//! [`rewritten_delete_files`](DVWriteResult::rewritten_delete_files). A source file that is not
-//! file-scoped stays in place, because Java can discard only DVs and file-scoped deletes. With no
-//! previous deletes the output is byte-identical to a fresh-only run.
-//!
-//! An engine feeds the result into a row delta:
-//! `row_delta().add_deletes(result.delete_files).remove_deletes_many(result.rewritten_delete_files)`.
+//! Deletion-vector (V3 Puffin DV) file writer, [`DVFileWriter`]. Java `BaseDVFileWriter`.
+//! One Puffin, one `deletion-vector-v1` blob per referenced data file, sorted by path.
+//! [`DVFileWriter::with_previous_deletes`] unions prior positions and returns file-scoped sources.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -91,12 +54,8 @@ struct DeletesForDataFile {
     partition_key: Option<PartitionKey>,
 }
 
-/// A data file's previous deletes, for [`DVFileWriter::with_previous_deletes`]. Mirrors the Java
-/// `PositionDeleteIndex` that `loadPreviousDeletes` returns, which pairs a position bitmap with
-/// the source delete files.
-///
-/// The merge unions `positions` into the new DV. It returns each file-scoped entry of
-/// `source_delete_files` as a rewritten delete file for the commit to remove.
+/// A data file's previous deletes, for [`DVFileWriter::with_previous_deletes`].
+/// Java `loadPreviousDeletes` / `PositionDeleteIndex`.
 #[derive(Debug, Clone)]
 pub struct PreviousDeletes {
     /// The data file's existing deleted positions. Load them through the production read path,
@@ -207,8 +166,7 @@ pub struct DVFileWriter {
     /// was called.
     previous_deletes_by_path: HashMap<String, PreviousDeletes>,
     /// The spec to stamp on a DV whose [`delete`](Self::delete) calls carried no [`PartitionKey`].
-    /// `None` falls back to `DEFAULT_PARTITION_SPEC_ID`. See
-    /// [`with_partition_spec`](Self::with_partition_spec).
+    /// `None` errors at close. See [`unpartitioned`](Self::unpartitioned).
     partition_spec: Option<PartitionSpec>,
 }
 
@@ -224,10 +182,13 @@ impl DVFileWriter {
         }
     }
 
-    /// Set the spec to stamp on a DV whose [`delete`](Self::delete) calls carried no
-    /// [`PartitionKey`]. Without it such a DV claims `DEFAULT_PARTITION_SPEC_ID` (0), an id no
-    /// table stands behind. Java takes the spec as a required per-call argument
-    /// (`BaseDVFileWriter.delete`).
+    /// Stamp [`PartitionSpec::unpartition_spec`] (spec id 0, no fields).
+    pub fn unpartitioned(self) -> Self {
+        self.with_partition_spec(PartitionSpec::unpartition_spec())
+    }
+
+    /// Spec to stamp when [`delete`](Self::delete) carries no [`PartitionKey`]. Java
+    /// `BaseDVFileWriter.delete` takes the spec per call.
     pub fn with_partition_spec(mut self, partition_spec: PartitionSpec) -> Self {
         self.partition_spec = Some(partition_spec);
         self
@@ -502,7 +463,8 @@ mod tests {
     async fn test_dv_writer_multi_file_delete_files_carry_blob_coordinates() {
         let temp_dir = TempDir::new().expect("temp dir");
         let file_io = FileIO::new_with_fs();
-        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+        let mut writer =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin")).unpartitioned();
 
         // Insertion order is deliberately NOT sorted; the output must be (sorted by path).
         writer
@@ -573,7 +535,7 @@ mod tests {
         let out = output_file(&file_io, &temp_dir, "empty.puffin");
         let path = out.location().to_string();
 
-        let writer = DVFileWriter::new(out);
+        let writer = DVFileWriter::new(out).unpartitioned();
         let delete_files = writer.close().await.expect("close with no deletes");
 
         assert!(delete_files.is_empty());
@@ -591,7 +553,8 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let file_io = FileIO::new_with_fs();
 
-        let mut first = DVFileWriter::new(output_file(&file_io, &temp_dir, "first.puffin"));
+        let mut first =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "first.puffin")).unpartitioned();
         for (path, pos) in [
             ("p/x.parquet", 5u64),
             ("p/y.parquet", 9),
@@ -601,7 +564,8 @@ mod tests {
         }
         let first_files = first.close().await.expect("close first");
 
-        let mut second = DVFileWriter::new(output_file(&file_io, &temp_dir, "second.puffin"));
+        let mut second =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "second.puffin")).unpartitioned();
         for (path, pos) in [
             ("p/y.parquet", 9u64),
             ("p/x.parquet", 2),
@@ -699,7 +663,8 @@ mod tests {
         )
         .expect("PartitionKey::new: valid partition tuple");
 
-        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+        let mut writer =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin")).unpartitioned();
         writer
             .delete("p/x.parquet", 1, Some(&partition_a))
             .expect("delete");
@@ -724,7 +689,8 @@ mod tests {
     async fn test_dv_writer_duplicate_position_counted_once() {
         let temp_dir = TempDir::new().expect("temp dir");
         let file_io = FileIO::new_with_fs();
-        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+        let mut writer =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin")).unpartitioned();
 
         writer.delete("p/x.parquet", 7, None).expect("delete");
         writer
@@ -749,7 +715,8 @@ mod tests {
     async fn test_dv_writer_rejects_position_above_java_max() {
         let temp_dir = TempDir::new().expect("temp dir");
         let file_io = FileIO::new_with_fs();
-        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+        let mut writer =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin")).unpartitioned();
 
         writer
             .delete("p/x.parquet", DV_MAX_POSITION, None)
@@ -770,7 +737,8 @@ mod tests {
     async fn test_dv_writer_round_trips_through_d1_loader() {
         let temp_dir = TempDir::new().expect("temp dir");
         let file_io = FileIO::new_with_fs();
-        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+        let mut writer =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin")).unpartitioned();
 
         let data_file_x = "mem://data/x.parquet";
         let data_file_y = "mem://data/y.parquet";
@@ -870,6 +838,7 @@ mod tests {
             synthetic_dv_delete_file("mem://data/dv1.puffin", data_file),
         ]);
         let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "dv2.puffin"))
+            .unpartitioned()
             .with_previous_deletes(HashMap::from([(data_file.to_string(), previous)]));
         // New delete: position {3}.
         writer
@@ -917,6 +886,7 @@ mod tests {
             synthetic_partition_scoped_pos_delete("mem://data/partition-deletes.parquet"),
         ]);
         let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "dv.puffin"))
+            .unpartitioned()
             .with_previous_deletes(HashMap::from([(data_file.to_string(), previous)]));
         writer
             .delete(data_file, 3, None)
@@ -961,6 +931,7 @@ mod tests {
             eq_delete,
         ]);
         let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "dv.puffin"))
+            .unpartitioned()
             .with_previous_deletes(HashMap::from([(data_file.to_string(), previous)]));
         writer
             .delete(data_file, 3, None)
@@ -988,10 +959,12 @@ mod tests {
             PreviousDeletes::new(DeleteVector::new([9u64].into_iter().collect()), vec![
                 synthetic_dv_delete_file("mem://data/old-dv.puffin", unwritten),
             ]);
-        let mut writer =
-            DVFileWriter::new(output_file(&file_io, &temp_dir, "dv.puffin")).with_previous_deletes(
-                HashMap::from([(unwritten.to_string(), previous_for_unwritten)]),
-            );
+        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "dv.puffin"))
+            .unpartitioned()
+            .with_previous_deletes(HashMap::from([(
+                unwritten.to_string(),
+                previous_for_unwritten,
+            )]));
         // Only `written` gets a new position; `unwritten` is never written.
         writer.delete(written, 0, None).expect("record new delete");
 
@@ -1021,13 +994,15 @@ mod tests {
         let file_io = FileIO::new_with_fs();
         let data_file = "mem://data/x.parquet";
 
-        let mut fresh = DVFileWriter::new(output_file(&file_io, &temp_dir, "fresh.puffin"));
+        let mut fresh =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "fresh.puffin")).unpartitioned();
         for pos in [0u64, 3, 7] {
             fresh.delete(data_file, pos, None).expect("fresh delete");
         }
         let fresh_files = fresh.close().await.expect("close fresh");
 
         let mut empty_prev = DVFileWriter::new(output_file(&file_io, &temp_dir, "empty.puffin"))
+            .unpartitioned()
             .with_previous_deletes(HashMap::new());
         for pos in [0u64, 3, 7] {
             empty_prev.delete(data_file, pos, None).expect("delete");
@@ -1348,7 +1323,8 @@ mod tests {
     async fn dv_result_referenced_data_files_names_every_referenced_file() {
         let temp_dir = TempDir::new().expect("temp dir");
         let file_io = FileIO::new_with_fs();
-        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+        let mut writer =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin")).unpartitioned();
         writer.delete("mem://data/a.parquet", 0, None).expect("a");
         writer.delete("mem://data/b.parquet", 4, None).expect("b");
         writer
@@ -1376,7 +1352,8 @@ mod tests {
     async fn dv_result_with_no_deletes_references_nothing() {
         let temp_dir = TempDir::new().expect("temp dir");
         let file_io = FileIO::new_with_fs();
-        let writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+        let writer =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin")).unpartitioned();
 
         let result = writer.close_with_result().await.expect("close with result");
         assert!(result.delete_files.is_empty(), "fixture precondition");
@@ -1405,6 +1382,7 @@ mod tests {
             synthetic_dv_delete_file("mem://data/old-dv.puffin", superseded_target),
         ]);
         let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"))
+            .unpartitioned()
             .with_previous_deletes(HashMap::from([(written.to_string(), previous)]));
         writer.delete(written, 7, None).expect("record new delete");
 
@@ -1427,7 +1405,8 @@ mod tests {
     async fn dv_result_referenced_data_files_is_not_the_puffin_path() {
         let temp_dir = TempDir::new().expect("temp dir");
         let file_io = FileIO::new_with_fs();
-        let mut writer = DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin"));
+        let mut writer =
+            DVFileWriter::new(output_file(&file_io, &temp_dir, "deletes.puffin")).unpartitioned();
         writer
             .delete("mem://data/only.parquet", 0, None)
             .expect("d");

@@ -79,7 +79,7 @@ use crate::metadata_columns::{
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriterBuilder,
-    MetricsConfig, PrimitiveLiteral, Snapshot, TableMetadata,
+    MetricsConfig, PartitionKey, PrimitiveLiteral, Snapshot, TableMetadata,
 };
 use crate::table::Table;
 use crate::writer::base_writer::position_delete_writer::{
@@ -505,10 +505,35 @@ impl RewriteTablePath {
             location_gen,
             file_name_gen,
         );
-        // A position delete carries its partition in the manifest entry, not in the rows.
-        let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
-            .build(None)
-            .await?;
+        // Stamp the source delete's spec. The old `build(None)` path silent-stamped spec 0.
+        let spec_id = delete_file.partition_spec_id();
+        let spec = self
+            .table
+            .metadata()
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "RewriteTablePath: position delete '{}' claims unknown partition spec {spec_id}",
+                        delete_file.file_path()
+                    ),
+                )
+            })?
+            .as_ref()
+            .clone();
+        let builder = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+            .with_partition_spec(spec.clone());
+        let partition_key = if spec.fields().is_empty() {
+            None
+        } else {
+            Some(PartitionKey::new(
+                spec,
+                self.table.metadata().current_schema().clone(),
+                delete_file.partition().clone(),
+            )?)
+        };
+        let mut writer = builder.build(partition_key).await?;
 
         let paths: Vec<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();
         let positions: Vec<i64> = pairs.iter().map(|(_, pos)| *pos).collect();
@@ -531,6 +556,20 @@ impl RewriteTablePath {
                 "RewriteTablePath: position-delete content writer produced no file",
             )
         })?;
+        if staged_file.partition_spec_id() != delete_file.partition_spec_id()
+            || staged_file.partition() != delete_file.partition()
+        {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "RewriteTablePath: rewritten position delete stamped spec {} {:?} but source is spec {} {:?}",
+                    staged_file.partition_spec_id(),
+                    staged_file.partition(),
+                    delete_file.partition_spec_id(),
+                    delete_file.partition()
+                ),
+            ));
+        }
         Ok(staged_file.file_path().to_string())
     }
 }

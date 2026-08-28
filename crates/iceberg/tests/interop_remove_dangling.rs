@@ -486,7 +486,7 @@ async fn write_dv_file(
         .file_io()
         .new_output(&dv_path)
         .expect("dv output file");
-    let mut dv_writer = DVFileWriter::new(output_file);
+    let mut dv_writer = DVFileWriter::new(output_file).unpartitioned();
     for pos in positions {
         dv_writer
             .delete(data_file_path, *pos, Some(&partition_key))

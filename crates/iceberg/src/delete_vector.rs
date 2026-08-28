@@ -1353,7 +1353,7 @@ mod loader_tests {
         let output = file_io
             .new_output(path.to_str().expect("utf-8 temp path"))
             .expect("create output file");
-        let mut writer = DVFileWriter::new(output);
+        let mut writer = DVFileWriter::new(output).unpartitioned();
         for position in positions {
             writer
                 .delete("s3://b/d.parquet", *position, None)

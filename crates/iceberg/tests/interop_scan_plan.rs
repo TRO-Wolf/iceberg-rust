@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java interop for the SCAN-PLAN layer (`plan_tasks`).
 //!
 //! It proves Rust `TableScan::plan_tasks` produces the same bin-packed `CombinedScanTask` groups as
 //! Java `planTasks()`, in both directions. The knobs are hand-declared on both sides, mirroring
@@ -716,6 +715,7 @@ async fn write_position_delete(table: &Table, data_file_path: &str) -> DataFile 
         file_name_gen,
     );
     let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .unpartitioned()
         .build(None)
         .await
         .expect("build position-delete writer");

@@ -589,7 +589,8 @@ async fn commit_shared_puffin_for_ids(table: &Table, catalog: &dyn Catalog, id_a
         table.metadata().location(),
         uuid::Uuid::now_v7()
     );
-    let mut writer = DVFileWriter::new(table.file_io().new_output(&puffin).expect("output"));
+    let mut writer =
+        DVFileWriter::new(table.file_io().new_output(&puffin).expect("output")).unpartitioned();
     let schema = table.metadata().current_schema().clone();
     for (path, position) in &deletes {
         let data_file = data_files.get(path).expect("live data file");

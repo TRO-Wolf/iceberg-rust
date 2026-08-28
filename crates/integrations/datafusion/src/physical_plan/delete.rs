@@ -56,7 +56,7 @@ use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::spec::{
     DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionKey, Struct,
-    referenced_data_file_location,
+    is_deletion_vector, referenced_data_file_location,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -143,6 +143,8 @@ pub(crate) struct IcebergDeleteExec {
     catalog: Arc<dyn Catalog>,
     /// The EXACT row filter, or `None` to delete every row (`DELETE FROM t`).
     predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Iceberg file prune only. Never replaces [`predicate`].
+    prune: Option<Predicate>,
     mode: WriteMode,
     /// The §5 isolation level, resolved at plan time from `write.delete.isolation-level`.
     isolation: IsolationLevel,
@@ -157,6 +159,7 @@ impl IcebergDeleteExec {
         table: Table,
         catalog: Arc<dyn Catalog>,
         predicate: Option<Arc<dyn PhysicalExpr>>,
+        prune: Option<Predicate>,
         mode: WriteMode,
         isolation: IsolationLevel,
         table_schema: SchemaRef,
@@ -167,6 +170,7 @@ impl IcebergDeleteExec {
             table,
             catalog,
             predicate,
+            prune,
             mode,
             isolation,
             table_schema,
@@ -175,7 +179,7 @@ impl IcebergDeleteExec {
         }
     }
 
-    fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {
+    pub(crate) fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {
         Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),
@@ -184,7 +188,7 @@ impl IcebergDeleteExec {
         ))
     }
 
-    fn make_count_schema() -> SchemaRef {
+    pub(crate) fn make_count_schema() -> SchemaRef {
         Arc::new(ArrowSchema::new(vec![Field::new(
             "count",
             DataType::UInt64,
@@ -192,7 +196,7 @@ impl IcebergDeleteExec {
         )]))
     }
 
-    fn make_count_batch(schema: SchemaRef, count: u64) -> DFResult<RecordBatch> {
+    pub(crate) fn make_count_batch(schema: SchemaRef, count: u64) -> DFResult<RecordBatch> {
         let count_array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
         RecordBatch::try_new(schema, vec![count_array]).map_err(|e| {
             DataFusionError::ArrowError(
@@ -259,6 +263,7 @@ impl ExecutionPlan for IcebergDeleteExec {
         let table = self.table.clone();
         let catalog = Arc::clone(&self.catalog);
         let predicate = self.predicate.clone();
+        let prune = self.prune.clone();
         let mode = self.mode;
         let isolation = self.isolation;
         let table_schema = Arc::clone(&self.table_schema);
@@ -271,6 +276,7 @@ impl ExecutionPlan for IcebergDeleteExec {
                         &table,
                         catalog.as_ref(),
                         predicate,
+                        prune,
                         &table_schema,
                         isolation,
                     )
@@ -281,6 +287,7 @@ impl ExecutionPlan for IcebergDeleteExec {
                         &table,
                         catalog.as_ref(),
                         predicate,
+                        prune,
                         &table_schema,
                         isolation,
                     )
@@ -376,6 +383,7 @@ async fn merge_on_read_delete(
     table: &Table,
     catalog: &dyn Catalog,
     predicate: Option<Arc<dyn PhysicalExpr>>,
+    prune: Option<Predicate>,
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
 ) -> DFResult<u64> {
@@ -383,8 +391,7 @@ async fn merge_on_read_delete(
     // The §5 `validate_from_snapshot` anchor. Java sets it only when the scan captured a snapshot.
     // The commit below is reached only when rows matched, which implies one existed.
     let scan_snapshot_id = table.metadata().current_snapshot_id();
-    // Scan every live row: the table columns for the exact filter, plus the `_file`/`_pos` row
-    // identity. The filter is NOT pushed into the scan — Iceberg pushdown is inexact.
+    // Table columns plus `_file`/`_pos`. File prune is optional; the row filter is PhysicalExpr.
     let mut projection: Vec<String> = table_schema
         .fields()
         .iter()
@@ -394,9 +401,11 @@ async fn merge_on_read_delete(
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
     // Awaiting `try_next()` polls the scan only as batches are consumed, so it is back-pressured.
-    let mut stream = table
-        .scan()
-        .select(projection)
+    let mut builder = table.scan().select(projection);
+    if let Some(prune) = prune {
+        builder = builder.with_file_prune_only(prune);
+    }
+    let mut stream = builder
         .build()
         .map_err(to_datafusion_error)?
         .to_arrow()
@@ -518,14 +527,13 @@ async fn merge_on_read_delete(
     Ok(deleted)
 }
 
-/// Opens ONE copy-on-write scan stream: every live row, the table columns plus the reserved `_file`
-/// path. The filter is not pushed into the scan; the caller's exact `PhysicalExpr` is the contract.
-/// The `scan_snapshot_id` pin is a no-op today, because an unpinned `build()` resolves the same
-/// snapshot from the same frozen `Table`. It documents that both passes read one snapshot.
+/// Opens ONE copy-on-write scan stream: table columns plus `_file`. `prune` is file-only.
+/// The caller's exact `PhysicalExpr` is the row contract. Both COW passes share one snapshot.
 async fn cow_scan_stream(
     table: &Table,
     table_schema: &SchemaRef,
     scan_snapshot_id: Option<i64>,
+    prune: Option<Predicate>,
 ) -> DFResult<iceberg::scan::ArrowRecordBatchStream> {
     let mut projection: Vec<String> = table_schema
         .fields()
@@ -538,7 +546,9 @@ async fn cow_scan_stream(
     if let Some(snapshot_id) = scan_snapshot_id {
         builder = builder.snapshot_id(snapshot_id);
     }
-    // Awaiting `try_next()` polls the scan only as batches are consumed, so it is back-pressured.
+    if let Some(prune) = prune {
+        builder = builder.with_file_prune_only(prune);
+    }
     builder
         .build()
         .map_err(to_datafusion_error)?
@@ -555,6 +565,7 @@ async fn copy_on_write_delete(
     table: &Table,
     catalog: &dyn Catalog,
     predicate: Option<Arc<dyn PhysicalExpr>>,
+    prune: Option<Predicate>,
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
 ) -> DFResult<u64> {
@@ -563,7 +574,7 @@ async fn copy_on_write_delete(
 
     // Pass 1 — affected-file detection. A file is affected when any of its rows matches. Only the
     // affected paths and the counter survive the pass; no rows are buffered.
-    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
+    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id, prune.clone()).await?;
     let mut deleted: u64 = 0;
     let mut affected: HashSet<String> = HashSet::new();
 
@@ -605,7 +616,8 @@ async fn copy_on_write_delete(
     let new_files = if predicate.is_none() {
         Vec::new()
     } else {
-        let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
+        let mut stream =
+            cow_scan_stream(table, table_schema, scan_snapshot_id, prune.clone()).await?;
         // Build the writer on the first batch that HAS survivors. A DELETE that empties every
         // affected file must not fail inside a constructor it never needed.
         let mut data_writer: Option<StreamingDataFileWriter> = None;
@@ -1068,7 +1080,7 @@ fn classify_live_delete(delete_file: &DataFile) -> Option<LiveDeleteKind> {
     if delete_file.content_type() != iceberg::spec::DataContentType::PositionDeletes {
         return None;
     }
-    if delete_file.file_format() == DataFileFormat::Puffin {
+    if is_deletion_vector(delete_file) {
         Some(LiveDeleteKind::DeletionVector)
     } else {
         Some(LiveDeleteKind::LegacyPositionDelete)
@@ -1381,147 +1393,6 @@ fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
     )))
 }
 
-// UPDATE
-
-/// `UPDATE … SET … WHERE` plan. It applies the assignments, commits, and counts the rows.
-pub(crate) struct IcebergUpdateExec {
-    table: Table,
-    catalog: Arc<dyn Catalog>,
-    /// The WHERE clause as a `PhysicalExpr`, or `None` to update every row.
-    predicate: Option<Arc<dyn PhysicalExpr>>,
-    /// The `SET` assignments: `(table-schema column index, new-value PhysicalExpr)`.
-    assignments: Vec<(usize, Arc<dyn PhysicalExpr>)>,
-    mode: WriteMode,
-    /// The §5 isolation level, resolved at plan time from `write.update.isolation-level`.
-    isolation: IsolationLevel,
-    table_schema: SchemaRef,
-    count_schema: SchemaRef,
-    plan_properties: Arc<PlanProperties>,
-}
-
-impl IcebergUpdateExec {
-    pub(crate) fn new(
-        table: Table,
-        catalog: Arc<dyn Catalog>,
-        predicate: Option<Arc<dyn PhysicalExpr>>,
-        assignments: Vec<(usize, Arc<dyn PhysicalExpr>)>,
-        mode: WriteMode,
-        isolation: IsolationLevel,
-        table_schema: SchemaRef,
-    ) -> Self {
-        let count_schema = IcebergDeleteExec::make_count_schema();
-        let plan_properties = IcebergDeleteExec::compute_properties(Arc::clone(&count_schema));
-        Self {
-            table,
-            catalog,
-            predicate,
-            assignments,
-            mode,
-            isolation,
-            table_schema,
-            count_schema,
-            plan_properties,
-        }
-    }
-}
-
-impl Debug for IcebergUpdateExec {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "IcebergUpdateExec(table={}, mode={:?})",
-            self.table.identifier(),
-            self.mode
-        )
-    }
-}
-
-impl DisplayAs for IcebergUpdateExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "IcebergUpdateExec: table={}, mode={:?}",
-            self.table.identifier(),
-            self.mode
-        )
-    }
-}
-
-impl ExecutionPlan for IcebergUpdateExec {
-    fn name(&self) -> &str {
-        "IcebergUpdateExec"
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.plan_properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(format!(
-                "IcebergUpdateExec only has one partition, but got partition {partition}"
-            )));
-        }
-
-        let table = self.table.clone();
-        let catalog = Arc::clone(&self.catalog);
-        let predicate = self.predicate.clone();
-        let assignments = self.assignments.clone();
-        let mode = self.mode;
-        let isolation = self.isolation;
-        let table_schema = Arc::clone(&self.table_schema);
-        let count_schema = Arc::clone(&self.count_schema);
-
-        let stream = futures::stream::once(async move {
-            let updated = match mode {
-                WriteMode::MergeOnRead => {
-                    merge_on_read_update(
-                        &table,
-                        catalog.as_ref(),
-                        predicate,
-                        &assignments,
-                        &table_schema,
-                        isolation,
-                    )
-                    .await?
-                }
-                WriteMode::CopyOnWrite => {
-                    copy_on_write_update(
-                        &table,
-                        catalog.as_ref(),
-                        predicate,
-                        &assignments,
-                        &table_schema,
-                        isolation,
-                    )
-                    .await?
-                }
-            };
-            IcebergDeleteExec::make_count_batch(count_schema, updated)
-        });
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&self.count_schema),
-            stream,
-        )))
-    }
-}
-
 /// Evaluate the `WHERE` predicate (or all-true when `None`) over `table_batch` to a NULL-free keep mask
 /// (`true` ⇒ the row matches — a NULL result is NOT a match, per SQL three-valued logic).
 fn match_mask(
@@ -1603,10 +1474,11 @@ fn apply_assignments(
 /// values, in one `RowDelta`. Returns the number of rows updated. The new rows go through
 /// [`StreamingDataFileWriter`], which reads partition values from the POST-assignment columns.
 /// Position deletes are keyed by `(path, pos)` and are partition-agnostic.
-async fn merge_on_read_update(
+pub(crate) async fn merge_on_read_update(
     table: &Table,
     catalog: &dyn Catalog,
     predicate: Option<Arc<dyn PhysicalExpr>>,
+    prune: Option<Predicate>,
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
@@ -1625,9 +1497,11 @@ async fn merge_on_read_update(
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
     // Awaiting `try_next` and the writer's `write` back-pressures the scan: no unbounded producer.
-    let mut stream = table
-        .scan()
-        .select(projection)
+    let mut builder = table.scan().select(projection);
+    if let Some(prune) = prune {
+        builder = builder.with_file_prune_only(prune);
+    }
+    let mut stream = builder
         .build()
         .map_err(to_datafusion_error)?
         .to_arrow()
@@ -1729,10 +1603,11 @@ async fn merge_on_read_update(
 /// row and rewrites those files in full: matched rows take the new values, the rest are carried
 /// unchanged. It then commits an `OverwriteFiles`. A SET on a partition-key column moves the row to
 /// its new partition, because [`StreamingDataFileWriter`] reads the post-assignment columns.
-async fn copy_on_write_update(
+pub(crate) async fn copy_on_write_update(
     table: &Table,
     catalog: &dyn Catalog,
     predicate: Option<Arc<dyn PhysicalExpr>>,
+    prune: Option<Predicate>,
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
@@ -1742,7 +1617,7 @@ async fn copy_on_write_update(
 
     // Pass 1 — affected-file detection. A file is affected when any of its rows matches. Only the
     // affected paths and the counter survive the pass; no rows and no masks are retained.
-    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
+    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id, prune.clone()).await?;
     let mut updated: u64 = 0;
     let mut affected: HashSet<String> = HashSet::new();
 
@@ -1777,7 +1652,7 @@ async fn copy_on_write_update(
 
     // Pass 2 — re-scan and rewrite affected files only. Matched rows take the new SET values; other
     // rows of the SAME affected file keep their original values. Nothing accumulates.
-    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id).await?;
+    let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id, prune.clone()).await?;
     // Eager construction is safe here, unlike the DELETE path: `updated > 0` means at least one file
     // is affected, and every row of an affected file is rewritten.
     let mut data_writer = StreamingDataFileWriter::try_new(table)?;

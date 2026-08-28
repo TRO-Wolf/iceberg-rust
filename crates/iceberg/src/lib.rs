@@ -103,6 +103,8 @@ mod utils;
 pub mod writer;
 
 pub mod delete_vector;
+mod delete_vector_lookup;
+pub use delete_vector_lookup::live_deletion_vectors_by_data_file;
 pub mod delete_vector_container;
 pub mod metadata_columns;
 pub mod puffin;

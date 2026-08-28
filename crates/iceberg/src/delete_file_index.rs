@@ -199,7 +199,7 @@ fn applicable_pos_deletes(
 
 /// Whether a delete file is a deletion vector. Java `ContentFileUtil.isDV` (L142-144):
 /// `deleteFile.format() == FileFormat.PUFFIN`.
-pub(crate) fn is_deletion_vector(data_file: &DataFile) -> bool {
+pub fn is_deletion_vector(data_file: &DataFile) -> bool {
     data_file.file_format() == DataFileFormat::Puffin
 }
 

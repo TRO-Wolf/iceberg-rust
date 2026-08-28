@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! DATA-LEVEL write-action interop for `MergeAppend`, `RewriteFiles`, `OverwriteFiles`,
-//! `DeleteFiles`, `ReplacePartitions`, and partitioned `RewriteFiles`. Each fixture runs the
 //! same chain as the matching Java `*DataOracle.generate`, writes real parquet through the
 //! production writers, and lands at `<gen_dir>/rust_table` for Java's `IcebergGenerics` to
 //! read back. Every fixture pins the `category` column through `id_to_category_sorted`,
@@ -486,6 +484,7 @@ async fn write_unpartitioned_data_file(table: &Table) -> DataFile {
     );
 
     let mut writer = DataFileWriterBuilder::new(rolling)
+        .unpartitioned()
         .build(None)
         .await
         .expect("build unpartitioned data file writer");
@@ -594,6 +593,7 @@ async fn write_unpartitioned_eq_delete_file(table: &Table) -> DataFile {
     );
 
     let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+        .unpartitioned()
         .build(None)
         .await
         .expect("build equality-delete writer");

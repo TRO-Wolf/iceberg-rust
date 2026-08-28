@@ -361,7 +361,7 @@ async fn write_dv_blobs(table: &Table, blobs: &[BlobWrite]) -> Result<Vec<Stampe
     );
     let location =
         location_generator.generate_location(None, &file_name_generator.generate_file_name());
-    let mut writer = DVFileWriter::new(table.file_io().new_output(location)?);
+    let mut writer = DVFileWriter::new(table.file_io().new_output(location)?).unpartitioned();
     let mut seq_by_ref: HashMap<String, Option<i64>> = HashMap::new();
     for blob in blobs {
         for &position in &blob.positions {

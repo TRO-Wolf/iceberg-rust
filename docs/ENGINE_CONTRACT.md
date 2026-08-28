@@ -327,13 +327,13 @@ partition, …)` — so a Java-written file can never claim a spec the table doe
   engines' routing predicates differ for an ALL-VOID spec carrying a null tuple — Rust would scope
   it, Java would globalise it. Backlog, not a writer concern.)
 - The mirror-image failure is loud but total: when the current spec is UNPARTITIONED with a NON-ZERO
-  id (reachable on V2 by removing a spec's only field), a writer given neither key nor spec claims
-  spec 0 — and if spec 0 is partitioned the commit rejects every file with `Partition value is not
-  compatible with partition type`. Such a table cannot be written at all until the spec is passed.
-- **Legacy fallback (deliberate, non-breaking).** A writer built with neither a `PartitionKey` nor a
-  configured spec still stamps `DEFAULT_PARTITION_SPEC_ID` (0), so pre-existing callers keep
-  compiling and behaving as before. That fallback is correct ONLY for a table whose current spec
-  really is spec 0. Treat it as deprecated: pass the spec.
+  id (reachable on V2 by removing a spec's only field), `unpartitioned()` stamps spec 0 — and if
+  spec 0 is partitioned the commit rejects every file with `Partition value is not compatible with
+  partition type`. Pass `with_partition_spec` with the current spec.
+- **Neither spec nor key is an error.** `resolve_partition_spec_id`'s `(None, None)` arm returns
+  `DataInvalid`. Call `unpartitioned()` to stamp spec 0 empty, or `with_partition_spec` / a
+  `PartitionKey`. Misusing `unpartitioned()` on a partitioned table still silent-never-applies
+  (row R113).
 - A partitioned spec configured WITHOUT a `PartitionKey` is rejected at `build()` with
   `ErrorKind::DataInvalid` — the file would claim a spec whose partition type has fields while
   carrying an empty tuple. The check is keyed on partition-field **arity**, not on

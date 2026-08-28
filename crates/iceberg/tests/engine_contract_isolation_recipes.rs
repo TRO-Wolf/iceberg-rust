@@ -154,6 +154,7 @@ async fn write_yid_file(table: &Table, ids: Vec<i64>, ys: Vec<i64>) -> DataFile 
     );
 
     let mut writer = DataFileWriterBuilder::new(rolling)
+        .unpartitioned()
         .build(None)
         .await
         .expect("build unpartitioned data file writer");
@@ -194,6 +195,7 @@ async fn write_position_delete_file(
     );
 
     let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .unpartitioned()
         .build(None)
         .await
         .expect("build unpartitioned position-delete writer");

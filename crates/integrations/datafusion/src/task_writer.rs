@@ -368,7 +368,7 @@ mod tests {
             location_gen,
             file_name_gen,
         );
-        Ok(DataFileWriterBuilder::new(rolling_writer_builder))
+        Ok(DataFileWriterBuilder::new(rolling_writer_builder).unpartitioned())
     }
 
     #[tokio::test]
