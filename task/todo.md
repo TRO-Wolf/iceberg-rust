@@ -75,7 +75,7 @@ Status lives on GAP_MATRIX row R135 (and the limit-(k) wording on row R136).
 - [x] Port `tooHighDeleteRatio` / `DELETE_RATIO_THRESHOLD_DEFAULT = 0.3`. Only file-scoped deletes count.
 - [x] Drop DVs that reference rewritten data files in the same `RewriteFiles` commit. Rewrite Puffin siblings.
 - [x] Comment part 2: apply `origin/docs/comment-compaction-part2` onto the 13 code-identical stack files.
-- [ ] Gates + independent Critic + PR.
+- [x] Gates + independent Critic + PR. Merged #232 (2026-08-27).
 
 ---
 
@@ -754,7 +754,8 @@ Unit 3. Mode A per-unit PRs; SEPMO v2.3 duties. Context at signing: nightly inte
       broken simultaneously and each masked the other. No Cargo.toml need materialised
       (`set_statistics_truncate_length` was already on the pinned parquet). R113 stays 🟡 (owes
       the Java-read interop leg on the evolved-DROP shape); R117 note added.
-- [ ] **H7-S2 → H7-P1** (re-scope at signing; P1's footgun pre-condition unchanged).
+- [x] **H7-S2** COW streaming. Merged #189 (2026-08-07). `copy_on_write_*` no longer `try_collect`.
+- [ ] **H7-P1** DML pushdown (prune only; `NOT`-over-dropped-conjunct footgun is a precondition).
 
 **Queue state 2026-08-05.** Since signing, the line has also absorbed: QD/QE (#178/#179, the two
 RePark filings — manifest schema tolerance + s3tables replace), the ledger archive (#177), interop
@@ -762,7 +763,7 @@ weekly cadence (#180), perf waves A–E (#181), the 07-31 slate (#182), the FK1�
 (#183), the V0 DF 52→54 churn map (#185), and the **DF 54.1 / arrow 58.4 family bump re-cut
 (#187)** — which moved MSRV 1.92 → 1.94 and toolchain to nightly-2026-03-05.
 
-**Remaining in signed order: Unit 3 (breaking) + QC alongside → H7-S2 → H7-P1.**
+**Remaining in signed order: Unit 3 (breaking) + QC alongside → H7-P1.**
 
 Two things now owed that were not at signing:
 
@@ -819,14 +820,12 @@ surfaced two new items. Statuses live ONLY in
 
 **In-flight (off-matrix, user-gated — staged work, not ranked above): H7 DML
 streaming/pushdown** on the DataFusion reference impl (scope converged 2026-06-30; engine-first
-hardening of the #124 DML loop, flips no matrix row). **H7-S1** (MoR DELETE/UPDATE streaming) is
-PUSHED — branch `parity/h7-s1-mor-streaming` (d2fecef6), gate green, all Critics/audits
-converged — awaiting user merge. Remaining stages, each its own ladder when the user resumes:
-**H7-S2** (COW streaming — the two `copy_on_write_*` fns, two-pass→bounded refactor) and
-**H7-P1** (pushdown pruning — must FIRST thread the raw `Vec<Expr>` through both exec structs,
+hardening of the #124 DML loop, flips no matrix row). **H7-S1** (MoR DELETE/UPDATE streaming) landed #140.
+**H7-S2** (COW streaming) landed #189.
+**H7-P1** (pushdown pruning) remains: thread the raw `Vec<Expr>` through both exec structs,
 and resolve the `NOT`-over-dropped-conjunct under-delete footgun before any
 `with_filter(convert_filters_to_predicate)`; pushdown may ONLY prune, never replace the exact
-post-scan filter).
+post-scan filter.
 
 PULL-BASED / DEMOTED: unchanged from the Roadmap re-anchor — link, do not restate.
 
