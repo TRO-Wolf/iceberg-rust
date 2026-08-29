@@ -24,6 +24,8 @@ mod manifest_list;
 mod metrics_config;
 mod name_mapping;
 mod partition;
+#[cfg(test)]
+mod partition_key_new_tests;
 mod partitioning;
 mod schema;
 mod snapshot;
