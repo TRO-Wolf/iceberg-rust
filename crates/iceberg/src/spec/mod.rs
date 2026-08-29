@@ -59,6 +59,7 @@ pub(crate) use table_metadata_builder::FIRST_FIELD_ID;
 pub use table_properties::*;
 pub use transform::*;
 pub(crate) use values::decimal_utils;
+pub(crate) use values::java_float::java_to_string_float;
 pub use values::*;
 pub use view_metadata::*;
 pub use view_version::*;

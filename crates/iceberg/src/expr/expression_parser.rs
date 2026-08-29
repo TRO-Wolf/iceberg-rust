@@ -326,77 +326,7 @@ fn format_java_float(v: f64, is_float: bool) -> Result<String> {
             format!("Cannot serialize non-finite floating-point value {v} to expression JSON"),
         ));
     }
-    if v == 0.0 {
-        // Java prints signed zero: `0.0` / `-0.0`.
-        return Ok(if v.is_sign_negative() {
-            "-0.0".to_string()
-        } else {
-            "0.0".to_string()
-        });
-    }
-
-    // Rust's `{:e}` yields the SHORTEST round-trip digits; Java's placement rule is applied below.
-    let neg = v < 0.0;
-    let sci = if is_float {
-        format!("{:e}", (v as f32).abs())
-    } else {
-        format!("{:e}", v.abs())
-    };
-    let (mantissa, exp_str) = sci.split_once('e').ok_or_else(|| {
-        Error::new(
-            ErrorKind::Unexpected,
-            format!("Rust scientific format produced no exponent for {v}"),
-        )
-    })?;
-    let exp: i32 = exp_str.parse().map_err(|e| {
-        Error::new(
-            ErrorKind::Unexpected,
-            format!("Cannot parse exponent from Rust scientific format {sci:?}"),
-        )
-        .with_source(e)
-    })?;
-    // `exp` is the power of ten of the FIRST digit: the value is `digits[0].digits[1..] * 10^exp`.
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let ndigits = digits.len();
-
-    let mut out = String::new();
-    if neg {
-        out.push('-');
-    }
-    // Java `FloatingDecimal`: scientific when the leading digit's power is `>= 7` or `<= -4`.
-    if exp >= 7 || exp <= -4 {
-        out.push_str(&digits[..1]);
-        out.push('.');
-        if ndigits == 1 {
-            out.push('0');
-        } else {
-            out.push_str(&digits[1..]);
-        }
-        out.push('E');
-        let _ = write!(out, "{exp}");
-    } else if exp >= 0 {
-        // Decimal point sits after `exp + 1` integer digits.
-        let int_len = (exp + 1) as usize;
-        if ndigits <= int_len {
-            out.push_str(&digits);
-            for _ in 0..(int_len - ndigits) {
-                out.push('0');
-            }
-            out.push_str(".0");
-        } else {
-            out.push_str(&digits[..int_len]);
-            out.push('.');
-            out.push_str(&digits[int_len..]);
-        }
-    } else {
-        // `exp` in -3..=-1: a leading `0.` then `(-exp - 1)` zeros then the digits.
-        out.push_str("0.");
-        for _ in 0..(-exp - 1) {
-            out.push('0');
-        }
-        out.push_str(&digits);
-    }
-    Ok(out)
+    Ok(crate::spec::java_to_string_float(v, is_float))
 }
 
 /// Formats `micros`-since-midnight as Java `DateTimeUtil.microsToIsoTime`, trailing zeros trimmed.
