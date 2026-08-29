@@ -183,9 +183,9 @@ impl Transform {
     ///
     /// Java-parity with `Transform.toHumanString(Type, T)` (iceberg-api 1.10.0): a null value
     /// (and the [`Transform::Void`] transform) renders the literal `"null"`; FIXED/BINARY values
-    /// render as standard Base64 via [`Datum::to_human_string`]; other primitives use their
-    /// [`Display`] form. A non-primitive field type is treated like a null (cannot form a
-    /// partition human string).
+    /// render as standard Base64 via [`Datum::to_human_string`]. Float/double use Java
+    /// `toString` through that method. Other primitives use [`Display`]. A non-primitive
+    /// field type is treated like a null (cannot form a partition human string).
     pub fn to_human_string(&self, field_type: &Type, value: Option<&Literal>) -> String {
         let Some(value) = value else {
             return "null".to_string();
