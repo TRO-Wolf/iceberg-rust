@@ -19,6 +19,7 @@
 
 pub(crate) mod datum;
 pub(crate) mod decimal_utils;
+pub(crate) mod java_float;
 mod literal;
 mod map;
 mod primitive;

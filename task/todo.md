@@ -740,8 +740,9 @@ Unit 3. Mode A per-unit PRs; SEPMO v2.3 duties. Context at signing: nightly inte
       main already returns `Result` and uses empty/zero status sentinels. This unit pins
       never-started + post-close `CurrentFileStatus` and names the breaking surface for
       RoadMapSync.
-- [ ] **QC — toHumanString parity** (D8-approved, format-visible; FIXED/BINARY hex→base64 +
-      Unknown taxonomy + identity(float/double)): alongside Unit 3; format-stability attestation.
+- [x] **QC — toHumanString parity** (D8-approved, format-visible). FIXED/BINARY base64 closed
+      2026-07-31. This unit closes `identity(float)`/`identity(double)` Java `toString`.
+      `Transform::Unknown` stays named on row R161. Temporal and year/month/hour remain.
 - [x] **QB — delete-writer file_path bounds** (fork file-scoped deletes must self-identify;
       parquet-rs 64-byte stat truncation; investigate-first, STOP on any Cargo.toml need).
       **MERGED #184 (`7e26c2a0`) 2026-08-03**, content-verified R4. Landed with BUG-001 (the
@@ -760,7 +761,7 @@ weekly cadence (#180), perf waves A–E (#181), the 07-31 slate (#182), the FK1�
 (#183), the V0 DF 52→54 churn map (#185), and the **DF 54.1 / arrow 58.4 family bump re-cut
 (#187)** — which moved MSRV 1.92 → 1.94 and toolchain to nightly-2026-03-05.
 
-**Remaining in signed order: QC alongside (Unit 3 pins land with this unit).**
+**Remaining in signed order: none (Unit 3 + QC landed).**
 
 Two things now owed that were not at signing:
 

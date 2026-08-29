@@ -1232,9 +1232,7 @@ impl Datum {
         }
     }
 
-    /// Returns a human-readable string, as Java `Transform.toHumanString` does: String raw and
-    /// unquoted, Binary and Fixed as standard Base64 (NOT the hex [`Display`] renders), the rest
-    /// through [`to_string()`].
+    /// Java `Transform.toHumanString`. Float/double use `Float`/`Double.toString`.
     pub fn to_human_string(&self) -> String {
         match self.literal() {
             PrimitiveLiteral::String(s) => s.to_string(),
@@ -1244,6 +1242,8 @@ impl Datum {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode(bytes)
             }
+            PrimitiveLiteral::Float(v) => super::java_float::java_to_string_f32(v.0),
+            PrimitiveLiteral::Double(v) => super::java_float::java_to_string_f64(v.0),
             _ => self.to_string(),
         }
     }
