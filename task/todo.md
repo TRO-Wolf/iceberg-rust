@@ -736,8 +736,10 @@ Unit 3. Mode A per-unit PRs; SEPMO v2.3 duties. Context at signing: nightly inte
       per-(file, claims) memo; the defect's unattributed path-keyed API REMOVED, `reader.rs`
       unchanged. Eq-deletes PROVEN not-same-class (pinned + mutation-proven); DVs covered.
       Interop crosstask leg added (id 30 survives == Java `{10,30,40,60}`). Lib 2977.
-- [ ] **Unit 3 — breaking** (`PartitionKey::new -> Result` + `CurrentFileStatus`): after QA
-      merges; RoadMapSync warning to RePark BEFORE their next repin.
+- [x] **Unit 3 — breaking** (`PartitionKey::new -> Result` + `CurrentFileStatus`): live
+      main already returns `Result` and uses empty/zero status sentinels. This unit pins
+      never-started + post-close `CurrentFileStatus` and names the breaking surface for
+      RoadMapSync.
 - [ ] **QC — toHumanString parity** (D8-approved, format-visible; FIXED/BINARY hex→base64 +
       Unknown taxonomy + identity(float/double)): alongside Unit 3; format-stability attestation.
 - [x] **QB — delete-writer file_path bounds** (fork file-scoped deletes must self-identify;
@@ -758,7 +760,7 @@ weekly cadence (#180), perf waves A–E (#181), the 07-31 slate (#182), the FK1�
 (#183), the V0 DF 52→54 churn map (#185), and the **DF 54.1 / arrow 58.4 family bump re-cut
 (#187)** — which moved MSRV 1.92 → 1.94 and toolchain to nightly-2026-03-05.
 
-**Remaining in signed order: Unit 3 (breaking) + QC alongside.**
+**Remaining in signed order: QC alongside (Unit 3 pins land with this unit).**
 
 Two things now owed that were not at signing:
 

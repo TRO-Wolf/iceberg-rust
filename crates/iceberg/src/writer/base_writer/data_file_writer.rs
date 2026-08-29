@@ -318,6 +318,11 @@ mod test {
             .await
             .unwrap();
 
+        use crate::writer::CurrentFileStatus;
+        assert_eq!(data_file_writer.current_file_path(), "");
+        assert_eq!(data_file_writer.current_row_num(), 0);
+        assert_eq!(data_file_writer.current_written_size(), 0);
+
         let arrow_schema = arrow_schema::Schema::new(vec![
             Field::new("foo", DataType::Int32, false).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
@@ -343,7 +348,6 @@ mod test {
         assert_eq!(data_file.partition, Struct::empty());
 
         // Post-close CurrentFileStatus must not panic (inner writer is taken on close).
-        use crate::writer::CurrentFileStatus;
         assert_eq!(
             data_file_writer.current_file_path(),
             "",
