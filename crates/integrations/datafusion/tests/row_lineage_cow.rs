@@ -26,7 +26,9 @@ use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuil
 use iceberg::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
 };
-use iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{
+    FormatVersion, NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
+};
 use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_datafusion::IcebergCatalogProvider;
@@ -51,6 +53,18 @@ async fn catalog() -> MemoryCatalog {
 }
 
 async fn v3_cow_ctx(ns: &str, tbl: &str) -> (SessionContext, Arc<MemoryCatalog>) {
+    v3_cow_ctx_inner(ns, tbl, false).await
+}
+
+async fn v3_cow_partitioned_ctx(ns: &str, tbl: &str) -> (SessionContext, Arc<MemoryCatalog>) {
+    v3_cow_ctx_inner(ns, tbl, true).await
+}
+
+async fn v3_cow_ctx_inner(
+    ns: &str,
+    tbl: &str,
+    partitioned: bool,
+) -> (SessionContext, Arc<MemoryCatalog>) {
     let iceberg_catalog = catalog().await;
     let namespace = NamespaceIdent::new(ns.to_string());
     iceberg_catalog
@@ -58,22 +72,44 @@ async fn v3_cow_ctx(ns: &str, tbl: &str) -> (SessionContext, Arc<MemoryCatalog>)
         .await
         .expect("namespace");
 
+    let mut fields =
+        vec![NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into()];
+    if partitioned {
+        fields.push(
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+        );
+        fields.push(NestedField::required(3, "val", Type::Primitive(PrimitiveType::String)).into());
+    } else {
+        fields.push(NestedField::required(2, "val", Type::Primitive(PrimitiveType::String)).into());
+    }
     let schema = Schema::builder()
         .with_schema_id(0)
-        .with_fields(vec![
-            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-            NestedField::required(2, "val", Type::Primitive(PrimitiveType::String)).into(),
-        ])
+        .with_fields(fields)
         .build()
         .expect("schema");
 
     let location = leak_temp_path();
-    let creation = TableCreation::builder()
-        .name(tbl.to_string())
-        .location(location)
-        .schema(schema)
-        .format_version(FormatVersion::V3)
-        .build();
+    let creation = if partitioned {
+        let partition_spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(2, "category", Transform::Identity)
+            .expect("identity(category)")
+            .build();
+        TableCreation::builder()
+            .name(tbl.to_string())
+            .location(location)
+            .schema(schema)
+            .partition_spec(partition_spec)
+            .format_version(FormatVersion::V3)
+            .build()
+    } else {
+        TableCreation::builder()
+            .name(tbl.to_string())
+            .location(location)
+            .schema(schema)
+            .format_version(FormatVersion::V3)
+            .build()
+    };
     iceberg_catalog
         .create_table(&namespace, creation)
         .await
@@ -242,6 +278,140 @@ async fn cow_update_keeps_row_id_and_bumps_matched_seq() {
         by_id[&3],
         (2, 2),
         "unmatched later row keeps _row_id and seq"
+    );
+    assert_eq!(by_id[&2].0, 1, "updated row keeps _row_id");
+    assert!(
+        by_id[&2].1 > 1,
+        "updated row last_updated_seq must advance, got {}",
+        by_id[&2].1
+    );
+}
+
+async fn load_v3_partitioned(client: &MemoryCatalog, ns: &str, tbl: &str) -> Table {
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("load");
+    assert_eq!(table.metadata().format_version(), FormatVersion::V3);
+    assert!(
+        !table.metadata().default_partition_spec().is_unpartitioned(),
+        "partitioned v3 pin must not silently create an unpartitioned table"
+    );
+    table
+}
+
+#[tokio::test]
+async fn cow_delete_keeps_survivor_row_ids_across_partitions() {
+    let ns = "lineage_cow_delete_part";
+    let tbl = "t";
+    let (ctx, client) = v3_cow_partitioned_ctx(ns, tbl).await;
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a', 'x'), (2, 'a', 'y')"
+    ))
+    .await
+    .expect("insert a")
+    .collect()
+    .await
+    .expect("insert a collect");
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{ns}.{tbl} VALUES (3, 'b', 'z')"
+    ))
+    .await
+    .expect("insert b")
+    .collect()
+    .await
+    .expect("insert b collect");
+
+    let table = load_v3_partitioned(client.as_ref(), ns, tbl).await;
+    let before = lineage_rows(&table).await;
+    assert_eq!(before, vec![(1, 0, 1), (2, 1, 1), (3, 2, 2)]);
+
+    ctx.sql(&format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 2"))
+        .await
+        .expect("delete")
+        .collect()
+        .await
+        .expect("delete collect");
+
+    let table = load_v3_partitioned(client.as_ref(), ns, tbl).await;
+    let after = lineage_rows(&table).await;
+    assert_eq!(
+        after,
+        vec![(1, 0, 1), (3, 2, 2)],
+        "partitioned COW DELETE must keep survivor _row_id/seq in the rewritten partition and the untouched one"
+    );
+}
+
+#[tokio::test]
+async fn cow_update_keeps_row_id_and_bumps_matched_seq_across_partitions() {
+    let ns = "lineage_cow_update_part";
+    let tbl = "t";
+    let (ctx, client) = v3_cow_partitioned_ctx(ns, tbl).await;
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a', 'x'), (2, 'a', 'y')"
+    ))
+    .await
+    .expect("insert a")
+    .collect()
+    .await
+    .expect("insert a collect");
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{ns}.{tbl} VALUES (3, 'b', 'z')"
+    ))
+    .await
+    .expect("insert b")
+    .collect()
+    .await
+    .expect("insert b collect");
+
+    let table = load_v3_partitioned(client.as_ref(), ns, tbl).await;
+    let before = lineage_rows(&table).await;
+    assert_eq!(before, vec![(1, 0, 1), (2, 1, 1), (3, 2, 2)]);
+
+    ctx.sql(&format!(
+        "UPDATE catalog.{ns}.{tbl} SET val = 'Y' WHERE id = 2"
+    ))
+    .await
+    .expect("update")
+    .collect()
+    .await
+    .expect("update collect");
+
+    let df = ctx
+        .sql(&format!(
+            "SELECT id, category, val FROM catalog.{ns}.{tbl} ORDER BY id"
+        ))
+        .await
+        .expect("select")
+        .collect()
+        .await
+        .expect("select collect");
+    assert_batches_eq!(
+        &[
+            "+----+----------+-----+",
+            "| id | category | val |",
+            "+----+----------+-----+",
+            "| 1  | a        | x   |",
+            "| 2  | a        | Y   |",
+            "| 3  | b        | z   |",
+            "+----+----------+-----+",
+        ],
+        &df
+    );
+
+    let table = load_v3_partitioned(client.as_ref(), ns, tbl).await;
+    let after = lineage_rows(&table).await;
+    let by_id: HashMap<i32, (i64, i64)> = after
+        .into_iter()
+        .map(|(id, row_id, seq)| (id, (row_id, seq)))
+        .collect();
+    assert_eq!(
+        by_id[&1],
+        (0, 1),
+        "same-partition unmatched survivor keeps _row_id and seq"
+    );
+    assert_eq!(
+        by_id[&3],
+        (2, 2),
+        "other-partition unmatched row keeps _row_id and seq"
     );
     assert_eq!(by_id[&2].0, 1, "updated row keeps _row_id");
     assert!(

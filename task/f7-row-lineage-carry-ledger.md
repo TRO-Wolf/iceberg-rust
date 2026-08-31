@@ -83,7 +83,7 @@ LEDGER:
       rewritten row; unmatched survivors keep last_updated_seq; matched rows store a null
       last_updated_seq so the reader uses the new file sequence.
     verdict: PROVEN
-    proof: iceberg-datafusion tests in row_lineage_cow.rs
+    proof: iceberg-datafusion tests in row_lineage_cow.rs (unpartitioned + identity-partitioned)
   - id: C-004
     proposition: Format v2 RewriteDataFiles does not write the reserved lineage columns.
     verdict: PROVEN
@@ -100,7 +100,7 @@ LEDGER:
 
 - V3-DANGLE-1 / row R137 dangling-DV drop on compaction.
 - Row R136 RewritePositionDeleteFiles DV remainder.
-- MoR UPDATE/DELETE `_row_id` carry on RowDelta-added data files.
+- MoR UPDATE/DELETE `_row_id` carry on RowDelta-added data files. MoR UPDATE already writes new rows through `StreamingDataFileWriter`, whose v3 schema includes the lineage pair, so those files currently persist all-null stored `_row_id` / `_last_updated_sequence_number` (the scan never attaches values); the later slice must project-and-attach rather than drop the columns.
 
 ## Risk
 
