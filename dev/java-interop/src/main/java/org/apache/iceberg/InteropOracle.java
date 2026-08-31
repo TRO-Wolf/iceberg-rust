@@ -26440,6 +26440,7 @@ public final class InteropOracle {
       }
 
       failures += verifyUpgraded(dir);
+      failures += verifyCompacted(dir);
 
       System.out.println("verify-interop-row-lineage: " + failures + " failures");
     }
@@ -26493,6 +26494,48 @@ public final class InteropOracle {
               failures++;
             }
           }
+        }
+      }
+      return failures;
+    }
+
+    /**
+     * D2 compact half: Java reads the V3 table the fork compacted through {@code RewriteDataFiles}.
+     * Stored {@code _row_id} / {@code _last_updated_sequence_number} must match the pre-compaction
+     * ids the fork recorded. A rewrite that only assigned a new {@code first_row_id} range reassigns
+     * every row.
+     */
+    private static int verifyCompacted(Path dir) throws IOException {
+      Path rustTable = dir.resolve("rust_table_compacted");
+      Path rustMetadata = rustTable.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(rustMetadata)) {
+        System.out.println("FAIL row-lineage compact: no Rust compacted metadata at " + rustMetadata);
+        return 1;
+      }
+
+      int failures = 0;
+      TableMetadata metadata =
+          TableMetadataParser.read(new LocalFileIO(), rustMetadata.toAbsolutePath().toString());
+      LocalTableOperations ops =
+          new LocalTableOperations(rustTable.toFile(), rustTable.resolve("metadata").toFile());
+      ops.commit(null, metadata);
+      BaseTable table = new BaseTable(ops, "rust_row_lineage_compacted");
+
+      String javaRows = rowIdsJson(table);
+      writeJson(dir.resolve("java_row_ids_of_rust_compacted_table.json"), javaRows);
+
+      Path expectedPath = dir.resolve("rust_compacted_row_ids_expected.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println("FAIL row-lineage compact: no Rust expectation at " + expectedPath);
+        failures++;
+      } else {
+        String expected = readString(expectedPath).trim();
+        if (!expected.equals(javaRows)) {
+          System.out.println(
+              "FAIL row-lineage compact: Java's per-row read of the compacted table differs.");
+          System.out.println("  rust  : " + expected);
+          System.out.println("  java  : " + javaRows);
+          failures++;
         }
       }
       return failures;

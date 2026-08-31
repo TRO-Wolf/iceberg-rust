@@ -212,9 +212,15 @@ Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next
       separate harness is not. Closes residue (3). It does NOT by itself close the row: residue
       (1), the untested ORC stored-`_row_id` arm, has no oracle either, so the flip needs the
       legend's named-unproven-slice allowance applied deliberately, not silently.
-- [ ] **Then F-7, not F-13.** F-13 is CLOSED (see row R114's engine answer, 2026-08-25), so the
-      unblocked item is F-7: lineage through `RewriteFiles`/`OverwriteFiles`, DV-aware
-      `RewritePositionDeleteFiles`, dangling-DV removal. Unlocks engine units V3-4 + V3-5.
+- [x] **F-7 slice 1** (2026-08-30, `parity/f7-row-lineage-carry`): V3-LINEAGE-1 + V3-COW-1 —
+      stored `_row_id` / `_last_updated_sequence_number` through `RewriteDataFiles` and
+      DataFusion COW `OverwriteFiles`. Ledger:
+      [`f7-row-lineage-carry-ledger.md`](f7-row-lineage-carry-ledger.md). Unlocks engine
+      units V3-4 + V3-5 at repin.
+- [ ] **F-7 remaining — V3-DANGLE-1 / row R137** dangling-DV drop on compaction.
+- [ ] **F-7 remaining — row R136** RewritePositionDeleteFiles DV-aware remainder.
+- [ ] **F-7 remaining — MoR RowDelta** `_row_id` carry on added data files. MoR UPDATE currently
+      writes all-null lineage columns through the shared v3 writer schema; see the F-7 ledger.
 - [ ] R166's other two residues stay open and named: the ORC stored-column arm has no oracle
       (Java's ORC reader is outside `iceberg-core`), and the ranged-split refusal is unreachable
       through `plan_tasks` but reachable through the public `PartitionWork` seam.

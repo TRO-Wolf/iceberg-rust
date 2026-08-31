@@ -31,6 +31,7 @@ use arrow_array::types::Int64Type;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::{FileIO, LocalFsStorageFactory};
+use iceberg::maintenance::RewriteDataFiles;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
@@ -713,5 +714,111 @@ async fn rust_assigns_the_same_upgraded_row_ids_java_does() {
         rust_numbers, java_numbers,
         "the fork ASSIGNED different row ids than Java did for the same upgraded chain.\n \
          rust: {rust_numbers}\n java: {java_numbers}"
+    );
+}
+
+/// D2 GEN COMPACT — six one-row V3 appends, then `RewriteDataFiles`. Stored lineage must survive.
+#[tokio::test]
+async fn row_lineage_compact_write_gen() {
+    let Some(dir) = fixture_dir(D2_ENV) else {
+        eprintln!("{D2_ENV} unset — skipping (run dev/java-interop/run-interop-row-lineage.sh)");
+        return;
+    };
+    fs::create_dir_all(&dir).expect("create the gen dir");
+
+    let table_location = format!("{}/rust_table_compacted", dir.to_string_lossy());
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "memory",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("build MemoryCatalog over local FS");
+
+    let namespace = NamespaceIdent::new("interop".to_string());
+    let _ = catalog.create_namespace(&namespace, HashMap::new()).await;
+    let creation = TableCreation::builder()
+        .name("rust_table_compacted".to_string())
+        .location(table_location.clone())
+        .schema(row_lineage_schema())
+        .sort_order(SortOrder::unsorted_order())
+        .format_version(FormatVersion::V3)
+        .build();
+    let mut table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create V3 compacted table");
+
+    let ids = [10_i64, 20, 30, 40, 50, 60];
+    let values = ["a", "b", "c", "d", "e", "f"];
+    for (id, value) in ids.into_iter().zip(values) {
+        let file = write_data_file(&table, vec![id], vec![value]).await;
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![file])
+            .apply(tx)
+            .expect("apply append");
+        table = tx.commit(&catalog).await.expect("commit append");
+    }
+
+    let before = row_ids_view(&table).await;
+    RewriteDataFiles::new(table.clone())
+        .target_file_size_bytes(1_000_000)
+        .execute(&catalog)
+        .await
+        .expect("compact");
+    table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload compacted table");
+
+    let after = row_ids_view(&table).await;
+    assert_eq!(
+        after, before,
+        "RewriteDataFiles must keep per-row _row_id and last_updated_seq.\n \
+         before: {before}\n after: {after}"
+    );
+
+    let final_metadata_path = format!("{table_location}/metadata/final.metadata.json");
+    table
+        .metadata()
+        .write_to(table.file_io(), &final_metadata_path)
+        .await
+        .expect("write compacted final.metadata.json");
+    fs::write(dir.join("rust_compacted_row_ids_expected.json"), &after)
+        .expect("write rust_compacted_row_ids_expected.json");
+    println!("interop_row_lineage COMPACT GEN OK — {table_location}\n  rows: {after}");
+}
+
+/// D2 compact materialization — Java's per-row read of the fork-compacted table.
+#[tokio::test]
+async fn java_materializes_rust_compacted_row_ids() {
+    let Some(dir) = fixture_dir(D2_ENV) else {
+        eprintln!("{D2_ENV} unset — skipping");
+        return;
+    };
+    let java_path = dir.join("java_row_ids_of_rust_compacted_table.json");
+    let java_rows = fs::read_to_string(&java_path).unwrap_or_else(|error| {
+        panic!(
+            "read {} ({error}) — run the oracle's verify first",
+            java_path.display()
+        )
+    });
+    let table = load_table(
+        &dir.join("rust_table_compacted/metadata/final.metadata.json"),
+        "rust_row_lineage_compacted",
+    );
+    let rust_rows = row_ids_view(&table).await;
+    assert_eq!(
+        rust_rows,
+        java_rows.trim(),
+        "Java's per-row read of the fork-compacted table differs from the fork's own.\n \
+         rust: {rust_rows}\n java: {}",
+        java_rows.trim()
     );
 }

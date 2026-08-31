@@ -21,6 +21,7 @@ pub(crate) mod expr_to_predicate;
 pub(crate) mod metadata_scan;
 pub(crate) mod project;
 pub(crate) mod repartition;
+pub(crate) mod row_lineage;
 pub(crate) mod scan;
 pub(crate) mod sort;
 pub(crate) mod update;

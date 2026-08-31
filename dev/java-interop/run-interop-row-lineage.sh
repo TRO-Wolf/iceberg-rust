@@ -108,7 +108,8 @@ echo "==> [3/5] (D1) Rust: lineage view + per-row _row_id of the JAVA tables, bo
 echo "==> [4/5] (D2) Rust: commit the equivalent V3 tables + emit the two expectation files"
 (
   cd "${REPO_ROOT}"
-  for test_name in row_lineage_write_gen row_lineage_upgraded_write_gen; do
+  for test_name in row_lineage_write_gen row_lineage_upgraded_write_gen \
+    row_lineage_compact_write_gen; do
     ICEBERG_INTEROP_ROW_LINEAGE_WRITE_DIR="${D2}" \
       cargo test -p iceberg --test interop_row_lineage \
       "${test_name}" -- --exact --nocapture
@@ -137,7 +138,8 @@ fi
       cargo test -p iceberg --test interop_row_lineage \
       "${test_name}" -- --exact --nocapture
   done
-  for test_name in java_materializes_rust_row_ids java_materializes_rust_upgraded_row_ids; do
+  for test_name in java_materializes_rust_row_ids java_materializes_rust_upgraded_row_ids \
+    java_materializes_rust_compacted_row_ids; do
     ICEBERG_INTEROP_ROW_LINEAGE_WRITE_DIR="${D2}" \
       cargo test -p iceberg --test interop_row_lineage \
       "${test_name}" -- --exact --nocapture

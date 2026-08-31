@@ -1,0 +1,149 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::sync::Arc;
+
+use futures::TryStreamExt;
+
+use crate::arrow::ArrowReaderBuilder;
+use crate::error::{Error, ErrorKind, Result};
+use crate::metadata_columns::{
+    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
+    format_supports_row_lineage, schema_with_row_lineage,
+};
+use crate::scan::FileScanTask;
+use crate::spec::{DataFile, DataFileFormat, PartitionKey, PartitionSpec, SchemaRef, Struct};
+use crate::table::Table;
+use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use crate::writer::file_writer::ParquetWriterBuilder;
+use crate::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+
+pub(super) async fn write_compacted_files(
+    table: &Table,
+    group: &[FileScanTask],
+    target_file_size_bytes: u64,
+) -> Result<Vec<DataFile>> {
+    let schema = rewrite_write_schema(table)?;
+    let spec = table.metadata().default_partition_spec().as_ref().clone();
+
+    let partition_key = group_partition_tuple(group, &spec)?
+        .map(|partition| PartitionKey::new(spec.clone(), schema.clone(), partition))
+        .transpose()?;
+
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let file_name_generator = DefaultFileNameGenerator::new(
+        "compacted".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        schema.clone(),
+    );
+    let rolling_builder = RollingFileWriterBuilder::new(
+        parquet_builder,
+        usize::try_from(target_file_size_bytes).unwrap_or(usize::MAX),
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    let mut writer = DataFileWriterBuilder::new(rolling_builder)
+        .with_partition_spec(spec.clone())
+        .build(partition_key)
+        .await?;
+
+    let carry_lineage = format_supports_row_lineage(table.metadata().format_version());
+    let tasks: Vec<Result<FileScanTask>> = group
+        .iter()
+        .cloned()
+        .map(|mut task| {
+            task.predicate = None;
+            if carry_lineage {
+                project_row_lineage(&mut task);
+            }
+            Ok(task)
+        })
+        .collect();
+    let task_stream = Box::pin(futures::stream::iter(tasks)) as crate::scan::FileScanTaskStream;
+    let mut batch_stream = ArrowReaderBuilder::new(table.file_io().clone())
+        .build()
+        .read(task_stream)?;
+
+    while let Some(batch) = batch_stream.try_next().await? {
+        writer.write(batch).await?;
+    }
+
+    writer.close().await
+}
+
+fn rewrite_write_schema(table: &Table) -> Result<SchemaRef> {
+    let schema = table.metadata().current_schema();
+    if format_supports_row_lineage(table.metadata().format_version()) {
+        Ok(Arc::new(schema_with_row_lineage(schema)?))
+    } else {
+        Ok(schema.clone())
+    }
+}
+
+fn project_row_lineage(task: &mut FileScanTask) {
+    let mut ids = task.project_field_ids.to_vec();
+    if !ids.contains(&RESERVED_FIELD_ID_ROW_ID) {
+        ids.push(RESERVED_FIELD_ID_ROW_ID);
+    }
+    if !ids.contains(&RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER) {
+        ids.push(RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER);
+    }
+    task.project_field_ids = Arc::from(ids);
+}
+
+pub(super) fn group_partition_tuple(
+    group: &[FileScanTask],
+    spec: &PartitionSpec,
+) -> Result<Option<Struct>> {
+    if spec.is_unpartitioned() {
+        return Ok(None);
+    }
+
+    let Some(partition) = group.first().and_then(|task| task.partition.clone()) else {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot compact into partitioned spec {}: the file group carries no partition tuple",
+                spec.spec_id()
+            ),
+        ));
+    };
+
+    if partition.fields().len() != spec.fields().len() {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot compact into partitioned spec {} ({} field(s)): the file group's partition \
+                 tuple has {} value(s) — its files were written under an incompatible spec",
+                spec.spec_id(),
+                spec.fields().len(),
+                partition.fields().len()
+            ),
+        ));
+    }
+
+    Ok(Some(partition))
+}

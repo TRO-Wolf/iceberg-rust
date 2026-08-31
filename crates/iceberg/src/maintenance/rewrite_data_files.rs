@@ -26,7 +26,7 @@
 //! | filter files | outside `[min_file_size, max_file_size]`, at `delete_file_threshold`, or at `delete_ratio_threshold` |
 //! | bin-pack | forward greedy first-fit, lookback 1 |
 //! | filter groups | enough files, enough content, too much content, or any delete-laden file |
-//! | rewrite | live rows only; one [`RewriteFilesAction`](crate::transaction::Transaction::rewrite_files) per group |
+//! | rewrite | live rows only; one [`RewriteFilesAction`](crate::transaction::Transaction::rewrite_files) per group. Format v3 writes stored `_row_id` / `_last_updated_sequence_number` (Java `SparkRewriteTable.rewriteSchema`) |
 //!
 //! A non-default-spec file can hold several current partitions, so Java groups it as unpartitioned.
 //!
@@ -73,8 +73,10 @@ pub(super) use crate::maintenance::rewrite_data_files_plan::{
 };
 #[cfg(test)]
 use crate::maintenance::rewrite_data_files_plan::{group_qualifies, is_candidate};
+#[cfg(test)]
+use crate::maintenance::rewrite_data_files_write::group_partition_tuple;
 use crate::scan::FileScanTask;
-use crate::spec::{DataFile, PartitionSpec, Struct, TableProperties};
+use crate::spec::{DataFile, TableProperties};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 
@@ -437,9 +439,12 @@ impl RewriteDataFiles {
             files_to_delete.push(data_file.clone());
         }
 
-        let added_files = self
-            .write_compacted_files(table, group, target_file_size_bytes)
-            .await?;
+        let added_files = crate::maintenance::rewrite_data_files_write::write_compacted_files(
+            table,
+            group,
+            target_file_size_bytes,
+        )
+        .await?;
 
         let group_result = FileGroupRewriteResult {
             added_data_files_count: added_files.len(),
@@ -471,113 +476,23 @@ impl RewriteDataFiles {
 
         Ok((group_result, committed, dv_plan.removed_count))
     }
+}
 
-    /// Read the group's live rows and write them through the rolling writer.
-    async fn write_compacted_files(
+#[cfg(test)]
+impl RewriteDataFiles {
+    pub(crate) async fn write_compacted_files(
         &self,
         table: &Table,
         group: &[FileScanTask],
         target_file_size_bytes: u64,
     ) -> Result<Vec<DataFile>> {
-        use futures::TryStreamExt;
-
-        use crate::arrow::ArrowReaderBuilder;
-        use crate::spec::{DataFileFormat, PartitionKey};
-        use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-        use crate::writer::file_writer::ParquetWriterBuilder;
-        use crate::writer::file_writer::location_generator::{
-            DefaultFileNameGenerator, DefaultLocationGenerator,
-        };
-        use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-        use crate::writer::{IcebergWriter, IcebergWriterBuilder};
-
-        let schema = table.metadata().current_schema().clone();
-        let spec = table.metadata().default_partition_spec().as_ref().clone();
-
-        // Validate the tuple against the output spec before stamping it onto anything.
-        let partition_key = group_partition_tuple(group, &spec)?
-            .map(|partition| PartitionKey::new(spec.clone(), schema.clone(), partition))
-            .transpose()?;
-
-        let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
-        let file_name_generator = DefaultFileNameGenerator::new(
-            "compacted".to_string(),
-            Some(uuid::Uuid::now_v7().to_string()),
-            DataFileFormat::Parquet,
-        );
-        let parquet_builder = ParquetWriterBuilder::new(
-            parquet::file::properties::WriterProperties::builder().build(),
-            schema.clone(),
-        );
-        let rolling_builder = RollingFileWriterBuilder::new(
-            parquet_builder,
-            usize::try_from(target_file_size_bytes).unwrap_or(usize::MAX),
-            table.file_io().clone(),
-            location_generator,
-            file_name_generator,
-        );
-        let mut writer = DataFileWriterBuilder::new(rolling_builder)
-            .with_partition_spec(spec.clone())
-            .build(partition_key)
-            .await?;
-
-        // Planning already leaves `predicate` as `None`. Clear it again so a future change to the
-        // plan path cannot leak a residual filter into the rewrite read and drop rows. Each task
-        // keeps its delete files.
-        let tasks: Vec<Result<FileScanTask>> = group
-            .iter()
-            .cloned()
-            .map(|mut task| {
-                task.predicate = None;
-                Ok(task)
-            })
-            .collect();
-        let task_stream = Box::pin(futures::stream::iter(tasks)) as crate::scan::FileScanTaskStream;
-        // Stream, never collect: a large group would otherwise hold every live row in memory.
-        let mut batch_stream = ArrowReaderBuilder::new(table.file_io().clone())
-            .build()
-            .read(task_stream)?;
-
-        while let Some(batch) = batch_stream.try_next().await? {
-            writer.write(batch).await?;
-        }
-
-        writer.close().await
+        crate::maintenance::rewrite_data_files_write::write_compacted_files(
+            table,
+            group,
+            target_file_size_bytes,
+        )
+        .await
     }
-}
-
-/// The partition tuple a group's output files carry under `spec`. `None` for an unpartitioned spec.
-/// An all-`void` spec has fields and still reports [`PartitionSpec::is_unpartitioned`], so this
-/// must branch on that method, never on a field count.
-fn group_partition_tuple(group: &[FileScanTask], spec: &PartitionSpec) -> Result<Option<Struct>> {
-    if spec.is_unpartitioned() {
-        return Ok(None);
-    }
-
-    let Some(partition) = group.first().and_then(|task| task.partition.clone()) else {
-        return Err(Error::new(
-            ErrorKind::DataInvalid,
-            format!(
-                "Cannot compact into partitioned spec {}: the file group carries no partition tuple",
-                spec.spec_id()
-            ),
-        ));
-    };
-
-    if partition.fields().len() != spec.fields().len() {
-        return Err(Error::new(
-            ErrorKind::DataInvalid,
-            format!(
-                "Cannot compact into partitioned spec {} ({} field(s)): the file group's partition \
-                 tuple has {} value(s) — its files were written under an incompatible spec",
-                spec.spec_id(),
-                spec.fields().len(),
-                partition.fields().len()
-            ),
-        ));
-    }
-
-    Ok(Some(partition))
 }
 
 /// Parses `write.target-file-size-bytes` (Java `defaultTargetFileSize`). An unparsable value is a
