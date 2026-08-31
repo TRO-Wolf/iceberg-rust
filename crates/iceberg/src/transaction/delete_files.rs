@@ -56,11 +56,11 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::expr::Predicate;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
-    deleted_data_files_after,
+    deleted_data_files_after_on,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
@@ -93,6 +93,7 @@ pub struct DeleteFilesAction {
     /// Column-name case sensitivity for binding [`Self::row_filter`] (Java
     /// `MergingSnapshotProducer.caseSensitive`). It defaults to `true`, the Java default.
     case_sensitive: bool,
+    pub(crate) target_branch: String,
 }
 
 impl DeleteFilesAction {
@@ -108,6 +109,7 @@ impl DeleteFilesAction {
             row_filter: None,
             // Java `MergingSnapshotProducer` defaults `caseSensitive` to true.
             case_sensitive: true,
+            target_branch: MAIN_BRANCH.to_string(),
         }
     }
 
@@ -209,6 +211,10 @@ impl DeleteFilesAction {
 
 #[async_trait]
 impl TransactionAction for DeleteFilesAction {
+    fn target_ref(&self) -> &str {
+        self.target_branch.as_str()
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let snapshot_producer = SnapshotProducer::new(
             table,
@@ -219,7 +225,8 @@ impl TransactionAction for DeleteFilesAction {
             vec![],
             FirstRowIdPolicy::Suppress,
         )
-        .with_stage_only(self.stage_only);
+        .with_stage_only(self.stage_only)
+        .with_target_branch(self.target_branch.clone())?;
 
         snapshot_producer
             .commit(
@@ -260,7 +267,13 @@ impl TransactionAction for DeleteFilesAction {
         // `skip_deletes == false`: a `DeleteFiles` commit validates against ALL data-removing operations,
         // including concurrent DELETE-op snapshots. The files it deletes must still exist whichever
         // operation removed them. `RowDelta` is the variant that skips DELETE-op snapshots by default.
-        let deleted = deleted_data_files_after(current, effective_start, false).await?;
+        let deleted = deleted_data_files_after_on(
+            current,
+            effective_start,
+            false,
+            self.target_branch.as_str(),
+        )
+        .await?;
 
         // Reject on the FIRST concurrently-deleted file this action also requires, as Java does.
         if let Some(missing) = deleted
@@ -501,49 +514,6 @@ mod tests {
             .delete_files(paths.into_iter().map(str::to_string));
         let tx = action.apply(tx).unwrap();
         tx.commit(catalog).await.unwrap()
-    }
-
-    /// Deleting one of several files in the SAME manifest must remove exactly that file and leave the
-    /// others. A wrong live set is data loss.
-    #[tokio::test]
-    async fn test_delete_files_removes_only_targeted_file_from_live_scan() {
-        let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-
-        let table = append_files(&catalog, &table, vec![
-            data_file("test/a.parquet", 0),
-            data_file("test/b.parquet", 0),
-            data_file("test/c.parquet", 0),
-        ])
-        .await;
-        assert_eq!(
-            live_file_paths(&table).await,
-            HashSet::from([
-                "test/a.parquet".to_string(),
-                "test/b.parquet".to_string(),
-                "test/c.parquet".to_string(),
-            ])
-        );
-
-        // Delete B.
-        let tx = Transaction::new(&table);
-        let action = tx.delete_files().delete_file("test/b.parquet");
-        let tx = action.apply(tx).unwrap();
-        let table = tx.commit(&catalog).await.unwrap();
-
-        assert_eq!(
-            table
-                .metadata()
-                .current_snapshot()
-                .unwrap()
-                .summary()
-                .operation,
-            Operation::Delete
-        );
-        assert_eq!(
-            live_file_paths(&table).await,
-            HashSet::from(["test/a.parquet".to_string(), "test/c.parquet".to_string()])
-        );
     }
 
     /// The deleted file's entry must be present as `Deleted` in the rewritten manifest, with correct
@@ -2286,4 +2256,6 @@ mod tests {
         // `test_delete_from_row_filter_case_insensitive_wrong_case_deletes`.
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
+
+    mod delete_files_extracted;
 }

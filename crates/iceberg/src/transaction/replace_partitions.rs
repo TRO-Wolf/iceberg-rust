@@ -70,11 +70,11 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::expr::Predicate;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation, Struct};
+use crate::spec::{DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation, Struct};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
-    added_data_files_after, added_delete_files_after, deleted_data_files_after,
+    added_data_files_after_on, added_delete_files_after_on, deleted_data_files_after_on,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
@@ -121,6 +121,7 @@ pub struct ReplacePartitionsAction {
     /// is a SAME-COMMIT guard on this action's own resolved partition deletes, NOT a concurrent-commit check
     /// (it is independent of and orthogonal to the two `validate_no_conflicting_*` flags above).
     validate_append_only: bool,
+    pub(crate) target_branch: String,
 }
 
 impl ReplacePartitionsAction {
@@ -134,6 +135,7 @@ impl ReplacePartitionsAction {
             validate_no_conflicting_deletes: false,
             validate_from_snapshot: None,
             validate_append_only: false,
+            target_branch: MAIN_BRANCH.to_string(),
         }
     }
 
@@ -331,6 +333,10 @@ impl ConflictScope {
 
 #[async_trait]
 impl TransactionAction for ReplacePartitionsAction {
+    fn target_ref(&self) -> &str {
+        self.target_branch.as_str()
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         // Mark the snapshot as a dynamic partition overwrite (Java `BaseReplacePartitions` constructor
         // sets `replace-partitions=true`). Layer it on top of any caller-provided properties.
@@ -344,7 +350,8 @@ impl TransactionAction for ReplacePartitionsAction {
             snapshot_properties,
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
-        );
+        )
+        .with_target_branch(self.target_branch.clone())?;
 
         // Validate the added files like fast append: data content type, partition-spec match, and
         // partition-value compatibility (Java `MergingSnapshotProducer.add`). The partition-scoped deletes
@@ -435,7 +442,9 @@ impl ReplacePartitionsAction {
         effective_start: Option<i64>,
         scope: &ConflictScope,
     ) -> Result<()> {
-        let added = added_data_files_after(current, effective_start).await?;
+        let added =
+            added_data_files_after_on(current, effective_start, self.target_branch.as_str())
+                .await?;
 
         // Naming the conflicting partition + file mirrors Java's
         // "Found conflicting files that can contain records matching partitions %s: %s".
@@ -473,7 +482,13 @@ impl ReplacePartitionsAction {
         // `skip_deletes == false`: Java's `validateDeletedDataFiles` uses `VALIDATE_DATA_FILES_EXIST_OPERATIONS`
         // (the full `{OVERWRITE, REPLACE, DELETE}` set), NOT the skip-delete subset — so a concurrent DELETE-op
         // snapshot that removed data from a replaced partition IS a conflict.
-        let deleted = deleted_data_files_after(current, effective_start, false).await?;
+        let deleted = deleted_data_files_after_on(
+            current,
+            effective_start,
+            false,
+            self.target_branch.as_str(),
+        )
+        .await?;
 
         // Java throws on the first matching entry:
         // "Found conflicting deleted files that can apply to records matching %s: %s".
@@ -507,7 +522,9 @@ impl ReplacePartitionsAction {
         effective_start: Option<i64>,
         scope: &ConflictScope,
     ) -> Result<()> {
-        let added_deletes = added_delete_files_after(current, effective_start).await?;
+        let added_deletes =
+            added_delete_files_after_on(current, effective_start, self.target_branch.as_str())
+                .await?;
 
         // Java throws on the first matching entry:
         // "Found new conflicting delete files that can apply to records matching %s: %s".
@@ -909,39 +926,6 @@ mod tests {
                 "test/c.parquet".to_string(),
             ]),
             "x=0 and x=1 replaced, x=2 (c) untouched"
-        );
-    }
-
-    /// Pins: replacing a single partition with MULTIPLE new files removes the old file and adds all the
-    /// new ones in that partition. Risk: only the first added file landing (lost new files).
-    #[tokio::test]
-    async fn test_replace_partition_with_multiple_new_files() {
-        let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-
-        let table = append_files(&catalog, &table, vec![
-            data_file("test/old.parquet", 0),
-            data_file("test/keep.parquet", 1),
-        ])
-        .await;
-
-        // Replace x=0 with TWO files; keep.parquet in x=1 must survive.
-        let tx = Transaction::new(&table);
-        let action = tx.replace_partitions().add_files(vec![
-            data_file("test/new1.parquet", 0),
-            data_file("test/new2.parquet", 0),
-        ]);
-        let tx = action.apply(tx).unwrap();
-        let table = tx.commit(&catalog).await.unwrap();
-
-        assert_eq!(
-            live_file_paths(&table).await,
-            HashSet::from([
-                "test/new1.parquet".to_string(),
-                "test/new2.parquet".to_string(),
-                "test/keep.parquet".to_string(),
-            ]),
-            "x=0 now holds new1+new2 (old replaced), x=1 keep survives"
         );
     }
 
@@ -2812,4 +2796,6 @@ mod tests {
             err.message()
         );
     }
+
+    mod replace_partitions_extracted;
 }

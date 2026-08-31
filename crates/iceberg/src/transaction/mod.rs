@@ -96,6 +96,7 @@ mod row_delta_fresh_dv;
 pub use row_delta::RowDeltaAction;
 mod snapshot;
 mod staged_table;
+mod to_branch;
 pub use staged_table::{StagedTableMode, StagedTableTransaction};
 mod sort_order;
 mod update_location;
@@ -106,6 +107,7 @@ mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,6 +140,7 @@ pub struct Transaction {
     /// [`Transaction::do_commit`] (which overwrites `self.table` with the refreshed base, losing the original
     /// head). `None` means the table had no snapshots yet at transaction start.
     starting_snapshot_id: Option<i64>,
+    starting_ref_snapshot_ids: HashMap<String, i64>,
     actions: Vec<BoxedTransactionAction>,
     /// The snapshot ids the MOST RECENT `do_commit` attempt handed to `Catalog::update_table`
     /// (one per `AddSnapshot` update, client-generated before the request). This is the
@@ -156,9 +159,22 @@ impl Transaction {
         Self {
             table: table.clone(),
             starting_snapshot_id: table.metadata().current_snapshot_id(),
+            starting_ref_snapshot_ids: table
+                .metadata()
+                .refs
+                .iter()
+                .map(|(name, reference)| (name.clone(), reference.snapshot_id))
+                .collect(),
             actions: vec![],
             latest_attempt_snapshot_ids: vec![],
         }
+    }
+
+    fn starting_snapshot_for(&self, branch: &str) -> Option<i64> {
+        self.starting_ref_snapshot_ids
+            .get(branch)
+            .copied()
+            .or(self.starting_snapshot_id)
     }
 
     fn update_table_metadata(table: Table, updates: &[TableUpdate]) -> Result<Table> {
@@ -521,8 +537,9 @@ impl Transaction {
         // non-retryable, so it propagates out of the retry loop instead of looping (Java's
         // non-retryable `ValidationException`). The default `validate` is a no-op, so opt-out actions skip it.
         for action in &self.actions {
+            let starting = self.starting_snapshot_for(action.target_ref());
             Arc::clone(action)
-                .validate(self.starting_snapshot_id, &current_table)
+                .validate(starting, &current_table)
                 .await?;
         }
 
@@ -1720,95 +1737,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod test_row_lineage {
-    use crate::memory::tests::new_memory_catalog;
-    use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct,
-    };
-    use crate::transaction::tests::make_v3_minimal_table_in_catalog;
-    use crate::transaction::{ApplyTransactionAction, Transaction};
-
-    #[tokio::test]
-    async fn test_fast_append_with_row_lineage() {
-        // Helper function to create a data file with specified number of rows
-        fn file_with_rows(record_count: u64) -> DataFile {
-            DataFileBuilder::default()
-                .content(DataContentType::Data)
-                .file_path(format!("test/{record_count}.parquet"))
-                .file_format(DataFileFormat::Parquet)
-                .file_size_in_bytes(100)
-                .record_count(record_count)
-                .partition(Struct::from_iter([Some(Literal::long(0))]))
-                .partition_spec_id(0)
-                .build()
-                .unwrap()
-        }
-        let catalog = new_memory_catalog().await;
-
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-
-        // Check initial state - next_row_id should be 0
-        assert_eq!(table.metadata().next_row_id(), 0);
-
-        // First fast append with 30 rows
-        let tx = Transaction::new(&table);
-        let data_file_30 = file_with_rows(30);
-        let action = tx.fast_append().add_data_files(vec![data_file_30]);
-        let tx = action.apply(tx).unwrap();
-        let table = tx.commit(&catalog).await.unwrap();
-
-        // Check snapshot and table state after first append
-        let snapshot = table.metadata().current_snapshot().unwrap();
-        assert_eq!(snapshot.first_row_id(), Some(0));
-        assert_eq!(table.metadata().next_row_id(), 30);
-
-        // Check written manifest for first_row_id
-        let manifest_list = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
-
-        assert_eq!(manifest_list.entries().len(), 1);
-        let manifest_file = &manifest_list.entries()[0];
-        assert_eq!(manifest_file.first_row_id, Some(0));
-
-        // Second fast append with 17 and 11 rows
-        let tx = Transaction::new(&table);
-        let data_file_17 = file_with_rows(17);
-        let data_file_11 = file_with_rows(11);
-        let action = tx
-            .fast_append()
-            .add_data_files(vec![data_file_17, data_file_11]);
-        let tx = action.apply(tx).unwrap();
-        let table = tx.commit(&catalog).await.unwrap();
-
-        // Check snapshot and table state after second append
-        let snapshot = table.metadata().current_snapshot().unwrap();
-        assert_eq!(snapshot.first_row_id(), Some(30));
-        assert_eq!(table.metadata().next_row_id(), 30 + 17 + 11);
-
-        // Check written manifest for first_row_id
-        let manifest_list = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
-        assert_eq!(manifest_list.entries().len(), 2);
-        // The NEW manifest comes first (Java `FastAppend.apply`: `writeNewManifests()` then
-        // `snapshot.allManifests()`), and the manifest-list writer assigns ranges in that order.
-        let new_manifest = &manifest_list.entries()[0];
-        assert_eq!(new_manifest.added_files_count, Some(2));
-        assert_eq!(new_manifest.first_row_id, Some(30));
-        let carried_manifest = &manifest_list.entries()[1];
-        assert_eq!(carried_manifest.added_files_count, Some(1));
-        assert_eq!(carried_manifest.first_row_id, Some(0));
-    }
-}
+mod transaction_row_lineage_tests;
 
 #[cfg(test)]
 mod test_create_snapshot_event {

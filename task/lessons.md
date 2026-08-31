@@ -1194,3 +1194,21 @@ remembering to write it.
   bytes carrying an ORC stamp, so the loader reads them and the probe proved nothing. Where no
   genuine fixture can exist — the fork has no ORC position-delete writer — record the limit as a
   CODE READ and say so, rather than manufacturing a green that means nothing.
+
+### 2026-08-31 — `to_branch` validate-start is not `current_snapshot()`, and a missing ref is not "walk from origin"
+
+- **DO fall `starting_snapshot_for(missing_ref)` back to the txn-start main head.** *Why:* Java
+  `ancestorsBetween(parent, starting)` is exclusive of the parent. A missing named ref used to
+  return `None`, so `files_after` walked the whole ancestry and opt-in conflict validation treated
+  the parent snapshot's own files as concurrent. Pin:
+  `to_branch_missing_ref_conflict_validation_does_not_see_parent_files`.
+- **DO walk the fresh-DV door through `latest_snapshot(metadata, target_branch)`.** *Why:*
+  `current_snapshot()` is main. On a diverged branch a live position delete that exists only on the
+  branch is invisible (fail-open) and a main-only delete false-rejects. Pins:
+  `to_branch_fresh_dv_rejects_branch_live_position_delete` and
+  `to_branch_fresh_dv_ignores_main_only_position_delete`.
+- **DO NOT treat a to_branch pin that creates the named ref AT main as covering branch-head
+  resolution.** *Why:* a parent that still reads `current_snapshot()` stays green when branch ==
+  main. Re-fixture with a diverged head (`branch_head != main_id`) and assert
+  `parent == branch_head`. Mutation C (`starting_snapshot_for` always returns main-at-txn-start)
+  stays green on the original 8 to_branch tests; the F-3 pins are what make it red.

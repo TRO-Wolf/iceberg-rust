@@ -57,12 +57,12 @@ use crate::expr::visitors::inclusive_projection::InclusiveProjection;
 use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
 use crate::expr::visitors::strict_projection::StrictProjection;
 use crate::expr::{Bind, BoundPredicate, Predicate};
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation, Schema};
+use crate::spec::{DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation, Schema};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
-    validate_deleted_data_files, validate_no_conflicting_added_data_files,
-    validate_no_conflicting_added_delete_files, validate_no_new_deletes_for_data_files,
+    validate_deleted_data_files_on, validate_no_conflicting_added_data_files_on,
+    validate_no_conflicting_added_delete_files_on, validate_no_new_deletes_for_data_files_on,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
@@ -116,6 +116,7 @@ pub struct OverwriteFilesAction {
     /// Defaults to `true`, the Java default. `false` switches EVERY filter binding this action performs to
     /// case-insensitive column resolution. See [`OverwriteFilesAction::case_sensitive`].
     case_sensitive: bool,
+    pub(crate) target_branch: String,
 }
 
 impl OverwriteFilesAction {
@@ -135,6 +136,7 @@ impl OverwriteFilesAction {
             validate_added_files_match_overwrite_filter: false,
             // Java `MergingSnapshotProducer` defaults `caseSensitive` to true.
             case_sensitive: true,
+            target_branch: MAIN_BRANCH.to_string(),
         }
     }
 
@@ -377,6 +379,10 @@ impl OverwriteFilesAction {
 
 #[async_trait]
 impl TransactionAction for OverwriteFilesAction {
+    fn target_ref(&self) -> &str {
+        self.target_branch.as_str()
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let snapshot_producer = SnapshotProducer::new(
             table,
@@ -385,7 +391,8 @@ impl TransactionAction for OverwriteFilesAction {
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
-        );
+        )
+        .with_target_branch(self.target_branch.clone())?;
 
         // Validate the added files like fast append: content type, spec match, partition values. The
         // producer's commit resolves the delete paths and fails on an absent one (Java
@@ -441,11 +448,12 @@ impl TransactionAction for OverwriteFilesAction {
         // Concurrent-added DATA-file conflict (Java `validateNewDataFiles`).
         if self.validate_no_conflicting_data {
             let conflict_filter = self.data_conflict_detection_filter();
-            validate_no_conflicting_added_data_files(
+            validate_no_conflicting_added_data_files_on(
                 current,
                 effective_start,
                 conflict_filter,
                 self.case_sensitive,
+                self.target_branch.as_str(),
             )
             .await?;
         }
@@ -458,18 +466,20 @@ impl TransactionAction for OverwriteFilesAction {
             let row_filter = self.row_filter();
             if row_filter != Predicate::AlwaysFalse {
                 let filter = self.conflict_detection_filter.clone().unwrap_or(row_filter);
-                validate_no_conflicting_added_delete_files(
+                validate_no_conflicting_added_delete_files_on(
                     current,
                     effective_start,
                     Some(&filter),
                     self.case_sensitive,
+                    self.target_branch.as_str(),
                 )
                 .await?;
-                validate_deleted_data_files(
+                validate_deleted_data_files_on(
                     current,
                     effective_start,
                     Some(&filter),
                     self.case_sensitive,
+                    self.target_branch.as_str(),
                 )
                 .await?;
             }
@@ -488,12 +498,13 @@ impl TransactionAction for OverwriteFilesAction {
                     )?),
                     None => None,
                 };
-                validate_no_new_deletes_for_data_files(
+                validate_no_new_deletes_for_data_files_on(
                     current,
                     effective_start,
                     bound_conflict_filter.as_ref(),
                     &self.deleted_data_files,
                     false,
+                    self.target_branch.as_str(),
                 )
                 .await?;
             }
@@ -790,37 +801,6 @@ mod tests {
             }
         }
         assert!(b_deleted, "B must appear as a Deleted tombstone");
-    }
-
-    /// An add-only overwrite succeeds and records `Append` (Java `BaseOverwriteFiles.operation()`). A wrong
-    /// operation misleads every consumer that branches on the snapshot type.
-    #[tokio::test]
-    async fn test_overwrite_add_only_records_append_operation() {
-        let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
-
-        let tx = Transaction::new(&table);
-        let action = tx
-            .overwrite_files()
-            .add_file(data_file("test/b.parquet", 0));
-        let tx = action.apply(tx).unwrap();
-        let table = tx.commit(&catalog).await.unwrap();
-
-        assert_eq!(
-            table
-                .metadata()
-                .current_snapshot()
-                .unwrap()
-                .summary()
-                .operation,
-            Operation::Append,
-            "an add-only overwrite records Append (Java BaseOverwriteFiles.operation())"
-        );
-        assert_eq!(
-            live_file_paths(&table).await,
-            HashSet::from(["test/a.parquet".to_string(), "test/b.parquet".to_string()])
-        );
     }
 
     /// A delete-only overwrite succeeds and records `Delete` (Java `BaseOverwriteFiles.operation()`). A
@@ -3444,4 +3424,6 @@ mod tests {
             err.message()
         );
     }
+
+    mod overwrite_extracted;
 }

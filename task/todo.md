@@ -33,6 +33,17 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-31): F-6 Critic remediation (row R168)
+
+- [x] F-1: `starting_snapshot_for` falls back to txn-start main when the named ref is missing.
+- [x] F-2: `validate_fresh_dvs_only` walks `latest_snapshot(..., target_branch)`.
+- [x] F-3: diverged-branch validate-start pins (main-only ignored; branch-only rejected).
+- [x] Q-002: re-fixture existing-branch as diverged; retry pin on OverwriteFiles.
+- [x] Q-003: `TransactionAction::validate` docs name `starting_snapshot_for(target_ref())`.
+- [x] Gates (`make check`, `make unit-test`, typos, file-size) + commit. Do not rewrite ce3719a6.
+
+Outcome: Critic F-1/F-2/F-3, Q-002, Q-003 remediations landed on `parity/f6-branch-commit-target` as a second commit after ce3719a6. Missing-ref validate start falls back to txn-start main; fresh-DV walks the named branch; mutation C is red on the diverged-branch pins.
+
 ## ACTIVE (2026-08-28): relocate SEPMO into `.agents/skills/`
 
 Scope ledger: C-001 `PROVEN` — `.agents/skills/` is the canonical agent-skill home and Claude
