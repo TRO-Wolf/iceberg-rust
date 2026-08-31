@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 
-use crate::spec::{NestedField, NestedFieldRef, PrimitiveType, Type};
+use crate::spec::{FormatVersion, NestedField, NestedFieldRef, PrimitiveType, Schema, Type, join};
 use crate::{Error, ErrorKind, Result};
 
 /// Reserved field ID for the file path (_file) column per Iceberg spec
@@ -337,6 +337,26 @@ pub fn last_updated_sequence_number_field() -> &'static NestedFieldRef {
     &LAST_UPDATED_SEQUENCE_NUMBER_FIELD
 }
 
+/// Whether format `version` supports V3 row lineage. Java `TableUtil.supportsRowLineage`.
+pub fn format_supports_row_lineage(version: FormatVersion) -> bool {
+    version >= FormatVersion::V3
+}
+
+/// Table schema plus the two reserved row-lineage fields. Java `MetadataColumns.schemaWithRowLineage`.
+///
+/// # Errors
+///
+/// Returns an error when joining the reserved fields onto `schema` fails.
+pub fn schema_with_row_lineage(schema: &Schema) -> Result<Schema> {
+    let lineage = Schema::builder()
+        .with_fields(vec![
+            row_id_field().clone(),
+            last_updated_sequence_number_field().clone(),
+        ])
+        .build()?;
+    join(schema, &lineage)
+}
+
 /// Creates the Iceberg field definition for the _partition metadata column.
 ///
 /// The _partition field is a struct whose fields depend on the partition spec.
@@ -582,5 +602,33 @@ mod tests {
         assert!(get_metadata_field(RESERVED_FIELD_ID_COMMIT_SNAPSHOT_ID).is_ok());
         assert!(get_metadata_field(RESERVED_FIELD_ID_ROW_ID).is_ok());
         assert!(get_metadata_field(RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER).is_ok());
+    }
+
+    #[test]
+    fn schema_with_row_lineage_joins_the_two_reserved_fields() {
+        use crate::spec::Schema;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let joined = schema_with_row_lineage(&schema).expect("join");
+        assert_eq!(joined.schema_id(), 1);
+        assert_eq!(joined.as_struct().fields().len(), 3);
+        assert_eq!(joined.as_struct().fields()[0].id, 1);
+        assert_eq!(joined.as_struct().fields()[1].id, RESERVED_FIELD_ID_ROW_ID);
+        assert!(!joined.as_struct().fields()[1].required);
+        assert_eq!(
+            joined.as_struct().fields()[2].id,
+            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+        );
+        assert!(!joined.as_struct().fields()[2].required);
+        assert!(format_supports_row_lineage(crate::spec::FormatVersion::V3));
+        assert!(!format_supports_row_lineage(crate::spec::FormatVersion::V2));
     }
 }

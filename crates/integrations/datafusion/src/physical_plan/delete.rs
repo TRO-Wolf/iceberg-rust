@@ -50,7 +50,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::TryStreamExt;
 use iceberg::Catalog;
-use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator};
 use iceberg::delete_vector_container::{DvContainerClose, close_touched_dv_containers};
 use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
@@ -60,7 +59,6 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
 };
@@ -71,7 +69,10 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 
-use crate::task_writer::TaskWriter;
+use super::row_lineage::{
+    StreamingDataFileWriter, attach_lineage, filter_lineage_columns, null_last_updated_where_true,
+    push_lineage_scan_columns,
+};
 use crate::to_datafusion_error;
 
 pub(crate) const WRITE_DELETE_MODE: &str = "write.delete.mode";
@@ -541,6 +542,7 @@ async fn cow_scan_stream(
         .map(|field| field.name().clone())
         .collect();
     projection.push(RESERVED_COL_NAME_FILE.to_string());
+    push_lineage_scan_columns(&mut projection, table.metadata().format_version());
 
     let mut builder = table.scan().select(projection);
     if let Some(snapshot_id) = scan_snapshot_id {
@@ -641,8 +643,11 @@ async fn copy_on_write_delete(
                 continue;
             }
 
-            let surviving = filter_record_batch(&table_batch, &keep)
+            let mut surviving = filter_record_batch(&table_batch, &keep)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            if let Some((row_id, last_updated)) = filter_lineage_columns(&batch, &keep)? {
+                surviving = attach_lineage(surviving, row_id, last_updated)?;
+            }
             if data_writer.is_none() {
                 data_writer = Some(StreamingDataFileWriter::try_new(table)?);
             }
@@ -739,146 +744,6 @@ async fn resolve_affected_data_files(
     }
 
     Ok(resolved)
-}
-
-/// A streaming, partition-correct data-file writer over the production `TaskWriter`. It buffers no
-/// batch, and each batch must hold only table-schema columns. For a partitioned table a
-/// `PartitionValueCalculator` injects the `_partition` column the splitter reads, and
-/// `fanout_enabled = true` routes rows of any partition without pre-sorting. The `TaskWriter` is
-/// created on the FIRST batch, so a writer that never receives one writes no file.
-type DmlDataFileWriterBuilder =
-    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
-
-struct StreamingDataFileWriter {
-    writer: Option<TaskWriter<DmlDataFileWriterBuilder>>,
-    schema: iceberg::spec::SchemaRef,
-    partition_spec: iceberg::spec::PartitionSpecRef,
-    /// Present only for partitioned tables; computes the `_partition` struct column per batch.
-    calculator: Option<PartitionValueCalculator>,
-    /// The builder used to lazily create the `TaskWriter` on the first batch.
-    builder: Option<DmlDataFileWriterBuilder>,
-}
-
-impl StreamingDataFileWriter {
-    /// Prepares a streaming writer. No `TaskWriter`, and so no file, exists until the first batch.
-    fn try_new(table: &Table) -> DFResult<Self> {
-        let schema = table.metadata().current_schema().clone();
-        let partition_spec = table.metadata().default_partition_spec().clone();
-
-        let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
-            parquet::file::properties::WriterProperties::default(),
-            schema.clone(),
-            FieldMatchMode::Name,
-        );
-        let location_gen =
-            DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
-        let file_name_gen = DefaultFileNameGenerator::new(
-            uuid::Uuid::now_v7().to_string(),
-            None,
-            DataFileFormat::Parquet,
-        );
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet_builder,
-            table.file_io().clone(),
-            location_gen,
-            file_name_gen,
-        );
-        // Always configure the default spec. `build(None)` would otherwise stamp a fabricated spec
-        // id 0, but a post-DROP-PARTITION-FIELD empty spec may carry a non-zero id (C5-L-001).
-        let builder = DataFileWriterBuilder::new(rolling)
-            .with_partition_spec(partition_spec.as_ref().clone());
-
-        let calculator = if partition_spec.is_unpartitioned() {
-            None
-        } else {
-            Some(
-                PartitionValueCalculator::try_new(&partition_spec, &schema)
-                    .map_err(to_datafusion_error)?,
-            )
-        };
-
-        Ok(Self {
-            writer: None,
-            schema,
-            partition_spec,
-            calculator,
-            builder: Some(builder),
-        })
-    }
-
-    fn ensure_writer(&mut self) -> DFResult<&mut TaskWriter<DmlDataFileWriterBuilder>> {
-        if self.writer.is_none() {
-            let builder = self.builder.take().ok_or_else(|| {
-                DataFusionError::Internal(
-                    "StreamingDataFileWriter builder already consumed".to_string(),
-                )
-            })?;
-            // fanout_enabled = true: successive batches may be unsorted across partitions.
-            let writer = TaskWriter::try_new(
-                builder,
-                true,
-                self.schema.clone(),
-                self.partition_spec.clone(),
-            )
-            .map_err(to_datafusion_error)?;
-            self.writer = Some(writer);
-        }
-        // Just-initialized above, so the writer is present.
-        self.writer.as_mut().ok_or_else(|| {
-            DataFusionError::Internal("StreamingDataFileWriter not initialized".into())
-        })
-    }
-
-    /// Feeds ONE batch to the writer. Awaiting the inner `write` back-pressures the scan.
-    async fn write_batch(&mut self, batch: RecordBatch) -> DFResult<()> {
-        if self.partition_spec.is_unpartitioned() {
-            self.ensure_writer()?
-                .write(batch)
-                .await
-                .map_err(to_datafusion_error)
-        } else {
-            // The TaskWriter's splitter routes rows by this injected `_partition` column.
-            let calculator = self.calculator.as_ref().ok_or_else(|| {
-                DataFusionError::Internal(
-                    "StreamingDataFileWriter partition calculator missing".to_string(),
-                )
-            })?;
-            let partition_array = calculator.calculate(&batch).map_err(to_datafusion_error)?;
-
-            let partition_field = datafusion::arrow::datatypes::Field::new(
-                PROJECTED_PARTITION_VALUE_COLUMN,
-                partition_array.data_type().clone(),
-                false,
-            );
-            let extended_schema = Arc::new(ArrowSchema::new(
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(Arc::new(partition_field)))
-                    .collect::<Vec<_>>(),
-            ));
-            let mut extended_columns: Vec<ArrayRef> = batch.columns().to_vec();
-            extended_columns.push(partition_array);
-            let extended_batch = RecordBatch::try_new(extended_schema, extended_columns)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-            self.ensure_writer()?
-                .write(extended_batch)
-                .await
-                .map_err(to_datafusion_error)
-        }
-    }
-
-    /// Close the writer and return every `DataFile` produced. If no batch was ever written, the
-    /// `TaskWriter` was never created and this returns an empty `Vec` — no empty file is committed.
-    async fn finish(self) -> DFResult<Vec<DataFile>> {
-        match self.writer {
-            None => Ok(Vec::new()),
-            Some(writer) => writer.close().await.map_err(to_datafusion_error),
-        }
-    }
 }
 
 /// Writes Parquet position-delete files from sorted `(path, pos)` pairs and returns EVERY file the
@@ -1683,12 +1548,16 @@ pub(crate) async fn copy_on_write_update(
         // not match, so it could apply one batch's mask to another batch's rows.
         let affected_match_mask = match_mask(&predicate, &affected_batch)?;
 
-        let rewritten = apply_assignments(
+        let mut rewritten = apply_assignments(
             &affected_batch,
             assignments,
             table_schema,
             Some(&affected_match_mask),
         )?;
+        if let Some((row_id, last_updated)) = filter_lineage_columns(&batch, &keep_affected)? {
+            let last_updated = null_last_updated_where_true(last_updated, &affected_match_mask)?;
+            rewritten = attach_lineage(rewritten, row_id, last_updated)?;
+        }
         data_writer.write_batch(rewritten).await?;
     }
 
