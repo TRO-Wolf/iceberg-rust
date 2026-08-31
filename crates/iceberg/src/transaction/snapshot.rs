@@ -29,9 +29,9 @@ use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, Manifest, ManifestContentType,
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter,
-    ManifestWriterBuilder, Operation, Schema, Snapshot, SnapshotReference, SnapshotRetention,
-    SnapshotSummaryCollector, Struct, StructType, Summary, TableProperties,
-    update_snapshot_summaries,
+    ManifestWriterBuilder, Operation, Schema, Snapshot, SnapshotRef, SnapshotReference,
+    SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary, TableMetadata,
+    TableProperties, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -136,6 +136,19 @@ pub(crate) enum FirstRowIdPolicy {
 /// `addFile(DeleteFile, long)` → `writeDeleteFileGroup`'s `writer.add(file, dataSeq)`).
 pub(crate) type PendingDeleteFile = (DataFile, Option<i64>);
 
+pub(crate) fn latest_snapshot<'a>(
+    metadata: &'a TableMetadata,
+    branch: &str,
+) -> Option<&'a SnapshotRef> {
+    if branch == MAIN_BRANCH {
+        metadata.current_snapshot()
+    } else if let Some(reference) = metadata.refs.get(branch) {
+        metadata.snapshot_by_id(reference.snapshot_id)
+    } else {
+        metadata.current_snapshot()
+    }
+}
+
 pub(crate) struct SnapshotProducer<'a> {
     pub(crate) table: &'a Table,
     snapshot_id: i64,
@@ -168,6 +181,7 @@ pub(crate) struct SnapshotProducer<'a> {
     // `main` ref and the snapshot log stay unchanged. A cherry-pick publishes it later. The staged
     // snapshot still CONSUMES a sequence number, exactly like a normal commit.
     stage_only: bool,
+    pub(crate) target_branch: String,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -209,7 +223,46 @@ impl<'a> SnapshotProducer<'a> {
             removed_data_files: vec![],
             removed_delete_files: vec![],
             stage_only: false,
+            target_branch: MAIN_BRANCH.to_string(),
             manifest_counter: (0..),
+        }
+    }
+
+    /// Commit onto `branch` instead of `main`. Java `SnapshotProducer.targetBranch(String)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::DataInvalid`] when `branch` names an existing tag.
+    pub(crate) fn with_target_branch(mut self, branch: impl Into<String>) -> Result<Self> {
+        let branch = branch.into();
+        if let Some(reference) = self.table.metadata().refs.get(&branch)
+            && !reference.is_branch()
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "{branch} is a tag, not a branch. Tags cannot be targets for producing snapshots"
+                ),
+            ));
+        }
+        self.target_branch = branch;
+        Ok(self)
+    }
+
+    pub(crate) fn parent_snapshot(&self) -> Option<&SnapshotRef> {
+        latest_snapshot(self.table.metadata(), &self.target_branch)
+    }
+
+    pub(crate) fn parent_snapshot_id(&self) -> Option<i64> {
+        self.parent_snapshot()
+            .map(|snapshot| snapshot.snapshot_id())
+    }
+
+    fn previous_branch_head(&self) -> Option<&SnapshotRef> {
+        if self.target_branch == MAIN_BRANCH {
+            self.table.metadata().current_snapshot()
+        } else {
+            self.table.metadata().snapshot_for_ref(&self.target_branch)
         }
     }
 
@@ -460,7 +513,7 @@ impl<'a> SnapshotProducer<'a> {
             .collect();
 
         let mut referenced_files = Vec::new();
-        if let Some(current_snapshot) = self.table.metadata().current_snapshot() {
+        if let Some(current_snapshot) = self.parent_snapshot() {
             let manifest_list = current_snapshot
                 .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
                 .await?;
@@ -510,7 +563,7 @@ impl<'a> SnapshotProducer<'a> {
     /// UNCHANGED. Keeping a delete that no longer applies is harmless, while dropping one that still
     /// applies resurrects rows. Cleanup belongs to `RemoveDanglingDeleteFiles`.
     pub(crate) async fn current_manifests(&self) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = self.table.metadata().current_snapshot() else {
+        let Some(snapshot) = self.parent_snapshot() else {
             return Ok(vec![]);
         };
 
@@ -543,7 +596,7 @@ impl<'a> SnapshotProducer<'a> {
 
         let mut resolved = Vec::new();
         let mut found_paths: HashSet<String> = HashSet::new();
-        if let Some(snapshot) = self.table.metadata().current_snapshot() {
+        if let Some(snapshot) = self.parent_snapshot() {
             let manifest_list = snapshot
                 .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
                 .await?;
@@ -601,7 +654,7 @@ impl<'a> SnapshotProducer<'a> {
 
         let mut resolved = Vec::new();
         let mut found_paths: HashSet<String> = HashSet::new();
-        if let Some(snapshot) = self.table.metadata().current_snapshot() {
+        if let Some(snapshot) = self.parent_snapshot() {
             let manifest_list = snapshot
                 .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
                 .await?;
@@ -654,7 +707,7 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         let mut resolved = Vec::new();
-        if let Some(snapshot) = self.table.metadata().current_snapshot() {
+        if let Some(snapshot) = self.parent_snapshot() {
             let manifest_list = snapshot
                 .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
                 .await?;
@@ -694,7 +747,7 @@ impl<'a> SnapshotProducer<'a> {
         predicate: &Predicate,
         case_sensitive: bool,
     ) -> Result<Vec<DataFile>> {
-        let Some(snapshot) = self.table.metadata().current_snapshot() else {
+        let Some(snapshot) = self.parent_snapshot() else {
             return Ok(vec![]);
         };
 
@@ -1370,7 +1423,7 @@ impl<'a> SnapshotProducer<'a> {
         // `previous.snapshot(previousBranchHead.snapshotId()).summary()`. (Looking up `self.snapshot_id`
         // here would always miss — the new snapshot does not exist yet — leaving totals seeded from zero,
         // which underflows the moment an operation removes more files than it adds.)
-        let previous_snapshot = table_metadata.current_snapshot();
+        let previous_snapshot = self.previous_branch_head();
 
         let mut additional_properties = summary_collector.build();
         additional_properties.extend(self.snapshot_properties.clone());
@@ -1429,20 +1482,21 @@ impl<'a> SnapshotProducer<'a> {
         let manifest_list_path = self.generate_manifest_list_file_path(0);
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
+        let parent_snapshot_id = self.parent_snapshot_id();
         let mut manifest_list_writer = match self.table.metadata().format_version() {
             FormatVersion::V1 => ManifestListWriter::v1(
                 self.table
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
+                parent_snapshot_id,
             ),
             FormatVersion::V2 => ManifestListWriter::v2(
                 self.table
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
+                parent_snapshot_id,
                 next_seq_num,
             ),
             FormatVersion::V3 => ManifestListWriter::v3(
@@ -1450,7 +1504,7 @@ impl<'a> SnapshotProducer<'a> {
                     .file_io()
                     .new_output(manifest_list_path.clone())?,
                 self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
+                parent_snapshot_id,
                 next_seq_num,
                 Some(first_row_id),
             ),
@@ -1475,7 +1529,7 @@ impl<'a> SnapshotProducer<'a> {
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
-            .with_parent_snapshot_id(self.table.metadata().current_snapshot_id())
+            .with_parent_snapshot_id(parent_snapshot_id)
             .with_sequence_number(next_seq_num)
             .with_summary(summary)
             .with_schema_id(self.table.metadata().current_schema_id())
@@ -1501,7 +1555,7 @@ impl<'a> SnapshotProducer<'a> {
         }];
         if !self.stage_only {
             updates.push(TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
+                ref_name: self.target_branch.clone(),
                 reference: SnapshotReference::new(
                     self.snapshot_id,
                     SnapshotRetention::branch(None, None, None),
@@ -1509,18 +1563,22 @@ impl<'a> SnapshotProducer<'a> {
             });
         }
 
-        // The `main`-ref optimistic-concurrency guard is only meaningful when this commit moves `main`. A
-        // staged commit moves no ref, so it emits only the table-uuid guard (it still requires the same
-        // table — a staged snapshot added to a different table's metadata would be nonsense). This mirrors
-        // Java deriving an `AssertRefSnapshotID` requirement only for the `SetSnapshotRef` update it emits
-        // (`UpdateRequirements`); with no ref update there is no ref requirement.
         let mut requirements = vec![TableRequirement::UuidMatch {
             uuid: self.table.metadata().uuid(),
         }];
         if !self.stage_only {
+            let requirement_snapshot_id = if self.target_branch == MAIN_BRANCH {
+                self.table.metadata().current_snapshot_id()
+            } else {
+                self.table
+                    .metadata()
+                    .refs
+                    .get(&self.target_branch)
+                    .map(|reference| reference.snapshot_id)
+            };
             requirements.push(TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRANCH.to_string(),
-                snapshot_id: self.table.metadata().current_snapshot_id(),
+                r#ref: self.target_branch.clone(),
+                snapshot_id: requirement_snapshot_id,
             });
         }
 
@@ -1647,9 +1705,10 @@ fn operation_adds_dvs(operation: &Operation) -> bool {
 ///
 /// There is no format-version guard, because Java's `validateAddedDVs` has none. The caller's
 /// self-skip means the walk runs only when this operation adds DVs.
-pub(crate) async fn added_dv_candidate_delete_files_after(
+pub(crate) async fn added_dv_candidate_delete_files_after_on(
     table: &Table,
     starting_snapshot_id: Option<i64>,
+    branch: &str,
 ) -> Result<Vec<DataFile>> {
     files_after(
         table,
@@ -1657,6 +1716,7 @@ pub(crate) async fn added_dv_candidate_delete_files_after(
         ManifestContentType::Deletes,
         operation_adds_dvs,
         ManifestStatus::Added,
+        branch,
     )
     .await
 }
@@ -1718,12 +1778,11 @@ async fn files_after(
     content: ManifestContentType,
     operation_filter: fn(&Operation) -> bool,
     status_to_keep: ManifestStatus,
+    branch: &str,
 ) -> Result<Vec<DataFile>> {
     let metadata = table.metadata();
 
-    // The "parent" of the operation in Java terms: the current head of the refreshed base. If there is no
-    // current snapshot, nothing has been added.
-    let Some(mut current) = metadata.current_snapshot().cloned() else {
+    let Some(mut current) = latest_snapshot(metadata, branch).cloned() else {
         return Ok(vec![]);
     };
 
@@ -1792,9 +1851,18 @@ async fn files_after(
 ///
 /// This is the shared foundation the per-action data-file conflict validations (`ReplacePartitions`
 /// `validateNoConflictingData`, `OverwriteFiles` / `RowDelta` `validateNoConflictingDataFiles`) build on.
+#[cfg(test)]
 pub(crate) async fn added_data_files_after(
     table: &Table,
     starting_snapshot_id: Option<i64>,
+) -> Result<Vec<DataFile>> {
+    added_data_files_after_on(table, starting_snapshot_id, MAIN_BRANCH).await
+}
+
+pub(crate) async fn added_data_files_after_on(
+    table: &Table,
+    starting_snapshot_id: Option<i64>,
+    branch: &str,
 ) -> Result<Vec<DataFile>> {
     files_after(
         table,
@@ -1802,6 +1870,7 @@ pub(crate) async fn added_data_files_after(
         ManifestContentType::Data,
         operation_adds_data_files,
         ManifestStatus::Added,
+        branch,
     )
     .await
 }
@@ -1819,12 +1888,19 @@ pub(crate) async fn added_data_files_after(
 /// port walks the snapshots alone and applies the metrics filter later in
 /// [`validate_no_conflicting_added_delete_files`]. Omitting the refinement is CONSERVATIVE: it can
 /// only consider more delete files, never fewer.
+#[cfg(test)]
 pub(crate) async fn added_delete_files_after(
     table: &Table,
     starting_snapshot_id: Option<i64>,
 ) -> Result<Vec<DataFile>> {
-    // V2 guard (Java `addedDeleteFiles`: `base.formatVersion() < 2` ⇒ empty). Delete files don't exist in
-    // V1, so there is nothing to enumerate and no history to walk.
+    added_delete_files_after_on(table, starting_snapshot_id, MAIN_BRANCH).await
+}
+
+pub(crate) async fn added_delete_files_after_on(
+    table: &Table,
+    starting_snapshot_id: Option<i64>,
+    branch: &str,
+) -> Result<Vec<DataFile>> {
     if table.metadata().format_version() < FormatVersion::V2 {
         return Ok(vec![]);
     }
@@ -1835,6 +1911,7 @@ pub(crate) async fn added_delete_files_after(
         ManifestContentType::Deletes,
         operation_adds_delete_files,
         ManifestStatus::Added,
+        branch,
     )
     .await
 }
@@ -1854,6 +1931,7 @@ pub(crate) async fn added_delete_files_after(
 async fn added_delete_files_with_seq_after(
     table: &Table,
     starting_snapshot_id: Option<i64>,
+    branch: &str,
 ) -> Result<Vec<(DataFile, Option<i64>)>> {
     let metadata = table.metadata();
 
@@ -1862,8 +1940,7 @@ async fn added_delete_files_with_seq_after(
         return Ok(vec![]);
     }
 
-    // The "parent" of the operation in Java terms: the current head of the refreshed base.
-    let Some(mut current) = metadata.current_snapshot().cloned() else {
+    let Some(mut current) = latest_snapshot(metadata, branch).cloned() else {
         return Ok(vec![]);
     };
 
@@ -1953,22 +2030,23 @@ fn starting_sequence_number(table: &Table, starting_snapshot_id: Option<i64>) ->
 ///
 /// A NON-retryable [`ErrorKind::DataInvalid`] on the FIRST conflicting data file, carrying Java's
 /// verbatim message, so the commit retry loop stops.
-pub(crate) async fn validate_no_new_deletes_for_data_files(
+pub(crate) async fn validate_no_new_deletes_for_data_files_on(
     table: &Table,
     starting_snapshot_id: Option<i64>,
     bound_conflict_filter: Option<&BoundPredicate>,
     data_files: &[DataFile],
     ignore_equality_deletes: bool,
+    branch: &str,
 ) -> Result<()> {
-    // Java L526-528: no current table state (`parent == null`) or a pre-V2 table ⇒ no delete files exist.
-    if table.metadata().current_snapshot().is_none()
+    if latest_snapshot(table.metadata(), branch).is_none()
         || table.metadata().format_version() < FormatVersion::V2
     {
         return Ok(());
     }
 
     // Java L530: the DELETE files concurrently added since the start (with their data sequence numbers).
-    let added_deletes = added_delete_files_with_seq_after(table, starting_snapshot_id).await?;
+    let added_deletes =
+        added_delete_files_with_seq_after(table, starting_snapshot_id, branch).await?;
     if added_deletes.is_empty() {
         return Ok(());
     }
@@ -2100,10 +2178,11 @@ fn delete_applies_to_data_file(
 ///
 /// The caller intersects these paths with the set it requires, to decide whether to reject the
 /// commit.
-pub(crate) async fn deleted_data_files_after(
+pub(crate) async fn deleted_data_files_after_on(
     table: &Table,
     starting_snapshot_id: Option<i64>,
     skip_deletes: bool,
+    branch: &str,
 ) -> Result<Vec<DataFile>> {
     let operation_filter = if skip_deletes {
         operation_removes_data_files_skip_deletes
@@ -2117,6 +2196,7 @@ pub(crate) async fn deleted_data_files_after(
         ManifestContentType::Data,
         operation_filter,
         ManifestStatus::Deleted,
+        branch,
     )
     .await
 }
@@ -2137,13 +2217,14 @@ pub(crate) async fn deleted_data_files_after(
 ///
 /// A NON-retryable [`ErrorKind::DataInvalid`] naming the filter and the conflicting path, so the
 /// commit retry loop stops.
-pub(crate) async fn validate_no_conflicting_added_data_files(
+pub(crate) async fn validate_no_conflicting_added_data_files_on(
     current: &Table,
     effective_start: Option<i64>,
     conflict_filter: Option<&Predicate>,
     case_sensitive: bool,
+    branch: &str,
 ) -> Result<()> {
-    let added = added_data_files_after(current, effective_start).await?;
+    let added = added_data_files_after_on(current, effective_start, branch).await?;
     if let Some(file) = first_conflicting_file(&added, current, conflict_filter, case_sensitive)? {
         return Err(Error::new(
             ErrorKind::DataInvalid,
@@ -2176,13 +2257,14 @@ pub(crate) async fn validate_no_conflicting_added_data_files(
 ///
 /// **Over-scan vs Java (documented):** see [`added_delete_files_after`] — this port omits Java's
 /// `DeleteFileIndex` `startingSequenceNumber` refinement, a conservative over-scan (can only over-reject).
-pub(crate) async fn validate_no_conflicting_added_delete_files(
+pub(crate) async fn validate_no_conflicting_added_delete_files_on(
     current: &Table,
     effective_start: Option<i64>,
     conflict_filter: Option<&Predicate>,
     case_sensitive: bool,
+    branch: &str,
 ) -> Result<()> {
-    let added = added_delete_files_after(current, effective_start).await?;
+    let added = added_delete_files_after_on(current, effective_start, branch).await?;
     if let Some(file) = first_conflicting_file(&added, current, conflict_filter, case_sensitive)? {
         return Err(Error::new(
             ErrorKind::DataInvalid,
@@ -2220,13 +2302,14 @@ pub(crate) async fn validate_no_conflicting_added_delete_files(
 ///
 /// A NON-retryable [`ErrorKind::DataInvalid`] naming the filter and the conflicting path, so the
 /// commit retry loop stops.
-pub(crate) async fn validate_deleted_data_files(
+pub(crate) async fn validate_deleted_data_files_on(
     current: &Table,
     effective_start: Option<i64>,
     conflict_filter: Option<&Predicate>,
     case_sensitive: bool,
+    branch: &str,
 ) -> Result<()> {
-    let deleted = deleted_data_files_after(current, effective_start, false).await?;
+    let deleted = deleted_data_files_after_on(current, effective_start, false, branch).await?;
     if let Some(file) = first_conflicting_file(&deleted, current, conflict_filter, case_sensitive)?
     {
         return Err(Error::new(
@@ -3207,256 +3290,8 @@ mod validate_partition_value_tests {
 }
 
 #[cfg(test)]
-mod first_row_id_suppression_tests {
-    //! The add-seam rule of [`FirstRowIdPolicy`], driven end to end through every producer that can
-    //! add a data file (Java `MergingSnapshotProducer.add(DataFile)` →
-    //! `Delegates.suppressFirstRowId`, and the `FastAppend` that does not call it).
-    //!
-    //! The probe file carries a `first_row_id` no reader would compute for it. The assertions read
-    //! the manifest bytes back with [`Manifest::parse_avro`], which skips read-side inheritance, so
-    //! they see the value the producer STORED rather than the one a reader derives.
-
-    use std::collections::HashMap;
-
-    use crate::memory::tests::new_memory_catalog;
-    use crate::spec::{
-        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Manifest,
-        ManifestContentType, ManifestStatus, Struct,
-    };
-    use crate::table::Table;
-    use crate::transaction::tests::make_v3_minimal_table_in_catalog;
-    use crate::transaction::{ApplyTransactionAction, Transaction};
-
-    /// The value the probe file arrives with. No manifest range in these fixtures reaches it, so a
-    /// stored `Some(PROBE_FIRST_ROW_ID)` can only have come from the caller.
-    const PROBE_FIRST_ROW_ID: i64 = 90_000;
-
-    /// A data file under the fixture's spec 0 (`identity(x)`), partition `(x = 0)`.
-    fn data_file(path: &str, first_row_id: Option<i64>) -> DataFile {
-        let mut file = DataFileBuilder::default()
-            .content(DataContentType::Data)
-            .file_path(path.to_string())
-            .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(100)
-            .record_count(3)
-            .partition_spec_id(0)
-            .partition(Struct::from_iter([Some(Literal::long(0))]))
-            .build()
-            .expect("build the fixture data file");
-        file.first_row_id = first_row_id;
-        file
-    }
-
-    /// Every live DATA entry's STORED `first_row_id`, keyed by file path.
-    ///
-    /// Reads the Avro directly: `ManifestFile::load_manifest` runs `assign_first_row_ids`, which
-    /// overwrites an absent value and would hide the difference this module measures.
-    async fn stored_first_row_ids(table: &Table) -> HashMap<String, Option<i64>> {
-        let metadata = table.metadata();
-        let snapshot = metadata
-            .current_snapshot()
-            .expect("the committed table has a current snapshot");
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), metadata)
-            .await
-            .expect("load the manifest list");
-
-        let mut stored = HashMap::new();
-        for manifest_file in manifest_list.entries() {
-            if manifest_file.content != ManifestContentType::Data {
-                continue;
-            }
-            let bytes = table
-                .file_io()
-                .new_input(&manifest_file.manifest_path)
-                .expect("open the manifest")
-                .read()
-                .await
-                .expect("read the manifest bytes");
-            let manifest = Manifest::parse_avro(&bytes).expect("parse the manifest avro");
-            for entry in manifest.entries() {
-                if entry.status() == ManifestStatus::Deleted {
-                    continue;
-                }
-                stored.insert(
-                    entry.file_path().to_string(),
-                    entry.data_file().first_row_id(),
-                );
-            }
-        }
-        stored
-    }
-
-    /// The producers of the charter's partition that can add a data file.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Producer {
-        FastAppend,
-        MergeAppend,
-        OverwriteFiles,
-        ReplacePartitions,
-        RewriteFiles,
-        RowDelta,
-    }
-
-    impl Producer {
-        /// Java `FastAppend` extends `SnapshotProducer`; every other arm extends
-        /// `MergingSnapshotProducer`, whose `add(DataFile)` suppresses.
-        fn suppresses(self) -> bool {
-            self != Producer::FastAppend
-        }
-    }
-
-    /// Seed the table with `seed`, then add `probe` through `producer`, and return what each file's
-    /// `first_row_id` was STORED as.
-    async fn commit_probe(producer: Producer) -> HashMap<String, Option<i64>> {
-        let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-
-        let seed = data_file("test/seed.parquet", None);
-        let transaction = Transaction::new(&table);
-        let transaction = transaction
-            .fast_append()
-            .add_data_files(vec![seed.clone()])
-            .apply(transaction)
-            .expect("apply the seed append");
-        let table = transaction
-            .commit(&catalog)
-            .await
-            .expect("commit the seed append");
-
-        let probe = data_file("test/probe.parquet", Some(PROBE_FIRST_ROW_ID));
-        let transaction = Transaction::new(&table);
-        let transaction = match producer {
-            Producer::FastAppend => transaction
-                .fast_append()
-                .add_data_files(vec![probe])
-                .apply(transaction),
-            Producer::MergeAppend => transaction
-                .merge_append()
-                .add_data_files(vec![probe])
-                .apply(transaction),
-            Producer::OverwriteFiles => transaction
-                .overwrite_files()
-                .add_file(probe)
-                .delete_file(seed.file_path().to_string())
-                .apply(transaction),
-            Producer::ReplacePartitions => transaction
-                .replace_partitions()
-                .add_file(probe)
-                .apply(transaction),
-            Producer::RewriteFiles => transaction
-                .rewrite_files(vec![seed.clone()], vec![probe])
-                .apply(transaction),
-            Producer::RowDelta => transaction
-                .row_delta()
-                .add_data_files(vec![probe])
-                .apply(transaction),
-        }
-        .expect("apply the probe action");
-        let table = transaction
-            .commit(&catalog)
-            .await
-            .expect("commit the probe action");
-
-        stored_first_row_ids(&table).await
-    }
-
-    /// The domain table: one row per producer that can add a data file.
-    ///
-    /// Risk pinned: a stale `first_row_id` survives read-side inheritance, so the added file claims
-    /// a row-id range that describes other rows. `FastAppend` is the deliberate exception — Java
-    /// does not suppress there, and matching that asymmetry is the point of the seam.
-    #[tokio::test]
-    async fn every_merging_producer_suppresses_first_row_id_and_fast_append_does_not() {
-        for producer in [
-            Producer::FastAppend,
-            Producer::MergeAppend,
-            Producer::OverwriteFiles,
-            Producer::ReplacePartitions,
-            Producer::RewriteFiles,
-            Producer::RowDelta,
-        ] {
-            let stored = commit_probe(producer).await;
-            let probe = stored
-                .get("test/probe.parquet")
-                .copied()
-                .unwrap_or_else(|| panic!("{producer:?} committed no probe entry"));
-            let expected = if producer.suppresses() {
-                None
-            } else {
-                Some(PROBE_FIRST_ROW_ID)
-            };
-            assert_eq!(
-                probe, expected,
-                "{producer:?} stored the wrong first_row_id for the added file"
-            );
-        }
-    }
-
-    /// The seed file's stored `first_row_id` must stay absent whatever the producer does to it, so
-    /// the domain table above cannot pass by suppressing every entry in the manifest.
-    #[tokio::test]
-    async fn suppression_reaches_only_the_added_file() {
-        let stored = commit_probe(Producer::MergeAppend).await;
-        assert_eq!(
-            stored.get("test/seed.parquet").copied(),
-            Some(None),
-            "the carried-forward seed entry must still be present and unassigned"
-        );
-    }
-
-    /// `DeleteFiles` is the seventh producer of the partition. It passes `Suppress` like every other
-    /// merging producer, but it hands the producer no data file at all, so the rule is vacuous
-    /// there. Asserted through the commit rather than by reading the call site.
-    ///
-    /// The survivor's stored id is its INHERITED one, not an absent value: the rewrite that
-    /// tombstones the deleted file reads the source manifest through the assigning reader.
-    #[tokio::test]
-    async fn delete_files_adds_no_data_file_to_suppress() {
-        let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-
-        let seed = data_file("test/seed.parquet", None);
-        let other = data_file("test/other.parquet", None);
-        let transaction = Transaction::new(&table);
-        let transaction = transaction
-            .fast_append()
-            .add_data_files(vec![seed.clone(), other])
-            .apply(transaction)
-            .expect("apply the seed append");
-        let table = transaction
-            .commit(&catalog)
-            .await
-            .expect("commit the seed append");
-
-        let transaction = Transaction::new(&table);
-        let transaction = transaction
-            .delete_files()
-            .delete_file(seed.file_path().to_string())
-            .apply(transaction)
-            .expect("apply the delete");
-        let table = transaction
-            .commit(&catalog)
-            .await
-            .expect("commit the delete");
-
-        let stored = stored_first_row_ids(&table).await;
-        assert!(
-            !stored.contains_key("test/seed.parquet"),
-            "the deleted file must not survive as a live entry"
-        );
-        assert_eq!(
-            stored.len(),
-            1,
-            "a delete-only commit adds no data file, so it has none to suppress: {stored:?}"
-        );
-        assert_eq!(
-            stored.get("test/other.parquet").copied(),
-            Some(Some(3)),
-            "the survivor keeps the id it inherited behind the 3-row seed"
-        );
-    }
-}
+#[path = "snapshot_first_row_id_tests.rs"]
+mod snapshot_first_row_id_tests;
 
 #[cfg(test)]
 mod manifest_list_order_tests {

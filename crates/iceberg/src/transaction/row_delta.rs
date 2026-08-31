@@ -73,13 +73,13 @@ use crate::delete_file_index::is_deletion_vector;
 use crate::error::Result;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::{Bind, Predicate};
-use crate::spec::{DataContentType, DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataContentType, DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
-    added_dv_candidate_delete_files_after, deleted_data_files_after, dv_desc,
-    validate_no_conflicting_added_data_files, validate_no_conflicting_added_delete_files,
-    validate_no_new_deletes_for_data_files,
+    added_dv_candidate_delete_files_after_on, deleted_data_files_after_on, dv_desc,
+    validate_no_conflicting_added_data_files_on, validate_no_conflicting_added_delete_files_on,
+    validate_no_new_deletes_for_data_files_on,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
@@ -137,6 +137,7 @@ pub struct RowDeltaAction {
     /// `MergingSnapshotProducer.caseSensitive`). `true` by default, as in Java. `false` switches every
     /// filter binding this action's `validate` performs. See [`RowDeltaAction::case_sensitive`].
     case_sensitive: bool,
+    pub(crate) target_branch: String,
 }
 
 impl RowDeltaAction {
@@ -157,6 +158,7 @@ impl RowDeltaAction {
             removed_delete_files: vec![],
             // Java `MergingSnapshotProducer` defaults this to true.
             case_sensitive: true,
+            target_branch: MAIN_BRANCH.to_string(),
         }
     }
 
@@ -405,7 +407,12 @@ impl RowDeltaAction {
         }
 
         // The DELETE-manifest walk is gated to Java's `{Overwrite, Delete, Replace}`.
-        let added_deletes = added_dv_candidate_delete_files_after(current, effective_start).await?;
+        let added_deletes = added_dv_candidate_delete_files_after_on(
+            current,
+            effective_start,
+            self.target_branch.as_str(),
+        )
+        .await?;
         if added_deletes.is_empty() {
             return Ok(());
         }
@@ -533,6 +540,10 @@ impl RowDeltaAction {
 
 #[async_trait]
 impl TransactionAction for RowDeltaAction {
+    fn target_ref(&self) -> &str {
+        self.target_branch.as_str()
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         // Java's `removeDeletes` takes a delete file, so a `Data` file here means the caller wanted
         // `removeRows`. Reject before the producer exists, because the producer guards only added files.
@@ -559,7 +570,8 @@ impl TransactionAction for RowDeltaAction {
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
         )
-        .with_removed_delete_files(self.removed_delete_files.clone());
+        .with_removed_delete_files(self.removed_delete_files.clone())
+        .with_target_branch(self.target_branch.clone())?;
         let snapshot_producer = if self
             .added_delete_files
             .iter()
@@ -642,11 +654,12 @@ impl TransactionAction for RowDeltaAction {
 
         // 1. Concurrently added DATA-file conflict (Java `validateNewDataFiles`).
         if self.validate_no_conflicting_data_files {
-            validate_no_conflicting_added_data_files(
+            validate_no_conflicting_added_data_files_on(
                 current,
                 effective_start,
                 conflict_filter,
                 self.case_sensitive,
+                self.target_branch.as_str(),
             )
             .await?;
         }
@@ -666,23 +679,25 @@ impl TransactionAction for RowDeltaAction {
                     )?),
                     None => None,
                 };
-                validate_no_new_deletes_for_data_files(
+                validate_no_new_deletes_for_data_files_on(
                     current,
                     effective_start,
                     bound_conflict_filter.as_ref(),
                     &self.removed_data_files,
                     false,
+                    self.target_branch.as_str(),
                 )
                 .await?;
             }
 
             // 2b. `validateNoNewDeleteFiles`, the filter-based check. The helper owns the DELETE-manifest
             //     walk and the V2 guard.
-            validate_no_conflicting_added_delete_files(
+            validate_no_conflicting_added_delete_files_on(
                 current,
                 effective_start,
                 conflict_filter,
                 self.case_sensitive,
+                self.target_branch.as_str(),
             )
             .await?;
         }
@@ -692,7 +707,13 @@ impl TransactionAction for RowDeltaAction {
         //    default excludes concurrent DELETE-op snapshots. `Replace` is in both operation sets.
         if !self.referenced_data_files.is_empty() {
             let skip_deletes = !self.validate_deleted_files;
-            let deleted = deleted_data_files_after(current, effective_start, skip_deletes).await?;
+            let deleted = deleted_data_files_after_on(
+                current,
+                effective_start,
+                skip_deletes,
+                self.target_branch.as_str(),
+            )
+            .await?;
             if let Some(missing) = deleted
                 .iter()
                 .find(|file| self.referenced_data_files.contains(file.file_path()))
@@ -787,7 +808,7 @@ impl SnapshotProduceOperation for RowDeltaOperation {
     ) -> Result<Vec<ManifestFile>> {
         // A row delta adds manifests without rewriting the existing ones, so carry every data and
         // delete manifest forward unchanged.
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.parent_snapshot() else {
             return Ok(vec![]);
         };
 
@@ -1156,37 +1177,6 @@ mod tests {
         assert!(
             delete_paths.contains("test/a-pos-del.parquet"),
             "the added delete file lands in the DELETE manifest; delete paths = {delete_paths:?}"
-        );
-    }
-
-    /// A deletes-only row delta is allowed and records `Delete`. The mutant: the producer's
-    /// empty-commit precondition rejects it.
-    #[tokio::test]
-    async fn test_row_delta_add_deletes_only_allowed() {
-        let catalog = new_memory_catalog().await;
-        let table = make_v2_minimal_table_in_catalog(&catalog).await;
-        let table = append_files(&catalog, &table, vec![synthetic_data_file(
-            "test/a.parquet",
-            0,
-        )])
-        .await;
-
-        let tx = Transaction::new(&table);
-        let action = tx
-            .row_delta()
-            .add_deletes(vec![synthetic_delete_file("test/a-pos-del.parquet", 0)]);
-        let tx = action.apply(tx).unwrap();
-        let table = tx.commit(&catalog).await.unwrap();
-
-        assert_eq!(
-            table
-                .metadata()
-                .current_snapshot()
-                .unwrap()
-                .summary()
-                .operation,
-            Operation::Delete,
-            "an add-deletes-only row delta records Delete (Java BaseRowDelta.operation())"
         );
     }
 
@@ -6388,4 +6378,6 @@ mod tests {
             err.message()
         );
     }
+
+    mod row_delta_extracted;
 }

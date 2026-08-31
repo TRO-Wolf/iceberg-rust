@@ -33,6 +33,14 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-08-30): F-6 branch commit target (`to_branch`, row R168)
+
+- [x] Phase-0 Java 1.10.0/1.11.0 audit of `toBranch` / `targetBranch` / `latestSnapshot` / `setBranchSnapshot`.
+- [x] Charter + ledger.
+- [x] Producer `target_branch`; `to_branch` on the seven Java-supporting actions.
+- [x] Catastrophe pins: named ref only, sibling refs stable, retry re-resolves the named branch.
+- [x] Gates (`make check`, `make unit-test`) + commit.
+
 ## ACTIVE (2026-08-28): relocate SEPMO into `.agents/skills/`
 
 Scope ledger: C-001 `PROVEN` — `.agents/skills/` is the canonical agent-skill home and Claude

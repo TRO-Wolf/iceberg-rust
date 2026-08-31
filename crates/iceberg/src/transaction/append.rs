@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
@@ -40,6 +40,7 @@ pub struct FastAppendAction {
     /// Stage the produced snapshot for write-audit-publish instead of moving `main` (Java
     /// `SnapshotProducer.stageOnly()`). See [`FastAppendAction::stage_only`].
     stage_only: bool,
+    pub(crate) target_branch: String,
 }
 
 impl FastAppendAction {
@@ -51,6 +52,7 @@ impl FastAppendAction {
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
             stage_only: false,
+            target_branch: MAIN_BRANCH.to_string(),
         }
     }
 
@@ -100,6 +102,10 @@ impl FastAppendAction {
 
 #[async_trait]
 impl TransactionAction for FastAppendAction {
+    fn target_ref(&self) -> &str {
+        self.target_branch.as_str()
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let snapshot_producer = SnapshotProducer::new(
             table,
@@ -110,7 +116,8 @@ impl TransactionAction for FastAppendAction {
             // Java `FastAppend` extends `SnapshotProducer` and never suppresses.
             FirstRowIdPolicy::Preserve,
         )
-        .with_stage_only(self.stage_only);
+        .with_stage_only(self.stage_only)
+        .with_target_branch(self.target_branch.clone())?;
 
         // validate added files
         snapshot_producer.validate_added_data_files()?;
@@ -151,7 +158,7 @@ impl SnapshotProduceOperation for FastAppendOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.parent_snapshot() else {
             return Ok(vec![]);
         };
 
@@ -245,36 +252,6 @@ mod tests {
                 .get("changed-partition-count")
                 .unwrap(),
             "1"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_append_snapshot_properties() {
-        let table = make_v2_minimal_table();
-        let tx = Transaction::new(&table);
-
-        let mut snapshot_properties = HashMap::new();
-        snapshot_properties.insert("key".to_string(), "val".to_string());
-
-        let action = tx
-            .fast_append()
-            .set_snapshot_properties(snapshot_properties);
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
-        let updates = action_commit.take_updates();
-
-        // Check customized properties is contained in snapshot summary properties.
-        let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
-            snapshot
-        } else {
-            unreachable!()
-        };
-        assert_eq!(
-            new_snapshot
-                .summary()
-                .additional_properties
-                .get("key")
-                .unwrap(),
-            "val"
         );
     }
 
@@ -1560,3 +1537,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod append_snapshot_properties_test;

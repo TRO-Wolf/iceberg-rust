@@ -70,11 +70,11 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::{Error, ErrorKind, Result};
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, FirstRowIdPolicy, PendingDeleteFile, SnapshotProduceOperation,
-    SnapshotProducer, validate_no_new_deletes_for_data_files,
+    SnapshotProducer, validate_no_new_deletes_for_data_files_on,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
@@ -120,6 +120,7 @@ pub struct RewriteFilesAction {
     /// An explicit starting snapshot for concurrent-commit conflict validation (Java
     /// `RewriteFiles.validateFromSnapshot`). `None` uses the transaction's starting snapshot.
     validate_from_snapshot: Option<i64>,
+    pub(crate) target_branch: String,
 }
 
 impl RewriteFilesAction {
@@ -134,6 +135,7 @@ impl RewriteFilesAction {
             snapshot_properties: HashMap::default(),
             data_sequence_number: None,
             validate_from_snapshot: None,
+            target_branch: MAIN_BRANCH.to_string(),
         }
     }
 
@@ -300,6 +302,10 @@ impl RewriteFilesAction {
 
 #[async_trait]
 impl TransactionAction for RewriteFilesAction {
+    fn target_ref(&self) -> &str {
+        self.target_branch.as_str()
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         // Java `BaseRewriteFiles.validateReplacedAndAddedFiles()`. It runs before the producer's own
         // machinery, so the exact Java message reaches the caller.
@@ -394,7 +400,8 @@ impl TransactionAction for RewriteFilesAction {
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
-        );
+        )
+        .with_target_branch(self.target_branch.clone())?;
 
         // Keep the replaced files' data seq on the added files when the caller asks for it. `None` leaves
         // the added files inheriting the new snapshot's seq.
@@ -467,12 +474,13 @@ impl TransactionAction for RewriteFilesAction {
 
         // Java `validateNoNewDeletesForDataFiles`. A preserved seq ignores equality deletes, because they
         // still apply. Java passes no data filter here.
-        validate_no_new_deletes_for_data_files(
+        validate_no_new_deletes_for_data_files_on(
             current,
             effective_start,
             None,
             &self.deleted_data_files,
             self.data_sequence_number.is_some(),
+            self.target_branch.as_str(),
         )
         .await
     }
@@ -760,38 +768,6 @@ mod tests {
         assert_deleted_tombstone(&table, "test/a.parquet").await;
         assert_deleted_tombstone(&table, "test/b.parquet").await;
         assert_deleted_tombstone(&table, "test/c.parquet").await;
-    }
-
-    /// Deleting a file that is NOT in the current snapshot must error (Java `failMissingDeletePaths`) and
-    /// must not add the added file. A silent drop keeps the add and loses the removal.
-    #[tokio::test]
-    async fn test_rewrite_delete_absent_file_errors() {
-        let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-        let table = append_files(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
-
-        let tx = Transaction::new(&table);
-        let action = tx.rewrite_files(vec![data_file("test/does-not-exist.parquet", 0)], vec![
-            data_file("test/b.parquet", 0),
-        ]);
-        let tx = action.apply(tx).unwrap();
-        let error = tx
-            .commit(&catalog)
-            .await
-            .expect_err("absent delete file must error");
-        assert_eq!(error.kind(), ErrorKind::DataInvalid);
-        assert!(
-            error.message().contains("Missing required files to delete"),
-            "unexpected error message: {}",
-            error.message()
-        );
-
-        // The failed rewrite did not add b.parquet.
-        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
-        assert_eq!(
-            live_file_paths(&reloaded).await,
-            HashSet::from(["test/a.parquet".to_string()])
-        );
     }
 
     /// An empty rewrite must be rejected, not committed as a no-op Replace snapshot.
@@ -2480,4 +2456,6 @@ mod tests {
             "the explicit seq 0 must be stamped on disk, not re-inherited"
         );
     }
+
+    mod rewrite_files_extracted;
 }

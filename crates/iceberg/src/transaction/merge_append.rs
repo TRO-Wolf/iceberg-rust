@@ -64,8 +64,8 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::spec::{
-    DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus, Operation,
-    TableProperties,
+    DataFile, MAIN_BRANCH, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
+    Operation, TableProperties,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::{
@@ -90,6 +90,7 @@ pub struct MergeAppendAction {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    pub(crate) target_branch: String,
 }
 
 impl MergeAppendAction {
@@ -100,6 +101,7 @@ impl MergeAppendAction {
             key_metadata: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
+            target_branch: MAIN_BRANCH.to_string(),
         }
     }
 
@@ -136,6 +138,10 @@ impl MergeAppendAction {
 
 #[async_trait]
 impl TransactionAction for MergeAppendAction {
+    fn target_ref(&self) -> &str {
+        self.target_branch.as_str()
+    }
+
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let snapshot_producer = SnapshotProducer::new(
             table,
@@ -144,7 +150,8 @@ impl TransactionAction for MergeAppendAction {
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
-        );
+        )
+        .with_target_branch(self.target_branch.clone())?;
 
         // Validate added files (identical to fast append — only DATA content, matching spec, valid
         // partition values).
@@ -242,7 +249,7 @@ impl SnapshotProduceOperation for MergeAppendOperation {
         // carries ALL manifests unfiltered (Java `FastAppend.apply` -> `allManifests`): Java itself
         // is asymmetric between the two append flavors (O1, 2026-06-11, bytecode-pinned both ways).
         // The merge step then decides which of these to combine.
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+        let Some(snapshot) = snapshot_produce.parent_snapshot() else {
             return Ok(vec![]);
         };
 
@@ -1116,36 +1123,6 @@ mod tests {
         );
     }
 
-    // 3. PROPERTY-DISABLED PASSTHROUGH (Risk: merge fires when disabled). merge-enabled=false + min-count=2
-    // ⇒ no merge even though the threshold is met.
-    #[tokio::test]
-    async fn test_merge_append_disabled_does_not_merge() {
-        let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-        let table =
-            set_table_property(&catalog, &table, "commit.manifest.min-count-to-merge", "2").await;
-        let table =
-            set_table_property(&catalog, &table, "commit.manifest-merge.enabled", "false").await;
-
-        let table = fast_append(&catalog, &table, vec![data_file("test/a.parquet", 0)]).await;
-        let table = fast_append(&catalog, &table, vec![data_file("test/b.parquet", 0)]).await;
-        let table = merge_append(&catalog, &table, vec![data_file("test/c.parquet", 0)]).await;
-
-        assert_eq!(
-            data_manifest_count(&table).await,
-            3,
-            "merge-enabled=false leaves all three manifests un-merged"
-        );
-        assert_eq!(
-            live_file_paths(&table).await,
-            HashSet::from([
-                "test/a.parquet".to_string(),
-                "test/b.parquet".to_string(),
-                "test/c.parquet".to_string(),
-            ])
-        );
-    }
-
     // 4. OLD-TOMBSTONE SUPPRESSION (Java createManifest L203-208). A delete_files commit rewrites a
     // manifest that carries BOTH a live entry (b) AND a prior-snapshot DELETED tombstone (a). Because it
     // still has a live (Existing) entry it SURVIVES `existing_manifest`'s `has_added/existing_files`
@@ -1680,4 +1657,6 @@ mod tests {
             ])
         );
     }
+
+    mod merge_append_extracted;
 }

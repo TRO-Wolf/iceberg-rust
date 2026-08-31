@@ -75,6 +75,11 @@ pub(crate) trait TransactionAction: AsAny + Sync + Send {
         let _ = (starting_snapshot_id, current);
         Ok(())
     }
+
+    /// Branch this action commits onto. Default `main`. Java `SnapshotProducer.targetBranch()`.
+    fn target_ref(&self) -> &str {
+        crate::spec::MAIN_BRANCH
+    }
 }
 
 /// A helper trait for applying a `TransactionAction` to a `Transaction`.
