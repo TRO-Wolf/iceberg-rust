@@ -113,22 +113,32 @@ Every Java-supporting producer must expose `to_branch` and commit through
 
 | Clause | Pin |
 |---|---|
-| Existing branch, main byte-stable | `to_branch_existing_branch_does_not_move_main` |
+| Existing branch, main byte-stable | `to_branch_existing_branch_does_not_move_main` (diverged: parent == branch head) |
 | Missing branch is created | `to_branch_creates_missing_branch` |
 | Empty table | `to_branch_empty_table_leaves_current_null` |
 | Tag rejected | `to_branch_tag_is_rejected` |
 | Other refs byte-stable | `to_branch_leaves_sibling_refs_byte_stable` |
-| Retry re-resolves named branch | `to_branch_retry_resolves_named_branch_not_main` |
+| Retry re-resolves named branch | `to_branch_retry_resolves_named_branch_not_main` (FastAppend) + `to_branch_retry_overwrite_resolves_named_branch` (OverwriteFiles; same `SnapshotProducer` OCC seam) |
 | Parent of new branch is current | `to_branch_new_branch_parents_off_current` |
 | Per-producer domain | `every_snapshot_producer_commits_to_named_branch` |
+| F-1 missing-ref validate start | `to_branch_missing_ref_conflict_validation_does_not_see_parent_files` (red: DataInvalid `test/a.parquet`) |
+| F-3 branch-head validate start | `to_branch_diverged_conflict_validation_uses_branch_head_not_main`; concurrent main write ignored; concurrent branch write rejected |
+| F-2 fresh-DV door on branch | `to_branch_fresh_dv_rejects_branch_live_position_delete`; `to_branch_fresh_dv_ignores_main_only_position_delete` |
 
 ## 4. Named residue
 
 - WAP / `stage_only` + `to_branch` not requested.
 - `RewriteManifests` / `CherryPick` keep Java's throwing default (not exposed).
 - No Java interop leg in this unit (row R168 🟡).
+- Maintenance `RewritePositionDeleteFiles` composes `rewrite_files` without a branch argument, so a rewrite-position-deletes commit still stamps `main`. Out of F-6 scope.
 
-## 5. Self Logic Review
+## 5. Critic remediation (2026-08-31)
+
+- `starting_snapshot_for` falls back to the txn-start main head when the named ref is missing, so `files_after` is exclusive of that parent (Java `ancestorsBetween(parent, starting)`). F-1 pin red before the fallback (`DataInvalid` `test/a.parquet`), green after.
+- `validate_fresh_dvs_only` walks `latest_snapshot(metadata, branch)`, not `current_snapshot()`. F-2 mutant (`current_snapshot()`) 0/2: branch live pos-delete fail-open (`expect_err` got `Ok`); main-only pos-delete false-reject (`DataInvalid` `test/a-pos.parquet`).
+- Mutation C (`starting_snapshot_for` always main-at-txn-start): original to_branch pins stay green (F-1 agrees with the fallback). F-3 pins red: `to_branch_diverged_conflict_validation_uses_branch_head_not_main` and `to_branch_conflict_validation_ignores_concurrent_main_writes` (`DataInvalid` `test/b.parquet`). Concurrent branch write still rejects.
+
+## 6. Self Logic Review
 
 Inputs: Java `toBranch` / `targetBranch` / `latestSnapshot` / `setBranchSnapshot`.
 Outputs: `to_branch` on the seven producers; producer commit uses named ref;

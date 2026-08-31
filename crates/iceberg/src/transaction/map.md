@@ -89,6 +89,8 @@ engine) parity work.
 | A lifted guard exposes latent bugs in the path it guarded | When removing a coarse precondition/guard, audit the ENTIRE previously-unreachable path — the guard may have masked a second bug no test could reach (the lifted `has_outstanding_delete_files` guard hid `existing_manifest` dropping every DELETE manifest). _Promoted 2026-06-11._ |
 | Surviving entries silently corrupted by a rewrite | The #1 corruption class: re-stamping a surviving/carried-forward entry's snapshot id or sequence numbers. `add_existing_entry` preserves provenance; `add_entry` RESTAMPS. Pin with a cross-snapshot provenance test (see docs/testing.md) |
 | A commit ABORTS mid-flight instead of returning an error | `commit()` runs `summary()` BEFORE `manifest_file()`, and the summary path is infallible: any panic in a summary helper preempts every typed error the later phases would have produced. The `removed_*_files` loops feed it tuples nothing validated, and `file_partition_spec` substitutes the DEFAULT spec for an unknown spec id — so the helpers it calls (e.g. `PartitionSpec::partition_to_path`) must be TOTAL. _Added 2026-07-25 (WG3-L2)._ |
+| `to_branch(missing)` + conflict validation false-conflicts the parent snapshot's files | `starting_snapshot_for` must fall back to the txn-start main head when the named ref is absent, so `files_after` is exclusive of that parent |
+| Fresh-DV door fail-open or false-reject on a diverged branch | `validate_fresh_dvs_only` must walk `latest_snapshot(metadata, target_branch)`, not `current_snapshot()` |
 
 ### First checks
 

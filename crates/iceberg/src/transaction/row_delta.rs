@@ -488,11 +488,11 @@ impl RowDeltaAction {
     ///
     /// Returns `DataInvalid` when a live delete would be shadowed without being removed.
     async fn validate_fresh_dvs_only(&self, table: &Table) -> Result<()> {
-        let added_dvs = self.added_dvs_by_referenced_file()?;
         super::row_delta_fresh_dv::validate_fresh_dvs_only(
             table,
-            &added_dvs,
+            &self.added_dvs_by_referenced_file()?,
             &self.removed_delete_files,
+            self.target_branch.as_str(),
         )
         .await
     }

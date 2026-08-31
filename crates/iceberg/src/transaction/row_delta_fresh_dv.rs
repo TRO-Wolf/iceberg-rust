@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};
 use crate::spec::{DataContentType, DataFile, ManifestContentType, Struct};
 use crate::table::Table;
-use crate::transaction::snapshot::dv_desc;
+use crate::transaction::snapshot::{dv_desc, latest_snapshot};
 use crate::{Error, ErrorKind, Result};
 
 /// Reject a DV that would silently supersede a live position-scoped delete, unless this commit
@@ -31,6 +31,7 @@ pub(crate) async fn validate_fresh_dvs_only(
     table: &Table,
     added_dvs: &HashMap<String, &DataFile>,
     removed_delete_files: &[DataFile],
+    branch: &str,
 ) -> Result<()> {
     if added_dvs.is_empty() {
         return Ok(());
@@ -41,7 +42,7 @@ pub(crate) async fn validate_fresh_dvs_only(
         .map(|file| file.file_path())
         .collect();
 
-    let Some(snapshot) = table.metadata().current_snapshot() else {
+    let Some(snapshot) = latest_snapshot(table.metadata(), branch) else {
         return Ok(());
     };
     let manifest_list = snapshot

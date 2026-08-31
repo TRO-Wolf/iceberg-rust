@@ -115,7 +115,7 @@ use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWi
 
 use crate::error::{Error, Result};
 use crate::events::{self, CreateSnapshotEvent};
-use crate::spec::{MAIN_BRANCH, Snapshot, TableProperties};
+use crate::spec::{Snapshot, TableProperties};
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
@@ -171,11 +171,10 @@ impl Transaction {
     }
 
     fn starting_snapshot_for(&self, branch: &str) -> Option<i64> {
-        if branch == MAIN_BRANCH {
-            self.starting_snapshot_id
-        } else {
-            self.starting_ref_snapshot_ids.get(branch).copied()
-        }
+        self.starting_ref_snapshot_ids
+            .get(branch)
+            .copied()
+            .or(self.starting_snapshot_id)
     }
 
     fn update_table_metadata(table: Table, updates: &[TableUpdate]) -> Result<Table> {

@@ -55,9 +55,8 @@ pub(crate) trait TransactionAction: AsAny + Sync + Send {
     /// This runs inside [`Transaction::commit`]'s retry loop, AFTER the catalog refresh + re-base and BEFORE
     /// the re-apply: `current` is the refreshed base, so an implementation can enumerate the snapshots
     /// `current` has that are NEWER than `starting_snapshot_id` (the concurrent commits that landed while this
-    /// transaction was being built) and reject conflicts. `starting_snapshot_id` is the current snapshot id
-    /// captured when the [`Transaction`] was created (it SURVIVES the re-base — see
-    /// [`Transaction::starting_snapshot_id`]).
+    /// transaction was being built) and reject conflicts. `starting_snapshot_id` is
+    /// `starting_snapshot_for(target_ref())`: named-ref head at txn start, else main.
     ///
     /// # Returns
     ///
