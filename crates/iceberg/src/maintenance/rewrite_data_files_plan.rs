@@ -17,10 +17,11 @@
 
 //! Planner predicates for [`super::RewriteDataFiles`]. Java `BinPackRewriteFilePlanner`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::error::{Error, ErrorKind, Result};
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
-use crate::spec::{DataContentType, Struct};
+use crate::spec::{DataContentType, Struct, TableProperties};
 
 /// Java `SizeBasedFileRewritePlanner.MIN_FILE_SIZE_DEFAULT_RATIO`.
 pub(super) const MIN_FILE_SIZE_DEFAULT_RATIO: f64 = 0.75;
@@ -50,6 +51,7 @@ pub(super) struct ResolvedConfig {
     pub(super) delete_file_threshold: usize,
     pub(super) delete_ratio_threshold: f64,
     pub(super) max_file_group_size_bytes: u64,
+    pub(super) file_scoped_delete_paths: HashSet<String>,
 }
 
 /// Groups scan tasks by partition, filters candidates, bin-packs, and filters groups. Java
@@ -135,10 +137,6 @@ fn too_many_deletes(task: &FileScanTask, config: &ResolvedConfig) -> bool {
 }
 
 /// Java `BinPackRewriteFilePlanner.tooHighDeleteRatio`.
-///
-/// Only file-scoped deletes count. Equality deletes never do. Partition-scoped position
-/// deletes never do. A scan task does not carry path bounds, so a bounds-only file-scoped
-/// parquet delete is not counted here.
 pub(super) fn too_high_delete_ratio(task: &FileScanTask, config: &ResolvedConfig) -> bool {
     if task.deletes.is_empty() {
         return false;
@@ -152,21 +150,36 @@ pub(super) fn too_high_delete_ratio(task: &FileScanTask, config: &ResolvedConfig
     let known_deleted: u64 = task
         .deletes
         .iter()
-        .filter(|delete| is_file_scoped_scan_delete(delete))
+        .filter(|delete| is_file_scoped_scan_delete(delete, config))
         .map(|delete| delete.record_count.unwrap_or(0))
         .sum();
     let deleted = known_deleted.min(data_record_count);
     (deleted as f64) / (data_record_count as f64) >= config.delete_ratio_threshold
 }
 
-/// Java `ContentFileUtil.isFileScoped` as far as a scan-task delete can tell.
-fn is_file_scoped_scan_delete(delete: &FileScanTaskDeleteFile) -> bool {
+fn is_file_scoped_scan_delete(delete: &FileScanTaskDeleteFile, config: &ResolvedConfig) -> bool {
     if delete.file_type == DataContentType::EqualityDeletes {
         return false;
     }
-    // Scan tasks do not carry path bounds. Equal-bounds parquet file-scoped
-    // deletes are the named R135 residue.
     delete.referenced_data_file.is_some()
+        || config.file_scoped_delete_paths.contains(&delete.file_path)
+}
+
+pub(super) fn parse_target_file_size(properties: &HashMap<String, String>) -> Result<u64> {
+    match properties.get(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES) {
+        None => Ok(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT as u64),
+        Some(value) => value.parse::<u64>().map_err(|error| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Invalid value '{value}' for table property \
+                     '{}'",
+                    TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES
+                ),
+            )
+            .with_source(error)
+        }),
+    }
 }
 
 /// Forward greedy first-fit bin-packing. Java `BinPacking.ListPacker` with lookback 1.
