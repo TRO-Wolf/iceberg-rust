@@ -36,12 +36,12 @@ DEFAULT_CEILING = 1000
 # without permitting more legacy file-size debt. Delete a row once its file is
 # at or below DEFAULT_CEILING. Keep keys sorted.
 LEGACY_CEILINGS: dict[str, int] = {
-    "crates/catalog/glue/src/catalog.rs": 1256,
+    "crates/catalog/glue/src/catalog.rs": 1212,
     "crates/catalog/hms/src/catalog.rs": 1063,
     "crates/catalog/rest/src/catalog.rs": 4970,
     "crates/catalog/rest/src/client.rs": 1483,
     "crates/catalog/rest/src/types.rs": 1128,
-    "crates/catalog/s3tables/src/catalog.rs": 1485,
+    "crates/catalog/s3tables/src/catalog.rs": 1406,
     "crates/catalog/sql/src/catalog.rs": 3947,
     "crates/iceberg/src/arrow/avro_reader.rs": 1256,
     "crates/iceberg/src/arrow/avro_reader_tests.rs": 1097,
