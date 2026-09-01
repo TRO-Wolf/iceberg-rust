@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! F-6c: `IcebergTableProvider::with_commit_branch` scopes scans and commits to the named branch.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 

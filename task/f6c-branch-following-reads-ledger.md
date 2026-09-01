@@ -37,7 +37,7 @@ from F-6b. Base `33c20da31` (F-6b in `main` as #245).
 | Missing ref, INSERT VALUES | still created at commit (F-6b pin; no target scan) |
 | Tag as commit target | INSERT still rejected at commit with Java's tag message (F-6b) |
 | Older schema-id on the branch | advertised schema stays current (catalog-backed contract). `IcebergTableScan` binds by field id and null-fills columns the snapshot lacks — the same rule as SELECT after `ADD COLUMN` (`test_scan_batches_match_advertised_schema_after_add_column`). Not `IcebergStaticTableProvider`, which re-advertises the snapshot schema because it is constructed from that snapshot. |
-| OCC | `validate_from_snapshot` is the **scanned** snapshot. Named-ref → branch head. Unset → current. Missing-ref INSERT OVERWRITE passes `None` so F-6 `starting_snapshot_for` still creates the branch. Diverged serializable INSERT OVERWRITE pin kept. |
+| OCC | `validate_from_snapshot` is the **scanned** snapshot so scan and OCC start agree. Named-ref → branch head. Unset → current. Missing-ref INSERT OVERWRITE passes `None` so F-6 `starting_snapshot_for` still creates the branch. Diverged serializable INSERT OVERWRITE pin kept. Java `SparkWrite.OverwriteByFilter.commit` 1.10.0 L367-369 arms `validateFromSnapshot` only when the writer tracked a snapshot. |
 
 DML projection is still name-select of advertised columns. A branch snapshot that
 lacks an advertised name fails at `TableScanBuilder::build`, same as DELETE after
