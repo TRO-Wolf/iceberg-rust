@@ -55,6 +55,14 @@ LEDGER:
     verdict: PROVEN
     evidence: >
       100% dead pin asserts rewritten=1, added=0, removed_delete_files_count=1
+  - id: C-005
+    proposition: >
+      A partition-scoped two-path parquet delete survives when a sibling
+      file-scoped 90% file is rewritten. The shared delete stays live and
+      the sibling's deleted row stays deleted. removed_delete_files_count
+      is 1.
+    verdict: PROVEN
+    evidence: test_partition_scoped_delete_survives_partial_rewrite
 ```
 
 ## Contradiction
@@ -107,10 +115,11 @@ Rejected hypotheses:
   no `size > 1` guard. The group never formed because the file was not a
   candidate.
 - Executor rewrite that keeps the delete: the planner selected nothing, so
-  execute returned the empty result. After the planner fix, apply-path
-  removal must also drop the parquet file (`plan_dv_removal`); the composed
-  dangling-delete action defaults off and its seq `<` clause would keep a
-  same-seq delete.
+  execute returned the empty result. After the planner fix the fork also
+  drops the file-scoped parquet file (`plan_dv_removal`). That parquet drop
+  is a fork extension: Java 1.10.0 `ManifestFilterManager.isDanglingDV` is
+  DV-only. The composed dangling-delete action defaults off and its seq `<`
+  clause would keep a same-seq delete.
 
 A second fixture defect sat under the residue: the rewrite-test helper
 `write_position_delete_file` uses default parquet `WriterProperties` and
@@ -130,7 +139,11 @@ the size clause cannot select it.
 2. `too_high_delete_ratio` counts a scan-task delete when that set contains
    its path, matching Java `ContentFileUtil.isFileScoped`.
 3. `plan_dv_removal` also removes non-DV file-scoped position deletes whose
-   referenced data file this group rewrote.
+   referenced data file this group rewrote. Java's apply path does not:
+   `isDanglingDV` requires `ContentFileUtil.isDV`. The parquet drop is a
+   fork extension. Java's Result DOES count apply-path DV drops
+   (`RewriteFileGroup.asResult` from `danglingDVs.size()`); the named
+   divergence is the extra parquet count, not the DV count.
 
 The scan-task field stays the raw null. `interop_spark_mor_fixtures` pins
 that Spark FILE-granularity deletes have `referenced_data_file: None`.
@@ -141,7 +154,10 @@ Before: `test_bounds_only_file_scoped_parquet_does_not_fire_ratio` expected
 `RewriteDataFilesResult::default()`. The 100%-dead in-band file stayed live.
 
 After: the 90% and 100% in-band parquet files are rewritten. The delete file
-is gone. 20% parquet is a no-op. Two-path parquet is still a no-op.
+is gone. 20% parquet is a no-op. Absent-bounds two-path parquet and
+unequal-bounds two-path parquet are still no-ops. A shared partition-scoped
+delete survives a partial rewrite
+(`test_partition_scoped_delete_survives_partial_rewrite`).
 
 ## Consuming engine
 

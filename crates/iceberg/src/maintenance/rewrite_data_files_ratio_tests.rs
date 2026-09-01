@@ -434,11 +434,11 @@ async fn test_planner_selects_bounds_only_parquet_because_referenced_data_file_l
     assert!(group_qualifies(std::slice::from_ref(task), &config));
 }
 
-/// A parquet position delete that names two data files is not file-scoped. Counting its
-/// record_count would admit each well-sized file; Java `isFileScoped` is false, so neither
-/// is rewritten.
 #[tokio::test]
-async fn test_two_path_parquet_pos_delete_does_not_fire_ratio() {
+async fn test_absent_path_bounds_two_path_parquet_pos_delete_does_not_fire_ratio() {
+    use crate::delete_file_index::referenced_data_file_location;
+    use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
+
     let (catalog, _temp) = local_fs_catalog().await;
     let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
 
@@ -452,6 +452,70 @@ async fn test_two_path_parquet_pos_delete_does_not_fire_ratio() {
     let mut deletes: Vec<(String, i64)> = (0..9).map(|pos| (path_a.clone(), pos)).collect();
     deletes.push((path_b, 0));
     let pos_delete = write_position_delete_file(&table, 0, &deletes).await;
+    assert!(
+        pos_delete.referenced_data_file().is_none(),
+        "Spark PARTITION shape: referenced_data_file is null"
+    );
+    assert!(
+        !pos_delete
+            .lower_bounds()
+            .contains_key(&RESERVED_FIELD_ID_DELETE_FILE_PATH),
+        "the default-metrics helper writes absent file_path bounds, not unequal ones"
+    );
+    assert!(
+        !pos_delete
+            .upper_bounds()
+            .contains_key(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
+    );
+    assert!(referenced_data_file_location(&pos_delete).is_none());
+    let table = add_deletes(&catalog, &table, vec![pos_delete]).await;
+
+    let result = well_sized_action(table.clone(), data_size)
+        .execute(&catalog)
+        .await
+        .expect("execute must succeed (no-op)");
+    assert_eq!(
+        result,
+        RewriteDataFilesResult::default(),
+        "absent file_path bounds are not file-scoped, so the ratio must not fire"
+    );
+}
+
+#[tokio::test]
+async fn test_unequal_path_bounds_two_path_parquet_pos_delete_does_not_fire_ratio() {
+    use crate::delete_file_index::referenced_data_file_location;
+    use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
+
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let file_a = write_data_file(&table, "a.parquet", 0, &ten_rows()).await;
+    let file_b = write_data_file(&table, "b.parquet", 0, &ten_rows()).await;
+    let path_a = file_a.file_path().to_string();
+    let path_b = file_b.file_path().to_string();
+    let data_size = file_a.file_size_in_bytes().max(file_b.file_size_in_bytes());
+    let table = append_files(&catalog, &table, vec![file_a, file_b]).await;
+
+    let mut deletes: Vec<(String, i64)> = (0..9).map(|pos| (path_a.clone(), pos)).collect();
+    deletes.push((path_b, 0));
+    let pos_delete = write_file_scoped_position_delete(&table, 0, &deletes).await;
+    assert!(pos_delete.referenced_data_file().is_none());
+    let lower = pos_delete
+        .lower_bounds()
+        .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
+        .expect("Full metrics write a file_path lower bound");
+    let upper = pos_delete
+        .upper_bounds()
+        .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
+        .expect("Full metrics write a file_path upper bound");
+    assert_ne!(
+        lower, upper,
+        "two data-file paths must produce unequal file_path bounds"
+    );
+    assert!(
+        referenced_data_file_location(&pos_delete).is_none(),
+        "unequal bounds are not file-scoped"
+    );
     let table = add_deletes(&catalog, &table, vec![pos_delete]).await;
 
     let result = well_sized_action(table.clone(), data_size)
@@ -462,6 +526,68 @@ async fn test_two_path_parquet_pos_delete_does_not_fire_ratio() {
         result,
         RewriteDataFilesResult::default(),
         "unequal file_path bounds are not file-scoped, so the ratio must not fire"
+    );
+}
+
+#[tokio::test]
+async fn test_partition_scoped_delete_survives_partial_rewrite() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let file_a = write_data_file(&table, "a.parquet", 0, &ten_rows()).await;
+    let file_b = write_data_file(&table, "b.parquet", 0, &ten_rows()).await;
+    let path_a = file_a.file_path().to_string();
+    let path_b = file_b.file_path().to_string();
+    let data_size = file_a.file_size_in_bytes().max(file_b.file_size_in_bytes());
+    let table = append_files(&catalog, &table, vec![file_a, file_b]).await;
+
+    let file_scoped_a: Vec<(String, i64)> = (0..9).map(|pos| (path_a.clone(), pos)).collect();
+    let scoped_a = write_file_scoped_position_delete(&table, 0, &file_scoped_a).await;
+    let scoped_a_path = scoped_a.file_path().to_string();
+    let shared =
+        write_position_delete_file(&table, 0, &[(path_a.clone(), 0), (path_b.clone(), 0)]).await;
+    let shared_path = shared.file_path().to_string();
+    let table = add_deletes(&catalog, &table, vec![scoped_a, shared]).await;
+
+    let rows_before = scan_rows(&table).await;
+    assert_eq!(rows_before.len(), 10, "A has 1 live row, B has 9");
+    assert!(
+        !rows_before.iter().any(|&(_, y, _)| y == 0),
+        "B's y=0 row is deleted by the shared partition-scoped file"
+    );
+
+    let result = well_sized_action(table.clone(), data_size)
+        .execute(&catalog)
+        .await
+        .expect("compaction must succeed");
+
+    assert_eq!(
+        result.rewritten_data_files_count, 1,
+        "only A is a ratio candidate"
+    );
+    assert_eq!(
+        result.removed_delete_files_count, 1,
+        "only A's file-scoped parquet delete is dropped"
+    );
+
+    let table = catalog.load_table(table.identifier()).await.unwrap();
+    let live_data = live_data_file_paths(&table).await;
+    assert!(!live_data.contains(&path_a), "A was rewritten");
+    assert!(live_data.contains(&path_b), "B was left in place");
+    let live_deletes = live_delete_file_paths(&table).await;
+    assert!(
+        !live_deletes.contains(&scoped_a_path),
+        "A's file-scoped delete left with A"
+    );
+    assert!(
+        live_deletes.contains(&shared_path),
+        "the shared two-path delete must survive"
+    );
+    assert_eq!(live_deletes.len(), 1);
+    assert_eq!(
+        scan_rows(&table).await,
+        rows_before,
+        "B's deleted row stays deleted through the surviving shared delete"
     );
 }
 

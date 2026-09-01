@@ -17,9 +17,9 @@
 
 //! Drop file-scoped deletes that reference data files this rewrite removes.
 //!
-//! Java `MergingSnapshotProducer.apply` calls `deleteFilterManager.removeDanglingDeletesFor`
-//! with the rewritten data files. A file-scoped delete whose referenced data file is in that
-//! set is dropped in the same commit.
+//! Java 1.10.0 `ManifestFilterManager.isDanglingDV` is `ContentFileUtil.isDV` and
+//! `removedDataFilePaths.contains(referencedDataFile())`. The apply path drops DVs
+//! only. File-scoped parquet position deletes are a fork extension of that predicate.
 //!
 //! Delete-file removal here is path-keyed. One Puffin can hold several blobs, so a drop
 //! of one blob would take its siblings. Those siblings are rewritten into a new Puffin.

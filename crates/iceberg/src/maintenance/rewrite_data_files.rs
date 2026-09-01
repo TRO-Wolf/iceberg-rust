@@ -92,7 +92,7 @@ pub struct RewriteDataFilesResult {
     pub rewritten_data_files_count: usize,
     /// Bytes of the replaced input files (Java `Result.rewrittenBytesCount()`).
     pub rewritten_bytes_count: u64,
-    /// Delete files removed: apply-path DVs plus the composed dangling-delete sub-action.
+    /// Delete files removed: apply-path DVs (Java Result), apply-path file-scoped parquet (fork), and the composed dangling-delete sub-action.
     pub removed_delete_files_count: usize,
     /// Per-group results, in commit order (Java `Result.rewriteResults()`).
     pub file_groups: Vec<FileGroupRewriteResult>,
@@ -406,8 +406,8 @@ impl RewriteDataFiles {
 
 impl RewriteDataFiles {
     /// Rewrites one planned group and commits a single `RewriteFiles` that replaces exactly its
-    /// data files. Returns the group result, the committed table, and the number of DVs dropped
-    /// because they referenced a rewritten file.
+    /// data files. Returns the group result, the committed table, and the number of file-scoped
+    /// deletes dropped because they referenced a rewritten file.
     #[allow(clippy::too_many_arguments)]
     async fn rewrite_group(
         &self,
