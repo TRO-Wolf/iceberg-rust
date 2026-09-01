@@ -102,8 +102,8 @@ impl FileWriterBuilder for ParquetWriterBuilder {
     }
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
-        // Refuse variant before any bytes land (row R88 conversion no longer throws).
         reject_variant_write(self.schema.as_ref())?;
+        reject_unknown_write(self.schema.as_ref())?;
         let collect_nan_value_counts =
             schema_needs_nan_value_counts(self.schema.as_ref(), &self.metrics_config);
         Ok(ParquetWriter {
@@ -141,6 +141,64 @@ fn reject_variant_write(schema: &Schema) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuse writing a schema that contains Iceberg `unknown` at any depth.
+///
+/// # Errors
+///
+/// [`ErrorKind::FeatureUnsupported`] naming the dotted path to the first unknown found.
+fn reject_unknown_write(schema: &Schema) -> Result<()> {
+    for field in schema.as_struct().fields() {
+        if let Some(path) = unknown_path_within(&field.name, field.field_type.as_ref()) {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "Writing the unknown column '{path}' is not supported yet: unknown is always \
+                     null and has no physical column"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unknown_path_within(name: &str, ty: &Type) -> Option<String> {
+    fn walk(name: &str, ty: &Type, depth: usize) -> Option<String> {
+        if depth > crate::arrow::MAX_VARIANT_NESTING_DEPTH {
+            return None;
+        }
+        let next = depth + 1;
+        match ty {
+            Type::Primitive(PrimitiveType::Unknown) => Some(name.to_string()),
+            Type::Struct(struct_type) => struct_type.fields().iter().find_map(|nested| {
+                walk(
+                    &format!("{name}.{}", nested.name),
+                    nested.field_type.as_ref(),
+                    next,
+                )
+            }),
+            Type::List(list) => walk(
+                &format!("{name}.element"),
+                list.element_field.field_type.as_ref(),
+                next,
+            ),
+            Type::Map(map) => walk(
+                &format!("{name}.key"),
+                map.key_field.field_type.as_ref(),
+                next,
+            )
+            .or_else(|| {
+                walk(
+                    &format!("{name}.value"),
+                    map.value_field.field_type.as_ref(),
+                    next,
+                )
+            }),
+            Type::Primitive(_) | Type::Variant => None,
+        }
+    }
+    walk(name, ty, 0)
 }
 
 /// A mapping from Parquet column path names to internal field id
@@ -3328,118 +3386,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod variant_write_refusal_tests {
-    use std::sync::Arc;
-
-    use parquet::file::properties::WriterProperties;
-    use tempfile::TempDir;
-
-    use super::ParquetWriterBuilder;
-    use crate::ErrorKind;
-    use crate::io::FileIO;
-    use crate::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
-    use crate::writer::file_writer::FileWriterBuilder;
-
-    /// A variant-bearing schema is refused BEFORE any bytes are written, at every depth. Without
-    /// the guard the refusal lands in `close()`, leaving an orphan file.
-    #[tokio::test]
-    async fn a_variant_schema_is_refused_before_any_bytes_are_written() {
-        for (label, variant_field) in [
-            ("top level", NestedField::optional(2, "v", Type::Variant)),
-            (
-                "in a struct",
-                NestedField::optional(
-                    2,
-                    "v",
-                    Type::Struct(StructType::new(vec![
-                        NestedField::optional(3, "inner", Type::Variant).into(),
-                    ])),
-                ),
-            ),
-            (
-                "in a list",
-                NestedField::optional(
-                    2,
-                    "v",
-                    Type::List(ListType {
-                        element_field: NestedField::list_element(3, Type::Variant, true).into(),
-                    }),
-                ),
-            ),
-            (
-                "as a map key",
-                NestedField::optional(
-                    2,
-                    "v",
-                    Type::Map(MapType {
-                        key_field: NestedField::map_key_element(3, Type::Variant).into(),
-                        value_field: NestedField::map_value_element(
-                            4,
-                            Type::Primitive(PrimitiveType::String),
-                            true,
-                        )
-                        .into(),
-                    }),
-                ),
-            ),
-            // The fourth container position, and the most realistic. Dropping the map-VALUE descent
-            // was green.
-            (
-                "as a map value",
-                NestedField::optional(
-                    2,
-                    "v",
-                    Type::Map(MapType {
-                        key_field: NestedField::map_key_element(
-                            3,
-                            Type::Primitive(PrimitiveType::String),
-                        )
-                        .into(),
-                        value_field: NestedField::map_value_element(4, Type::Variant, true).into(),
-                    }),
-                ),
-            ),
-        ] {
-            let schema = Arc::new(
-                Schema::builder()
-                    .with_fields(vec![
-                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-                        variant_field.into(),
-                    ])
-                    .build()
-                    .expect("schema"),
-            );
-
-            let temp_dir = TempDir::new().expect("temp dir");
-            let file_io = FileIO::new_with_fs();
-            let path = temp_dir
-                .path()
-                .join("out.parquet")
-                .to_string_lossy()
-                .to_string();
-            let output = file_io.new_output(&path).expect("output file");
-
-            let error = match ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
-                .build(output)
-                .await
-            {
-                Ok(_) => panic!("a variant schema must be refused at BUILD time ({label})"),
-                Err(error) => error,
-            };
-            assert_eq!(
-                error.kind(),
-                ErrorKind::FeatureUnsupported,
-                "variant {label} must be refused"
-            );
-            assert!(
-                error.message().contains("Writing the variant column"),
-                "the error must name the write refusal for {label}, got: {}",
-                error.message()
-            );
-            assert!(
-                !std::path::Path::new(&path).exists(),
-                "refusing at build time must leave NO file behind for {label}"
-            );
-        }
-    }
+mod unsupported_write_refusal_tests {
+    include!("parquet_writer_unsupported_tests.rs");
 }

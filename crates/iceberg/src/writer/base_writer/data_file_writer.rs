@@ -764,4 +764,182 @@ mod test {
         assert_eq!(data_files[0].partition, Struct::empty());
         Ok(())
     }
+
+    fn unknown_column_schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Unknown)).into(),
+                ])
+                .build()
+                .expect("schema with unknown column"),
+        )
+    }
+
+    fn unknown_column_batch() -> RecordBatch {
+        let arrow_schema = arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                1.to_string(),
+            )])),
+            Field::new("u", DataType::Null, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                2.to_string(),
+            )])),
+        ]);
+        RecordBatch::try_new(Arc::new(arrow_schema), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(arrow_array::NullArray::new(3)),
+        ])
+        .expect("batch with Null unknown column")
+    }
+
+    /// Pin (row R91): a Null/`unknown` column is refused loud. Risk: a silent parquet commit
+    /// leaves a file the Iceberg reader cannot visit (`Cannot visit Arrow data type: Null`).
+    #[tokio::test]
+    async fn data_file_writer_refuses_unknown_null_column_loud() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let schema = unknown_column_schema();
+        let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
+            .unpartitioned()
+            .build(None)
+            .await
+            .expect("build data file writer");
+
+        let err = writer
+            .write(unknown_column_batch())
+            .await
+            .expect_err("a Null unknown column must be refused, not committed");
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            err.message().contains("unknown"),
+            "refusal must name the type, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("Writing the unknown column"),
+            "refusal must name the write path, got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("'u'") || err.message().contains("column 'u"),
+            "refusal must name the column when cheap, got: {}",
+            err.message()
+        );
+        assert_eq!(
+            std::fs::read_dir(temp_dir.path())
+                .expect("read temp dir")
+                .count(),
+            0,
+            "refusal must leave no parquet file behind"
+        );
+    }
+
+    /// Pin: `apply_write_defaults` filling a missing optional `unknown` as Null is still refused.
+    #[tokio::test]
+    async fn data_file_writer_refuses_omitted_optional_unknown_column() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let schema = unknown_column_schema();
+        let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
+            .unpartitioned()
+            .build(None)
+            .await
+            .expect("build data file writer");
+
+        let arrow_schema = arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                1.to_string(),
+            )])),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(Int32Array::from(
+            vec![1, 2, 3],
+        ))])
+        .expect("batch omitting unknown");
+
+        let err = writer
+            .write(batch)
+            .await
+            .expect_err("an omitted optional unknown must not be filled into an unreadable file");
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            err.message().contains("unknown"),
+            "refusal must name the type, got: {}",
+            err.message()
+        );
+    }
+
+    /// Neighbouring pin: a batch with no unknown/Null column still writes and reads back.
+    #[tokio::test]
+    async fn data_file_writer_writes_and_reads_back_int_string_batch() -> Result<()> {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_io = FileIO::new_with_fs();
+        let schema = Schema::builder()
+            .with_schema_id(3)
+            .with_fields(vec![
+                NestedField::required(3, "foo", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(4, "bar", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()?;
+        let schema = Arc::new(schema);
+
+        let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
+            .unpartitioned()
+            .build(None)
+            .await
+            .expect("build data file writer");
+
+        let arrow_schema = arrow_schema::Schema::new(vec![
+            Field::new("foo", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                3.to_string(),
+            )])),
+            Field::new("bar", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                4.to_string(),
+            )])),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+        ])?;
+        writer.write(batch).await?;
+        let data_files = writer.close().await.expect("close");
+        assert_eq!(data_files.len(), 1);
+
+        let bytes = file_io
+            .new_input(data_files[0].file_path.clone())?
+            .read()
+            .await?;
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("open parquet")
+            .build()
+            .expect("build reader");
+        let read = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read batches");
+        assert_eq!(read.len(), 1);
+        assert_eq!(
+            read[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("int column")
+                .values(),
+            &[1, 2, 3]
+        );
+        let names = read[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        assert_eq!(names.value(0), "Alice");
+        assert_eq!(names.value(1), "Bob");
+        assert_eq!(names.value(2), "Charlie");
+        Ok(())
+    }
 }
