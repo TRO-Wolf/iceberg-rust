@@ -28,7 +28,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 
 | File | What it pins |
 |---|---|
-| `commit_branch.rs` | `IcebergTableProvider::with_commit_branch` scopes scans and commits to the named branch (row R168). Diverged SELECT/DELETE/INSERT-SELECT follow the branch head; missing-ref SELECT/DELETE error; INSERT VALUES still creates the ref; advertised schema stays current and field-id bind null-fills; default path stays on `main` |
+| `commit_branch.rs` | `IcebergTableProvider::with_commit_branch` scopes scans and commits to the named branch (row R168). Diverged SELECT/DELETE/INSERT-SELECT follow the branch head; CoW/MoR UPDATE and CoW/MoR DELETE each have a branch-only (`id = 10`) pin so a main-read is red; missing-ref SELECT/DELETE error; INSERT VALUES still creates the ref; advertised schema stays current and field-id bind null-fills; default path stays on `main` |
 | `integration_datafusion_test.rs` | Core provider SQL / scan / DML |
 | `cow_memory_bound.rs` | Copy-on-write memory bound |
 | `h7_p1_dml_prune.rs` | DML file prune |

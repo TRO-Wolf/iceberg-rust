@@ -805,7 +805,7 @@ struct LiveDeletes {
     legacy_position_deletes: Vec<(Option<String>, i32, Struct, Option<i64>)>,
 }
 
-/// Reads the current snapshot's delete manifests once. V3 allows at most one DV per data file, so
+/// Reads the scanned snapshot's delete manifests once. V3 allows at most one DV per data file, so
 /// `dv_by_data_file` is unambiguous. A second delete on a data file must merge that DV and supersede
 /// it, or the positions are counted twice.
 async fn live_delete_vectors_by_data_file(

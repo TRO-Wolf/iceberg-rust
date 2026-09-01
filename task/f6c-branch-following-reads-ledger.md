@@ -63,6 +63,10 @@ Live-file walks (`live_data_file_partitions`, `live_delete_vectors_by_data_file`
 |---|---|
 | Diverged SELECT returns B not A | `scan_with_commit_branch_returns_branch_rows_not_main` |
 | Diverged DELETE follows B, main untouched | `delete_with_commit_branch_follows_branch_rows_and_leaves_main_untouched` |
+| Diverged CoW UPDATE, branch-only `id = 10` | `copy_on_write_update_on_diverged_branch_follows_branch_only_row` |
+| Diverged MoR UPDATE, branch-only `id = 10` | `merge_on_read_update_on_diverged_branch_follows_branch_only_row` |
+| Diverged MoR DELETE, branch-only `id = 10` | `merge_on_read_delete_on_diverged_branch_follows_branch_only_row` |
+| Diverged CoW DELETE, branch-only `id = 10` (live-file walk) | `copy_on_write_delete_on_diverged_branch_follows_branch_only_row` |
 | INSERT SELECT reads B | `insert_select_with_commit_branch_reads_the_named_branch` |
 | Default SELECT stays on main | `scan_with_commit_branch_returns_branch_rows_not_main` (second assert) |
 | Default DML stays on main | F-6b `insert_without_target_advances_main` and the five `*_does_not_move_main` site pins |
@@ -84,10 +88,21 @@ Live-file walks (`live_data_file_partitions`, `live_delete_vectors_by_data_file`
 
 | Command | Exit |
 |---|---|
-| `cargo test -p iceberg-datafusion --test commit_branch --locked` | 0 (16 passed) |
+| `cargo test -p iceberg-datafusion --test commit_branch --locked` | 0 (20 passed, Critic S2 pins) |
 | `cargo test -p iceberg -p iceberg-datafusion --locked` | 0 |
 | `make check` | 0 |
 | Docker / `make test` | excused (Docker unavailable) |
+
+## 5b. Mutation red counts (Critic S2)
+
+Each mutation restored in the same command. Production tree clean after the run.
+
+| Mutation | Pin | Red |
+|---|---|---|
+| `merge_on_read_update` `resolve_scan_snapshot_id` → `current_snapshot_id()` | `merge_on_read_update_on_diverged_branch_follows_branch_only_row` | 1 red of 1 (name stayed `"branch"`, expected `"z"`) |
+| `copy_on_write_update` `resolve_scan_snapshot_id` → `current_snapshot_id()` | `copy_on_write_update_on_diverged_branch_follows_branch_only_row` | 1 red of 1 (name stayed `"branch"`, expected `"z"`) |
+| `merge_on_read_delete` `resolve_scan_snapshot_id` → `current_snapshot_id()` | `merge_on_read_delete_on_diverged_branch_follows_branch_only_row` | 1 red of 1 (ids `[1, 10]`, expected `[1]`) |
+| `snapshot_for_scan` forced to `current_snapshot()` | `copy_on_write_delete_on_diverged_branch_follows_branch_only_row` | 1 red of 1 (`scanned data file(s) not live in the scanned snapshot`) |
 
 ## 6. Self Logic Review
 
