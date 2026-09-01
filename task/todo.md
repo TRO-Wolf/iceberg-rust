@@ -84,6 +84,34 @@ Ledger: [`pr6a-branch-interop-ledger.md`](pr6a-branch-interop-ledger.md). Plan: 
 - [x] `make check` 0; `cargo test -p iceberg --locked` 0; `cargo test -p iceberg-datafusion --locked` 0. Docker `make test` legs excused.
 
 Outcome: PR-6A landed. Java/Rust branch DML interop both directions. Every row-asserting verify pins main vs branch data-file sets. V3 MoR on a named branch closes DVs at the scanned snapshot. Row R168 ✅.
+## ACTIVE (2026-09-01): PR-6B V3 MoR UPDATE lineage on a branch — Java interop cell (row R168)
+
+Ledger: [`pr6b-mor-branch-lineage-ledger.md`](pr6b-mor-branch-lineage-ledger.md). Closes the cell PR-6A named as residue: merge-on-read UPDATE **lineage columns** on a diverged branch, both directions.
+
+- [x] Decode iceberg-data 1.10.0 `IcebergGenerics$ScanBuilder`: no `useRef`; `project(Schema)` and `useSnapshot(long)` both fold into the same `TableScan`, so the lineage projection survives the branch-head pin.
+- [x] Java fixture: one V3 merge-on-read table, `main` rows 1/2/3, `createBranch("b")`, `newAppend().toBranch("b")` rows 10/11. Java records its own seed lineage `1=0=1 2=1=1 3=2=1 10=3=2 11=4=2`, main file set, main snapshot id and `next-row-id` 5.
+- [x] Rust GEN: two MoR UPDATEs of id 10 through `IcebergTableProvider::with_commit_branch("b")`.
+- [x] Java verify: branch head keeps `_row_id` 3, sequence 2 → 3 → 4, unmatched rows unchanged, `main` rows / ref / current snapshot / file set untouched, `next-row-id` still 5.
+- [x] Runner `dev/java-interop/run-interop-mor-branch-lineage.sh` (six steps, prerequisites hard-fail, 1 fixture asserted, 5 GEN artifacts asserted, sabotage fail-closed). `SUITE_FLOOR_DEFAULT` 55 → 57.
+- [x] Mutations 12 red out of 12 (4 Rust, 8 Java-verify one-knob bends).
+- [x] GAP_MATRIX row R168, maps, ledger.
+- [ ] **Blocked on topology:** the cell needs PR-6A's `close_touched_dv_containers_at`. On `repark/pr3` alone the branch UPDATE fails `DataInvalid ... is not a live file of the current snapshot`. This commit is the interop layer only, so PR-6B must be stacked on or merged after PR-6A rather than duplicating that two-file crate change.
+
+Outcome: with PR-6A's two crate files applied on top of this branch, `bash dev/java-interop/run-interop-mor-branch-lineage.sh` passes both directions with the sabotage RED, `cargo test -p iceberg-datafusion --locked` is green, and `make check` is exit 0. Docker `make test` legs excused.
+
+## ACTIVE (2026-09-01): PR-3 V3 row-DML lineage (rows R114, R166)
+
+Ledger: [`pr3-row-dml-lineage-ledger.md`](pr3-row-dml-lineage-ledger.md). Plan `task/iceberg-v3-production-work-plan-2026-09-01.md` section 4 / 11.2, clause C-003 and F-rp3-c7.
+
+- [x] Decode Java 1.10.0 `ManifestListWriter$V3Writer.prepare`, `ManifestWriter`, `SnapshotProducer.apply`, `Delegates.suppressFirstRowId`. Diagnosis confirmed: unassigned V3 data manifests advance by added+existing.
+- [x] MoR UPDATE projects `_row_id` / `_last_updated_sequence_number`, attaches original row id, writes null last-updated.
+- [x] Rewrite-aware allocation: stored `_row_id` files do not move `next-row-id`.
+- [x] Required tests (one MoR UPDATE, sequential, partitioned, shared Puffin, conflict, sequential COW DELETE/UPDATE, V2 control) plus mutations 3/5, 3/5, 3/5, 2/2.
+- [x] Interop `run-interop-mor-update-lineage.sh`, 2 fixtures. Reverse Java MoR UPDATE not in iceberg-core 1.10.0.
+- [x] `make check` + `cargo test -p iceberg --locked` + `cargo test -p iceberg-datafusion --locked`. Docker `make test` legs excused.
+- [x] Critic S1–S3: per-file mixed-manifest recovery; RePark recipe absolute `{0,2}` / `next-row-id` 5; Java COW oracle absolute; runner narrative moved to `dev/java-interop/map.md`.
+
+Outcome: MoR UPDATE keeps `_row_id` and advances last-updated. RePark sequential COW DELETE ends at `_row_id` {0,2} and `next-row-id` 5. Interop 2 fixtures. Docker `make test` legs excused.
 
 ## ACTIVE (2026-09-01): F-6c branch-following reads (row R168)
 

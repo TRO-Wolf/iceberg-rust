@@ -395,6 +395,18 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-mor-branch-lineage":
+        MorBranchLineageOracle.generate(requireFixturesDir("interop.mor_branch_lineage.dir"));
+        break;
+      case "verify-interop-mor-branch-lineage":
+        int morBranchLineageFailures =
+            MorBranchLineageOracle.verify(requireFixturesDir("interop.mor_branch_lineage.dir"));
+        System.out.println(
+            "verify-interop-mor-branch-lineage: " + morBranchLineageFailures + " failures");
+        if (morBranchLineageFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-dv":
         // DELETION-VECTOR merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes" (Increment
         // D1). Writes an unpartitioned V3 table (DVs require format version 3) with TWO real
@@ -28001,6 +28013,426 @@ public final class InteropOracle {
           new LocalTableOperations(rustTable.toFile(), rustTable.resolve("metadata").toFile());
       ops.commit(null, parsed);
       return new BaseTable(ops, name);
+    }
+  }
+
+  static final class MorBranchLineageOracle {
+    static final String BRANCH = "b";
+    static final int EXPECTED_FIXTURES = 1;
+
+    private MorBranchLineageOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      Path tableDir = dir.resolve("branch_table");
+      BaseTable table = seedDivergedV3(tableDir);
+      SnapshotRef branchRef = table.refs().get(BRANCH);
+      if (branchRef == null || !branchRef.isBranch()) {
+        throw new IllegalStateException("seed did not create branch " + BRANCH);
+      }
+      Snapshot mainSnapshot = table.currentSnapshot();
+      if (mainSnapshot == null || mainSnapshot.snapshotId() == branchRef.snapshotId()) {
+        throw new IllegalStateException("seed branch did not diverge from main");
+      }
+      writeText(dir.resolve("java_seed_branch_lineage.txt"),
+          lineageText(scanLineage(table, branchRef.snapshotId())));
+      writeText(dir.resolve("java_seed_main_lineage.txt"),
+          lineageText(scanLineage(table, mainSnapshot.snapshotId())));
+      writeText(dir.resolve("java_seed_main_files.txt"),
+          String.join("\n", fileBasenames(table, SnapshotRef.MAIN_BRANCH)) + "\n");
+      writeText(dir.resolve("java_seed_branch_files.txt"),
+          String.join("\n", fileBasenames(table, BRANCH)) + "\n");
+      writeText(dir.resolve("java_seed_main_snapshot_id.txt"),
+          mainSnapshot.snapshotId() + "\n");
+      writeText(dir.resolve("java_seed_next_row_id.txt"),
+          table.operations().current().nextRowId() + "\n");
+      writeJson(dir.resolve("fixture_count.json"), "{\"count\":" + EXPECTED_FIXTURES + "}");
+      System.out.println(
+          "generate-interop-mor-branch-lineage: wrote "
+              + EXPECTED_FIXTURES
+              + " fixture to "
+              + dir);
+    }
+
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path countPath = dir.resolve("fixture_count.json");
+      if (!Files.exists(countPath)) {
+        System.out.println("FAIL mor-branch-lineage: missing fixture_count.json");
+        return 1;
+      }
+      String countJson = readString(countPath).trim();
+      if (!countJson.equals("{\"count\":" + EXPECTED_FIXTURES + "}")) {
+        System.out.println(
+            "FAIL mor-branch-lineage: fixture count "
+                + countJson
+                + " != {\"count\":"
+                + EXPECTED_FIXTURES
+                + "}");
+        failures++;
+      }
+      Path afterDir = dir.resolve("rust_after");
+      Path metadata = afterDir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(metadata) || Files.size(metadata) == 0) {
+        System.out.println("FAIL mor-branch-lineage: missing Rust result metadata at " + metadata);
+        return failures + 1;
+      }
+      BaseTable table = loadRust(afterDir);
+      if (table.operations().current().formatVersion() < 3) {
+        System.out.println(
+            "FAIL mor-branch-lineage: format version "
+                + table.operations().current().formatVersion()
+                + " expected 3");
+        failures++;
+      }
+      SnapshotRef mainRef = table.refs().get(SnapshotRef.MAIN_BRANCH);
+      SnapshotRef branchRef = table.refs().get(BRANCH);
+      Snapshot current = table.currentSnapshot();
+      if (mainRef == null || branchRef == null || current == null) {
+        System.out.println("FAIL mor-branch-lineage: missing main/branch ref after Rust DML");
+        return failures + 1;
+      }
+      if (!branchRef.isBranch()) {
+        System.out.println("FAIL mor-branch-lineage: ref " + BRANCH + " is not a branch");
+        failures++;
+      }
+      if (branchRef.snapshotId() == mainRef.snapshotId()) {
+        System.out.println("FAIL mor-branch-lineage: branch head equals main head");
+        failures++;
+      }
+      long seedMain = Long.parseLong(readString(dir.resolve("java_seed_main_snapshot_id.txt")).trim());
+      if (current.snapshotId() != seedMain || mainRef.snapshotId() != seedMain) {
+        System.out.println(
+            "FAIL mor-branch-lineage/main_snapshot: current="
+                + current.snapshotId()
+                + " main_ref="
+                + mainRef.snapshotId()
+                + " seed="
+                + seedMain);
+        failures++;
+      } else {
+        System.out.println("PASS mor-branch-lineage/main_snapshot: " + seedMain);
+      }
+      long seedNextRowId = Long.parseLong(readString(dir.resolve("java_seed_next_row_id.txt")).trim());
+      long actualNextRowId = table.operations().current().nextRowId();
+      if (actualNextRowId != seedNextRowId) {
+        System.out.println(
+            "FAIL mor-branch-lineage/next_row_id: "
+                + actualNextRowId
+                + " expected "
+                + seedNextRowId
+                + " (MoR UPDATE adds no rows)");
+        failures++;
+      } else {
+        System.out.println("PASS mor-branch-lineage/next_row_id: " + actualNextRowId);
+      }
+      failures +=
+          assertLines(
+              "mor-branch-lineage/main_files",
+              fileBasenames(table, SnapshotRef.MAIN_BRANCH),
+              readLines(dir.resolve("java_seed_main_files.txt")));
+      failures +=
+          assertLines(
+              "mor-branch-lineage/branch_files",
+              fileBasenames(table, BRANCH),
+              readLines(afterDir.resolve("expected_branch_files.txt")));
+      Map<Integer, long[]> seedMainLineage = parseLineage(dir.resolve("java_seed_main_lineage.txt"));
+      Map<Integer, long[]> mainLineage = scanLineage(table, current.snapshotId());
+      failures += assertLineage("mor-branch-lineage/main_lineage", mainLineage, seedMainLineage);
+      Map<Integer, long[]> seedBranchLineage =
+          parseLineage(dir.resolve("java_seed_branch_lineage.txt"));
+      Map<Integer, long[]> branchLineage = scanLineage(table, branchRef.snapshotId());
+      failures +=
+          assertLineage(
+              "mor-branch-lineage/branch_lineage",
+              branchLineage,
+              parseLineage(afterDir.resolve("expected_branch_lineage.txt")));
+      failures += assertUpdatedRow(branchLineage, seedBranchLineage, afterDir);
+      return failures;
+    }
+
+    private static int assertUpdatedRow(
+        Map<Integer, long[]> branchLineage, Map<Integer, long[]> seedBranchLineage, Path afterDir)
+        throws IOException {
+      int failures = 0;
+      int updatedId = Integer.parseInt(readString(afterDir.resolve("updated_id.txt")).trim());
+      long[] seedRow = seedBranchLineage.get(updatedId);
+      long[] liveRow = branchLineage.get(updatedId);
+      if (seedRow == null || liveRow == null) {
+        System.out.println("FAIL mor-branch-lineage/updated_row: id " + updatedId + " missing");
+        return 1;
+      }
+      if (liveRow[0] != seedRow[0]) {
+        System.out.println(
+            "FAIL mor-branch-lineage/updated_row_id: id="
+                + updatedId
+                + " row_id="
+                + liveRow[0]
+                + " expected the seed row_id "
+                + seedRow[0]);
+        failures++;
+      } else {
+        System.out.println(
+            "PASS mor-branch-lineage/updated_row_id: id=" + updatedId + " row_id=" + liveRow[0]);
+      }
+      long firstSeq = Long.parseLong(readString(afterDir.resolve("first_update_seq.txt")).trim());
+      if (firstSeq <= seedRow[1]) {
+        System.out.println(
+            "FAIL mor-branch-lineage/first_update_seq: "
+                + firstSeq
+                + " did not advance past the seed "
+                + seedRow[1]);
+        failures++;
+      }
+      if (liveRow[1] <= firstSeq) {
+        System.out.println(
+            "FAIL mor-branch-lineage/second_update_seq: "
+                + liveRow[1]
+                + " did not advance past the first update "
+                + firstSeq);
+        failures++;
+      }
+      if (failures == 0) {
+        System.out.println(
+            "PASS mor-branch-lineage/seq_advanced_twice: "
+                + seedRow[1]
+                + " -> "
+                + firstSeq
+                + " -> "
+                + liveRow[1]);
+      }
+      for (Map.Entry<Integer, long[]> entry : seedBranchLineage.entrySet()) {
+        if (entry.getKey() == updatedId) {
+          continue;
+        }
+        long[] live = branchLineage.get(entry.getKey());
+        if (live == null) {
+          System.out.println("FAIL mor-branch-lineage/unmatched: id " + entry.getKey() + " vanished");
+          failures++;
+          continue;
+        }
+        if (live[0] != entry.getValue()[0] || live[1] != entry.getValue()[1]) {
+          System.out.println(
+              "FAIL mor-branch-lineage/unmatched: id="
+                  + entry.getKey()
+                  + " live="
+                  + live[0]
+                  + "/"
+                  + live[1]
+                  + " seed="
+                  + entry.getValue()[0]
+                  + "/"
+                  + entry.getValue()[1]);
+          failures++;
+        }
+      }
+      return failures;
+    }
+
+    private static int assertLineage(
+        String label, Map<Integer, long[]> actual, Map<Integer, long[]> expected) {
+      if (!actual.keySet().equals(expected.keySet())) {
+        System.out.println(
+            "FAIL " + label + ": ids " + actual.keySet() + " expected " + expected.keySet());
+        return 1;
+      }
+      int failures = 0;
+      for (Map.Entry<Integer, long[]> entry : expected.entrySet()) {
+        long[] live = actual.get(entry.getKey());
+        if (live[0] != entry.getValue()[0] || live[1] != entry.getValue()[1]) {
+          System.out.println(
+              "FAIL "
+                  + label
+                  + ": id="
+                  + entry.getKey()
+                  + " live="
+                  + live[0]
+                  + "/"
+                  + live[1]
+                  + " expected="
+                  + entry.getValue()[0]
+                  + "/"
+                  + entry.getValue()[1]);
+          failures++;
+        }
+      }
+      if (failures == 0) {
+        System.out.println("PASS " + label + ": " + lineageText(actual).replace("\n", " "));
+      }
+      return failures;
+    }
+
+    private static int assertLines(String label, List<String> actual, List<String> expected) {
+      if (!actual.equals(expected)) {
+        System.out.println("FAIL " + label + ": live=" + actual + " expected=" + expected);
+        return 1;
+      }
+      System.out.println("PASS " + label + ": " + actual);
+      return 0;
+    }
+
+    private static BaseTable seedDivergedV3(Path tableDir) throws IOException {
+      File tableFile = tableDir.toFile();
+      File metadataDir = new File(tableFile, "metadata");
+      File dataDir = new File(tableFile, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+      Schema schema = schema();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "3");
+      props.put(TableProperties.DELETE_MODE, "merge-on-read");
+      props.put(TableProperties.UPDATE_MODE, "merge-on-read");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema,
+              PartitionSpec.unpartitioned(),
+              SortOrder.unsorted(),
+              tableFile.getAbsolutePath(),
+              props);
+      LocalTableOperations ops = new LocalTableOperations(tableFile, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_mor_branch_lineage");
+      DataFile mainFile =
+          writeRows(
+              table,
+              schema,
+              new File(dataDir, "00000-main.parquet").getAbsolutePath(),
+              new int[] {1, 2, 3},
+              new String[] {"a", "b", "c"});
+      table.newAppend().appendFile(mainFile).commit();
+      table.refresh();
+      table.manageSnapshots().createBranch(BRANCH).commit();
+      table.refresh();
+      DataFile branchFile =
+          writeRows(
+              table,
+              schema,
+              new File(dataDir, "00001-branch.parquet").getAbsolutePath(),
+              new int[] {10, 11},
+              new String[] {"x", "y"});
+      table.newAppend().appendFile(branchFile).toBranch(BRANCH).commit();
+      table.refresh();
+      Path finalMetadata = Paths.get(ops.metadataFileLocation("final.metadata.json"));
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+      return table;
+    }
+
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.IntegerType.get()),
+          Types.NestedField.required(2, "val", Types.StringType.get()));
+    }
+
+    private static DataFile writeRows(
+        BaseTable table, Schema schema, String path, int[] ids, String[] values)
+        throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("val", values[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(schema, PartitionSpec.unpartitioned());
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static BaseTable loadRust(Path afterDir) throws IOException {
+      Path metadata =
+          afterDir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      TableMetadata parsed =
+          TableMetadataParser.fromJson(metadata.toString(), readString(metadata));
+      return new BaseTable(
+          new InMemoryInspectionOperations(parsed, new LocalFileIO()), "rust_mor_branch_lineage");
+    }
+
+    private static Map<Integer, long[]> scanLineage(BaseTable table, long snapshotId)
+        throws IOException {
+      Schema lineage = MetadataColumns.schemaWithRowLineage(table.schema());
+      Map<Integer, long[]> rows = new TreeMap<>();
+      try (CloseableIterable<Record> records =
+          IcebergGenerics.read(table).project(lineage).useSnapshot(snapshotId).build()) {
+        for (Record record : records) {
+          Object idObj = record.getField("id");
+          Object rowId = record.getField("_row_id");
+          Object seq = record.getField("_last_updated_sequence_number");
+          int id = idObj instanceof Integer ? (Integer) idObj : ((Long) idObj).intValue();
+          long rid = rowId == null ? Long.MIN_VALUE : ((Number) rowId).longValue();
+          long value = seq == null ? Long.MIN_VALUE : ((Number) seq).longValue();
+          rows.put(id, new long[] {rid, value});
+        }
+      }
+      return rows;
+    }
+
+    private static List<String> fileBasenames(BaseTable table, String refName) throws IOException {
+      TreeSet<String> names = new TreeSet<>();
+      try (CloseableIterable<FileScanTask> tasks = table.newScan().useRef(refName).planFiles()) {
+        for (FileScanTask task : tasks) {
+          names.add(new File(task.file().path().toString()).getName());
+        }
+      }
+      return new ArrayList<>(names);
+    }
+
+    private static String lineageText(Map<Integer, long[]> rows) {
+      StringBuilder text = new StringBuilder();
+      for (Map.Entry<Integer, long[]> entry : rows.entrySet()) {
+        text.append(entry.getKey())
+            .append('=')
+            .append(entry.getValue()[0])
+            .append('=')
+            .append(entry.getValue()[1])
+            .append('\n');
+      }
+      return text.toString();
+    }
+
+    private static Map<Integer, long[]> parseLineage(Path path) throws IOException {
+      Map<Integer, long[]> rows = new TreeMap<>();
+      for (String line : readLines(path)) {
+        String[] parts = line.split("=");
+        if (parts.length != 3) {
+          throw new IOException("malformed lineage line '" + line + "' in " + path);
+        }
+        rows.put(
+            Integer.parseInt(parts[0]),
+            new long[] {Long.parseLong(parts[1]), Long.parseLong(parts[2])});
+      }
+      return rows;
+    }
+
+    private static List<String> readLines(Path path) throws IOException {
+      List<String> lines = new ArrayList<>();
+      for (String line : readString(path).split("\n")) {
+        String trimmed = line.trim();
+        if (!trimmed.isEmpty()) {
+          lines.add(trimmed);
+        }
+      }
+      return lines;
+    }
+
+    private static void writeText(Path path, String text) throws IOException {
+      Files.createDirectories(path.getParent());
+      Files.write(path, text.getBytes(StandardCharsets.UTF_8));
     }
   }
 

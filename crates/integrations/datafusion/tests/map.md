@@ -39,6 +39,8 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `row_lineage_cow.rs` | V3 row lineage on CoW DML; Spark sequences at the fork's single-file layout (F-rp3-c7, row R166) |
 | `row_lineage_mor.rs` | V3 merge-on-read UPDATE lineage, sequential/partitioned UPDATE, V2 control, commit-conflict |
 | `interop_mor_update_lineage.rs` | GEN for `run-interop-mor-update-lineage.sh` (Java-created V3 tables; two MoR UPDATE statements + RePark COW UPDATE-then-DELETE) |
+| `interop_mor_update_lineage.rs` | GEN for `run-interop-mor-update-lineage.sh` (Java-created V3 tables; two MoR UPDATE statements + overwrite-then-DELETE) |
+| `interop_mor_branch_lineage.rs` | V3 merge-on-read UPDATE lineage on a DIVERGED BRANCH (row R168 / PR-6B). Offline: Rust seeds `main` 1/2/3 + branch `b` 10/11, runs two MoR UPDATEs of id 10 through `with_commit_branch("b")`, and pins stable `_row_id`, a sequence that advances on each UPDATE, unmatched branch rows unchanged, `main` snapshot / files / lineage untouched and `next-row-id` unmoved. `ICEBERG_INTEROP_MOR_BRANCH_LINEAGE_DIR` adds the Direction-1 read of the Java fixture; `..._GEN_DIR` adds the Direction-2 GEN that writes `rust_after/` for Java. Both env vars are set by `dev/java-interop/run-interop-mor-branch-lineage.sh`. pins: R168/C-006 |
 | `shared_puffin_dv/` | Shared-Puffin deletion-vector DML |
 
 ## I want to...
@@ -47,6 +49,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 |---|---|
 | Pin `with_commit_branch` scan + commit | `commit_branch.rs` |
 | Prove Java/Rust branch DML interop | `interop_branch_dml.rs` |
+| Prove V3 MoR UPDATE lineage on a branch vs Java | `interop_mor_branch_lineage.rs` |
 | Pin default (no branch) DML | `integration_datafusion_test.rs` |
 
 ## Pointers
@@ -62,6 +65,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | Named-branch SELECT returns `main` rows | `IcebergTableProvider::scan` passed `None` instead of `resolve_scan_snapshot_id` |
 | Missing-ref DELETE creates the branch | the read leg did not call `resolve_scan_snapshot_id` (INSERT VALUES is the only create-on-missing path) |
 | V3 MoR DELETE on a diverged branch fails "not a live file" | DV container close used `current_snapshot()`; see `close_touched_dv_containers_at` |
+| MoR UPDATE on a diverged branch fails `not a live file of the current snapshot` | the DV container close resolved live data files from `current_snapshot()`; it must close at the scanned branch head (`close_touched_dv_containers_at`, PR-6A) |
 
 ### First checks
 
