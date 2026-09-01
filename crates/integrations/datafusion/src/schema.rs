@@ -150,6 +150,7 @@ impl IcebergSchemaProvider {
 ///
 /// `table_names` / `table_exist` / `table` share this so a suffix cannot drift from
 /// [`MetadataTableType::as_str`].
+#[cfg(test)]
 fn metadata_table_ident(base: &str, ty: MetadataTableType) -> String {
     format!("{}${}", base, ty.as_str())
 }
@@ -211,13 +212,7 @@ impl SchemaProvider for IcebergSchemaProvider {
         self.refresh_table_names_best_effort();
         self.tables
             .iter()
-            .flat_map(|entry| {
-                let table_name = entry.key().clone();
-                [table_name.clone()].into_iter().chain(
-                    MetadataTableType::all_types()
-                        .map(move |ty| metadata_table_ident(&table_name, ty)),
-                )
-            })
+            .map(|entry| entry.key().clone())
             .collect()
     }
 
@@ -760,16 +755,16 @@ mod tests {
         assert!(!schema_provider.table_exist("missing$files"));
 
         let names = schema_provider.table_names();
-        assert!(names.contains(&"a$b".to_string()));
+        assert_eq!(names, vec!["a$b".to_string()]);
         for ty in MetadataTableType::all_types() {
             let synthesized = metadata_table_ident("a$b", ty);
             assert!(
-                names.contains(&synthesized),
-                "table_names must include {synthesized}"
+                !names.contains(&synthesized),
+                "table_names must not enumerate {synthesized}"
             );
             assert!(
                 schema_provider.table_exist(&synthesized),
-                "table_exist must be true for synthesized {synthesized}"
+                "table_exist must be true for {synthesized}"
             );
         }
         assert!(
@@ -809,5 +804,36 @@ mod tests {
             .map(|batch| batch.expect("a$b batch").num_rows())
             .sum();
         assert_eq!(rows, 0, "empty a$b read returns zero rows");
+    }
+
+    #[tokio::test]
+    async fn test_table_names_lists_catalog_entries_only_and_dollar_names_still_resolve() {
+        let (schema_provider, _temp_dir) = create_test_schema_provider().await;
+        schema_provider
+            .register_table("orders".to_string(), empty_mem_table())
+            .expect("register orders");
+
+        let mut names = schema_provider.table_names();
+        names.sort();
+        assert_eq!(names, vec!["orders".to_string()]);
+        assert!(
+            names.iter().all(|name| !name.contains('$')),
+            "table_names must not synthesize metadata twins"
+        );
+
+        assert!(schema_provider.table_exist("orders"));
+        assert!(schema_provider.table_exist("orders$snapshots"));
+        assert!(!schema_provider.table_exist("orders$not_a_type"));
+        assert!(!schema_provider.table_exist("missing$snapshots"));
+
+        let snapshots = schema_provider
+            .table("orders$snapshots")
+            .await
+            .expect("resolve orders$snapshots")
+            .expect("orders$snapshots provider");
+        assert!(
+            snapshots.schema().field_with_name("snapshot_id").is_ok(),
+            "orders$snapshots must resolve after listing dropped synthesized names"
+        );
     }
 }
