@@ -69,12 +69,14 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 
-use super::cow_affected::resolve_affected_data_files;
+use super::cow_affected::{live_data_file_partitions, resolve_affected_data_files};
 use super::row_lineage::{
     StreamingDataFileWriter, attach_lineage, filter_lineage_columns, null_last_updated_where_true,
     push_lineage_scan_columns,
 };
-use super::snapshot_target::{maybe_to_branch, maybe_validate_from_snapshot};
+use super::snapshot_target::{
+    maybe_to_branch, maybe_validate_from_snapshot, resolve_scan_snapshot_id,
+};
 use crate::to_datafusion_error;
 
 pub(crate) const WRITE_DELETE_MODE: &str = "write.delete.mode";
@@ -347,17 +349,20 @@ async fn write_merge_on_read_deletes(
     table: &Table,
     kind: MergeOnReadDeleteKind,
     pairs: &[(String, i64)],
+    scan_snapshot_id: Option<i64>,
 ) -> DFResult<DvContainerClose> {
     match kind {
         MergeOnReadDeleteKind::PositionDeletes => Ok(DvContainerClose {
-            added: write_position_deletes(table, pairs)
+            added: write_position_deletes(table, pairs, scan_snapshot_id)
                 .await?
                 .into_iter()
                 .map(|file| (file, None))
                 .collect(),
             removed: Vec::new(),
         }),
-        MergeOnReadDeleteKind::DeletionVectors => write_deletion_vectors(table, pairs).await,
+        MergeOnReadDeleteKind::DeletionVectors => {
+            write_deletion_vectors(table, pairs, scan_snapshot_id).await
+        }
     }
 }
 
@@ -399,10 +404,8 @@ async fn merge_on_read_delete(
     commit_branch: Option<&str>,
 ) -> DFResult<u64> {
     let delete_kind = merge_on_read_delete_kind(table)?;
-    // The §5 `validate_from_snapshot` anchor. Java sets it only when the scan captured a snapshot.
-    // The commit below is reached only when rows matched, which implies one existed.
-    let scan_snapshot_id = table.metadata().current_snapshot_id();
-    // Table columns plus `_file`/`_pos`. File prune is optional; the row filter is PhysicalExpr.
+    let scan_snapshot_id =
+        resolve_scan_snapshot_id(table, commit_branch).map_err(to_datafusion_error)?;
     let mut projection: Vec<String> = table_schema
         .fields()
         .iter()
@@ -411,8 +414,10 @@ async fn merge_on_read_delete(
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
-    // Awaiting `try_next()` polls the scan only as batches are consumed, so it is back-pressured.
     let mut builder = table.scan().select(projection);
+    if let Some(snapshot_id) = scan_snapshot_id {
+        builder = builder.snapshot_id(snapshot_id);
+    }
     if let Some(prune) = prune {
         builder = builder.with_file_prune_only(prune);
     }
@@ -498,7 +503,7 @@ async fn merge_on_read_delete(
 
     // The §5 `validate_data_files_exist` set. Java arms this for every command, DELETE included: a
     // referenced file rewritten away by a concurrent commit would silently lose these deletes.
-    let close = write_merge_on_read_deletes(table, delete_kind, &pairs).await?;
+    let close = write_merge_on_read_deletes(table, delete_kind, &pairs, scan_snapshot_id).await?;
     // V3 container close copies sibling references, so files-exist must cover every replacement.
     let referenced_files = if close
         .added
@@ -522,12 +527,9 @@ async fn merge_on_read_delete(
         action = action.validate_deleted_files();
     }
     action = apply_dv_container_close(action, close);
-    action = maybe_validate_from_snapshot(
-        action,
-        commit_branch,
-        scan_snapshot_id,
-        |action, snapshot_id| action.validate_from_snapshot(snapshot_id),
-    );
+    action = maybe_validate_from_snapshot(action, scan_snapshot_id, |action, snapshot_id| {
+        action.validate_from_snapshot(snapshot_id)
+    });
     if isolation == IsolationLevel::Serializable {
         action = action.validate_no_conflicting_data_files();
     }
@@ -588,11 +590,9 @@ async fn copy_on_write_delete(
     isolation: IsolationLevel,
     commit_branch: Option<&str>,
 ) -> DFResult<u64> {
-    // The §5 `validate_from_snapshot` anchor. Both passes pin it, so they read the identical rows.
-    let scan_snapshot_id = table.metadata().current_snapshot_id();
+    let scan_snapshot_id =
+        resolve_scan_snapshot_id(table, commit_branch).map_err(to_datafusion_error)?;
 
-    // Pass 1 — affected-file detection. A file is affected when any of its rows matches. Only the
-    // affected paths and the counter survive the pass; no rows are buffered.
     let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id, prune.clone()).await?;
     let mut deleted: u64 = 0;
     let mut affected: HashSet<String> = HashSet::new();
@@ -686,7 +686,8 @@ async fn copy_on_write_delete(
     // Commit: remove the affected source files, add the rewritten ones. The removals carry FULL
     // `DataFile` metadata, so the §5 conflicting-deletes check is LIVE. It tests concurrent delete
     // files against partition and metrics, which a bare path cannot carry.
-    let removed_data_files = resolve_affected_data_files(table, &affected).await?;
+    let removed_data_files =
+        resolve_affected_data_files(table, &affected, scan_snapshot_id).await?;
     let tx = Transaction::new(table);
     let mut action = tx
         .overwrite_files()
@@ -694,12 +695,9 @@ async fn copy_on_write_delete(
         .add_files(new_files)
         .conflict_detection_filter(Predicate::AlwaysTrue)
         .validate_no_conflicting_deletes();
-    action = maybe_validate_from_snapshot(
-        action,
-        commit_branch,
-        scan_snapshot_id,
-        |action, snapshot_id| action.validate_from_snapshot(snapshot_id),
-    );
+    action = maybe_validate_from_snapshot(action, scan_snapshot_id, |action, snapshot_id| {
+        action.validate_from_snapshot(snapshot_id)
+    });
     if isolation == IsolationLevel::Serializable {
         action = action.validate_no_conflicting_data();
     }
@@ -731,7 +729,11 @@ async fn copy_on_write_delete(
 /// | partitioned | walk |
 pub(crate) use super::cow_affected::position_delete_unpartitioned_fast_path;
 
-async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFResult<Vec<DataFile>> {
+async fn write_position_deletes(
+    table: &Table,
+    pairs: &[(String, i64)],
+    scan_snapshot_id: Option<i64>,
+) -> DFResult<Vec<DataFile>> {
     let config = PositionDeleteWriterConfig::new().map_err(to_datafusion_error)?;
     let metadata = table.metadata();
     let default_spec = metadata.default_partition_spec();
@@ -753,7 +755,7 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
         .await;
     }
 
-    let path_to_partition = live_data_file_partitions(table).await?;
+    let path_to_partition = live_data_file_partitions(table, scan_snapshot_id).await?;
 
     let path_to_partition: HashMap<String, (i32, Struct)> = path_to_partition
         .into_iter()
@@ -794,50 +796,6 @@ async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFRes
     Ok(all_delete_files)
 }
 
-/// Maps every live data file of the current snapshot to its `(spec_id, partition)`. Both delete
-/// write paths stamp from this, so a position delete and a deletion vector covering one data file
-/// cannot disagree about its partition.
-async fn live_data_file_partitions(
-    table: &Table,
-) -> DFResult<HashMap<String, (i32, Struct, Option<i64>)>> {
-    let metadata = table.metadata();
-    let mut path_to_partition: HashMap<String, (i32, Struct, Option<i64>)> = HashMap::new();
-    let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(path_to_partition);
-    };
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), metadata)
-        .await
-        .map_err(to_datafusion_error)?;
-
-    for manifest_entry in manifest_list.entries() {
-        if manifest_entry.content != iceberg::spec::ManifestContentType::Data {
-            continue;
-        }
-        let manifest = manifest_entry
-            .load_manifest(table.file_io())
-            .await
-            .map_err(to_datafusion_error)?;
-        for entry in manifest.entries() {
-            if entry.is_alive()
-                && entry.data_file().content_type() == iceberg::spec::DataContentType::Data
-            {
-                let df = entry.data_file();
-                path_to_partition
-                    .entry(df.file_path().to_string())
-                    .or_insert_with(|| {
-                        (
-                            df.partition_spec_id(),
-                            df.partition().clone(),
-                            entry.sequence_number(),
-                        )
-                    });
-            }
-        }
-    }
-    Ok(path_to_partition)
-}
-
 /// The live delete files of the current snapshot, split by whether they are deletion vectors.
 struct LiveDeletes {
     /// Puffin DVs, keyed by the data file each covers.
@@ -850,13 +808,16 @@ struct LiveDeletes {
 /// Reads the current snapshot's delete manifests once. V3 allows at most one DV per data file, so
 /// `dv_by_data_file` is unambiguous. A second delete on a data file must merge that DV and supersede
 /// it, or the positions are counted twice.
-async fn live_delete_vectors_by_data_file(table: &Table) -> DFResult<LiveDeletes> {
+async fn live_delete_vectors_by_data_file(
+    table: &Table,
+    snapshot_id: Option<i64>,
+) -> DFResult<LiveDeletes> {
     let metadata = table.metadata();
     let mut live = LiveDeletes {
         dv_by_data_file: HashMap::new(),
         legacy_position_deletes: Vec::new(),
     };
-    let Some(snapshot) = metadata.current_snapshot() else {
+    let Some(snapshot) = super::cow_affected::snapshot_for_scan(table, snapshot_id) else {
         return Ok(live);
     };
     let manifest_list = snapshot
@@ -964,9 +925,10 @@ fn legacy_position_delete_applies(
 async fn write_deletion_vectors(
     table: &Table,
     pairs: &[(String, i64)],
+    scan_snapshot_id: Option<i64>,
 ) -> DFResult<DvContainerClose> {
-    let path_to_partition = live_data_file_partitions(table).await?;
-    let live = live_delete_vectors_by_data_file(table).await?;
+    let path_to_partition = live_data_file_partitions(table, scan_snapshot_id).await?;
+    let live = live_delete_vectors_by_data_file(table, scan_snapshot_id).await?;
 
     let mut resolved: Vec<(&str, i32, Struct, Option<i64>)> = Vec::new();
     let mut seen = HashSet::new();
@@ -1316,9 +1278,8 @@ pub(crate) async fn merge_on_read_update(
     commit_branch: Option<&str>,
 ) -> DFResult<u64> {
     let delete_kind = merge_on_read_delete_kind(table)?;
-
-    // The §5 `validate_from_snapshot` anchor.
-    let scan_snapshot_id = table.metadata().current_snapshot_id();
+    let scan_snapshot_id =
+        resolve_scan_snapshot_id(table, commit_branch).map_err(to_datafusion_error)?;
 
     let mut projection: Vec<String> = table_schema
         .fields()
@@ -1328,8 +1289,10 @@ pub(crate) async fn merge_on_read_update(
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
-    // Awaiting `try_next` and the writer's `write` back-pressures the scan: no unbounded producer.
     let mut builder = table.scan().select(projection);
+    if let Some(snapshot_id) = scan_snapshot_id {
+        builder = builder.snapshot_id(snapshot_id);
+    }
     if let Some(prune) = prune {
         builder = builder.with_file_prune_only(prune);
     }
@@ -1391,7 +1354,7 @@ pub(crate) async fn merge_on_read_update(
     // Grouping and sorting need the whole pair set up front. Both sides complete BEFORE the single
     // commit below.
     sort_position_delete_pairs(&mut pairs);
-    let close = write_merge_on_read_deletes(table, delete_kind, &pairs).await?;
+    let close = write_merge_on_read_deletes(table, delete_kind, &pairs, scan_snapshot_id).await?;
     let referenced_files = if close
         .added
         .iter()
@@ -1415,12 +1378,9 @@ pub(crate) async fn merge_on_read_update(
         .validate_deleted_files()
         .validate_no_conflicting_delete_files();
     action = apply_dv_container_close(action, close);
-    action = maybe_validate_from_snapshot(
-        action,
-        commit_branch,
-        scan_snapshot_id,
-        |action, snapshot_id| action.validate_from_snapshot(snapshot_id),
-    );
+    action = maybe_validate_from_snapshot(action, scan_snapshot_id, |action, snapshot_id| {
+        action.validate_from_snapshot(snapshot_id)
+    });
     if isolation == IsolationLevel::Serializable {
         action = action.validate_no_conflicting_data_files();
     }
@@ -1452,11 +1412,9 @@ pub(crate) async fn copy_on_write_update(
     isolation: IsolationLevel,
     commit_branch: Option<&str>,
 ) -> DFResult<u64> {
-    // The §5 `validate_from_snapshot` anchor. Both passes pin it, so they read the identical rows.
-    let scan_snapshot_id = table.metadata().current_snapshot_id();
+    let scan_snapshot_id =
+        resolve_scan_snapshot_id(table, commit_branch).map_err(to_datafusion_error)?;
 
-    // Pass 1 — affected-file detection. A file is affected when any of its rows matches. Only the
-    // affected paths and the counter survive the pass; no rows and no masks are retained.
     let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id, prune.clone()).await?;
     let mut updated: u64 = 0;
     let mut affected: HashSet<String> = HashSet::new();
@@ -1543,7 +1501,8 @@ pub(crate) async fn copy_on_write_update(
     // Commit: remove the affected source files, add the rewritten ones. The removals carry FULL
     // metadata, not bare paths, because the §5 conflicting-deletes check needs partition and metrics.
     // Java's isolation switch does not branch on the command, so this matches the DELETE recipe.
-    let removed_data_files = resolve_affected_data_files(table, &affected).await?;
+    let removed_data_files =
+        resolve_affected_data_files(table, &affected, scan_snapshot_id).await?;
     let tx = Transaction::new(table);
     let mut action = tx
         .overwrite_files()
@@ -1551,12 +1510,9 @@ pub(crate) async fn copy_on_write_update(
         .add_files(new_files)
         .conflict_detection_filter(Predicate::AlwaysTrue)
         .validate_no_conflicting_deletes();
-    action = maybe_validate_from_snapshot(
-        action,
-        commit_branch,
-        scan_snapshot_id,
-        |action, snapshot_id| action.validate_from_snapshot(snapshot_id),
-    );
+    action = maybe_validate_from_snapshot(action, scan_snapshot_id, |action, snapshot_id| {
+        action.validate_from_snapshot(snapshot_id)
+    });
     if isolation == IsolationLevel::Serializable {
         action = action.validate_no_conflicting_data();
     }

@@ -59,6 +59,7 @@ engine) parity work.
 | I want to... | go to |
 |---|---|
 | Commit a snapshot onto a named branch | `to_branch.rs` + `SnapshotProducer::with_target_branch`; each producer builder has `to_branch(name)` (row R168) |
+| Scan and commit a named branch from DataFusion | `IcebergTableProvider::with_commit_branch` — scans resolve `snapshot_for_ref`; DML commits still call `to_branch` (row R168). A missing ref errors on the read leg (SELECT/DELETE/UPDATE); INSERT without a target scan still creates the branch |
 | Add a new transaction action | copy the `sort_order.rs` pattern: builder struct + `#[async_trait] impl TransactionAction` returning `ActionCommit::new(updates, requirements)`; wire `mod` + `pub fn` ctor in `mod.rs` |
 | Add conflict validation to an action | the `validate` hook (`action.rs`) + the shared walk/helpers in `snapshot.rs`; mirror `replace_partitions.rs` or `row_delta.rs` |
 | Understand the commit/retry loop | `mod.rs` `Transaction::commit` — refresh, re-apply, `validate` (non-retryable `DataInvalid` on conflict), catalog `update_table`; an `ErrorKind::CommitStateUnknown` from the catalog is never retried — it is RECONCILED by refresh (`commit_status.rs`: landed ⇒ `Ok`, else the unknown error surfaces; no cleanup either way) (row R157) |

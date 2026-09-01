@@ -24,6 +24,18 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+## ACTIVE (2026-09-01): F-6c branch-following reads (row R168)
+
+Ledger: [`f6c-branch-following-reads-ledger.md`](f6c-branch-following-reads-ledger.md). Completes F-6b: `with_commit_branch` now scopes scans as well as commits.
+
+- [x] Resolve the named-ref snapshot at every DataFusion scan (provider `scan`, CoW/MoR DELETE/UPDATE). Missing ref errors (Java `useRef`); INSERT without a target scan still creates the branch (F-6b).
+- [x] Arm `validate_from_snapshot` with the same scan snapshot id (drop the F-6b skip-when-branch-set). Re-pin diverged serializable INSERT OVERWRITE.
+- [x] CoW/MoR live-file walks follow the scanned snapshot, not `current_snapshot()` (main).
+- [x] Pins: diverged SELECT/DELETE/INSERT-SELECT; default path; missing-ref scan vs DML vs INSERT; schema field-id bind; OCC scan==validate-from.
+- [x] GAP_MATRIX row R168, ledger, map.md, `make check` + `cargo test -p iceberg -p iceberg-datafusion --locked`.
+
+Outcome: `with_commit_branch` scans the named-ref head as well as committing onto it. Missing-ref SELECT/DELETE error; INSERT VALUES still creates. Schema follows IcebergTableScan field-id bind. `make check` and `cargo test -p iceberg -p iceberg-datafusion --locked` green. Docker `make test` legs excused.
+
 ## ACTIVE (2026-09-01): R91 parquet write refuses `unknown` loud
 
 Ledger: [`r91-unknown-parquet-loud-ledger.md`](r91-unknown-parquet-loud-ledger.md). GAP_MATRIX row R91.
