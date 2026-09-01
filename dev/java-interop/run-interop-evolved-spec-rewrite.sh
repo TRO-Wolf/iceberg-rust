@@ -16,15 +16,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-#
-# Evolved-spec RewriteDataFiles interop (GAP_MATRIX row R135 / plan C-001).
-#
-# Three fixtures:
-#   D1  Java writes identity(x); Rust evolves to identity(y) and compacts; Java reads
-#   D2  Rust writes identity(x); Java evolves and rewrites; Rust reads
-#   V3  Rust writes V3 identity(x); Rust evolves and compacts; Java compares _row_id
-#
-# FAIL-CLOSED: missing Maven, Java, or a fixture count other than 3 exits non-zero.
 
 set -euo pipefail
 
@@ -128,4 +119,4 @@ if ! echo "${SAB_OUT}" | grep -Eq 'FAIL |failures'; then
   exit 1
 fi
 
-echo "==> DONE — evolved-spec RewriteDataFiles interop passed (3 fixtures, both directions + V3 _row_id)."
+echo "==> DONE — evolved-spec RewriteDataFiles interop passed (5 final.metadata.json)."

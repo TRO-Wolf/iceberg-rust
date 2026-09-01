@@ -29,7 +29,6 @@
 //! | rewrite | live rows only; output files use the current spec and a tuple computed from each row. Format v3 writes stored `_row_id` / `_last_updated_sequence_number` (Java `SparkRewriteTable.rewriteSchema`) |
 //!
 //! A non-default-spec file can hold several current partitions, so Java groups it as unpartitioned.
-//! Output routing is separate: each row is split under the current spec.
 //!
 //! # Defaults
 //!

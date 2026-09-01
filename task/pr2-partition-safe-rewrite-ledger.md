@@ -47,7 +47,7 @@ Spark `RewriteDataFiles` is not on this classpath. Java D2 interop therefore evo
 
 ## Test commands
 
-- `cargo test -p iceberg --locked --lib rewrite_data_files` — 59 passed (includes new evolved-spec and bound tests plus prior rewrite suite).
+- `cargo test -p iceberg --locked --lib rewrite_data_files` — 60 passed (includes new evolved-spec and bound tests plus prior rewrite suite).
 - `cargo test -p iceberg --locked --test interop_evolved_spec_rewrite` — env-gated; offline no-op.
 - Interop: `dev/java-interop/run-interop-evolved-spec-rewrite.sh`
 - Docker `make test` legs excused (Docker unavailable).
@@ -59,13 +59,13 @@ Spark `RewriteDataFiles` is not on this classpath. Java D2 interop therefore evo
 | `make check` | 0 |
 | `make check-matrix-anchors` (via `make check`) | 0 |
 | `cargo test -p iceberg --locked --offline` | 0 |
-| `cargo test -p iceberg --locked --lib rewrite_data_files` | 0 (59 passed) |
+| `cargo test -p iceberg --locked --lib rewrite_data_files` | 0 (60 passed) |
 | `dev/java-interop/run-interop-evolved-spec-rewrite.sh` | 0 (5 `final.metadata.json`) |
 | Docker `make test` legs | excused (Docker unavailable) |
 
 ## Mutations (one knob at a time)
 
-Command unless noted: `cargo test -p iceberg --locked --lib rewrite_data_files` (population 59). Restored from `.bak` + `touch` after each run.
+Command unless noted: `cargo test -p iceberg --locked --lib rewrite_data_files` (population 60 after critic-fix pins). Restored from `.bak` + `touch` after each run.
 
 | # | Knob | Result | Tests that went red |
 |---|---|---|---|
@@ -77,6 +77,7 @@ Command unless noted: `cargo test -p iceberg --locked --lib rewrite_data_files` 
 | 6 | Drop accumulated output from an evicted writer | **1 red out of 1** on `high_cardinality_eviction_keeps_rows` | row census |
 | 7 | Drop lineage projection | **1 red out of 1** on `v3_evolved_spec_rewrite_keeps_row_id` | V3 lineage |
 | 8 | Disable MoR (`task.deletes` cleared) | **3 red out of 4** on `evolved_spec_rewrite_` | equality, position, and DV delete-class tests; V3 lineage stayed green |
+| 9 | Move zero check to after `router.close()` so compacted parquet is written first | **1 red out of 1** on `zero_max_open_partition_writers_is_data_invalid_before_write` | parquet census (`compacted-*.parquet` appeared under `y=10` / `y=20`) |
 
 ## Interop
 
@@ -94,7 +95,7 @@ Files changed: maintenance/rewrite_data_files.rs, rewrite_data_files_plan.rs, re
 Behavior before: write_compacted_files stamped group.first() under the current default spec (arity-only check). Same-arity identity(x)->identity(y) wrote the old x value as y. Partition-pruned scans returned the wrong rows.
 Behavior after: live rows are split with RecordBatchPartitionSplitter on the current spec. Each output file is stamped with that spec id and the recomputed tuple. Open writers are bounded (default 64; zero rejected).
 Negative cases: max_open_partition_writers=0 is DataInvalid and writes no output file; high-cardinality input keeps peak open writers at the bound; evolved-spec equality / position / DV deletes keep only live rows.
-Test command and population: cargo test -p iceberg --locked --lib rewrite_data_files (59 passed this session among that filter).
+Test command and population: cargo test -p iceberg --locked --lib rewrite_data_files (60 passed this session among that filter).
 Mutations, one at a time: see ledger Mutations.
 Java interop command and fixture count: run-interop-evolved-spec-rewrite.sh ; 5 final.metadata.json.
 CI-only evidence gap: Docker make test legs excused.

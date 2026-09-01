@@ -22,6 +22,7 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use futures::TryStreamExt;
 
 use crate::arrow::RecordBatchPartitionSplitter;
+use crate::error::ErrorKind;
 use crate::expr::Reference;
 use crate::maintenance::rewrite_data_files::RewriteDataFiles;
 use crate::maintenance::rewrite_data_files::tests::{
@@ -347,6 +348,16 @@ async fn transform_identity_x_to_bucket_x_stamps_bucket_not_identity() {
     assert!(result.rewritten_data_files_count >= 2);
 
     assert_eq!(scan_rows(&table).await, before);
+    assert_eq!(
+        scan_pruned_rows(&table, "x", 1).await,
+        vec![(1, 10, 100)],
+        "pruned x=1 must return only that row"
+    );
+    assert_eq!(
+        scan_pruned_rows(&table, "x", 2).await,
+        vec![(2, 20, 200)],
+        "pruned x=2 must return only that row"
+    );
     let files = live_data_files(&table).await;
     let bucket_1 = literal_from_long_transform(Transform::Bucket(8), 1);
     let bucket_2 = literal_from_long_transform(Transform::Bucket(8), 2);
@@ -397,6 +408,16 @@ async fn transform_bucket8_to_truncate10_stamps_current_transform() {
     let (table, result) = compact(&catalog, table).await;
     assert!(result.rewritten_data_files_count >= 2);
     assert_eq!(scan_rows(&table).await, before);
+    assert_eq!(
+        scan_pruned_rows(&table, "x", 11).await,
+        vec![(11, 10, 100)],
+        "pruned x=11 must return only that row"
+    );
+    assert_eq!(
+        scan_pruned_rows(&table, "x", 22).await,
+        vec![(22, 20, 200)],
+        "pruned x=22 must return only that row"
+    );
 
     let files = live_data_files(&table).await;
     let t11 = literal_from_long_transform(Transform::Truncate(10), 11);
@@ -435,6 +456,16 @@ async fn partitioned_to_unpartitioned_uses_empty_tuples() {
     let (table, result) = compact(&catalog, table).await;
     assert!(result.rewritten_data_files_count >= 2);
     assert_eq!(scan_rows(&table).await, before);
+    assert_eq!(
+        scan_pruned_rows(&table, "x", 1).await,
+        vec![(1, 10, 100)],
+        "residual x=1 must return only that row after the spec is empty"
+    );
+    assert_eq!(
+        scan_pruned_rows(&table, "x", 2).await,
+        vec![(2, 20, 200)],
+        "residual x=2 must return only that row after the spec is empty"
+    );
 
     let files = live_data_files(&table).await;
     let spec_id = table.metadata().default_partition_spec().spec_id();
@@ -518,5 +549,38 @@ async fn mixed_current_and_old_files_all_use_recomputed_current_spec() {
         live_data_file_paths(&table).await.len(),
         files_before,
         "mixed rewrite must change the live file set"
+    );
+}
+
+#[tokio::test]
+async fn all_void_current_spec_is_refused() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_unpartitioned_table(&catalog, FormatVersion::V2).await;
+    let a = write_current_spec_file(&table, "a", &[(1, 10, 100)]).await;
+    let b = write_current_spec_file(&table, "b", &[(2, 20, 200)]).await;
+    let table = append_files(&catalog, &table, vec![a, b]).await;
+    let table = evolve_spec(
+        &catalog,
+        &table,
+        Transaction::new(&table)
+            .update_partition_spec()
+            .add_field_with_transform(None, "x", Transform::Void),
+    )
+    .await;
+    let spec = table.metadata().default_partition_spec();
+    assert_eq!(spec.fields().len(), 1);
+    assert!(spec.is_unpartitioned());
+    assert_eq!(spec.fields()[0].transform, Transform::Void);
+
+    let err = compact_action(table)
+        .execute(&catalog)
+        .await
+        .expect_err("all-void current spec must fail");
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(
+        err.message()
+            .contains("Cannot create partition calculator for unpartitioned table"),
+        "unexpected message: {}",
+        err.message()
     );
 }

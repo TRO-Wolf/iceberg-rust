@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -52,6 +54,25 @@ use crate::writer::file_writer::location_generator::{
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+
+fn parquet_paths(root: &Path) -> BTreeSet<PathBuf> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                out.insert(path);
+            }
+        }
+    }
+    out
+}
 
 async fn plan_tasks(table: &Table) -> Vec<FileScanTask> {
     let stream = table
@@ -217,7 +238,7 @@ async fn default_max_open_partition_writers_is_64_and_peak_obeys_it() {
 
 #[tokio::test]
 async fn zero_max_open_partition_writers_is_data_invalid_before_write() {
-    let (catalog, _temp) = local_fs_catalog().await;
+    let (catalog, temp) = local_fs_catalog().await;
     let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
     let a = write_data_file(&table, "a.parquet", 1, &[(1, 10, 100)]).await;
     let b = write_data_file(&table, "b.parquet", 2, &[(2, 20, 200)]).await;
@@ -234,6 +255,7 @@ async fn zero_max_open_partition_writers_is_data_invalid_before_write() {
 
     let snapshot_before = table.metadata().current_snapshot_id();
     let files_before = live_data_file_paths(&table).await;
+    let parquet_before = parquet_paths(temp.path());
     let err = compact_action(table.clone())
         .max_open_partition_writers(0)
         .execute(&catalog)
@@ -252,6 +274,28 @@ async fn zero_max_open_partition_writers_is_data_invalid_before_write() {
         .expect("reload");
     assert_eq!(table.metadata().current_snapshot_id(), snapshot_before);
     assert_eq!(live_data_file_paths(&table).await, files_before);
+    let parquet_after = parquet_paths(temp.path());
+    assert_eq!(
+        parquet_after, parquet_before,
+        "zero bound must not create an output parquet file"
+    );
+    assert!(
+        parquet_after
+            .iter()
+            .filter(|path| path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("compacted-")))
+            .count()
+            == parquet_before
+                .iter()
+                .filter(|path| path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("compacted-")))
+                .count(),
+        "zero bound must not write compacted-*.parquet"
+    );
 }
 
 #[tokio::test]

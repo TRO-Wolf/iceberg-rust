@@ -50,6 +50,7 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | Change output rolling or the rewrite read | `rewrite_data_files_write.rs` |
 | Change how rewritten rows are routed after spec evolution | `rewrite_data_files_write.rs` + `rewrite_data_files_router.rs` |
 | Pin evolved-spec output tuples or the writer bound | `rewrite_data_files_evolved_spec_tests.rs`, `rewrite_data_files_router_bound_tests.rs` |
+| See why an all-void current spec (`void(x)`, one field, `is_unpartitioned`) fails rewrite | unsupported current-spec shape: `RecordBatchPartitionSplitter` refuses it (`Cannot create partition calculator for unpartitioned table`). Pin: `all_void_current_spec_is_refused` |
 | Pin delete-ratio or 100%-dead in-band rewrite | `rewrite_data_files_ratio_tests.rs` |
 
 ## Pointers
@@ -69,6 +70,7 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | A shared partition-scoped delete vanishes when one file is rewritten | `plan_dv_removal` must drop only file-scoped parquet whose referenced path was rewritten. Pin: `test_partition_scoped_delete_survives_partial_rewrite`. |
 | A single-file group is skipped | `enough_input_files` and `enough_content` require `size > 1`. `any_too_high_delete_ratio` does not. A lone needs-rewrite candidate must still qualify. |
 | After spec evolution, partition-pruned scans miss live rows | Output used `group.first()` under the current spec. Routing must recompute tuples from rows (`rewrite_data_files_write.rs`). Pin: `source_field_identity_x_to_identity_y_rewrites_two_old_partitions`. |
+| Rewrite fails with `Cannot create partition calculator for unpartitioned table` | Current spec is all-void (`void(x)`, one field, `is_unpartitioned` but `fields()` is not empty). Unsupported current-spec shape. Pin: `all_void_current_spec_is_refused`. |
 
 ### First checks
 
