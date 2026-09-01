@@ -24,6 +24,18 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+## ACTIVE (2026-09-01): F-8 metadata-table projection + table_names synthesis
+
+Ledger: [`f8-metadata-table-projection-ledger.md`](f8-metadata-table-projection-ledger.md). GAP_MATRIX rows R169, R170.
+
+- [x] Honor `projection` in `IcebergMetadataTableProvider::scan` / `IcebergMetadataScan` (subset, reorder, empty).
+- [x] Stop synthesizing `$` names in `table_names`; keep `table` / `table_exist` resolution.
+- [x] Pins beside the providers; update listing snapshots / `show_tables.slt`.
+- [x] File and close GAP_MATRIX rows R169 and R170. Maps + ledger.
+- [x] `make check` + `cargo test -p iceberg-datafusion --locked`. Docker legs excused.
+
+Outcome: metadata-table `scan` honors projection (subset, reorder, empty). `table_names` lists catalog entries only; `$`-name resolution is unchanged. Rows R169 and R170 ✅.
+
 ## ACTIVE (2026-09-01): R91 parquet write refuses `unknown` loud
 
 Ledger: [`r91-unknown-parquet-loud-ledger.md`](r91-unknown-parquet-loud-ledger.md). GAP_MATRIX row R91.
