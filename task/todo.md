@@ -24,6 +24,19 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+## ACTIVE (2026-09-01): PR-6A branch read/commit interop (row R168, C-006)
+
+Ledger: [`pr6a-branch-interop-ledger.md`](pr6a-branch-interop-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md` PR-6A.
+
+- [x] Decode Java 1.10.0 `SnapshotProducer.targetBranch` / `SnapshotUtil.latestSnapshot` / `SnapshotScan.useRef` / tag refusal.
+- [x] Java oracle `generate-interop-branch-dml` + `emit-branch-meta` + `verify-interop-branch-dml` (4 fixtures).
+- [x] Runner `run-interop-branch-dml.sh` (six-step + sabotage). `SUITE_FLOOR_DEFAULT` 55→56.
+- [x] Rust `interop_branch_dml.rs`: offline Direction-1 + env GEN/D1. V3 MoR DV close at scanned snapshot.
+- [x] Nine required cases both directions. Mutations 3 red out of 3. Row R168 ✅.
+- [x] `make check` 0; `cargo test -p iceberg --locked` 0; `cargo test -p iceberg-datafusion --locked` 0. Docker `make test` legs excused.
+
+Outcome: PR-6A landed. Java/Rust branch DML interop both directions. V3 MoR on a named branch closes DVs at the scanned snapshot. Row R168 ✅.
+
 ## ACTIVE (2026-09-01): F-6c branch-following reads (row R168)
 
 Ledger: [`f6c-branch-following-reads-ledger.md`](f6c-branch-following-reads-ledger.md). Completes F-6b: `with_commit_branch` now scopes scans as well as commits.
