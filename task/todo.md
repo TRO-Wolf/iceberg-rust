@@ -24,6 +24,22 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+## ACTIVE (2026-09-01): F-16r delete-ratio residue (row R135)
+
+Ledger: [`f16r-delete-ratio-residue-ledger.md`](f16r-delete-ratio-residue-ledger.md).
+
+- [x] Reproduce: v2 MOR, one in-band data file, 100% parquet position deletes, `RewriteDataFiles` defaults.
+- [x] Name the mechanism: scan-task `isFileScoped` dropped equal `file_path` bounds.
+- [x] Count bounds-derived file-scoped deletes in `tooHighDeleteRatio`; drop those parquet deletes on rewrite.
+- [x] Pins: 100% dead → zero delete files; 20% parquet is a no-op; 2500-row in-band shape.
+- [x] GAP_MATRIX row R135, maintenance/scan map.md, ledger note for the engine pin.
+
+Outcome: Bounds-only file-scoped parquet position deletes fire
+`tooHighDeleteRatio` and leave with the rewritten data file. 100%-dead
+in-band pin ends at zero delete files. 20% parquet is a no-op. Row R135
+updated. `make check` and `cargo test -p iceberg --locked` green. Docker
+`make test` legs excused.
+
 ## ACTIVE (2026-09-01): F-8 metadata-table projection + table_names synthesis
 
 Ledger: [`f8-metadata-table-projection-ledger.md`](f8-metadata-table-projection-ledger.md). GAP_MATRIX rows R169, R170.
