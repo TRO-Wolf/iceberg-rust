@@ -24,6 +24,22 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+## ACTIVE (2026-09-01): R91 parquet write refuses `unknown` loud
+
+Ledger: [`r91-unknown-parquet-loud-ledger.md`](r91-unknown-parquet-loud-ledger.md). GAP_MATRIX row R91.
+
+- [x] Reproduce silent `DataFileWriter::write` of a Null/`unknown` column (red leg).
+- [x] Refuse at `ParquetWriterBuilder::build` with `FeatureUnsupported` naming the type and column.
+- [x] Pin refusal + a neighbouring write/read of a legitimate batch in the same test module.
+- [x] Enumerate parquet write doors (data / eq-delete / pos-delete / rolling) in the ledger.
+- [x] Restate GAP_MATRIX row R91. Run `make check` and `cargo test -p iceberg --locked`.
+
+Outcome: Parquet write of Iceberg `unknown` is `FeatureUnsupported` at
+`ParquetWriterBuilder::build`. Red-leg at `33be9a0f4` was silent commit of an
+unreadable Null column. Pins in `data_file_writer.rs` and
+`parquet_writer_unsupported_tests.rs`. Row R91 is 🟡. `make check` and
+`cargo test -p iceberg --locked` green. Docker `make test` legs excused.
+
 How to use it (see the manuals' §1):
 
 - Write a 3–7 bullet plan here before writing code.
