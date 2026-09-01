@@ -30,11 +30,11 @@ Ledger: [`pr1-replace-invariant-ledger.md`](pr1-replace-invariant-ledger.md). Pl
 
 - [x] Decode Java `SnapshotProducer.apply` 1.10.0 offsets 311-364 (`added-records` / `deleted-records`, `propertyAsLong` absent=0).
 - [x] Shared-layer guard after summary, before manifest IO; `DataInvalid` when added > deleted.
-- [x] Pins: invalid 3→5 (no new avro, pointer unchanged); equal 3→3; shrink 5→3; RewriteManifests missing keys; retry after refresh.
-- [x] Mutations 1/1/1 red out of 1; restore + green re-run.
+- [x] Pins: invalid 3→5 (no new avro, pointer unchanged); equal 3→3; shrink 5→3; RewriteManifests missing keys; conflict-then-retry (retried attempt refuses).
+- [x] Mutations 1/1/1/1 red out of 1; restore + green re-run. Critic S2 retry pin rewritten.
 - [x] Interop `run-interop-replace-invariant.sh` (3 fixtures); GAP_MATRIX row R107; maps; suite floor 56.
 
-Outcome: Shared producer refuses added-records > deleted-records before manifest IO. Five unit pins green. Mutations 1/1/1 red out of 1. Interop 3/3 fixtures. Docker `make test` legs excused.
+Outcome: Shared producer refuses added-records > deleted-records before manifest IO. Five unit pins green. Mutations 1/1/1/1 red out of 1. Interop 3/3 fixtures. Docker `make test` legs excused.
 
 ## ACTIVE (2026-09-01): F-6c branch-following reads (row R168)
 

@@ -16,17 +16,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-#
-# REPLACE record-count invariant interop (plan PR-1 / clause C-002, GAP_MATRIX row R107).
-# Java SnapshotProducer.apply (1.10.0 offsets 311-364) refuses a replace snapshot whose
-# summary has added-records > deleted-records. This runner proves:
-#   1. The same 3-row-to-5-row replacement is refused by Java AND by Rust.
-#   2. A valid 3-row-to-3-row replacement written by Java is read by Rust with the same rows.
-#   3. A valid 3-row-to-3-row replacement written by Rust is read by Java with the same rows.
-# Fixture count is asserted (HARD-FAIL, never skip).
-#
-# Requirements: Maven at /opt/maven/bin/mvn, Java 11 at /usr/lib/jvm/java-11-openjdk-amd64.
-# Run from anywhere; paths resolve relative to this script.
 
 set -euo pipefail
 

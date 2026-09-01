@@ -42,7 +42,7 @@ LEDGER:
       Every claimed test proves its cited behavior. Negative guards have a
       mutation that turns the test red.
     verdict: PROVEN
-    evidence: three one-knob mutations, each 1 red out of 1, restored after.
+    evidence: four one-knob mutations, each 1 red out of 1, restored after.
 ```
 
 ## Java decode (iceberg-core 1.10.0)
@@ -85,7 +85,7 @@ Bytecode (offsets 294-367):
 
 `BaseRewriteFiles.operation()` and `BaseRewriteManifests.operation()` both `ldc "replace"; areturn`.
 
-Java writes manifests before this check. The fork already completes summary before `manifest_file()`. The plan requires the guard after summary and before any manifest or manifest-list IO, so the fork refuses without writing avro metadata objects.
+Java writes manifests first (`apply(TableMetadata, Snapshot)` at offset 59, `manifestListPath` at 64, close at 189) and only then runs the record-count check (offsets 311-364). An invalid 3-to-5 replacement therefore leaves orphan manifests on the Java side; the snapshot pointer does not move. The fork is outcome-equal (both refuse, neither moves the pointer) and stricter on placement: `SnapshotProducer::commit` completes summary, runs the guard, and only then constructs `ManifestListWriter` / calls `manifest_file()`, so a refused REPLACE writes no metadata object. That placement is the plan PR-1 requirement, not a claim of byte-level equality on the refused path.
 
 ## Unit pins
 
@@ -95,7 +95,7 @@ Java writes manifests before this check. The fork already completes summary befo
 | `replace_commits_when_added_records_equal_deleted_records` | 3 → 3 commits as `Operation::Replace` |
 | `replace_commits_when_added_records_trail_deleted_records` | 5 → 3 commits as `Operation::Replace` |
 | `rewrite_manifests_replace_commits_when_record_count_keys_are_absent` | `RewriteManifests` cluster-by commits; `added-records` and `deleted-records` absent |
-| `replace_still_refuses_after_the_base_refreshes` | concurrent append then retry still `DataInvalid` with the same message |
+| `replace_still_refuses_on_retried_attempt_after_conflict` | first attempt is a valid 5-to-5 replace; catalog CAS fails after a concurrent shrink of the original to 3 rows; the retried attempt is `DataInvalid` (`5 > 3`); avro count equals the post-conflict count |
 
 Command: `cargo test -p iceberg --locked --lib replace_`
 
@@ -110,6 +110,7 @@ Each HARD-FAIL if the pattern is absent or the mutant has no assertion signal. R
 | 1 | `if added > deleted` → `if false` in `replace_record_count.rs` | `cargo test -p iceberg --locked --lib replace_rejects_added_records_greater_than_deleted_records` | **1 red out of 1**. Panicked at `expect_err("replacing 3 rows with 5 rows must be DataInvalid")` |
 | 2 | move `validate_replace_record_counts` to after `manifest_file()` in `snapshot.rs` | same command | **1 red out of 1**. `refused REPLACE must not write a new manifest or manifest-list object` left 4 right 2 |
 | 3 | `None => Ok(0)` → `None => Err(...)` in `property_as_long` | `cargo test -p iceberg --locked --lib rewrite_manifests_replace_commits_when_record_count_keys_are_absent` | **1 red out of 1**. `RewriteManifests REPLACE with absent record-count keys must commit: DataInvalid => missing snapshot summary property added-records` |
+| 4 | skip the comparison after the first `Operation::Replace` call (`FIRST_REPLACE_CHECK` swap) | `cargo test -p iceberg --locked --lib replace_still_refuses_on_retried_attempt_after_conflict` | **1 red out of 1**. Panicked at `expect_err("retried invalid REPLACE after a conflict refresh must still be DataInvalid")` — the retried 5-to-3 attempt committed |
 
 ## Interop
 
@@ -157,9 +158,9 @@ Java methods or bytecode read: SnapshotProducer.apply() offsets 311-364; Propert
 Files changed: crates/iceberg/src/transaction/{snapshot.rs,replace_record_count.rs,replace_record_count_tests.rs,map.md}; crates/iceberg/tests/{interop_replace_invariant.rs,map.md}; dev/java-interop/{InteropOracle.java,run-interop-replace-invariant.sh,map.md}; docs/parity/GAP_MATRIX.md; scripts/run_interop_suites.sh; task/pr1-replace-invariant-ledger.md; task/todo.md
 Behavior before: a RewriteFiles replace with added-records > deleted-records committed
 Behavior after: the shared producer refuses that shape with DataInvalid before manifest IO; equal and shrinking replaces still commit; RewriteManifests with absent keys still commits
-Negative cases: 3-to-5 rewrite; retry after concurrent append; missing-key handling
+Negative cases: 3-to-5 rewrite; conflict-then-retry (retried 5-to-3 after shrink); missing-key handling
 Test command and population: cargo test -p iceberg --locked --lib replace_ (five named pins green); cargo test -p iceberg --locked
-Mutations, one at a time: (1) remove comparison → 1 red out of 1; (2) move guard below manifest_file → 1 red out of 1 (avro 4 vs 2); (3) missing key as error → 1 red out of 1
+Mutations, one at a time: (1) remove comparison → 1 red out of 1; (2) move guard below manifest_file → 1 red out of 1 (avro 4 vs 2); (3) missing key as error → 1 red out of 1; (4) skip comparison after the first Replace call → 1 red out of 1 (retried 5-to-3 committed)
 Java interop command and fixture count: dev/java-interop/run-interop-replace-invariant.sh ; 3 fixtures
 CI-only evidence gap: Docker make test legs excused
 Breaking public API change: none

@@ -16,9 +16,12 @@
 // under the License.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::Catalog;
-use crate::error::ErrorKind;
+use crate::catalog::MockCatalog;
+use crate::error::{Error, ErrorKind};
 use crate::memory::tests::new_memory_catalog;
 use crate::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Operation, Struct,
@@ -246,34 +249,105 @@ async fn rewrite_manifests_replace_commits_when_record_count_keys_are_absent() {
 }
 
 #[tokio::test]
-async fn replace_still_refuses_after_the_base_refreshes() {
-    let catalog = new_memory_catalog().await;
-    let table = make_v3_minimal_table_in_catalog(&catalog).await;
-    let original = data_file("test/original.parquet", 3);
-    let table = append_files(&catalog, &table, vec![original.clone()]).await;
+async fn replace_still_refuses_on_retried_attempt_after_conflict() {
+    let memory_catalog = Arc::new(new_memory_catalog().await);
+    let table = make_v3_minimal_table_in_catalog(memory_catalog.as_ref()).await;
+    let original = data_file("test/original.parquet", 5);
+    let table = append_files(memory_catalog.as_ref(), &table, vec![original.clone()]).await;
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_table_properties()
+        .set("commit.retry.num-retries".to_string(), "3".to_string())
+        .set("commit.retry.min-wait-ms".to_string(), "1".to_string())
+        .set("commit.retry.max-wait-ms".to_string(), "5".to_string())
+        .apply(tx)
+        .expect("apply retry properties");
+    let table = tx
+        .commit(memory_catalog.as_ref())
+        .await
+        .expect("commit retry properties");
+
+    let ident = table.identifier().clone();
+    let original_for_shrink = original.clone();
+    let avro_after_conflict = Arc::new(Mutex::new(None::<usize>));
+    let mut mock_catalog = MockCatalog::new();
+    let load_delegate = Arc::clone(&memory_catalog);
+    mock_catalog.expect_load_table().returning_st(move |ident| {
+        let catalog = Arc::clone(&load_delegate);
+        let ident = ident.clone();
+        Box::pin(async move { catalog.load_table(&ident).await })
+    });
+    let first_update = Arc::new(AtomicBool::new(false));
+    let update_delegate = Arc::clone(&memory_catalog);
+    let avro_slot = Arc::clone(&avro_after_conflict);
+    mock_catalog
+        .expect_update_table()
+        .returning_st(move |commit| {
+            let catalog = Arc::clone(&update_delegate);
+            let first_update = Arc::clone(&first_update);
+            let ident = ident.clone();
+            let original_for_shrink = original_for_shrink.clone();
+            let avro_slot = Arc::clone(&avro_slot);
+            Box::pin(async move {
+                if !first_update.swap(true, Ordering::SeqCst) {
+                    let live = catalog
+                        .load_table(&ident)
+                        .await
+                        .expect("load table to shrink the original file");
+                    let shrunk = data_file(original_for_shrink.file_path(), 3);
+                    let tx = Transaction::new(&live);
+                    let action = tx.rewrite_files(vec![original_for_shrink], vec![shrunk]);
+                    let tx = action.apply(tx).expect("apply shrinking rewrite");
+                    let shrunk_table = tx
+                        .commit(catalog.as_ref())
+                        .await
+                        .expect("commit shrinking rewrite");
+                    *avro_slot.lock().expect("avro slot") =
+                        Some(metadata_avro_count(&shrunk_table).await);
+                    return Err(Error::new(
+                        ErrorKind::CatalogCommitConflicts,
+                        "injected CAS conflict",
+                    )
+                    .with_retryable(true));
+                }
+                catalog.update_table(commit).await
+            })
+        });
 
     let replacement = data_file("test/replacement.parquet", 5);
     let tx = Transaction::new(&table);
     let action = tx.rewrite_files(vec![original], vec![replacement]);
-    let tx = action.apply(tx).expect("apply rewrite_files");
-
-    let _refreshed = append_files(&catalog, &table, vec![data_file(
-        "test/concurrent.parquet",
-        1,
-    )])
-    .await;
-
+    let tx = action.apply(tx).expect("apply equal rewrite");
     let error = tx
-        .commit(&catalog)
+        .commit(&mock_catalog)
         .await
-        .expect_err("retried invalid REPLACE after a refreshed base must still be DataInvalid");
+        .expect_err("retried invalid REPLACE after a conflict refresh must still be DataInvalid");
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
     assert!(
         !error.retryable(),
-        "the REPLACE record-count guard is not retryable after refresh"
+        "the REPLACE record-count guard is not retryable on the retried attempt"
     );
     assert_eq!(
         error.message(),
         "Invalid REPLACE operation: 5 added records > 3 replaced records"
+    );
+
+    let reloaded = memory_catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload after refused retry");
+    let expected_avro = avro_after_conflict
+        .lock()
+        .expect("avro slot")
+        .expect("first update_table stored the post-conflict avro count");
+    assert_eq!(
+        metadata_avro_count(&reloaded).await,
+        expected_avro,
+        "the retried invalid REPLACE must not write a new manifest or manifest-list object"
+    );
+    assert_eq!(
+        live_file_paths(&reloaded).await,
+        HashSet::from(["test/original.parquet".to_string()])
     );
 }
