@@ -33,6 +33,15 @@ How to use it (see the manuals' §1):
 
 ---
 
+## ACTIVE (2026-09-01): F-6b DataFusion commit target (row R168)
+
+- [x] Enumerate every snapshot-producing DataFusion commit site; store a provider-level branch.
+- [x] Wire `to_branch` at INSERT INTO, INSERT OVERWRITE, CoW/MoR DELETE, CoW/MoR UPDATE.
+- [x] Pins: default=`main`, named branch, missing ref, tag, each DML site.
+- [x] Extend GAP_MATRIX row R168; unit gate + commit.
+
+Outcome: `IcebergTableProvider::with_commit_branch` reaches all six DataFusion snapshot-producing DML sites. Default remains `main`. Pins in `tests/commit_branch.rs`.
+
 ## ACTIVE (2026-08-31): F-6 Critic remediation (row R168)
 
 - [x] F-1: `starting_snapshot_for` falls back to txn-start main when the named ref is missing.

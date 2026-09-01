@@ -1,0 +1,60 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+pub(crate) fn maybe_to_branch<A>(
+    action: A,
+    branch: Option<&str>,
+    to_branch: impl FnOnce(A, &str) -> A,
+) -> A {
+    match branch {
+        Some(name) => to_branch(action, name),
+        None => action,
+    }
+}
+
+pub(crate) fn maybe_validate_from_snapshot<A>(
+    action: A,
+    commit_branch: Option<&str>,
+    snapshot_id: Option<i64>,
+    validate: impl FnOnce(A, i64) -> A,
+) -> A {
+    if commit_branch.is_some() {
+        return action;
+    }
+    match snapshot_id {
+        Some(id) => validate(action, id),
+        None => action,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn maybe_validate_from_snapshot_skips_when_branch_is_set() {
+        let out = super::maybe_validate_from_snapshot(0_i64, Some("audit"), Some(7), |_, id| id);
+        assert_eq!(
+            out, 0,
+            "a named commit branch must not pin validate_from_snapshot to main"
+        );
+    }
+
+    #[test]
+    fn maybe_validate_from_snapshot_applies_when_branch_is_unset() {
+        let out = super::maybe_validate_from_snapshot(0_i64, None, Some(7), |_, id| id);
+        assert_eq!(out, 7, "the default path still arms validate_from_snapshot");
+    }
+}

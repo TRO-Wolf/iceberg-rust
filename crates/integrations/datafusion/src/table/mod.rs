@@ -23,6 +23,7 @@
 //! - [`IcebergStaticTableProvider`], read-only over one snapshot. Use it for time travel.
 
 pub mod metadata_table;
+mod static_provider;
 pub mod table_provider_factory;
 
 use std::num::NonZeroUsize;
@@ -44,6 +45,7 @@ use iceberg::spec::TableProperties;
 use iceberg::table::Table;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
+pub use static_provider::IcebergStaticTableProvider;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
@@ -67,12 +69,12 @@ pub struct IcebergTableProvider {
     table_ident: TableIdent,
     /// FIXED for the life of the instance: DataFusion stores ordinals against it.
     schema: ArrowSchemaRef,
+    commit_branch: Option<String>,
 }
 
 impl IcebergTableProvider {
-    /// Creates a catalog-backed provider. It loads the table once for the schema this instance
-    /// advertises, then keeps the catalog so every operation reloads the data.
-    pub(crate) async fn try_new(
+    /// Creates a catalog-backed provider. Writes land on `main` until [`Self::with_commit_branch`].
+    pub async fn try_new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         name: impl Into<String>,
@@ -86,6 +88,7 @@ impl IcebergTableProvider {
             catalog,
             table_ident,
             schema,
+            commit_branch: None,
         })
     }
 
@@ -98,11 +101,18 @@ impl IcebergTableProvider {
             catalog: self.catalog.clone(),
             table_ident: self.table_ident.clone(),
             schema: Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?),
+            commit_branch: self.commit_branch.clone(),
         })
     }
 
-    /// Loads the table's current state, with its CURRENT schema in Arrow form. The write paths plan
-    /// against this, not [`Self::schema`], because they re-scan and commit against what they load.
+    /// Commit snapshot-producing DML onto `branch` instead of `main`. Java `SnapshotUpdate.toBranch`.
+    /// The branch receives the commit only. DML scans still read the current `main` snapshot.
+    pub fn with_commit_branch(mut self, branch: impl Into<String>) -> Self {
+        self.commit_branch = Some(branch.into());
+        self
+    }
+
+    /// Loads the table's current state and Arrow schema. Write paths plan against this, not [`Self::schema`].
     async fn load_table_with_current_schema(&self) -> Result<(Table, ArrowSchemaRef)> {
         let table = self.catalog.load_table(&self.table_ident).await?;
         let schema: ArrowSchemaRef =
@@ -231,13 +241,16 @@ impl TableProvider for IcebergTableProvider {
         // Merge the outputs of write_plan into one so we can commit all files together
         let coalesce_partitions = Arc::new(CoalescePartitionsExec::new(write_plan));
 
-        Ok(Arc::new(IcebergCommitExec::new(
-            table,
-            self.catalog.clone(),
-            coalesce_partitions,
-            current_schema,
-            insert_op,
-        )))
+        Ok(Arc::new(
+            IcebergCommitExec::new(
+                table,
+                self.catalog.clone(),
+                coalesce_partitions,
+                current_schema,
+                insert_op,
+            )
+            .with_commit_branch(self.commit_branch.clone()),
+        ))
     }
 
     async fn delete_from(
@@ -270,6 +283,7 @@ impl TableProvider for IcebergTableProvider {
             mode,
             isolation,
             current_schema,
+            self.commit_branch.clone(),
         )))
     }
 
@@ -314,107 +328,7 @@ impl TableProvider for IcebergTableProvider {
             mode,
             isolation,
             current_schema,
-        )))
-    }
-}
-
-/// Static table provider for read-only snapshot access. It holds a cached table instance and
-/// refreshes no metadata. To write, use [`IcebergTableProvider`].
-#[derive(Debug, Clone)]
-pub struct IcebergStaticTableProvider {
-    /// Never refreshed.
-    table: Table,
-    snapshot_id: Option<i64>,
-    schema: ArrowSchemaRef,
-}
-
-impl IcebergStaticTableProvider {
-    /// Creates a read-only provider over the table's current snapshot.
-    pub async fn try_new_from_table(table: Table) -> Result<Self> {
-        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
-        Ok(IcebergStaticTableProvider {
-            table,
-            snapshot_id: None,
-            schema,
-        })
-    }
-
-    /// Creates a read-only provider over one snapshot, for a time-travel query.
-    pub async fn try_new_from_table_snapshot(table: Table, snapshot_id: i64) -> Result<Self> {
-        let snapshot = table
-            .metadata()
-            .snapshot_by_id(snapshot_id)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!(
-                        "snapshot id {snapshot_id} not found in table {}",
-                        table.identifier().name()
-                    ),
-                )
-            })?;
-        let table_schema = snapshot.schema(table.metadata())?;
-        let schema = Arc::new(schema_to_arrow_schema(&table_schema)?);
-        Ok(IcebergStaticTableProvider {
-            table,
-            snapshot_id: Some(snapshot_id),
-            schema,
-        })
-    }
-}
-
-#[async_trait]
-impl TableProvider for IcebergStaticTableProvider {
-    fn schema(&self) -> ArrowSchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Use cached table (no refresh); multi-partition plan via plan_tasks (G1).
-        let knobs = crate::physical_plan::scan::scan_knobs_from_context(&state.task_ctx());
-        Ok(Arc::new(
-            IcebergTableScan::plan(
-                self.table.clone(),
-                self.snapshot_id,
-                self.schema.clone(),
-                projection,
-                filters,
-                limit,
-                knobs,
-            )
-            .await?,
-        ))
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // One source of truth: the scanner drops the filters it cannot push down.
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
-    }
-
-    async fn insert_into(
-        &self,
-        _state: &dyn Session,
-        _input: Arc<dyn ExecutionPlan>,
-        _insert_op: InsertOp,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Err(to_datafusion_error(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Write operations are not supported on IcebergStaticTableProvider. \
-             Use IcebergTableProvider with a catalog for write support."
-                .to_string(),
+            self.commit_branch.clone(),
         )))
     }
 }

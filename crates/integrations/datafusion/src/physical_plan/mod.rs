@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod commit;
+pub(crate) mod cow_affected;
 pub(crate) mod delete;
 pub(crate) mod expr_to_predicate;
 pub(crate) mod metadata_scan;
@@ -23,6 +24,7 @@ pub(crate) mod project;
 pub(crate) mod repartition;
 pub(crate) mod row_lineage;
 pub(crate) mod scan;
+pub(crate) mod snapshot_target;
 pub(crate) mod sort;
 pub(crate) mod update;
 pub(crate) mod write;
