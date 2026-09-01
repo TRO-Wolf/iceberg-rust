@@ -81,24 +81,26 @@ Changing this envelope requires a new scope audit. Section 6 records the known d
 ## 3. Dependency order
 
 ```text
-PR-1 replace invariant
-  |
-  +--> PR-2 partition-safe RewriteDataFiles
-  |      |
-  |      +--> PR-4 upgrade and maintenance interop
-  |
-  +--> PR-3 merge-on-read UPDATE lineage
-         |
-         +--> PR-4 upgrade and maintenance interop
+PR-6A branch interop (first)
 
-PR-5 catalog outcome conformance
-PR-6 branch interop
+PR-1 replace invariant          PR-3 row-DML lineage        PR-5A harness (offline)
+  |                               (MoR UPDATE + F-rp3-c7)      |
+  +--> PR-2 partition-safe          |                          |
+         RewriteDataFiles           +--> PR-6B MoR UPDATE      |
+         |                          |    lineage branch cell   |
+         +--------------------------+--> PR-4 upgrade and      |
+                                         maintenance interop   |
+                                                               +--> PR-5A credentialed run
 
-PR-1..PR-6 --> PR-7 production evidence closeout
+PR-1..PR-6B, PR-5A --> PR-7 production evidence closeout
+PR-5B (throttle matrix, sub-SDK connector) --> deferred to the reliability / multi-writer track
 ```
 
-PR-1 through PR-6 are STANDARD units. They touch data integrity, public behavior, or external
-catalogs. PR-7 is also STANDARD because it closes the production claim.
+Order of record (section 11.3): PR-6A immediately; PR-1, the expanded PR-3 and the PR-5A
+harness in parallel; PR-2 after PR-1; PR-4 after PR-2 and PR-3; PR-6B after PR-3; PR-5A
+credentialed execution; PR-7. PR-3 has no dependency on PR-1; overlap in snapshot accounting is
+merge coordination. PR-1 through PR-6B are STANDARD units. They touch data integrity, public
+behavior, or external catalogs. PR-7 is also STANDARD because it closes the production claim.
 
 ## 4. Mandatory fork units
 
@@ -253,13 +255,23 @@ Keep the bounded router private to maintenance unless a second caller needs the 
 - Matrix row R135 records the evidence and no longer hides this defect under `output-spec` residue.
 - Independent Critic converges with no open S0, S1, or S2 finding.
 
-### PR-3: Preserve row lineage in V3 merge-on-read UPDATE
+### PR-3: Preserve row lineage in V3 merge-on-read UPDATE and repair rewrite-aware row allocation (F-rp3-c7)
 
 **Owns:** C-003 and the relevant part of C-007
 
 **Matrix:** rows R114 and R166
 
-**Depends on:** PR-1
+**Depends on:** none (section 11.3 removed the PR-1 edge)
+
+**Amended scope (section 11.2).** Beside the merge-on-read UPDATE repair below, this unit
+carries F-rp3-c7: new V3 manifests with no `first_row_id` advance the writer counter by all
+added and existing rows (`spec/manifest_list.rs`), which becomes the snapshot's assigned-row
+count (`transaction/snapshot.rs`), so rewritten rows carrying a stored `_row_id` are counted as
+newly assigned (RePark measured next-row-id 6 where Spark stays 5). Required additions:
+the rewrite-aware allocation repair; sequential COW DELETE and UPDATE tests; assertions for the
+complete row multiset, `_row_id`, `_last_updated_sequence_number` and next-row-id after every
+step; a mutation restoring the count-all-rows allocation that turns both sequential tests red.
+RePark re-measures its COW UPDATE lineage statement now and lifts no guard until this unit lands.
 
 #### Implementation
 
@@ -382,6 +394,19 @@ clustering only. Direct external-manifest input stays in H-3 because RePark does
 
 **Depends on:** none for the harness, PR-1 through PR-4 for the final run
 
+**Split (section 11.1).** PR-5A is mandatory for V1.0: the narrow commit-transport seams;
+offline proof of never-sent, maybe-sent, accepted-but-response-lost, reconciliation success,
+reconciliation exhaustion, metadata-only unknown and no blind retry; exactly one offline
+CAS/conflict retry test per catalog; one offline test that a permanent authorization denial is
+terminal; one credentialed normal smoke per catalog per commit class; exactly one credentialed
+accepted-then-response-lost append per catalog (closes row R157's real-catalog claim).
+PR-5B holds the full throttle matrix, the counting connector below the AWS SDK retry
+middleware, detailed attempt accounting and the exhaustive error cross-product, deferred to the
+reliability and multi-writer track. The Phase A ledger, Phase B connector, the 98-cell
+cross-product and the throttle rows below describe PR-5B unless PR-5A names them; the
+never-sent, accepted-then-lost, conflict, terminal-authorization, reconciliation and
+metadata-only rows are PR-5A. Credentialed runs use the existing owner-approved AWS boundary.
+
 #### Required operation partition
 
 Test each catalog with these commit classes:
@@ -497,6 +522,10 @@ For each supported operation class, exercise these outcomes:
 
 **Depends on:** none
 
+**Split (section 11.3).** PR-6A runs first and carries cases 1 through 9 below except the
+merge-on-read UPDATE lineage columns; PR-6B adds the merge-on-read UPDATE lineage branch cell
+after PR-3 lands.
+
 #### Required cases
 
 1. Rust reads a Java-created branch whose head diverges from `main`.
@@ -561,7 +590,9 @@ cannot substitute for any fork-side test.
 | Legacy position deletes survive a V3 upgrade incorrectly | required | required | required | required in final AWS run |
 | Ordinary RewriteManifests changes row ranges | required | required | required | optional |
 | Unknown commit outcome causes a duplicate commit | mock required | failure injection required | not applicable | required |
-| Branch commit moves `main` | required | required | required | required when refs are enabled there |
+| Branch commit moves `main` | required | required | required (PR-6A) | required when refs are enabled there |
+| Rewritten rows counted as newly assigned (F-rp3-c7, PR-3) | required | required | required | optional |
+| Duplicate commit after response loss (PR-5A) | mock required | failure injection required | not applicable | one credentialed append per catalog |
 
 ## 6. Decision-gated fork work
 
@@ -661,7 +692,7 @@ status changes only in the owning matrix cell.
 
 The fork portion of V3 production support is complete only when all statements below are true:
 
-- PR-1 through PR-7 meet their exit gates.
+- PR-1 through PR-7 (PR-5A and PR-6A/6B as split) meet their exit gates; PR-5B is not a V1.0 gate.
 - Every mandatory clause has a local regression, a load-bearing mutation, and required interop.
 - No compaction path can duplicate rows or mislabel partitions silently.
 - Every required V3 row rewrite keeps row identity.
