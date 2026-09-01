@@ -51,6 +51,7 @@ pub(crate) struct IcebergUpdateExec {
     table_schema: SchemaRef,
     count_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
+    commit_branch: Option<String>,
 }
 
 impl IcebergUpdateExec {
@@ -64,6 +65,7 @@ impl IcebergUpdateExec {
         mode: WriteMode,
         isolation: IsolationLevel,
         table_schema: SchemaRef,
+        commit_branch: Option<String>,
     ) -> Self {
         let count_schema = IcebergDeleteExec::make_count_schema();
         let plan_properties = IcebergDeleteExec::compute_properties(Arc::clone(&count_schema));
@@ -78,6 +80,7 @@ impl IcebergUpdateExec {
             table_schema,
             count_schema,
             plan_properties,
+            commit_branch,
         }
     }
 }
@@ -144,6 +147,7 @@ impl ExecutionPlan for IcebergUpdateExec {
         let isolation = self.isolation;
         let table_schema = Arc::clone(&self.table_schema);
         let count_schema = Arc::clone(&self.count_schema);
+        let commit_branch = self.commit_branch.clone();
 
         let stream = futures::stream::once(async move {
             let updated = match mode {
@@ -156,6 +160,7 @@ impl ExecutionPlan for IcebergUpdateExec {
                         &assignments,
                         &table_schema,
                         isolation,
+                        commit_branch.as_deref(),
                     )
                     .await?
                 }
@@ -168,6 +173,7 @@ impl ExecutionPlan for IcebergUpdateExec {
                         &assignments,
                         &table_schema,
                         isolation,
+                        commit_branch.as_deref(),
                     )
                     .await?
                 }

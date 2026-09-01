@@ -69,10 +69,12 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 
+use super::cow_affected::resolve_affected_data_files;
 use super::row_lineage::{
     StreamingDataFileWriter, attach_lineage, filter_lineage_columns, null_last_updated_where_true,
     push_lineage_scan_columns,
 };
+use super::snapshot_target::{maybe_to_branch, maybe_validate_from_snapshot};
 use crate::to_datafusion_error;
 
 pub(crate) const WRITE_DELETE_MODE: &str = "write.delete.mode";
@@ -153,9 +155,11 @@ pub(crate) struct IcebergDeleteExec {
     table_schema: SchemaRef,
     count_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
+    commit_branch: Option<String>,
 }
 
 impl IcebergDeleteExec {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         table: Table,
         catalog: Arc<dyn Catalog>,
@@ -164,6 +168,7 @@ impl IcebergDeleteExec {
         mode: WriteMode,
         isolation: IsolationLevel,
         table_schema: SchemaRef,
+        commit_branch: Option<String>,
     ) -> Self {
         let count_schema = Self::make_count_schema();
         let plan_properties = Self::compute_properties(Arc::clone(&count_schema));
@@ -177,6 +182,7 @@ impl IcebergDeleteExec {
             table_schema,
             count_schema,
             plan_properties,
+            commit_branch,
         }
     }
 
@@ -269,6 +275,7 @@ impl ExecutionPlan for IcebergDeleteExec {
         let isolation = self.isolation;
         let table_schema = Arc::clone(&self.table_schema);
         let count_schema = Arc::clone(&self.count_schema);
+        let commit_branch = self.commit_branch.clone();
 
         let stream = futures::stream::once(async move {
             let deleted = match mode {
@@ -280,6 +287,7 @@ impl ExecutionPlan for IcebergDeleteExec {
                         prune,
                         &table_schema,
                         isolation,
+                        commit_branch.as_deref(),
                     )
                     .await?
                 }
@@ -291,6 +299,7 @@ impl ExecutionPlan for IcebergDeleteExec {
                         prune,
                         &table_schema,
                         isolation,
+                        commit_branch.as_deref(),
                     )
                     .await?
                 }
@@ -387,6 +396,7 @@ async fn merge_on_read_delete(
     prune: Option<Predicate>,
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
+    commit_branch: Option<&str>,
 ) -> DFResult<u64> {
     let delete_kind = merge_on_read_delete_kind(table)?;
     // The §5 `validate_from_snapshot` anchor. Java sets it only when the scan captured a snapshot.
@@ -512,12 +522,18 @@ async fn merge_on_read_delete(
         action = action.validate_deleted_files();
     }
     action = apply_dv_container_close(action, close);
-    if let Some(snapshot_id) = scan_snapshot_id {
-        action = action.validate_from_snapshot(snapshot_id);
-    }
+    action = maybe_validate_from_snapshot(
+        action,
+        commit_branch,
+        scan_snapshot_id,
+        |action, snapshot_id| action.validate_from_snapshot(snapshot_id),
+    );
     if isolation == IsolationLevel::Serializable {
         action = action.validate_no_conflicting_data_files();
     }
+    let action = maybe_to_branch(action, commit_branch, |action, branch| {
+        action.to_branch(branch)
+    });
     action
         .apply(tx)
         .map_err(to_datafusion_error)?
@@ -570,6 +586,7 @@ async fn copy_on_write_delete(
     prune: Option<Predicate>,
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
+    commit_branch: Option<&str>,
 ) -> DFResult<u64> {
     // The §5 `validate_from_snapshot` anchor. Both passes pin it, so they read the identical rows.
     let scan_snapshot_id = table.metadata().current_snapshot_id();
@@ -677,12 +694,18 @@ async fn copy_on_write_delete(
         .add_files(new_files)
         .conflict_detection_filter(Predicate::AlwaysTrue)
         .validate_no_conflicting_deletes();
-    if let Some(snapshot_id) = scan_snapshot_id {
-        action = action.validate_from_snapshot(snapshot_id);
-    }
+    action = maybe_validate_from_snapshot(
+        action,
+        commit_branch,
+        scan_snapshot_id,
+        |action, snapshot_id| action.validate_from_snapshot(snapshot_id),
+    );
     if isolation == IsolationLevel::Serializable {
         action = action.validate_no_conflicting_data();
     }
+    let action = maybe_to_branch(action, commit_branch, |action, branch| {
+        action.to_branch(branch)
+    });
     action
         .apply(tx)
         .map_err(to_datafusion_error)?
@@ -691,59 +714,6 @@ async fn copy_on_write_delete(
         .map_err(to_datafusion_error)?;
 
     Ok(deleted)
-}
-
-/// Resolves affected file paths to their live [`DataFile`] entries in the scanned snapshot. The full
-/// metadata makes the §5 `validate_no_conflicting_deletes` check live; bare paths are never
-/// validated. Every path MUST resolve: the scan just read these files from this same immutable
-/// handle, so a miss is an internal invariant breach, not a user error.
-async fn resolve_affected_data_files(
-    table: &Table,
-    affected: &HashSet<String>,
-) -> DFResult<Vec<DataFile>> {
-    let metadata = table.metadata();
-    let mut resolved: Vec<DataFile> = Vec::with_capacity(affected.len());
-    let mut found: HashSet<String> = HashSet::with_capacity(affected.len());
-
-    if let Some(snapshot) = metadata.current_snapshot() {
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), metadata)
-            .await
-            .map_err(to_datafusion_error)?;
-        for manifest_entry in manifest_list.entries() {
-            if manifest_entry.content != iceberg::spec::ManifestContentType::Data {
-                continue;
-            }
-            let manifest = manifest_entry
-                .load_manifest(table.file_io())
-                .await
-                .map_err(to_datafusion_error)?;
-            for entry in manifest.entries() {
-                if entry.is_alive()
-                    && entry.data_file().content_type() == iceberg::spec::DataContentType::Data
-                    && affected.contains(entry.file_path())
-                    && !found.contains(entry.file_path())
-                {
-                    found.insert(entry.file_path().to_string());
-                    resolved.push(entry.data_file().clone());
-                }
-            }
-        }
-    }
-
-    if found.len() != affected.len() {
-        let missing: Vec<&str> = affected
-            .iter()
-            .map(String::as_str)
-            .filter(|path| !found.contains(*path))
-            .collect();
-        return Err(DataFusionError::Internal(format!(
-            "copy-on-write: scanned data file(s) not live in the current snapshot: {}",
-            missing.join(", ")
-        )));
-    }
-
-    Ok(resolved)
 }
 
 /// Writes Parquet position-delete files from sorted `(path, pos)` pairs and returns EVERY file the
@@ -759,12 +729,7 @@ async fn resolve_affected_data_files(
 /// | multi-spec, empty default (after `DROP PARTITION FIELD`) | walk: old data files keep their own partition, and a fabricated `None`/spec-0 stamp misses on read and resurrects rows |
 /// | one all-Void spec (unpartitioned, non-empty fields) | walk: it needs a null tuple of matching arity |
 /// | partitioned | walk |
-pub(crate) fn position_delete_unpartitioned_fast_path(
-    spec_count: usize,
-    default_field_count: usize,
-) -> bool {
-    spec_count == 1 && default_field_count == 0
-}
+pub(crate) use super::cow_affected::position_delete_unpartitioned_fast_path;
 
 async fn write_position_deletes(table: &Table, pairs: &[(String, i64)]) -> DFResult<Vec<DataFile>> {
     let config = PositionDeleteWriterConfig::new().map_err(to_datafusion_error)?;
@@ -1339,6 +1304,7 @@ fn apply_assignments(
 /// values, in one `RowDelta`. Returns the number of rows updated. The new rows go through
 /// [`StreamingDataFileWriter`], which reads partition values from the POST-assignment columns.
 /// Position deletes are keyed by `(path, pos)` and are partition-agnostic.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn merge_on_read_update(
     table: &Table,
     catalog: &dyn Catalog,
@@ -1347,6 +1313,7 @@ pub(crate) async fn merge_on_read_update(
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
+    commit_branch: Option<&str>,
 ) -> DFResult<u64> {
     let delete_kind = merge_on_read_delete_kind(table)?;
 
@@ -1448,12 +1415,18 @@ pub(crate) async fn merge_on_read_update(
         .validate_deleted_files()
         .validate_no_conflicting_delete_files();
     action = apply_dv_container_close(action, close);
-    if let Some(snapshot_id) = scan_snapshot_id {
-        action = action.validate_from_snapshot(snapshot_id);
-    }
+    action = maybe_validate_from_snapshot(
+        action,
+        commit_branch,
+        scan_snapshot_id,
+        |action, snapshot_id| action.validate_from_snapshot(snapshot_id),
+    );
     if isolation == IsolationLevel::Serializable {
         action = action.validate_no_conflicting_data_files();
     }
+    let action = maybe_to_branch(action, commit_branch, |action, branch| {
+        action.to_branch(branch)
+    });
     action
         .apply(tx)
         .map_err(to_datafusion_error)?
@@ -1468,6 +1441,7 @@ pub(crate) async fn merge_on_read_update(
 /// row and rewrites those files in full: matched rows take the new values, the rest are carried
 /// unchanged. It then commits an `OverwriteFiles`. A SET on a partition-key column moves the row to
 /// its new partition, because [`StreamingDataFileWriter`] reads the post-assignment columns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn copy_on_write_update(
     table: &Table,
     catalog: &dyn Catalog,
@@ -1476,6 +1450,7 @@ pub(crate) async fn copy_on_write_update(
     assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
+    commit_branch: Option<&str>,
 ) -> DFResult<u64> {
     // The §5 `validate_from_snapshot` anchor. Both passes pin it, so they read the identical rows.
     let scan_snapshot_id = table.metadata().current_snapshot_id();
@@ -1576,12 +1551,18 @@ pub(crate) async fn copy_on_write_update(
         .add_files(new_files)
         .conflict_detection_filter(Predicate::AlwaysTrue)
         .validate_no_conflicting_deletes();
-    if let Some(snapshot_id) = scan_snapshot_id {
-        action = action.validate_from_snapshot(snapshot_id);
-    }
+    action = maybe_validate_from_snapshot(
+        action,
+        commit_branch,
+        scan_snapshot_id,
+        |action, snapshot_id| action.validate_from_snapshot(snapshot_id),
+    );
     if isolation == IsolationLevel::Serializable {
         action = action.validate_no_conflicting_data();
     }
+    let action = maybe_to_branch(action, commit_branch, |action, branch| {
+        action.to_branch(branch)
+    });
     action
         .apply(tx)
         .map_err(to_datafusion_error)?

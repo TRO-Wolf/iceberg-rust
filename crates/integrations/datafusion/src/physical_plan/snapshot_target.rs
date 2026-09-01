@@ -15,21 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod commit;
-pub(crate) mod cow_affected;
-pub(crate) mod delete;
-pub(crate) mod expr_to_predicate;
-pub(crate) mod metadata_scan;
-pub(crate) mod project;
-pub(crate) mod repartition;
-pub(crate) mod row_lineage;
-pub(crate) mod scan;
-pub(crate) mod snapshot_target;
-pub(crate) mod sort;
-pub(crate) mod update;
-pub(crate) mod write;
+pub(crate) fn maybe_to_branch<A>(
+    action: A,
+    branch: Option<&str>,
+    to_branch: impl FnOnce(A, &str) -> A,
+) -> A {
+    match branch {
+        Some(name) => to_branch(action, name),
+        None => action,
+    }
+}
 
-pub(crate) const DATA_FILES_COL_NAME: &str = "data_files";
-
-pub use project::project_with_partition;
-pub use scan::{IcebergScanOptions, IcebergTableScan, ensure_iceberg_scan_options};
+pub(crate) fn maybe_validate_from_snapshot<A>(
+    action: A,
+    commit_branch: Option<&str>,
+    snapshot_id: Option<i64>,
+    validate: impl FnOnce(A, i64) -> A,
+) -> A {
+    if commit_branch.is_some() {
+        return action;
+    }
+    match snapshot_id {
+        Some(id) => validate(action, id),
+        None => action,
+    }
+}
