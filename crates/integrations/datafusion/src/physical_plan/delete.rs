@@ -50,7 +50,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::TryStreamExt;
 use iceberg::Catalog;
-use iceberg::delete_vector_container::{DvContainerClose, close_touched_dv_containers};
+use iceberg::delete_vector_container::{DvContainerClose, close_touched_dv_containers_at};
 use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::spec::{
@@ -970,7 +970,7 @@ async fn write_deletion_vectors(
             .or_default()
             .push(position);
     }
-    close_touched_dv_containers(table, &new_positions)
+    close_touched_dv_containers_at(table, &new_positions, scan_snapshot_id)
         .await
         .map_err(to_datafusion_error)
 }

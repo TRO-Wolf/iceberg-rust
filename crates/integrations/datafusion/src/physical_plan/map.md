@@ -59,6 +59,7 @@ exec (row R169).
 | Metadata plan schema has every column | `IcebergMetadataScan::new` ignored `projection` |
 | Empty projection panics or reports 0 rows | `RecordBatch::project(&[])` must keep `num_rows` |
 | Reordered columns come back in table order | execute path is not applying `batch.project(indices)` |
+| V3 MoR DELETE on a diverged branch: data file is not a live file of the scanned snapshot | `close_touched_dv_containers` walked `current_snapshot()` (main). Pass the scan snapshot to `close_touched_dv_containers_at` |
 
 ### First checks
 
