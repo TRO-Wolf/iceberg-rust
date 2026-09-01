@@ -25,8 +25,8 @@ Plan of record: `task/iceberg-v3-production-work-plan-2026-09-01.md` (section 4 
 
 | Id | Proposition | Result |
 |---|---|---|
-| C-006 | Every required V3 reference operation reads and commits the named branch without moving `main`. Java and Rust agree. | PROVEN, 9/9 cases both directions |
-| C-007 (this unit) | Claimed tests prove the cited behavior. Negative guards have a mutation that turns them red. Interop hard-fails when the fixture cannot run. | PROVEN, mutations 3 red out of 3; sabotage FAIL-closed |
+| C-006 | Every required V3 reference operation reads and commits the named branch without moving `main`. Java and Rust agree. | PROVEN, 9/9 cases both directions including main vs branch file sets on every row-asserting verify |
+| C-007 (this unit) | Claimed tests prove the cited behavior. Negative guards have a mutation that turns them red. Interop hard-fails when the fixture cannot run. | PROVEN, mutations 3 red out of 3; sabotage A truncate + sabotage B file-set (ids unchanged) FAIL-closed |
 
 ## 2. Required cases (plan section 4 PR-6; MoR UPDATE lineage is PR-6B)
 
@@ -68,9 +68,11 @@ V3 MoR DELETE/UPDATE on a diverged branch failed: `close_touched_dv_containers` 
 | 2 | `close_touched_dv_containers_at(..., scan_snapshot_id)` → `None` | `... -- v3_merge_on_read_delete_on_diverged_branch_uses_branch_files` | RED: `not a live file of the scanned snapshot` |
 | 3 | Delete `with_target_branch` tag guard | `... -- tag_target_refuses_writes` | RED: INSERT on tag committed |
 
-**3 red out of 3.** Restored from `cp` backup + `touch`; restore re-run green.
+**3 red out of 3** (scan fallback, DV snapshot `None`, tag guard deleted). Restored from `cp` backup + `touch`; restore re-run green.
 
-Sabotage: truncate `rust_append/metadata/final.metadata.json` → `FAIL branch-dml/rust_append: missing ...` (1 failure). Restored.
+Sabotage A: truncate `rust_append/metadata/final.metadata.json` → `FAIL branch-dml/rust_append: missing ...`.
+
+Sabotage B (Critic S2-1): rewrite one basename in `rust_created/expected_branch_files.txt` (live row ids unchanged) → `FAIL branch-dml/rust_created/branch_files`. That is the no-op file-set rewrite: ids stay, file set pin goes red.
 
 ## 6. Interop command and fixture count
 

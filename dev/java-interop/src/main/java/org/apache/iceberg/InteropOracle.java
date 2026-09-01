@@ -26955,6 +26955,61 @@ public final class InteropOracle {
       return 0;
     }
 
+    private static int assertFileSets(
+        String label, Path tableDir, BaseTable table, int expectedMainCount, int expectedBranchCount)
+        throws IOException {
+      List<String> mainFiles = fileBasenames(table, SnapshotRef.MAIN_BRANCH);
+      List<String> branchFiles = fileBasenames(table, BRANCH);
+      int failures = 0;
+      if (mainFiles.isEmpty() || mainFiles.size() != expectedMainCount) {
+        System.out.println(
+            "FAIL "
+                + label
+                + "/main_files: expected "
+                + expectedMainCount
+                + " non-empty, got "
+                + mainFiles);
+        failures++;
+      }
+      if (branchFiles.size() != expectedBranchCount || !branchFiles.containsAll(mainFiles)) {
+        System.out.println(
+            "FAIL "
+                + label
+                + "/branch_files: expected count "
+                + expectedBranchCount
+                + " containing all main files; main="
+                + mainFiles
+                + " branch="
+                + branchFiles);
+        failures++;
+      }
+      Path expectedMainPath = tableDir.resolve("expected_main_files.txt");
+      Path expectedBranchPath = tableDir.resolve("expected_branch_files.txt");
+      if (!Files.exists(expectedMainPath) || !Files.exists(expectedBranchPath)) {
+        System.out.println("FAIL " + label + "/files: missing expected_main_files.txt or expected_branch_files.txt");
+        return failures + 1;
+      }
+      List<String> expectedMain = Files.readAllLines(expectedMainPath, StandardCharsets.UTF_8);
+      List<String> expectedBranch = Files.readAllLines(expectedBranchPath, StandardCharsets.UTF_8);
+      expectedMain.removeIf(String::isEmpty);
+      expectedBranch.removeIf(String::isEmpty);
+      if (!mainFiles.equals(expectedMain)) {
+        System.out.println(
+            "FAIL " + label + "/main_files: live=" + mainFiles + " expected=" + expectedMain);
+        failures++;
+      }
+      if (!branchFiles.equals(expectedBranch)) {
+        System.out.println(
+            "FAIL " + label + "/branch_files: live=" + branchFiles + " expected=" + expectedBranch);
+        failures++;
+      }
+      if (failures == 0) {
+        System.out.println(
+            "PASS " + label + "/files: main=" + mainFiles + " branch=" + branchFiles);
+      }
+      return failures;
+    }
+
     private static int verifyAppend(Path dir) throws IOException {
       if (failIfMissing(dir, "rust_append") != 0) {
         return 1;
@@ -26972,29 +27027,9 @@ public final class InteropOracle {
               "branch-dml/rust_append/branch_ids",
               liveIds(table, table.refs().get(BRANCH).snapshotId()),
               Arrays.asList(1, 2, 10, 11, 20));
-      List<String> mainFiles = fileBasenames(table, SnapshotRef.MAIN_BRANCH);
-      List<String> branchFiles = fileBasenames(table, BRANCH);
-      if (mainFiles.isEmpty() || branchFiles.size() <= mainFiles.size()) {
-        System.out.println(
-            "FAIL branch-dml/rust_append/files: main="
-                + mainFiles
-                + " branch="
-                + branchFiles);
-        failures++;
-      } else if (!branchFiles.containsAll(mainFiles)) {
-        System.out.println(
-            "FAIL branch-dml/rust_append/files: branch missing main files main="
-                + mainFiles
-                + " branch="
-                + branchFiles);
-        failures++;
-      } else {
-        System.out.println(
-            "PASS branch-dml/rust_append/files: main="
-                + mainFiles
-                + " branch="
-                + branchFiles);
-      }
+      failures +=
+          assertFileSets(
+              "branch-dml/rust_append", dir.resolve("rust_append"), table, 1, 3);
       return failures;
     }
 
@@ -27023,6 +27058,7 @@ public final class InteropOracle {
       } else {
         System.out.println("PASS branch-dml/rust_cow/update: id 11 data=z");
       }
+      failures += assertFileSets("branch-dml/rust_cow", dir.resolve("rust_cow"), table, 1, 2);
       return failures;
     }
 
@@ -27055,6 +27091,7 @@ public final class InteropOracle {
       } else {
         System.out.println("PASS branch-dml/rust_mor/update: id 11 data=z");
       }
+      failures += assertFileSets("branch-dml/rust_mor", dir.resolve("rust_mor"), table, 1, 3);
       return failures;
     }
 
@@ -27105,6 +27142,8 @@ public final class InteropOracle {
               "branch-dml/rust_created/branch_ids",
               liveIds(table, branchRef.snapshotId()),
               Arrays.asList(1, 2, 10, 11));
+      failures +=
+          assertFileSets("branch-dml/rust_created", dir.resolve("rust_created"), table, 1, 2);
       return failures;
     }
 
@@ -27135,6 +27174,9 @@ public final class InteropOracle {
       } else {
         System.out.println("PASS branch-dml/rust_insert_create/parent");
       }
+      failures +=
+          assertFileSets(
+              "branch-dml/rust_insert_create", dir.resolve("rust_insert_create"), table, 1, 2);
       return failures;
     }
 
@@ -27179,6 +27221,8 @@ public final class InteropOracle {
               "branch-dml/rust_retry/branch_ids",
               liveIds(table, branchRef.snapshotId()),
               Arrays.asList(1, 2, 10, 11, 30, 31));
+      failures +=
+          assertFileSets("branch-dml/rust_retry", dir.resolve("rust_retry"), table, 1, 4);
       return failures;
     }
 

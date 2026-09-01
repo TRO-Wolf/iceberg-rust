@@ -17,20 +17,6 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# Branch read/commit interop (PR-6A / C-006 / row R168). Six-step shape matches
-# run-interop-cherrypick.sh. Java 1.10.0 iceberg-core toBranch writes the diverged
-# fixtures; Rust DataFusion with_commit_branch performs DML; Java's production
-# scan (IcebergGenerics.useSnapshot) judges the result.
-#
-#   1. Reset the temp dir.
-#   2. Java generate-interop-branch-dml (4 fixtures). Fixture count is asserted.
-#   3. Rust: Direction-1 read of Java tables + GEN of rust_* tables.
-#   4. Java emit-branch-meta of each rust_* table + verify-interop-branch-dml.
-#   5. Rust Direction-1 assertions already ran in step 3 (Java tables untouched).
-#   6. Summary.
-#
-# Requirements: Maven at /opt/maven/bin/mvn, Java 11 at
-# /usr/lib/jvm/java-11-openjdk-amd64. Hard-fails on a missing prerequisite.
 
 set -euo pipefail
 
@@ -56,6 +42,17 @@ fi
 
 run_oracle() {
   (cd "${SCRIPT_DIR}" && "${MVN}" -o -q compile exec:java "$@" 2>&1)
+}
+
+run_verify() {
+  local out
+  out="$(
+    cd "${SCRIPT_DIR}"
+    "${MVN}" -o -q compile exec:java \
+      -Dexec.args=verify-interop-branch-dml \
+      -Dinterop.branch.dir="${TMP}" 2>&1
+  )" || true
+  echo "${out}"
 }
 
 echo "==> [1/6] Reset the temp dir: ${TMP}"
@@ -87,18 +84,17 @@ for table in "${RUST_TABLES[@]}"; do
     echo "ERROR: missing ${meta} after Rust GEN" >&2
     exit 1
   fi
+  if [[ ! -f "${TMP}/${table}/expected_main_files.txt" || ! -f "${TMP}/${table}/expected_branch_files.txt" ]]; then
+    echo "ERROR: missing expected file-set pins for ${table}" >&2
+    exit 1
+  fi
   run_oracle -Dexec.args=emit-branch-meta \
     -Dinterop.meta.metadata="${meta}" \
     -Dinterop.meta.out="${TMP}/${table}/java_view_rust_branch_meta.json" \
     -Dinterop.meta.branch=b
   echo "    ${table}: emit-branch-meta OK"
 done
-VERIFY_OUT="$(
-  cd "${SCRIPT_DIR}"
-  "${MVN}" -o -q compile exec:java \
-    -Dexec.args=verify-interop-branch-dml \
-    -Dinterop.branch.dir="${TMP}" 2>&1
-)" || true
+VERIFY_OUT="$(run_verify)"
 echo "${VERIFY_OUT}"
 if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
   || ! echo "${VERIFY_OUT}" | grep -q 'verify-interop-branch-dml: 0 failures'; then
@@ -120,7 +116,7 @@ echo "    Rust tables: ${#RUST_TABLES[@]} (${RUST_TABLES[*]})"
 echo "    D1: Rust reads Java diverged branch (main vs branch file sets + rows)"
 echo "    D2: Java IcebergGenerics reads Rust append / COW / MoR / created / insert-create / retry"
 
-echo "==> SABOTAGE: truncate rust_append final.metadata.json must turn verify RED"
+echo "==> SABOTAGE A: truncate rust_append final.metadata.json must turn verify RED"
 meta="${TMP}/rust_append/metadata/final.metadata.json"
 cp "${meta}" "${meta}.bak"
 : > "${meta}"
@@ -129,18 +125,44 @@ if [[ -s "${meta}" ]]; then
   mv "${meta}.bak" "${meta}"
   exit 1
 fi
-SABOTAGE_OUT="$(
-  cd "${SCRIPT_DIR}"
-  "${MVN}" -o -q compile exec:java \
-    -Dexec.args=verify-interop-branch-dml \
-    -Dinterop.branch.dir="${TMP}" 2>&1
-)" || true
+SABOTAGE_OUT="$(run_verify)" || true
 mv "${meta}.bak" "${meta}"
 echo "${SABOTAGE_OUT}"
 if ! echo "${SABOTAGE_OUT}" | grep -q '^FAIL '; then
-  echo "ERROR: sabotage did not FAIL (vacuous verify)" >&2
+  echo "ERROR: sabotage A did not FAIL (vacuous verify)" >&2
   exit 1
 fi
-echo "    sabotage RED OK"
+echo "    sabotage A RED OK"
+
+echo "==> SABOTAGE B: keep row ids, change rust_created expected branch file set"
+expected_branch="${TMP}/rust_created/expected_branch_files.txt"
+if [[ ! -s "${expected_branch}" ]]; then
+  echo "ERROR: expected_branch_files.txt missing or empty; cannot apply file-set sabotage" >&2
+  exit 1
+fi
+cp "${expected_branch}" "${expected_branch}.bak"
+python3 - "${expected_branch}" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+lines = [line for line in path.read_text().splitlines() if line]
+if not lines:
+    raise SystemExit("no branch file names to mutate")
+original = lines[0]
+mutated = original + ".rewritten"
+if mutated == original:
+    raise SystemExit("mutation was a no-op")
+lines[0] = mutated
+path.write_text("\n".join(lines) + "\n")
+print(f"mutated {original} -> {mutated}")
+PY
+SABOTAGE_B_OUT="$(run_verify)" || true
+cp "${expected_branch}.bak" "${expected_branch}"
+rm -f "${expected_branch}.bak"
+echo "${SABOTAGE_B_OUT}"
+if ! echo "${SABOTAGE_B_OUT}" | grep -q 'FAIL branch-dml/rust_created/branch_files'; then
+  echo "ERROR: sabotage B did not FAIL on branch_files (ids-only pin would stay green)" >&2
+  exit 1
+fi
+echo "    sabotage B RED OK (file-set pin, row ids unchanged)"
 
 echo "==> DONE — branch-dml interop passed both directions over ${EXPECTED_JAVA_FIXTURES} Java fixtures + ${#RUST_TABLES[@]} Rust tables"

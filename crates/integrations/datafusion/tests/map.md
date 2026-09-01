@@ -33,7 +33,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `cow_memory_bound.rs` | Copy-on-write memory bound |
 | `h7_p1_dml_prune.rs` | DML file prune |
 | `interop_dv_sql.rs` / `interop_partitioned_dml.rs` | Interop DML |
-| `interop_branch_dml.rs` | Branch read/commit Java interop (row R168 / PR-6A). Offline: Rust reproduces a Java diverged branch table; missing-ref SELECT/UPDATE; INSERT creates; tag refuses; V3 MoR DELETE uses branch live files. Env `ICEBERG_INTEROP_BRANCH_DIR` / `_GEN_DIR` via `dev/java-interop/run-interop-branch-dml.sh` |
+| `interop_branch_dml.rs` | Branch read/commit Java interop (row R168 / PR-6A). Offline: Rust reproduces a Java diverged branch table; missing-ref SELECT/UPDATE; INSERT creates (ids, parent, main vs branch file sets); tag refuses; V3 MoR DELETE uses branch live files. GEN of 6 `rust_*` tables pins post-DML main vs branch file sets and writes `expected_*_files.txt`. Env `ICEBERG_INTEROP_BRANCH_DIR` / `_GEN_DIR` via `dev/java-interop/run-interop-branch-dml.sh` |
 | `lazy_table_resolution_test.rs` | Catalog-backed lazy resolve |
 | `partitioned_insert_select_test.rs` | Partitioned INSERT SELECT |
 | `row_lineage_cow.rs` | V3 row lineage on CoW DML |

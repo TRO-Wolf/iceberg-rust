@@ -239,6 +239,38 @@ fn assert_file_sets_diverged(main_files: &[String], branch_files: &[String]) {
     }
 }
 
+fn assert_file_sets_shape(
+    main_now: &[String],
+    branch_now: &[String],
+    seed_main: &[String],
+    expected_branch_count: usize,
+) {
+    assert_eq!(
+        main_now, seed_main,
+        "main file set moved: was {seed_main:?} now {main_now:?}"
+    );
+    assert_eq!(
+        branch_now.len(),
+        expected_branch_count,
+        "branch file count: expected {expected_branch_count} got {branch_now:?}"
+    );
+    assert_file_sets_diverged(main_now, branch_now);
+}
+
+fn write_expected_files(location: &str, main_files: &[String], branch_files: &[String]) {
+    let root = Path::new(location);
+    std::fs::write(
+        root.join("expected_main_files.txt"),
+        main_files.join("\n") + "\n",
+    )
+    .expect("write expected_main_files.txt");
+    std::fs::write(
+        root.join("expected_branch_files.txt"),
+        branch_files.join("\n") + "\n",
+    )
+    .expect("write expected_branch_files.txt");
+}
+
 async fn write_final(table: &Table, location: &str) {
     let path = format!("{location}/metadata/final.metadata.json");
     table
@@ -358,12 +390,18 @@ async fn v3_merge_on_read_delete_on_diverged_branch_uses_branch_files() -> Resul
     let namespace =
         create_named_table(&catalog, "t", &location, FormatVersion::V3, properties).await;
     let catalog: Arc<dyn Catalog> = Arc::new(catalog);
-    let (main_id, main_files, _) = seed_diverged(&catalog, namespace.clone(), "t").await;
+    let (main_id, main_files, seed_branch) = seed_diverged(&catalog, namespace.clone(), "t").await;
     let ctx = register(provider(catalog.clone(), namespace.clone(), "t", Some(BRANCH)).await).await;
     run_sql(&ctx, "DELETE FROM t WHERE id = 10").await;
     let table = load(catalog.as_ref(), &namespace, "t").await;
     assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
     assert_eq!(file_basenames(&table, MAIN_BRANCH).await, main_files);
+    assert_eq!(
+        file_basenames(&table, BRANCH).await,
+        seed_branch,
+        "MoR DELETE must keep the branch data-file set (DVs, not rewrite)"
+    );
+    assert_file_sets_diverged(&main_files, &seed_branch);
     let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
     assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1, 2]);
     let ctx = register(provider(catalog.clone(), namespace.clone(), "t", Some(BRANCH)).await).await;
@@ -425,6 +463,7 @@ async fn insert_creates_missing_branch_per_snapshot_producer() -> Result<()> {
     run_sql(&ctx, "INSERT INTO t VALUES (1, 'main-a'), (2, 'main-b')").await;
     let table = load(catalog.as_ref(), &namespace, "t").await;
     let main_id = table.metadata().current_snapshot_id().expect("main");
+    let main_files = file_basenames(&table, MAIN_BRANCH).await;
     let ctx = register(provider(catalog.clone(), namespace.clone(), "t", Some(BRANCH)).await).await;
     run_sql(&ctx, "INSERT INTO t VALUES (20, 'created')").await;
     let table = load(catalog.as_ref(), &namespace, "t").await;
@@ -437,6 +476,12 @@ async fn insert_creates_missing_branch_per_snapshot_producer() -> Result<()> {
         .expect("snapshot")
         .parent_snapshot_id();
     assert_eq!(parent, Some(main_id));
+    assert_file_sets_shape(
+        &file_basenames(&table, MAIN_BRANCH).await,
+        &file_basenames(&table, BRANCH).await,
+        &main_files,
+        2,
+    );
     Ok(())
 }
 
@@ -720,8 +765,9 @@ async fn gen_rust_append() {
         1, 2, 10, 11, 20
     ]);
     let after_main = file_basenames(&table, MAIN_BRANCH).await;
-    assert_eq!(after_main, main_files);
-    assert_file_sets_diverged(&after_main, &file_basenames(&table, BRANCH).await);
+    let after_branch = file_basenames(&table, BRANCH).await;
+    assert_file_sets_shape(&after_main, &after_branch, &main_files, 3);
+    write_expected_files(&location, &after_main, &after_branch);
     write_final(&table, &location).await;
 }
 
@@ -733,7 +779,8 @@ async fn gen_rust_cow() {
     };
     let (catalog, namespace, location) =
         gen_table(&gen_path, "rust_cow", FormatVersion::V2, HashMap::new()).await;
-    let (main_id, main_files, _) = seed_diverged(&catalog, namespace.clone(), "rust_cow").await;
+    let (main_id, main_files, seed_branch) =
+        seed_diverged(&catalog, namespace.clone(), "rust_cow").await;
     let ctx =
         register(provider(catalog.clone(), namespace.clone(), "rust_cow", Some(BRANCH)).await)
             .await;
@@ -747,7 +794,14 @@ async fn gen_rust_cow() {
         register(provider(catalog.clone(), namespace.clone(), "rust_cow", Some(BRANCH)).await)
             .await;
     assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1, 2, 11]);
-    assert_eq!(file_basenames(&table, MAIN_BRANCH).await, main_files);
+    let after_main = file_basenames(&table, MAIN_BRANCH).await;
+    let after_branch = file_basenames(&table, BRANCH).await;
+    assert_file_sets_shape(&after_main, &after_branch, &main_files, 2);
+    assert_ne!(
+        after_branch, seed_branch,
+        "COW DML must change the branch file set, not only the row set"
+    );
+    write_expected_files(&location, &after_main, &after_branch);
     write_final(&table, &location).await;
 }
 
@@ -778,7 +832,10 @@ async fn gen_rust_mor() {
         register(provider(catalog.clone(), namespace.clone(), "rust_mor", Some(BRANCH)).await)
             .await;
     assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1, 2, 11]);
-    assert_eq!(file_basenames(&table, MAIN_BRANCH).await, main_files);
+    let after_main = file_basenames(&table, MAIN_BRANCH).await;
+    let after_branch = file_basenames(&table, BRANCH).await;
+    assert_file_sets_shape(&after_main, &after_branch, &main_files, 3);
+    write_expected_files(&location, &after_main, &after_branch);
     write_final(&table, &location).await;
 }
 
@@ -794,7 +851,8 @@ async fn gen_rust_created() {
         seed_diverged(&catalog, namespace.clone(), "rust_created").await;
     let table = load(catalog.as_ref(), &namespace, "rust_created").await;
     assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
-    assert_file_sets_diverged(&main_files, &branch_files);
+    assert_file_sets_shape(&main_files, &branch_files, &main_files, 2);
+    write_expected_files(&location, &main_files, &branch_files);
     write_final(&table, &location).await;
 }
 
@@ -838,8 +896,10 @@ async fn gen_rust_insert_create() {
     run_sql(&ctx, "INSERT INTO t VALUES (20, 'created')").await;
     let table = load(catalog.as_ref(), &namespace, "rust_insert_create").await;
     assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
-    assert_eq!(file_basenames(&table, MAIN_BRANCH).await, main_files);
-    assert_file_sets_diverged(&main_files, &file_basenames(&table, BRANCH).await);
+    let after_main = file_basenames(&table, MAIN_BRANCH).await;
+    let after_branch = file_basenames(&table, BRANCH).await;
+    assert_file_sets_shape(&after_main, &after_branch, &main_files, 2);
+    write_expected_files(&location, &after_main, &after_branch);
     write_final(&table, &location).await;
 }
 
@@ -887,6 +947,9 @@ async fn gen_rust_retry() {
             .parent_snapshot_id(),
         Some(winner_id)
     );
-    assert_eq!(file_basenames(&table, MAIN_BRANCH).await, main_files);
+    let after_main = file_basenames(&table, MAIN_BRANCH).await;
+    let after_branch = file_basenames(&table, BRANCH).await;
+    assert_file_sets_shape(&after_main, &after_branch, &main_files, 4);
+    write_expected_files(&location, &after_main, &after_branch);
     write_final(&table, &location).await;
 }
