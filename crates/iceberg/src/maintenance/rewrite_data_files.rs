@@ -63,20 +63,20 @@ use crate::Catalog;
 use crate::error::{Error, ErrorKind, Result};
 use crate::expr::Predicate;
 use crate::maintenance::RemoveDanglingDeleteFiles;
-use crate::maintenance::rewrite_data_files_dv::plan_dv_removal;
+use crate::maintenance::rewrite_data_files_dv::{file_scoped_delete_paths, plan_dv_removal};
 use crate::maintenance::rewrite_data_files_plan::{
     DELETE_FILE_THRESHOLD_DEFAULT, DELETE_RATIO_THRESHOLD_DEFAULT, ResolvedConfig, plan_file_groups,
 };
 pub(super) use crate::maintenance::rewrite_data_files_plan::{
     MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO, MIN_FILE_SIZE_DEFAULT_RATIO,
-    MIN_INPUT_FILES_DEFAULT, pack_bins,
+    MIN_INPUT_FILES_DEFAULT, pack_bins, parse_target_file_size,
 };
 #[cfg(test)]
 use crate::maintenance::rewrite_data_files_plan::{group_qualifies, is_candidate};
 #[cfg(test)]
 use crate::maintenance::rewrite_data_files_write::group_partition_tuple;
 use crate::scan::FileScanTask;
-use crate::spec::{DataFile, TableProperties};
+use crate::spec::DataFile;
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 
@@ -92,7 +92,7 @@ pub struct RewriteDataFilesResult {
     pub rewritten_data_files_count: usize,
     /// Bytes of the replaced input files (Java `Result.rewrittenBytesCount()`).
     pub rewritten_bytes_count: u64,
-    /// Delete files removed: apply-path DVs plus the composed dangling-delete sub-action.
+    /// Delete files removed: apply-path DVs (Java Result), apply-path file-scoped parquet (fork), and the composed dangling-delete sub-action.
     pub removed_delete_files_count: usize,
     /// Per-group results, in commit order (Java `Result.rewriteResults()`).
     pub file_groups: Vec<FileGroupRewriteResult>,
@@ -225,9 +225,8 @@ impl RewriteDataFiles {
     /// merge-on-read deletes applied, so the output carries only live rows. When no file qualifies
     /// it returns zero counts and commits nothing.
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RewriteDataFilesResult> {
-        let config = self.resolve_config()?;
+        let mut config = self.resolve_config()?;
 
-        // A table with no current snapshot has nothing to compact.
         let Some(starting_snapshot) = self.table.metadata().current_snapshot().cloned() else {
             return Ok(RewriteDataFilesResult::default());
         };
@@ -236,6 +235,7 @@ impl RewriteDataFiles {
 
         let tasks = self.plan_scan_tasks().await?;
         let data_files_by_path = self.collect_live_data_files().await?;
+        config.file_scoped_delete_paths = file_scoped_delete_paths(&self.table).await?;
 
         let groups = plan_file_groups(
             tasks,
@@ -361,6 +361,7 @@ impl RewriteDataFiles {
             delete_file_threshold: self.delete_file_threshold,
             delete_ratio_threshold: self.delete_ratio_threshold,
             max_file_group_size_bytes: self.max_file_group_size_bytes,
+            file_scoped_delete_paths: HashSet::new(),
         })
     }
 
@@ -405,8 +406,8 @@ impl RewriteDataFiles {
 
 impl RewriteDataFiles {
     /// Rewrites one planned group and commits a single `RewriteFiles` that replaces exactly its
-    /// data files. Returns the group result, the committed table, and the number of DVs dropped
-    /// because they referenced a rewritten file.
+    /// data files. Returns the group result, the committed table, and the number of file-scoped
+    /// deletes dropped because they referenced a rewritten file.
     #[allow(clippy::too_many_arguments)]
     async fn rewrite_group(
         &self,
@@ -492,28 +493,6 @@ impl RewriteDataFiles {
             target_file_size_bytes,
         )
         .await
-    }
-}
-
-/// Parses `write.target-file-size-bytes` (Java `defaultTargetFileSize`). An unparsable value is a
-/// loud error, and an absent one gives the 512 MiB default.
-///
-/// `pub(super)` so [`partition_key_audit`](super::partition_key_audit) resolves its target the same
-/// way, keeping one home for the property name and the default.
-pub(super) fn parse_target_file_size(properties: &HashMap<String, String>) -> Result<u64> {
-    match properties.get(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES) {
-        None => Ok(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT as u64),
-        Some(value) => value.parse::<u64>().map_err(|error| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Invalid value '{value}' for table property \
-                     '{}'",
-                    TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES
-                ),
-            )
-            .with_source(error)
-        }),
     }
 }
 
@@ -2195,6 +2174,7 @@ pub(crate) mod tests {
             delete_file_threshold: DELETE_FILE_THRESHOLD_DEFAULT,
             delete_ratio_threshold: DELETE_RATIO_THRESHOLD_DEFAULT,
             max_file_group_size_bytes: 1_000_000,
+            file_scoped_delete_paths: HashSet::new(),
         }
     }
 

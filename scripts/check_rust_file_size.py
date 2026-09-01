@@ -74,7 +74,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/maintenance/compute_table_stats.rs": 1248,
     "crates/iceberg/src/maintenance/partition_stats.rs": 4665,
     "crates/iceberg/src/maintenance/remove_dangling_delete_files.rs": 1804,
-    "crates/iceberg/src/maintenance/rewrite_data_files.rs": 2764,
+    "crates/iceberg/src/maintenance/rewrite_data_files.rs": 2744,
     "crates/iceberg/src/maintenance/rewrite_position_delete_files.rs": 1367,
     "crates/iceberg/src/maintenance/rewrite_position_delete_files_tests.rs": 4817,
     "crates/iceberg/src/maintenance/tests.rs": 1524,
@@ -134,7 +134,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/integrations/datafusion/src/physical_plan/project.rs": 1506,
     "crates/integrations/datafusion/src/physical_plan/scan.rs": 1999,
     "crates/integrations/datafusion/src/table/mod.rs": 2251,
-    "crates/integrations/datafusion/tests/integration_datafusion_test.rs": 6913,
+    "crates/integrations/datafusion/tests/integration_datafusion_test.rs": 6893,
     "crates/sketches/src/theta.rs": 1024,
     "crates/storage/opendal/src/lib.rs": 2080,
 }

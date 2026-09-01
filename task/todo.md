@@ -36,6 +36,34 @@ Ledger: [`f6c-branch-following-reads-ledger.md`](f6c-branch-following-reads-ledg
 
 Outcome: `with_commit_branch` scans the named-ref head as well as committing onto it. Missing-ref SELECT/DELETE error; INSERT VALUES still creates. Schema follows IcebergTableScan field-id bind. `make check` and `cargo test -p iceberg -p iceberg-datafusion --locked` green. Docker `make test` legs excused.
 
+## ACTIVE (2026-09-01): F-16r delete-ratio residue (row R135)
+
+Ledger: [`f16r-delete-ratio-residue-ledger.md`](f16r-delete-ratio-residue-ledger.md).
+
+- [x] Reproduce: v2 MOR, one in-band data file, 100% parquet position deletes, `RewriteDataFiles` defaults.
+- [x] Name the mechanism: scan-task `isFileScoped` dropped equal `file_path` bounds.
+- [x] Count bounds-derived file-scoped deletes in `tooHighDeleteRatio`; drop those parquet deletes on rewrite.
+- [x] Pins: 100% dead → zero delete files; 20% parquet is a no-op; 2500-row in-band shape.
+- [x] GAP_MATRIX row R135, maintenance/scan map.md, ledger note for the engine pin.
+
+Outcome: Bounds-only file-scoped parquet position deletes fire
+`tooHighDeleteRatio` and leave with the rewritten data file. 100%-dead
+in-band pin ends at zero delete files. 20% parquet is a no-op. Row R135
+updated. `make check` and `cargo test -p iceberg --locked` green. Docker
+`make test` legs excused.
+
+## ACTIVE (2026-09-01): F-8 metadata-table projection + table_names synthesis
+
+Ledger: [`f8-metadata-table-projection-ledger.md`](f8-metadata-table-projection-ledger.md). GAP_MATRIX rows R169, R170.
+
+- [x] Honor `projection` in `IcebergMetadataTableProvider::scan` / `IcebergMetadataScan` (subset, reorder, empty).
+- [x] Stop synthesizing `$` names in `table_names`; keep `table` / `table_exist` resolution.
+- [x] Pins beside the providers; update listing snapshots / `show_tables.slt`.
+- [x] File and close GAP_MATRIX rows R169 and R170. Maps + ledger.
+- [x] `make check` + `cargo test -p iceberg-datafusion --locked`. Docker legs excused.
+
+Outcome: metadata-table `scan` honors projection (subset, reorder, empty). `table_names` lists catalog entries only; `$`-name resolution is unchanged. Rows R169 and R170 ✅.
+
 ## ACTIVE (2026-09-01): R91 parquet write refuses `unknown` loud
 
 Ledger: [`r91-unknown-parquet-loud-ledger.md`](r91-unknown-parquet-loud-ledger.md). GAP_MATRIX row R91.

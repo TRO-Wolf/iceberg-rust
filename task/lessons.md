@@ -1213,6 +1213,20 @@ remembering to write it.
   `parent == branch_head`. Mutation C (`starting_snapshot_for` always returns main-at-txn-start)
   stays green on the original 8 to_branch tests; the F-3 pins are what make it red.
 
+### 2026-09-01 — `tooHighDeleteRatio` must use Java `isFileScoped`, not the raw `referenced_data_file` field
+
+- **DO count file-scoped parquet position deletes via `referenced_data_file_location` (equal
+  `file_path` bounds), not `FileScanTaskDeleteFile.referenced_data_file`.** *Why:* Spark v2 writers
+  leave that field null. The scan-task projection copies the raw field. #232 then skipped the
+  delete in `tooHighDeleteRatio`, so a 100%-dead in-band file survived compaction. Java
+  `ContentFileUtil.isFileScoped` is `referencedDataFile(f) != null`, and that helper falls back to
+  equal bounds. Do not fill the scan-task field from bounds: `interop_spark_mor_fixtures` asserts
+  it stays null. Pin: `test_planner_selects_bounds_only_parquet_because_referenced_data_file_location_is_set`.
+- **DO drop those parquet deletes in the same `RewriteFiles` commit as the rewritten data file.**
+  *Why:* `remove_dangling_deletes` defaults off, and its seq `<` clause keeps a same-seq delete.
+  Spark with that flag off still ends at zero delete files because `removeDanglingDeletesFor` runs
+  on the rewrite apply path.
+
 ### 2026-09-01 — DataFusion `to_branch` skip of `validate_from_snapshot(main)` is invisible until the branch diverges
 
 - **DO pin a DataFusion commit-branch OCC start on a DIVERGED branch, not on a branch created at main.** *Why:* when `audit` still equals `main`, `validate_from_snapshot(current_snapshot_id())` and `starting_snapshot_for("audit")` are the same id, so a main-read stays 0 red. A serializable INSERT OVERWRITE after a branch-only append treats the branch's own files as concurrent unless `validate_from_snapshot` is the scanned (named-ref) snapshot. Pins: `maybe_validate_from_snapshot_applies_the_scan_snapshot_when_set` and `insert_overwrite_on_diverged_branch_does_not_treat_branch_files_as_concurrent`. _F-6c 2026-09-01: the F-6b skip-when-branch-set helper is gone; OCC now applies the scanned snapshot._
