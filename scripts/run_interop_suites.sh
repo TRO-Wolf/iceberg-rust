@@ -75,7 +75,6 @@ REPO_ROOT="$(pwd)"
 # run-interop-ranged-read.sh was added for MIDPOINT row-group selection over a byte-range split —
 # the 52nd was run-interop-file-scoped-deletes.sh, for the path-keyed position-delete routing).
 # The 55th is run-interop-row-lineage.sh, added 2026-08-25 for V3 row lineage (row R166).
-# The 56th is run-interop-branch-dml.sh, added 2026-09-01 for branch read/commit (row R168 / PR-6A).
 # RATCHET THIS UP when a suite is added (same change); lower it only with a deliberate removal.
 SUITE_FLOOR_DEFAULT=56
 
