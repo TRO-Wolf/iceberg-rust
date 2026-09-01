@@ -17,9 +17,6 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# Credentialed PR-5A runner. Hard-fails when ICEBERG_PR5A_CREDENTIALED=1 and
-# required configuration is absent. Does not print credentials or object-store
-# URLs. HTTP attempt counting is PR-5B; this runner records it as unavailable.
 
 set -euo pipefail
 

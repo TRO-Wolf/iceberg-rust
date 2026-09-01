@@ -17,8 +17,6 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# PR-5A Java commit-path decode. Hard-fails if a prerequisite is missing or if
-# the fixture count differs from EXPECTED_NEEDLES. Not a skip.
 
 set -euo pipefail
 

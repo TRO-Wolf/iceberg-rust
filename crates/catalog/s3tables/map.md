@@ -67,3 +67,5 @@ S3 Tables service-side maintenance is a concurrent committer even under one appl
 ### Escalate to
 
 `docs/ENGINE_CONTRACT.md` §8, `task/pr5a-catalog-commit-outcomes-ledger.md`
+
+- Debug redaction pin (PR-5A): `S3TablesCatalog`'s `Debug` renders `config`, so the redaction must survive one level up; the test pins that a `{:?}` of the whole catalog leaks no credential, and reverting the config `Debug` to derived turns it red.

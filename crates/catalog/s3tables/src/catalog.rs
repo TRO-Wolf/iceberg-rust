@@ -880,9 +880,6 @@ mod tests {
         );
     }
 
-    /// Risk: `S3TablesCatalog` Debug renders `config`, so the redaction must survive one level up.
-    /// Pins that a `{:?}` of the whole catalog leaks no credential.
-    /// Mutation: revert the config `Debug` to derived gives RED.
     #[tokio::test]
     async fn test_catalog_debug_redacts_secret_prop_values() {
         let catalog = S3TablesCatalog::new(config_with_secret_props(), None)
