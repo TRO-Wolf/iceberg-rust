@@ -105,8 +105,7 @@ impl IcebergTableProvider {
         })
     }
 
-    /// Commit snapshot-producing DML onto `branch` instead of `main`. Java `SnapshotUpdate.toBranch`.
-    /// The branch receives the commit only. DML scans still read the current `main` snapshot.
+    /// Scan and commit snapshot-producing DML against `branch` instead of `main`. Java `SnapshotUpdate.toBranch`.
     pub fn with_commit_branch(mut self, branch: impl Into<String>) -> Self {
         self.commit_branch = Some(branch.into());
         self
@@ -146,20 +145,21 @@ impl TableProvider for IcebergTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // The DATA is always current.
         let table = self
             .catalog
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
-
-        // `self.schema` IS the schema DataFusion planned against, and it cannot have moved since.
-        // `IcebergTableScan` binds it to the reloaded table by FIELD ID.
+        let snapshot_id = crate::physical_plan::snapshot_target::resolve_scan_snapshot_id(
+            &table,
+            self.commit_branch.as_deref(),
+        )
+        .map_err(to_datafusion_error)?;
         let knobs = crate::physical_plan::scan::scan_knobs_from_context(&state.task_ctx());
         Ok(Arc::new(
             IcebergTableScan::plan(
                 table,
-                None, // Always use current snapshot for catalog-backed provider
+                snapshot_id,
                 self.schema.clone(),
                 projection,
                 filters,

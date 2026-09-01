@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use datafusion::common::{DataFusionError, Result as DFResult};
-use iceberg::spec::DataFile;
+use iceberg::spec::{DataFile, Struct};
 use iceberg::table::Table;
 
 use crate::to_datafusion_error;
@@ -30,15 +30,69 @@ pub(crate) fn position_delete_unpartitioned_fast_path(
     spec_count == 1 && default_field_count == 0
 }
 
+pub(crate) fn snapshot_for_scan(
+    table: &Table,
+    snapshot_id: Option<i64>,
+) -> Option<&iceberg::spec::SnapshotRef> {
+    let metadata = table.metadata();
+    match snapshot_id {
+        Some(id) => metadata.snapshot_by_id(id),
+        None => metadata.current_snapshot(),
+    }
+}
+
+pub(crate) async fn live_data_file_partitions(
+    table: &Table,
+    snapshot_id: Option<i64>,
+) -> DFResult<HashMap<String, (i32, Struct, Option<i64>)>> {
+    let metadata = table.metadata();
+    let mut path_to_partition: HashMap<String, (i32, Struct, Option<i64>)> = HashMap::new();
+    let Some(snapshot) = snapshot_for_scan(table, snapshot_id) else {
+        return Ok(path_to_partition);
+    };
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), metadata)
+        .await
+        .map_err(to_datafusion_error)?;
+
+    for manifest_entry in manifest_list.entries() {
+        if manifest_entry.content != iceberg::spec::ManifestContentType::Data {
+            continue;
+        }
+        let manifest = manifest_entry
+            .load_manifest(table.file_io())
+            .await
+            .map_err(to_datafusion_error)?;
+        for entry in manifest.entries() {
+            if entry.is_alive()
+                && entry.data_file().content_type() == iceberg::spec::DataContentType::Data
+            {
+                let data_file = entry.data_file();
+                path_to_partition
+                    .entry(data_file.file_path().to_string())
+                    .or_insert_with(|| {
+                        (
+                            data_file.partition_spec_id(),
+                            data_file.partition().clone(),
+                            entry.sequence_number(),
+                        )
+                    });
+            }
+        }
+    }
+    Ok(path_to_partition)
+}
+
 pub(crate) async fn resolve_affected_data_files(
     table: &Table,
     affected: &HashSet<String>,
+    snapshot_id: Option<i64>,
 ) -> DFResult<Vec<DataFile>> {
     let metadata = table.metadata();
     let mut resolved: Vec<DataFile> = Vec::with_capacity(affected.len());
     let mut found: HashSet<String> = HashSet::with_capacity(affected.len());
 
-    if let Some(snapshot) = metadata.current_snapshot() {
+    if let Some(snapshot) = snapshot_for_scan(table, snapshot_id) {
         let manifest_list = snapshot
             .load_manifest_list(table.file_io(), metadata)
             .await
@@ -71,7 +125,7 @@ pub(crate) async fn resolve_affected_data_files(
             .filter(|path| !found.contains(*path))
             .collect();
         return Err(DataFusionError::Internal(format!(
-            "copy-on-write: scanned data file(s) not live in the current snapshot: {}",
+            "copy-on-write: scanned data file(s) not live in the scanned snapshot: {}",
             missing.join(", ")
         )));
     }

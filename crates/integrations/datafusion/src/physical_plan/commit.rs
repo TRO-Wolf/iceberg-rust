@@ -346,11 +346,6 @@ impl ExecutionPlan for IcebergCommitExec {
                 // `validate_no_conflicting_deletes` (L374-375); serializable → +
                 // `validate_no_conflicting_data` (L371-373). NO explicit conflict-detection filter —
                 // Java never sets one here; the row filter itself is the default conflict filter.
-                // `validate_from_snapshot` is armed with the handle's current snapshot (Java arms it
-                // only when the writer tracked one, L367-369; this exec's natural anchor is the
-                // table state the statement was planned against). The policy knob (incl. `none` =
-                // Spark's unvalidated default) is documented on
-                // [`WRITE_OVERWRITE_ISOLATION_LEVEL`].
                 InsertOp::Overwrite => {
                     let mut action = tx
                         .overwrite_files()
@@ -365,8 +360,10 @@ impl ExecutionPlan for IcebergCommitExec {
                         action =
                             crate::physical_plan::snapshot_target::maybe_validate_from_snapshot(
                                 action,
-                                commit_branch.as_deref(),
-                                table.metadata().current_snapshot_id(),
+                                crate::physical_plan::snapshot_target::optional_ref_snapshot_id(
+                                    &table,
+                                    commit_branch.as_deref(),
+                                ),
                                 |action, snapshot_id| action.validate_from_snapshot(snapshot_id),
                             );
                     }

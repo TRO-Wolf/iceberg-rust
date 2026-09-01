@@ -130,7 +130,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/tests/interop_scan_plan.rs": 1028,
     "crates/iceberg/tests/interop_write_data.rs": 2115,
     "crates/integrations/datafusion/src/catalog.rs": 1589,
-    "crates/integrations/datafusion/src/physical_plan/delete.rs": 2152,
+    "crates/integrations/datafusion/src/physical_plan/delete.rs": 2108,
     "crates/integrations/datafusion/src/physical_plan/project.rs": 1506,
     "crates/integrations/datafusion/src/physical_plan/scan.rs": 1999,
     "crates/integrations/datafusion/src/table/mod.rs": 2251,

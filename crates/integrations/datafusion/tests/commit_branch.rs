@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! F-6b: `IcebergTableProvider::with_commit_branch` hands `to_branch` at every DML commit site.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::arrow::array::{Int32Array, StringArray};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -408,5 +409,367 @@ async fn merge_on_read_update_with_commit_branch_does_not_move_main() -> Result<
     assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
     let branch_id = ref_id(&table, "audit").expect("audit");
     assert_ne!(branch_id, main_id);
+    Ok(())
+}
+
+fn sorted_ids(batches: &[RecordBatch]) -> Vec<i32> {
+    let mut ids = Vec::new();
+    for batch in batches {
+        let column = batch
+            .column_by_name("id")
+            .expect("id")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id int");
+        for row in 0..column.len() {
+            ids.push(column.value(row));
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+async fn query_ids(ctx: &SessionContext, sql: &str) -> Vec<i32> {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .unwrap_or_else(|e| panic!("plan `{sql}`: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("exec `{sql}`: {e}"));
+    sorted_ids(&batches)
+}
+
+async fn diverge_main_and_branch(
+    catalog: &Arc<dyn Catalog>,
+    namespace: NamespaceIdent,
+) -> (NamespaceIdent, i64, Vec<iceberg::spec::SnapshotLog>) {
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    run_sql(&ctx, "INSERT INTO t VALUES (1, 'shared')").await;
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    let _branched = create_named_branch(catalog.as_ref(), &table, "audit").await;
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    run_sql(&ctx, "INSERT INTO t VALUES (10, 'branch')").await;
+
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    run_sql(&ctx, "INSERT INTO t VALUES (2, 'main')").await;
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    let main_id = table.metadata().current_snapshot_id().expect("main");
+    let branch_id = ref_id(&table, "audit").expect("audit");
+    assert_ne!(branch_id, main_id, "fixture must diverge");
+    let history = table.metadata().history().to_vec();
+    (namespace, main_id, history)
+}
+
+#[tokio::test]
+async fn scan_with_commit_branch_returns_branch_rows_not_main() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_scan_div", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let (namespace, main_id, history) = diverge_main_and_branch(&catalog, namespace).await;
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    assert_eq!(
+        query_ids(&ctx, "SELECT id FROM t").await,
+        vec![1, 10],
+        "named-branch scan must return the branch head, not main"
+    );
+
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    assert_eq!(
+        query_ids(&ctx, "SELECT id FROM t").await,
+        vec![1, 2],
+        "default scan must stay on main"
+    );
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    assert_eq!(table.metadata().history(), history.as_slice());
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_with_commit_branch_follows_branch_rows_and_leaves_main_untouched() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_del_div", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let (namespace, main_id, history) = diverge_main_and_branch(&catalog, namespace).await;
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    run_sql(&ctx, "DELETE FROM t WHERE id = 1").await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![10]);
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(
+        table.metadata().current_snapshot_id(),
+        Some(main_id),
+        "main snapshot pointer must be byte-unmoved"
+    );
+    assert_eq!(
+        table.metadata().history(),
+        history.as_slice(),
+        "main snapshot log must be byte-unmoved"
+    );
+    let branch_id = ref_id(&table, "audit").expect("audit");
+    assert_ne!(branch_id, main_id);
+
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    assert_eq!(
+        query_ids(&ctx, "SELECT id FROM t").await,
+        vec![1, 2],
+        "main rows must be untouched"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_select_with_commit_branch_reads_the_named_branch() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_ins_sel", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let (namespace, main_id, history) = diverge_main_and_branch(&catalog, namespace).await;
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    run_sql(&ctx, "INSERT INTO t SELECT id + 100, name FROM t").await;
+    assert_eq!(
+        query_ids(&ctx, "SELECT id FROM t").await,
+        vec![1, 10, 101, 110],
+        "INSERT SELECT source must scan the named branch"
+    );
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    assert_eq!(table.metadata().history(), history.as_slice());
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1, 2]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_missing_branch_errors_loudly() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_scan_miss", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    run_sql(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    let err = ctx
+        .sql("SELECT id FROM t")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect_err("a missing branch must not fall back to main");
+    let message = err.to_string();
+    assert!(
+        message.contains("audit") && message.contains("not found"),
+        "missing-ref scan must name the ref, got: {message}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_missing_branch_errors_on_the_read_leg() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_del_miss", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    run_sql(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    let main_id = table.metadata().current_snapshot_id().expect("main");
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    let err = ctx
+        .sql("DELETE FROM t WHERE id = 1")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect_err("DELETE on a missing branch must fail the scan, not create the ref");
+    let message = err.to_string();
+    assert!(
+        message.contains("audit") && message.contains("not found"),
+        "composed missing-ref DELETE must name the ref, got: {message}"
+    );
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    assert!(
+        table.metadata().snapshot_for_ref("audit").is_none(),
+        "a failed DELETE must not create the missing branch"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_older_branch_schema_null_fills_columns_added_on_main() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_schema", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    run_sql(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    let table = create_named_branch(catalog.as_ref(), &table, "audit").await;
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_schema()
+        .add_column("extra", Type::Primitive(PrimitiveType::Int))
+        .apply(tx)
+        .expect("apply add_column");
+    tx.commit(catalog.as_ref())
+        .await
+        .expect("commit add_column");
+
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    run_sql(&ctx, "INSERT INTO t VALUES (2, 'main', 9)").await;
+
+    let provider = provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await;
+    assert_eq!(
+        provider.schema().fields().len(),
+        3,
+        "catalog-backed advertised schema stays current; IcebergTableScan binds the branch snapshot by field id"
+    );
+    let ctx = register(provider).await;
+    let batches = ctx
+        .sql("SELECT id, extra FROM t")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("exec");
+    assert_eq!(sorted_ids(&batches), vec![1]);
+    for batch in &batches {
+        let extra = batch.column_by_name("extra").expect("extra");
+        assert_eq!(
+            extra.null_count(),
+            batch.num_rows(),
+            "a column the branch snapshot lacks must null-fill, matching IcebergTableScan field-id bind"
+        );
+    }
+    Ok(())
+}
+
+async fn query_name_for_id(ctx: &SessionContext, id: i32) -> String {
+    let sql = format!("SELECT name FROM t WHERE id = {id}");
+    let batches = ctx
+        .sql(&sql)
+        .await
+        .unwrap_or_else(|e| panic!("plan `{sql}`: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("exec `{sql}`: {e}"));
+    let mut names = Vec::new();
+    for batch in &batches {
+        let column = batch
+            .column_by_name("name")
+            .expect("name")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name utf8");
+        for row in 0..batch.num_rows() {
+            names.push(column.value(row).to_string());
+        }
+    }
+    assert_eq!(
+        names.len(),
+        1,
+        "expected one name for id={id}, got {names:?}"
+    );
+    names.remove(0)
+}
+
+#[tokio::test]
+async fn copy_on_write_update_on_diverged_branch_follows_branch_only_row() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_cow_upd_div", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let (namespace, main_id, _history) = diverge_main_and_branch(&catalog, namespace).await;
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    run_sql(&ctx, "UPDATE t SET name = 'z' WHERE id = 10").await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1, 10]);
+    assert_eq!(query_name_for_id(&ctx, 10).await, "z");
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1, 2]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn merge_on_read_update_on_diverged_branch_follows_branch_only_row() -> Result<()> {
+    let properties = HashMap::from([
+        ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+        ("write.update.mode".to_string(), "merge-on-read".to_string()),
+    ]);
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_mor_upd_div", "t", properties).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let (namespace, main_id, _history) = diverge_main_and_branch(&catalog, namespace).await;
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    run_sql(&ctx, "UPDATE t SET name = 'z' WHERE id = 10").await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1, 10]);
+    assert_eq!(query_name_for_id(&ctx, 10).await, "z");
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1, 2]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn merge_on_read_delete_on_diverged_branch_follows_branch_only_row() -> Result<()> {
+    let properties = HashMap::from([
+        ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+        ("write.update.mode".to_string(), "merge-on-read".to_string()),
+    ]);
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_mor_del_div", "t", properties).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let (namespace, main_id, _history) = diverge_main_and_branch(&catalog, namespace).await;
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    run_sql(&ctx, "DELETE FROM t WHERE id = 10").await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1]);
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1, 2]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn copy_on_write_delete_on_diverged_branch_follows_branch_only_row() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_cow_del_only", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let (namespace, main_id, _history) = diverge_main_and_branch(&catalog, namespace).await;
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    run_sql(&ctx, "DELETE FROM t WHERE id = 10").await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1]);
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1, 2]);
     Ok(())
 }
