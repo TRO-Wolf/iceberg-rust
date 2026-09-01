@@ -460,11 +460,13 @@ async fn table_names_and_existence_come_from_listing_not_loading() -> Result<()>
         lists("unloadable"),
         "listing includes the UNLOADABLE table — names come from list_tables, not load_table"
     );
-    // The base + metadata-table variants are present for both (behavior unchanged).
-    assert!(lists("good$snapshots"), "good's metadata tables are listed");
     assert!(
-        lists("unloadable$snapshots"),
-        "the unloadable table's metadata tables are listed too"
+        !lists("good$snapshots"),
+        "table_names must not synthesize metadata twins"
+    );
+    assert!(
+        !lists("unloadable$snapshots"),
+        "table_names must not synthesize metadata twins for unloadable tables"
     );
 
     // table_exist: true for both listed tables (incl. a metadata variant), false for a stranger.

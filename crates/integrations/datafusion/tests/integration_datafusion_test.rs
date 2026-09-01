@@ -191,30 +191,9 @@ async fn test_provider_list_table_names() -> Result<()> {
     let provider = ctx.catalog("catalog").unwrap();
     let schema = provider.schema("test_provider_list_table_names").unwrap();
 
-    let result = schema.table_names();
-
-    expect![[r#"
-        [
-            "my_table",
-            "my_table$snapshots",
-            "my_table$manifests",
-            "my_table$files",
-            "my_table$data_files",
-            "my_table$delete_files",
-            "my_table$entries",
-            "my_table$all_files",
-            "my_table$all_data_files",
-            "my_table$all_delete_files",
-            "my_table$all_entries",
-            "my_table$history",
-            "my_table$refs",
-            "my_table$metadata_log_entries",
-            "my_table$partitions",
-            "my_table$all_manifests",
-            "my_table$position_deletes",
-        ]
-    "#]]
-    .assert_debug_eq(&result);
+    let mut result = schema.table_names();
+    result.sort();
+    assert_eq!(result, vec!["my_table".to_string()]);
 
     Ok(())
 }
@@ -243,7 +222,8 @@ async fn test_dollar_in_base_table_name_sql_read_and_metadata_twin() -> Result<(
     assert!(schema.table_exist("a$b$files"));
     let names = schema.table_names();
     assert!(names.contains(&"a$b".to_string()));
-    assert!(names.contains(&"a$b$files".to_string()));
+    assert!(!names.contains(&"a$b$files".to_string()));
+    assert!(!names.contains(&"a$b$snapshots".to_string()));
 
     // Plain a$b read (empty table).
     let batches = ctx

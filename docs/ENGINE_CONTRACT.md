@@ -86,6 +86,11 @@
   snapshots only the named namespace(s) **plus descendants** (same nested BFS + U+001F naming as
   #191). An empty scope walks nothing. The DataFusion `CatalogProvider` trait is unchanged.
   Per-namespace `list_tables` is lazy (see the previous bullet).
+- **Catalog-parity table enumeration (2026-09-01, row R170).** `SchemaProvider::table_names`
+  lists catalog table names only. Metadata twins (`<base>$snapshots`, and the rest of
+  `MetadataTableType`) are not enumerated. `$`-name resolution (`table` / `table_exist`,
+  last-`$` + `MetadataTableType` vocabulary) is unchanged. Metadata-table
+  `TableProvider::scan` honors DataFusion `projection` (row R169).
 
 ## 2. Read surface
 

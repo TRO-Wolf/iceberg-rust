@@ -100,11 +100,14 @@ impl TableProvider for IcebergMetadataTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(IcebergMetadataScan::new(self.clone())))
+        Ok(Arc::new(IcebergMetadataScan::new(
+            self.clone(),
+            projection,
+        )?))
     }
 }
 
@@ -140,7 +143,12 @@ impl IcebergMetadataTableProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use datafusion::datasource::TableProvider;
+    use datafusion::execution::TaskContext;
+    use datafusion::prelude::SessionContext;
+    use futures::TryStreamExt;
     use iceberg::TableIdent;
     use iceberg::inspect::MetadataTableType;
     use iceberg::io::FileIO;
@@ -202,5 +210,125 @@ mod tests {
                 "arrow schema for metadata table {type:?} must be non-empty",
             );
         }
+    }
+
+    async fn collect_scan(
+        provider: &IcebergMetadataTableProvider,
+        projection: Option<&Vec<usize>>,
+    ) -> (
+        datafusion::arrow::datatypes::SchemaRef,
+        Vec<datafusion::arrow::array::RecordBatch>,
+    ) {
+        let ctx = SessionContext::new();
+        let plan = TableProvider::scan(provider, &ctx.state(), projection, &[], None)
+            .await
+            .expect("metadata table scan must plan");
+        let schema = plan.schema();
+        let stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("metadata table scan must execute");
+        let batches: Vec<_> = stream
+            .try_collect()
+            .await
+            .expect("metadata table scan must collect");
+        (schema, batches)
+    }
+
+    fn total_rows(batches: &[datafusion::arrow::array::RecordBatch]) -> usize {
+        batches.iter().map(|batch| batch.num_rows()).sum()
+    }
+
+    #[tokio::test]
+    async fn test_metadata_table_scan_projects_subset_in_requested_order() {
+        let table = test_table().await;
+        let provider = IcebergMetadataTableProvider::try_new(table, MetadataTableType::Snapshots)
+            .expect("snapshots metadata provider");
+        let full_fields: Vec<String> = provider
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        assert!(
+            full_fields.len() >= 2,
+            "snapshots schema must have at least two columns"
+        );
+        let last = full_fields.len() - 1;
+        let indices = vec![last, 0];
+
+        let (projected_schema, projected_batches) = collect_scan(&provider, Some(&indices)).await;
+        let projected_names: Vec<&str> = projected_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(projected_names, vec![
+            full_fields[last].as_str(),
+            full_fields[0].as_str()
+        ]);
+
+        let (full_schema, full_batches) = collect_scan(&provider, None).await;
+        assert_eq!(full_schema.fields().len(), full_fields.len());
+        assert_eq!(
+            provider.schema().fields().len(),
+            full_fields.len(),
+            "TableProvider::schema must stay the full schema"
+        );
+        assert_eq!(
+            total_rows(&projected_batches),
+            total_rows(&full_batches),
+            "a column subset must keep the snapshot row count"
+        );
+        assert!(
+            !projected_batches.is_empty() && !full_batches.is_empty(),
+            "the fixture must yield at least one snapshots batch"
+        );
+        assert_eq!(
+            projected_batches[0].column(0).as_ref(),
+            full_batches[0].column(last).as_ref()
+        );
+        assert_eq!(
+            projected_batches[0].column(1).as_ref(),
+            full_batches[0].column(0).as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_table_scan_empty_projection_preserves_row_count() {
+        let table = test_table().await;
+        let provider = IcebergMetadataTableProvider::try_new(table, MetadataTableType::Snapshots)
+            .expect("snapshots metadata provider");
+        let (_, full_batches) = collect_scan(&provider, None).await;
+        let full_rows = total_rows(&full_batches);
+        assert!(full_rows > 0, "the fixture must have snapshot rows");
+
+        let empty: Vec<usize> = Vec::new();
+        let (empty_schema, empty_batches) = collect_scan(&provider, Some(&empty)).await;
+        assert_eq!(empty_schema.fields().len(), 0);
+        assert_eq!(
+            total_rows(&empty_batches),
+            full_rows,
+            "SELECT count(*) empty projection must keep the snapshot row count"
+        );
+        assert!(
+            empty_batches.iter().all(|batch| batch.num_columns() == 0),
+            "every empty-projection batch must have zero columns"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_table_scan_rejects_out_of_bounds_projection() {
+        let table = test_table().await;
+        let provider = IcebergMetadataTableProvider::try_new(table, MetadataTableType::Snapshots)
+            .expect("snapshots metadata provider");
+        let ctx = SessionContext::new();
+        let err = TableProvider::scan(&provider, &ctx.state(), Some(&vec![999]), &[], None)
+            .await
+            .expect_err("index 999 must fail at plan time");
+        let message = err.to_string();
+        assert!(
+            message.contains("999") || message.to_lowercase().contains("index"),
+            "out-of-bounds projection must name the bad index, got: {message}"
+        );
     }
 }
