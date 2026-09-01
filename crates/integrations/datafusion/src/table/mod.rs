@@ -106,13 +106,13 @@ impl IcebergTableProvider {
     }
 
     /// Commit snapshot-producing DML onto `branch` instead of `main`. Java `SnapshotUpdate.toBranch`.
+    /// The branch receives the commit only. DML scans still read the current `main` snapshot.
     pub fn with_commit_branch(mut self, branch: impl Into<String>) -> Self {
         self.commit_branch = Some(branch.into());
         self
     }
 
-    /// Loads the table's current state, with its CURRENT schema in Arrow form. The write paths plan
-    /// against this, not [`Self::schema`], because they re-scan and commit against what they load.
+    /// Loads the table's current state and Arrow schema. Write paths plan against this, not [`Self::schema`].
     async fn load_table_with_current_schema(&self) -> Result<(Table, ArrowSchemaRef)> {
         let table = self.catalog.load_table(&self.table_ident).await?;
         let schema: ArrowSchemaRef =

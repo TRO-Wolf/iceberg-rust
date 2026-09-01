@@ -1212,3 +1212,8 @@ remembering to write it.
   main. Re-fixture with a diverged head (`branch_head != main_id`) and assert
   `parent == branch_head`. Mutation C (`starting_snapshot_for` always returns main-at-txn-start)
   stays green on the original 8 to_branch tests; the F-3 pins are what make it red.
+
+### 2026-09-01 — DataFusion `to_branch` skip of `validate_from_snapshot(main)` is invisible until the branch diverges
+
+- **DO pin a DataFusion commit-branch OCC skip on a DIVERGED branch, not on a branch created at main.** *Why:* when `audit` still equals `main`, `validate_from_snapshot(current_snapshot_id())` and `starting_snapshot_for("audit")` are the same id, so deleting the skip is 0 red. A serializable INSERT OVERWRITE after a branch-only append treats the branch's own files as concurrent unless the skip holds. Pins: `maybe_validate_from_snapshot_skips_when_branch_is_set` and `insert_overwrite_on_diverged_branch_does_not_treat_branch_files_as_concurrent`.
+- **DO state the scan/commit split on `with_commit_branch`.** *Why:* the setter is a commit target, not `asBranch`. Callers otherwise assume DELETE/UPDATE read the named branch.

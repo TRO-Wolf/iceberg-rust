@@ -65,7 +65,9 @@ Default `write.delete.mode` / `write.update.mode` is copy-on-write. Merge-on-rea
 `IcebergTableProvider::with_commit_branch(name)` stores `Option<String>` on the provider.
 `None` (default) does not call `to_branch` — commits land on `main`, byte-identical to
 `33be9a0f4`. `Some` is passed through `IcebergCommitExec` / `IcebergDeleteExec` /
-`IcebergUpdateExec` into `to_branch`.
+`IcebergUpdateExec` into `to_branch`. The branch receives the COMMIT only. DML
+reads/scans still use the table handle's current snapshot (`main`). A DELETE with a
+commit branch set reads `main` rows and commits the result to the named branch.
 
 `refreshed()` copies the target. Catalog-level / session / per-statement overrides are
 out of scope.
@@ -90,6 +92,7 @@ target, not `table.asBranch`.
 | MoR DELETE site | `merge_on_read_delete_with_commit_branch_does_not_move_main` |
 | CoW UPDATE site | `copy_on_write_update_with_commit_branch_does_not_move_main` |
 | MoR UPDATE site | `merge_on_read_update_with_commit_branch_does_not_move_main` |
+| Named-ref OCC start (skip `validate_from_snapshot(main)`) | `maybe_validate_from_snapshot_skips_when_branch_is_set` (helper) + `insert_overwrite_on_diverged_branch_does_not_treat_branch_files_as_concurrent` (provider: serializable INSERT OVERWRITE after a branch-only append). Mutation (drop the `commit_branch.is_some()` skip): helper 1 red of 2 (`skips_when_branch_is_set`; unset path still green); provider 1 red of 1 (`DataInvalid` "Found conflicting files" on the branch's own parquet). Restore: both green. |
 
 ## 5. Named residue
 
@@ -105,8 +108,8 @@ target, not `table.asBranch`.
 
 | Command | Exit |
 |---|---|
-| `cargo test -p iceberg-datafusion --test commit_branch --locked` | 0 (9 passed) |
-| `cargo test -p iceberg -p iceberg-datafusion --locked` | 0 |
+| `cargo test -p iceberg-datafusion --test commit_branch --locked` | 0 (10 passed, Critic remediation) |
+| `cargo test -p iceberg-datafusion --locked` | 0 |
 | `make check` | 0 |
 | Docker / `make test` | excused (Docker unavailable) |
 

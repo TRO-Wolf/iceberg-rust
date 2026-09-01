@@ -40,3 +40,21 @@ pub(crate) fn maybe_validate_from_snapshot<A>(
         None => action,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn maybe_validate_from_snapshot_skips_when_branch_is_set() {
+        let out = super::maybe_validate_from_snapshot(0_i64, Some("audit"), Some(7), |_, id| id);
+        assert_eq!(
+            out, 0,
+            "a named commit branch must not pin validate_from_snapshot to main"
+        );
+    }
+
+    #[test]
+    fn maybe_validate_from_snapshot_applies_when_branch_is_unset() {
+        let out = super::maybe_validate_from_snapshot(0_i64, None, Some(7), |_, id| id);
+        assert_eq!(out, 7, "the default path still arms validate_from_snapshot");
+    }
+}

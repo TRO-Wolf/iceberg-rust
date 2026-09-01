@@ -282,6 +282,42 @@ async fn insert_overwrite_with_commit_branch_does_not_move_main() -> Result<()> 
     Ok(())
 }
 
+#[tokio::test]
+async fn insert_overwrite_on_diverged_branch_does_not_treat_branch_files_as_concurrent()
+-> Result<()> {
+    let properties = HashMap::from([(
+        "write.overwrite.isolation-level".to_string(),
+        "serializable".to_string(),
+    )]);
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_ow_div", "t", properties).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None).await).await;
+    run_sql(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    let table = create_named_branch(catalog.as_ref(), &table, "audit").await;
+    let main_id = table.metadata().current_snapshot_id().expect("main");
+
+    let ctx =
+        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit")).await).await;
+    run_sql(&ctx, "INSERT INTO t VALUES (2, 'b')").await;
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    let diverged = ref_id(&table, "audit").expect("diverged audit");
+    assert_ne!(diverged, main_id);
+
+    run_sql(&ctx, "INSERT OVERWRITE t VALUES (9, 'z')").await;
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(
+        table.metadata().current_snapshot_id(),
+        Some(main_id),
+        "main must stay at the pre-diverge snapshot"
+    );
+    let after = ref_id(&table, "audit").expect("audit after overwrite");
+    assert_ne!(after, diverged);
+    Ok(())
+}
+
 async fn seed_then_branch(
     catalog: &Arc<dyn Catalog>,
     namespace: NamespaceIdent,
