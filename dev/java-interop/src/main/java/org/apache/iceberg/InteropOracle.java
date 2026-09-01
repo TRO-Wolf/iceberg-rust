@@ -383,6 +383,18 @@ public final class InteropOracle {
         // ✅-gating residue.
         RowLineageOracle.verify(requireFixturesDir("interop.row_lineage.dir"));
         break;
+      case "generate-interop-mor-update-lineage":
+        MorUpdateLineageOracle.generate(requireFixturesDir("interop.mor_update_lineage.dir"));
+        break;
+      case "verify-interop-mor-update-lineage":
+        int morUpdateLineageFailures =
+            MorUpdateLineageOracle.verify(requireFixturesDir("interop.mor_update_lineage.dir"));
+        System.out.println(
+            "verify-interop-mor-update-lineage: " + morUpdateLineageFailures + " failures");
+        if (morUpdateLineageFailures > 0) {
+          System.exit(1);
+        }
+        break;
       case "generate-interop-dv":
         // DELETION-VECTOR merge-on-read, DIRECTION 1 — "Rust reads what JAVA writes" (Increment
         // D1). Writes an unpartitioned V3 table (DVs require format version 3) with TWO real
@@ -26568,6 +26580,250 @@ public final class InteropOracle {
         writer.write(rows);
       }
       return writer.toDataFile();
+    }
+  }
+
+  static final class MorUpdateLineageOracle {
+    static final int EXPECTED_FIXTURES = 2;
+
+    private MorUpdateLineageOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      writeThreeRowV3(dir.resolve("mor_table"));
+      writeThreeRowV3(dir.resolve("cow_table"));
+      writeJson(
+          dir.resolve("fixture_count.json"), "{\"count\":" + EXPECTED_FIXTURES + "}");
+    }
+
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path countPath = dir.resolve("fixture_count.json");
+      if (!Files.exists(countPath)) {
+        System.out.println("FAIL mor-update-lineage: missing fixture_count.json");
+        return 1;
+      }
+      String countJson = readString(countPath).trim();
+      if (!countJson.equals("{\"count\":" + EXPECTED_FIXTURES + "}")) {
+        System.out.println(
+            "FAIL mor-update-lineage: fixture count "
+                + countJson
+                + " != {\"count\":"
+                + EXPECTED_FIXTURES
+                + "}");
+        failures++;
+      }
+      failures += verifyMor(dir.resolve("mor_after"));
+      failures += verifyCow(dir.resolve("cow_after"));
+      return failures;
+    }
+
+    private static void writeThreeRowV3(Path tableDir) throws IOException {
+      Files.createDirectories(tableDir);
+      File metadataDir = tableDir.resolve("metadata").toFile();
+      File dataDir = tableDir.resolve("data").toFile();
+      if (!metadataDir.mkdirs() && !metadataDir.isDirectory()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.mkdirs() && !dataDir.isDirectory()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "id", Types.IntegerType.get()),
+              Types.NestedField.required(2, "val", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "3");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.toAbsolutePath().toString(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir.toFile(), metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, tableDir.getFileName().toString());
+      DataFile file =
+          writeThreeRowFile(
+              table,
+              schema,
+              spec,
+              new File(dataDir, "00000-data.parquet").getAbsolutePath());
+      table.newAppend().appendFile(file).commit();
+      table.refresh();
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+    }
+
+    private static DataFile writeThreeRowFile(
+        BaseTable table, Schema schema, PartitionSpec spec, String path) throws IOException {
+      List<Record> rows = new ArrayList<>();
+      int[] ids = new int[] {1, 2, 3};
+      String[] values = new String[] {"a", "b", "c"};
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("val", values[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static int verifyMor(Path afterDir) throws IOException {
+      int failures = 0;
+      BaseTable table = loadRustTable(afterDir, "mor_after");
+      if (table == null) {
+        System.out.println("FAIL mor-update-lineage: missing MOR result table at " + afterDir);
+        return 1;
+      }
+      if (table.operations().current().nextRowId() != 3L) {
+        System.out.println(
+            "FAIL mor-update-lineage: MOR next_row_id="
+                + table.operations().current().nextRowId()
+                + " expected 3");
+        failures++;
+      }
+      Map<Integer, long[]> rows = scanLineage(table);
+      if (rows.size() != 3) {
+        System.out.println("FAIL mor-update-lineage: MOR live rows=" + rows.size() + " expected 3");
+        failures++;
+      }
+      failures += expectRow(rows, 1, 0L, 1L, true);
+      failures += expectRow(rows, 3, 2L, 1L, true);
+      if (!rows.containsKey(2)) {
+        System.out.println("FAIL mor-update-lineage: missing updated id=2");
+        failures++;
+      } else {
+        long[] vals = rows.get(2);
+        if (vals[0] != 1L) {
+          System.out.println("FAIL mor-update-lineage: id=2 row_id=" + vals[0] + " expected 1");
+          failures++;
+        }
+        if (vals[1] <= 1L) {
+          System.out.println(
+              "FAIL mor-update-lineage: id=2 last_updated_seq=" + vals[1] + " did not advance");
+          failures++;
+        }
+      }
+      return failures;
+    }
+
+    private static int verifyCow(Path afterDir) throws IOException {
+      int failures = 0;
+      BaseTable table = loadRustTable(afterDir, "cow_after");
+      if (table == null) {
+        System.out.println("FAIL mor-update-lineage: missing COW result table at " + afterDir);
+        return 1;
+      }
+      Path nextPath = afterDir.resolve("next_row_id_after_overwrite.txt");
+      if (!Files.exists(nextPath)) {
+        System.out.println("FAIL mor-update-lineage: missing next_row_id_after_overwrite.txt");
+        return failures + 1;
+      }
+      long expectedNext = Long.parseLong(readString(nextPath).trim());
+      long actualNext = table.operations().current().nextRowId();
+      if (actualNext != expectedNext) {
+        System.out.println(
+            "FAIL mor-update-lineage: COW next_row_id="
+                + actualNext
+                + " expected "
+                + expectedNext
+                + " (unchanged by DELETE rewrite)");
+        failures++;
+      }
+      Map<Integer, long[]> rows = scanLineage(table);
+      if (rows.size() != 2 || !rows.containsKey(1) || !rows.containsKey(3) || rows.containsKey(2)) {
+        System.out.println("FAIL mor-update-lineage: COW live ids=" + rows.keySet() + " expected {1,3}");
+        failures++;
+      }
+      Path idsPath = afterDir.resolve("overwrite_row_ids.txt");
+      if (!Files.exists(idsPath)) {
+        System.out.println("FAIL mor-update-lineage: missing overwrite_row_ids.txt");
+        return failures + 1;
+      }
+      for (String line : readString(idsPath).trim().split("\n")) {
+        if (line.isEmpty()) {
+          continue;
+        }
+        String[] parts = line.split("=");
+        int id = Integer.parseInt(parts[0]);
+        long rowId = Long.parseLong(parts[1]);
+        if (!rows.containsKey(id) || rows.get(id)[0] != rowId) {
+          System.out.println(
+              "FAIL mor-update-lineage: COW id="
+                  + id
+                  + " row_id="
+                  + (rows.containsKey(id) ? rows.get(id)[0] : "missing")
+                  + " expected "
+                  + rowId);
+          failures++;
+        }
+      }
+      return failures;
+    }
+
+    private static int expectRow(
+        Map<Integer, long[]> rows, int id, long rowId, long seq, boolean seqExact) {
+      if (!rows.containsKey(id)) {
+        System.out.println("FAIL mor-update-lineage: missing id=" + id);
+        return 1;
+      }
+      long[] vals = rows.get(id);
+      int failures = 0;
+      if (vals[0] != rowId) {
+        System.out.println(
+            "FAIL mor-update-lineage: id=" + id + " row_id=" + vals[0] + " expected " + rowId);
+        failures++;
+      }
+      if (seqExact && vals[1] != seq) {
+        System.out.println(
+            "FAIL mor-update-lineage: id=" + id + " last_updated_seq=" + vals[1] + " expected " + seq);
+        failures++;
+      }
+      return failures;
+    }
+
+    private static Map<Integer, long[]> scanLineage(BaseTable table) throws IOException {
+      Schema lineage = MetadataColumns.schemaWithRowLineage(table.schema());
+      Map<Integer, long[]> rows = new TreeMap<>();
+      try (CloseableIterable<Record> records =
+          IcebergGenerics.read(table).project(lineage).build()) {
+        for (Record record : records) {
+          Object idObj = record.getField("id");
+          Object rowId = record.getField("_row_id");
+          Object seq = record.getField("_last_updated_sequence_number");
+          int id = idObj instanceof Integer ? (Integer) idObj : ((Long) idObj).intValue();
+          long rid = rowId == null ? Long.MIN_VALUE : ((Number) rowId).longValue();
+          long s = seq == null ? Long.MIN_VALUE : ((Number) seq).longValue();
+          rows.put(id, new long[] {rid, s});
+        }
+      }
+      return rows;
+    }
+
+    private static BaseTable loadRustTable(Path afterDir, String name) throws IOException {
+      Path metadata = afterDir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(metadata)) {
+        return null;
+      }
+      Path rustTable = afterDir.resolve("rust_table");
+      TableMetadata parsed =
+          TableMetadataParser.read(new LocalFileIO(), metadata.toAbsolutePath().toString());
+      LocalTableOperations ops =
+          new LocalTableOperations(rustTable.toFile(), rustTable.resolve("metadata").toFile());
+      ops.commit(null, parsed);
+      return new BaseTable(ops, name);
     }
   }
 

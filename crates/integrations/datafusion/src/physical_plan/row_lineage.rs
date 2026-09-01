@@ -20,13 +20,14 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Builder, RecordBatch};
 use datafusion::arrow::compute::filter;
-use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator};
+use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{
-    RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
-    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
-    format_supports_row_lineage, schema_with_row_lineage,
+    RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+    RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    RESERVED_FIELD_ID_ROW_ID, format_supports_row_lineage, schema_with_row_lineage,
 };
 use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, SchemaRef as IcebergSchemaRef};
 use iceberg::table::Table;
@@ -122,6 +123,54 @@ pub(super) fn table_prefix_batch(
     let columns: Vec<ArrayRef> = batch.columns()[..table_field_count].to_vec();
     RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+pub(super) fn attach_update_lineage(
+    scan_batch: &RecordBatch,
+    keep: &BooleanArray,
+    rewritten: RecordBatch,
+    null_last_updated_where: Option<&BooleanArray>,
+) -> DFResult<RecordBatch> {
+    let Some((row_id, last_updated)) = filter_lineage_columns(scan_batch, keep)? else {
+        return Ok(rewritten);
+    };
+    let last_updated = match null_last_updated_where {
+        Some(mask) => null_last_updated_where_true(last_updated, mask)?,
+        None => {
+            let all_updated = BooleanArray::from(vec![true; last_updated.len()]);
+            null_last_updated_where_true(last_updated, &all_updated)?
+        }
+    };
+    attach_lineage(rewritten, row_id, last_updated)
+}
+
+pub(super) async fn cow_scan_stream(
+    table: &Table,
+    table_schema: &SchemaRef,
+    scan_snapshot_id: Option<i64>,
+    prune: Option<Predicate>,
+) -> DFResult<iceberg::scan::ArrowRecordBatchStream> {
+    let mut projection: Vec<String> = table_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    projection.push(RESERVED_COL_NAME_FILE.to_string());
+    push_lineage_scan_columns(&mut projection, table.metadata().format_version());
+
+    let mut builder = table.scan().select(projection);
+    if let Some(snapshot_id) = scan_snapshot_id {
+        builder = builder.snapshot_id(snapshot_id);
+    }
+    if let Some(prune) = prune {
+        builder = builder.with_file_prune_only(prune);
+    }
+    builder
+        .build()
+        .map_err(crate::to_datafusion_error)?
+        .to_arrow()
+        .await
+        .map_err(crate::to_datafusion_error)
 }
 
 pub(super) fn attach_lineage(

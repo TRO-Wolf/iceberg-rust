@@ -199,7 +199,7 @@ async fn update_rejects_concurrent_delete_of_untouched_sibling() {
     let table = load_table(&harness.catalog).await;
     let tx = Transaction::new(&table);
     tx.delete_files()
-        .delete_files([b])
+        .delete_files([b.clone()])
         .apply(tx)
         .expect("apply delete_files")
         .commit(harness.catalog.as_ref())
@@ -212,6 +212,28 @@ async fn update_rejects_concurrent_delete_of_untouched_sibling() {
     assert!(
         message.contains("missing data files") || message.contains("conflicting delete"),
         "expected deleted-files rejection of B, got {message}"
+    );
+    let table = load_table(&harness.catalog).await;
+    let data = harness
+        .ctx
+        .sql(&format!("SELECT data FROM catalog.{NS}.{TBL} WHERE id = 1"))
+        .await
+        .expect("select")
+        .collect()
+        .await
+        .expect("collect");
+    let value = data[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("data utf8")
+        .value(0);
+    assert_eq!(value, "a", "rejected UPDATE must not change id 1");
+    let data_files = live_data_files(&table).await;
+    assert_eq!(
+        data_files.len(),
+        1,
+        "a refused UPDATE must not publish a replacement data file or DV-backed rewrite"
     );
 }
 

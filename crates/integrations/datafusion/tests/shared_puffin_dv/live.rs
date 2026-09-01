@@ -15,8 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::arrow::array::StringArray;
+use datafusion::arrow::array::{Array, AsArray, StringArray};
+use futures::TryStreamExt;
+use iceberg::metadata_columns::{
+    RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
+};
 use iceberg::spec::DataFileFormat;
+use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
 use super::harness::{
@@ -107,6 +112,9 @@ async fn delete_of_one_file_must_not_resurrect_shared_puffin_sibling() {
 async fn update_of_one_file_must_not_resurrect_shared_puffin_sibling() {
     let harness = harness().await;
     seed_two_file_shared_puffin(&harness).await;
+    let table_before = load_table(&harness.catalog).await;
+    let before = lineage_id_rows(&table_before).await;
+    let id1_before = before.iter().find(|row| row.0 == 1).expect("id 1 before");
 
     let updated = sql_count(
         &harness.ctx,
@@ -136,6 +144,32 @@ async fn update_of_one_file_must_not_resurrect_shared_puffin_sibling() {
         .expect("data utf8")
         .value(0);
     assert_eq!(data, "z", "updated row must carry the new value");
+
+    let table = load_table(&harness.catalog).await;
+    let next = table.metadata().next_row_id();
+    let rows = lineage_id_rows(&table).await;
+    assert_eq!(rows.len(), 4, "every live row must still project lineage");
+    let id1 = rows.iter().find(|row| row.0 == 1).expect("id 1");
+    let id3 = rows.iter().find(|row| row.0 == 3).expect("id 3");
+    let id3_before = before.iter().find(|row| row.0 == 3).expect("id 3 before");
+    assert_eq!(id1.1, id1_before.1, "updated row keeps _row_id");
+    assert!(
+        id1.2 > id1_before.2,
+        "updated row last_updated_seq must advance"
+    );
+    assert_eq!(id3.1, id3_before.1);
+    assert_eq!(id3.2, id3_before.2);
+    let deletes = live_delete_files(&table).await;
+    assert!(
+        deletes
+            .iter()
+            .any(|file| file.file_format() == DataFileFormat::Puffin),
+        "sibling DV blobs must remain as a live Puffin"
+    );
+    assert!(
+        next >= 6,
+        "the six inserted rows assigned ids 0..5; next_row_id={next}"
+    );
 }
 
 /// T12: a no-match DELETE must not write a Puffin or bump the snapshot.
@@ -368,4 +402,44 @@ async fn delete_allows_concurrent_delete_of_unrelated_file() {
         .await
         .expect("DELETE must succeed when only unrelated C was removed");
     assert_eq!(live_ids(&harness.ctx).await, vec![3, 4, 6]);
+}
+
+async fn lineage_id_rows(table: &Table) -> Vec<(i32, i64, i64)> {
+    let batches: Vec<_> = table
+        .scan()
+        .select([
+            "id",
+            RESERVED_COL_NAME_ROW_ID,
+            RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+        ])
+        .build()
+        .expect("lineage scan")
+        .to_arrow()
+        .await
+        .expect("to_arrow")
+        .try_collect()
+        .await
+        .expect("collect lineage");
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id")
+            .as_primitive::<datafusion::arrow::datatypes::Int32Type>();
+        let row_ids = batch
+            .column_by_name(RESERVED_COL_NAME_ROW_ID)
+            .expect("_row_id")
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        let seqs = batch
+            .column_by_name(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER)
+            .expect("seq")
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        for index in 0..batch.num_rows() {
+            assert!(row_ids.is_valid(index));
+            assert!(seqs.is_valid(index));
+            rows.push((ids.value(index), row_ids.value(index), seqs.value(index)));
+        }
+    }
+    rows.sort_unstable();
+    rows
 }

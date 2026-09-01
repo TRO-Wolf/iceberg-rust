@@ -71,8 +71,8 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 
 use super::cow_affected::{live_data_file_partitions, resolve_affected_data_files};
 use super::row_lineage::{
-    StreamingDataFileWriter, attach_lineage, filter_lineage_columns, null_last_updated_where_true,
-    push_lineage_scan_columns,
+    StreamingDataFileWriter, attach_lineage, attach_update_lineage, cow_scan_stream,
+    filter_lineage_columns, push_lineage_scan_columns,
 };
 use super::snapshot_target::{
     maybe_to_branch, maybe_validate_from_snapshot, resolve_scan_snapshot_id,
@@ -544,37 +544,6 @@ async fn merge_on_read_delete(
         .map_err(to_datafusion_error)?;
 
     Ok(deleted)
-}
-
-/// Opens ONE copy-on-write scan stream: table columns plus `_file`. `prune` is file-only.
-/// The caller's exact `PhysicalExpr` is the row contract. Both COW passes share one snapshot.
-async fn cow_scan_stream(
-    table: &Table,
-    table_schema: &SchemaRef,
-    scan_snapshot_id: Option<i64>,
-    prune: Option<Predicate>,
-) -> DFResult<iceberg::scan::ArrowRecordBatchStream> {
-    let mut projection: Vec<String> = table_schema
-        .fields()
-        .iter()
-        .map(|field| field.name().clone())
-        .collect();
-    projection.push(RESERVED_COL_NAME_FILE.to_string());
-    push_lineage_scan_columns(&mut projection, table.metadata().format_version());
-
-    let mut builder = table.scan().select(projection);
-    if let Some(snapshot_id) = scan_snapshot_id {
-        builder = builder.snapshot_id(snapshot_id);
-    }
-    if let Some(prune) = prune {
-        builder = builder.with_file_prune_only(prune);
-    }
-    builder
-        .build()
-        .map_err(to_datafusion_error)?
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)
 }
 
 /// Copy-on-write DELETE: a file-level rewrite. It finds the data files holding at least one deleted
@@ -1288,6 +1257,7 @@ pub(crate) async fn merge_on_read_update(
         .collect();
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     projection.push(RESERVED_COL_NAME_POS.to_string());
+    push_lineage_scan_columns(&mut projection, table.metadata().format_version());
 
     let mut builder = table.scan().select(projection);
     if let Some(snapshot_id) = scan_snapshot_id {
@@ -1340,6 +1310,7 @@ pub(crate) async fn merge_on_read_update(
         let matching = filter_record_batch(&table_batch, &mask)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         let new_rows_batch = apply_assignments(&matching, assignments, table_schema, None)?;
+        let new_rows_batch = attach_update_lineage(&batch, &mask, new_rows_batch, None)?;
         data_writer.write_batch(new_rows_batch).await?;
     }
 
@@ -1481,16 +1452,18 @@ pub(crate) async fn copy_on_write_update(
         // not match, so it could apply one batch's mask to another batch's rows.
         let affected_match_mask = match_mask(&predicate, &affected_batch)?;
 
-        let mut rewritten = apply_assignments(
+        let rewritten = apply_assignments(
             &affected_batch,
             assignments,
             table_schema,
             Some(&affected_match_mask),
         )?;
-        if let Some((row_id, last_updated)) = filter_lineage_columns(&batch, &keep_affected)? {
-            let last_updated = null_last_updated_where_true(last_updated, &affected_match_mask)?;
-            rewritten = attach_lineage(rewritten, row_id, last_updated)?;
-        }
+        let rewritten = attach_update_lineage(
+            &batch,
+            &keep_affected,
+            rewritten,
+            Some(&affected_match_mask),
+        )?;
         data_writer.write_batch(rewritten).await?;
     }
 

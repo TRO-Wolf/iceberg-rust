@@ -399,7 +399,6 @@ impl ManifestWriter {
     }
 
     fn add_entry_inner(&mut self, entry: ManifestEntry) -> Result<()> {
-        // Check if the entry has sequence number
         if (entry.status == ManifestStatus::Deleted || entry.status == ManifestStatus::Existing)
             && (entry.sequence_number.is_none() || entry.file_sequence_number.is_none())
         {
@@ -409,7 +408,6 @@ impl ManifestWriter {
             ));
         }
 
-        // Update the statistics
         match entry.status {
             ManifestStatus::Added => {
                 self.added_files += 1;
@@ -435,7 +433,6 @@ impl ManifestWriter {
 
     /// Write manifest file and return it.
     pub async fn write_manifest_file(mut self) -> Result<ManifestFile> {
-        // Create the avro writer
         let partition_type = self
             .metadata
             .partition_spec
@@ -443,7 +440,6 @@ impl ManifestWriter {
         let table_schema = &self.metadata.schema;
         let avro_schema = match self.metadata.format_version {
             FormatVersion::V1 => manifest_schema_v1(&partition_type)?,
-            // Manifest schema did not change between V2 and V3
             FormatVersion::V2 | FormatVersion::V3 => manifest_schema_v2(&partition_type)?,
         };
         let mut avro_writer = AvroWriter::new(&avro_schema, Vec::new());
@@ -482,12 +478,18 @@ impl ManifestWriter {
         }
 
         let partition_summary = self.construct_partition_summaries(&partition_type)?;
-        // Write manifest entries
+        if self.metadata.format_version == FormatVersion::V3
+            && self.metadata.content == ManifestContentType::Data
+        {
+            self.first_row_id = super::apply_rewrite_aware_first_row_ids(
+                self.first_row_id,
+                &mut self.manifest_entries,
+            );
+        }
         for entry in std::mem::take(&mut self.manifest_entries) {
             let value = match self.metadata.format_version {
                 FormatVersion::V1 => to_value(ManifestEntryV1::try_from(entry, &partition_type)?)?
                     .resolve(&avro_schema)?,
-                // Manifest entry format did not change between V2 and V3
                 FormatVersion::V2 | FormatVersion::V3 => {
                     to_value(ManifestEntryV2::try_from(entry, &partition_type)?)?
                         .resolve(&avro_schema)?
@@ -506,8 +508,6 @@ impl ManifestWriter {
             manifest_length: length as i64,
             partition_spec_id: self.metadata.partition_spec.spec_id(),
             content: self.metadata.content,
-            // sequence_number and min_sequence_number with UNASSIGNED_SEQUENCE_NUMBER will be replace with
-            // real sequence number in `ManifestListWriter`.
             sequence_number: UNASSIGNED_SEQUENCE_NUMBER,
             min_sequence_number: self.min_seq_num.unwrap_or(UNASSIGNED_SEQUENCE_NUMBER),
             added_snapshot_id: self.snapshot_id.unwrap_or(UNASSIGNED_SNAPSHOT_ID),

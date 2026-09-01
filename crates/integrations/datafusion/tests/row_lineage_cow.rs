@@ -420,3 +420,148 @@ async fn cow_update_keeps_row_id_and_bumps_matched_seq_across_partitions() {
         by_id[&2].1
     );
 }
+
+fn next_row_id(table: &Table) -> u64 {
+    table.metadata().next_row_id()
+}
+
+#[tokio::test]
+async fn sequential_cow_delete_does_not_advance_next_row_id_for_rewritten_survivors() {
+    let ns = "lineage_cow_delete_seq";
+    let tbl = "t";
+    let (ctx, client) = v3_cow_ctx(ns, tbl).await;
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    ))
+    .await
+    .expect("insert")
+    .collect()
+    .await
+    .expect("insert collect");
+
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("load");
+    assert_eq!(lineage_rows(&table).await, vec![
+        (1, 0, 1),
+        (2, 1, 1),
+        (3, 2, 1)
+    ]);
+    assert_eq!(next_row_id(&table), 3);
+
+    ctx.sql(&format!(
+        "INSERT OVERWRITE catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    ))
+    .await
+    .expect("overwrite")
+    .collect()
+    .await
+    .expect("overwrite collect");
+    let table = client.load_table(&ident).await.expect("reload overwrite");
+    let after_overwrite = lineage_rows(&table).await;
+    let next_after_overwrite = next_row_id(&table);
+    assert_eq!(after_overwrite.len(), 3);
+
+    ctx.sql(&format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 2"))
+        .await
+        .expect("delete")
+        .collect()
+        .await
+        .expect("delete collect");
+    let table = client.load_table(&ident).await.expect("reload delete");
+    let after_delete = lineage_rows(&table).await;
+    assert_eq!(after_delete.len(), 2);
+    for (id, row_id, seq) in &after_delete {
+        let source = after_overwrite
+            .iter()
+            .find(|row| row.0 == *id)
+            .expect("survivor existed before delete");
+        assert_eq!(*row_id, source.1, "survivor id={id} must keep _row_id");
+        assert_eq!(*seq, source.2, "untouched last_updated_seq for id={id}");
+    }
+    assert!(
+        !after_delete.iter().any(|row| row.0 == 2),
+        "id=2 must be gone"
+    );
+    assert_eq!(
+        next_row_id(&table),
+        next_after_overwrite,
+        "COW DELETE rewrite must not consume row ids"
+    );
+}
+
+#[tokio::test]
+async fn sequential_cow_update_does_not_advance_next_row_id_and_keeps_row_id() {
+    let ns = "lineage_cow_update_seq";
+    let tbl = "t";
+    let (ctx, client) = v3_cow_ctx(ns, tbl).await;
+    ctx.sql(&format!(
+        "INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    ))
+    .await
+    .expect("insert")
+    .collect()
+    .await
+    .expect("insert collect");
+
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("load");
+    assert_eq!(next_row_id(&table), 3);
+
+    ctx.sql(&format!(
+        "INSERT OVERWRITE catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    ))
+    .await
+    .expect("overwrite")
+    .collect()
+    .await
+    .expect("overwrite collect");
+    let table = client.load_table(&ident).await.expect("reload overwrite");
+    let after_overwrite = lineage_rows(&table).await;
+    let next_after_overwrite = next_row_id(&table);
+    let id2 = after_overwrite
+        .iter()
+        .find(|row| row.0 == 2)
+        .copied()
+        .expect("id=2");
+
+    ctx.sql(&format!(
+        "UPDATE catalog.{ns}.{tbl} SET val = 'B' WHERE id = 2"
+    ))
+    .await
+    .expect("update")
+    .collect()
+    .await
+    .expect("update collect");
+    let table = client.load_table(&ident).await.expect("reload update");
+    let after = lineage_rows(&table).await;
+    let by_id: HashMap<i32, (i64, i64)> = after
+        .into_iter()
+        .map(|(id, row_id, seq)| (id, (row_id, seq)))
+        .collect();
+    assert_eq!(by_id[&2].0, id2.1, "updated row keeps overwrite _row_id");
+    assert!(
+        by_id[&2].1 > id2.2,
+        "updated row last_updated_seq must advance"
+    );
+    assert_eq!(
+        by_id[&1].0,
+        after_overwrite
+            .iter()
+            .find(|row| row.0 == 1)
+            .expect("id=1")
+            .1
+    );
+    assert_eq!(
+        by_id[&3].0,
+        after_overwrite
+            .iter()
+            .find(|row| row.0 == 3)
+            .expect("id=3")
+            .1
+    );
+    assert_eq!(
+        next_row_id(&table),
+        next_after_overwrite,
+        "COW UPDATE rewrite must not consume row ids"
+    );
+}

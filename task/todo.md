@@ -24,6 +24,19 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+## ACTIVE (2026-09-01): PR-3 V3 row-DML lineage (rows R114, R166)
+
+Ledger: [`pr3-row-dml-lineage-ledger.md`](pr3-row-dml-lineage-ledger.md). Plan `task/iceberg-v3-production-work-plan-2026-09-01.md` section 4 / 11.2, clause C-003 and F-rp3-c7.
+
+- [x] Decode Java 1.10.0 `ManifestListWriter$V3Writer.prepare`, `ManifestWriter`, `SnapshotProducer.apply`, `Delegates.suppressFirstRowId`. Diagnosis confirmed: unassigned V3 data manifests advance by added+existing.
+- [x] MoR UPDATE projects `_row_id` / `_last_updated_sequence_number`, attaches original row id, writes null last-updated.
+- [x] Rewrite-aware allocation: stored `_row_id` files do not move `next-row-id`.
+- [x] Required tests (one MoR UPDATE, sequential, partitioned, shared Puffin, conflict, sequential COW DELETE/UPDATE, V2 control) plus mutations 3/5, 3/5, 3/5, 2/2.
+- [x] Interop `run-interop-mor-update-lineage.sh`, 2 fixtures. Reverse Java MoR UPDATE not in iceberg-core 1.10.0.
+- [x] `make check` + `cargo test -p iceberg --locked` + `cargo test -p iceberg-datafusion --locked`. Docker `make test` legs excused.
+
+Outcome: MoR UPDATE keeps `_row_id` and advances last-updated. Rewrite-aware allocation holds `next-row-id` across COW overwrite-then-DELETE/UPDATE. Interop 2 fixtures green. `make check` exit 0. `cargo test -p iceberg --locked` exit 0. `cargo test -p iceberg-datafusion --locked` exit 0 after T2 lineage-id capture fix.
+
 ## ACTIVE (2026-09-01): F-6c branch-following reads (row R168)
 
 Ledger: [`f6c-branch-following-reads-ledger.md`](f6c-branch-following-reads-ledger.md). Completes F-6b: `with_commit_branch` now scopes scans as well as commits.
