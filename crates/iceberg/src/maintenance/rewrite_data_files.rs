@@ -26,9 +26,10 @@
 //! | filter files | outside `[min_file_size, max_file_size]`, at `delete_file_threshold`, or at `delete_ratio_threshold` |
 //! | bin-pack | forward greedy first-fit, lookback 1 |
 //! | filter groups | enough files, enough content, too much content, or any delete-laden file |
-//! | rewrite | live rows only; one [`RewriteFilesAction`](crate::transaction::Transaction::rewrite_files) per group. Format v3 writes stored `_row_id` / `_last_updated_sequence_number` (Java `SparkRewriteTable.rewriteSchema`) |
+//! | rewrite | live rows only; output files use the current spec and a tuple computed from each row. Format v3 writes stored `_row_id` / `_last_updated_sequence_number` (Java `SparkRewriteTable.rewriteSchema`) |
 //!
 //! A non-default-spec file can hold several current partitions, so Java groups it as unpartitioned.
+//! Output routing is separate: each row is split under the current spec.
 //!
 //! # Defaults
 //!
@@ -43,6 +44,7 @@
 //! | `max_file_group_size_bytes` | 100 GiB |
 //! | `use_starting_sequence_number` | true |
 //! | `remove_dangling_deletes` | false |
+//! | `max_open_partition_writers` | 64 |
 //! | `filter` | always true |
 //!
 //! `remove-dangling-deletes` runs after a non-empty plan only. Failure fails the action.
@@ -68,13 +70,12 @@ use crate::maintenance::rewrite_data_files_plan::{
     DELETE_FILE_THRESHOLD_DEFAULT, DELETE_RATIO_THRESHOLD_DEFAULT, ResolvedConfig, plan_file_groups,
 };
 pub(super) use crate::maintenance::rewrite_data_files_plan::{
-    MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO, MIN_FILE_SIZE_DEFAULT_RATIO,
-    MIN_INPUT_FILES_DEFAULT, pack_bins, parse_target_file_size,
+    MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO,
+    MAX_OPEN_PARTITION_WRITERS_DEFAULT, MIN_FILE_SIZE_DEFAULT_RATIO, MIN_INPUT_FILES_DEFAULT,
+    pack_bins, parse_target_file_size,
 };
 #[cfg(test)]
 use crate::maintenance::rewrite_data_files_plan::{group_qualifies, is_candidate};
-#[cfg(test)]
-use crate::maintenance::rewrite_data_files_write::group_partition_tuple;
 use crate::scan::FileScanTask;
 use crate::spec::DataFile;
 use crate::table::Table;
@@ -127,6 +128,7 @@ pub struct RewriteDataFiles {
     use_starting_sequence_number: bool,
     /// Java `REMOVE_DANGLING_DELETES`, default `false`.
     remove_dangling_deletes: bool,
+    max_open_partition_writers: Option<usize>,
     filter: Predicate,
 }
 
@@ -145,6 +147,7 @@ impl RewriteDataFiles {
             max_file_group_size_bytes: MAX_FILE_GROUP_SIZE_BYTES_DEFAULT,
             use_starting_sequence_number: true,
             remove_dangling_deletes: false,
+            max_open_partition_writers: None,
             filter: Predicate::AlwaysTrue,
         }
     }
@@ -212,6 +215,12 @@ impl RewriteDataFiles {
         self
     }
 
+    /// Caps how many partition writers stay open at once. Default 64. Zero is rejected.
+    pub fn max_open_partition_writers(mut self, max_open_partition_writers: usize) -> Self {
+        self.max_open_partition_writers = Some(max_open_partition_writers);
+        self
+    }
+
     /// Restricts the rewrite to files matching `filter` (Java `RewriteDataFiles.filter`). The
     /// predicate selects files only; no residual applies. Every live row of a selected file is
     /// rewritten, so a co-located non-matching row survives.
@@ -259,6 +268,7 @@ impl RewriteDataFiles {
                     starting_snapshot_id,
                     starting_sequence_number,
                     config.target_file_size_bytes,
+                    config.max_open_partition_writers,
                 )
                 .await?;
 
@@ -353,6 +363,16 @@ impl RewriteDataFiles {
             ));
         }
 
+        let max_open_partition_writers = self
+            .max_open_partition_writers
+            .unwrap_or(MAX_OPEN_PARTITION_WRITERS_DEFAULT);
+        if max_open_partition_writers == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "'max-open-partition-writers' is set to 0 but must be > 0",
+            ));
+        }
+
         Ok(ResolvedConfig {
             target_file_size_bytes: target,
             min_file_size_bytes,
@@ -361,6 +381,7 @@ impl RewriteDataFiles {
             delete_file_threshold: self.delete_file_threshold,
             delete_ratio_threshold: self.delete_ratio_threshold,
             max_file_group_size_bytes: self.max_file_group_size_bytes,
+            max_open_partition_writers,
             file_scoped_delete_paths: HashSet::new(),
         })
     }
@@ -418,6 +439,7 @@ impl RewriteDataFiles {
         starting_snapshot_id: i64,
         starting_sequence_number: i64,
         target_file_size_bytes: u64,
+        max_open_partition_writers: usize,
     ) -> Result<(FileGroupRewriteResult, Table, usize)> {
         // A path that vanished since planning means a concurrent commit removed it. Fail here,
         // naming the file, rather than in the writer's own missing-path check.
@@ -444,8 +466,10 @@ impl RewriteDataFiles {
             table,
             group,
             target_file_size_bytes,
+            max_open_partition_writers,
         )
-        .await?;
+        .await?
+        .files;
 
         let group_result = FileGroupRewriteResult {
             added_data_files_count: added_files.len(),
@@ -491,8 +515,15 @@ impl RewriteDataFiles {
             table,
             group,
             target_file_size_bytes,
+            self.max_open_partition_writers
+                .unwrap_or(MAX_OPEN_PARTITION_WRITERS_DEFAULT),
         )
         .await
+        .map(|compacted| compacted.files)
+    }
+
+    pub(crate) fn resolved_max_open_partition_writers(&self) -> Result<usize> {
+        Ok(self.resolve_config()?.max_open_partition_writers)
     }
 }
 
@@ -646,7 +677,7 @@ pub(crate) mod tests {
     }
 
     /// Writes a real equality-delete file on `y`, in partition `x = part_value`.
-    async fn write_equality_delete_file(
+    pub(crate) async fn write_equality_delete_file(
         table: &Table,
         part_value: i64,
         delete_ys: &[i64],
@@ -2174,6 +2205,7 @@ pub(crate) mod tests {
             delete_file_threshold: DELETE_FILE_THRESHOLD_DEFAULT,
             delete_ratio_threshold: DELETE_RATIO_THRESHOLD_DEFAULT,
             max_file_group_size_bytes: 1_000_000,
+            max_open_partition_writers: MAX_OPEN_PARTITION_WRITERS_DEFAULT,
             file_scoped_delete_paths: HashSet::new(),
         }
     }
@@ -2336,118 +2368,6 @@ pub(crate) mod tests {
             "an incompatible-spec file and a current-spec file with the SAME partition struct are \
              bucketed SEPARATELY (incompatible ⇒ empty struct), never merged into a qualifying group"
         );
-    }
-
-    // The output partition tuple is validated against the output spec, never fabricated as empty.
-
-    /// A two-field output spec, the shape a table has after `add_field("y")` while its files still
-    /// carry the one-value tuple of the older spec.
-    fn two_field_spec() -> (Arc<PartitionSpec>, crate::spec::SchemaRef) {
-        let schema: crate::spec::SchemaRef = Arc::new(three_long_schema());
-        let spec = Arc::new(
-            PartitionSpec::builder(schema.clone())
-                .with_spec_id(1)
-                .add_partition_field("x", "x", Transform::Identity)
-                .expect("identity(x)")
-                .add_partition_field("y", "y", Transform::Identity)
-                .expect("identity(y)")
-                .build()
-                .expect("two-field spec"),
-        );
-        (spec, schema)
-    }
-
-    /// An unpartitioned output spec yields no key and never errors, even when the tasks carry
-    /// tuples.
-    #[test]
-    fn test_group_partition_tuple_unpartitioned_spec_is_none() {
-        let (spec, schema) = synthetic_spec_and_schema();
-        let unpartitioned = PartitionSpec::unpartition_spec();
-        let group = vec![synthetic_task("a", 10, 0, 0, &spec, &schema)];
-
-        assert!(
-            group_partition_tuple(&group, &unpartitioned)
-                .expect("an unpartitioned output spec never errors")
-                .is_none()
-        );
-    }
-
-    /// An all-`void` spec has fields yet reports `is_unpartitioned()`, and callers pair it with an
-    /// empty tuple. It must take the `None` branch, which a raw field count would get wrong.
-    ///
-    /// Mutation: branch on `spec.fields().is_empty()` and this reddens while the arity test stays
-    /// green, proving the two rules are independent.
-    #[test]
-    fn test_group_partition_tuple_all_void_spec_is_none() {
-        let (spec, schema) = synthetic_spec_and_schema();
-        let void_spec = PartitionSpec::builder(schema.clone())
-            .with_spec_id(2)
-            .add_partition_field("x", "x_void", Transform::Void)
-            .expect("void(x)")
-            .build()
-            .expect("all-void spec");
-        assert!(
-            void_spec.is_unpartitioned(),
-            "fixture sanity: an all-void spec reports unpartitioned"
-        );
-        let group = vec![synthetic_task("a", 10, 0, 0, &spec, &schema)];
-
-        assert!(
-            group_partition_tuple(&group, &void_spec)
-                .expect("an all-void output spec is unpartitioned, not an anomaly")
-                .is_none()
-        );
-    }
-
-    /// The normal path: the group's tuple matches the output spec's arity and is returned as-is.
-    #[test]
-    fn test_group_partition_tuple_matching_arity_is_returned() {
-        let (spec, schema) = synthetic_spec_and_schema();
-        let group = vec![synthetic_task("a", 10, 7, 0, &spec, &schema)];
-
-        assert_eq!(
-            group_partition_tuple(&group, &spec).expect("a matching tuple is accepted"),
-            Some(Struct::from_iter([Some(Literal::long(7))]))
-        );
-    }
-
-    /// A reachable mismatch: an old-spec task keeps its one-value tuple while bucketing under the
-    /// empty struct, so a group can reach the writer with a tuple shaped for another spec. It must
-    /// fail loudly, or the output file gets a tuple that does not describe it.
-    #[test]
-    fn test_group_partition_tuple_cross_spec_arity_mismatch_errors() {
-        let (old_spec, schema) = synthetic_spec_and_schema();
-        let (output_spec, _schema) = two_field_spec();
-        let group = vec![synthetic_task("old", 10, 5, 0, &old_spec, &schema)];
-
-        let err = group_partition_tuple(&group, &output_spec)
-            .expect_err("a tuple shaped for another spec must be rejected");
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.message().contains("tuple has 1 value(s)"),
-            "unexpected message: {}",
-            err.message()
-        );
-    }
-
-    /// A task with no tuple under a partitioned output spec, the input an
-    /// `unwrap_or_else(Struct::empty)` would fabricate a key from.
-    #[test]
-    fn test_group_partition_tuple_absent_tuple_errors() {
-        let (spec, schema) = synthetic_spec_and_schema();
-        let mut task = synthetic_task("a", 10, 0, 0, &spec, &schema);
-        task.partition = None;
-
-        let err = group_partition_tuple(&[task], &spec)
-            .expect_err("a partitioned output spec with no group tuple must be rejected");
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.message().contains("carries no partition tuple"),
-            "unexpected message: {}",
-            err.message()
-        );
-        // The empty group is the same shape (nothing to take a tuple from).
-        assert!(group_partition_tuple(&[], &spec).is_err());
     }
 
     // The composed `remove-dangling-deletes` sub-action.
