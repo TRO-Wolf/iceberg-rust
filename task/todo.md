@@ -30,14 +30,15 @@ Ledger: [`pr3-row-dml-lineage-ledger.md`](pr3-row-dml-lineage-ledger.md). Plan `
 
 - [x] Decode Java 1.10.0 `ManifestListWriter$V3Writer.prepare`, `ManifestWriter`, `SnapshotProducer.apply`, `Delegates.suppressFirstRowId`. Diagnosis confirmed: unassigned V3 data manifests advance by added+existing.
 - [x] MoR UPDATE projects `_row_id` / `_last_updated_sequence_number`, attaches original row id, writes null last-updated.
-- [x] Rewrite-aware allocation: stored `_row_id` files do not move `next-row-id`.
+- [x] `next-row-id` is Java `+= existing+added` on unassigned DATA (layout-dependent). F-rp3-c7 sequential-COW mismatch was a two-file Spark-seed artefact.
 - [x] Required tests (one MoR UPDATE, sequential, partitioned, shared Puffin, conflict, sequential COW DELETE/UPDATE, V2 control) plus mutations 3/5, 3/5, 3/5, 2/2.
 - [x] Interop `run-interop-mor-update-lineage.sh`, 2 fixtures. Reverse Java MoR UPDATE not in iceberg-core 1.10.0.
 - [x] `make check` + `cargo test -p iceberg --locked` + `cargo test -p iceberg-datafusion --locked`. Docker `make test` legs excused.
 - [x] Critic S1–S3: per-file mixed-manifest recovery; RePark recipe absolute `{0,2}` / `next-row-id` 5; Java COW oracle absolute; runner narrative moved to `dev/java-interop/map.md`.
 - [x] Delta critic: Spark 1.11 seven-sequence table; mixed probe; `unassigned_row_count` on `ManifestFile`; C-007 restated as Spark fidelity.
+- [x] Followup-3: revert allocation override; pin single-file Spark sequences; C-007 is the Java algorithm.
 
-Outcome: Spark 7-sequence table green. MoR next-row-id unchanged (no-removed → 0). Mixed probe first_row_id 3 / next 6. Interop 2 fixtures, COW next 7. Docker `make test` legs excused.
+Outcome: MoR UPDATE keeps `_row_id`. COW `next-row-id` is Java `+= existing+added` at matched layout. Interop 2 fixtures (Java reads fork `next_row_id`). Docker `make test` legs excused.
 
 ## ACTIVE (2026-09-01): F-6c branch-following reads (row R168)
 

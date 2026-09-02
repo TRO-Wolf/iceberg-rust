@@ -1778,7 +1778,6 @@ mod tests {
             partitions: None,
             key_metadata: None,
             first_row_id: None,
-            unassigned_row_count: None,
         }
     }
 

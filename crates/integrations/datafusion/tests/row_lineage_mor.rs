@@ -301,8 +301,8 @@ async fn mor_update_keeps_row_id_and_advances_matched_seq() {
     assert_eq!(by_id[&2].0, "B");
     assert_eq!(
         next_row_id(&table),
-        next_before,
-        "replacement rows must not consume a new row id"
+        next_before + 1,
+        "MoR replacement is an unassigned DATA manifest; Java += added"
     );
 }
 
@@ -330,7 +330,7 @@ async fn sequential_mor_update_keeps_one_row_id_and_advances_seq_twice() {
     let first_seq = mid_by_id[&2].2;
     assert_eq!(mid_by_id[&2].1, 1);
     assert!(first_seq > 1);
-    assert_eq!(next_row_id(&table), next_before);
+    assert_eq!(next_row_id(&table), next_before + 1);
 
     run_sql(
         &ctx,
@@ -352,7 +352,7 @@ async fn sequential_mor_update_keeps_one_row_id_and_advances_seq_twice() {
     assert_eq!(by_id[&2].0, "BB");
     assert_eq!(by_id[&1], ("a".to_string(), 0, 1));
     assert_eq!(by_id[&3], ("c".to_string(), 2, 1));
-    assert_eq!(next_row_id(&table), next_before);
+    assert_eq!(next_row_id(&table), next_before + 2);
 }
 
 #[tokio::test]
@@ -403,7 +403,7 @@ async fn partitioned_mor_update_keeps_lineage_across_partitions() {
         "updated row last_updated_seq must advance"
     );
     assert_eq!(by_id[&2].0, "Y");
-    assert_eq!(next_row_id(&table), next_before);
+    assert_eq!(next_row_id(&table), next_before + 1);
 }
 
 #[tokio::test]

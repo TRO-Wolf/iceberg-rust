@@ -26,7 +26,7 @@ Plan of record: `task/iceberg-v3-production-work-plan-2026-09-01.md` (section 4 
 | Id | Proposition | Result |
 |---|---|---|
 | C-003 | Every V3 DataFusion UPDATE path keeps `_row_id`. An updated row advances `_last_updated_sequence_number`. | PROVEN. MoR UPDATE now projects both lineage columns, applies SET to user columns only, attaches the original `_row_id`, and writes null `_last_updated_sequence_number` so the reader resolves the new data file's sequence. COW UPDATE was already the reference (`row_lineage.rs`). |
-| C-007 (PR-3 slice) | Spark 4.1.2 + Iceberg 1.11.0 COW `next-row-id` on the 7-sequence table (not iceberg-core 1.10.0 write rules). | PROVEN. Bounds from parquet `_row_id` metrics only (not `DataFile.first_row_id`). First materialization (`Some(false)`: removed files exist, metrics incomplete) uses Java `nextRowId += existing+added`. Stored-source (`Some(true)`) advances by holes `(max-min+1)-count`. No removed files (`None`, MoR) consumes 0. Mixed added files advance only by rows that still need ids. 1.10.0 always `+= added` for unassigned DATA manifests (`ManifestFiles.write` passes null `firstRowId`). |
+| C-007 (PR-3 slice) | `next-row-id` follows the Java list-writer algorithm. Literal numbers compare only at matched physical layout. | PROVEN. Unassigned DATA: `nextRowId += existing+added`. Carried manifest with stored `first_row_id`: +0. TableMetadata `nextRowId` += listWriter.next − base. Survivors keep `_row_id` because rewritten parquet materialises the column. Same formula in 1.10.0 and 1.11.0. |
 
 ## Decode (Iceberg 1.11.0 in `/tmp/iceberg-spark-runtime-4.1_2.13-1.11.0.jar`)
 
@@ -41,28 +41,29 @@ Plan of record: `task/iceberg-v3-production-work-plan-2026-09-01.md` (section 4 
 | `DataWriter.close` | `DataFiles.builder` without `withFirstRowId` | Spark does not stamp file `firstRowId` at write. |
 | `ExtractRowLineage.apply` | `rowLineageRequired` from write schema; `meta==null` → empty lineage row | INSERT/OVERWRITE VALUES: no stored `_row_id`. COW DELETE/UPDATE: scan metadata joined onto rows. |
 | `SparkWrite$CopyOnWriteOperation.commit` | `table.newOverwrite()` + `addFile` | COW DML is OverwriteFiles, not copyRewriteManifest. |
+| `SnapshotProducer.apply` | `firstRowId=null` on added **and** filtered manifests | New snapshot writes unassigned DATA manifests. |
 
-1.11 core write path does not encode holes. Spark-measured `next-row-id` is: Java `+= added` on first materialization (source parquet has no complete stored `_row_id`); later stored-source rewrites `+= (max-min+1)-count`.
+Layout: followup-2 Spark table used a two-file seed (rc=1+rc=2). Fork INSERT VALUES writes one 3-row file. `next-row-id` is a function of that layout, not a second allocation rule.
 
-## Spark 4.1.2 + Iceberg 1.11.0 oracle (INSERT 3 then …)
+## Spark 4.1.2 + Iceberg 1.11.0, coalesce(1) single-file seed (fork layout)
 
-| Sequence | after step 1 | after step 2 |
+| Sequence | after step 1 | after step 2 / 3 |
 |---|---|---|
-| DELETE id=2 | (1,a,0,1),(3,c,2,1) next 5 | — |
-| DELETE id=3 | (1,a,0,1),(2,b,1,1) next 5 | — |
-| DELETE id=1 | (2,b,1,1),(3,c,2,1) next 5 | — |
-| DELETE id=2, then DELETE id=1 | next 5 | (3,c,2,1) next 5 |
-| UPDATE id=2 SET val='B', then DELETE id=1 | (1,a,0,1),(2,B,1,2),(3,c,2,1) next 6 | (2,B,1,2),(3,c,2,1) next 6 |
-| UPDATE id=2 SET val='B', then DELETE id=2 | same, next 6 | (1,a,0,1),(3,c,2,1) next 7 |
+| DELETE any one of id=1,2,3 | survivors keep ids; next 5 | — |
+| DELETE id=2, then DELETE id=1 | next 5 | (3,c,2,1) next 6 |
+| UPDATE id=2 SET val='B', then DELETE id=1 | (1,a,0,1),(2,B,1,2),(3,c,2,1) next 6 | (2,B,1,2),(3,c,2,1) next 8 |
+| UPDATE id=2 SET val='B', then DELETE id=2 | same, next 6 | (1,a,0,1),(3,c,2,1) next 8 |
 | INSERT OVERWRITE VALUES then DELETE id=2 | (1,a,3,2),(2,b,4,2),(3,c,5,2) next 6 | (1,a,3,2),(3,c,5,2) next 8 |
+| UPDATE id<=2 SET val='B', then DELETE id=3 | (1,B,0,2),(2,B,1,2),(3,c,2,1) next 6 | (1,B,0,2),(2,B,1,2) next 8 |
+| DELETE id=2, INSERT (4,'d'), DELETE id=1 | next 5 | next 6; then (3,c,2,1),(4,d,5,3) next 7 |
+| three single-row INSERT, DELETE id=2, DELETE id=1 | next 3 | next 3; then (3,c,2,3) next 3 |
 
 ## Files
 
 - `crates/integrations/datafusion/src/physical_plan/delete.rs` — MoR UPDATE projects lineage; uses `attach_update_lineage`.
 - `crates/integrations/datafusion/src/physical_plan/row_lineage.rs` — `attach_update_lineage`, `cow_scan_stream`.
-- `crates/iceberg/src/spec/manifest/rewrite_aware.rs` — per-file stamp; holes vs first-materialization vs no-removed; mixed increment on `ManifestFile.unassigned_row_count`.
-- `crates/iceberg/src/spec/manifest/writer.rs` — `source_has_stored_row_ids: Option<bool>` from removed files.
-- `crates/iceberg/src/spec/manifest_list.rs` — increment uses `unassigned_row_count` when present.
+- `crates/iceberg/src/spec/manifest_list.rs` — Java `+= existing+added` on unassigned DATA. No `unassigned_row_count`.
+- `crates/iceberg/src/spec/manifest/writer.rs` — EXISTING/DELETED copy per-file `first_row_id`; manifest `first_row_id` stays null.
 - Tests: `row_lineage_mor.rs`, sequential COW in `row_lineage_cow.rs`, shared-Puffin T2/T16.
 - Interop: `dev/java-interop/run-interop-mor-update-lineage.sh`, `MorUpdateLineageOracle`, `tests/interop_mor_update_lineage.rs`.
 
@@ -70,14 +71,13 @@ Plan of record: `task/iceberg-v3-production-work-plan-2026-09-01.md` (section 4 
 
 | Test | Result |
 |---|---|
-| One MoR UPDATE | updated row keeps `_row_id`; last-updated advances; unmatched keep both; `next-row-id` unchanged |
-| Sequential MoR UPDATE | one `_row_id`; sequence advances twice |
+| One MoR UPDATE | updated row keeps `_row_id`; last-updated advances; unmatched keep both; `next-row-id` += added (Java) |
+| Sequential MoR UPDATE | one `_row_id`; sequence advances twice; `next-row-id` += 1 per replacement |
 | Partitioned MoR UPDATE | lineage correct across two partitions |
 | Shared Puffin T2 | updating one row preserves sibling DV blobs and every live row's lineage |
 | Commit conflict | frozen UPDATE after concurrent removal of the referenced data file refuses; no replacement DV |
-| Spark 7-sequence COW table | `row_lineage_cow.rs` `spark_*` tests; all 7 cells green |
-| Mixed ManifestWriter+ListWriter | `mixed_manifest_list_writer_advances_only_by_new_rows`: first_row_id 3, next 6, per-file [3, 0] |
-| No-removed all-stored | `no_removed_files_all_stored_consumes_zero`: `None` source → `Some(0)` |
+| Spark single-file COW sequences | `row_lineage_cow.rs` `spark_*` (7 + OVERWRITE + 3 extra) |
+| Filtered EXISTING/DELETED `first_row_id` | `filtered_manifest_copies_existing_and_deleted_first_row_id` |
 | V2 control | V2 still writes parquet position deletes; `_row_id` / last-updated are all-null; `next-row-id` is 0 |
 
 ## Mutations (`N red out of M`)
@@ -94,15 +94,14 @@ Exact command for 4: `cargo test -p iceberg-datafusion --locked --test row_linea
 
 | # | Knob | Result |
 |---|---|---|
-| 4 | Drop applying `apply_rewrite_aware_first_row_ids` (count-all-rows) | **3 red out of 7** Spark sequences (second-step stored-source rewrites: 6 vs 5, 8 vs 6, 8 vs 7). Restored + `touch`. |
-| 5 | `unassigned_row_count` forced `None` | **1 red out of 1** mixed probe (`None` vs `Some(3)`). Restored. |
+| 4 | List-writer increment: skip `added_rows_count` (existing only) | **10 red out of 10** `spark_*`. Restored + `touch`. |
 
 ## Interop
 
 Command: `bash dev/java-interop/run-interop-mor-update-lineage.sh`
 
 - Fixture count: **2** (`mor_table`, `cow_table`), asserted in `fixture_count.json` and the runner.
-- Java writes two 3-row V3 tables. Rust: two MoR UPDATE statements + Spark COW UPDATE id=2 then DELETE id=2. Java read asserts Spark numbers: MOR next 3; COW survivors `_row_id` {0,2}, last-updated 1, next 7. 1.10.0 harness cannot drive Spark DML; it only reads Rust output.
+- Java writes two 3-row V3 tables. Rust: two MoR UPDATE statements + COW UPDATE id=2 then DELETE id=2. Java production-scan reads the fork's own `next_row_id` back (MOR `_row_id`/`last_updated`; COW survivors `{0,2}` last-updated 1, next 8). No independent Java-written DML oracle. 1.10.0 cannot drive Spark DML.
 - **Reverse MoR UPDATE:** iceberg-core 1.10.0 has no SQL / DataFusion-shaped merge-on-read UPDATE. That surface is Spark `SparkPositionDelta` / `SparkCopyOnWriteOperation`, not on this oracle's classpath. Reverse leg omitted.
 
 Docker `make test` legs excused (no Docker).
@@ -112,9 +111,7 @@ Docker `make test` legs excused (no Docker).
 Liftable after this unit:
 
 - `V3-COW-1` UPDATE half (already green on fork #243; this unit does not regress it).
-- `V3-COW-1` sequential COW / next-row-id (F-rp3-c7). Seven Spark sequences pinned.
-
-Do not lift the guard until RePark re-measures that recipe on this SHA.
+- `V3-COW-1` sequential COW / next-row-id (F-rp3-c7) was a two-file Spark-seed layout artefact, not a defect. Re-measure `V3-COW-1` sequential-COW at matched layout.
 
 ## Gates
 
@@ -132,10 +129,10 @@ Matrix rows: row R114, row R166
 Java methods or bytecode read: ManifestListWriter$V3Writer.prepare (assign vs already-assigned; nextRowId += existingRowsCount + addedRowsCount); ManifestFiles.write aconst_null firstRowId; Delegates$1.firstRowId aconst_null; SnapshotProducer.apply assignedRows = writer.nextRowId - table.nextRowId
 Files changed: physical_plan/delete.rs, physical_plan/row_lineage.rs, spec/manifest/entry.rs, spec/manifest/writer.rs, row_lineage_mor.rs, row_lineage_cow.rs, shared_puffin_dv live/extra, interop_mor_update_lineage.rs, run-interop-mor-update-lineage.sh, InteropOracle.MorUpdateLineageOracle, GAP_MATRIX rows R114 and R166, maps, this ledger
 Behavior before: MoR UPDATE wrote replacement rows without _row_id / last-updated; COW rewrite of stored-_row_id files advanced next-row-id by every added row
-Behavior after: MoR UPDATE keeps _row_id and nulls last-updated on the modified row; rewrite-aware manifests of fully stored-_row_id files do not move next-row-id
+Behavior after: MoR UPDATE keeps _row_id and nulls last-updated on the modified row; next-row-id is Java += existing+added on unassigned DATA at matched layout
 Negative cases: V2 still writes position deletes; concurrent removal of a referenced data file refuses the UPDATE; no replacement DV
 Test command and population: cargo test -p iceberg --locked --lib spec::manifest::entry::first_row_id_tests; cargo test -p iceberg-datafusion --locked --test row_lineage_mor --test row_lineage_cow --test shared_puffin_dv; bash dev/java-interop/run-interop-mor-update-lineage.sh (2 fixtures)
-Mutations, one at a time: (1) drop MoR lineage projections 3/5 red; (2) null attached row_id 3/5 red; (3) keep old last-updated 3/5 red; (4) drop rewrite-aware assignment 2/2 sequential COW red
+Mutations, one at a time: (1) drop MoR lineage projections 3/5 red; (2) null attached row_id 3/5 red; (3) keep old last-updated 3/5 red; (4) list-writer skip added_rows_count 10/10 spark_ red
 Java interop command and fixture count: bash dev/java-interop/run-interop-mor-update-lineage.sh ; 2 fixtures; reverse MoR UPDATE not in iceberg-core 1.10.0
 CI-only evidence gap: Docker make test legs excused
 Breaking public API change: none

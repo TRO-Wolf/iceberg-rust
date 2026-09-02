@@ -31,7 +31,7 @@ use crate::spec::{
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter,
     ManifestWriterBuilder, Operation, Schema, Snapshot, SnapshotRef, SnapshotReference,
     SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary, TableMetadata,
-    TableProperties, data_file_has_complete_stored_row_ids, update_snapshot_summaries,
+    TableProperties, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -168,7 +168,6 @@ pub(crate) struct SnapshotProducer<'a> {
     // makes the added files inherit the new snapshot's sequence number.
     new_data_files_data_sequence_number: Option<i64>,
     removed_data_files: Vec<DataFile>,
-    source_has_stored_row_ids: Option<bool>,
     removed_delete_files: Vec<DataFile>,
     stage_only: bool,
     pub(crate) target_branch: String,
@@ -208,7 +207,6 @@ impl<'a> SnapshotProducer<'a> {
             added_delete_files: vec![],
             new_data_files_data_sequence_number: None,
             removed_data_files: vec![],
-            source_has_stored_row_ids: None,
             removed_delete_files: vec![],
             stage_only: false,
             target_branch: MAIN_BRANCH.to_string(),
@@ -397,9 +395,7 @@ impl<'a> SnapshotProducer<'a> {
                 ManifestContentType::Deletes => Ok(builder.build_v2_deletes()),
             },
             FormatVersion::V3 => match content {
-                ManifestContentType::Data => Ok(builder
-                    .with_source_has_stored_row_ids(self.source_has_stored_row_ids)
-                    .build_v3_data()),
+                ManifestContentType::Data => Ok(builder.build_v3_data()),
                 ManifestContentType::Deletes => Ok(builder.build_v3_deletes()),
             },
         }
@@ -1454,11 +1450,6 @@ impl<'a> SnapshotProducer<'a> {
         // summary can reflect the deleted file/record counts and `manifest_file()` can reuse the result
         // without re-resolving. Empty for add-only operations (e.g. fast append).
         self.removed_data_files = snapshot_produce_operation.delete_files(&self).await?;
-        self.source_has_stored_row_ids = (!self.removed_data_files.is_empty()).then(|| {
-            self.removed_data_files
-                .iter()
-                .all(data_file_has_complete_stored_row_ids)
-        });
 
         // Resolve the DELETE files this operation removes against the current snapshot's DELETE manifests by
         // path (the apply-side `RowDelta.removeDeletes` path). Re-binding `self.removed_delete_files` to the

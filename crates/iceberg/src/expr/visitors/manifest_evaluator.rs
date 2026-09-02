@@ -712,7 +712,6 @@ mod test {
             partitions: Some(partitions),
             key_metadata: None,
             first_row_id: None,
-            unassigned_row_count: None,
         }
     }
 

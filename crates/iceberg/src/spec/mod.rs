@@ -43,7 +43,6 @@ mod view_version;
 
 pub use datatypes::*;
 pub use encrypted_key::*;
-pub(crate) use manifest::data_file_has_complete_stored_row_ids;
 pub use manifest::*;
 pub use manifest_list::*;
 pub use metrics_config::*;

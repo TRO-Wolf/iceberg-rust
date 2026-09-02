@@ -20,10 +20,6 @@ mod data_file;
 pub use data_file::*;
 mod entry;
 pub use entry::*;
-mod rewrite_aware;
-pub(crate) use rewrite_aware::{
-    apply_rewrite_aware_first_row_ids, data_file_has_complete_stored_row_ids,
-};
 mod metadata;
 pub use metadata::*;
 mod writer;

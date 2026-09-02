@@ -199,7 +199,7 @@ async fn test_mor_update_lineage_gen() {
     let mor_table = client.load_table(&mor_ident).await.expect("reload mor");
     let mor_after = gen_dir.join("mor_after");
     write_final(&mor_table, &mor_after).await;
-    assert_eq!(mor_table.metadata().next_row_id(), 3);
+    assert_eq!(mor_table.metadata().next_row_id(), 5);
 
     run_sql(
         &ctx,
@@ -217,6 +217,6 @@ async fn test_mor_update_lineage_gen() {
     let cow_table = client.load_table(&cow_ident).await.expect("reload cow del");
     let cow_after = gen_dir.join("cow_after");
     write_final(&cow_table, &cow_after).await;
-    assert_eq!(cow_table.metadata().next_row_id(), 7);
+    assert_eq!(cow_table.metadata().next_row_id(), 8);
     assert_eq!(lineage_pairs(&cow_table).await, vec![(1, 0, 1), (3, 2, 1)]);
 }

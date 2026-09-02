@@ -1290,7 +1290,7 @@ mod tests {
         );
     }
 
-    /// No-op helper documenting that the default collector starts trusted with a zero limit; kept
+    /// No-op helper documenting that the default collector starts trusted with a zero limit.
     fn collector_partition_summary_limit_check(collector: &SnapshotSummaryCollector) {
         assert!(collector.trust_partition_metrics);
         assert_eq!(collector.max_changed_partitions_for_summaries, 0);
@@ -1318,7 +1318,6 @@ mod tests {
             partitions: Some(Vec::new()),
             key_metadata: None,
             first_row_id: None,
-            unassigned_row_count: None,
         };
 
         collector
@@ -1436,7 +1435,6 @@ mod tests {
             partitions: Some(Vec::new()),
             key_metadata: None,
             first_row_id: None,
-            unassigned_row_count: None,
         });
 
         summary_four.add_file(

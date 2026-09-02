@@ -26687,11 +26687,11 @@ public final class InteropOracle {
         System.out.println("FAIL mor-update-lineage: missing MOR result table at " + afterDir);
         return 1;
       }
-      if (table.operations().current().nextRowId() != 3L) {
+      if (table.operations().current().nextRowId() != 5L) {
         System.out.println(
             "FAIL mor-update-lineage: MOR next_row_id="
                 + table.operations().current().nextRowId()
-                + " expected 3");
+                + " expected 5");
         failures++;
       }
       Map<Integer, long[]> rows = scanLineage(table);
@@ -26727,9 +26727,9 @@ public final class InteropOracle {
         return 1;
       }
       long actualNext = table.operations().current().nextRowId();
-      if (actualNext != 7L) {
+      if (actualNext != 8L) {
         System.out.println(
-            "FAIL mor-update-lineage: COW next_row_id=" + actualNext + " expected 7");
+            "FAIL mor-update-lineage: COW next_row_id=" + actualNext + " expected 8");
         failures++;
       }
       Map<Integer, long[]> rows = scanLineage(table);

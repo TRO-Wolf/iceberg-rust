@@ -21,7 +21,7 @@
 
 ## Purpose
 
-Manifest entries, data-file structs, and the V3 rewrite-aware first-row-id allocator.
+Manifest entries, data-file structs, and the V3 first-row-id reader/writer.
 
 ## Contents
 
@@ -29,16 +29,15 @@ Manifest entries, data-file structs, and the V3 rewrite-aware first-row-id alloc
 |---|---|
 | `entry.rs` | `ManifestEntry`, `assign_first_row_ids` (Java `ManifestReader.idAssigner`) |
 | `data_file.rs` | on-disk data-file fields including `first_row_id` |
-| `writer.rs` | `ManifestWriter` / `ManifestWriterBuilder` |
-| `rewrite_aware.rs` | `RewriteAwareFirstRowIds`: per-file stored `_row_id` recovery after Suppress. Increment: mixed = new rows; stored source = holes; no removed files = 0; else Java `+= existing+added`. |
+| `writer.rs` | `ManifestWriter` / `ManifestWriterBuilder`. EXISTING/DELETED entries copy `data_file.first_row_id` verbatim. Manifest `first_row_id` stays null for the list writer. |
 | `metadata.rs` | manifest metadata |
 
 ## I want to...
 
 | I want to... | go to |
 |---|---|
-| Stamp stored `_row_id` files after Suppress | `rewrite_aware.rs` `apply_rewrite_aware_first_row_ids` |
 | Inherit `first_row_id` on read | `entry.rs` `assign_first_row_ids` |
+| See how `next-row-id` advances | `../manifest_list.rs` `ManifestListWriter::assign_first_row_id` (Java `+= existing+added` on unassigned DATA) |
 
 ## Pointers
 
@@ -48,6 +47,5 @@ Manifest entries, data-file structs, and the V3 rewrite-aware first-row-id alloc
 
 | Symptom | Likely cause |
 |---|---|
-| COW DELETE of id=1 vs id=2 disagrees on `next-row-id` | `source_has_stored_row_ids` not passed into `ManifestWriterBuilder` (`None` = no removed files, `Some(false)` = first materialization, `Some(true)` = stored source) |
-| Mixed stored+new file advances by all rows | `unassigned_row_count` not set on `ManifestFile` |
-| MoR UPDATE advances `next-row-id` | no-removed path must return `Some(0)`, not Java `+= added` |
+| Sequential COW `next-row-id` disagrees with a Spark notebook | layout mismatch (file count / manifest count); numbers compare only at matched layout |
+| EXISTING survivor lost `first_row_id` | filtered rewrite did not copy the entry's `data_file` |

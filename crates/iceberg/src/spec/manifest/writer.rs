@@ -42,7 +42,6 @@ pub struct ManifestWriterBuilder {
     key_metadata: Option<Vec<u8>>,
     schema: SchemaRef,
     partition_spec: PartitionSpec,
-    source_has_stored_row_ids: Option<bool>,
 }
 
 impl ManifestWriterBuilder {
@@ -60,13 +59,7 @@ impl ManifestWriterBuilder {
             key_metadata,
             schema,
             partition_spec,
-            source_has_stored_row_ids: None,
         }
-    }
-
-    pub(crate) fn with_source_has_stored_row_ids(mut self, value: Option<bool>) -> Self {
-        self.source_has_stored_row_ids = value;
-        self
     }
 
     /// Build a [`ManifestWriter`] for format version 1.
@@ -84,7 +77,6 @@ impl ManifestWriterBuilder {
             self.key_metadata,
             metadata,
             None,
-            self.source_has_stored_row_ids,
         )
     }
 
@@ -103,7 +95,6 @@ impl ManifestWriterBuilder {
             self.key_metadata,
             metadata,
             None,
-            self.source_has_stored_row_ids,
         )
     }
 
@@ -122,7 +113,6 @@ impl ManifestWriterBuilder {
             self.key_metadata,
             metadata,
             None,
-            self.source_has_stored_row_ids,
         )
     }
 
@@ -141,7 +131,6 @@ impl ManifestWriterBuilder {
             self.key_metadata,
             metadata,
             None,
-            self.source_has_stored_row_ids,
         )
     }
 
@@ -160,7 +149,6 @@ impl ManifestWriterBuilder {
             self.key_metadata,
             metadata,
             None,
-            self.source_has_stored_row_ids,
         )
     }
 }
@@ -176,7 +164,6 @@ pub struct ManifestWriter {
     deleted_files: u32,
     deleted_rows: u64,
     first_row_id: Option<u64>,
-    source_has_stored_row_ids: Option<bool>,
     min_seq_num: Option<i64>,
     key_metadata: Option<Vec<u8>>,
     manifest_entries: Vec<ManifestEntry>,
@@ -191,7 +178,6 @@ impl ManifestWriter {
         key_metadata: Option<Vec<u8>>,
         metadata: ManifestMetadata,
         first_row_id: Option<u64>,
-        source_has_stored_row_ids: Option<bool>,
     ) -> Self {
         Self {
             output,
@@ -203,7 +189,6 @@ impl ManifestWriter {
             deleted_files: 0,
             deleted_rows: 0,
             first_row_id,
-            source_has_stored_row_ids,
             min_seq_num: None,
             key_metadata,
             manifest_entries: Vec::new(),
@@ -481,18 +466,6 @@ impl ManifestWriter {
         }
 
         let partition_summary = self.construct_partition_summaries(&partition_type)?;
-        let mut unassigned_row_count = None;
-        if self.metadata.format_version == FormatVersion::V3
-            && self.metadata.content == ManifestContentType::Data
-        {
-            let assigned = super::apply_rewrite_aware_first_row_ids(
-                self.first_row_id,
-                &mut self.manifest_entries,
-                self.source_has_stored_row_ids,
-            );
-            self.first_row_id = assigned.manifest_first_row_id;
-            unassigned_row_count = assigned.unassigned_row_count;
-        }
         for entry in std::mem::take(&mut self.manifest_entries) {
             let value = match self.metadata.format_version {
                 FormatVersion::V1 => to_value(ManifestEntryV1::try_from(entry, &partition_type)?)?
@@ -527,7 +500,6 @@ impl ManifestWriter {
             partitions: Some(partition_summary),
             key_metadata: self.key_metadata,
             first_row_id: self.first_row_id,
-            unassigned_row_count,
         })
     }
 }

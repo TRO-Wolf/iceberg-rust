@@ -324,12 +324,10 @@ impl ManifestListWriter {
                     (Some(writer_next_row_id), None) => {
                         let (existing_rows_count, added_rows_count) =
                             require_row_counts_in_manifest(manifest)?;
-                        let increment = manifest
-                            .unassigned_row_count
-                            .or_else(|| existing_rows_count.checked_add(added_rows_count));
                         manifest.first_row_id = Some(writer_next_row_id);
-                        self.next_row_id = increment
-                            .and_then(|n| writer_next_row_id.checked_add(n))
+                        self.next_row_id = writer_next_row_id
+                            .checked_add(existing_rows_count)
+                            .and_then(|sum| sum.checked_add(added_rows_count))
                             .ok_or_else(|| {
                                 Error::new(
                                     ErrorKind::DataInvalid,
@@ -772,7 +770,6 @@ pub struct ManifestFile {
     ///
     /// The starting _row_id to assign to rows added by ADDED data files
     pub first_row_id: Option<u64>,
-    pub(crate) unassigned_row_count: Option<u64>,
 }
 
 impl ManifestFile {
@@ -1110,7 +1107,6 @@ pub(super) mod _serde {
                 partitions: self.partitions,
                 key_metadata: self.key_metadata.map(|b| b.into_vec()),
                 first_row_id: self.first_row_id,
-                unassigned_row_count: None,
             };
 
             Ok(manifest_file)
@@ -1137,7 +1133,6 @@ pub(super) mod _serde {
                 partitions: self.partitions,
                 key_metadata: self.key_metadata.map(|b| b.into_vec()),
                 first_row_id: None,
-                unassigned_row_count: None,
             })
         }
     }
@@ -1188,7 +1183,6 @@ pub(super) mod _serde {
                 sequence_number: 0,
                 min_sequence_number: 0,
                 first_row_id: None,
-                unassigned_row_count: None,
             })
         }
     }
@@ -1423,7 +1417,6 @@ mod test {
                     partitions: Some(vec![]),
                     key_metadata: None,
                     first_row_id: None,
-                    unassigned_row_count: None,
                 }
             ]
         };
@@ -1476,7 +1469,6 @@ mod test {
                     ),
                     key_metadata: None,
                     first_row_id: None,
-                    unassigned_row_count: None,
                 },
                 ManifestFile {
                     manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m1.avro".to_string(),
@@ -1497,7 +1489,6 @@ mod test {
                     ),
                     key_metadata: None,
                     first_row_id: None,
-                    unassigned_row_count: None,
                 }
             ]
         };
@@ -1551,7 +1542,6 @@ mod test {
                     ),
                     key_metadata: None,
                     first_row_id: Some(10),
-                    unassigned_row_count: None,
                 },
                 ManifestFile {
                     manifest_path: "s3a://icebergdata/demo/s1/t1/metadata/05ffe08b-810f-49b3-a8f4-e88fc99b254a-m1.avro".to_string(),
@@ -1572,7 +1562,6 @@ mod test {
                     ),
                     key_metadata: None,
                     first_row_id: Some(13),
-                    unassigned_row_count: None,
                 }
             ]
         };
@@ -1624,7 +1613,6 @@ mod test {
                 partitions: None,
                 key_metadata: None,
                 first_row_id: None,
-                unassigned_row_count: None,
             }]
         }.try_into().unwrap();
         let result = serde_json::to_string(&manifest_list).unwrap();
@@ -1656,7 +1644,6 @@ mod test {
                 ),
                 key_metadata: None,
                 first_row_id: None,
-                unassigned_row_count: None,
             }]
         }.try_into().unwrap();
         let result = serde_json::to_string(&manifest_list).unwrap();
@@ -1688,7 +1675,6 @@ mod test {
                 ),
                 key_metadata: None,
                 first_row_id: Some(10),
-                unassigned_row_count: None,
             }]
         }.try_into().unwrap();
         let result = serde_json::to_string(&manifest_list).unwrap();
@@ -1720,7 +1706,6 @@ mod test {
                 ),
                 key_metadata: None,
                 first_row_id: None,
-                unassigned_row_count: None,
             }]
         };
 
@@ -1768,7 +1753,6 @@ mod test {
                 ),
                 key_metadata: None,
                 first_row_id: None,
-                unassigned_row_count: None,
             }]
         };
 
@@ -1817,7 +1801,6 @@ mod test {
                 ),
                 key_metadata: None,
                 first_row_id: Some(10),
-                unassigned_row_count: None,
             }]
         };
 
@@ -1870,7 +1853,6 @@ mod test {
                 partitions: None,
                 key_metadata: None,
                 first_row_id: None,
-                unassigned_row_count: None,
             }
         }
 
@@ -1927,7 +1909,6 @@ mod test {
                 ),
                 key_metadata: None,
                 first_row_id: None,
-                unassigned_row_count: None,
             }]
         };
 
@@ -1973,7 +1954,6 @@ mod test {
                 ),
                 key_metadata: None,
                 first_row_id: None,
-                unassigned_row_count: None,
             }]
         };
 
@@ -2021,7 +2001,6 @@ mod test {
                 ),
                 key_metadata: None,
                 first_row_id: None,
-                unassigned_row_count: None,
             }]
         };
 
@@ -2110,7 +2089,6 @@ mod test {
             partitions: Some(vec![]),
             key_metadata: None,
             first_row_id: None,
-            unassigned_row_count: None,
         };
         let file_io = FileIO::new_with_fs();
         let tmp_dir = TempDir::new().unwrap();
