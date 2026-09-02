@@ -112,10 +112,10 @@ its correctness is pinned by the unchanged 388-byte container and by Java's read
 allocation profile is structural — no `Vec<u64>` is built for a previous vector at all.
 
 Command: `cargo test -p iceberg-datafusion --locked --offline --test shared_puffin_dv -- --ignored --nocapture --test-threads=1`.
-No wall-clock pin is in CI. Recorded honestly: the byte amplification is closed (51x at 64 blobs);
-the wall-clock cells move only slightly in this harness, whose 192 data files live in ONE data
-manifest, so the walk the reviewer measured was already cheap here. The reviewer's larger
-wall-clock numbers are not reproduced by this fixture and are not claimed.
+No wall-clock pin is in CI. Recorded honestly: round 1 closed the byte amplification (51x at 64
+blobs) but barely moved the clock, because that fixture puts all 192 data files in ONE data
+manifest and the walk was already cheap there. Round 2's manifest-per-file fixture is the shape the
+reviewer measured, and it does move: -26 % at 64 manifests.
 
 ## 6. Mutations (one knob at a time, `cargo test -p iceberg-datafusion --locked --offline --test shared_puffin_dv`)
 
@@ -123,7 +123,7 @@ wall-clock numbers are not reproduced by this fixture and are not claimed.
 |---|---|---|
 | M1 | `RemovalTargets::matches` DELETE arm compares the path only | 7 red out of 20 (`container::touched_blob_moves...`, `measure::a_later_delete...`, both resurrection pins, `untouched_sibling_keeps_original_data_sequence`, `equality_delete_survives...`, `delete_allows_concurrent_delete_of_unrelated_file`) |
 | M2 | `close.retained_references` never populated | 6 red out of 20 (the four concurrent-Replace/Delete sibling pins plus both post-output-failure pins) |
-| M3 | `resolve_removed_delete_files` matches on the path only | 7 red out of 20 (same set as M1) |
+| M3 | `resolve_removed_delete_files` / `DeleteFileMatcher::hit` matches on the path only | 7 red out of 20 in round 1 (same set as M1); 8 of 20 in round 2 |
 | M4 | interop: both seed offsets shifted by one in `before_dvs.json` | oracle red, `kept=0 moved=2` |
 | M5 | `close_touched_dv_containers_with_partitions` ignores `known_partitions` | 1 red out of 2 (`a_supplied_partition_map_reads_no_data_manifest`) |
 
