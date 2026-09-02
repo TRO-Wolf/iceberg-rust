@@ -41,13 +41,15 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `interop_v3_upgrade_mor.rs` | GEN for `run-interop-v3-upgrade.sh` cell u3: the first V3 DML after Rust converts a Java parquet position delete to a deletion vector. Runs one merge-on-read `UPDATE`, asserts the replacement row keeps its original `_row_id` and that no parquet position delete is added, then lands the result table and the shared expectation document for the Java verify. |
 | `interop_mor_update_lineage.rs` | GEN for `run-interop-mor-update-lineage.sh` (Java-created V3 tables; two MoR UPDATE statements + RePark COW UPDATE-then-DELETE) |
 | `interop_mor_branch_lineage.rs` | V3 merge-on-read UPDATE lineage on a DIVERGED BRANCH (row R168 / PR-6B). Offline: Rust seeds `main` 1/2/3 + branch `b` 10/11, runs two MoR UPDATE statements of id 10 through `with_commit_branch("b")`, and pins stable `_row_id`, a sequence that advances on each UPDATE, unmatched branch rows unchanged, `main` snapshot / files / lineage untouched and `next-row-id` advancing by one added row per UPDATE (5 → 6 → 7). `ICEBERG_INTEROP_MOR_BRANCH_LINEAGE_DIR` adds the Direction-1 read of the Java fixture; `..._GEN_DIR` adds the Direction-2 GEN that writes `rust_after/` for Java. Both env vars are set by `dev/java-interop/run-interop-mor-branch-lineage.sh`. pins: R168/C-006 |
-| `shared_puffin_dv/` | Shared-Puffin deletion-vector DML |
+| `shared_puffin_dv/` | Shared-Puffin deletion-vector DML. `live.rs`/`extra.rs` are F-17 (T1–T23); `container.rs` is F-18's Spark layout pin (touched blob moves, sibling entry unchanged, two containers, `removed-dvs`/`removed-delete-files`/`added-delete-files` = 1); `measure.rs` pins the rewrite amplification (a later single-row DELETE writes a ONE-blob container at 16 and 64 blobs) and carries the two `#[ignore]`d wall-clock/byte measurements |
+| `interop_f18_dv_sibling_close.rs` | GEN for `run-interop-f18-dv-sibling-close.sh` (row R114 / F-18). Java `BaseDVFileWriter` writes the two-file seed and its two-blob delete; Rust runs the second DELETE and lands `before_dvs.json` / `after_dvs.json` / `summary.json` / `expected_rows.json` + `final.metadata.json` for the Java verify. Env `ICEBERG_INTEROP_F18_JAVA_SHARED`; a clean no-op when unset |
 
 ## I want to...
 
 | I want to... | go to |
 |---|---|
 | Pin `with_commit_branch` scan + commit | `commit_branch.rs` |
+| Pin the Spark-equal DV container layout | `shared_puffin_dv/container.rs`, `interop_f18_dv_sibling_close.rs` |
 | Prove Java/Rust branch DML interop | `interop_branch_dml.rs` |
 | Prove V3 MoR UPDATE lineage on a branch vs Java | `interop_mor_branch_lineage.rs` |
 | Pin default (no branch) DML | `integration_datafusion_test.rs` |

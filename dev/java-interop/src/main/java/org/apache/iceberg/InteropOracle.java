@@ -493,6 +493,14 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "verify-interop-f18-sibling-close":
+        Path f18Dir = requireFixturesDir("interop.f18.dir");
+        int f18Failures = F18SiblingCloseOracle.verify(f18Dir);
+        System.out.println("verify-interop-f18-sibling-close: " + f18Failures + " failures");
+        if (f18Failures > 0) {
+          System.exit(1);
+        }
+        break;
       case "verify-interop-dv-table":
         // DELETION-VECTOR TABLE-level, DIRECTION 2 — "JAVA reads what RUST writes" (Increment
         // D4, the headline). The Rust GEN test (env ICEBERG_INTEROP_DV_TABLE_DIR,
@@ -9922,6 +9930,212 @@ public final class InteropOracle {
             "PASS dv-sql: every live delete file is a PUFFIN DV, one per data file ("
                 + dvByReferencedFile.size()
                 + " total)");
+      }
+      return failures;
+    }
+  }
+
+  static final class F18SiblingCloseOracle {
+    private F18SiblingCloseOracle() {}
+
+    private static final class DvEntry {
+      final String referenced;
+      final String container;
+      final long offset;
+      final long size;
+
+      DvEntry(String referenced, String container, long offset, long size) {
+        this.referenced = referenced;
+        this.container = container;
+        this.offset = offset;
+        this.size = size;
+      }
+
+      boolean sameAs(DvEntry other) {
+        return container.equals(other.container) && offset == other.offset && size == other.size;
+      }
+
+      @Override
+      public String toString() {
+        return referenced + " -> " + container + "@" + offset + "+" + size;
+      }
+    }
+
+    private static Map<String, DvEntry> readEntries(Path file) throws IOException {
+      Map<String, DvEntry> entries = new LinkedHashMap<>();
+      for (com.fasterxml.jackson.databind.JsonNode node :
+          JsonUtil.mapper().readTree(readString(file))) {
+        DvEntry entry =
+            new DvEntry(
+                node.get("referenced").asText(),
+                node.get("container").asText(),
+                node.get("offset").asLong(),
+                node.get("size").asLong());
+        entries.put(entry.referenced, entry);
+      }
+      return entries;
+    }
+
+    private static int summaryValue(Map<String, String> summary, String key) {
+      String value = summary.get(key);
+      return value == null ? 0 : Integer.parseInt(value);
+    }
+
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path after = dir.resolve("after_delete");
+      Path finalMetadata =
+          after.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      for (String fixture :
+          new String[] {"before_dvs.json", "after_dvs.json", "summary.json", "expected_rows.json"}) {
+        if (!Files.exists(after.resolve(fixture))) {
+          System.out.println("FAIL f18: missing fixture " + after.resolve(fixture));
+          return 1;
+        }
+      }
+      if (!Files.exists(finalMetadata)) {
+        System.out.println("FAIL f18: missing " + finalMetadata + " (run the Rust GEN path first)");
+        return 1;
+      }
+      int fixtureCount = 0;
+      try (java.util.stream.Stream<Path> listed = Files.list(after)) {
+        fixtureCount = (int) listed.filter(Files::isRegularFile).count();
+      }
+      if (fixtureCount != 4) {
+        System.out.println("FAIL f18: expected 4 fixture files under " + after + ", got " + fixtureCount);
+        return 1;
+      }
+
+      Map<String, DvEntry> before = readEntries(after.resolve("before_dvs.json"));
+      Map<String, DvEntry> rustAfter = readEntries(after.resolve("after_dvs.json"));
+      if (before.size() != 2) {
+        System.out.println("FAIL f18: the Java seed must leave two DV blobs, got " + before);
+        return 1;
+      }
+
+      TableMetadata metadata;
+      try {
+        metadata = TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException parseError) {
+        System.out.println("FAIL f18: Java could not parse the Rust-written metadata: " + parseError);
+        return 1;
+      }
+      if (metadata.formatVersion() != 3) {
+        System.out.println("FAIL f18: expected format-version 3, got " + metadata.formatVersion());
+        return 1;
+      }
+
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println("FAIL f18: Java could not READ the table Rust's DELETE committed: " + readError);
+        return 1;
+      }
+      Map<Long, String> expected = new LinkedHashMap<>();
+      for (com.fasterxml.jackson.databind.JsonNode node :
+          JsonUtil.mapper().readTree(readString(after.resolve("expected_rows.json")))) {
+        com.fasterxml.jackson.databind.JsonNode data = node.get("data");
+        expected.put(node.get("id").asLong(), data == null || data.isNull() ? null : data.asText());
+      }
+      if (!dataById.equals(expected)) {
+        System.out.println("FAIL f18: live rows " + dataById + " != expected " + expected);
+        failures++;
+      } else {
+        System.out.println("PASS f18: Java's production scan read " + dataById);
+      }
+
+      Map<String, DvEntry> live = new LinkedHashMap<>();
+      Snapshot current = table.currentSnapshot();
+      for (ManifestFile manifest : current.deleteManifests(io)) {
+        try (ManifestReader<DeleteFile> reader =
+            ManifestFiles.readDeleteManifest(manifest, io, metadata.specsById())) {
+          for (DeleteFile deleteFile : reader) {
+            if (deleteFile.format() != FileFormat.PUFFIN
+                || deleteFile.referencedDataFile() == null
+                || deleteFile.contentOffset() == null
+                || deleteFile.contentSizeInBytes() == null) {
+              System.out.println("FAIL f18: not a well-formed DV entry: " + deleteFile.location());
+              failures++;
+              continue;
+            }
+            live.put(
+                deleteFile.referencedDataFile(),
+                new DvEntry(
+                    deleteFile.referencedDataFile(),
+                    deleteFile.location(),
+                    deleteFile.contentOffset(),
+                    deleteFile.contentSizeInBytes()));
+          }
+        }
+      }
+      if (live.size() != 2) {
+        System.out.println("FAIL f18: expected one live DV per referenced data file, got " + live);
+        return failures + 1;
+      }
+      if (!live.keySet().equals(rustAfter.keySet())) {
+        System.out.println("FAIL f18: Java and Rust disagree on the referenced files: " + live + " vs " + rustAfter);
+        failures++;
+      }
+      for (Map.Entry<String, DvEntry> entry : live.entrySet()) {
+        DvEntry rustView = rustAfter.get(entry.getKey());
+        if (rustView == null || !entry.getValue().sameAs(rustView)) {
+          System.out.println("FAIL f18: Java read " + entry.getValue() + ", Rust wrote " + rustView);
+          failures++;
+        }
+      }
+
+      Set<String> containers = new java.util.LinkedHashSet<>();
+      for (DvEntry entry : live.values()) {
+        containers.add(entry.container);
+      }
+      if (containers.size() != 2) {
+        System.out.println("FAIL f18: expected TWO live containers after the second DELETE, got " + containers);
+        failures++;
+      } else {
+        System.out.println("PASS f18: two live containers " + containers);
+      }
+
+      int kept = 0;
+      int moved = 0;
+      for (Map.Entry<String, DvEntry> entry : live.entrySet()) {
+        DvEntry old = before.get(entry.getKey());
+        if (old == null) {
+          System.out.println("FAIL f18: no seed DV for " + entry.getKey());
+          failures++;
+        } else if (entry.getValue().sameAs(old)) {
+          kept++;
+        } else {
+          moved++;
+        }
+      }
+      if (kept != 1 || moved != 1) {
+        System.out.println(
+            "FAIL f18: expected exactly ONE unchanged sibling entry and ONE moved blob, got kept="
+                + kept + " moved=" + moved + " live=" + live + " seed=" + before);
+        failures++;
+      } else {
+        System.out.println("PASS f18: the untouched sibling entry kept its container, offset and size");
+      }
+
+      Map<String, String> summary = current.summary();
+      int removedDeleteFiles = summaryValue(summary, "removed-delete-files");
+      int removedDvs = summaryValue(summary, "removed-dvs");
+      int addedDeleteFiles = summaryValue(summary, "added-delete-files");
+      if (removedDeleteFiles != 1 || removedDvs != 1 || addedDeleteFiles != 1) {
+        System.out.println(
+            "FAIL f18: expected removed-delete-files=1 removed-dvs=1 added-delete-files=1, got "
+                + removedDeleteFiles + "/" + removedDvs + "/" + addedDeleteFiles);
+        failures++;
+      } else {
+        System.out.println("PASS f18: summary removed-delete-files=1 removed-dvs=1 added-delete-files=1");
       }
       return failures;
     }

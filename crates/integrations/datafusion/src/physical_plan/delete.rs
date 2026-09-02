@@ -358,7 +358,7 @@ async fn write_merge_on_read_deletes(
                 .into_iter()
                 .map(|file| (file, None))
                 .collect(),
-            removed: Vec::new(),
+            ..DvContainerClose::default()
         }),
         MergeOnReadDeleteKind::DeletionVectors => {
             write_deletion_vectors(table, pairs, scan_snapshot_id).await

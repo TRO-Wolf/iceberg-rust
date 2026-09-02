@@ -46,8 +46,6 @@ const REFERENCED_DATA_FILE_PROPERTY: &str = "referenced-data-file";
 /// Puffin blob property carrying the number of deleted positions.
 const CARDINALITY_PROPERTY: &str = "cardinality";
 
-/// Per-data-file accumulation state. Holds the position set and the partition context. The
-/// first `delete` call for a path captures the partition.
 #[derive(Debug)]
 struct DeletesForDataFile {
     positions: DeleteVector,
@@ -58,8 +56,6 @@ struct DeletesForDataFile {
 /// Java `loadPreviousDeletes` / `PositionDeleteIndex`.
 #[derive(Debug, Clone)]
 pub struct PreviousDeletes {
-    /// The data file's existing deleted positions. Load them through the production read path,
-    /// not by hand.
     positions: DeleteVector,
     /// The delete files those positions came from. Each file-scoped entry becomes a rewritten
     /// delete file after the merge.
@@ -224,14 +220,17 @@ impl DVFileWriter {
             ));
         }
 
-        let deletes = self
-            .deletes_by_path
-            .entry(data_file_path.to_string())
-            .or_insert_with(|| DeletesForDataFile {
-                positions: DeleteVector::default(),
-                partition_key: partition_key.cloned(),
-            });
+        if let Some(deletes) = self.deletes_by_path.get_mut(data_file_path) {
+            deletes.positions.insert(position);
+            return Ok(());
+        }
+        let mut deletes = DeletesForDataFile {
+            positions: DeleteVector::default(),
+            partition_key: partition_key.cloned(),
+        };
         deletes.positions.insert(position);
+        self.deletes_by_path
+            .insert(data_file_path.to_string(), deletes);
         Ok(())
     }
 

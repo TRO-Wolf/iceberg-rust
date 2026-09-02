@@ -27,8 +27,8 @@ use crate::{Error, ErrorKind, Result};
 
 /// Live Puffin DVs of the current snapshot, keyed by referenced data-file path.
 ///
-/// Merge with `DVFileWriter::with_previous_deletes`. Close a shared Puffin with
-/// `close_touched_dv_containers`: path-keyed `remove_deletes` drops sibling blobs.
+/// Merge with `DVFileWriter::with_previous_deletes`. Close a touched blob with
+/// `close_touched_dv_containers`, which leaves the sibling blobs of a shared Puffin in place.
 ///
 /// No snapshot yields an empty map. Missing referenced path or a duplicate is `DataInvalid`.
 pub async fn live_deletion_vectors_by_data_file(

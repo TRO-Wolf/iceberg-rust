@@ -60,7 +60,7 @@ fn arm_fail_before_container_write() -> FailCloseGuard {
     FailCloseGuard
 }
 
-/// T5: two Puffins; touching both containers rewrites each independently.
+/// T5: two Puffins; touching both leaves each old blob behind and writes ONE new container.
 #[tokio::test]
 async fn delete_touching_both_puffins_rewrites_each_container() {
     let harness = harness().await;
@@ -94,10 +94,10 @@ async fn delete_touching_both_puffins_rewrites_each_container() {
         books_puffin,
         "books Puffin must close independently"
     );
-    assert_ne!(
+    assert_eq!(
         electronics_after.file_path(),
         books_after.file_path(),
-        "containers must not merge"
+        "one statement writes ONE Puffin (Spark BaseDVFileWriter per write)"
     );
 }
 
