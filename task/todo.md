@@ -90,7 +90,7 @@ Ledger: [`pr6b-mor-branch-lineage-ledger.md`](pr6b-mor-branch-lineage-ledger.md)
 
 - [x] Decode iceberg-data 1.10.0 `IcebergGenerics$ScanBuilder`: no `useRef`; `project(Schema)` and `useSnapshot(long)` both fold into the same `TableScan`, so the lineage projection survives the branch-head pin.
 - [x] Java fixture: one V3 merge-on-read table, `main` rows 1/2/3, `createBranch("b")`, `newAppend().toBranch("b")` rows 10/11. Java records its own seed lineage `1=0=1 2=1=1 3=2=1 10=3=2 11=4=2`, main file set, main snapshot id and `next-row-id` 5.
-- [x] Rust GEN: two MoR UPDATEs of id 10 through `IcebergTableProvider::with_commit_branch("b")`.
+- [x] Rust GEN: two MoR UPDATE statements of id 10 through `IcebergTableProvider::with_commit_branch("b")`.
 - [x] Java verify: branch head keeps `_row_id` 3, sequence 2 → 3 → 4, unmatched rows unchanged, `main` rows / ref / current snapshot / file set untouched, `next-row-id` 5 → 6 → 7 (a table counter: one added row per UPDATE), cross-checked against live Spark 4.1.2 + Iceberg 1.11.0 at the same layout.
 - [x] Runner `dev/java-interop/run-interop-mor-branch-lineage.sh` (six steps, prerequisites hard-fail, 1 fixture asserted, 5 GEN artifacts asserted, sabotage fail-closed). `SUITE_FLOOR_DEFAULT` 56 → 58.
 - [x] Mutations 12 red out of 12 (4 Rust, 8 Java-verify one-knob bends).

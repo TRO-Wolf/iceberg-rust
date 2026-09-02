@@ -27,7 +27,7 @@ Plan of record: `task/iceberg-v3-production-work-plan-2026-09-01.md`, PR-6B. Mat
 
 | Id | Proposition | Result |
 |---|---|---|
-| C-006 (PR-6B cell) | On a diverged branch a V3 merge-on-read UPDATE keeps the updated row's `_row_id`, advances its `_last_updated_sequence_number` once per UPDATE, leaves unmatched rows' lineage untouched, leaves `main` (rows, current snapshot id, `main` ref, `main` file set) untouched, and advances `next-row-id` by the one row each UPDATE adds. Java's production scan of the branch head reads back exactly what Rust wrote. | PROVEN. Measured on the branch head: `_row_id` 3 stable across both UPDATEs, sequence 2 → 3 → 4, rows 1/2/3/11 unchanged, `main` at `1=0=1 2=1=1 3=2=1` with its single file and its snapshot/ref unmoved, `next-row-id` 5 → 6 → 7. |
+| C-006 (PR-6B cell) | On a diverged branch a V3 merge-on-read UPDATE keeps the updated row's `_row_id`, advances its `_last_updated_sequence_number` once per UPDATE, leaves unmatched rows' lineage untouched, leaves `main` (rows, current snapshot id, `main` ref, `main` file set) untouched, and advances `next-row-id` by the one row each UPDATE adds. Java's production scan of the branch head reads back exactly what Rust wrote. | PROVEN. Measured on the branch head: `_row_id` 3 stable across both UPDATE statements, sequence 2 → 3 → 4, rows 1/2/3/11 unchanged, `main` at `1=0=1 2=1=1 3=2=1` with its single file and its snapshot/ref unmoved, `next-row-id` 5 → 6 → 7. |
 | C-007 (PR-6B slice) | The cell is proven by a runner that hard-fails on any missing prerequisite, asserts the fixture count, and carries a sabotage pass so the lineage assertion is non-vacuous. | PROVEN. `dev/java-interop/run-interop-mor-branch-lineage.sh`, six steps, 1 Java fixture asserted twice (`fixture_count.json` and the metadata glob), 7 Rust GEN artifacts asserted non-empty, sabotage RED on a one-knob sequence-number bend. |
 
 ## 2. Java 1.10.0 decode
@@ -83,7 +83,7 @@ Direction 2 is judged against these Java-side observations as well as against th
 | seed `main` | `(1,0,1) (2,1,1) (3,2,1)` | identical |
 | after UPDATE 1 | id 10 → `_row_id` 3, seq 3; `next-row-id` 6 | identical |
 | after UPDATE 2 | id 10 → `_row_id` 3, seq 4; `next-row-id` 7 | identical |
-| `main` after both branch UPDATEs | `(1,0,1) (2,1,1) (3,2,1)` | identical |
+| `main` after both branch UPDATE statements | `(1,0,1) (2,1,1) (3,2,1)` | identical |
 
 `NEXT_ROW_ID_SEQUENCE 5 6 7` on both sides. Nothing in the fork's numbers diverges from the live oracle at this layout.
 
@@ -100,7 +100,7 @@ Direction 2 is judged against these Java-side observations as well as against th
 
 | Test | Result |
 |---|---|
-| `mor_update_on_branch_keeps_row_id_and_advances_seq_twice` (offline) | updated row keeps one `_row_id` across two branch UPDATEs; sequence advances each time; unmatched branch rows unchanged; `main` snapshot, `main` ref, files and lineage unchanged; `next-row-id` 5 → 6 → 7 pinned absolutely and as seed + 2; branch file set is `main` plus three |
+| `mor_update_on_branch_keeps_row_id_and_advances_seq_twice` (offline) | updated row keeps one `_row_id` across two branch UPDATE statements; sequence advances each time; unmatched branch rows unchanged; `main` snapshot, `main` ref, files and lineage unchanged; `next-row-id` 5 → 6 → 7 pinned absolutely and as seed + 2; branch file set is `main` plus three |
 | `rust_reads_java_branch_lineage` (Direction 1, env-gated) | Rust's branch-head and `main` lineage scans equal Java's seed observations; the Java branch diverges |
 | `rust_updates_java_branch_lineage_gen` (Direction 2, env-gated) | Rust updates the Java-created branch twice and writes `rust_after/` for Java to judge |
 | Java `verify-interop-mor-branch-lineage` | 0 failures: `main_snapshot` 1, `next_row_id` `5 -> 6 -> 7 (one added row per UPDATE)`, `main_files`, `branch_files`, `main_lineage`, `branch_lineage` `10=3=4`, `updated_row_id` 3, `seq_advanced_twice` 2 → 3 → 4 |
@@ -163,5 +163,5 @@ Java interop command and fixture count: bash dev/java-interop/run-interop-mor-br
 CI-only evidence gap: Docker make test legs excused; the suite is nightly-only (run_interop_suites.sh floor raised to 57)
 Breaking public API change: none — the commit adds no crate source
 Critic attestation: pending independent Critic
-Open findings and dispositions: none. The PR-6A dependency is satisfied on this rebase. next-row-id is a table counter and moves 5 -> 6 -> 7 across the two branch UPDATEs; main's snapshot, ref, file set and lineage are the invariants, not main's counter. Cross-checked against live Spark 4.1.2 + Iceberg 1.11.0 at the same layout.
+Open findings and dispositions: none. The PR-6A dependency is satisfied on this rebase. next-row-id is a table counter and moves 5 -> 6 -> 7 across the two branch UPDATE statements; main's snapshot, ref, file set and lineage are the invariants, not main's counter. Cross-checked against live Spark 4.1.2 + Iceberg 1.11.0 at the same layout.
 ```
