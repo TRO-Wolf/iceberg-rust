@@ -21,9 +21,8 @@
 //! `removedDataFilePaths.contains(referencedDataFile())`. The apply path drops DVs
 //! only. File-scoped parquet position deletes are a fork extension of that predicate.
 //!
-//! Delete-file removal is keyed by the Java `DeleteFileSet` triple, so a drop no longer
-//! takes a sibling blob at the same Puffin path. This path still rewrites those siblings
-//! into a new Puffin; that copy is now redundant rather than load-bearing (unit F-19).
+//! Delete-file removal is keyed by the Java `DeleteFileSet` triple, so a drop no longer takes
+//! a sibling blob at the same Puffin path. This path still rewrites those siblings anyway.
 
 use std::collections::HashSet;
 

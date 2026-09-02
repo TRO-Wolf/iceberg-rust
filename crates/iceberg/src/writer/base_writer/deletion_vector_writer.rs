@@ -50,8 +50,8 @@ const REFERENCED_DATA_FILE_PROPERTY: &str = "referenced-data-file";
 /// Puffin blob property carrying the number of deleted positions.
 const CARDINALITY_PROPERTY: &str = "cardinality";
 
-/// Per-data-file accumulation state: the position set and the partition context. The first
-/// `delete` call for a path captures the partition.
+/// Per-data-file accumulation state. Holds the position set and the partition context. The
+/// first `delete` call for a path captures the partition.
 #[derive(Debug)]
 struct DeletesForDataFile {
     positions: DeleteVector,

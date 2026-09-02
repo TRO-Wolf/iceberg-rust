@@ -154,7 +154,7 @@ sabotages a COPY and requires the oracle to go red. `SUITE_FLOOR_DEFAULT` 63 -> 
 | `cargo test -p iceberg-datafusion --locked` | 0 |
 | `typos .` | 0 |
 | `make check-matrix-anchors` | 0 |
-| `scripts/check_rust_file_size.py` | 0 (ceilings ratcheted DOWN: `transaction/snapshot.rs` 3502 -> 3491, `deletion_vector_writer.rs` 1426 -> 1425) |
+| `scripts/check_rust_file_size.py` | 0 (ceilings ratcheted DOWN: `transaction/snapshot.rs` 3502 -> 3490, `writer/base_writer/deletion_vector_writer.rs` 1426 -> 1400, `physical_plan/delete.rs` 2081 -> 2075) |
 | `dev/java-interop/run-interop-f18-dv-sibling-close.sh` | 0 |
 | `scripts/run_interop_suites.sh` (all 64 suites) | recorded in the round-2 hand-back |
 
@@ -181,7 +181,7 @@ Files changed: crates/iceberg/src/transaction/snapshot.rs; crates/iceberg/src/tr
 Behavior before: a DELETE touching one blob of a shared Puffin rewrote every blob in it, moved the sibling entry, and reported removed-dvs 2. A 64-blob container cost 19,830 rewritten bytes per later statement.
 Behavior after: only the touched blob is rewritten, into ONE new container per statement; the sibling entry keeps its path, content_offset, content_size_in_bytes and data sequence; summary removed-delete-files 1 / removed-dvs 1 / added-delete-files 1; 388 bytes per later statement. Removal of a DELETE file is keyed by the Java DeleteFileSet triple.
 Negative cases: a sabotaged seed offset turns the Java oracle red (kept=0 moved=2); three source mutations each turn the pins red
-Test command and population: cargo test -p iceberg --locked; cargo test -p iceberg-datafusion --locked; shared_puffin_dv is 20 passed / 2 ignored
+Test command and population: cargo test -p iceberg --locked; cargo test -p iceberg-datafusion --locked; shared_puffin_dv is 20 passed / 3 ignored
 Mutations, one at a time: M1 7 red of 20; M2 6 red of 20; M3 8 red of 20; M4 interop oracle red; M5 1 red of 2 (manifest-read pin)
 Java interop command and fixture count: dev/java-interop/run-interop-f18-dv-sibling-close.sh — 4 fixtures + final.metadata.json; sabotage FAIL-closed
 CI-only evidence gap: Docker make test legs excused (Docker unavailable)
