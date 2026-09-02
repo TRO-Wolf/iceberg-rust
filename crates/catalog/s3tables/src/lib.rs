@@ -49,6 +49,9 @@
 #![deny(missing_docs)]
 
 mod catalog;
+#[cfg(test)]
+mod commit_outcome_tests;
+mod commit_transport;
 mod utils;
 
 pub use catalog::*;

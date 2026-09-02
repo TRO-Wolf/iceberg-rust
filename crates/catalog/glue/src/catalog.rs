@@ -22,7 +22,6 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use aws_sdk_glue::operation::create_table::CreateTableError;
-use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
 use iceberg::io::{
     FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
@@ -37,6 +36,13 @@ use iceberg::{
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
+#[cfg(test)]
+use crate::commit_transport::GlueCommitHarness;
+#[cfg(test)]
+use crate::commit_transport::glue_commit_send_landed;
+use crate::commit_transport::{
+    GlueCommitTransport, GlueUpdateTableCall, LiveGlueCommitTransport, map_glue_commit_send,
+};
 use crate::error::{from_aws_build_error, from_aws_sdk_error};
 use crate::utils::{
     convert_to_database, convert_to_glue_table, convert_to_namespace, create_sdk_config,
@@ -180,6 +186,9 @@ pub struct GlueCatalog {
     config: GlueCatalogConfig,
     client: GlueClient,
     file_io: FileIO,
+    commit_transport: Arc<dyn GlueCommitTransport>,
+    #[cfg(test)]
+    outcome_harness: Option<Arc<GlueCommitHarness>>,
 }
 
 impl Debug for GlueCatalog {
@@ -228,6 +237,10 @@ impl GlueCatalog {
         }
 
         let client = aws_sdk_glue::Client::new(&sdk_config);
+        let commit_transport = Arc::new(LiveGlueCommitTransport::new(
+            client.clone(),
+            config.catalog_id.clone(),
+        ));
 
         // Use provided factory or default to OpenDalStorageFactory::S3
         let factory = storage_factory.unwrap_or_else(|| {
@@ -244,7 +257,52 @@ impl GlueCatalog {
             config,
             client: GlueClient(client),
             file_io,
+            commit_transport,
+            #[cfg(test)]
+            outcome_harness: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_commit_attempts(&self) -> u64 {
+        self.commit_transport.catalog_commit_attempts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_commit_transport(
+        mut self,
+        commit_transport: Arc<dyn GlueCommitTransport>,
+    ) -> Self {
+        self.commit_transport = commit_transport;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_commit_transport(&self) -> Arc<dyn GlueCommitTransport> {
+        Arc::clone(&self.commit_transport)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_commit_outcome_tests(
+        file_io: FileIO,
+        commit_transport: Arc<dyn GlueCommitTransport>,
+        table: Table,
+        client: aws_sdk_glue::Client,
+    ) -> Self {
+        let harness = GlueCommitHarness::new(table, Some("v0".to_string()));
+        GlueCatalog {
+            config: GlueCatalogConfig {
+                name: Some("pr5a-glue".to_string()),
+                uri: None,
+                catalog_id: None,
+                warehouse: "memory://pr5a".to_string(),
+                props: HashMap::new(),
+            },
+            client: GlueClient(client),
+            file_io,
+            commit_transport,
+            outcome_harness: Some(harness),
+        }
     }
     /// Get the catalogs `FileIO`
     pub fn file_io(&self) -> FileIO {
@@ -263,6 +321,11 @@ impl GlueCatalog {
     )> {
         let db_name = validate_namespace(table.namespace())?;
         let table_name = table.name();
+
+        #[cfg(test)]
+        if let Some(harness) = &self.outcome_harness {
+            return Ok(harness.pointer());
+        }
 
         let builder = self
             .client
@@ -306,6 +369,33 @@ impl GlueCatalog {
     ) -> Result<(Table, Option<String>)> {
         let db_name = validate_namespace(table.namespace())?;
         let table_name = table.name();
+        #[cfg(test)]
+        if let Some(harness) = &self.outcome_harness {
+            let loaded = harness.table();
+            let version_id = harness.pointer().1;
+            let rebound = Table::builder()
+                .file_io(self.file_io())
+                .metadata_location(
+                    loaded
+                        .metadata_location()
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Unexpected,
+                                format!(
+                                    "Table object for database: {db_name} and table: {table_name} is missing a metadata location"
+                                ),
+                            )
+                        })?
+                        .to_string(),
+                )
+                .metadata(loaded.metadata_ref())
+                .identifier(TableIdent::new(
+                    NamespaceIdent::new(db_name),
+                    table_name.to_owned(),
+                ))
+                .build()?;
+            return Ok((rebound, version_id));
+        }
         let (metadata_location, version_id) = self.get_table_pointer(table).await?;
 
         let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
@@ -941,58 +1031,29 @@ impl Catalog for GlueCatalog {
             .write_to(staged_table.file_io(), staged_metadata_location)
             .await?;
 
-        // Persist staged table to Glue with optimistic locking
-        let mut builder = self
-            .client
-            .0
-            .update_table()
-            .database_name(table_namespace)
-            .set_skip_archive(Some(true)) // todo make this configurable
-            .table_input(convert_to_glue_table(
-                table_ident.name(),
-                staged_metadata_location.to_string(),
-                staged_table.metadata(),
-                staged_table.metadata().properties(),
-                Some(current_metadata_location),
-            )?);
-
-        // Add VersionId for optimistic locking
-        if let Some(version_id) = current_version_id {
-            builder = builder.version_id(version_id);
+        let table_input = convert_to_glue_table(
+            table_ident.name(),
+            staged_metadata_location.to_string(),
+            staged_table.metadata(),
+            staged_table.metadata().properties(),
+            Some(current_metadata_location),
+        )?;
+        let send = self
+            .commit_transport
+            .send_update_table(GlueUpdateTableCall {
+                database_name: table_namespace,
+                table_input,
+                version_id: current_version_id,
+                catalog_id: self.config.catalog_id.clone(),
+            })
+            .await;
+        #[cfg(test)]
+        if glue_commit_send_landed(&send)
+            && let Some(harness) = &self.outcome_harness
+        {
+            harness.publish(staged_table.clone());
         }
-
-        let builder = with_catalog_id!(builder, self.config);
-        // Sent-vs-unsent classification of the commit call (GAP_MATRIX row R157): a failure
-        // that may have occurred AFTER the request reached Glue maps to `CommitStateUnknown`
-        // (Java `GlueTableOperations.doCommit` surfaces `CommitStateUnknownException` when the
-        // outcome cannot be confirmed); a never-sent failure keeps the terminal mapping; a
-        // modeled service response classifies per `map_update_table_service_error`.
-        let _ =
-            builder.send().await.map_err(
-                |e| match crate::error::classify_commit_send_disposition(&e) {
-                    crate::error::CommitSendDisposition::MaybeSent => Error::new(
-                        ErrorKind::CommitStateUnknown,
-                        format!(
-                            "Commit outcome unknown for table {table_ident}: the update request \
-                         may have reached Glue before the failure. Verify whether the commit \
-                         landed before retrying: retrying an already-applied commit \
-                         duplicates its changes."
-                        ),
-                    )
-                    .with_source(anyhow!("aws sdk error: {e:?}")),
-                    crate::error::CommitSendDisposition::NeverSent => Error::new(
-                        ErrorKind::Unexpected,
-                        format!(
-                            "Operation failed for table: {table_ident} before the update request \
-                         was sent"
-                        ),
-                    )
-                    .with_source(anyhow!("aws sdk error: {e:?}")),
-                    crate::error::CommitSendDisposition::ResponseReceived => {
-                        map_update_table_service_error(e.into_service_error(), &table_ident)
-                    }
-                },
-            )?;
+        map_glue_commit_send(send, &table_ident)?;
 
         Ok(staged_table)
     }
@@ -1011,42 +1072,6 @@ fn namespace_not_empty_error(db_name: &str) -> Error {
         ErrorKind::NamespaceNotEmpty,
         format!("Database with name: {db_name} is not empty"),
     )
-}
-
-/// Map a modeled Glue `UpdateTableError` (the service RESPONDED) on the commit path.
-///
-/// Java `GlueTableOperations` (iceberg-aws 1.10.0): `ConcurrentModificationException` →
-/// `CommitFailedException` (retryable, `handleAWSExceptions` L354-356); `EntityNotFoundException`
-/// → `NotFoundException` (L363-365); a 5xx `AwsServiceException` that survives reconciliation →
-/// `CommitStateUnknownException` (L180-190 — Glue's `InternalServiceException` is the 5xx class,
-/// and `OperationTimeoutException` reports the operation timing out server-side, equally
-/// ambiguous). Everything else keeps the terminal mapping.
-fn map_update_table_service_error(error: UpdateTableError, table_ident: &TableIdent) -> Error {
-    match error {
-        UpdateTableError::EntityNotFoundException(_) => Error::new(
-            ErrorKind::TableNotFound,
-            format!("Table {table_ident} is not found"),
-        ),
-        UpdateTableError::ConcurrentModificationException(_) => Error::new(
-            ErrorKind::CatalogCommitConflicts,
-            format!("Commit failed for table: {table_ident}"),
-        )
-        .with_retryable(true),
-        UpdateTableError::InternalServiceException(_)
-        | UpdateTableError::OperationTimeoutException(_) => Error::new(
-            ErrorKind::CommitStateUnknown,
-            format!(
-                "Commit outcome unknown for table {table_ident}: Glue failed (or timed out) \
-                 while processing the update — it may have been applied. Verify before \
-                 retrying: retrying an already-applied commit duplicates its changes."
-            ),
-        ),
-        _ => Error::new(
-            ErrorKind::Unexpected,
-            format!("Operation failed for table: {table_ident} for hitting aws sdk error"),
-        ),
-    }
-    .with_source(anyhow!("aws sdk error: {error:?}"))
 }
 
 #[cfg(test)]
@@ -1087,75 +1112,6 @@ mod tests {
     async fn test_name_defaults_to_sentinel_when_unset() {
         let catalog = build_glue_catalog(None, HashMap::new()).await;
         assert_eq!(catalog.name(), UNNAMED_CATALOG);
-    }
-
-    fn test_table_ident() -> TableIdent {
-        TableIdent::from_strs(["ns1", "test1"]).expect("build test table ident")
-    }
-
-    /// Risk (GAP_MATRIX row R157): Glue's CAS conflict (`ConcurrentModificationException`) is
-    /// reclassified unknown-outcome — the commit retry loop then STOPS retrying plain
-    /// optimistic-concurrency conflicts, breaking every concurrent writer (Java maps it to the
-    /// retryable `CommitFailedException`, `GlueTableOperations.handleAWSExceptions` L354-356).
-    /// Pins that the conflict stays `CatalogCommitConflicts` + retryable.
-    #[test]
-    fn test_concurrent_modification_stays_retryable_conflict() {
-        let error = map_update_table_service_error(
-            UpdateTableError::ConcurrentModificationException(
-                aws_sdk_glue::types::error::ConcurrentModificationException::builder().build(),
-            ),
-            &test_table_ident(),
-        );
-        assert_eq!(error.kind(), iceberg::ErrorKind::CatalogCommitConflicts);
-        assert!(error.retryable(), "a CAS conflict is safely retryable");
-    }
-
-    /// Risk (GAP_MATRIX row R157): Glue's 5xx (`InternalServiceException`) or server-side
-    /// operation timeout keeps the terminal `Unexpected` mapping — the caller cannot tell
-    /// may-have-landed from safe-to-rerun, and an outer re-run duplicates an applied commit
-    /// (Java surfaces `CommitStateUnknownException` when reconciliation cannot confirm the
-    /// outcome, `GlueTableOperations.doCommit` L180-190). Pins the unknown-outcome mapping,
-    /// non-retryable.
-    #[test]
-    fn test_internal_service_and_operation_timeout_map_to_unknown_outcome() {
-        for error in [
-            UpdateTableError::InternalServiceException(
-                aws_sdk_glue::types::error::InternalServiceException::builder().build(),
-            ),
-            UpdateTableError::OperationTimeoutException(
-                aws_sdk_glue::types::error::OperationTimeoutException::builder().build(),
-            ),
-        ] {
-            let mapped = map_update_table_service_error(error, &test_table_ident());
-            assert_eq!(mapped.kind(), iceberg::ErrorKind::CommitStateUnknown);
-            assert!(
-                !mapped.retryable(),
-                "an unknown-outcome commit error must not advertise retryability"
-            );
-        }
-    }
-
-    /// Risk (GAP_MATRIX row R157, over-broadening): a DEFINITE service rejection (entity not
-    /// found, or any other modeled 4xx) classifies as unknown, hiding a plain terminal failure
-    /// behind reconciliation guidance. Pins the definite arms.
-    #[test]
-    fn test_definite_service_rejections_stay_terminal() {
-        let not_found = map_update_table_service_error(
-            UpdateTableError::EntityNotFoundException(
-                aws_sdk_glue::types::error::EntityNotFoundException::builder().build(),
-            ),
-            &test_table_ident(),
-        );
-        assert_eq!(not_found.kind(), iceberg::ErrorKind::TableNotFound);
-
-        let invalid_input = map_update_table_service_error(
-            UpdateTableError::InvalidInputException(
-                aws_sdk_glue::types::error::InvalidInputException::builder().build(),
-            ),
-            &test_table_ident(),
-        );
-        assert_eq!(invalid_input.kind(), iceberg::ErrorKind::Unexpected);
-        assert!(!invalid_input.retryable());
     }
 
     #[tokio::test]

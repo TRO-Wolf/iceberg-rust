@@ -36,6 +36,7 @@ generate/verify flow; this map only routes.**
 | `pom.xml` | Maven module, `package org.apache.iceberg` (reaches package-private ctors like `@VisibleForTesting SchemaUpdate(Schema,int)`) |
 | `src/.../InteropOracle.java` | all oracles in one program: schema / partition / manage-snapshots `generate` + `verify`, scan-exec data writers, inspection expectations |
 | `run.sh` | metadata-evolution oracle pass (generate fixtures + verify Rust output) |
+| `run-pr5a-catalog-commit-decode.sh` | PR-5A javap decode of Glue `doCommit` / `handleAWSExceptions` and REST commit 409/5xx/403. Hard-fails on a missing jar or a fixture count other than 12. |
 | `run-interop-scan-exec.sh` / `-d2.sh` | data-level scan-execution interop (Java writes parquet + position delete; D2: Java reads Rust) |
 | `run-interop-eq-delete.sh` / `-d2.sh` | equality-delete scan-exec interop, both directions |
 | `run-interop-part.sh` / `-d2.sh` | partitioned merge-on-read scan-exec interop, both directions |

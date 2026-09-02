@@ -24,6 +24,18 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+## ACTIVE (2026-09-01): PR-5A catalog commit-outcome conformance (rows R110, R157)
+
+Ledger: [`pr5a-catalog-commit-outcomes-ledger.md`](pr5a-catalog-commit-outcomes-ledger.md). Plan clause C-005 / section 11.1. Cite plan as `task/iceberg-v3-production-work-plan-2026-09-01.md`.
+
+- [x] Narrow Glue and S3 Tables commit-transport seams with test constructors (stop-before-send, discard-success, modeled service).
+- [x] Offline proofs per shared `update_table` path for the seven commit classes: never-sent, maybe-sent, accepted-then-lost, reconcile success, reconcile exhaustion, metadata-only unknown, no blind retry.
+- [x] One CAS/conflict rebase test per catalog; one terminal authorization test per catalog.
+- [x] Phase A Java decode (`GlueTableOperations.doCommit` / REST commit handlers). No `S3TablesTableOperations` in iceberg-aws 1.10.0.
+- [x] Credentialed runner under `dev/` (not executed here). GAP_MATRIX rows record offline evidence; credentialed cells pending.
+- [x] Mutations, javap decode (12 needles), maps, ledger, `make check` + crate tests.
+
+Outcome: seams and offline proofs land. Credentialed execution is the orchestrator's next step. Docker `make test` legs excused.
 ## ACTIVE (2026-09-01): PR-2 partition-safe RewriteDataFiles (row R135, C-001)
 
 Ledger: [`pr2-partition-safe-rewrite-ledger.md`](pr2-partition-safe-rewrite-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md`.

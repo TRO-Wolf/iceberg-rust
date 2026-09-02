@@ -24,7 +24,6 @@ use aws_sdk_s3tables::operation::create_table::CreateTableOutput;
 use aws_sdk_s3tables::operation::get_namespace::GetNamespaceOutput;
 use aws_sdk_s3tables::operation::get_table::GetTableOutput;
 use aws_sdk_s3tables::operation::list_tables::ListTablesOutput;
-use aws_sdk_s3tables::operation::update_table_metadata_location::UpdateTableMetadataLocationError;
 use aws_sdk_s3tables::types::OpenTableFormat;
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
@@ -36,6 +35,14 @@ use iceberg::{
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
+#[cfg(test)]
+use crate::commit_transport::S3TablesCommitHarness;
+#[cfg(test)]
+use crate::commit_transport::s3tables_commit_send_landed;
+use crate::commit_transport::{
+    LiveS3TablesCommitTransport, S3TablesCommitTransport, S3TablesUpdateCall,
+    map_s3tables_commit_send,
+};
 use crate::utils::create_sdk_config;
 
 /// S3Tables table bucket ARN property
@@ -194,11 +201,21 @@ impl CatalogBuilder for S3TablesCatalogBuilder {
 }
 
 /// S3Tables catalog implementation.
-#[derive(Debug)]
 pub struct S3TablesCatalog {
     config: S3TablesCatalogConfig,
     s3tables_client: aws_sdk_s3tables::Client,
     file_io: FileIO,
+    commit_transport: Arc<dyn S3TablesCommitTransport>,
+    #[cfg(test)]
+    outcome_harness: Option<Arc<S3TablesCommitHarness>>,
+}
+
+impl std::fmt::Debug for S3TablesCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3TablesCatalog")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl S3TablesCatalog {
@@ -224,11 +241,58 @@ impl S3TablesCatalog {
             .with_props(&config.props)
             .build();
 
+        let commit_transport = Arc::new(LiveS3TablesCommitTransport::new(s3tables_client.clone()));
+
         Ok(Self {
             config,
             s3tables_client,
             file_io,
+            commit_transport,
+            #[cfg(test)]
+            outcome_harness: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_commit_attempts(&self) -> u64 {
+        self.commit_transport.catalog_commit_attempts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_commit_transport(
+        mut self,
+        commit_transport: Arc<dyn S3TablesCommitTransport>,
+    ) -> Self {
+        self.commit_transport = commit_transport;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_commit_transport(&self) -> Arc<dyn S3TablesCommitTransport> {
+        Arc::clone(&self.commit_transport)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_commit_outcome_tests(
+        file_io: FileIO,
+        commit_transport: Arc<dyn S3TablesCommitTransport>,
+        table: Table,
+        client: aws_sdk_s3tables::Client,
+    ) -> Self {
+        let harness = S3TablesCommitHarness::new(table, "v0".to_string());
+        Self {
+            config: S3TablesCatalogConfig {
+                name: Some("pr5a-s3tables".to_string()),
+                table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/pr5a".to_string(),
+                endpoint_url: None,
+                client: None,
+                props: HashMap::new(),
+            },
+            s3tables_client: client,
+            file_io,
+            commit_transport,
+            outcome_harness: Some(harness),
+        }
     }
 
     /// GetTable for the service metadata pointer and version_token. Reads no object storage.
@@ -239,6 +303,10 @@ impl S3TablesCatalog {
         String, /* metadata_location */
         String, /* version_token */
     )> {
+        #[cfg(test)]
+        if let Some(harness) = &self.outcome_harness {
+            return Ok(harness.pointer());
+        }
         let req = self
             .s3tables_client
             .get_table()
@@ -264,6 +332,31 @@ impl S3TablesCatalog {
         &self,
         table_ident: &TableIdent,
     ) -> Result<(Table, String)> {
+        #[cfg(test)]
+        if let Some(harness) = &self.outcome_harness {
+            let loaded = harness.table();
+            let version_token = harness.pointer().1;
+            let rebound = Table::builder()
+                .identifier(table_ident.clone())
+                .metadata(loaded.metadata_ref())
+                .metadata_location(
+                    loaded
+                        .metadata_location()
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Unexpected,
+                                format!(
+                                    "Table {} does not have metadata location",
+                                    table_ident.name()
+                                ),
+                            )
+                        })?
+                        .to_string(),
+                )
+                .file_io(self.file_io.clone())
+                .build()?;
+            return Ok((rebound, version_token));
+        }
         let (metadata_location, version_token) = self.get_table_pointer(table_ident).await?;
         let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
 
@@ -644,6 +737,7 @@ impl Catalog for S3TablesCatalog {
             table_namespace,
             version_token,
             staged_metadata_location,
+            Some(&staged_table),
         )
         .await?;
 
@@ -685,6 +779,7 @@ impl Catalog for S3TablesCatalog {
             table_namespace,
             version_token,
             &new_metadata_location,
+            Some(&table),
         )
         .await?;
 
@@ -700,49 +795,33 @@ impl S3TablesCatalog {
         table_namespace: &NamespaceIdent,
         version_token: String,
         metadata_location: &str,
+        #[cfg_attr(not(test), allow(unused_variables))] published: Option<&Table>,
     ) -> Result<()> {
-        let builder = self
-            .s3tables_client
-            .update_table_metadata_location()
-            .table_bucket_arn(&self.config.table_bucket_arn)
-            .namespace(table_namespace.to_url_string())
-            .name(table_ident.name())
-            .version_token(version_token)
-            .metadata_location(metadata_location);
-
-        // S3 Tables maintenance commits concurrently with every writer, so an ambiguous
-        // outcome here is common. A retry of an applied commit duplicates rows. So a failure
-        // that may have reached the service maps to `CommitStateUnknown` (row R157).
-        let _ = builder
-            .send()
-            .await
-            .map_err(|e| match classify_commit_send_disposition(&e) {
-                CommitSendDisposition::MaybeSent => Error::new(
-                    ErrorKind::CommitStateUnknown,
-                    format!(
-                        "Commit outcome unknown for table {table_ident}: the update request \
-                         may have reached S3 Tables before the failure. Verify whether the \
-                         commit landed before retrying: retrying an already-applied commit \
-                         duplicates its changes."
-                    ),
-                )
-                .with_source(anyhow::Error::msg(format!("aws sdk error: {e:?}"))),
-                CommitSendDisposition::NeverSent => Error::new(
-                    ErrorKind::Unexpected,
-                    format!(
-                        "Operation failed for table: {table_ident} before the update request \
-                         was sent"
-                    ),
-                )
-                .with_source(anyhow::Error::msg(format!("aws sdk error: {e:?}"))),
-                CommitSendDisposition::ResponseReceived => {
-                    map_update_table_metadata_location_service_error(
-                        e.into_service_error(),
-                        table_ident,
-                    )
-                }
-            })?;
+        let send = self
+            .commit_transport
+            .send_update_metadata_location(S3TablesUpdateCall {
+                table_bucket_arn: self.config.table_bucket_arn.clone(),
+                namespace: table_namespace.to_url_string(),
+                name: table_ident.name().to_string(),
+                version_token,
+                metadata_location: metadata_location.to_string(),
+            })
+            .await;
+        #[cfg(test)]
+        if s3tables_commit_send_landed(&send)
+            && let Some(table) = published
+        {
+            self.publish_outcome_harness(table);
+        }
+        map_s3tables_commit_send(send, table_ident)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn publish_outcome_harness(&self, table: &Table) {
+        if let Some(harness) = &self.outcome_harness {
+            harness.publish(table.clone());
+        }
     }
 }
 
@@ -755,170 +834,12 @@ where T: std::fmt::Debug {
     )
 }
 
-/// Where a failed AWS SDK commit call stopped, classified sent-vs-unsent (row R157).
-///
-/// The Glue catalog holds a copy of this classifier. The two AWS SDK crates share no common
-/// crate that can host one copy.
-enum CommitSendDisposition {
-    /// The request never left the client. The failure keeps its terminal mapping.
-    NeverSent,
-    /// The request may have reached the service. The commit outcome is ambiguous.
-    MaybeSent,
-    /// The service definitively responded with a modeled error.
-    ResponseReceived,
-}
-
-/// Classify the transport layer of a failed SDK call on the commit path.
-///
-/// Java `BaseMetastoreTableOperations.checkCommitStatus` reports `UNKNOWN` for the same class
-/// of failure. The SDK cannot tell connect-refused from reset-after-send, so this function
-/// picks the ambiguous side. A needless reconciliation is safe. A duplicate commit is not.
-fn classify_commit_send_disposition<E, R>(
-    error: &aws_sdk_s3tables::error::SdkError<E, R>,
-) -> CommitSendDisposition {
-    use aws_sdk_s3tables::error::SdkError;
-    match error {
-        SdkError::ConstructionFailure(_) => CommitSendDisposition::NeverSent,
-        SdkError::DispatchFailure(dispatch) if dispatch.is_user() || dispatch.is_other() => {
-            CommitSendDisposition::NeverSent
-        }
-        SdkError::ServiceError(_) => CommitSendDisposition::ResponseReceived,
-        _ => CommitSendDisposition::MaybeSent,
-    }
-}
-
-/// Map a modeled `UpdateTableMetadataLocationError` on the commit path.
-///
-/// `ConflictException` is the version-token CAS conflict, so it stays retryable.
-/// `InternalServerErrorException` may have applied the update, so it maps to
-/// `CommitStateUnknown`. Java `ErrorHandlers$CommitErrorHandler` maps 500 the same way.
-fn map_update_table_metadata_location_service_error(
-    error: UpdateTableMetadataLocationError,
-    table_ident: &TableIdent,
-) -> Error {
-    match error {
-        UpdateTableMetadataLocationError::ConflictException(_) => Error::new(
-            ErrorKind::CatalogCommitConflicts,
-            format!("Commit conflicted for table: {table_ident}"),
-        )
-        .with_retryable(true),
-        UpdateTableMetadataLocationError::NotFoundException(_) => Error::new(
-            ErrorKind::TableNotFound,
-            format!("Table {table_ident} is not found"),
-        ),
-        UpdateTableMetadataLocationError::InternalServerErrorException(_) => Error::new(
-            ErrorKind::CommitStateUnknown,
-            format!(
-                "Commit outcome unknown for table {table_ident}: S3 Tables failed while \
-                 processing the update — it may have been applied. Verify before retrying: \
-                 retrying an already-applied commit duplicates its changes."
-            ),
-        ),
-        _ => Error::new(
-            ErrorKind::Unexpected,
-            "Operation failed for hitting aws sdk error",
-        ),
-    }
-    .with_source(anyhow::Error::msg(format!("aws sdk error: {error:?}")))
-}
-
 #[cfg(test)]
 mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
     use super::*;
-
-    fn test_table_ident() -> TableIdent {
-        TableIdent::from_strs(["ns1", "test1"]).expect("build test table ident")
-    }
-
-    /// Risk: a reclassified `ConflictException` stops the retry loop from absorbing routine
-    /// concurrency, so every maintenance race reaches the caller. Pins the conflict as
-    /// `CatalogCommitConflicts` and retryable.
-    #[test]
-    fn test_conflict_exception_stays_retryable_conflict() {
-        let error = map_update_table_metadata_location_service_error(
-            UpdateTableMetadataLocationError::ConflictException(
-                aws_sdk_s3tables::types::error::ConflictException::builder().build(),
-            ),
-            &test_table_ident(),
-        );
-        assert_eq!(error.kind(), iceberg::ErrorKind::CatalogCommitConflicts);
-        assert!(error.retryable(), "a CAS conflict is safely retryable");
-    }
-
-    /// Risk: a 5xx that keeps a terminal mapping hides may-have-landed from the caller. Pins
-    /// the unknown-outcome mapping as non-retryable. Also pins that `NotFoundException` stays
-    /// terminal, which is the over-broadening direction.
-    #[test]
-    fn test_internal_server_error_maps_to_unknown_outcome_but_not_found_stays_terminal() {
-        let unknown = map_update_table_metadata_location_service_error(
-            UpdateTableMetadataLocationError::InternalServerErrorException(
-                aws_sdk_s3tables::types::error::InternalServerErrorException::builder().build(),
-            ),
-            &test_table_ident(),
-        );
-        assert_eq!(unknown.kind(), iceberg::ErrorKind::CommitStateUnknown);
-        assert!(
-            !unknown.retryable(),
-            "an unknown-outcome commit error must not advertise retryability"
-        );
-
-        let not_found = map_update_table_metadata_location_service_error(
-            UpdateTableMetadataLocationError::NotFoundException(
-                aws_sdk_s3tables::types::error::NotFoundException::builder().build(),
-            ),
-            &test_table_ident(),
-        );
-        assert_eq!(not_found.kind(), iceberg::ErrorKind::TableNotFound);
-    }
-
-    /// Risk: a post-send ambiguous failure classifies NeverSent, so an outer re-run duplicates
-    /// an applied commit. The opposite misroute costs a needless reconciliation. Pins both
-    /// sides of the classifier.
-    #[test]
-    fn test_commit_send_disposition_split() {
-        use aws_sdk_s3tables::error::ConnectorError;
-        type TestSdkError = aws_sdk_s3tables::error::SdkError<(), ()>;
-        fn boxed(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
-            msg.to_string().into()
-        }
-
-        assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::timeout_error(boxed("timed out"))),
-            CommitSendDisposition::MaybeSent
-        ));
-        assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::dispatch_failure(ConnectorError::io(
-                boxed("reset mid-exchange")
-            ))),
-            CommitSendDisposition::MaybeSent
-        ));
-        assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::response_error(
-                boxed("unparsable response"),
-                ()
-            )),
-            CommitSendDisposition::MaybeSent
-        ));
-        assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::construction_failure(boxed(
-                "invalid request"
-            ))),
-            CommitSendDisposition::NeverSent
-        ));
-        assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::dispatch_failure(
-                ConnectorError::user(boxed("client-side setup failure"))
-            )),
-            CommitSendDisposition::NeverSent
-        ));
-        assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::service_error((), ())),
-            CommitSendDisposition::ResponseReceived
-        ));
-    }
 
     const SECRET: &str = "SECRET_DO_NOT_LEAK";
 
@@ -959,9 +880,6 @@ mod tests {
         );
     }
 
-    /// Risk: `S3TablesCatalog` derives `Debug`, so the redaction must survive one level up.
-    /// Pins that a `{:?}` of the whole catalog leaks no credential.
-    /// Mutation: revert the config `Debug` to derived gives RED.
     #[tokio::test]
     async fn test_catalog_debug_redacts_secret_prop_values() {
         let catalog = S3TablesCatalog::new(config_with_secret_props(), None)
