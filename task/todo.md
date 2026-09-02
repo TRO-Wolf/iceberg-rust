@@ -36,6 +36,18 @@ Ledger: [`pr5a-catalog-commit-outcomes-ledger.md`](pr5a-catalog-commit-outcomes-
 - [x] Mutations, javap decode (12 needles), maps, ledger, `make check` + crate tests.
 
 Outcome: seams and offline proofs land. Credentialed execution is the orchestrator's next step. Docker `make test` legs excused.
+## ACTIVE (2026-09-01): PR-6A branch read/commit interop (row R168, C-006)
+
+Ledger: [`pr6a-branch-interop-ledger.md`](pr6a-branch-interop-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md` PR-6A.
+
+- [x] Decode Java 1.10.0 `SnapshotProducer.targetBranch` / `SnapshotUtil.latestSnapshot` / `SnapshotScan.useRef` / tag refusal.
+- [x] Java oracle `generate-interop-branch-dml` + `emit-branch-meta` + `verify-interop-branch-dml` (4 fixtures).
+- [x] Runner `run-interop-branch-dml.sh` (six-step + sabotage). `SUITE_FLOOR_DEFAULT` 55→56.
+- [x] Rust `interop_branch_dml.rs`: offline Direction-1 + env GEN/D1. V3 MoR DV close at scanned snapshot.
+- [x] Nine required cases both directions including main vs branch file sets on every row-asserting verify. Mutations 3 red out of 3 plus file-set sabotage B. Row R168 ✅.
+- [x] `make check` 0; `cargo test -p iceberg --locked` 0; `cargo test -p iceberg-datafusion --locked` 0. Docker `make test` legs excused.
+
+Outcome: PR-6A landed. Java/Rust branch DML interop both directions. Every row-asserting verify pins main vs branch data-file sets. V3 MoR on a named branch closes DVs at the scanned snapshot. Row R168 ✅.
 
 ## ACTIVE (2026-09-01): F-6c branch-following reads (row R168)
 
