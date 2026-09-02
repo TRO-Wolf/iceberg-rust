@@ -38,6 +38,8 @@ use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 const META_ROOT_PATH: &str = "metadata";
+#[path = "replace_record_count.rs"]
+mod replace_record_count;
 
 /// A trait that defines how different table operations produce new snapshots.
 ///
@@ -1483,6 +1485,11 @@ impl<'a> SnapshotProducer<'a> {
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
         let parent_snapshot_id = self.parent_snapshot_id();
+        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
+            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
+        })?;
+        replace_record_count::validate_replace_record_counts(&summary)?;
+
         let mut manifest_list_writer = match self.table.metadata().format_version() {
             FormatVersion::V1 => ManifestListWriter::v1(
                 self.table
@@ -1509,13 +1516,6 @@ impl<'a> SnapshotProducer<'a> {
                 Some(first_row_id),
             ),
         };
-
-        // Calling self.summary() before self.manifest_file() is important because self.added_data_files
-        // will be set to an empty vec after self.manifest_file() returns, resulting in an empty summary
-        // being generated.
-        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
-            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
-        })?;
 
         let new_manifests = self
             .manifest_file(&snapshot_produce_operation, &process)
