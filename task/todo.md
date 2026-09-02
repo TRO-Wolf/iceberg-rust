@@ -96,7 +96,7 @@ Ledger: [`pr4-v3-upgrade-maintenance-interop-ledger.md`](pr4-v3-upgrade-maintena
 - [x] Mutations one knob at a time on the delete-conversion arm, manifest row-id inheritance, the computed row-id base, the stored row-id preference and the rewrite lineage carry.
 - [x] GAP_MATRIX rows R109, R114, R135, R136, R166 record only what this unit proves. R109 keeps ✅ and loses its named strict-bar gap; R114 and R135 stay 🟡 on their existing residues; R136 and R166 keep ✅.
 - [x] `make check`, `cargo test -p iceberg -p iceberg-datafusion --locked`, both interop runners. Docker legs of `make test` excused (no Docker in this environment).
-- [ ] Independent Critic pass.
+- [x] Independent Critic pass: PASS with three S3 pin-adequacy findings, all landed. Java now compares the `m0` and `m1` live data-file path sets with a fifth `no-op-rewrite` sabotage; every action stage asserts the committing snapshot's operation; the `m4` range check asserts a six-entry map first.
 
 Outcome: composed V3 upgrade and maintenance interop is proven against Java 1.10.0 in both directions. No product code changed.
 

@@ -28515,6 +28515,8 @@ public final class InteropOracle {
       failures += verifyStages(dir.resolve("plain"), new String[] {"m0", "m1", "m2"}, "plain");
       failures +=
           verifyStages(dir.resolve("deletes"), new String[] {"m0", "m3", "m4", "m5"}, "deletes");
+      failures +=
+          verifyRewriteChangedFiles(dir.resolve("plain"), "m0", "m1", "plain/m1");
       failures += verifyEvolvedSpec(dir.resolve("plain").resolve("m2"), "plain/m2");
       failures += verifyDeletionVectors(dir.resolve("deletes").resolve("m3"), "deletes/m3");
       failures += verifyDeletionVectors(dir.resolve("deletes").resolve("m4"), "deletes/m4");
@@ -28590,6 +28592,61 @@ public final class InteropOracle {
         failures++;
       }
       return failures;
+    }
+
+    private static int verifyRewriteChangedFiles(
+        Path root, String beforeStage, String afterStage, String tag) {
+      Path before = root.resolve(beforeStage).resolve("metadata").resolve("final.metadata.json");
+      Path after = root.resolve(afterStage).resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(before) || !Files.exists(after)) {
+        System.out.println("FAIL v3-maintenance " + tag + ": missing " + before + " or " + after);
+        return 1;
+      }
+      try {
+        java.util.Set<String> beforePaths = liveDataFilePaths(loadReadOnly(before, tag + "-before"));
+        java.util.Set<String> afterPaths = loadDataFilePaths(after, tag);
+        int failures = 0;
+        if (beforePaths.isEmpty() || afterPaths.isEmpty()) {
+          System.out.println("FAIL v3-maintenance " + tag + ": a stage has no live data file");
+          failures++;
+        }
+        if (beforePaths.equals(afterPaths)) {
+          System.out.println(
+              "FAIL v3-maintenance "
+                  + tag
+                  + ": rewrite left the live data-file set unchanged ("
+                  + afterPaths.size()
+                  + " files)");
+          failures++;
+        }
+        if (failures == 0) {
+          System.out.println(
+              "PASS v3-maintenance "
+                  + tag
+                  + ": live data-file set changed, "
+                  + beforePaths.size()
+                  + " to "
+                  + afterPaths.size()
+                  + " file(s)");
+        }
+        return failures;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static java.util.Set<String> loadDataFilePaths(Path meta, String tag)
+        throws IOException {
+      return liveDataFilePaths(loadReadOnly(meta, tag + "-after"));
+    }
+
+    private static java.util.Set<String> liveDataFilePaths(BaseTable table) throws IOException {
+      java.util.Set<String> paths = new TreeSet<>();
+      for (DataFile file : liveDataFiles(table)) {
+        paths.add(file.location());
+      }
+      return paths;
     }
 
     private static int verifyEvolvedSpec(Path stageDir, String tag) {

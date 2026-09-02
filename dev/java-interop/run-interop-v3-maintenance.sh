@@ -134,6 +134,11 @@ sabotage_swap "delete-conversion" \
   "deletes/m0/metadata/final.metadata.json" \
   "parquet position delete survived the V3 conversion"
 
+sabotage_swap "no-op-rewrite" \
+  "plain/m1/metadata/final.metadata.json" \
+  "plain/m0/metadata/final.metadata.json" \
+  "rewrite left the live data-file set unchanged"
+
 sabotage_swap "evolved-spec" \
   "plain/m2/metadata/final.metadata.json" \
   "plain/m1/metadata/final.metadata.json" \

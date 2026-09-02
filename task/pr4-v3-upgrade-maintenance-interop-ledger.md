@@ -131,13 +131,15 @@ no stage can drift silently.
   data-file path set plus a non-zero rewritten count, an evolved spec id and tuple set, a parquet
   count of 2 falling to 0 with a Puffin count rising, a data-manifest count falling to 1, and a
   strictly smaller snapshot count.
-- Sabotage, each on a scratch copy, hard-fail if the corruption cannot be applied:
+- Sabotage, seven in total (two upgrade, five maintenance), each on a scratch copy, hard-fail if the
+  corruption cannot be applied:
 
 | Runner | Sabotage | Required failure line |
 |---|---|---|
 | upgrade | u3 result replaced by the pre-conversion V2 table | `parquet position delete survived the V3 conversion` |
 | upgrade | u1 result truncated | `FAIL v3-upgrade u1: unexpected error` |
 | maintenance | `deletes/m3` replaced by `deletes/m0` | `parquet position delete survived the V3 conversion` |
+| maintenance | `plain/m1` replaced by `plain/m0` | `rewrite left the live data-file set unchanged` |
 | maintenance | `plain/m2` replaced by `plain/m1` | `FAIL v3-maintenance plain/m2: current spec is` |
 | maintenance | `deletes/m4` replaced by `deletes/m3` | `clustered data manifests` |
 | maintenance | `plain/m0` truncated | `FAIL v3-maintenance plain: unexpected error` |
@@ -169,6 +171,20 @@ both exited 101 with the mutation applied (`gen_rust_converts_java_v2_position_d
 and `gen_rust_runs_the_v3_delete_matrix_over_the_java_seed` assert-failed), and the source restored
 clean.
 
+## Critic S3 remediation
+
+- S3-1: the Java verify compared only rows and `_row_id`, so swapping `plain/m1` for `plain/m0` stayed
+  green. `V3MaintenanceOracle.verifyRewriteChangedFiles` now compares the live data-file path sets of
+  `plain/m0` and `plain/m1` and fails when they are equal or either is empty ("live data-file set
+  changed, 6 to 2 file(s)" on the clean run). A fifth sabotage, `no-op-rewrite`, applies that swap:
+  1 red out of 1, and the sabotaged verify reports exactly one failure, through the new line — which
+  also measures that the swap produced zero failures before this rule existed.
+- S3-2: each action stage now asserts the committing snapshot's `operation` in the Rust matrix. `m0`
+  is `Append` (so a no-op action cannot satisfy the stages after it) and `m1`, `m2`, `m3`, `m4` and
+  `m5` are all `Replace`; `m5` keeps `m4`'s snapshot, so its operation is the clustering commit's.
+- S3-3: `run_delete_matrix` asserts `m3_ranges.len() == 6` before the `m3`-to-`m4` range comparison,
+  so the per-file range check cannot pass over an empty map.
+
 ## Deviations and notes
 
 - The merge-on-read half of upgrade cell u3 lives in
@@ -194,6 +210,7 @@ clean.
 | Lint and static gates | `make check` | 0 |
 | Crate tests | `cargo test -p iceberg -p iceberg-datafusion --locked` | 0 |
 | Upgrade interop | `dev/java-interop/run-interop-v3-upgrade.sh` | 0 |
+| Crate tests, remediation re-run | `cargo test -p iceberg --test interop_v3_upgrade --test interop_v3_maintenance --locked` | 0 |
 | Maintenance interop | `dev/java-interop/run-interop-v3-maintenance.sh` | 0 |
 | Prose | `typos .` | 0 |
 | Docker legs of `make test` | not run | EXCUSED — no Docker in this environment. The offline lib and integration suites plus both interop runners were run. |
@@ -210,12 +227,12 @@ Java methods or bytecode read: TableMetadata.upgradeToFormatVersion; TableMetada
 Files changed: crates/iceberg/tests/interop_v3_upgrade.rs (new); crates/iceberg/tests/interop_v3_maintenance.rs (new); crates/integrations/datafusion/tests/interop_v3_upgrade_mor.rs (new); dev/java-interop/run-interop-v3-upgrade.sh (new); dev/java-interop/run-interop-v3-maintenance.sh (new); dev/java-interop/src/main/java/org/apache/iceberg/InteropOracle.java; scripts/run_interop_suites.sh; docs/parity/GAP_MATRIX.md; task/pr4-v3-upgrade-maintenance-interop-ledger.md (new); task/todo.md; three map.md files.
 Behavior before: no bidirectional interop fixture existed for the V2 to V3 bump, for a legacy parquet position delete converted on an upgraded table, or for the five V3 maintenance actions run in sequence over a Java-written seed.
 Behavior after: unchanged product behavior. Four upgrade cells and five maintenance actions are proven against Java 1.10.0 in both directions, with row, format-version, snapshot-sequence, delete-file and row-lineage comparison at every stage.
-Negative cases: six sabotages (two upgrade, four maintenance) each pinned to a specific failure line; every runner hard-fails on a missing environment, oracle output or fixture count.
+Negative cases: seven sabotages (two upgrade, five maintenance) each pinned to a specific failure line; every runner hard-fails on a missing environment, oracle output or fixture count.
 Test command and population: cargo test -p iceberg -p iceberg-datafusion --locked; dev/java-interop/run-interop-v3-upgrade.sh (9 fixtures); dev/java-interop/run-interop-v3-maintenance.sh (9 fixtures).
 Mutations, one at a time: see the mutation table in this ledger.
 Java interop command and fixture count: run-interop-v3-upgrade.sh, 9 final.metadata.json; run-interop-v3-maintenance.sh, 9 final.metadata.json; both assert the Java-side {"count":2}.
 CI-only evidence gap: the Docker legs of `make test` were not run (no Docker in this environment); the offline lib and integration suites plus both interop runners were.
 Breaking public API change: none. No product code changed.
-Critic attestation: pending — an independent Critic has not run on this unit.
+Critic attestation: independent Critic PASS with three S3 pin-adequacy findings; all three landed in the remediation commit (see the "Critic S3 remediation" section).
 Open findings and dispositions: none open. The suspected PR-2 rewrite-lineage defect was refuted as a cargo mtime fingerprint artifact of the mutation harness and is recorded above.
 ```

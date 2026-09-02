@@ -29,8 +29,8 @@ use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::metadata_columns::RESERVED_COL_NAME_ROW_ID;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Literal, ManifestContentType,
-    NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema, SortOrder, Struct, Transform,
-    Type,
+    NestedField, Operation, PartitionKey, PartitionSpec, PrimitiveType, Schema, SortOrder, Struct,
+    Transform, Type,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -447,6 +447,16 @@ async fn prepare_v3(catalog: &impl Catalog, table: &Table) -> Table {
     fast_append(catalog, &table, vec![a, b]).await
 }
 
+fn current_operation(table: &Table) -> Operation {
+    table
+        .metadata()
+        .current_snapshot()
+        .expect("the table has a current snapshot")
+        .summary()
+        .operation
+        .clone()
+}
+
 fn assert_distinct_row_ids(row_ids: &BTreeMap<i64, Option<i64>>) {
     let assigned: BTreeSet<i64> = row_ids.values().filter_map(|row_id| *row_id).collect();
     assert_eq!(
@@ -466,6 +476,11 @@ async fn run_rewrite_matrix(catalog: &impl Catalog, table: Table, out_root: Opti
     let (before_data, _) = live_files(&table).await;
     let before_paths = data_paths(&before_data);
     assert_eq!(table.metadata().format_version(), FormatVersion::V3);
+    assert_eq!(
+        current_operation(&table),
+        Operation::Append,
+        "the seed stage must be an append, so a Replace assertion below cannot pass on a no-op"
+    );
     write_stage(&table, out_root, "m0").await;
 
     let result = RewriteDataFiles::new(table.clone())
@@ -482,6 +497,7 @@ async fn run_rewrite_matrix(catalog: &impl Catalog, table: Table, out_root: Opti
     assert_ne!(data_paths(&m1_data), before_paths);
     assert_eq!(scan_row_ids(&m1).await, before_ids);
     assert!(m1_deletes.is_empty());
+    assert_eq!(current_operation(&m1), Operation::Replace);
     write_stage(&m1, out_root, "m1").await;
 
     let tx = Transaction::new(&m1);
@@ -509,6 +525,7 @@ async fn run_rewrite_matrix(catalog: &impl Catalog, table: Table, out_root: Opti
     for file in &m2_data {
         assert_eq!(file.partition_spec_id(), evolved_spec_id);
     }
+    assert_eq!(current_operation(&m2), Operation::Replace);
     write_stage(&m2, out_root, "m2").await;
 }
 
@@ -521,6 +538,11 @@ async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Optio
     write_expected(out_root, &before_rows, &before_ids);
     let (_, before_deletes) = live_files(&table).await;
     assert_eq!(parquet_position_deletes(&before_deletes), 2);
+    assert_eq!(
+        current_operation(&table),
+        Operation::Append,
+        "the seed stage must be an append, so a Replace assertion below cannot pass on a no-op"
+    );
     write_stage(&table, out_root, "m0").await;
 
     let result = RewritePositionDeleteFiles::new(table.clone())
@@ -536,12 +558,18 @@ async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Optio
     assert_eq!(parquet_position_deletes(&m3_deletes), 0);
     assert!(puffin_deletes(&m3_deletes) >= 1);
     assert_eq!(scan_row_ids(&m3).await, before_ids);
+    assert_eq!(current_operation(&m3), Operation::Replace);
     write_stage(&m3, out_root, "m3").await;
 
     let (m3_data_manifests, m3_delete_manifests) = manifest_counts(&m3).await;
     assert!(m3_data_manifests > 1);
     assert!(m3_delete_manifests >= 1);
     let m3_ranges = assigned_row_ranges(&m3).await;
+    assert_eq!(
+        m3_ranges.len(),
+        6,
+        "every live data file must carry a row-id range, or the m4 range comparison is vacuous"
+    );
     let next_row_id = i64::try_from(m3.metadata().next_row_id()).expect("next_row_id fits i64");
 
     let tx = Transaction::new(&m3);
@@ -566,6 +594,7 @@ async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Optio
     for (first, count) in m4_ranges_values(&assigned_row_ranges(&m4).await) {
         assert!(first + i64::try_from(count).expect("record count fits i64") <= next_row_id);
     }
+    assert_eq!(current_operation(&m4), Operation::Replace);
     write_stage(&m4, out_root, "m4").await;
 
     let before_snapshots = m4.metadata().snapshots().count();
@@ -600,6 +629,11 @@ async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Optio
     );
     assert_eq!(scan_rows(&m5).await, before_rows);
     assert_eq!(scan_row_ids(&m5).await, before_ids);
+    assert_eq!(
+        current_operation(&m5),
+        Operation::Replace,
+        "expiry keeps the current snapshot, so its operation is still the clustering commit's"
+    );
     write_stage(&m5, out_root, "m5").await;
 }
 
