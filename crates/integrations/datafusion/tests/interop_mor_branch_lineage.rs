@@ -192,6 +192,13 @@ async fn lineage_on_ref(table: &Table, ref_name: &str) -> Vec<(i32, i64, i64)> {
     rows
 }
 
+fn main_ref_id(table: &Table) -> Option<i64> {
+    table
+        .metadata()
+        .snapshot_for_ref(MAIN_BRANCH)
+        .map(|snapshot| snapshot.snapshot_id())
+}
+
 fn lineage_text(rows: &[(i32, i64, i64)]) -> String {
     let mut text = String::new();
     for (id, row_id, seq) in rows {
@@ -314,7 +321,8 @@ async fn mor_update_on_branch_keeps_row_id_and_advances_seq_twice() {
     let main_id = table.metadata().current_snapshot_id().expect("main");
     let main_files = file_basenames(&table, MAIN_BRANCH).await;
     let main_lineage = lineage_on_ref(&table, MAIN_BRANCH).await;
-    let next_row_id_before = table.metadata().next_row_id();
+    let seed_next_row_id = table.metadata().next_row_id();
+    assert_eq!(seed_next_row_id, 5, "seed next-row-id");
     let branch_seed = lineage_on_ref(&table, BRANCH).await;
     assert_eq!(branch_seed.len(), 5, "seed branch rows: {branch_seed:?}");
     let seed_row_id = row_id_of(&branch_seed, UPDATED_ID);
@@ -329,6 +337,11 @@ async fn mor_update_on_branch_keeps_row_id_and_advances_seq_twice() {
     assert!(
         first_seq > seed_seq,
         "first update must advance the sequence"
+    );
+    assert_eq!(
+        table.metadata().next_row_id(),
+        6,
+        "the first UPDATE writes one replacement row into an unassigned V3 data manifest"
     );
 
     run_sql(&ctx, "UPDATE t SET val = 'XX' WHERE id = 10").await;
@@ -354,9 +367,15 @@ async fn mor_update_on_branch_keeps_row_id_and_advances_seq_twice() {
         );
     }
     assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    assert_eq!(main_ref_id(&table), Some(main_id));
     assert_eq!(file_basenames(&table, MAIN_BRANCH).await, main_files);
     assert_eq!(lineage_on_ref(&table, MAIN_BRANCH).await, main_lineage);
-    assert_eq!(table.metadata().next_row_id(), next_row_id_before);
+    assert_eq!(
+        table.metadata().next_row_id(),
+        7,
+        "next-row-id is a table counter: each branch UPDATE advances it by its one added row"
+    );
+    assert_eq!(table.metadata().next_row_id(), seed_next_row_id + 2);
     let branch_files = file_basenames(&table, BRANCH).await;
     assert_eq!(
         branch_files.len(),
@@ -444,7 +463,7 @@ async fn rust_updates_java_branch_lineage_gen() {
     let main_id = table.metadata().current_snapshot_id().expect("main");
     let main_files = file_basenames(&table, MAIN_BRANCH).await;
     let main_lineage = lineage_on_ref(&table, MAIN_BRANCH).await;
-    let next_row_id_before = table.metadata().next_row_id();
+    let seed_next_row_id = table.metadata().next_row_id();
     let branch_seed = lineage_on_ref(&table, BRANCH).await;
     let seed_row_id = row_id_of(&branch_seed, UPDATED_ID);
     let seed_seq = seq_of(&branch_seed, UPDATED_ID);
@@ -460,21 +479,25 @@ async fn rust_updates_java_branch_lineage_gen() {
     let table = load(catalog.as_ref(), &namespace, "branch_table").await;
     let after_first = lineage_on_ref(&table, BRANCH).await;
     let first_seq = seq_of(&after_first, UPDATED_ID);
+    let first_next_row_id = table.metadata().next_row_id();
     assert_eq!(row_id_of(&after_first, UPDATED_ID), seed_row_id);
     assert!(
         first_seq > seed_seq,
         "first update must advance the sequence"
     );
+    assert_eq!(first_next_row_id, seed_next_row_id + 1);
 
     run_sql(&ctx, "UPDATE t SET val = 'XX' WHERE id = 10").await;
     let table = load(catalog.as_ref(), &namespace, "branch_table").await;
     let after_second = lineage_on_ref(&table, BRANCH).await;
+    let second_next_row_id = table.metadata().next_row_id();
     assert_eq!(row_id_of(&after_second, UPDATED_ID), seed_row_id);
     assert!(seq_of(&after_second, UPDATED_ID) > first_seq);
+    assert_eq!(second_next_row_id, first_next_row_id + 1);
     assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    assert_eq!(main_ref_id(&table), Some(main_id));
     assert_eq!(file_basenames(&table, MAIN_BRANCH).await, main_files);
     assert_eq!(lineage_on_ref(&table, MAIN_BRANCH).await, main_lineage);
-    assert_eq!(table.metadata().next_row_id(), next_row_id_before);
 
     let after_dir = dir.join("rust_after");
     let rust_metadata_dir = after_dir.join("rust_table").join("metadata");
@@ -506,4 +529,14 @@ async fn rust_updates_java_branch_lineage_gen() {
         format!("{first_seq}\n"),
     )
     .expect("first_update_seq.txt");
+    fs::write(
+        after_dir.join("expected_next_row_id.txt"),
+        format!("{second_next_row_id}\n"),
+    )
+    .expect("expected_next_row_id.txt");
+    fs::write(
+        after_dir.join("first_update_next_row_id.txt"),
+        format!("{first_next_row_id}\n"),
+    )
+    .expect("first_update_next_row_id.txt");
 }

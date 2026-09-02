@@ -28115,16 +28115,37 @@ public final class InteropOracle {
       }
       long seedNextRowId = Long.parseLong(readString(dir.resolve("java_seed_next_row_id.txt")).trim());
       long actualNextRowId = table.operations().current().nextRowId();
-      if (actualNextRowId != seedNextRowId) {
+      long pinnedNextRowId =
+          Long.parseLong(readString(afterDir.resolve("expected_next_row_id.txt")).trim());
+      long pinnedFirstNextRowId =
+          Long.parseLong(readString(afterDir.resolve("first_update_next_row_id.txt")).trim());
+      if (actualNextRowId != pinnedNextRowId) {
         System.out.println(
             "FAIL mor-branch-lineage/next_row_id: "
                 + actualNextRowId
-                + " expected "
+                + " expected the Rust pin "
+                + pinnedNextRowId);
+        failures++;
+      } else if (pinnedFirstNextRowId != seedNextRowId + 1
+          || pinnedNextRowId != pinnedFirstNextRowId + 1) {
+        System.out.println(
+            "FAIL mor-branch-lineage/next_row_id: seed "
                 + seedNextRowId
-                + " (MoR UPDATE adds no rows)");
+                + " then "
+                + pinnedFirstNextRowId
+                + " then "
+                + pinnedNextRowId
+                + " is not one added row per UPDATE");
         failures++;
       } else {
-        System.out.println("PASS mor-branch-lineage/next_row_id: " + actualNextRowId);
+        System.out.println(
+            "PASS mor-branch-lineage/next_row_id: "
+                + seedNextRowId
+                + " -> "
+                + pinnedFirstNextRowId
+                + " -> "
+                + pinnedNextRowId
+                + " (one added row per UPDATE)");
       }
       failures +=
           assertLines(

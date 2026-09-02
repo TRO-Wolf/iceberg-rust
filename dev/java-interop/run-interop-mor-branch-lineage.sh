@@ -35,6 +35,8 @@ AFTER_ARTIFACTS=(
   expected_branch_files.txt
   updated_id.txt
   first_update_seq.txt
+  expected_next_row_id.txt
+  first_update_next_row_id.txt
 )
 
 if [[ ! -x "${MVN}" ]]; then
