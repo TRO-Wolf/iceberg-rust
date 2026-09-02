@@ -854,9 +854,9 @@ mod tests {
     /// A Puffin that a dying delete manifest and a retained one both reference must survive. A
     /// Puffin only the dying manifest references must die. Both directions in one fixture.
     ///
-    /// The shape shares across manifests, not within one Puffin. Java removes a delete file by
-    /// path, so removing one vector of a shared Puffin tombstones every same-path entry and the
-    /// Puffin does become unreachable. The cross-manifest share is the real hazard.
+    /// The shape shares across manifests, not within one Puffin. Removing one vector of a shared
+    /// Puffin leaves its siblings live, so the Puffin stays reachable through them. The
+    /// cross-manifest share is the real hazard.
     #[tokio::test]
     async fn test_shared_puffin_with_one_retained_dv_survives() {
         let catalog = new_memory_catalog().await;

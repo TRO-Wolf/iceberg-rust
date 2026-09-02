@@ -703,7 +703,7 @@ impl RewritePositionDeleteFiles {
         refuse_shadowed_deletes(&inventory, &plans)?;
         let new_deletion_vectors = self.write_deletion_vectors(&plans, &inventory).await?;
 
-        // Path-keyed removal: superseding one DV removes every sibling in the same Puffin.
+        // Superseded blobs plus the siblings this path rewrites alongside them.
         let mut rewritten_files: Vec<DataFile> = inventory
             .legacy_position_deletes
             .iter()

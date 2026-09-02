@@ -60,9 +60,9 @@ fn arm_fail_before_container_write() -> FailCloseGuard {
     FailCloseGuard
 }
 
-/// T5: two Puffins; touching both leaves each old blob behind and writes ONE new container.
+/// T5: touching a blob in each of two Puffins leaves both old blobs behind and writes ONE new container.
 #[tokio::test]
-async fn delete_touching_both_puffins_rewrites_each_container() {
+async fn delete_touching_two_puffins_writes_one_new_container() {
     let harness = harness().await;
     let (electronics, books, electronics_puffin, books_puffin) =
         seed_two_separate_puffins(&harness).await;

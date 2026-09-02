@@ -4209,7 +4209,7 @@ async fn test_v3_conversion_merges_the_data_file_existing_deletion_vector() {
     );
 }
 
-/// Delete-file removal is path-keyed. Superseding one DV blob removes every sibling in that Puffin.
+/// Superseding one DV blob must leave every sibling of that Puffin live and applying.
 #[tokio::test]
 async fn test_v3_rewrite_keeps_sibling_deletion_vectors_of_the_same_puffin() {
     let (catalog, _temp) = local_fs_catalog().await;

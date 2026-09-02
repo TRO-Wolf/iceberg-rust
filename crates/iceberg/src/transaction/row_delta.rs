@@ -128,7 +128,7 @@ pub struct RowDeltaAction {
     removed_data_files: Vec<DataFile>,
     /// The delete files this row delta removes (Java `BaseRowDelta.removeDeletes`). They reach the
     /// producer through [`SnapshotProducer::with_removed_delete_files`], resolve against the current
-    /// snapshot's DELETE manifests by path, and are tombstoned in the rewritten DELETE manifest.
+    /// snapshot's DELETE manifests by the Java `DeleteFileSet` triple, and are tombstoned there.
     ///
     /// The use case is merge-on-read superseding, so the table never holds two live DVs for one data
     /// file. Each file must be `PositionDeletes` or `EqualityDeletes` content.

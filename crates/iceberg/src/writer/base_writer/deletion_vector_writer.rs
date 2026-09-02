@@ -21,9 +21,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod file_scope;
+
+use file_scope::is_file_scoped;
+
 use crate::delete_vector::DeleteVector;
 use crate::io::OutputFile;
-use crate::metadata_columns::{RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_POS};
+use crate::metadata_columns::RESERVED_FIELD_ID_POS;
 use crate::puffin::{Blob, CompressionCodec, DELETION_VECTOR_V1, PuffinWriter};
 use crate::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, PartitionKey, PartitionSpec,
@@ -46,6 +50,8 @@ const REFERENCED_DATA_FILE_PROPERTY: &str = "referenced-data-file";
 /// Puffin blob property carrying the number of deleted positions.
 const CARDINALITY_PROPERTY: &str = "cardinality";
 
+/// Per-data-file accumulation state: the position set and the partition context. The first
+/// `delete` call for a path captures the partition.
 #[derive(Debug)]
 struct DeletesForDataFile {
     positions: DeleteVector,
@@ -56,6 +62,8 @@ struct DeletesForDataFile {
 /// Java `loadPreviousDeletes` / `PositionDeleteIndex`.
 #[derive(Debug, Clone)]
 pub struct PreviousDeletes {
+    /// The data file's existing deleted positions. Load them through the production read path,
+    /// not by hand.
     positions: DeleteVector,
     /// The delete files those positions came from. Each file-scoped entry becomes a rewritten
     /// delete file after the merge.
@@ -107,40 +115,6 @@ impl DVWriteResult {
         self.delete_files
             .iter()
             .any(|delete_file| delete_file.referenced_data_file().is_some())
-    }
-}
-
-/// Whether a previous delete file is file-scoped, so the merge may discard it from the table
-/// state. Mirrors Java `ContentFileUtil.isFileScoped`, which is
-/// `referencedDataFile(df) != null`. The predicate is broader than `is_deletion_vector`. A DV
-/// qualifies because it carries `referenced_data_file`, not because it is a DV.
-///
-/// | Delete file | File-scoped |
-/// |---|---|
-/// | equality delete | no |
-/// | non-null `referenced_data_file` | yes |
-/// | position delete whose `_file_path` lower and upper bounds are present and equal | yes |
-/// | any other position delete, which spans many data files | no |
-fn is_file_scoped(delete_file: &DataFile) -> bool {
-    if delete_file.content_type() == DataContentType::EqualityDeletes {
-        return false;
-    }
-    if delete_file.referenced_data_file().is_some() {
-        return true;
-    }
-    // The Java `referencedDataFile` fallback: a position delete whose `_file_path` bounds pin a
-    // single data file is file-scoped even without the explicit field. `lower_bounds`/`upper_bounds`
-    // are `HashMap<i32, Datum>`; equal Datums under the reserved path id mean a one-data-file delete.
-    match (
-        delete_file
-            .lower_bounds()
-            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH),
-        delete_file
-            .upper_bounds()
-            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH),
-    ) {
-        (Some(lower), Some(upper)) => lower == upper,
-        _ => false,
     }
 }
 
@@ -414,6 +388,7 @@ mod tests {
     use super::*;
     use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
     use crate::io::FileIO;
+    use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
     use crate::scan::FileScanTaskDeleteFile;
     use crate::spec::{Literal, NestedField, PartitionSpec, PrimitiveType, Schema, Struct, Type};
 
