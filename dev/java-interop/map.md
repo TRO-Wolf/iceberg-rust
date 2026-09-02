@@ -116,10 +116,12 @@ time — a new suite is picked up with zero maintenance) and run unprompted ever
 [`scripts/run_interop_suites.sh`](../../scripts/run_interop_suites.sh) (`make interop`) via
 [`.github/workflows/nightly_interop.yml`](../../.github/workflows/nightly_interop.yml). The driver
 hard-fails on missing prerequisites (never skips), fails if discovery drops below its suite-count
-FLOOR (`SUITE_FLOOR_DEFAULT`, 60 as of 2026-09-02), continues across failing suites, and reports every
+FLOOR (`SUITE_FLOOR_DEFAULT`, 62 as of 2026-09-02, measured by PR-7), continues across failing suites, and reports every
 suite's PASS/FAIL. **When you ADD a suite here, ratchet `SUITE_FLOOR_DEFAULT` up in the same
-change.** `run.sh` and `run-inspection-manifests.sh` do not match the glob and are OUTSIDE the
-scheduled set (named deferral).
+change.** `run.sh`, `run-inspection-manifests.sh` and
+`run-pr5a-catalog-commit-decode.sh` do not match the glob and are OUTSIDE the scheduled set. The
+first two are the long-standing named deferral; the third was named by PR-7 (finding F-pr7-2) — it
+is a real gate that CI never runs, and renaming it or widening the glob is a follow-up.
 
 ## I want to...
 
