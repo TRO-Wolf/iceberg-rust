@@ -1756,6 +1756,19 @@ public final class InteropOracle {
         PartitionPathOracle.generate(requireFixturesDir("interop.partition_path.dir"));
         break;
 
+      case "generate-interop-replace-invariant":
+        ReplaceInvariantOracle.generate(requireFixturesDir("interop.replace_invariant.dir"));
+        break;
+      case "verify-interop-replace-invariant":
+        int replaceInvariantFailures =
+            ReplaceInvariantOracle.verify(requireFixturesDir("interop.replace_invariant.dir"));
+        System.out.println(
+            "verify-interop-replace-invariant: " + replaceInvariantFailures + " failures");
+        if (replaceInvariantFailures > 0) {
+          System.exit(1);
+        }
+        break;
+
       default:
         System.err.println("unknown mode: " + mode + " (expected generate|verify)");
         System.exit(2);
@@ -12805,6 +12818,230 @@ public final class InteropOracle {
                 + "live rows = {10,30,50}");
       }
       return failures;
+    }
+  }
+
+  static final class ReplaceInvariantOracle {
+    private ReplaceInvariantOracle() {}
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()));
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      generateInvalid(dir.resolve("invalid"));
+      generateValid(dir.resolve("valid_java"));
+      System.out.println(
+          "generated replace-invariant fixtures under "
+              + dir
+              + " (invalid threw + valid_java 3-to-3 rewrite)");
+    }
+
+    static int verify(Path dir) {
+      int failures = 0;
+      failures += verifyJavaInvalidStillThrows(dir.resolve("invalid"));
+      failures += verifyRustValidTable(dir.resolve("valid_rust"));
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-replace-invariant OK — Java still refuses the invalid replacement "
+                + "and Java IcebergGenerics reads the Rust 3-to-3 rewrite as {10,20,30}");
+      }
+      return failures;
+    }
+
+    private static void generateInvalid(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      BaseTable table = newUnpartitionedTable(dir.resolve("table").toFile());
+      DataFile original =
+          writeRows(table, new File(new File(table.location(), "data"), "original.parquet"), 3);
+      table.newAppend().appendFile(original).commit();
+      long snapshotBefore = table.currentSnapshot().snapshotId();
+      DataFile grown =
+          writeRows(table, new File(new File(table.location(), "data"), "grown.parquet"), 5);
+      boolean threw = false;
+      String message = "";
+      try {
+        java.util.Set<DataFile> deleted = new java.util.HashSet<>();
+        deleted.add(original);
+        java.util.Set<DataFile> added = new java.util.HashSet<>();
+        added.add(grown);
+        table.newRewrite().rewriteFiles(deleted, added).commit();
+      } catch (RuntimeException error) {
+        if (isReplaceInvariantFailure(error)) {
+          threw = true;
+          message = error.getMessage();
+        } else {
+          throw error;
+        }
+      }
+      if (!threw) {
+        throw new RuntimeException(
+            "Java rewriteFiles of a 3-row file with a 5-row file must throw Invalid REPLACE");
+      }
+      if (table.currentSnapshot().snapshotId() != snapshotBefore) {
+        throw new RuntimeException("Java invalid REPLACE moved the current snapshot");
+      }
+      writeJson(
+          dir.resolve("threw.json"),
+          "{\"threw\":true,\"message\":"
+              + quoteJson(message)
+              + ",\"added\":5,\"deleted\":3}");
+      Path finalMetadata = dir.resolve("table").resolve("metadata").resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(
+          ((BaseTable) table).operations().current(), finalOut);
+    }
+
+    private static void generateValid(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      BaseTable table = newUnpartitionedTable(dir.resolve("table").toFile());
+      DataFile original =
+          writeRows(table, new File(new File(table.location(), "data"), "original.parquet"), 3);
+      table.newAppend().appendFile(original).commit();
+      DataFile replacement =
+          writeRows(table, new File(new File(table.location(), "data"), "replacement.parquet"), 3);
+      java.util.Set<DataFile> deleted = new java.util.HashSet<>();
+      deleted.add(original);
+      java.util.Set<DataFile> added = new java.util.HashSet<>();
+      added.add(replacement);
+      table.newRewrite().rewriteFiles(deleted, added).commit();
+      Path finalMetadata = dir.resolve("table").resolve("metadata").resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(
+          ((BaseTable) table).operations().current(), finalOut);
+      writeJson(dir.resolve("java_rows.json"), readLiveRowsToJson(table, "data"));
+    }
+
+    private static int verifyJavaInvalidStillThrows(Path invalidDir) {
+      Path threw = invalidDir.resolve("threw.json");
+      if (!Files.exists(threw)) {
+        System.out.println("FAIL replace-invariant invalid: missing " + threw);
+        return 1;
+      }
+      try {
+        Path scratch = invalidDir.resolve("verify-scratch");
+        Files.createDirectories(scratch);
+        generateInvalid(scratch);
+        System.out.println(
+            "PASS replace-invariant invalid: Java refuses 3-to-5 REPLACE (generate + verify)");
+        return 0;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL replace-invariant invalid: " + error);
+        return 1;
+      }
+    }
+
+    private static int verifyRustValidTable(Path rustDir) {
+      Path finalMetadata =
+          rustDir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(finalMetadata)) {
+        System.out.println("FAIL replace-invariant valid-rust: missing " + finalMetadata);
+        return 1;
+      }
+      TableMetadata metadata;
+      try {
+        metadata = TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL replace-invariant valid-rust: Java could not parse Rust metadata: " + parseError);
+        return 1;
+      }
+      BaseTable table =
+          new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), "rust_valid");
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL replace-invariant valid-rust: Java could not read Rust table: " + readError);
+        return 1;
+      }
+      Map<Long, String> expected = new LinkedHashMap<>();
+      expected.put(10L, "a");
+      expected.put(20L, "b");
+      expected.put(30L, "c");
+      if (!dataById.equals(expected)) {
+        System.out.println(
+            "FAIL replace-invariant valid-rust: live rows "
+                + dataById
+                + " expected "
+                + expected);
+        return 1;
+      }
+      System.out.println(
+          "PASS replace-invariant valid-rust: Java read Rust 3-to-3 rewrite as {10=a, 20=b, 30=c}");
+      return 0;
+    }
+
+    private static BaseTable newUnpartitionedTable(File tableDir) throws IOException {
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              SCHEMA,
+              PartitionSpec.unpartitioned(),
+              SortOrder.unsorted(),
+              tableDir.getAbsolutePath(),
+              props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      return new BaseTable(ops, "replace_invariant");
+    }
+
+    private static DataFile writeRows(BaseTable table, File path, int n) throws IOException {
+      String[] values = {"a", "b", "c", "d", "e"};
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < n; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", 10L * (i + 1));
+        record.setField("data", values[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(SCHEMA, PartitionSpec.unpartitioned());
+      OutputFile out = table.io().newOutputFile(path.getAbsolutePath());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static boolean isReplaceInvariantFailure(Throwable error) {
+      for (Throwable cursor = error; cursor != null; cursor = cursor.getCause()) {
+        String message = cursor.getMessage();
+        if (message != null && message.contains("Invalid REPLACE operation")) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    private static String quoteJson(String value) {
+      return "\""
+          + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+          + "\"";
     }
   }
 

@@ -24,6 +24,17 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+## ACTIVE (2026-09-01): PR-1 REPLACE record-count invariant (row R107 / C-002)
+
+Ledger: [`pr1-replace-invariant-ledger.md`](pr1-replace-invariant-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md` PR-1.
+
+- [x] Decode Java `SnapshotProducer.apply` 1.10.0 offsets 311-364 (`added-records` / `deleted-records`, `propertyAsLong` absent=0).
+- [x] Shared-layer guard after summary, before manifest IO; `DataInvalid` when added > deleted.
+- [x] Pins: invalid 3→5 (no new avro, pointer unchanged); equal 3→3; shrink 5→3; RewriteManifests missing keys; conflict-then-retry (retried attempt refuses).
+- [x] Mutations 1/1/1/1 red out of 1; restore + green re-run. Critic S2 retry pin rewritten.
+- [x] Interop `run-interop-replace-invariant.sh` (3 fixtures); GAP_MATRIX row R107; maps; suite floor 56.
+
+Outcome: Shared producer refuses added-records > deleted-records before manifest IO. Five unit pins green. Mutations 1/1/1/1 red out of 1. Interop 3/3 fixtures. Docker `make test` legs excused.
 ## ACTIVE (2026-09-01): PR-6A branch read/commit interop (row R168, C-006)
 
 Ledger: [`pr6a-branch-interop-ledger.md`](pr6a-branch-interop-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md` PR-6A.
