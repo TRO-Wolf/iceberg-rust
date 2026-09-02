@@ -39,9 +39,7 @@ impl ManifestEvaluatorBuilder {
         }
     }
 
-    /// Enables NOT rewriting optimization for the partition filter.
-    /// When enabled, the builder will apply NOT elimination to simplify the predicate
-    /// before creating the evaluator.
+    /// Enables NOT rewriting for the partition filter.
     #[allow(unused)]
     pub(crate) fn with_rewrite_not(mut self, rewrite_not: bool) -> Self {
         self.rewrite_not = rewrite_not;

@@ -169,24 +169,10 @@ pub(crate) struct SnapshotProducer<'a> {
     // preservation path that keeps outstanding equality deletes applying to rewritten data. `None`
     // makes the added files inherit the new snapshot's sequence number.
     new_data_files_data_sequence_number: Option<i64>,
-    // Data files removed by this snapshot, resolved against the current snapshot at commit time. Held
-    // so the snapshot summary can reflect the deleted file/record counts (Java overwrite/delete summary).
-    // Empty for add-only operations such as fast append.
     removed_data_files: Vec<DataFile>,
-    // DELETE files removed by this snapshot: the apply-side removal of superseded merge-on-read
-    // delete files. Java `MergingSnapshotProducer.delete(DeleteFile)`. Resolved by path against the
-    // current DELETE manifests in `commit()`, then fed to the same `process_deletes` rewrite path
-    // and to the summary's `remove_file`.
     removed_delete_files: Vec<DataFile>,
-    // The write-audit-publish staging flag. Java `SnapshotProducer.stageOnly`. When `true` the
-    // commit emits `AddSnapshot` ALONE, with no `SetSnapshotRef`, so `current-snapshot-id`, the
-    // `main` ref and the snapshot log stay unchanged. A cherry-pick publishes it later. The staged
-    // snapshot still CONSUMES a sequence number, exactly like a normal commit.
     stage_only: bool,
     pub(crate) target_branch: String,
-    // A counter used to generate unique manifest file names.
-    // It starts from 0 and increments for each new manifest file.
-    // Note: This counter is limited to the range of (0..u64::MAX).
     manifest_counter: RangeFrom<u64>,
 }
 

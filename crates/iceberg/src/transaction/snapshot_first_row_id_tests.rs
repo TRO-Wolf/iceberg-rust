@@ -263,3 +263,72 @@ async fn delete_files_adds_no_data_file_to_suppress() {
         "the survivor keeps the id it inherited behind the 3-row seed"
     );
 }
+
+#[tokio::test]
+async fn filtered_manifest_copies_existing_and_deleted_first_row_id() {
+    let catalog = new_memory_catalog().await;
+    let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+    let seed = data_file("test/seed.parquet", None);
+    let other = data_file("test/other.parquet", None);
+    let transaction = Transaction::new(&table);
+    let transaction = transaction
+        .fast_append()
+        .add_data_files(vec![seed.clone(), other])
+        .apply(transaction)
+        .expect("apply the seed append");
+    let table = transaction
+        .commit(&catalog)
+        .await
+        .expect("commit the seed append");
+
+    let transaction = Transaction::new(&table);
+    let transaction = transaction
+        .delete_files()
+        .delete_file(seed.file_path().to_string())
+        .apply(transaction)
+        .expect("apply the delete");
+    let table = transaction
+        .commit(&catalog)
+        .await
+        .expect("commit the delete");
+
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .current_snapshot()
+        .expect("the committed table has a current snapshot");
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), metadata)
+        .await
+        .expect("load the manifest list");
+    let mut by_path = HashMap::new();
+    for manifest_file in manifest_list.entries() {
+        if manifest_file.content != ManifestContentType::Data {
+            continue;
+        }
+        let bytes = table
+            .file_io()
+            .new_input(&manifest_file.manifest_path)
+            .expect("open the manifest")
+            .read()
+            .await
+            .expect("read the manifest bytes");
+        let manifest = Manifest::parse_avro(&bytes).expect("parse the manifest avro");
+        for entry in manifest.entries() {
+            by_path.insert(
+                entry.file_path().to_string(),
+                (entry.status(), entry.data_file().first_row_id()),
+            );
+        }
+    }
+    assert_eq!(
+        by_path.get("test/other.parquet").copied(),
+        Some((ManifestStatus::Existing, Some(3))),
+        "EXISTING survivor keeps the stored file first_row_id"
+    );
+    assert_eq!(
+        by_path.get("test/seed.parquet").copied(),
+        Some((ManifestStatus::Deleted, Some(0))),
+        "DELETED entry keeps the stored file first_row_id"
+    );
+}

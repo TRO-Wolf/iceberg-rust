@@ -36,6 +36,7 @@ generate/verify flow; this map only routes.**
 | `pom.xml` | Maven module, `package org.apache.iceberg` (reaches package-private ctors like `@VisibleForTesting SchemaUpdate(Schema,int)`) |
 | `src/.../InteropOracle.java` | all oracles in one program: schema / partition / manage-snapshots `generate` + `verify`, scan-exec data writers, inspection expectations |
 | `run.sh` | metadata-evolution oracle pass (generate fixtures + verify Rust output) |
+| `run-interop-mor-update-lineage.sh` | PR-3 V3 row-DML lineage. Java writes two 3-row V3 tables (`mor_table`, `cow_table`; fixture count 2). Rust runs two MoR UPDATE statements on `mor_table` and COW UPDATE id=2 then DELETE id=2 on `cow_table`. Java production-scan reads the fork's own `next_row_id` back: MOR `_row_id` stable / next 5 (two 1-row replacements), COW survivors `_row_id` {0,2} last-updated 1 / `next-row-id` 8 (single-file layout). Reverse MoR UPDATE is not in iceberg-core 1.10.0. |
 | `run-pr5a-catalog-commit-decode.sh` | PR-5A javap decode of Glue `doCommit` / `handleAWSExceptions` and REST commit 409/5xx/403. Hard-fails on a missing jar or a fixture count other than 12. |
 | `run-interop-scan-exec.sh` / `-d2.sh` | data-level scan-execution interop (Java writes parquet + position delete; D2: Java reads Rust) |
 | `run-interop-eq-delete.sh` / `-d2.sh` | equality-delete scan-exec interop, both directions |

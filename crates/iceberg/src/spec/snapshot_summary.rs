@@ -87,8 +87,7 @@ impl SnapshotSummaryCollector {
         self.properties.insert(key.to_string(), value.to_string());
     }
 
-    /// Sets the limit for including partition summaries. Summaries are not
-    /// included if the number of partitions is exceeded.
+    /// Sets the limit for including partition summaries.
     pub fn set_partition_summary_limit(&mut self, limit: u64) {
         self.max_changed_partitions_for_summaries = limit;
     }
@@ -1291,8 +1290,7 @@ mod tests {
         );
     }
 
-    /// No-op helper documenting that the default collector starts trusted with a zero limit; kept
-    /// separate so the assertion above reads as the risk it pins.
+    /// No-op helper documenting that the default collector starts trusted with a zero limit.
     fn collector_partition_summary_limit_check(collector: &SnapshotSummaryCollector) {
         assert!(collector.trust_partition_metrics);
         assert_eq!(collector.max_changed_partitions_for_summaries, 0);

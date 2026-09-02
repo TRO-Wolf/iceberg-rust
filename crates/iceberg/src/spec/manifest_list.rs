@@ -322,28 +322,24 @@ impl ManifestListWriter {
                         ));
                     }
                     (Some(writer_next_row_id), None) => {
-                        // Case: Unassigned first row ID for data manifest. This is either a new
-                        // manifest, or a manifest from a pre-v3 snapshot. We need to assign one.
                         let (existing_rows_count, added_rows_count) =
                             require_row_counts_in_manifest(manifest)?;
                         manifest.first_row_id = Some(writer_next_row_id);
-
                         self.next_row_id = writer_next_row_id
-                        .checked_add(existing_rows_count)
-                        .and_then(|sum| sum.checked_add(added_rows_count))
-                        .ok_or_else(|| {
-                            Error::new(
-                                ErrorKind::DataInvalid,
-                                format!(
-                                    "Row ID overflow when computing next row ID for Manifest {}. Next Row ID: {writer_next_row_id}, Existing Rows Count: {existing_rows_count}, Added Rows Count: {added_rows_count}",
-                                    manifest.manifest_path
-                                ),
-                            )
-                        }).map(Some)?;
+                            .checked_add(existing_rows_count)
+                            .and_then(|sum| sum.checked_add(added_rows_count))
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    format!(
+                                        "Row ID overflow when computing next row ID for Manifest {}. Next Row ID: {writer_next_row_id}, Existing Rows Count: {existing_rows_count}, Added Rows Count: {added_rows_count}",
+                                        manifest.manifest_path
+                                    ),
+                                )
+                            })
+                            .map(Some)?;
                     }
-                    (None, None) => {
-                        // Case: Table without row lineage. No action needed.
-                    }
+                    (None, None) => {}
                 }
             }
             ManifestContentType::Deletes => {
@@ -2187,16 +2183,8 @@ mod test {
             ManifestContentType::Data,
             "V1 manifest content should default to Data (0)"
         );
-        assert_eq!(
-            v2_manifest.sequence_number, 0,
-            "V1 manifest sequence_number should default to 0"
-        );
-        assert_eq!(
-            v2_manifest.min_sequence_number, 0,
-            "V1 manifest min_sequence_number should default to 0"
-        );
-
-        // Verify other fields are preserved correctly
+        assert_eq!(v2_manifest.sequence_number, 0);
+        assert_eq!(v2_manifest.min_sequence_number, 0);
         assert_eq!(v2_manifest.manifest_path, "/test/manifest.avro");
         assert_eq!(v2_manifest.manifest_length, 5806);
         assert_eq!(v2_manifest.partition_spec_id, 0);
@@ -2211,13 +2199,7 @@ mod test {
         assert_eq!(v2_manifest.key_metadata, None);
     }
 
-    // ---- V3 row lineage: `first_row_id` inheritance through `load_manifest` -------------------
-    //
-    // The unit rules live in `spec::manifest::entry::first_row_id_tests`; these pin the WIRING. Both
-    // arms are needed: with only the assigning arm, dropping the call site yields `None` everywhere.
-
-    /// Write a real V3 data manifest holding `record_counts.len()` added entries, and return the
-    /// `ManifestFile` describing it with `first_row_id` forced to the given value.
+    /// Write a V3 data manifest with `record_counts.len()` added entries.
     async fn v3_manifest_with(
         temp_dir: &TempDir,
         file_io: &FileIO,
@@ -2285,16 +2267,10 @@ mod test {
             .iter()
             .map(|entry| entry.data_file.first_row_id)
             .collect();
-        assert_eq!(
-            ids,
-            vec![Some(1_000), Some(1_010), Some(1_013)],
-            "ids start at the MANIFEST's own first_row_id and advance by record_count — not at \
-             0, and not all at the same value"
-        );
+        assert_eq!(ids, vec![Some(1_000), Some(1_010), Some(1_013)]);
     }
 
-    /// A delete manifest carrying a row-id range is READ and its range IGNORED, as Java does. What
-    /// must not happen is assigning row ids to delete files.
+    /// A delete manifest's row-id range is ignored, matching Java.
     #[tokio::test]
     async fn test_a_row_range_on_a_delete_manifest_is_ignored_not_assigned() {
         let temp_dir = TempDir::new().expect("temp dir");

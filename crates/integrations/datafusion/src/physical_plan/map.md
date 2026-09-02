@@ -35,7 +35,7 @@ exec (row R169).
 | `delete.rs` / `update.rs` | DELETE / UPDATE |
 | `repartition.rs` / `sort.rs` | writer helpers |
 | `expr_to_predicate.rs` | filter pushdown |
-| `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers |
+| `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`). |
 | `mod.rs` | module root |
 
 ## I want to...
@@ -45,6 +45,7 @@ exec (row R169).
 | Honor metadata-table `projection` | `metadata_scan.rs` (schema at plan time, `RecordBatch::project` at execute) |
 | Honor data-table `projection` | `scan.rs` `IcebergTableScan::new` |
 | Change INSERT / DELETE / UPDATE | `commit.rs` / `delete.rs` / `update.rs` |
+| Carry V3 `_row_id` on MoR UPDATE | `delete.rs` `merge_on_read_update` + `row_lineage.rs` |
 
 ## Pointers
 
@@ -59,6 +60,8 @@ exec (row R169).
 | Metadata plan schema has every column | `IcebergMetadataScan::new` ignored `projection` |
 | Empty projection panics or reports 0 rows | `RecordBatch::project(&[])` must keep `num_rows` |
 | Reordered columns come back in table order | execute path is not applying `batch.project(indices)` |
+| MoR UPDATE reassigns `_row_id` | `merge_on_read_update` omitted `push_lineage_scan_columns` / `attach_update_lineage` |
+| COW rewrite drifts `next-row-id` | layout mismatch (file / manifest count between the compared trees); an unassigned V3 DATA manifest advances by existing+added rows, a carried assigned manifest advances 0 (`spec/manifest/map.md`) |
 | V3 MoR DELETE on a diverged branch: data file is not a live file of the scanned snapshot | `close_touched_dv_containers` walked `current_snapshot()` (main). Pass the scan snapshot to `close_touched_dv_containers_at` |
 
 ### First checks

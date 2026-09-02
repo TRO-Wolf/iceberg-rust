@@ -420,3 +420,243 @@ async fn cow_update_keeps_row_id_and_bumps_matched_seq_across_partitions() {
         by_id[&2].1
     );
 }
+
+fn next_row_id(table: &Table) -> u64 {
+    table.metadata().next_row_id()
+}
+
+async fn state_rows(table: &Table) -> Vec<(i32, String, i64, i64)> {
+    let batches: Vec<_> = table
+        .scan()
+        .select([
+            "id",
+            "val",
+            RESERVED_COL_NAME_ROW_ID,
+            RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+        ])
+        .build()
+        .expect("scan")
+        .to_arrow()
+        .await
+        .expect("to_arrow")
+        .try_collect()
+        .await
+        .expect("collect");
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id")
+            .as_primitive::<datafusion::arrow::datatypes::Int32Type>();
+        let vals = batch.column_by_name("val").expect("val").as_string::<i32>();
+        let row_ids = batch
+            .column_by_name(RESERVED_COL_NAME_ROW_ID)
+            .expect("_row_id")
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        let seqs = batch
+            .column_by_name(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER)
+            .expect("seq")
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        for index in 0..batch.num_rows() {
+            assert!(row_ids.is_valid(index));
+            assert!(seqs.is_valid(index));
+            rows.push((
+                ids.value(index),
+                vals.value(index).to_string(),
+                row_ids.value(index),
+                seqs.value(index),
+            ));
+        }
+    }
+    rows.sort_unstable();
+    rows
+}
+
+async fn assert_state(table: &Table, rows: &[(i32, &str, i64, i64)], next: u64) {
+    let expected: Vec<(i32, String, i64, i64)> = rows
+        .iter()
+        .map(|(id, val, row_id, seq)| (*id, (*val).to_string(), *row_id, *seq))
+        .collect();
+    assert_eq!(state_rows(table).await, expected);
+    assert_eq!(next_row_id(table), next);
+}
+
+async fn run_sql(ctx: &SessionContext, sql: &str) {
+    ctx.sql(sql)
+        .await
+        .unwrap_or_else(|error| panic!("plan `{sql}`: {error}"))
+        .collect()
+        .await
+        .unwrap_or_else(|error| panic!("execute `{sql}`: {error}"));
+}
+
+async fn spark_insert3(ns: &str) -> (SessionContext, Arc<MemoryCatalog>, TableIdent) {
+    let tbl = "t";
+    let (ctx, client) = v3_cow_ctx(ns, tbl).await;
+    run_sql(
+        &ctx,
+        &format!("INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+    )
+    .await;
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("load");
+    assert_state(&table, &[(1, "a", 0, 1), (2, "b", 1, 1), (3, "c", 2, 1)], 3).await;
+    (ctx, client, ident)
+}
+
+#[tokio::test]
+async fn spark_delete_id_2() {
+    let ns = "spark_del_2";
+    let (ctx, client, ident) = spark_insert3(ns).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 2")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 0, 1), (3, "c", 2, 1)], 5).await;
+}
+
+#[tokio::test]
+async fn spark_delete_id_3() {
+    let ns = "spark_del_3";
+    let (ctx, client, ident) = spark_insert3(ns).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 3")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 0, 1), (2, "b", 1, 1)], 5).await;
+}
+
+#[tokio::test]
+async fn spark_delete_id_1() {
+    let ns = "spark_del_1";
+    let (ctx, client, ident) = spark_insert3(ns).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 1")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(2, "b", 1, 1), (3, "c", 2, 1)], 5).await;
+}
+
+#[tokio::test]
+async fn spark_delete_id_2_then_id_1() {
+    let ns = "spark_del_2_1";
+    let (ctx, client, ident) = spark_insert3(ns).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 2")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 0, 1), (3, "c", 2, 1)], 5).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 1")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(3, "c", 2, 1)], 6).await;
+}
+
+#[tokio::test]
+async fn spark_update_id_2_then_delete_id_1() {
+    let ns = "spark_upd_del_1";
+    let (ctx, client, ident) = spark_insert3(ns).await;
+    run_sql(
+        &ctx,
+        &format!("UPDATE catalog.{ns}.t SET val = 'B' WHERE id = 2"),
+    )
+    .await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 0, 1), (2, "B", 1, 2), (3, "c", 2, 1)], 6).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 1")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(2, "B", 1, 2), (3, "c", 2, 1)], 8).await;
+}
+
+#[tokio::test]
+async fn spark_update_id_2_then_delete_id_2() {
+    let ns = "spark_upd_del_2";
+    let (ctx, client, ident) = spark_insert3(ns).await;
+    run_sql(
+        &ctx,
+        &format!("UPDATE catalog.{ns}.t SET val = 'B' WHERE id = 2"),
+    )
+    .await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 0, 1), (2, "B", 1, 2), (3, "c", 2, 1)], 6).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 2")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 0, 1), (3, "c", 2, 1)], 8).await;
+}
+
+#[tokio::test]
+async fn spark_insert_overwrite_then_delete_id_2() {
+    let ns = "spark_ow_del_2";
+    let (ctx, client, ident) = spark_insert3(ns).await;
+    run_sql(
+        &ctx,
+        &format!("INSERT OVERWRITE catalog.{ns}.t VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+    )
+    .await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 3, 2), (2, "b", 4, 2), (3, "c", 5, 2)], 6).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 2")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 3, 2), (3, "c", 5, 2)], 8).await;
+}
+
+#[tokio::test]
+async fn spark_update_id_le_2_then_delete_id_3() {
+    let ns = "spark_upd_le2_del_3";
+    let (ctx, client, ident) = spark_insert3(ns).await;
+    run_sql(
+        &ctx,
+        &format!("UPDATE catalog.{ns}.t SET val = 'B' WHERE id <= 2"),
+    )
+    .await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "B", 0, 2), (2, "B", 1, 2), (3, "c", 2, 1)], 6).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 3")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "B", 0, 2), (2, "B", 1, 2)], 8).await;
+}
+
+#[tokio::test]
+async fn spark_delete_id_2_insert_4_then_delete_id_1() {
+    let ns = "spark_del_ins_del";
+    let (ctx, client, ident) = spark_insert3(ns).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 2")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 0, 1), (3, "c", 2, 1)], 5).await;
+    run_sql(&ctx, &format!("INSERT INTO catalog.{ns}.t VALUES (4, 'd')")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 0, 1), (3, "c", 2, 1), (4, "d", 5, 3)], 6).await;
+    run_sql(&ctx, &format!("DELETE FROM catalog.{ns}.t WHERE id = 1")).await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(3, "c", 2, 1), (4, "d", 5, 3)], 7).await;
+}
+
+#[tokio::test]
+async fn spark_three_single_row_inserts_then_delete_id_2_then_id_1() {
+    let ns = "spark_3ins_del";
+    let tbl = "t";
+    let (ctx, client) = v3_cow_ctx(ns, tbl).await;
+    run_sql(
+        &ctx,
+        &format!("INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a')"),
+    )
+    .await;
+    run_sql(
+        &ctx,
+        &format!("INSERT INTO catalog.{ns}.{tbl} VALUES (2, 'b')"),
+    )
+    .await;
+    run_sql(
+        &ctx,
+        &format!("INSERT INTO catalog.{ns}.{tbl} VALUES (3, 'c')"),
+    )
+    .await;
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("load");
+    assert_state(&table, &[(1, "a", 0, 1), (2, "b", 1, 2), (3, "c", 2, 3)], 3).await;
+    run_sql(
+        &ctx,
+        &format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 2"),
+    )
+    .await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(1, "a", 0, 1), (3, "c", 2, 3)], 3).await;
+    run_sql(
+        &ctx,
+        &format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 1"),
+    )
+    .await;
+    let table = client.load_table(&ident).await.expect("reload");
+    assert_state(&table, &[(3, "c", 2, 3)], 3).await;
+}

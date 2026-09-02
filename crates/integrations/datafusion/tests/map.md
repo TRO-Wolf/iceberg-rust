@@ -36,7 +36,9 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `interop_branch_dml.rs` | Branch read/commit Java interop (row R168 / PR-6A). Offline: Rust reproduces a Java diverged branch table; missing-ref SELECT/UPDATE; INSERT creates (ids, parent, main vs branch file sets); tag refuses; V3 MoR DELETE uses branch live files. GEN of 6 `rust_*` tables pins post-DML main vs branch file sets and writes `expected_*_files.txt`. Env `ICEBERG_INTEROP_BRANCH_DIR` / `_GEN_DIR` via `dev/java-interop/run-interop-branch-dml.sh` |
 | `lazy_table_resolution_test.rs` | Catalog-backed lazy resolve |
 | `partitioned_insert_select_test.rs` | Partitioned INSERT SELECT |
-| `row_lineage_cow.rs` | V3 row lineage on CoW DML |
+| `row_lineage_cow.rs` | V3 row lineage on CoW DML; Spark sequences at the fork's single-file layout (F-rp3-c7, row R166) |
+| `row_lineage_mor.rs` | V3 merge-on-read UPDATE lineage, sequential/partitioned UPDATE, V2 control, commit-conflict |
+| `interop_mor_update_lineage.rs` | GEN for `run-interop-mor-update-lineage.sh` (Java-created V3 tables; two MoR UPDATE statements + RePark COW UPDATE-then-DELETE) |
 | `shared_puffin_dv/` | Shared-Puffin deletion-vector DML |
 
 ## I want to...
