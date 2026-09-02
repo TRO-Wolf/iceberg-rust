@@ -127,8 +127,8 @@ Liftable after this unit:
 Charter clauses: C-003; C-007 PR-3 slice (F-rp3-c7)
 Matrix rows: row R114, row R166
 Java methods or bytecode read: ManifestListWriter$V3Writer.prepare (assign vs already-assigned; nextRowId += existingRowsCount + addedRowsCount); ManifestFiles.write aconst_null firstRowId; Delegates$1.firstRowId aconst_null; SnapshotProducer.apply assignedRows = writer.nextRowId - table.nextRowId
-Files changed: physical_plan/delete.rs, physical_plan/row_lineage.rs, spec/manifest/entry.rs, spec/manifest/writer.rs, row_lineage_mor.rs, row_lineage_cow.rs, shared_puffin_dv live/extra, interop_mor_update_lineage.rs, run-interop-mor-update-lineage.sh, InteropOracle.MorUpdateLineageOracle, GAP_MATRIX rows R114 and R166, maps, this ledger
-Behavior before: MoR UPDATE wrote replacement rows without _row_id / last-updated; COW rewrite of stored-_row_id files advanced next-row-id by every added row
+Files changed: physical_plan/delete.rs, physical_plan/row_lineage.rs (spec/manifest/entry.rs and writer.rs unchanged in behavior — the filtered-rewrite first_row_id copy is base behavior, newly pinned), row_lineage_mor.rs, row_lineage_cow.rs, shared_puffin_dv live/extra, interop_mor_update_lineage.rs, run-interop-mor-update-lineage.sh, InteropOracle.MorUpdateLineageOracle, GAP_MATRIX rows R114 and R166, maps, this ledger
+Behavior before: MoR UPDATE wrote replacement rows without _row_id / last-updated (COW next-row-id vs the merge base is unchanged; the intermediate overrides were reverted)
 Behavior after: MoR UPDATE keeps _row_id and nulls last-updated on the modified row; next-row-id is Java += existing+added on unassigned DATA at matched layout
 Negative cases: V2 still writes position deletes; concurrent removal of a referenced data file refuses the UPDATE; no replacement DV
 Test command and population: cargo test -p iceberg --locked --lib spec::manifest::entry::first_row_id_tests; cargo test -p iceberg-datafusion --locked --test row_lineage_mor --test row_lineage_cow --test shared_puffin_dv; bash dev/java-interop/run-interop-mor-update-lineage.sh (2 fixtures)
