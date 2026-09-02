@@ -140,7 +140,7 @@ pub(crate) type PendingDeleteFile = (DataFile, Option<i64>);
 
 mod removal_targets;
 
-use removal_targets::{OwnedDeleteFileKey, RemovalHits, RemovalTargets, owned_delete_key};
+use removal_targets::{DeleteFileMatcher, RemovalHits, RemovalTargets};
 
 pub(crate) fn latest_snapshot<'a>(
     metadata: &'a TableMetadata,
@@ -303,9 +303,9 @@ impl<'a> SnapshotProducer<'a> {
     /// `MergingSnapshotProducer.delete(DeleteFile)`. `RowDelta.removeDeletes` uses it to drop a
     /// delete file the new delete supersedes, such as the old DV a merged super-set DV replaces.
     ///
-    /// [`SnapshotProducer::commit`] resolves the paths against the current DELETE manifests, and a
-    /// missing path fails loud. `process_deletes` matches by path across EVERY manifest, so the
-    /// tombstone lands in the rewritten DELETE manifest and DATA manifests are untouched.
+    /// [`SnapshotProducer::commit`] resolves each file against the current DELETE manifests by the
+    /// Java `DeleteFileSet` triple, and a missing blob fails loud. `process_deletes` matches DELETE
+    /// manifests on that same triple, so a sibling blob at the same Puffin path is not tombstoned.
     pub(crate) fn with_removed_delete_files(mut self, removed_delete_files: Vec<DataFile>) -> Self {
         self.removed_delete_files = removed_delete_files;
         self
@@ -638,9 +638,8 @@ impl<'a> SnapshotProducer<'a> {
             return Ok(vec![]);
         }
 
-        let wanted: HashSet<OwnedDeleteFileKey> = requested.iter().map(owned_delete_key).collect();
+        let mut matcher = DeleteFileMatcher::new(requested);
         let mut resolved = Vec::new();
-        let mut found: HashSet<OwnedDeleteFileKey> = HashSet::new();
         if let Some(snapshot) = self.parent_snapshot() {
             let manifest_list = snapshot
                 .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
@@ -655,20 +654,14 @@ impl<'a> SnapshotProducer<'a> {
                     if !entry.is_alive() {
                         continue;
                     }
-                    let key = owned_delete_key(entry.data_file());
-                    if wanted.contains(&key) {
-                        found.insert(key);
+                    if matcher.hit(entry.data_file()) {
                         resolved.push(entry.data_file().clone());
                     }
                 }
             }
         }
 
-        let missing: Vec<&str> = wanted
-            .iter()
-            .filter(|key| !found.contains(*key))
-            .map(|(path, _, _)| path.as_str())
-            .collect();
+        let missing = matcher.missing();
         if !missing.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -1172,8 +1165,14 @@ impl<'a> SnapshotProducer<'a> {
         let mut result_manifests = Vec::with_capacity(existing_manifests.len());
 
         for manifest_file in existing_manifests {
-            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
             let content = manifest_file.content;
+            if !targets.wants(content) {
+                if manifest_file.has_added_files() || manifest_file.has_existing_files() {
+                    result_manifests.push(manifest_file);
+                }
+                continue;
+            }
+            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
 
             let has_matching_delete = manifest
                 .entries()
@@ -1193,7 +1192,7 @@ impl<'a> SnapshotProducer<'a> {
             result_manifests.push(rewritten);
         }
 
-        let missing = targets.missing(&hits);
+        let missing = targets.missing_data_paths(&hits);
         if !missing.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,

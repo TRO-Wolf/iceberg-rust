@@ -654,7 +654,7 @@ pub(crate) fn is_transaction_base_stale(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::BufReader;

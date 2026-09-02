@@ -15,23 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::spec::{DataFile, ManifestContentType};
 
-pub(super) type OwnedDeleteFileKey = (String, Option<i64>, Option<i64>);
+pub(super) type DeleteFileKey<'a> = (&'a str, Option<i64>, Option<i64>);
 
-type DeleteFileKey<'a> = (&'a str, Option<i64>, Option<i64>);
-
-pub(super) fn owned_delete_key(file: &DataFile) -> OwnedDeleteFileKey {
-    (
-        file.file_path().to_string(),
-        file.content_offset(),
-        file.content_size_in_bytes(),
-    )
-}
-
-fn delete_key(file: &DataFile) -> DeleteFileKey<'_> {
+pub(super) fn delete_key(file: &DataFile) -> DeleteFileKey<'_> {
     (
         file.file_path(),
         file.content_offset(),
@@ -47,7 +37,6 @@ pub(super) struct RemovalTargets<'a> {
 #[derive(Default)]
 pub(super) struct RemovalHits {
     data_paths: HashSet<String>,
-    delete_keys: HashSet<OwnedDeleteFileKey>,
 }
 
 impl<'a> RemovalTargets<'a> {
@@ -71,36 +60,73 @@ impl<'a> RemovalTargets<'a> {
         }
     }
 
-    pub(super) fn missing(&self, hits: &RemovalHits) -> Vec<&str> {
-        let mut missing: Vec<&str> = self
-            .data_paths
+    pub(super) fn has_data_targets(&self) -> bool {
+        !self.data_paths.is_empty()
+    }
+
+    pub(super) fn has_delete_targets(&self) -> bool {
+        !self.delete_keys.is_empty()
+    }
+
+    pub(super) fn wants(&self, content: ManifestContentType) -> bool {
+        match content {
+            ManifestContentType::Deletes => self.has_delete_targets(),
+            ManifestContentType::Data => self.has_data_targets(),
+        }
+    }
+
+    pub(super) fn missing_data_paths(&self, hits: &RemovalHits) -> Vec<&str> {
+        self.data_paths
             .iter()
             .filter(|path| !hits.data_paths.contains(**path))
             .copied()
-            .collect();
-        missing.extend(
-            self.delete_keys
-                .iter()
-                .filter(|key| {
-                    !hits
-                        .delete_keys
-                        .contains(&(key.0.to_string(), key.1, key.2))
-                })
-                .map(|key| key.0),
-        );
-        missing
+            .collect()
     }
 }
 
 impl RemovalHits {
     pub(super) fn record(&mut self, content: ManifestContentType, file: &DataFile) {
-        match content {
-            ManifestContentType::Deletes => {
-                self.delete_keys.insert(owned_delete_key(file));
-            }
-            ManifestContentType::Data => {
-                self.data_paths.insert(file.file_path().to_string());
-            }
+        if content == ManifestContentType::Data {
+            self.data_paths.insert(file.file_path().to_string());
         }
+    }
+}
+
+pub(super) struct DeleteFileMatcher<'a> {
+    requested: &'a [DataFile],
+    wanted: HashMap<DeleteFileKey<'a>, usize>,
+    found: Vec<bool>,
+}
+
+impl<'a> DeleteFileMatcher<'a> {
+    pub(super) fn new(requested: &'a [DataFile]) -> Self {
+        let mut wanted = HashMap::with_capacity(requested.len());
+        for (index, file) in requested.iter().enumerate() {
+            wanted.insert(delete_key(file), index);
+        }
+        Self {
+            requested,
+            wanted,
+            found: vec![false; requested.len()],
+        }
+    }
+
+    pub(super) fn hit(&mut self, file: &DataFile) -> bool {
+        match self.wanted.get(&delete_key(file)) {
+            Some(index) => {
+                self.found[*index] = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn missing(&self) -> Vec<&'a str> {
+        self.requested
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.found[*index])
+            .map(|(_, file)| file.file_path())
+            .collect()
     }
 }

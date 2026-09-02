@@ -30,11 +30,11 @@ Ledger: [`f18-dv-container-close-ledger.md`](f18-dv-container-close-ledger.md). 
 
 - [x] C-001 red: `shared_puffin_dv/container.rs::touched_blob_moves_and_the_sibling_entry_stays_put` failed on base d4ef080ac (sibling entry moved container), green after.
 - [x] C-002 Spark-equal close: DELETE-file removal keyed by the Java `DeleteFileSet` triple; only the touched blob is rewritten; the sibling entry is untouched. T5 re-aimed — one statement writes ONE Puffin.
-- [x] C-003 lazy walk: one manifest-list load per close, `buffer_unordered(8)` manifest and DV reads, `collect_live_data_files` only for the paths with no previous DV, `DVFileWriter::delete` `get_mut` before allocating.
+- [x] C-003 lazy walk, PINNED by a counting `Storage`: a supplied partition map reads ZERO data manifests; without it each data manifest is read exactly once. Round 2 adds `with_previous_deletes` for the touched blob, the untargeted-manifest early-out, the caller-supplied partition map, and the borrowed streaming manifest reads.
 - [x] C-004 measured: 64-blob later DELETE rewrote 19,830 B before, 388 B after (16 blobs 5,006 -> 388); six single-row `DELETE` statements at 8/64/192 live data files 850/922/1152 ms before, 731/841/1138 ms after (debug, same clone).
 - [x] C-005 interop: `dev/java-interop/run-interop-f18-dv-sibling-close.sh` PASSED with its sabotage leg red; `SUITE_FLOOR_DEFAULT` 63 -> 64.
 - [x] C-006 docs: row R114, this entry, `map.md` lockstep, ledger.
-- [ ] RULING: retire the F-17 `DELETE`-side Java skip-delete divergence now that untouched siblings are no longer rewritten (kept conservatively in this unit).
+- [x] RULED: the F-17 `DELETE`-side skip-delete divergence and `rewrite_siblings_for_dropped_references` both retire in unit F-19, not here.
 - [ ] RePark: re-aim the shared-Puffin cell in `crates/repark-spark/src/tests/v3e4.rs`, registry row `V3-DV-1`, repin unit RP-7.
 
 ## ACTIVE (2026-09-02): F-16 residue 2 — partition-scoped delete ratio (RePark RDF-1); HALT, premise refuted

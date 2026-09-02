@@ -162,3 +162,41 @@ async fn dv_close_bytes_by_blob_count() {
         );
     }
 }
+
+async fn seed_one_manifest_per_file(harness: &Harness, files: usize) {
+    for file in 0..files {
+        let rows: Vec<String> = (0..ROWS_PER_FILE)
+            .map(|row| {
+                let id = file * 10 + row;
+                format!("({id}, 'd{id}', 'p{file:04}')")
+            })
+            .collect();
+        run_sql(
+            &harness.ctx,
+            &format!("INSERT INTO catalog.{NS}.{TBL} VALUES {}", rows.join(", ")),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "wall-clock measurement, not a CI pin"]
+async fn dv_close_wall_time_by_data_manifest_count() {
+    for files in [8usize, 64, 192] {
+        let harness = harness().await;
+        seed_one_manifest_per_file(&harness, files).await;
+        let started = Instant::now();
+        for file in 0..6usize {
+            let id = file * 10 + 1;
+            run_sql(
+                &harness.ctx,
+                &format!("DELETE FROM catalog.{NS}.{TBL} WHERE id = {id}"),
+            )
+            .await;
+        }
+        eprintln!(
+            "data-manifests={files} six-single-row-deletes={}ms",
+            started.elapsed().as_millis()
+        );
+    }
+}

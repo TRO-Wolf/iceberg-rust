@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared-Puffin deletion-vector container closure.
-//!
-//! `RowDelta` removal is keyed by the Java `DeleteFileSet` triple, so one blob of a shared Puffin
-//! is replaced on its own: Spark's layout, where the untouched sibling entry keeps pointing at the
-//! old container. Maintenance and DataFusion DML both use this module.
+//! Deletion-vector container closure for DataFusion DML and maintenance.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,13 +23,14 @@ use futures::{StreamExt, TryStreamExt, stream};
 use uuid::Uuid;
 
 use crate::delete_file_index::is_deletion_vector;
-use crate::delete_vector::load_delete_vector;
+use crate::delete_vector::{DeleteVector, load_delete_vector};
+use crate::io::FileIO;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, Manifest, ManifestContentType, ManifestList,
-    PartitionKey,
+    PartitionKey, PartitionSpec, Struct,
 };
 use crate::table::Table;
-use crate::writer::base_writer::deletion_vector_writer::DVFileWriter;
+use crate::writer::base_writer::deletion_vector_writer::{DVFileWriter, PreviousDeletes};
 use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
 };
@@ -56,8 +53,7 @@ pub struct DvContainerClose {
 }
 
 impl DvContainerClose {
-    /// Referenced data-file paths the commit depends on: the replacement blobs plus the untouched
-    /// siblings of every container this commit rewrote out of.
+    /// Referenced data-file paths the commit depends on: replacements plus retained siblings.
     pub fn referenced_data_files(&self) -> HashSet<String> {
         let mut references: HashSet<String> = self
             .added
@@ -85,16 +81,20 @@ struct LiveDv {
     sequence_number: i64,
 }
 
+struct DvIndex {
+    touched: Vec<DataFile>,
+    siblings: Vec<(String, String)>,
+}
+
 struct BlobWrite {
     referenced: String,
     positions: Vec<u64>,
+    previous: Option<DeleteVector>,
     partition_key: PartitionKey,
     data_sequence: Option<i64>,
 }
 
-/// Close the deletion vectors touched by `new_positions`, Spark-equal. A touched blob is rewritten
-/// (old positions union new) into ONE new container and its old entry removed; a live sibling blob
-/// is neither read nor moved, and the bytes it supersedes stay put for orphan cleanup.
+/// Close the deletion vectors touched by `new_positions` against the current snapshot.
 pub async fn close_touched_dv_containers(
     table: &Table,
     new_positions: &HashMap<String, Vec<u64>>,
@@ -107,6 +107,17 @@ pub async fn close_touched_dv_containers_at(
     table: &Table,
     new_positions: &HashMap<String, Vec<u64>>,
     snapshot_id: Option<i64>,
+) -> Result<DvContainerClose> {
+    close_touched_dv_containers_with_partitions(table, new_positions, snapshot_id, &HashMap::new())
+        .await
+}
+
+/// Close touched DV containers, taking each touched path's `(partition_spec_id, partition)` from `known_partitions`.
+pub async fn close_touched_dv_containers_with_partitions(
+    table: &Table,
+    new_positions: &HashMap<String, Vec<u64>>,
+    snapshot_id: Option<i64>,
+    known_partitions: &HashMap<String, (i32, Struct)>,
 ) -> Result<DvContainerClose> {
     if new_positions.is_empty() {
         return Ok(DvContainerClose::default());
@@ -122,47 +133,26 @@ pub async fn close_touched_dv_containers_at(
     }
 
     let manifest_list = live_manifest_list(table, snapshot_id).await?;
-    let live_dvs = collect_live_dvs(table, manifest_list.as_ref()).await?;
-
-    let mut by_container: HashMap<String, Vec<String>> = HashMap::new();
-    let mut by_reference: HashMap<String, LiveDv> = HashMap::new();
-    for dv in live_dvs {
-        let referenced = referenced_path(&dv.data_file)?;
-        by_container
-            .entry(dv.data_file.file_path().to_string())
-            .or_default()
-            .push(referenced.clone());
-        by_reference.insert(referenced, dv);
-    }
-
-    let mut touched: Vec<DataFile> = Vec::new();
-    let mut fresh: Vec<&String> = Vec::new();
-    for path in new_positions.keys() {
-        match by_reference.get(path) {
-            Some(dv) => touched.push(dv.data_file.clone()),
-            None => fresh.push(path),
-        }
-    }
+    let DvIndex { touched, siblings } =
+        collect_dv_index(table, manifest_list.as_ref(), new_positions).await?;
 
     let mut close = DvContainerClose::default();
     let mut specs: Vec<BlobWrite> = Vec::with_capacity(new_positions.len());
 
     let file_io = table.file_io().clone();
-    let loaded: Vec<(DataFile, Vec<u64>)> = stream::iter(touched.into_iter().map(|data_file| {
-        let file_io = file_io.clone();
-        async move {
-            let positions: Vec<u64> = load_delete_vector(&file_io, &data_file)
-                .await?
-                .iter()
-                .collect();
-            Ok::<_, Error>((data_file, positions))
-        }
-    }))
-    .buffer_unordered(DV_IO_CONCURRENCY)
-    .try_collect()
-    .await?;
+    let loaded: Vec<(DataFile, DeleteVector)> =
+        stream::iter(touched.into_iter().map(|data_file| {
+            let file_io = file_io.clone();
+            async move {
+                let previous = load_delete_vector(&file_io, &data_file).await?;
+                Ok::<_, Error>((data_file, previous))
+            }
+        }))
+        .buffer_unordered(DV_IO_CONCURRENCY)
+        .try_collect()
+        .await?;
 
-    for (data_file, mut positions) in loaded {
+    for (data_file, previous) in loaded {
         let referenced = referenced_path(&data_file)?;
         let added = new_positions.get(&referenced).ok_or_else(|| {
             Error::new(
@@ -170,56 +160,77 @@ pub async fn close_touched_dv_containers_at(
                 format!("deletion-vector: untouched blob `{referenced}` entered the rewrite set"),
             )
         })?;
-        positions.extend(added.iter().copied());
-        positions.sort_unstable();
-        positions.dedup();
+        if added.is_empty() {
+            continue;
+        }
         specs.push(BlobWrite {
             partition_key: partition_key_for(table, &data_file)?,
             referenced,
-            positions,
+            positions: added.clone(),
+            previous: Some(previous),
             data_sequence: None,
         });
         close.removed.push(data_file);
     }
 
+    let fresh: Vec<&String> = {
+        let rewritten: HashSet<&str> = specs.iter().map(|spec| spec.referenced.as_str()).collect();
+        new_positions
+            .iter()
+            .filter(|(path, positions)| !positions.is_empty() && !rewritten.contains(path.as_str()))
+            .map(|(path, _)| path)
+            .collect()
+    };
+
     if !fresh.is_empty() {
-        let wanted: HashSet<&str> = fresh.iter().map(|path| path.as_str()).collect();
-        let data_files = collect_live_data_files(table, manifest_list.as_ref(), &wanted).await?;
+        let unresolved: HashSet<&str> = fresh
+            .iter()
+            .map(|path| path.as_str())
+            .filter(|path| !known_partitions.contains_key(*path))
+            .collect();
+        let discovered = if unresolved.is_empty() {
+            HashMap::new()
+        } else {
+            collect_live_data_files(table, manifest_list.as_ref(), &unresolved).await?
+        };
         for path in fresh {
-            let data_file = data_files.get(path.as_str()).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "deletion-vector: data file `{path}` is not a live file of the scanned snapshot"
-                    ),
-                )
-            })?;
-            let mut positions = new_positions[path].clone();
-            positions.sort_unstable();
-            positions.dedup();
+            let partition_key = match known_partitions.get(path) {
+                Some((spec_id, partition)) => partition_key_of(table, *spec_id, partition, path)?,
+                None => {
+                    let data_file = discovered.get(path.as_str()).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "deletion-vector: data file `{path}` is not a live file of the scanned snapshot"
+                            ),
+                        )
+                    })?;
+                    partition_key_for(table, data_file)?
+                }
+            };
             specs.push(BlobWrite {
-                partition_key: partition_key_for(table, data_file)?,
+                partition_key,
                 referenced: path.clone(),
-                positions,
+                positions: new_positions[path].clone(),
+                previous: None,
                 data_sequence: None,
             });
         }
     }
 
-    specs.sort_unstable_by(|left, right| left.referenced.cmp(&right.referenced));
     close.removed.sort_unstable_by(|left, right| {
         (left.file_path(), left.content_offset()).cmp(&(right.file_path(), right.content_offset()))
     });
-    close.added = write_dv_blobs(table, &specs).await?;
+    close.added = write_dv_blobs(table, specs).await?;
 
-    for data_file in &close.removed {
-        let Some(siblings) = by_container.get(data_file.file_path()) else {
-            continue;
-        };
-        for referenced in siblings {
-            if !new_positions.contains_key(referenced) {
-                close.retained_references.insert(referenced.clone());
-            }
+    let rewritten_containers: HashSet<&str> = close
+        .removed
+        .iter()
+        .map(|data_file| data_file.file_path())
+        .collect();
+    for (container, referenced) in &siblings {
+        if rewritten_containers.contains(container.as_str()) {
+            close.retained_references.insert(referenced.clone());
         }
     }
 
@@ -277,10 +288,11 @@ pub async fn rewrite_siblings_for_dropped_references(
                     partition_key: partition_key_for(table, &sibling.data_file)?,
                     referenced,
                     positions,
+                    previous: None,
                     data_sequence: Some(sibling.sequence_number),
                 });
             }
-            for (file, seq) in write_dv_blobs(table, &specs).await? {
+            for (file, seq) in write_dv_blobs(table, specs).await? {
                 let seq = seq.ok_or_else(|| {
                     Error::new(
                         ErrorKind::Unexpected,
@@ -332,26 +344,62 @@ async fn live_manifest_list(
         .map(Some)
 }
 
-async fn load_manifests(
-    table: &Table,
-    manifest_list: &ManifestList,
+fn manifest_stream<'a>(
+    file_io: &FileIO,
+    manifest_list: &'a ManifestList,
     content: ManifestContentType,
-) -> Result<Vec<Manifest>> {
-    let file_io = table.file_io().clone();
-    let reads: Vec<_> = manifest_list
-        .entries()
-        .iter()
-        .filter(|manifest_file| manifest_file.content == content)
-        .cloned()
-        .map(move |manifest_file| {
-            let file_io = file_io.clone();
-            async move { manifest_file.load_manifest(&file_io).await }
-        })
-        .collect();
-    stream::iter(reads)
-        .buffer_unordered(DV_IO_CONCURRENCY)
-        .try_collect()
-        .await
+) -> impl futures::Stream<Item = Result<Manifest>> + 'a {
+    let file_io = file_io.clone();
+    stream::iter(
+        manifest_list
+            .entries()
+            .iter()
+            .filter(move |manifest_file| manifest_file.content == content),
+    )
+    .map(move |manifest_file| {
+        let file_io = file_io.clone();
+        async move { manifest_file.load_manifest(&file_io).await }
+    })
+    .buffer_unordered(DV_IO_CONCURRENCY)
+}
+
+fn is_live_dv(entry: &crate::spec::ManifestEntry) -> bool {
+    entry.is_alive()
+        && entry.data_file().content_type() == DataContentType::PositionDeletes
+        && is_deletion_vector(entry.data_file())
+}
+
+async fn collect_dv_index(
+    table: &Table,
+    manifest_list: Option<&ManifestList>,
+    new_positions: &HashMap<String, Vec<u64>>,
+) -> Result<DvIndex> {
+    let mut index = DvIndex {
+        touched: Vec::new(),
+        siblings: Vec::new(),
+    };
+    let Some(manifest_list) = manifest_list else {
+        return Ok(index);
+    };
+    let mut manifests =
+        manifest_stream(table.file_io(), manifest_list, ManifestContentType::Deletes);
+    while let Some(manifest) = manifests.try_next().await? {
+        for entry in manifest.entries() {
+            if !is_live_dv(entry) {
+                continue;
+            }
+            let data_file = entry.data_file();
+            let referenced = referenced_path(data_file)?;
+            if new_positions.contains_key(&referenced) {
+                index.touched.push(data_file.clone());
+            } else {
+                index
+                    .siblings
+                    .push((data_file.file_path().to_string(), referenced));
+            }
+        }
+    }
+    Ok(index)
 }
 
 async fn collect_live_dvs(
@@ -362,19 +410,15 @@ async fn collect_live_dvs(
     let Some(manifest_list) = manifest_list else {
         return Ok(live);
     };
-    for manifest in load_manifests(table, manifest_list, ManifestContentType::Deletes).await? {
+    let mut manifests =
+        manifest_stream(table.file_io(), manifest_list, ManifestContentType::Deletes);
+    while let Some(manifest) = manifests.try_next().await? {
         for entry in manifest.entries() {
-            if !entry.is_alive() {
-                continue;
-            }
-            let data_file = entry.data_file();
-            if data_file.content_type() != DataContentType::PositionDeletes
-                || !is_deletion_vector(data_file)
-            {
+            if !is_live_dv(entry) {
                 continue;
             }
             live.push(LiveDv {
-                data_file: data_file.clone(),
+                data_file: entry.data_file().clone(),
                 sequence_number: entry.sequence_number().unwrap_or(0),
             });
         }
@@ -391,7 +435,8 @@ async fn collect_live_data_files(
     let Some(manifest_list) = manifest_list else {
         return Ok(files);
     };
-    for manifest in load_manifests(table, manifest_list, ManifestContentType::Data).await? {
+    let mut manifests = manifest_stream(table.file_io(), manifest_list, ManifestContentType::Data);
+    while let Some(manifest) = manifests.try_next().await? {
         for entry in manifest.entries() {
             if !entry.is_alive() || entry.data_file().content_type() != DataContentType::Data {
                 continue;
@@ -421,16 +466,28 @@ fn referenced_path(data_file: &DataFile) -> Result<String> {
 }
 
 fn partition_key_for(table: &Table, data_file: &DataFile) -> Result<PartitionKey> {
-    let spec = table
+    partition_key_of(
+        table,
+        data_file.partition_spec_id(),
+        data_file.partition(),
+        data_file.file_path(),
+    )
+}
+
+fn partition_key_of(
+    table: &Table,
+    spec_id: i32,
+    partition: &Struct,
+    described: &str,
+) -> Result<PartitionKey> {
+    let spec: PartitionSpec = table
         .metadata()
-        .partition_spec_by_id(data_file.partition_spec_id())
+        .partition_spec_by_id(spec_id)
         .ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Deletion vector '{}' references unknown partition spec {}",
-                    data_file.file_path(),
-                    data_file.partition_spec_id()
+                    "Deletion vector '{described}' references unknown partition spec {spec_id}"
                 ),
             )
         })?
@@ -439,11 +496,11 @@ fn partition_key_for(table: &Table, data_file: &DataFile) -> Result<PartitionKey
     PartitionKey::new(
         spec,
         table.metadata().current_schema().clone(),
-        data_file.partition().clone(),
+        partition.clone(),
     )
 }
 
-async fn write_dv_blobs(table: &Table, blobs: &[BlobWrite]) -> Result<Vec<StampedDeleteFile>> {
+async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<StampedDeleteFile>> {
     if blobs.is_empty() {
         return Ok(Vec::new());
     }
@@ -456,13 +513,26 @@ async fn write_dv_blobs(table: &Table, blobs: &[BlobWrite]) -> Result<Vec<Stampe
     );
     let location =
         location_generator.generate_location(None, &file_name_generator.generate_file_name());
-    let mut writer = DVFileWriter::new(table.file_io().new_output(location)?).unpartitioned();
-    let mut seq_by_ref: HashMap<String, Option<i64>> = HashMap::new();
+    let mut seq_by_ref: HashMap<String, Option<i64>> = HashMap::with_capacity(blobs.len());
+    let mut previous_by_path: HashMap<String, PreviousDeletes> = HashMap::new();
+    let mut writes: Vec<(String, Vec<u64>, PartitionKey)> = Vec::with_capacity(blobs.len());
     for blob in blobs {
-        for &position in &blob.positions {
-            writer.delete(&blob.referenced, position, Some(&blob.partition_key))?;
-        }
         seq_by_ref.insert(blob.referenced.clone(), blob.data_sequence);
+        if let Some(previous) = blob.previous {
+            previous_by_path.insert(
+                blob.referenced.clone(),
+                PreviousDeletes::new(previous, Vec::new()),
+            );
+        }
+        writes.push((blob.referenced, blob.positions, blob.partition_key));
+    }
+    let mut writer = DVFileWriter::new(table.file_io().new_output(location)?)
+        .unpartitioned()
+        .with_previous_deletes(previous_by_path);
+    for (referenced, positions, partition_key) in &writes {
+        for &position in positions {
+            writer.delete(referenced, position, Some(partition_key))?;
+        }
     }
     let files = writer.close().await?;
     let mut out = Vec::with_capacity(files.len());
@@ -481,3 +551,6 @@ async fn write_dv_blobs(table: &Table, blobs: &[BlobWrite]) -> Result<Vec<Stampe
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests;
