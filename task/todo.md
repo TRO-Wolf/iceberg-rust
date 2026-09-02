@@ -30,7 +30,7 @@ Ledger: [`pr7-production-evidence-closeout-ledger.md`](pr7-production-evidence-c
 
 - [x] Re-run gates 1 to 5 alone on the merged tree: `typos .` 0, `make check` 0, `make check-msrv` 0, `cargo build -p iceberg --no-default-features` 0, `cargo deny check advisories` 0.
 - [x] Gate 6 recorded RED at exit 100 with the 26 Docker-backed failures named; the non-Docker leg is 4606 passed, 3 skipped, exit 0.
-- [x] Gate 7: the seven targeted interop suites plus `run-pr5a-catalog-commit-decode.sh`, every fixture count read from the runner's own output (3, 5, 2, 9, 9, 4+6, 1+7, 12 needles).
+- [x] Gate 7: the seven targeted interop suites plus `run-interop-pr5a-catalog-commit-decode.sh`, every fixture count read from the runner's own output (3, 5, 2, 9, 9, 4+6, 1+7, 12 needles).
 - [x] Gate 8 recorded as the owner-run prerequisite with its exact command; gate 9 named as RePark's.
 - [x] Clause table C-001 to C-007 with PR, matrix row, population, mutation counts and interop fixture count; CI-only exceptions enumerated; open findings rolled up (three open, all S3).
 - [x] Re-audited rows R107, R109, R110, R114, R135, R136, R157, R166 and R168 against `fb0cacfa8`. No status changed; every cell carries a dated re-audit stamp naming its residue.

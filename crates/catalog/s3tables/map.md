@@ -62,7 +62,7 @@ S3 Tables service-side maintenance is a concurrent committer even under one appl
 ### First checks
 
 - Offline: `cargo test -p iceberg-catalog-s3tables --lib --locked`
-- Decode: `dev/java-interop/run-pr5a-catalog-commit-decode.sh`
+- Decode: `dev/java-interop/run-interop-pr5a-catalog-commit-decode.sh`
 
 ### Escalate to
 

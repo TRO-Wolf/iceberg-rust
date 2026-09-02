@@ -54,7 +54,7 @@ LEDGER:
 | C-002 REPLACE record-count | PR-1 (#253) | R107 | `cargo test -p iceberg --locked --lib replace_`, 5 named pins | 4 knobs, 1 red out of 1 each | `run-interop-replace-invariant.sh`, 3 | PROVEN |
 | C-003 V3 MoR UPDATE lineage | PR-3 (#255) | R114, R166 | `cargo test -p iceberg-datafusion --locked --test row_lineage_mor --test row_lineage_cow --test shared_puffin_dv` | 3/5, 3/5, 3/5, 10/10 | `run-interop-mor-update-lineage.sh`, 2 | PROVEN |
 | C-004 upgrade + maintenance | PR-4 (#257) | R109, R114, R135, R136, R166 | `cargo test -p iceberg -p iceberg-datafusion --locked` | MUT-1 2/4, MUT-2 3/4, MUT-3 3/4, MUT-4 1/4, MUT-5 1/4; control 0/4 | `run-interop-v3-upgrade.sh` 9; `run-interop-v3-maintenance.sh` 9 | PROVEN |
-| C-005 catalog commit outcomes | PR-5A (#252) | R110, R157 | `cargo test -p iceberg-catalog-glue --lib --locked`, 41; `-p iceberg-catalog-s3tables`, 39 | glue M1-M7: 2,2,2,2,2,1,2 out of 41; matching S3 Tables knobs | `run-pr5a-catalog-commit-decode.sh`, 12 needles | OFFLINE PROVEN; credentialed cells PENDING (gate 8) |
+| C-005 catalog commit outcomes | PR-5A (#252) | R110, R157 | `cargo test -p iceberg-catalog-glue --lib --locked`, 41; `-p iceberg-catalog-s3tables`, 39 | glue M1-M7: 2,2,2,2,2,1,2 out of 41; matching S3 Tables knobs | `run-interop-pr5a-catalog-commit-decode.sh`, 12 needles | OFFLINE PROVEN; credentialed cells PENDING (gate 8) |
 | C-006 branch reference ops | PR-6A (#251) | R168 | `cargo test -p iceberg-datafusion --test interop_branch_dml --locked`, 14 | 3 red out of 3 plus file-set sabotage B | `run-interop-branch-dml.sh`, 4 Java + 6 Rust | PROVEN |
 | C-006 branch MoR lineage cell | PR-6B (#256) | R168 | `cargo test -p iceberg-datafusion --test interop_mor_branch_lineage --locked`, 3 | 14 red out of 14 (4 Rust, 10 Java-verify) | `run-interop-mor-branch-lineage.sh`, 1 Java + 7 Rust | PROVEN |
 | C-007 evidence discipline | PR-7 (this) | all of the above | gates 1-7, section 3 | the mutation columns above | section 3 gate 7 | PROVEN |
@@ -76,7 +76,7 @@ Unit ledgers: `pr1-replace-invariant-ledger.md`, `pr2-partition-safe-rewrite-led
 | 6 | `cargo nextest run --workspace --all-targets --all-features --exclude iceberg-sqllogictest` | 100 | 3895/4653 run, 3869 passed, 26 failed — every failure a Docker-backed suite (section 4) |
 | 6b | the non-Docker leg: same command plus `--no-fail-fast --exclude iceberg-integration-tests -E 'not (binary(hms_catalog_test) or binary(glue_catalog_test) or binary(rest_catalog_test) or binary(file_io_s3_test) or binary(file_io_gcs_test))'` | 0 | 4606 run, 4606 passed, 3 skipped, 91 binaries |
 | 7 | `scripts/run_interop_suites.sh --only <the seven suites below>` | 0 | discovery 62, floor 62; `TOTAL: 7 passed, 0 failed, 7 run`. Subset run, branded non-certifying by the driver |
-| 7 | `dev/java-interop/run-pr5a-catalog-commit-decode.sh` | 0 | `12 needles` (not in the discovered set — finding F-pr7-2) |
+| 7 | `dev/java-interop/run-interop-pr5a-catalog-commit-decode.sh` | 0 | `12 needles` (not in the discovered set — finding F-pr7-2) |
 | 8 | `ICEBERG_PR5A_CREDENTIALED=1 dev/pr5a-catalog-commit-outcomes.sh` | not run | owner-run prerequisite, section 5 |
 | 9 | RePark V3 scale and statement matrix | not run | consumer prerequisite, section 6 |
 
@@ -91,7 +91,7 @@ Gate 7, per suite, each fixture count read from the runner's own output, not fro
 | `run-interop-v3-maintenance.sh` | 0 | 73 | 9 `final.metadata.json`, 5 actions, 5 sabotages PASS |
 | `run-interop-branch-dml.sh` | 0 | 151 | Java fixture count 4 asserted; 6 Rust tables |
 | `run-interop-mor-branch-lineage.sh` | 0 | 43 | Java fixture count 1 asserted; 7 Rust GEN artifacts; sabotage RED |
-| `run-pr5a-catalog-commit-decode.sh` | 0 | — | 12 needles asserted |
+| `run-interop-pr5a-catalog-commit-decode.sh` | 0 | — | 12 needles asserted |
 
 Maven `/opt/maven/bin/mvn -o`, `JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64`. Every runner
 hard-fails on a missing prerequisite or a wrong fixture count.
@@ -135,7 +135,7 @@ release prerequisite. It authorizes no fork change and substitutes for no fork-s
 | F-rp3-c7 | — | pr3 ledger | suspected rewrite row-allocation defect | REFUTED — two-file Spark-seed layout artefact; recorded on row R166 |
 | PR-2 suspected rewrite-lineage defect | — | pr4 ledger | suspected defect | REFUTED — cargo mtime fingerprint artefact of the mutation harness |
 | F-pr7-1 | S3 | this unit | `Critic attestation:` still reads "pending independent Critic" in the PR-2, PR-3, PR-5A, PR-6A and PR-6B ledgers although all five merged | OPEN, evidence-trace only. The attestations are orchestrator-held and are not fork-tree artefacts. The plan's PR-7 exit gate "all PR Critics converged" is therefore attested outside this repository, and the bundle-scope Critic follows this PR |
-| F-pr7-2 | S3 | this unit | `run-pr5a-catalog-commit-decode.sh` does not match the driver's `run-interop-*.sh` glob, so the nightly net never runs it; the driver's documented not-discovered list names only `run.sh` and `run-inspection-manifests.sh` | OPEN. Named in `dev/java-interop/map.md`. Renaming the runner or widening the glob is a code change and is out of this unit's scope |
+| F-pr7-2 | S3 | this unit | `run-interop-pr5a-catalog-commit-decode.sh` does not match the driver's `run-interop-*.sh` glob, so the nightly net never runs it; the driver's documented not-discovered list names only `run.sh` and `run-inspection-manifests.sh` | OPEN. Named in `dev/java-interop/map.md`. Renaming the runner or widening the glob is a code change and is out of this unit's scope |
 | F-pr7-3 | S3 | this unit | `cargo deny check advisories` exits 0 with `warning[yanked]: chacha20 0.10.1`, transitive through `rand` → `object_store` → `datafusion` | OPEN. A dependency-file change is out of this unit's scope |
 
 No S0, S1 or S2 finding is open. The three open findings are S3 and none of them is a
@@ -174,7 +174,7 @@ Behavior after: every clause maps to a PR, a matrix row, a counted local populat
 Negative cases: gate 6 is recorded RED at exit 100 with the Docker-backed failures named rather than hidden; environment-gated early returns are excluded from the interop claim
 Test command and population: gates 1-7, section 3 — 4606 offline tests passed (3 skipped) plus 7 interop suites and the PR-5A decode
 Mutations, one at a time: none added; the per-unit counts are carried in section 2
-Java interop command and fixture count: seven suites through scripts/run_interop_suites.sh --only (3, 5, 2, 9, 9, 4+6, 1+7) plus run-pr5a-catalog-commit-decode.sh (12 needles)
+Java interop command and fixture count: seven suites through scripts/run_interop_suites.sh --only (3, 5, 2, 9, 9, 4+6, 1+7) plus run-interop-pr5a-catalog-commit-decode.sh (12 needles)
 CI-only evidence gap: section 4
 Breaking public API change: none — no product code changed
 Critic attestation: bundle-scope Critic follows this PR (finding F-pr7-1)

@@ -105,6 +105,6 @@ Mutations, one at a time: 3 red out of 3 (scan fallback; DV snapshot None; tag g
 Java interop command and fixture count: dev/java-interop/run-interop-branch-dml.sh — 4 Java fixtures + 6 Rust tables; sabotage FAIL-closed
 CI-only evidence gap: Docker make test legs excused; no credentialed catalog
 Breaking public API change: additive close_touched_dv_containers_at; close_touched_dv_containers unchanged
-Critic attestation: pending independent Critic
+Critic attestation: independent Critic (Grok, fresh clone, read-only) NOT PASS on 625828c00 — file sets asserted on one of six cases, R168 overclaim; remediated in b35b432e5 (file-set asserts both sides, sabotage B 1/1); orchestrator delta: runner re-run green; merged as #251.
 Open findings and dispositions: none from Actor. Residue named in row R168 (WAP/stage_only, RewriteManifests/CherryPick throwing default, catalog/session overrides). MoR UPDATE lineage columns are PR-6B.
 ```

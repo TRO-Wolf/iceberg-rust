@@ -36,7 +36,7 @@ Developer tools: Java interop oracles, Spark provisioner, and credentialed catal
 
 | Intent | Go to |
 |---|---|
-| Decode Java Glue / REST commit outcomes | `java-interop/run-pr5a-catalog-commit-decode.sh` |
+| Decode Java Glue / REST commit outcomes | `java-interop/run-interop-pr5a-catalog-commit-decode.sh` |
 | Run credentialed catalog commit smokes | `pr5a-catalog-commit-outcomes.sh` |
 | Run a table-format interop oracle | `java-interop/map.md` |
 
@@ -57,7 +57,7 @@ Developer tools: Java interop oracles, Spark provisioner, and credentialed catal
 
 ### First checks
 
-- `bash dev/java-interop/run-pr5a-catalog-commit-decode.sh`
+- `bash dev/java-interop/run-interop-pr5a-catalog-commit-decode.sh`
 - Do not run the credentialed runner without the owner-approved AWS boundary.
 
 ### Escalate to
