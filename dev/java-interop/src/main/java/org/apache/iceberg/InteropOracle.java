@@ -26605,66 +26605,6 @@ public final class InteropOracle {
     }
   }
 
-  static final class EvolvedSpecRewriteOracle {
-    private EvolvedSpecRewriteOracle() {}
-
-    static void generate(Path dir) throws IOException {
-      Files.createDirectories(dir);
-      File tableDir = dir.resolve("d1").resolve("table").toFile();
-      File metadataDir = new File(tableDir, "metadata");
-      File dataDir = new File(tableDir, "data");
-      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
-        throw new IOException("failed to create " + metadataDir);
-      }
-      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
-        throw new IOException("failed to create " + dataDir);
-      }
-
-      Schema schema =
-          new Schema(
-              Types.NestedField.required(1, "x", Types.LongType.get()),
-              Types.NestedField.required(2, "y", Types.LongType.get()),
-              Types.NestedField.required(3, "z", Types.LongType.get()));
-      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("x").build();
-      Map<String, String> props = new LinkedHashMap<>();
-      props.put(TableProperties.FORMAT_VERSION, "2");
-      TableMetadata seed =
-          TableMetadata.newTableMetadata(
-              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
-      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
-      ops.commit(null, seed);
-      BaseTable table = new BaseTable(ops, "evolved_spec_d1");
-
-      Types.StructType partitionType = spec.partitionType();
-      PartitionData p1 = new PartitionData(partitionType);
-      p1.set(0, 1L);
-      PartitionData p2 = new PartitionData(partitionType);
-      p2.set(0, 2L);
-      DataFile f1 =
-          writeXyzFile(
-              table,
-              schema,
-              spec,
-              p1,
-              new File(dataDir, "x=1.parquet").getAbsolutePath(),
-              new long[][] {{1L, 10L, 100L}});
-      DataFile f2 =
-          writeXyzFile(
-              table,
-              schema,
-              spec,
-              p2,
-              new File(dataDir, "x=2.parquet").getAbsolutePath(),
-              new long[][] {{2L, 20L, 200L}});
-      table.newAppend().appendFile(f1).appendFile(f2).commit();
-
-      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
-      TableMetadataParser.write(
-          ops.current(), new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString()));
-      if (!Files.exists(finalMetadata)) {
-        throw new IOException("generate did not write " + finalMetadata);
-      }
-      System.out.println("generated evolved-spec D1 table at " + tableDir);
   static final class BranchDmlOracle {
     private BranchDmlOracle() {}
 
@@ -26703,213 +26643,6 @@ public final class InteropOracle {
 
     static int verify(Path dir) {
       int failures = 0;
-      failures += verifyCompacted(dir.resolve("d1").resolve("compacted"), "d1");
-      failures += verifyV3(dir.resolve("v3").resolve("compacted"));
-      return failures;
-    }
-
-    static void rewriteRustTable(Path dir) throws IOException {
-      Path rustFinal =
-          dir.resolve("d2").resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
-      if (!Files.exists(rustFinal)) {
-        throw new IOException("missing Rust D2 table " + rustFinal);
-      }
-      File metadataDir = rustFinal.getParent().toFile();
-      File tableDir = metadataDir.getParentFile();
-      File dataDir = new File(tableDir, "data");
-      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
-        throw new IOException("failed to create " + dataDir);
-      }
-      TableMetadata loaded = TableMetadataParser.fromJson(rustFinal.toString(), readString(rustFinal));
-      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
-      ops.commit(null, loaded);
-      BaseTable table = new BaseTable(ops, "evolved_spec_d2");
-      table.updateSpec().removeField("x").addField("y").commit();
-
-      java.util.Set<DataFile> toDelete = new java.util.HashSet<>();
-      try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
-        for (FileScanTask task : tasks) {
-          toDelete.add(task.file());
-        }
-      }
-      Map<Long, List<Record>> byY = new LinkedHashMap<>();
-      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
-        for (Record record : records) {
-          Long y = (Long) record.getField("y");
-          byY.computeIfAbsent(y, key -> new ArrayList<>()).add(record);
-        }
-      }
-      Schema schema = table.schema();
-      PartitionSpec spec = table.spec();
-      java.util.Set<DataFile> toAdd = new java.util.HashSet<>();
-      int index = 0;
-      for (Map.Entry<Long, List<Record>> entry : byY.entrySet()) {
-        PartitionData partition = new PartitionData(spec.partitionType());
-        partition.set(0, entry.getKey());
-        String path =
-            new File(dataDir, "rewritten-y-" + entry.getKey() + "-" + index + ".parquet")
-                .getAbsolutePath();
-        index++;
-        toAdd.add(writeRecords(table, schema, spec, partition, path, entry.getValue()));
-      }
-      long seq = table.currentSnapshot().sequenceNumber();
-      table.newRewrite().rewriteFiles(toDelete, toAdd, seq).commit();
-      Path rewritten = dir.resolve("d2").resolve("rewritten").resolve("metadata");
-      Files.createDirectories(rewritten);
-      Path rewrittenFinal = rewritten.resolve("final.metadata.json");
-      TableMetadataParser.write(
-          ops.current(),
-          new LocalFileIO().newOutputFile(rewrittenFinal.toAbsolutePath().toString()));
-      System.out.println("rewrote Rust D2 table to " + rewrittenFinal);
-    }
-
-    private static int verifyCompacted(Path compacted, String tag) {
-      Path meta = compacted.resolve("metadata").resolve("final.metadata.json");
-      if (!Files.exists(meta)) {
-        System.out.println("FAIL " + tag + ": missing compacted table " + meta);
-        return 1;
-      }
-      int failures = 0;
-      try {
-        TableMetadata metadata = TableMetadataParser.fromJson(meta.toString(), readString(meta));
-        BaseTable table =
-            new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), tag);
-        java.util.Set<String> full = liveXyz(table, Expressions.alwaysTrue());
-        if (!full.equals(java.util.Set.of("1,10,100", "2,20,200"))) {
-          System.out.println("FAIL " + tag + ": full scan " + full);
-          failures++;
-        } else {
-          System.out.println("PASS " + tag + ": full scan " + full);
-        }
-        java.util.Set<String> y10 = liveXyz(table, Expressions.equal("y", 10L));
-        if (!y10.equals(java.util.Set.of("1,10,100"))) {
-          System.out.println("FAIL " + tag + ": pruned y=10 " + y10);
-          failures++;
-        } else {
-          System.out.println("PASS " + tag + ": pruned y=10 " + y10);
-        }
-        java.util.Set<String> y20 = liveXyz(table, Expressions.equal("y", 20L));
-        if (!y20.equals(java.util.Set.of("2,20,200"))) {
-          System.out.println("FAIL " + tag + ": pruned y=20 " + y20);
-          failures++;
-        } else {
-          System.out.println("PASS " + tag + ": pruned y=20 " + y20);
-        }
-        int currentSpec = table.spec().specId();
-        java.util.Set<Long> tuples = new java.util.TreeSet<>();
-        Snapshot snapshot = table.currentSnapshot();
-        for (ManifestFile manifest : snapshot.dataManifests(table.io())) {
-          try (ManifestReader<DataFile> reader =
-              ManifestFiles.read(manifest, table.io(), table.specs())) {
-            for (ManifestEntry<DataFile> entry : reader.liveEntries()) {
-              if (entry.file().specId() != currentSpec) {
-                System.out.println(
-                    "FAIL " + tag + ": output spec " + entry.file().specId() + " != " + currentSpec);
-                failures++;
-              }
-              tuples.add(entry.file().partition().get(0, Long.class));
-            }
-          }
-        }
-        if (!tuples.equals(java.util.Set.of(10L, 20L))) {
-          System.out.println("FAIL " + tag + ": output tuples " + tuples);
-          failures++;
-        } else {
-          System.out.println("PASS " + tag + ": output tuples " + tuples);
-        }
-      } catch (RuntimeException | IOException error) {
-        System.out.println("FAIL " + tag + ": " + error);
-        failures++;
-      }
-      return failures;
-    }
-
-    private static int verifyV3(Path compacted) {
-      Path meta = compacted.resolve("metadata").resolve("final.metadata.json");
-      Path expected = compacted.resolve("expected_row_ids.json");
-      if (!Files.exists(meta) || !Files.exists(expected)) {
-        System.out.println("FAIL v3: missing " + meta + " or " + expected);
-        return 1;
-      }
-      try {
-        TableMetadata metadata = TableMetadataParser.fromJson(meta.toString(), readString(meta));
-        BaseTable table =
-            new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), "v3");
-        java.util.List<Long> got = new ArrayList<>();
-        Schema lineage = MetadataColumns.schemaWithRowLineage(table.schema());
-        try (CloseableIterable<Record> records =
-            IcebergGenerics.read(table).project(lineage).build()) {
-          for (Record record : records) {
-            Object rowId = record.getField("_row_id");
-            if (rowId == null) {
-              System.out.println("FAIL v3: null _row_id");
-              return 1;
-            }
-            got.add((Long) rowId);
-          }
-        }
-        java.util.List<Long> want = new ArrayList<>();
-        for (String part : readString(expected).replace("[", "").replace("]", "").split(",")) {
-          String trimmed = part.trim();
-          if (!trimmed.isEmpty()) {
-            want.add(Long.parseLong(trimmed));
-          }
-        }
-        java.util.Collections.sort(got);
-        java.util.Collections.sort(want);
-        if (!got.equals(want)) {
-          System.out.println("FAIL v3: _row_id got " + got + " want " + want);
-          return 1;
-        }
-        System.out.println("PASS v3: _row_id " + got);
-        return 0;
-      } catch (RuntimeException | IOException error) {
-        System.out.println("FAIL v3: " + error);
-        return 1;
-      }
-    }
-
-    private static java.util.Set<String> liveXyz(BaseTable table, Expression filter) {
-      java.util.Set<String> rows = new java.util.TreeSet<>();
-      try (CloseableIterable<Record> records = IcebergGenerics.read(table).where(filter).build()) {
-        for (Record record : records) {
-          rows.add(
-              record.getField("x") + "," + record.getField("y") + "," + record.getField("z"));
-        }
-      } catch (IOException error) {
-        throw new RuntimeException(error);
-      }
-      return rows;
-    }
-
-    private static DataFile writeXyzFile(
-        BaseTable table,
-        Schema schema,
-        PartitionSpec spec,
-        StructLike partition,
-        String path,
-        long[][] rows)
-        throws IOException {
-      List<Record> records = new ArrayList<>();
-      for (long[] row : rows) {
-        GenericRecord record = GenericRecord.create(schema);
-        record.setField("x", row[0]);
-        record.setField("y", row[1]);
-        record.setField("z", row[2]);
-        records.add(record);
-      }
-      return writeRecords(table, schema, spec, partition, path, records);
-    }
-
-    private static DataFile writeRecords(
-        BaseTable table,
-        Schema schema,
-        PartitionSpec spec,
-        StructLike partition,
-        String path,
-        List<Record> records)
-        throws IOException {
-      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
       failures += runVerify("rust_append", () -> verifyAppend(dir));
       failures += runVerify("rust_cow", () -> verifyCow(dir));
       failures += runVerify("rust_mor", () -> verifyMor(dir));
@@ -27038,12 +26771,6 @@ public final class InteropOracle {
               org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
                   out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
               FileFormat.PARQUET,
-              partition);
-      try (Closeable toClose = writer) {
-        writer.write(records);
-      }
-      return writer.toDataFile();
-    }
               null);
       try (Closeable toClose = writer) {
         writer.write(rows);
@@ -27526,6 +27253,291 @@ public final class InteropOracle {
         throw new RuntimeException("IcebergGenerics failed for snapshot " + snapshotId, error);
       }
       return data;
+    }
+  }
+
+  static final class EvolvedSpecRewriteOracle {
+    private EvolvedSpecRewriteOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = dir.resolve("d1").resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "x", Types.LongType.get()),
+              Types.NestedField.required(2, "y", Types.LongType.get()),
+              Types.NestedField.required(3, "z", Types.LongType.get()));
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("x").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "evolved_spec_d1");
+
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData p1 = new PartitionData(partitionType);
+      p1.set(0, 1L);
+      PartitionData p2 = new PartitionData(partitionType);
+      p2.set(0, 2L);
+      DataFile f1 =
+          writeXyzFile(
+              table,
+              schema,
+              spec,
+              p1,
+              new File(dataDir, "x=1.parquet").getAbsolutePath(),
+              new long[][] {{1L, 10L, 100L}});
+      DataFile f2 =
+          writeXyzFile(
+              table,
+              schema,
+              spec,
+              p2,
+              new File(dataDir, "x=2.parquet").getAbsolutePath(),
+              new long[][] {{2L, 20L, 200L}});
+      table.newAppend().appendFile(f1).appendFile(f2).commit();
+
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      TableMetadataParser.write(
+          ops.current(), new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString()));
+      if (!Files.exists(finalMetadata)) {
+        throw new IOException("generate did not write " + finalMetadata);
+      }
+      System.out.println("generated evolved-spec D1 table at " + tableDir);
+    }
+
+    static int verify(Path dir) {
+      int failures = 0;
+      failures += verifyCompacted(dir.resolve("d1").resolve("compacted"), "d1");
+      failures += verifyV3(dir.resolve("v3").resolve("compacted"));
+      return failures;
+    }
+
+    static void rewriteRustTable(Path dir) throws IOException {
+      Path rustFinal =
+          dir.resolve("d2").resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(rustFinal)) {
+        throw new IOException("missing Rust D2 table " + rustFinal);
+      }
+      File metadataDir = rustFinal.getParent().toFile();
+      File tableDir = metadataDir.getParentFile();
+      File dataDir = new File(tableDir, "data");
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create " + dataDir);
+      }
+      TableMetadata loaded = TableMetadataParser.fromJson(rustFinal.toString(), readString(rustFinal));
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, loaded);
+      BaseTable table = new BaseTable(ops, "evolved_spec_d2");
+      table.updateSpec().removeField("x").addField("y").commit();
+
+      java.util.Set<DataFile> toDelete = new java.util.HashSet<>();
+      try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+        for (FileScanTask task : tasks) {
+          toDelete.add(task.file());
+        }
+      }
+      Map<Long, List<Record>> byY = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long y = (Long) record.getField("y");
+          byY.computeIfAbsent(y, key -> new ArrayList<>()).add(record);
+        }
+      }
+      Schema schema = table.schema();
+      PartitionSpec spec = table.spec();
+      java.util.Set<DataFile> toAdd = new java.util.HashSet<>();
+      int index = 0;
+      for (Map.Entry<Long, List<Record>> entry : byY.entrySet()) {
+        PartitionData partition = new PartitionData(spec.partitionType());
+        partition.set(0, entry.getKey());
+        String path =
+            new File(dataDir, "rewritten-y-" + entry.getKey() + "-" + index + ".parquet")
+                .getAbsolutePath();
+        index++;
+        toAdd.add(writeRecords(table, schema, spec, partition, path, entry.getValue()));
+      }
+      long seq = table.currentSnapshot().sequenceNumber();
+      table.newRewrite().rewriteFiles(toDelete, toAdd, seq).commit();
+      Path rewritten = dir.resolve("d2").resolve("rewritten").resolve("metadata");
+      Files.createDirectories(rewritten);
+      Path rewrittenFinal = rewritten.resolve("final.metadata.json");
+      TableMetadataParser.write(
+          ops.current(),
+          new LocalFileIO().newOutputFile(rewrittenFinal.toAbsolutePath().toString()));
+      System.out.println("rewrote Rust D2 table to " + rewrittenFinal);
+    }
+
+    private static int verifyCompacted(Path compacted, String tag) {
+      Path meta = compacted.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(meta)) {
+        System.out.println("FAIL " + tag + ": missing compacted table " + meta);
+        return 1;
+      }
+      int failures = 0;
+      try {
+        TableMetadata metadata = TableMetadataParser.fromJson(meta.toString(), readString(meta));
+        BaseTable table =
+            new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), tag);
+        java.util.Set<String> full = liveXyz(table, Expressions.alwaysTrue());
+        if (!full.equals(java.util.Set.of("1,10,100", "2,20,200"))) {
+          System.out.println("FAIL " + tag + ": full scan " + full);
+          failures++;
+        } else {
+          System.out.println("PASS " + tag + ": full scan " + full);
+        }
+        java.util.Set<String> y10 = liveXyz(table, Expressions.equal("y", 10L));
+        if (!y10.equals(java.util.Set.of("1,10,100"))) {
+          System.out.println("FAIL " + tag + ": pruned y=10 " + y10);
+          failures++;
+        } else {
+          System.out.println("PASS " + tag + ": pruned y=10 " + y10);
+        }
+        java.util.Set<String> y20 = liveXyz(table, Expressions.equal("y", 20L));
+        if (!y20.equals(java.util.Set.of("2,20,200"))) {
+          System.out.println("FAIL " + tag + ": pruned y=20 " + y20);
+          failures++;
+        } else {
+          System.out.println("PASS " + tag + ": pruned y=20 " + y20);
+        }
+        int currentSpec = table.spec().specId();
+        java.util.Set<Long> tuples = new java.util.TreeSet<>();
+        Snapshot snapshot = table.currentSnapshot();
+        for (ManifestFile manifest : snapshot.dataManifests(table.io())) {
+          try (ManifestReader<DataFile> reader =
+              ManifestFiles.read(manifest, table.io(), table.specs())) {
+            for (ManifestEntry<DataFile> entry : reader.liveEntries()) {
+              if (entry.file().specId() != currentSpec) {
+                System.out.println(
+                    "FAIL " + tag + ": output spec " + entry.file().specId() + " != " + currentSpec);
+                failures++;
+              }
+              tuples.add(entry.file().partition().get(0, Long.class));
+            }
+          }
+        }
+        if (!tuples.equals(java.util.Set.of(10L, 20L))) {
+          System.out.println("FAIL " + tag + ": output tuples " + tuples);
+          failures++;
+        } else {
+          System.out.println("PASS " + tag + ": output tuples " + tuples);
+        }
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL " + tag + ": " + error);
+        failures++;
+      }
+      return failures;
+    }
+
+    private static int verifyV3(Path compacted) {
+      Path meta = compacted.resolve("metadata").resolve("final.metadata.json");
+      Path expected = compacted.resolve("expected_row_ids.json");
+      if (!Files.exists(meta) || !Files.exists(expected)) {
+        System.out.println("FAIL v3: missing " + meta + " or " + expected);
+        return 1;
+      }
+      try {
+        TableMetadata metadata = TableMetadataParser.fromJson(meta.toString(), readString(meta));
+        BaseTable table =
+            new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), "v3");
+        java.util.List<Long> got = new ArrayList<>();
+        Schema lineage = MetadataColumns.schemaWithRowLineage(table.schema());
+        try (CloseableIterable<Record> records =
+            IcebergGenerics.read(table).project(lineage).build()) {
+          for (Record record : records) {
+            Object rowId = record.getField("_row_id");
+            if (rowId == null) {
+              System.out.println("FAIL v3: null _row_id");
+              return 1;
+            }
+            got.add((Long) rowId);
+          }
+        }
+        java.util.List<Long> want = new ArrayList<>();
+        for (String part : readString(expected).replace("[", "").replace("]", "").split(",")) {
+          String trimmed = part.trim();
+          if (!trimmed.isEmpty()) {
+            want.add(Long.parseLong(trimmed));
+          }
+        }
+        java.util.Collections.sort(got);
+        java.util.Collections.sort(want);
+        if (!got.equals(want)) {
+          System.out.println("FAIL v3: _row_id got " + got + " want " + want);
+          return 1;
+        }
+        System.out.println("PASS v3: _row_id " + got);
+        return 0;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3: " + error);
+        return 1;
+      }
+    }
+
+    private static java.util.Set<String> liveXyz(BaseTable table, Expression filter) {
+      java.util.Set<String> rows = new java.util.TreeSet<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).where(filter).build()) {
+        for (Record record : records) {
+          rows.add(
+              record.getField("x") + "," + record.getField("y") + "," + record.getField("z"));
+        }
+      } catch (IOException error) {
+        throw new RuntimeException(error);
+      }
+      return rows;
+    }
+
+    private static DataFile writeXyzFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path,
+        long[][] rows)
+        throws IOException {
+      List<Record> records = new ArrayList<>();
+      for (long[] row : rows) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("x", row[0]);
+        record.setField("y", row[1]);
+        record.setField("z", row[2]);
+        records.add(record);
+      }
+      return writeRecords(table, schema, spec, partition, path, records);
+    }
+
+    private static DataFile writeRecords(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path,
+        List<Record> records)
+        throws IOException {
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(records);
+      }
+      return writer.toDataFile();
     }
   }
 
