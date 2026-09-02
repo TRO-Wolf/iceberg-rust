@@ -41,7 +41,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/catalog/rest/src/catalog.rs": 4970,
     "crates/catalog/rest/src/client.rs": 1483,
     "crates/catalog/rest/src/types.rs": 1128,
-    "crates/catalog/s3tables/src/catalog.rs": 1406,
+    "crates/catalog/s3tables/src/catalog.rs": 1403,
     "crates/catalog/sql/src/catalog.rs": 3947,
     "crates/iceberg/src/arrow/avro_reader.rs": 1256,
     "crates/iceberg/src/arrow/avro_reader_tests.rs": 1097,
