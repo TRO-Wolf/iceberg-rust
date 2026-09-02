@@ -283,10 +283,9 @@ async fn seed_diverged_v3(
     let ctx = branch_ctx(catalog.clone(), namespace.clone(), name, None).await;
     run_sql(&ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").await;
     let table = load(catalog.as_ref(), namespace, name).await;
-    let table = create_branch(catalog.as_ref(), &table, BRANCH).await;
+    create_branch(catalog.as_ref(), &table, BRANCH).await;
     let ctx = branch_ctx(catalog.clone(), namespace.clone(), name, Some(BRANCH)).await;
     run_sql(&ctx, "INSERT INTO t VALUES (10, 'x'), (11, 'y')").await;
-    let _ = table;
     load(catalog.as_ref(), namespace, name).await
 }
 
@@ -359,9 +358,10 @@ async fn mor_update_on_branch_keeps_row_id_and_advances_seq_twice() {
     assert_eq!(lineage_on_ref(&table, MAIN_BRANCH).await, main_lineage);
     assert_eq!(table.metadata().next_row_id(), next_row_id_before);
     let branch_files = file_basenames(&table, BRANCH).await;
-    assert!(
-        branch_files.len() > main_files.len(),
-        "branch file set must stay a strict superset: main={main_files:?} branch={branch_files:?}"
+    assert_eq!(
+        branch_files.len(),
+        main_files.len() + 3,
+        "branch holds the seed pair plus the two UPDATE outputs: main={main_files:?} branch={branch_files:?}"
     );
 }
 
@@ -407,9 +407,10 @@ async fn rust_reads_java_branch_lineage() {
     );
     let branch_files = file_basenames(&table, BRANCH).await;
     let main_files = file_basenames(&table, MAIN_BRANCH).await;
-    assert!(
-        branch_files.len() > main_files.len(),
-        "Java branch must diverge: main={main_files:?} branch={branch_files:?}"
+    assert_eq!(
+        branch_files.len(),
+        main_files.len() + 1,
+        "Java branch seed is main's file plus one branch file: main={main_files:?} branch={branch_files:?}"
     );
 }
 

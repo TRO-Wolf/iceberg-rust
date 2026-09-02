@@ -92,7 +92,7 @@ Ledger: [`pr6b-mor-branch-lineage-ledger.md`](pr6b-mor-branch-lineage-ledger.md)
 - [x] Java fixture: one V3 merge-on-read table, `main` rows 1/2/3, `createBranch("b")`, `newAppend().toBranch("b")` rows 10/11. Java records its own seed lineage `1=0=1 2=1=1 3=2=1 10=3=2 11=4=2`, main file set, main snapshot id and `next-row-id` 5.
 - [x] Rust GEN: two MoR UPDATEs of id 10 through `IcebergTableProvider::with_commit_branch("b")`.
 - [x] Java verify: branch head keeps `_row_id` 3, sequence 2 → 3 → 4, unmatched rows unchanged, `main` rows / ref / current snapshot / file set untouched, `next-row-id` still 5.
-- [x] Runner `dev/java-interop/run-interop-mor-branch-lineage.sh` (six steps, prerequisites hard-fail, 1 fixture asserted, 5 GEN artifacts asserted, sabotage fail-closed). `SUITE_FLOOR_DEFAULT` 55 → 57.
+- [x] Runner `dev/java-interop/run-interop-mor-branch-lineage.sh` (six steps, prerequisites hard-fail, 1 fixture asserted, 5 GEN artifacts asserted, sabotage fail-closed). `SUITE_FLOOR_DEFAULT` 56 → 58.
 - [x] Mutations 12 red out of 12 (4 Rust, 8 Java-verify one-knob bends).
 - [x] GAP_MATRIX row R168, maps, ledger.
 - [ ] **Blocked on topology:** the cell needs PR-6A's `close_touched_dv_containers_at`. On `repark/pr3` alone the branch UPDATE fails `DataInvalid ... is not a live file of the current snapshot`. This commit is the interop layer only, so PR-6B must be stacked on or merged after PR-6A rather than duplicating that two-file crate change.

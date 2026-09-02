@@ -81,7 +81,7 @@ is not a live file of the current snapshot
 - `dev/java-interop/src/main/java/org/apache/iceberg/InteropOracle.java` — `MorBranchLineageOracle` plus the `generate-interop-mor-branch-lineage` / `verify-interop-mor-branch-lineage` modes (a separate mode from PR-6A's `BranchDmlOracle`, so the two PRs do not collide).
 - `dev/java-interop/run-interop-mor-branch-lineage.sh` — the six-step runner and its sabotage pass.
 - `crates/integrations/datafusion/tests/interop_mor_branch_lineage.rs` — the offline reproduction, the Direction-1 read, the Direction-2 GEN.
-- `scripts/run_interop_suites.sh` — `SUITE_FLOOR_DEFAULT` 55 → 57 (57 is the real discovered count on this branch: PR-3 added a suite without ratcheting, and this unit adds the 57th).
+- `scripts/run_interop_suites.sh` — `SUITE_FLOOR_DEFAULT` 56 → 58 (58 is the real discovered count on this branch: PR-3 added a suite without ratcheting, and this unit adds the 57th).
 - `docs/parity/GAP_MATRIX.md` — row R168 only.
 - `dev/java-interop/map.md`, `crates/integrations/datafusion/tests/map.md`, `task/todo.md`, this ledger.
 
