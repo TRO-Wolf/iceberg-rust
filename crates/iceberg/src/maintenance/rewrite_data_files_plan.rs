@@ -42,6 +42,8 @@ pub(super) const DELETE_FILE_THRESHOLD_DEFAULT: usize = usize::MAX;
 /// Java `BinPackRewriteFilePlanner.DELETE_RATIO_THRESHOLD_DEFAULT`.
 pub(super) const DELETE_RATIO_THRESHOLD_DEFAULT: f64 = 0.3;
 
+pub(super) const MAX_OPEN_PARTITION_WRITERS_DEFAULT: usize = 64;
+
 /// Thresholds after defaults and preconditions.
 pub(super) struct ResolvedConfig {
     pub(super) target_file_size_bytes: u64,
@@ -51,6 +53,7 @@ pub(super) struct ResolvedConfig {
     pub(super) delete_file_threshold: usize,
     pub(super) delete_ratio_threshold: f64,
     pub(super) max_file_group_size_bytes: u64,
+    pub(super) max_open_partition_writers: usize,
     pub(super) file_scoped_delete_paths: HashSet<String>,
 }
 

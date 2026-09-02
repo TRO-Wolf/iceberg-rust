@@ -31,7 +31,10 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | `rewrite_data_files.rs` | Bin-pack compaction. Java `RewriteDataFiles`. Plans candidates, rewrites live rows, commits per group through `RewriteFiles`. |
 | `rewrite_data_files_plan.rs` | Candidate and group predicates. Java `BinPackRewriteFilePlanner`. Size band, `tooManyDeletes`, `tooHighDeleteRatio`. |
 | `rewrite_data_files_dv.rs` | Drop file-scoped deletes whose referenced data file this rewrite removes. Java `isDanglingDV` is DV-only; parquet file-scoped drops are a fork extension. Rewrite Puffin siblings. |
-| `rewrite_data_files_write.rs` | Read a planned group with merge-on-read applied and write compacted data files. |
+| `rewrite_data_files_write.rs` | Read a planned group with merge-on-read applied and write compacted data files under the current spec. |
+| `rewrite_data_files_router.rs` | Bounded LRU partition router for rewrite output. Default 64 open writers. Private to maintenance. |
+| `rewrite_data_files_evolved_spec_tests.rs` | Spec-evolution output routing pins: source-field, transform, unpartitioned, mixed specs. |
+| `rewrite_data_files_router_bound_tests.rs` | Writer bound, eviction, V3 lineage, and evolved-spec delete-class pins. |
 | `rewrite_data_files_ratio_tests.rs` | Execute-path pins for `delete_ratio_threshold` and file-scoped delete removal. |
 | `remove_dangling_delete_files.rs` | Composed GC pass. Java `RemoveDanglingDeletes`. Opt-in on `RewriteDataFiles`, default off. |
 | `rewrite_position_delete_files.rs` | Compact live parquet position deletes, or convert them to DVs on v3. |
@@ -45,6 +48,9 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | Count file-scoped parquet position deletes toward the ratio | `rewrite_data_files_dv.rs::file_scoped_delete_paths` then `ResolvedConfig.file_scoped_delete_paths`. Scan-task deletes do not carry `file_path` bounds. |
 | Drop deletes that targeted a rewritten data file | `rewrite_data_files_dv.rs::plan_dv_removal`. Java drops DVs only (`isDanglingDV`). The parquet file-scoped drop is a fork extension. |
 | Change output rolling or the rewrite read | `rewrite_data_files_write.rs` |
+| Change how rewritten rows are routed after spec evolution | `rewrite_data_files_write.rs` + `rewrite_data_files_router.rs` |
+| Pin evolved-spec output tuples or the writer bound | `rewrite_data_files_evolved_spec_tests.rs`, `rewrite_data_files_router_bound_tests.rs` |
+| See why an all-void current spec (`void(x)`, one field, `is_unpartitioned`) fails rewrite | unsupported current-spec shape: `RecordBatchPartitionSplitter` refuses it (`Cannot create partition calculator for unpartitioned table`). Pin: `all_void_current_spec_is_refused` |
 | Pin delete-ratio or 100%-dead in-band rewrite | `rewrite_data_files_ratio_tests.rs` |
 
 ## Pointers
@@ -63,6 +69,8 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | A two-path parquet position delete rewrites both files | Absent bounds (Spark PARTITION) and unequal Full bounds are both not file-scoped. Pins: `test_absent_path_bounds_two_path_parquet_pos_delete_does_not_fire_ratio`, `test_unequal_path_bounds_two_path_parquet_pos_delete_does_not_fire_ratio`. |
 | A shared partition-scoped delete vanishes when one file is rewritten | `plan_dv_removal` must drop only file-scoped parquet whose referenced path was rewritten. Pin: `test_partition_scoped_delete_survives_partial_rewrite`. |
 | A single-file group is skipped | `enough_input_files` and `enough_content` require `size > 1`. `any_too_high_delete_ratio` does not. A lone needs-rewrite candidate must still qualify. |
+| After spec evolution, partition-pruned scans miss live rows | Output used `group.first()` under the current spec. Routing must recompute tuples from rows (`rewrite_data_files_write.rs`). Pin: `source_field_identity_x_to_identity_y_rewrites_two_old_partitions`. |
+| Rewrite fails with `Cannot create partition calculator for unpartitioned table` | Current spec is all-void (`void(x)`, one field, `is_unpartitioned` but `fields()` is not empty). Unsupported current-spec shape. Pin: `all_void_current_spec_is_refused`. |
 
 ### First checks
 

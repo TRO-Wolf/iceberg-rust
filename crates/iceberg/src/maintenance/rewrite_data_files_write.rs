@@ -19,14 +19,15 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 
-use crate::arrow::ArrowReaderBuilder;
+use crate::arrow::{ArrowReaderBuilder, RecordBatchPartitionSplitter};
 use crate::error::{Error, ErrorKind, Result};
+use crate::maintenance::rewrite_data_files_router::BoundedPartitionRouter;
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
     format_supports_row_lineage, schema_with_row_lineage,
 };
 use crate::scan::FileScanTask;
-use crate::spec::{DataFile, DataFileFormat, PartitionKey, PartitionSpec, SchemaRef, Struct};
+use crate::spec::{DataFile, DataFileFormat, SchemaRef};
 use crate::table::Table;
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::ParquetWriterBuilder;
@@ -36,17 +37,27 @@ use crate::writer::file_writer::location_generator::{
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
-pub(super) async fn write_compacted_files(
+pub(crate) struct CompactedWrite {
+    pub files: Vec<DataFile>,
+    #[allow(dead_code)]
+    pub peak_open_partition_writers: usize,
+}
+
+pub(crate) async fn write_compacted_files(
     table: &Table,
     group: &[FileScanTask],
     target_file_size_bytes: u64,
-) -> Result<Vec<DataFile>> {
+    max_open_partition_writers: usize,
+) -> Result<CompactedWrite> {
+    if max_open_partition_writers == 0 {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "'max-open-partition-writers' is set to 0 but must be > 0",
+        ));
+    }
+
     let schema = rewrite_write_schema(table)?;
     let spec = table.metadata().default_partition_spec().as_ref().clone();
-
-    let partition_key = group_partition_tuple(group, &spec)?
-        .map(|partition| PartitionKey::new(spec.clone(), schema.clone(), partition))
-        .transpose()?;
 
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
     let file_name_generator = DefaultFileNameGenerator::new(
@@ -65,10 +76,8 @@ pub(super) async fn write_compacted_files(
         location_generator,
         file_name_generator,
     );
-    let mut writer = DataFileWriterBuilder::new(rolling_builder)
-        .with_partition_spec(spec.clone())
-        .build(partition_key)
-        .await?;
+    let writer_builder =
+        DataFileWriterBuilder::new(rolling_builder).with_partition_spec(spec.clone());
 
     let carry_lineage = format_supports_row_lineage(table.metadata().format_version());
     let tasks: Vec<Result<FileScanTask>> = group
@@ -87,11 +96,34 @@ pub(super) async fn write_compacted_files(
         .build()
         .read(task_stream)?;
 
-    while let Some(batch) = batch_stream.try_next().await? {
-        writer.write(batch).await?;
+    if spec.fields().is_empty() {
+        let mut writer = writer_builder.build(None).await?;
+        while let Some(batch) = batch_stream.try_next().await? {
+            writer.write(batch).await?;
+        }
+        let files = writer.close().await?;
+        return Ok(CompactedWrite {
+            files,
+            peak_open_partition_writers: 1,
+        });
     }
 
-    writer.close().await
+    let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+        schema.clone(),
+        table.metadata().default_partition_spec().clone(),
+    )?;
+    let mut router = BoundedPartitionRouter::new(writer_builder, max_open_partition_writers)?;
+    while let Some(batch) = batch_stream.try_next().await? {
+        for (partition_key, partition_batch) in splitter.split(&batch)? {
+            router.write(partition_key, partition_batch).await?;
+        }
+    }
+    let peak_open_partition_writers = router.peak_open_partition_writers();
+    let files = router.close().await?;
+    Ok(CompactedWrite {
+        files,
+        peak_open_partition_writers,
+    })
 }
 
 fn rewrite_write_schema(table: &Table) -> Result<SchemaRef> {
@@ -112,38 +144,4 @@ fn project_row_lineage(task: &mut FileScanTask) {
         ids.push(RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER);
     }
     task.project_field_ids = Arc::from(ids);
-}
-
-pub(super) fn group_partition_tuple(
-    group: &[FileScanTask],
-    spec: &PartitionSpec,
-) -> Result<Option<Struct>> {
-    if spec.is_unpartitioned() {
-        return Ok(None);
-    }
-
-    let Some(partition) = group.first().and_then(|task| task.partition.clone()) else {
-        return Err(Error::new(
-            ErrorKind::DataInvalid,
-            format!(
-                "Cannot compact into partitioned spec {}: the file group carries no partition tuple",
-                spec.spec_id()
-            ),
-        ));
-    };
-
-    if partition.fields().len() != spec.fields().len() {
-        return Err(Error::new(
-            ErrorKind::DataInvalid,
-            format!(
-                "Cannot compact into partitioned spec {} ({} field(s)): the file group's partition \
-                 tuple has {} value(s) — its files were written under an incompatible spec",
-                spec.spec_id(),
-                spec.fields().len(),
-                partition.fields().len()
-            ),
-        ));
-    }
-
-    Ok(Some(partition))
 }

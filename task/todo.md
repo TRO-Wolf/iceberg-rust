@@ -36,6 +36,16 @@ Ledger: [`pr5a-catalog-commit-outcomes-ledger.md`](pr5a-catalog-commit-outcomes-
 - [x] Mutations, javap decode (12 needles), maps, ledger, `make check` + crate tests.
 
 Outcome: seams and offline proofs land. Credentialed execution is the orchestrator's next step. Docker `make test` legs excused.
+## ACTIVE (2026-09-01): PR-2 partition-safe RewriteDataFiles (row R135, C-001)
+
+Ledger: [`pr2-partition-safe-rewrite-ledger.md`](pr2-partition-safe-rewrite-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md`.
+
+- [x] Keep planner grouping; route rewrite output through `RecordBatchPartitionSplitter` + bounded LRU router.
+- [x] `max_open_partition_writers` default 64, reject zero before write.
+- [x] Remove `group_partition_tuple` as an output source.
+- [x] Evolution-class tests, bound/eviction tests, V3 lineage, delete-class tests.
+- [x] Interop `run-interop-evolved-spec-rewrite.sh` (D1 / D2 / V3).
+- [x] GAP_MATRIX row R135, maps, mutations, `make check` + `cargo test -p iceberg --locked`. Docker legs excused.
 ## ACTIVE (2026-09-01): PR-1 REPLACE record-count invariant (row R107 / C-002)
 
 Ledger: [`pr1-replace-invariant-ledger.md`](pr1-replace-invariant-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md` PR-1.
