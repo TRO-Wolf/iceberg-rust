@@ -322,28 +322,26 @@ impl ManifestListWriter {
                         ));
                     }
                     (Some(writer_next_row_id), None) => {
-                        // Case: Unassigned first row ID for data manifest. This is either a new
-                        // manifest, or a manifest from a pre-v3 snapshot. We need to assign one.
                         let (existing_rows_count, added_rows_count) =
                             require_row_counts_in_manifest(manifest)?;
+                        let increment =
+                            super::manifest::take_unassigned_row_count(&manifest.manifest_path)
+                                .or_else(|| existing_rows_count.checked_add(added_rows_count));
                         manifest.first_row_id = Some(writer_next_row_id);
-
-                        self.next_row_id = writer_next_row_id
-                        .checked_add(existing_rows_count)
-                        .and_then(|sum| sum.checked_add(added_rows_count))
-                        .ok_or_else(|| {
-                            Error::new(
-                                ErrorKind::DataInvalid,
-                                format!(
-                                    "Row ID overflow when computing next row ID for Manifest {}. Next Row ID: {writer_next_row_id}, Existing Rows Count: {existing_rows_count}, Added Rows Count: {added_rows_count}",
-                                    manifest.manifest_path
-                                ),
-                            )
-                        }).map(Some)?;
+                        self.next_row_id = increment
+                            .and_then(|n| writer_next_row_id.checked_add(n))
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    format!(
+                                        "Row ID overflow when computing next row ID for Manifest {}. Next Row ID: {writer_next_row_id}, Existing Rows Count: {existing_rows_count}, Added Rows Count: {added_rows_count}",
+                                        manifest.manifest_path
+                                    ),
+                                )
+                            })
+                            .map(Some)?;
                     }
-                    (None, None) => {
-                        // Case: Table without row lineage. No action needed.
-                    }
+                    (None, None) => {}
                 }
             }
             ManifestContentType::Deletes => {

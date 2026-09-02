@@ -26726,50 +26726,20 @@ public final class InteropOracle {
         System.out.println("FAIL mor-update-lineage: missing COW result table at " + afterDir);
         return 1;
       }
-      Path nextPath = afterDir.resolve("next_row_id_after_overwrite.txt");
-      if (!Files.exists(nextPath)) {
-        System.out.println("FAIL mor-update-lineage: missing next_row_id_after_overwrite.txt");
-        return failures + 1;
-      }
-      long expectedNext = Long.parseLong(readString(nextPath).trim());
       long actualNext = table.operations().current().nextRowId();
-      if (actualNext != expectedNext) {
+      if (actualNext != 5L) {
         System.out.println(
-            "FAIL mor-update-lineage: COW next_row_id="
-                + actualNext
-                + " expected "
-                + expectedNext
-                + " (unchanged by DELETE rewrite)");
+            "FAIL mor-update-lineage: COW next_row_id=" + actualNext + " expected 5");
         failures++;
       }
       Map<Integer, long[]> rows = scanLineage(table);
       if (rows.size() != 2 || !rows.containsKey(1) || !rows.containsKey(3) || rows.containsKey(2)) {
-        System.out.println("FAIL mor-update-lineage: COW live ids=" + rows.keySet() + " expected {1,3}");
+        System.out.println(
+            "FAIL mor-update-lineage: COW live ids=" + rows.keySet() + " expected {1,3}");
         failures++;
       }
-      Path idsPath = afterDir.resolve("overwrite_row_ids.txt");
-      if (!Files.exists(idsPath)) {
-        System.out.println("FAIL mor-update-lineage: missing overwrite_row_ids.txt");
-        return failures + 1;
-      }
-      for (String line : readString(idsPath).trim().split("\n")) {
-        if (line.isEmpty()) {
-          continue;
-        }
-        String[] parts = line.split("=");
-        int id = Integer.parseInt(parts[0]);
-        long rowId = Long.parseLong(parts[1]);
-        if (!rows.containsKey(id) || rows.get(id)[0] != rowId) {
-          System.out.println(
-              "FAIL mor-update-lineage: COW id="
-                  + id
-                  + " row_id="
-                  + (rows.containsKey(id) ? rows.get(id)[0] : "missing")
-                  + " expected "
-                  + rowId);
-          failures++;
-        }
-      }
+      failures += expectRow(rows, 1, 0L, 1L, true);
+      failures += expectRow(rows, 3, 2L, 1L, true);
       return failures;
     }
 

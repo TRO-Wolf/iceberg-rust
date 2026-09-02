@@ -15,13 +15,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-#
-# PR-3 interop: Java writes two V3 tables. Rust performs two merge-on-read UPDATE statements on one
-# and INSERT OVERWRITE then COW DELETE on the other. Java production-scans _row_id and
-# _last_updated_sequence_number and asserts stable ids, advancing sequences, and next-row-id.
-#
-# Expected fixture count: 2 (mor_table + cow_table). A missing prerequisite or a fixture
-# count mismatch hard-fails.
 
 set -euo pipefail
 
@@ -67,7 +60,7 @@ if [[ ! -f "${TMP}/mor_table/metadata/final.metadata.json" ]] \
   exit 1
 fi
 
-echo "==> [3/4] Rust: two MoR UPDATE statements + overwrite-then-DELETE"
+echo "==> [3/4] Rust: two MoR UPDATE statements + COW UPDATE-then-DELETE"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_MOR_UPDATE_LINEAGE_GEN_DIR="${TMP}" \

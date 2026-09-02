@@ -16,11 +16,14 @@
 // under the License.
 
 mod _serde;
-
 mod data_file;
 pub use data_file::*;
 mod entry;
 pub use entry::*;
+mod rewrite_aware;
+pub(crate) use rewrite_aware::{
+    apply_rewrite_aware_first_row_ids, note_unassigned_row_count, take_unassigned_row_count,
+};
 mod metadata;
 pub use metadata::*;
 mod writer;
@@ -1243,8 +1246,6 @@ mod tests {
         });
         assert_eq!(pretty_json1, expected_serialized_file1);
         assert_eq!(pretty_json2, expected_serialized_file2);
-
-        // Now deserialize the JSON strings back into DataFile objects
         let deserialized_files: Vec<DataFile> = serialized_files
             .into_iter()
             .map(|json| {
@@ -1257,8 +1258,6 @@ mod tests {
                 .unwrap()
             })
             .collect();
-
-        // Verify we have the expected number of deserialized files
         assert_eq!(deserialized_files.len(), 2);
         let deserialized_data_file1 = deserialized_files.first().unwrap();
         let deserialized_data_file2 = deserialized_files.get(1).unwrap();

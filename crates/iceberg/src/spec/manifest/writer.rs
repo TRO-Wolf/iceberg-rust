@@ -158,9 +158,7 @@ impl ManifestWriterBuilder {
 /// A manifest writer.
 pub struct ManifestWriter {
     output: OutputFile,
-
     snapshot_id: Option<i64>,
-
     added_files: u32,
     added_rows: u64,
     existing_files: u32,
@@ -168,13 +166,9 @@ pub struct ManifestWriter {
     deleted_files: u32,
     deleted_rows: u64,
     first_row_id: Option<u64>,
-
     min_seq_num: Option<i64>,
-
     key_metadata: Option<Vec<u8>>,
-
     manifest_entries: Vec<ManifestEntry>,
-
     metadata: ManifestMetadata,
 }
 
@@ -481,10 +475,14 @@ impl ManifestWriter {
         if self.metadata.format_version == FormatVersion::V3
             && self.metadata.content == ManifestContentType::Data
         {
-            self.first_row_id = super::apply_rewrite_aware_first_row_ids(
+            let assigned = super::apply_rewrite_aware_first_row_ids(
                 self.first_row_id,
                 &mut self.manifest_entries,
             );
+            self.first_row_id = assigned.manifest_first_row_id;
+            if let Some(n) = assigned.unassigned_row_count {
+                super::note_unassigned_row_count(self.output.location().to_string(), n);
+            }
         }
         for entry in std::mem::take(&mut self.manifest_entries) {
             let value = match self.metadata.format_version {

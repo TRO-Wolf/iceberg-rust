@@ -203,28 +203,20 @@ async fn test_mor_update_lineage_gen() {
 
     run_sql(
         &ctx,
-        "INSERT OVERWRITE catalog.interop.cow_table VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        "UPDATE catalog.interop.cow_table SET val = 'B' WHERE id = 2",
     )
     .await;
     let cow_table = client.load_table(&cow_ident).await.expect("reload cow ow");
-    let next_after_overwrite = cow_table.metadata().next_row_id();
-    let overwrite_rows = lineage_pairs(&cow_table).await;
+    assert_eq!(cow_table.metadata().next_row_id(), 3);
+    assert_eq!(lineage_pairs(&cow_table).await, vec![
+        (1, 0, 1),
+        (2, 1, 2),
+        (3, 2, 1)
+    ]);
     run_sql(&ctx, "DELETE FROM catalog.interop.cow_table WHERE id = 2").await;
     let cow_table = client.load_table(&cow_ident).await.expect("reload cow del");
     let cow_after = gen_dir.join("cow_after");
     write_final(&cow_table, &cow_after).await;
-    fs::write(
-        cow_after.join("next_row_id_after_overwrite.txt"),
-        format!("{next_after_overwrite}\n"),
-    )
-    .expect("next_row_id_after_overwrite.txt");
-    let mut overwrite_ids = String::new();
-    for (id, row_id, _) in overwrite_rows {
-        if id != 2 {
-            overwrite_ids.push_str(&format!("{id}={row_id}\n"));
-        }
-    }
-    fs::write(cow_after.join("overwrite_row_ids.txt"), overwrite_ids)
-        .expect("overwrite_row_ids.txt");
-    assert_eq!(cow_table.metadata().next_row_id(), next_after_overwrite);
+    assert_eq!(cow_table.metadata().next_row_id(), 5);
+    assert_eq!(lineage_pairs(&cow_table).await, vec![(1, 0, 1), (3, 2, 1)]);
 }

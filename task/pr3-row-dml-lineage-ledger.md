@@ -26,7 +26,7 @@ Plan of record: `task/iceberg-v3-production-work-plan-2026-09-01.md` (section 4 
 | Id | Proposition | Result |
 |---|---|---|
 | C-003 | Every V3 DataFusion UPDATE path keeps `_row_id`. An updated row advances `_last_updated_sequence_number`. | PROVEN. MoR UPDATE now projects both lineage columns, applies SET to user columns only, attaches the original `_row_id`, and writes null `_last_updated_sequence_number` so the reader resolves the new data file's sequence. COW UPDATE was already the reference (`row_lineage.rs`). |
-| C-007 (PR-3 slice) | Rewritten rows that already carry a stored `_row_id` do not move `next-row-id`. | PROVEN as F-rp3-c7. A new V3 data manifest whose live files all have stored `_row_id` (parquet bounds, recovered after `FirstRowIdPolicy::Suppress`) sets `ManifestFile.first_row_id` so `ManifestListWriter$V3Writer` takes the already-assigned arm and does not add `existing_rows_count + added_rows_count`. |
+| C-007 (PR-3 slice) | Rewritten rows that already carry a stored `_row_id` do not consume new identities. Contiguous stored rewrites do not move `next-row-id`. Non-contiguous COW DELETE survivors take Java `nextRowId += existing + added`. | PROVEN as F-rp3-c7 (critic S1). Per-file stamp after Suppress; mixed manifests do not `?`-short-circuit. RePark recipe after DELETE: `_row_id` {0,2}, `next-row-id` 5. |
 
 ## Java 1.10.0 decode
 
@@ -34,10 +34,15 @@ Jar: `~/.m2/repository/org/apache/iceberg/iceberg-core/1.10.0/iceberg-core-1.10.
 
 ### `ManifestListWriter$V3Writer.prepare`
 
-- `content != DATA` OR `firstRowId != null`: `wrapper.wrap(manifest, null)` and return (keep the stored range; do not advance `nextRowId`).
-- Else (`DATA` and `firstRowId == null`): `wrap(manifest, nextRowId)` then `nextRowId += existingRowsCount + addedRowsCount` (offsets: `ladd` / `ladd` after `existingRowsCount()` and `addedRowsCount()`).
+Re-decoded 2026-09-01 from `iceberg-core-1.10.0.jar` (`javap -p -c`).
 
-This matches the fork's `assign_first_row_id` and confirms the plan's diagnosis: a new unassigned V3 data manifest advances the writer by every added and existing row.
+- Offset 9 `if_acmpne 21`: `content != DATA` → already-assigned arm.
+- Offset 18 `ifnull 31`: `firstRowId != null` stays on the already-assigned arm (21–30): `wrapper.wrap(manifest, null)` and `areturn`. Does not read or add `nextRowId`.
+- Offset 31–43: DATA and `firstRowId == null`: `wrap(manifest, nextRowId)`.
+- Offsets 52–71: `existingRowsCount()` + `addedRowsCount()`; `ladd` then `ladd`.
+- Offset 75: `putfield nextRowId`. Then `areturn` the wrapper.
+
+A DATA manifest with `firstRowId` already set does not advance the counter. An unassigned DATA manifest is given `nextRowId` and then `nextRowId += existing + added`.
 
 ### `ManifestFiles.write` / `ManifestWriter`
 
@@ -56,14 +61,34 @@ This matches the fork's `assign_first_row_id` and confirms the plan's diagnosis:
 
 ### Does Java contradict the plan?
 
-No. Java iceberg-core 1.10.0 counts all added+existing rows of an unassigned data manifest. Stored `_row_id` lives in parquet and is invisible to that counter. Spark staying at 5 on the RePark recipe is the engine-side rewrite (stored `_row_id` in the replacement file) plus not consuming ids for those rows. The plan's rewrite-aware allocation is implemented by recovering the stored `_row_id` min from parquet metrics after Suppress and marking the manifest already-assigned, so the list writer takes Java's already-assigned arm. The increment formula for still-unassigned manifests (upgrade / plain append) is unchanged.
+Java iceberg-core 1.10.0 counts all added+existing rows of an unassigned DATA manifest. Stored `_row_id` lives in parquet and is invisible to that counter. Spark on the RePark recipe (INSERT 3 → COW rewrite of the file → COW DELETE of id=2) ends at `_row_id` {0,2} and `next-row-id` 5 because the DELETE rewrite is an unassigned added manifest of two non-contiguous stored ids, so prepare does `nextRowId += 2`, while parquet stored values win at read.
+
+Rewrite-aware recovery therefore:
+
+- Stamps `DataFile.first_row_id` per live file that has complete stored `_row_id` (no `?` short-circuit on mixed manifests).
+- Claims `ManifestFile.first_row_id` only when every live file is stored and the parquet bounds are a single contiguous span (COW UPDATE of `{0,1,2}`: already-assigned, counter stays 3).
+- Leaves a non-contiguous all-stored rewrite unassigned so prepare advances by `existing + added` (COW DELETE survivors `{0,2}`: next 3→5).
+- Mixed manifests (stored + new) record only the new-file row count for the increment.
+
+The increment formula for still-unassigned manifests with no mixed note (upgrade / plain append) is unchanged.
+
+## RePark recipe values
+
+| Step | Row multiset | `_row_id` | `_last_updated_sequence_number` | `next-row-id` |
+|---|---|---|---|---|
+| INSERT 3 | (1,a), (2,b), (3,c) | {0,1,2} | {1,1,1} | 3 |
+| COW UPDATE id=2 | (1,a), (2,B), (3,c) | {0,1,2} | {1,2,1} | 3 |
+| COW DELETE id=2 | (1,a), (3,c) | {0,2} | {1,1} | 5 |
+
+Before this fix the sequential tests used `INSERT OVERWRITE … VALUES`, which assigned new identities. After DELETE the fork was `_row_id` {3,5} and `next-row-id` 6. Spark was {0,2} and 5.
 
 ## Files
 
 - `crates/integrations/datafusion/src/physical_plan/delete.rs` — MoR UPDATE projects lineage; uses `attach_update_lineage`.
 - `crates/integrations/datafusion/src/physical_plan/row_lineage.rs` — `attach_update_lineage`, `cow_scan_stream`.
-- `crates/iceberg/src/spec/manifest/entry.rs` — `stored_row_id_first`, `apply_rewrite_aware_first_row_ids`.
+- `crates/iceberg/src/spec/manifest/rewrite_aware.rs` — per-file stored `_row_id` recovery; mixed increment note.
 - `crates/iceberg/src/spec/manifest/writer.rs` — apply rewrite-aware range before serializing a V3 data manifest.
+- `crates/iceberg/src/spec/manifest_list.rs` — unassigned increment uses mixed note when present.
 - Tests: `row_lineage_mor.rs`, sequential COW in `row_lineage_cow.rs`, shared-Puffin T2/T16.
 - Interop: `dev/java-interop/run-interop-mor-update-lineage.sh`, `MorUpdateLineageOracle`, `tests/interop_mor_update_lineage.rs`.
 
@@ -76,8 +101,8 @@ No. Java iceberg-core 1.10.0 counts all added+existing rows of an unassigned dat
 | Partitioned MoR UPDATE | lineage correct across two partitions |
 | Shared Puffin T2 | updating one row preserves sibling DV blobs and every live row's lineage |
 | Commit conflict | frozen UPDATE after concurrent removal of the referenced data file refuses; no replacement DV |
-| Sequential COW DELETE (F-rp3-c7) | overwrite then DELETE: `next-row-id` unchanged by the rewrite; survivors keep `_row_id` |
-| Sequential COW UPDATE (F-rp3-c7) | overwrite then UPDATE: same, updated rows keep `_row_id`, sequence advances |
+| Sequential COW DELETE (F-rp3-c7) | INSERT then UPDATE then DELETE: after DELETE rows (1,a)/(3,c), `_row_id` {0,2}, last-updated {1,1}, `next-row-id` 5 |
+| Sequential COW UPDATE (F-rp3-c7) | INSERT then two UPDATE statements: `_row_id` {0,1,2} throughout, `next-row-id` stays 3, last-updated on id=2 is 2 then 3 |
 | V2 control | V2 still writes parquet position deletes; `_row_id` / last-updated are all-null; `next-row-id` is 0 |
 
 ## Mutations (`N red out of M`)
@@ -94,14 +119,14 @@ Exact command for 4: `cargo test -p iceberg-datafusion --locked --test row_linea
 
 | # | Knob | Result |
 |---|---|---|
-| 4 | Restore count-all-rows allocation (drop `apply_rewrite_aware_first_row_ids`) | **2 red out of 2** sequential COW tests. Restored + `touch`. Green re-run: 6/6 COW + 5/5 MoR. |
+| 4 | Restore count-all-rows allocation (drop applying `apply_rewrite_aware_first_row_ids`) | **2 red out of 2** sequential COW tests (after UPDATE `next-row-id` 6 vs 3). Restored + `touch`. Green re-run: 2/2 sequential. |
 
 ## Interop
 
 Command: `bash dev/java-interop/run-interop-mor-update-lineage.sh`
 
 - Fixture count: **2** (`mor_table`, `cow_table`), asserted in `fixture_count.json` and the runner.
-- Java writes two 3-row V3 tables. Rust performs two MoR UPDATE statements on one and INSERT OVERWRITE then COW DELETE on the other. Java `IcebergGenerics.project(MetadataColumns.schemaWithRowLineage)` asserts stable ids, advancing sequences, and `next-row-id`.
+- Java writes two 3-row V3 tables. Rust performs two MoR UPDATE statements on one and the RePark COW UPDATE-then-DELETE recipe on the other. Java `IcebergGenerics.project(MetadataColumns.schemaWithRowLineage)` asserts absolute values: MOR `_row_id` stable and `next-row-id` 3; COW survivors `_row_id` {0,2}, last-updated 1, `next-row-id` 5.
 - **Reverse MoR UPDATE:** iceberg-core 1.10.0 has no SQL / DataFusion-shaped merge-on-read UPDATE. That surface is Spark `SparkPositionDelta` / `SparkCopyOnWriteOperation`, not on this oracle's classpath. Reverse leg omitted.
 
 Docker `make test` legs excused (no Docker).
@@ -111,7 +136,7 @@ Docker `make test` legs excused (no Docker).
 Liftable after this unit:
 
 - `V3-COW-1` UPDATE half (already green on fork #243; this unit does not regress it).
-- `V3-COW-1` sequential COW / next-row-id counter (F-rp3-c7). Recipe RePark must re-measure: 3-row V3 table → COW overwrite (`INSERT OVERWRITE` of the three rows) → COW DELETE of one row → `next-row-id` equals the post-overwrite value (Spark 5 vs pre-fix fork 6 on the original measurement; this unit holds the post-overwrite counter still).
+- `V3-COW-1` sequential COW / next-row-id counter (F-rp3-c7). Recipe now matches Spark absolute values: INSERT 3 → COW UPDATE → COW DELETE of id=2 → `_row_id` {0,2}, `next-row-id` 5.
 
 Do not lift the guard until RePark re-measures that recipe on this SHA.
 

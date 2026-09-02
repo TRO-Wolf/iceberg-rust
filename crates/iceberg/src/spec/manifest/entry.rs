@@ -187,50 +187,6 @@ pub(crate) fn assign_first_row_ids(
     Ok(())
 }
 
-pub(crate) fn stored_row_id_first(file: &DataFile) -> Option<i64> {
-    if let Some(first) = file.first_row_id {
-        return Some(first);
-    }
-    let field_id = crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID;
-    let values = file.value_counts.get(&field_id).copied()?;
-    if values != file.record_count {
-        return None;
-    }
-    let nulls = file.null_value_counts.get(&field_id).copied().unwrap_or(0);
-    if nulls != 0 {
-        return None;
-    }
-    match file.lower_bounds.get(&field_id)?.literal() {
-        PrimitiveLiteral::Long(value) => Some(*value),
-        _ => None,
-    }
-}
-
-pub(crate) fn apply_rewrite_aware_first_row_ids(
-    manifest_first_row_id: Option<u64>,
-    entries: &mut [ManifestEntry],
-) -> Option<u64> {
-    if manifest_first_row_id.is_some() {
-        return manifest_first_row_id;
-    }
-    let mut min_assigned: Option<u64> = None;
-    for entry in entries.iter_mut() {
-        if !entry.is_alive() {
-            continue;
-        }
-        let first = stored_row_id_first(&entry.data_file)?;
-        if entry.data_file.first_row_id.is_none() {
-            entry.data_file.first_row_id = Some(first);
-        }
-        let as_u64 = u64::try_from(first).ok()?;
-        min_assigned = Some(match min_assigned {
-            Some(current) => current.min(as_u64),
-            None => as_u64,
-        });
-    }
-    min_assigned
-}
-
 /// Used to track additions and deletions in ManifestEntry.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ManifestStatus {
@@ -911,67 +867,5 @@ mod first_row_id_tests {
         let mut entries: Vec<ManifestEntry> = Vec::new();
         assign_first_row_ids(&mut entries, None).expect("absent arm");
         assign_first_row_ids(&mut entries, Some(7)).expect("present arm");
-    }
-
-    fn entry_with_stored_row_ids(
-        path: &str,
-        record_count: u64,
-        min_row_id: i64,
-        nulls: u64,
-    ) -> ManifestEntry {
-        use std::collections::HashMap;
-
-        use crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID;
-        use crate::spec::Datum;
-
-        let mut builder = DataFileBuilder::default();
-        builder
-            .content(DataContentType::Data)
-            .file_path(path.to_string())
-            .file_format(DataFileFormat::Parquet)
-            .partition(Struct::empty())
-            .record_count(record_count)
-            .file_size_in_bytes(100)
-            .value_counts(HashMap::from([(RESERVED_FIELD_ID_ROW_ID, record_count)]))
-            .null_value_counts(HashMap::from([(RESERVED_FIELD_ID_ROW_ID, nulls)]))
-            .lower_bounds(HashMap::from([(
-                RESERVED_FIELD_ID_ROW_ID,
-                Datum::long(min_row_id),
-            )]));
-        ManifestEntry {
-            status: ManifestStatus::Added,
-            snapshot_id: None,
-            sequence_number: None,
-            file_sequence_number: None,
-            data_file: builder.build().expect("build data file"),
-        }
-    }
-
-    #[test]
-    fn stored_row_ids_set_manifest_first_row_id_to_the_min() {
-        let mut entries = vec![
-            entry_with_stored_row_ids("a.parquet", 2, 4, 0),
-            entry_with_stored_row_ids("b.parquet", 1, 1, 0),
-        ];
-        let assigned = apply_rewrite_aware_first_row_ids(None, &mut entries);
-        assert_eq!(assigned, Some(1));
-        assert_eq!(entries[0].data_file.first_row_id, Some(4));
-        assert_eq!(entries[1].data_file.first_row_id, Some(1));
-    }
-
-    #[test]
-    fn a_null_stored_row_id_does_not_claim_the_manifest_range() {
-        let mut entries = vec![entry_with_stored_row_ids("a.parquet", 2, 4, 1)];
-        assert_eq!(apply_rewrite_aware_first_row_ids(None, &mut entries), None);
-        assert!(entries[0].data_file.first_row_id.is_none());
-    }
-
-    #[test]
-    fn an_already_assigned_manifest_range_is_kept() {
-        let mut entries = vec![entry_with_stored_row_ids("a.parquet", 2, 4, 0)];
-        assert_eq!(
-            apply_rewrite_aware_first_row_ids(Some(90), &mut entries),
-            Some(90)
-        );
     }
 }

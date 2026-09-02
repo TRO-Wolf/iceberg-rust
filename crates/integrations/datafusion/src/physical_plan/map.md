@@ -61,7 +61,7 @@ exec (row R169).
 | Empty projection panics or reports 0 rows | `RecordBatch::project(&[])` must keep `num_rows` |
 | Reordered columns come back in table order | execute path is not applying `batch.project(indices)` |
 | MoR UPDATE reassigns `_row_id` | `merge_on_read_update` omitted `push_lineage_scan_columns` / `attach_update_lineage` |
-| COW rewrite drifts `next-row-id` | new V3 data manifest was unassigned; `apply_rewrite_aware_first_row_ids` did not recover stored `_row_id` bounds |
+| COW rewrite drifts `next-row-id` | new V3 data manifest was unassigned; mixed-manifest `?` short-circuit or non-contiguous stored ids skipped rewrite-aware recovery |
 
 ### First checks
 
