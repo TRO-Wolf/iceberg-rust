@@ -101,7 +101,7 @@ for seed in java_seed_branch_lineage.txt java_seed_main_lineage.txt java_seed_ma
 done
 echo "    Java fixture count=${java_count} OK"
 
-echo "==> [3/6] Rust: D1 read of the Java branch lineage + two MoR UPDATEs on branch b"
+echo "==> [3/6] Rust: D1 read of the Java branch lineage + two MoR UPDATE statements on branch b"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_MOR_BRANCH_LINEAGE_DIR="${TMP}" \
@@ -156,4 +156,4 @@ if ! echo "${SABOTAGE_OUT}" | grep -q '^FAIL mor-branch-lineage/branch_lineage';
 fi
 echo "    sabotage RED OK (1 red out of 1 mutation)"
 
-echo "==> interop-mor-branch-lineage PASSED (${EXPECTED_JAVA_FIXTURES} Java fixture, 2 MoR UPDATEs on branch b, sabotage RED)"
+echo "==> interop-mor-branch-lineage PASSED (${EXPECTED_JAVA_FIXTURES} Java fixture, 2 MoR UPDATE statements on branch b, sabotage RED)"
