@@ -26727,9 +26727,9 @@ public final class InteropOracle {
         return 1;
       }
       long actualNext = table.operations().current().nextRowId();
-      if (actualNext != 5L) {
+      if (actualNext != 7L) {
         System.out.println(
-            "FAIL mor-update-lineage: COW next_row_id=" + actualNext + " expected 5");
+            "FAIL mor-update-lineage: COW next_row_id=" + actualNext + " expected 7");
         failures++;
       }
       Map<Integer, long[]> rows = scanLineage(table);

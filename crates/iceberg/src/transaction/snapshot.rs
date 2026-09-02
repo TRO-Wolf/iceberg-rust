@@ -31,7 +31,7 @@ use crate::spec::{
     ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter,
     ManifestWriterBuilder, Operation, Schema, Snapshot, SnapshotRef, SnapshotReference,
     SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary, TableMetadata,
-    TableProperties, update_snapshot_summaries,
+    TableProperties, data_file_has_complete_stored_row_ids, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -167,24 +167,11 @@ pub(crate) struct SnapshotProducer<'a> {
     // preservation path that keeps outstanding equality deletes applying to rewritten data. `None`
     // makes the added files inherit the new snapshot's sequence number.
     new_data_files_data_sequence_number: Option<i64>,
-    // Data files removed by this snapshot, resolved against the current snapshot at commit time. Held
-    // so the snapshot summary can reflect the deleted file/record counts (Java overwrite/delete summary).
-    // Empty for add-only operations such as fast append.
     removed_data_files: Vec<DataFile>,
-    // DELETE files removed by this snapshot: the apply-side removal of superseded merge-on-read
-    // delete files. Java `MergingSnapshotProducer.delete(DeleteFile)`. Resolved by path against the
-    // current DELETE manifests in `commit()`, then fed to the same `process_deletes` rewrite path
-    // and to the summary's `remove_file`.
+    source_has_stored_row_ids: Option<bool>,
     removed_delete_files: Vec<DataFile>,
-    // The write-audit-publish staging flag. Java `SnapshotProducer.stageOnly`. When `true` the
-    // commit emits `AddSnapshot` ALONE, with no `SetSnapshotRef`, so `current-snapshot-id`, the
-    // `main` ref and the snapshot log stay unchanged. A cherry-pick publishes it later. The staged
-    // snapshot still CONSUMES a sequence number, exactly like a normal commit.
     stage_only: bool,
     pub(crate) target_branch: String,
-    // A counter used to generate unique manifest file names.
-    // It starts from 0 and increments for each new manifest file.
-    // Note: This counter is limited to the range of (0..u64::MAX).
     manifest_counter: RangeFrom<u64>,
 }
 
@@ -221,6 +208,7 @@ impl<'a> SnapshotProducer<'a> {
             added_delete_files: vec![],
             new_data_files_data_sequence_number: None,
             removed_data_files: vec![],
+            source_has_stored_row_ids: None,
             removed_delete_files: vec![],
             stage_only: false,
             target_branch: MAIN_BRANCH.to_string(),
@@ -409,7 +397,9 @@ impl<'a> SnapshotProducer<'a> {
                 ManifestContentType::Deletes => Ok(builder.build_v2_deletes()),
             },
             FormatVersion::V3 => match content {
-                ManifestContentType::Data => Ok(builder.build_v3_data()),
+                ManifestContentType::Data => Ok(builder
+                    .with_source_has_stored_row_ids(self.source_has_stored_row_ids)
+                    .build_v3_data()),
                 ManifestContentType::Deletes => Ok(builder.build_v3_deletes()),
             },
         }
@@ -1464,6 +1454,11 @@ impl<'a> SnapshotProducer<'a> {
         // summary can reflect the deleted file/record counts and `manifest_file()` can reuse the result
         // without re-resolving. Empty for add-only operations (e.g. fast append).
         self.removed_data_files = snapshot_produce_operation.delete_files(&self).await?;
+        self.source_has_stored_row_ids = (!self.removed_data_files.is_empty()).then(|| {
+            self.removed_data_files
+                .iter()
+                .all(data_file_has_complete_stored_row_ids)
+        });
 
         // Resolve the DELETE files this operation removes against the current snapshot's DELETE manifests by
         // path (the apply-side `RowDelta.removeDeletes` path). Re-binding `self.removed_delete_files` to the

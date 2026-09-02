@@ -1759,12 +1759,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------------------------------
-    // Helpers that build real data / delete files + scan (mirrors the row_delta.rs fixtures).
-    // -------------------------------------------------------------------------------------------------
-
-    /// A bogus [`ManifestFile`] with the given path + (added, deleted) file counts — for precondition /
-    /// validateDeletedManifests tests that never load it.
+    /// A bogus [`ManifestFile`] for precondition tests that never load it.
     fn bogus_manifest_file(path: &str, added_files: u32, deleted_files: u32) -> ManifestFile {
         ManifestFile {
             manifest_path: path.to_string(),
@@ -1783,6 +1778,7 @@ mod tests {
             partitions: None,
             key_metadata: None,
             first_row_id: None,
+            unassigned_row_count: None,
         }
     }
 

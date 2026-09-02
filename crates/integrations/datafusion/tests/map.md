@@ -35,7 +35,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `interop_dv_sql.rs` / `interop_partitioned_dml.rs` | Interop DML |
 | `lazy_table_resolution_test.rs` | Catalog-backed lazy resolve |
 | `partitioned_insert_select_test.rs` | Partitioned INSERT SELECT |
-| `row_lineage_cow.rs` | V3 row lineage on CoW DML, including the RePark sequential recipe (INSERT 3 → COW UPDATE → COW DELETE) with absolute `_row_id` {0,2} and `next-row-id` 5 (F-rp3-c7, row R166) |
+| `row_lineage_cow.rs` | V3 row lineage on CoW DML; seven Spark 4.1.2 + Iceberg 1.11.0 sequences (F-rp3-c7, row R166) |
 | `row_lineage_mor.rs` | V3 merge-on-read UPDATE lineage, sequential/partitioned UPDATE, V2 control, commit-conflict |
 | `interop_mor_update_lineage.rs` | GEN for `run-interop-mor-update-lineage.sh` (Java-created V3 tables; two MoR UPDATE statements + RePark COW UPDATE-then-DELETE) |
 | `shared_puffin_dv/` | Shared-Puffin deletion-vector DML |

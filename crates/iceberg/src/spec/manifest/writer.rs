@@ -42,6 +42,7 @@ pub struct ManifestWriterBuilder {
     key_metadata: Option<Vec<u8>>,
     schema: SchemaRef,
     partition_spec: PartitionSpec,
+    source_has_stored_row_ids: Option<bool>,
 }
 
 impl ManifestWriterBuilder {
@@ -59,7 +60,13 @@ impl ManifestWriterBuilder {
             key_metadata,
             schema,
             partition_spec,
+            source_has_stored_row_ids: None,
         }
+    }
+
+    pub(crate) fn with_source_has_stored_row_ids(mut self, value: Option<bool>) -> Self {
+        self.source_has_stored_row_ids = value;
+        self
     }
 
     /// Build a [`ManifestWriter`] for format version 1.
@@ -77,6 +84,7 @@ impl ManifestWriterBuilder {
             self.key_metadata,
             metadata,
             None,
+            self.source_has_stored_row_ids,
         )
     }
 
@@ -95,6 +103,7 @@ impl ManifestWriterBuilder {
             self.key_metadata,
             metadata,
             None,
+            self.source_has_stored_row_ids,
         )
     }
 
@@ -113,6 +122,7 @@ impl ManifestWriterBuilder {
             self.key_metadata,
             metadata,
             None,
+            self.source_has_stored_row_ids,
         )
     }
 
@@ -130,9 +140,8 @@ impl ManifestWriterBuilder {
             self.snapshot_id,
             self.key_metadata,
             metadata,
-            // First row id is assigned by the [`ManifestListWriter`] when the manifest
-            // is added to the list.
             None,
+            self.source_has_stored_row_ids,
         )
     }
 
@@ -151,6 +160,7 @@ impl ManifestWriterBuilder {
             self.key_metadata,
             metadata,
             None,
+            self.source_has_stored_row_ids,
         )
     }
 }
@@ -166,6 +176,7 @@ pub struct ManifestWriter {
     deleted_files: u32,
     deleted_rows: u64,
     first_row_id: Option<u64>,
+    source_has_stored_row_ids: Option<bool>,
     min_seq_num: Option<i64>,
     key_metadata: Option<Vec<u8>>,
     manifest_entries: Vec<ManifestEntry>,
@@ -180,6 +191,7 @@ impl ManifestWriter {
         key_metadata: Option<Vec<u8>>,
         metadata: ManifestMetadata,
         first_row_id: Option<u64>,
+        source_has_stored_row_ids: Option<bool>,
     ) -> Self {
         Self {
             output,
@@ -191,6 +203,7 @@ impl ManifestWriter {
             deleted_files: 0,
             deleted_rows: 0,
             first_row_id,
+            source_has_stored_row_ids,
             min_seq_num: None,
             key_metadata,
             manifest_entries: Vec::new(),
@@ -202,10 +215,6 @@ impl ManifestWriter {
         &mut self,
         partition_type: &StructType,
     ) -> Result<Vec<FieldSummary>> {
-        // Every step surfaces malformed input as a typed error (never an `unwrap`/`zip_eq`
-        // panic): Java's partition summaries read each slot through the typed
-        // `PartitionData.get(int, Class<T>)` accessor, which throws a catchable
-        // `IllegalArgumentException` for a wrong-kind value (`PartitionSummary.update`).
         let mut field_stats = partition_type
             .fields()
             .iter()
@@ -472,17 +481,17 @@ impl ManifestWriter {
         }
 
         let partition_summary = self.construct_partition_summaries(&partition_type)?;
+        let mut unassigned_row_count = None;
         if self.metadata.format_version == FormatVersion::V3
             && self.metadata.content == ManifestContentType::Data
         {
             let assigned = super::apply_rewrite_aware_first_row_ids(
                 self.first_row_id,
                 &mut self.manifest_entries,
+                self.source_has_stored_row_ids,
             );
             self.first_row_id = assigned.manifest_first_row_id;
-            if let Some(n) = assigned.unassigned_row_count {
-                super::note_unassigned_row_count(self.output.location().to_string(), n);
-            }
+            unassigned_row_count = assigned.unassigned_row_count;
         }
         for entry in std::mem::take(&mut self.manifest_entries) {
             let value = match self.metadata.format_version {
@@ -518,6 +527,7 @@ impl ManifestWriter {
             partitions: Some(partition_summary),
             key_metadata: self.key_metadata,
             first_row_id: self.first_row_id,
+            unassigned_row_count,
         })
     }
 }
@@ -807,8 +817,6 @@ mod tests {
                     },
                 },
             ];
-
-        // write manifest to file
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("test_manifest.avro");
         let io = FileIO::new_with_fs();
@@ -825,16 +833,12 @@ mod tests {
         writer.add_delete_entry(entries[1].clone()).unwrap();
         writer.add_existing_entry(entries[2].clone()).unwrap();
         writer.write_manifest_file().await.unwrap();
-
-        // read back the manifest file and check the content
         let actual_manifest =
             Manifest::parse_avro(fs::read(path).expect("read_file must succeed").as_slice())
                 .unwrap();
-
-        // The snapshot id is assigned when the entry is added and delete to the manifest. Existing entries are keep original.
         entries[0].snapshot_id = Some(3);
         entries[1].snapshot_id = Some(3);
-        // file sequence number is assigned to None when the entry is added and delete to the manifest.
+
         entries[0].file_sequence_number = None;
         assert_eq!(actual_manifest, Manifest::new(metadata, entries));
     }
@@ -864,7 +868,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // Create a position delete file entry
         let delete_entry = ManifestEntry {
             status: ManifestStatus::Added,
             snapshot_id: None,
@@ -894,8 +897,6 @@ mod tests {
                 content_size_in_bytes: None,
             },
         };
-
-        // Write a V3 delete manifest
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("v3_delete_manifest.avro");
         let io = FileIO::new_with_fs();
@@ -912,16 +913,10 @@ mod tests {
 
         writer.add_entry(delete_entry).unwrap();
         let manifest_file = writer.write_manifest_file().await.unwrap();
-
-        // The returned ManifestFile correctly reports Deletes content
         assert_eq!(manifest_file.content, ManifestContentType::Deletes);
-
-        // Read back the manifest file
         let actual_manifest =
             Manifest::parse_avro(fs::read(&path).expect("read_file must succeed").as_slice())
                 .unwrap();
-
-        // Verify the content type is correctly preserved as Deletes
         assert_eq!(
             actual_manifest.metadata().content,
             ManifestContentType::Deletes,
