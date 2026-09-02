@@ -383,6 +383,39 @@ public final class InteropOracle {
         // ✅-gating residue.
         RowLineageOracle.verify(requireFixturesDir("interop.row_lineage.dir"));
         break;
+      case "generate-interop-v3-upgrade":
+        V3UpgradeOracle.generate(requireFixturesDir("interop.v3_upgrade.dir"));
+        break;
+      case "upgrade-interop-v3-upgrade":
+        V3UpgradeOracle.upgrade(requireFixturesDir("interop.v3_upgrade.dir"));
+        break;
+      case "verify-interop-v3-upgrade":
+        {
+          int v3UpgradeFailures =
+              V3UpgradeOracle.verify(requireFixturesDir("interop.v3_upgrade.dir"));
+          System.out.println("verify-interop-v3-upgrade: " + v3UpgradeFailures + " failures");
+          if (v3UpgradeFailures > 0) {
+            System.exit(1);
+          }
+        }
+        break;
+      case "generate-interop-v3-maintenance":
+        V3MaintenanceOracle.generate(requireFixturesDir("interop.v3_maintenance.dir"));
+        break;
+      case "confirm-interop-v3-maintenance":
+        V3MaintenanceOracle.confirm(requireFixturesDir("interop.v3_maintenance.dir"));
+        break;
+      case "verify-interop-v3-maintenance":
+        {
+          int v3MaintenanceFailures =
+              V3MaintenanceOracle.verify(requireFixturesDir("interop.v3_maintenance.dir"));
+          System.out.println(
+              "verify-interop-v3-maintenance: " + v3MaintenanceFailures + " failures");
+          if (v3MaintenanceFailures > 0) {
+            System.exit(1);
+          }
+        }
+        break;
       case "generate-interop-mor-update-lineage":
         MorUpdateLineageOracle.generate(requireFixturesDir("interop.mor_update_lineage.dir"));
         break;
@@ -28457,4 +28490,1139 @@ public final class InteropOracle {
     }
   }
 
+  static final class V3UpgradeOracle {
+    static final int EXPECTED_FIXTURES = 2;
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "val", Types.StringType.get()));
+
+    private V3UpgradeOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+
+      Path u1 = dir.resolve("u1").resolve("java_v2");
+      BaseTable u1Table = newV2Table(u1, "u1_java_v2");
+      appendRows(u1Table, u1, "u1-seed", new long[] {1L, 2L, 3L}, new String[] {"a", "b", "c"});
+      writeFinal(u1Table, u1);
+
+      Path u3 = dir.resolve("u3").resolve("java_v2");
+      BaseTable u3Table = newV2Table(u3, "u3_java_v2");
+      DataFile seed =
+          appendRows(
+              u3Table,
+              u3,
+              "u3-seed",
+              new long[] {1L, 2L, 3L, 4L, 5L},
+              new String[] {"a", "b", "c", "d", "e"});
+      DeleteFile posDelete = writePosDelete(u3Table, u3, "u3-posdel", seed.location(), 1L);
+      u3Table.newRowDelta().addDeletes(posDelete).commit();
+      u3Table.refresh();
+      writeFinal(u3Table, u3);
+      writeJson(dir.resolve("u3").resolve("java_pre_rows.json"), snapshotJson(u3Table));
+
+      writeJson(dir.resolve("fixture_count.json"), "{\"count\":" + EXPECTED_FIXTURES + "}");
+      System.out.println("generated v3-upgrade Java V2 fixtures at " + dir);
+    }
+
+    static void upgrade(Path dir) throws IOException {
+      Path u2Src = dir.resolve("u2").resolve("rust_v2");
+      BaseTable u2 = loadTable(u2Src, "u2_java_v3");
+      upgradeToV3(u2);
+      appendRows(u2, u2Src, "u2-java-append", new long[] {4L, 5L}, new String[] {"d", "e"});
+      writeFinalTo(u2, dir.resolve("u2").resolve("java_v3"));
+      writeJson(dir.resolve("u2").resolve("java_expected.json"), snapshotJson(u2));
+
+      Path u4Src = dir.resolve("u4").resolve("rust_v2");
+      BaseTable u4 = loadTable(u4Src, "u4_java_v3");
+      upgradeToV3(u4);
+      int converted = convertPositionDeletesToDvs(u4);
+      if (converted < 1) {
+        throw new IOException("u4: Java converted no parquet position delete into a DV");
+      }
+      writeFinalTo(u4, dir.resolve("u4").resolve("java_v3_dv"));
+      writeJson(dir.resolve("u4").resolve("java_expected.json"), snapshotJson(u4));
+      System.out.println("upgraded the Rust V2 fixtures to V3 at " + dir);
+    }
+
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      failures += verifyCount(dir);
+      failures +=
+          verifyAgainstExpected(
+              dir.resolve("u1").resolve("rust_v3"),
+              dir.resolve("u1").resolve("rust_expected.json"),
+              "u1");
+      failures +=
+          verifyAgainstExpected(
+              dir.resolve("u3").resolve("rust_v3_mor"),
+              dir.resolve("u3").resolve("rust_expected.json"),
+              "u3");
+      failures += verifyNoParquetPositionDelete(dir.resolve("u3").resolve("rust_v3_mor"), "u3");
+      return failures;
+    }
+
+    private static int verifyCount(Path dir) throws IOException {
+      Path countPath = dir.resolve("fixture_count.json");
+      if (!Files.exists(countPath)) {
+        System.out.println("FAIL v3-upgrade: missing fixture_count.json");
+        return 1;
+      }
+      String json = readString(countPath).trim();
+      if (!json.equals("{\"count\":" + EXPECTED_FIXTURES + "}")) {
+        System.out.println("FAIL v3-upgrade: fixture count " + json);
+        return 1;
+      }
+      return 0;
+    }
+
+    private static int verifyAgainstExpected(Path tableDir, Path expectedPath, String tag) {
+      Path meta = tableDir.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(meta) || !Files.exists(expectedPath)) {
+        System.out.println("FAIL v3-upgrade " + tag + ": missing " + meta + " or " + expectedPath);
+        return 1;
+      }
+      try {
+        BaseTable table = loadReadOnly(meta, tag);
+        return compareSnapshot(readString(expectedPath), table, tag);
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-upgrade " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static int verifyNoParquetPositionDelete(Path tableDir, String tag) {
+      Path meta = tableDir.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(meta)) {
+        System.out.println("FAIL v3-upgrade " + tag + ": missing " + meta);
+        return 1;
+      }
+      try {
+        BaseTable table = loadReadOnly(meta, tag);
+        int parquet = 0;
+        int puffin = 0;
+        for (DeleteFile file : liveDeleteFiles(table)) {
+          if (file.format() == FileFormat.PUFFIN) {
+            puffin++;
+          } else if (file.content() == FileContent.POSITION_DELETES) {
+            parquet++;
+          }
+        }
+        int failures = 0;
+        if (parquet != 0) {
+          System.out.println(
+              "FAIL v3-upgrade " + tag + ": parquet position delete survived the V3 conversion: " + parquet);
+          failures++;
+        }
+        if (puffin < 1) {
+          System.out.println("FAIL v3-upgrade " + tag + ": no Puffin deletion vector is live");
+          failures++;
+        }
+        if (failures == 0) {
+          System.out.println(
+              "PASS v3-upgrade " + tag + ": " + puffin + " deletion vector(s), no parquet position delete");
+        }
+        return failures;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-upgrade " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static BaseTable newV2Table(Path tableDir, String name) throws IOException {
+      Files.createDirectories(tableDir.resolve("metadata"));
+      Files.createDirectories(tableDir.resolve("data"));
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              SCHEMA,
+              PartitionSpec.unpartitioned(),
+              SortOrder.unsorted(),
+              tableDir.toAbsolutePath().toString(),
+              props);
+      LocalTableOperations ops =
+          new LocalTableOperations(tableDir.toFile(), tableDir.resolve("metadata").toFile());
+      ops.commit(null, seed);
+      return new BaseTable(ops, name);
+    }
+
+    private static BaseTable loadTable(Path tableDir, String name) throws IOException {
+      Path meta = tableDir.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(meta)) {
+        throw new IOException("missing Rust fixture " + meta);
+      }
+      Files.createDirectories(tableDir.resolve("data"));
+      TableMetadata parsed = TableMetadataParser.fromJson(meta.toString(), readString(meta));
+      LocalTableOperations ops =
+          new LocalTableOperations(tableDir.toFile(), tableDir.resolve("metadata").toFile());
+      ops.commit(null, parsed);
+      return new BaseTable(ops, name);
+    }
+
+    private static BaseTable loadReadOnly(Path meta, String name) throws IOException {
+      TableMetadata parsed = TableMetadataParser.fromJson(meta.toString(), readString(meta));
+      return new BaseTable(new InMemoryInspectionOperations(parsed, new LocalFileIO()), name);
+    }
+
+    private static void upgradeToV3(BaseTable table) {
+      LocalTableOperations ops = (LocalTableOperations) table.operations();
+      TableMetadata base = ops.current();
+      ops.commit(base, base.upgradeToFormatVersion(3));
+      table.refresh();
+      if (table.operations().current().formatVersion() != 3) {
+        throw new IllegalStateException("upgradeToFormatVersion(3) did not take effect");
+      }
+    }
+
+    private static DataFile appendRows(
+        BaseTable table, Path tableDir, String tag, long[] ids, String[] values)
+        throws IOException {
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", ids[i]);
+        record.setField("val", values[i]);
+        rows.add(record);
+      }
+      File out = tableDir.resolve("data").resolve(tag + ".parquet").toFile();
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, PartitionSpec.unpartitioned());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  table.io().newOutputFile(out.getAbsolutePath()),
+                  org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      DataFile file = writer.toDataFile();
+      table.newAppend().appendFile(file).commit();
+      table.refresh();
+      return file;
+    }
+
+    private static DeleteFile writePosDelete(
+        BaseTable table, Path tableDir, String tag, CharSequence referenced, long position)
+        throws IOException {
+      File out = tableDir.resolve("data").resolve(tag + ".parquet").toFile();
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, PartitionSpec.unpartitioned());
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  table.io().newOutputFile(out.getAbsolutePath()),
+                  org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        writer.write(posDelete.set(referenced, position, null));
+      }
+      return writer.toDeleteFile();
+    }
+
+    private static int convertPositionDeletesToDvs(BaseTable table) throws IOException {
+      List<DeleteFile> legacy = new ArrayList<>();
+      for (DeleteFile file : liveDeleteFiles(table)) {
+        if (file.content() == FileContent.POSITION_DELETES && file.format() == FileFormat.PARQUET) {
+          legacy.add(file);
+        }
+      }
+      if (legacy.isEmpty()) {
+        throw new IOException("no live parquet position delete to convert");
+      }
+      List<DataFile> dataFiles = liveDataFiles(table);
+      org.apache.iceberg.data.DeleteLoader loader =
+          new org.apache.iceberg.data.BaseDeleteLoader(
+              deleteFile -> table.io().newInputFile(deleteFile.location()));
+      org.apache.iceberg.io.OutputFileFactory factory =
+          org.apache.iceberg.io.OutputFileFactory.builderFor(table, 1, 1L)
+              .format(FileFormat.PUFFIN)
+              .build();
+      org.apache.iceberg.deletes.DVFileWriter dvWriter =
+          new org.apache.iceberg.deletes.BaseDVFileWriter(factory, path -> null);
+      int converted = 0;
+      for (DataFile dataFile : dataFiles) {
+        org.apache.iceberg.deletes.PositionDeleteIndex index =
+            loader.loadPositionDeletes(legacy, dataFile.location());
+        if (index.isEmpty()) {
+          continue;
+        }
+        PartitionSpec spec = table.specs().get(dataFile.specId());
+        index.forEach(
+            position -> dvWriter.delete(dataFile.location(), position, spec, dataFile.partition()));
+        converted++;
+      }
+      dvWriter.close();
+      if (converted == 0) {
+        throw new IOException("no data file was covered by the legacy parquet position deletes");
+      }
+      java.util.Set<DeleteFile> added =
+          new java.util.LinkedHashSet<>(dvWriter.result().deleteFiles());
+      java.util.Set<DeleteFile> removed = new java.util.LinkedHashSet<>(legacy);
+      table
+          .newRewrite()
+          .rewriteFiles(java.util.Collections.emptySet(), removed, java.util.Collections.emptySet(), added)
+          .commit();
+      table.refresh();
+      return converted;
+    }
+
+    private static void writeFinal(BaseTable table, Path tableDir) throws IOException {
+      writeFinalTo(table, tableDir);
+    }
+
+    private static void writeFinalTo(BaseTable table, Path outDir) throws IOException {
+      Files.createDirectories(outDir.resolve("metadata"));
+      Path finalMetadata = outDir.resolve("metadata").resolve("final.metadata.json");
+      TableMetadataParser.write(
+          table.operations().current(),
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString()));
+      if (!Files.exists(finalMetadata)) {
+        throw new IOException("did not write " + finalMetadata);
+      }
+    }
+
+    static String snapshotJson(BaseTable table) {
+      TableMetadata metadata = table.operations().current();
+      List<Long> sequenceNumbers = new ArrayList<>();
+      for (Snapshot snapshot : metadata.snapshots()) {
+        sequenceNumbers.add(snapshot.sequenceNumber());
+      }
+      Collections.sort(sequenceNumbers);
+      Map<Long, Object[]> rows = readLineage(table);
+      List<Long> ids = new ArrayList<>(rows.keySet());
+      Collections.sort(ids);
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartObject();
+            gen.writeNumberField("format_version", metadata.formatVersion());
+            gen.writeNumberField("next_row_id", metadata.nextRowId());
+            gen.writeArrayFieldStart("snapshot_sequence_numbers");
+            for (Long sequenceNumber : sequenceNumbers) {
+              gen.writeNumber(sequenceNumber);
+            }
+            gen.writeEndArray();
+            gen.writeArrayFieldStart("rows");
+            for (Long id : ids) {
+              Object[] row = rows.get(id);
+              gen.writeStartObject();
+              gen.writeNumberField("id", id);
+              gen.writeStringField("val", (String) row[0]);
+              if (row[1] == null) {
+                gen.writeNullField("row_id");
+              } else {
+                gen.writeNumberField("row_id", (Long) row[1]);
+              }
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+            gen.writeEndObject();
+          },
+          false);
+    }
+
+    private static Map<Long, Object[]> readLineage(BaseTable table) {
+      Map<Long, Object[]> rows = new TreeMap<>();
+      Schema projection =
+          table.operations().current().formatVersion() >= 3
+              ? MetadataColumns.schemaWithRowLineage(table.schema())
+              : table.schema();
+      try (CloseableIterable<Record> records =
+          IcebergGenerics.read(table).project(projection).build()) {
+        for (Record record : records) {
+          Long id = ((Number) record.getField("id")).longValue();
+          Object value = record.getField("val");
+          Object rowId =
+              projection == table.schema() ? null : record.getField("_row_id");
+          rows.put(
+              id,
+              new Object[] {
+                value == null ? null : value.toString(),
+                rowId == null ? null : ((Number) rowId).longValue()
+              });
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows", error);
+      }
+      return rows;
+    }
+
+    private static int compareSnapshot(String expectedJson, BaseTable table, String tag)
+        throws IOException {
+      com.fasterxml.jackson.databind.JsonNode expected =
+          JsonUtil.mapper().readTree(expectedJson);
+      com.fasterxml.jackson.databind.JsonNode actual =
+          JsonUtil.mapper().readTree(snapshotJson(table));
+      int failures = 0;
+      failures += compareField(expected, actual, "format_version", tag);
+      failures += compareField(expected, actual, "next_row_id", tag);
+      if (!expected.get("snapshot_sequence_numbers").equals(actual.get("snapshot_sequence_numbers"))) {
+        System.out.println(
+            "FAIL v3-upgrade "
+                + tag
+                + ": snapshot sequence numbers expected "
+                + expected.get("snapshot_sequence_numbers")
+                + " actual "
+                + actual.get("snapshot_sequence_numbers"));
+        failures++;
+      }
+      if (!expected.get("rows").equals(actual.get("rows"))) {
+        System.out.println(
+            "FAIL v3-upgrade "
+                + tag
+                + ": rows and row ids expected "
+                + expected.get("rows")
+                + " actual "
+                + actual.get("rows"));
+        failures++;
+      }
+      if (failures == 0) {
+        System.out.println("PASS v3-upgrade " + tag + ": " + actual.get("rows"));
+      }
+      return failures;
+    }
+
+    private static int compareField(
+        com.fasterxml.jackson.databind.JsonNode expected,
+        com.fasterxml.jackson.databind.JsonNode actual,
+        String field,
+        String tag) {
+      if (!expected.get(field).equals(actual.get(field))) {
+        System.out.println(
+            "FAIL v3-upgrade "
+                + tag
+                + ": "
+                + field
+                + " expected "
+                + expected.get(field)
+                + " actual "
+                + actual.get(field));
+        return 1;
+      }
+      return 0;
+    }
+  }
+
+  static List<DeleteFile> liveDeleteFiles(BaseTable table) throws IOException {
+    List<DeleteFile> files = new ArrayList<>();
+    Snapshot snapshot = table.currentSnapshot();
+    if (snapshot == null) {
+      return files;
+    }
+    for (ManifestFile manifest : snapshot.deleteManifests(table.io())) {
+      try (ManifestReader<DeleteFile> reader =
+          ManifestFiles.readDeleteManifest(manifest, table.io(), table.specs())) {
+        for (ManifestEntry<DeleteFile> entry : reader.liveEntries()) {
+          files.add(entry.file().copy());
+        }
+      }
+    }
+    return files;
+  }
+
+  static List<DataFile> liveDataFiles(BaseTable table) throws IOException {
+    List<DataFile> files = new ArrayList<>();
+    Snapshot snapshot = table.currentSnapshot();
+    if (snapshot == null) {
+      return files;
+    }
+    for (ManifestFile manifest : snapshot.dataManifests(table.io())) {
+      try (ManifestReader<DataFile> reader =
+          ManifestFiles.read(manifest, table.io(), table.specs())) {
+        for (ManifestEntry<DataFile> entry : reader.liveEntries()) {
+          files.add(entry.file().copy());
+        }
+      }
+    }
+    return files;
+  }
+
+  static final class V3MaintenanceOracle {
+    static final int EXPECTED_FIXTURES = 2;
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "grp", Types.LongType.get()),
+            Types.NestedField.required(3, "y", Types.LongType.get()));
+
+    private static final long[][] FILE_G1A = {{100L, 1L, 10L}, {110L, 1L, 10L}, {120L, 1L, 20L}};
+    private static final long[][] FILE_G2A = {{200L, 2L, 10L}, {210L, 2L, 20L}};
+    private static final long[][] FILE_G1B = {{130L, 1L, 20L}, {140L, 1L, 10L}};
+    private static final long[][] FILE_G2B = {{220L, 2L, 20L}, {230L, 2L, 10L}, {240L, 2L, 20L}};
+
+    private V3MaintenanceOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      buildSeed(dir.resolve("java_v2_plain"), "java_v2_plain", false);
+      buildSeed(dir.resolve("java_v2_deletes"), "java_v2_deletes", true);
+      writeJson(dir.resolve("fixture_count.json"), "{\"count\":" + EXPECTED_FIXTURES + "}");
+      System.out.println("generated v3-maintenance Java V2 fixtures at " + dir);
+    }
+
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      failures += verifyCount(dir);
+      failures += verifyStages(dir.resolve("plain"), new String[] {"m0", "m1", "m2"}, "plain");
+      failures +=
+          verifyStages(dir.resolve("deletes"), new String[] {"m0", "m3", "m4", "m5"}, "deletes");
+      failures +=
+          verifyRewriteChangedFiles(dir.resolve("plain"), "m0", "m1", "plain/m1");
+      failures += verifyEvolvedSpec(dir.resolve("plain").resolve("m2"), "plain/m2");
+      failures += verifyDeletionVectors(dir.resolve("deletes").resolve("m3"), "deletes/m3");
+      failures += verifyDeletionVectors(dir.resolve("deletes").resolve("m4"), "deletes/m4");
+      failures += verifyDeletionVectors(dir.resolve("deletes").resolve("m5"), "deletes/m5");
+      failures += verifyClusteredManifests(dir.resolve("deletes").resolve("m4"), "deletes/m4");
+      failures +=
+          verifyExpiry(
+              dir.resolve("deletes").resolve("m4"), dir.resolve("deletes").resolve("m5"), "deletes/m5");
+      return failures;
+    }
+
+    private static int verifyCount(Path dir) throws IOException {
+      Path countPath = dir.resolve("fixture_count.json");
+      if (!Files.exists(countPath)) {
+        System.out.println("FAIL v3-maintenance: missing fixture_count.json");
+        return 1;
+      }
+      String json = readString(countPath).trim();
+      if (!json.equals("{\"count\":" + EXPECTED_FIXTURES + "}")) {
+        System.out.println("FAIL v3-maintenance: fixture count " + json);
+        return 1;
+      }
+      return 0;
+    }
+
+    private static int verifyStages(Path root, String[] stages, String tag) {
+      Path expectedPath = root.resolve("expected.json");
+      if (!Files.exists(expectedPath)) {
+        System.out.println("FAIL v3-maintenance " + tag + ": missing " + expectedPath);
+        return 1;
+      }
+      int failures = 0;
+      try {
+        com.fasterxml.jackson.databind.JsonNode expected =
+            JsonUtil.mapper().readTree(readString(expectedPath)).get("rows");
+        for (String stage : stages) {
+          Path meta = root.resolve(stage).resolve("metadata").resolve("final.metadata.json");
+          if (!Files.exists(meta)) {
+            System.out.println("FAIL v3-maintenance " + tag + "/" + stage + ": missing " + meta);
+            failures++;
+            continue;
+          }
+          BaseTable table = loadReadOnly(meta, tag + "/" + stage);
+          if (table.operations().current().formatVersion() != 3) {
+            System.out.println(
+                "FAIL v3-maintenance "
+                    + tag
+                    + "/"
+                    + stage
+                    + ": format version "
+                    + table.operations().current().formatVersion());
+            failures++;
+          }
+          com.fasterxml.jackson.databind.JsonNode actual =
+              JsonUtil.mapper().readTree(rowsJson(table));
+          if (!expected.equals(actual)) {
+            System.out.println(
+                "FAIL v3-maintenance "
+                    + tag
+                    + "/"
+                    + stage
+                    + ": rows and row ids expected "
+                    + expected
+                    + " actual "
+                    + actual);
+            failures++;
+          } else {
+            System.out.println("PASS v3-maintenance " + tag + "/" + stage + ": " + actual);
+          }
+        }
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance " + tag + ": unexpected error " + error);
+        failures++;
+      }
+      return failures;
+    }
+
+    static void confirm(Path dir) throws IOException {
+      int failures = 0;
+      failures += confirmClustering(dir);
+      failures += confirmRewrite(dir);
+      System.out.println("confirm-interop-v3-maintenance: " + failures + " failures");
+      if (failures > 0) {
+        System.exit(1);
+      }
+    }
+
+    private static long expectedNextRowId(Path root, String stage) throws IOException {
+      Path path = root.resolve("next_row_ids.json");
+      if (!Files.exists(path)) {
+        throw new IOException("missing " + path);
+      }
+      com.fasterxml.jackson.databind.JsonNode node =
+          JsonUtil.mapper().readTree(readString(path)).get(stage);
+      if (node == null) {
+        throw new IOException("missing stage " + stage + " in " + path);
+      }
+      return node.asLong();
+    }
+
+    private static BaseTable loadWritable(Path sourceMeta, Path workDir, String name)
+        throws IOException {
+      Files.createDirectories(workDir.resolve("metadata"));
+      Files.createDirectories(workDir.resolve("data"));
+      TableMetadata parsed =
+          TableMetadataParser.fromJson(sourceMeta.toString(), readString(sourceMeta));
+      LocalTableOperations ops =
+          new LocalTableOperations(workDir.toFile(), workDir.resolve("metadata").toFile());
+      ops.commit(null, parsed);
+      return new BaseTable(ops, name);
+    }
+
+    private static int confirmClustering(Path dir) {
+      String tag = "deletes/m4";
+      try {
+        Path source = dir.resolve("deletes").resolve("m3").resolve("metadata").resolve("final.metadata.json");
+        if (!Files.exists(source)) {
+          System.out.println("FAIL v3-maintenance confirm " + tag + ": missing " + source);
+          return 1;
+        }
+        long rustNextRowId = expectedNextRowId(dir.resolve("deletes"), "m4");
+        BaseTable table =
+            loadWritable(source, dir.resolve("java_confirm").resolve("m4"), "java_confirm_m4");
+        long before = table.operations().current().nextRowId();
+        table.rewriteManifests().clusterBy(file -> "all").commit();
+        table.refresh();
+        long javaNextRowId = table.operations().current().nextRowId();
+        Snapshot snapshot = table.currentSnapshot();
+        int dataManifests = snapshot.dataManifests(table.io()).size();
+        if (javaNextRowId != rustNextRowId) {
+          System.out.println(
+              "FAIL v3-maintenance confirm "
+                  + tag
+                  + ": Java next_row_id "
+                  + javaNextRowId
+                  + " != Rust "
+                  + rustNextRowId
+                  + " (before "
+                  + before
+                  + ", "
+                  + dataManifests
+                  + " data manifest(s))");
+          printManifests(table, tag);
+          return 1;
+        }
+        System.out.println(
+            "PASS v3-maintenance confirm "
+                + tag
+                + ": Java and Rust agree, next_row_id "
+                + before
+                + " to "
+                + javaNextRowId
+                + " over "
+                + dataManifests
+                + " clustered data manifest(s)");
+        return 0;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance confirm " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static int confirmRewrite(Path dir) {
+      String tag = "plain/m1";
+      try {
+        Path source = dir.resolve("plain").resolve("m0").resolve("metadata").resolve("final.metadata.json");
+        if (!Files.exists(source)) {
+          System.out.println("FAIL v3-maintenance confirm " + tag + ": missing " + source);
+          return 1;
+        }
+        long rustNextRowId = expectedNextRowId(dir.resolve("plain"), "m1");
+        Path workDir = dir.resolve("java_confirm").resolve("m1");
+        BaseTable table = loadWritable(source, workDir, "java_confirm_m1");
+        long before = table.operations().current().nextRowId();
+        for (long grp : new long[] {1L, 2L}) {
+          compactOnePartition(table, workDir, grp);
+        }
+        long javaNextRowId = table.operations().current().nextRowId();
+        if (javaNextRowId != rustNextRowId) {
+          System.out.println(
+              "FAIL v3-maintenance confirm "
+                  + tag
+                  + ": Java next_row_id "
+                  + javaNextRowId
+                  + " != Rust "
+                  + rustNextRowId
+                  + " (before "
+                  + before
+                  + ")");
+          printManifests(table, tag);
+          return 1;
+        }
+        System.out.println(
+            "PASS v3-maintenance confirm "
+                + tag
+                + ": Java and Rust agree, next_row_id "
+                + before
+                + " to "
+                + javaNextRowId
+                + " after two per-partition rewrites");
+        return 0;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance confirm " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static void compactOnePartition(BaseTable table, Path workDir, long grp)
+        throws IOException {
+      PartitionSpec spec = table.spec();
+      java.util.Set<DataFile> toDelete = new java.util.LinkedHashSet<>();
+      for (DataFile file : liveDataFiles(table)) {
+        if (file.partition().get(0, Long.class) == grp) {
+          toDelete.add(file);
+        }
+      }
+      if (toDelete.isEmpty()) {
+        throw new IOException("no live data file in partition " + grp);
+      }
+      List<Record> records = new ArrayList<>();
+      try (CloseableIterable<Record> rows =
+          IcebergGenerics.read(table).where(Expressions.equal("grp", grp)).build()) {
+        for (Record record : rows) {
+          records.add(record);
+        }
+      }
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, grp);
+      File out = workDir.resolve("data").resolve("compacted-grp-" + grp + ".parquet").toFile();
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  table.io().newOutputFile(out.getAbsolutePath()),
+                  org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(records);
+      }
+      java.util.Set<DataFile> toAdd = new java.util.LinkedHashSet<>();
+      toAdd.add(writer.toDataFile());
+      long sequenceNumber = table.currentSnapshot().sequenceNumber();
+      table.newRewrite().rewriteFiles(toDelete, toAdd, sequenceNumber).commit();
+      table.refresh();
+    }
+
+    private static void printManifests(BaseTable table, String tag) throws IOException {
+      Snapshot snapshot = table.currentSnapshot();
+      for (ManifestFile manifest : snapshot.dataManifests(table.io())) {
+        System.out.println(
+            "INFO v3-maintenance confirm "
+                + tag
+                + ": data manifest first_row_id="
+                + manifest.firstRowId()
+                + " existing="
+                + manifest.existingRowsCount()
+                + " added="
+                + manifest.addedRowsCount());
+      }
+    }
+
+    private static int verifyRewriteChangedFiles(
+        Path root, String beforeStage, String afterStage, String tag) {
+      Path before = root.resolve(beforeStage).resolve("metadata").resolve("final.metadata.json");
+      Path after = root.resolve(afterStage).resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(before) || !Files.exists(after)) {
+        System.out.println("FAIL v3-maintenance " + tag + ": missing " + before + " or " + after);
+        return 1;
+      }
+      try {
+        java.util.Set<String> beforePaths = liveDataFilePaths(loadReadOnly(before, tag + "-before"));
+        java.util.Set<String> afterPaths = loadDataFilePaths(after, tag);
+        int failures = 0;
+        if (beforePaths.isEmpty() || afterPaths.isEmpty()) {
+          System.out.println("FAIL v3-maintenance " + tag + ": a stage has no live data file");
+          failures++;
+        }
+        if (beforePaths.equals(afterPaths)) {
+          System.out.println(
+              "FAIL v3-maintenance "
+                  + tag
+                  + ": rewrite left the live data-file set unchanged ("
+                  + afterPaths.size()
+                  + " files)");
+          failures++;
+        }
+        if (failures == 0) {
+          System.out.println(
+              "PASS v3-maintenance "
+                  + tag
+                  + ": live data-file set changed, "
+                  + beforePaths.size()
+                  + " to "
+                  + afterPaths.size()
+                  + " file(s)");
+        }
+        return failures;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static java.util.Set<String> loadDataFilePaths(Path meta, String tag)
+        throws IOException {
+      return liveDataFilePaths(loadReadOnly(meta, tag + "-after"));
+    }
+
+    private static java.util.Set<String> liveDataFilePaths(BaseTable table) throws IOException {
+      java.util.Set<String> paths = new TreeSet<>();
+      for (DataFile file : liveDataFiles(table)) {
+        paths.add(file.location());
+      }
+      return paths;
+    }
+
+    private static int verifyEvolvedSpec(Path stageDir, String tag) {
+      Path meta = stageDir.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(meta)) {
+        System.out.println("FAIL v3-maintenance " + tag + ": missing " + meta);
+        return 1;
+      }
+      try {
+        BaseTable table = loadReadOnly(meta, tag);
+        PartitionSpec spec = table.spec();
+        int failures = 0;
+        if (spec.fields().size() != 1 || !spec.fields().get(0).name().equals("y")) {
+          System.out.println("FAIL v3-maintenance " + tag + ": current spec is " + spec);
+          failures++;
+        }
+        java.util.Set<Long> tuples = new TreeSet<>();
+        for (DataFile file : liveDataFiles(table)) {
+          if (file.specId() != spec.specId()) {
+            System.out.println(
+                "FAIL v3-maintenance "
+                    + tag
+                    + ": live data file carries spec "
+                    + file.specId()
+                    + " not the evolved "
+                    + spec.specId());
+            failures++;
+          }
+          tuples.add(file.partition().get(0, Long.class));
+        }
+        if (!tuples.equals(java.util.Set.of(10L, 20L))) {
+          System.out.println("FAIL v3-maintenance " + tag + ": evolved tuples " + tuples);
+          failures++;
+        }
+        if (failures == 0) {
+          System.out.println("PASS v3-maintenance " + tag + ": evolved tuples " + tuples);
+        }
+        return failures;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static int verifyDeletionVectors(Path stageDir, String tag) {
+      Path meta = stageDir.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(meta)) {
+        System.out.println("FAIL v3-maintenance " + tag + ": missing " + meta);
+        return 1;
+      }
+      try {
+        BaseTable table = loadReadOnly(meta, tag);
+        int parquet = 0;
+        int puffin = 0;
+        for (DeleteFile file : liveDeleteFiles(table)) {
+          if (file.format() == FileFormat.PUFFIN) {
+            puffin++;
+          } else if (file.content() == FileContent.POSITION_DELETES) {
+            parquet++;
+          }
+        }
+        int failures = 0;
+        if (parquet != 0) {
+          System.out.println(
+              "FAIL v3-maintenance " + tag + ": parquet position delete survived the V3 conversion: " + parquet);
+          failures++;
+        }
+        if (puffin < 1) {
+          System.out.println("FAIL v3-maintenance " + tag + ": no Puffin deletion vector is live");
+          failures++;
+        }
+        if (failures == 0) {
+          System.out.println("PASS v3-maintenance " + tag + ": " + puffin + " deletion vector(s)");
+        }
+        return failures;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static int verifyClusteredManifests(Path stageDir, String tag) {
+      Path meta = stageDir.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(meta)) {
+        System.out.println("FAIL v3-maintenance " + tag + ": missing " + meta);
+        return 1;
+      }
+      try {
+        BaseTable table = loadReadOnly(meta, tag);
+        Snapshot snapshot = table.currentSnapshot();
+        int dataManifests = snapshot.dataManifests(table.io()).size();
+        int deleteManifests = snapshot.deleteManifests(table.io()).size();
+        long nextRowId = table.operations().current().nextRowId();
+        int failures = 0;
+        if (dataManifests != 1) {
+          System.out.println(
+              "FAIL v3-maintenance " + tag + ": clustered data manifests " + dataManifests + " != 1");
+          failures++;
+        }
+        if (deleteManifests < 1) {
+          System.out.println("FAIL v3-maintenance " + tag + ": no delete manifest survived");
+          failures++;
+        }
+        int assigned = 0;
+        for (DataFile file : liveDataFiles(table)) {
+          Long first = file.firstRowId();
+          if (first == null) {
+            continue;
+          }
+          assigned++;
+          long end = first + file.recordCount();
+          if (end > nextRowId) {
+            System.out.println(
+                "FAIL v3-maintenance "
+                    + tag
+                    + ": live range ["
+                    + first
+                    + ", "
+                    + end
+                    + ") exceeds next_row_id "
+                    + nextRowId);
+            failures++;
+          }
+        }
+        if (assigned == 0) {
+          System.out.println("FAIL v3-maintenance " + tag + ": no live data file carries a row-id range");
+          failures++;
+        }
+        if (failures == 0) {
+          System.out.println(
+              "PASS v3-maintenance "
+                  + tag
+                  + ": "
+                  + dataManifests
+                  + " data manifest, "
+                  + deleteManifests
+                  + " delete manifest, "
+                  + assigned
+                  + " assigned range(s) below next_row_id "
+                  + nextRowId);
+        }
+        return failures;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static int verifyExpiry(Path beforeDir, Path afterDir, String tag) {
+      Path before = beforeDir.resolve("metadata").resolve("final.metadata.json");
+      Path after = afterDir.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(before) || !Files.exists(after)) {
+        System.out.println("FAIL v3-maintenance " + tag + ": missing " + before + " or " + after);
+        return 1;
+      }
+      try {
+        BaseTable beforeTable = loadReadOnly(before, tag + "-before");
+        BaseTable afterTable = loadReadOnly(after, tag + "-after");
+        int beforeCount = countSnapshots(beforeTable);
+        int afterCount = countSnapshots(afterTable);
+        int failures = 0;
+        if (afterCount >= beforeCount) {
+          System.out.println(
+              "FAIL v3-maintenance "
+                  + tag
+                  + ": expiry kept "
+                  + afterCount
+                  + " snapshots, was "
+                  + beforeCount);
+          failures++;
+        }
+        long beforeCurrent = beforeTable.currentSnapshot().snapshotId();
+        long afterCurrent = afterTable.currentSnapshot().snapshotId();
+        if (beforeCurrent != afterCurrent) {
+          System.out.println(
+              "FAIL v3-maintenance " + tag + ": expiry moved the current snapshot " + beforeCurrent + " -> " + afterCurrent);
+          failures++;
+        }
+        if (failures == 0) {
+          System.out.println(
+              "PASS v3-maintenance " + tag + ": snapshots " + beforeCount + " -> " + afterCount);
+        }
+        return failures;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static int countSnapshots(BaseTable table) {
+      int count = 0;
+      for (Snapshot ignored : table.operations().current().snapshots()) {
+        count++;
+      }
+      return count;
+    }
+
+    private static void buildSeed(Path tableDir, String name, boolean withDeletes)
+        throws IOException {
+      Files.createDirectories(tableDir.resolve("metadata"));
+      Files.createDirectories(tableDir.resolve("data"));
+      PartitionSpec spec = PartitionSpec.builderFor(SCHEMA).identity("grp").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              SCHEMA, spec, SortOrder.unsorted(), tableDir.toAbsolutePath().toString(), props);
+      LocalTableOperations ops =
+          new LocalTableOperations(tableDir.toFile(), tableDir.resolve("metadata").toFile());
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, name);
+
+      DataFile g1a = writeRows(table, tableDir, spec, "g1a", 1L, FILE_G1A);
+      DataFile g2a = writeRows(table, tableDir, spec, "g2a", 2L, FILE_G2A);
+      table.newAppend().appendFile(g1a).appendFile(g2a).commit();
+      table.refresh();
+      DataFile g1b = writeRows(table, tableDir, spec, "g1b", 1L, FILE_G1B);
+      DataFile g2b = writeRows(table, tableDir, spec, "g2b", 2L, FILE_G2B);
+      table.newAppend().appendFile(g1b).appendFile(g2b).commit();
+      table.refresh();
+
+      if (withDeletes) {
+        DeleteFile d1 = writePosDelete(table, tableDir, spec, "d1", 1L, g1a.location(), 1L);
+        DeleteFile d2 = writePosDelete(table, tableDir, spec, "d2", 2L, g2a.location(), 0L);
+        table.newRowDelta().addDeletes(d1).addDeletes(d2).commit();
+        table.refresh();
+      }
+
+      Path finalMetadata = tableDir.resolve("metadata").resolve("final.metadata.json");
+      TableMetadataParser.write(
+          ops.current(), new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString()));
+      writeJson(tableDir.resolve("java_rows.json"), rowsJson(table));
+    }
+
+    private static DataFile writeRows(
+        BaseTable table, Path tableDir, PartitionSpec spec, String tag, long grp, long[][] rows)
+        throws IOException {
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, grp);
+      List<Record> records = new ArrayList<>();
+      for (long[] row : rows) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", row[0]);
+        record.setField("grp", row[1]);
+        record.setField("y", row[2]);
+        records.add(record);
+      }
+      File out = tableDir.resolve("data").resolve(tag + ".parquet").toFile();
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  table.io().newOutputFile(out.getAbsolutePath()),
+                  org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(records);
+      }
+      return writer.toDataFile();
+    }
+
+    private static DeleteFile writePosDelete(
+        BaseTable table,
+        Path tableDir,
+        PartitionSpec spec,
+        String tag,
+        long grp,
+        CharSequence referenced,
+        long position)
+        throws IOException {
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, grp);
+      File out = tableDir.resolve("data").resolve(tag + ".parquet").toFile();
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      PositionDeleteWriter<Record> writer =
+          factory.newPosDeleteWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  table.io().newOutputFile(out.getAbsolutePath()),
+                  org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      try (Closeable toClose = writer) {
+        writer.write(posDelete.set(referenced, position, null));
+      }
+      return writer.toDeleteFile();
+    }
+
+    private static BaseTable loadReadOnly(Path meta, String name) throws IOException {
+      TableMetadata parsed = TableMetadataParser.fromJson(meta.toString(), readString(meta));
+      return new BaseTable(new InMemoryInspectionOperations(parsed, new LocalFileIO()), name);
+    }
+
+    static String rowsJson(BaseTable table) {
+      Map<Long, long[]> rows = new TreeMap<>();
+      Map<Long, Boolean> hasRowId = new TreeMap<>();
+      Schema projection =
+          table.operations().current().formatVersion() >= 3
+              ? MetadataColumns.schemaWithRowLineage(table.schema())
+              : table.schema();
+      try (CloseableIterable<Record> records =
+          IcebergGenerics.read(table).project(projection).build()) {
+        for (Record record : records) {
+          Long id = ((Number) record.getField("id")).longValue();
+          long grp = ((Number) record.getField("grp")).longValue();
+          long y = ((Number) record.getField("y")).longValue();
+          Object rowId = projection == table.schema() ? null : record.getField("_row_id");
+          rows.put(id, new long[] {grp, y, rowId == null ? 0L : ((Number) rowId).longValue()});
+          hasRowId.put(id, rowId != null);
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("failed to read live rows", error);
+      }
+      List<Long> ids = new ArrayList<>(rows.keySet());
+      Collections.sort(ids);
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartArray();
+            for (Long id : ids) {
+              long[] row = rows.get(id);
+              gen.writeStartObject();
+              gen.writeNumberField("id", id);
+              gen.writeNumberField("grp", row[0]);
+              gen.writeNumberField("y", row[1]);
+              if (Boolean.TRUE.equals(hasRowId.get(id))) {
+                gen.writeNumberField("row_id", row[2]);
+              } else {
+                gen.writeNullField("row_id");
+              }
+              gen.writeEndObject();
+            }
+            gen.writeEndArray();
+          },
+          false);
+    }
+  }
 }
