@@ -24,6 +24,21 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+## ACTIVE (2026-09-02): F-16 residue 2 — partition-scoped delete ratio (RePark RDF-1); HALT, premise refuted
+
+Ledger: [`f16-residue-2-partition-scoped-ratio-ledger.md`](f16-residue-2-partition-scoped-ratio-ledger.md). Row R135. Evidence and pins only; no product code changed.
+
+- [x] C-001 decode: `tooHighDeleteRatio` filters `ContentFileUtil.isFileScoped`, maps `ContentFile.recordCount`, threshold 0.3, delete-file threshold `Integer.MAX_VALUE` — IDENTICAL in iceberg-core 1.10.0 and the Spark 4.1 runtime 1.11.0, and the fork matches.
+- [x] C-001 route: Spark reclaims MW-7 through the BOUNDS leg of `ContentFileUtil.referencedDataFile`, because `MetricsConfig.forPositionDelete` forces `file_path` to `Full` and `SparkFileWriterFactory` applies it. Not the v3 DV path, not `tooManyDeletes`, not `remove-dangling-deletes`.
+- [x] C-002 REFUTED: the MW-7 red could not be reproduced. The fork already rewrites the file and drops the delete (rewritten=1, removed_delete_files_count=1, zero live deletes).
+- [x] C-003 REFUTED: no behavior change is correct here. Reading a partition-scoped delete's contents to attribute rows would rewrite files Java leaves alone.
+- [x] C-004 pins: two MW-7 pins, five mutations (4-red-of-5 and 1-red-of-5); F-16r's no-resurrection pin re-run green.
+- [x] C-005 docs: row R135, this ledger, `map.md` lockstep.
+- [ ] RULING: whether to land the Java interop runner and raise `SUITE_FLOOR_DEFAULT` 63 -> 64 for a unit with no fix.
+- [ ] RePark: check whether the MW-7 delete file it wrote carries EQUAL exact `file_path` bounds before retiring RDF-1.
+
+Outcome: HALT. The registry premise is refuted with measurements on both engines; the proven behavior is pinned.
+
 ## ACTIVE (2026-09-02): PR-7 production evidence closeout (C-007; verifies C-001 through C-006)
 
 Ledger: [`pr7-production-evidence-closeout-ledger.md`](pr7-production-evidence-closeout-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md` section 4 PR-7 and section 10. Evidence and documents only; no product code changed.

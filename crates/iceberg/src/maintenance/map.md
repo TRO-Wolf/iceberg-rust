@@ -36,6 +36,7 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | `rewrite_data_files_evolved_spec_tests.rs` | Spec-evolution output routing pins: source-field, transform, unpartitioned, mixed specs. |
 | `rewrite_data_files_router_bound_tests.rs` | Writer bound, eviction, V3 lineage, and evolved-spec delete-class pins. |
 | `rewrite_data_files_ratio_tests.rs` | Execute-path pins for `delete_ratio_threshold` and file-scoped delete removal. |
+| `rewrite_data_files_mw7_tests.rs` | The MW-7 pair (unpartitioned v2, one in-band data file, one PARTITION-scoped position delete covering every row): reclaimed when the delete carries EQUAL exact `file_path` bounds, a no-op when it does not — the bounds leg of Java `ContentFileUtil.referencedDataFile`, which is how Spark reclaims the shape. pins: task/f16-residue-2-partition-scoped-ratio-ledger.md |
 | `remove_dangling_delete_files.rs` | Composed GC pass. Java `RemoveDanglingDeletes`. Opt-in on `RewriteDataFiles`, default off. |
 | `rewrite_position_delete_files.rs` | Compact live parquet position deletes, or convert them to DVs on v3. |
 | `actions_provider.rs` | Java `ActionsProvider` factory. |

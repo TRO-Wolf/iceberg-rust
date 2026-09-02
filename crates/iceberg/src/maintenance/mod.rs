@@ -145,6 +145,8 @@ mod rewrite_data_files_dv;
 mod rewrite_data_files_evolved_spec_tests;
 #[cfg(test)]
 mod rewrite_data_files_lineage_tests;
+#[cfg(test)]
+mod rewrite_data_files_mw7_tests;
 mod rewrite_data_files_plan;
 #[cfg(test)]
 mod rewrite_data_files_ratio_tests;
