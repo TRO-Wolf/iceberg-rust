@@ -84,6 +84,36 @@ Ledger: [`pr6a-branch-interop-ledger.md`](pr6a-branch-interop-ledger.md). Plan: 
 - [x] `make check` 0; `cargo test -p iceberg --locked` 0; `cargo test -p iceberg-datafusion --locked` 0. Docker `make test` legs excused.
 
 Outcome: PR-6A landed. Java/Rust branch DML interop both directions. Every row-asserting verify pins main vs branch data-file sets. V3 MoR on a named branch closes DVs at the scanned snapshot. Row R168 ✅.
+## ACTIVE (2026-09-01): PR-4 V3 upgrade and maintenance interop (rows R109, R114, R135, R136, R166)
+
+Ledger: [`pr4-v3-upgrade-maintenance-interop-ledger.md`](pr4-v3-upgrade-maintenance-interop-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md` section 4 PR-4, clause C-004 and the PR-4 part of C-007.
+
+- [x] Decode Java 1.10.0 `TableMetadata.upgradeToFormatVersion` / `TableMetadata$Builder.upgradeFormatVersion` (never touches `nextRowId`), `deletes.BaseDVFileWriter`, `data.BaseDeleteLoader.loadPositionDeletes`, `PositionDeleteIndex.forEach`, the 4-argument `RewriteFiles.rewriteFiles`.
+- [x] Upgrade matrix, four cells: Java V2 upgraded by Rust; Rust V2 upgraded by Java; Java V2 with a parquet position delete converted by Rust then merge-on-read UPDATE; Rust V2 with a parquet position delete converted by Java. All four PASS both directions.
+- [x] Maintenance matrix, five actions over a Java V2 seed upgraded to V3: `RewriteDataFiles` current spec, `RewriteDataFiles` after spec evolution, `RewritePositionDeleteFiles` converting legacy parquet deletes to DVs, `RewriteManifests` with data and delete manifests, `ExpireSnapshots`. All five PASS; Java re-reads every stage.
+- [x] `RewriteManifests` row-id conservation: the per-file range map and `next_row_id` are unchanged and Java confirms every live range ends at or below `next_row_id`.
+- [x] Runners `run-interop-v3-upgrade.sh` and `run-interop-v3-maintenance.sh`, 9 fixtures each, six sabotages total. `SUITE_FLOOR_DEFAULT` 56 to 60.
+- [x] Mutations one knob at a time on the delete-conversion arm, manifest row-id inheritance, the computed row-id base, the stored row-id preference and the rewrite lineage carry.
+- [x] GAP_MATRIX rows R109, R114, R135, R136, R166 record only what this unit proves. R109 keeps ✅ and loses its named strict-bar gap; R114 and R135 stay 🟡 on their existing residues; R136 and R166 keep ✅.
+- [x] `make check`, `cargo test -p iceberg -p iceberg-datafusion --locked`, both interop runners. Docker legs of `make test` excused (no Docker in this environment).
+- [x] Re-pin after the PR-3 final rebase (2026-09-01): PR-3's reverted rewrite-aware allocation restores the plain-Iceberg rule, so every stage now pins `next_row_id` absolutely (12, 30, 42 and 12, 12, 24, 24) plus the rule as an identity. The seed partitions were made symmetric at six rows each so the `RewriteDataFiles` bin order cannot move the pins. New `confirm-interop-v3-maintenance` step: Java runs `clusterBy` and the per-partition `rewriteFiles` itself and agrees with Rust at 24 and 30, so ordinary clustering advancing the counter is not a fork divergence.
+- [x] Independent Critic pass: PASS with three S3 pin-adequacy findings, all landed. Java now compares the `m0` and `m1` live data-file path sets with a fifth `no-op-rewrite` sabotage; every action stage asserts the committing snapshot's operation; the `m4` range check asserts a six-entry map first.
+
+Outcome: composed V3 upgrade and maintenance interop is proven against Java 1.10.0 in both directions. No product code changed.
+
+## ACTIVE (2026-09-01): PR-3 V3 row-DML lineage (rows R114, R166)
+
+Ledger: [`pr3-row-dml-lineage-ledger.md`](pr3-row-dml-lineage-ledger.md). Plan `task/iceberg-v3-production-work-plan-2026-09-01.md` section 4 / 11.2, clause C-003 and F-rp3-c7.
+
+- [x] Decode Java 1.10.0 `ManifestListWriter$V3Writer.prepare`, `ManifestWriter`, `SnapshotProducer.apply`, `Delegates.suppressFirstRowId`. Diagnosis confirmed: unassigned V3 data manifests advance by added+existing.
+- [x] MoR UPDATE projects `_row_id` / `_last_updated_sequence_number`, attaches original row id, writes null last-updated.
+- [x] Rewrite-aware allocation: stored `_row_id` files do not move `next-row-id`.
+- [x] Required tests (one MoR UPDATE, sequential, partitioned, shared Puffin, conflict, sequential COW DELETE/UPDATE, V2 control) plus mutations 3/5, 3/5, 3/5, 2/2.
+- [x] Interop `run-interop-mor-update-lineage.sh`, 2 fixtures. Reverse Java MoR UPDATE not in iceberg-core 1.10.0.
+- [x] `make check` + `cargo test -p iceberg --locked` + `cargo test -p iceberg-datafusion --locked`. Docker `make test` legs excused.
+- [x] Critic S1–S3: per-file mixed-manifest recovery; RePark recipe absolute `{0,2}` / `next-row-id` 5; Java COW oracle absolute; runner narrative moved to `dev/java-interop/map.md`.
+
+Outcome: MoR UPDATE keeps `_row_id` and advances last-updated. RePark sequential COW DELETE ends at `_row_id` {0,2} and `next-row-id` 5. Interop 2 fixtures. Docker `make test` legs excused.
 
 ## ACTIVE (2026-09-01): F-6c branch-following reads (row R168)
 
