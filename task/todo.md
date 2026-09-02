@@ -39,6 +39,51 @@ Ledger: [`pr3-row-dml-lineage-ledger.md`](pr3-row-dml-lineage-ledger.md). Plan `
 - [x] Followup-3: revert allocation override; pin single-file Spark sequences; C-007 is the Java algorithm.
 
 Outcome: MoR UPDATE keeps `_row_id`. COW `next-row-id` is Java `+= existing+added` at matched layout. Interop 2 fixtures (Java reads fork `next_row_id`). Docker `make test` legs excused.
+## ACTIVE (2026-09-01): PR-5A catalog commit-outcome conformance (rows R110, R157)
+
+Ledger: [`pr5a-catalog-commit-outcomes-ledger.md`](pr5a-catalog-commit-outcomes-ledger.md). Plan clause C-005 / section 11.1. Cite plan as `task/iceberg-v3-production-work-plan-2026-09-01.md`.
+
+- [x] Narrow Glue and S3 Tables commit-transport seams with test constructors (stop-before-send, discard-success, modeled service).
+- [x] Offline proofs per shared `update_table` path for the seven commit classes: never-sent, maybe-sent, accepted-then-lost, reconcile success, reconcile exhaustion, metadata-only unknown, no blind retry.
+- [x] One CAS/conflict rebase test per catalog; one terminal authorization test per catalog.
+- [x] Phase A Java decode (`GlueTableOperations.doCommit` / REST commit handlers). No `S3TablesTableOperations` in iceberg-aws 1.10.0.
+- [x] Credentialed runner under `dev/` (not executed here). GAP_MATRIX rows record offline evidence; credentialed cells pending.
+- [x] Mutations, javap decode (12 needles), maps, ledger, `make check` + crate tests.
+
+Outcome: seams and offline proofs land. Credentialed execution is the orchestrator's next step. Docker `make test` legs excused.
+## ACTIVE (2026-09-01): PR-2 partition-safe RewriteDataFiles (row R135, C-001)
+
+Ledger: [`pr2-partition-safe-rewrite-ledger.md`](pr2-partition-safe-rewrite-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md`.
+
+- [x] Keep planner grouping; route rewrite output through `RecordBatchPartitionSplitter` + bounded LRU router.
+- [x] `max_open_partition_writers` default 64, reject zero before write.
+- [x] Remove `group_partition_tuple` as an output source.
+- [x] Evolution-class tests, bound/eviction tests, V3 lineage, delete-class tests.
+- [x] Interop `run-interop-evolved-spec-rewrite.sh` (D1 / D2 / V3).
+- [x] GAP_MATRIX row R135, maps, mutations, `make check` + `cargo test -p iceberg --locked`. Docker legs excused.
+## ACTIVE (2026-09-01): PR-1 REPLACE record-count invariant (row R107 / C-002)
+
+Ledger: [`pr1-replace-invariant-ledger.md`](pr1-replace-invariant-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md` PR-1.
+
+- [x] Decode Java `SnapshotProducer.apply` 1.10.0 offsets 311-364 (`added-records` / `deleted-records`, `propertyAsLong` absent=0).
+- [x] Shared-layer guard after summary, before manifest IO; `DataInvalid` when added > deleted.
+- [x] Pins: invalid 3→5 (no new avro, pointer unchanged); equal 3→3; shrink 5→3; RewriteManifests missing keys; conflict-then-retry (retried attempt refuses).
+- [x] Mutations 1/1/1/1 red out of 1; restore + green re-run. Critic S2 retry pin rewritten.
+- [x] Interop `run-interop-replace-invariant.sh` (3 fixtures); GAP_MATRIX row R107; maps; suite floor 56.
+
+Outcome: Shared producer refuses added-records > deleted-records before manifest IO. Five unit pins green. Mutations 1/1/1/1 red out of 1. Interop 3/3 fixtures. Docker `make test` legs excused.
+## ACTIVE (2026-09-01): PR-6A branch read/commit interop (row R168, C-006)
+
+Ledger: [`pr6a-branch-interop-ledger.md`](pr6a-branch-interop-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md` PR-6A.
+
+- [x] Decode Java 1.10.0 `SnapshotProducer.targetBranch` / `SnapshotUtil.latestSnapshot` / `SnapshotScan.useRef` / tag refusal.
+- [x] Java oracle `generate-interop-branch-dml` + `emit-branch-meta` + `verify-interop-branch-dml` (4 fixtures).
+- [x] Runner `run-interop-branch-dml.sh` (six-step + sabotage). `SUITE_FLOOR_DEFAULT` 55→56.
+- [x] Rust `interop_branch_dml.rs`: offline Direction-1 + env GEN/D1. V3 MoR DV close at scanned snapshot.
+- [x] Nine required cases both directions including main vs branch file sets on every row-asserting verify. Mutations 3 red out of 3 plus file-set sabotage B. Row R168 ✅.
+- [x] `make check` 0; `cargo test -p iceberg --locked` 0; `cargo test -p iceberg-datafusion --locked` 0. Docker `make test` legs excused.
+
+Outcome: PR-6A landed. Java/Rust branch DML interop both directions. Every row-asserting verify pins main vs branch data-file sets. V3 MoR on a named branch closes DVs at the scanned snapshot. Row R168 ✅.
 
 ## ACTIVE (2026-09-01): F-6c branch-following reads (row R168)
 

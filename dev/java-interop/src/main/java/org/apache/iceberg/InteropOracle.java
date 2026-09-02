@@ -955,6 +955,22 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-evolved-spec-rewrite":
+        EvolvedSpecRewriteOracle.generate(requireFixturesDir("interop.evolved_spec_rewrite.dir"));
+        break;
+      case "verify-interop-evolved-spec-rewrite":
+        {
+          Path evolvedDir = requireFixturesDir("interop.evolved_spec_rewrite.dir");
+          int evolvedFailures = EvolvedSpecRewriteOracle.verify(evolvedDir);
+          System.out.println("verify-interop-evolved-spec-rewrite: " + evolvedFailures + " failures");
+          if (evolvedFailures > 0) {
+            System.exit(1);
+          }
+        }
+        break;
+      case "rewrite-interop-evolved-spec-d2":
+        EvolvedSpecRewriteOracle.rewriteRustTable(requireFixturesDir("interop.evolved_spec_rewrite.dir"));
+        break;
       case "verify-interop-rewrite-pos-deletes":
         // MAINTENANCE RewritePositionDeleteFiles interop (BLOCK-2 G1), VERIFY-only direction — "Java
         // validates what RUST compacted". Java loads the Rust-written PRE table (<dir>/rust_table, with
@@ -1176,6 +1192,24 @@ public final class InteropOracle {
         int cherrypickFailures = CherryPickOracle.verify(cherrypickVerifyDir);
         System.out.println("verify-interop-cherrypick: " + cherrypickFailures + " failures");
         if (cherrypickFailures > 0) {
+          System.exit(1);
+        }
+        break;
+      case "generate-interop-branch-dml":
+        Path branchGenDir = requireFixturesDir("interop.branch.dir");
+        BranchDmlOracle.generate(branchGenDir);
+        break;
+      case "emit-branch-meta":
+        Path branchMetaIn = requireFixturesDir("interop.meta.metadata");
+        Path branchMetaOut = requireFixturesDir("interop.meta.out");
+        String emitBranch = System.getProperty("interop.meta.branch", "b");
+        BranchDmlOracle.emit(branchMetaIn, branchMetaOut, emitBranch);
+        break;
+      case "verify-interop-branch-dml":
+        Path branchVerifyDir = requireFixturesDir("interop.branch.dir");
+        int branchDmlFailures = BranchDmlOracle.verify(branchVerifyDir);
+        System.out.println("verify-interop-branch-dml: " + branchDmlFailures + " failures");
+        if (branchDmlFailures > 0) {
           System.exit(1);
         }
         break;
@@ -1748,6 +1782,19 @@ public final class InteropOracle {
         // Rust test rebuilds each case independently and byte-compares. The dir is supplied via
         // -Dinterop.partition_path.dir on the CLI (same JVM, so System.getProperty sees it).
         PartitionPathOracle.generate(requireFixturesDir("interop.partition_path.dir"));
+        break;
+
+      case "generate-interop-replace-invariant":
+        ReplaceInvariantOracle.generate(requireFixturesDir("interop.replace_invariant.dir"));
+        break;
+      case "verify-interop-replace-invariant":
+        int replaceInvariantFailures =
+            ReplaceInvariantOracle.verify(requireFixturesDir("interop.replace_invariant.dir"));
+        System.out.println(
+            "verify-interop-replace-invariant: " + replaceInvariantFailures + " failures");
+        if (replaceInvariantFailures > 0) {
+          System.exit(1);
+        }
         break;
 
       default:
@@ -12799,6 +12846,230 @@ public final class InteropOracle {
                 + "live rows = {10,30,50}");
       }
       return failures;
+    }
+  }
+
+  static final class ReplaceInvariantOracle {
+    private ReplaceInvariantOracle() {}
+
+    private static final Schema SCHEMA =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()));
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      generateInvalid(dir.resolve("invalid"));
+      generateValid(dir.resolve("valid_java"));
+      System.out.println(
+          "generated replace-invariant fixtures under "
+              + dir
+              + " (invalid threw + valid_java 3-to-3 rewrite)");
+    }
+
+    static int verify(Path dir) {
+      int failures = 0;
+      failures += verifyJavaInvalidStillThrows(dir.resolve("invalid"));
+      failures += verifyRustValidTable(dir.resolve("valid_rust"));
+      if (failures == 0) {
+        System.out.println(
+            "verify-interop-replace-invariant OK — Java still refuses the invalid replacement "
+                + "and Java IcebergGenerics reads the Rust 3-to-3 rewrite as {10,20,30}");
+      }
+      return failures;
+    }
+
+    private static void generateInvalid(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      BaseTable table = newUnpartitionedTable(dir.resolve("table").toFile());
+      DataFile original =
+          writeRows(table, new File(new File(table.location(), "data"), "original.parquet"), 3);
+      table.newAppend().appendFile(original).commit();
+      long snapshotBefore = table.currentSnapshot().snapshotId();
+      DataFile grown =
+          writeRows(table, new File(new File(table.location(), "data"), "grown.parquet"), 5);
+      boolean threw = false;
+      String message = "";
+      try {
+        java.util.Set<DataFile> deleted = new java.util.HashSet<>();
+        deleted.add(original);
+        java.util.Set<DataFile> added = new java.util.HashSet<>();
+        added.add(grown);
+        table.newRewrite().rewriteFiles(deleted, added).commit();
+      } catch (RuntimeException error) {
+        if (isReplaceInvariantFailure(error)) {
+          threw = true;
+          message = error.getMessage();
+        } else {
+          throw error;
+        }
+      }
+      if (!threw) {
+        throw new RuntimeException(
+            "Java rewriteFiles of a 3-row file with a 5-row file must throw Invalid REPLACE");
+      }
+      if (table.currentSnapshot().snapshotId() != snapshotBefore) {
+        throw new RuntimeException("Java invalid REPLACE moved the current snapshot");
+      }
+      writeJson(
+          dir.resolve("threw.json"),
+          "{\"threw\":true,\"message\":"
+              + quoteJson(message)
+              + ",\"added\":5,\"deleted\":3}");
+      Path finalMetadata = dir.resolve("table").resolve("metadata").resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(
+          ((BaseTable) table).operations().current(), finalOut);
+    }
+
+    private static void generateValid(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      BaseTable table = newUnpartitionedTable(dir.resolve("table").toFile());
+      DataFile original =
+          writeRows(table, new File(new File(table.location(), "data"), "original.parquet"), 3);
+      table.newAppend().appendFile(original).commit();
+      DataFile replacement =
+          writeRows(table, new File(new File(table.location(), "data"), "replacement.parquet"), 3);
+      java.util.Set<DataFile> deleted = new java.util.HashSet<>();
+      deleted.add(original);
+      java.util.Set<DataFile> added = new java.util.HashSet<>();
+      added.add(replacement);
+      table.newRewrite().rewriteFiles(deleted, added).commit();
+      Path finalMetadata = dir.resolve("table").resolve("metadata").resolve("final.metadata.json");
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(
+          ((BaseTable) table).operations().current(), finalOut);
+      writeJson(dir.resolve("java_rows.json"), readLiveRowsToJson(table, "data"));
+    }
+
+    private static int verifyJavaInvalidStillThrows(Path invalidDir) {
+      Path threw = invalidDir.resolve("threw.json");
+      if (!Files.exists(threw)) {
+        System.out.println("FAIL replace-invariant invalid: missing " + threw);
+        return 1;
+      }
+      try {
+        Path scratch = invalidDir.resolve("verify-scratch");
+        Files.createDirectories(scratch);
+        generateInvalid(scratch);
+        System.out.println(
+            "PASS replace-invariant invalid: Java refuses 3-to-5 REPLACE (generate + verify)");
+        return 0;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL replace-invariant invalid: " + error);
+        return 1;
+      }
+    }
+
+    private static int verifyRustValidTable(Path rustDir) {
+      Path finalMetadata =
+          rustDir.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(finalMetadata)) {
+        System.out.println("FAIL replace-invariant valid-rust: missing " + finalMetadata);
+        return 1;
+      }
+      TableMetadata metadata;
+      try {
+        metadata = TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      } catch (RuntimeException | IOException parseError) {
+        System.out.println(
+            "FAIL replace-invariant valid-rust: Java could not parse Rust metadata: " + parseError);
+        return 1;
+      }
+      BaseTable table =
+          new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), "rust_valid");
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long id = (Long) record.getField("id");
+          Object data = record.getField("data");
+          dataById.put(id, data == null ? null : data.toString());
+        }
+      } catch (RuntimeException | IOException readError) {
+        System.out.println(
+            "FAIL replace-invariant valid-rust: Java could not read Rust table: " + readError);
+        return 1;
+      }
+      Map<Long, String> expected = new LinkedHashMap<>();
+      expected.put(10L, "a");
+      expected.put(20L, "b");
+      expected.put(30L, "c");
+      if (!dataById.equals(expected)) {
+        System.out.println(
+            "FAIL replace-invariant valid-rust: live rows "
+                + dataById
+                + " expected "
+                + expected);
+        return 1;
+      }
+      System.out.println(
+          "PASS replace-invariant valid-rust: Java read Rust 3-to-3 rewrite as {10=a, 20=b, 30=c}");
+      return 0;
+    }
+
+    private static BaseTable newUnpartitionedTable(File tableDir) throws IOException {
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              SCHEMA,
+              PartitionSpec.unpartitioned(),
+              SortOrder.unsorted(),
+              tableDir.getAbsolutePath(),
+              props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      return new BaseTable(ops, "replace_invariant");
+    }
+
+    private static DataFile writeRows(BaseTable table, File path, int n) throws IOException {
+      String[] values = {"a", "b", "c", "d", "e"};
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < n; i++) {
+        GenericRecord record = GenericRecord.create(SCHEMA);
+        record.setField("id", 10L * (i + 1));
+        record.setField("data", values[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(SCHEMA, PartitionSpec.unpartitioned());
+      OutputFile out = table.io().newOutputFile(path.getAbsolutePath());
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static boolean isReplaceInvariantFailure(Throwable error) {
+      for (Throwable cursor = error; cursor != null; cursor = cursor.getCause()) {
+        String message = cursor.getMessage();
+        if (message != null && message.contains("Invalid REPLACE operation")) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    private static String quoteJson(String value) {
+      return "\""
+          + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+          + "\"";
     }
   }
 
@@ -26578,6 +26849,942 @@ public final class InteropOracle {
               null);
       try (Closeable toClose = writer) {
         writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+  }
+
+  static final class BranchDmlOracle {
+    private BranchDmlOracle() {}
+
+    static final String BRANCH = "b";
+    static final String TAG = "t";
+    static final List<String> FIXTURES =
+        Arrays.asList("diverged", "v3_diverged", "tag", "no_branch");
+
+    private static Schema schema() {
+      return new Schema(
+          Types.NestedField.required(1, "id", Types.IntegerType.get()),
+          Types.NestedField.required(2, "data", Types.StringType.get()));
+    }
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      buildDiverged(dir.resolve("diverged"), "2");
+      buildDiverged(dir.resolve("v3_diverged"), "3");
+      buildTag(dir.resolve("tag"));
+      buildNoBranch(dir.resolve("no_branch"));
+      if (FIXTURES.size() != 4) {
+        throw new IllegalStateException("branch-dml fixture names drifted from generate");
+      }
+      System.out.println(
+          "generate-interop-branch-dml: wrote " + FIXTURES.size() + " fixtures to " + dir);
+    }
+
+    static void emit(Path metadataPath, Path out, String branchName) throws IOException {
+      String json = readString(metadataPath);
+      TableMetadata metadata = TableMetadataParser.fromJson(metadataPath.toString(), json);
+      FileIO io = new LocalFileIO();
+      BaseTable table =
+          new BaseTable(new InMemoryInspectionOperations(metadata, io), "branch_dml_emit");
+      writeJson(out, viewJson(table, branchName));
+    }
+
+    static int verify(Path dir) {
+      int failures = 0;
+      failures += runVerify("rust_append", () -> verifyAppend(dir));
+      failures += runVerify("rust_cow", () -> verifyCow(dir));
+      failures += runVerify("rust_mor", () -> verifyMor(dir));
+      failures += runVerify("rust_created", () -> verifyCreated(dir));
+      failures += runVerify("rust_insert_create", () -> verifyInsertCreate(dir));
+      failures += runVerify("rust_retry", () -> verifyRetry(dir));
+      return failures;
+    }
+
+    @FunctionalInterface
+    private interface VerifyStep {
+      int run() throws IOException;
+    }
+
+    private static int runVerify(String label, VerifyStep step) {
+      try {
+        return step.run();
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL branch-dml/" + label + ": " + error);
+        return 1;
+      }
+    }
+
+    private static void buildDiverged(Path dir, String formatVersion) throws IOException {
+      BaseTable table = newTable(dir, formatVersion);
+      DataFile mainFile =
+          writeRows(
+              table,
+              new File(new File(table.location(), "data"), "main.parquet").getAbsolutePath(),
+              new int[] {1, 2},
+              new String[] {"main-a", "main-b"});
+      table.newFastAppend().appendFile(mainFile).commit();
+      table.manageSnapshots().createBranch(BRANCH).commit();
+      DataFile branchFile =
+          writeRows(
+              table,
+              new File(new File(table.location(), "data"), "branch.parquet").getAbsolutePath(),
+              new int[] {10, 11},
+              new String[] {"branch-x", "branch-y"});
+      table.newFastAppend().appendFile(branchFile).toBranch(BRANCH).commit();
+      landFinal(table);
+      Path metaOut = dir.resolve("java_branch_meta.json");
+      writeJson(metaOut, viewJson(table, BRANCH));
+      System.out.println("generate-interop-branch-dml/" + dir.getFileName() + ": written");
+    }
+
+    private static void buildTag(Path dir) throws IOException {
+      BaseTable table = newTable(dir, "2");
+      DataFile mainFile =
+          writeRows(
+              table,
+              new File(new File(table.location(), "data"), "main.parquet").getAbsolutePath(),
+              new int[] {1, 2},
+              new String[] {"main-a", "main-b"});
+      table.newFastAppend().appendFile(mainFile).commit();
+      table
+          .manageSnapshots()
+          .createTag(TAG, table.currentSnapshot().snapshotId())
+          .commit();
+      landFinal(table);
+      writeJson(dir.resolve("java_branch_meta.json"), viewJson(table, BRANCH));
+      System.out.println("generate-interop-branch-dml/tag: written");
+    }
+
+    private static void buildNoBranch(Path dir) throws IOException {
+      BaseTable table = newTable(dir, "2");
+      DataFile mainFile =
+          writeRows(
+              table,
+              new File(new File(table.location(), "data"), "main.parquet").getAbsolutePath(),
+              new int[] {1, 2},
+              new String[] {"main-a", "main-b"});
+      table.newFastAppend().appendFile(mainFile).commit();
+      landFinal(table);
+      writeJson(dir.resolve("java_branch_meta.json"), viewJson(table, BRANCH));
+      System.out.println("generate-interop-branch-dml/no_branch: written");
+    }
+
+    private static BaseTable newTable(Path dir, String formatVersion) throws IOException {
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create metadata dir at " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create data dir at " + dataDir);
+      }
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, formatVersion);
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema(),
+              PartitionSpec.unpartitioned(),
+              SortOrder.unsorted(),
+              tableDir.getAbsolutePath(),
+              props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      return new BaseTable(ops, "interop_branch_dml_" + dir.getFileName());
+    }
+
+    private static void landFinal(BaseTable table) {
+      TableOperations ops = table.operations();
+      Path finalMetadata = Paths.get(ops.metadataFileLocation("final.metadata.json"));
+      OutputFile finalOut =
+          new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+    }
+
+    private static DataFile writeRows(BaseTable table, String path, int[] ids, String[] values)
+        throws IOException {
+      Schema schema = schema();
+      List<Record> rows = new ArrayList<>();
+      for (int i = 0; i < ids.length; i++) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("id", ids[i]);
+        record.setField("data", values[i]);
+        rows.add(record);
+      }
+      GenericAppenderFactory factory =
+          new GenericAppenderFactory(schema, PartitionSpec.unpartitioned());
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              null);
+      try (Closeable toClose = writer) {
+        writer.write(rows);
+      }
+      return writer.toDataFile();
+    }
+
+    private static String viewJson(BaseTable table, String branchName) {
+      return JsonUtil.generate(
+          gen -> {
+            gen.writeStartObject();
+            Snapshot current = table.currentSnapshot();
+            if (current == null) {
+              gen.writeNullField("current_snapshot_id");
+            } else {
+              gen.writeNumberField("current_snapshot_id", current.snapshotId());
+            }
+            SnapshotRef mainRef = table.refs().get(SnapshotRef.MAIN_BRANCH);
+            writeRef(gen, "main", mainRef, table);
+            SnapshotRef branchRef = table.refs().get(branchName);
+            writeRef(gen, "branch", branchRef, table);
+            SnapshotRef tagRef = table.refs().get(TAG);
+            writeRef(gen, "tag", tagRef, table);
+            writeSortedStrings(gen, "main_file_basenames", fileBasenames(table, SnapshotRef.MAIN_BRANCH));
+            if (branchRef != null) {
+              writeSortedStrings(gen, "branch_file_basenames", fileBasenames(table, branchName));
+              writeSortedInts(gen, "branch_ids", liveIds(table, branchRef.snapshotId()));
+              Snapshot branchSnap = table.snapshot(branchRef.snapshotId());
+              if (branchSnap != null && branchSnap.parentId() != null) {
+                gen.writeNumberField("branch_parent_snapshot_id", branchSnap.parentId());
+              } else {
+                gen.writeNullField("branch_parent_snapshot_id");
+              }
+            } else {
+              gen.writeNullField("branch_file_basenames");
+              gen.writeNullField("branch_ids");
+              gen.writeNullField("branch_parent_snapshot_id");
+            }
+            if (current == null) {
+              gen.writeNullField("main_ids");
+            } else {
+              writeSortedInts(gen, "main_ids", liveIds(table, current.snapshotId()));
+            }
+            gen.writeEndObject();
+          },
+          true);
+    }
+
+    private static void writeRef(
+        JsonGenerator gen, String field, SnapshotRef ref, BaseTable table) throws IOException {
+      gen.writeFieldName(field);
+      if (ref == null) {
+        gen.writeNull();
+        return;
+      }
+      gen.writeStartObject();
+      gen.writeNumberField("snapshot_id", ref.snapshotId());
+      gen.writeStringField("type", ref.isBranch() ? "branch" : "tag");
+      if (ref.minSnapshotsToKeep() == null) {
+        gen.writeNullField("min_snapshots_to_keep");
+      } else {
+        gen.writeNumberField("min_snapshots_to_keep", ref.minSnapshotsToKeep());
+      }
+      if (ref.maxSnapshotAgeMs() == null) {
+        gen.writeNullField("max_snapshot_age_ms");
+      } else {
+        gen.writeNumberField("max_snapshot_age_ms", ref.maxSnapshotAgeMs());
+      }
+      if (ref.maxRefAgeMs() == null) {
+        gen.writeNullField("max_ref_age_ms");
+      } else {
+        gen.writeNumberField("max_ref_age_ms", ref.maxRefAgeMs());
+      }
+      Snapshot snap = table.snapshot(ref.snapshotId());
+      if (snap == null || snap.parentId() == null) {
+        gen.writeNullField("parent_snapshot_id");
+      } else {
+        gen.writeNumberField("parent_snapshot_id", snap.parentId());
+      }
+      gen.writeEndObject();
+    }
+
+    private static void writeSortedStrings(JsonGenerator gen, String field, List<String> values)
+        throws IOException {
+      gen.writeArrayFieldStart(field);
+      for (String value : values) {
+        gen.writeString(value);
+      }
+      gen.writeEndArray();
+    }
+
+    private static void writeSortedInts(JsonGenerator gen, String field, List<Integer> values)
+        throws IOException {
+      gen.writeArrayFieldStart(field);
+      for (Integer value : values) {
+        gen.writeNumber(value);
+      }
+      gen.writeEndArray();
+    }
+
+    private static List<String> fileBasenames(BaseTable table, String refName) {
+      TreeSet<String> names = new TreeSet<>();
+      try (CloseableIterable<FileScanTask> tasks = table.newScan().useRef(refName).planFiles()) {
+        for (FileScanTask task : tasks) {
+          String path = task.file().path().toString();
+          names.add(new File(path).getName());
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("planFiles failed for ref " + refName, error);
+      }
+      return new ArrayList<>(names);
+    }
+
+    private static List<Integer> liveIds(BaseTable table, long snapshotId) {
+      TreeSet<Integer> ids = new TreeSet<>();
+      try (CloseableIterable<Record> records =
+          IcebergGenerics.read(table).useSnapshot(snapshotId).build()) {
+        for (Record record : records) {
+          ids.add((Integer) record.getField("id"));
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("IcebergGenerics failed for snapshot " + snapshotId, error);
+      }
+      return new ArrayList<>(ids);
+    }
+
+    private static BaseTable loadRust(Path dir, String tableName) throws IOException {
+      Path finalMetadata =
+          dir.resolve(tableName).resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(finalMetadata)) {
+        throw new IOException("missing " + finalMetadata);
+      }
+      TableMetadata metadata =
+          TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata));
+      FileIO io = new LocalFileIO();
+      return new BaseTable(new InMemoryInspectionOperations(metadata, io), tableName);
+    }
+
+    private static int failIfMissing(Path dir, String tableName) {
+      Path finalMetadata =
+          dir.resolve(tableName).resolve("metadata").resolve("final.metadata.json");
+      try {
+        if (!Files.exists(finalMetadata) || Files.size(finalMetadata) == 0) {
+          System.out.println("FAIL branch-dml/" + tableName + ": missing " + finalMetadata);
+          return 1;
+        }
+      } catch (IOException error) {
+        System.out.println("FAIL branch-dml/" + tableName + ": " + error);
+        return 1;
+      }
+      return 0;
+    }
+
+    private static int assertIds(
+        String label, List<Integer> actual, List<Integer> expected) {
+      if (!actual.equals(expected)) {
+        System.out.println(
+            "FAIL " + label + ": expected ids " + expected + " got " + actual);
+        return 1;
+      }
+      System.out.println("PASS " + label + ": ids " + actual);
+      return 0;
+    }
+
+    private static int assertMainUnmoved(String label, BaseTable table) {
+      Snapshot current = table.currentSnapshot();
+      SnapshotRef mainRef = table.refs().get(SnapshotRef.MAIN_BRANCH);
+      if (current == null || mainRef == null) {
+        System.out.println("FAIL " + label + ": missing current/main");
+        return 1;
+      }
+      if (current.snapshotId() != mainRef.snapshotId()) {
+        System.out.println(
+            "FAIL "
+                + label
+                + ": current "
+                + current.snapshotId()
+                + " != main "
+                + mainRef.snapshotId());
+        return 1;
+      }
+      SnapshotRef branchRef = table.refs().get(BRANCH);
+      if (branchRef == null) {
+        System.out.println("FAIL " + label + ": missing branch " + BRANCH);
+        return 1;
+      }
+      if (branchRef.snapshotId() == mainRef.snapshotId()) {
+        System.out.println("FAIL " + label + ": branch head equals main");
+        return 1;
+      }
+      System.out.println(
+          "PASS "
+              + label
+              + ": main="
+              + mainRef.snapshotId()
+              + " branch="
+              + branchRef.snapshotId());
+      return 0;
+    }
+
+    private static int assertFileSets(
+        String label, Path tableDir, BaseTable table, int expectedMainCount, int expectedBranchCount)
+        throws IOException {
+      List<String> mainFiles = fileBasenames(table, SnapshotRef.MAIN_BRANCH);
+      List<String> branchFiles = fileBasenames(table, BRANCH);
+      int failures = 0;
+      if (mainFiles.isEmpty() || mainFiles.size() != expectedMainCount) {
+        System.out.println(
+            "FAIL "
+                + label
+                + "/main_files: expected "
+                + expectedMainCount
+                + " non-empty, got "
+                + mainFiles);
+        failures++;
+      }
+      if (branchFiles.size() != expectedBranchCount || !branchFiles.containsAll(mainFiles)) {
+        System.out.println(
+            "FAIL "
+                + label
+                + "/branch_files: expected count "
+                + expectedBranchCount
+                + " containing all main files; main="
+                + mainFiles
+                + " branch="
+                + branchFiles);
+        failures++;
+      }
+      Path expectedMainPath = tableDir.resolve("expected_main_files.txt");
+      Path expectedBranchPath = tableDir.resolve("expected_branch_files.txt");
+      if (!Files.exists(expectedMainPath) || !Files.exists(expectedBranchPath)) {
+        System.out.println("FAIL " + label + "/files: missing expected_main_files.txt or expected_branch_files.txt");
+        return failures + 1;
+      }
+      List<String> expectedMain = Files.readAllLines(expectedMainPath, StandardCharsets.UTF_8);
+      List<String> expectedBranch = Files.readAllLines(expectedBranchPath, StandardCharsets.UTF_8);
+      expectedMain.removeIf(String::isEmpty);
+      expectedBranch.removeIf(String::isEmpty);
+      if (!mainFiles.equals(expectedMain)) {
+        System.out.println(
+            "FAIL " + label + "/main_files: live=" + mainFiles + " expected=" + expectedMain);
+        failures++;
+      }
+      if (!branchFiles.equals(expectedBranch)) {
+        System.out.println(
+            "FAIL " + label + "/branch_files: live=" + branchFiles + " expected=" + expectedBranch);
+        failures++;
+      }
+      if (failures == 0) {
+        System.out.println(
+            "PASS " + label + "/files: main=" + mainFiles + " branch=" + branchFiles);
+      }
+      return failures;
+    }
+
+    private static int verifyAppend(Path dir) throws IOException {
+      if (failIfMissing(dir, "rust_append") != 0) {
+        return 1;
+      }
+      int failures = 0;
+      BaseTable table = loadRust(dir, "rust_append");
+      failures += assertMainUnmoved("branch-dml/rust_append/main", table);
+      failures +=
+          assertIds(
+              "branch-dml/rust_append/main_ids",
+              liveIds(table, table.currentSnapshot().snapshotId()),
+              Arrays.asList(1, 2));
+      failures +=
+          assertIds(
+              "branch-dml/rust_append/branch_ids",
+              liveIds(table, table.refs().get(BRANCH).snapshotId()),
+              Arrays.asList(1, 2, 10, 11, 20));
+      failures +=
+          assertFileSets(
+              "branch-dml/rust_append", dir.resolve("rust_append"), table, 1, 3);
+      return failures;
+    }
+
+    private static int verifyCow(Path dir) throws IOException {
+      if (failIfMissing(dir, "rust_cow") != 0) {
+        return 1;
+      }
+      int failures = 0;
+      BaseTable table = loadRust(dir, "rust_cow");
+      failures += assertMainUnmoved("branch-dml/rust_cow/main", table);
+      failures +=
+          assertIds(
+              "branch-dml/rust_cow/main_ids",
+              liveIds(table, table.currentSnapshot().snapshotId()),
+              Arrays.asList(1, 2));
+      failures +=
+          assertIds(
+              "branch-dml/rust_cow/branch_ids",
+              liveIds(table, table.refs().get(BRANCH).snapshotId()),
+              Arrays.asList(1, 2, 11));
+      Map<Integer, String> data = liveData(table, table.refs().get(BRANCH).snapshotId());
+      if (!"z".equals(data.get(11))) {
+        System.out.println(
+            "FAIL branch-dml/rust_cow/update: id 11 data expected z got " + data.get(11));
+        failures++;
+      } else {
+        System.out.println("PASS branch-dml/rust_cow/update: id 11 data=z");
+      }
+      failures += assertFileSets("branch-dml/rust_cow", dir.resolve("rust_cow"), table, 1, 2);
+      return failures;
+    }
+
+    private static int verifyMor(Path dir) throws IOException {
+      if (failIfMissing(dir, "rust_mor") != 0) {
+        return 1;
+      }
+      int failures = 0;
+      BaseTable table = loadRust(dir, "rust_mor");
+      if (table.operations().current().formatVersion() < 3) {
+        System.out.println("FAIL branch-dml/rust_mor: expected format version 3");
+        failures++;
+      }
+      failures += assertMainUnmoved("branch-dml/rust_mor/main", table);
+      failures +=
+          assertIds(
+              "branch-dml/rust_mor/main_ids",
+              liveIds(table, table.currentSnapshot().snapshotId()),
+              Arrays.asList(1, 2));
+      failures +=
+          assertIds(
+              "branch-dml/rust_mor/branch_ids",
+              liveIds(table, table.refs().get(BRANCH).snapshotId()),
+              Arrays.asList(1, 2, 11));
+      Map<Integer, String> data = liveData(table, table.refs().get(BRANCH).snapshotId());
+      if (!"z".equals(data.get(11))) {
+        System.out.println(
+            "FAIL branch-dml/rust_mor/update: id 11 data expected z got " + data.get(11));
+        failures++;
+      } else {
+        System.out.println("PASS branch-dml/rust_mor/update: id 11 data=z");
+      }
+      failures += assertFileSets("branch-dml/rust_mor", dir.resolve("rust_mor"), table, 1, 3);
+      return failures;
+    }
+
+    private static int verifyCreated(Path dir) throws IOException {
+      if (failIfMissing(dir, "rust_created") != 0) {
+        return 1;
+      }
+      int failures = 0;
+      BaseTable table = loadRust(dir, "rust_created");
+      failures += assertMainUnmoved("branch-dml/rust_created/main", table);
+      SnapshotRef branchRef = table.refs().get(BRANCH);
+      if (branchRef == null || !branchRef.isBranch()) {
+        System.out.println("FAIL branch-dml/rust_created: branch ref missing or not a branch");
+        return failures + 1;
+      }
+      Snapshot branchSnap = table.snapshot(branchRef.snapshotId());
+      Snapshot mainSnap = table.currentSnapshot();
+      if (branchSnap == null
+          || mainSnap == null
+          || branchSnap.parentId() == null
+          || branchSnap.parentId() != mainSnap.snapshotId()) {
+        System.out.println(
+            "FAIL branch-dml/rust_created/parent: parent="
+                + (branchSnap == null ? "null" : branchSnap.parentId())
+                + " main="
+                + (mainSnap == null ? "null" : mainSnap.snapshotId()));
+        failures++;
+      } else {
+        System.out.println(
+            "PASS branch-dml/rust_created/parent: " + branchSnap.parentId());
+      }
+      if (branchRef.minSnapshotsToKeep() != null
+          || branchRef.maxSnapshotAgeMs() != null
+          || branchRef.maxRefAgeMs() != null) {
+        System.out.println(
+            "FAIL branch-dml/rust_created/retention: expected default-null retention");
+        failures++;
+      } else {
+        System.out.println("PASS branch-dml/rust_created/retention: default-null");
+      }
+      failures +=
+          assertIds(
+              "branch-dml/rust_created/main_ids",
+              liveIds(table, mainSnap.snapshotId()),
+              Arrays.asList(1, 2));
+      failures +=
+          assertIds(
+              "branch-dml/rust_created/branch_ids",
+              liveIds(table, branchRef.snapshotId()),
+              Arrays.asList(1, 2, 10, 11));
+      failures +=
+          assertFileSets("branch-dml/rust_created", dir.resolve("rust_created"), table, 1, 2);
+      return failures;
+    }
+
+    private static int verifyInsertCreate(Path dir) throws IOException {
+      if (failIfMissing(dir, "rust_insert_create") != 0) {
+        return 1;
+      }
+      int failures = 0;
+      BaseTable table = loadRust(dir, "rust_insert_create");
+      failures += assertMainUnmoved("branch-dml/rust_insert_create/main", table);
+      failures +=
+          assertIds(
+              "branch-dml/rust_insert_create/main_ids",
+              liveIds(table, table.currentSnapshot().snapshotId()),
+              Arrays.asList(1, 2));
+      failures +=
+          assertIds(
+              "branch-dml/rust_insert_create/branch_ids",
+              liveIds(table, table.refs().get(BRANCH).snapshotId()),
+              Arrays.asList(1, 2, 20));
+      SnapshotRef branchRef = table.refs().get(BRANCH);
+      Snapshot branchSnap = table.snapshot(branchRef.snapshotId());
+      if (branchSnap == null
+          || branchSnap.parentId() == null
+          || branchSnap.parentId() != table.currentSnapshot().snapshotId()) {
+        System.out.println("FAIL branch-dml/rust_insert_create/parent");
+        failures++;
+      } else {
+        System.out.println("PASS branch-dml/rust_insert_create/parent");
+      }
+      failures +=
+          assertFileSets(
+              "branch-dml/rust_insert_create", dir.resolve("rust_insert_create"), table, 1, 2);
+      return failures;
+    }
+
+    private static int verifyRetry(Path dir) throws IOException {
+      if (failIfMissing(dir, "rust_retry") != 0) {
+        return 1;
+      }
+      int failures = 0;
+      BaseTable table = loadRust(dir, "rust_retry");
+      failures += assertMainUnmoved("branch-dml/rust_retry/main", table);
+      SnapshotRef branchRef = table.refs().get(BRANCH);
+      Snapshot branchSnap = table.snapshot(branchRef.snapshotId());
+      Snapshot mainSnap = table.currentSnapshot();
+      if (branchSnap == null
+          || mainSnap == null
+          || branchSnap.parentId() == null
+          || branchSnap.parentId() == mainSnap.snapshotId()) {
+        System.out.println(
+            "FAIL branch-dml/rust_retry/parent: retried commit parented onto main");
+        failures++;
+      } else {
+        Snapshot parent = table.snapshot(branchSnap.parentId());
+        if (parent == null || parent.parentId() == null) {
+          System.out.println("FAIL branch-dml/rust_retry/parent: winner missing parent");
+          failures++;
+        } else {
+          System.out.println(
+              "PASS branch-dml/rust_retry/parent: "
+                  + branchSnap.parentId()
+                  + " (not main "
+                  + mainSnap.snapshotId()
+                  + ")");
+        }
+      }
+      failures +=
+          assertIds(
+              "branch-dml/rust_retry/main_ids",
+              liveIds(table, mainSnap.snapshotId()),
+              Arrays.asList(1, 2));
+      failures +=
+          assertIds(
+              "branch-dml/rust_retry/branch_ids",
+              liveIds(table, branchRef.snapshotId()),
+              Arrays.asList(1, 2, 10, 11, 30, 31));
+      failures +=
+          assertFileSets("branch-dml/rust_retry", dir.resolve("rust_retry"), table, 1, 4);
+      return failures;
+    }
+
+    private static Map<Integer, String> liveData(BaseTable table, long snapshotId) {
+      Map<Integer, String> data = new TreeMap<>();
+      try (CloseableIterable<Record> records =
+          IcebergGenerics.read(table).useSnapshot(snapshotId).build()) {
+        for (Record record : records) {
+          data.put((Integer) record.getField("id"), (String) record.getField("data"));
+        }
+      } catch (IOException error) {
+        throw new RuntimeException("IcebergGenerics failed for snapshot " + snapshotId, error);
+      }
+      return data;
+    }
+  }
+
+  static final class EvolvedSpecRewriteOracle {
+    private EvolvedSpecRewriteOracle() {}
+
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = dir.resolve("d1").resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) {
+        throw new IOException("failed to create " + metadataDir);
+      }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create " + dataDir);
+      }
+
+      Schema schema =
+          new Schema(
+              Types.NestedField.required(1, "x", Types.LongType.get()),
+              Types.NestedField.required(2, "y", Types.LongType.get()),
+              Types.NestedField.required(3, "z", Types.LongType.get()));
+      PartitionSpec spec = PartitionSpec.builderFor(schema).identity("x").build();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed =
+          TableMetadata.newTableMetadata(
+              schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "evolved_spec_d1");
+
+      Types.StructType partitionType = spec.partitionType();
+      PartitionData p1 = new PartitionData(partitionType);
+      p1.set(0, 1L);
+      PartitionData p2 = new PartitionData(partitionType);
+      p2.set(0, 2L);
+      DataFile f1 =
+          writeXyzFile(
+              table,
+              schema,
+              spec,
+              p1,
+              new File(dataDir, "x=1.parquet").getAbsolutePath(),
+              new long[][] {{1L, 10L, 100L}});
+      DataFile f2 =
+          writeXyzFile(
+              table,
+              schema,
+              spec,
+              p2,
+              new File(dataDir, "x=2.parquet").getAbsolutePath(),
+              new long[][] {{2L, 20L, 200L}});
+      table.newAppend().appendFile(f1).appendFile(f2).commit();
+
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      TableMetadataParser.write(
+          ops.current(), new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString()));
+      if (!Files.exists(finalMetadata)) {
+        throw new IOException("generate did not write " + finalMetadata);
+      }
+      System.out.println("generated evolved-spec D1 table at " + tableDir);
+    }
+
+    static int verify(Path dir) {
+      int failures = 0;
+      failures += verifyCompacted(dir.resolve("d1").resolve("compacted"), "d1");
+      failures += verifyV3(dir.resolve("v3").resolve("compacted"));
+      return failures;
+    }
+
+    static void rewriteRustTable(Path dir) throws IOException {
+      Path rustFinal =
+          dir.resolve("d2").resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(rustFinal)) {
+        throw new IOException("missing Rust D2 table " + rustFinal);
+      }
+      File metadataDir = rustFinal.getParent().toFile();
+      File tableDir = metadataDir.getParentFile();
+      File dataDir = new File(tableDir, "data");
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) {
+        throw new IOException("failed to create " + dataDir);
+      }
+      TableMetadata loaded = TableMetadataParser.fromJson(rustFinal.toString(), readString(rustFinal));
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, loaded);
+      BaseTable table = new BaseTable(ops, "evolved_spec_d2");
+      table.updateSpec().removeField("x").addField("y").commit();
+
+      java.util.Set<DataFile> toDelete = new java.util.HashSet<>();
+      try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+        for (FileScanTask task : tasks) {
+          toDelete.add(task.file());
+        }
+      }
+      Map<Long, List<Record>> byY = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+        for (Record record : records) {
+          Long y = (Long) record.getField("y");
+          byY.computeIfAbsent(y, key -> new ArrayList<>()).add(record);
+        }
+      }
+      Schema schema = table.schema();
+      PartitionSpec spec = table.spec();
+      java.util.Set<DataFile> toAdd = new java.util.HashSet<>();
+      int index = 0;
+      for (Map.Entry<Long, List<Record>> entry : byY.entrySet()) {
+        PartitionData partition = new PartitionData(spec.partitionType());
+        partition.set(0, entry.getKey());
+        String path =
+            new File(dataDir, "rewritten-y-" + entry.getKey() + "-" + index + ".parquet")
+                .getAbsolutePath();
+        index++;
+        toAdd.add(writeRecords(table, schema, spec, partition, path, entry.getValue()));
+      }
+      long seq = table.currentSnapshot().sequenceNumber();
+      table.newRewrite().rewriteFiles(toDelete, toAdd, seq).commit();
+      Path rewritten = dir.resolve("d2").resolve("rewritten").resolve("metadata");
+      Files.createDirectories(rewritten);
+      Path rewrittenFinal = rewritten.resolve("final.metadata.json");
+      TableMetadataParser.write(
+          ops.current(),
+          new LocalFileIO().newOutputFile(rewrittenFinal.toAbsolutePath().toString()));
+      System.out.println("rewrote Rust D2 table to " + rewrittenFinal);
+    }
+
+    private static int verifyCompacted(Path compacted, String tag) {
+      Path meta = compacted.resolve("metadata").resolve("final.metadata.json");
+      if (!Files.exists(meta)) {
+        System.out.println("FAIL " + tag + ": missing compacted table " + meta);
+        return 1;
+      }
+      int failures = 0;
+      try {
+        TableMetadata metadata = TableMetadataParser.fromJson(meta.toString(), readString(meta));
+        BaseTable table =
+            new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), tag);
+        java.util.Set<String> full = liveXyz(table, Expressions.alwaysTrue());
+        if (!full.equals(java.util.Set.of("1,10,100", "2,20,200"))) {
+          System.out.println("FAIL " + tag + ": full scan " + full);
+          failures++;
+        } else {
+          System.out.println("PASS " + tag + ": full scan " + full);
+        }
+        java.util.Set<String> y10 = liveXyz(table, Expressions.equal("y", 10L));
+        if (!y10.equals(java.util.Set.of("1,10,100"))) {
+          System.out.println("FAIL " + tag + ": pruned y=10 " + y10);
+          failures++;
+        } else {
+          System.out.println("PASS " + tag + ": pruned y=10 " + y10);
+        }
+        java.util.Set<String> y20 = liveXyz(table, Expressions.equal("y", 20L));
+        if (!y20.equals(java.util.Set.of("2,20,200"))) {
+          System.out.println("FAIL " + tag + ": pruned y=20 " + y20);
+          failures++;
+        } else {
+          System.out.println("PASS " + tag + ": pruned y=20 " + y20);
+        }
+        int currentSpec = table.spec().specId();
+        java.util.Set<Long> tuples = new java.util.TreeSet<>();
+        Snapshot snapshot = table.currentSnapshot();
+        for (ManifestFile manifest : snapshot.dataManifests(table.io())) {
+          try (ManifestReader<DataFile> reader =
+              ManifestFiles.read(manifest, table.io(), table.specs())) {
+            for (ManifestEntry<DataFile> entry : reader.liveEntries()) {
+              if (entry.file().specId() != currentSpec) {
+                System.out.println(
+                    "FAIL " + tag + ": output spec " + entry.file().specId() + " != " + currentSpec);
+                failures++;
+              }
+              tuples.add(entry.file().partition().get(0, Long.class));
+            }
+          }
+        }
+        if (!tuples.equals(java.util.Set.of(10L, 20L))) {
+          System.out.println("FAIL " + tag + ": output tuples " + tuples);
+          failures++;
+        } else {
+          System.out.println("PASS " + tag + ": output tuples " + tuples);
+        }
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL " + tag + ": " + error);
+        failures++;
+      }
+      return failures;
+    }
+
+    private static int verifyV3(Path compacted) {
+      Path meta = compacted.resolve("metadata").resolve("final.metadata.json");
+      Path expected = compacted.resolve("expected_row_ids.json");
+      if (!Files.exists(meta) || !Files.exists(expected)) {
+        System.out.println("FAIL v3: missing " + meta + " or " + expected);
+        return 1;
+      }
+      try {
+        TableMetadata metadata = TableMetadataParser.fromJson(meta.toString(), readString(meta));
+        BaseTable table =
+            new BaseTable(new InMemoryInspectionOperations(metadata, new LocalFileIO()), "v3");
+        java.util.List<Long> got = new ArrayList<>();
+        Schema lineage = MetadataColumns.schemaWithRowLineage(table.schema());
+        try (CloseableIterable<Record> records =
+            IcebergGenerics.read(table).project(lineage).build()) {
+          for (Record record : records) {
+            Object rowId = record.getField("_row_id");
+            if (rowId == null) {
+              System.out.println("FAIL v3: null _row_id");
+              return 1;
+            }
+            got.add((Long) rowId);
+          }
+        }
+        java.util.List<Long> want = new ArrayList<>();
+        for (String part : readString(expected).replace("[", "").replace("]", "").split(",")) {
+          String trimmed = part.trim();
+          if (!trimmed.isEmpty()) {
+            want.add(Long.parseLong(trimmed));
+          }
+        }
+        java.util.Collections.sort(got);
+        java.util.Collections.sort(want);
+        if (!got.equals(want)) {
+          System.out.println("FAIL v3: _row_id got " + got + " want " + want);
+          return 1;
+        }
+        System.out.println("PASS v3: _row_id " + got);
+        return 0;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3: " + error);
+        return 1;
+      }
+    }
+
+    private static java.util.Set<String> liveXyz(BaseTable table, Expression filter) {
+      java.util.Set<String> rows = new java.util.TreeSet<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).where(filter).build()) {
+        for (Record record : records) {
+          rows.add(
+              record.getField("x") + "," + record.getField("y") + "," + record.getField("z"));
+        }
+      } catch (IOException error) {
+        throw new RuntimeException(error);
+      }
+      return rows;
+    }
+
+    private static DataFile writeXyzFile(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path,
+        long[][] rows)
+        throws IOException {
+      List<Record> records = new ArrayList<>();
+      for (long[] row : rows) {
+        GenericRecord record = GenericRecord.create(schema);
+        record.setField("x", row[0]);
+        record.setField("y", row[1]);
+        record.setField("z", row[2]);
+        records.add(record);
+      }
+      return writeRecords(table, schema, spec, partition, path, records);
+    }
+
+    private static DataFile writeRecords(
+        BaseTable table,
+        Schema schema,
+        PartitionSpec spec,
+        StructLike partition,
+        String path,
+        List<Record> records)
+        throws IOException {
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(records);
       }
       return writer.toDataFile();
     }

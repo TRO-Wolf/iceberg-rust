@@ -31,3 +31,4 @@ dist/*
 # skills symlink and map.md, but per-machine state must never be committed.
 .claude/settings.local.json
 .claude/worktrees/
+PROGRESS.md

@@ -33,6 +33,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `cow_memory_bound.rs` | Copy-on-write memory bound |
 | `h7_p1_dml_prune.rs` | DML file prune |
 | `interop_dv_sql.rs` / `interop_partitioned_dml.rs` | Interop DML |
+| `interop_branch_dml.rs` | Branch read/commit Java interop (row R168 / PR-6A). Offline: Rust reproduces a Java diverged branch table; missing-ref SELECT/UPDATE; INSERT creates (ids, parent, main vs branch file sets); tag refuses; V3 MoR DELETE uses branch live files. GEN of 6 `rust_*` tables pins post-DML main vs branch file sets and writes `expected_*_files.txt`. Env `ICEBERG_INTEROP_BRANCH_DIR` / `_GEN_DIR` via `dev/java-interop/run-interop-branch-dml.sh` |
 | `lazy_table_resolution_test.rs` | Catalog-backed lazy resolve |
 | `partitioned_insert_select_test.rs` | Partitioned INSERT SELECT |
 | `row_lineage_cow.rs` | V3 row lineage on CoW DML; Spark sequences at the fork's single-file layout (F-rp3-c7, row R166) |
@@ -45,6 +46,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | I want to... | go to |
 |---|---|
 | Pin `with_commit_branch` scan + commit | `commit_branch.rs` |
+| Prove Java/Rust branch DML interop | `interop_branch_dml.rs` |
 | Pin default (no branch) DML | `integration_datafusion_test.rs` |
 
 ## Pointers
@@ -59,6 +61,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 |---|---|
 | Named-branch SELECT returns `main` rows | `IcebergTableProvider::scan` passed `None` instead of `resolve_scan_snapshot_id` |
 | Missing-ref DELETE creates the branch | the read leg did not call `resolve_scan_snapshot_id` (INSERT VALUES is the only create-on-missing path) |
+| V3 MoR DELETE on a diverged branch fails "not a live file" | DV container close used `current_snapshot()`; see `close_touched_dv_containers_at` |
 
 ### First checks
 

@@ -142,10 +142,15 @@ mod remove_dangling_delete_files;
 mod rewrite_data_files;
 mod rewrite_data_files_dv;
 #[cfg(test)]
+mod rewrite_data_files_evolved_spec_tests;
+#[cfg(test)]
 mod rewrite_data_files_lineage_tests;
 mod rewrite_data_files_plan;
 #[cfg(test)]
 mod rewrite_data_files_ratio_tests;
+mod rewrite_data_files_router;
+#[cfg(test)]
+mod rewrite_data_files_router_bound_tests;
 mod rewrite_data_files_write;
 mod rewrite_position_delete_files;
 mod rewrite_table_path;

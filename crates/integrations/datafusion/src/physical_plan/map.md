@@ -62,6 +62,7 @@ exec (row R169).
 | Reordered columns come back in table order | execute path is not applying `batch.project(indices)` |
 | MoR UPDATE reassigns `_row_id` | `merge_on_read_update` omitted `push_lineage_scan_columns` / `attach_update_lineage` |
 | COW rewrite drifts `next-row-id` | layout mismatch (file / manifest count between the compared trees); an unassigned V3 DATA manifest advances by existing+added rows, a carried assigned manifest advances 0 (`spec/manifest/map.md`) |
+| V3 MoR DELETE on a diverged branch: data file is not a live file of the scanned snapshot | `close_touched_dv_containers` walked `current_snapshot()` (main). Pass the scan snapshot to `close_touched_dv_containers_at` |
 
 ### First checks
 
