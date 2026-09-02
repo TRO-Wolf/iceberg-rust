@@ -402,6 +402,9 @@ public final class InteropOracle {
       case "generate-interop-v3-maintenance":
         V3MaintenanceOracle.generate(requireFixturesDir("interop.v3_maintenance.dir"));
         break;
+      case "confirm-interop-v3-maintenance":
+        V3MaintenanceOracle.confirm(requireFixturesDir("interop.v3_maintenance.dir"));
+        break;
       case "verify-interop-v3-maintenance":
         {
           int v3MaintenanceFailures =
@@ -28497,7 +28500,7 @@ public final class InteropOracle {
     private static final long[][] FILE_G1A = {{100L, 1L, 10L}, {110L, 1L, 10L}, {120L, 1L, 20L}};
     private static final long[][] FILE_G2A = {{200L, 2L, 10L}, {210L, 2L, 20L}};
     private static final long[][] FILE_G1B = {{130L, 1L, 20L}, {140L, 1L, 10L}};
-    private static final long[][] FILE_G2B = {{220L, 2L, 20L}, {230L, 2L, 10L}};
+    private static final long[][] FILE_G2B = {{220L, 2L, 20L}, {230L, 2L, 10L}, {240L, 2L, 20L}};
 
     private V3MaintenanceOracle() {}
 
@@ -28592,6 +28595,191 @@ public final class InteropOracle {
         failures++;
       }
       return failures;
+    }
+
+    static void confirm(Path dir) throws IOException {
+      int failures = 0;
+      failures += confirmClustering(dir);
+      failures += confirmRewrite(dir);
+      System.out.println("confirm-interop-v3-maintenance: " + failures + " failures");
+      if (failures > 0) {
+        System.exit(1);
+      }
+    }
+
+    private static long expectedNextRowId(Path root, String stage) throws IOException {
+      Path path = root.resolve("next_row_ids.json");
+      if (!Files.exists(path)) {
+        throw new IOException("missing " + path);
+      }
+      com.fasterxml.jackson.databind.JsonNode node =
+          JsonUtil.mapper().readTree(readString(path)).get(stage);
+      if (node == null) {
+        throw new IOException("missing stage " + stage + " in " + path);
+      }
+      return node.asLong();
+    }
+
+    private static BaseTable loadWritable(Path sourceMeta, Path workDir, String name)
+        throws IOException {
+      Files.createDirectories(workDir.resolve("metadata"));
+      Files.createDirectories(workDir.resolve("data"));
+      TableMetadata parsed =
+          TableMetadataParser.fromJson(sourceMeta.toString(), readString(sourceMeta));
+      LocalTableOperations ops =
+          new LocalTableOperations(workDir.toFile(), workDir.resolve("metadata").toFile());
+      ops.commit(null, parsed);
+      return new BaseTable(ops, name);
+    }
+
+    private static int confirmClustering(Path dir) {
+      String tag = "deletes/m4";
+      try {
+        Path source = dir.resolve("deletes").resolve("m3").resolve("metadata").resolve("final.metadata.json");
+        if (!Files.exists(source)) {
+          System.out.println("FAIL v3-maintenance confirm " + tag + ": missing " + source);
+          return 1;
+        }
+        long rustNextRowId = expectedNextRowId(dir.resolve("deletes"), "m4");
+        BaseTable table =
+            loadWritable(source, dir.resolve("java_confirm").resolve("m4"), "java_confirm_m4");
+        long before = table.operations().current().nextRowId();
+        table.rewriteManifests().clusterBy(file -> "all").commit();
+        table.refresh();
+        long javaNextRowId = table.operations().current().nextRowId();
+        Snapshot snapshot = table.currentSnapshot();
+        int dataManifests = snapshot.dataManifests(table.io()).size();
+        if (javaNextRowId != rustNextRowId) {
+          System.out.println(
+              "FAIL v3-maintenance confirm "
+                  + tag
+                  + ": Java next_row_id "
+                  + javaNextRowId
+                  + " != Rust "
+                  + rustNextRowId
+                  + " (before "
+                  + before
+                  + ", "
+                  + dataManifests
+                  + " data manifest(s))");
+          printManifests(table, tag);
+          return 1;
+        }
+        System.out.println(
+            "PASS v3-maintenance confirm "
+                + tag
+                + ": Java and Rust agree, next_row_id "
+                + before
+                + " to "
+                + javaNextRowId
+                + " over "
+                + dataManifests
+                + " clustered data manifest(s)");
+        return 0;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance confirm " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static int confirmRewrite(Path dir) {
+      String tag = "plain/m1";
+      try {
+        Path source = dir.resolve("plain").resolve("m0").resolve("metadata").resolve("final.metadata.json");
+        if (!Files.exists(source)) {
+          System.out.println("FAIL v3-maintenance confirm " + tag + ": missing " + source);
+          return 1;
+        }
+        long rustNextRowId = expectedNextRowId(dir.resolve("plain"), "m1");
+        Path workDir = dir.resolve("java_confirm").resolve("m1");
+        BaseTable table = loadWritable(source, workDir, "java_confirm_m1");
+        long before = table.operations().current().nextRowId();
+        for (long grp : new long[] {1L, 2L}) {
+          compactOnePartition(table, workDir, grp);
+        }
+        long javaNextRowId = table.operations().current().nextRowId();
+        if (javaNextRowId != rustNextRowId) {
+          System.out.println(
+              "FAIL v3-maintenance confirm "
+                  + tag
+                  + ": Java next_row_id "
+                  + javaNextRowId
+                  + " != Rust "
+                  + rustNextRowId
+                  + " (before "
+                  + before
+                  + ")");
+          printManifests(table, tag);
+          return 1;
+        }
+        System.out.println(
+            "PASS v3-maintenance confirm "
+                + tag
+                + ": Java and Rust agree, next_row_id "
+                + before
+                + " to "
+                + javaNextRowId
+                + " after two per-partition rewrites");
+        return 0;
+      } catch (RuntimeException | IOException error) {
+        System.out.println("FAIL v3-maintenance confirm " + tag + ": unexpected error " + error);
+        return 1;
+      }
+    }
+
+    private static void compactOnePartition(BaseTable table, Path workDir, long grp)
+        throws IOException {
+      PartitionSpec spec = table.spec();
+      java.util.Set<DataFile> toDelete = new java.util.LinkedHashSet<>();
+      for (DataFile file : liveDataFiles(table)) {
+        if (file.partition().get(0, Long.class) == grp) {
+          toDelete.add(file);
+        }
+      }
+      if (toDelete.isEmpty()) {
+        throw new IOException("no live data file in partition " + grp);
+      }
+      List<Record> records = new ArrayList<>();
+      try (CloseableIterable<Record> rows =
+          IcebergGenerics.read(table).where(Expressions.equal("grp", grp)).build()) {
+        for (Record record : rows) {
+          records.add(record);
+        }
+      }
+      PartitionData partition = new PartitionData(spec.partitionType());
+      partition.set(0, grp);
+      File out = workDir.resolve("data").resolve("compacted-grp-" + grp + ".parquet").toFile();
+      GenericAppenderFactory factory = new GenericAppenderFactory(SCHEMA, spec);
+      DataWriter<Record> writer =
+          factory.newDataWriter(
+              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
+                  table.io().newOutputFile(out.getAbsolutePath()),
+                  org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY),
+              FileFormat.PARQUET,
+              partition);
+      try (Closeable toClose = writer) {
+        writer.write(records);
+      }
+      java.util.Set<DataFile> toAdd = new java.util.LinkedHashSet<>();
+      toAdd.add(writer.toDataFile());
+      long sequenceNumber = table.currentSnapshot().sequenceNumber();
+      table.newRewrite().rewriteFiles(toDelete, toAdd, sequenceNumber).commit();
+      table.refresh();
+    }
+
+    private static void printManifests(BaseTable table, String tag) throws IOException {
+      Snapshot snapshot = table.currentSnapshot();
+      for (ManifestFile manifest : snapshot.dataManifests(table.io())) {
+        System.out.println(
+            "INFO v3-maintenance confirm "
+                + tag
+                + ": data manifest first_row_id="
+                + manifest.firstRowId()
+                + " existing="
+                + manifest.existingRowsCount()
+                + " added="
+                + manifest.addedRowsCount());
+      }
     }
 
     private static int verifyRewriteChangedFiles(

@@ -49,11 +49,11 @@ expect_file() {
   fi
 }
 
-echo "==> [1/6] Reset ${TMP}"
+echo "==> [1/7] Reset ${TMP}"
 rm -rf "${TMP}"
 mkdir -p "${TMP}"
 
-echo "==> [2/6] Java: write the partitioned V2 seeds (plain, and one with parquet position deletes)"
+echo "==> [2/7] Java: write the partitioned V2 seeds (plain, and one with parquet position deletes)"
 run_oracle -Dexec.args=generate-interop-v3-maintenance -Dinterop.v3_maintenance.dir="${TMP}"
 expect_file "${TMP}/fixture_count.json"
 COUNT="$(tr -d '[:space:]' < "${TMP}/fixture_count.json")"
@@ -66,7 +66,7 @@ expect_file "${TMP}/java_v2_plain/java_rows.json"
 expect_file "${TMP}/java_v2_deletes/metadata/final.metadata.json"
 expect_file "${TMP}/java_v2_deletes/java_rows.json"
 
-echo "==> [3/6] Rust: upgrade both seeds to V3 and run the five maintenance actions"
+echo "==> [3/7] Rust: upgrade both seeds to V3 and run the five maintenance actions"
 (
   cd "${REPO_ROOT}"
   ICEBERG_INTEROP_V3_MAINTENANCE_DIR="${TMP}" \
@@ -77,8 +77,10 @@ for stage in plain/m0 plain/m1 plain/m2 deletes/m0 deletes/m3 deletes/m4 deletes
 done
 expect_file "${TMP}/plain/expected.json"
 expect_file "${TMP}/deletes/expected.json"
+expect_file "${TMP}/plain/next_row_ids.json"
+expect_file "${TMP}/deletes/next_row_ids.json"
 
-echo "==> [4/6] Java: production scan of every maintenance stage"
+echo "==> [4/7] Java: production scan of every maintenance stage"
 VERIFY_OUT="$(run_oracle -Dexec.args=verify-interop-v3-maintenance -Dinterop.v3_maintenance.dir="${TMP}" || true)"
 echo "${VERIFY_OUT}"
 if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
@@ -87,7 +89,16 @@ if echo "${VERIFY_OUT}" | grep -q '^FAIL ' \
   exit 1
 fi
 
-echo "==> [5/6] Fixture count"
+echo "==> [5/7] Java: run RewriteDataFiles and RewriteManifests itself and compare next_row_id"
+CONFIRM_OUT="$(run_oracle -Dexec.args=confirm-interop-v3-maintenance -Dinterop.v3_maintenance.dir="${TMP}" || true)"
+echo "${CONFIRM_OUT}"
+if echo "${CONFIRM_OUT}" | grep -q '^FAIL ' \
+  || ! echo "${CONFIRM_OUT}" | grep -q 'confirm-interop-v3-maintenance: 0 failures'; then
+  echo "FAIL: Java and Rust disagree on next_row_id for the same action at the same layout" >&2
+  exit 1
+fi
+
+echo "==> [6/7] Fixture count"
 FIXTURES="$(find "${TMP}" -name 'final.metadata.json' | wc -l | tr -d ' ')"
 if [[ "${FIXTURES}" != "${EXPECTED_FINAL_METADATA}" ]]; then
   echo "FAIL: expected ${EXPECTED_FINAL_METADATA} final.metadata.json files, got ${FIXTURES}" >&2
@@ -95,7 +106,7 @@ if [[ "${FIXTURES}" != "${EXPECTED_FINAL_METADATA}" ]]; then
   exit 1
 fi
 
-echo "==> [6/6] Sabotage battery"
+echo "==> [7/7] Sabotage battery"
 build_scratch() {
   local scratch="${TMP}/sabotage_scratch"
   rm -rf "${scratch}"

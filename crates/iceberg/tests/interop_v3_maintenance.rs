@@ -49,6 +49,12 @@ use tempfile::TempDir;
 
 type Row = (i64, i64, i64);
 
+const SEED_NEXT_ROW_ID: i64 = 12;
+const M1_NEXT_ROW_ID: i64 = 30;
+const M2_NEXT_ROW_ID: i64 = 42;
+const M3_NEXT_ROW_ID: i64 = 12;
+const M4_NEXT_ROW_ID: i64 = 24;
+
 fn maintenance_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_V3_MAINTENANCE_DIR")
         .filter(|value| !value.is_empty())
@@ -417,7 +423,12 @@ async fn seed_plain(catalog: &impl Catalog, table: Table) -> Table {
     let f3 = write_data_file(&table, "g2a", 2, &[(200, 2, 10), (210, 2, 20)]).await;
     let table = fast_append(catalog, &table, vec![f1, f3]).await;
     let f2 = write_data_file(&table, "g1b", 1, &[(130, 1, 20), (140, 1, 10)]).await;
-    let f4 = write_data_file(&table, "g2b", 2, &[(220, 2, 20), (230, 2, 10)]).await;
+    let f4 = write_data_file(&table, "g2b", 2, &[
+        (220, 2, 20),
+        (230, 2, 10),
+        (240, 2, 20),
+    ])
+    .await;
     fast_append(catalog, &table, vec![f2, f4]).await
 }
 
@@ -433,7 +444,12 @@ async fn seed_with_deletes(catalog: &impl Catalog, table: Table) -> Table {
     let f3_path = f3.file_path().to_string();
     let table = fast_append(catalog, &table, vec![f1, f3]).await;
     let f2 = write_data_file(&table, "g1b", 1, &[(130, 1, 20), (140, 1, 10)]).await;
-    let f4 = write_data_file(&table, "g2b", 2, &[(220, 2, 20), (230, 2, 10)]).await;
+    let f4 = write_data_file(&table, "g2b", 2, &[
+        (220, 2, 20),
+        (230, 2, 10),
+        (240, 2, 20),
+    ])
+    .await;
     let table = fast_append(catalog, &table, vec![f2, f4]).await;
     let d1 = write_position_delete(&table, "g1", 1, &[(&f1_path, 1)]).await;
     let d2 = write_position_delete(&table, "g2", 2, &[(&f3_path, 0)]).await;
@@ -455,6 +471,48 @@ fn current_operation(table: &Table) -> Operation {
         .summary()
         .operation
         .clone()
+}
+
+async fn manifest_row_id_end(table: &Table) -> i64 {
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("the table has a current snapshot");
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("load the manifest list");
+    let mut end = 0i64;
+    for manifest in manifest_list.entries() {
+        if manifest.content != ManifestContentType::Data {
+            continue;
+        }
+        let Some(first) = manifest.first_row_id else {
+            continue;
+        };
+        let rows =
+            manifest.existing_rows_count.unwrap_or(0) + manifest.added_rows_count.unwrap_or(0);
+        let manifest_end = i64::try_from(first + rows).expect("row-id range fits i64");
+        end = end.max(manifest_end);
+    }
+    end
+}
+
+async fn assert_row_id_accounting(table: &Table, expected: i64, stage: &str) {
+    let next_row_id = i64::try_from(table.metadata().next_row_id()).expect("next_row_id fits i64");
+    assert_eq!(next_row_id, expected, "{stage}: next_row_id");
+    assert_eq!(
+        manifest_row_id_end(table).await,
+        next_row_id,
+        "{stage}: next_row_id must equal the highest assigned manifest range end"
+    );
+    for (path, (first, count)) in assigned_row_ranges(table).await {
+        let file_end = first + i64::try_from(count).expect("record count fits i64");
+        assert!(
+            file_end <= next_row_id,
+            "{stage}: live file {path} range ends at {file_end}, above next_row_id {next_row_id}"
+        );
+    }
 }
 
 fn assert_distinct_row_ids(row_ids: &BTreeMap<i64, Option<i64>>) {
@@ -481,6 +539,7 @@ async fn run_rewrite_matrix(catalog: &impl Catalog, table: Table, out_root: Opti
         Operation::Append,
         "the seed stage must be an append, so a Replace assertion below cannot pass on a no-op"
     );
+    assert_row_id_accounting(&table, SEED_NEXT_ROW_ID, "plain/m0").await;
     write_stage(&table, out_root, "m0").await;
 
     let result = RewriteDataFiles::new(table.clone())
@@ -498,6 +557,7 @@ async fn run_rewrite_matrix(catalog: &impl Catalog, table: Table, out_root: Opti
     assert_eq!(scan_row_ids(&m1).await, before_ids);
     assert!(m1_deletes.is_empty());
     assert_eq!(current_operation(&m1), Operation::Replace);
+    assert_row_id_accounting(&m1, M1_NEXT_ROW_ID, "plain/m1").await;
     write_stage(&m1, out_root, "m1").await;
 
     let tx = Transaction::new(&m1);
@@ -526,7 +586,13 @@ async fn run_rewrite_matrix(catalog: &impl Catalog, table: Table, out_root: Opti
         assert_eq!(file.partition_spec_id(), evolved_spec_id);
     }
     assert_eq!(current_operation(&m2), Operation::Replace);
+    assert_row_id_accounting(&m2, M2_NEXT_ROW_ID, "plain/m2").await;
     write_stage(&m2, out_root, "m2").await;
+    write_next_row_ids(out_root, &[
+        ("m0", SEED_NEXT_ROW_ID),
+        ("m1", M1_NEXT_ROW_ID),
+        ("m2", M2_NEXT_ROW_ID),
+    ]);
 }
 
 async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Option<&Path>) {
@@ -543,6 +609,7 @@ async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Optio
         Operation::Append,
         "the seed stage must be an append, so a Replace assertion below cannot pass on a no-op"
     );
+    assert_row_id_accounting(&table, SEED_NEXT_ROW_ID, "deletes/m0").await;
     write_stage(&table, out_root, "m0").await;
 
     let result = RewritePositionDeleteFiles::new(table.clone())
@@ -559,6 +626,7 @@ async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Optio
     assert!(puffin_deletes(&m3_deletes) >= 1);
     assert_eq!(scan_row_ids(&m3).await, before_ids);
     assert_eq!(current_operation(&m3), Operation::Replace);
+    assert_row_id_accounting(&m3, M3_NEXT_ROW_ID, "deletes/m3").await;
     write_stage(&m3, out_root, "m3").await;
 
     let (m3_data_manifests, m3_delete_manifests) = manifest_counts(&m3).await;
@@ -570,7 +638,6 @@ async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Optio
         6,
         "every live data file must carry a row-id range, or the m4 range comparison is vacuous"
     );
-    let next_row_id = i64::try_from(m3.metadata().next_row_id()).expect("next_row_id fits i64");
 
     let tx = Transaction::new(&m3);
     let m4 = tx
@@ -587,14 +654,8 @@ async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Optio
     assert_eq!(scan_rows(&m4).await, before_rows);
     assert_eq!(scan_row_ids(&m4).await, before_ids);
     assert_eq!(assigned_row_ranges(&m4).await, m3_ranges);
-    assert_eq!(
-        i64::try_from(m4.metadata().next_row_id()).expect("next_row_id fits i64"),
-        next_row_id
-    );
-    for (first, count) in m4_ranges_values(&assigned_row_ranges(&m4).await) {
-        assert!(first + i64::try_from(count).expect("record count fits i64") <= next_row_id);
-    }
     assert_eq!(current_operation(&m4), Operation::Replace);
+    assert_row_id_accounting(&m4, M4_NEXT_ROW_ID, "deletes/m4").await;
     write_stage(&m4, out_root, "m4").await;
 
     let before_snapshots = m4.metadata().snapshots().count();
@@ -634,11 +695,14 @@ async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Optio
         Operation::Replace,
         "expiry keeps the current snapshot, so its operation is still the clustering commit's"
     );
+    assert_row_id_accounting(&m5, M4_NEXT_ROW_ID, "deletes/m5").await;
     write_stage(&m5, out_root, "m5").await;
-}
-
-fn m4_ranges_values(ranges: &BTreeMap<String, (i64, u64)>) -> Vec<(i64, u64)> {
-    ranges.values().copied().collect()
+    write_next_row_ids(out_root, &[
+        ("m0", SEED_NEXT_ROW_ID),
+        ("m3", M3_NEXT_ROW_ID),
+        ("m4", M4_NEXT_ROW_ID),
+        ("m5", M4_NEXT_ROW_ID),
+    ]);
 }
 
 #[tokio::test]
@@ -685,6 +749,20 @@ fn expectation_rows(rows: &[Row], row_ids: &BTreeMap<i64, Option<i64>>) -> Vec<M
                 .expect("a row id entry for every scanned id"),
         })
         .collect()
+}
+
+fn write_next_row_ids(out_root: Option<&Path>, stages: &[(&str, i64)]) {
+    let Some(root) = out_root else {
+        return;
+    };
+    std::fs::create_dir_all(root).unwrap_or_else(|e| panic!("create {}: {e}", root.display()));
+    let body: Vec<String> = stages
+        .iter()
+        .map(|(stage, value)| format!("\"{stage}\":{value}"))
+        .collect();
+    let path = root.join("next_row_ids.json");
+    std::fs::write(&path, format!("{{{}}}", body.join(",")))
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
 fn write_expected(out_root: Option<&Path>, rows: &[Row], row_ids: &BTreeMap<i64, Option<i64>>) {

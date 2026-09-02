@@ -32,7 +32,7 @@ the shipped actions end to end and compares the result against Apache Iceberg Ja
 | Id | Proposition | Result |
 |---|---|---|
 | C-004 | A V2 to V3 upgrade and every required V3 maintenance action preserve live rows, delete semantics, row lineage, and snapshot validity across Java and Rust. | PROVEN for the four upgrade cells and the five maintenance actions below. Both directions are green; no cell relies on a skipped oracle. |
-| C-007 (PR-4 slice) | `RewriteManifests` over ordinary clustering keeps every live file's row-id range, and `next_row_id` stays above every live assigned range. | PROVEN. Java re-reads the clustered table and asserts one data manifest, six assigned ranges, and every range end at or below `next_row_id` 11. Rust asserts the range map and `next_row_id` are byte-identical before and after the clustering. |
+| C-007 (PR-4 slice) | `RewriteManifests` over ordinary clustering keeps every live file's row-id range, and `next_row_id` stays above every live assigned range. | PROVEN. Rust asserts the per-file range map is byte-identical across the clustering and that `next_row_id` moves 12 to 24 under the assignment rule below. Java re-reads the clustered table and asserts one data manifest, six assigned ranges, and every range end at or below `next_row_id` 24; Java then runs the SAME `clusterBy` itself over the same input table and lands on the same 24. |
 
 ## Java 1.10.0 decode
 
@@ -105,21 +105,65 @@ ORC and Avro legacy position deletes stay outside the envelope (plan section 6).
 
 ## Maintenance matrix — per-action verdicts
 
-Two Java-written partitioned V2 seeds (`identity(grp)`, nine rows across four data files; the
-second seed adds two parquet position deletes). Rust upgrades each to V3 and appends one file per
-partition, so every live row carries a row id before any action runs.
+Two Java-written partitioned V2 seeds (`identity(grp)`, ten rows across four data files, five rows
+per partition; the second seed adds two parquet position deletes). Rust upgrades each to V3 and
+appends one file per partition, so the table reaches twelve rows in six data files, six rows per
+partition, and every live row carries a row id before any action runs. The partitions are
+deliberately symmetric: `RewriteDataFiles` commits one snapshot per bin and the bin order is not
+fixed, so unequal partitions would make the `next_row_id` pins order-dependent.
+
+### The row-id assignment rule and the per-stage derivation
+
+Plain Iceberg, identical in 1.10.0 and 1.11.0: every V3 DATA manifest a snapshot writes with
+`first_row_id == null` is assigned `next-row-id` and advances it by `existing + added` rows; a
+carried, already-assigned manifest advances it by 0. `SnapshotProducer.newManifestWriter` calls the
+four-argument `ManifestFiles.write`, whose `newWriter` call passes `aconst_null` for `firstRowId`
+(offset 4), so EVERY manifest an ordinary commit writes — including the ones `RewriteManifests`
+clustering produces and the filtered copies a rewrite makes of the manifests it touched — arrives
+unassigned. `ManifestFiles.copyRewriteManifest` is the only path that carries a source
+`first_row_id` through, and `BaseRewriteManifests` uses it from `copyManifest`, i.e. the
+`addManifest` external-manifest path (H-3), never from `clusterBy`.
+
+Per stage, over the twelve-row fixture:
+
+| Stage | Manifests the snapshot writes unassigned | Rows they carry | `next_row_id` |
+|---|---|---|---|
+| `m0` seed | three append manifests | 2 + 4 + 6 | 12 |
+| `m1` `RewriteDataFiles`, current spec | first bin: its new manifest plus the filtered copies of every manifest it touched (all 12 live rows); second bin: its own new manifest only | 12, then 6 | 30 |
+| `m2` `RewriteDataFiles`, evolved spec | one new manifest holding all 12 rows | 12 | 42 |
+| `m3` `RewritePositionDeleteFiles` | none — only DELETE manifests are written, and data manifests are carried assigned | 0 | 12 |
+| `m4` `RewriteManifests` | one clustered data manifest holding all 12 rows as `existing` | 12 | 24 |
+| `m5` `ExpireSnapshots` | none — expiry writes no manifest | 0 | 24 |
+
+Each stage asserts that absolute value, and also the rule as a per-stage identity:
+`next_row_id == max over live DATA manifests of (first_row_id + existing + added)`, plus every live
+file's `first_row_id + record_count <= next_row_id`.
 
 | Action | Stage | Verdict |
 |---|---|---|
 | `RewriteDataFiles` on the current spec | `plain/m1` | PASS. 4 files rewritten, the live data-file path set changes, rows and every `_row_id` are unchanged, no delete file appears. |
 | `RewriteDataFiles` after spec evolution (`identity(grp)` to `identity(y)`) | `plain/m2` | PASS. Every live data file carries the evolved spec id; Java confirms the current spec is a single `y` field and the output tuples are `{10, 20}`. Rows and row ids unchanged. |
 | `RewritePositionDeleteFiles` converting legacy parquet deletes to DVs | `deletes/m3` | PASS. 2 parquet position deletes in, 2 Puffin deletion vectors out, 0 parquet position deletes left live, rows and row ids unchanged. |
-| `RewriteManifests` with data and delete manifests | `deletes/m4` | PASS. Data manifests go from more than one to exactly 1; both delete manifests survive; the per-file `(first_row_id, record_count)` map and `next_row_id` are identical to `m3`; Java confirms 6 assigned ranges all ending at or below `next_row_id` 11. |
+| `RewriteManifests` with data and delete manifests | `deletes/m4` | PASS. Data manifests go from more than one to exactly 1; both delete manifests survive; the per-file `(first_row_id, record_count)` map is identical to `m3` and `next_row_id` moves 12 to 24 exactly as the rule predicts; Java confirms 6 assigned ranges all ending at or below `next_row_id` 24. |
 | `ExpireSnapshots` after the rewrite sequence | `deletes/m5` | PASS. Snapshots 6 to 1, the current snapshot id is unchanged, rows and row ids unchanged. |
 
 Java re-reads all seven stage tables through `IcebergGenerics` projected on
 `MetadataColumns.schemaWithRowLineage` and asserts the SAME row and row-id document at each one, so
 no stage can drift silently.
+
+### Java and Rust agreement on the counter, measured not argued
+
+`confirm-interop-v3-maintenance` makes Java run the two counter-moving actions ITSELF, over the
+same input table and at the same layout, and compares its `next_row_id` with the value Rust wrote
+to `next_row_ids.json`:
+
+- `deletes/m4`: Java loads Rust's `m3` table and runs `rewriteManifests().clusterBy(f -> "all")`.
+  Java 12 to 24, Rust 12 to 24, one clustered data manifest on both sides. AGREE.
+- `plain/m1`: Java loads Rust's `m0` table and runs one `newRewrite().rewriteFiles(deleted, added,
+  seq)` per partition, mirroring Rust's two bins. Java 12 to 30, Rust 12 to 30. AGREE.
+
+So ordinary clustering DOES advance the counter, in both implementations, and the fork has no
+divergence here. The runner fails closed if the two ever disagree.
 
 ## Test adequacy
 
@@ -211,12 +255,12 @@ clean.
 | Crate tests | `cargo test -p iceberg -p iceberg-datafusion --locked` | 0 |
 | Upgrade interop | `dev/java-interop/run-interop-v3-upgrade.sh` | 0 |
 | Crate tests, remediation re-run | `cargo test -p iceberg --test interop_v3_upgrade --test interop_v3_maintenance --locked` | 0 |
-| Maintenance interop | `dev/java-interop/run-interop-v3-maintenance.sh` | 0 |
+| Maintenance interop | `dev/java-interop/run-interop-v3-maintenance.sh` | 0 (7 steps, 5 sabotages, both Java confirmation legs agree) |
 | Prose | `typos .` | 0 |
 | Docker legs of `make test` | not run | EXCUSED — no Docker in this environment. The offline lib and integration suites plus both interop runners were run. |
 
 Rust file-size ceilings did not move: the three new test files are 735, 731 and 308 lines, all under
-the 1000-line default. `rust-file-size: 411 files clean (101 legacy ceilings)`.
+the 1000-line default. `rust-file-size: 417 files clean (101 legacy ceilings)`.
 
 ## Section 9 delivery template
 
@@ -230,7 +274,7 @@ Behavior after: unchanged product behavior. Four upgrade cells and five maintena
 Negative cases: seven sabotages (two upgrade, five maintenance) each pinned to a specific failure line; every runner hard-fails on a missing environment, oracle output or fixture count.
 Test command and population: cargo test -p iceberg -p iceberg-datafusion --locked; dev/java-interop/run-interop-v3-upgrade.sh (9 fixtures); dev/java-interop/run-interop-v3-maintenance.sh (9 fixtures).
 Mutations, one at a time: see the mutation table in this ledger.
-Java interop command and fixture count: run-interop-v3-upgrade.sh, 9 final.metadata.json; run-interop-v3-maintenance.sh, 9 final.metadata.json; both assert the Java-side {"count":2}.
+Java interop command and fixture count: run-interop-v3-upgrade.sh, 9 final.metadata.json; run-interop-v3-maintenance.sh, 9 final.metadata.json plus confirm-interop-v3-maintenance; both assert the Java-side {"count":2}.
 CI-only evidence gap: the Docker legs of `make test` were not run (no Docker in this environment); the offline lib and integration suites plus both interop runners were.
 Breaking public API change: none. No product code changed.
 Critic attestation: independent Critic PASS with three S3 pin-adequacy findings; all three landed in the remediation commit (see the "Critic S3 remediation" section).
