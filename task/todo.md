@@ -84,6 +84,22 @@ Ledger: [`pr6a-branch-interop-ledger.md`](pr6a-branch-interop-ledger.md). Plan: 
 - [x] `make check` 0; `cargo test -p iceberg --locked` 0; `cargo test -p iceberg-datafusion --locked` 0. Docker `make test` legs excused.
 
 Outcome: PR-6A landed. Java/Rust branch DML interop both directions. Every row-asserting verify pins main vs branch data-file sets. V3 MoR on a named branch closes DVs at the scanned snapshot. Row R168 ✅.
+## ACTIVE (2026-09-01): PR-6B V3 MoR UPDATE lineage on a branch — Java interop cell (row R168)
+
+Ledger: [`pr6b-mor-branch-lineage-ledger.md`](pr6b-mor-branch-lineage-ledger.md). Closes the cell PR-6A named as residue: merge-on-read UPDATE **lineage columns** on a diverged branch, both directions.
+
+- [x] Decode iceberg-data 1.10.0 `IcebergGenerics$ScanBuilder`: no `useRef`; `project(Schema)` and `useSnapshot(long)` both fold into the same `TableScan`, so the lineage projection survives the branch-head pin.
+- [x] Java fixture: one V3 merge-on-read table, `main` rows 1/2/3, `createBranch("b")`, `newAppend().toBranch("b")` rows 10/11. Java records its own seed lineage `1=0=1 2=1=1 3=2=1 10=3=2 11=4=2`, main file set, main snapshot id and `next-row-id` 5.
+- [x] Rust GEN: two MoR UPDATE statements of id 10 through `IcebergTableProvider::with_commit_branch("b")`.
+- [x] Java verify: branch head keeps `_row_id` 3, sequence 2 → 3 → 4, unmatched rows unchanged, `main` rows / ref / current snapshot / file set untouched, `next-row-id` 5 → 6 → 7 (a table counter: one added row per UPDATE), cross-checked against live Spark 4.1.2 + Iceberg 1.11.0 at the same layout.
+- [x] Runner `dev/java-interop/run-interop-mor-branch-lineage.sh` (six steps, prerequisites hard-fail, 1 fixture asserted, 5 GEN artifacts asserted, sabotage fail-closed). `SUITE_FLOOR_DEFAULT` 56 → 58.
+- [x] Mutations 12 red out of 12 (4 Rust, 8 Java-verify one-knob bends).
+- [x] GAP_MATRIX row R168, maps, ledger.
+- [x] Rebased onto fork `main` (PR-6A's `close_touched_dv_containers_at` is now in, so the branch UPDATE commits).
+- [x] Re-pinned `next-row-id` after PR-3's final form dropped the rewrite-aware allocation: it is a table counter and advances by each UPDATE's one added row (5 → 6 → 7), so the `main` invariants are its snapshot, ref, file set and lineage — not its counter. Java re-derives the arithmetic from its own seed instead of trusting the Rust pin.
+- [x] Cross-checked one full sequence against live Spark 4.1.2 + Iceberg 1.11.0 at the same layout: seed branch `(1,0,1) (2,1,1) (3,2,1) (10,3,2) (11,4,2)`, UPDATE 1 → id 10 seq 3, UPDATE 2 → id 10 seq 4, `next-row-id` 3 → 5 → 6 → 7, `main` unchanged. Every number matches the fork.
+
+Outcome: `bash dev/java-interop/run-interop-mor-branch-lineage.sh` passes both directions with the sabotage RED, `cargo test -p iceberg-datafusion --locked --test interop_mor_branch_lineage` is green, and `make check` is exit 0. Mutations 14 red out of 14. Docker `make test` legs excused.
 ## ACTIVE (2026-09-01): PR-4 V3 upgrade and maintenance interop (rows R109, R114, R135, R136, R166)
 
 Ledger: [`pr4-v3-upgrade-maintenance-interop-ledger.md`](pr4-v3-upgrade-maintenance-interop-ledger.md). Plan: `task/iceberg-v3-production-work-plan-2026-09-01.md` section 4 PR-4, clause C-004 and the PR-4 part of C-007.
