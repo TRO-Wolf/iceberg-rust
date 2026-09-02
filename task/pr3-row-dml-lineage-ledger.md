@@ -136,6 +136,6 @@ Mutations, one at a time: (1) drop MoR lineage projections 3/5 red; (2) null att
 Java interop command and fixture count: bash dev/java-interop/run-interop-mor-update-lineage.sh ; 2 fixtures; reverse MoR UPDATE not in iceberg-core 1.10.0
 CI-only evidence gap: Docker make test legs excused
 Breaking public API change: none
-Critic attestation: pending independent Critic
+Critic attestation: four independent rounds — Grok NOT PASS (F-rp3-c7 half unclosed); Opus NOT PASS (allocation rule fitted to one recipe); Opus NOT PASS (second fit; 1.11.0 decode unchanged, two-file-seed artefact identified, Spark re-measured at matched layout); Opus PASS on substance for 8eb57517a with one stale map row and one ledger overclaim fixed by the orchestrator; merged as #255.
 Open findings and dispositions: none from Actor
 ```

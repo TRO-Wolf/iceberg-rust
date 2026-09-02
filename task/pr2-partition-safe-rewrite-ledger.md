@@ -100,6 +100,6 @@ Mutations, one at a time: see ledger Mutations.
 Java interop command and fixture count: run-interop-evolved-spec-rewrite.sh ; 5 final.metadata.json.
 CI-only evidence gap: Docker make test legs excused.
 Breaking public API change: none. Additive builder max_open_partition_writers.
-Critic attestation: pending independent Critic.
+Critic attestation: independent Critic (Opus 5, fresh clone) NOT PASS on a257e4389 — S2 zero-bound pin could not distinguish before/after write, five S3 hygiene items; remediated in c5762787c (warehouse parquet census, pruned scans, all-void pin, map narrative); orchestrator delta: suite 60/60, runner 5 fixtures; merged as #254.
 Open findings and dispositions: none from Actor.
 ```

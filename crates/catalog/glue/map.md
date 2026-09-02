@@ -60,7 +60,7 @@ AWS Glue catalog implementation. PR-5A owns the commit-transport seam on `update
 ### First checks
 
 - Offline: `cargo test -p iceberg-catalog-glue --lib --locked`
-- Decode: `dev/java-interop/run-pr5a-catalog-commit-decode.sh`
+- Decode: `dev/java-interop/run-interop-pr5a-catalog-commit-decode.sh`
 
 ### Escalate to
 

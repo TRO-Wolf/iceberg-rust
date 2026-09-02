@@ -57,7 +57,7 @@ Throttle matrix and HTTP-attempt counting are PR-5B.
 
 ## 3. Java decode
 
-Command: `dev/java-interop/run-pr5a-catalog-commit-decode.sh`
+Command: `dev/java-interop/run-interop-pr5a-catalog-commit-decode.sh`
 Fixture count: **12 needles** (hard-fail if different).
 
 `javap -c -p` iceberg-aws 1.10.0 `GlueTableOperations`:
@@ -137,7 +137,7 @@ Unique namespaces `pr5a{millis}`. Cleanup drops the table and namespace. One dis
 | `make check` | 0 |
 | `cargo test -p iceberg-catalog-glue --lib --locked` | 0 (41 passed) |
 | `cargo test -p iceberg-catalog-s3tables --lib --locked` | 0 (39 passed) |
-| `dev/java-interop/run-pr5a-catalog-commit-decode.sh` | 0 (12 needles) |
+| `dev/java-interop/run-interop-pr5a-catalog-commit-decode.sh` | 0 (12 needles) |
 | `make check-matrix-anchors` | 0 (inside `make check`) |
 | `cargo test -p iceberg --lib --locked` | 0 (3559 passed, 1 ignored) |
 
@@ -155,9 +155,9 @@ Behavior after: a narrow GlueCommitTransport / S3TablesCommitTransport wraps the
 Negative cases: never-sent, maybe-sent, accepted-then-lost, exhaustion, metadata-only unknown, CAS conflict, authorization denial
 Test command and population: cargo test -p iceberg-catalog-glue --lib --locked (41); cargo test -p iceberg-catalog-s3tables --lib --locked (39)
 Mutations, one at a time: M1 2/41, M2 2/41, M3 2/41, M4 2/41, M5 2/41, M6 1/41, M7 2/41 (glue); matching S3 Tables knobs
-Java interop command and fixture count: dev/java-interop/run-pr5a-catalog-commit-decode.sh — 12 needles
+Java interop command and fixture count: dev/java-interop/run-interop-pr5a-catalog-commit-decode.sh — 12 needles
 CI-only evidence gap: credentialed Glue/S3 Tables smokes and the accepted-then-lost append (ICEBERG_PR5A_CREDENTIALED=1). HTTP attempt counting is PR-5B.
 Breaking public API change: none
-Critic attestation: pending independent Critic
+Critic attestation: independent Critic (Grok, fresh clone, read-only) PASS on 21074f8fa — seams narrow, outcome partition pinned on both catalogs, recorded mutations reproduced, critic knobs red, credentialed cells pending; three comments re-homed by the orchestrator (dd93735e1); merged as #252.
 Open findings and dispositions: none from this Actor
 ```

@@ -162,6 +162,6 @@ Mutations, one at a time: 14 red out of 14 — 4 Rust (revert the branch-aware D
 Java interop command and fixture count: bash dev/java-interop/run-interop-mor-branch-lineage.sh — 1 Java fixture + 7 Rust GEN artifacts; sabotage FAIL-closed; reverse MoR UPDATE not in iceberg-core 1.10.0
 CI-only evidence gap: Docker make test legs excused; the suite is nightly-only (run_interop_suites.sh floor raised to 57)
 Breaking public API change: none — the commit adds no crate source
-Critic attestation: pending independent Critic
+Critic attestation: independent Critic (Opus 5) NOT PASS on 83bfceeac for record-keeping only (duplicated map rows, stale floor prose, tracked scratch file), substance PASS (every value asserted on both sides, bytecode claims confirmed, 6/6 mutations); fixed by the orchestrator (d7131e00e); re-pinned after PR-3 final with live-Spark identity (32c1992e4); merged as #256.
 Open findings and dispositions: none. The PR-6A dependency is satisfied on this rebase. next-row-id is a table counter and moves 5 -> 6 -> 7 across the two branch UPDATE statements; main's snapshot, ref, file set and lineage are the invariants, not main's counter. Cross-checked against live Spark 4.1.2 + Iceberg 1.11.0 at the same layout.
 ```

@@ -690,21 +690,32 @@ status changes only in the owning matrix cell.
 
 ## 10. Definition of done
 
-The fork portion of V3 production support is complete only when all statements below are true:
+The fork portion of V3 production support is complete only when all statements below are true.
+Marked against fork `main` `fb0cacfa8` on 2026-09-02 by PR-7; evidence in
+`task/pr7-production-evidence-closeout-ledger.md`.
 
-- PR-1 through PR-7 (PR-5A and PR-6A/6B as split) meet their exit gates; PR-5B is not a V1.0 gate.
-- Every mandatory clause has a local regression, a load-bearing mutation, and required interop.
-- No compaction path can duplicate rows or mislabel partitions silently.
-- Every required V3 row rewrite keeps row identity.
-- Upgrade and maintenance preserve live rows, lineage, deletes, and snapshot validity.
-- Glue and S3 Tables pass the credentialed commit-outcome matrix.
-- Unsupported selected-out surfaces fail before writing bytes or committing metadata.
-- `typos .`, `make check`, the pre-merge gate, targeted interop, and required live tests are green.
-- Every PR has an independent Critic. The bundle has a fresh closing Critic.
-- No open S0, S1, or S2 finding remains.
-- RePark completes its downstream gate and the user approves the production-ready claim.
+| # | Statement | Marked | Evidence |
+|---|---|---|---|
+| 1 | PR-1 through PR-7 (PR-5A and PR-6A/6B as split) meet their exit gates; PR-5B is not a V1.0 gate. | FALSE | PR-1..PR-6B merged (#251-#257); PR-5A's credentialed execution and PR-7's bundle Critic are outstanding. Ledger sections 3, 5, 7 |
+| 2 | Every mandatory clause has a local regression, a load-bearing mutation, and required interop. | TRUE | Ledger section 2 |
+| 3 | No compaction path can duplicate rows or mislabel partitions silently. | TRUE | PR-2 row R135, PR-1 row R107. Ledger section 2 |
+| 4 | Every required V3 row rewrite keeps row identity. | TRUE | PR-3 and PR-4, row R166. Ledger section 2 |
+| 5 | Upgrade and maintenance preserve live rows, lineage, deletes, and snapshot validity. | TRUE | PR-4, rows R109, R114, R135, R136, R166. Ledger section 2 |
+| 6 | Glue and S3 Tables pass the credentialed commit-outcome matrix. | FALSE | Gate 8 not run — no credentials here. Ledger section 5; rows R110, R157 |
+| 7 | Unsupported selected-out surfaces fail before writing bytes or committing metadata. | QUALIFIED | TRUE for the in-tree arms (parquet `unknown` refused at builder, row R91; the merge-on-read legacy-delete refusal is pre-IO). An external engine driving `DVFileWriter` directly is refused only at the commit door and leaves an orphan — row R114 bound (b) |
+| 8 | `typos .`, `make check`, the pre-merge gate, targeted interop, and required live tests are green. | FALSE | Gates 1-7 green; the credentialed live gate 8 is not run and the Docker legs are a CI-only exception. Ledger sections 3, 4 |
+| 9 | Every PR has an independent Critic. The bundle has a fresh closing Critic. | FALSE | Five unit ledgers still read "pending independent Critic"; the bundle Critic follows PR-7. Ledger finding F-pr7-1 |
+| 10 | No open S0, S1, or S2 finding remains. | TRUE | Ledger section 7 — three open findings, all S3 |
+| 11 | RePark completes its downstream gate and the user approves the production-ready claim. | FALSE | Gate 9 is RePark's; the approval is the owner's. Ledger section 6 |
 
 Until then, the fork can support a guarded V3 pilot. It cannot support the full production claim.
+
+### Fork closeout (2026-09-02)
+
+The seven mandatory units are merged and their evidence is re-run and recorded. The production
+claim is **not** made: it waits on the owner running gate 8
+(`ICEBERG_PR5A_CREDENTIALED=1 dev/pr5a-catalog-commit-outcomes.sh`) and on RePark completing gate 9,
+its V3 scale and statement matrix. The bundle-scope Critic attestation follows this PR.
 
 ## 11. Owner approval and binding amendments (2026-09-01)
 
