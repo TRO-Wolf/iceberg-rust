@@ -87,6 +87,15 @@ pub async fn close_touched_dv_containers(
     table: &Table,
     new_positions: &HashMap<String, Vec<u64>>,
 ) -> Result<DvContainerClose> {
+    close_touched_dv_containers_at(table, new_positions, None).await
+}
+
+/// Close touched DV containers against `snapshot_id`, or the current snapshot when `None`.
+pub async fn close_touched_dv_containers_at(
+    table: &Table,
+    new_positions: &HashMap<String, Vec<u64>>,
+    snapshot_id: Option<i64>,
+) -> Result<DvContainerClose> {
     if new_positions.is_empty() {
         return Ok(DvContainerClose::default());
     }
@@ -100,8 +109,8 @@ pub async fn close_touched_dv_containers(
         ));
     }
 
-    let live_dvs = collect_live_dvs(table).await?;
-    let data_files = collect_live_data_files(table).await?;
+    let live_dvs = collect_live_dvs(table, snapshot_id).await?;
+    let data_files = collect_live_data_files(table, snapshot_id).await?;
     let mut by_puffin: HashMap<String, Vec<LiveDv>> = HashMap::new();
     for dv in live_dvs {
         by_puffin
@@ -162,7 +171,7 @@ pub async fn close_touched_dv_containers(
             Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "deletion-vector: data file `{path}` is not a live file of the current snapshot"
+                    "deletion-vector: data file `{path}` is not a live file of the scanned snapshot"
                 ),
             )
         })?;
@@ -191,7 +200,7 @@ pub async fn rewrite_siblings_for_dropped_references(
         return Ok(DvDropPlan::default());
     }
 
-    let live_dvs = collect_live_dvs(table).await?;
+    let live_dvs = collect_live_dvs(table, None).await?;
     let mut by_puffin: HashMap<String, Vec<LiveDv>> = HashMap::new();
     for dv in live_dvs {
         by_puffin
@@ -254,10 +263,30 @@ pub async fn rewrite_siblings_for_dropped_references(
     Ok(plan)
 }
 
-async fn collect_live_dvs(table: &Table) -> Result<Vec<LiveDv>> {
+fn snapshot_for_live(
+    table: &Table,
+    snapshot_id: Option<i64>,
+) -> Result<Option<crate::spec::SnapshotRef>> {
+    match snapshot_id {
+        Some(id) => table
+            .metadata()
+            .snapshot_by_id(id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("deletion-vector: snapshot {id} not found"),
+                )
+            })
+            .map(Some),
+        None => Ok(table.metadata().current_snapshot().cloned()),
+    }
+}
+
+async fn collect_live_dvs(table: &Table, snapshot_id: Option<i64>) -> Result<Vec<LiveDv>> {
     let mut live = Vec::new();
     let metadata = table.metadata();
-    let Some(snapshot) = metadata.current_snapshot() else {
+    let Some(snapshot) = snapshot_for_live(table, snapshot_id)? else {
         return Ok(live);
     };
     let manifest_list = snapshot
@@ -287,10 +316,13 @@ async fn collect_live_dvs(table: &Table) -> Result<Vec<LiveDv>> {
     Ok(live)
 }
 
-async fn collect_live_data_files(table: &Table) -> Result<HashMap<String, DataFile>> {
+async fn collect_live_data_files(
+    table: &Table,
+    snapshot_id: Option<i64>,
+) -> Result<HashMap<String, DataFile>> {
     let mut files = HashMap::new();
     let metadata = table.metadata();
-    let Some(snapshot) = metadata.current_snapshot() else {
+    let Some(snapshot) = snapshot_for_live(table, snapshot_id)? else {
         return Ok(files);
     };
     let manifest_list = snapshot
