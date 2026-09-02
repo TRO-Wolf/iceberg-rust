@@ -21,8 +21,8 @@
 //! `removedDataFilePaths.contains(referencedDataFile())`. The apply path drops DVs
 //! only. File-scoped parquet position deletes are a fork extension of that predicate.
 //!
-//! Delete-file removal here is path-keyed. One Puffin can hold several blobs, so a drop
-//! of one blob would take its siblings. Those siblings are rewritten into a new Puffin.
+//! Delete-file removal is keyed by the Java `DeleteFileSet` triple, so a drop no longer takes
+//! a sibling blob at the same Puffin path. This path still rewrites those siblings anyway.
 
 use std::collections::HashSet;
 
@@ -32,8 +32,7 @@ use crate::delete_vector_container::{DvDropPlan, rewrite_siblings_for_dropped_re
 use crate::spec::{DataContentType, DataFile, ManifestContentType};
 use crate::table::Table;
 
-/// DVs to drop, and sibling blobs that must be rewritten because path-keyed removal
-/// would otherwise delete them.
+/// DVs to drop, and the sibling blobs this path still rewrites alongside them.
 pub(super) struct DvRewritePlan {
     pub(super) removed: Vec<DataFile>,
     pub(super) rewritten_siblings: Vec<(DataFile, i64)>,

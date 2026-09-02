@@ -50,7 +50,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::TryStreamExt;
 use iceberg::Catalog;
-use iceberg::delete_vector_container::{DvContainerClose, close_touched_dv_containers_at};
+use iceberg::delete_vector_container::{
+    DvContainerClose, close_touched_dv_containers_with_partitions,
+};
 use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::spec::{
@@ -358,7 +360,7 @@ async fn write_merge_on_read_deletes(
                 .into_iter()
                 .map(|file| (file, None))
                 .collect(),
-            removed: Vec::new(),
+            ..DvContainerClose::default()
         }),
         MergeOnReadDeleteKind::DeletionVectors => {
             write_deletion_vectors(table, pairs, scan_snapshot_id).await
@@ -504,7 +506,7 @@ async fn merge_on_read_delete(
     // The §5 `validate_data_files_exist` set. Java arms this for every command, DELETE included: a
     // referenced file rewritten away by a concurrent commit would silently lose these deletes.
     let close = write_merge_on_read_deletes(table, delete_kind, &pairs, scan_snapshot_id).await?;
-    // V3 container close copies sibling references, so files-exist must cover every replacement.
+    // V3 container close RETAINS untouched sibling references, so files-exist covers them too.
     let referenced_files = if close
         .added
         .iter()
@@ -765,27 +767,18 @@ async fn write_position_deletes(
     Ok(all_delete_files)
 }
 
-/// The live delete files of the current snapshot, split by whether they are deletion vectors.
-struct LiveDeletes {
-    /// Puffin DVs, keyed by the data file each covers.
-    dv_by_data_file: HashMap<String, DataFile>,
-    /// Non-Puffin position deletes as `(referenced_data_file, spec_id, partition, sequence)`. The
-    /// reference is [`referenced_data_file_location`], the same derivation the scan uses.
-    legacy_position_deletes: Vec<(Option<String>, i32, Struct, Option<i64>)>,
-}
+/// Live non-Puffin position deletes as `(referenced_data_file, spec_id, partition, sequence)`; the
+/// reference is [`referenced_data_file_location`], the same derivation the scan uses. Live DVs are
+/// NOT collected here — `close_touched_dv_containers_with_partitions` reads and merges them.
+type LegacyPositionDeletes = Vec<(Option<String>, i32, Struct, Option<i64>)>;
 
-/// Reads the scanned snapshot's delete manifests once. V3 allows at most one DV per data file, so
-/// `dv_by_data_file` is unambiguous. A second delete on a data file must merge that DV and supersede
-/// it, or the positions are counted twice.
-async fn live_delete_vectors_by_data_file(
+/// Reads the scanned snapshot's delete manifests once, for the legacy-position-delete refusal.
+async fn live_legacy_position_deletes(
     table: &Table,
     snapshot_id: Option<i64>,
-) -> DFResult<LiveDeletes> {
+) -> DFResult<LegacyPositionDeletes> {
     let metadata = table.metadata();
-    let mut live = LiveDeletes {
-        dv_by_data_file: HashMap::new(),
-        legacy_position_deletes: Vec::new(),
-    };
+    let mut live = LegacyPositionDeletes::new();
     let Some(snapshot) = super::cow_affected::snapshot_for_scan(table, snapshot_id) else {
         return Ok(live);
     };
@@ -807,16 +800,8 @@ async fn live_delete_vectors_by_data_file(
                 continue;
             }
             let df = entry.data_file();
-            match classify_live_delete(df) {
-                Some(LiveDeleteKind::DeletionVector) => {
-                    if let Some(referenced) = df.referenced_data_file() {
-                        live.dv_by_data_file.insert(referenced, df.clone());
-                    }
-                }
-                Some(LiveDeleteKind::LegacyPositionDelete) => live
-                    .legacy_position_deletes
-                    .push(legacy_position_delete_entry(df, entry.sequence_number())),
-                None => continue,
+            if let Some(LiveDeleteKind::LegacyPositionDelete) = classify_live_delete(df) {
+                live.push(legacy_position_delete_entry(df, entry.sequence_number()));
             }
         }
     }
@@ -897,7 +882,7 @@ async fn write_deletion_vectors(
     scan_snapshot_id: Option<i64>,
 ) -> DFResult<DvContainerClose> {
     let path_to_partition = live_data_file_partitions(table, scan_snapshot_id).await?;
-    let live = live_delete_vectors_by_data_file(table, scan_snapshot_id).await?;
+    let live = live_legacy_position_deletes(table, scan_snapshot_id).await?;
 
     let mut resolved: Vec<(&str, i32, Struct, Option<i64>)> = Vec::new();
     let mut seen = HashSet::new();
@@ -914,7 +899,7 @@ async fn write_deletion_vectors(
     }
 
     for (path, spec_id, partition, data_seq) in &resolved {
-        let covered = live.legacy_position_deletes.iter().any(|delete| {
+        let covered = live.iter().any(|delete| {
             legacy_position_delete_applies(delete, path, *spec_id, partition, *data_seq)
         });
         if covered {
@@ -939,9 +924,18 @@ async fn write_deletion_vectors(
             .or_default()
             .push(position);
     }
-    close_touched_dv_containers_at(table, &new_positions, scan_snapshot_id)
-        .await
-        .map_err(to_datafusion_error)
+    let known_partitions: HashMap<String, (i32, Struct)> = resolved
+        .into_iter()
+        .map(|(path, spec_id, partition, _)| (path.to_string(), (spec_id, partition)))
+        .collect();
+    close_touched_dv_containers_with_partitions(
+        table,
+        &new_positions,
+        scan_snapshot_id,
+        &known_partitions,
+    )
+    .await
+    .map_err(to_datafusion_error)
 }
 
 /// The `(path, pos)` pairs of one position-delete output file, keyed by the `(spec_id, partition)`

@@ -17,6 +17,8 @@
 
 //! F-17: DataFusion V3 DELETE/UPDATE must close a shared Puffin as one container.
 
+mod container;
 mod extra;
 mod harness;
 mod live;
+mod measure;

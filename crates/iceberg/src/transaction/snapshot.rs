@@ -138,6 +138,10 @@ pub(crate) enum FirstRowIdPolicy {
 /// `addFile(DeleteFile, long)` → `writeDeleteFileGroup`'s `writer.add(file, dataSeq)`).
 pub(crate) type PendingDeleteFile = (DataFile, Option<i64>);
 
+mod removal_targets;
+
+use removal_targets::{DeleteFileMatcher, RemovalHits, RemovalTargets};
+
 pub(crate) fn latest_snapshot<'a>(
     metadata: &'a TableMetadata,
     branch: &str,
@@ -299,9 +303,9 @@ impl<'a> SnapshotProducer<'a> {
     /// `MergingSnapshotProducer.delete(DeleteFile)`. `RowDelta.removeDeletes` uses it to drop a
     /// delete file the new delete supersedes, such as the old DV a merged super-set DV replaces.
     ///
-    /// [`SnapshotProducer::commit`] resolves the paths against the current DELETE manifests, and a
-    /// missing path fails loud. `process_deletes` matches by path across EVERY manifest, so the
-    /// tombstone lands in the rewritten DELETE manifest and DATA manifests are untouched.
+    /// [`SnapshotProducer::commit`] resolves each file against the current DELETE manifests by the
+    /// Java `DeleteFileSet` triple, and a missing blob fails loud. `process_deletes` matches DELETE
+    /// manifests on that same triple, so a sibling blob at the same Puffin path is not tombstoned.
     pub(crate) fn with_removed_delete_files(mut self, removed_delete_files: Vec<DataFile>) -> Self {
         self.removed_delete_files = removed_delete_files;
         self
@@ -573,7 +577,7 @@ impl<'a> SnapshotProducer<'a> {
     /// `failMissingDeletePaths()`, so the loud failure is Java-faithful for them. Java's
     /// `BaseRowDelta` does NOT set the flag for `removeRows`, so this path is STRICTER than Java for
     /// that caller. It is the same conservative posture as
-    /// [`Self::resolve_delete_file_paths`].
+    /// [`Self::resolve_removed_delete_files`].
     pub(crate) async fn resolve_delete_paths(
         &self,
         delete_paths: &HashSet<String>,
@@ -618,30 +622,24 @@ impl<'a> SnapshotProducer<'a> {
         Ok(resolved)
     }
 
-    /// Resolve `delete_paths` against the current snapshot's live DELETE entries, returning the matching
-    /// [`DataFile`]s, and fail if any requested path matched no live delete entry — the DELETE-manifest
-    /// sibling of [`SnapshotProducer::resolve_delete_paths`] (Java
-    /// `MergingSnapshotProducer.delete(DeleteFile)` → `deleteFilterManager.delete(file)` resolved at
-    /// `filterManifests` time).
-    ///
-    /// Scans every current DELETE manifest, never data manifests, and collects each live entry whose
-    /// path is in `delete_paths`. The missing-path check mirrors `resolve_delete_paths`.
+    /// Resolve `requested` against the current snapshot's live DELETE entries by the Java
+    /// `DeleteFileSet$DeleteFileWrapper` identity — `(location, content_offset,
+    /// content_size_in_bytes)` — and fail if a requested blob matched no live entry. Two deletion
+    /// vectors may share one Puffin path, so path keying would tombstone an untouched sibling.
     ///
     /// **Posture: stricter than Java's `RowDelta.removeDeletes` default.** Java fails only when
     /// `failMissingDeletePaths` is set, and `RowDelta` does not set it. This port always fails loud,
-    /// as `process_deletes` already does for removed DATA files. One consequence: a retry whose
-    /// target delete file was concurrently removed fails loud where Java would converge. That is the
-    /// safe direction, and it is accepted.
-    pub(crate) async fn resolve_delete_file_paths(
+    /// as `process_deletes` already does for removed DATA files.
+    pub(crate) async fn resolve_removed_delete_files(
         &self,
-        delete_paths: &HashSet<String>,
+        requested: &[DataFile],
     ) -> Result<Vec<DataFile>> {
-        if delete_paths.is_empty() {
+        if requested.is_empty() {
             return Ok(vec![]);
         }
 
+        let mut matcher = DeleteFileMatcher::new(requested);
         let mut resolved = Vec::new();
-        let mut found_paths: HashSet<String> = HashSet::new();
         if let Some(snapshot) = self.parent_snapshot() {
             let manifest_list = snapshot
                 .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
@@ -653,19 +651,17 @@ impl<'a> SnapshotProducer<'a> {
                 }
                 let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
                 for entry in manifest.entries() {
-                    if entry.is_alive() && delete_paths.contains(entry.file_path()) {
-                        found_paths.insert(entry.file_path().to_string());
+                    if !entry.is_alive() {
+                        continue;
+                    }
+                    if matcher.hit(entry.data_file()) {
                         resolved.push(entry.data_file().clone());
                     }
                 }
             }
         }
 
-        let missing: Vec<&str> = delete_paths
-            .iter()
-            .map(String::as_str)
-            .filter(|path| !found_paths.contains(*path))
-            .collect();
+        let missing = matcher.missing();
         if !missing.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -1057,15 +1053,13 @@ impl<'a> SnapshotProducer<'a> {
         manifest_process: &MP,
     ) -> Result<Vec<ManifestFile>> {
         // The files to remove were resolved in `commit()` (before `summary()`, so the summary can reflect
-        // the deletes) and stored in `self.removed_data_files` / `self.removed_delete_files`. Take both
-        // here and pass them as ONE set to `process_deletes`, which matches by path across the full
-        // manifest list (DATA and DELETE manifests): a removed DATA file's tombstone lands in the
-        // rewritten DATA manifest, a removed DELETE file's in the rewritten DELETE manifest — the Rust
-        // analogue of Java composing `filterManager.filterManifests(dataManifests)` AND
+        // the deletes) and stored in `self.removed_data_files` / `self.removed_delete_files`. They stay
+        // SEPARATE here because the two manifest kinds match on different keys: a DATA entry by path, a
+        // DELETE entry by the Java `DeleteFileSet` triple. The Rust analogue of Java composing
+        // `filterManager.filterManifests(dataManifests)` AND
         // `deleteFilterManager.filterManifests(deleteManifests)` (`MergingSnapshotProducer.apply` L977-1000).
-        let mut delete_files = std::mem::take(&mut self.removed_data_files);
+        let removed_data_files = std::mem::take(&mut self.removed_data_files);
         let removed_delete_files = std::mem::take(&mut self.removed_delete_files);
-        delete_files.extend(removed_delete_files);
 
         // Assert the new snapshot contributes content: added data files, added DELETE files, removed
         // (deleted) data or delete files, or added snapshot properties. An add-deletes-only commit (delete
@@ -1078,7 +1072,8 @@ impl<'a> SnapshotProducer<'a> {
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
         if self.added_data_files.is_empty()
             && self.added_delete_files.is_empty()
-            && delete_files.is_empty()
+            && removed_data_files.is_empty()
+            && removed_delete_files.is_empty()
             && self.snapshot_properties.is_empty()
         {
             return Err(Error::new(
@@ -1093,7 +1088,11 @@ impl<'a> SnapshotProducer<'a> {
         // `ManifestFilterManager.filterManifests`). Manifests that contain none of the target files are
         // carried forward unchanged.
         let processed = self
-            .process_deletes(existing_manifests, &delete_files)
+            .process_deletes(
+                existing_manifests,
+                &removed_data_files,
+                &removed_delete_files,
+            )
             .await?;
         let (existing_data_manifests, existing_delete_manifests): (Vec<_>, Vec<_>) = processed
             .into_iter()
@@ -1139,46 +1138,48 @@ impl<'a> SnapshotProducer<'a> {
     /// Rewrite the existing manifests to remove `delete_files`, mirroring Java
     /// `ManifestFilterManager.filterManifests` + `MergingSnapshotProducer.apply`'s keep rule.
     ///
-    /// A manifest holding a live entry whose path is in `delete_files` is rewritten. Matching live
-    /// entries become `Deleted`, keeping their data file and both sequence numbers. Every other live
-    /// entry is copied forward as `Existing`, keeping its snapshot id and both sequence numbers.
-    /// Every other manifest carries forward unchanged.
+    /// A DATA manifest entry matches by path; a DELETE manifest entry matches by the Java
+    /// `DeleteFileSet` triple, so two deletion vectors sharing one Puffin path are removed
+    /// independently. Matching live entries become `Deleted`, keeping their data file and both
+    /// sequence numbers. Every other live entry is copied forward as `Existing`, keeping its snapshot
+    /// id and both sequence numbers. Every other manifest carries forward unchanged.
     ///
     /// A rewritten manifest is kept even when every live entry became `Deleted`. An unrewritten
     /// manifest with no live files is dropped.
     ///
     /// # Errors
     ///
-    /// A requested delete path matched no live entry. Java `failMissingDeletePaths`.
+    /// A requested removal matched no live entry. Java `failMissingDeletePaths`.
     async fn process_deletes(
         &mut self,
         existing_manifests: Vec<ManifestFile>,
-        delete_files: &[DataFile],
+        removed_data_files: &[DataFile],
+        removed_delete_files: &[DataFile],
     ) -> Result<Vec<ManifestFile>> {
-        if delete_files.is_empty() {
+        if removed_data_files.is_empty() && removed_delete_files.is_empty() {
             return Ok(existing_manifests);
         }
 
-        let delete_paths: HashSet<&str> = delete_files
-            .iter()
-            .map(|df| df.file_path.as_str())
-            .collect();
-
-        // Track which requested paths were actually removed, to validate that none was missing.
-        let mut deleted_paths: HashSet<String> = HashSet::new();
+        let targets = RemovalTargets::new(removed_data_files, removed_delete_files);
+        let mut hits = RemovalHits::default();
         let mut result_manifests = Vec::with_capacity(existing_manifests.len());
 
         for manifest_file in existing_manifests {
+            let content = manifest_file.content;
+            if !targets.wants(content) {
+                if manifest_file.has_added_files() || manifest_file.has_existing_files() {
+                    result_manifests.push(manifest_file);
+                }
+                continue;
+            }
             let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
 
-            // Does any live entry in this manifest target one of the files to delete?
             let has_matching_delete = manifest
                 .entries()
                 .iter()
-                .any(|entry| entry.is_alive() && delete_paths.contains(entry.file_path()));
+                .any(|entry| entry.is_alive() && targets.matches(content, entry.data_file()));
 
             if !has_matching_delete {
-                // Carry the manifest forward unchanged unless it has no live files at all.
                 if manifest_file.has_added_files() || manifest_file.has_existing_files() {
                     result_manifests.push(manifest_file);
                 }
@@ -1186,23 +1187,12 @@ impl<'a> SnapshotProducer<'a> {
             }
 
             let rewritten = self
-                .rewrite_manifest_with_deletes(
-                    &manifest_file,
-                    &manifest,
-                    &delete_paths,
-                    &mut deleted_paths,
-                )
+                .rewrite_manifest_with_deletes(&manifest_file, &manifest, &targets, &mut hits)
                 .await?;
             result_manifests.push(rewritten);
         }
 
-        // Validate that every requested delete path was found in a live entry (Java
-        // `failMissingDeletePaths`).
-        let missing: Vec<&str> = delete_paths
-            .iter()
-            .filter(|path| !deleted_paths.contains(**path))
-            .copied()
-            .collect();
+        let missing = targets.missing_data_paths(&hits);
         if !missing.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -1213,17 +1203,18 @@ impl<'a> SnapshotProducer<'a> {
         Ok(result_manifests)
     }
 
-    /// Write a rewritten copy of `manifest` with the entries in `delete_paths` marked `Deleted` and the
-    /// rest copied forward as `Existing`. Records each removed path in `deleted_paths`.
+    /// Write a rewritten copy of `manifest` with the entries `targets` matches marked `Deleted` and
+    /// the rest copied forward as `Existing`. Records each removal in `hits`.
     async fn rewrite_manifest_with_deletes(
         &mut self,
         manifest_file: &ManifestFile,
         manifest: &Manifest,
-        delete_paths: &HashSet<&str>,
-        deleted_paths: &mut HashSet<String>,
+        targets: &RemovalTargets<'_>,
+        hits: &mut RemovalHits,
     ) -> Result<ManifestFile> {
         // Rewrite with the source manifest's own partition spec so the spec id / partition type of the
         // copied-forward entries is preserved (Java writes with `reader.spec()`).
+        let content = manifest_file.content;
         let mut writer = self.new_filtering_manifest_writer(manifest_file)?;
 
         for entry in manifest.entries() {
@@ -1233,8 +1224,8 @@ impl<'a> SnapshotProducer<'a> {
             }
 
             let entry = entry.as_ref().clone();
-            if delete_paths.contains(entry.file_path()) {
-                deleted_paths.insert(entry.file_path().to_string());
+            if targets.matches(content, entry.data_file()) {
+                hits.record(content, entry.data_file());
                 writer.add_delete_entry(entry)?;
             } else {
                 writer.add_existing_entry(entry)?;
@@ -1453,18 +1444,15 @@ impl<'a> SnapshotProducer<'a> {
         // without re-resolving. Empty for add-only operations (e.g. fast append).
         self.removed_data_files = snapshot_produce_operation.delete_files(&self).await?;
 
-        // Resolve the DELETE files this operation removes against the current snapshot's DELETE manifests by
-        // path (the apply-side `RowDelta.removeDeletes` path). Re-binding `self.removed_delete_files` to the
-        // RESOLVED set (a) validates every requested removal is a live delete file (missing path fails loud)
-        // and (b) replaces the caller-supplied (possibly-stale) `DataFile`s with the ON-DISK entries, so the
-        // summary's `remove_file` reads the committed metadata. Empty when no delete files are removed.
+        // Resolve the DELETE files this operation removes against the current snapshot's DELETE manifests
+        // by the Java `DeleteFileSet` triple (the apply-side `RowDelta.removeDeletes` path). Re-binding
+        // `self.removed_delete_files` to the RESOLVED set (a) validates every requested removal is a live
+        // delete file (a missing blob fails loud) and (b) replaces the caller-supplied (possibly-stale)
+        // `DataFile`s with the ON-DISK entries, so the summary's `remove_file` reads the committed
+        // metadata. Empty when no delete files are removed.
         if !self.removed_delete_files.is_empty() {
-            let requested_paths: HashSet<String> = self
-                .removed_delete_files
-                .iter()
-                .map(|file| file.file_path().to_string())
-                .collect();
-            self.removed_delete_files = self.resolve_delete_file_paths(&requested_paths).await?;
+            let requested = std::mem::take(&mut self.removed_delete_files);
+            self.removed_delete_files = self.resolve_removed_delete_files(&requested).await?;
         }
 
         let manifest_list_path = self.generate_manifest_list_file_path(0);

@@ -21,9 +21,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod file_scope;
+
+use file_scope::is_file_scoped;
+
 use crate::delete_vector::DeleteVector;
 use crate::io::OutputFile;
-use crate::metadata_columns::{RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_POS};
+use crate::metadata_columns::RESERVED_FIELD_ID_POS;
 use crate::puffin::{Blob, CompressionCodec, DELETION_VECTOR_V1, PuffinWriter};
 use crate::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, PartitionKey, PartitionSpec,
@@ -114,40 +118,6 @@ impl DVWriteResult {
     }
 }
 
-/// Whether a previous delete file is file-scoped, so the merge may discard it from the table
-/// state. Mirrors Java `ContentFileUtil.isFileScoped`, which is
-/// `referencedDataFile(df) != null`. The predicate is broader than `is_deletion_vector`. A DV
-/// qualifies because it carries `referenced_data_file`, not because it is a DV.
-///
-/// | Delete file | File-scoped |
-/// |---|---|
-/// | equality delete | no |
-/// | non-null `referenced_data_file` | yes |
-/// | position delete whose `_file_path` lower and upper bounds are present and equal | yes |
-/// | any other position delete, which spans many data files | no |
-fn is_file_scoped(delete_file: &DataFile) -> bool {
-    if delete_file.content_type() == DataContentType::EqualityDeletes {
-        return false;
-    }
-    if delete_file.referenced_data_file().is_some() {
-        return true;
-    }
-    // The Java `referencedDataFile` fallback: a position delete whose `_file_path` bounds pin a
-    // single data file is file-scoped even without the explicit field. `lower_bounds`/`upper_bounds`
-    // are `HashMap<i32, Datum>`; equal Datums under the reserved path id mean a one-data-file delete.
-    match (
-        delete_file
-            .lower_bounds()
-            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH),
-        delete_file
-            .upper_bounds()
-            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH),
-    ) {
-        (Some(lower), Some(upper)) => lower == upper,
-        _ => false,
-    }
-}
-
 /// Writer for deletion vectors (V3 Puffin DVs), mirroring Java `BaseDVFileWriter`. Accumulate
 /// deleted positions with [`delete`](Self::delete), then call [`close`](Self::close) for the DVs
 /// alone, or [`close_with_result`](Self::close_with_result) for the DVs plus the superseded delete
@@ -224,14 +194,17 @@ impl DVFileWriter {
             ));
         }
 
-        let deletes = self
-            .deletes_by_path
-            .entry(data_file_path.to_string())
-            .or_insert_with(|| DeletesForDataFile {
-                positions: DeleteVector::default(),
-                partition_key: partition_key.cloned(),
-            });
+        if let Some(deletes) = self.deletes_by_path.get_mut(data_file_path) {
+            deletes.positions.insert(position);
+            return Ok(());
+        }
+        let mut deletes = DeletesForDataFile {
+            positions: DeleteVector::default(),
+            partition_key: partition_key.cloned(),
+        };
         deletes.positions.insert(position);
+        self.deletes_by_path
+            .insert(data_file_path.to_string(), deletes);
         Ok(())
     }
 
@@ -415,6 +388,7 @@ mod tests {
     use super::*;
     use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
     use crate::io::FileIO;
+    use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
     use crate::scan::FileScanTaskDeleteFile;
     use crate::spec::{Literal, NestedField, PartitionSpec, PrimitiveType, Schema, Struct, Type};
 

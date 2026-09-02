@@ -591,7 +591,7 @@ async fn test_partition_scoped_delete_survives_partial_rewrite() {
     );
 }
 
-/// Path-keyed DV removal rewrites a sibling blob in the same Puffin.
+/// Rewriting one file's data rewrites the sibling blob of its Puffin and keeps it applying.
 #[tokio::test]
 async fn test_rewriting_one_file_keeps_sibling_dv_in_same_puffin() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -643,7 +643,7 @@ async fn test_rewriting_one_file_keeps_sibling_dv_in_same_puffin() {
     assert_eq!(remaining.len(), 1, "B's DV survives");
     assert!(
         !remaining.contains(&puffin_path),
-        "the old Puffin must not remain: path-keyed removal dropped it"
+        "the old Puffin must not remain: plan.removed carries the sibling entry too"
     );
     assert_eq!(
         scan_rows(&table).await,
