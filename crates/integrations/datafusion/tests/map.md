@@ -38,6 +38,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `partitioned_insert_select_test.rs` | Partitioned INSERT SELECT |
 | `row_lineage_cow.rs` | V3 row lineage on CoW DML; Spark sequences at the fork's single-file layout (F-rp3-c7, row R166) |
 | `row_lineage_mor.rs` | V3 merge-on-read UPDATE lineage, sequential/partitioned UPDATE, V2 control, commit-conflict |
+| `interop_v3_upgrade_mor.rs` | GEN for `run-interop-v3-upgrade.sh` cell u3: the first V3 DML after Rust converts a Java parquet position delete to a deletion vector. Runs one merge-on-read `UPDATE`, asserts the replacement row keeps its original `_row_id` and that no parquet position delete is added, then lands the result table and the shared expectation document for the Java verify. |
 | `interop_mor_update_lineage.rs` | GEN for `run-interop-mor-update-lineage.sh` (Java-created V3 tables; two MoR UPDATE statements + RePark COW UPDATE-then-DELETE) |
 | `shared_puffin_dv/` | Shared-Puffin deletion-vector DML |
 
