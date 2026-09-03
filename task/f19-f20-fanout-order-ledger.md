@@ -35,7 +35,7 @@ Matrix rows: R114, R115, R135. R136 re-audited unchanged.
 
 | pin | base (`ff4764d3e` drain / retained_references) | after |
 |---|---|---|
-| `extra::delete_allows_concurrent_replace_of_untouched_sibling` | RED: `Cannot commit, missing data files: …/category=books/…parquet` | GREEN: DELETE commits; id 1 is gone |
+| `extra::delete_allows_concurrent_replace_of_untouched_sibling` | RED: `Cannot commit, missing data files: …/category=books/…parquet` | GREEN: DELETE commits; live ids `[3, 4, 5, 6]` |
 | `test_fanout_close_drains_identity_int_partitions_ascending` | RED: `[Some(1), Some(3), Some(0), Some(2), Some(4)]` | GREEN: `[Some(0)…Some(4)]` |
 | `test_fanout_close_drains_null_partition_first` | RED: `[Some(0), None]` | GREEN: `[None, Some(0)]` |
 | `fanout_insert_order` run 0 shuffle `[3,1,4,0,2]` | RED: manifest order `[4,0,3,1,2]` | GREEN: `[0,1,2,3,4]` ten times |
@@ -53,15 +53,34 @@ Matrix rows: R114, R115, R135. R136 re-audited unchanged.
 | `crates/iceberg/src/maintenance/rewrite_data_files_ratio_tests.rs` | sibling stays at the original Puffin path |
 | `crates/integrations/datafusion/tests/fanout_insert_order.rs` | NEW. ten shuffled identity-int INSERT statements |
 
-Deleted: `DvContainerClose::retained_references`, `rewrite_siblings_for_dropped_references`, `DvDropPlan`, `LiveDv`, `collect_live_dvs`, `collect_dv_index` (renamed `collect_touched_dvs`).
+Deleted: `DvContainerClose::retained_references`, `rewrite_siblings_for_dropped_references`, `DvDropPlan`, `LiveDv`, `collect_live_dvs`, `collect_dv_index` (renamed `collect_touched_dvs`), `StampedDeleteFile` (collapsed to `Vec<DataFile>`).
 
-## 4. Measurement (debug, same clone)
+Id 5 is live after the F-19a pin: the harness `rewrite_data_file` is a byte-copy `RewriteFiles` that does not apply DV_B, and the fork's conservative dangling-delete carry-forward leaves DV_B pointing at the old books path. Java `isDanglingDV` would drop DV_B and land the same rows.
 
-| cell | before (hash drain) | after (ascending sort) |
+## 4. Measurement (debug, same clone, alternated knob)
+
+| cell | hash drain | sorted keys |
 |---|---|---|
-| 1e6 rows / 8 partitions: write_ms / close_ms / files | 1900 / 2812 / 8 | 1833 / 173 / 8 |
+| 1e6 rows / 8 partitions close_ms | 109 / 110 / 115 | 81 / 101 |
 
-Sort is 8 keys. close_ms is parquet flush; the 2812→173 gap is warm-cache, not the sort. Command: `cargo test -p iceberg --locked --lib writer::partitioning::fanout_writer::tests::measure_fanout_one_million_rows_eight_partitions -- --ignored --nocapture --exact`.
+No measurable change. The sort is 8 keys; parquet flush dominates. A warm/cold pair is not a before/after.
+
+Command: `cargo test -p iceberg --locked --lib writer::partitioning::fanout_writer::tests::measure_fanout_one_million_rows_eight_partitions -- --ignored --nocapture --exact`.
+
+## 4b. Critic remediations (2026-09-02)
+
+| item | change |
+|---|---|
+| R115 / §4 timing | alternated knob: hash 109/110/115 ms vs sorted 81/101 ms; no measurable change |
+| F-19a pin | `assert_eq!(ids, vec![3, 4, 5, 6])`; id 5 live because harness byte-copy RewriteFiles + dangling-delete carry-forward (Java `isDanglingDV` drops DV_B, same rows) |
+| R114 | F-18 `retained_references` sentence past-tense / superseded below |
+| `StampedDeleteFile` | collapsed to `Vec<DataFile>`; `apply_dv_container_close` always `add_deletes` |
+| `FanoutWriter::close` comments | restored the two upstream `//` lines byte-exact |
+| §6 / §10 interop | 4 fixtures; sabotage leg red |
+| files-exist set | run-length pass on sorted `(path, pos)` pairs. 1e6 rows / 8 paths (release, alternated): clone-all 42/42/42 ms vs run-length 11/11/12 ms |
+| `plan_dv_removal` / `file_scoped_delete_paths` | one cached walk per `RewriteDataFiles::execute`; DELETE manifests via `buffer_unordered(8)`; path-only variant clones no `DataFile` |
+| `FanoutWriter::close` | sorts `Struct` keys, then `remove` by key |
+| `collect_touched_dvs` | `referenced_data_file_ref() -> Option<&str>`; owned String only for touched `BlobWrite` |
 
 ## 5. Mutations (one knob at a time)
 
@@ -79,7 +98,7 @@ Restored after each.
 dev/java-interop/run-interop-f18-dv-sibling-close.sh
 ```
 
-F-18 sibling-close runner. Recorded below.
+F-18 sibling-close runner: 4 fixtures; sabotage leg red (`kept=0 moved=2`). PASSED.
 
 ## 7. Gate exits
 
@@ -90,7 +109,7 @@ F-18 sibling-close runner. Recorded below.
 | `cargo test -p iceberg-datafusion --locked` | 0 |
 | `typos .` | 0 |
 | `make check-matrix-anchors` | 0 |
-| `scripts/check_rust_file_size.py` | 0 (ceilings ratcheted DOWN: `rewrite_data_files.rs` 2663 -> 2660, `physical_plan/delete.rs` 2075 -> 2074) |
+| `scripts/check_rust_file_size.py` | 0 (ceilings ratcheted DOWN: `rewrite_data_files.rs` 2663 -> 2659, `physical_plan/delete.rs` 2075 -> 2071) |
 | `dev/java-interop/run-interop-f18-dv-sibling-close.sh` | 0 |
 
 Docker legs of `make test` excused: Docker is unavailable on this box.
@@ -118,8 +137,8 @@ Behavior after: files-exist covers replacement blobs only; sibling blob stays in
 Negative cases: F-19a pin was red on missing-data-files; F-20 pins were red on hash order; mutations recorded in section 5
 Test command and population: cargo test -p iceberg --locked; cargo test -p iceberg-datafusion --locked; shared_puffin_dv is 20 passed / 3 ignored
 Mutations, one at a time: see section 5
-Java interop command and fixture count: dev/java-interop/run-interop-f18-dv-sibling-close.sh
+Java interop command and fixture count: dev/java-interop/run-interop-f18-dv-sibling-close.sh — 4 fixtures; sabotage leg red (`kept=0 moved=2`)
 CI-only evidence gap: Docker make test legs excused (Docker unavailable)
-Breaking public API change: DvContainerClose loses retained_references; rewrite_siblings_for_dropped_references and DvDropPlan are deleted
+Breaking public API change: DvContainerClose loses retained_references; rewrite_siblings_for_dropped_references and DvDropPlan are deleted; StampedDeleteFile collapsed to Vec<DataFile> (the Some(sequence) stamp arm was unreachable after F-19b)
 Open findings and dispositions: RePark RP-8 / V3-FILEORDER-1
 ```

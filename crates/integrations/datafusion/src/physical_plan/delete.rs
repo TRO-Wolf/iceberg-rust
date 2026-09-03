@@ -355,11 +355,7 @@ async fn write_merge_on_read_deletes(
 ) -> DFResult<DvContainerClose> {
     match kind {
         MergeOnReadDeleteKind::PositionDeletes => Ok(DvContainerClose {
-            added: write_position_deletes(table, pairs, scan_snapshot_id)
-                .await?
-                .into_iter()
-                .map(|file| (file, None))
-                .collect(),
+            added: write_position_deletes(table, pairs, scan_snapshot_id).await?,
             ..DvContainerClose::default()
         }),
         MergeOnReadDeleteKind::DeletionVectors => {
@@ -372,11 +368,8 @@ fn apply_dv_container_close(
     mut action: iceberg::transaction::RowDeltaAction,
     close: DvContainerClose,
 ) -> iceberg::transaction::RowDeltaAction {
-    for (file, sequence) in close.added {
-        action = match sequence {
-            Some(sequence) => action.add_delete_file_with_sequence_number(file, sequence),
-            None => action.add_deletes([file]),
-        };
+    if !close.added.is_empty() {
+        action = action.add_deletes(close.added);
     }
     if !close.removed.is_empty() {
         action = action.remove_deletes_many(close.removed);
@@ -388,6 +381,26 @@ fn apply_dv_container_close(
 /// scan interleaves files, so the pairs arrive unordered. A named seam, so a test can pin it.
 fn sort_position_delete_pairs(pairs: &mut [(String, i64)]) {
     pairs.sort();
+}
+
+fn files_exist_set(close: &DvContainerClose, pairs: &[(String, i64)]) -> HashSet<String> {
+    if close
+        .added
+        .iter()
+        .any(|file| file.file_format() == DataFileFormat::Puffin)
+    {
+        return close.referenced_data_files();
+    }
+    let mut paths = HashSet::new();
+    let mut previous: Option<&str> = None;
+    for (path, _) in pairs {
+        if previous == Some(path.as_str()) {
+            continue;
+        }
+        paths.insert(path.clone());
+        previous = Some(path.as_str());
+    }
+    paths
 }
 
 /// Merge-on-read DELETE: finds the matching rows' `_file`/`_pos`, writes the delete files, and
@@ -506,15 +519,7 @@ async fn merge_on_read_delete(
     // The §5 `validate_data_files_exist` set. Java arms this for every command, DELETE included: a
     // referenced file rewritten away by a concurrent commit would silently lose these deletes.
     let close = write_merge_on_read_deletes(table, delete_kind, &pairs, scan_snapshot_id).await?;
-    let referenced_files = if close
-        .added
-        .iter()
-        .any(|(file, _)| file.file_format() == DataFileFormat::Puffin)
-    {
-        close.referenced_data_files()
-    } else {
-        pairs.iter().map(|(path, _)| path.clone()).collect()
-    };
+    let referenced_files = files_exist_set(&close, &pairs);
 
     // §5 row-delta recipe, MoR DELETE. `AlwaysTrue` is Java-exact because this path pushes no filter
     // into the scan. V3 shared-Puffin closure arms deleted-files checks (F-17 C-013); V2 keeps
@@ -1319,15 +1324,7 @@ pub(crate) async fn merge_on_read_update(
     // commit below.
     sort_position_delete_pairs(&mut pairs);
     let close = write_merge_on_read_deletes(table, delete_kind, &pairs, scan_snapshot_id).await?;
-    let referenced_files = if close
-        .added
-        .iter()
-        .any(|(file, _)| file.file_format() == DataFileFormat::Puffin)
-    {
-        close.referenced_data_files()
-    } else {
-        pairs.iter().map(|(path, _)| path.clone()).collect()
-    };
+    let referenced_files = files_exist_set(&close, &pairs);
     let data_files = data_writer.finish().await?;
 
     // §5 row-delta recipe, MoR UPDATE. UPDATE arms the deleted-files checks at BOTH levels, because

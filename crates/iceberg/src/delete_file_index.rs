@@ -225,8 +225,8 @@ pub fn referenced_data_file_location(delete_file: &DataFile) -> Option<String> {
         return None;
     }
 
-    if let Some(referenced) = delete_file.referenced_data_file() {
-        return Some(referenced);
+    if let Some(referenced) = delete_file.referenced_data_file_ref() {
+        return Some(referenced.to_string());
     }
 
     let lower = delete_file

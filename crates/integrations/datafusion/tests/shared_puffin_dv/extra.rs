@@ -138,11 +138,7 @@ async fn delete_allows_concurrent_replace_of_untouched_sibling() {
     collect(plan, harness.ctx.task_ctx())
         .await
         .expect("DELETE must commit when only sibling B was compacted");
-    let ids = live_ids(&harness.ctx).await;
-    assert!(
-        !ids.contains(&1),
-        "committed DELETE must remove id 1, got {ids:?}"
-    );
+    assert_eq!(live_ids(&harness.ctx).await, vec![3, 4, 5, 6]);
 }
 
 #[tokio::test]

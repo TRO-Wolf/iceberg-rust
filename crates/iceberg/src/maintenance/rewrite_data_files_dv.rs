@@ -26,56 +26,76 @@
 
 use std::collections::HashSet;
 
+use futures::{StreamExt, TryStreamExt, stream};
+
 use crate::Result;
 use crate::delete_file_index::referenced_data_file_location;
-use crate::spec::{DataContentType, DataFile, ManifestContentType};
+use crate::io::FileIO;
+use crate::spec::{DataContentType, DataFile, Manifest, ManifestContentType, ManifestList};
 use crate::table::Table;
+
+const DELETE_MANIFEST_IO_CONCURRENCY: usize = 8;
 
 pub(super) struct DvRewritePlan {
     pub(super) removed: Vec<DataFile>,
     pub(super) removed_count: usize,
 }
 
-pub(super) async fn plan_dv_removal(
-    table: &Table,
+pub(super) fn plan_dv_removal(
+    live: &[(DataFile, String)],
     rewritten_data_paths: &HashSet<String>,
-) -> Result<DvRewritePlan> {
+) -> DvRewritePlan {
     let mut removed = Vec::new();
     let mut removed_count: usize = 0;
-    for (delete_file, referenced) in live_file_scoped_position_deletes(table).await? {
-        if rewritten_data_paths.contains(&referenced) {
+    for (delete_file, referenced) in live {
+        if rewritten_data_paths.contains(referenced) {
             removed_count = removed_count.saturating_add(1);
-            removed.push(delete_file);
+            removed.push(delete_file.clone());
         }
     }
-    Ok(DvRewritePlan {
+    DvRewritePlan {
         removed,
         removed_count,
-    })
+    }
 }
 
+pub(super) fn file_scoped_delete_paths_from(live: &[(DataFile, String)]) -> HashSet<String> {
+    live.iter()
+        .map(|(delete_file, _)| delete_file.file_path().to_string())
+        .collect()
+}
+
+#[cfg(test)]
 pub(super) async fn file_scoped_delete_paths(table: &Table) -> Result<HashSet<String>> {
     let mut paths = HashSet::new();
-    for (delete_file, _) in live_file_scoped_position_deletes(table).await? {
-        paths.insert(delete_file.file_path().to_string());
+    let Some(manifests) = load_delete_manifests(table).await? else {
+        return Ok(paths);
+    };
+    for manifest in manifests {
+        for entry in manifest.entries() {
+            if !entry.is_alive() {
+                continue;
+            }
+            let data_file = entry.data_file();
+            if data_file.content_type() != DataContentType::PositionDeletes {
+                continue;
+            }
+            if referenced_data_file_location(data_file).is_some() {
+                paths.insert(data_file.file_path().to_string());
+            }
+        }
     }
     Ok(paths)
 }
 
-async fn live_file_scoped_position_deletes(table: &Table) -> Result<Vec<(DataFile, String)>> {
+pub(super) async fn live_file_scoped_position_deletes(
+    table: &Table,
+) -> Result<Vec<(DataFile, String)>> {
     let mut out = Vec::new();
-    let metadata = table.metadata();
-    let Some(snapshot) = metadata.current_snapshot() else {
+    let Some(manifests) = load_delete_manifests(table).await? else {
         return Ok(out);
     };
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), metadata)
-        .await?;
-    for manifest_file in manifest_list.entries() {
-        if manifest_file.content != ManifestContentType::Deletes {
-            continue;
-        }
-        let manifest = manifest_file.load_manifest(table.file_io()).await?;
+    for manifest in manifests {
         for entry in manifest.entries() {
             if !entry.is_alive() {
                 continue;
@@ -90,4 +110,36 @@ async fn live_file_scoped_position_deletes(table: &Table) -> Result<Vec<(DataFil
         }
     }
     Ok(out)
+}
+
+async fn load_delete_manifests(table: &Table) -> Result<Option<Vec<Manifest>>> {
+    let metadata = table.metadata();
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return Ok(None);
+    };
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), metadata)
+        .await?;
+    let manifests = delete_manifest_stream(table.file_io(), &manifest_list)
+        .try_collect()
+        .await?;
+    Ok(Some(manifests))
+}
+
+fn delete_manifest_stream<'a>(
+    file_io: &FileIO,
+    manifest_list: &'a ManifestList,
+) -> impl futures::Stream<Item = Result<Manifest>> + 'a {
+    let file_io = file_io.clone();
+    stream::iter(
+        manifest_list
+            .entries()
+            .iter()
+            .filter(|manifest_file| manifest_file.content == ManifestContentType::Deletes),
+    )
+    .map(move |manifest_file| {
+        let file_io = file_io.clone();
+        async move { manifest_file.load_manifest(&file_io).await }
+    })
+    .buffer_unordered(DELETE_MANIFEST_IO_CONCURRENCY)
 }

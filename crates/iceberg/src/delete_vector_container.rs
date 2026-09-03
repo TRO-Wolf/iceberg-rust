@@ -38,14 +38,11 @@ use crate::{Error, ErrorKind, Result};
 
 const DV_IO_CONCURRENCY: usize = 8;
 
-/// One rewritten DV blob plus the data sequence to stamp, or `None` to inherit the new snapshot.
-pub type StampedDeleteFile = (DataFile, Option<i64>);
-
 /// Result of closing the deletion vectors of one commit.
 #[derive(Debug, Default)]
 pub struct DvContainerClose {
     /// Replacement DV metadata.
-    pub added: Vec<StampedDeleteFile>,
+    pub added: Vec<DataFile>,
     /// The superseded blobs, one per touched referenced file. Untouched siblings are not here.
     pub removed: Vec<DataFile>,
 }
@@ -55,7 +52,7 @@ impl DvContainerClose {
     pub fn referenced_data_files(&self) -> HashSet<String> {
         self.added
             .iter()
-            .filter_map(|(file, _)| file.referenced_data_file())
+            .filter_map(|file| file.referenced_data_file_ref().map(str::to_string))
             .collect()
     }
 }
@@ -125,7 +122,7 @@ pub async fn close_touched_dv_containers_with_partitions(
         .await?;
 
     for (data_file, previous) in loaded {
-        let referenced = referenced_path(&data_file)?;
+        let referenced = referenced_path(&data_file)?.to_string();
         let added = new_positions.get(&referenced).ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -272,7 +269,7 @@ async fn collect_touched_dvs(
             }
             let data_file = entry.data_file();
             let referenced = referenced_path(data_file)?;
-            if new_positions.contains_key(&referenced) {
+            if new_positions.contains_key(referenced) {
                 touched.push(data_file.clone());
             }
         }
@@ -307,8 +304,8 @@ async fn collect_live_data_files(
     Ok(files)
 }
 
-fn referenced_path(data_file: &DataFile) -> Result<String> {
-    data_file.referenced_data_file().ok_or_else(|| {
+fn referenced_path(data_file: &DataFile) -> Result<&str> {
+    data_file.referenced_data_file_ref().ok_or_else(|| {
         Error::new(
             ErrorKind::DataInvalid,
             format!(
@@ -354,7 +351,7 @@ fn partition_key_of(
     )
 }
 
-async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<StampedDeleteFile>> {
+async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<DataFile>> {
     if blobs.is_empty() {
         return Ok(Vec::new());
     }
@@ -386,8 +383,7 @@ async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<Stam
             writer.delete(referenced, position, Some(partition_key))?;
         }
     }
-    let files = writer.close().await?;
-    Ok(files.into_iter().map(|file| (file, None)).collect())
+    writer.close().await
 }
 
 #[cfg(test)]

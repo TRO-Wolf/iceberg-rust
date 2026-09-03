@@ -324,7 +324,11 @@ impl DataFile {
     /// Get the fully qualified referenced location for the corresponding data file.
     /// Positional delete files could have the field set, and deletion vectors must the field set.
     pub fn referenced_data_file(&self) -> Option<String> {
-        self.referenced_data_file.clone()
+        self.referenced_data_file_ref().map(str::to_string)
+    }
+    /// Borrowed referenced data-file path.
+    pub fn referenced_data_file_ref(&self) -> Option<&str> {
+        self.referenced_data_file.as_deref()
     }
     /// Get the offset in the file where the blob content starts.
     /// Only meaningful for puffin blobs, and required for deletion vectors.

@@ -39,7 +39,7 @@ The file-writing layer (Java `data/` writers): Arrow batches in → data / delet
 | `write_defaults.rs` | fill missing top-level primitive columns from `write-default` (row R92); called from `DataFileWriter::write` only. Extra batch columns are dropped; a write schema that includes the reserved row-lineage pair (`schema_with_row_lineage`) keeps them, which is how v3 rewrite/COW persist stored `_row_id` / `_last_updated_sequence_number` (row R166) |
 | `file_writer/rolling_writer.rs` | size-based file rolling |
 | `file_writer/location_generator.rs` | file naming/placement |
-| `partitioning/fanout_writer.rs` | concurrent multi-partition fanout. **F-20:** `close` drains writers in ascending partition-value order (nulls first, spec-field order, primitive literal ascending). Row R115 |
+| `partitioning/fanout_writer.rs` | concurrent multi-partition fanout. **F-20:** `close` sorts partition-value keys (nulls first, spec-field order, primitive literal ascending) then drains writers by key. Row R115 |
 | `partitioning/clustered_writer.rs` | sorted-input single-partition-at-a-time |
 | `partitioning/unpartitioned_writer.rs` | passthrough |
 

@@ -105,12 +105,20 @@ where
     }
 
     async fn close(mut self) -> Result<O> {
-        let mut writers: Vec<(Struct, B::R)> = self.partition_writers.into_iter().collect();
-        writers.sort_by(|(left, _), (right, _)| ascending_partition_order(left, right));
-        for (_, mut writer) in writers {
+        // Close all partition writers
+        let mut keys: Vec<Struct> = self.partition_writers.keys().cloned().collect();
+        keys.sort_by(ascending_partition_order);
+        for key in keys {
+            let mut writer = self.partition_writers.remove(&key).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to get partition writer after creation",
+                )
+            })?;
             self.output.extend(writer.close().await?);
         }
 
+        // Collect all output items into the output collection type
         Ok(O::from_iter(self.output))
     }
 }
