@@ -33,6 +33,7 @@ exec (row R169).
 | `project.rs` | partition-value projection |
 | `commit.rs` / `write.rs` | INSERT commit |
 | `delete.rs` / `update.rs` | DELETE / UPDATE |
+| `delete_legacy_merge.rs` | legacy parquet → DV merge (R114, F-21) |
 | `repartition.rs` / `sort.rs` | writer helpers |
 | `expr_to_predicate.rs` | filter pushdown |
 | `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`). |
@@ -45,6 +46,7 @@ exec (row R169).
 | Honor metadata-table `projection` | `metadata_scan.rs` (schema at plan time, `RecordBatch::project` at execute) |
 | Honor data-table `projection` | `scan.rs` `IcebergTableScan::new` |
 | Change INSERT / DELETE / UPDATE | `commit.rs` / `delete.rs` / `update.rs` |
+| Merge V2 parquet position deletes into a V3 DV | `delete_legacy_merge.rs` `write_deletion_vectors` |
 | Carry V3 `_row_id` on MoR UPDATE | `delete.rs` `merge_on_read_update` + `row_lineage.rs` |
 
 ## Pointers
@@ -63,6 +65,9 @@ exec (row R169).
 | MoR UPDATE reassigns `_row_id` | `merge_on_read_update` omitted `push_lineage_scan_columns` / `attach_update_lineage` |
 | COW rewrite drifts `next-row-id` | layout mismatch (file / manifest count between the compared trees); an unassigned V3 DATA manifest advances by existing+added rows, a carried assigned manifest advances 0 (`spec/manifest/map.md`) |
 | V3 MoR DELETE on a diverged branch: data file is not a live file of the scanned snapshot | `close_touched_dv_containers` walked `current_snapshot()` (main). Pass the scan snapshot to `close_touched_dv_containers_at` |
+| V3 DELETE on a V2-upgrade table with live parquet position deletes resurrects rows | merge must union only `delete_seq >= data_seq` positions of files that `referenced_data_file_location` or the partition tuple names; file-scoped parquet is removed, partition-scoped is kept |
+| Partition-scoped parquet delete is dropped after a one-file DELETE | `referenced_data_file_location` is None: merge per touched file, do not add the parquet to `DvContainerClose::removed` |
+| Old parquet delete from an earlier snapshot is merged into a newer data file's DV | sequence filter: skip when `delete_seq < data_seq` |
 
 ### First checks
 

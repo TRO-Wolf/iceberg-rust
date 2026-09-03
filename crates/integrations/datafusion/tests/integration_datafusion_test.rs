@@ -6686,12 +6686,9 @@ async fn test_delete_mread_v3_multi_file_dvs_each_carry_their_own_partition() ->
     Ok(())
 }
 
-/// Risk pinned: a V2 table with Parquet position deletes upgraded to V3, then deleted from again.
-/// Java's `loadPreviousDeletes` would union those positions into the new DV; this port reads DVs
-/// only, so it must refuse — and refuse BEFORE the Puffin is written. The commit door catches it
-/// either way, but only after a fully written, unreferenced Puffin has reached storage.
+/// Risk pinned: V2 parquet position deletes merge into the V3 DV and the parquet file is removed.
 #[tokio::test]
-async fn test_delete_mread_v3_refuses_a_file_still_covered_by_position_deletes() -> Result<()> {
+async fn test_delete_mread_v3_merges_a_file_still_covered_by_position_deletes() -> Result<()> {
     let (ctx, client) = make_versioned_mread_ctx(
         "test_del_mread_upgrade",
         "items",
@@ -6731,30 +6728,20 @@ async fn test_delete_mread_v3_refuses_a_file_still_covered_by_position_deletes()
         Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?),
     );
 
-    let error = ctx
-        .sql("DELETE FROM catalog.test_del_mread_upgrade.items WHERE id = 2")
+    ctx.sql("DELETE FROM catalog.test_del_mread_upgrade.items WHERE id = 2")
         .await
         .unwrap()
         .collect()
         .await
-        .expect_err("the data file is still covered by a Parquet position delete");
-    assert!(
-        error.to_string().contains("Parquet position-delete"),
-        "the refusal must name the cause; got: {error}"
-    );
-
-    // Nothing was written: the refusal runs before the Puffin is opened.
+        .unwrap();
     let delete_files = live_delete_files(&client, "test_del_mread_upgrade", "items").await?;
-    assert_eq!(
-        delete_files.len(),
-        1,
-        "only the original V2 position-delete file is live — no orphaned DV was committed"
-    );
+    assert_eq!(delete_files.len(), 1, "one DV after merge");
     assert_eq!(
         delete_files[0].file_format(),
-        iceberg::spec::DataFileFormat::Parquet,
-        "the live delete file is still the V2 position delete"
+        iceberg::spec::DataFileFormat::Puffin,
+        "merged delete is a puffin DV"
     );
+    assert_eq!(delete_files[0].record_count(), 2, "DV merged 2 positions");
     Ok(())
 }
 
@@ -6827,10 +6814,9 @@ async fn test_delete_mread_v3_after_drop_partition_field_stamps_the_files_own_sp
     Ok(())
 }
 
-/// The PARTITIONED form of the legacy-position-delete refusal. It does NOT isolate the
-/// partition-tuple carry, though an earlier version of this comment claimed it did.
+/// The PARTITIONED form of the V2-upgrade merge: file-scoped parquet positions merge into the DV.
 #[tokio::test]
-async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_position_deletes()
+async fn test_delete_mread_v3_partitioned_merges_a_file_still_covered_by_position_deletes()
 -> Result<()> {
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
@@ -6870,24 +6856,19 @@ async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_positi
         Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?),
     );
 
-    // The other electronics row lives in the file that delete still covers.
-    let error = ctx
-        .sql("DELETE FROM catalog.test_del_mread_part_upgrade.items WHERE id = 2")
+    ctx.sql("DELETE FROM catalog.test_del_mread_part_upgrade.items WHERE id = 2")
         .await
         .unwrap()
         .collect()
         .await
-        .expect_err("the data file is still covered by a Parquet position delete");
-    assert!(
-        error.to_string().contains("Parquet position-delete"),
-        "the refusal must name the cause; got: {error}"
-    );
-
+        .unwrap();
     let delete_files = live_delete_files(&client, "test_del_mread_part_upgrade", "items").await?;
+    assert_eq!(delete_files.len(), 1, "one DV after merge");
     assert_eq!(
-        delete_files.len(),
-        1,
-        "only the original V2 position-delete file is live — no orphaned DV was committed"
+        delete_files[0].file_format(),
+        iceberg::spec::DataFileFormat::Puffin,
+        "merged delete is a puffin DV"
     );
+    assert_eq!(delete_files[0].record_count(), 2, "DV merged 2 positions");
     Ok(())
 }

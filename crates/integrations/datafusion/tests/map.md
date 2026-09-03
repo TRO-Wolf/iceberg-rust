@@ -44,6 +44,9 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `shared_puffin_dv/` | Shared-Puffin deletion-vector DML. `live.rs`/`extra.rs` are F-17 (T1–T23); F-19a re-aims concurrent sibling Replace/Delete to COMMIT (files-exist covers replacement blobs only). `container.rs` is F-18's Spark layout pin (touched blob moves, sibling entry unchanged, two containers, `removed-dvs`/`removed-delete-files`/`added-delete-files` = 1); `measure.rs` pins the rewrite amplification (a later single-row DELETE writes a ONE-blob container at 16 and 64 blobs) and carries the two `#[ignore]`d wall-clock/byte measurements |
 | `fanout_insert_order.rs` | F-20: ten shuffled identity-int partitioned INSERT statements; the committed manifest data-file order is always ascending (row R115) |
 | `interop_f18_dv_sibling_close.rs` | GEN for `run-interop-f18-dv-sibling-close.sh` (row R114 / F-18). Java `BaseDVFileWriter` writes the two-file seed and its two-blob delete; Rust runs the second DELETE and lands `before_dvs.json` / `after_dvs.json` / `summary.json` / `expected_rows.json` + `final.metadata.json` for the Java verify. Env `ICEBERG_INTEROP_F18_JAVA_SHARED`; a clean no-op when unset |
+| `f21_legacy_delete_merge.rs` | F-21 V2 MoR parquet → V3 DV merge (row R114): two file-scoped deletes on one data file, partition-scoped keep, sequence skip, UPDATE, untouched file |
+| `f21_legacy_delete_merge_measure.rs` | `#[ignore]` wall-clock: K=8 partition-scoped 100k positions; file-scoped 100k with a 200-byte `row` column. Not a CI pin |
+| `interop_f21_legacy_delete_merge.rs` | GEN for `run-interop-f21-legacy-delete-merge.sh`: file-scoped merge plus partition-scoped coexistence (two data files, parquet stays live beside one DV) |
 
 ## I want to...
 

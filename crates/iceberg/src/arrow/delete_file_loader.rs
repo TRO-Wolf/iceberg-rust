@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow_array::Array;
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::schema::types::SchemaDescriptor;
@@ -31,7 +32,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
-use crate::spec::{Schema, SchemaRef};
+use crate::spec::{DataFile, Schema, SchemaRef};
 use crate::{Error, ErrorKind, Result};
 
 /// Delete File Loader
@@ -188,6 +189,114 @@ impl BasicDeleteFileLoader {
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
+}
+
+/// Loads reserved-id parquet position deletes grouped by data-file path.
+pub async fn load_position_deletes_by_path(
+    file_io: &FileIO,
+    delete_file: &DataFile,
+) -> Result<HashMap<String, Vec<u64>>> {
+    let loader = BasicDeleteFileLoader::new(file_io.clone());
+    let mut stream = loader
+        .parquet_positional_delete_batch_stream(
+            delete_file.file_path(),
+            delete_file.file_size_in_bytes,
+        )
+        .await?;
+    let cap: usize = delete_file.record_count().try_into().unwrap_or(0);
+    let mut out: HashMap<String, Vec<u64>> = HashMap::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let mut path_idx: Option<usize> = None;
+        let mut pos_idx: Option<usize> = None;
+        for (idx, field) in batch.schema().fields().iter().enumerate() {
+            if let Some(id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY)
+                && let Ok(id) = id_str.parse::<i32>()
+            {
+                if id == RESERVED_FIELD_ID_DELETE_FILE_PATH {
+                    path_idx = Some(idx);
+                } else if id == RESERVED_FIELD_ID_DELETE_FILE_POS {
+                    pos_idx = Some(idx);
+                }
+            }
+        }
+        let path_idx = path_idx.ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Position delete '{}' is missing the reserved file_path column (field id {})",
+                    delete_file.file_path(),
+                    RESERVED_FIELD_ID_DELETE_FILE_PATH
+                ),
+            )
+        })?;
+        let pos_idx = pos_idx.ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Position delete '{}' is missing the reserved pos column (field id {})",
+                    delete_file.file_path(),
+                    RESERVED_FIELD_ID_DELETE_FILE_POS
+                ),
+            )
+        })?;
+        let path_col = batch
+            .column(path_idx)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Position delete '{}' file_path column is not a string array",
+                        delete_file.file_path()
+                    ),
+                )
+            })?;
+        let pos_col = batch
+            .column(pos_idx)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Position delete '{}' pos column is not an int64 array",
+                        delete_file.file_path()
+                    ),
+                )
+            })?;
+        for row in 0..batch.num_rows() {
+            if path_col.is_null(row) || pos_col.is_null(row) {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Position delete '{}' has a null file_path/pos at row {row}",
+                        delete_file.file_path()
+                    ),
+                ));
+            }
+            let path = path_col.value(row);
+            let pos = pos_col.value(row);
+            let pos_u64 = u64::try_from(pos).map_err(|_| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Position delete '{}' has a negative pos {pos}",
+                        delete_file.file_path()
+                    ),
+                )
+            })?;
+            if let Some(positions) = out.get_mut(path) {
+                positions.push(pos_u64);
+            } else {
+                let mut positions = Vec::with_capacity(cap);
+                positions.push(pos_u64);
+                out.insert(path.to_string(), positions);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Best-effort projection mask for delete-file columns.

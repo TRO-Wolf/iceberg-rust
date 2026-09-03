@@ -18,6 +18,7 @@
 pub(crate) mod commit;
 pub(crate) mod cow_affected;
 pub(crate) mod delete;
+pub(crate) mod delete_legacy_merge;
 pub(crate) mod expr_to_predicate;
 pub(crate) mod metadata_scan;
 pub(crate) mod project;

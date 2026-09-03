@@ -44,6 +44,7 @@ pub(crate) fn snapshot_for_scan(
 pub(crate) async fn live_data_file_partitions(
     table: &Table,
     snapshot_id: Option<i64>,
+    wanted: Option<&HashSet<&str>>,
 ) -> DFResult<HashMap<String, (i32, Struct, Option<i64>)>> {
     let metadata = table.metadata();
     let mut path_to_partition: HashMap<String, (i32, Struct, Option<i64>)> = HashMap::new();
@@ -68,6 +69,11 @@ pub(crate) async fn live_data_file_partitions(
                 && entry.data_file().content_type() == iceberg::spec::DataContentType::Data
             {
                 let data_file = entry.data_file();
+                if let Some(wanted) = wanted
+                    && !wanted.contains(entry.file_path())
+                {
+                    continue;
+                }
                 path_to_partition
                     .entry(data_file.file_path().to_string())
                     .or_insert_with(|| {
