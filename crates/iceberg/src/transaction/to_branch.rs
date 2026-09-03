@@ -147,6 +147,7 @@ mod tests {
             .record_count(1)
             .partition_spec_id(0)
             .partition(Struct::from_iter([Some(Literal::long(part))]))
+            .referenced_data_file(Some("test/a.parquet".to_string()))
             .build()
             .expect("build fixture position delete")
     }

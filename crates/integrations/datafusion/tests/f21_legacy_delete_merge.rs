@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![allow(unused_assignments)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -316,8 +314,12 @@ async fn test_f21_partition_scoped_merge_keeps_parquet() {
         let schema = table.metadata().current_schema();
         let arrow_schema = Arc::new(schema_to_arrow_schema(schema).unwrap());
         let batch = RecordBatch::try_new(arrow_schema, vec![
-            Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 2])) as _,
-            Arc::new(StringArray::from(vec!["a".to_string(), "a".to_string()])) as _,
+            Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 2, 5])) as _,
+            Arc::new(StringArray::from(vec![
+                "a".to_string(),
+                "a".to_string(),
+                "a".to_string(),
+            ])) as _,
         ])
         .unwrap();
         let path = format!("{}/data/f1.parquet", table.metadata().location());
@@ -428,14 +430,14 @@ async fn test_f21_partition_scoped_merge_keeps_parquet() {
         .set_format_version(FormatVersion::V3)
         .apply(tx)
         .unwrap();
-    table = tx.commit(catalog.as_ref()).await.unwrap();
+    tx.commit(catalog.as_ref()).await.unwrap();
     let client = catalog.clone() as Arc<dyn Catalog>;
     let provider = IcebergCatalogProvider::try_new(client.clone())
         .await
         .unwrap();
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", Arc::new(provider));
-    ctx.sql("DELETE FROM catalog.ns2.t2 WHERE id = 2")
+    ctx.sql("DELETE FROM catalog.ns2.t2 WHERE id = 5")
         .await
         .unwrap()
         .collect()
@@ -452,13 +454,40 @@ async fn test_f21_partition_scoped_merge_keeps_parquet() {
         .iter()
         .filter(|f| f.file_format() == DataFileFormat::Parquet)
         .count();
-    assert_eq!(puffin_count, 1);
-    assert_eq!(parquet_count, 1);
+    assert_eq!(puffin_count, 1, "one DV for the touched file");
+    assert_eq!(parquet_count, 1, "partition-scoped parquet stays live");
     let dv = deletes
         .iter()
         .find(|f| f.file_format() == DataFileFormat::Puffin)
         .unwrap();
-    assert_eq!(dv.record_count(), 2);
+    assert_eq!(
+        dv.record_count(),
+        2,
+        "DV merges p1 pos 0 with the new pos 2, not p2 pos 1"
+    );
+    let batches = ctx
+        .sql("SELECT id FROM catalog.ns2.t2 ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![2, 3],
+        "file 1 keeps id 2; file 2 keeps id 3; parquet still deletes id 4"
+    );
 }
 
 #[tokio::test]
@@ -523,7 +552,7 @@ async fn test_f21_update_merges_parquet_into_dv() {
         .set_format_version(FormatVersion::V3)
         .apply(tx)
         .unwrap();
-    table = tx.commit(catalog.as_ref()).await.unwrap();
+    tx.commit(catalog.as_ref()).await.unwrap();
     let client = catalog.clone() as Arc<dyn Catalog>;
     let provider = IcebergCatalogProvider::try_new(client.clone())
         .await
@@ -597,7 +626,7 @@ async fn test_f21_untouched_file_stays_live() {
         .set_format_version(FormatVersion::V3)
         .apply(tx)
         .unwrap();
-    table = tx.commit(catalog.as_ref()).await.unwrap();
+    tx.commit(catalog.as_ref()).await.unwrap();
     let client = catalog.clone() as Arc<dyn Catalog>;
     let provider = IcebergCatalogProvider::try_new(client.clone())
         .await
@@ -685,7 +714,7 @@ async fn test_f21_sequence_number_not_apply() {
         .set_format_version(FormatVersion::V3)
         .apply(tx)
         .unwrap();
-    table = tx.commit(catalog.as_ref()).await.unwrap();
+    tx.commit(catalog.as_ref()).await.unwrap();
     let client = catalog.clone() as Arc<dyn Catalog>;
     let provider = IcebergCatalogProvider::try_new(client.clone())
         .await

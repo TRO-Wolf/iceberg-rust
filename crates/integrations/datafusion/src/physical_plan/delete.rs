@@ -342,7 +342,7 @@ fn merge_on_read_delete_kind(table: &Table) -> DFResult<MergeOnReadDeleteKind> {
 
 /// Writes the merge-on-read delete files for `pairs`, which the caller already sorted by
 /// `(path, pos)` for the V2 writer. Returns `(files to add, files the commit must remove)`. The
-/// removal half is non-empty only on the V3 path, where a merged DV supersedes the one it absorbed.
+/// removal half is non-empty on the V3 path: a merged DV supersedes the DV or file-scoped parquet it absorbed.
 async fn write_merge_on_read_deletes(
     table: &Table,
     kind: MergeOnReadDeleteKind,
@@ -726,7 +726,7 @@ async fn write_position_deletes(
         .await;
     }
 
-    let path_to_partition = live_data_file_partitions(table, scan_snapshot_id).await?;
+    let path_to_partition = live_data_file_partitions(table, scan_snapshot_id, None).await?;
 
     let path_to_partition: HashMap<String, (i32, Struct)> = path_to_partition
         .into_iter()

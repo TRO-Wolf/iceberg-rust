@@ -25,8 +25,7 @@ use crate::table::Table;
 use crate::transaction::snapshot::{dv_desc, latest_snapshot};
 use crate::{Error, ErrorKind, Result};
 
-/// Reject a DV that would silently supersede a live position-scoped delete, unless this commit
-/// removes that delete.
+/// Reject a DV over a live file-scoped parquet position delete unless this commit removes that delete.
 pub(crate) async fn validate_fresh_dvs_only(
     table: &Table,
     added_dvs: &HashMap<String, &DataFile>,
@@ -139,4 +138,126 @@ pub(crate) async fn validate_fresh_dvs_only(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ErrorKind;
+    use crate::memory::tests::new_memory_catalog;
+    use crate::spec::{
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Literal, Struct,
+    };
+    use crate::transaction::tests::make_v2_minimal_table_in_catalog;
+    use crate::transaction::{ApplyTransactionAction, Transaction};
+
+    fn synthetic_data_file(path: &str, part_value: i64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(part_value))]))
+            .build()
+            .unwrap()
+    }
+
+    fn synthetic_file_scoped_delete(path: &str, referenced: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .referenced_data_file(Some(referenced.to_string()))
+            .build()
+            .unwrap()
+    }
+
+    fn synthetic_dv_file(path: &str, referenced: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .referenced_data_file(Some(referenced.to_string()))
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(40))
+            .build()
+            .unwrap()
+    }
+
+    async fn append_files(
+        catalog: &impl crate::Catalog,
+        table: &crate::table::Table,
+        files: Vec<DataFile>,
+    ) -> crate::table::Table {
+        let tx = Transaction::new(table);
+        let tx = tx.fast_append().add_data_files(files).apply(tx).unwrap();
+        tx.commit(catalog).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_row_delta_dv_refuses_file_scoped_parquet_unless_removed() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let table = append_files(&catalog, &table, vec![synthetic_data_file(
+            "test/a.parquet",
+            0,
+        )])
+        .await;
+        let parquet = synthetic_file_scoped_delete("test/a-pos.parquet", "test/a.parquet");
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .row_delta()
+            .add_deletes(vec![parquet.clone()])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V3)
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_dv_file(
+                "test/a-dv.puffin",
+                "test/a.parquet",
+            )])
+            .apply(tx)
+            .unwrap();
+        let err = tx
+            .commit(&catalog)
+            .await
+            .expect_err("a file-scoped parquet delete still blocks a DV");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("test/a.parquet"),
+            "door names the referenced file, got: {}",
+            err.message()
+        );
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_dv_file(
+                "test/a-dv-2.puffin",
+                "test/a.parquet",
+            )])
+            .remove_deletes(parquet)
+            .apply(tx)
+            .unwrap();
+        tx.commit(&catalog)
+            .await
+            .expect("removing the file-scoped parquet in the same commit lets the DV land");
+    }
 }

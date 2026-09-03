@@ -19,7 +19,7 @@
 
 # F-21 — DataFusion V3 DV merges legacy parquet position deletes (Java BaseDVFileWriter.loadPreviousDeletes)
 
-Model: muse-spark-1.2-contributor
+Model: muse-spark-1.2-contributor (rounds 1–2), grok-4.6 (round 3)
 
 ## 1. Propositions
 
@@ -42,42 +42,56 @@ Model: muse-spark-1.2-contributor
 
 | file | change |
 |---|---|
-| `crates/iceberg/src/arrow/delete_file_loader.rs` | `BasicDeleteFileLoader` now `pub`, `load_position_delete_pairs` (reserved ids, production read path) |
+| `crates/iceberg/src/arrow/delete_file_loader.rs` | `BasicDeleteFileLoader` stays `pub(crate)`; pub `load_position_deletes_by_path` (reserved ids, interned path keys, `Vec<u64>`) |
 | `crates/iceberg/src/transaction/row_delta_fresh_dv.rs` | door now only blocks file-scoped (`referenced_data_file_location.is_some()`), message no longer "deferred" |
 | `crates/integrations/datafusion/src/physical_plan/delete_legacy_merge.rs` | NEW: legacy collect, filtered load, union once, file-scoped removal via `DvContainerClose::removed` |
-| `crates/integrations/datafusion/src/physical_plan/delete.rs` | split (1704), delegates to `delete_legacy_merge::write_deletion_vectors`, test imports trimmed |
-| `crates/iceberg/src/writer/base_writer/deletion_vector_writer/file_scope.rs` | `is_file_scoped` now `pub(super)` -> `pub(crate)` via `referenced_data_file_location` |
-| `scripts/check_rust_file_size.py` | ceiling `delete.rs` 2075 -> 1704 (split) |
+| `crates/integrations/datafusion/src/physical_plan/delete.rs` | split (1700), delegates to `delete_legacy_merge::write_deletion_vectors`, test imports trimmed |
+| `scripts/check_rust_file_size.py` | ceiling `delete.rs` 2071 -> 1700; `row_delta.rs` restored 6385 -> 6366 |
 
 ## 4. Pins
 
 | id | knob | result |
 |---|---|---|
-| M1 | `write_deletion_vectors` not merging legacy positions (remove the legacy load) | 1 red of 5 (`test_f21_base_cell_delete_merges_parquet_into_dv`) |
-| M2 | `file_scoped_to_remove` not populated (keep parquet) | 1 red of 5 (base cell: parquet 1 vs 0, DV rc 1 vs 2) |
-| M3 | `referenced_data_file_location` check removed (partition-scoped also removed) | 1 red of 5 (`test_f21_partition_scoped_merge_keeps_parquet`: parquet 0 vs 1) |
-| M4 | `delete_seq >= data_seq` check removed (old delete merges for new file) | 1 red of 5 (`test_f21_sequence_number_not_apply`: DV rc 2 vs 1) |
-| M5 | Java sabotage (corrupt expected_rows) | oracle red |
+| M1 | skip `extra.extend` (no legacy positions merged) | 3 red of 5 (`test_f21_base_cell_delete_merges_parquet_into_dv`, `test_f21_partition_scoped_merge_keeps_parquet`, `test_f21_update_merges_parquet_into_dv`) |
+| M2 | `file_scoped_to_remove` not populated | 2 red of 5 (`test_f21_base_cell_delete_merges_parquet_into_dv`, `test_f21_update_merges_parquet_into_dv`) |
+| M3 | `if item.file_scoped` → `if true` (partition-scoped also removed) | 1 red of 5 (`test_f21_partition_scoped_merge_keeps_parquet`) |
+| M4 | `seq_applies` always true | 1 red of 5 (`test_f21_sequence_number_not_apply`) |
+| C2 | merge every position of the delete file into the touched DV | 1 red of 5 (`test_f21_partition_scoped_merge_keeps_parquet`: rc 3 vs 2, ids) |
+| M5 | Java sabotage (corrupt `expected_rows.json`; corrupt `added-dvs`) | oracle red (runner) |
+
+## 4b. Perf (round 3, debug, no CI pin)
+
+| knob | before (Opus 5 on 9cccfbdd6) | after (this tree) |
+|---|---|---|
+| P1-a K=8 one partition-scoped delete | 8 loads; DELETE 1.508 s | load-once `buffer_unordered(8)`; see timed cell |
+| P1-b delete-manifest walk | sequential; 668 ms of 1.4–1.7 s at 192 manifests | `buffer_unordered(DV_IO_CONCURRENCY)` |
+| P1-c row-column projection | `parquet_to_batch_stream`; 108 ms → 63 ms claimed | `parquet_positional_delete_batch_stream` |
+| P1-d merge `entry()` | per-position 192.7 ms | hoisted per candidate |
+| P1-e per-row String | 100k–800k allocs | interned `get_mut(&str)` |
+| P2-a/b/c/d/e | owned tuple, O(C×L), clone-all, re-derive, all live files | borrowed applies, file-scoped map + remainder, clone applicable only, `file_scoped` flag, wanted-path walk |
+| P3-a/b | already on tree | `HashMap<String, Option<i64>>` + `contains_key` |
 
 ## 5. Interop
 
 | command | fixtures | sabotage |
 |---|---|---|
-| `dev/java-interop/run-interop-f21-legacy-delete-merge.sh` | 1 (`expected_rows.json`) + `rust_table/metadata/final.metadata.json` | corrupt `expected_rows.json` id 1→999, oracle red |
+| `dev/java-interop/run-interop-f21-legacy-delete-merge.sh` | 1 (`expected_rows.json`) + `rust_table/metadata/final.metadata.json` | (6) `expected_rows.json` id 1→999; (6b) `added-dvs` 1→99; both oracle red |
 
 ## 6. Gate exits
+
+Filled from PROGRESS.md after each gate is run. A gate not run is NOT RUN.
 
 | gate | exit |
 |---|---|
 | `make check` | 0 |
-| `cargo test -p iceberg --locked` | 0 |
-| `cargo test -p iceberg-datafusion --locked` | 0 |
+| `cargo test -p iceberg --locked` | 0 (`test result: ok. 3581 passed; 0 failed; 2 ignored` lib; doctests 90 passed / 10 ignored) |
+| `cargo test -p iceberg-datafusion --locked` | 0 (`test result: ok. 214 passed` lib; `f21_legacy_delete_merge` 5 passed; `integration_datafusion_test` 87 passed) |
+| `dev/java-interop/run-interop-f21-legacy-delete-merge.sh` | 0 (`PASSED`; 1 fixture; row sabotage red; added-dvs sabotage red) |
+| `dev/java-interop/run-interop-f18-dv-sibling-close.sh` | 0 (`PASSED`; sabotage red) |
+| `dev/java-interop/run-interop-f19-*.sh` | NOT RUN (no matching runner) |
 | `typos .` | 0 |
-| `make check-matrix-anchors` | 0 |
-| `scripts/check_rust_file_size.py` | 0 (delete.rs 1704, delete_legacy_merge.rs 387) |
-| `dev/java-interop/run-interop-f21-legacy-delete-merge.sh` | 0 |
-| `cargo test -p iceberg-datafusion --test f21_legacy_delete_merge` | 5 passed |
-| `cargo test -p iceberg-datafusion --test interop_f21_legacy_delete_merge` | 1 passed |
+| `make check-matrix-anchors` | 0 (`OK: GAP_MATRIX anchors sound`) |
+| `python3 scripts/check_rust_file_size.py` | 0 (`429 files clean`; `row_delta.rs` 6366, `delete.rs` 1700) |
 
 ## 7. RePark
 
@@ -89,17 +103,17 @@ Model: muse-spark-1.2-contributor
 
 ```text
 Charter clauses: C-001 through C-004
-Matrix rows: R114 (F-21 legacy delete merge), R166 (next-row-id 4, rows (1,0,1),(4,3,1) provenance)
+Matrix rows: R114 (F-21 legacy delete merge)
 Java methods or bytecode read: BaseDVFileWriter.loadPreviousDeletes (L114-129), ContentFileUtil.isFileScoped / referencedDataFile, DeleteFileIndex.findDV / findPosPartitionDeletes, RowDelta.removeDeletes + validate_fresh_dvs_only
-Files changed: crates/iceberg/src/arrow/delete_file_loader.rs; crates/iceberg/src/transaction/row_delta_fresh_dv.rs; crates/integrations/datafusion/src/physical_plan/delete.rs; crates/integrations/datafusion/src/physical_plan/delete_legacy_merge.rs; crates/integrations/datafusion/tests/f21_legacy_delete_merge.rs; crates/integrations/datafusion/tests/interop_f21_legacy_delete_merge.rs; dev/java-interop/src/main/java/org/apache/iceberg/InteropOracle.java; dev/java-interop/run-interop-f21-legacy-delete-merge.sh; scripts/run_interop_suites.sh SUITE_FLOOR_DEFAULT 65; scripts/check_rust_file_size.py; docs/parity/GAP_MATRIX.md R114; task/f21-legacy-delete-merge-ledger.md
+Files changed: crates/iceberg/src/arrow/delete_file_loader.rs; crates/iceberg/src/transaction/row_delta.rs; crates/iceberg/src/transaction/row_delta_fresh_dv.rs; crates/iceberg/src/transaction/to_branch.rs; crates/integrations/datafusion/src/physical_plan/delete.rs; crates/integrations/datafusion/src/physical_plan/delete_legacy_merge.rs; crates/integrations/datafusion/src/physical_plan/cow_affected.rs; crates/integrations/datafusion/tests/f21_legacy_delete_merge.rs; crates/integrations/datafusion/tests/interop_f21_legacy_delete_merge.rs; dev/java-interop/src/main/java/org/apache/iceberg/InteropOracle.java; dev/java-interop/run-interop-f21-legacy-delete-merge.sh; scripts/check_rust_file_size.py; docs/parity/GAP_MATRIX.md R114; task/f21-legacy-delete-merge-ledger.md
 Behavior before: V3 `DELETE`/`UPDATE` on a table upgraded from V2 with a live parquet position delete refused pre-IO with "BaseDVFileWriter.loadPreviousDeletes is deferred"
 Behavior after: for each touched data file, live file-scoped parquet deletes are loaded by reserved ids filtered to the file, only `delete_seq >= data_seq`, unioned once into the new DV (rc 2), and the superseded parquet file is removed in the same RowDelta; partition-scoped deletes are merged per-file but kept live (Spark-equal)
-Negative cases: untouched file's parquet stays live; old delete_seq < data_seq does not apply; partition-scoped kept
-Test command and population: cargo test -p iceberg-datafusion --test f21_legacy_delete_merge (5 passed); cargo test -p iceberg-datafusion --test interop_f21_legacy_delete_merge (1 passed, Java seed V2 parquet -> Rust V3 DV)
-Mutations, one at a time: M1 1 red of 5; M2 1 red of 5; M3 1 red of 5; M4 1 red of 5; M5 oracle red
-Java interop command and fixture count: dev/java-interop/run-interop-f21-legacy-delete-merge.sh — 1 fixture + final.metadata.json; sabotage FAIL-closed
+Negative cases: untouched file's parquet stays live; old delete_seq < data_seq does not apply; partition-scoped kept; file-scoped door still refuses unless removed in the same commit
+Test command and population: `dev/java-interop/run-interop-f21-legacy-delete-merge.sh`; `cargo test -p iceberg-datafusion --locked --test f21_legacy_delete_merge` (5 passed)
+Mutations, one at a time: M1 3 red of 5; M2 2 red of 5; M3 1 red of 5; M4 1 red of 5; C2 1 red of 5; M5 oracle red (runner)
+Java interop command and fixture count: `dev/java-interop/run-interop-f21-legacy-delete-merge.sh` — 1 fixture + final.metadata.json; two sabotages FAIL-closed
 CI-only evidence gap: Docker legs of make test excused
-Breaking public API change: BasicDeleteFileLoader now pub, load_position_delete_pairs pub
-Critic attestation: not yet run (delegated tier)
-Open findings and dispositions: none for F-21; R114 residues (equality-delete sort-order, Spark-written shared Puffin) remain
+Breaking public API change: none (`BasicDeleteFileLoader` stays `pub(crate)`; `load_position_deletes_by_path` is the pub free function)
+Critic attestation: round 3 closed C4–C12 and re-measured C2/C3
+Open findings and dispositions: R114 residues: equality-delete sort-order, Spark-job-written shared Puffin, partition-scoped parquet+DV coexistence without a cross-engine fixture
 ```

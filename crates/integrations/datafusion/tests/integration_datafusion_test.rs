@@ -6687,9 +6687,7 @@ async fn test_delete_mread_v3_multi_file_dvs_each_carry_their_own_partition() ->
 }
 
 /// Risk pinned: a V2 table with Parquet position deletes upgraded to V3, then deleted from again.
-/// Java's `loadPreviousDeletes` would union those positions into the new DV; this port reads DVs
-/// only, so it must refuse — and refuse BEFORE the Puffin is written. The commit door catches it
-/// either way, but only after a fully written, unreferenced Puffin has reached storage.
+/// File-scoped parquet positions merge into the new DV and the parquet file is removed.
 #[tokio::test]
 async fn test_delete_mread_v3_refuses_a_file_still_covered_by_position_deletes() -> Result<()> {
     let (ctx, client) = make_versioned_mread_ctx(
@@ -6820,8 +6818,7 @@ async fn test_delete_mread_v3_after_drop_partition_field_stamps_the_files_own_sp
     Ok(())
 }
 
-/// The PARTITIONED form of the legacy-position-delete refusal. It does NOT isolate the
-/// partition-tuple carry, though an earlier version of this comment claimed it did.
+/// The PARTITIONED form of the V2-upgrade merge: file-scoped parquet positions merge into the DV.
 #[tokio::test]
 async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_position_deletes()
 -> Result<()> {
@@ -6871,7 +6868,10 @@ async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_positi
         .unwrap();
     let delete_files = live_delete_files(&client, "test_del_mread_part_upgrade", "items").await?;
     assert_eq!(delete_files.len(), 1, "one DV after merge");
-    assert_eq!(delete_files[0].file_format(), iceberg::spec::DataFileFormat::Puffin);
+    assert_eq!(
+        delete_files[0].file_format(),
+        iceberg::spec::DataFileFormat::Puffin
+    );
     assert_eq!(delete_files[0].record_count(), 2);
     Ok(())
 }

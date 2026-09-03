@@ -52,16 +52,15 @@
 //! concurrently removed fails non-retryably where Java converges.
 //!
 //! [`RowDeltaAction::validate_fresh_dvs_only`] is a Rust-conservative door with no Java
-//! counterpart. It rejects a DV for a data file that already carries a live position-scoped delete,
-//! unless this same commit removes that delete.
+//! counterpart. It rejects a DV for a data file that already carries a live file-scoped parquet
+//! position delete, unless this same commit removes that delete.
 //!
 //! # Out of scope
 //!
 //! - The equality-delete writer exists, but the RowDelta-with-equality-deletes scan path may have
 //!   gaps. The end-to-end test covers position deletes.
-//! - Merging a legacy parquet position delete into a new DV. Java `loadPreviousDeletes` unions
-//!   whatever covers the data file. This port reads DVs only, so a data file that a parquet
-//!   position delete still covers is refused here.
+//! - DataFusion V3 DELETE/UPDATE merges live parquet position deletes into the new DV. This door
+//!   still refuses a file-scoped parquet delete that this commit does not remove.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -592,8 +591,8 @@ impl TransactionAction for RowDeltaAction {
         snapshot_producer.validate_added_data_files()?;
         snapshot_producer.validate_added_delete_files()?;
 
-        // See `validate_fresh_dvs_only`. A DV for a data file that already has a live position-scoped
-        // delete commits only when this same commit removes that delete.
+        // See `validate_fresh_dvs_only`. A DV for a data file that already has a live file-scoped
+        // parquet delete commits only when this same commit removes that delete.
         self.validate_fresh_dvs_only(table).await?;
 
         snapshot_producer
@@ -4132,7 +4131,7 @@ mod tests {
     }
 
     // The fresh-DV-only door, see `validate_fresh_dvs_only`. A DV added for a data file that already
-    // has a live position-scoped delete is rejected loud at commit, instead of corrupting the table
+    // has a live file-scoped parquet delete is rejected loud at commit, instead of corrupting the table
     // late at scan. `test_row_delta_dv_no_concurrent_commit_succeeds` pins the accept direction.
 
     /// A bounds-scoped position delete must not escape the door. Java's `PositionDeleteWriter`
@@ -4300,12 +4299,10 @@ mod tests {
     /// The V2 to V3 upgrade case. A V2 table commits a partition-scoped parquet position delete in
     /// x=0, upgrades to V3, then adds a DV for a data file in x=0.
     ///
-    /// A DV supersedes every parquet position delete for its data file at read time, so the mutant
-    /// commits the DV unmerged and resurrects the parquet delete's positions. A DV for a data file in
-    /// x=1, where the parquet delete does not apply, must still commit.
+    /// The door continues past a partition-scoped delete (DataFusion merges it; a direct RowDelta
+    /// caller keeps both). A DV for a data file in x=1 still commits.
     #[tokio::test]
-    #[ignore]
-    async fn test_row_delta_dv_rejected_when_legacy_parquet_position_delete_still_applies() {
+    async fn test_row_delta_dv_commits_when_legacy_partition_scoped_delete_still_applies() {
         use crate::spec::FormatVersion;
 
         let catalog = new_memory_catalog().await;
@@ -4332,7 +4329,6 @@ mod tests {
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
-        // The live parquet delete still applies to A, so this DV would supersede it.
         let tx = Transaction::new(&table);
         let action = tx.row_delta().add_deletes(vec![synthetic_dv_file(
             "test/a-dv.puffin",
@@ -4340,19 +4336,9 @@ mod tests {
             "test/a.parquet",
         )]);
         let tx = action.apply(tx).unwrap();
-        let err = tx.commit(&catalog).await.expect_err(
-            "a DV for a data file a live parquet position delete still applies to must be rejected",
-        );
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.message()
-                .contains("Cannot commit deletion vector for test/a.parquet")
-                && err.message().contains("test/x0-pos-del.parquet")
-                && err.message().contains("superseded"),
-            "the door must name the referenced file, the shadowed parquet delete, and the \
-             supersede hazard, got: {}",
-            err.message()
-        );
+        tx.commit(&catalog)
+            .await
+            .expect("a partition-scoped parquet delete no longer blocks a DV");
 
         // Negative control: the x=0 parquet delete does not apply to B, so its DV commits.
         let tx = Transaction::new(&table);
@@ -4814,12 +4800,9 @@ mod tests {
     /// read time, because the index matches on the DATA file's spec id, which a partition evolution
     /// does not change.
     ///
-    /// The added DV must carry the NEW default spec. The mutant tests the shadow against the DV's own
-    /// spec and partition, which can never match, so the DV commits and supersedes the legacy delete.
-    /// The door must resolve the referenced file's live entry instead.
+    /// The door continues past a partition-scoped delete, so a DV under the new spec commits.
     #[tokio::test]
-    #[ignore]
-    async fn test_row_delta_dv_rejected_when_cross_spec_legacy_partition_delete_applies() {
+    async fn test_row_delta_dv_commits_when_cross_spec_legacy_partition_delete_applies() {
         use crate::spec::FormatVersion;
 
         let catalog = new_memory_catalog().await;
@@ -4873,11 +4856,9 @@ mod tests {
         let tx = Transaction::new(&table);
         let action = tx.row_delta().add_deletes(vec![dv]);
         let tx = action.apply(tx).unwrap();
-        let err = tx.commit(&catalog).await.expect_err(
-            "the legacy spec-0 partition delete still applies to A — the DV must be rejected \
-             (silent supersede = resurrection)",
-        );
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        tx.commit(&catalog)
+            .await
+            .expect("a partition-scoped parquet delete no longer blocks a DV");
     }
 
     /// A row delta adding a parquet position delete is built against a V2 table, then a concurrent

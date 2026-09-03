@@ -104,6 +104,48 @@ if ! echo "${sabotage_out}" | grep -q '^FAIL '; then
   echo "==> FAILED -- the sabotaged expected rows did not turn the oracle red." >&2
   exit 1
 fi
-echo "    sabotage correctly rejected"
+echo "    row sabotage correctly rejected"
+
+echo "==> [6b] Sabotage: added-dvs 1 -> 99; the oracle must FAIL"
+SABOTAGE2="${TMP}/sabotage-dvs"
+rm -rf "${SABOTAGE2}"
+mkdir -p "${SABOTAGE2}"
+cp -r "${TMP}/seed/after_delete" "${SABOTAGE2}/after_delete"
+cp -r "${TMP}/seed/table" "${SABOTAGE2}/table"
+META="${SABOTAGE2}/after_delete/rust_table/metadata/final.metadata.json"
+mut_rc=0
+python3 - "${META}" <<'PY' || mut_rc=$?
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    data = json.load(f)
+current = data.get("current-snapshot-id")
+snaps = data.get("snapshots") or []
+target = None
+for snap in snaps:
+    if snap.get("snapshot-id") == current:
+        target = snap
+        break
+if target is None:
+    sys.exit(2)
+summary = target.get("summary") or {}
+if "added-dvs" not in summary:
+    sys.exit(2)
+summary["added-dvs"] = "99"
+target["summary"] = summary
+with open(path, "w") as out:
+    json.dump(data, out)
+PY
+if [ "${mut_rc}" -ne 0 ]; then
+  echo "==> FAILED -- added-dvs sabotage could not be applied (exit ${mut_rc})" >&2
+  exit 1
+fi
+sabotage2_out="$(verify_f21 "${SABOTAGE2}")"
+echo "${sabotage2_out}"
+if ! echo "${sabotage2_out}" | grep -q '^FAIL '; then
+  echo "==> FAILED -- the sabotaged added-dvs did not turn the oracle red." >&2
+  exit 1
+fi
+echo "    added-dvs sabotage correctly rejected"
 
 echo "==> interop-f21-legacy-delete-merge PASSED"
