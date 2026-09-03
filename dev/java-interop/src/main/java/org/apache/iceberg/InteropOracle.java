@@ -10477,6 +10477,11 @@ public final class InteropOracle {
         System.out.println("FAIL f21-part: Java could not parse Rust metadata: " + e);
         return 1;
       }
+      if (metadata.formatVersion() != 3) {
+        System.out.println(
+            "FAIL f21-part: expected format-version 3, got " + metadata.formatVersion());
+        return 1;
+      }
       FileIO io = new LocalFileIO();
       BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
       Map<Long, String> dataById = new LinkedHashMap<>();

@@ -207,7 +207,6 @@ async fn test_f21_measure_k8_partition_scoped_100k() {
         .unwrap();
     let elapsed = start.elapsed();
     println!("F21 K=8 100k DELETE elapsed={elapsed:?}");
-    assert!(elapsed.as_secs_f64() > 0.0);
 }
 
 #[tokio::test]
@@ -325,5 +324,4 @@ async fn test_f21_measure_row_column_100k() {
         .unwrap();
     let elapsed = start.elapsed();
     println!("F21 row-column 100k DELETE elapsed={elapsed:?}");
-    assert!(elapsed.as_secs_f64() > 0.0);
 }

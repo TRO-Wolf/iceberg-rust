@@ -31,10 +31,11 @@ Ledger: [`f21-legacy-delete-merge-ledger.md`](f21-legacy-delete-merge-ledger.md)
 
 - [x] C-001 red: V2 MoR + file-scoped parquet delete (id 2) upgraded to V3, DELETE id 3 refused before IO, green after (DV rc 2, parquet 0)
 - [x] C-002 merge: file-scoped via `referenced_data_file_location` (field or equal file_path bounds) loaded by reserved ids filtered to the data file, only `delete_seq >= data_seq`, union once via `DVFileWriter::with_previous_deletes`, removed in same RowDelta; partition-scoped merged per-file but kept live
-- [x] C-003 pins: base cell, UPDATE, untouched-file control, partition-scoped merge-and-keep (DV rc 2 + parquet 1), sequence-number not-apply (old delete not merged for new file); 5 tests, mutations 1 red each, Java interop `run-interop-f21-legacy-delete-merge.sh` (1 fixture, sabotage red)
+- [x] C-003 pins: base cell, two file-scoped parquet on one data file (DV rc 3), UPDATE, untouched-file control, partition-scoped merge-and-keep (DV rc 2 + parquet 1), sequence-number not-apply (warehouse parquet); 6 tests; Java interop `run-interop-f21-legacy-delete-merge.sh` (2 fixtures, 3 sabotages red). Mutations recorded in the ledger as N red of 6.
 - [x] C-004 docs: row R114, `task/todo.md`, `map.md` lockstep, ledger, `SUITE_FLOOR_DEFAULT` 64 -> 65
 - [x] Round 3: load-once merge, door pins, C2/C3 re-measured, R114 rewrite, ceiling `row_delta.rs` 6385→6366
 - [x] Round 4: two-file-scoped cache pin (M6 1 red of 6), own §4b timings, banned docs, rename, warehouse sequence parquet, door seq pin, partition Java fixture (FIXTURE_COUNT=2), assert messages, ceiling `integration_datafusion_test.rs` 6877→6874
+- [x] Round 5: re-measure mutations of 6; regenerate Files changed from `2e9b5b591..HEAD`; C-003 6 tests / 2 fixtures / 3 sabotages; `verifyPartition` format-version 3 guard; drop measure-test elapsed asserts
 - [ ] RePark: close `V3-UPGRADE-DV-PLAIN-1`, keep `V3-UPGRADE-DV-PART-1`
 
 ## ACTIVE (2026-09-02): F-19 + F-20 — retire DELETE-side files-exist broadening, drop sibling rewrite, drain FanoutWriter in partition order
