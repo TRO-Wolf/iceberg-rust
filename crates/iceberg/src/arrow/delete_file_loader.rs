@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::Array;
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::schema::types::SchemaDescriptor;
@@ -32,7 +31,7 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
-use crate::spec::{DataFile, Schema, SchemaRef};
+use crate::spec::{Schema, SchemaRef};
 use crate::{Error, ErrorKind, Result};
 
 /// Delete File Loader
@@ -191,114 +190,6 @@ impl BasicDeleteFileLoader {
     }
 }
 
-/// Loads reserved-id parquet position deletes grouped by data-file path.
-pub async fn load_position_deletes_by_path(
-    file_io: &FileIO,
-    delete_file: &DataFile,
-) -> Result<HashMap<String, Vec<u64>>> {
-    let loader = BasicDeleteFileLoader::new(file_io.clone());
-    let mut stream = loader
-        .parquet_positional_delete_batch_stream(
-            delete_file.file_path(),
-            delete_file.file_size_in_bytes,
-        )
-        .await?;
-    let cap: usize = delete_file.record_count().try_into().unwrap_or(0);
-    let mut out: HashMap<String, Vec<u64>> = HashMap::new();
-    while let Some(batch) = stream.next().await {
-        let batch = batch?;
-        let mut path_idx: Option<usize> = None;
-        let mut pos_idx: Option<usize> = None;
-        for (idx, field) in batch.schema().fields().iter().enumerate() {
-            if let Some(id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY)
-                && let Ok(id) = id_str.parse::<i32>()
-            {
-                if id == RESERVED_FIELD_ID_DELETE_FILE_PATH {
-                    path_idx = Some(idx);
-                } else if id == RESERVED_FIELD_ID_DELETE_FILE_POS {
-                    pos_idx = Some(idx);
-                }
-            }
-        }
-        let path_idx = path_idx.ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Position delete '{}' is missing the reserved file_path column (field id {})",
-                    delete_file.file_path(),
-                    RESERVED_FIELD_ID_DELETE_FILE_PATH
-                ),
-            )
-        })?;
-        let pos_idx = pos_idx.ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Position delete '{}' is missing the reserved pos column (field id {})",
-                    delete_file.file_path(),
-                    RESERVED_FIELD_ID_DELETE_FILE_POS
-                ),
-            )
-        })?;
-        let path_col = batch
-            .column(path_idx)
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Position delete '{}' file_path column is not a string array",
-                        delete_file.file_path()
-                    ),
-                )
-            })?;
-        let pos_col = batch
-            .column(pos_idx)
-            .as_any()
-            .downcast_ref::<arrow_array::Int64Array>()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Position delete '{}' pos column is not an int64 array",
-                        delete_file.file_path()
-                    ),
-                )
-            })?;
-        for row in 0..batch.num_rows() {
-            if path_col.is_null(row) || pos_col.is_null(row) {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Position delete '{}' has a null file_path/pos at row {row}",
-                        delete_file.file_path()
-                    ),
-                ));
-            }
-            let path = path_col.value(row);
-            let pos = pos_col.value(row);
-            let pos_u64 = u64::try_from(pos).map_err(|_| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Position delete '{}' has a negative pos {pos}",
-                        delete_file.file_path()
-                    ),
-                )
-            })?;
-            if let Some(positions) = out.get_mut(path) {
-                positions.push(pos_u64);
-            } else {
-                let mut positions = Vec::with_capacity(cap);
-                positions.push(pos_u64);
-                out.insert(path.to_string(), positions);
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// Best-effort projection mask for delete-file columns.
 ///
 /// Returns `Some(mask)` only when every requested field id (or, for the positional-delete
@@ -338,11 +229,11 @@ fn try_build_delete_projection_mask(
     // Name-based fallback for the positional-delete reserved pair when field ids are missing
     // (some writers emit `file_path` / `pos` by name only). Only safe when the request is
     // exactly those two reserved ids — equality-delete keys must not be guessed by name.
-    let is_pos_delete_projection = wanted.len() == 2
+    let is_pos_delete_pair = wanted.len() == 2
         && wanted.contains(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
         && wanted.contains(&RESERVED_FIELD_ID_DELETE_FILE_POS);
-    if !is_pos_delete_projection {
-        // Incomplete field-id match or non-pos projection: refuse rather than guess.
+    let is_pos_only = wanted.len() == 1 && wanted.contains(&RESERVED_FIELD_ID_DELETE_FILE_POS);
+    if !is_pos_delete_pair && !is_pos_only {
         return None;
     }
 
@@ -352,7 +243,7 @@ fn try_build_delete_projection_mask(
     arrow_schema
         .fields()
         .filter_leaves(|idx, field| match field.name().as_str() {
-            RESERVED_COL_NAME_DELETE_FILE_PATH if !saw_path => {
+            RESERVED_COL_NAME_DELETE_FILE_PATH if is_pos_delete_pair && !saw_path => {
                 name_indices.push(idx);
                 saw_path = true;
                 true
@@ -364,7 +255,12 @@ fn try_build_delete_projection_mask(
             }
             _ => false,
         });
-    if saw_path && saw_pos && !name_indices.is_empty() {
+    let complete = if is_pos_only {
+        saw_pos
+    } else {
+        saw_path && saw_pos
+    };
+    if complete && !name_indices.is_empty() {
         Some(ProjectionMask::leaves(parquet_schema, name_indices))
     } else {
         None
@@ -776,6 +672,92 @@ mod tests {
         assert!(
             mask_ok.is_some(),
             "complete single-id match must build a mask"
+        );
+    }
+
+    #[test]
+    fn test_pos_only_name_fallback_without_field_ids_builds_one_leaf_mask() {
+        let tmp = TempDir::new().expect("tempdir");
+        let with_pos = tmp.path().join("pos-name-only.parquet");
+        let path_only = tmp.path().join("path-only.parquet");
+        let with_pos_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ]));
+        let path_only_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "file_path",
+            DataType::Utf8,
+            false,
+        )]));
+        let with_pos_batch = RecordBatch::try_new(with_pos_schema.clone(), vec![
+            Arc::new(StringArray::from(vec!["d.parquet"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+        ])
+        .expect("file_path/pos batch");
+        let path_only_batch =
+            RecordBatch::try_new(path_only_schema.clone(), vec![
+                Arc::new(StringArray::from(vec!["d.parquet"])) as ArrayRef,
+            ])
+            .expect("file_path-only batch");
+        {
+            let file = File::create(&with_pos).expect("create");
+            let mut writer = ArrowWriter::try_new(
+                file,
+                with_pos_schema,
+                Some(WriterProperties::builder().build()),
+            )
+            .expect("writer");
+            writer.write(&with_pos_batch).expect("write");
+            writer.close().expect("close");
+        }
+        {
+            let file = File::create(&path_only).expect("create");
+            let mut writer = ArrowWriter::try_new(
+                file,
+                path_only_schema,
+                Some(WriterProperties::builder().build()),
+            )
+            .expect("writer");
+            writer.write(&path_only_batch).expect("write");
+            writer.close().expect("close");
+        }
+        let with_pos_file = File::open(&with_pos).expect("open");
+        let with_pos_meta = parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
+            &with_pos_file,
+            Default::default(),
+        )
+        .expect("meta");
+        let mask = try_build_delete_projection_mask(
+            &[RESERVED_FIELD_ID_DELETE_FILE_POS],
+            with_pos_meta.parquet_schema(),
+            with_pos_meta.schema(),
+        )
+        .expect("pos-only request over a nameless-id file_path/pos schema must build a mask");
+        let pos_leaf = (0..with_pos_meta.parquet_schema().num_columns())
+            .find(|&index| {
+                with_pos_meta.parquet_schema().column(index).name()
+                    == RESERVED_COL_NAME_DELETE_FILE_POS
+            })
+            .expect("pos leaf");
+        assert_eq!(
+            mask,
+            ProjectionMask::leaves(with_pos_meta.parquet_schema(), [pos_leaf]),
+            "pos-only name fallback must project the pos leaf alone"
+        );
+        let path_only_file = File::open(&path_only).expect("open");
+        let path_only_meta = parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
+            &path_only_file,
+            Default::default(),
+        )
+        .expect("meta");
+        let refused = try_build_delete_projection_mask(
+            &[RESERVED_FIELD_ID_DELETE_FILE_POS],
+            path_only_meta.parquet_schema(),
+            path_only_meta.schema(),
+        );
+        assert!(
+            refused.is_none(),
+            "pos-only request must refuse when only file_path is present"
         );
     }
 }
