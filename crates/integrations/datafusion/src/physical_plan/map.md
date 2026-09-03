@@ -33,7 +33,7 @@ exec (row R169).
 | `project.rs` | partition-value projection |
 | `commit.rs` / `write.rs` | INSERT commit |
 | `delete.rs` / `update.rs` | DELETE / UPDATE |
-| `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions` (R114) |
+| `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions_by_path` (R114) |
 | `repartition.rs` / `sort.rs` | writer helpers |
 | `expr_to_predicate.rs` | filter pushdown |
 | `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`). |
@@ -46,7 +46,7 @@ exec (row R169).
 | Honor metadata-table `projection` | `metadata_scan.rs` (schema at plan time, `RecordBatch::project` at execute) |
 | Honor data-table `projection` | `scan.rs` `IcebergTableScan::new` |
 | Change INSERT / DELETE / UPDATE | `commit.rs` / `delete.rs` / `update.rs` |
-| Merge V2 parquet position deletes into a V3 DV | `delete_legacy_merge.rs` `write_deletion_vectors` → `close_touched_dv_containers_with_partitions` (`legacy_deletes` + `load_legacy_positions`) |
+| Merge V2 parquet position deletes into a V3 DV | `delete_legacy_merge.rs` `write_deletion_vectors` → `close_touched_dv_containers_with_partitions` (`legacy_deletes` + `load_legacy_positions_by_path`) |
 | Carry V3 `_row_id` on MoR UPDATE | `delete.rs` `merge_on_read_update` + `row_lineage.rs` |
 
 ## Pointers

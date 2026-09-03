@@ -34,7 +34,8 @@ Ledger: [`f22-legacy-scan-one-pass-ledger.md`](f22-legacy-scan-one-pass-ledger.m
 - [x] C-003: DataFusion `write_deletion_vectors` uses close (no second walk)
 - [x] C-004: manifest-read pin (once with and without legacy); projected-read pin (bytes < file size); wall at 8/192 recorded in the ledger
 - [x] C-005: GAP_MATRIX R114, this entry, `map.md` lockstep, ledger
-- [ ] RePark: delete `legacy_deletes.rs` own walk; consume `DvContainerClose::legacy_deletes` + `load_legacy_positions`; do not re-walk data manifests for sequence numbers (`data_sequence_numbers`)
+- [x] Round 2: load-once `load_legacy_positions_by_path`; one data-manifest walk; sequences with a supplied partition map; list-read pin; partition/bounds pins; overlay; Arc merge; sort after extend; Option seq
+- [ ] RePark: delete `legacy_deletes.rs` own walk; consume `DvContainerClose::legacy_deletes` + `load_legacy_positions_by_path` (one read per delete file); do not re-walk data manifests (`data_sequence_numbers` is populated even with a complete `known_partitions` and no legacy). `Option<&ManifestList>` is for RePark.
 
 ## ACTIVE (2026-09-02): F-21 legacy parquet position-delete merge into DV (row R114) — DataFusion V3 DV now merges file-scoped parquet deletes (Java BaseDVFileWriter.loadPreviousDeletes) and keeps partition-scoped live (Spark-equal)
 

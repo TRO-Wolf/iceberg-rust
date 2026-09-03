@@ -28,6 +28,7 @@ use tempfile::TempDir;
 use super::{
     LegacyPositionDelete, close_touched_dv_containers_at,
     close_touched_dv_containers_with_partitions, load_legacy_positions,
+    load_legacy_positions_by_path,
 };
 use crate::io::{
     FileIOBuilder, FileInfo, FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorageFactory,
@@ -39,8 +40,17 @@ use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::{Catalog, CatalogBuilder, Result};
 
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn is_snapshot_list(path: &str) -> bool {
+    let name = file_name(path);
+    name.starts_with("snap-") && name.ends_with(".avro")
+}
+
 fn is_manifest(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = file_name(path);
     name.ends_with(".avro") && !name.starts_with("snap-")
 }
 
@@ -56,6 +66,12 @@ struct CountingStorage {
     delete_manifest_paths: Arc<Mutex<HashSet<String>>>,
     #[serde(skip)]
     delete_manifest_reads: Arc<AtomicU64>,
+    #[serde(skip)]
+    data_manifest_paths: Arc<Mutex<HashSet<String>>>,
+    #[serde(skip)]
+    data_manifest_reads: Arc<AtomicU64>,
+    #[serde(skip)]
+    snapshot_list_reads: Arc<AtomicU64>,
 }
 
 impl CountingStorage {
@@ -64,6 +80,10 @@ impl CountingStorage {
     }
 
     fn count(&self, path: &str) {
+        if is_snapshot_list(path) {
+            self.snapshot_list_reads.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if is_manifest(path) {
             self.manifest_reads.fetch_add(1, Ordering::Relaxed);
             if self
@@ -73,6 +93,14 @@ impl CountingStorage {
                 .contains(path)
             {
                 self.delete_manifest_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            if self
+                .data_manifest_paths
+                .lock()
+                .expect("data-manifest path set")
+                .contains(path)
+            {
+                self.data_manifest_reads.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -160,6 +188,12 @@ struct CountingStorageFactory {
     delete_manifest_paths: Arc<Mutex<HashSet<String>>>,
     #[serde(skip)]
     delete_manifest_reads: Arc<AtomicU64>,
+    #[serde(skip)]
+    data_manifest_paths: Arc<Mutex<HashSet<String>>>,
+    #[serde(skip)]
+    data_manifest_reads: Arc<AtomicU64>,
+    #[serde(skip)]
+    snapshot_list_reads: Arc<AtomicU64>,
 }
 
 #[typetag::serde]
@@ -171,6 +205,9 @@ impl StorageFactory for CountingStorageFactory {
             bytes_read: self.bytes_read.clone(),
             delete_manifest_paths: self.delete_manifest_paths.clone(),
             delete_manifest_reads: self.delete_manifest_reads.clone(),
+            data_manifest_paths: self.data_manifest_paths.clone(),
+            data_manifest_reads: self.data_manifest_reads.clone(),
+            snapshot_list_reads: self.snapshot_list_reads.clone(),
         }))
     }
 }
@@ -212,8 +249,7 @@ async fn three_data_manifests() -> Fixture {
         .with_storage_factory(Arc::new(CountingStorageFactory {
             manifest_reads: manifest_reads.clone(),
             bytes_read: Arc::new(AtomicU64::new(0)),
-            delete_manifest_paths: Arc::new(Mutex::new(HashSet::new())),
-            delete_manifest_reads: Arc::new(AtomicU64::new(0)),
+            ..Default::default()
         }))
         .load(
             "memory",
@@ -260,8 +296,12 @@ async fn a_supplied_partition_map_reads_no_data_manifest() {
     assert_eq!(close.added.len(), 1);
     assert_eq!(
         fixture.manifest_reads.load(Ordering::Relaxed),
-        0,
-        "a supplied partition map must not walk any manifest"
+        3,
+        "a supplied partition map still reads each data manifest once for sequence numbers"
+    );
+    assert!(
+        close.data_sequence_numbers.contains_key(&fixture.paths[0]),
+        "close reports the touched file's data sequence number with a supplied partition map"
     );
 }
 
@@ -376,8 +416,11 @@ async fn delete_manifest_count(table: &Table) -> usize {
 struct DeleteManifestFixture {
     table: Table,
     path: String,
+    other: String,
     manifest_reads: Arc<AtomicU64>,
     delete_manifest_reads: Arc<AtomicU64>,
+    data_manifest_reads: Arc<AtomicU64>,
+    snapshot_list_reads: Arc<AtomicU64>,
     delete_manifests: usize,
     _warehouse: TempDir,
 }
@@ -387,12 +430,18 @@ async fn n_delete_manifests(n: usize, with_legacy: bool) -> DeleteManifestFixtur
     let manifest_reads = Arc::new(AtomicU64::new(0));
     let delete_manifest_reads = Arc::new(AtomicU64::new(0));
     let delete_manifest_paths = Arc::new(Mutex::new(HashSet::new()));
+    let data_manifest_paths = Arc::new(Mutex::new(HashSet::new()));
+    let data_manifest_reads = Arc::new(AtomicU64::new(0));
+    let snapshot_list_reads = Arc::new(AtomicU64::new(0));
     let catalog = MemoryCatalogBuilder::default()
         .with_storage_factory(Arc::new(CountingStorageFactory {
             manifest_reads: manifest_reads.clone(),
             bytes_read: Arc::new(AtomicU64::new(0)),
             delete_manifest_paths: delete_manifest_paths.clone(),
             delete_manifest_reads: delete_manifest_reads.clone(),
+            data_manifest_paths: data_manifest_paths.clone(),
+            data_manifest_reads: data_manifest_reads.clone(),
+            snapshot_list_reads: snapshot_list_reads.clone(),
         }))
         .load(
             "memory",
@@ -427,22 +476,34 @@ async fn n_delete_manifests(n: usize, with_legacy: bool) -> DeleteManifestFixtur
         .load_manifest_list(table.file_io(), table.metadata())
         .await
         .expect("manifest list");
-    let paths: HashSet<String> = list
+    let delete_paths: HashSet<String> = list
         .entries()
         .iter()
         .filter(|manifest| manifest.content == crate::spec::ManifestContentType::Deletes)
         .map(|manifest| manifest.manifest_path.clone())
         .collect();
+    let data_paths: HashSet<String> = list
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.content == crate::spec::ManifestContentType::Data)
+        .map(|manifest| manifest.manifest_path.clone())
+        .collect();
     *delete_manifest_paths
         .lock()
-        .expect("delete-manifest path set") = paths;
+        .expect("delete-manifest path set") = delete_paths;
+    *data_manifest_paths.lock().expect("data-manifest path set") = data_paths;
     manifest_reads.store(0, Ordering::Relaxed);
     delete_manifest_reads.store(0, Ordering::Relaxed);
+    data_manifest_reads.store(0, Ordering::Relaxed);
+    snapshot_list_reads.store(0, Ordering::Relaxed);
     DeleteManifestFixture {
         table,
         path,
+        other,
         manifest_reads,
         delete_manifest_reads,
+        data_manifest_reads,
+        snapshot_list_reads,
         delete_manifests,
         _warehouse: warehouse,
     }
@@ -479,6 +540,15 @@ async fn delete_manifests_are_read_once_without_legacy_deletes() {
         fixture.delete_manifest_reads.load(Ordering::Relaxed),
         u64::try_from(expected).expect("count fits"),
         "each delete manifest is read exactly once"
+    );
+    assert!(
+        close.data_sequence_numbers.contains_key(&fixture.path),
+        "close reports data sequence numbers with a complete partition map and no applicable legacy"
+    );
+    assert_eq!(
+        fixture.snapshot_list_reads.load(Ordering::Relaxed),
+        1,
+        "close with None reads the snapshot list once"
     );
 }
 
@@ -531,13 +601,19 @@ async fn preloaded_manifest_list_skips_the_list_reread() {
         .expect("current snapshot")
         .clone();
     fixture.manifest_reads.store(0, Ordering::Relaxed);
+    fixture.snapshot_list_reads.store(0, Ordering::Relaxed);
     let list = snapshot
         .load_manifest_list(fixture.table.file_io(), fixture.table.metadata())
         .await
         .expect("preload manifest list");
-    let list_reads = fixture.manifest_reads.load(Ordering::Relaxed);
+    assert_eq!(
+        fixture.snapshot_list_reads.load(Ordering::Relaxed),
+        1,
+        "pre-load reads the snapshot list once"
+    );
     fixture.manifest_reads.store(0, Ordering::Relaxed);
     fixture.delete_manifest_reads.store(0, Ordering::Relaxed);
+    fixture.snapshot_list_reads.store(0, Ordering::Relaxed);
     let known = HashMap::from([(
         fixture.path.clone(),
         (0i32, Struct::from_iter([Some(Literal::long(0))])),
@@ -558,7 +634,71 @@ async fn preloaded_manifest_list_skips_the_list_reread() {
         u64::try_from(fixture.delete_manifests).expect("count fits"),
         "pre-loaded list must not be read again; delete manifests still once"
     );
-    let _ = list_reads;
+    assert_eq!(
+        fixture.snapshot_list_reads.load(Ordering::Relaxed),
+        0,
+        "a pre-loaded ManifestList must not re-read snap-*.avro"
+    );
+}
+
+#[tokio::test]
+async fn partial_partition_map_with_legacy_reads_each_data_manifest_once() {
+    let fixture = n_delete_manifests(1, true).await;
+    let known = HashMap::from([(
+        fixture.path.clone(),
+        (0i32, Struct::from_iter([Some(Literal::long(0))])),
+    )]);
+    let new_positions = HashMap::from([
+        (fixture.path.clone(), vec![0u64]),
+        (fixture.other.clone(), vec![0u64]),
+    ]);
+    let close = close_touched_dv_containers_with_partitions(
+        &fixture.table,
+        &new_positions,
+        None,
+        &known,
+        None,
+    )
+    .await
+    .expect("close with a partial partition map and legacy deletes");
+    assert_eq!(close.added.len(), 2);
+    assert_eq!(
+        fixture.data_manifest_reads.load(Ordering::Relaxed),
+        2,
+        "partial known_partitions plus legacy must walk each data manifest once"
+    );
+}
+
+#[tokio::test]
+async fn file_scoped_delete_with_two_touched_paths_errors() {
+    let file = DataFileBuilder::default()
+        .content(DataContentType::PositionDeletes)
+        .file_path("s3://b/d.parquet".to_string())
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(100)
+        .record_count(1)
+        .partition_spec_id(0)
+        .partition(Struct::empty())
+        .referenced_data_file(Some("s3://b/a.parquet".to_string()))
+        .build()
+        .expect("delete file");
+    let delete = LegacyPositionDelete {
+        file,
+        touched: vec![
+            "s3://b/a.parquet".to_string(),
+            "s3://b/b.parquet".to_string(),
+        ],
+        file_scoped: true,
+        data_sequence_number: Some(1),
+    };
+    let file_io = crate::io::FileIO::new_with_memory();
+    let err = load_legacy_positions_by_path(&file_io, &delete)
+        .await
+        .expect_err("file-scoped with two touched paths");
+    assert!(
+        err.message().contains("file-scoped but names 2 data files"),
+        "error names the illegal touched len: {err}"
+    );
 }
 
 #[tokio::test]
@@ -589,10 +729,8 @@ async fn load_legacy_positions_projects_past_the_row_column() {
     let warehouse = TempDir::new().expect("warehouse");
     let bytes_read = Arc::new(AtomicU64::new(0));
     let file_io = FileIOBuilder::new(Arc::new(CountingStorageFactory {
-        manifest_reads: Arc::new(AtomicU64::new(0)),
         bytes_read: bytes_read.clone(),
-        delete_manifest_paths: Arc::new(Mutex::new(HashSet::new())),
-        delete_manifest_reads: Arc::new(AtomicU64::new(0)),
+        ..Default::default()
     }))
     .build();
     let del_path = format!(
@@ -644,7 +782,7 @@ async fn load_legacy_positions_projects_past_the_row_column() {
         file,
         touched: vec![data_path.to_string()],
         file_scoped: true,
-        data_sequence_number: 1,
+        data_sequence_number: Some(1),
     };
     bytes_read.store(0, Ordering::Relaxed);
     let positions = load_legacy_positions(&file_io, &delete, data_path)
@@ -661,7 +799,7 @@ async fn load_legacy_positions_projects_past_the_row_column() {
 #[tokio::test]
 #[ignore = "measurement, not a CI pin"]
 async fn measure_close_at_8_and_192_delete_manifests() {
-    for n in [8usize, 192usize] {
+    for n in [8usize, 48usize, 192usize] {
         let fixture = n_delete_manifests(n, false).await;
         let known = HashMap::from([(
             fixture.path.clone(),
