@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Deletion-vector container closure for DataFusion DML and maintenance.
+//! Deletion-vector container closure for DataFusion DML.
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,52 +38,23 @@ use crate::{Error, ErrorKind, Result};
 
 const DV_IO_CONCURRENCY: usize = 8;
 
-/// One rewritten DV blob plus the data sequence to stamp, or `None` to inherit the new snapshot.
-pub type StampedDeleteFile = (DataFile, Option<i64>);
-
 /// Result of closing the deletion vectors of one commit.
 #[derive(Debug, Default)]
 pub struct DvContainerClose {
-    /// Replacement DV metadata. `Some(seq)` keeps a sibling's original data sequence.
-    pub added: Vec<StampedDeleteFile>,
+    /// Replacement DV metadata.
+    pub added: Vec<DataFile>,
     /// The superseded blobs, one per touched referenced file. Untouched siblings are not here.
     pub removed: Vec<DataFile>,
-    /// Untouched sibling references in a rewritten blob's container; the commit still checks them.
-    pub retained_references: HashSet<String>,
 }
 
 impl DvContainerClose {
-    /// Referenced data-file paths the commit depends on: replacements plus retained siblings.
+    /// Referenced data-file paths of the replacement blobs this commit adds.
     pub fn referenced_data_files(&self) -> HashSet<String> {
-        let mut references: HashSet<String> = self
-            .added
+        self.added
             .iter()
-            .filter_map(|(file, _)| file.referenced_data_file())
-            .collect();
-        references.extend(self.retained_references.iter().cloned());
-        references
+            .filter_map(|file| file.referenced_data_file_ref().map(str::to_string))
+            .collect()
     }
-}
-
-/// Maintenance plan: drop DVs whose referenced data file is gone, rewrite live siblings.
-#[derive(Debug, Default)]
-pub struct DvDropPlan {
-    /// All blobs in each affected Puffin (dropped + rewritten siblings).
-    pub removed: Vec<DataFile>,
-    /// Sibling replacements stamped with the original data sequence.
-    pub rewritten_siblings: Vec<(DataFile, i64)>,
-    /// Count of dropped blobs, not including rewritten siblings.
-    pub dropped_count: usize,
-}
-
-struct LiveDv {
-    data_file: DataFile,
-    sequence_number: i64,
-}
-
-struct DvIndex {
-    touched: Vec<DataFile>,
-    siblings: Vec<(String, String)>,
 }
 
 struct BlobWrite {
@@ -91,7 +62,6 @@ struct BlobWrite {
     positions: Vec<u64>,
     previous: Option<DeleteVector>,
     partition_key: PartitionKey,
-    data_sequence: Option<i64>,
 }
 
 /// Close the deletion vectors touched by `new_positions` against the current snapshot.
@@ -133,8 +103,7 @@ pub async fn close_touched_dv_containers_with_partitions(
     }
 
     let manifest_list = live_manifest_list(table, snapshot_id).await?;
-    let DvIndex { touched, siblings } =
-        collect_dv_index(table, manifest_list.as_ref(), new_positions).await?;
+    let touched = collect_touched_dvs(table, manifest_list.as_ref(), new_positions).await?;
 
     let mut close = DvContainerClose::default();
     let mut specs: Vec<BlobWrite> = Vec::with_capacity(new_positions.len());
@@ -153,7 +122,7 @@ pub async fn close_touched_dv_containers_with_partitions(
         .await?;
 
     for (data_file, previous) in loaded {
-        let referenced = referenced_path(&data_file)?;
+        let referenced = referenced_path(&data_file)?.to_string();
         let added = new_positions.get(&referenced).ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -168,7 +137,6 @@ pub async fn close_touched_dv_containers_with_partitions(
             referenced,
             positions: added.clone(),
             previous: Some(previous),
-            data_sequence: None,
         });
         close.removed.push(data_file);
     }
@@ -213,7 +181,6 @@ pub async fn close_touched_dv_containers_with_partitions(
                 referenced: path.clone(),
                 positions: new_positions[path].clone(),
                 previous: None,
-                data_sequence: None,
             });
         }
     }
@@ -223,92 +190,7 @@ pub async fn close_touched_dv_containers_with_partitions(
     });
     close.added = write_dv_blobs(table, specs).await?;
 
-    let rewritten_containers: HashSet<&str> = close
-        .removed
-        .iter()
-        .map(|data_file| data_file.file_path())
-        .collect();
-    for (container, referenced) in &siblings {
-        if rewritten_containers.contains(container.as_str()) {
-            close.retained_references.insert(referenced.clone());
-        }
-    }
-
     Ok(close)
-}
-
-/// Drop DVs that reference `dropped_data_paths` and rewrite live siblings in those Puffins.
-pub async fn rewrite_siblings_for_dropped_references(
-    table: &Table,
-    dropped_data_paths: &HashSet<String>,
-) -> Result<DvDropPlan> {
-    if dropped_data_paths.is_empty() {
-        return Ok(DvDropPlan::default());
-    }
-
-    let manifest_list = live_manifest_list(table, None).await?;
-    let live_dvs = collect_live_dvs(table, manifest_list.as_ref()).await?;
-    let mut by_puffin: HashMap<String, Vec<LiveDv>> = HashMap::new();
-    for dv in live_dvs {
-        by_puffin
-            .entry(dv.data_file.file_path().to_string())
-            .or_default()
-            .push(dv);
-    }
-
-    let mut plan = DvDropPlan::default();
-    for (_puffin, blobs) in by_puffin {
-        let mut dropping = Vec::new();
-        let mut siblings = Vec::new();
-        for blob in blobs {
-            match blob.data_file.referenced_data_file() {
-                Some(referenced) if dropped_data_paths.contains(&referenced) => {
-                    dropping.push(blob);
-                }
-                _ => siblings.push(blob),
-            }
-        }
-        if dropping.is_empty() {
-            continue;
-        }
-        plan.dropped_count += dropping.len();
-        plan.removed
-            .extend(dropping.into_iter().map(|blob| blob.data_file));
-        if !siblings.is_empty() {
-            let mut specs = Vec::with_capacity(siblings.len());
-            for sibling in &siblings {
-                let referenced = referenced_path(&sibling.data_file)?;
-                let mut positions: Vec<u64> =
-                    load_delete_vector(table.file_io(), &sibling.data_file)
-                        .await?
-                        .iter()
-                        .collect();
-                positions.sort_unstable();
-                specs.push(BlobWrite {
-                    partition_key: partition_key_for(table, &sibling.data_file)?,
-                    referenced,
-                    positions,
-                    previous: None,
-                    data_sequence: Some(sibling.sequence_number),
-                });
-            }
-            for (file, seq) in write_dv_blobs(table, specs).await? {
-                let seq = seq.ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        format!(
-                            "rewritten sibling deletion vector '{}' lost its data sequence",
-                            file.file_path()
-                        ),
-                    )
-                })?;
-                plan.rewritten_siblings.push((file, seq));
-            }
-            plan.removed
-                .extend(siblings.into_iter().map(|blob| blob.data_file));
-        }
-    }
-    Ok(plan)
 }
 
 fn snapshot_for_live(
@@ -369,17 +251,14 @@ fn is_live_dv(entry: &crate::spec::ManifestEntry) -> bool {
         && is_deletion_vector(entry.data_file())
 }
 
-async fn collect_dv_index(
+async fn collect_touched_dvs(
     table: &Table,
     manifest_list: Option<&ManifestList>,
     new_positions: &HashMap<String, Vec<u64>>,
-) -> Result<DvIndex> {
-    let mut index = DvIndex {
-        touched: Vec::new(),
-        siblings: Vec::new(),
-    };
+) -> Result<Vec<DataFile>> {
+    let mut touched = Vec::new();
     let Some(manifest_list) = manifest_list else {
-        return Ok(index);
+        return Ok(touched);
     };
     let mut manifests =
         manifest_stream(table.file_io(), manifest_list, ManifestContentType::Deletes);
@@ -390,40 +269,12 @@ async fn collect_dv_index(
             }
             let data_file = entry.data_file();
             let referenced = referenced_path(data_file)?;
-            if new_positions.contains_key(&referenced) {
-                index.touched.push(data_file.clone());
-            } else {
-                index
-                    .siblings
-                    .push((data_file.file_path().to_string(), referenced));
+            if new_positions.contains_key(referenced) {
+                touched.push(data_file.clone());
             }
         }
     }
-    Ok(index)
-}
-
-async fn collect_live_dvs(
-    table: &Table,
-    manifest_list: Option<&ManifestList>,
-) -> Result<Vec<LiveDv>> {
-    let mut live = Vec::new();
-    let Some(manifest_list) = manifest_list else {
-        return Ok(live);
-    };
-    let mut manifests =
-        manifest_stream(table.file_io(), manifest_list, ManifestContentType::Deletes);
-    while let Some(manifest) = manifests.try_next().await? {
-        for entry in manifest.entries() {
-            if !is_live_dv(entry) {
-                continue;
-            }
-            live.push(LiveDv {
-                data_file: entry.data_file().clone(),
-                sequence_number: entry.sequence_number().unwrap_or(0),
-            });
-        }
-    }
-    Ok(live)
+    Ok(touched)
 }
 
 async fn collect_live_data_files(
@@ -453,8 +304,8 @@ async fn collect_live_data_files(
     Ok(files)
 }
 
-fn referenced_path(data_file: &DataFile) -> Result<String> {
-    data_file.referenced_data_file().ok_or_else(|| {
+fn referenced_path(data_file: &DataFile) -> Result<&str> {
+    data_file.referenced_data_file_ref().ok_or_else(|| {
         Error::new(
             ErrorKind::DataInvalid,
             format!(
@@ -500,7 +351,7 @@ fn partition_key_of(
     )
 }
 
-async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<StampedDeleteFile>> {
+async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<DataFile>> {
     if blobs.is_empty() {
         return Ok(Vec::new());
     }
@@ -513,11 +364,9 @@ async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<Stam
     );
     let location =
         location_generator.generate_location(None, &file_name_generator.generate_file_name());
-    let mut seq_by_ref: HashMap<String, Option<i64>> = HashMap::with_capacity(blobs.len());
     let mut previous_by_path: HashMap<String, PreviousDeletes> = HashMap::new();
     let mut writes: Vec<(String, Vec<u64>, PartitionKey)> = Vec::with_capacity(blobs.len());
     for blob in blobs {
-        seq_by_ref.insert(blob.referenced.clone(), blob.data_sequence);
         if let Some(previous) = blob.previous {
             previous_by_path.insert(
                 blob.referenced.clone(),
@@ -534,22 +383,7 @@ async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<Stam
             writer.delete(referenced, position, Some(partition_key))?;
         }
     }
-    let files = writer.close().await?;
-    let mut out = Vec::with_capacity(files.len());
-    for file in files {
-        let referenced = referenced_path(&file)?;
-        let sequence = seq_by_ref.get(&referenced).copied().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!(
-                    "Rewritten deletion vector '{}' referenced unknown data file '{referenced}'",
-                    file.file_path()
-                ),
-            )
-        })?;
-        out.push((file, sequence));
-    }
-    Ok(out)
+    writer.close().await
 }
 
 #[cfg(test)]

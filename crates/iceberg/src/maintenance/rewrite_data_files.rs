@@ -63,8 +63,6 @@ use std::collections::{HashMap, HashSet};
 use crate::Catalog;
 use crate::error::{Error, ErrorKind, Result};
 use crate::expr::Predicate;
-use crate::maintenance::RemoveDanglingDeleteFiles;
-use crate::maintenance::rewrite_data_files_dv::{file_scoped_delete_paths, plan_dv_removal};
 use crate::maintenance::rewrite_data_files_plan::{
     DELETE_FILE_THRESHOLD_DEFAULT, DELETE_RATIO_THRESHOLD_DEFAULT, ResolvedConfig, plan_file_groups,
 };
@@ -75,6 +73,7 @@ pub(super) use crate::maintenance::rewrite_data_files_plan::{
 };
 #[cfg(test)]
 use crate::maintenance::rewrite_data_files_plan::{group_qualifies, is_candidate};
+use crate::maintenance::{RemoveDanglingDeleteFiles, rewrite_data_files_dv as rewrite_dv};
 use crate::scan::FileScanTask;
 use crate::spec::DataFile;
 use crate::table::Table;
@@ -243,8 +242,8 @@ impl RewriteDataFiles {
 
         let tasks = self.plan_scan_tasks().await?;
         let data_files_by_path = self.collect_live_data_files().await?;
-        config.file_scoped_delete_paths = file_scoped_delete_paths(&self.table).await?;
-
+        let live_deletes = rewrite_dv::live_file_scoped_position_deletes(&self.table).await?;
+        config.file_scoped_delete_paths = rewrite_dv::file_scoped_delete_paths_from(&live_deletes);
         let groups = plan_file_groups(
             tasks,
             &config,
@@ -264,10 +263,10 @@ impl RewriteDataFiles {
                     &table,
                     &group,
                     &data_files_by_path,
+                    &live_deletes,
                     starting_snapshot_id,
                     starting_sequence_number,
-                    config.target_file_size_bytes,
-                    config.max_open_partition_writers,
+                    &config,
                 )
                 .await?;
 
@@ -435,10 +434,10 @@ impl RewriteDataFiles {
         table: &Table,
         group: &[FileScanTask],
         data_files_by_path: &HashMap<String, DataFile>,
+        live_file_scoped_deletes: &[(DataFile, String)],
         starting_snapshot_id: i64,
         starting_sequence_number: i64,
-        target_file_size_bytes: u64,
-        max_open_partition_writers: usize,
+        config: &ResolvedConfig,
     ) -> Result<(FileGroupRewriteResult, Table, usize)> {
         // A path that vanished since planning means a concurrent commit removed it. Fail here,
         // naming the file, rather than in the writer's own missing-path check.
@@ -464,8 +463,8 @@ impl RewriteDataFiles {
         let added_files = crate::maintenance::rewrite_data_files_write::write_compacted_files(
             table,
             group,
-            target_file_size_bytes,
-            max_open_partition_writers,
+            config.target_file_size_bytes,
+            config.max_open_partition_writers,
         )
         .await?
         .files;
@@ -480,7 +479,7 @@ impl RewriteDataFiles {
             .iter()
             .map(|file| file.file_path().to_string())
             .collect();
-        let dv_plan = plan_dv_removal(table, &rewritten_paths).await?;
+        let dv_plan = rewrite_dv::plan_dv_removal(live_file_scoped_deletes, &rewritten_paths);
 
         let transaction = Transaction::new(table);
         let mut action = transaction
@@ -491,9 +490,6 @@ impl RewriteDataFiles {
         }
         if !dv_plan.removed.is_empty() {
             action = action.delete_delete_files(dv_plan.removed);
-            for (delete_file, sequence_number) in dv_plan.rewritten_siblings {
-                action = action.add_delete_file_with_sequence_number(delete_file, sequence_number);
-            }
         }
         let transaction = action.apply(transaction)?;
         let committed = transaction.commit(catalog).await?;

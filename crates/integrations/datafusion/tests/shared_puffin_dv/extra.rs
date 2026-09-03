@@ -123,9 +123,8 @@ async fn equality_delete_survives_shared_puffin_delete() {
     assert!(eq_live, "equality delete must remain live");
 }
 
-/// T14: concurrent Replace of untouched B rejects the frozen DELETE.
 #[tokio::test]
-async fn delete_rejects_concurrent_replace_of_untouched_sibling() {
+async fn delete_allows_concurrent_replace_of_untouched_sibling() {
     let harness = harness().await;
     let (_a, b) = seed_two_file_shared_puffin(&harness).await;
     set_snapshot_isolation(&harness).await;
@@ -136,22 +135,14 @@ async fn delete_rejects_concurrent_replace_of_untouched_sibling() {
     .await;
     let table = load_table(&harness.catalog).await;
     rewrite_data_file(&harness.catalog, &table, &b).await;
-    let err = collect(plan, harness.ctx.task_ctx())
+    collect(plan, harness.ctx.task_ctx())
         .await
-        .expect_err("DELETE must reject concurrent Replace of sibling B");
-    assert!(
-        err.to_string().contains("missing data files"),
-        "files-exist must cover B, got {err}"
-    );
-    assert!(
-        live_ids(&harness.ctx).await.contains(&1),
-        "rejected DELETE must not remove id 1"
-    );
+        .expect("DELETE must commit when only sibling B was compacted");
+    assert_eq!(live_ids(&harness.ctx).await, vec![3, 4, 5, 6]);
 }
 
-/// T15: concurrent Replace of B rejects the frozen UPDATE.
 #[tokio::test]
-async fn update_rejects_concurrent_replace_of_untouched_sibling() {
+async fn update_allows_concurrent_replace_of_untouched_sibling() {
     let harness = harness().await;
     let (_a, b) = seed_two_file_shared_puffin(&harness).await;
     set_snapshot_isolation(&harness).await;
@@ -162,13 +153,9 @@ async fn update_rejects_concurrent_replace_of_untouched_sibling() {
     .await;
     let table = load_table(&harness.catalog).await;
     rewrite_data_file(&harness.catalog, &table, &b).await;
-    let err = collect(plan, harness.ctx.task_ctx())
+    collect(plan, harness.ctx.task_ctx())
         .await
-        .expect_err("UPDATE must reject concurrent Replace of sibling B");
-    assert!(
-        err.to_string().contains("missing data files"),
-        "files-exist must cover B, got {err}"
-    );
+        .expect("UPDATE must commit when only sibling B was compacted");
     let data = harness
         .ctx
         .sql(&format!("SELECT data FROM catalog.{NS}.{TBL} WHERE id = 1"))
@@ -183,12 +170,11 @@ async fn update_rejects_concurrent_replace_of_untouched_sibling() {
         .downcast_ref::<StringArray>()
         .expect("data utf8")
         .value(0);
-    assert_eq!(value, "a", "rejected UPDATE must not change id 1");
+    assert_eq!(value, "z");
 }
 
-/// T16: concurrent DeleteFiles of B rejects the frozen UPDATE.
 #[tokio::test]
-async fn update_rejects_concurrent_delete_of_untouched_sibling() {
+async fn update_allows_concurrent_delete_of_untouched_sibling() {
     let harness = harness().await;
     let (_a, b) = seed_two_file_shared_puffin(&harness).await;
     let plan = freeze_sql(
@@ -205,15 +191,9 @@ async fn update_rejects_concurrent_delete_of_untouched_sibling() {
         .commit(harness.catalog.as_ref())
         .await
         .expect("concurrent DeleteFiles of B");
-    let err = collect(plan, harness.ctx.task_ctx())
+    collect(plan, harness.ctx.task_ctx())
         .await
-        .expect_err("UPDATE must reject concurrent Delete of sibling B");
-    let message = err.to_string();
-    assert!(
-        message.contains("missing data files") || message.contains("conflicting delete"),
-        "expected deleted-files rejection of B, got {message}"
-    );
-    let table = load_table(&harness.catalog).await;
+        .expect("UPDATE must commit when only sibling B was removed");
     let data = harness
         .ctx
         .sql(&format!("SELECT data FROM catalog.{NS}.{TBL} WHERE id = 1"))
@@ -228,13 +208,7 @@ async fn update_rejects_concurrent_delete_of_untouched_sibling() {
         .downcast_ref::<StringArray>()
         .expect("data utf8")
         .value(0);
-    assert_eq!(value, "a", "rejected UPDATE must not change id 1");
-    let data_files = live_data_files(&table).await;
-    assert_eq!(
-        data_files.len(),
-        1,
-        "a refused UPDATE must not publish a replacement data file or DV-backed rewrite"
-    );
+    assert_eq!(value, "z");
 }
 
 /// T19: a shared-Puffin close failure before the replacement write is a byte-noop.
@@ -269,7 +243,7 @@ async fn delete_pre_output_failure_is_a_byte_noop() {
 #[tokio::test]
 async fn delete_post_output_commit_failure_leaves_one_orphan_puffin() {
     let harness = harness().await;
-    let (_a, b) = seed_two_file_shared_puffin(&harness).await;
+    let (a, _b) = seed_two_file_shared_puffin(&harness).await;
     set_snapshot_isolation(&harness).await;
     let plan = freeze_sql(
         &harness,
@@ -277,7 +251,7 @@ async fn delete_post_output_commit_failure_leaves_one_orphan_puffin() {
     )
     .await;
     let table = load_table(&harness.catalog).await;
-    rewrite_data_file(&harness.catalog, &table, &b).await;
+    rewrite_data_file(&harness.catalog, &table, &a).await;
     let table = load_table(&harness.catalog).await;
     let snap_before = snapshot_id(&harness.catalog).await;
     let puffins_before = puffin_paths(&list_table_files(&table));
@@ -352,7 +326,7 @@ async fn update_pre_puffin_failure_leaves_one_orphan_data_file() {
 #[tokio::test]
 async fn update_post_output_commit_failure_leaves_data_and_puffin_orphans() {
     let harness = harness().await;
-    let (_a, b) = seed_two_file_shared_puffin(&harness).await;
+    let (a, _b) = seed_two_file_shared_puffin(&harness).await;
     set_snapshot_isolation(&harness).await;
     let plan = freeze_sql(
         &harness,
@@ -362,12 +336,12 @@ async fn update_post_output_commit_failure_leaves_data_and_puffin_orphans() {
     let table = load_table(&harness.catalog).await;
     let tx = Transaction::new(&table);
     tx.delete_files()
-        .delete_files([b])
+        .delete_files([a])
         .apply(tx)
         .expect("apply delete_files")
         .commit(harness.catalog.as_ref())
         .await
-        .expect("concurrent DeleteFiles of B");
+        .expect("concurrent DeleteFiles of A");
     let table = load_table(&harness.catalog).await;
     let snap_before = snapshot_id(&harness.catalog).await;
     let files_before: HashSet<_> = list_table_files(&table).into_iter().collect();

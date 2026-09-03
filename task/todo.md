@@ -24,6 +24,16 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+## ACTIVE (2026-09-02): F-19 + F-20 — retire DELETE-side files-exist broadening, drop sibling rewrite, drain FanoutWriter in partition order
+
+Ledger: [`f19-f20-fanout-order-ledger.md`](f19-f20-fanout-order-ledger.md). Rows R114, R115, R135.
+
+- [x] C-001 red: F-19a `delete_allows_concurrent_replace_of_untouched_sibling` failed with `missing data files` on sibling B; F-20 unit `[1,3,0,2,4]` vs `[0,1,2,3,4]` and DataFusion run 0 `[4,0,3,1,2]`.
+- [x] C-002: `retained_references` deleted; files-exist is replacement blobs only; `rewrite_siblings_for_dropped_references` deleted; `FanoutWriter::close` sorts by ascending partition value.
+- [x] C-003: `shared_puffin_dv` 20 passed / 3 ignored; sibling-in-same-puffin pin green; mutations recorded in the ledger; F-18 Java interop re-run.
+- [x] C-004: rows R114 / R115 / R135 / R136, this entry, `map.md` lockstep, ledger.
+- [ ] RePark: repin unit RP-8 `F-v3-10-partition-file-order` closes; registry `V3-FILEORDER-1` gains "fork INSERT path now ascending too".
+
 ## ACTIVE (2026-09-02): F-18 deletion-vector container close — Spark-equal layout, lazy walk (row R114)
 
 Ledger: [`f18-dv-container-close-ledger.md`](f18-dv-container-close-ledger.md). Row R114.

@@ -295,9 +295,8 @@ async fn untouched_sibling_keeps_original_data_sequence() {
     );
 }
 
-/// T17: concurrent DeleteFiles of untouched sibling B rejects the frozen DELETE.
 #[tokio::test]
-async fn delete_rejects_concurrent_delete_of_untouched_sibling() {
+async fn delete_allows_concurrent_delete_of_untouched_sibling() {
     let harness = harness().await;
     let (_a, b) = seed_two_file_shared_puffin(&harness).await;
     let plan = harness
@@ -319,14 +318,10 @@ async fn delete_rejects_concurrent_delete_of_untouched_sibling() {
         .await
         .expect("concurrent DeleteFiles of sibling B");
 
-    let err = datafusion::physical_plan::collect(plan, harness.ctx.task_ctx())
+    datafusion::physical_plan::collect(plan, harness.ctx.task_ctx())
         .await
-        .expect_err("DELETE must reject concurrent Delete of sibling B");
-    let message = err.to_string();
-    assert!(
-        message.contains("missing data files") || message.contains("conflicting delete"),
-        "expected files-exist rejection of sibling B, got {message}"
-    );
+        .expect("DELETE must commit when only sibling B was removed");
+    assert_eq!(live_ids(&harness.ctx).await, vec![3]);
 }
 
 /// T18: concurrent DeleteFiles of touched file A also rejects the frozen DELETE.

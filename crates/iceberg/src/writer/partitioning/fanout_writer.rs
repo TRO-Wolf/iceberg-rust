@@ -17,6 +17,7 @@
 
 //! This module provides the `FanoutWriter` implementation.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
@@ -105,13 +106,45 @@ where
 
     async fn close(mut self) -> Result<O> {
         // Close all partition writers
-        for (_, mut writer) in self.partition_writers {
+        let mut keys: Vec<Struct> = self.partition_writers.keys().cloned().collect();
+        keys.sort_by(ascending_partition_order);
+        for key in keys {
+            let mut writer = self.partition_writers.remove(&key).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to get partition writer after creation",
+                )
+            })?;
             self.output.extend(writer.close().await?);
         }
 
         // Collect all output items into the output collection type
         Ok(O::from_iter(self.output))
     }
+}
+
+fn ascending_partition_order(left: &Struct, right: &Struct) -> Ordering {
+    use crate::spec::Literal;
+    for (left_field, right_field) in left.iter().zip(right.iter()) {
+        match (left_field, right_field) {
+            (None, None) => {}
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(left_value), Some(right_value)) => {
+                let order = match (left_value, right_value) {
+                    (Literal::Primitive(left_lit), Literal::Primitive(right_lit)) => {
+                        left_lit.partial_cmp(right_lit)
+                    }
+                    _ => None,
+                };
+                match order {
+                    Some(Ordering::Equal) | None => {}
+                    Some(other) => return other,
+                }
+            }
+        }
+    }
+    left.fields().len().cmp(&right.fields().len())
 }
 
 #[cfg(test)]
@@ -383,6 +416,160 @@ mod tests {
             "Missing ASIA partition"
         );
 
+        Ok(())
+    }
+
+    fn partition_int(data_file: &crate::spec::DataFile) -> Option<i32> {
+        match data_file.partition.fields() {
+            [None] => None,
+            [Some(Literal::Primitive(crate::spec::PrimitiveLiteral::Int(value)))] => Some(*value),
+            other => panic!("expected single int partition, got {other:?}"),
+        }
+    }
+
+    async fn close_int_partitions(values: &[Option<i32>]) -> Result<Vec<Option<i32>>> {
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let schema = Arc::new(
+            crate::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "part", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()?,
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone()).build()?;
+        let parquet_writer_builder =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone());
+        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_writer_builder,
+            file_io,
+            location_gen,
+            file_name_gen,
+        );
+        let mut writer = FanoutWriter::new(DataFileWriterBuilder::new(rolling_writer_builder));
+        let arrow_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                1.to_string(),
+            )])),
+            Field::new("part", DataType::Int32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                2.to_string(),
+            )])),
+        ]);
+        for (index, value) in values.iter().enumerate() {
+            let key = PartitionKey::new(
+                partition_spec.clone(),
+                schema.clone(),
+                Struct::from_iter([value.map(Literal::int)]),
+            )
+            .expect("PartitionKey::new: valid partition tuple");
+            let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), vec![
+                Arc::new(Int32Array::from(vec![index as i32])),
+                Arc::new(Int32Array::from(vec![*value])),
+            ])?;
+            writer.write(key, batch).await?;
+        }
+        let data_files = writer.close().await?;
+        Ok(data_files.iter().map(partition_int).collect())
+    }
+
+    #[tokio::test]
+    async fn test_fanout_close_drains_identity_int_partitions_ascending() -> Result<()> {
+        let order = close_int_partitions(&[Some(3), Some(1), Some(4), Some(0), Some(2)]).await?;
+        assert_eq!(
+            order,
+            vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+            "FanoutWriter::close must drain in ascending partition-value order"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fanout_close_drains_null_partition_first() -> Result<()> {
+        let order = close_int_partitions(&[Some(0), None]).await?;
+        assert_eq!(
+            order,
+            vec![None, Some(0)],
+            "null partition values must close before non-null"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn measure_fanout_one_million_rows_eight_partitions() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("bench".to_string(), None, DataFileFormat::Parquet);
+        let schema = Arc::new(
+            crate::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "part", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()?,
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone()).build()?;
+        let parquet_writer_builder =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone());
+        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_writer_builder,
+            file_io,
+            location_gen,
+            file_name_gen,
+        );
+        let mut writer = FanoutWriter::new(DataFileWriterBuilder::new(rolling_writer_builder));
+        let arrow_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                1.to_string(),
+            )])),
+            Field::new("part", DataType::Int32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                2.to_string(),
+            )])),
+        ]);
+        let rows_per_partition = 1_000_000 / 8;
+        let write_start = std::time::Instant::now();
+        for part in 0..8 {
+            let ids: Vec<i32> = (0..rows_per_partition)
+                .map(|row| row + part * rows_per_partition)
+                .collect();
+            let parts: Vec<Option<i32>> = (0..rows_per_partition).map(|_| Some(part)).collect();
+            let key = PartitionKey::new(
+                partition_spec.clone(),
+                schema.clone(),
+                Struct::from_iter([Some(Literal::int(part))]),
+            )
+            .expect("PartitionKey::new: valid partition tuple");
+            let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(parts)),
+            ])?;
+            writer.write(key, batch).await?;
+        }
+        let write_ms = write_start.elapsed().as_millis();
+        let close_start = std::time::Instant::now();
+        let data_files = writer.close().await?;
+        let close_ms = close_start.elapsed().as_millis();
+        assert_eq!(data_files.len(), 8);
+        println!(
+            "fanout 1e6/8 write_ms={write_ms} close_ms={close_ms} files={}",
+            data_files.len()
+        );
         Ok(())
     }
 }

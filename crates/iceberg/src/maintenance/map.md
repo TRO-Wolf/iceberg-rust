@@ -47,7 +47,7 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 |---|---|
 | Change which data files compaction selects | `rewrite_data_files_plan.rs` (`is_candidate`, `group_qualifies`, `too_high_delete_ratio`) |
 | Count file-scoped parquet position deletes toward the ratio | `rewrite_data_files_dv.rs::file_scoped_delete_paths` then `ResolvedConfig.file_scoped_delete_paths`. Scan-task deletes do not carry `file_path` bounds. |
-| Drop deletes that targeted a rewritten data file | `rewrite_data_files_dv.rs::plan_dv_removal`. Java drops DVs only (`isDanglingDV`). The parquet file-scoped drop is a fork extension. |
+| Drop deletes that targeted a rewritten data file | `rewrite_data_files_dv.rs::plan_dv_removal`. Java drops DVs only (`isDanglingDV`). The parquet file-scoped drop is a fork extension. F-19b: no sibling rewrite; the sibling blob stays in the original Puffin. One DELETE-manifest walk is cached for planning and commit; `file_scoped_delete_paths` is path-only. |
 | Change output rolling or the rewrite read | `rewrite_data_files_write.rs` |
 | Change how rewritten rows are routed after spec evolution | `rewrite_data_files_write.rs` + `rewrite_data_files_router.rs` |
 | Pin evolved-spec output tuples or the writer bound | `rewrite_data_files_evolved_spec_tests.rs`, `rewrite_data_files_router_bound_tests.rs` |
