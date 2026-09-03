@@ -29,11 +29,13 @@ The current plan for in-flight work. The operating manuals
 
 Ledger: [`f23-conditional-data-walk-ledger.md`](f23-conditional-data-walk-ledger.md). Row R114.
 
-- [x] C-001: skip `collect_live_data_files` when `pending_legacy` is empty and `known_partitions` covers every touched path; `data_sequence_numbers` total iff the walk ran
+- [x] C-001: skip `collect_live_data_files` when `pending_legacy` is empty and `known_partitions` covers every touched path; `data_sequence_numbers` total on the legacy arm, else only the paths the map missed (r2)
 - [x] C-002: walk stops once every wanted path is found (`wanted.len()` on a buffered stream)
 - [x] C-003: before/after at 8/48/192 data manifests, three runs, in the ledger
 - [x] C-004: GAP_MATRIX R114, this entry, `map.md` lockstep, ledger
-- [ ] RePark: keep supplying `known_partitions`; that sink is what makes the skip fire. `data_sequence_numbers` is empty on the pure-DV complete-map path.
+- [x] Round 2 (Rust perf review): first data manifest alone then a buffered tail (an ordered buffer of 8 issued 8 GETs for a one-manifest hit on a store that is not ready on the first poll); no-legacy arm wants only the paths `known_partitions` missed; exact `== 1` early-exit pin plus two latent-store pins; borrowed manifest entries
+- [ ] `iceberg-datafusion` MoR V3 DELETE/UPDATE: resolve partitions in the delete plan and hand them to `write_deletion_vectors` as `known_partitions`, so the skip fires in tree. Today `delete_legacy_merge.rs` passes an empty map and `live_data_file_partitions` is itself a full unstoppable walk, so routing through it would be a regression
+- [ ] RePark: keep supplying `known_partitions`; that sink is what makes the skip fire. `data_sequence_numbers` is empty on the pure-DV complete-map path, and on the no-legacy arm it carries only the paths the map missed.
 
 ## ACTIVE (2026-09-03): F-22 one-pass legacy scan on DV container close (row R114)
 

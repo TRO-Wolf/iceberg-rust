@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
@@ -39,6 +39,7 @@ struct Fixture {
     paths: Vec<String>,
     manifest_reads: Arc<AtomicU64>,
     data_manifest_reads: Arc<AtomicU64>,
+    latent: Arc<AtomicBool>,
     _warehouse: TempDir,
 }
 
@@ -47,12 +48,14 @@ async fn n_data_manifests(n: usize) -> Fixture {
     let manifest_reads = Arc::new(AtomicU64::new(0));
     let data_manifest_reads = Arc::new(AtomicU64::new(0));
     let data_manifest_paths = Arc::new(Mutex::new(HashSet::new()));
+    let latent = Arc::new(AtomicBool::new(false));
     let catalog = MemoryCatalogBuilder::default()
         .with_storage_factory(Arc::new(CountingStorageFactory {
             manifest_reads: manifest_reads.clone(),
             bytes_read: Arc::new(AtomicU64::new(0)),
             data_manifest_paths: data_manifest_paths.clone(),
             data_manifest_reads: data_manifest_reads.clone(),
+            latent: latent.clone(),
             ..Default::default()
         }))
         .load(
@@ -93,6 +96,7 @@ async fn n_data_manifests(n: usize) -> Fixture {
         paths,
         manifest_reads,
         data_manifest_reads,
+        latent,
         _warehouse: warehouse,
     }
 }
@@ -469,16 +473,63 @@ async fn a_touched_file_in_the_first_data_manifest_stops_the_walk() {
         .await
         .expect("close without a partition map");
     assert_eq!(close.added.len(), 1);
-    let reads = fixture.data_manifest_reads.load(Ordering::Relaxed);
-    println!("F-23 early-exit n=192 data_manifest_reads={reads}");
-    assert!(reads > 0, "the walk must run without a partition map");
-    assert!(
-        reads < 192,
-        "a file in the first data manifest must not consume all 192 manifests, reads={reads}"
+    assert_eq!(
+        fixture.data_manifest_reads.load(Ordering::Relaxed),
+        1,
+        "a file in the newest data manifest stops the walk after one read"
     );
-    assert!(
-        reads <= u64::try_from(DV_IO_CONCURRENCY).expect("concurrency fits") * 2,
-        "ordered early-exit should stay near the IO bound, reads={reads}"
+}
+
+#[tokio::test]
+async fn a_latent_store_reads_one_data_manifest_for_a_newest_file_hit() {
+    let fixture = n_data_manifests(192).await;
+    fixture.latent.store(true, Ordering::Relaxed);
+    let touched = fixture.paths.last().expect("n > 0").clone();
+    let new_positions = HashMap::from([(touched, vec![0u64])]);
+    let close = close_touched_dv_containers_at(&fixture.table, &new_positions, None)
+        .await
+        .expect("close without a partition map");
+    fixture.latent.store(false, Ordering::Relaxed);
+    assert_eq!(close.added.len(), 1);
+    assert_eq!(
+        fixture.data_manifest_reads.load(Ordering::Relaxed),
+        1,
+        "a store whose read is not ready on the first poll must still issue one GET, not {}",
+        DV_IO_CONCURRENCY
+    );
+}
+
+#[tokio::test]
+async fn only_the_paths_the_map_misses_are_wanted_without_legacy_deletes() {
+    let fixture = n_data_manifests(192).await;
+    fixture.latent.store(true, Ordering::Relaxed);
+    let newest = fixture.paths.last().expect("n > 0").clone();
+    let oldest = fixture.paths.first().expect("n > 0").clone();
+    let known = HashMap::from([(
+        oldest.clone(),
+        (0i32, Struct::from_iter([Some(Literal::long(0))])),
+    )]);
+    let new_positions = HashMap::from([(newest.clone(), vec![0u64]), (oldest, vec![0u64])]);
+    let close = close_touched_dv_containers_with_partitions(
+        &fixture.table,
+        &new_positions,
+        None,
+        &known,
+        None,
+    )
+    .await
+    .expect("close with a partial partition map and no legacy deletes");
+    fixture.latent.store(false, Ordering::Relaxed);
+    assert_eq!(close.added.len(), 2);
+    assert_eq!(
+        fixture.data_manifest_reads.load(Ordering::Relaxed),
+        1,
+        "only the path the map missed is wanted, and it is in the newest data manifest"
+    );
+    assert_eq!(
+        close.data_sequence_numbers.keys().collect::<Vec<_>>(),
+        vec![&newest],
+        "the no-legacy arm fills sequences only for the paths the map missed"
     );
 }
 

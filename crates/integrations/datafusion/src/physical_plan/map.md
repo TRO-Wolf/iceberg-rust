@@ -33,7 +33,7 @@ exec (row R169).
 | `project.rs` | partition-value projection |
 | `commit.rs` / `write.rs` | INSERT commit |
 | `delete.rs` / `update.rs` | DELETE / UPDATE |
-| `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions_by_path` (R114). F-23: this wrapper still passes an empty `known_partitions` map, so the data-manifest walk runs; RePark's complete map is what skips it |
+| `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions_by_path` (R114). F-23: this wrapper still passes an empty `known_partitions` map, so the data-manifest walk runs; RePark's complete map is what skips it. F-23 r2: handing the partitions down here means calling `live_data_file_partitions`, itself a full unstoppable walk, so the skip stays RePark-only until the MoR delete plan resolves partitions before the close (`task/todo.md`) |
 | `repartition.rs` / `sort.rs` | writer helpers |
 | `expr_to_predicate.rs` | filter pushdown |
 | `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`). |

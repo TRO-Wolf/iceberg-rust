@@ -17,7 +17,7 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -67,6 +67,8 @@ struct CountingStorage {
     snapshot_list_reads: Arc<AtomicU64>,
     #[serde(skip)]
     opens: Arc<AtomicU64>,
+    #[serde(skip)]
+    latent: Arc<AtomicBool>,
 }
 
 impl CountingStorage {
@@ -117,6 +119,9 @@ impl Storage for CountingStorage {
 
     async fn read(&self, path: &str) -> Result<Bytes> {
         self.count(path);
+        if self.latent.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
         let bytes = self.inner().read(path).await?;
         self.bytes_read
             .fetch_add(u64::try_from(bytes.len()).unwrap_or(0), Ordering::Relaxed);
@@ -194,6 +199,8 @@ pub(crate) struct CountingStorageFactory {
     pub(crate) snapshot_list_reads: Arc<AtomicU64>,
     #[serde(skip)]
     pub(crate) opens: Arc<AtomicU64>,
+    #[serde(skip)]
+    pub(crate) latent: Arc<AtomicBool>,
 }
 
 #[typetag::serde]
@@ -209,6 +216,7 @@ impl StorageFactory for CountingStorageFactory {
             data_manifest_reads: self.data_manifest_reads.clone(),
             snapshot_list_reads: self.snapshot_list_reads.clone(),
             opens: self.opens.clone(),
+            latent: self.latent.clone(),
         }))
     }
 }

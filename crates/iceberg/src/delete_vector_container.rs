@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::stream::FuturesOrdered;
 use futures::{StreamExt, TryStreamExt, stream};
 use uuid::Uuid;
 
@@ -53,7 +54,7 @@ pub struct DvContainerClose {
     pub removed: Vec<DataFile>,
     /// Live non-Puffin position deletes that name a touched data file.
     pub legacy_deletes: Vec<LegacyPositionDelete>,
-    /// Touched-file data sequence numbers: total when the data-manifest walk ran, otherwise empty.
+    /// Touched-file data sequence numbers: total with legacy deletes, else only paths the map missed.
     pub data_sequence_numbers: HashMap<String, i64>,
 }
 
@@ -141,15 +142,17 @@ pub async fn close_touched_dv_containers_with_partitions(
             .or_insert_with(|| (data_file.partition_spec_id(), data_file.partition().clone()));
     }
 
-    let walk_data = !pending_legacy.is_empty()
-        || touched_paths
-            .iter()
-            .any(|path| !known_partitions.contains_key(*path));
-    let discovered = if walk_data {
-        collect_live_data_files(table, list_ref, &touched_paths).await?
+    let unresolved: HashSet<&str> = touched_paths
+        .iter()
+        .copied()
+        .filter(|path| !known_partitions.contains_key(*path))
+        .collect();
+    let wanted = if pending_legacy.is_empty() {
+        &unresolved
     } else {
-        HashMap::new()
+        &touched_paths
     };
+    let discovered = collect_live_data_files(table, list_ref, wanted).await?;
     let mut data_sequence_numbers: HashMap<String, i64> = HashMap::new();
     for (path, (data_file, seq)) in &discovered {
         extra_partitions
@@ -441,21 +444,22 @@ async fn collect_live_data_files(
         return Ok(files);
     }
     let wanted_len = wanted.len();
-    let data_manifests: Vec<ManifestFile> = manifest_list
+    let data_manifests: Vec<&ManifestFile> = manifest_list
         .entries()
         .iter()
         .filter(|manifest_file| manifest_file.content == ManifestContentType::Data)
-        .cloned()
         .collect();
-    let file_io = table.file_io().clone();
-    let mut manifests = stream::iter(data_manifests)
-        .map(move |manifest_file| {
-            let file_io = file_io.clone();
-            async move { manifest_file.load_manifest(&file_io).await }
-        })
-        .buffered(DV_IO_CONCURRENCY);
+    let file_io = table.file_io();
+    let mut pending = FuturesOrdered::new();
+    let mut issued = 0usize;
     while files.len() < wanted_len {
-        let Some(manifest) = manifests.try_next().await? else {
+        let budget = if issued == 0 { 1 } else { DV_IO_CONCURRENCY };
+        while pending.len() < budget && issued < data_manifests.len() {
+            let manifest_file = data_manifests[issued];
+            pending.push_back(async move { manifest_file.load_manifest(file_io).await });
+            issued += 1;
+        }
+        let Some(manifest) = pending.try_next().await? else {
             break;
         };
         for entry in manifest.entries() {
