@@ -25,6 +25,18 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-03): F-23 conditional data-manifest walk on DV container close (row R114)
+
+Ledger: [`f23-conditional-data-walk-ledger.md`](f23-conditional-data-walk-ledger.md). Row R114.
+
+- [x] C-001: skip `collect_live_data_files` when `pending_legacy` is empty and `known_partitions` covers every touched path; `data_sequence_numbers` total on the legacy arm, else only the paths the map missed (r2)
+- [x] C-002: walk stops once every wanted path is found (`wanted.len()` on a buffered stream)
+- [x] C-003: before/after at 8/48/192 data manifests, three runs, in the ledger
+- [x] C-004: GAP_MATRIX R114, this entry, `map.md` lockstep, ledger
+- [x] Round 2 (Rust perf review): first data manifest alone then a buffered tail (an ordered buffer of 8 issued 8 GETs for a one-manifest hit on a store that is not ready on the first poll); no-legacy arm wants only the paths `known_partitions` missed; exact `== 1` early-exit pin plus two latent-store pins; borrowed manifest entries
+- [ ] `iceberg-datafusion` MoR V3 DELETE/UPDATE: resolve partitions in the delete plan and hand them to `write_deletion_vectors` as `known_partitions`, so the skip fires in tree. Today `delete_legacy_merge.rs` passes an empty map and `live_data_file_partitions` is itself a full unstoppable walk, so routing through it would be a regression
+- [ ] RePark: keep supplying `known_partitions`; that sink is what makes the skip fire. `data_sequence_numbers` is empty on the pure-DV complete-map path, and on the no-legacy arm it carries only the paths the map missed.
+
 ## ACTIVE (2026-09-03): F-22 one-pass legacy scan on DV container close (row R114)
 
 Ledger: [`f22-legacy-scan-one-pass-ledger.md`](f22-legacy-scan-one-pass-ledger.md). Row R114.
@@ -37,7 +49,7 @@ Ledger: [`f22-legacy-scan-one-pass-ledger.md`](f22-legacy-scan-one-pass-ledger.m
 - [x] Round 2: load-once `load_legacy_positions_by_path`; one data-manifest walk; sequences with a supplied partition map; list-read pin; partition/bounds pins; overlay; Arc merge; sort after extend; Option seq
 - [x] Round 3: `load_legacy_positions` is a lookup; one-read pin; F-18 ZERO clause corrected; F-21 `load_position_deletes_by_path` removed; sort `legacy_deletes`/`touched`; `partition_matches` in `finalize_legacy`; pos-only name-fallback pin
 - [x] Round 4: pos-only mask leaf identity; hashed `by_partition.get`; one load-bearing sort in `finalize_legacy`; reverse-alpha grouping so the order pin is red every run
-- [ ] RePark: delete `legacy_deletes.rs` own walk; consume `DvContainerClose::legacy_deletes` + `load_legacy_positions_by_path` once per delete file, then `load_legacy_positions` for a path lookup; do not re-walk data manifests (`data_sequence_numbers` is populated even with a complete `known_partitions` and no legacy). `Option<&ManifestList>` is for RePark.
+- [ ] RePark: delete `legacy_deletes.rs` own walk; consume `DvContainerClose::legacy_deletes` + `load_legacy_positions_by_path` once per delete file, then `load_legacy_positions` for a path lookup. F-23: `data_sequence_numbers` is empty when `pending_legacy` is empty and `known_partitions` covers every touched path — keep supplying that map (the skip sink). `Option<&ManifestList>` is for RePark.
 
 ## ACTIVE (2026-09-02): F-21 legacy parquet position-delete merge into DV (row R114) — DataFusion V3 DV now merges file-scoped parquet deletes (Java BaseDVFileWriter.loadPreviousDeletes) and keeps partition-scoped live (Spark-equal)
 
@@ -68,7 +80,7 @@ Ledger: [`f18-dv-container-close-ledger.md`](f18-dv-container-close-ledger.md). 
 
 - [x] C-001 red: `shared_puffin_dv/container.rs::touched_blob_moves_and_the_sibling_entry_stays_put` failed on base d4ef080ac (sibling entry moved container), green after.
 - [x] C-002 Spark-equal close: DELETE-file removal keyed by the Java `DeleteFileSet` triple; only the touched blob is rewritten; the sibling entry is untouched. T5 re-aimed — one statement writes ONE Puffin.
-- [x] C-003 lazy walk, PINNED by a counting `Storage`: without a partition map each data manifest is read exactly once. F-22 reversed the supplied-map ZERO-read so sequence numbers always fill (a full-map caller that wants no sequence numbers has no opt-out). Round 2 added `with_previous_deletes` for the touched blob, the untargeted-manifest early-out, the caller-supplied partition map, and the borrowed streaming manifest reads.
+- [x] C-003 lazy walk, PINNED by a counting `Storage`: without a partition map each data manifest is read exactly once. F-22 reversed the supplied-map ZERO-read so sequence numbers always fill; F-23 restored the skip when `pending_legacy` is empty and `known_partitions` covers every touched path. Round 2 added `with_previous_deletes` for the touched blob, the untargeted-manifest early-out, the caller-supplied partition map, and the borrowed streaming manifest reads.
 - [x] C-004 measured: 64-blob later DELETE rewrote 19,830 B before, 388 B after (16 blobs 5,006 -> 388); six single-row `DELETE` statements at 8/64/192 live data files 850/922/1152 ms before, 731/841/1138 ms after (debug, same clone).
 - [x] C-005 interop: `dev/java-interop/run-interop-f18-dv-sibling-close.sh` PASSED with its sabotage leg red; `SUITE_FLOOR_DEFAULT` 63 -> 64.
 - [x] C-006 docs: row R114, this entry, `map.md` lockstep, ledger.

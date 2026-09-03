@@ -16,247 +16,46 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+use super::counting::{CountingStorageFactory, append, synthetic_data_file};
 use super::{
-    LegacyPositionDelete, close_touched_dv_containers_at,
+    DV_IO_CONCURRENCY, LegacyPositionDelete, close_touched_dv_containers_at,
     close_touched_dv_containers_with_partitions, load_legacy_positions,
     load_legacy_positions_by_path,
 };
-use crate::io::{
-    FileIOBuilder, FileInfo, FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorageFactory,
-    OutputFile, Storage, StorageConfig, StorageFactory,
-};
+use crate::io::FileIOBuilder;
 use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use crate::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
-use crate::{Catalog, CatalogBuilder, Result};
-
-fn file_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
-fn is_snapshot_list(path: &str) -> bool {
-    let name = file_name(path);
-    name.starts_with("snap-") && name.ends_with(".avro")
-}
-
-fn is_manifest(path: &str) -> bool {
-    let name = file_name(path);
-    name.ends_with(".avro") && !name.starts_with("snap-")
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct CountingStorage {
-    #[serde(skip)]
-    inner: Option<Arc<dyn Storage>>,
-    #[serde(skip)]
-    manifest_reads: Arc<AtomicU64>,
-    #[serde(skip)]
-    bytes_read: Arc<AtomicU64>,
-    #[serde(skip)]
-    delete_manifest_paths: Arc<Mutex<HashSet<String>>>,
-    #[serde(skip)]
-    delete_manifest_reads: Arc<AtomicU64>,
-    #[serde(skip)]
-    data_manifest_paths: Arc<Mutex<HashSet<String>>>,
-    #[serde(skip)]
-    data_manifest_reads: Arc<AtomicU64>,
-    #[serde(skip)]
-    snapshot_list_reads: Arc<AtomicU64>,
-    #[serde(skip)]
-    opens: Arc<AtomicU64>,
-}
-
-impl CountingStorage {
-    fn inner(&self) -> &Arc<dyn Storage> {
-        self.inner.as_ref().expect("counting storage was built")
-    }
-
-    fn count(&self, path: &str) {
-        if path.ends_with(".parquet") {
-            self.opens.fetch_add(1, Ordering::Relaxed);
-        }
-        if is_snapshot_list(path) {
-            self.snapshot_list_reads.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        if is_manifest(path) {
-            self.manifest_reads.fetch_add(1, Ordering::Relaxed);
-            if self
-                .delete_manifest_paths
-                .lock()
-                .expect("delete-manifest path set")
-                .contains(path)
-            {
-                self.delete_manifest_reads.fetch_add(1, Ordering::Relaxed);
-            }
-            if self
-                .data_manifest_paths
-                .lock()
-                .expect("data-manifest path set")
-                .contains(path)
-            {
-                self.data_manifest_reads.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-#[async_trait]
-#[typetag::serde]
-impl Storage for CountingStorage {
-    async fn exists(&self, path: &str) -> Result<bool> {
-        self.inner().exists(path).await
-    }
-
-    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        self.inner().metadata(path).await
-    }
-
-    async fn read(&self, path: &str) -> Result<Bytes> {
-        self.count(path);
-        let bytes = self.inner().read(path).await?;
-        self.bytes_read
-            .fetch_add(u64::try_from(bytes.len()).unwrap_or(0), Ordering::Relaxed);
-        Ok(bytes)
-    }
-
-    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        self.count(path);
-        let inner = self.inner().reader(path).await?;
-        Ok(Box::new(CountingFileRead {
-            inner,
-            bytes_read: self.bytes_read.clone(),
-        }))
-    }
-
-    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-        self.inner().write(path, bs).await
-    }
-
-    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        self.inner().writer(path).await
-    }
-
-    async fn delete(&self, path: &str) -> Result<()> {
-        self.inner().delete(path).await
-    }
-
-    async fn delete_prefix(&self, path: &str) -> Result<()> {
-        self.inner().delete_prefix(path).await
-    }
-
-    async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
-        self.inner().list(prefix).await
-    }
-
-    fn new_input(&self, path: &str) -> Result<InputFile> {
-        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
-    }
-
-    fn new_output(&self, path: &str) -> Result<OutputFile> {
-        self.inner().new_output(path)
-    }
-}
-
-struct CountingFileRead {
-    inner: Box<dyn FileRead>,
-    bytes_read: Arc<AtomicU64>,
-}
-
-#[async_trait]
-impl FileRead for CountingFileRead {
-    async fn read(&self, range: Range<u64>) -> Result<Bytes> {
-        let bytes = self.inner.read(range).await?;
-        self.bytes_read
-            .fetch_add(u64::try_from(bytes.len()).unwrap_or(0), Ordering::Relaxed);
-        Ok(bytes)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct CountingStorageFactory {
-    #[serde(skip)]
-    manifest_reads: Arc<AtomicU64>,
-    #[serde(skip)]
-    bytes_read: Arc<AtomicU64>,
-    #[serde(skip)]
-    delete_manifest_paths: Arc<Mutex<HashSet<String>>>,
-    #[serde(skip)]
-    delete_manifest_reads: Arc<AtomicU64>,
-    #[serde(skip)]
-    data_manifest_paths: Arc<Mutex<HashSet<String>>>,
-    #[serde(skip)]
-    data_manifest_reads: Arc<AtomicU64>,
-    #[serde(skip)]
-    snapshot_list_reads: Arc<AtomicU64>,
-    #[serde(skip)]
-    opens: Arc<AtomicU64>,
-}
-
-#[typetag::serde]
-impl StorageFactory for CountingStorageFactory {
-    fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
-        Ok(Arc::new(CountingStorage {
-            inner: Some(LocalFsStorageFactory.build(config)?),
-            manifest_reads: self.manifest_reads.clone(),
-            bytes_read: self.bytes_read.clone(),
-            delete_manifest_paths: self.delete_manifest_paths.clone(),
-            delete_manifest_reads: self.delete_manifest_reads.clone(),
-            data_manifest_paths: self.data_manifest_paths.clone(),
-            data_manifest_reads: self.data_manifest_reads.clone(),
-            snapshot_list_reads: self.snapshot_list_reads.clone(),
-            opens: self.opens.clone(),
-        }))
-    }
-}
-
-fn synthetic_data_file(path: &str) -> DataFile {
-    DataFileBuilder::default()
-        .content(DataContentType::Data)
-        .file_path(path.to_string())
-        .file_format(DataFileFormat::Parquet)
-        .file_size_in_bytes(100)
-        .record_count(1)
-        .partition_spec_id(0)
-        .partition(Struct::from_iter([Some(Literal::long(0))]))
-        .build()
-        .expect("build synthetic data file")
-}
-
-async fn append(catalog: &impl Catalog, table: &Table, file: DataFile) -> Table {
-    let tx = Transaction::new(table);
-    let tx = tx
-        .fast_append()
-        .add_data_files(vec![file])
-        .apply(tx)
-        .expect("apply fast append");
-    tx.commit(catalog).await.expect("commit fast append")
-}
+use crate::{Catalog, CatalogBuilder};
 
 struct Fixture {
     table: Table,
     paths: Vec<String>,
     manifest_reads: Arc<AtomicU64>,
+    data_manifest_reads: Arc<AtomicU64>,
+    latent: Arc<AtomicBool>,
     _warehouse: TempDir,
 }
 
-async fn three_data_manifests() -> Fixture {
+async fn n_data_manifests(n: usize) -> Fixture {
     let warehouse = TempDir::new().expect("warehouse");
     let manifest_reads = Arc::new(AtomicU64::new(0));
+    let data_manifest_reads = Arc::new(AtomicU64::new(0));
+    let data_manifest_paths = Arc::new(Mutex::new(HashSet::new()));
+    let latent = Arc::new(AtomicBool::new(false));
     let catalog = MemoryCatalogBuilder::default()
         .with_storage_factory(Arc::new(CountingStorageFactory {
             manifest_reads: manifest_reads.clone(),
             bytes_read: Arc::new(AtomicU64::new(0)),
+            data_manifest_paths: data_manifest_paths.clone(),
+            data_manifest_reads: data_manifest_reads.clone(),
+            latent: latent.clone(),
             ..Default::default()
         }))
         .load(
@@ -269,23 +68,45 @@ async fn three_data_manifests() -> Fixture {
         .await
         .expect("catalog");
     let mut table = crate::transaction::tests::make_v3_minimal_table_in_catalog(&catalog).await;
-    let mut paths = Vec::new();
-    for index in 0..3 {
+    let mut paths = Vec::with_capacity(n);
+    for index in 0..n {
         let path = format!("{}/data/f{index}.parquet", table.metadata().location());
         table = append(&catalog, &table, synthetic_data_file(&path)).await;
         paths.push(path);
     }
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("current snapshot");
+    let list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("manifest list");
+    let data_paths: HashSet<String> = list
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.content == crate::spec::ManifestContentType::Data)
+        .map(|manifest| manifest.manifest_path.clone())
+        .collect();
+    *data_manifest_paths.lock().expect("data-manifest path set") = data_paths;
     manifest_reads.store(0, Ordering::Relaxed);
+    data_manifest_reads.store(0, Ordering::Relaxed);
     Fixture {
         table,
         paths,
         manifest_reads,
+        data_manifest_reads,
+        latent,
         _warehouse: warehouse,
     }
 }
 
+async fn three_data_manifests() -> Fixture {
+    n_data_manifests(3).await
+}
+
 #[tokio::test]
-async fn a_supplied_partition_map_still_reads_each_data_manifest_once() {
+async fn a_supplied_partition_map_reads_no_data_manifest() {
     let fixture = three_data_manifests().await;
     let new_positions = HashMap::from([(fixture.paths[0].clone(), vec![0u64])]);
     let known = HashMap::from([(
@@ -303,28 +124,32 @@ async fn a_supplied_partition_map_still_reads_each_data_manifest_once() {
     .expect("close with a supplied partition map");
     assert_eq!(close.added.len(), 1);
     assert_eq!(
-        fixture.manifest_reads.load(Ordering::Relaxed),
-        3,
-        "a supplied partition map still reads each data manifest once for sequence numbers"
+        fixture.data_manifest_reads.load(Ordering::Relaxed),
+        0,
+        "zero-legacy complete known_partitions must not walk data manifests"
     );
     assert!(
-        close.data_sequence_numbers.contains_key(&fixture.paths[0]),
-        "close reports the touched file's data sequence number with a supplied partition map"
+        close.data_sequence_numbers.is_empty(),
+        "data_sequence_numbers is empty when the data-manifest walk is skipped"
     );
 }
 
 #[tokio::test]
 async fn without_the_map_every_data_manifest_is_read_once() {
     let fixture = three_data_manifests().await;
-    let new_positions = HashMap::from([(fixture.paths[0].clone(), vec![0u64])]);
+    let new_positions = HashMap::from([
+        (fixture.paths[0].clone(), vec![0u64]),
+        (fixture.paths[1].clone(), vec![0u64]),
+        (fixture.paths[2].clone(), vec![0u64]),
+    ]);
     let close = close_touched_dv_containers_at(&fixture.table, &new_positions, None)
         .await
         .expect("close without a partition map");
-    assert_eq!(close.added.len(), 1);
+    assert_eq!(close.added.len(), 3);
     assert_eq!(
         fixture.manifest_reads.load(Ordering::Relaxed),
         3,
-        "each of the three data manifests is read exactly once"
+        "touching every file without a partition map reads each data manifest once"
     );
 }
 
@@ -551,8 +376,13 @@ async fn delete_manifests_are_read_once_without_legacy_deletes() {
         "each delete manifest is read exactly once"
     );
     assert!(
-        close.data_sequence_numbers.contains_key(&fixture.path),
-        "close reports data sequence numbers with a complete partition map and no applicable legacy"
+        close.data_sequence_numbers.is_empty(),
+        "zero-legacy complete known_partitions leaves data_sequence_numbers empty"
+    );
+    assert_eq!(
+        fixture.data_manifest_reads.load(Ordering::Relaxed),
+        0,
+        "zero-legacy complete known_partitions must not walk data manifests"
     );
     assert_eq!(
         fixture.snapshot_list_reads.load(Ordering::Relaxed),
@@ -597,6 +427,109 @@ async fn delete_manifests_are_read_once_with_legacy_deletes() {
         fixture.delete_manifest_reads.load(Ordering::Relaxed),
         u64::try_from(expected).expect("count fits"),
         "each delete manifest is read exactly once"
+    );
+}
+
+#[tokio::test]
+async fn a_supplied_partition_map_still_reads_each_data_manifest_once() {
+    let fixture = n_delete_manifests(1, true).await;
+    let partition = (0i32, Struct::from_iter([Some(Literal::long(0))]));
+    let known = HashMap::from([
+        (fixture.path.clone(), partition.clone()),
+        (fixture.other.clone(), partition),
+    ]);
+    let new_positions = HashMap::from([
+        (fixture.path.clone(), vec![99u64]),
+        (fixture.other.clone(), vec![99u64]),
+    ]);
+    let close = close_touched_dv_containers_with_partitions(
+        &fixture.table,
+        &new_positions,
+        None,
+        &known,
+        None,
+    )
+    .await
+    .expect("close with legacy deletes and a complete partition map");
+    assert_eq!(close.added.len(), 2);
+    assert_eq!(
+        fixture.data_manifest_reads.load(Ordering::Relaxed),
+        2,
+        "legacy deletes force one read of each data manifest even with a complete partition map"
+    );
+    assert!(
+        close.data_sequence_numbers.contains_key(&fixture.path)
+            && close.data_sequence_numbers.contains_key(&fixture.other),
+        "the data-manifest walk fills data_sequence_numbers for every touched path"
+    );
+}
+
+#[tokio::test]
+async fn a_touched_file_in_the_first_data_manifest_stops_the_walk() {
+    let fixture = n_data_manifests(192).await;
+    let touched = fixture.paths.last().expect("n > 0").clone();
+    let new_positions = HashMap::from([(touched, vec![0u64])]);
+    let close = close_touched_dv_containers_at(&fixture.table, &new_positions, None)
+        .await
+        .expect("close without a partition map");
+    assert_eq!(close.added.len(), 1);
+    assert_eq!(
+        fixture.data_manifest_reads.load(Ordering::Relaxed),
+        1,
+        "a file in the newest data manifest stops the walk after one read"
+    );
+}
+
+#[tokio::test]
+async fn a_latent_store_reads_one_data_manifest_for_a_newest_file_hit() {
+    let fixture = n_data_manifests(192).await;
+    fixture.latent.store(true, Ordering::Relaxed);
+    let touched = fixture.paths.last().expect("n > 0").clone();
+    let new_positions = HashMap::from([(touched, vec![0u64])]);
+    let close = close_touched_dv_containers_at(&fixture.table, &new_positions, None)
+        .await
+        .expect("close without a partition map");
+    fixture.latent.store(false, Ordering::Relaxed);
+    assert_eq!(close.added.len(), 1);
+    assert_eq!(
+        fixture.data_manifest_reads.load(Ordering::Relaxed),
+        1,
+        "a store whose read is not ready on the first poll must still issue one GET, not {}",
+        DV_IO_CONCURRENCY
+    );
+}
+
+#[tokio::test]
+async fn only_the_paths_the_map_misses_are_wanted_without_legacy_deletes() {
+    let fixture = n_data_manifests(192).await;
+    fixture.latent.store(true, Ordering::Relaxed);
+    let newest = fixture.paths.last().expect("n > 0").clone();
+    let oldest = fixture.paths.first().expect("n > 0").clone();
+    let known = HashMap::from([(
+        oldest.clone(),
+        (0i32, Struct::from_iter([Some(Literal::long(0))])),
+    )]);
+    let new_positions = HashMap::from([(newest.clone(), vec![0u64]), (oldest, vec![0u64])]);
+    let close = close_touched_dv_containers_with_partitions(
+        &fixture.table,
+        &new_positions,
+        None,
+        &known,
+        None,
+    )
+    .await
+    .expect("close with a partial partition map and no legacy deletes");
+    fixture.latent.store(false, Ordering::Relaxed);
+    assert_eq!(close.added.len(), 2);
+    assert_eq!(
+        fixture.data_manifest_reads.load(Ordering::Relaxed),
+        1,
+        "only the path the map missed is wanted, and it is in the newest data manifest"
+    );
+    assert_eq!(
+        close.data_sequence_numbers.keys().collect::<Vec<_>>(),
+        vec![&newest],
+        "the no-legacy arm fills sequences only for the paths the map missed"
     );
 }
 

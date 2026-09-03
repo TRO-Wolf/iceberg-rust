@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::stream::FuturesOrdered;
 use futures::{StreamExt, TryStreamExt, stream};
 use uuid::Uuid;
 
@@ -26,8 +27,8 @@ use crate::delete_file_index::is_deletion_vector;
 use crate::delete_vector::{DeleteVector, load_delete_vector};
 use crate::io::FileIO;
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, Manifest, ManifestContentType, ManifestList,
-    PartitionKey, PartitionSpec, Struct,
+    DataContentType, DataFile, DataFileFormat, Manifest, ManifestContentType, ManifestFile,
+    ManifestList, PartitionKey, PartitionSpec, Struct,
 };
 use crate::table::Table;
 use crate::writer::base_writer::deletion_vector_writer::{DVFileWriter, PreviousDeletes};
@@ -53,7 +54,7 @@ pub struct DvContainerClose {
     pub removed: Vec<DataFile>,
     /// Live non-Puffin position deletes that name a touched data file.
     pub legacy_deletes: Vec<LegacyPositionDelete>,
-    /// Data sequence numbers of the touched data files.
+    /// Touched-file data sequence numbers: total with legacy deletes, else only paths the map missed.
     pub data_sequence_numbers: HashMap<String, i64>,
 }
 
@@ -141,7 +142,17 @@ pub async fn close_touched_dv_containers_with_partitions(
             .or_insert_with(|| (data_file.partition_spec_id(), data_file.partition().clone()));
     }
 
-    let discovered = collect_live_data_files(table, list_ref, &touched_paths).await?;
+    let unresolved: HashSet<&str> = touched_paths
+        .iter()
+        .copied()
+        .filter(|path| !known_partitions.contains_key(*path))
+        .collect();
+    let wanted = if pending_legacy.is_empty() {
+        &unresolved
+    } else {
+        &touched_paths
+    };
+    let discovered = collect_live_data_files(table, list_ref, wanted).await?;
     let mut data_sequence_numbers: HashMap<String, i64> = HashMap::new();
     for (path, (data_file, seq)) in &discovered {
         extra_partitions
@@ -432,8 +443,25 @@ async fn collect_live_data_files(
     if wanted.is_empty() {
         return Ok(files);
     }
-    let mut manifests = manifest_stream(table.file_io(), manifest_list, ManifestContentType::Data);
-    while let Some(manifest) = manifests.try_next().await? {
+    let wanted_len = wanted.len();
+    let data_manifests: Vec<&ManifestFile> = manifest_list
+        .entries()
+        .iter()
+        .filter(|manifest_file| manifest_file.content == ManifestContentType::Data)
+        .collect();
+    let file_io = table.file_io();
+    let mut pending = FuturesOrdered::new();
+    let mut issued = 0usize;
+    while files.len() < wanted_len {
+        let budget = if issued == 0 { 1 } else { DV_IO_CONCURRENCY };
+        while pending.len() < budget && issued < data_manifests.len() {
+            let manifest_file = data_manifests[issued];
+            pending.push_back(async move { manifest_file.load_manifest(file_io).await });
+            issued += 1;
+        }
+        let Some(manifest) = pending.try_next().await? else {
+            break;
+        };
         for entry in manifest.entries() {
             if !entry.is_alive() || entry.data_file().content_type() != DataContentType::Data {
                 continue;
@@ -446,6 +474,9 @@ async fn collect_live_data_files(
             files
                 .entry(data_file.file_path().to_string())
                 .or_insert((data_file, seq));
+            if files.len() == wanted_len {
+                break;
+            }
         }
     }
     Ok(files)
@@ -533,6 +564,8 @@ async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<Data
     writer.close().await
 }
 
+#[cfg(test)]
+mod counting;
 #[cfg(test)]
 mod measure;
 #[cfg(test)]

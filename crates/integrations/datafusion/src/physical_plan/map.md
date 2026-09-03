@@ -33,7 +33,7 @@ exec (row R169).
 | `project.rs` | partition-value projection |
 | `commit.rs` / `write.rs` | INSERT commit |
 | `delete.rs` / `update.rs` | DELETE / UPDATE |
-| `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions_by_path` (R114) |
+| `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions_by_path` (R114). F-23: this wrapper still passes an empty `known_partitions` map, so the data-manifest walk runs; RePark's complete map is what skips it. F-23 r2: handing the partitions down here means calling `live_data_file_partitions`, itself a full unstoppable walk, so the skip stays RePark-only until the MoR delete plan resolves partitions before the close (`task/todo.md`) |
 | `repartition.rs` / `sort.rs` | writer helpers |
 | `expr_to_predicate.rs` | filter pushdown |
 | `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`). |
@@ -67,6 +67,7 @@ exec (row R169).
 | V3 MoR DELETE on a diverged branch: data file is not a live file of the scanned snapshot | `close_touched_dv_containers` walked `current_snapshot()` (main). Pass the scan snapshot to `close_touched_dv_containers_at` |
 | V3 DELETE on a V2-upgrade table with live parquet position deletes resurrects rows | close must return `legacy_deletes` from the same delete-manifest pass and merge via `load_legacy_positions_by_path`; file-scoped parquet is removed, partition-scoped is kept |
 | Delete manifests are read twice per V3 DELETE | F-22: `write_deletion_vectors` must not walk manifests; consume `DvContainerClose::legacy_deletes` |
+| Pure-DV close rereads every data manifest | F-23: skip the walk when `pending_legacy` is empty and `known_partitions` covers every touched path; this wrapper passes an empty map so RePark must keep supplying the map |
 | Partition-scoped parquet delete is dropped after a one-file DELETE | `referenced_data_file_location` is None: merge per touched file, do not add the parquet to `DvContainerClose::removed` |
 | Old parquet delete from an earlier snapshot is merged into a newer data file's DV | sequence filter: skip when `delete_seq < data_seq` |
 

@@ -189,7 +189,7 @@ Docker legs of `make test` excused.
 | note |
 |---|
 | Delete `legacy_deletes.rs`'s own delete-manifest walk. Consume `DvContainerClose::legacy_deletes` + `load_legacy_positions_by_path` once per delete file, then `load_legacy_positions` for a path lookup. Do not call the by-path loader per touched path. |
-| Do not re-walk data manifests for sequence numbers; `data_sequence_numbers` is filled for every touched path even with a complete `known_partitions` and no legacy. Pass statement-only positions into close (close merges). A full-map caller that wants no sequence numbers has no opt-out (F-18 reversal). |
+| Do not re-walk data manifests for sequence numbers. F-23: `data_sequence_numbers` is total only on the legacy arm; with no legacy deletes it carries only the touched paths `known_partitions` missed (F-23 r2), and it is empty when the map covers them all. RePark's `known_partitions` sink is what makes the skip fire — keep it. Pass statement-only positions into close (close merges). |
 | `Option<&ManifestList>` has no in-tree DataFusion consumer (`delete_legacy_merge.rs` passes `None`); RePark is the consumer (P3-c). |
 | F-21 `arrow/delete_file_loader.rs::load_position_deletes_by_path` is removed. Use `load_legacy_positions_by_path`. |
 
