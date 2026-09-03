@@ -33,6 +33,7 @@ exec (row R169).
 | `project.rs` | partition-value projection |
 | `commit.rs` / `write.rs` | INSERT commit |
 | `delete.rs` / `update.rs` | DELETE / UPDATE |
+| `delete_legacy_merge.rs` | legacy parquet → DV merge (R114, F-21) |
 | `repartition.rs` / `sort.rs` | writer helpers |
 | `expr_to_predicate.rs` | filter pushdown |
 | `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`). |

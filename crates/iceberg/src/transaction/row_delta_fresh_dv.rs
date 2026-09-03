@@ -111,33 +111,31 @@ pub(crate) async fn validate_fresh_dvs_only(
                     ));
                 }
             } else {
+                let Some(referenced_path) = referenced_data_file_location(existing) else {
+                    continue;
+                };
                 for referenced in added_dvs.keys() {
-                    let Some((data_spec_id, data_partition, data_seq)) =
-                        live_data_entry_by_path.get(referenced)
-                    else {
+                    if &referenced_path != referenced {
+                        continue;
+                    }
+                    let Some((_, _, data_seq)) = live_data_entry_by_path.get(referenced) else {
                         continue;
                     };
-                    let scope_matches = match referenced_data_file_location(existing) {
-                        Some(path) => &path == referenced,
-                        None => {
-                            existing.partition_spec_id() == *data_spec_id
-                                && existing.partition() == data_partition
-                        }
+                    let applies = match (entry.sequence_number(), *data_seq) {
+                        (Some(delete_seq), Some(data_seq)) => delete_seq >= data_seq,
+                        _ => true,
                     };
-                    let applies = scope_matches
-                        && match (entry.sequence_number(), *data_seq) {
-                            (Some(delete_seq), Some(data_seq)) => delete_seq >= data_seq,
-                            _ => true,
-                        };
                     if applies {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
                             format!(
                                 "Cannot commit deletion vector for {}: live position delete file \
                                  {} still applies to that data file and would be silently \
-                                 superseded by the DV at read time. Merging previous deletes into \
-                                 the new DV (Java BaseDVFileWriter.loadPreviousDeletes) is deferred \
-                                 in this port",
+                                 superseded by the DV at read time. Read it back and merge it \
+                                 through DVFileWriter::with_previous_deletes, and pass the \
+                                 superseded file to RowDelta::remove_deletes_many in THIS commit \
+                                 (Java BaseDVFileWriter.loadPreviousDeletes + \
+                                 RowDelta.removeDeletes)",
                                 referenced,
                                 existing.file_path()
                             ),

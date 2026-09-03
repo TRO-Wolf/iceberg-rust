@@ -24,6 +24,17 @@ The current plan for in-flight work. The operating manuals
 [engineering method](../.agents/skills/engineering-method/SKILL.md)) require this file to be written
 **before** any non-trivial change and kept current as work proceeds.
 
+
+## ACTIVE (2026-09-02): F-21 legacy parquet position-delete merge into DV (row R114) — DataFusion V3 DV now merges file-scoped parquet deletes (Java BaseDVFileWriter.loadPreviousDeletes) and keeps partition-scoped live (Spark-equal)
+
+Ledger: [`f21-legacy-delete-merge-ledger.md`](f21-legacy-delete-merge-ledger.md). Row R114.
+
+- [x] C-001 red: V2 MoR + file-scoped parquet delete (id 2) upgraded to V3, DELETE id 3 refused before IO, green after (DV rc 2, parquet 0)
+- [x] C-002 merge: file-scoped via `referenced_data_file_location` (field or equal file_path bounds) loaded by reserved ids filtered to the data file, only `delete_seq >= data_seq`, union once via `DVFileWriter::with_previous_deletes`, removed in same RowDelta; partition-scoped merged per-file but kept live
+- [x] C-003 pins: base cell, UPDATE, untouched-file control, partition-scoped merge-and-keep (DV rc 2 + parquet 1), sequence-number not-apply (old delete not merged for new file); 5 tests, mutations 1 red each, Java interop `run-interop-f21-legacy-delete-merge.sh` (1 fixture, sabotage red)
+- [x] C-004 docs: row R114, `task/todo.md`, `map.md` lockstep, ledger, `SUITE_FLOOR_DEFAULT` 64 -> 65
+- [ ] RePark: close `V3-UPGRADE-DV-PLAIN-1`, keep `V3-UPGRADE-DV-PART-1`
+
 ## ACTIVE (2026-09-02): F-19 + F-20 — retire DELETE-side files-exist broadening, drop sibling rewrite, drain FanoutWriter in partition order
 
 Ledger: [`f19-f20-fanout-order-ledger.md`](f19-f20-fanout-order-ledger.md). Rows R114, R115, R135.

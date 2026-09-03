@@ -76,7 +76,7 @@ REPO_ROOT="$(pwd)"
 # the 52nd was run-interop-file-scoped-deletes.sh, for the path-keyed position-delete routing).
 # The 55th is run-interop-row-lineage.sh, added 2026-08-25 for V3 row lineage (row R166).
 # RATCHET THIS UP when a suite is added (same change); lower it only with a deliberate removal.
-SUITE_FLOOR_DEFAULT=64
+SUITE_FLOOR_DEFAULT=65
 
 SUITES_DIR_DEFAULT="${REPO_ROOT}/dev/java-interop"
 MVN_DEFAULT="/opt/maven/bin/mvn"

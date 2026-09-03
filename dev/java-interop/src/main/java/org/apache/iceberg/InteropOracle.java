@@ -501,6 +501,16 @@ public final class InteropOracle {
           System.exit(1);
         }
         break;
+      case "generate-interop-f21-legacy-delete-merge":
+        F21LegacyDeleteMergeOracle.generate(requireFixturesDir("interop.f21_legacy_delete_merge.dir"));
+        break;
+      case "verify-interop-f21-legacy-delete-merge":
+        int f21Failures = F21LegacyDeleteMergeOracle.verify(requireFixturesDir("interop.f21_legacy_delete_merge.dir"));
+        System.out.println("verify-interop-f21-legacy-delete-merge: " + f21Failures + " failures");
+        if (f21Failures > 0) {
+          System.exit(1);
+        }
+        break;
       case "verify-interop-dv-table":
         // DELETION-VECTOR TABLE-level, DIRECTION 2 — "JAVA reads what RUST writes" (Increment
         // D4, the headline). The Rust GEN test (env ICEBERG_INTEROP_DV_TABLE_DIR,
@@ -10137,6 +10147,83 @@ public final class InteropOracle {
       } else {
         System.out.println("PASS f18: summary removed-delete-files=1 removed-dvs=1 added-delete-files=1");
       }
+      return failures;
+    }
+  }
+
+  static final class F21LegacyDeleteMergeOracle {
+    private F21LegacyDeleteMergeOracle() {}
+    static void generate(Path dir) throws IOException {
+      Files.createDirectories(dir);
+      File tableDir = dir.resolve("table").toFile();
+      File metadataDir = new File(tableDir, "metadata");
+      File dataDir = new File(tableDir, "data");
+      if (!metadataDir.isDirectory() && !metadataDir.mkdirs()) { throw new IOException("failed to create metadata dir at " + metadataDir); }
+      if (!dataDir.isDirectory() && !dataDir.mkdirs()) { throw new IOException("failed to create data dir at " + dataDir); }
+      Schema schema = new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()), Types.NestedField.optional(2, "data", Types.StringType.get()));
+      PartitionSpec spec = PartitionSpec.unpartitioned();
+      Map<String, String> props = new LinkedHashMap<>();
+      props.put(TableProperties.FORMAT_VERSION, "2");
+      TableMetadata seed = TableMetadata.newTableMetadata(schema, spec, SortOrder.unsorted(), tableDir.getAbsolutePath(), props);
+      LocalTableOperations ops = new LocalTableOperations(tableDir, metadataDir);
+      ops.commit(null, seed);
+      BaseTable table = new BaseTable(ops, "interop_f21");
+      String dataPath = new File(dataDir, "00000-data.parquet").getAbsolutePath();
+      DataFile dataFile = writeDataFileF21(table, schema, spec, dataPath);
+      table.newFastAppend().appendFile(dataFile).commit();
+      String deletePath = new File(dataDir, "00000-data-deletes.parquet").getAbsolutePath();
+      DeleteFile deleteFile = writePosDeleteFileF21(table, schema, spec, deletePath, dataFile.path().toString(), new long[]{1L});
+      table.newRowDelta().addDeletes(deleteFile).commit();
+      Path finalMetadata = metadataDir.toPath().resolve("final.metadata.json");
+      OutputFile finalOut = new LocalFileIO().newOutputFile(finalMetadata.toAbsolutePath().toString());
+      TableMetadataParser.write(ops.current(), finalOut);
+      System.out.println("generated f21 v2 table with pos delete at " + dir);
+    }
+    private static DataFile writeDataFileF21(BaseTable table, Schema schema, PartitionSpec spec, String path) throws IOException {
+      List<Record> rows = new ArrayList<>();
+      int[] ids = {1, 2, 3, 4};
+      String[] values = {"a", "b", "c", "d"};
+      for (int i = 0; i < ids.length; i++) { GenericRecord record = GenericRecord.create(schema); record.setField("id", ids[i]); record.setField("data", values[i]); rows.add(record); }
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec);
+      OutputFile out = table.io().newOutputFile(path);
+      DataWriter<Record> writer = factory.newDataWriter(org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY), FileFormat.PARQUET, null);
+      try (Closeable toClose = writer) { writer.write(rows); }
+      return writer.toDataFile();
+    }
+    private static DeleteFile writePosDeleteFileF21(BaseTable table, Schema schema, PartitionSpec spec, String path, String dataFilePath, long[] positions) throws IOException {
+      GenericAppenderFactory factory = new GenericAppenderFactory(schema, spec).set(TableProperties.METRICS_MODE_COLUMN_CONF_PREFIX + MetadataColumns.DELETE_FILE_PATH.name(), "full");
+      OutputFile out = table.io().newOutputFile(path);
+      org.apache.iceberg.deletes.PositionDeleteWriter<Record> writer = factory.newPosDeleteWriter(org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(out, org.apache.iceberg.encryption.EncryptionKeyMetadata.EMPTY), FileFormat.PARQUET, null);
+      for (long pos : positions) { PositionDelete<Record> del = PositionDelete.create(); del.set(dataFilePath, pos, null); writer.write(del); }
+      writer.close();
+      return writer.toDeleteFile();
+    }
+    static int verify(Path dir) throws IOException {
+      int failures = 0;
+      Path after = dir.resolve("after_delete");
+      Path finalMetadata = after.resolve("rust_table").resolve("metadata").resolve("final.metadata.json");
+      for (String fixture : new String[]{"expected_rows.json"}) { if (!Files.exists(after.resolve(fixture))) { System.out.println("FAIL f21: missing fixture " + after.resolve(fixture)); return 1; } }
+      if (!Files.exists(finalMetadata)) { System.out.println("FAIL f21: missing " + finalMetadata + " (run the Rust GEN path first)"); return 1; }
+      int fixtureCount = 0; try (java.util.stream.Stream<Path> listed = Files.list(after)) { fixtureCount = (int) listed.filter(Files::isRegularFile).count(); }
+      if (fixtureCount != 1) { System.out.println("FAIL f21: expected 1 fixture files under " + after + ", got " + fixtureCount); return 1; }
+      TableMetadata metadata; try { metadata = TableMetadataParser.fromJson(finalMetadata.toString(), readString(finalMetadata)); } catch (RuntimeException e) { System.out.println("FAIL f21: Java could not parse Rust metadata: " + e); return 1; }
+      if (metadata.formatVersion() != 3) { System.out.println("FAIL f21: expected format-version 3, got " + metadata.formatVersion()); return 1; }
+      FileIO io = new LocalFileIO();
+      BaseTable table = new BaseTable(new InMemoryInspectionOperations(metadata, io), "rust_table");
+      Map<Long, String> dataById = new LinkedHashMap<>();
+      try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) { for (Record r : records) { Number idNum = (Number) r.getField("id"); Long id = idNum.longValue(); Object d = r.getField("data"); dataById.put(id, d == null ? null : d.toString()); } } catch (Exception e) { System.out.println("FAIL f21: Java could not read Rust table: " + e); return 1; }
+      Map<Long, String> expected = new LinkedHashMap<>();
+      for (com.fasterxml.jackson.databind.JsonNode n : com.fasterxml.jackson.databind.ObjectMapper.class.cast(JsonUtil.mapper()).readTree(readString(after.resolve("expected_rows.json")))) { expected.put(n.get("id").asLong(), n.get("data").asText()); }
+      if (!dataById.equals(expected)) { System.out.println("FAIL f21: live rows " + dataById + " != expected " + expected); failures++; } else { System.out.println("PASS f21: Java read live rows " + dataById); }
+      int puffinCount = 0; int parquetCount = 0; long dvRecordCount = 0;
+      Snapshot current = table.currentSnapshot();
+      for (ManifestFile mf : current.deleteManifests(io)) { try (ManifestReader<DeleteFile> reader = ManifestFiles.readDeleteManifest(mf, io, metadata.specsById())) { for (DeleteFile df : reader) { if (df.format() == FileFormat.PUFFIN) { puffinCount++; dvRecordCount = df.recordCount(); } else if (df.format() == FileFormat.PARQUET) { parquetCount++; } } } }
+      if (puffinCount != 1 || dvRecordCount != 2) { System.out.println("FAIL f21: expected 1 puffin DV with rc 2, got puffin=" + puffinCount + " rc=" + dvRecordCount); failures++; } else { System.out.println("PASS f21: one puffin DV rc 2"); }
+      if (parquetCount != 0) { System.out.println("FAIL f21: expected 0 parquet deletes after merge, got " + parquetCount); failures++; } else { System.out.println("PASS f21: no parquet deletes remain"); }
+      Map<String, String> summary = current.summary();
+      int addedDvs = summary.get("added-dvs") == null ? 0 : Integer.parseInt(summary.get("added-dvs"));
+      int addedPosDeletes = summary.get("added-position-deletes") == null ? 0 : Integer.parseInt(summary.get("added-position-deletes"));
+      if (addedDvs != 1 || addedPosDeletes != 2) { System.out.println("FAIL f21: expected added-dvs 1 added-position-deletes 2, got " + addedDvs + "/" + addedPosDeletes); failures++; } else { System.out.println("PASS f21: summary added-dvs 1 added-position-deletes 2"); }
       return failures;
     }
   }
