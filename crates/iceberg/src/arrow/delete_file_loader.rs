@@ -338,11 +338,11 @@ fn try_build_delete_projection_mask(
     // Name-based fallback for the positional-delete reserved pair when field ids are missing
     // (some writers emit `file_path` / `pos` by name only). Only safe when the request is
     // exactly those two reserved ids — equality-delete keys must not be guessed by name.
-    let is_pos_delete_projection = wanted.len() == 2
+    let is_pos_delete_pair = wanted.len() == 2
         && wanted.contains(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
         && wanted.contains(&RESERVED_FIELD_ID_DELETE_FILE_POS);
-    if !is_pos_delete_projection {
-        // Incomplete field-id match or non-pos projection: refuse rather than guess.
+    let is_pos_only = wanted.len() == 1 && wanted.contains(&RESERVED_FIELD_ID_DELETE_FILE_POS);
+    if !is_pos_delete_pair && !is_pos_only {
         return None;
     }
 
@@ -352,7 +352,7 @@ fn try_build_delete_projection_mask(
     arrow_schema
         .fields()
         .filter_leaves(|idx, field| match field.name().as_str() {
-            RESERVED_COL_NAME_DELETE_FILE_PATH if !saw_path => {
+            RESERVED_COL_NAME_DELETE_FILE_PATH if is_pos_delete_pair && !saw_path => {
                 name_indices.push(idx);
                 saw_path = true;
                 true
@@ -364,7 +364,12 @@ fn try_build_delete_projection_mask(
             }
             _ => false,
         });
-    if saw_path && saw_pos && !name_indices.is_empty() {
+    let complete = if is_pos_only {
+        saw_pos
+    } else {
+        saw_path && saw_pos
+    };
+    if complete && !name_indices.is_empty() {
         Some(ProjectionMask::leaves(parquet_schema, name_indices))
     } else {
         None
