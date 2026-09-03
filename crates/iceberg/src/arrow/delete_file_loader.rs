@@ -731,10 +731,18 @@ mod tests {
             &[RESERVED_FIELD_ID_DELETE_FILE_POS],
             with_pos_meta.parquet_schema(),
             with_pos_meta.schema(),
-        );
-        assert!(
-            mask.is_some(),
-            "pos-only request over a nameless-id file_path/pos schema must build a mask"
+        )
+        .expect("pos-only request over a nameless-id file_path/pos schema must build a mask");
+        let pos_leaf = (0..with_pos_meta.parquet_schema().num_columns())
+            .find(|&index| {
+                with_pos_meta.parquet_schema().column(index).name()
+                    == RESERVED_COL_NAME_DELETE_FILE_POS
+            })
+            .expect("pos leaf");
+        assert_eq!(
+            mask,
+            ProjectionMask::leaves(with_pos_meta.parquet_schema(), [pos_leaf]),
+            "pos-only name fallback must project the pos leaf alone"
         );
         let path_only_file = File::open(&path_only).expect("open");
         let path_only_meta = parquet::arrow::arrow_reader::ArrowReaderMetadata::load(

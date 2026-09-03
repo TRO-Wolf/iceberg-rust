@@ -310,18 +310,21 @@ pub(super) fn finalize_legacy(
     known_partitions: &HashMap<String, (i32, Struct)>,
     extra_partitions: &HashMap<String, (i32, Struct)>,
 ) -> Vec<Arc<LegacyPositionDelete>> {
+    let mut ordered: Vec<&str> = touched_paths.iter().copied().collect();
+    ordered.sort_unstable();
+    ordered.reverse();
     let mut by_partition: HashMap<(i32, Struct), Vec<&str>> = HashMap::new();
-    for path in touched_paths {
+    for path in ordered {
         let Some((spec_id, partition)) = extra_partitions
-            .get(*path)
-            .or_else(|| known_partitions.get(*path))
+            .get(path)
+            .or_else(|| known_partitions.get(path))
         else {
             continue;
         };
         by_partition
             .entry((*spec_id, partition.clone()))
             .or_default()
-            .push(*path);
+            .push(path);
     }
     let mut out = Vec::new();
     for item in pending {
@@ -336,11 +339,11 @@ pub(super) fn finalize_legacy(
             }
             continue;
         }
+        let key = (item.file.partition_spec_id(), item.file.partition().clone());
         let mut touched = Vec::new();
-        for ((spec_id, partition), paths) in &by_partition {
-            if !partition_matches(&item.file, *spec_id, partition) {
-                continue;
-            }
+        if let Some(paths) = by_partition.get(&key)
+            && partition_matches(&item.file, key.0, &key.1)
+        {
             for path in paths {
                 if file_path_bounds_admit(&item.file, path) {
                     touched.push((*path).to_string());
@@ -365,16 +368,20 @@ pub(super) fn finalize_legacy(
 mod scope_tests {
     use std::collections::{HashMap, HashSet};
 
-    use super::{PendingLegacy, file_path_bounds_admit, finalize_legacy};
+    use super::{PendingLegacy, file_path_bounds_admit, finalize_legacy, partition_matches};
     use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, Struct,
     };
 
     fn parquet_delete(spec_id: i32, part: i64) -> DataFile {
+        parquet_delete_at("s3://b/d.parquet", spec_id, part)
+    }
+
+    fn parquet_delete_at(path: &str, spec_id: i32, part: i64) -> DataFile {
         DataFileBuilder::default()
             .content(DataContentType::PositionDeletes)
-            .file_path("s3://b/d.parquet".to_string())
+            .file_path(path.to_string())
             .file_format(DataFileFormat::Parquet)
             .file_size_in_bytes(100)
             .record_count(1)
@@ -408,6 +415,10 @@ mod scope_tests {
     #[test]
     fn partition_scoped_delete_is_not_collected_for_another_partition() {
         let file = parquet_delete(0, 1);
+        assert!(
+            !partition_matches(&file, 0, &Struct::from_iter([Some(Literal::long(0))])),
+            "partition 1 does not match 0"
+        );
         let pending = vec![PendingLegacy {
             file,
             seq: Some(1),
@@ -428,6 +439,10 @@ mod scope_tests {
     #[test]
     fn partition_scoped_delete_is_not_collected_under_another_spec() {
         let file = parquet_delete(1, 0);
+        assert!(
+            !partition_matches(&file, 0, &Struct::from_iter([Some(Literal::long(0))])),
+            "spec 1 does not match spec 0"
+        );
         let pending = vec![PendingLegacy {
             file,
             seq: Some(1),
@@ -490,5 +505,39 @@ mod scope_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].touched, vec!["s3://b/c.parquet".to_string()]);
         assert!(!out[0].file_scoped);
+    }
+
+    #[test]
+    fn partition_scoped_deletes_and_touched_paths_are_sorted() {
+        let pending = vec![
+            PendingLegacy {
+                file: parquet_delete_at("s3://b/del-z.parquet", 0, 0),
+                seq: Some(1),
+                referenced: None,
+            },
+            PendingLegacy {
+                file: parquet_delete_at("s3://b/del-a.parquet", 0, 0),
+                seq: Some(1),
+                referenced: None,
+            },
+        ];
+        let touched = HashSet::from(["s3://b/c.parquet", "s3://b/a.parquet", "s3://b/b.parquet"]);
+        let part = (0i32, Struct::from_iter([Some(Literal::long(0))]));
+        let known = HashMap::from([
+            ("s3://b/c.parquet".to_string(), part.clone()),
+            ("s3://b/a.parquet".to_string(), part.clone()),
+            ("s3://b/b.parquet".to_string(), part),
+        ]);
+        let out = finalize_legacy(pending, &touched, &known, &HashMap::new());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].file.file_path(), "s3://b/del-a.parquet");
+        assert_eq!(out[1].file.file_path(), "s3://b/del-z.parquet");
+        let expected = vec![
+            "s3://b/a.parquet".to_string(),
+            "s3://b/b.parquet".to_string(),
+            "s3://b/c.parquet".to_string(),
+        ];
+        assert_eq!(out[0].touched, expected);
+        assert_eq!(out[1].touched, expected);
     }
 }

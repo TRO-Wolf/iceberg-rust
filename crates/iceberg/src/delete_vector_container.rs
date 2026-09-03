@@ -199,16 +199,11 @@ pub async fn close_touched_dv_containers_with_partitions(
         overlay = Some(merged);
     }
 
-    let mut legacy_deletes: Vec<LegacyPositionDelete> = legacy_arcs
-        .iter()
-        .map(|item| item.as_ref().clone())
-        .collect();
-    for item in &mut legacy_deletes {
-        item.touched.sort();
-    }
-    legacy_deletes.sort_by(|left, right| left.file.file_path().cmp(right.file.file_path()));
     let mut close = DvContainerClose {
-        legacy_deletes,
+        legacy_deletes: legacy_arcs
+            .iter()
+            .map(|item| item.as_ref().clone())
+            .collect(),
         data_sequence_numbers,
         ..DvContainerClose::default()
     };
