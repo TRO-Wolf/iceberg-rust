@@ -6870,16 +6870,8 @@ async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_positi
         .await
         .unwrap();
     let delete_files = live_delete_files(&client, "test_del_mread_part_upgrade", "items").await?;
-    assert_eq!(delete_files.len(), 2, "parquet kept + DV");
-    let puffin = delete_files
-        .iter()
-        .find(|f| f.file_format() == iceberg::spec::DataFileFormat::Puffin)
-        .unwrap();
-    let parquet = delete_files
-        .iter()
-        .find(|f| f.file_format() == iceberg::spec::DataFileFormat::Parquet)
-        .unwrap();
-    assert_eq!(puffin.record_count(), 2);
-    assert_eq!(parquet.record_count(), 1);
+    assert_eq!(delete_files.len(), 1, "one DV after merge");
+    assert_eq!(delete_files[0].file_format(), iceberg::spec::DataFileFormat::Puffin);
+    assert_eq!(delete_files[0].record_count(), 2);
     Ok(())
 }
