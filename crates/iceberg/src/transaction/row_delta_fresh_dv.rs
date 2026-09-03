@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};
-use crate::spec::{DataContentType, DataFile, ManifestContentType, Struct};
+use crate::spec::{DataContentType, DataFile, ManifestContentType};
 use crate::table::Table;
 use crate::transaction::snapshot::{dv_desc, latest_snapshot};
 use crate::{Error, ErrorKind, Result};
@@ -49,7 +49,7 @@ pub(crate) async fn validate_fresh_dvs_only(
         .load_manifest_list(table.file_io(), &table.metadata_ref())
         .await?;
 
-    let mut live_data_entry_by_path: HashMap<String, (i32, Struct, Option<i64>)> = HashMap::new();
+    let mut live_data_entry_by_path: HashMap<String, Option<i64>> = HashMap::new();
     for manifest_file in manifest_list.entries() {
         if manifest_file.content != ManifestContentType::Data {
             continue;
@@ -61,14 +61,8 @@ pub(crate) async fn validate_fresh_dvs_only(
             }
             let file = entry.data_file();
             if added_dvs.contains_key(file.file_path()) {
-                live_data_entry_by_path.insert(
-                    file.file_path().to_string(),
-                    (
-                        file.partition_spec_id(),
-                        file.partition().clone(),
-                        entry.sequence_number(),
-                    ),
-                );
+                live_data_entry_by_path
+                    .insert(file.file_path().to_string(), entry.sequence_number());
             }
         }
     }
@@ -114,33 +108,31 @@ pub(crate) async fn validate_fresh_dvs_only(
                 let Some(referenced_path) = referenced_data_file_location(existing) else {
                     continue;
                 };
-                for referenced in added_dvs.keys() {
-                    if &referenced_path != referenced {
-                        continue;
-                    }
-                    let Some((_, _, data_seq)) = live_data_entry_by_path.get(referenced) else {
-                        continue;
-                    };
-                    let applies = match (entry.sequence_number(), *data_seq) {
-                        (Some(delete_seq), Some(data_seq)) => delete_seq >= data_seq,
-                        _ => true,
-                    };
-                    if applies {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Cannot commit deletion vector for {}: live position delete file \
-                                 {} still applies to that data file and would be silently \
-                                 superseded by the DV at read time. Read it back and merge it \
-                                 through DVFileWriter::with_previous_deletes, and pass the \
-                                 superseded file to RowDelta::remove_deletes_many in THIS commit \
-                                 (Java BaseDVFileWriter.loadPreviousDeletes + \
-                                 RowDelta.removeDeletes)",
-                                referenced,
-                                existing.file_path()
-                            ),
-                        ));
-                    }
+                if !added_dvs.contains_key(&referenced_path) {
+                    continue;
+                }
+                let Some(data_seq) = live_data_entry_by_path.get(&referenced_path) else {
+                    continue;
+                };
+                let applies = match (entry.sequence_number(), *data_seq) {
+                    (Some(delete_seq), Some(data_seq)) => delete_seq >= data_seq,
+                    _ => true,
+                };
+                if applies {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot commit deletion vector for {}: live position delete file \
+                             {} still applies to that data file and would be silently \
+                             superseded by the DV at read time. Read it back and merge it \
+                             through DVFileWriter::with_previous_deletes, and pass the \
+                             superseded file to RowDelta::remove_deletes_many in THIS commit \
+                             (Java BaseDVFileWriter.loadPreviousDeletes + \
+                             RowDelta.removeDeletes)",
+                            referenced_path,
+                            existing.file_path()
+                        ),
+                    ));
                 }
             }
         }

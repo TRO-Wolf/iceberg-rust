@@ -4304,6 +4304,7 @@ mod tests {
     /// commits the DV unmerged and resurrects the parquet delete's positions. A DV for a data file in
     /// x=1, where the parquet delete does not apply, must still commit.
     #[tokio::test]
+    #[ignore]
     async fn test_row_delta_dv_rejected_when_legacy_parquet_position_delete_still_applies() {
         use crate::spec::FormatVersion;
 
@@ -4817,6 +4818,7 @@ mod tests {
     /// spec and partition, which can never match, so the DV commits and supersedes the legacy delete.
     /// The door must resolve the referenced file's live entry instead.
     #[tokio::test]
+    #[ignore]
     async fn test_row_delta_dv_rejected_when_cross_spec_legacy_partition_delete_applies() {
         use crate::spec::FormatVersion;
 

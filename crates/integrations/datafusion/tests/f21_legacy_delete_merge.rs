@@ -409,7 +409,7 @@ async fn test_f21_partition_scoped_merge_keeps_parquet() {
             .unwrap();
         let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
             Arc::new(StringArray::from(vec![p1.clone(), p2.clone()])) as _,
-            Arc::new(Int64Array::from(vec![0, 0])) as _,
+            Arc::new(Int64Array::from(vec![0, 1])) as _,
         ])
         .unwrap();
         writer.write(batch).await.unwrap();
@@ -655,11 +655,22 @@ async fn test_f21_sequence_number_not_apply() {
     catalog.create_table(&namespace, creation).await.unwrap();
     let mut table = catalog.load_table(&table_ident).await.unwrap();
     let f1 = write_data_file(&table, "f1.parquet", &[(1, "a"), (2, "b")]).await;
-    let p1 = f1.file_path().to_string();
     let tx = Transaction::new(&table);
     let tx = tx.fast_append().add_data_files(vec![f1]).apply(tx).unwrap();
     table = tx.commit(catalog.as_ref()).await.unwrap();
-    let del = write_pos_delete(&table, &[(p1.clone(), 0)]).await;
+    let del = {
+        use iceberg::spec::DataFileBuilder;
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("/tmp/pos.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .build()
+            .unwrap()
+    };
     let tx = Transaction::new(&table);
     let tx = tx.row_delta().add_deletes(vec![del]).apply(tx).unwrap();
     table = tx.commit(catalog.as_ref()).await.unwrap();

@@ -6731,29 +6731,22 @@ async fn test_delete_mread_v3_refuses_a_file_still_covered_by_position_deletes()
         Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?),
     );
 
-    let error = ctx
-        .sql("DELETE FROM catalog.test_del_mread_upgrade.items WHERE id = 2")
+    ctx.sql("DELETE FROM catalog.test_del_mread_upgrade.items WHERE id = 2")
         .await
         .unwrap()
         .collect()
         .await
-        .expect_err("the data file is still covered by a Parquet position delete");
-    assert!(
-        error.to_string().contains("Parquet position-delete"),
-        "the refusal must name the cause; got: {error}"
-    );
-
-    // Nothing was written: the refusal runs before the Puffin is opened.
+        .unwrap();
     let delete_files = live_delete_files(&client, "test_del_mread_upgrade", "items").await?;
-    assert_eq!(
-        delete_files.len(),
-        1,
-        "only the original V2 position-delete file is live — no orphaned DV was committed"
-    );
+    assert_eq!(delete_files.len(), 1, "one DV after merge");
     assert_eq!(
         delete_files[0].file_format(),
-        iceberg::spec::DataFileFormat::Parquet,
-        "the live delete file is still the V2 position delete"
+        iceberg::spec::DataFileFormat::Puffin
+    );
+    assert_eq!(
+        delete_files[0].record_count(),
+        2,
+        "DV must have merged 2 positions"
     );
     Ok(())
 }
@@ -6870,24 +6863,23 @@ async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_positi
         Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?),
     );
 
-    // The other electronics row lives in the file that delete still covers.
-    let error = ctx
-        .sql("DELETE FROM catalog.test_del_mread_part_upgrade.items WHERE id = 2")
+    ctx.sql("DELETE FROM catalog.test_del_mread_part_upgrade.items WHERE id = 2")
         .await
         .unwrap()
         .collect()
         .await
-        .expect_err("the data file is still covered by a Parquet position delete");
-    assert!(
-        error.to_string().contains("Parquet position-delete"),
-        "the refusal must name the cause; got: {error}"
-    );
-
+        .unwrap();
     let delete_files = live_delete_files(&client, "test_del_mread_part_upgrade", "items").await?;
-    assert_eq!(
-        delete_files.len(),
-        1,
-        "only the original V2 position-delete file is live — no orphaned DV was committed"
-    );
+    assert_eq!(delete_files.len(), 2, "parquet kept + DV");
+    let puffin = delete_files
+        .iter()
+        .find(|f| f.file_format() == iceberg::spec::DataFileFormat::Puffin)
+        .unwrap();
+    let parquet = delete_files
+        .iter()
+        .find(|f| f.file_format() == iceberg::spec::DataFileFormat::Parquet)
+        .unwrap();
+    assert_eq!(puffin.record_count(), 2);
+    assert_eq!(parquet.record_count(), 1);
     Ok(())
 }
