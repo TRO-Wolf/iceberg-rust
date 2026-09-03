@@ -24,12 +24,19 @@ use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use super::{LegacyPositionDelete, load_legacy_positions_by_path};
+use super::{
+    LegacyPositionDelete, close_touched_dv_containers_with_partitions,
+    load_legacy_positions_by_path,
+};
 use crate::io::FileIO;
+use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
-use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+use crate::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct};
+use crate::table::Table;
+use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::{Catalog, CatalogBuilder};
 
 fn write_pos_parquet(path: &str, rows: Vec<(String, i64)>, with_row_column: bool) -> u64 {
     let mut fields = vec![
@@ -196,4 +203,75 @@ async fn measure_load_legacy_touched_128_partition_scoped() {
         index.len()
     );
     assert_eq!(index.len(), 128);
+}
+
+fn synthetic_data_file(path: &str) -> DataFile {
+    DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(path.to_string())
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(100)
+        .record_count(1)
+        .partition_spec_id(0)
+        .partition(Struct::from_iter([Some(Literal::long(0))]))
+        .build()
+        .expect("build synthetic data file")
+}
+
+async fn append(catalog: &impl Catalog, table: &Table, file: DataFile) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file])
+        .apply(tx)
+        .expect("apply fast append");
+    tx.commit(catalog).await.expect("commit fast append")
+}
+
+async fn n_data_manifests(n: usize) -> (Table, Vec<String>, TempDir) {
+    let warehouse = TempDir::new().expect("warehouse");
+    let catalog = MemoryCatalogBuilder::default()
+        .load(
+            "memory",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                warehouse.path().to_str().expect("utf8").to_string(),
+            )]),
+        )
+        .await
+        .expect("catalog");
+    let mut table = crate::transaction::tests::make_v3_minimal_table_in_catalog(&catalog).await;
+    let mut paths = Vec::with_capacity(n);
+    for index in 0..n {
+        let path = format!("{}/data/f{index}.parquet", table.metadata().location());
+        table = append(&catalog, &table, synthetic_data_file(&path)).await;
+        paths.push(path);
+    }
+    (table, paths, warehouse)
+}
+
+#[tokio::test]
+#[ignore = "measurement, not a CI pin"]
+async fn measure_close_at_8_48_192_data_manifests() {
+    for n in [8usize, 48usize, 192usize] {
+        let (table, paths, _warehouse) = n_data_manifests(n).await;
+        let touched = paths.last().expect("n > 0").clone();
+        let known = HashMap::from([(
+            touched.clone(),
+            (0i32, Struct::from_iter([Some(Literal::long(0))])),
+        )]);
+        let new_positions = HashMap::from([(touched, vec![0u64])]);
+        let start = std::time::Instant::now();
+        let close =
+            close_touched_dv_containers_with_partitions(&table, &new_positions, None, &known, None)
+                .await
+                .expect("close");
+        let elapsed = start.elapsed();
+        println!(
+            "F-23 n={n} close={elapsed:?} added={} sequences={}",
+            close.added.len(),
+            close.data_sequence_numbers.len()
+        );
+        assert_eq!(close.added.len(), 1);
+    }
 }
