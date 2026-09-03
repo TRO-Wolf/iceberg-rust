@@ -34,6 +34,7 @@ Ledger: [`f21-legacy-delete-merge-ledger.md`](f21-legacy-delete-merge-ledger.md)
 - [x] C-003 pins: base cell, UPDATE, untouched-file control, partition-scoped merge-and-keep (DV rc 2 + parquet 1), sequence-number not-apply (old delete not merged for new file); 5 tests, mutations 1 red each, Java interop `run-interop-f21-legacy-delete-merge.sh` (1 fixture, sabotage red)
 - [x] C-004 docs: row R114, `task/todo.md`, `map.md` lockstep, ledger, `SUITE_FLOOR_DEFAULT` 64 -> 65
 - [x] Round 3: load-once merge, door pins, C2/C3 re-measured, R114 rewrite, ceiling `row_delta.rs` 6385→6366
+- [x] Round 4: two-file-scoped cache pin (M6 1 red of 6), own §4b timings, banned docs, rename, warehouse sequence parquet, door seq pin, partition Java fixture (FIXTURE_COUNT=2), assert messages, ceiling `integration_datafusion_test.rs` 6877→6874
 - [ ] RePark: close `V3-UPGRADE-DV-PLAIN-1`, keep `V3-UPGRADE-DV-PART-1`
 
 ## ACTIVE (2026-09-02): F-19 + F-20 — retire DELETE-side files-exist broadening, drop sibling rewrite, drain FanoutWriter in partition order

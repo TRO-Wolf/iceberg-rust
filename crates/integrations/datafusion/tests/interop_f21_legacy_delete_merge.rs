@@ -30,6 +30,7 @@ use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergCatalogProvider;
 
 const EXPECTED_FIXTURES: usize = 1;
+const EXPECTED_PART_FIXTURES: usize = 1;
 
 fn current_hadoop_metadata(meta_dir: &Path) -> PathBuf {
     let mut best: Option<(u64, PathBuf)> = None;
@@ -176,5 +177,112 @@ async fn test_f21_rust_delete_merges_legacy_parquet() {
     println!(
         "interop_f21 legacy-delete-merge GEN OK ({fixtures} fixtures) → {}",
         final_metadata_path.display()
+    );
+
+    let part_meta = java_dir.join("part_table").join("metadata");
+    if !part_meta.is_dir() {
+        return;
+    }
+    let part_metadata_location = current_hadoop_metadata(&part_meta);
+    let part_out = java_dir.join("after_part");
+    fs::create_dir_all(part_out.join("rust_table").join("metadata")).expect("after_part dir");
+    let part_catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop_f21_java_part",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                java_dir.to_string_lossy().to_string(),
+            )]),
+        )
+        .await
+        .expect("part catalog");
+    let part_ns = NamespaceIdent::new("interop_part".to_string());
+    part_catalog
+        .create_namespace(&part_ns, HashMap::new())
+        .await
+        .expect("part namespace");
+    let part_ident = TableIdent::new(part_ns.clone(), "rust_table".to_string());
+    part_catalog
+        .register_table(
+            &part_ident,
+            part_metadata_location.to_string_lossy().to_string(),
+        )
+        .await
+        .expect("register part table");
+    let mut part_table = part_catalog
+        .load_table(&part_ident)
+        .await
+        .expect("load part table");
+    let tx = Transaction::new(&part_table);
+    let tx = tx
+        .upgrade_table_version()
+        .set_format_version(FormatVersion::V3)
+        .apply(tx)
+        .unwrap();
+    part_table = tx.commit(&part_catalog).await.unwrap();
+    let tx = Transaction::new(&part_table);
+    let tx = tx
+        .update_table_properties()
+        .set("write.delete.mode".to_string(), "merge-on-read".to_string())
+        .set("write.update.mode".to_string(), "merge-on-read".to_string())
+        .apply(tx)
+        .unwrap();
+    tx.commit(&part_catalog).await.unwrap();
+    let part_client = Arc::new(part_catalog);
+    let part_provider = IcebergCatalogProvider::try_new(part_client.clone())
+        .await
+        .expect("part provider");
+    let part_ctx = SessionContext::new();
+    part_ctx.register_catalog("catalog", Arc::new(part_provider));
+    part_ctx
+        .sql("DELETE FROM catalog.interop_part.rust_table WHERE id = 2")
+        .await
+        .expect("plan part DELETE")
+        .collect()
+        .await
+        .expect("execute part DELETE");
+    let part_table = part_client
+        .load_table(&part_ident)
+        .await
+        .expect("load part after delete");
+    let part_deletes = live_delete_files(&part_table).await;
+    let puffin = part_deletes
+        .iter()
+        .filter(|f| f.file_format() == iceberg::spec::DataFileFormat::Puffin)
+        .count();
+    let parquet = part_deletes
+        .iter()
+        .filter(|f| f.file_format() == iceberg::spec::DataFileFormat::Parquet)
+        .count();
+    assert_eq!(puffin, 1, "one DV for the touched file");
+    assert_eq!(parquet, 1, "partition-scoped parquet stays live");
+    fs::write(
+        part_out.join("expected_part_rows.json"),
+        "[\n  {\"id\": 4, \"data\": \"d\"}\n]\n",
+    )
+    .expect("expected_part_rows.json");
+    let part_final = part_out
+        .join("rust_table")
+        .join("metadata")
+        .join("final.metadata.json");
+    part_table
+        .metadata()
+        .write_to(part_table.file_io(), part_final.to_str().expect("utf8"))
+        .await
+        .expect("write part final.metadata.json");
+    let part_fixtures = fs::read_dir(&part_out)
+        .expect("part fixture dir")
+        .filter(|e| e.as_ref().map(|e| e.path().is_file()).unwrap_or(false))
+        .count();
+    assert_eq!(
+        part_fixtures,
+        EXPECTED_PART_FIXTURES,
+        "expected exactly {EXPECTED_PART_FIXTURES} fixture files in {}",
+        part_out.display()
+    );
+    println!(
+        "interop_f21 partition GEN OK ({part_fixtures} fixtures) → {}",
+        part_final.display()
     );
 }

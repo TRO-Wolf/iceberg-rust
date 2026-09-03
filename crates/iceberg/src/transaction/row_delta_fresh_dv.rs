@@ -260,4 +260,38 @@ mod tests {
             .await
             .expect("removing the file-scoped parquet in the same commit lets the DV land");
     }
+
+    #[tokio::test]
+    async fn test_row_delta_dv_commits_when_file_scoped_delete_predates_data_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let parquet = synthetic_file_scoped_delete("test/a-pos.parquet", "test/a.parquet");
+        let tx = Transaction::new(&table);
+        let tx = tx.row_delta().add_deletes(vec![parquet]).apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let table = append_files(&catalog, &table, vec![synthetic_data_file(
+            "test/a.parquet",
+            0,
+        )])
+        .await;
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V3)
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_dv_file(
+                "test/a-dv.puffin",
+                "test/a.parquet",
+            )])
+            .apply(tx)
+            .unwrap();
+        tx.commit(&catalog)
+            .await
+            .expect("a file-scoped delete older than the data file does not block the DV");
+    }
 }

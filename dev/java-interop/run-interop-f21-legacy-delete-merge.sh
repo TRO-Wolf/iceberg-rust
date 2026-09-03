@@ -23,7 +23,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TMP="${SCRIPT_DIR}/target/interop-f21-legacy-delete-merge"
 MVN=/opt/maven/bin/mvn
 JDK=/usr/lib/jvm/java-11-openjdk-amd64
-FIXTURE_COUNT=1
+FIXTURE_COUNT=2
 
 for prereq in "${MVN}" "${JDK}/bin/java"; do
   if [ ! -x "${prereq}" ]; then
@@ -49,6 +49,19 @@ if [ ! -d "${TMP}/seed/table/metadata" ]; then
   exit 1
 fi
 
+echo "==> [2b] Java: partition-scoped seed (two data files, one partition delete)"
+(
+  cd "${SCRIPT_DIR}"
+  JAVA_HOME="${JDK}" PATH="${JDK}/bin:${PATH}" \
+    "${MVN}" -o -q compile exec:java \
+    -Dexec.args=generate-interop-f21-legacy-delete-merge-part \
+    -Dinterop.f21_legacy_delete_merge.dir="${TMP}/seed"
+)
+if [ ! -d "${TMP}/seed/part_table/metadata" ]; then
+  echo "==> FAILED -- the Java partition seed produced no table" >&2
+  exit 1
+fi
+
 echo "==> [3/6] Rust: upgrades to V3 and DELETE id=3, merging the parquet delete"
 (
   cd "${REPO_ROOT}"
@@ -57,7 +70,9 @@ echo "==> [3/6] Rust: upgrades to V3 and DELETE id=3, merging the parquet delete
 )
 
 echo "==> [4/6] Fixture count"
-produced="$(find "${TMP}/seed/after_delete" -maxdepth 1 -type f | wc -l)"
+produced_file="$(find "${TMP}/seed/after_delete" -maxdepth 1 -type f | wc -l)"
+produced_part="$(find "${TMP}/seed/after_part" -maxdepth 1 -type f | wc -l)"
+produced=$((produced_file + produced_part))
 if [ "${produced}" -ne "${FIXTURE_COUNT}" ]; then
   echo "==> FAILED -- expected ${FIXTURE_COUNT} fixtures, found ${produced}" >&2
   exit 1
@@ -71,6 +86,17 @@ verify_f21() {
     JAVA_HOME="${JDK}" PATH="${JDK}/bin:${PATH}" \
       "${MVN}" -o -q compile exec:java \
       -Dexec.args=verify-interop-f21-legacy-delete-merge \
+      -Dinterop.f21_legacy_delete_merge.dir="${dir}" 2>&1
+  ) || true
+}
+
+verify_f21_part() {
+  local dir="$1"
+  (
+    cd "${SCRIPT_DIR}"
+    JAVA_HOME="${JDK}" PATH="${JDK}/bin:${PATH}" \
+      "${MVN}" -o -q compile exec:java \
+      -Dexec.args=verify-interop-f21-legacy-delete-merge-part \
       -Dinterop.f21_legacy_delete_merge.dir="${dir}" 2>&1
   ) || true
 }
@@ -147,5 +173,36 @@ if ! echo "${sabotage2_out}" | grep -q '^FAIL '; then
   exit 1
 fi
 echo "    added-dvs sabotage correctly rejected"
+
+echo "==> [7] Java: partition-scoped coexistence"
+part_out="$(verify_f21_part "${TMP}/seed")"
+echo "${part_out}"
+if echo "${part_out}" | grep -q '^FAIL ' || ! echo "${part_out}" | grep -q 'verify-interop-f21-legacy-delete-merge-part: 0 failures'; then
+  echo "==> FAILED -- Java rejected the partition-scoped F21 layout." >&2
+  exit 1
+fi
+
+echo "==> [8] Sabotage: partition expected rows; the oracle must FAIL"
+SABOTAGE3="${TMP}/sabotage-part"
+rm -rf "${SABOTAGE3}"
+mkdir -p "${SABOTAGE3}"
+cp -r "${TMP}/seed/after_part" "${SABOTAGE3}/after_part"
+cp -r "${TMP}/seed/part_table" "${SABOTAGE3}/part_table"
+python3 - "${SABOTAGE3}/after_part/expected_part_rows.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    data = json.load(f)
+data[0]["id"] = 999
+with open(path, "w") as out:
+    json.dump(data, out)
+PY
+sabotage3_out="$(verify_f21_part "${SABOTAGE3}")"
+echo "${sabotage3_out}"
+if ! echo "${sabotage3_out}" | grep -q '^FAIL '; then
+  echo "==> FAILED -- the sabotaged partition rows did not turn the oracle red." >&2
+  exit 1
+fi
+echo "    partition row sabotage correctly rejected"
 
 echo "==> interop-f21-legacy-delete-merge PASSED"

@@ -6686,10 +6686,9 @@ async fn test_delete_mread_v3_multi_file_dvs_each_carry_their_own_partition() ->
     Ok(())
 }
 
-/// Risk pinned: a V2 table with Parquet position deletes upgraded to V3, then deleted from again.
-/// File-scoped parquet positions merge into the new DV and the parquet file is removed.
+/// Risk pinned: V2 parquet position deletes merge into the V3 DV and the parquet file is removed.
 #[tokio::test]
-async fn test_delete_mread_v3_refuses_a_file_still_covered_by_position_deletes() -> Result<()> {
+async fn test_delete_mread_v3_merges_a_file_still_covered_by_position_deletes() -> Result<()> {
     let (ctx, client) = make_versioned_mread_ctx(
         "test_del_mread_upgrade",
         "items",
@@ -6739,13 +6738,10 @@ async fn test_delete_mread_v3_refuses_a_file_still_covered_by_position_deletes()
     assert_eq!(delete_files.len(), 1, "one DV after merge");
     assert_eq!(
         delete_files[0].file_format(),
-        iceberg::spec::DataFileFormat::Puffin
+        iceberg::spec::DataFileFormat::Puffin,
+        "merged delete is a puffin DV"
     );
-    assert_eq!(
-        delete_files[0].record_count(),
-        2,
-        "DV must have merged 2 positions"
-    );
+    assert_eq!(delete_files[0].record_count(), 2, "DV merged 2 positions");
     Ok(())
 }
 
@@ -6820,7 +6816,7 @@ async fn test_delete_mread_v3_after_drop_partition_field_stamps_the_files_own_sp
 
 /// The PARTITIONED form of the V2-upgrade merge: file-scoped parquet positions merge into the DV.
 #[tokio::test]
-async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_position_deletes()
+async fn test_delete_mread_v3_partitioned_merges_a_file_still_covered_by_position_deletes()
 -> Result<()> {
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
@@ -6870,8 +6866,9 @@ async fn test_delete_mread_v3_partitioned_refuses_a_file_still_covered_by_positi
     assert_eq!(delete_files.len(), 1, "one DV after merge");
     assert_eq!(
         delete_files[0].file_format(),
-        iceberg::spec::DataFileFormat::Puffin
+        iceberg::spec::DataFileFormat::Puffin,
+        "merged delete is a puffin DV"
     );
-    assert_eq!(delete_files[0].record_count(), 2);
+    assert_eq!(delete_files[0].record_count(), 2, "DV merged 2 positions");
     Ok(())
 }

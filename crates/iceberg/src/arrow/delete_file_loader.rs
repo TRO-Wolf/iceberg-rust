@@ -49,7 +49,6 @@ pub trait DeleteFileLoader {
     ) -> Result<ArrowRecordBatchStream>;
 }
 
-/// Basic delete file loader.
 #[derive(Clone, Debug)]
 pub(crate) struct BasicDeleteFileLoader {
     file_io: FileIO,
@@ -57,7 +56,6 @@ pub(crate) struct BasicDeleteFileLoader {
 
 #[allow(unused_variables)]
 impl BasicDeleteFileLoader {
-    /// Creates a new loader.
     pub fn new(file_io: FileIO) -> Self {
         BasicDeleteFileLoader { file_io }
     }

@@ -122,6 +122,20 @@ async fn write_pos_delete(table: &Table, deletes: &[(String, i64)]) -> DataFile 
     writer.close().await.unwrap().into_iter().next().unwrap()
 }
 
+fn ids_from_batches(batches: &[RecordBatch]) -> Vec<i32> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
 async fn live_delete_files(table: &Table) -> Vec<DataFile> {
     let snapshot = table.metadata().current_snapshot().unwrap();
     let manifest_list = snapshot
@@ -259,6 +273,100 @@ async fn test_f21_base_cell_delete_merges_parquet_into_dv() {
         })
         .collect();
     assert_eq!(ids, vec![1, 4]);
+}
+
+#[tokio::test]
+async fn test_f21_two_file_scoped_parquet_deletes_merge_into_one_dv() {
+    let warehouse = TempDir::new().unwrap();
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "memory",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                warehouse.path().to_str().unwrap().to_string(),
+            )]),
+        )
+        .await
+        .unwrap();
+    let catalog = Arc::new(catalog);
+    let namespace = NamespaceIdent::new("ns_two".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .unwrap();
+    let loc = format!("{}/t_two", warehouse.path().to_str().unwrap());
+    let creation = TableCreation::builder()
+        .location(loc)
+        .name("t_two".to_string())
+        .properties(HashMap::from([
+            ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+            ("write.update.mode".to_string(), "merge-on-read".to_string()),
+        ]))
+        .schema(v2_mor_schema())
+        .build();
+    let table_ident = TableIdent::new(namespace.clone(), "t_two".to_string());
+    catalog.create_table(&namespace, creation).await.unwrap();
+    let mut table = catalog.load_table(&table_ident).await.unwrap();
+    let data_file = write_data_file(&table, "data.parquet", &[
+        (1, "a"),
+        (2, "b"),
+        (3, "c"),
+        (4, "d"),
+    ])
+    .await;
+    let data_path = data_file.file_path().to_string();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![data_file])
+        .apply(tx)
+        .unwrap();
+    table = tx.commit(catalog.as_ref()).await.unwrap();
+    let d1 = write_pos_delete(&table, &[(data_path.clone(), 1)]).await;
+    let tx = Transaction::new(&table);
+    let tx = tx.row_delta().add_deletes(vec![d1]).apply(tx).unwrap();
+    table = tx.commit(catalog.as_ref()).await.unwrap();
+    let d2 = write_pos_delete(&table, &[(data_path.clone(), 2)]).await;
+    let tx = Transaction::new(&table);
+    let tx = tx.row_delta().add_deletes(vec![d2]).apply(tx).unwrap();
+    table = tx.commit(catalog.as_ref()).await.unwrap();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .upgrade_table_version()
+        .set_format_version(FormatVersion::V3)
+        .apply(tx)
+        .unwrap();
+    tx.commit(catalog.as_ref()).await.unwrap();
+    let client = catalog.clone() as Arc<dyn Catalog>;
+    let provider = IcebergCatalogProvider::try_new(client.clone())
+        .await
+        .unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", Arc::new(provider));
+    ctx.sql("DELETE FROM catalog.ns_two.t_two WHERE id = 4")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let table = catalog.load_table(&table_ident).await.unwrap();
+    let deletes = live_delete_files(&table).await;
+    assert_eq!(deletes.len(), 1, "both parquet deletes must be removed");
+    assert_eq!(deletes[0].file_format(), DataFileFormat::Puffin);
+    assert_eq!(
+        deletes[0].record_count(),
+        3,
+        "DV must union pos 1, pos 2, and the new pos 3"
+    );
+    let batches = ctx
+        .sql("SELECT id FROM catalog.ns_two.t_two ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(ids_from_batches(&batches), vec![1], "only id 1 survives");
 }
 
 #[tokio::test]
@@ -685,26 +793,19 @@ async fn test_f21_sequence_number_not_apply() {
     let mut table = catalog.load_table(&table_ident).await.unwrap();
     let f1 = write_data_file(&table, "f1.parquet", &[(1, "a"), (2, "b")]).await;
     let tx = Transaction::new(&table);
-    let tx = tx.fast_append().add_data_files(vec![f1]).apply(tx).unwrap();
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![f1.clone()])
+        .apply(tx)
+        .unwrap();
     table = tx.commit(catalog.as_ref()).await.unwrap();
-    let del = {
-        use iceberg::spec::DataFileBuilder;
-        DataFileBuilder::default()
-            .content(DataContentType::PositionDeletes)
-            .file_path("/tmp/pos.parquet".to_string())
-            .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(100)
-            .record_count(1)
-            .partition_spec_id(0)
-            .partition(Struct::empty())
-            .build()
-            .unwrap()
-    };
+    let f2 = write_data_file(&table, "f2.parquet", &[(3, "c"), (4, "d")]).await;
+    let p1 = f1.file_path().to_string();
+    let p2 = f2.file_path().to_string();
+    let del = write_pos_delete(&table, &[(p1, 0), (p2.clone(), 0)]).await;
     let tx = Transaction::new(&table);
     let tx = tx.row_delta().add_deletes(vec![del]).apply(tx).unwrap();
     table = tx.commit(catalog.as_ref()).await.unwrap();
-    let f2 = write_data_file(&table, "f2.parquet", &[(3, "c"), (4, "d")]).await;
-    let p2 = f2.file_path().to_string();
     let tx = Transaction::new(&table);
     let tx = tx.fast_append().add_data_files(vec![f2]).apply(tx).unwrap();
     table = tx.commit(catalog.as_ref()).await.unwrap();
@@ -743,4 +844,16 @@ async fn test_f21_sequence_number_not_apply() {
         .iter()
         .any(|f| f.file_format() == DataFileFormat::Parquet);
     assert!(parquet_still, "old parquet for f1 still live");
+    let batches = ctx
+        .sql("SELECT id FROM catalog.ns5.t5 ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        ids_from_batches(&batches),
+        vec![2, 3],
+        "f1 keeps id 2; f2 keeps id 3; seq must not merge f2 pos 0"
+    );
 }
