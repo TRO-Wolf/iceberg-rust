@@ -169,13 +169,11 @@ pub async fn load_legacy_positions_by_path(
 }
 
 /// Positions of `touched_path` from a loaded [`load_legacy_positions_by_path`] index.
-pub async fn load_legacy_positions(
-    file_io: &FileIO,
-    delete: &LegacyPositionDelete,
+pub fn load_legacy_positions<'a>(
+    index: &'a HashMap<String, Vec<u64>>,
     touched_path: &str,
-) -> Result<Vec<u64>> {
-    let mut by_path = load_legacy_positions_by_path(file_io, delete).await?;
-    Ok(by_path.remove(touched_path).unwrap_or_default())
+) -> &'a [u64] {
+    index.get(touched_path).map_or(&[], Vec::as_slice)
 }
 
 fn push_file_scoped_positions(
@@ -296,7 +294,6 @@ pub(super) fn file_path_bounds_admit(delete_file: &DataFile, path: &str) -> bool
     }
 }
 
-#[cfg(test)]
 pub(super) fn partition_matches(delete_file: &DataFile, spec_id: i32, partition: &Struct) -> bool {
     delete_file.partition_spec_id() == spec_id && delete_file.partition() == partition
 }
@@ -339,9 +336,11 @@ pub(super) fn finalize_legacy(
             }
             continue;
         }
-        let key = (item.file.partition_spec_id(), item.file.partition().clone());
         let mut touched = Vec::new();
-        if let Some(paths) = by_partition.get(&key) {
+        for ((spec_id, partition), paths) in &by_partition {
+            if !partition_matches(&item.file, *spec_id, partition) {
+                continue;
+            }
             for path in paths {
                 if file_path_bounds_admit(&item.file, path) {
                     touched.push((*path).to_string());
@@ -349,6 +348,7 @@ pub(super) fn finalize_legacy(
             }
         }
         if !touched.is_empty() {
+            touched.sort();
             out.push(Arc::new(LegacyPositionDelete {
                 file: item.file,
                 touched,
@@ -357,6 +357,7 @@ pub(super) fn finalize_legacy(
             }));
         }
     }
+    out.sort_by(|left, right| left.file.file_path().cmp(right.file.file_path()));
     out
 }
 
@@ -364,7 +365,7 @@ pub(super) fn finalize_legacy(
 mod scope_tests {
     use std::collections::{HashMap, HashSet};
 
-    use super::{PendingLegacy, file_path_bounds_admit, finalize_legacy, partition_matches};
+    use super::{PendingLegacy, file_path_bounds_admit, finalize_legacy};
     use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, Struct,
@@ -407,10 +408,6 @@ mod scope_tests {
     #[test]
     fn partition_scoped_delete_is_not_collected_for_another_partition() {
         let file = parquet_delete(0, 1);
-        assert!(
-            !partition_matches(&file, 0, &Struct::from_iter([Some(Literal::long(0))])),
-            "partition 1 does not match 0"
-        );
         let pending = vec![PendingLegacy {
             file,
             seq: Some(1),
@@ -431,10 +428,6 @@ mod scope_tests {
     #[test]
     fn partition_scoped_delete_is_not_collected_under_another_spec() {
         let file = parquet_delete(1, 0);
-        assert!(
-            !partition_matches(&file, 0, &Struct::from_iter([Some(Literal::long(0))])),
-            "spec 1 does not match spec 0"
-        );
         let pending = vec![PendingLegacy {
             file,
             seq: Some(1),

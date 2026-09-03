@@ -19,7 +19,7 @@
 
 # F-22 — deletion-vector container close reports live non-DV position deletes (one-pass)
 
-Model: grok-4.6. Base: F-21 tip `63d3d09f4` (round 2 parent). Branch `repark/f22-legacy-scan-one-pass`.
+Model: grok-4.6. Base: fork main `c4213e0f3` (F-21 merged). Branch `repark/f22-legacy-scan-one-pass`.
 Matrix row: R114.
 
 ## 1. Propositions
@@ -27,7 +27,7 @@ Matrix row: R114.
 | id | proposition | verdict | evidence |
 |---|---|---|---|
 | C-001 | One delete-manifest pass returns live non-Puffin position deletes that name a touched data file, plus touched data sequence numbers; optional pre-loaded `ManifestList` | PROVEN | `collect_delete_index` on `manifest_stream(Deletes)`; `DvContainerClose::legacy_deletes` / `data_sequence_numbers`; `preloaded_manifest_list_skips_the_list_reread` |
-| C-002 | `load_legacy_positions_by_path` is one projected parquet read per delete file; `load_legacy_positions` looks up a path on that index | PROVEN | `load_legacy_positions_projects_past_the_row_column`; P1-a 64-path 14.6 ms |
+| C-002 | `load_legacy_positions_by_path` is one projected parquet read per delete file; `load_legacy_positions` looks up a path on that index | PROVEN | `load_legacy_positions_projects_past_the_row_column`; `load_legacy_positions_by_path_opens_the_delete_file_once`; `close_opens_one_partition_scoped_delete_file_once_for_two_paths` |
 | C-003 | DataFusion delete exec uses the close result; no second delete-manifest walk | PROVEN | `delete_legacy_merge.rs::write_deletion_vectors` calls `close_touched_dv_containers_with_partitions` only; F-21 battery green |
 | C-004 | Delete manifests read once with and without legacy; projected pin; wall at 8/192 recorded; mutations one knob at a time | PROVEN | section 4 / 5 |
 | C-005 | Docs, maps, this ledger | PROVEN | row R114, `task/todo.md`, three `map.md` files |
@@ -44,10 +44,11 @@ Matrix row: R114.
 
 | file | change |
 |---|---|
-| `crates/iceberg/src/delete_vector_container.rs` | one delete-manifest pass; one data-manifest pass seeding partitions and sequences; overlay instead of cloning `new_positions`; Arc merge; sort `removed` after extending; `seq: Option<i64>` with F-21 `_ => true` |
-| `crates/iceberg/src/delete_vector_container/legacy.rs` | `load_legacy_positions_by_path`; pos-only `values()` path; HashSet touched; `finalize_legacy` groups by `(spec_id, partition)`; file-scoped requires `touched.len()==1` |
-| `crates/iceberg/src/arrow/delete_file_loader.rs` | name-based projection fallback for pos-only |
+| `crates/iceberg/src/delete_vector_container.rs` | one delete-manifest pass; one data-manifest pass seeding partitions and sequences; overlay instead of cloning `new_positions`; Arc merge; sort `removed` after extending; sort `legacy_deletes` by `file.file_path()` and each `touched`; `seq: Option<i64>` with F-21 `_ => true` |
+| `crates/iceberg/src/delete_vector_container/legacy.rs` | `load_legacy_positions_by_path` (one read); `load_legacy_positions` is a lookup; `finalize_legacy` calls `partition_matches` and sorts `touched` |
+| `crates/iceberg/src/arrow/delete_file_loader.rs` | name-based projection fallback for pos-only; F-21 `load_position_deletes_by_path` removed |
 | `crates/integrations/datafusion/src/physical_plan/delete_legacy_merge.rs` | no manifest walk; close merges |
+| F-18 reversal | `collect_live_data_files` always walks every data manifest so `data_sequence_numbers` fills. A full-map caller that wants no sequence numbers has no opt-out. Cost: one read per data manifest even when `known_partitions` is complete. |
 
 Concurrency bound: `DV_IO_CONCURRENCY = 8` (now `pub`).
 
@@ -61,7 +62,9 @@ Concurrency bound: `DV_IO_CONCURRENCY = 8` (now `pub`).
 | P-seq | close without partition map AND with a complete map and no legacy | `data_sequence_numbers` contains the touched path (C2 / P1-f) |
 | P-list | pre-loaded `ManifestList` | `snapshot_list_reads == 0` with `Some(&list)`, `== 1` with `None` (C1 / P3-b) |
 | P-data | partial `known_partitions` + legacy, two data manifests | `data_manifest_reads == 2` (C4 / P1-e) |
-| P-scope | `finalize_legacy` / `partition_matches` / `file_path_bounds_admit` | other partition empty; other spec_id empty; bounds exclude empty; bounds include collected (C3) |
+| P-scope | `finalize_legacy` calls `partition_matches`; `file_path_bounds_admit` | other partition empty; other spec_id empty; bounds exclude empty; bounds include collected (C3) |
+| P-open | CountingStorage parquet opens | `load_legacy_positions_by_path` plus lookup: opens stay 1; close of one partition-scoped delete covering two paths: opens == 1 |
+| P-mask | pos-only name fallback without field ids | one-leaf mask over `file_path`/`pos`; refuses when only `file_path` present |
 
 ## 5. Measurement (debug, this clone, no CI pin)
 
@@ -76,6 +79,16 @@ Round 2 close wall (debug, this clone, `with_legacy=false` — the extra walk is
 | 8 | 35.758 ms | 44.796 ms | 80.554 ms |
 | 48 | 179.135 ms | 192.450 ms | 371.585 ms |
 | 192 | 693.921 ms | 723.409 ms | 1417.330 ms → 723.409 ms |
+
+Round 3 re-take of n=48 close (three debug runs, this clone, same ignored test). Critic could not reproduce 192.5 ms (saw 393.9 ms). This clone:
+
+| run | n=48 walk | n=48 close |
+|---|---|---|
+| 1 | 176.893 ms | 196.265 ms |
+| 2 | 175.657 ms | 192.147 ms |
+| 3 | 178.027 ms | 252.753 ms |
+
+Median close 196.265 ms (range 192.147–252.753). The round-2 192.5 ms cell is in range; 393.9 ms was not reproduced here. n=8/192 on the same three runs: close 48.5/49.6/59.8 ms and 735.7/717.1/718.6 ms.
 
 Round 1 table at 192 quoted walk 718 ms vs close 727 ms without adding them; C10: the statement used to pay both (≈1417 ms), now only close (723 ms). Fixture has no live parquet to load.
 
@@ -97,7 +110,9 @@ P2-d: pos-only projection vs a two-column delete is ~0.09 %; the C-002 pin's fix
 | M4 | do not collect pending parquet deletes | 4 red of 6 (same set as M1) |
 | C1 | ignore `Option<&ManifestList>` and always load the list | 1 red of 13 (`preloaded_manifest_list_skips_the_list_reread`: list_reads 1 vs 0) |
 | C3-bounds | `file_path_bounds_admit` always true | 1 red of 13 (`bounds_range_excluding_the_path_is_not_admitted`) |
-| C3-part | `partition_matches` always true | 2 red of 13 (other partition; other spec_id) |
+| C3-part | `partition_matches` always true | 2 red of 15 (`finalize_legacy` other partition; other spec_id) |
+| R1-open | extra parquet open inside `load_legacy_positions_by_path` | 3 red of 15 (loader opens pin; close two-path opens pin; projected bytes ≥ file size) |
+| R6-mask | `is_pos_only = false` | 1 red of 8 (`test_pos_only_name_fallback_without_field_ids_builds_one_leaf_mask`) |
 
 ## 6b. Round 2 (P / C)
 
@@ -118,8 +133,20 @@ P2-d: pos-only projection vs a two-column delete is ~0.09 %; the C-002 pin's fix
 | P3-c | RePark consumes `Option<&ManifestList>` |
 | C5 | `removed.extend` then sort |
 | C7 | `data_sequence_number: Option<i64>` and F-21 `_ => true` |
-| C8 | ledger base `63d3d09f4` |
+| C8 | ledger base `c4213e0f3` (F-21 merged; `63d3d09f4` was pre-rebase) |
 | C10 | honest walk+close total in §5 |
+
+## 6c. Round 3 (R1–R7)
+
+| id | closed by |
+|---|---|
+| R1 | `load_legacy_positions` is a lookup; CountingStorage parquet `opens` pin (loader + close) |
+| R2 | R114 F-18 clause, `task/todo.md` C-003, test rename; §3 F-18 reversal row |
+| R3 | `load_position_deletes_by_path` removed; §9 tells RePark to use `load_legacy_positions_by_path` |
+| R4 | sort `legacy_deletes` by `file.file_path()` and each `touched` before building the close |
+| R5 | header + §10 base `c4213e0f3` |
+| R6 | pos-only name-fallback mask pin; `finalize_legacy` calls `partition_matches` |
+| R7 | §5 n=48 re-taken (three runs) |
 
 ## 7. Interop
 
@@ -134,14 +161,14 @@ Filled from PROGRESS.md after each gate is run. A gate not run is NOT RUN.
 
 | gate | exit |
 |---|---|
-| `make check` | 0 (round 2) |
-| `cargo test -p iceberg --locked` | 0 (`3593 passed; 0 failed; 6 ignored` lib; doctests 90 passed / 10 ignored) |
+| `make check` | 0 (round 3) |
+| `cargo test -p iceberg --locked` | 0 (`3596 passed; 0 failed; 6 ignored` lib; doctests 90 passed / 10 ignored) |
 | `cargo test -p iceberg-datafusion --locked` | 0 (`211 passed` lib; `f21_legacy_delete_merge` 6 passed; `shared_puffin_dv` 20 passed / 3 ignored) |
 | `dev/java-interop/run-interop-f21-legacy-delete-merge.sh` | 0 (`PASSED`; 2 fixtures; sabotages red) |
 | `dev/java-interop/run-interop-f18-dv-sibling-close.sh` | 0 (`PASSED`; sabotage red) |
 | `typos .` | 0 |
 | `make check-matrix-anchors` | 0 (`OK: GAP_MATRIX anchors sound`) |
-| `python3 scripts/check_rust_file_size.py` | 0 (`431 files clean`; `delete_vector_container.rs` 571) |
+| `python3 scripts/check_rust_file_size.py` | 0 (`432 files clean`; `delete_vector_container.rs` 544) |
 
 Docker legs of `make test` excused.
 
@@ -149,26 +176,27 @@ Docker legs of `make test` excused.
 
 | note |
 |---|
-| Delete `legacy_deletes.rs`'s own delete-manifest walk. Consume `DvContainerClose::legacy_deletes` + `load_legacy_positions_by_path` (one read per delete file). |
-| Do not re-walk data manifests for sequence numbers; `data_sequence_numbers` is filled for every touched path even with a complete `known_partitions` and no legacy. Pass statement-only positions into close (close merges). |
+| Delete `legacy_deletes.rs`'s own delete-manifest walk. Consume `DvContainerClose::legacy_deletes` + `load_legacy_positions_by_path` once per delete file, then `load_legacy_positions` for a path lookup. Do not call the by-path loader per touched path. |
+| Do not re-walk data manifests for sequence numbers; `data_sequence_numbers` is filled for every touched path even with a complete `known_partitions` and no legacy. Pass statement-only positions into close (close merges). A full-map caller that wants no sequence numbers has no opt-out (F-18 reversal). |
 | `Option<&ManifestList>` has no in-tree DataFusion consumer (`delete_legacy_merge.rs` passes `None`); RePark is the consumer (P3-c). |
+| F-21 `arrow/delete_file_loader.rs::load_position_deletes_by_path` is removed. Use `load_legacy_positions_by_path`. |
 
 ## 10. Section 9 delivery template
 
 ```text
-Charter clauses: C-001 through C-005; round 2 P1-a..f P2-a..d P3-a..c C1-C10
+Charter clauses: C-001 through C-005; round 2 P1-a..f P2-a..d P3-a..c C1-C10; round 3 R1-R7
 Matrix rows: R114 (F-22 one-pass legacy scan)
-Base: 63d3d09f4
+Base: c4213e0f3
 Java methods or bytecode read: BaseDVFileWriter.loadPreviousDeletes (L114-129), ContentFileUtil.referencedDataFile / isFileScoped
 Files changed: crates/iceberg/src/delete_vector_container.rs; crates/iceberg/src/delete_vector_container/legacy.rs; crates/iceberg/src/delete_vector_container/tests.rs; crates/iceberg/src/arrow/delete_file_loader.rs; crates/integrations/datafusion/src/physical_plan/delete_legacy_merge.rs; docs/parity/GAP_MATRIX.md R114; maps; task/todo.md; task/f22-legacy-scan-one-pass-ledger.md
 Behavior before: close collected only Puffin DVs; DataFusion (and RePark) walked every delete manifest a second time for live parquet position deletes, and walked data manifests for sequence numbers
-Behavior after: one delete-manifest pass returns legacy_deletes and data_sequence_numbers; load_legacy_positions projects pos (and file_path when not file-scoped); DataFusion write_deletion_vectors does not walk; file-scoped parquet is merged and removed in the same close
-Negative cases: file-scoped parquet that does not name the touched file is not collected; delete_seq < data_seq is not merged and not removed; projected read of a row-column delete is smaller than the file
+Behavior after: one delete-manifest pass returns legacy_deletes and data_sequence_numbers; load_legacy_positions_by_path is one projected parquet read per delete file; load_legacy_positions looks up a path on that index; DataFusion write_deletion_vectors does not walk; file-scoped parquet is merged and removed in the same close; data manifests are always walked once for sequence numbers (F-18 zero-read reversed)
+Negative cases: file-scoped parquet that does not name the touched file is not collected; delete_seq < data_seq is not merged and not removed; projected read of a row-column delete is smaller than the file; a second open of the same delete file fails the opens pin
 Test command and population: cargo test -p iceberg --locked --lib delete_vector_container; cargo test -p iceberg-datafusion --locked --test f21_legacy_delete_merge (6 passed); shared_puffin_dv 20 passed / 3 ignored
 Mutations, one at a time: see section 6
 Java interop command and fixture count: run-interop-f21-legacy-delete-merge.sh (2 fixtures); run-interop-f18-dv-sibling-close.sh
 CI-only evidence gap: Docker legs of make test excused
-Breaking public API change: close_touched_dv_containers_with_partitions gains Option<&ManifestList>; DvContainerClose gains legacy_deletes and data_sequence_numbers
+Breaking public API change: close_touched_dv_containers_with_partitions gains Option<&ManifestList>; DvContainerClose gains legacy_deletes and data_sequence_numbers; load_legacy_positions is a lookup (no FileIO); iceberg::arrow::delete_file_loader::load_position_deletes_by_path is removed
 Critic attestation: Actor only (this unit)
 Open findings and dispositions: R114 residues unchanged (equality-delete sort-order; Spark-job-written shared Puffin)
 ```

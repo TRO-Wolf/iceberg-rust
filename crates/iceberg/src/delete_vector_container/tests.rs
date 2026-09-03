@@ -72,6 +72,8 @@ struct CountingStorage {
     data_manifest_reads: Arc<AtomicU64>,
     #[serde(skip)]
     snapshot_list_reads: Arc<AtomicU64>,
+    #[serde(skip)]
+    opens: Arc<AtomicU64>,
 }
 
 impl CountingStorage {
@@ -80,6 +82,9 @@ impl CountingStorage {
     }
 
     fn count(&self, path: &str) {
+        if path.ends_with(".parquet") {
+            self.opens.fetch_add(1, Ordering::Relaxed);
+        }
         if is_snapshot_list(path) {
             self.snapshot_list_reads.fetch_add(1, Ordering::Relaxed);
             return;
@@ -194,6 +199,8 @@ struct CountingStorageFactory {
     data_manifest_reads: Arc<AtomicU64>,
     #[serde(skip)]
     snapshot_list_reads: Arc<AtomicU64>,
+    #[serde(skip)]
+    opens: Arc<AtomicU64>,
 }
 
 #[typetag::serde]
@@ -208,6 +215,7 @@ impl StorageFactory for CountingStorageFactory {
             data_manifest_paths: self.data_manifest_paths.clone(),
             data_manifest_reads: self.data_manifest_reads.clone(),
             snapshot_list_reads: self.snapshot_list_reads.clone(),
+            opens: self.opens.clone(),
         }))
     }
 }
@@ -277,7 +285,7 @@ async fn three_data_manifests() -> Fixture {
 }
 
 #[tokio::test]
-async fn a_supplied_partition_map_reads_no_data_manifest() {
+async fn a_supplied_partition_map_still_reads_each_data_manifest_once() {
     let fixture = three_data_manifests().await;
     let new_positions = HashMap::from([(fixture.paths[0].clone(), vec![0u64])]);
     let known = HashMap::from([(
@@ -442,6 +450,7 @@ async fn n_delete_manifests(n: usize, with_legacy: bool) -> DeleteManifestFixtur
             data_manifest_paths: data_manifest_paths.clone(),
             data_manifest_reads: data_manifest_reads.clone(),
             snapshot_list_reads: snapshot_list_reads.clone(),
+            ..Default::default()
         }))
         .load(
             "memory",
@@ -670,6 +679,63 @@ async fn partial_partition_map_with_legacy_reads_each_data_manifest_once() {
 }
 
 #[tokio::test]
+async fn close_opens_one_partition_scoped_delete_file_once_for_two_paths() {
+    let warehouse = TempDir::new().expect("warehouse");
+    let opens = Arc::new(AtomicU64::new(0));
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(CountingStorageFactory {
+            opens: opens.clone(),
+            ..Default::default()
+        }))
+        .load(
+            "memory",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                warehouse.path().to_str().expect("utf8").to_string(),
+            )]),
+        )
+        .await
+        .expect("catalog");
+    let mut table = crate::transaction::tests::make_v2_minimal_table_in_catalog(&catalog).await;
+    let path = format!("{}/data/f0.parquet", table.metadata().location());
+    let other = format!("{}/data/f1.parquet", table.metadata().location());
+    table = append(&catalog, &table, synthetic_data_file(&path)).await;
+    table = append(&catalog, &table, synthetic_data_file(&other)).await;
+    let pos_delete = write_pos_delete(&table, &[(path.clone(), 0), (other.clone(), 1)]).await;
+    table = commit_delete(&catalog, &table, pos_delete).await;
+    table = upgrade_v3(&catalog, &table).await;
+    opens.store(0, Ordering::Relaxed);
+    let known = HashMap::from([
+        (
+            path.clone(),
+            (0i32, Struct::from_iter([Some(Literal::long(0))])),
+        ),
+        (
+            other.clone(),
+            (0i32, Struct::from_iter([Some(Literal::long(0))])),
+        ),
+    ]);
+    let new_positions = HashMap::from([(path.clone(), vec![99u64]), (other.clone(), vec![99u64])]);
+    let close =
+        close_touched_dv_containers_with_partitions(&table, &new_positions, None, &known, None)
+            .await
+            .expect("close two paths against one partition-scoped delete");
+    assert_eq!(close.legacy_deletes.len(), 1, "one partition-scoped delete");
+    assert!(!close.legacy_deletes[0].file_scoped);
+    let mut expected = vec![path, other];
+    expected.sort();
+    assert_eq!(
+        close.legacy_deletes[0].touched, expected,
+        "close returns touched paths in sorted order"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        1,
+        "close must open the partition-scoped delete file once for two touched paths"
+    );
+}
+
+#[tokio::test]
 async fn file_scoped_delete_with_two_touched_paths_errors() {
     let file = DataFileBuilder::default()
         .content(DataContentType::PositionDeletes)
@@ -785,14 +851,97 @@ async fn load_legacy_positions_projects_past_the_row_column() {
         data_sequence_number: Some(1),
     };
     bytes_read.store(0, Ordering::Relaxed);
-    let positions = load_legacy_positions(&file_io, &delete, data_path)
+    let index = load_legacy_positions_by_path(&file_io, &delete)
         .await
         .expect("load positions");
+    let positions = load_legacy_positions(&index, data_path);
     assert_eq!(positions.len(), usize::try_from(n).expect("n"));
     let read = bytes_read.load(Ordering::Relaxed);
     assert!(
         read < file_size,
         "projected pos-only read {read} must be smaller than file size {file_size}"
+    );
+}
+
+#[tokio::test]
+async fn load_legacy_positions_by_path_opens_the_delete_file_once() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use parquet::file::properties::WriterProperties;
+
+    use crate::metadata_columns::{
+        RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
+    };
+    use crate::spec::DataFileBuilder;
+
+    let warehouse = TempDir::new().expect("warehouse");
+    let opens = Arc::new(AtomicU64::new(0));
+    let file_io = FileIOBuilder::new(Arc::new(CountingStorageFactory {
+        opens: opens.clone(),
+        ..Default::default()
+    }))
+    .build();
+    let del_path = format!(
+        "{}/two-path.parquet",
+        warehouse.path().to_str().expect("utf8")
+    );
+    let path_a = "s3://b/a.parquet";
+    let path_b = "s3://b/b.parquet";
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("file_path", DataType::Utf8, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            RESERVED_FIELD_ID_DELETE_FILE_PATH.to_string(),
+        )])),
+        Field::new("pos", DataType::Int64, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            RESERVED_FIELD_ID_DELETE_FILE_POS.to_string(),
+        )])),
+    ]));
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+        Arc::new(StringArray::from(vec![path_a, path_b])) as _,
+        Arc::new(Int64Array::from(vec![0i64, 1i64])) as _,
+    ])
+    .expect("two-path batch");
+    {
+        let file = std::fs::File::create(&del_path).expect("create parquet");
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close parquet");
+    }
+    let file_size = std::fs::metadata(&del_path).expect("metadata").len();
+    let file = DataFileBuilder::default()
+        .content(DataContentType::PositionDeletes)
+        .file_path(del_path)
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(file_size)
+        .record_count(2)
+        .partition_spec_id(0)
+        .partition(Struct::empty())
+        .build()
+        .expect("delete file");
+    let delete = LegacyPositionDelete {
+        file,
+        touched: vec![path_a.to_string(), path_b.to_string()],
+        file_scoped: false,
+        data_sequence_number: Some(1),
+    };
+    opens.store(0, Ordering::Relaxed);
+    let index = load_legacy_positions_by_path(&file_io, &delete)
+        .await
+        .expect("one read of the delete file");
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        1,
+        "one parquet open per delete file"
+    );
+    assert_eq!(load_legacy_positions(&index, path_a), &[0]);
+    assert_eq!(load_legacy_positions(&index, path_b), &[1]);
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        1,
+        "a lookup on the loaded index must not open the delete file again"
     );
 }
 
