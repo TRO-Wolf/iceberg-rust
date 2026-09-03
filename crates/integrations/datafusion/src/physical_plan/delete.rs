@@ -29,7 +29,7 @@
 //! |---|---|---|
 //! | copy-on-write DELETE and UPDATE | no conflicting deletes | no conflicting data |
 //! | merge-on-read DELETE (V2) | referenced data files exist; skip `Operation::Delete` | no conflicting data files |
-//! | merge-on-read DELETE (V3) | every replacement DV reference exists, including copied siblings; `validate_deleted_files` (F-17, named Java skip-delete divergence) | no conflicting data files |
+//! | merge-on-read DELETE (V3) | every replacement DV reference exists; `validate_deleted_files` (F-17, named Java skip-delete divergence) | no conflicting data files |
 //! | merge-on-read UPDATE | files exist, deleted files, no conflicting delete files | no conflicting data files |
 
 use std::collections::{HashMap, HashSet};
@@ -506,7 +506,6 @@ async fn merge_on_read_delete(
     // The §5 `validate_data_files_exist` set. Java arms this for every command, DELETE included: a
     // referenced file rewritten away by a concurrent commit would silently lose these deletes.
     let close = write_merge_on_read_deletes(table, delete_kind, &pairs, scan_snapshot_id).await?;
-    // V3 container close RETAINS untouched sibling references, so files-exist covers them too.
     let referenced_files = if close
         .added
         .iter()
@@ -1333,7 +1332,7 @@ pub(crate) async fn merge_on_read_update(
 
     // §5 row-delta recipe, MoR UPDATE. UPDATE arms the deleted-files checks at BOTH levels, because
     // the op READ the rows it rewrote: a concurrent delete of them conflicts. Java arms these for
-    // UPDATE and MERGE only, never DELETE. V3 also covers sibling references from container close.
+    // UPDATE and MERGE only, never DELETE.
     let tx = Transaction::new(table);
     let mut action = tx
         .row_delta()

@@ -491,9 +491,6 @@ impl RewriteDataFiles {
         }
         if !dv_plan.removed.is_empty() {
             action = action.delete_delete_files(dv_plan.removed);
-            for (delete_file, sequence_number) in dv_plan.rewritten_siblings {
-                action = action.add_delete_file_with_sequence_number(delete_file, sequence_number);
-            }
         }
         let transaction = action.apply(transaction)?;
         let committed = transaction.commit(catalog).await?;

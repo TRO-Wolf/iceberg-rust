@@ -591,7 +591,7 @@ async fn test_partition_scoped_delete_survives_partial_rewrite() {
     );
 }
 
-/// Rewriting one file's data rewrites the sibling blob of its Puffin and keeps it applying.
+/// Rewriting one file's data drops that file's DV and leaves the sibling blob in the same Puffin.
 #[tokio::test]
 async fn test_rewriting_one_file_keeps_sibling_dv_in_same_puffin() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -642,8 +642,8 @@ async fn test_rewriting_one_file_keeps_sibling_dv_in_same_puffin() {
     let remaining = live_delete_file_paths(&table).await;
     assert_eq!(remaining.len(), 1, "B's DV survives");
     assert!(
-        !remaining.contains(&puffin_path),
-        "the old Puffin must not remain: plan.removed carries the sibling entry too"
+        remaining.contains(&puffin_path),
+        "sibling stays in the original Puffin"
     );
     assert_eq!(
         scan_rows(&table).await,
@@ -653,7 +653,7 @@ async fn test_rewriting_one_file_keeps_sibling_dv_in_same_puffin() {
     assert_eq!(
         live_dv_sequence(&table, &path_b).await,
         sibling_seq_before,
-        "the rewritten sibling keeps its original data sequence number"
+        "the sibling keeps its original data sequence number"
     );
 }
 

@@ -21,21 +21,18 @@
 //! `removedDataFilePaths.contains(referencedDataFile())`. The apply path drops DVs
 //! only. File-scoped parquet position deletes are a fork extension of that predicate.
 //!
-//! Delete-file removal is keyed by the Java `DeleteFileSet` triple, so a drop no longer takes
-//! a sibling blob at the same Puffin path. This path still rewrites those siblings anyway.
+//! Delete-file removal is keyed by the Java `DeleteFileSet` triple, so a drop leaves
+//! a sibling blob at the same Puffin path in place.
 
 use std::collections::HashSet;
 
 use crate::Result;
-use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};
-use crate::delete_vector_container::{DvDropPlan, rewrite_siblings_for_dropped_references};
+use crate::delete_file_index::referenced_data_file_location;
 use crate::spec::{DataContentType, DataFile, ManifestContentType};
 use crate::table::Table;
 
-/// DVs to drop, and the sibling blobs this path still rewrites alongside them.
 pub(super) struct DvRewritePlan {
     pub(super) removed: Vec<DataFile>,
-    pub(super) rewritten_siblings: Vec<(DataFile, i64)>,
     pub(super) removed_count: usize,
 }
 
@@ -43,21 +40,17 @@ pub(super) async fn plan_dv_removal(
     table: &Table,
     rewritten_data_paths: &HashSet<String>,
 ) -> Result<DvRewritePlan> {
-    let mut plan: DvDropPlan =
-        rewrite_siblings_for_dropped_references(table, rewritten_data_paths).await?;
+    let mut removed = Vec::new();
+    let mut removed_count: usize = 0;
     for (delete_file, referenced) in live_file_scoped_position_deletes(table).await? {
-        if is_deletion_vector(&delete_file) {
-            continue;
-        }
         if rewritten_data_paths.contains(&referenced) {
-            plan.dropped_count = plan.dropped_count.saturating_add(1);
-            plan.removed.push(delete_file);
+            removed_count = removed_count.saturating_add(1);
+            removed.push(delete_file);
         }
     }
     Ok(DvRewritePlan {
-        removed: plan.removed,
-        rewritten_siblings: plan.rewritten_siblings,
-        removed_count: plan.dropped_count,
+        removed,
+        removed_count,
     })
 }
 
