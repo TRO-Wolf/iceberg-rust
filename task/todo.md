@@ -25,6 +25,17 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-04): F-26 in-tree MoR v3 DELETE/UPDATE hands known_partitions to the DV close (row R114)
+
+Ledger: [`f26-known-partitions-in-tree-ledger.md`](f26-known-partitions-in-tree-ledger.md). Row R114.
+
+- [x] C-001 red: counting-Storage pins on the in-tree DataFusion MoR v3 DELETE/UPDATE path (48 data manifests, one row from the oldest file, close reads `== 0`; red at 48)
+- [x] C-002 fix: the delete plan scans once for batches plus the per-path `(spec_id, partition)` map and passes it as `known_partitions`; no new manifest walk; `live_data_file_partitions` untouched; outcomes identical
+- [x] C-003 pins + mutation: the two new pins; partial-map control still walks (`== 48`, outcome identical); end-to-end threading pins on empty `data_sequence_numbers`; production-empty-map mutation 2 red of 5, helper-ignore mutation 4 red of 5; F-17/F-18/F-21/F-23/F-25 batteries + F-18/F-21 interop runners green
+- [x] C-004 measure: sibling `measure_mor_delete_close_at_8_48_192` (close reads/opens/wall at 8/48/192 before/after, three runs, medians in the ledger; 192: 192 reads at 685 ms → 0 reads at 10 ms, opens 0)
+- [x] C-005 docs: GAP_MATRIX R114 F-26 note; this entry; `map.md` lockstep; ledger
+- [ ] RePark: no repin needed unless RePark's own map is partial (the in-tree map is now complete by construction; a partial RePark map still walks only the missed paths per F-23 r2)
+
 ## ACTIVE (2026-09-04): F-24 v3 parquet-to-DV arm honours min-input-files (row R136)
 
 Ledger: [`f24-rewrite-pos-deletes-floor-ledger.md`](f24-rewrite-pos-deletes-floor-ledger.md). Row R136.
@@ -54,7 +65,7 @@ Ledger: [`f23-conditional-data-walk-ledger.md`](f23-conditional-data-walk-ledger
 - [x] C-003: before/after at 8/48/192 data manifests, three runs, in the ledger
 - [x] C-004: GAP_MATRIX R114, this entry, `map.md` lockstep, ledger
 - [x] Round 2 (Rust perf review): first data manifest alone then a buffered tail (an ordered buffer of 8 issued 8 GETs for a one-manifest hit on a store that is not ready on the first poll); no-legacy arm wants only the paths `known_partitions` missed; exact `== 1` early-exit pin plus two latent-store pins; borrowed manifest entries
-- [ ] `iceberg-datafusion` MoR V3 DELETE/UPDATE: resolve partitions in the delete plan and hand them to `write_deletion_vectors` as `known_partitions`, so the skip fires in tree. Today `delete_legacy_merge.rs` passes an empty map and `live_data_file_partitions` is itself a full unstoppable walk, so routing through it would be a regression
+- [x] `iceberg-datafusion` MoR V3 DELETE/UPDATE: resolve partitions in the delete plan and hand them to `write_deletion_vectors` as `known_partitions`, so the skip fires in tree (F-26 [`f26-known-partitions-in-tree-ledger.md`](f26-known-partitions-in-tree-ledger.md); carried from the scan tasks, not `live_data_file_partitions`)
 - [ ] RePark: keep supplying `known_partitions`; that sink is what makes the skip fire. `data_sequence_numbers` is empty on the pure-DV complete-map path, and on the no-legacy arm it carries only the paths the map missed.
 
 ## ACTIVE (2026-09-03): F-22 one-pass legacy scan on DV container close (row R114)

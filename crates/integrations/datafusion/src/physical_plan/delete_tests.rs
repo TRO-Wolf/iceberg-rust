@@ -801,7 +801,10 @@ async fn measure_mor_delete_close_at_8_48_192() {
         assert_eq!(pairs.len(), 1);
         assert_eq!(known.len(), n);
         for run in 1..=3usize {
-            fixture.factory.data_manifest_reads.store(0, Ordering::Relaxed);
+            fixture
+                .factory
+                .data_manifest_reads
+                .store(0, Ordering::Relaxed);
             fixture.factory.opens.store(0, Ordering::Relaxed);
             let start = std::time::Instant::now();
             let before = write_merge_on_read_deletes(
@@ -816,7 +819,10 @@ async fn measure_mor_delete_close_at_8_48_192() {
             let before_wall = start.elapsed();
             let before_reads = fixture.factory.data_manifest_reads.load(Ordering::Relaxed);
             let before_opens = fixture.factory.opens.load(Ordering::Relaxed);
-            fixture.factory.data_manifest_reads.store(0, Ordering::Relaxed);
+            fixture
+                .factory
+                .data_manifest_reads
+                .store(0, Ordering::Relaxed);
             fixture.factory.opens.store(0, Ordering::Relaxed);
             let start = std::time::Instant::now();
             let after = write_merge_on_read_deletes(
