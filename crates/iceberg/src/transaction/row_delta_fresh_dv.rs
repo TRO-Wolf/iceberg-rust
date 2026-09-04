@@ -334,6 +334,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_dv_commit_for_oldest_file_reads_every_data_manifest() {
+        let fixture = commit_fixture(192).await;
+        let oldest = fixture.paths.first().expect("n > 0").clone();
+        commit_dv_for(
+            &fixture.catalog,
+            &fixture.table,
+            "test/oldest-dv.puffin",
+            &oldest,
+        )
+        .await;
+        assert_eq!(
+            fixture.data_manifest_reads.load(Ordering::Relaxed),
+            u64::try_from(fixture.paths.len()).expect("count fits"),
+            "a file in the oldest data manifest keeps the full walk and validates"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_dv_commit_for_unknown_file_reads_every_data_manifest() {
+        let fixture = commit_fixture(192).await;
+        commit_dv_for(
+            &fixture.catalog,
+            &fixture.table,
+            "test/ghost-dv.puffin",
+            "test/ghost.parquet",
+        )
+        .await;
+        assert_eq!(
+            fixture.data_manifest_reads.load(Ordering::Relaxed),
+            u64::try_from(fixture.paths.len()).expect("count fits"),
+            "a key never found keeps the full walk"
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_dv_commit_for_newest_file_reads_one_data_manifest_on_latent_store() {
         let fixture = commit_fixture(192).await;
         fixture.latent.store(true, Ordering::Relaxed);
