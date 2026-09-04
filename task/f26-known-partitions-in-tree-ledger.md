@@ -136,3 +136,46 @@ Open findings and dispositions: R114 residues unchanged (equality-delete sort-or
 | note |
 |---|
 | No repin needed unless RePark's own map is partial — the in-tree map is now complete by construction. |
+
+## 11. Round 2 (critic follow-ups, 2026-09-04)
+
+| item | change | evidence |
+|---|---|---|
+| S2 reader | One `TableScan::configure_reader` helper feeds `to_arrow` and `to_arrow_with_file_partitions`; the latter streams tasks through a recording tap instead of `try_collect`ing them first | `scan/partition_work.rs`; `scan/mod.rs` shrinks 13 lines |
+| S2 pin | New-method batches `==` `to_arrow` batches (data-only; schema field-metadata order is nondeterministic); map names every planned file | `to_arrow_with_file_partitions_matches_to_arrow_and_names_every_file` |
+| S3 scope | `dv_partitions_for` (new `mor_scan.rs` size-gate split): DV arm snapshots the shared map and retains touched paths; V2 `PositionDeletes` arm passes empty | `mor_delete_*` / `mor_update_*` pins green |
+| S3 split | `mor_scan.rs` extracted; `delete.rs` ceiling 1163 → 1149, `scan/mod.rs` 6892 → 6879 | `check_rust_file_size.py` 438 files clean |
+| S3 prose | One-line F-26 corrections in `writer/map.md:36`, `transaction/map.md:48`, `todo.md:69`; F-7 V3-DANGLE-1 ticked (RePark registry FIXED by V3-5 2026-08-31; fork `rewrite_data_files_dv.rs` apply path drops DVs) | prose commit |
+| S1 un-publish | HALTED for ruling, see §12 | Q1 |
+
+Re-measured n=48 after-wall cell, five samples (same command as §5; n=8/192 stay at three runs):
+
+| n=48 run | before wall | after wall |
+|---|---|---|
+| 1 | 182.728 ms | 9.984 ms |
+| 2 | 179.541 ms | 10.393 ms |
+| 3 | 211.851 ms | 8.009 ms |
+| 4 | 178.561 ms | 7.899 ms |
+| 5 | 178.869 ms | 13.548 ms |
+| median | 179.541 ms | 9.984 ms |
+
+Reads unchanged: before 48 / after 0 every run; opens 0 every run.
+
+Round-2 gate exits (2026-09-04, this clone):
+
+| gate | exit |
+|---|---|
+| `make check` | 0 |
+| `cargo test -p iceberg --locked --offline` | 0 |
+| `cargo test -p iceberg-datafusion --locked --offline` | 0 |
+| F-21 interop `run-interop-f21-legacy-delete-merge.sh` | 0 |
+| F-18 interop `run-interop-f18-dv-sibling-close.sh` | 0 |
+| `typos .` | 0 |
+| `make check-matrix-anchors` | 0 |
+| `python3 scripts/check_rust_file_size.py` | 0 (438 files clean) |
+
+## 12. Round-2 questions
+
+| id | class | question | premise | lean |
+|---|---|---|---|---|
+| Q1 | RULING | S1 demands `delete_tests.rs` gets its own counting storage factory while `counting.rs` reverts to `#[cfg(test)] pub(crate)`. A local factory must implement the `#[typetag::serde]` `StorageFactory` trait (methods take `bytes::Bytes`; registration needs `serde` derives), but `typetag`, `serde` and `bytes` are not direct dependencies of `iceberg-datafusion`, and dependency-file changes fail the unit. Allow adding the three as `[dev-dependencies]` (workspace-pinned, lockfile regenerated offline), or recast the pins onto the `data_sequence_numbers` emptiness signal (no factory anywhere), or keep the factory `pub` in `iceberg`? | `#[cfg(test)]` items in `iceberg` are invisible cross-crate; no re-export path for the three crates exists; `FileIO`/`MemoryCatalog` offer no observer hook | Allow the three workspace-pinned dev-deps; it keeps every pin and count identical |
