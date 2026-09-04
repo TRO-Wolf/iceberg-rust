@@ -25,7 +25,6 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
-<<<<<<< HEAD
 ## ACTIVE (2026-09-04): F-24 v3 parquet-to-DV arm honours min-input-files (row R136)
 
 Ledger: [`f24-rewrite-pos-deletes-floor-ledger.md`](f24-rewrite-pos-deletes-floor-ledger.md). Row R136.
@@ -35,7 +34,6 @@ Ledger: [`f24-rewrite-pos-deletes-floor-ledger.md`](f24-rewrite-pos-deletes-floo
 - [x] C-003 pins + mutation: 5-file control converts to 5 DVs with second-run zeros; lone-file bypass; admitted-shadows-declined refusal; drop-gate 4 red of 91; drop-bypass 12 red of 91 (partition/spec pin hardened after an 11-red run); battery 91 green; `run-interop-rewrite-pos-deletes.sh` green
 - [x] C-004 docs: GAP_MATRIX R136 F-24 note (V-1 retired); this entry; maintenance `map.md`; ledger
 - [ ] RePark: repin closes `B-MOR-3-FLOOR-1`
-=======
 ## ACTIVE (2026-09-04): F-25 fresh-DV validation early exit on row-delta commit (row R114)
 
 Ledger: [`f25-fresh-dv-early-exit-ledger.md`](f25-fresh-dv-early-exit-ledger.md). Row R114.
@@ -46,7 +44,6 @@ Ledger: [`f25-fresh-dv-early-exit-ledger.md`](f25-fresh-dv-early-exit-ledger.md)
 - [x] C-004 measure: sibling `measure_commit_at_8_48_192_data_manifests` (close + commit opens and wall at 8/48/192, three runs, medians in the ledger; 192: commit 726 ms → 44 ms, opens 192 → 1)
 - [x] C-005 docs: row R114, this entry, `map.md` lockstep, ledger
 - [ ] RePark: RP-10 repins; registry row `PERF-DVCLOSE-STMT-1` → FIXED. Commit-door validation now costs one data-manifest GET for the usual single-DV statement.
->>>>>>> 85a4aaf0cda9ea643bfe34c1666228178e363e94
 
 ## ACTIVE (2026-09-03): F-23 conditional data-manifest walk on DV container close (row R114)
 
