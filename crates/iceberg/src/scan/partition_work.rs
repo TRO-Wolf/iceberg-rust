@@ -939,12 +939,18 @@ mod tests {
             .expect("partition stream");
         let partnered = batches(stream).await;
         let single = batches(scan.to_arrow().await.expect("to_arrow")).await;
-        assert_eq!(partnered, single, "partition stream must read what to_arrow reads");
+        assert_eq!(
+            partnered, single,
+            "partition stream must read what to_arrow reads"
+        );
         assert!(!partnered.is_empty(), "readable fixture must yield batches");
         let known = shared.lock().expect("partition map").clone();
         assert_eq!(known.len(), planned.len(), "map names every planned file");
         for path in &planned {
-            assert!(known.contains_key(path), "map is missing planned file {path}");
+            assert!(
+                known.contains_key(path),
+                "map is missing planned file {path}"
+            );
         }
     }
 }

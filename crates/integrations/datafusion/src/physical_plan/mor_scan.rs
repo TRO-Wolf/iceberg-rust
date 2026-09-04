@@ -57,8 +57,7 @@ pub(super) fn dv_partitions_for(
     match kind {
         MergeOnReadDeleteKind::PositionDeletes => Ok(HashMap::new()),
         MergeOnReadDeleteKind::DeletionVectors => {
-            let touched: HashSet<&str> =
-                pairs.iter().map(|(path, _)| path.as_str()).collect();
+            let touched: HashSet<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();
             let mut known = shared
                 .lock()
                 .map_err(|error| {
