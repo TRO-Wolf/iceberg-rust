@@ -28,7 +28,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::delete_vector_container::CountingStorageFactory;
-use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::spec::{
     DataContentType, ManifestContentType, NestedField, PrimitiveType, Schema as IcebergSchema, Type,
@@ -38,10 +38,10 @@ use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation};
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
+use super::delete_position_deletes::group_pairs_by_partition;
 use super::{
     IsolationLevel, apply_assignments, decode_file_path, decode_file_paths_batch, decode_position,
-    group_pairs_by_partition, position_delete_unpartitioned_fast_path, sort_position_delete_pairs,
-    *,
+    position_delete_unpartitioned_fast_path, sort_position_delete_pairs, *,
 };
 
 // An assignment must never smuggle a NULL into a REQUIRED column. A dictionary or REE array
@@ -406,6 +406,7 @@ fn test_group_pairs_by_partition_rejects_an_unmatched_data_file() {
     );
 }
 struct MorCloseFixture {
+    catalog: MemoryCatalog,
     table: Table,
     paths: Vec<String>,
     factory: Arc<CountingStorageFactory>,
@@ -518,11 +519,20 @@ async fn mor_close_fixture() -> MorCloseFixture {
     factory.manifest_reads.store(0, Ordering::Relaxed);
     factory.opens.store(0, Ordering::Relaxed);
     MorCloseFixture {
+        catalog,
         table,
         paths,
         factory,
         _warehouse: warehouse,
     }
+}
+
+fn oldest_eq_predicate() -> Arc<dyn PhysicalExpr> {
+    Arc::new(BinaryExpr::new(
+        Arc::new(Column::new("id", 0)),
+        Operator::Eq,
+        Arc::new(Literal::new(ScalarValue::Int32(Some(0)))),
+    ))
 }
 
 async fn scan_oldest_pair(
@@ -531,11 +541,7 @@ async fn scan_oldest_pair(
     table_schema: &SchemaRef,
     scan_snapshot_id: Option<i64>,
 ) -> (Vec<(String, i64)>, HashMap<String, (i32, Struct)>) {
-    let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-        Arc::new(Column::new("id", 0)),
-        Operator::Eq,
-        Arc::new(Literal::new(ScalarValue::Int32(Some(0)))),
-    ));
+    let predicate = oldest_eq_predicate();
     let (mut stream, known) = mor_scan_stream(table, projection, None, scan_snapshot_id)
         .await
         .expect("scan");
@@ -601,6 +607,8 @@ async fn mor_delete_close_with_complete_partitions_reads_no_data_manifest() {
     .await
     .expect("close");
     assert_eq!(close.added.len(), 1);
+    assert_eq!(close.added[0].partition_spec_id(), 0);
+    assert_eq!(close.added[0].partition(), &Struct::empty());
     assert_eq!(
         close
             .referenced_data_files()
@@ -655,5 +663,111 @@ async fn mor_update_close_with_complete_partitions_reads_no_data_manifest() {
         fixture.factory.data_manifest_reads.load(Ordering::Relaxed),
         0,
         "a complete known_partitions map must skip the data-manifest walk"
+    );
+}
+
+#[tokio::test]
+async fn mor_delete_close_with_partial_partitions_still_walks_and_matches() {
+    let fixture = mor_close_fixture().await;
+    let table = &fixture.table;
+    let oldest = fixture.paths.first().expect("paths").clone();
+    let table_schema =
+        Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
+    let mut projection: Vec<String> = table_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    projection.push(RESERVED_COL_NAME_FILE.to_string());
+    projection.push(RESERVED_COL_NAME_POS.to_string());
+    let scan_snapshot_id = table
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id());
+    let (pairs, known) = scan_oldest_pair(table, projection, &table_schema, scan_snapshot_id).await;
+    assert_eq!(pairs, vec![(oldest.clone(), 0)]);
+    let mut partial = known.clone();
+    partial.remove(&oldest);
+    assert_eq!(partial.len(), 47);
+    fixture
+        .factory
+        .data_manifest_reads
+        .store(0, Ordering::Relaxed);
+    let close = write_merge_on_read_deletes(
+        table,
+        MergeOnReadDeleteKind::DeletionVectors,
+        &pairs,
+        &partial,
+        scan_snapshot_id,
+    )
+    .await
+    .expect("close");
+    assert_eq!(close.added.len(), 1);
+    assert_eq!(
+        close
+            .referenced_data_files()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![oldest]
+    );
+    assert_eq!(
+        fixture.factory.data_manifest_reads.load(Ordering::Relaxed),
+        48,
+        "a touched file the map misses still walks every data manifest"
+    );
+}
+
+#[tokio::test]
+async fn mor_delete_threads_scan_partitions_to_the_close() {
+    let fixture = mor_close_fixture().await;
+    let table = &fixture.table;
+    let table_schema =
+        Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
+    let (deleted, close) = merge_on_read_delete(
+        table,
+        &fixture.catalog,
+        Some(oldest_eq_predicate()),
+        None,
+        &table_schema,
+        IsolationLevel::Serializable,
+        None,
+    )
+    .await
+    .expect("delete");
+    assert_eq!(deleted, 1);
+    assert_eq!(close.added.len(), 1);
+    assert!(
+        close.data_sequence_numbers.is_empty(),
+        "threaded partitions must skip the data-manifest walk"
+    );
+}
+
+#[tokio::test]
+async fn mor_update_threads_scan_partitions_to_the_close() {
+    let fixture = mor_close_fixture().await;
+    let table = &fixture.table;
+    let table_schema =
+        Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
+    let assignments: Vec<(usize, Arc<dyn PhysicalExpr>)> = vec![(
+        1,
+        Arc::new(Literal::new(ScalarValue::Utf8(Some("w".to_string())))),
+    )];
+    let (updated, close) = merge_on_read_update(
+        table,
+        &fixture.catalog,
+        Some(oldest_eq_predicate()),
+        None,
+        &assignments,
+        &table_schema,
+        IsolationLevel::Serializable,
+        None,
+    )
+    .await
+    .expect("update");
+    assert_eq!(updated, 1);
+    assert_eq!(close.added.len(), 1);
+    assert!(
+        close.data_sequence_numbers.is_empty(),
+        "threaded partitions must skip the data-manifest walk"
     );
 }

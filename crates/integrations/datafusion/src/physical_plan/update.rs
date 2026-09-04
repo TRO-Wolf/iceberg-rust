@@ -151,19 +151,18 @@ impl ExecutionPlan for IcebergUpdateExec {
 
         let stream = futures::stream::once(async move {
             let updated = match mode {
-                WriteMode::MergeOnRead => {
-                    merge_on_read_update(
-                        &table,
-                        catalog.as_ref(),
-                        predicate,
-                        prune,
-                        &assignments,
-                        &table_schema,
-                        isolation,
-                        commit_branch.as_deref(),
-                    )
-                    .await?
-                }
+                WriteMode::MergeOnRead => merge_on_read_update(
+                    &table,
+                    catalog.as_ref(),
+                    predicate,
+                    prune,
+                    &assignments,
+                    &table_schema,
+                    isolation,
+                    commit_branch.as_deref(),
+                )
+                .await
+                .map(|(updated, _)| updated)?,
                 WriteMode::CopyOnWrite => {
                     copy_on_write_update(
                         &table,

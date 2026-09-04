@@ -80,7 +80,6 @@ use crate::to_datafusion_error;
 
 #[path = "delete_position_deletes.rs"]
 mod delete_position_deletes;
-pub(crate) use delete_position_deletes::group_pairs_by_partition;
 use delete_position_deletes::write_position_deletes;
 
 pub(crate) use super::cow_affected::position_delete_unpartitioned_fast_path;
@@ -287,18 +286,17 @@ impl ExecutionPlan for IcebergDeleteExec {
 
         let stream = futures::stream::once(async move {
             let deleted = match mode {
-                WriteMode::MergeOnRead => {
-                    merge_on_read_delete(
-                        &table,
-                        catalog.as_ref(),
-                        predicate,
-                        prune,
-                        &table_schema,
-                        isolation,
-                        commit_branch.as_deref(),
-                    )
-                    .await?
-                }
+                WriteMode::MergeOnRead => merge_on_read_delete(
+                    &table,
+                    catalog.as_ref(),
+                    predicate,
+                    prune,
+                    &table_schema,
+                    isolation,
+                    commit_branch.as_deref(),
+                )
+                .await
+                .map(|(deleted, _)| deleted)?,
                 WriteMode::CopyOnWrite => {
                     copy_on_write_delete(
                         &table,
@@ -390,13 +388,13 @@ async fn write_merge_on_read_deletes(
 
 fn apply_dv_container_close(
     mut action: iceberg::transaction::RowDeltaAction,
-    close: DvContainerClose,
+    close: &DvContainerClose,
 ) -> iceberg::transaction::RowDeltaAction {
     if !close.added.is_empty() {
-        action = action.add_deletes(close.added);
+        action = action.add_deletes(close.added.clone());
     }
     if !close.removed.is_empty() {
-        action = action.remove_deletes_many(close.removed);
+        action = action.remove_deletes_many(close.removed.clone());
     }
     action
 }
@@ -441,7 +439,7 @@ async fn merge_on_read_delete(
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
     commit_branch: Option<&str>,
-) -> DFResult<u64> {
+) -> DFResult<(u64, DvContainerClose)> {
     let delete_kind = merge_on_read_delete_kind(table)?;
     let scan_snapshot_id =
         resolve_scan_snapshot_id(table, commit_branch).map_err(to_datafusion_error)?;
@@ -522,7 +520,7 @@ async fn merge_on_read_delete(
 
     // No matching rows → no-op (an empty RowDelta would be a pointless snapshot).
     if pairs.is_empty() {
-        return Ok(0);
+        return Ok((0, DvContainerClose::default()));
     }
 
     // Position deletes MUST be sorted by (path, pos) per the spec.
@@ -552,7 +550,7 @@ async fn merge_on_read_delete(
     if delete_kind == MergeOnReadDeleteKind::DeletionVectors {
         action = action.validate_deleted_files();
     }
-    action = apply_dv_container_close(action, close);
+    action = apply_dv_container_close(action, &close);
     action = maybe_validate_from_snapshot(action, scan_snapshot_id, |action, snapshot_id| {
         action.validate_from_snapshot(snapshot_id)
     });
@@ -569,7 +567,7 @@ async fn merge_on_read_delete(
         .await
         .map_err(to_datafusion_error)?;
 
-    Ok(deleted)
+    Ok((deleted, close))
 }
 
 /// Copy-on-write DELETE: a file-level rewrite. It finds the data files holding at least one deleted
@@ -916,7 +914,7 @@ pub(crate) async fn merge_on_read_update(
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
     commit_branch: Option<&str>,
-) -> DFResult<u64> {
+) -> DFResult<(u64, DvContainerClose)> {
     let delete_kind = merge_on_read_delete_kind(table)?;
     let scan_snapshot_id =
         resolve_scan_snapshot_id(table, commit_branch).map_err(to_datafusion_error)?;
@@ -979,7 +977,7 @@ pub(crate) async fn merge_on_read_update(
         // No batch ever reached the writer, so `finish` produces no file. Nothing to commit.
         let empty = data_writer.finish().await?;
         debug_assert!(empty.is_empty());
-        return Ok(0);
+        return Ok((0, DvContainerClose::default()));
     }
 
     // Grouping and sorting need the whole pair set up front. Both sides complete BEFORE the single
@@ -1007,7 +1005,7 @@ pub(crate) async fn merge_on_read_update(
         .validate_data_files_exist(referenced_files)
         .validate_deleted_files()
         .validate_no_conflicting_delete_files();
-    action = apply_dv_container_close(action, close);
+    action = apply_dv_container_close(action, &close);
     action = maybe_validate_from_snapshot(action, scan_snapshot_id, |action, snapshot_id| {
         action.validate_from_snapshot(snapshot_id)
     });
@@ -1024,7 +1022,7 @@ pub(crate) async fn merge_on_read_update(
         .await
         .map_err(to_datafusion_error)?;
 
-    Ok(updated)
+    Ok((updated, close))
 }
 
 /// Copy-on-write UPDATE: a file-level rewrite. It finds the data files holding at least one updated
