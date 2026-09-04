@@ -4098,6 +4098,150 @@ async fn test_v3_converts_parquet_position_deletes_into_one_deletion_vector() {
     assert_eq!(after[0].record_count, 2, "both positions landed in the DV");
 }
 
+#[tokio::test]
+async fn test_v3_two_parquet_deletes_below_the_five_floor_stay_parquet() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 7, &[
+        (7, 10, 100),
+        (7, 20, 200),
+        (7, 30, 300),
+        (7, 40, 400),
+        (7, 50, 500),
+    ])
+    .await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+
+    let pd1 = write_position_delete_file(&table, Some(7), &[(&x_path, 1)]).await;
+    let table = add_deletes(&catalog, &table, vec![pd1]).await;
+    let pd2 = write_position_delete_file(&table, Some(7), &[(&x_path, 3)]).await;
+    let table = add_deletes(&catalog, &table, vec![pd2]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(before, HashSet::from([10, 30, 50]));
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "two files are below Java's min-input-files floor of five: four zeros"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "a declined group must NOT commit"
+    );
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 2, "both parquet deletes stay live");
+    assert!(
+        after
+            .iter()
+            .all(|f| f.file_format() == DataFileFormat::Parquet),
+        "no deletion vector is written below the floor"
+    );
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+#[tokio::test]
+async fn test_v3_one_parquet_delete_below_the_five_floor_stays_parquet() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 7, &[(7, 10, 1), (7, 20, 2)]).await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+    let pd = write_position_delete_file(&table, Some(7), &[(&x_path, 1)]).await;
+    let table = add_deletes(&catalog, &table, vec![pd]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(before, HashSet::from([10]));
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "one file is below Java's min-input-files floor of five: four zeros"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "a declined group must NOT commit"
+    );
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 1, "the parquet delete stays live");
+    assert_eq!(after[0].file_format(), DataFileFormat::Parquet);
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
+#[tokio::test]
+async fn test_v3_one_partition_scoped_delete_covering_two_files_stays_parquet() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let a = write_data_file(&table, "a.parquet", 7, &[(7, 10, 1), (7, 11, 2)]).await;
+    let b = write_data_file(&table, "b.parquet", 7, &[(7, 20, 1), (7, 21, 2)]).await;
+    let a_path = a.file_path().to_string();
+    let b_path = b.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![a, b]).await;
+
+    let pd = write_position_delete_file(&table, Some(7), &[
+        (a_path.as_str(), 1),
+        (b_path.as_str(), 1),
+    ])
+    .await;
+    assert!(
+        referenced_data_file_location(&pd).is_none(),
+        "fixture: a delete naming two data files is PARTITION-scoped"
+    );
+    let table = add_deletes(&catalog, &table, vec![pd]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([10, 20]),
+        "fixture: the partition-scoped delete masks one row per data file"
+    );
+    let snapshot_before = table.metadata().current_snapshot_id();
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "one partition-scoped delete is one file below the floor even though it covers two data files: four zeros"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().current_snapshot_id(),
+        snapshot_before,
+        "a declined group must NOT commit"
+    );
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(after.len(), 1, "the parquet delete stays live");
+    assert_eq!(after[0].file_format(), DataFileFormat::Parquet);
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+}
+
 /// Each `DVFileWriter::delete` carries that data file's own `PartitionKey`.
 /// `with_partition_spec` is not used: one Puffin spans every partition.
 #[tokio::test]
