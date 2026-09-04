@@ -565,7 +565,7 @@ async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<Data
 }
 
 #[cfg(test)]
-mod counting;
+pub(crate) mod counting;
 #[cfg(test)]
 mod measure;
 #[cfg(test)]

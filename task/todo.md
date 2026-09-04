@@ -25,6 +25,17 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-04): F-25 fresh-DV validation early exit on row-delta commit (row R114)
+
+Ledger: [`f25-fresh-dv-early-exit-ledger.md`](f25-fresh-dv-early-exit-ledger.md). Row R114.
+
+- [x] C-001 red: counting-Storage pins on the row-delta commit path (192 data manifests, DV for the newest file, `== 1` latent and non-latent; red at 192)
+- [x] C-002 fix: `validate_fresh_dvs_only` walks newest-first, one load before buffering `DV_IO_CONCURRENCY`, stops once every `added_dvs` key is found; never-found keys keep the full walk
+- [x] C-003 pins + mutation: oldest-manifest and unknown-key full-walk controls, malformed-DV pin unchanged; remove-the-stop mutation 2 red of 6; F-17/F-18/F-21/F-23 suites + F-18/F-21 interop runners green
+- [x] C-004 measure: sibling `measure_commit_at_8_48_192_data_manifests` (close + commit opens and wall at 8/48/192, three runs, medians in the ledger; 192: commit 726 ms → 44 ms, opens 192 → 1)
+- [x] C-005 docs: row R114, this entry, `map.md` lockstep, ledger
+- [ ] RePark: RP-10 repins; registry row `PERF-DVCLOSE-STMT-1` → FIXED. Commit-door validation now costs one data-manifest GET for the usual single-DV statement.
+
 ## ACTIVE (2026-09-03): F-23 conditional data-manifest walk on DV container close (row R114)
 
 Ledger: [`f23-conditional-data-walk-ledger.md`](f23-conditional-data-walk-ledger.md). Row R114.
