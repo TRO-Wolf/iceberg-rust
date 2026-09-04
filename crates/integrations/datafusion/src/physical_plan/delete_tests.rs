@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::arrow::array::{
     ArrayRef, DictionaryArray, Int32Array, Int64Array, RecordBatch, RunArray, StringArray,
 };
@@ -27,15 +30,19 @@ use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::delete_vector_container::CountingStorageFactory;
+use iceberg::io::{
+    FileInfo, FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorageFactory, OutputFile,
+    Storage, StorageConfig, StorageFactory,
+};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::spec::{
     DataContentType, ManifestContentType, NestedField, PrimitiveType, Schema as IcebergSchema, Type,
 };
 use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
-use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation};
+use iceberg::{CatalogBuilder, NamespaceIdent, Result, TableCreation};
 use parquet::file::properties::WriterProperties;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use super::delete_position_deletes::group_pairs_by_partition;
@@ -405,6 +412,135 @@ fn test_group_pairs_by_partition_rejects_an_unmatched_data_file() {
         "the error must name the offending file: {err}"
     );
 }
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn is_snapshot_list(path: &str) -> bool {
+    let name = file_name(path);
+    name.starts_with("snap-") && name.ends_with(".avro")
+}
+
+fn is_manifest(path: &str) -> bool {
+    let name = file_name(path);
+    name.ends_with(".avro") && !name.starts_with("snap-")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CountingStorage {
+    #[serde(skip)]
+    inner: Option<Arc<dyn Storage>>,
+    #[serde(skip)]
+    manifest_reads: Arc<AtomicU64>,
+    #[serde(skip)]
+    data_manifest_paths: Arc<Mutex<HashSet<String>>>,
+    #[serde(skip)]
+    data_manifest_reads: Arc<AtomicU64>,
+    #[serde(skip)]
+    opens: Arc<AtomicU64>,
+}
+
+impl CountingStorage {
+    fn inner(&self) -> &Arc<dyn Storage> {
+        self.inner.as_ref().expect("counting storage was built")
+    }
+
+    fn count(&self, path: &str) {
+        if path.ends_with(".parquet") {
+            self.opens.fetch_add(1, Ordering::Relaxed);
+        }
+        if is_snapshot_list(path) {
+            return;
+        }
+        if is_manifest(path) {
+            self.manifest_reads.fetch_add(1, Ordering::Relaxed);
+            if self
+                .data_manifest_paths
+                .lock()
+                .expect("data-manifest path set")
+                .contains(path)
+            {
+                self.data_manifest_reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[async_trait]
+#[typetag::serde]
+impl Storage for CountingStorage {
+    async fn exists(&self, path: &str) -> Result<bool> {
+        self.inner().exists(path).await
+    }
+
+    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
+        self.inner().metadata(path).await
+    }
+
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        self.count(path);
+        self.inner().read(path).await
+    }
+
+    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        self.count(path);
+        self.inner().reader(path).await
+    }
+
+    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        self.inner().write(path, bs).await
+    }
+
+    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        self.inner().writer(path).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        self.inner().delete(path).await
+    }
+
+    async fn delete_prefix(&self, path: &str) -> Result<()> {
+        self.inner().delete_prefix(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
+        self.inner().list(prefix).await
+    }
+
+    fn new_input(&self, path: &str) -> Result<InputFile> {
+        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+
+    fn new_output(&self, path: &str) -> Result<OutputFile> {
+        self.inner().new_output(path)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CountingStorageFactory {
+    #[serde(skip)]
+    manifest_reads: Arc<AtomicU64>,
+    #[serde(skip)]
+    data_manifest_paths: Arc<Mutex<HashSet<String>>>,
+    #[serde(skip)]
+    data_manifest_reads: Arc<AtomicU64>,
+    #[serde(skip)]
+    opens: Arc<AtomicU64>,
+}
+
+#[typetag::serde]
+impl StorageFactory for CountingStorageFactory {
+    fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        Ok(Arc::new(CountingStorage {
+            inner: Some(LocalFsStorageFactory.build(config)?),
+            manifest_reads: self.manifest_reads.clone(),
+            data_manifest_paths: self.data_manifest_paths.clone(),
+            data_manifest_reads: self.data_manifest_reads.clone(),
+            opens: self.opens.clone(),
+        }))
+    }
+}
+
 struct MorCloseFixture {
     catalog: MemoryCatalog,
     table: Table,

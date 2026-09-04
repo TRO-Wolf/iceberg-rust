@@ -564,8 +564,8 @@ async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<Data
     writer.close().await
 }
 
+#[cfg(test)]
 pub(crate) mod counting;
-pub use counting::CountingStorageFactory;
 #[cfg(test)]
 mod measure;
 #[cfg(test)]

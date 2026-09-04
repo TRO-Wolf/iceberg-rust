@@ -24,19 +24,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use crate::Catalog;
-use crate::Result;
 use crate::io::{
     FileInfo, FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorageFactory, OutputFile,
     Storage, StorageConfig, StorageFactory,
 };
-#[cfg(test)]
 use crate::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct};
-#[cfg(test)]
 use crate::table::Table;
-#[cfg(test)]
 use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::{Catalog, Result};
 
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -186,36 +181,26 @@ impl FileRead for CountingFileRead {
     }
 }
 
-/// Storage factory that counts manifest GETs per content type.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CountingStorageFactory {
-    /// All manifest GETs.
+pub(crate) struct CountingStorageFactory {
     #[serde(skip)]
-    pub manifest_reads: Arc<AtomicU64>,
-    /// Bytes returned by storage reads.
+    pub(crate) manifest_reads: Arc<AtomicU64>,
     #[serde(skip)]
-    pub bytes_read: Arc<AtomicU64>,
-    /// Delete-manifest paths to count.
+    pub(crate) bytes_read: Arc<AtomicU64>,
     #[serde(skip)]
-    pub delete_manifest_paths: Arc<Mutex<HashSet<String>>>,
-    /// GETs against the recorded delete-manifest paths.
+    pub(crate) delete_manifest_paths: Arc<Mutex<HashSet<String>>>,
     #[serde(skip)]
-    pub delete_manifest_reads: Arc<AtomicU64>,
-    /// Data-manifest paths to count.
+    pub(crate) delete_manifest_reads: Arc<AtomicU64>,
     #[serde(skip)]
-    pub data_manifest_paths: Arc<Mutex<HashSet<String>>>,
-    /// GETs against the recorded data-manifest paths.
+    pub(crate) data_manifest_paths: Arc<Mutex<HashSet<String>>>,
     #[serde(skip)]
-    pub data_manifest_reads: Arc<AtomicU64>,
-    /// Manifest-list GETs.
+    pub(crate) data_manifest_reads: Arc<AtomicU64>,
     #[serde(skip)]
-    pub snapshot_list_reads: Arc<AtomicU64>,
-    /// Parquet opens.
+    pub(crate) snapshot_list_reads: Arc<AtomicU64>,
     #[serde(skip)]
-    pub opens: Arc<AtomicU64>,
-    /// Yield after counting a GET, exposing prefetch fan-out.
+    pub(crate) opens: Arc<AtomicU64>,
     #[serde(skip)]
-    pub latent: Arc<AtomicBool>,
+    pub(crate) latent: Arc<AtomicBool>,
 }
 
 #[typetag::serde]
@@ -236,7 +221,6 @@ impl StorageFactory for CountingStorageFactory {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn synthetic_data_file(path: &str) -> DataFile {
     DataFileBuilder::default()
         .content(DataContentType::Data)
@@ -250,7 +234,6 @@ pub(crate) fn synthetic_data_file(path: &str) -> DataFile {
         .expect("build synthetic data file")
 }
 
-#[cfg(test)]
 pub(crate) async fn append(catalog: &impl Catalog, table: &Table, file: DataFile) -> Table {
     let tx = Transaction::new(table);
     let tx = tx

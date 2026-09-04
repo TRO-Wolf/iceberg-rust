@@ -179,3 +179,27 @@ Round-2 gate exits (2026-09-04, this clone):
 | id | class | question | premise | lean |
 |---|---|---|---|---|
 | Q1 | RULING | S1 demands `delete_tests.rs` gets its own counting storage factory while `counting.rs` reverts to `#[cfg(test)] pub(crate)`. A local factory must implement the `#[typetag::serde]` `StorageFactory` trait (methods take `bytes::Bytes`; registration needs `serde` derives), but `typetag`, `serde` and `bytes` are not direct dependencies of `iceberg-datafusion`, and dependency-file changes fail the unit. Allow adding the three as `[dev-dependencies]` (workspace-pinned, lockfile regenerated offline), or recast the pins onto the `data_sequence_numbers` emptiness signal (no factory anywhere), or keep the factory `pub` in `iceberg`? | `#[cfg(test)]` items in `iceberg` are invisible cross-crate; no re-export path for the three crates exists; `FileIO`/`MemoryCatalog` offer no observer hook | Allow the three workspace-pinned dev-deps; it keeps every pin and count identical |
+
+## 13. Round 3 (Q1 ruling execution, 2026-09-04)
+
+| item | change | evidence |
+|---|---|---|
+| Ruling | `bytes`, `serde`, `typetag` added to `iceberg-datafusion` `[dev-dependencies]` only, each `<name>.workspace = true` | `crates/integrations/datafusion/Cargo.toml`; one sanctioned dependency-file change of the unit |
+| Lockfile | `Cargo.lock` gains exactly 3 edge lines on the `iceberg-datafusion` entry (`bytes`, `serde`, `typetag`); zero new packages, zero version changes; the ruled "NO diff" expectation is unachievable because the lock records per-package edges and the crate never depended on the three — `cargo test --locked` fails without it | `git diff -- Cargo.lock` (3 `+` lines, §3586 entry) |
+| Un-publish | `counting.rs` byte-identical to `main` (`#[cfg(test)] pub(crate)`, ten forced `///` lines gone); `delete_vector_container.rs` loses `pub use counting::CountingStorageFactory` (also byte-identical to `main`) | `git diff main --stat` empty for both files |
+| Local factory | `delete_tests.rs` (already `#[cfg(test)]`) owns a minimal counting factory (`manifest_reads`, `data_manifest_paths/reads`, `opens`; `#[typetag::serde]`, no `///`); follows `table_metadata_cache.rs:319` precedent | `physical_plan::delete::` pins green, same counts |
+| Size | `delete_tests.rs` 986 lines, under the 1000 default ceiling (minimal factory, no split needed) | `check_rust_file_size.py` 438 files clean |
+| Pins | `physical_plan::delete::` 23 passed / 1 ignored (measure), same population as §9; complete-map pins read 0 data manifests, partial-map pin walks and matches | `cargo test -p iceberg-datafusion --locked --offline physical_plan::delete::` |
+
+Round-3 gate exits (2026-09-04, this clone):
+
+| gate | exit |
+|---|---|
+| `make check` | 0 |
+| `cargo test -p iceberg --locked --offline` | 0 |
+| `cargo test -p iceberg-datafusion --locked --offline` | 0 |
+| F-21 interop `run-interop-f21-legacy-delete-merge.sh` | 0 (PASSED) |
+| F-18 interop `run-interop-f18-dv-sibling-close.sh` | 0 (PASSED) |
+| `typos .` | 0 |
+| `make check-matrix-anchors` | 0 |
+| `python3 scripts/check_rust_file_size.py` | 0 (438 files clean) |
