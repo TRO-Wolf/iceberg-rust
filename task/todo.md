@@ -66,7 +66,7 @@ Ledger: [`f23-conditional-data-walk-ledger.md`](f23-conditional-data-walk-ledger
 - [x] C-004: GAP_MATRIX R114, this entry, `map.md` lockstep, ledger
 - [x] Round 2 (Rust perf review): first data manifest alone then a buffered tail (an ordered buffer of 8 issued 8 GETs for a one-manifest hit on a store that is not ready on the first poll); no-legacy arm wants only the paths `known_partitions` missed; exact `== 1` early-exit pin plus two latent-store pins; borrowed manifest entries
 - [x] `iceberg-datafusion` MoR V3 DELETE/UPDATE: resolve partitions in the delete plan and hand them to `write_deletion_vectors` as `known_partitions`, so the skip fires in tree (F-26 [`f26-known-partitions-in-tree-ledger.md`](f26-known-partitions-in-tree-ledger.md); carried from the scan tasks, not `live_data_file_partitions`)
-- [ ] RePark: keep supplying `known_partitions`; that sink is what makes the skip fire. `data_sequence_numbers` is empty on the pure-DV complete-map path, and on the no-legacy arm it carries only the paths the map missed.
+- [ ] RePark: keep supplying `known_partitions`; F-26: the in-tree MoR DELETE/UPDATE plans now supply it too from their scan tasks, so the skip fires in tree as well as via RePark. `data_sequence_numbers` is empty on the pure-DV complete-map path, and on the no-legacy arm it carries only the paths the map missed.
 
 ## ACTIVE (2026-09-03): F-22 one-pass legacy scan on DV container close (row R114)
 
@@ -523,7 +523,7 @@ Order set with the engine side 2026-08-25. F-14 and F-15 are explicitly NOT next
       DataFusion COW `OverwriteFiles`. Ledger:
       [`f7-row-lineage-carry-ledger.md`](f7-row-lineage-carry-ledger.md). Unlocks engine
       units V3-4 + V3-5 at repin.
-- [ ] **F-7 remaining — V3-DANGLE-1 / row R137** dangling-DV drop on compaction.
+- [x] **F-7 remaining — V3-DANGLE-1 / row R137** dangling-DV drop on compaction: RePark's registry records FIXED by V3-5 (2026-08-31); the fork's `rewrite_data_files_dv.rs` apply path already drops DVs referencing rewritten data files.
 - [ ] **F-7 remaining — row R136** RewritePositionDeleteFiles DV-aware remainder.
 - [ ] **F-7 remaining — MoR RowDelta** `_row_id` carry on added data files. MoR UPDATE currently
       writes all-null lineage columns through the shared v3 writer schema; see the F-7 ledger.
