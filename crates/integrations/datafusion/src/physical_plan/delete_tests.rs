@@ -414,6 +414,10 @@ struct MorCloseFixture {
 }
 
 async fn mor_close_fixture() -> MorCloseFixture {
+    mor_close_fixture_at(48).await
+}
+
+async fn mor_close_fixture_at(n: usize) -> MorCloseFixture {
     let warehouse = TempDir::new().expect("warehouse");
     let factory = Arc::new(CountingStorageFactory {
         data_manifest_paths: Arc::new(Mutex::new(HashSet::new())),
@@ -460,8 +464,8 @@ async fn mor_close_fixture() -> MorCloseFixture {
         .expect("table");
     let arrow_schema =
         Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
-    let mut paths = Vec::with_capacity(48);
-    for index in 0..48i32 {
+    let mut paths = Vec::with_capacity(n);
+    for index in 0..i32::try_from(n).expect("n fits") {
         let file_path = format!("{}/data/f{index}.parquet", table.metadata().location());
         let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![
             Arc::new(Int32Array::from(vec![index])) as ArrayRef,
@@ -510,7 +514,7 @@ async fn mor_close_fixture() -> MorCloseFixture {
         .filter(|manifest| manifest.content == ManifestContentType::Data)
         .map(|manifest| manifest.manifest_path.clone())
         .collect();
-    assert_eq!(data_paths.len(), 48, "one data manifest per append");
+    assert_eq!(data_paths.len(), n, "one data manifest per append");
     *factory
         .data_manifest_paths
         .lock()
@@ -770,4 +774,69 @@ async fn mor_update_threads_scan_partitions_to_the_close() {
         close.data_sequence_numbers.is_empty(),
         "threaded partitions must skip the data-manifest walk"
     );
+}
+
+#[tokio::test]
+#[ignore = "measurement, not a CI pin"]
+async fn measure_mor_delete_close_at_8_48_192() {
+    for n in [8usize, 48, 192] {
+        let fixture = mor_close_fixture_at(n).await;
+        let table = &fixture.table;
+        let table_schema = Arc::new(
+            schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"),
+        );
+        let mut projection: Vec<String> = table_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        projection.push(RESERVED_COL_NAME_FILE.to_string());
+        projection.push(RESERVED_COL_NAME_POS.to_string());
+        let scan_snapshot_id = table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id());
+        let (pairs, known) =
+            scan_oldest_pair(table, projection, &table_schema, scan_snapshot_id).await;
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(known.len(), n);
+        for run in 1..=3usize {
+            fixture.factory.data_manifest_reads.store(0, Ordering::Relaxed);
+            fixture.factory.opens.store(0, Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            let before = write_merge_on_read_deletes(
+                table,
+                MergeOnReadDeleteKind::DeletionVectors,
+                &pairs,
+                &HashMap::new(),
+                scan_snapshot_id,
+            )
+            .await
+            .expect("close");
+            let before_wall = start.elapsed();
+            let before_reads = fixture.factory.data_manifest_reads.load(Ordering::Relaxed);
+            let before_opens = fixture.factory.opens.load(Ordering::Relaxed);
+            fixture.factory.data_manifest_reads.store(0, Ordering::Relaxed);
+            fixture.factory.opens.store(0, Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            let after = write_merge_on_read_deletes(
+                table,
+                MergeOnReadDeleteKind::DeletionVectors,
+                &pairs,
+                &known,
+                scan_snapshot_id,
+            )
+            .await
+            .expect("close");
+            let after_wall = start.elapsed();
+            let after_reads = fixture.factory.data_manifest_reads.load(Ordering::Relaxed);
+            let after_opens = fixture.factory.opens.load(Ordering::Relaxed);
+            println!(
+                "F-26 n={n} run={run} before_reads={before_reads} before_opens={before_opens} before_wall={before_wall:?} after_reads={after_reads} after_opens={after_opens} after_wall={after_wall:?} added={}",
+                after.added.len() + before.added.len(),
+            );
+            assert_eq!(before.added.len(), 1);
+            assert_eq!(after.added.len(), 1);
+        }
+    }
 }
