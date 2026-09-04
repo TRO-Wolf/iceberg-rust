@@ -25,6 +25,16 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-04): F-24 v3 parquet-to-DV arm honours min-input-files (row R136)
+
+Ledger: [`f24-rewrite-pos-deletes-floor-ledger.md`](f24-rewrite-pos-deletes-floor-ledger.md). Row R136.
+
+- [x] C-001 red: three below-floor cells (2, 1, partition-scoped covering 2 files) asserting four zeros with live parquet; 3 red of 3
+- [x] C-002 fix: v3 arm groups admitted legacy deletes by `(spec, partition)` through shared candidate/pack/group predicates; `rewrite_all` ported (both arms); gate-declined deletes join the shadow closure; collided v3 pins repinned (`min_input_files(2)` / `rewrite_all(true)`); GEN V3 pair topped to 5 per partition; u3/M3 via `rewrite_all(true)`
+- [x] C-003 pins + mutation: 5-file control converts to 5 DVs with second-run zeros; lone-file bypass; admitted-shadows-declined refusal; drop-gate 4 red of 91; drop-bypass 12 red of 91 (partition/spec pin hardened after an 11-red run); battery 91 green; `run-interop-rewrite-pos-deletes.sh` green
+- [x] C-004 docs: GAP_MATRIX R136 F-24 note (V-1 retired); this entry; maintenance `map.md`; ledger
+- [ ] RePark: repin closes `B-MOR-3-FLOOR-1`
+
 ## ACTIVE (2026-09-03): F-23 conditional data-manifest walk on DV container close (row R114)
 
 Ledger: [`f23-conditional-data-walk-ledger.md`](f23-conditional-data-walk-ledger.md). Row R114.
