@@ -21,6 +21,7 @@ use datafusion::common::{DataFusionError, Result as DFResult};
 use iceberg::delete_vector_container::{
     DvContainerClose, close_touched_dv_containers_with_partitions,
 };
+use iceberg::spec::Struct;
 use iceberg::table::Table;
 
 use crate::to_datafusion_error;
@@ -28,6 +29,7 @@ use crate::to_datafusion_error;
 pub(crate) async fn write_deletion_vectors(
     table: &Table,
     pairs: &[(String, i64)],
+    known_partitions: &HashMap<String, (i32, Struct)>,
     scan_snapshot_id: Option<i64>,
 ) -> DFResult<DvContainerClose> {
     let mut new_positions: HashMap<String, Vec<u64>> = HashMap::new();
@@ -46,7 +48,7 @@ pub(crate) async fn write_deletion_vectors(
         table,
         &new_positions,
         scan_snapshot_id,
-        &HashMap::new(),
+        known_partitions,
         None,
     )
     .await

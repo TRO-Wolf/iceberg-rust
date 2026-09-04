@@ -40,9 +40,12 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 expect-test = { workspace = true }
 parquet = { workspace = true }
+serde = { workspace = true }
 tempfile = { workspace = true }
+typetag = { workspace = true }
 # `macros` + `rt-multi-thread` are needed only by the `#[tokio::main]` doctest in
 # `table/table_provider_factory.rs`. Kept out of `[dependencies]` so feature unification does not
 # force the multi-threaded runtime onto downstream consumers; library code uses

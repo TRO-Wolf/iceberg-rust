@@ -894,24 +894,11 @@ impl TableScan {
     /// `split_offsets` expands into per-row-group sub-tasks. One multi-row-group file then issues
     /// several ranged GETs in parallel.
     pub async fn to_arrow(&self) -> Result<ArrowRecordBatchStream> {
-        let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
-            .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
-            .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
-            .with_row_selection_enabled(self.row_selection_enabled);
-
-        if let Some(batch_size) = self.batch_size {
-            arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
-        }
-        if let Some(concurrency) = self.range_fetch_concurrency {
-            arrow_reader_builder = arrow_reader_builder.with_range_fetch_concurrency(concurrency);
-        }
-        if let Some(bytes) = self.range_coalesce_bytes {
-            arrow_reader_builder = arrow_reader_builder.with_range_coalesce_bytes(bytes);
-        }
-
         let tasks = self.plan_files().await?;
         let tasks = self.expand_within_file_parallel_tasks(tasks)?;
-        arrow_reader_builder.build().read(tasks)
+        self.configure_reader(ArrowReaderBuilder::new(self.file_io.clone()))
+            .build()
+            .read(tasks)
     }
 
     /// Expand whole-file tasks into per-`split_offsets` sub-tasks for concurrent within-file

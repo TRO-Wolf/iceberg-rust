@@ -3586,14 +3586,17 @@ version = "0.9.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "dashmap",
  "datafusion",
  "expect-test",
  "futures",
  "iceberg",
  "parquet",
+ "serde",
  "tempfile",
  "tokio",
+ "typetag",
  "uuid",
 ]
 

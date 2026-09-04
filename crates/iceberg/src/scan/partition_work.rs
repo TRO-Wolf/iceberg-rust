@@ -27,15 +27,17 @@
 //! alone. Streaming a [`PartitionWork`] uses the legacy single-stream reader path (no within-file
 //! parallel expand) so multi-partition SELECT does not inherit WG2 composition risk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 
 use super::task::FileScanTask;
 use super::task_group::CombinedScanTask;
-use super::{ArrowRecordBatchStream, TableScan};
+use super::{ArrowRecordBatchStream, FileScanTaskStream, TableScan};
 use crate::arrow::ArrowReaderBuilder;
 use crate::io::FileIO;
+use crate::spec::Struct;
 use crate::{Error, ErrorKind, Result};
 
 /// Identity of a planned [`FileScanTask`] at byte-range grain.
@@ -293,6 +295,61 @@ impl TableScan {
             self.row_group_filtering_enabled,
             self.row_selection_enabled,
         )
+    }
+
+    pub(crate) fn configure_reader(&self, builder: ArrowReaderBuilder) -> ArrowReaderBuilder {
+        let mut configured = builder
+            .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
+            .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
+            .with_row_selection_enabled(self.row_selection_enabled);
+        if let Some(batch_size) = self.batch_size {
+            configured = configured.with_batch_size(batch_size);
+        }
+        if let Some(concurrency) = self.range_fetch_concurrency {
+            configured = configured.with_range_fetch_concurrency(concurrency);
+        }
+        if let Some(bytes) = self.range_coalesce_bytes {
+            configured = configured.with_range_coalesce_bytes(bytes);
+        }
+        configured
+    }
+
+    /// Read the scan as Arrow batches, also returning each planned data file's `(spec_id, partition)`.
+    pub async fn to_arrow_with_file_partitions(
+        &self,
+    ) -> Result<(
+        ArrowRecordBatchStream,
+        Arc<Mutex<HashMap<String, (i32, Struct)>>>,
+    )> {
+        let known: Arc<Mutex<HashMap<String, (i32, Struct)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let tapped: FileScanTaskStream = {
+            let known = Arc::clone(&known);
+            self.plan_files()
+                .await?
+                .map_ok(move |task: FileScanTask| {
+                    if let (Some(spec), Some(partition)) =
+                        (task.partition_spec.as_ref(), task.partition.as_ref())
+                    {
+                        known
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(
+                                task.data_file_path.to_string(),
+                                (spec.spec_id(), partition.clone()),
+                            );
+                    }
+                    task
+                })
+                .boxed()
+        };
+        let tapped = self.expand_within_file_parallel_tasks(tapped)?;
+        Ok((
+            self.configure_reader(ArrowReaderBuilder::new(self.file_io.clone()))
+                .build()
+                .read(tapped)?,
+            known,
+        ))
     }
 }
 
@@ -847,5 +904,56 @@ mod tests {
         assert_eq!(residual[0].filter_mode(), ScanFilterMode::Residual);
         assert_eq!(prune[0].filter_mode(), ScanFilterMode::FilePruneOnly);
         assert_ne!(residual[0].filter_mode(), prune[0].filter_mode());
+    }
+
+    #[tokio::test]
+    async fn to_arrow_with_file_partitions_matches_to_arrow_and_names_every_file() {
+        use crate::scan::tests::TableTestFixture;
+
+        async fn batches(stream: crate::scan::ArrowRecordBatchStream) -> Vec<String> {
+            let mut out: Vec<String> = stream
+                .map(|batch| {
+                    let batch = batch.expect("batch");
+                    let columns: Vec<String> =
+                        batch.columns().iter().map(|c| format!("{c:?}")).collect();
+                    format!("{}|{}", batch.num_rows(), columns.join(";"))
+                })
+                .collect()
+                .await;
+            out.sort_unstable();
+            out
+        }
+
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let scan = fixture.table.scan().build().expect("scan");
+        let planned: HashSet<String> = scan
+            .plan_files()
+            .await
+            .expect("plan")
+            .map_ok(|task| task.data_file_path().to_string())
+            .try_collect()
+            .await
+            .expect("paths");
+        assert!(!planned.is_empty(), "fixture must plan files");
+        let (stream, shared) = scan
+            .to_arrow_with_file_partitions()
+            .await
+            .expect("partition stream");
+        let partnered = batches(stream).await;
+        let single = batches(scan.to_arrow().await.expect("to_arrow")).await;
+        assert_eq!(
+            partnered, single,
+            "partition stream must read what to_arrow reads"
+        );
+        assert!(!partnered.is_empty(), "readable fixture must yield batches");
+        let known = shared.lock().expect("partition map").clone();
+        assert_eq!(known.len(), planned.len(), "map names every planned file");
+        for path in &planned {
+            assert!(
+                known.contains_key(path),
+                "map is missing planned file {path}"
+            );
+        }
     }
 }

@@ -32,8 +32,11 @@ exec (row R169).
 | `metadata_scan.rs` | `IcebergMetadataScan` — projects inspect batches |
 | `project.rs` | partition-value projection |
 | `commit.rs` / `write.rs` | INSERT commit |
-| `delete.rs` / `update.rs` | DELETE / UPDATE |
-| `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions_by_path` (R114). F-23: this wrapper still passes an empty `known_partitions` map, so the data-manifest walk runs; RePark's complete map is what skips it. F-23 r2: handing the partitions down here means calling `live_data_file_partitions`, itself a full unstoppable walk, so the skip stays RePark-only until the MoR delete plan resolves partitions before the close (`task/todo.md`) |
+| `delete.rs` / `update.rs` | DELETE / UPDATE (F-26: both MoR paths scan once for batches plus the per-path partition map via `mor_scan` and hand it to the V3 close as `known_partitions`; both return the close alongside the row count so tests pin the threading; r2: the map is DV-only and retained to touched paths) |
+| `mor_scan.rs` | F-26 r2 size-gate split: the MoR scan seam (`mor_scan_stream`) plus the DV-only partition-map shaping (`dv_partitions_for`), called from `delete.rs` |
+| `delete_position_deletes.rs` | F-26 size-gate split: the V2 parquet position-delete writers (`write_position_deletes`, grouping, per-partition write), called from `delete.rs` |
+| `delete_tests.rs` | F-26 size-gate split: the `delete.rs` unit tests plus the MoR `known_partitions` pins, control and measure |
+| `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions_by_path` (R114). F-26: this wrapper takes the caller-supplied `known_partitions` map; the MoR DELETE/UPDATE plans carry it from their own scan tasks (`to_arrow_with_file_partitions`), so the F-23 skip fires in tree with no new walk (`live_data_file_partitions` untouched) |
 | `repartition.rs` / `sort.rs` | writer helpers |
 | `expr_to_predicate.rs` | filter pushdown |
 | `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`). |
@@ -67,7 +70,7 @@ exec (row R169).
 | V3 MoR DELETE on a diverged branch: data file is not a live file of the scanned snapshot | `close_touched_dv_containers` walked `current_snapshot()` (main). Pass the scan snapshot to `close_touched_dv_containers_at` |
 | V3 DELETE on a V2-upgrade table with live parquet position deletes resurrects rows | close must return `legacy_deletes` from the same delete-manifest pass and merge via `load_legacy_positions_by_path`; file-scoped parquet is removed, partition-scoped is kept |
 | Delete manifests are read twice per V3 DELETE | F-22: `write_deletion_vectors` must not walk manifests; consume `DvContainerClose::legacy_deletes` |
-| Pure-DV close rereads every data manifest | F-23: skip the walk when `pending_legacy` is empty and `known_partitions` covers every touched path; this wrapper passes an empty map so RePark must keep supplying the map |
+| Pure-DV close rereads every data manifest | F-23: skip the walk when `pending_legacy` is empty and `known_partitions` covers every touched path. F-26: the MoR DELETE/UPDATE plans supply that map from their scan tasks, so the skip fires in tree; a partial map still walks only the missed paths |
 | Partition-scoped parquet delete is dropped after a one-file DELETE | `referenced_data_file_location` is None: merge per touched file, do not add the parquet to `DvContainerClose::removed` |
 | Old parquet delete from an earlier snapshot is merged into a newer data file's DV | sequence filter: skip when `delete_seq < data_seq` |
 

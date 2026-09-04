@@ -77,6 +77,16 @@ use super::snapshot_target::{
 use crate::physical_plan::delete_legacy_merge::write_deletion_vectors;
 use crate::to_datafusion_error;
 
+#[path = "delete_position_deletes.rs"]
+mod delete_position_deletes;
+use delete_position_deletes::write_position_deletes;
+
+#[path = "mor_scan.rs"]
+mod mor_scan;
+use mor_scan::{dv_partitions_for, mor_scan_stream};
+
+pub(crate) use super::cow_affected::position_delete_unpartitioned_fast_path;
+
 pub(crate) const WRITE_DELETE_MODE: &str = "write.delete.mode";
 pub(crate) const WRITE_UPDATE_MODE: &str = "write.update.mode";
 const MODE_MERGE_ON_READ: &str = "merge-on-read";
@@ -279,18 +289,17 @@ impl ExecutionPlan for IcebergDeleteExec {
 
         let stream = futures::stream::once(async move {
             let deleted = match mode {
-                WriteMode::MergeOnRead => {
-                    merge_on_read_delete(
-                        &table,
-                        catalog.as_ref(),
-                        predicate,
-                        prune,
-                        &table_schema,
-                        isolation,
-                        commit_branch.as_deref(),
-                    )
-                    .await?
-                }
+                WriteMode::MergeOnRead => merge_on_read_delete(
+                    &table,
+                    catalog.as_ref(),
+                    predicate,
+                    prune,
+                    &table_schema,
+                    isolation,
+                    commit_branch.as_deref(),
+                )
+                .await
+                .map(|(deleted, _)| deleted)?,
                 WriteMode::CopyOnWrite => {
                     copy_on_write_delete(
                         &table,
@@ -347,6 +356,7 @@ async fn write_merge_on_read_deletes(
     table: &Table,
     kind: MergeOnReadDeleteKind,
     pairs: &[(String, i64)],
+    known_partitions: &HashMap<String, (i32, Struct)>,
     scan_snapshot_id: Option<i64>,
 ) -> DFResult<DvContainerClose> {
     match kind {
@@ -355,20 +365,20 @@ async fn write_merge_on_read_deletes(
             ..DvContainerClose::default()
         }),
         MergeOnReadDeleteKind::DeletionVectors => {
-            write_deletion_vectors(table, pairs, scan_snapshot_id).await
+            write_deletion_vectors(table, pairs, known_partitions, scan_snapshot_id).await
         }
     }
 }
 
 fn apply_dv_container_close(
     mut action: iceberg::transaction::RowDeltaAction,
-    close: DvContainerClose,
+    close: &DvContainerClose,
 ) -> iceberg::transaction::RowDeltaAction {
     if !close.added.is_empty() {
-        action = action.add_deletes(close.added);
+        action = action.add_deletes(close.added.clone());
     }
     if !close.removed.is_empty() {
-        action = action.remove_deletes_many(close.removed);
+        action = action.remove_deletes_many(close.removed.clone());
     }
     action
 }
@@ -413,7 +423,7 @@ async fn merge_on_read_delete(
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
     commit_branch: Option<&str>,
-) -> DFResult<u64> {
+) -> DFResult<(u64, DvContainerClose)> {
     let delete_kind = merge_on_read_delete_kind(table)?;
     let scan_snapshot_id =
         resolve_scan_snapshot_id(table, commit_branch).map_err(to_datafusion_error)?;
@@ -425,19 +435,8 @@ async fn merge_on_read_delete(
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
-    let mut builder = table.scan().select(projection);
-    if let Some(snapshot_id) = scan_snapshot_id {
-        builder = builder.snapshot_id(snapshot_id);
-    }
-    if let Some(prune) = prune {
-        builder = builder.with_file_prune_only(prune);
-    }
-    let mut stream = builder
-        .build()
-        .map_err(to_datafusion_error)?
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?;
+    let (mut stream, shared_partitions) =
+        mor_scan_stream(table, projection, prune, scan_snapshot_id).await?;
 
     let mut pairs: Vec<(String, i64)> = Vec::new();
     while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
@@ -505,7 +504,7 @@ async fn merge_on_read_delete(
 
     // No matching rows → no-op (an empty RowDelta would be a pointless snapshot).
     if pairs.is_empty() {
-        return Ok(0);
+        return Ok((0, DvContainerClose::default()));
     }
 
     // Position deletes MUST be sorted by (path, pos) per the spec.
@@ -514,7 +513,15 @@ async fn merge_on_read_delete(
 
     // The §5 `validate_data_files_exist` set. Java arms this for every command, DELETE included: a
     // referenced file rewritten away by a concurrent commit would silently lose these deletes.
-    let close = write_merge_on_read_deletes(table, delete_kind, &pairs, scan_snapshot_id).await?;
+    let known_partitions = dv_partitions_for(delete_kind, &pairs, &shared_partitions)?;
+    let close = write_merge_on_read_deletes(
+        table,
+        delete_kind,
+        &pairs,
+        &known_partitions,
+        scan_snapshot_id,
+    )
+    .await?;
     let referenced_files = files_exist_set(&close, &pairs);
 
     // §5 row-delta recipe, MoR DELETE. `AlwaysTrue` is Java-exact because this path pushes no filter
@@ -528,7 +535,7 @@ async fn merge_on_read_delete(
     if delete_kind == MergeOnReadDeleteKind::DeletionVectors {
         action = action.validate_deleted_files();
     }
-    action = apply_dv_container_close(action, close);
+    action = apply_dv_container_close(action, &close);
     action = maybe_validate_from_snapshot(action, scan_snapshot_id, |action, snapshot_id| {
         action.validate_from_snapshot(snapshot_id)
     });
@@ -545,7 +552,7 @@ async fn merge_on_read_delete(
         .await
         .map_err(to_datafusion_error)?;
 
-    Ok(deleted)
+    Ok((deleted, close))
 }
 
 /// Copy-on-write DELETE: a file-level rewrite. It finds the data files holding at least one deleted
@@ -683,182 +690,6 @@ async fn copy_on_write_delete(
         .map_err(to_datafusion_error)?;
 
     Ok(deleted)
-}
-
-/// Writes Parquet position-delete files from sorted `(path, pos)` pairs and returns EVERY file the
-/// rolling writer produced; dropping one silently resurrects its rows. Each file is stamped with the
-/// `(spec_id, partition)` of the DATA file it deletes from, which the partitioned path reads from
-/// the snapshot's manifests. The commit validates that stamp against the spec.
-///
-/// This predicate decides which table shape may skip that walk (BUG-001, C1-L-002):
-///
-/// | Table shape | Path |
-/// |---|---|
-/// | one spec, zero fields | fast path: one file, stamped through `with_partition_spec` so the real spec id survives |
-/// | multi-spec, empty default (after `DROP PARTITION FIELD`) | walk: old data files keep their own partition, and a fabricated `None`/spec-0 stamp misses on read and resurrects rows |
-/// | one all-Void spec (unpartitioned, non-empty fields) | walk: it needs a null tuple of matching arity |
-/// | partitioned | walk |
-pub(crate) use super::cow_affected::position_delete_unpartitioned_fast_path;
-
-async fn write_position_deletes(
-    table: &Table,
-    pairs: &[(String, i64)],
-    scan_snapshot_id: Option<i64>,
-) -> DFResult<Vec<DataFile>> {
-    let config = PositionDeleteWriterConfig::new().map_err(to_datafusion_error)?;
-    let metadata = table.metadata();
-    let default_spec = metadata.default_partition_spec();
-    let schema = metadata.current_schema();
-
-    // Only a never-evolved empty spec skips the manifest walk — see the fast-path table above.
-    if position_delete_unpartitioned_fast_path(
-        metadata.partition_specs_iter().len(),
-        default_spec.fields().len(),
-    ) {
-        // `with_partition_spec` keeps the sole spec's real id; `None` would fabricate spec id 0.
-        return write_position_deletes_for_partition(
-            table,
-            &config,
-            pairs,
-            None,
-            Some(default_spec.as_ref().clone()),
-        )
-        .await;
-    }
-
-    let path_to_partition = live_data_file_partitions(table, scan_snapshot_id, None).await?;
-
-    let path_to_partition: HashMap<String, (i32, Struct)> = path_to_partition
-        .into_iter()
-        .map(|(path, (spec_id, partition, _))| (path, (spec_id, partition)))
-        .collect();
-    let groups = group_pairs_by_partition(pairs, &path_to_partition)?;
-
-    let mut all_delete_files: Vec<DataFile> = Vec::new();
-    for ((spec_id, partition), mut group_pairs) in groups {
-        // Maintain the per-file (path, pos) sort order within each group.
-        sort_position_delete_pairs(&mut group_pairs);
-
-        let spec = metadata
-            .partition_spec_by_id(spec_id)
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "position-delete: data file references unknown partition spec {spec_id}"
-                ))
-            })?
-            .as_ref()
-            .clone();
-        // Carry the data file's own (spec, partition), including empty and all-Void null tuples. A
-        // `None` key would fabricate spec id 0 and under-attach after DROP PARTITION FIELD.
-        let partition_key =
-            PartitionKey::new(spec, schema.clone(), partition).map_err(to_datafusion_error)?;
-
-        let files = write_position_deletes_for_partition(
-            table,
-            &config,
-            &group_pairs,
-            Some(partition_key),
-            None,
-        )
-        .await?;
-        all_delete_files.extend(files);
-    }
-
-    Ok(all_delete_files)
-}
-
-/// The `(path, pos)` pairs of one position-delete output file, keyed by the `(spec_id, partition)`
-/// of the data files they delete from.
-type PositionDeleteGroups = HashMap<(i32, Struct), Vec<(String, i64)>>;
-
-/// Groups `(path, pos)` pairs by the `(spec_id, partition)` of the data file each deletes from, so
-/// every output file is stamped like its target. Only the partitioned path reaches this. A pair
-/// whose data file is absent from `path_to_partition` is a hard error: the pairs come from a scan of
-/// the same snapshot that built the map. The old fallback fabricated an EMPTY tuple under a
-/// PARTITIONED spec, writing a delete file under a `field=null` path that no reader can match.
-fn group_pairs_by_partition(
-    pairs: &[(String, i64)],
-    path_to_partition: &HashMap<String, (i32, Struct)>,
-) -> DFResult<PositionDeleteGroups> {
-    let mut groups = PositionDeleteGroups::new();
-    for pair in pairs {
-        let key = path_to_partition.get(&pair.0).cloned().ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "position-delete: data file `{}` is not a live file of the current snapshot, so \
-                 its partition cannot be resolved",
-                pair.0
-            ))
-        })?;
-        groups.entry(key).or_default().push(pair.clone());
-    }
-    Ok(groups)
-}
-
-/// Writes one position-delete file for a SINGLE `(spec_id, partition)` group. `pairs` must already
-/// be sorted by `(path, pos)`. With `partition_key = None`, `configured_spec` MUST be `Some`, or the
-/// writer fabricates `DEFAULT_PARTITION_SPEC_ID` (0) instead of the real spec id.
-async fn write_position_deletes_for_partition(
-    table: &Table,
-    config: &PositionDeleteWriterConfig,
-    pairs: &[(String, i64)],
-    partition_key: Option<PartitionKey>,
-    configured_spec: Option<iceberg::spec::PartitionSpec>,
-) -> DFResult<Vec<DataFile>> {
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
-    let file_name_gen = DefaultFileNameGenerator::new(
-        "pos-del".to_string(),
-        Some(uuid::Uuid::now_v7().to_string()),
-        DataFileFormat::Parquet,
-    );
-    // Keep the `file_path` and `pos` bounds FULL and EXACT: no parquet stats truncation, so
-    // min_is_exact/max_is_exact stay true and equal-bounds path routing works for long S3 URIs.
-    let parquet_builder =
-        ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
-            .with_metrics_config(MetricsConfig::for_position_delete());
-    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        table.file_io().clone(),
-        location_gen,
-        file_name_gen,
-    );
-    if partition_key.is_none() && configured_spec.is_none() {
-        return Err(DataFusionError::Internal(
-            "position-delete: write_position_deletes_for_partition requires either a PartitionKey \
-             or a configured_spec; both None would fabricate partition_spec_id 0"
-                .to_string(),
-        ));
-    }
-    let mut builder = PositionDeleteFileWriterBuilder::new(rolling, config.clone());
-    if let Some(spec) = configured_spec {
-        builder = builder.with_partition_spec(spec);
-    }
-    let mut writer = builder
-        .build(partition_key)
-        .await
-        .map_err(to_datafusion_error)?;
-
-    let paths: Vec<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();
-    let positions: Vec<i64> = pairs.iter().map(|(_, pos)| *pos).collect();
-    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
-        Arc::new(StringArray::from(paths)) as ArrayRef,
-        Arc::new(Int64Array::from(positions)) as ArrayRef,
-    ])
-    .map_err(|e| {
-        DataFusionError::ArrowError(
-            Box::new(e),
-            Some("Failed to build position-delete batch".into()),
-        )
-    })?;
-    writer.write(batch).await.map_err(to_datafusion_error)?;
-    let files = writer.close().await.map_err(to_datafusion_error)?;
-    // A non-empty group MUST produce a file, or the deletes vanish and the rows come back.
-    if files.is_empty() {
-        return Err(DataFusionError::Internal(
-            "position-delete writer produced no file for a non-empty pair group".to_string(),
-        ));
-    }
-    Ok(files)
 }
 
 /// Decodes the reserved `_file` column at `row`, tolerating run-end-encoded and plain `Utf8`. A NULL
@@ -1068,7 +899,7 @@ pub(crate) async fn merge_on_read_update(
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
     commit_branch: Option<&str>,
-) -> DFResult<u64> {
+) -> DFResult<(u64, DvContainerClose)> {
     let delete_kind = merge_on_read_delete_kind(table)?;
     let scan_snapshot_id =
         resolve_scan_snapshot_id(table, commit_branch).map_err(to_datafusion_error)?;
@@ -1082,19 +913,8 @@ pub(crate) async fn merge_on_read_update(
     projection.push(RESERVED_COL_NAME_POS.to_string());
     push_lineage_scan_columns(&mut projection, table.metadata().format_version());
 
-    let mut builder = table.scan().select(projection);
-    if let Some(snapshot_id) = scan_snapshot_id {
-        builder = builder.snapshot_id(snapshot_id);
-    }
-    if let Some(prune) = prune {
-        builder = builder.with_file_prune_only(prune);
-    }
-    let mut stream = builder
-        .build()
-        .map_err(to_datafusion_error)?
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?;
+    let (mut stream, shared_partitions) =
+        mor_scan_stream(table, projection, prune, scan_snapshot_id).await?;
 
     // The delete side buffers the matched pairs, because `write_position_deletes` must group and
     // sort them. The new-row side streams into the writer per batch.
@@ -1142,13 +962,21 @@ pub(crate) async fn merge_on_read_update(
         // No batch ever reached the writer, so `finish` produces no file. Nothing to commit.
         let empty = data_writer.finish().await?;
         debug_assert!(empty.is_empty());
-        return Ok(0);
+        return Ok((0, DvContainerClose::default()));
     }
 
     // Grouping and sorting need the whole pair set up front. Both sides complete BEFORE the single
     // commit below.
     sort_position_delete_pairs(&mut pairs);
-    let close = write_merge_on_read_deletes(table, delete_kind, &pairs, scan_snapshot_id).await?;
+    let known_partitions = dv_partitions_for(delete_kind, &pairs, &shared_partitions)?;
+    let close = write_merge_on_read_deletes(
+        table,
+        delete_kind,
+        &pairs,
+        &known_partitions,
+        scan_snapshot_id,
+    )
+    .await?;
     let referenced_files = files_exist_set(&close, &pairs);
     let data_files = data_writer.finish().await?;
 
@@ -1163,7 +991,7 @@ pub(crate) async fn merge_on_read_update(
         .validate_data_files_exist(referenced_files)
         .validate_deleted_files()
         .validate_no_conflicting_delete_files();
-    action = apply_dv_container_close(action, close);
+    action = apply_dv_container_close(action, &close);
     action = maybe_validate_from_snapshot(action, scan_snapshot_id, |action, snapshot_id| {
         action.validate_from_snapshot(snapshot_id)
     });
@@ -1180,7 +1008,7 @@ pub(crate) async fn merge_on_read_update(
         .await
         .map_err(to_datafusion_error)?;
 
-    Ok(updated)
+    Ok((updated, close))
 }
 
 /// Copy-on-write UPDATE: a file-level rewrite. It finds the data files holding at least one updated
@@ -1316,385 +1144,6 @@ pub(crate) async fn copy_on_write_update(
 
     Ok(updated)
 }
-
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use datafusion::arrow::array::{
-        ArrayRef, DictionaryArray, Int32Array, Int64Array, RecordBatch, RunArray, StringArray,
-    };
-    use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
-    use datafusion::physical_expr::PhysicalExpr;
-    use datafusion::physical_expr::expressions::Column;
-
-    use super::{
-        IsolationLevel, apply_assignments, decode_file_path, decode_file_paths_batch,
-        decode_position, group_pairs_by_partition, position_delete_unpartitioned_fast_path,
-        sort_position_delete_pairs,
-    };
-
-    // An assignment must never smuggle a NULL into a REQUIRED column. A dictionary or REE array
-    // whose VALUES hold a NULL reports `null_count() == 0`, and `RecordBatch::try_new`'s own check
-    // is physical too, so the NULL passes both gates and is written.
-
-    /// A single-column table schema for `d`, `nullable` as given, dictionary-encoded Utf8.
-    fn dict_column_schema(nullable: bool) -> SchemaRef {
-        Arc::new(Schema::new(vec![Field::new(
-            "d",
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-            nullable,
-        )]))
-    }
-
-    /// Dictionary array with a NULL in the VALUES: null-free keys, logically NULL at row 1.
-    fn dict_with_null_value() -> ArrayRef {
-        let values = StringArray::from(vec![Some("x"), None]);
-        let keys = Int32Array::from(vec![0, 1]);
-        Arc::new(
-            DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))
-                .expect("dictionary array"),
-        )
-    }
-
-    #[test]
-    fn test_dictionary_encoded_null_cannot_be_assigned_to_a_required_column() {
-        let column = dict_with_null_value();
-        // The premise of the whole test: physically clean, logically NULL.
-        assert_eq!(column.null_count(), 0, "physical null count must be 0");
-        assert_eq!(column.logical_null_count(), 1, "row 1 is logically NULL");
-
-        let schema = dict_column_schema(false);
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column)]).expect("batch");
-        let assignment: Arc<dyn PhysicalExpr> = Arc::new(Column::new("d", 0));
-
-        let err = apply_assignments(&batch, &[(0, assignment)], &schema, None)
-            .expect_err("a dictionary-encoded NULL must not reach a required column");
-        assert!(
-            err.to_string()
-                .contains("UPDATE cannot assign NULL to required column 'd'"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_dictionary_encoded_null_is_fine_for_an_optional_column() {
-        // The negative pin: the guard must reject only REQUIRED columns.
-        let column = dict_with_null_value();
-        let schema = dict_column_schema(true);
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column)]).expect("batch");
-        let assignment: Arc<dyn PhysicalExpr> = Arc::new(Column::new("d", 0));
-
-        let out = apply_assignments(&batch, &[(0, assignment)], &schema, None)
-            .expect("an optional column may take a NULL");
-        assert_eq!(out.column(0).logical_null_count(), 1);
-    }
-
-    #[test]
-    fn test_null_free_assignment_to_a_required_column_still_succeeds() {
-        // The other negative pin: `logical_null_count` must not reject clean data.
-        let values = StringArray::from(vec![Some("x"), Some("y")]);
-        let keys = Int32Array::from(vec![0, 1]);
-        let column: ArrayRef = Arc::new(
-            DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))
-                .expect("dictionary array"),
-        );
-        let schema = dict_column_schema(false);
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column)]).expect("batch");
-        let assignment: Arc<dyn PhysicalExpr> = Arc::new(Column::new("d", 0));
-
-        let out = apply_assignments(&batch, &[(0, assignment)], &schema, None)
-            .expect("a NULL-free assignment to a required column must succeed");
-        assert_eq!(out.column(0).logical_null_count(), 0);
-    }
-
-    // Arrow's `value()` on a NULL slot returns a well-formed lie: `""` for a string, `0` for an i64.
-    // Both feed a position-delete tuple, so a NULL `_file` deletes against an empty path and a NULL
-    // `_pos` deletes ROW 0 of a real data file.
-
-    #[test]
-    fn test_decode_file_path_rejects_a_null_path() {
-        let col: ArrayRef = Arc::new(StringArray::from(vec![Some("s3://b/a.parquet"), None]));
-        assert!(
-            decode_file_path(&col, 0).is_ok(),
-            "the live row must still decode"
-        );
-        let err = decode_file_path(&col, 1).expect_err("a NULL _file must not decode to \"\"");
-        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn test_decode_file_paths_batch_rejects_a_null_path() {
-        let col: ArrayRef = Arc::new(StringArray::from(vec![Some("s3://b/a.parquet"), None]));
-        let err = decode_file_paths_batch(&col).expect_err("a NULL _file must not decode to \"\"");
-        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn test_decode_file_path_rejects_a_null_ree_value() {
-        // The REE shape the COW scan actually produces, with a NULL in the run VALUES.
-        let run_ends = Int32Array::from(vec![2, 4]);
-        let values = StringArray::from(vec![Some("f/a.parquet"), None]);
-        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
-        let col: ArrayRef = Arc::new(ree);
-        assert!(decode_file_path(&col, 0).is_ok(), "run 0 is live");
-        let err = decode_file_path(&col, 3).expect_err("a NULL REE _file value must not decode");
-        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
-        let err = decode_file_paths_batch(&col).expect_err("batch decode must reject it too");
-        assert!(err.to_string().contains("_file"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn test_decode_position_rejects_a_null_position() {
-        let col = Int64Array::from(vec![Some(7), None]);
-        assert_eq!(
-            decode_position(&col, 0).expect("the live row must decode"),
-            7
-        );
-        let err = decode_position(&col, 1).expect_err("a NULL _pos must not decode to 0");
-        assert!(err.to_string().contains("_pos"), "unexpected error: {err}");
-    }
-
-    /// `decode_file_paths_batch` must produce, for every row, EXACTLY the string `decode_file_path`
-    /// would: plain, run-end-encoded, and sliced REE. Byte-identical per-row results are the
-    /// correctness contract for COW affected-file detection and keep-masks.
-    fn assert_batch_matches_per_row(col: &ArrayRef) {
-        let batch = decode_file_paths_batch(col).expect("batch decode");
-        assert_eq!(batch.len(), col.len(), "one decoded path per row");
-        for (row, decoded) in batch.iter().enumerate() {
-            let per_row = decode_file_path(col, row).expect("per-row decode");
-            assert_eq!(
-                *decoded, per_row,
-                "row {row}: batch decode must equal per-row decode"
-            );
-        }
-    }
-
-    #[test]
-    fn test_decode_file_paths_batch_plain_string_array() {
-        let col: ArrayRef = Arc::new(StringArray::from(vec![
-            "s3://b/a.parquet",
-            "s3://b/a.parquet",
-            "s3://b/c.parquet",
-        ]));
-        assert_batch_matches_per_row(&col);
-    }
-
-    #[test]
-    fn test_decode_file_paths_batch_ree_with_runs() {
-        let run_ends = Int32Array::from(vec![3, 4, 6]);
-        let values = StringArray::from(vec!["f/a.parquet", "f/b.parquet", "f/a.parquet"]);
-        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
-        let col: ArrayRef = Arc::new(ree);
-        assert_eq!(col.len(), 6);
-        assert_batch_matches_per_row(&col);
-    }
-
-    #[test]
-    fn test_decode_file_paths_batch_ree_single_run() {
-        let run_ends = Int32Array::from(vec![5]);
-        let values = StringArray::from(vec!["only/file.parquet"]);
-        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
-        let col: ArrayRef = Arc::new(ree);
-        assert_batch_matches_per_row(&col);
-    }
-
-    #[test]
-    fn test_decode_file_paths_batch_sliced_ree_offset_fallback() {
-        // offset != 0 exercises the `get_physical_index` fallback branch.
-        let run_ends = Int32Array::from(vec![3, 4, 7]);
-        let values = StringArray::from(vec!["f/a.parquet", "f/b.parquet", "f/c.parquet"]);
-        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).expect("build REE");
-        let sliced = ree.slice(2, 3);
-        let col: ArrayRef = Arc::new(sliced);
-        assert_eq!(col.len(), 3);
-        assert_batch_matches_per_row(&col);
-    }
-
-    /// `sort_position_delete_pairs` MUST produce ascending `(file_path, pos)` order for ANY input.
-    /// The concurrent scan interleaves files, so an integration test cannot pin the spec order
-    /// deterministically.
-    ///
-    /// MUTATION PROOF: make `sort_position_delete_pairs` a no-op (delete the `pairs.sort()`) and this
-    /// test goes RED, because the deliberately-unsorted input stays unsorted.
-    #[test]
-    fn test_sort_position_delete_pairs_orders_by_path_then_pos() {
-        // Files interleaved, positions descending within a file: the shape a concurrent scan gives.
-        let mut pairs: Vec<(String, i64)> = vec![
-            ("s3://b/file_b.parquet".to_string(), 5),
-            ("s3://b/file_a.parquet".to_string(), 2),
-            ("s3://b/file_b.parquet".to_string(), 1),
-            ("s3://b/file_a.parquet".to_string(), 0),
-            ("s3://b/file_a.parquet".to_string(), 10),
-        ];
-        sort_position_delete_pairs(&mut pairs);
-        let expected: Vec<(String, i64)> = vec![
-            ("s3://b/file_a.parquet".to_string(), 0),
-            ("s3://b/file_a.parquet".to_string(), 2),
-            ("s3://b/file_a.parquet".to_string(), 10),
-            ("s3://b/file_b.parquet".to_string(), 1),
-            ("s3://b/file_b.parquet".to_string(), 5),
-        ];
-        assert_eq!(
-            pairs, expected,
-            "position-delete pairs must be sorted ascending by (file_path, pos) — spec order"
-        );
-        // Form-agnostic: catch any sort that is not a true ascending `(path, pos)` order.
-        for window in pairs.windows(2) {
-            assert!(
-                window[0] <= window[1],
-                "pairs must be non-decreasing by (file_path, pos): {:?} then {:?}",
-                window[0],
-                window[1]
-            );
-        }
-    }
-
-    /// Parse parity with Java `IsolationLevel.fromName`: case-insensitive accept, and a LOUD
-    /// `"Invalid isolation level: <name>"` on an unknown name, never a silent default.
-    ///
-    /// MUTATION: make the parse default instead of erroring and this test goes RED.
-    #[test]
-    fn test_isolation_level_parse_java_parity() {
-        for accepted in ["serializable", "SERIALIZABLE", "Serializable"] {
-            assert_eq!(
-                IsolationLevel::parse(accepted).expect("parse serializable spelling"),
-                IsolationLevel::Serializable,
-                "'{accepted}' must parse as serializable"
-            );
-        }
-        for accepted in ["snapshot", "SNAPSHOT", "Snapshot"] {
-            assert_eq!(
-                IsolationLevel::parse(accepted).expect("parse snapshot spelling"),
-                IsolationLevel::Snapshot,
-                "'{accepted}' must parse as snapshot"
-            );
-        }
-
-        // An unknown name fails loud, carrying Java's message shape and the offending name.
-        let err = IsolationLevel::parse("read-committed")
-            .expect_err("an unknown isolation level must fail loud, not default");
-        assert!(
-            err.to_string()
-                .contains("Invalid isolation level: read-committed"),
-            "error must carry Java's message + the offending name, got: {err}"
-        );
-        // Java cannot disable row-level validation, so 'none' is not a row-level isolation level.
-        assert!(
-            IsolationLevel::parse("none").is_err(),
-            "'none' must be rejected for row-level operations"
-        );
-    }
-
-    // BUG-001 — the unpartitioned fast-path predicate (mutation-proven).
-
-    #[test]
-    fn test_pos_delete_fast_path_only_for_single_empty_spec() {
-        // A never-evolved empty partition type.
-        assert!(position_delete_unpartitioned_fast_path(1, 0));
-        // Partitioned or all-Void: always walk the manifests.
-        assert!(!position_delete_unpartitioned_fast_path(1, 1));
-        // Evolved: multi-spec with an empty default MUST NOT fast-path.
-        assert!(
-            !position_delete_unpartitioned_fast_path(2, 0),
-            "BUG-001: multi-spec with empty default must take the manifest walk"
-        );
-        assert!(!position_delete_unpartitioned_fast_path(2, 1));
-        // Zero specs is not a real table shape; refuse the fast path.
-        assert!(!position_delete_unpartitioned_fast_path(0, 0));
-    }
-
-    /// Mutation twin: weakening the rule to "the default is empty" alone fails this assert.
-    #[test]
-    fn test_pos_delete_fast_path_mutation_field_count_only_is_wrong() {
-        let evolved_empty_default = position_delete_unpartitioned_fast_path(2, 0);
-        assert!(
-            !evolved_empty_default,
-            "mutation RED: field_count-only condition would take the fast path here"
-        );
-    }
-
-    /// C1-L-002: an all-Void spec is unpartitioned but has fields, so it must NOT fast-path.
-    #[test]
-    fn test_pos_delete_fast_path_rejects_all_void_single_spec() {
-        // One void field.
-        assert!(
-            !position_delete_unpartitioned_fast_path(1, 1),
-            "all-Void needs a null-tuple PartitionKey, not the empty fast path"
-        );
-    }
-
-    // The grouping resolves every pair's real partition, instead of fabricating an empty tuple.
-
-    /// `path → (spec_id, partition)` for two files of a one-field partitioned spec.
-    fn partition_map() -> std::collections::HashMap<String, (i32, iceberg::spec::Struct)> {
-        use iceberg::spec::{Literal, Struct};
-
-        let mut map = std::collections::HashMap::new();
-        map.insert(
-            "s3://b/x0.parquet".to_string(),
-            (1, Struct::from_iter([Some(Literal::long(0))])),
-        );
-        map.insert(
-            "s3://b/x1.parquet".to_string(),
-            (1, Struct::from_iter([Some(Literal::long(1))])),
-        );
-        map
-    }
-
-    /// The normal path: pairs are grouped by their data file's own `(spec_id, partition)`, so each
-    /// delete file is stamped with the spec + partition of the file it deletes from.
-    #[test]
-    fn test_group_pairs_by_partition_groups_by_the_target_files_partition() {
-        let map = partition_map();
-        let pairs = vec![
-            ("s3://b/x0.parquet".to_string(), 3),
-            ("s3://b/x1.parquet".to_string(), 7),
-            ("s3://b/x0.parquet".to_string(), 1),
-        ];
-
-        let groups = group_pairs_by_partition(&pairs, &map).expect("every pair resolves");
-        assert_eq!(
-            groups.len(),
-            2,
-            "one group per distinct partition: {groups:?}"
-        );
-        let x0 = groups
-            .get(&map["s3://b/x0.parquet"])
-            .expect("the x=0 group must exist");
-        assert_eq!(x0.len(), 2, "both x=0 pairs land in the same group");
-        assert_eq!(
-            groups
-                .get(&map["s3://b/x1.parquet"])
-                .expect("the x=1 group must exist")
-                .len(),
-            1
-        );
-    }
-
-    /// A pair whose data file is not live in the map's snapshot must FAIL. The old fallback paired
-    /// a partitioned spec with an empty tuple, writing a delete file under a `field=null` path that
-    /// no reader matches — a silent under-delete, so the rows come back.
-    ///
-    /// MUTATION: restore the `unwrap_or_else(|| (default_spec.spec_id(), Struct::empty()))` fallback
-    /// and this test goes RED.
-    #[test]
-    fn test_group_pairs_by_partition_rejects_an_unmatched_data_file() {
-        let map = partition_map();
-        let pairs = vec![
-            ("s3://b/x0.parquet".to_string(), 3),
-            ("s3://b/ghost.parquet".to_string(), 0),
-        ];
-
-        let err = group_pairs_by_partition(&pairs, &map)
-            .expect_err("an unresolvable data file must fail loudly");
-        assert!(
-            err.to_string().contains("s3://b/ghost.parquet")
-                && err.to_string().contains("is not a live file"),
-            "the error must name the offending file: {err}"
-        );
-    }
-}
+#[path = "delete_tests.rs"]
+mod tests;
