@@ -167,6 +167,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::delete_vector_container::close_touched_dv_containers_with_partitions;
     use crate::delete_vector_container::counting::{
         CountingStorageFactory, append, synthetic_data_file as counting_data_file,
     };
@@ -180,7 +181,7 @@ mod tests {
         make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog,
     };
     use crate::transaction::{ApplyTransactionAction, Transaction};
-    use crate::{Catalog, CatalogBuilder, ErrorKind};
+    use crate::{CatalogBuilder, ErrorKind};
 
     fn synthetic_data_file(path: &str, part_value: i64) -> DataFile {
         DataFileBuilder::default()
@@ -478,5 +479,45 @@ mod tests {
         tx.commit(&catalog)
             .await
             .expect("a file-scoped delete older than the data file does not block the DV");
+    }
+
+    #[tokio::test]
+    #[ignore = "measurement, not a CI pin"]
+    async fn measure_commit_at_8_48_192_data_manifests() {
+        for n in [8usize, 48usize, 192usize] {
+            let fixture = commit_fixture(n).await;
+            let newest = fixture.paths.last().expect("n > 0").clone();
+            let known = HashMap::from([(
+                newest.clone(),
+                (0i32, Struct::from_iter([Some(Literal::long(0))])),
+            )]);
+            let new_positions = HashMap::from([(newest.clone(), vec![0u64])]);
+            let start = std::time::Instant::now();
+            let close = close_touched_dv_containers_with_partitions(
+                &fixture.table,
+                &new_positions,
+                None,
+                &known,
+                None,
+            )
+            .await
+            .expect("close");
+            let close_elapsed = start.elapsed();
+            let start = std::time::Instant::now();
+            commit_dv_for(
+                &fixture.catalog,
+                &fixture.table,
+                "test/measure-dv.puffin",
+                &newest,
+            )
+            .await;
+            let commit_elapsed = start.elapsed();
+            println!(
+                "F-25 n={n} close={close_elapsed:?} commit={commit_elapsed:?} added={} commit_data_manifest_reads={}",
+                close.added.len(),
+                fixture.data_manifest_reads.load(Ordering::Relaxed),
+            );
+            assert_eq!(close.added.len(), 1);
+        }
     }
 }
