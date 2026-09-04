@@ -142,13 +142,26 @@ pub(crate) async fn validate_fresh_dvs_only(
 
 #[cfg(test)]
 mod tests {
-    use crate::ErrorKind;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tempfile::TempDir;
+
+    use crate::delete_vector_container::counting::{
+        CountingStorageFactory, append, synthetic_data_file as counting_data_file,
+    };
     use crate::memory::tests::new_memory_catalog;
+    use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Literal, Struct,
     };
-    use crate::transaction::tests::make_v2_minimal_table_in_catalog;
+    use crate::table::Table;
+    use crate::transaction::tests::{
+        make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog,
+    };
     use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::{Catalog, CatalogBuilder, ErrorKind};
 
     fn synthetic_data_file(path: &str, part_value: i64) -> DataFile {
         DataFileBuilder::default()
@@ -201,6 +214,124 @@ mod tests {
         let tx = Transaction::new(table);
         let tx = tx.fast_append().add_data_files(files).apply(tx).unwrap();
         tx.commit(catalog).await.unwrap()
+    }
+
+    struct CommitFixture {
+        catalog: MemoryCatalog,
+        table: Table,
+        paths: Vec<String>,
+        data_manifest_reads: Arc<AtomicU64>,
+        latent: Arc<AtomicBool>,
+        _warehouse: TempDir,
+    }
+
+    async fn commit_fixture(n: usize) -> CommitFixture {
+        let warehouse = TempDir::new().expect("warehouse");
+        let data_manifest_reads = Arc::new(AtomicU64::new(0));
+        let data_manifest_paths = Arc::new(Mutex::new(HashSet::new()));
+        let latent = Arc::new(AtomicBool::new(false));
+        let catalog = MemoryCatalogBuilder::default()
+            .with_storage_factory(Arc::new(CountingStorageFactory {
+                manifest_reads: Arc::new(AtomicU64::new(0)),
+                bytes_read: Arc::new(AtomicU64::new(0)),
+                data_manifest_paths: data_manifest_paths.clone(),
+                data_manifest_reads: data_manifest_reads.clone(),
+                latent: latent.clone(),
+                ..Default::default()
+            }))
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().expect("utf8").to_string(),
+                )]),
+            )
+            .await
+            .expect("catalog");
+        let mut table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let mut paths = Vec::with_capacity(n);
+        for index in 0..n {
+            let path = format!("{}/data/f{index}.parquet", table.metadata().location());
+            table = append(&catalog, &table, counting_data_file(&path)).await;
+            paths.push(path);
+        }
+        let snapshot = table
+            .metadata()
+            .current_snapshot()
+            .expect("current snapshot");
+        let list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .expect("manifest list");
+        let data_paths: HashSet<String> = list
+            .entries()
+            .iter()
+            .filter(|manifest| manifest.content == crate::spec::ManifestContentType::Data)
+            .map(|manifest| manifest.manifest_path.clone())
+            .collect();
+        *data_manifest_paths.lock().expect("data-manifest path set") = data_paths;
+        data_manifest_reads.store(0, Ordering::Relaxed);
+        CommitFixture {
+            catalog,
+            table,
+            paths,
+            data_manifest_reads,
+            latent,
+            _warehouse: warehouse,
+        }
+    }
+
+    async fn commit_dv_for(
+        catalog: &MemoryCatalog,
+        table: &Table,
+        dv_path: &str,
+        referenced: &str,
+    ) -> Table {
+        let tx = Transaction::new(table);
+        let tx = tx
+            .row_delta()
+            .add_deletes(vec![synthetic_dv_file(dv_path, referenced)])
+            .apply(tx)
+            .expect("apply row delta");
+        tx.commit(catalog).await.expect("commit row delta")
+    }
+
+    #[tokio::test]
+    async fn fresh_dv_commit_for_newest_file_reads_one_data_manifest() {
+        let fixture = commit_fixture(192).await;
+        let newest = fixture.paths.last().expect("n > 0").clone();
+        commit_dv_for(
+            &fixture.catalog,
+            &fixture.table,
+            "test/newest-dv.puffin",
+            &newest,
+        )
+        .await;
+        assert_eq!(
+            fixture.data_manifest_reads.load(Ordering::Relaxed),
+            1,
+            "validation stops once every added DV file is found"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_dv_commit_for_newest_file_reads_one_data_manifest_on_latent_store() {
+        let fixture = commit_fixture(192).await;
+        fixture.latent.store(true, Ordering::Relaxed);
+        let newest = fixture.paths.last().expect("n > 0").clone();
+        commit_dv_for(
+            &fixture.catalog,
+            &fixture.table,
+            "test/newest-dv.puffin",
+            &newest,
+        )
+        .await;
+        fixture.latent.store(false, Ordering::Relaxed);
+        assert_eq!(
+            fixture.data_manifest_reads.load(Ordering::Relaxed),
+            1,
+            "a latent store must issue one GET, not DV_IO_CONCURRENCY"
+        );
     }
 
     #[tokio::test]
