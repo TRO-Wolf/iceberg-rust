@@ -546,7 +546,7 @@ async fn scan_oldest_pair(
     scan_snapshot_id: Option<i64>,
 ) -> (Vec<(String, i64)>, HashMap<String, (i32, Struct)>) {
     let predicate = oldest_eq_predicate();
-    let (mut stream, known) = mor_scan_stream(table, projection, None, scan_snapshot_id)
+    let (mut stream, shared) = mor_scan::mor_scan_stream(table, projection, None, scan_snapshot_id)
         .await
         .expect("scan");
     let mut pairs: Vec<(String, i64)> = Vec::new();
@@ -572,6 +572,7 @@ async fn scan_oldest_pair(
         }
     }
     sort_position_delete_pairs(&mut pairs);
+    let known = shared.lock().expect("partition map").clone();
     (pairs, known)
 }
 
@@ -800,7 +801,8 @@ async fn measure_mor_delete_close_at_8_48_192() {
             scan_oldest_pair(table, projection, &table_schema, scan_snapshot_id).await;
         assert_eq!(pairs.len(), 1);
         assert_eq!(known.len(), n);
-        for run in 1..=3usize {
+        let runs = if n == 48 { 5 } else { 3 };
+        for run in 1..=runs {
             fixture
                 .factory
                 .data_manifest_reads

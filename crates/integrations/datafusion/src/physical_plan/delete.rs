@@ -53,7 +53,6 @@ use iceberg::Catalog;
 use iceberg::delete_vector_container::DvContainerClose;
 use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
-use iceberg::scan::ArrowRecordBatchStream;
 use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionKey, Struct};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -81,6 +80,10 @@ use crate::to_datafusion_error;
 #[path = "delete_position_deletes.rs"]
 mod delete_position_deletes;
 use delete_position_deletes::write_position_deletes;
+
+#[path = "mor_scan.rs"]
+mod mor_scan;
+use mor_scan::{dv_partitions_for, mor_scan_stream};
 
 pub(crate) use super::cow_affected::position_delete_unpartitioned_fast_path;
 
@@ -346,25 +349,6 @@ fn merge_on_read_delete_kind(table: &Table) -> DFResult<MergeOnReadDeleteKind> {
     }
 }
 
-async fn mor_scan_stream(
-    table: &Table,
-    projection: Vec<String>,
-    prune: Option<Predicate>,
-    scan_snapshot_id: Option<i64>,
-) -> DFResult<(ArrowRecordBatchStream, HashMap<String, (i32, Struct)>)> {
-    let mut builder = table.scan().select(projection);
-    if let Some(snapshot_id) = scan_snapshot_id {
-        builder = builder.snapshot_id(snapshot_id);
-    }
-    if let Some(prune) = prune {
-        builder = builder.with_file_prune_only(prune);
-    }
-    let scan = builder.build().map_err(to_datafusion_error)?;
-    scan.to_arrow_with_file_partitions()
-        .await
-        .map_err(to_datafusion_error)
-}
-
 /// Writes the merge-on-read delete files for `pairs`, which the caller already sorted by
 /// `(path, pos)` for the V2 writer. Returns `(files to add, files the commit must remove)`. The
 /// removal half is non-empty on the V3 path: a merged DV supersedes the DV or file-scoped parquet it absorbed.
@@ -451,7 +435,7 @@ async fn merge_on_read_delete(
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
-    let (mut stream, known_partitions) =
+    let (mut stream, shared_partitions) =
         mor_scan_stream(table, projection, prune, scan_snapshot_id).await?;
 
     let mut pairs: Vec<(String, i64)> = Vec::new();
@@ -529,6 +513,7 @@ async fn merge_on_read_delete(
 
     // The §5 `validate_data_files_exist` set. Java arms this for every command, DELETE included: a
     // referenced file rewritten away by a concurrent commit would silently lose these deletes.
+    let known_partitions = dv_partitions_for(delete_kind, &pairs, &shared_partitions)?;
     let close = write_merge_on_read_deletes(
         table,
         delete_kind,
@@ -928,7 +913,7 @@ pub(crate) async fn merge_on_read_update(
     projection.push(RESERVED_COL_NAME_POS.to_string());
     push_lineage_scan_columns(&mut projection, table.metadata().format_version());
 
-    let (mut stream, known_partitions) =
+    let (mut stream, shared_partitions) =
         mor_scan_stream(table, projection, prune, scan_snapshot_id).await?;
 
     // The delete side buffers the matched pairs, because `write_position_deletes` must group and
@@ -983,6 +968,7 @@ pub(crate) async fn merge_on_read_update(
     // Grouping and sorting need the whole pair set up front. Both sides complete BEFORE the single
     // commit below.
     sort_position_delete_pairs(&mut pairs);
+    let known_partitions = dv_partitions_for(delete_kind, &pairs, &shared_partitions)?;
     let close = write_merge_on_read_deletes(
         table,
         delete_kind,

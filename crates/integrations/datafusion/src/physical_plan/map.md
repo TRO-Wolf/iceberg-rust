@@ -32,7 +32,8 @@ exec (row R169).
 | `metadata_scan.rs` | `IcebergMetadataScan` — projects inspect batches |
 | `project.rs` | partition-value projection |
 | `commit.rs` / `write.rs` | INSERT commit |
-| `delete.rs` / `update.rs` | DELETE / UPDATE (F-26: both MoR paths scan once for batches plus the per-path partition map via `mor_scan_stream` and hand it to the V3 close as `known_partitions`; both return the close alongside the row count so tests pin the threading) |
+| `delete.rs` / `update.rs` | DELETE / UPDATE (F-26: both MoR paths scan once for batches plus the per-path partition map via `mor_scan` and hand it to the V3 close as `known_partitions`; both return the close alongside the row count so tests pin the threading; r2: the map is DV-only and retained to touched paths) |
+| `mor_scan.rs` | F-26 r2 size-gate split: the MoR scan seam (`mor_scan_stream`) plus the DV-only partition-map shaping (`dv_partitions_for`), called from `delete.rs` |
 | `delete_position_deletes.rs` | F-26 size-gate split: the V2 parquet position-delete writers (`write_position_deletes`, grouping, per-partition write), called from `delete.rs` |
 | `delete_tests.rs` | F-26 size-gate split: the `delete.rs` unit tests plus the MoR `known_partitions` pins, control and measure |
 | `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions_by_path` (R114). F-26: this wrapper takes the caller-supplied `known_partitions` map; the MoR DELETE/UPDATE plans carry it from their own scan tasks (`to_arrow_with_file_partitions`), so the F-23 skip fires in tree with no new walk (`live_data_file_partitions` untouched) |
