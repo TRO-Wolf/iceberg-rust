@@ -613,7 +613,7 @@ async fn run_delete_matrix(catalog: &impl Catalog, table: Table, out_root: Optio
     write_stage(&table, out_root, "m0").await;
 
     let result = RewritePositionDeleteFiles::new(table.clone())
-        .min_input_files(1)
+        .rewrite_all(true)
         .execute(catalog)
         .await
         .expect("M3 RewritePositionDeleteFiles converting to deletion vectors");

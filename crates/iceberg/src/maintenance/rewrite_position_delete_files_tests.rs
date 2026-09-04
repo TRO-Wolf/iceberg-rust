@@ -46,6 +46,9 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
 use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
+#[path = "rewrite_position_delete_files_floor_tests.rs"]
+mod floor_tests;
+
 // Helpers (table build / data + position-delete writers / scan) — same shape as the convert tests.
 
 async fn local_fs_catalog() -> (impl Catalog, TempDir) {
@@ -279,11 +282,9 @@ async fn write_file_scoped_position_delete_file(
         Some(uuid::Uuid::now_v7().to_string()),
         DataFileFormat::Parquet,
     );
-    let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder().build(),
-        config.schema().clone(),
-    )
-    .with_metrics_config(MetricsConfig::for_position_delete());
+    let parquet_builder =
+        ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
+            .with_metrics_config(MetricsConfig::for_position_delete());
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_builder,
         table.file_io().clone(),
@@ -752,128 +753,6 @@ async fn test_filter_restricts_compacted_partitions() {
         3,
         "partition 0 compacted to 1; partition 1's two files remain"
     );
-}
-
-/// Honest zeros: five Puffin DVs on V3. File-scoped, so nothing to convert and no commit.
-#[tokio::test]
-async fn test_v3_deletion_vectors_are_not_compacted() {
-    let (catalog, _temp) = local_fs_catalog().await;
-    let table = create_partitioned_table(&catalog, FormatVersion::V3).await;
-
-    // FIVE data files in partition 0, each holding two rows; the DV below masks the SECOND.
-    let mut data_paths = Vec::new();
-    let mut files = Vec::new();
-    for (index, y) in [10i64, 20, 30, 40, 50].into_iter().enumerate() {
-        let file = write_data_file(&table, &format!("dv-target-{index}.parquet"), 0, &[
-            (0, y, 1),
-            (0, y + 1, 2),
-        ])
-        .await;
-        data_paths.push(file.file_path().to_string());
-        files.push(file);
-    }
-    let table = append_files(&catalog, &table, files).await;
-
-    // FIVE Puffin DVs in the SAME partition 0 — one per data file, each masking its position 1.
-    let mut table = table;
-    for path in &data_paths {
-        let dv = write_deletion_vector(&table, path, &[1]).await;
-        table = add_deletes(&catalog, &table, vec![dv]).await;
-    }
-
-    let before = scan_y_values(&table).await;
-    assert_eq!(
-        before,
-        HashSet::from([10, 20, 30, 40, 50]),
-        "before: each DV masks its data file's second row (y = 11, 21, 31, 41, 51)"
-    );
-
-    let action = || RewritePositionDeleteFiles::new(table.clone());
-    let config = action().resolve_config().expect("the defaults are legal");
-    let dvs = live_delete_files(&table).await;
-    assert_eq!(dvs.len(), 5, "fixture: FIVE live deletion vectors");
-    assert!(
-        dvs.iter()
-            .all(|f| f.file_format() == DataFileFormat::Puffin),
-        "fixture: every live delete is a Puffin DV"
-    );
-    assert!(
-        dvs.iter()
-            .all(|f| f.content_type() == DataContentType::PositionDeletes),
-        "fixture NON-VACUITY: a DV carries content PositionDeletes, so it clears the CONTENT \
-         filter and reaches the FORMAT skip — this test would prove nothing if it were dropped one \
-         line earlier"
-    );
-    assert!(
-        dvs.iter()
-            .all(|f| f.file_size_in_bytes < config.min_file_size_bytes),
-        "fixture: every DV is SUB-MIN, so the mutated build makes all five candidates"
-    );
-    assert_eq!(
-        config.min_input_files, 5,
-        "fixture: FIVE files clear the DEFAULT floor with no knob — the literal, so a moved \
-         constant reds here rather than silently re-shaping the fixture"
-    );
-
-    let snapshot_before = table.metadata().current_snapshot_id();
-    let result = action().execute(&catalog).await.unwrap();
-    assert_eq!(
-        result,
-        RewritePositionDeleteFilesResult::default(),
-        "DVs are NOT compacted by this action — zero counts, no commit, even at five same-partition DVs"
-    );
-
-    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
-    assert_eq!(
-        reloaded.metadata().current_snapshot_id(),
-        snapshot_before,
-        "post-execute SHAPE: a skipped group must NOT commit a new snapshot"
-    );
-    assert_eq!(
-        scan_y_values(&reloaded).await,
-        before,
-        "read identity: the DVs are untouched, the live set unchanged"
-    );
-    // All five Puffin DVs are still live, and none became a parquet pos-delete.
-    let deletes = live_delete_files(&reloaded).await;
-    assert_eq!(deletes.len(), 5, "all five DVs remain live");
-    assert!(
-        deletes
-            .iter()
-            .all(|f| f.file_format() == DataFileFormat::Puffin),
-        "every surviving delete is a Puffin DV (none was compacted into a parquet pos-delete)"
-    );
-}
-
-/// Write a single-data-file Puffin DELETION VECTOR masking the given absolute positions of `target_path`, in partition x=0.
-async fn write_deletion_vector(table: &Table, target_path: &str, positions: &[u64]) -> DataFile {
-    use crate::writer::base_writer::deletion_vector_writer::DVFileWriter;
-
-    let dv_path = format!(
-        "{}/data/dv-{}.puffin",
-        table.metadata().location(),
-        uuid::Uuid::now_v7()
-    );
-    let output = table.file_io().new_output(&dv_path).unwrap();
-    let partition_key = PartitionKey::new(
-        table.metadata().default_partition_spec().as_ref().clone(),
-        table.metadata().current_schema().clone(),
-        Struct::from_iter([Some(Literal::long(0))]),
-    )
-    .expect("PartitionKey::new: valid partition tuple");
-    let mut writer = DVFileWriter::new(output).unpartitioned();
-    for &pos in positions {
-        writer
-            .delete(target_path, pos, Some(&partition_key))
-            .expect("record DV position");
-    }
-    writer
-        .close()
-        .await
-        .expect("close DV writer")
-        .into_iter()
-        .next()
-        .expect("one DV delete file")
 }
 
 /// Commit FIVE live position-delete manifest entries in partition 0 whose `file_format` is `format`, and return their measured sizes.
@@ -2375,6 +2254,7 @@ async fn test_group_input_size_saturates_not_wraps() {
         // Above the bin size, so `enough_input_files` cannot be the admitter under EITHER arithmetic.
         min_input_files: 10,
         max_file_group_size_bytes: 1_000_000,
+        rewrite_all: false,
         write_max_file_size: 550,
         chunk_budget: 225,
     };
@@ -2406,6 +2286,7 @@ fn white_box_gate_config() -> ResolvedConfig {
         max_file_size_bytes: 1_000,
         min_input_files: 10,
         max_file_group_size_bytes: 1_000_000,
+        rewrite_all: false,
         // Java `writeMaxFileSize()` = 100 + (1000 - 100) * 0.5. Neither gate leaf reads it.
         write_max_file_size: 550,
         // min(16384, (1000 - 550) / 2). Neither gate leaf reads it either.
@@ -4068,6 +3949,7 @@ async fn test_v3_converts_parquet_position_deletes_into_one_deletion_vector() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4113,6 +3995,7 @@ async fn test_v3_deletion_vector_carries_its_data_file_partition_and_spec() {
     let table = upgrade_to_v3(&catalog, &table).await;
 
     RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4120,6 +4003,11 @@ async fn test_v3_deletion_vector_carries_its_data_file_partition_and_spec() {
     let reloaded = catalog.load_table(table.identifier()).await.unwrap();
     let after = live_delete_files(&reloaded).await;
     assert_eq!(after.len(), 1, "one deletion vector");
+    assert_eq!(
+        after[0].file_format(),
+        DataFileFormat::Puffin,
+        "the survivor is the converted vector, not the declined parquet delete"
+    );
     assert_eq!(
         after[0].partition(),
         &Struct::from_iter([Some(Literal::long(7))]),
@@ -4183,6 +4071,7 @@ async fn test_v3_conversion_merges_the_data_file_existing_deletion_vector() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4255,6 +4144,7 @@ async fn test_v3_rewrite_keeps_sibling_deletion_vectors_of_the_same_puffin() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4305,6 +4195,7 @@ async fn test_v3_filter_restricts_the_converted_partitions() {
     let before = scan_y_values(&table).await;
     let result = RewritePositionDeleteFiles::new(table.clone())
         .filter(Reference::new("x").equal_to(Datum::long(0)))
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4351,6 +4242,7 @@ async fn test_v3_position_naming_a_non_live_data_file_is_dropped() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect("a stale reference must not dead-end the arm");
@@ -4406,6 +4298,7 @@ async fn test_v3_refuses_when_a_filtered_out_delete_would_be_shadowed() {
 
     let error = RewritePositionDeleteFiles::new(table.clone())
         .filter(Reference::new("x").equal_to(Datum::long(0)))
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect_err("a delete that would be shadowed must fail the run closed");
@@ -4453,6 +4346,7 @@ async fn test_v3_each_deletion_vector_carries_its_own_source_max_seq() {
 
     let before = scan_y_values(&table).await;
     RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4531,6 +4425,7 @@ async fn test_v3_refuses_when_a_partition_scoped_delete_would_be_shadowed() {
 
     let error = RewritePositionDeleteFiles::new(table.clone())
         .filter(Reference::new("x").equal_to(Datum::long(1)))
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect_err("a partition-scoped delete that would be shadowed must fail the run closed");
@@ -4587,6 +4482,7 @@ async fn test_v3_refuses_when_the_existing_vector_does_not_cover_the_legacy_dele
 
     // NO FILTER — so the shadow closure is silent and only the superset check can catch this.
     let error = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect_err("a non-superset vector must fail the run closed");
@@ -4651,6 +4547,7 @@ async fn test_v3_puffin_closure_skips_a_sibling_whose_data_file_is_gone() {
 
     let before = scan_y_values(&table).await;
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect("a sibling naming a dead data file must not fail the run");
@@ -4696,6 +4593,7 @@ async fn test_v3_shadowed_unreadable_delete_says_no_filter_width_helps() {
 
     let error = RewritePositionDeleteFiles::new(table)
         .filter(Reference::new("x").equal_to(Datum::long(0)))
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect_err("an unreadable shadowed delete must fail the run closed");
@@ -4751,6 +4649,7 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
     let (table, before) = build_non_superset_vector_table(&catalog).await;
 
     let refusal = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect_err("the arm refuses this shape");

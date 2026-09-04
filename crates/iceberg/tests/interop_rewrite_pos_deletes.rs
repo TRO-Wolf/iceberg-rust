@@ -234,7 +234,7 @@ async fn add_deletes(catalog: &impl Catalog, table: &Table, deletes: Vec<DataFil
 }
 
 /// PRE world: two partitions, then two position deletes per partition in separate commits.
-async fn build_pre_world(catalog: &impl Catalog, table: Table) -> Table {
+async fn build_pre_world(catalog: &impl Catalog, table: Table) -> (Table, String, String) {
     let a = write_data_file(&table, "A", &[(100, 10), (120, 20), (130, 30)]).await;
     let b = write_data_file(&table, "B", &[(200, 10), (220, 20), (230, 30)]).await;
     let a_path = a.file_path().to_string();
@@ -249,7 +249,22 @@ async fn build_pre_world(catalog: &impl Catalog, table: Table) -> Table {
     // Duplicate the mask. Java does not dedup; the reader bitmap does.
     let pd_a2 = write_position_delete(&table, "A", &[(&a_path, 1)]).await;
     let pd_b2 = write_position_delete(&table, "B", &[(&b_path, 1)]).await;
-    add_deletes(catalog, &table, vec![pd_a2, pd_b2]).await
+    let table = add_deletes(catalog, &table, vec![pd_a2, pd_b2]).await;
+    (table, a_path, b_path)
+}
+
+async fn top_up_to_floor(
+    catalog: &impl Catalog,
+    table: Table,
+    a_path: &str,
+    b_path: &str,
+) -> Table {
+    let mut extra = Vec::new();
+    for _ in 0..3 {
+        extra.push(write_position_delete(&table, "A", &[(a_path, 1)]).await);
+        extra.push(write_position_delete(&table, "B", &[(b_path, 1)]).await);
+    }
+    add_deletes(catalog, &table, extra).await
 }
 
 /// Upgrade to V3, leaving parquet position deletes the table can no longer write.
@@ -301,7 +316,8 @@ async fn live_delete_count_of_format(
 async fn write_v3_pair(catalog: &impl Catalog, warehouse: &str, expected_ids: &HashSet<i64>) {
     let pre_location = format!("{warehouse}/rust_table_v3");
     let pre = create_table(catalog, "rust_table_v3", &pre_location).await;
-    let pre = build_pre_world(catalog, pre).await;
+    let (pre, a_path, b_path) = build_pre_world(catalog, pre).await;
+    let pre = top_up_to_floor(catalog, pre, &a_path, &b_path).await;
     let pre = upgrade_to_v3(catalog, &pre).await;
     pre.metadata()
         .clone()
@@ -323,22 +339,23 @@ async fn write_v3_pair(catalog: &impl Catalog, warehouse: &str, expected_ids: &H
             DataFileFormat::Parquet
         )
         .await,
-        4,
-        "GEN sanity: the V3 PRE table carries FOUR legacy parquet position deletes"
+        10,
+        "GEN sanity: the V3 PRE table carries TEN legacy parquet position deletes"
     );
 
     let post_location = format!("{warehouse}/rust_table_v3_dv");
     let post = create_table(catalog, "rust_table_v3_dv", &post_location).await;
-    let post = build_pre_world(catalog, post).await;
+    let (post, a_path, b_path) = build_pre_world(catalog, post).await;
+    let post = top_up_to_floor(catalog, post, &a_path, &b_path).await;
     let post = upgrade_to_v3(catalog, &post).await;
-    // NO `min_input_files` knob: the V3 arm converts every legacy file and applies no size gate.
+    // Five deletes per partition clear the default min-input-files floor of five.
     let result = RewritePositionDeleteFiles::new(post.clone())
         .execute(catalog)
         .await
         .expect("run RewritePositionDeleteFiles on the V3 table");
     assert_eq!(
-        result.rewritten_delete_files_count, 4,
-        "GEN sanity: all four legacy parquet position deletes consumed"
+        result.rewritten_delete_files_count, 10,
+        "GEN sanity: all ten legacy parquet position deletes consumed"
     );
     assert_eq!(
         result.added_delete_files_count, 2,
@@ -455,7 +472,7 @@ async fn test_rewrite_pos_deletes_gen() {
 
     // PRE table (many pos-deletes). Land its final metadata BEFORE the action.
     let pre = create_table(&catalog, "rust_table", &pre_location).await;
-    let pre = build_pre_world(&catalog, pre).await;
+    let (pre, _, _) = build_pre_world(&catalog, pre).await;
     let pre_final = format!("{pre_location}/metadata/final.metadata.json");
     pre.metadata()
         .clone()
@@ -477,7 +494,7 @@ async fn test_rewrite_pos_deletes_gen() {
 
     // Build a SEPARATE compacted table so Java can read BOTH the PRE and POST tables.
     let compacted = create_table(&catalog, "rust_table_compacted", &compacted_location).await;
-    let compacted = build_pre_world(&catalog, compacted).await;
+    let (compacted, _, _) = build_pre_world(&catalog, compacted).await;
     // Floor 2: Java's default 5 declines this two-file bin. 1 would disable the size>=N clause.
     let result = RewritePositionDeleteFiles::new(compacted.clone())
         .min_input_files(2)
