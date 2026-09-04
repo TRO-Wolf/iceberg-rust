@@ -503,6 +503,7 @@ mod tests {
             .await
             .expect("close");
             let close_elapsed = start.elapsed();
+            let close_reads = fixture.data_manifest_reads.load(Ordering::Relaxed);
             let start = std::time::Instant::now();
             commit_dv_for(
                 &fixture.catalog,
@@ -512,10 +513,10 @@ mod tests {
             )
             .await;
             let commit_elapsed = start.elapsed();
+            let commit_reads = fixture.data_manifest_reads.load(Ordering::Relaxed) - close_reads;
             println!(
-                "F-25 n={n} close={close_elapsed:?} commit={commit_elapsed:?} added={} commit_data_manifest_reads={}",
+                "F-25 n={n} close={close_elapsed:?} commit={commit_elapsed:?} added={} close_data_manifest_reads={close_reads} commit_data_manifest_reads={commit_reads}",
                 close.added.len(),
-                fixture.data_manifest_reads.load(Ordering::Relaxed),
             );
             assert_eq!(close.added.len(), 1);
         }
