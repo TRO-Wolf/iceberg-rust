@@ -24,6 +24,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::Catalog;
+use crate::Result;
 use crate::io::{
     FileInfo, FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorageFactory, OutputFile,
     Storage, StorageConfig, StorageFactory,
@@ -34,9 +37,6 @@ use crate::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Li
 use crate::table::Table;
 #[cfg(test)]
 use crate::transaction::{ApplyTransactionAction, Transaction};
-#[cfg(test)]
-use crate::Catalog;
-use crate::Result;
 
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)

@@ -15,42 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
-use super::*;
-
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::array::{
     ArrayRef, DictionaryArray, Int32Array, Int64Array, RecordBatch, RunArray, StringArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::expressions::Column;
-
-use super::{
-    IsolationLevel, apply_assignments, decode_file_path, decode_file_paths_batch,
-    decode_position, group_pairs_by_partition, position_delete_unpartitioned_fast_path,
-    sort_position_delete_pairs,
-};
-
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
-use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::delete_vector_container::CountingStorageFactory;
-use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
+use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
 use iceberg::spec::{
-    DataContentType, ManifestContentType, NestedField, PrimitiveType, Schema as IcebergSchema,
-    Type,
+    DataContentType, ManifestContentType, NestedField, PrimitiveType, Schema as IcebergSchema, Type,
 };
 use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
 use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation};
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
+
+use super::{
+    IsolationLevel, apply_assignments, decode_file_path, decode_file_paths_batch, decode_position,
+    group_pairs_by_partition, position_delete_unpartitioned_fast_path, sort_position_delete_pairs,
+    *,
+};
 
 // An assignment must never smuggle a NULL into a REQUIRED column. A dictionary or REE array
 // whose VALUES hold a NULL reports `null_count() == 0`, and `RecordBatch::try_new`'s own check
@@ -70,8 +62,7 @@ fn dict_with_null_value() -> ArrayRef {
     let values = StringArray::from(vec![Some("x"), None]);
     let keys = Int32Array::from(vec![0, 1]);
     Arc::new(
-        DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))
-            .expect("dictionary array"),
+        DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dictionary array"),
     )
 }
 
@@ -116,8 +107,7 @@ fn test_null_free_assignment_to_a_required_column_still_succeeds() {
     let values = StringArray::from(vec![Some("x"), Some("y")]);
     let keys = Int32Array::from(vec![0, 1]);
     let column: ArrayRef = Arc::new(
-        DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))
-            .expect("dictionary array"),
+        DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dictionary array"),
     );
     let schema = dict_column_schema(false);
     let batch =
@@ -416,7 +406,6 @@ fn test_group_pairs_by_partition_rejects_an_unmatched_data_file() {
     );
 }
 struct MorCloseFixture {
-    catalog: MemoryCatalog,
     table: Table,
     paths: Vec<String>,
     factory: Arc<CountingStorageFactory>,
@@ -468,19 +457,15 @@ async fn mor_close_fixture() -> MorCloseFixture {
         .create_table(&namespace, creation)
         .await
         .expect("table");
-    let arrow_schema = Arc::new(
-        schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"),
-    );
+    let arrow_schema =
+        Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
     let mut paths = Vec::with_capacity(48);
     for index in 0..48i32 {
         let file_path = format!("{}/data/f{index}.parquet", table.metadata().location());
-        let batch = RecordBatch::try_new(
-            Arc::clone(&arrow_schema),
-            vec![
-                Arc::new(Int32Array::from(vec![index])) as ArrayRef,
-                Arc::new(StringArray::from(vec![format!("v{index}")])) as ArrayRef,
-            ],
-        )
+        let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![
+            Arc::new(Int32Array::from(vec![index])) as ArrayRef,
+            Arc::new(StringArray::from(vec![format!("v{index}")])) as ArrayRef,
+        ])
         .expect("batch");
         let output = table
             .file_io()
@@ -533,7 +518,6 @@ async fn mor_close_fixture() -> MorCloseFixture {
     factory.manifest_reads.store(0, Ordering::Relaxed);
     factory.opens.store(0, Ordering::Relaxed);
     MorCloseFixture {
-        catalog,
         table,
         paths,
         factory,
@@ -586,9 +570,8 @@ async fn mor_delete_close_with_complete_partitions_reads_no_data_manifest() {
     let fixture = mor_close_fixture().await;
     let table = &fixture.table;
     let oldest = fixture.paths.first().expect("paths").clone();
-    let table_schema = Arc::new(
-        schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"),
-    );
+    let table_schema =
+        Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
     let mut projection: Vec<String> = table_schema
         .fields()
         .iter()
@@ -600,16 +583,19 @@ async fn mor_delete_close_with_complete_partitions_reads_no_data_manifest() {
         .metadata()
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id());
-    let (pairs, known) =
-        scan_oldest_pair(table, projection, &table_schema, scan_snapshot_id).await;
+    let (pairs, known) = scan_oldest_pair(table, projection, &table_schema, scan_snapshot_id).await;
     assert_eq!(pairs, vec![(oldest.clone(), 0)]);
     assert_eq!(known.len(), 48);
     assert_eq!(known.get(&oldest), Some(&(0, Struct::empty())));
-    fixture.factory.data_manifest_reads.store(0, Ordering::Relaxed);
+    fixture
+        .factory
+        .data_manifest_reads
+        .store(0, Ordering::Relaxed);
     let close = write_merge_on_read_deletes(
         table,
         MergeOnReadDeleteKind::DeletionVectors,
         &pairs,
+        &known,
         scan_snapshot_id,
     )
     .await
@@ -634,9 +620,8 @@ async fn mor_update_close_with_complete_partitions_reads_no_data_manifest() {
     let fixture = mor_close_fixture().await;
     let table = &fixture.table;
     let oldest = fixture.paths.first().expect("paths").clone();
-    let table_schema = Arc::new(
-        schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"),
-    );
+    let table_schema =
+        Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
     let mut projection: Vec<String> = table_schema
         .fields()
         .iter()
@@ -649,15 +634,18 @@ async fn mor_update_close_with_complete_partitions_reads_no_data_manifest() {
         .metadata()
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id());
-    let (pairs, known) =
-        scan_oldest_pair(table, projection, &table_schema, scan_snapshot_id).await;
+    let (pairs, known) = scan_oldest_pair(table, projection, &table_schema, scan_snapshot_id).await;
     assert_eq!(pairs, vec![(oldest.clone(), 0)]);
     assert_eq!(known.len(), 48);
-    fixture.factory.data_manifest_reads.store(0, Ordering::Relaxed);
+    fixture
+        .factory
+        .data_manifest_reads
+        .store(0, Ordering::Relaxed);
     let close = write_merge_on_read_deletes(
         table,
         MergeOnReadDeleteKind::DeletionVectors,
         &pairs,
+        &known,
         scan_snapshot_id,
     )
     .await

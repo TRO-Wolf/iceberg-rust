@@ -78,6 +78,13 @@ use super::snapshot_target::{
 use crate::physical_plan::delete_legacy_merge::write_deletion_vectors;
 use crate::to_datafusion_error;
 
+#[path = "delete_position_deletes.rs"]
+mod delete_position_deletes;
+pub(crate) use delete_position_deletes::group_pairs_by_partition;
+use delete_position_deletes::write_position_deletes;
+
+pub(crate) use super::cow_affected::position_delete_unpartitioned_fast_path;
+
 pub(crate) const WRITE_DELETE_MODE: &str = "write.delete.mode";
 pub(crate) const WRITE_UPDATE_MODE: &str = "write.update.mode";
 const MODE_MERGE_ON_READ: &str = "merge-on-read";
@@ -346,10 +353,7 @@ async fn mor_scan_stream(
     projection: Vec<String>,
     prune: Option<Predicate>,
     scan_snapshot_id: Option<i64>,
-) -> DFResult<(
-    ArrowRecordBatchStream,
-    HashMap<String, (i32, Struct)>,
-)> {
+) -> DFResult<(ArrowRecordBatchStream, HashMap<String, (i32, Struct)>)> {
     let mut builder = table.scan().select(projection);
     if let Some(snapshot_id) = scan_snapshot_id {
         builder = builder.snapshot_id(snapshot_id);
@@ -358,8 +362,7 @@ async fn mor_scan_stream(
         builder = builder.with_file_prune_only(prune);
     }
     let scan = builder.build().map_err(to_datafusion_error)?;
-    scan
-        .to_arrow_with_file_partitions()
+    scan.to_arrow_with_file_partitions()
         .await
         .map_err(to_datafusion_error)
 }
@@ -371,6 +374,7 @@ async fn write_merge_on_read_deletes(
     table: &Table,
     kind: MergeOnReadDeleteKind,
     pairs: &[(String, i64)],
+    known_partitions: &HashMap<String, (i32, Struct)>,
     scan_snapshot_id: Option<i64>,
 ) -> DFResult<DvContainerClose> {
     match kind {
@@ -379,7 +383,7 @@ async fn write_merge_on_read_deletes(
             ..DvContainerClose::default()
         }),
         MergeOnReadDeleteKind::DeletionVectors => {
-            write_deletion_vectors(table, pairs, scan_snapshot_id).await
+            write_deletion_vectors(table, pairs, known_partitions, scan_snapshot_id).await
         }
     }
 }
@@ -449,7 +453,8 @@ async fn merge_on_read_delete(
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
-    let (mut stream, _) = mor_scan_stream(table, projection, prune, scan_snapshot_id).await?;
+    let (mut stream, known_partitions) =
+        mor_scan_stream(table, projection, prune, scan_snapshot_id).await?;
 
     let mut pairs: Vec<(String, i64)> = Vec::new();
     while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
@@ -526,7 +531,14 @@ async fn merge_on_read_delete(
 
     // The §5 `validate_data_files_exist` set. Java arms this for every command, DELETE included: a
     // referenced file rewritten away by a concurrent commit would silently lose these deletes.
-    let close = write_merge_on_read_deletes(table, delete_kind, &pairs, scan_snapshot_id).await?;
+    let close = write_merge_on_read_deletes(
+        table,
+        delete_kind,
+        &pairs,
+        &known_partitions,
+        scan_snapshot_id,
+    )
+    .await?;
     let referenced_files = files_exist_set(&close, &pairs);
 
     // §5 row-delta recipe, MoR DELETE. `AlwaysTrue` is Java-exact because this path pushes no filter
@@ -695,182 +707,6 @@ async fn copy_on_write_delete(
         .map_err(to_datafusion_error)?;
 
     Ok(deleted)
-}
-
-/// Writes Parquet position-delete files from sorted `(path, pos)` pairs and returns EVERY file the
-/// rolling writer produced; dropping one silently resurrects its rows. Each file is stamped with the
-/// `(spec_id, partition)` of the DATA file it deletes from, which the partitioned path reads from
-/// the snapshot's manifests. The commit validates that stamp against the spec.
-///
-/// This predicate decides which table shape may skip that walk (BUG-001, C1-L-002):
-///
-/// | Table shape | Path |
-/// |---|---|
-/// | one spec, zero fields | fast path: one file, stamped through `with_partition_spec` so the real spec id survives |
-/// | multi-spec, empty default (after `DROP PARTITION FIELD`) | walk: old data files keep their own partition, and a fabricated `None`/spec-0 stamp misses on read and resurrects rows |
-/// | one all-Void spec (unpartitioned, non-empty fields) | walk: it needs a null tuple of matching arity |
-/// | partitioned | walk |
-pub(crate) use super::cow_affected::position_delete_unpartitioned_fast_path;
-
-async fn write_position_deletes(
-    table: &Table,
-    pairs: &[(String, i64)],
-    scan_snapshot_id: Option<i64>,
-) -> DFResult<Vec<DataFile>> {
-    let config = PositionDeleteWriterConfig::new().map_err(to_datafusion_error)?;
-    let metadata = table.metadata();
-    let default_spec = metadata.default_partition_spec();
-    let schema = metadata.current_schema();
-
-    // Only a never-evolved empty spec skips the manifest walk — see the fast-path table above.
-    if position_delete_unpartitioned_fast_path(
-        metadata.partition_specs_iter().len(),
-        default_spec.fields().len(),
-    ) {
-        // `with_partition_spec` keeps the sole spec's real id; `None` would fabricate spec id 0.
-        return write_position_deletes_for_partition(
-            table,
-            &config,
-            pairs,
-            None,
-            Some(default_spec.as_ref().clone()),
-        )
-        .await;
-    }
-
-    let path_to_partition = live_data_file_partitions(table, scan_snapshot_id, None).await?;
-
-    let path_to_partition: HashMap<String, (i32, Struct)> = path_to_partition
-        .into_iter()
-        .map(|(path, (spec_id, partition, _))| (path, (spec_id, partition)))
-        .collect();
-    let groups = group_pairs_by_partition(pairs, &path_to_partition)?;
-
-    let mut all_delete_files: Vec<DataFile> = Vec::new();
-    for ((spec_id, partition), mut group_pairs) in groups {
-        // Maintain the per-file (path, pos) sort order within each group.
-        sort_position_delete_pairs(&mut group_pairs);
-
-        let spec = metadata
-            .partition_spec_by_id(spec_id)
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "position-delete: data file references unknown partition spec {spec_id}"
-                ))
-            })?
-            .as_ref()
-            .clone();
-        // Carry the data file's own (spec, partition), including empty and all-Void null tuples. A
-        // `None` key would fabricate spec id 0 and under-attach after DROP PARTITION FIELD.
-        let partition_key =
-            PartitionKey::new(spec, schema.clone(), partition).map_err(to_datafusion_error)?;
-
-        let files = write_position_deletes_for_partition(
-            table,
-            &config,
-            &group_pairs,
-            Some(partition_key),
-            None,
-        )
-        .await?;
-        all_delete_files.extend(files);
-    }
-
-    Ok(all_delete_files)
-}
-
-/// The `(path, pos)` pairs of one position-delete output file, keyed by the `(spec_id, partition)`
-/// of the data files they delete from.
-type PositionDeleteGroups = HashMap<(i32, Struct), Vec<(String, i64)>>;
-
-/// Groups `(path, pos)` pairs by the `(spec_id, partition)` of the data file each deletes from, so
-/// every output file is stamped like its target. Only the partitioned path reaches this. A pair
-/// whose data file is absent from `path_to_partition` is a hard error: the pairs come from a scan of
-/// the same snapshot that built the map. The old fallback fabricated an EMPTY tuple under a
-/// PARTITIONED spec, writing a delete file under a `field=null` path that no reader can match.
-fn group_pairs_by_partition(
-    pairs: &[(String, i64)],
-    path_to_partition: &HashMap<String, (i32, Struct)>,
-) -> DFResult<PositionDeleteGroups> {
-    let mut groups = PositionDeleteGroups::new();
-    for pair in pairs {
-        let key = path_to_partition.get(&pair.0).cloned().ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "position-delete: data file `{}` is not a live file of the current snapshot, so \
-                 its partition cannot be resolved",
-                pair.0
-            ))
-        })?;
-        groups.entry(key).or_default().push(pair.clone());
-    }
-    Ok(groups)
-}
-
-/// Writes one position-delete file for a SINGLE `(spec_id, partition)` group. `pairs` must already
-/// be sorted by `(path, pos)`. With `partition_key = None`, `configured_spec` MUST be `Some`, or the
-/// writer fabricates `DEFAULT_PARTITION_SPEC_ID` (0) instead of the real spec id.
-async fn write_position_deletes_for_partition(
-    table: &Table,
-    config: &PositionDeleteWriterConfig,
-    pairs: &[(String, i64)],
-    partition_key: Option<PartitionKey>,
-    configured_spec: Option<iceberg::spec::PartitionSpec>,
-) -> DFResult<Vec<DataFile>> {
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
-    let file_name_gen = DefaultFileNameGenerator::new(
-        "pos-del".to_string(),
-        Some(uuid::Uuid::now_v7().to_string()),
-        DataFileFormat::Parquet,
-    );
-    // Keep the `file_path` and `pos` bounds FULL and EXACT: no parquet stats truncation, so
-    // min_is_exact/max_is_exact stay true and equal-bounds path routing works for long S3 URIs.
-    let parquet_builder =
-        ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
-            .with_metrics_config(MetricsConfig::for_position_delete());
-    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        table.file_io().clone(),
-        location_gen,
-        file_name_gen,
-    );
-    if partition_key.is_none() && configured_spec.is_none() {
-        return Err(DataFusionError::Internal(
-            "position-delete: write_position_deletes_for_partition requires either a PartitionKey \
-             or a configured_spec; both None would fabricate partition_spec_id 0"
-                .to_string(),
-        ));
-    }
-    let mut builder = PositionDeleteFileWriterBuilder::new(rolling, config.clone());
-    if let Some(spec) = configured_spec {
-        builder = builder.with_partition_spec(spec);
-    }
-    let mut writer = builder
-        .build(partition_key)
-        .await
-        .map_err(to_datafusion_error)?;
-
-    let paths: Vec<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();
-    let positions: Vec<i64> = pairs.iter().map(|(_, pos)| *pos).collect();
-    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
-        Arc::new(StringArray::from(paths)) as ArrayRef,
-        Arc::new(Int64Array::from(positions)) as ArrayRef,
-    ])
-    .map_err(|e| {
-        DataFusionError::ArrowError(
-            Box::new(e),
-            Some("Failed to build position-delete batch".into()),
-        )
-    })?;
-    writer.write(batch).await.map_err(to_datafusion_error)?;
-    let files = writer.close().await.map_err(to_datafusion_error)?;
-    // A non-empty group MUST produce a file, or the deletes vanish and the rows come back.
-    if files.is_empty() {
-        return Err(DataFusionError::Internal(
-            "position-delete writer produced no file for a non-empty pair group".to_string(),
-        ));
-    }
-    Ok(files)
 }
 
 /// Decodes the reserved `_file` column at `row`, tolerating run-end-encoded and plain `Utf8`. A NULL
@@ -1094,7 +930,8 @@ pub(crate) async fn merge_on_read_update(
     projection.push(RESERVED_COL_NAME_POS.to_string());
     push_lineage_scan_columns(&mut projection, table.metadata().format_version());
 
-    let (mut stream, _) = mor_scan_stream(table, projection, prune, scan_snapshot_id).await?;
+    let (mut stream, known_partitions) =
+        mor_scan_stream(table, projection, prune, scan_snapshot_id).await?;
 
     // The delete side buffers the matched pairs, because `write_position_deletes` must group and
     // sort them. The new-row side streams into the writer per batch.
@@ -1148,7 +985,14 @@ pub(crate) async fn merge_on_read_update(
     // Grouping and sorting need the whole pair set up front. Both sides complete BEFORE the single
     // commit below.
     sort_position_delete_pairs(&mut pairs);
-    let close = write_merge_on_read_deletes(table, delete_kind, &pairs, scan_snapshot_id).await?;
+    let close = write_merge_on_read_deletes(
+        table,
+        delete_kind,
+        &pairs,
+        &known_partitions,
+        scan_snapshot_id,
+    )
+    .await?;
     let referenced_files = files_exist_set(&close, &pairs);
     let data_files = data_writer.finish().await?;
 
