@@ -331,10 +331,13 @@ impl TableScan {
                     if let (Some(spec), Some(partition)) =
                         (task.partition_spec.as_ref(), task.partition.as_ref())
                     {
-                        known.lock().expect("partition map lock").insert(
-                            task.data_file_path.to_string(),
-                            (spec.spec_id(), partition.clone()),
-                        );
+                        known
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(
+                                task.data_file_path.to_string(),
+                                (spec.spec_id(), partition.clone()),
+                            );
                     }
                     task
                 })
