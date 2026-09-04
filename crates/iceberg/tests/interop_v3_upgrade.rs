@@ -494,7 +494,7 @@ async fn test_upgraded_v3_converts_legacy_parquet_deletes_and_keeps_no_parquet_d
     assert_eq!(live_delete_files(&table).await.len(), 1);
 
     let result = RewritePositionDeleteFiles::new(table.clone())
-        .min_input_files(1)
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect("convert the legacy parquet position deletes");
@@ -604,7 +604,7 @@ async fn gen_rust_converts_java_v2_position_deletes_after_upgrade() {
 
     let table = upgrade_to_v3(&catalog, &table).await;
     let result = RewritePositionDeleteFiles::new(table.clone())
-        .min_input_files(1)
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect("convert the Java parquet position delete into a deletion vector");

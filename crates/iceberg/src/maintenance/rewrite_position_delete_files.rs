@@ -182,6 +182,7 @@ struct ResolvedConfig {
     max_file_size_bytes: u64,
     min_input_files: usize,
     max_file_group_size_bytes: u64,
+    rewrite_all: bool,
     /// Java `writeMaxFileSize()` — the rolling-writer bound, not the resolved target.
     write_max_file_size: u64,
     /// Per-chunk measured-byte cap, derived from candidate-filter headroom.
@@ -192,7 +193,6 @@ struct ResolvedConfig {
 ///
 /// | Deferred option | Why it is not emulable here |
 /// |---|---|
-/// | `rewrite-all` | `min_file_size_bytes(0)` plus a huge max empties the candidate set. That is the inverse of Java's bypass. |
 /// | `rewrite-job-order` | Bins commit in plan order. |
 /// | `partial-progress.*` / `max-concurrent-file-group-rewrites` | Sequential, one commit per bin. Failure is not atomic. |
 /// | `output-spec-id` | Each bin writes under its group spec. Java never consults this option. |
@@ -209,6 +209,7 @@ pub struct RewritePositionDeleteFiles {
     max_file_size_bytes: Option<u64>,
     min_input_files: usize,
     max_file_group_size_bytes: u64,
+    rewrite_all: bool,
 }
 
 impl RewritePositionDeleteFiles {
@@ -222,6 +223,7 @@ impl RewritePositionDeleteFiles {
             max_file_size_bytes: None,
             min_input_files: MIN_INPUT_FILES_DEFAULT,
             max_file_group_size_bytes: MAX_FILE_GROUP_SIZE_BYTES_DEFAULT,
+            rewrite_all: false,
         }
     }
 
@@ -255,6 +257,12 @@ impl RewritePositionDeleteFiles {
         self
     }
 
+    /// Rewrite every group regardless of size (Java `REWRITE_ALL`, default false).
+    pub fn rewrite_all(mut self, rewrite_all: bool) -> Self {
+        self.rewrite_all = rewrite_all;
+        self
+    }
+
     /// Compact only partitions matching `filter`. Java `RewritePositionDeleteFiles.filter`.
     pub fn filter(mut self, filter: Predicate) -> Self {
         self.filter = filter;
@@ -284,6 +292,7 @@ impl RewritePositionDeleteFiles {
                     &snapshot,
                     &mut partition_filter,
                     starting_snapshot_id,
+                    &config,
                 )
                 .await;
         }
@@ -292,7 +301,7 @@ impl RewritePositionDeleteFiles {
             .collect_position_delete_groups(&snapshot, &mut partition_filter)
             .await?;
 
-        let bins = plan_bins(groups, &config);
+        let (bins, _) = plan_bins(groups, &config);
 
         // Advance the base after each commit so later bins skip a full stale-base re-apply.
         let mut table = self.table.clone();
@@ -431,6 +440,7 @@ impl RewritePositionDeleteFiles {
             max_file_size_bytes,
             min_input_files: self.min_input_files,
             max_file_group_size_bytes: self.max_file_group_size_bytes,
+            rewrite_all: self.rewrite_all,
             write_max_file_size,
             chunk_budget,
         })
@@ -691,10 +701,28 @@ impl RewritePositionDeleteFiles {
         snapshot: &Snapshot,
         partition_filter: &mut PartitionFilter,
         starting_snapshot_id: i64,
+        config: &ResolvedConfig,
     ) -> Result<RewritePositionDeleteFilesResult> {
-        let inventory = self
+        let mut inventory = self
             .collect_v3_delete_inventory(snapshot, partition_filter)
             .await?;
+        if inventory.legacy_position_deletes.is_empty() {
+            return Ok(RewritePositionDeleteFilesResult::default());
+        }
+
+        let mut groups: HashMap<GroupKey, Vec<LiveDeleteEntry>> = HashMap::new();
+        for entry in std::mem::take(&mut inventory.legacy_position_deletes) {
+            groups
+                .entry((
+                    entry.data_file.partition_spec_id,
+                    entry.data_file.partition().clone(),
+                ))
+                .or_default()
+                .push(entry);
+        }
+        let (bins, declined) = plan_bins(groups, config);
+        inventory.gate_declined_position_deletes.extend(declined);
+        inventory.legacy_position_deletes = bins.into_iter().flat_map(|(_, bin)| bin).collect();
         if inventory.legacy_position_deletes.is_empty() {
             return Ok(RewritePositionDeleteFilesResult::default());
         }
@@ -1039,14 +1067,20 @@ fn build_partition_evaluator(
 fn plan_bins(
     groups: HashMap<GroupKey, Vec<LiveDeleteEntry>>,
     config: &ResolvedConfig,
-) -> Vec<AdmittedBin> {
+) -> (Vec<AdmittedBin>, Vec<LiveDeleteEntry>) {
     let mut admitted: Vec<AdmittedBin> = Vec::new();
+    let mut declined: Vec<LiveDeleteEntry> = Vec::new();
 
     for (key, entries) in groups {
-        let candidates: Vec<LiveDeleteEntry> = entries
-            .into_iter()
-            .filter(|entry| is_candidate(entry, config))
-            .collect();
+        let candidates: Vec<LiveDeleteEntry> = if config.rewrite_all {
+            entries
+        } else {
+            let (candidates, filtered): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .partition(|entry| is_candidate(entry, config));
+            declined.extend(filtered);
+            candidates
+        };
         if candidates.is_empty() {
             continue;
         }
@@ -1058,13 +1092,15 @@ fn plan_bins(
         );
 
         for bin in bins {
-            if group_qualifies(&bin, config) {
+            if config.rewrite_all || group_qualifies(&bin, config) {
                 admitted.push((key.clone(), bin));
+            } else {
+                declined.extend(bin);
             }
         }
     }
 
-    admitted
+    (admitted, declined)
 }
 
 /// Candidate iff undersized or oversized, both strict. No delete-count clause: that is the data planner.
@@ -1178,6 +1214,8 @@ struct V3DeleteInventory {
     deletion_vectors: HashMap<String, LiveDeleteEntry>,
     /// Position deletes the filter rejected. A new DV covering their data file would shadow them.
     unconverted_position_deletes: Vec<LiveDeleteEntry>,
+    /// Filter-admitted deletes the size gate declined. They stay live like the rejected ones.
+    gate_declined_position_deletes: Vec<LiveDeleteEntry>,
 }
 
 impl V3DeleteInventory {
@@ -1287,14 +1325,8 @@ fn refuse_shadowed_deletes(
 
     for entry in &inventory.unconverted_position_deletes {
         let delete_file = &entry.data_file;
-        let shadowed_data_file = match referenced_data_file_location(delete_file) {
-            Some(referenced) => plans.contains_key(&referenced).then_some(referenced),
-            // Partition-scoped: do not apply the seq rule. A false alarm beats losing rows.
-            None => planned_partitions
-                .contains(&(delete_file.partition_spec_id, delete_file.partition()))
-                .then(|| "a data file in the same partition".to_string()),
-        };
-        let Some(shadowed_data_file) = shadowed_data_file else {
+        let Some(shadowed_data_file) = shadowed_data_file(plans, &planned_partitions, delete_file)
+        else {
             continue;
         };
         let remedy = if delete_file.file_format() == DataFileFormat::Parquet {
@@ -1312,7 +1344,38 @@ fn refuse_shadowed_deletes(
             ),
         ));
     }
+    for entry in &inventory.gate_declined_position_deletes {
+        let delete_file = &entry.data_file;
+        let Some(shadowed_data_file) = shadowed_data_file(plans, &planned_partitions, delete_file)
+        else {
+            continue;
+        };
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Position delete '{}' still applies to {shadowed_data_file} but the size gate \
+                 declined it: the deletion vector this run would write there SHADOWS it and its \
+                 deleted rows would come back. Rerun once its partition holds enough files, or set \
+                 rewrite-all.",
+                delete_file.file_path()
+            ),
+        ));
+    }
     Ok(())
+}
+
+fn shadowed_data_file(
+    plans: &HashMap<String, DeletionVectorPlan>,
+    planned_partitions: &HashSet<(i32, &Struct)>,
+    delete_file: &DataFile,
+) -> Option<String> {
+    match referenced_data_file_location(delete_file) {
+        Some(referenced) => plans.contains_key(&referenced).then_some(referenced),
+        // Partition-scoped: do not apply the seq rule. A false alarm beats losing rows.
+        None => planned_partitions
+            .contains(&(delete_file.partition_spec_id, delete_file.partition()))
+            .then(|| "a data file in the same partition".to_string()),
+    }
 }
 
 /// Stamp for one written DV, read back from the plan it came from.

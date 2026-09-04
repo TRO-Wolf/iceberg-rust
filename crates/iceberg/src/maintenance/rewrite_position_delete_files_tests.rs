@@ -279,11 +279,9 @@ async fn write_file_scoped_position_delete_file(
         Some(uuid::Uuid::now_v7().to_string()),
         DataFileFormat::Parquet,
     );
-    let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder().build(),
-        config.schema().clone(),
-    )
-    .with_metrics_config(MetricsConfig::for_position_delete());
+    let parquet_builder =
+        ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
+            .with_metrics_config(MetricsConfig::for_position_delete());
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_builder,
         table.file_io().clone(),
@@ -2375,6 +2373,7 @@ async fn test_group_input_size_saturates_not_wraps() {
         // Above the bin size, so `enough_input_files` cannot be the admitter under EITHER arithmetic.
         min_input_files: 10,
         max_file_group_size_bytes: 1_000_000,
+        rewrite_all: false,
         write_max_file_size: 550,
         chunk_budget: 225,
     };
@@ -2406,6 +2405,7 @@ fn white_box_gate_config() -> ResolvedConfig {
         max_file_size_bytes: 1_000,
         min_input_files: 10,
         max_file_group_size_bytes: 1_000_000,
+        rewrite_all: false,
         // Java `writeMaxFileSize()` = 100 + (1000 - 100) * 0.5. Neither gate leaf reads it.
         write_max_file_size: 550,
         // min(16384, (1000 - 550) / 2). Neither gate leaf reads it either.
@@ -4068,6 +4068,7 @@ async fn test_v3_converts_parquet_position_deletes_into_one_deletion_vector() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4242,6 +4243,182 @@ async fn test_v3_one_partition_scoped_delete_covering_two_files_stays_parquet() 
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
+#[tokio::test]
+async fn test_v3_five_file_scoped_deletes_at_the_floor_convert_to_one_dv_per_data_file() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let mut paths = Vec::new();
+    let mut data_files = Vec::new();
+    for index in 0..5 {
+        let data = write_data_file(&table, &format!("d{index}.parquet"), 7, &[
+            (7, 10 + index * 10, 1),
+            (7, 11 + index * 10, 2),
+        ])
+        .await;
+        paths.push(data.file_path().to_string());
+        data_files.push(data);
+    }
+    let table = append_files(&catalog, &table, data_files).await;
+
+    let mut deletes = Vec::new();
+    for path in &paths {
+        deletes.push(write_file_scoped_position_delete_file(&table, 7, path, &[1]).await);
+    }
+    assert!(
+        deletes
+            .iter()
+            .all(|f| referenced_data_file_location(f).is_some()),
+        "fixture: every delete is FILE-scoped"
+    );
+    let table = add_deletes(&catalog, &table, deletes).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before.len(),
+        5,
+        "fixture: each delete masks one of two rows"
+    );
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rewritten_delete_files_count, 5,
+        "five files meet the floor: the whole group converts"
+    );
+    assert_eq!(
+        result.added_delete_files_count, 5,
+        "one deletion vector per referenced data file"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(
+        after
+            .iter()
+            .filter(|f| f.file_format() == DataFileFormat::Parquet)
+            .count(),
+        0,
+        "no parquet position delete survives"
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|f| f.file_format() == DataFileFormat::Puffin)
+            .count(),
+        5,
+        "one Puffin deletion vector per data file"
+    );
+
+    let second = RewritePositionDeleteFiles::new(reloaded.clone())
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        second,
+        RewritePositionDeleteFilesResult::default(),
+        "second run: nothing legacy left, honest zeros"
+    );
+}
+
+#[tokio::test]
+async fn test_v3_rewrite_all_converts_a_lone_parquet_delete_below_the_floor() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let x = write_data_file(&table, "x.parquet", 7, &[(7, 10, 1), (7, 20, 2)]).await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+    let pd = write_position_delete_file(&table, Some(7), &[(&x_path, 1)]).await;
+    let table = add_deletes(&catalog, &table, vec![pd]).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let before = scan_y_values(&table).await;
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(result.rewritten_delete_files_count, 1);
+    assert_eq!(result.added_delete_files_count, 1);
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
+    let after = live_delete_files(&reloaded).await;
+    assert_eq!(
+        after.len(),
+        1,
+        "one deletion vector replaces the lone delete"
+    );
+    assert_eq!(after[0].file_format(), DataFileFormat::Puffin);
+}
+
+#[tokio::test]
+async fn test_v3_refuses_when_an_admitted_vector_would_shadow_a_gate_declined_delete() {
+    let (catalog, temp) = local_fs_catalog().await;
+    let table = create_short_path_partitioned_table(&catalog, temp.path(), FormatVersion::V2).await;
+
+    let a = write_data_file(&table, "a.parquet", 0, &[
+        (0, 10, 1),
+        (0, 11, 2),
+        (0, 12, 3),
+        (0, 13, 4),
+        (0, 14, 5),
+        (0, 15, 6),
+        (0, 16, 7),
+    ])
+    .await;
+    let a_path = a.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![a]).await;
+
+    let mut admitted = Vec::new();
+    for position in 0..5 {
+        admitted
+            .push(write_file_scoped_position_delete_file(&table, 1, &a_path, &[position]).await);
+    }
+    let declined = write_position_delete_file(&table, Some(0), &[(&a_path, 5)]).await;
+    assert!(
+        referenced_data_file_location(&declined).is_none(),
+        "fixture: the declined delete is PARTITION-scoped"
+    );
+    let table = add_deletes(&catalog, &table, vec![declined]).await;
+    let table = add_deletes(&catalog, &table, admitted).await;
+    let table = upgrade_to_v3(&catalog, &table).await;
+
+    let before = scan_y_values(&table).await;
+    assert_eq!(
+        before,
+        HashSet::from([16]),
+        "fixture: all six deletes apply to the same data file by different routes"
+    );
+
+    let error = RewritePositionDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .expect_err("a gate-declined delete shadowed by an admitted vector must fail closed");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert!(
+        error.to_string().contains("size gate"),
+        "the refusal names the gate, not the filter: {error}"
+    );
+    assert!(
+        error.to_string().contains("rewrite-all"),
+        "the refusal names the bypass: {error}"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        scan_y_values(&reloaded).await,
+        before,
+        "fail CLOSED: nothing committed, so no row came back"
+    );
+}
+
 /// Each `DVFileWriter::delete` carries that data file's own `PartitionKey`.
 /// `with_partition_spec` is not used: one Puffin spans every partition.
 #[tokio::test]
@@ -4257,6 +4434,7 @@ async fn test_v3_deletion_vector_carries_its_data_file_partition_and_spec() {
     let table = upgrade_to_v3(&catalog, &table).await;
 
     RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4327,6 +4505,7 @@ async fn test_v3_conversion_merges_the_data_file_existing_deletion_vector() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4399,6 +4578,7 @@ async fn test_v3_rewrite_keeps_sibling_deletion_vectors_of_the_same_puffin() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4449,6 +4629,7 @@ async fn test_v3_filter_restricts_the_converted_partitions() {
     let before = scan_y_values(&table).await;
     let result = RewritePositionDeleteFiles::new(table.clone())
         .filter(Reference::new("x").equal_to(Datum::long(0)))
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4495,6 +4676,7 @@ async fn test_v3_position_naming_a_non_live_data_file_is_dropped() {
     );
 
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect("a stale reference must not dead-end the arm");
@@ -4550,6 +4732,7 @@ async fn test_v3_refuses_when_a_filtered_out_delete_would_be_shadowed() {
 
     let error = RewritePositionDeleteFiles::new(table.clone())
         .filter(Reference::new("x").equal_to(Datum::long(0)))
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect_err("a delete that would be shadowed must fail the run closed");
@@ -4597,6 +4780,7 @@ async fn test_v3_each_deletion_vector_carries_its_own_source_max_seq() {
 
     let before = scan_y_values(&table).await;
     RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
         .execute(&catalog)
         .await
         .unwrap();
@@ -4675,6 +4859,7 @@ async fn test_v3_refuses_when_a_partition_scoped_delete_would_be_shadowed() {
 
     let error = RewritePositionDeleteFiles::new(table.clone())
         .filter(Reference::new("x").equal_to(Datum::long(1)))
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect_err("a partition-scoped delete that would be shadowed must fail the run closed");
@@ -4731,6 +4916,7 @@ async fn test_v3_refuses_when_the_existing_vector_does_not_cover_the_legacy_dele
 
     // NO FILTER — so the shadow closure is silent and only the superset check can catch this.
     let error = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect_err("a non-superset vector must fail the run closed");
@@ -4795,6 +4981,7 @@ async fn test_v3_puffin_closure_skips_a_sibling_whose_data_file_is_gone() {
 
     let before = scan_y_values(&table).await;
     let result = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect("a sibling naming a dead data file must not fail the run");
@@ -4840,6 +5027,7 @@ async fn test_v3_shadowed_unreadable_delete_says_no_filter_width_helps() {
 
     let error = RewritePositionDeleteFiles::new(table)
         .filter(Reference::new("x").equal_to(Datum::long(0)))
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect_err("an unreadable shadowed delete must fail the run closed");
@@ -4895,6 +5083,7 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
     let (table, before) = build_non_superset_vector_table(&catalog).await;
 
     let refusal = RewritePositionDeleteFiles::new(table.clone())
+        .rewrite_all(true)
         .execute(&catalog)
         .await
         .expect_err("the arm refuses this shape");
