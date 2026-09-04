@@ -19,8 +19,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::stream::{FuturesOrdered, TryStreamExt};
+
 use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};
-use crate::spec::{DataContentType, DataFile, ManifestContentType};
+use crate::delete_vector_container::DV_IO_CONCURRENCY;
+use crate::spec::{DataContentType, DataFile, ManifestContentType, ManifestFile};
 use crate::table::Table;
 use crate::transaction::snapshot::{dv_desc, latest_snapshot};
 use crate::{Error, ErrorKind, Result};
@@ -49,11 +52,24 @@ pub(crate) async fn validate_fresh_dvs_only(
         .await?;
 
     let mut live_data_entry_by_path: HashMap<String, Option<i64>> = HashMap::new();
-    for manifest_file in manifest_list.entries() {
-        if manifest_file.content != ManifestContentType::Data {
-            continue;
+    let data_manifests: Vec<&ManifestFile> = manifest_list
+        .entries()
+        .iter()
+        .filter(|manifest_file| manifest_file.content == ManifestContentType::Data)
+        .collect();
+    let file_io = table.file_io();
+    let mut pending = FuturesOrdered::new();
+    let mut issued = 0usize;
+    while live_data_entry_by_path.len() < added_dvs.len() {
+        let budget = if issued == 0 { 1 } else { DV_IO_CONCURRENCY };
+        while pending.len() < budget && issued < data_manifests.len() {
+            let manifest_file = data_manifests[issued];
+            pending.push_back(async move { manifest_file.load_manifest(file_io).await });
+            issued += 1;
         }
-        let manifest = manifest_file.load_manifest(table.file_io()).await?;
+        let Some(manifest) = pending.try_next().await? else {
+            break;
+        };
         for entry in manifest.entries() {
             if !entry.is_alive() {
                 continue;
@@ -62,6 +78,9 @@ pub(crate) async fn validate_fresh_dvs_only(
             if added_dvs.contains_key(file.file_path()) {
                 live_data_entry_by_path
                     .insert(file.file_path().to_string(), entry.sequence_number());
+                if live_data_entry_by_path.len() == added_dvs.len() {
+                    break;
+                }
             }
         }
     }
