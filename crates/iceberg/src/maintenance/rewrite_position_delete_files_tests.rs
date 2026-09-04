@@ -4443,6 +4443,11 @@ async fn test_v3_deletion_vector_carries_its_data_file_partition_and_spec() {
     let after = live_delete_files(&reloaded).await;
     assert_eq!(after.len(), 1, "one deletion vector");
     assert_eq!(
+        after[0].file_format(),
+        DataFileFormat::Puffin,
+        "the survivor is the converted vector, not the declined parquet delete"
+    );
+    assert_eq!(
         after[0].partition(),
         &Struct::from_iter([Some(Literal::long(7))]),
         "the DV carries the data file's OWN partition tuple, not an empty one"
