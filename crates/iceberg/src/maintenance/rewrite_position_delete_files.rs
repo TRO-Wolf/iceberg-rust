@@ -260,7 +260,6 @@ impl RewritePositionDeleteFiles {
         self
     }
 
-    /// Rewrite every group regardless of size (Java `REWRITE_ALL`, default false).
     pub fn rewrite_all(mut self, rewrite_all: bool) -> Self {
         self.rewrite_all = rewrite_all;
         self
