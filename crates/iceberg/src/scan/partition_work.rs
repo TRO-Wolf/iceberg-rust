@@ -27,15 +27,16 @@
 //! alone. Streaming a [`PartitionWork`] uses the legacy single-stream reader path (no within-file
 //! parallel expand) so multi-partition SELECT does not inherit WG2 composition risk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 
 use super::task::FileScanTask;
 use super::task_group::CombinedScanTask;
 use super::{ArrowRecordBatchStream, TableScan};
 use crate::arrow::ArrowReaderBuilder;
 use crate::io::FileIO;
+use crate::spec::Struct;
 use crate::{Error, ErrorKind, Result};
 
 /// Identity of a planned [`FileScanTask`] at byte-range grain.
@@ -293,6 +294,40 @@ impl TableScan {
             self.row_group_filtering_enabled,
             self.row_selection_enabled,
         )
+    }
+
+    /// Read the scan as Arrow batches, also returning each planned data file's `(spec_id, partition)`.
+    pub async fn to_arrow_with_file_partitions(
+        &self,
+    ) -> Result<(ArrowRecordBatchStream, HashMap<String, (i32, Struct)>)> {
+        let tasks: Vec<FileScanTask> = self.plan_files().await?.try_collect().await?;
+        let mut known: HashMap<String, (i32, Struct)> = HashMap::with_capacity(tasks.len());
+        for task in &tasks {
+            if let (Some(spec), Some(partition)) =
+                (task.partition_spec.as_ref(), task.partition.as_ref())
+            {
+                known.insert(
+                    task.data_file_path.to_string(),
+                    (spec.spec_id(), partition.clone()),
+                );
+            }
+        }
+        let mut reader = ArrowReaderBuilder::new(self.file_io.clone())
+            .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
+            .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
+            .with_row_selection_enabled(self.row_selection_enabled);
+        if let Some(batch_size) = self.batch_size {
+            reader = reader.with_batch_size(batch_size);
+        }
+        if let Some(concurrency) = self.range_fetch_concurrency {
+            reader = reader.with_range_fetch_concurrency(concurrency);
+        }
+        if let Some(bytes) = self.range_coalesce_bytes {
+            reader = reader.with_range_coalesce_bytes(bytes);
+        }
+        let task_stream = self
+            .expand_within_file_parallel_tasks(stream::iter(tasks.into_iter().map(Ok)).boxed())?;
+        Ok((reader.build().read(task_stream)?, known))
     }
 }
 
