@@ -49,3 +49,4 @@ Manifest entries, data-file structs, and the V3 first-row-id reader/writer.
 |---|---|
 | Sequential COW `next-row-id` disagrees with a Spark notebook | layout mismatch (file count / manifest count); numbers compare only at matched layout |
 | EXISTING survivor lost `first_row_id` | filtered rewrite did not copy the entry's `data_file` |
+| Cached manifest lacks inherited ids | by design: `ObjectCache` stores the raw parse as `CachedItem::RawManifest`; `get_manifest` applies the caller's list entry on a per-call clone, never on the cached `Arc` |
