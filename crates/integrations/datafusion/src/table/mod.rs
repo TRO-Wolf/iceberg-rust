@@ -70,6 +70,7 @@ pub struct IcebergTableProvider {
     /// FIXED for the life of the instance: DataFusion stores ordinals against it.
     schema: ArrowSchemaRef,
     commit_branch: Option<String>,
+    planning_table: Option<Table>,
 }
 
 impl IcebergTableProvider {
@@ -89,6 +90,18 @@ impl IcebergTableProvider {
             table_ident,
             schema,
             commit_branch: None,
+            planning_table: None,
+        })
+    }
+
+    pub(crate) fn from_planning_load(catalog: Arc<dyn Catalog>, table: Table) -> Result<Self> {
+        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+        Ok(IcebergTableProvider {
+            catalog,
+            table_ident: table.identifier().clone(),
+            schema,
+            commit_branch: None,
+            planning_table: Some(table),
         })
     }
 
@@ -102,6 +115,7 @@ impl IcebergTableProvider {
             table_ident: self.table_ident.clone(),
             schema: Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?),
             commit_branch: self.commit_branch.clone(),
+            planning_table: None,
         })
     }
 
@@ -145,11 +159,14 @@ impl TableProvider for IcebergTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(to_datafusion_error)?;
+        let table = match self.planning_table.as_ref() {
+            Some(table) => table.clone(),
+            None => self
+                .catalog
+                .load_table(&self.table_ident)
+                .await
+                .map_err(to_datafusion_error)?,
+        };
         let snapshot_id = crate::physical_plan::snapshot_target::resolve_scan_snapshot_id(
             &table,
             self.commit_branch.as_deref(),

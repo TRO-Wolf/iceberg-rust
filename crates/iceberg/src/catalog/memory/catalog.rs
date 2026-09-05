@@ -26,9 +26,10 @@ use itertools::Itertools;
 
 use super::namespace_state::NamespaceState;
 use crate::catalog::table_metadata_cache::{TableMetadataCache, load_or_fetch_table_metadata};
+use crate::io::object_cache::ObjectCache;
 use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
 use crate::spec::{TableMetadata, TableMetadataBuilder, ViewMetadata, ViewMetadataBuilder};
-use crate::table::Table;
+use crate::table::{Table, TableBuilder};
 use crate::view::{View, ViewCommit};
 use crate::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
@@ -48,6 +49,7 @@ pub struct MemoryCatalogBuilder {
     storage_factory: Option<Arc<dyn StorageFactory>>,
     /// Opt-in session metadata-pointer cache (FK4.1). Default `None` = OFF.
     table_metadata_cache: Option<Arc<TableMetadataCache>>,
+    shared_object_cache_bytes: Option<u64>,
 }
 
 impl Default for MemoryCatalogBuilder {
@@ -60,6 +62,7 @@ impl Default for MemoryCatalogBuilder {
             },
             storage_factory: None,
             table_metadata_cache: None,
+            shared_object_cache_bytes: None,
         }
     }
 }
@@ -71,6 +74,12 @@ impl MemoryCatalogBuilder {
     /// one session. The cache keeps no global state.
     pub fn with_table_metadata_cache(mut self, cache: Arc<TableMetadataCache>) -> Self {
         self.table_metadata_cache = Some(cache);
+        self
+    }
+
+    /// Share ONE manifest [`ObjectCache`] of `bytes` across every table this catalog loads.
+    pub fn with_shared_object_cache_bytes(mut self, bytes: u64) -> Self {
+        self.shared_object_cache_bytes = Some(bytes);
         self
     }
 }
@@ -115,7 +124,12 @@ impl CatalogBuilder for MemoryCatalogBuilder {
                     "Catalog warehouse is required",
                 ))
             } else {
-                MemoryCatalog::new(self.config, self.storage_factory, self.table_metadata_cache)
+                MemoryCatalog::new(
+                    self.config,
+                    self.storage_factory,
+                    self.table_metadata_cache,
+                    self.shared_object_cache_bytes,
+                )
             }
         };
 
@@ -140,6 +154,7 @@ pub struct MemoryCatalog {
     properties: HashMap<String, String>,
     /// Opt-in metadata-pointer cache (FK4.1). `None` = default OFF.
     table_metadata_cache: Option<Arc<TableMetadataCache>>,
+    shared_object_cache: Option<Arc<ObjectCache>>,
 }
 
 impl MemoryCatalog {
@@ -148,6 +163,7 @@ impl MemoryCatalog {
         config: MemoryCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
         table_metadata_cache: Option<Arc<TableMetadataCache>>,
+        shared_object_cache_bytes: Option<u64>,
     ) -> Result<Self> {
         // Use provided factory or default to MemoryStorageFactory
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
@@ -157,14 +173,28 @@ impl MemoryCatalog {
         let name = config.name.unwrap_or_default();
         let properties = config.props.clone();
 
+        let file_io = FileIOBuilder::new(factory).with_props(config.props).build();
+        let shared_object_cache = shared_object_cache_bytes
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| Arc::new(ObjectCache::new_with_capacity(file_io.clone(), bytes)));
+
         Ok(Self {
             name,
             root_namespace_state: Mutex::new(NamespaceState::default()),
-            file_io: FileIOBuilder::new(factory).with_props(config.props).build(),
+            file_io,
             warehouse_location: config.warehouse,
             properties,
             table_metadata_cache,
+            shared_object_cache,
         })
+    }
+
+    fn table_builder(&self) -> TableBuilder {
+        let builder = Table::builder().file_io(self.file_io.clone());
+        match self.shared_object_cache.as_ref() {
+            Some(cache) => builder.object_cache(cache.clone()),
+            None => builder,
+        }
     }
 
     /// Snapshot a table's stored metadata location under a short lock (no FileIO).
@@ -210,11 +240,10 @@ impl MemoryCatalog {
         )
         .await?;
 
-        Table::builder()
+        self.table_builder()
             .identifier(table_ident.clone())
             .metadata(metadata)
             .metadata_location(metadata_location.to_string())
-            .file_io(self.file_io.clone())
             .build()
     }
 
@@ -423,8 +452,7 @@ impl Catalog for MemoryCatalog {
         // for a location the catalog does not own.
         self.cache_put(&metadata_location, &metadata);
 
-        Table::builder()
-            .file_io(self.file_io.clone())
+        self.table_builder()
             .metadata_location(metadata_location)
             .metadata(metadata)
             .identifier(table_ident)
@@ -516,8 +544,7 @@ impl Catalog for MemoryCatalog {
             }
         }
 
-        Table::builder()
-            .file_io(self.file_io.clone())
+        self.table_builder()
             .metadata_location(metadata_location)
             .metadata(metadata)
             .identifier(table_ident.clone())
