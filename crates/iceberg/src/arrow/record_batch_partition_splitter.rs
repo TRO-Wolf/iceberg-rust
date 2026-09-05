@@ -814,6 +814,8 @@ mod tests {
             vec![(2, "l_truncate", Transform::Truncate(2))],
             vec![(1, "i_bucket", Transform::Bucket(4))],
             vec![(3, "s_bucket", Transform::Bucket(8))],
+            vec![(4, "d_identity", Transform::Identity)],
+            vec![(5, "t_identity", Transform::Identity)],
             vec![(4, "d_year", Transform::Year)],
             vec![(4, "d_month", Transform::Month)],
             vec![(4, "d_day", Transform::Day)],
