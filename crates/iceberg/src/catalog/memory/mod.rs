@@ -17,6 +17,7 @@
 
 //! Memory catalog implementation.
 
+mod caches;
 mod catalog;
 mod namespace_state;
 

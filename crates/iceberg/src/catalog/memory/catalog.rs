@@ -28,8 +28,8 @@ use super::namespace_state::NamespaceState;
 use crate::catalog::table_metadata_cache::{TableMetadataCache, load_or_fetch_table_metadata};
 use crate::io::object_cache::ObjectCache;
 use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
-use crate::spec::{TableMetadata, TableMetadataBuilder, ViewMetadata, ViewMetadataBuilder};
-use crate::table::{Table, TableBuilder};
+use crate::spec::{TableMetadataBuilder, ViewMetadata, ViewMetadataBuilder};
+use crate::table::Table;
 use crate::view::{View, ViewCommit};
 use crate::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
@@ -49,7 +49,7 @@ pub struct MemoryCatalogBuilder {
     storage_factory: Option<Arc<dyn StorageFactory>>,
     /// Opt-in session metadata-pointer cache (FK4.1). Default `None` = OFF.
     table_metadata_cache: Option<Arc<TableMetadataCache>>,
-    shared_object_cache_bytes: Option<u64>,
+    pub(crate) shared_object_cache_bytes: Option<u64>,
 }
 
 impl Default for MemoryCatalogBuilder {
@@ -74,12 +74,6 @@ impl MemoryCatalogBuilder {
     /// one session. The cache keeps no global state.
     pub fn with_table_metadata_cache(mut self, cache: Arc<TableMetadataCache>) -> Self {
         self.table_metadata_cache = Some(cache);
-        self
-    }
-
-    /// Share ONE manifest [`ObjectCache`] of `bytes` across every table this catalog loads.
-    pub fn with_shared_object_cache_bytes(mut self, bytes: u64) -> Self {
-        self.shared_object_cache_bytes = Some(bytes);
         self
     }
 }
@@ -149,12 +143,12 @@ pub(crate) struct MemoryCatalogConfig {
 pub struct MemoryCatalog {
     name: String,
     root_namespace_state: Mutex<NamespaceState>,
-    file_io: FileIO,
+    pub(crate) file_io: FileIO,
     warehouse_location: String,
     properties: HashMap<String, String>,
     /// Opt-in metadata-pointer cache (FK4.1). `None` = default OFF.
-    table_metadata_cache: Option<Arc<TableMetadataCache>>,
-    shared_object_cache: Option<Arc<ObjectCache>>,
+    pub(crate) table_metadata_cache: Option<Arc<TableMetadataCache>>,
+    pub(crate) shared_object_cache: Option<Arc<ObjectCache>>,
 }
 
 impl MemoryCatalog {
@@ -174,9 +168,7 @@ impl MemoryCatalog {
         let properties = config.props.clone();
 
         let file_io = FileIOBuilder::new(factory).with_props(config.props).build();
-        let shared_object_cache = shared_object_cache_bytes
-            .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(ObjectCache::new_with_capacity(file_io.clone(), bytes)));
+        let shared_object_cache = Self::shared_cache(&file_io, shared_object_cache_bytes);
 
         Ok(Self {
             name,
@@ -187,14 +179,6 @@ impl MemoryCatalog {
             table_metadata_cache,
             shared_object_cache,
         })
-    }
-
-    fn table_builder(&self) -> TableBuilder {
-        let builder = Table::builder().file_io(self.file_io.clone());
-        match self.shared_object_cache.as_ref() {
-            Some(cache) => builder.object_cache(cache.clone()),
-            None => builder,
-        }
     }
 
     /// Snapshot a table's stored metadata location under a short lock (no FileIO).
@@ -211,17 +195,6 @@ impl MemoryCatalog {
         root_namespace_state
             .get_existing_view_location(view_ident)
             .cloned()
-    }
-
-    /// Publish parsed metadata into the optional session cache (no-op when cache is OFF).
-    fn cache_put(&self, metadata_location: &str, metadata: &TableMetadata) {
-        if let Some(cache) = self.table_metadata_cache.as_ref() {
-            cache.put(
-                metadata_location.to_string(),
-                Arc::new(metadata.clone()),
-                None,
-            );
-        }
     }
 
     /// Load table metadata from FileIO (or the opt-in pointer cache) and assemble a [`Table`].
