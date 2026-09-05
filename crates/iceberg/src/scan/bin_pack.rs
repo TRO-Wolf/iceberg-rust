@@ -736,6 +736,161 @@ mod split_tests {
         assert_tiles(found, 20_000_000);
     }
 
+    const SUBDIVIDE_ROWS: i64 = 32000;
+    const SUBDIVIDE_ROWS_PER_GROUP: usize = 4000;
+
+    fn write_subdivide_fixture(path: &str) {
+        use std::collections::HashMap;
+        use std::fs::File;
+
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+        use parquet::basic::Compression;
+        use parquet::file::properties::WriterProperties;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let props = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_max_row_group_row_count(Some(SUBDIVIDE_ROWS_PER_GROUP))
+            .build();
+        let file = File::create(path).expect("create subdivide fixture");
+        let mut writer =
+            ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).expect("arrow writer");
+        for base in (0..SUBDIVIDE_ROWS).step_by(SUBDIVIDE_ROWS_PER_GROUP) {
+            let group_rows = i64::try_from(SUBDIVIDE_ROWS_PER_GROUP).expect("group fits i64");
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+                Int64Array::from_iter_values(base..base + group_rows),
+            )])
+            .expect("id batch");
+            writer.write(&batch).expect("write row group");
+        }
+        writer.close().expect("close subdivide fixture");
+    }
+
+    async fn read_piece_ids(piece: FileScanTask) -> Vec<i64> {
+        use arrow_array::RecordBatch;
+        use arrow_array::cast::AsArray;
+        use futures::TryStreamExt;
+
+        use crate::arrow::ArrowReaderBuilder;
+        use crate::io::FileIO;
+        use crate::scan::FileScanTaskStream;
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let batches = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(piece)])) as FileScanTaskStream)
+            .expect("stream construction")
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect("piece read");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn subdivided_ranged_pieces_read_every_row_exactly_once() {
+        use std::fs::File;
+
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir
+            .path()
+            .join("subdivide.parquet")
+            .to_string_lossy()
+            .to_string();
+        write_subdivide_fixture(&path);
+        let file_len = std::fs::metadata(&path).expect("stat fixture").len();
+        assert!(
+            file_len > 3 * MIN_SPLIT_TARGET_BYTES,
+            "the fixture must clear three split floors so the parent subdivides into several pieces, got {file_len}"
+        );
+        let footer = SerializedFileReader::new(File::open(&path).expect("open fixture"))
+            .expect("read footer");
+        assert_eq!(
+            footer.metadata().num_row_groups(),
+            8,
+            "the fixture must hold 8 row groups"
+        );
+        for row_group in footer.metadata().row_groups() {
+            assert!(
+                u64::try_from(row_group.compressed_size()).expect("non-negative size")
+                    < MIN_SPLIT_TARGET_BYTES,
+                "one row group must fit inside one split window"
+            );
+        }
+
+        let parent = task(&path, file_len, 4, file_len - 4, vec![1]);
+        let out = expand(vec![CombinedScanTask::new(vec![parent])], 8, &[1], true);
+        let pieces: Vec<FileScanTask> = out
+            .iter()
+            .flat_map(|group| group.tasks().iter().cloned())
+            .collect();
+        let mut found: Vec<(u64, u64)> = pieces
+            .iter()
+            .map(|piece| (piece.start, piece.length))
+            .collect();
+        found.sort_unstable();
+        assert!(
+            found.len() >= 3,
+            "the ranged parent must subdivide into several pieces, got {}",
+            found.len()
+        );
+        let mut cursor = 4u64;
+        for (index, (start, length)) in found.iter().enumerate() {
+            assert_eq!(*start, cursor, "gap or overlap in {found:?}");
+            if index + 1 < found.len() {
+                assert_eq!(
+                    *length, MIN_SPLIT_TARGET_BYTES,
+                    "every piece but the last must be one full split window"
+                );
+            }
+            cursor += length;
+        }
+        assert_eq!(cursor, file_len, "short cover in {found:?}");
+
+        let mut readings: Vec<Vec<i64>> = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            readings.push(read_piece_ids(piece).await);
+        }
+        let mut all: Vec<i64> = readings.iter().flatten().copied().collect();
+        assert_eq!(
+            all.len(),
+            usize::try_from(SUBDIVIDE_ROWS).expect("row count fits usize"),
+            "the union over the pieces must hold every row"
+        );
+        assert_eq!(
+            all.iter().sum::<i64>(),
+            SUBDIVIDE_ROWS * (SUBDIVIDE_ROWS - 1) / 2,
+            "the union sum must match 0..ROWS"
+        );
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            (0..SUBDIVIDE_ROWS).collect::<Vec<i64>>(),
+            "the union must be every id exactly once"
+        );
+        assert!(
+            readings.iter().filter(|ids| !ids.is_empty()).count() >= 2,
+            "rows must spread across several pieces, else the split partitioned nothing"
+        );
+    }
+
     #[test]
     fn split_pieces_inherit_deletes() {
         use crate::scan::FileScanTaskDeleteFile;

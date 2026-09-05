@@ -15,17 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::Int32Array;
+use datafusion::common::stats::Precision;
+use datafusion::execution::TaskContext;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
+use datafusion::physical_plan::ExecutionPlan;
+use futures::TryStreamExt;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
-use iceberg_datafusion::IcebergCatalogProvider;
+use iceberg_datafusion::{IcebergCatalogProvider, IcebergTableScan};
 use tempfile::TempDir;
 
 fn temp_path() -> String {
@@ -115,6 +120,20 @@ async fn scan_partition_count(
     plan.properties().output_partitioning().partition_count()
 }
 
+async fn scan_with_limit(
+    ctx: &SessionContext,
+    table: &str,
+    projection: Option<Vec<usize>>,
+    limit: Option<usize>,
+) -> Arc<dyn ExecutionPlan> {
+    let provider = ctx.table_provider(table).await.expect("table provider");
+    let state = ctx.state();
+    provider
+        .scan(&state, projection.as_ref(), &[], limit)
+        .await
+        .expect("scan")
+}
+
 async fn sorted_ids(ctx: &SessionContext, table: &str) -> Vec<i32> {
     let batches = ctx
         .sql(&format!("SELECT foo1 FROM {table} ORDER BY foo1"))
@@ -159,6 +178,53 @@ async fn small_table_scan_is_single_partition_at_target_one() {
     );
     let expected: Vec<i32> = (1..=24).collect();
     assert_eq!(sorted_ids(&ctx, &table).await, expected);
+}
+
+#[tokio::test]
+async fn limit_cleared_at_n_gt_1_scan_emits_all_rows_with_exact_stats() {
+    let (ctx, table) = ctx_with_files("par_limit", 8, 8).await;
+    let plan = scan_with_limit(&ctx, &table, Some(vec![0, 1]), Some(2)).await;
+    assert_eq!(plan.properties().output_partitioning().partition_count(), 8);
+    let scan = (&*plan as &dyn Any)
+        .downcast_ref::<IcebergTableScan>()
+        .expect("IcebergTableScan");
+    assert_eq!(scan.limit(), None);
+    let stats = plan.partition_statistics(None).expect("statistics");
+    assert!(matches!(stats.num_rows, Precision::Exact(24)));
+    let task_ctx = Arc::new(TaskContext::default());
+    let mut total = 0;
+    for partition in 0..8 {
+        let batches: Vec<_> = plan
+            .execute(partition, task_ctx.clone())
+            .expect("execute")
+            .try_collect()
+            .await
+            .expect("collect");
+        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 3);
+        total += rows;
+    }
+    assert_eq!(total, 24);
+    let batches = ctx
+        .sql(&format!("SELECT foo1 FROM {table} ORDER BY foo1 LIMIT 2"))
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id column")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
 }
 
 #[tokio::test]
