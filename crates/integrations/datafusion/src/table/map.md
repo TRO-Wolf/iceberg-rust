@@ -29,6 +29,7 @@ DataFusion `TableProvider` implementations. Metadata-table `scan` honors `projec
 | File | Role |
 |---|---|
 | `mod.rs` | `IcebergTableProvider` (catalog-backed, writes) |
+| `loaded.rs` | `IcebergTableProvider` loaded-Table paths (`from_planning_load`, planning fast path) |
 | `static_provider.rs` | `IcebergStaticTableProvider` (one snapshot, read-only) |
 | `metadata_table.rs` | `IcebergMetadataTableProvider` — inspect tables as DataFusion tables |
 | `table_provider_factory.rs` | DataFusion factory for `CREATE EXTERNAL TABLE` |
