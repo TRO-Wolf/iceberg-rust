@@ -18,12 +18,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, BooleanArray, RecordBatch, StructArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StructArray, UInt32Array};
+use arrow_ord::partition::partition;
+use arrow_ord::sort::{SortColumn, lexsort_to_indices};
+use arrow_schema::ArrowError;
 use arrow_select::filter::filter_record_batch;
+use arrow_select::take::{take, take_record_batch};
 
 use super::arrow_struct_to_literal;
 use super::partition_value_calculator::PartitionValueCalculator;
-use crate::spec::{Literal, PartitionKey, PartitionSpecRef, SchemaRef, Struct, StructType};
+use crate::spec::{
+    Literal, PartitionKey, PartitionSpecRef, PrimitiveType, SchemaRef, Struct, StructType, Type,
+};
 use crate::{Error, ErrorKind, Result};
 
 /// Column name for the projected partition values struct
@@ -43,6 +49,7 @@ pub struct RecordBatchPartitionSplitter {
     partition_spec: PartitionSpecRef,
     calculator: Option<PartitionValueCalculator>,
     partition_type: StructType,
+    arrow_grouping: bool,
 }
 
 impl RecordBatchPartitionSplitter {
@@ -65,12 +72,14 @@ impl RecordBatchPartitionSplitter {
         calculator: Option<PartitionValueCalculator>,
     ) -> Result<Self> {
         let partition_type = partition_spec.partition_type(&iceberg_schema)?;
+        let arrow_grouping = arrow_order_matches_struct_equality(&partition_type);
 
         Ok(Self {
             schema: iceberg_schema,
             partition_spec,
             calculator,
             partition_type,
+            arrow_grouping,
         })
     }
 
@@ -117,64 +126,146 @@ impl RecordBatchPartitionSplitter {
 
     /// Split the record batch into multiple record batches based on the partition spec.
     pub fn split(&self, batch: &RecordBatch) -> Result<Vec<(PartitionKey, RecordBatch)>> {
-        let partition_structs = if let Some(calculator) = &self.calculator {
-            // Compute partition values from source columns using calculator
-            let partition_array = calculator.calculate(batch)?;
-            let struct_array = arrow_struct_to_literal(&partition_array, &self.partition_type)?;
-
-            struct_array
-                .into_iter()
-                .map(|s| {
-                    if let Some(Literal::Struct(s)) = s {
-                        Ok(s)
-                    } else {
-                        Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Partition value is not a struct literal or is null",
-                        ))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?
+        let partition_array = self.partition_value_array(batch)?;
+        if self.arrow_grouping {
+            self.split_by_arrow_order(batch, &partition_array)
         } else {
-            // Extract partition values from pre-computed partition column
-            let partition_column = batch
-                .column_by_name(PROJECTED_PARTITION_VALUE_COLUMN)
-                .ok_or_else(|| {
-                    Error::new(
+            self.split_row_wise(batch, &partition_array)
+        }
+    }
+
+    fn partition_value_array(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        if let Some(calculator) = &self.calculator {
+            return calculator.calculate(batch);
+        }
+        let partition_column = batch
+            .column_by_name(PROJECTED_PARTITION_VALUE_COLUMN)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in batch"
+                    ),
+                )
+            })?;
+        let partition_struct_array = partition_column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Partition column is not a StructArray",
+                )
+            })?;
+        Ok(Arc::new(partition_struct_array.clone()) as ArrayRef)
+    }
+
+    fn split_by_arrow_order(
+        &self,
+        batch: &RecordBatch,
+        partition_array: &ArrayRef,
+    ) -> Result<Vec<(PartitionKey, RecordBatch)>> {
+        let num_rows = batch.num_rows();
+        if num_rows == 0 {
+            return Ok(Vec::new());
+        }
+        let key_columns = self.partition_key_columns(partition_array)?;
+        let sort_columns = key_columns
+            .iter()
+            .map(|values| SortColumn {
+                values: values.clone(),
+                options: None,
+            })
+            .collect::<Vec<_>>();
+        let sorted_positions = lexsort_to_indices(&sort_columns, None).map_err(arrow_err)?;
+        let sorted_keys = key_columns
+            .iter()
+            .map(|values| take(values.as_ref(), &sorted_positions, None))
+            .collect::<std::result::Result<Vec<_>, ArrowError>>()
+            .map_err(arrow_err)?;
+        let ranges = partition(&sorted_keys).map_err(arrow_err)?.ranges();
+
+        let mut group_of_row = vec![0usize; num_rows];
+        for (group, range) in ranges.iter().enumerate() {
+            for position in range.clone() {
+                group_of_row[sorted_positions.value(position) as usize] = group;
+            }
+        }
+        let mut row_ids = ranges
+            .iter()
+            .map(|range| Vec::with_capacity(range.len()))
+            .collect::<Vec<Vec<u32>>>();
+        for (row, group) in group_of_row.into_iter().enumerate() {
+            row_ids[group].push(row as u32);
+        }
+
+        let representatives = UInt32Array::from(
+            row_ids
+                .iter()
+                .filter_map(|ids| ids.first().copied())
+                .collect::<Vec<u32>>(),
+        );
+        let representative_values =
+            take(partition_array.as_ref(), &representatives, None).map_err(arrow_err)?;
+        let literals = arrow_struct_to_literal(&representative_values, &self.partition_type)?;
+
+        let mut partition_batches = Vec::with_capacity(row_ids.len());
+        for (literal, ids) in literals.into_iter().zip(row_ids) {
+            let Some(Literal::Struct(row)) = literal else {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Partition value is not a struct literal or is null",
+                ));
+            };
+            let partition_key = PartitionKey::new(
+                self.partition_spec.as_ref().clone(),
+                self.schema.clone(),
+                row,
+            )?;
+            let indices = UInt32Array::from(ids);
+            let partition_batch = take_record_batch(batch, &indices).map_err(arrow_err)?;
+            partition_batches.push((partition_key, partition_batch));
+        }
+        Ok(partition_batches)
+    }
+
+    fn partition_key_columns(&self, partition_array: &ArrayRef) -> Result<Vec<ArrayRef>> {
+        let struct_array = partition_array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Partition column is not a StructArray",
+                )
+            })?;
+        if struct_array.null_count() > 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Partition value is not a struct literal or is null",
+            ));
+        }
+        Ok(struct_array.columns().to_vec())
+    }
+
+    fn split_row_wise(
+        &self,
+        batch: &RecordBatch,
+        partition_array: &ArrayRef,
+    ) -> Result<Vec<(PartitionKey, RecordBatch)>> {
+        let partition_structs = arrow_struct_to_literal(partition_array, &self.partition_type)?
+            .into_iter()
+            .map(|s| {
+                if let Some(Literal::Struct(s)) = s {
+                    Ok(s)
+                } else {
+                    Err(Error::new(
                         ErrorKind::DataInvalid,
-                        format!(
-                            "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in batch"
-                        ),
-                    )
-                })?;
-
-            let partition_struct_array = partition_column
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "Partition column is not a StructArray",
-                    )
-                })?;
-
-            let arrow_struct_array = Arc::new(partition_struct_array.clone()) as ArrayRef;
-            let struct_array = arrow_struct_to_literal(&arrow_struct_array, &self.partition_type)?;
-
-            struct_array
-                .into_iter()
-                .map(|s| {
-                    if let Some(Literal::Struct(s)) = s {
-                        Ok(s)
-                    } else {
-                        Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Partition value is not a struct literal or is null",
-                        ))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
+                        "Partition value is not a struct literal or is null",
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Group the batch by row value. Key the group map by a BORROW of each partition struct (and
         // remember the first row at which the group appears) so we clone a `Struct` only ONCE per
@@ -222,13 +313,52 @@ impl RecordBatchPartitionSplitter {
     }
 }
 
+fn arrow_order_matches_struct_equality(partition_type: &StructType) -> bool {
+    !partition_type.fields().is_empty()
+        && partition_type.fields().iter().all(|field| {
+            matches!(
+                field.field_type.as_ref(),
+                Type::Primitive(
+                    PrimitiveType::Boolean
+                        | PrimitiveType::Int
+                        | PrimitiveType::Long
+                        | PrimitiveType::Decimal { .. }
+                        | PrimitiveType::Date
+                        | PrimitiveType::Time
+                        | PrimitiveType::Timestamp
+                        | PrimitiveType::Timestamptz
+                        | PrimitiveType::TimestampNs
+                        | PrimitiveType::TimestamptzNs
+                        | PrimitiveType::String
+                        | PrimitiveType::Uuid
+                        | PrimitiveType::Fixed(_)
+                        | PrimitiveType::Binary
+                )
+            )
+        })
+}
+
+fn arrow_err(error: ArrowError) -> Error {
+    Error::new(
+        ErrorKind::Unexpected,
+        "Failed to group a record batch by its partition values",
+    )
+    .with_source(error)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_array::{
+        BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float64Array, Int32Array,
+        Int64Array, LargeBinaryArray, RecordBatch, StringArray, Time64MicrosecondArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray,
+    };
     use arrow_schema::DataType;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
     use super::*;
     use crate::arrow::schema_to_arrow_schema;
@@ -486,5 +616,295 @@ mod tests {
         let (ids, names) = extract_values(batch);
         assert_eq!(ids, vec![3, 3]);
         assert_eq!(names, vec!["d", "f"]);
+    }
+
+    const BINARY_WORDS: [&[u8]; 5] = [b"", b"a", b"ab", b"abc", b"\xff\x00"];
+
+    fn property_schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "i", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "l", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(3, "s", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(4, "d", Type::Primitive(PrimitiveType::Date)).into(),
+                    NestedField::optional(5, "t", Type::Primitive(PrimitiveType::Timestamp)).into(),
+                    NestedField::optional(6, "b", Type::Primitive(PrimitiveType::Boolean)).into(),
+                    NestedField::optional(
+                        7,
+                        "n",
+                        Type::Primitive(PrimitiveType::Decimal {
+                            precision: 9,
+                            scale: 2,
+                        }),
+                    )
+                    .into(),
+                    NestedField::optional(8, "y", Type::Primitive(PrimitiveType::Binary)).into(),
+                    NestedField::optional(9, "f", Type::Primitive(PrimitiveType::Fixed(4))).into(),
+                    NestedField::optional(10, "u", Type::Primitive(PrimitiveType::Uuid)).into(),
+                    NestedField::optional(11, "z", Type::Primitive(PrimitiveType::Timestamptz))
+                        .into(),
+                    NestedField::optional(12, "m", Type::Primitive(PrimitiveType::Time)).into(),
+                    NestedField::optional(13, "g", Type::Primitive(PrimitiveType::TimestampNs))
+                        .into(),
+                    NestedField::optional(14, "h", Type::Primitive(PrimitiveType::TimestamptzNs))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn random_batch(schema: &Schema, rows: usize, rng: &mut StdRng) -> RecordBatch {
+        let words = ["", "a", "ab", "abc", "abcd", "zzzz"];
+        let ints = Int32Array::from(
+            (0..rows)
+                .map(|_| rng.random_range(-3i32..3))
+                .collect::<Vec<_>>(),
+        );
+        let longs = Int64Array::from(
+            (0..rows)
+                .map(|_| (!rng.random_bool(0.2)).then(|| rng.random_range(-4i64..4)))
+                .collect::<Vec<_>>(),
+        );
+        let strings = StringArray::from(
+            (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.2))
+                        .then(|| words[rng.random_range(0..words.len())].to_string())
+                })
+                .collect::<Vec<_>>(),
+        );
+        let dates = Date32Array::from(
+            (0..rows)
+                .map(|_| (!rng.random_bool(0.2)).then(|| rng.random_range(-800i32..800)))
+                .collect::<Vec<_>>(),
+        );
+        let stamps = TimestampMicrosecondArray::from(
+            (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.2))
+                        .then(|| rng.random_range(-5_000_000_000i64..5_000_000_000))
+                })
+                .collect::<Vec<_>>(),
+        );
+        let bools = BooleanArray::from(
+            (0..rows)
+                .map(|_| (!rng.random_bool(0.2)).then(|| rng.random_bool(0.5)))
+                .collect::<Vec<_>>(),
+        );
+        let decimals = Decimal128Array::from(
+            (0..rows)
+                .map(|_| (!rng.random_bool(0.2)).then(|| rng.random_range(-500i128..500)))
+                .collect::<Vec<_>>(),
+        )
+        .with_precision_and_scale(9, 2)
+        .unwrap();
+        let binaries = LargeBinaryArray::from_opt_vec(
+            (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.2))
+                        .then(|| BINARY_WORDS[rng.random_range(0..BINARY_WORDS.len())])
+                })
+                .collect::<Vec<_>>(),
+        );
+        let fixed = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            (0..rows).map(|_| {
+                (!rng.random_bool(0.2)).then(|| {
+                    let value = rng.random_range(0u32..6).to_be_bytes();
+                    value.to_vec()
+                })
+            }),
+            4,
+        )
+        .unwrap();
+        let uuids = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            (0..rows).map(|_| {
+                (!rng.random_bool(0.2)).then(|| {
+                    let value = u128::from(rng.random_range(0u32..6));
+                    value.to_be_bytes().to_vec()
+                })
+            }),
+            16,
+        )
+        .unwrap();
+        let stamps_tz = TimestampMicrosecondArray::from(
+            (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.2))
+                        .then(|| rng.random_range(-5_000_000_000i64..5_000_000_000))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with_timezone("UTC");
+        let times = Time64MicrosecondArray::from(
+            (0..rows)
+                .map(|_| (!rng.random_bool(0.2)).then(|| rng.random_range(0i64..86_400_000_000)))
+                .collect::<Vec<_>>(),
+        );
+        let nanos = TimestampNanosecondArray::from(
+            (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.2))
+                        .then(|| rng.random_range(-5_000_000_000i64..5_000_000_000))
+                })
+                .collect::<Vec<_>>(),
+        );
+        let nanos_tz = TimestampNanosecondArray::from(
+            (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.2))
+                        .then(|| rng.random_range(-5_000_000_000i64..5_000_000_000))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with_timezone("UTC");
+        RecordBatch::try_new(Arc::new(schema_to_arrow_schema(schema).unwrap()), vec![
+            Arc::new(ints),
+            Arc::new(longs),
+            Arc::new(strings),
+            Arc::new(dates),
+            Arc::new(stamps),
+            Arc::new(bools),
+            Arc::new(decimals),
+            Arc::new(binaries),
+            Arc::new(fixed),
+            Arc::new(uuids),
+            Arc::new(stamps_tz),
+            Arc::new(times),
+            Arc::new(nanos),
+            Arc::new(nanos_tz),
+        ])
+        .unwrap()
+    }
+
+    fn canonical(parts: Vec<(PartitionKey, RecordBatch)>) -> Vec<(String, RecordBatch)> {
+        let mut rows = parts
+            .into_iter()
+            .map(|(key, batch)| (format!("{:?}", key.data()), batch))
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    }
+
+    fn built_spec(schema: &Arc<Schema>, fields: &[(i32, &str, Transform)]) -> PartitionSpecRef {
+        let mut builder = PartitionSpecBuilder::new(schema.clone()).with_spec_id(7);
+        for (source_id, name, transform) in fields {
+            builder = builder
+                .add_unbound_field(UnboundPartitionField {
+                    source_id: *source_id,
+                    field_id: None,
+                    name: (*name).to_string(),
+                    transform: *transform,
+                })
+                .unwrap();
+        }
+        Arc::new(builder.build().unwrap())
+    }
+
+    #[test]
+    fn test_arrow_order_grouping_equals_row_wise_grouping() {
+        let schema = property_schema();
+        let specs: Vec<Vec<(i32, &str, Transform)>> = vec![
+            vec![(1, "i_identity", Transform::Identity)],
+            vec![(2, "l_identity", Transform::Identity)],
+            vec![(3, "s_identity", Transform::Identity)],
+            vec![(3, "s_truncate", Transform::Truncate(3))],
+            vec![(2, "l_truncate", Transform::Truncate(2))],
+            vec![(1, "i_bucket", Transform::Bucket(4))],
+            vec![(3, "s_bucket", Transform::Bucket(8))],
+            vec![(4, "d_identity", Transform::Identity)],
+            vec![(5, "t_identity", Transform::Identity)],
+            vec![(4, "d_year", Transform::Year)],
+            vec![(4, "d_month", Transform::Month)],
+            vec![(4, "d_day", Transform::Day)],
+            vec![(5, "t_hour", Transform::Hour)],
+            vec![(6, "b_identity", Transform::Identity)],
+            vec![(7, "n_identity", Transform::Identity)],
+            vec![(7, "n_bucket", Transform::Bucket(5))],
+            vec![(8, "y_identity", Transform::Identity)],
+            vec![(9, "f_identity", Transform::Identity)],
+            vec![(9, "f_bucket", Transform::Bucket(3))],
+            vec![(10, "u_identity", Transform::Identity)],
+            vec![(10, "u_bucket", Transform::Bucket(4))],
+            vec![(11, "z_identity", Transform::Identity)],
+            vec![(11, "z_hour", Transform::Hour)],
+            vec![(12, "m_identity", Transform::Identity)],
+            vec![(12, "m_bucket", Transform::Bucket(4))],
+            vec![(13, "g_identity", Transform::Identity)],
+            vec![(14, "h_identity", Transform::Identity)],
+            vec![
+                (6, "b_identity", Transform::Identity),
+                (7, "n_identity", Transform::Identity),
+                (9, "f_identity", Transform::Identity),
+            ],
+            vec![
+                (11, "z_day", Transform::Day),
+                (8, "y_identity", Transform::Identity),
+            ],
+            vec![
+                (1, "i_identity", Transform::Identity),
+                (2, "l_void", Transform::Void),
+            ],
+            vec![(3, "s_void", Transform::Void), (4, "d_day", Transform::Day)],
+            vec![
+                (1, "i_identity", Transform::Identity),
+                (3, "s_truncate", Transform::Truncate(2)),
+            ],
+            vec![
+                (2, "l_bucket", Transform::Bucket(3)),
+                (4, "d_month", Transform::Month),
+                (3, "s_identity", Transform::Identity),
+            ],
+        ];
+
+        let mut rng = StdRng::seed_from_u64(0x5150_2026);
+        for fields in &specs {
+            let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+                schema.clone(),
+                built_spec(&schema, fields),
+            )
+            .unwrap();
+            assert!(
+                splitter.arrow_grouping,
+                "{fields:?} should group by arrow order"
+            );
+            for rows in [0usize, 1, 2, 7, 64, 257, 1024] {
+                let batch = random_batch(&schema, rows, &mut rng);
+                let values = splitter.partition_value_array(&batch).unwrap();
+                let expected = canonical(splitter.split_row_wise(&batch, &values).unwrap());
+                let actual = canonical(splitter.split_by_arrow_order(&batch, &values).unwrap());
+                assert_eq!(actual, expected, "{fields:?} at {rows} rows");
+            }
+        }
+    }
+
+    #[test]
+    fn test_float_partition_values_stay_on_the_row_wise_split() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "v", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+            schema.clone(),
+            built_spec(&schema, &[(1, "v_identity", Transform::Identity)]),
+        )
+        .unwrap();
+        assert!(!splitter.arrow_grouping);
+
+        let batch = RecordBatch::try_new(Arc::new(schema_to_arrow_schema(&schema).unwrap()), vec![
+            Arc::new(Float64Array::from(vec![0.0f64, -0.0, 1.0, 0.0])),
+        ])
+        .unwrap();
+        let parts = splitter.split(&batch).unwrap();
+        assert_eq!(parts.len(), 2);
+        let rows: usize = parts.iter().map(|(_, batch)| batch.num_rows()).sum();
+        assert_eq!(rows, 4);
     }
 }
