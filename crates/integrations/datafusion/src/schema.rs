@@ -138,10 +138,14 @@ impl IcebergSchemaProvider {
 
         // The deferred metadata read. A failure here is the loud, by-name error the lazy contract
         // promises — propagate it; do NOT swallow to `Ok(None)`.
-        let provider =
-            IcebergTableProvider::try_new(self.catalog.clone(), self.namespace.clone(), name)
-                .await
-                .map_err(to_datafusion_error)?;
+        let ident = TableIdent::new(self.namespace.clone(), name.to_string());
+        let table = self
+            .catalog
+            .load_table(&ident)
+            .await
+            .map_err(to_datafusion_error)?;
+        let provider = IcebergTableProvider::from_planning_load(self.catalog.clone(), table)
+            .map_err(to_datafusion_error)?;
         Ok(Some(Arc::new(provider)))
     }
 }

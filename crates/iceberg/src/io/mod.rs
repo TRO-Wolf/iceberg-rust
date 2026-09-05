@@ -56,7 +56,8 @@ mod storage;
 pub use file_io::*;
 pub use storage::*;
 
-pub(crate) mod object_cache;
+/// Shareable cache of manifests and manifest lists, keyed by their immutable paths.
+pub mod object_cache;
 
 pub(crate) fn is_truthy(value: &str) -> bool {
     ["true", "t", "1", "on"].contains(&value.to_lowercase().as_str())

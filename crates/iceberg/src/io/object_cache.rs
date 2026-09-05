@@ -98,9 +98,8 @@ impl ObjectCache {
         Self::new_with_capacity(file_io, DEFAULT_CACHE_SIZE_BYTES)
     }
 
-    /// Creates a new [`ObjectCache`]
-    /// with a specific cache size
-    pub(crate) fn new_with_capacity(file_io: FileIO, cache_size_bytes: u64) -> Self {
+    /// Creates a new [`ObjectCache`] with a specific cache size, shareable across tables.
+    pub fn new_with_capacity(file_io: FileIO, cache_size_bytes: u64) -> Self {
         if cache_size_bytes == 0 {
             Self::with_disabled_cache(file_io)
         } else {

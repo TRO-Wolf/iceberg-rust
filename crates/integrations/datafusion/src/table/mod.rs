@@ -22,6 +22,7 @@
 //! - [`IcebergTableProvider`], catalog-backed with metadata refresh. Use it to write.
 //! - [`IcebergStaticTableProvider`], read-only over one snapshot. Use it for time travel.
 
+mod loaded;
 pub mod metadata_table;
 mod static_provider;
 pub mod table_provider_factory;
@@ -65,11 +66,12 @@ use crate::physical_plan::write::IcebergWriteExec;
 /// read-only access to one snapshot, use [`IcebergStaticTableProvider`].
 #[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
-    catalog: Arc<dyn Catalog>,
-    table_ident: TableIdent,
+    pub(crate) catalog: Arc<dyn Catalog>,
+    pub(crate) table_ident: TableIdent,
     /// FIXED for the life of the instance: DataFusion stores ordinals against it.
-    schema: ArrowSchemaRef,
-    commit_branch: Option<String>,
+    pub(crate) schema: ArrowSchemaRef,
+    pub(crate) commit_branch: Option<String>,
+    pub(crate) planning_table: Option<Table>,
 }
 
 impl IcebergTableProvider {
@@ -89,6 +91,7 @@ impl IcebergTableProvider {
             table_ident,
             schema,
             commit_branch: None,
+            planning_table: None,
         })
     }
 
@@ -102,6 +105,7 @@ impl IcebergTableProvider {
             table_ident: self.table_ident.clone(),
             schema: Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?),
             commit_branch: self.commit_branch.clone(),
+            planning_table: None,
         })
     }
 
@@ -109,14 +113,6 @@ impl IcebergTableProvider {
     pub fn with_commit_branch(mut self, branch: impl Into<String>) -> Self {
         self.commit_branch = Some(branch.into());
         self
-    }
-
-    /// Loads the table's current state and Arrow schema. Write paths plan against this, not [`Self::schema`].
-    async fn load_table_with_current_schema(&self) -> Result<(Table, ArrowSchemaRef)> {
-        let table = self.catalog.load_table(&self.table_ident).await?;
-        let schema: ArrowSchemaRef =
-            Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
-        Ok((table, schema))
     }
 
     pub(crate) async fn metadata_table(
@@ -145,11 +141,7 @@ impl TableProvider for IcebergTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(to_datafusion_error)?;
+        let table = self.planning_table_or_load().await?;
         let snapshot_id = crate::physical_plan::snapshot_target::resolve_scan_snapshot_id(
             &table,
             self.commit_branch.as_deref(),

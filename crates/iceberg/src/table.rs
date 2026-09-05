@@ -38,6 +38,7 @@ pub struct TableBuilder {
     readonly: bool,
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
+    object_cache: Option<Arc<ObjectCache>>,
 }
 
 impl TableBuilder {
@@ -50,7 +51,14 @@ impl TableBuilder {
             readonly: false,
             disable_cache: false,
             cache_size_bytes: None,
+            object_cache: None,
         }
+    }
+
+    /// Share one [`ObjectCache`] with every other table built from it; the cache must have been built on the same `FileIO` this builder is given.
+    pub fn object_cache(mut self, object_cache: Arc<ObjectCache>) -> Self {
+        self.object_cache = Some(object_cache);
+        self
     }
 
     /// required - sets the necessary FileIO to use for the table
@@ -107,6 +115,7 @@ impl TableBuilder {
             readonly,
             disable_cache,
             cache_size_bytes,
+            object_cache: shared_object_cache,
         } = self;
 
         let Some(file_io) = file_io else {
@@ -132,6 +141,8 @@ impl TableBuilder {
 
         let object_cache = if disable_cache {
             Arc::new(ObjectCache::with_disabled_cache(file_io.clone()))
+        } else if let Some(shared) = shared_object_cache {
+            shared
         } else if let Some(cache_size_bytes) = cache_size_bytes {
             Arc::new(ObjectCache::new_with_capacity(
                 file_io.clone(),
