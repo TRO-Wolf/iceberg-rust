@@ -351,8 +351,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        TimestampMicrosecondArray,
+        BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float64Array, Int32Array,
+        Int64Array, LargeBinaryArray, RecordBatch, StringArray, Time64MicrosecondArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use arrow_schema::DataType;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -617,6 +618,8 @@ mod tests {
         assert_eq!(names, vec!["d", "f"]);
     }
 
+    const BINARY_WORDS: [&[u8]; 5] = [b"", b"a", b"ab", b"abc", b"\xff\x00"];
+
     fn property_schema() -> Arc<Schema> {
         Arc::new(
             Schema::builder()
@@ -627,6 +630,26 @@ mod tests {
                     NestedField::optional(3, "s", Type::Primitive(PrimitiveType::String)).into(),
                     NestedField::optional(4, "d", Type::Primitive(PrimitiveType::Date)).into(),
                     NestedField::optional(5, "t", Type::Primitive(PrimitiveType::Timestamp)).into(),
+                    NestedField::optional(6, "b", Type::Primitive(PrimitiveType::Boolean)).into(),
+                    NestedField::optional(
+                        7,
+                        "n",
+                        Type::Primitive(PrimitiveType::Decimal {
+                            precision: 9,
+                            scale: 2,
+                        }),
+                    )
+                    .into(),
+                    NestedField::optional(8, "y", Type::Primitive(PrimitiveType::Binary)).into(),
+                    NestedField::optional(9, "f", Type::Primitive(PrimitiveType::Fixed(4))).into(),
+                    NestedField::optional(10, "u", Type::Primitive(PrimitiveType::Uuid)).into(),
+                    NestedField::optional(11, "z", Type::Primitive(PrimitiveType::Timestamptz))
+                        .into(),
+                    NestedField::optional(12, "m", Type::Primitive(PrimitiveType::Time)).into(),
+                    NestedField::optional(13, "g", Type::Primitive(PrimitiveType::TimestampNs))
+                        .into(),
+                    NestedField::optional(14, "h", Type::Primitive(PrimitiveType::TimestamptzNs))
+                        .into(),
                 ])
                 .build()
                 .unwrap(),
@@ -666,12 +689,92 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         );
+        let bools = BooleanArray::from(
+            (0..rows)
+                .map(|_| (!rng.random_bool(0.2)).then(|| rng.random_bool(0.5)))
+                .collect::<Vec<_>>(),
+        );
+        let decimals = Decimal128Array::from(
+            (0..rows)
+                .map(|_| (!rng.random_bool(0.2)).then(|| rng.random_range(-500i128..500)))
+                .collect::<Vec<_>>(),
+        )
+        .with_precision_and_scale(9, 2)
+        .unwrap();
+        let binaries = LargeBinaryArray::from_opt_vec(
+            (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.2))
+                        .then(|| BINARY_WORDS[rng.random_range(0..BINARY_WORDS.len())])
+                })
+                .collect::<Vec<_>>(),
+        );
+        let fixed = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            (0..rows).map(|_| {
+                (!rng.random_bool(0.2)).then(|| {
+                    let value = rng.random_range(0u32..6).to_be_bytes();
+                    value.to_vec()
+                })
+            }),
+            4,
+        )
+        .unwrap();
+        let uuids = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            (0..rows).map(|_| {
+                (!rng.random_bool(0.2)).then(|| {
+                    let value = u128::from(rng.random_range(0u32..6));
+                    value.to_be_bytes().to_vec()
+                })
+            }),
+            16,
+        )
+        .unwrap();
+        let stamps_tz = TimestampMicrosecondArray::from(
+            (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.2))
+                        .then(|| rng.random_range(-5_000_000_000i64..5_000_000_000))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with_timezone("UTC");
+        let times = Time64MicrosecondArray::from(
+            (0..rows)
+                .map(|_| (!rng.random_bool(0.2)).then(|| rng.random_range(0i64..86_400_000_000)))
+                .collect::<Vec<_>>(),
+        );
+        let nanos = TimestampNanosecondArray::from(
+            (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.2))
+                        .then(|| rng.random_range(-5_000_000_000i64..5_000_000_000))
+                })
+                .collect::<Vec<_>>(),
+        );
+        let nanos_tz = TimestampNanosecondArray::from(
+            (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.2))
+                        .then(|| rng.random_range(-5_000_000_000i64..5_000_000_000))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with_timezone("UTC");
         RecordBatch::try_new(Arc::new(schema_to_arrow_schema(schema).unwrap()), vec![
             Arc::new(ints),
             Arc::new(longs),
             Arc::new(strings),
             Arc::new(dates),
             Arc::new(stamps),
+            Arc::new(bools),
+            Arc::new(decimals),
+            Arc::new(binaries),
+            Arc::new(fixed),
+            Arc::new(uuids),
+            Arc::new(stamps_tz),
+            Arc::new(times),
+            Arc::new(nanos),
+            Arc::new(nanos_tz),
         ])
         .unwrap()
     }
@@ -715,6 +818,29 @@ mod tests {
             vec![(4, "d_month", Transform::Month)],
             vec![(4, "d_day", Transform::Day)],
             vec![(5, "t_hour", Transform::Hour)],
+            vec![(6, "b_identity", Transform::Identity)],
+            vec![(7, "n_identity", Transform::Identity)],
+            vec![(7, "n_bucket", Transform::Bucket(5))],
+            vec![(8, "y_identity", Transform::Identity)],
+            vec![(9, "f_identity", Transform::Identity)],
+            vec![(9, "f_bucket", Transform::Bucket(3))],
+            vec![(10, "u_identity", Transform::Identity)],
+            vec![(10, "u_bucket", Transform::Bucket(4))],
+            vec![(11, "z_identity", Transform::Identity)],
+            vec![(11, "z_hour", Transform::Hour)],
+            vec![(12, "m_identity", Transform::Identity)],
+            vec![(12, "m_bucket", Transform::Bucket(4))],
+            vec![(13, "g_identity", Transform::Identity)],
+            vec![(14, "h_identity", Transform::Identity)],
+            vec![
+                (6, "b_identity", Transform::Identity),
+                (7, "n_identity", Transform::Identity),
+                (9, "f_identity", Transform::Identity),
+            ],
+            vec![
+                (11, "z_day", Transform::Day),
+                (8, "y_identity", Transform::Identity),
+            ],
             vec![
                 (1, "i_identity", Transform::Identity),
                 (2, "l_void", Transform::Void),
