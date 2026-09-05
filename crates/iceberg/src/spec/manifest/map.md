@@ -27,7 +27,7 @@ Manifest entries, data-file structs, and the V3 first-row-id reader/writer.
 
 | File | Role |
 |---|---|
-| `entry.rs` | `ManifestEntry`, `assign_first_row_ids` (Java `ManifestReader.idAssigner`) |
+| `entry.rs` | `ManifestEntry`, `assign_first_row_ids` (Java `ManifestReader.idAssigner`), `apply_manifest_list_context` (list-entry inherit + assign per caller) |
 | `data_file.rs` | on-disk data-file fields including `first_row_id` |
 | `writer.rs` | `ManifestWriter` / `ManifestWriterBuilder`. EXISTING/DELETED entries copy `data_file.first_row_id` verbatim. Manifest `first_row_id` stays null for the list writer. |
 | `metadata.rs` | manifest metadata |
@@ -49,3 +49,4 @@ Manifest entries, data-file structs, and the V3 first-row-id reader/writer.
 |---|---|
 | Sequential COW `next-row-id` disagrees with a Spark notebook | layout mismatch (file count / manifest count); numbers compare only at matched layout |
 | EXISTING survivor lost `first_row_id` | filtered rewrite did not copy the entry's `data_file` |
+| Cached manifest lacks inherited ids | by design: `ObjectCache` stores the raw parse as `CachedItem::RawManifest`; `get_manifest` applies the caller's list entry on a per-call clone, never on the cached `Arc` |

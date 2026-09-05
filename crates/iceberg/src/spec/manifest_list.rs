@@ -28,8 +28,8 @@ use serde_derive::{Deserialize, Serialize};
 
 use self::_const_schema::{MANIFEST_LIST_AVRO_SCHEMA_V1, MANIFEST_LIST_AVRO_SCHEMA_V2};
 use self::_serde::{ManifestFileV1, ManifestFileV2};
-use super::manifest::assign_first_row_ids;
-use super::{FormatVersion, Manifest};
+use super::manifest::apply_manifest_list_context;
+use super::{FormatVersion, Manifest, ManifestEntry, ManifestMetadata};
 use crate::error::Result;
 use crate::io::{FileIO, OutputFile};
 use crate::spec::manifest_list::_const_schema::MANIFEST_LIST_AVRO_SCHEMA_V3;
@@ -857,27 +857,23 @@ impl ManifestFile {
         file_io: &FileIO,
         schema_fallback: Option<crate::spec::SchemaRef>,
     ) -> Result<Manifest> {
-        let avro = file_io.new_input(&self.manifest_path)?.read().await?;
+        let (metadata, mut entries) = self
+            .load_manifest_parts_with_schema_fallback(file_io, schema_fallback)
+            .await?;
 
-        let (metadata, mut entries) =
-            Manifest::try_from_avro_bytes_with_schema_fallback(&avro, schema_fallback)?;
-
-        // Let entries inherit values from the manifest list entry.
-        for entry in &mut entries {
-            entry.inherit_data(self);
-        }
-
-        // V3 row lineage: assign `first_row_id` from this manifest's range (Java
-        // `ManifestReader.idAssigner`). The ids are a running total, so entries must arrive in
-        // manifest order. A delete manifest never lends row ids and Java ignores a range on one, so
-        // `None` here matches; erroring would reject a table Java scans fine.
-        let manifest_range = match self.content {
-            ManifestContentType::Deletes => None,
-            ManifestContentType::Data => self.first_row_id,
-        };
-        assign_first_row_ids(&mut entries, manifest_range)?;
+        apply_manifest_list_context(&mut entries, self)?;
 
         Ok(Manifest::new(metadata, entries))
+    }
+
+    pub(crate) async fn load_manifest_parts_with_schema_fallback(
+        &self,
+        file_io: &FileIO,
+        schema_fallback: Option<crate::spec::SchemaRef>,
+    ) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
+        let avro = file_io.new_input(&self.manifest_path)?.read().await?;
+
+        Manifest::try_from_avro_bytes_with_schema_fallback(&avro, schema_fallback)
     }
 }
 
