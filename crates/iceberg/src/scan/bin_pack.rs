@@ -41,6 +41,13 @@
 //! it is unit-testable independent of the scan plumbing.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+use super::task::FileScanTask;
+use super::task_group::CombinedScanTask;
+use crate::Result;
+use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
+use crate::spec::DataFileFormat;
 
 /// One open bin: the items packed into it plus their running weight total. Mirrors Java
 /// `BinPacking$Bin` (`binWeight` + `items`), minus the `targetWeight` field — the target is held
@@ -302,5 +309,480 @@ mod tests {
         let mut all: Vec<u64> = groups.into_iter().flatten().collect();
         all.sort_unstable();
         assert_eq!(all, vec![10, 10, 40, 40, 40, 200]);
+    }
+}
+
+pub(crate) const MIN_SPLIT_TARGET_BYTES: u64 = 65536;
+
+pub(crate) fn expand_groups_for_target(
+    groups: Vec<CombinedScanTask>,
+    target_partitions: usize,
+    lookback: usize,
+    open_file_cost: u64,
+    split_size: u64,
+    project_field_ids: &[i32],
+    apply_residual_filter: bool,
+) -> Result<Vec<CombinedScanTask>> {
+    let target = target_partitions.max(1);
+    if groups.len() >= target
+        || !apply_residual_filter
+        || project_field_ids.is_empty()
+        || project_field_ids
+            .iter()
+            .any(|id| *id == RESERVED_FIELD_ID_POS || *id == RESERVED_FIELD_ID_ROW_ID)
+    {
+        return Ok(groups);
+    }
+    let total: u64 = groups
+        .iter()
+        .flat_map(|group| group.tasks().iter())
+        .map(task_window_bytes)
+        .fold(0u64, u64::saturating_add);
+    if total == 0 {
+        return Ok(groups);
+    }
+    let target_bytes = u64::try_from(target).unwrap_or(u64::MAX);
+    let pack_target = split_size.min(total.div_ceil(target_bytes).max(MIN_SPLIT_TARGET_BYTES));
+    let split_target = pack_target.max(MIN_SPLIT_TARGET_BYTES);
+    let mut pieces: Vec<FileScanTask> = Vec::new();
+    for group in &groups {
+        for task in group.tasks() {
+            pieces.extend(split_task_for_target(task, split_target)?);
+        }
+    }
+    Ok(PackingIterator::new(
+        pieces.into_iter(),
+        pack_target.max(1),
+        lookback.max(1),
+        true,
+        |task: &FileScanTask| task.weight(open_file_cost),
+    )
+    .map(CombinedScanTask::new)
+    .collect())
+}
+
+fn task_window_bytes(task: &FileScanTask) -> u64 {
+    if task.length == 0 {
+        task.file_size_in_bytes
+    } else {
+        task.length
+    }
+}
+
+fn split_task_for_target(task: &FileScanTask, split_target: u64) -> Result<Vec<FileScanTask>> {
+    if task_window_bytes(task) <= split_target {
+        return Ok(vec![task.clone()]);
+    }
+    if task.start == 0 && (task.length == 0 || task.length == task.file_size_in_bytes) {
+        return task.split(split_target);
+    }
+    Ok(subdivide_ranged_task(task, split_target).unwrap_or_else(|| vec![task.clone()]))
+}
+
+fn subdivide_ranged_task(task: &FileScanTask, split_target: u64) -> Option<Vec<FileScanTask>> {
+    if task.data_file_format != DataFileFormat::Parquet
+        || task.length == 0
+        || task
+            .project_field_ids
+            .iter()
+            .any(|id| *id == RESERVED_FIELD_ID_POS || *id == RESERVED_FIELD_ID_ROW_ID)
+    {
+        return None;
+    }
+    let mut pieces = Vec::new();
+    let mut offset = task.start;
+    let mut remaining = task.length;
+    while remaining > 0 {
+        let length = split_target.min(remaining);
+        pieces.push(split_window(task, offset, length));
+        offset = offset.checked_add(length)?;
+        remaining -= length;
+    }
+    Some(pieces)
+}
+
+#[cfg(test)]
+mod split_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::spec::{NestedField, PrimitiveType, Schema, Type};
+
+    const OPEN_FILE_COST: u64 = 4_194_304;
+
+    fn task_schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .expect("schema"),
+        )
+    }
+
+    fn task(
+        path: &str,
+        file_size: u64,
+        start: u64,
+        length: u64,
+        project: Vec<i32>,
+    ) -> FileScanTask {
+        FileScanTask {
+            file_size_in_bytes: file_size,
+            start,
+            length,
+            record_count: Some(1000),
+            data_file_path: Arc::from(path),
+            data_file_format: DataFileFormat::Parquet,
+            schema: task_schema(),
+            project_field_ids: Arc::from(project),
+            predicate: None,
+            deletes: Arc::from(vec![]),
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: true,
+            split_offsets: None,
+            first_row_id: None,
+            file_sequence_number: None,
+        }
+    }
+
+    fn whole_file(path: &str, size: u64) -> FileScanTask {
+        task(path, size, 0, size, vec![1])
+    }
+
+    fn windows(groups: &[CombinedScanTask], path: &str) -> Vec<(u64, u64)> {
+        let mut found: Vec<(u64, u64)> = groups
+            .iter()
+            .flat_map(|group| group.tasks().iter())
+            .filter(|task| task.data_file_path.as_ref() == path)
+            .map(|task| (task.start, task.length))
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
+    fn assert_tiles(mut found: Vec<(u64, u64)>, end: u64) {
+        found.sort_unstable();
+        let mut cursor = 0u64;
+        for (start, length) in &found {
+            assert_eq!(*start, cursor, "gap or overlap in {found:?}");
+            cursor += length;
+        }
+        assert_eq!(cursor, end, "short cover in {found:?}");
+    }
+
+    fn expand(
+        groups: Vec<CombinedScanTask>,
+        target: usize,
+        fields: &[i32],
+        residual: bool,
+    ) -> Vec<CombinedScanTask> {
+        expand_groups_for_target(
+            groups,
+            target,
+            10,
+            OPEN_FILE_COST,
+            134_217_728,
+            fields,
+            residual,
+        )
+        .expect("expand")
+    }
+
+    #[test]
+    fn expand_leaves_enough_groups_untouched() {
+        let groups: Vec<CombinedScanTask> = (0..8)
+            .map(|index| {
+                CombinedScanTask::new(vec![whole_file(&format!("{index}.parquet"), 5_000_000)])
+            })
+            .collect();
+        let out = expand(groups, 8, &[1], true);
+        assert_eq!(out.len(), 8);
+        assert_eq!(windows(&out, "0.parquet"), vec![(0, 5_000_000)]);
+    }
+
+    #[test]
+    fn expand_splits_small_whole_files_to_target() {
+        let groups = vec![CombinedScanTask::new(vec![
+            whole_file("a.parquet", 5_000_000),
+            whole_file("b.parquet", 5_000_000),
+            whole_file("c.parquet", 5_000_000),
+            whole_file("d.parquet", 5_000_000),
+        ])];
+        let out = expand(groups, 8, &[1], true);
+        assert_eq!(out.len(), 8);
+        for path in ["a.parquet", "b.parquet", "c.parquet", "d.parquet"] {
+            let found = windows(&out, path);
+            assert_eq!(found.len(), 2);
+            assert_tiles(found, 5_000_000);
+        }
+        for group in &out {
+            for piece in group.tasks() {
+                assert_eq!(piece.record_count, None);
+                assert_eq!(piece.split_offsets, None);
+            }
+        }
+        let total: u64 = out
+            .iter()
+            .flat_map(|group| group.tasks().iter())
+            .map(task_window_bytes)
+            .sum();
+        assert_eq!(total, 20_000_000);
+    }
+
+    #[test]
+    fn expand_takes_offsets_branch_for_offset_files() {
+        let mut file = whole_file("a.parquet", 6_000_000);
+        file.split_offsets = Some(vec![0, 2_000_000, 4_000_000]);
+        let groups = vec![CombinedScanTask::new(vec![file])];
+        let out = expand(groups, 8, &[1], true);
+        assert_eq!(out.len(), 3);
+        assert_eq!(windows(&out, "a.parquet"), vec![
+            (0, 2_000_000),
+            (2_000_000, 2_000_000),
+            (4_000_000, 2_000_000)
+        ]);
+    }
+
+    #[test]
+    fn expand_subdivides_ranged_tasks() {
+        let groups = vec![CombinedScanTask::new(vec![task(
+            "a.parquet",
+            200_000_000,
+            128_000_000,
+            72_000_000,
+            vec![1],
+        )])];
+        let out = expand(groups, 8, &[1], true);
+        let found = windows(&out, "a.parquet");
+        assert_eq!(found.len(), 8);
+        let mut cursor = 128_000_000u64;
+        for (start, length) in &found {
+            assert_eq!(*start, cursor);
+            cursor += length;
+        }
+        assert_eq!(cursor, 200_000_000);
+    }
+
+    #[test]
+    fn expand_repacks_without_subdividing_within_target_tasks() {
+        let groups = vec![CombinedScanTask::new(vec![
+            task("a.parquet", 1_000_000, 0, 1_000_000, vec![1]),
+            task("b.parquet", 1_000_000, 0, 1_000_000, vec![1]),
+        ])];
+        let out = expand(groups, 2, &[1], true);
+        assert_eq!(out.len(), 2);
+        assert_eq!(windows(&out, "a.parquet"), vec![(0, 1_000_000)]);
+        assert_eq!(windows(&out, "b.parquet"), vec![(0, 1_000_000)]);
+    }
+
+    #[test]
+    fn expand_skips_empty_projection() {
+        let groups = vec![CombinedScanTask::new(vec![whole_file(
+            "a.parquet",
+            5_000_000,
+        )])];
+        let out = expand(groups, 8, &[], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(windows(&out, "a.parquet"), vec![(0, 5_000_000)]);
+    }
+
+    #[test]
+    fn expand_skips_pos_projection() {
+        let groups = vec![CombinedScanTask::new(vec![whole_file(
+            "a.parquet",
+            5_000_000,
+        )])];
+        let out = expand(groups, 8, &[RESERVED_FIELD_ID_POS], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(windows(&out, "a.parquet"), vec![(0, 5_000_000)]);
+    }
+
+    #[test]
+    fn expand_skips_row_id_projection() {
+        let groups = vec![CombinedScanTask::new(vec![whole_file(
+            "a.parquet",
+            5_000_000,
+        )])];
+        let out = expand(groups, 8, &[RESERVED_FIELD_ID_ROW_ID], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(windows(&out, "a.parquet"), vec![(0, 5_000_000)]);
+    }
+
+    #[test]
+    fn expand_skips_file_prune_only() {
+        let groups = vec![CombinedScanTask::new(vec![whole_file(
+            "a.parquet",
+            5_000_000,
+        )])];
+        let out = expand(groups, 8, &[1], false);
+        assert_eq!(out.len(), 1);
+        assert_eq!(windows(&out, "a.parquet"), vec![(0, 5_000_000)]);
+    }
+
+    #[test]
+    fn expand_skips_tiny_tables() {
+        let groups = vec![CombinedScanTask::new(vec![whole_file("a.parquet", 4096)])];
+        let out = expand(groups, 8, &[1], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(windows(&out, "a.parquet"), vec![(0, 4096)]);
+    }
+
+    #[test]
+    fn expand_declines_avro_tasks() {
+        let mut file = whole_file("a.avro", 5_000_000);
+        file.data_file_format = DataFileFormat::Avro;
+        let groups = vec![CombinedScanTask::new(vec![file])];
+        let out = expand(groups, 8, &[1], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(windows(&out, "a.avro"), vec![(0, 5_000_000)]);
+    }
+
+    #[test]
+    fn expand_zero_target_means_one_partition() {
+        let groups = vec![CombinedScanTask::new(vec![whole_file(
+            "a.parquet",
+            5_000_000,
+        )])];
+        let out = expand(groups, 0, &[1], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(windows(&out, "a.parquet"), vec![(0, 5_000_000)]);
+    }
+
+    #[test]
+    fn expand_zero_total_bytes_is_noop() {
+        let groups = vec![CombinedScanTask::new(vec![task(
+            "a.parquet",
+            0,
+            0,
+            0,
+            vec![1],
+        )])];
+        let out = expand(groups, 8, &[1], true);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn subdivide_overflow_stays_whole() {
+        let groups = vec![CombinedScanTask::new(vec![task(
+            "a.parquet",
+            u64::MAX,
+            u64::MAX - 70_000,
+            100_000,
+            vec![1],
+        )])];
+        let out = expand(groups, 8, &[1], true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(windows(&out, "a.parquet"), vec![(
+            u64::MAX - 70_000,
+            100_000
+        )]);
+    }
+
+    #[test]
+    fn expand_zero_lookback_is_clamped() {
+        let groups = vec![CombinedScanTask::new(vec![whole_file(
+            "a.parquet",
+            5_000_000,
+        )])];
+        let out = expand_groups_for_target(groups, 2, 0, OPEN_FILE_COST, 134_217_728, &[1], true)
+            .expect("ok");
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn expand_honors_tiny_configured_split_size() {
+        let groups = vec![CombinedScanTask::new(vec![
+            task("a.parquet", 3000, 4, 2996, vec![1]),
+            task("b.parquet", 3000, 4, 2996, vec![1]),
+            task("c.parquet", 3000, 4, 2996, vec![1]),
+        ])];
+        let out = expand_groups_for_target(groups, 4, 100, 1, 1, &[1], true).expect("ok");
+        assert_eq!(out.len(), 3);
+        assert_eq!(windows(&out, "a.parquet"), vec![(4, 2996)]);
+    }
+
+    #[test]
+    fn expand_never_emits_windows_below_floor() {
+        let groups = vec![CombinedScanTask::new(vec![task(
+            "a.parquet",
+            200_000,
+            0,
+            200_000,
+            vec![1],
+        )])];
+        let out =
+            expand_groups_for_target(groups, 8, 10, OPEN_FILE_COST, 1, &[1], true).expect("ok");
+        let found = windows(&out, "a.parquet");
+        assert_eq!(found.len(), 4);
+        assert_tiles(found, 200_000);
+    }
+
+    #[test]
+    fn expand_explicit_small_split_size_wins_over_derived() {
+        let groups = vec![CombinedScanTask::new(vec![whole_file(
+            "a.parquet",
+            20_000_000,
+        )])];
+        let out = expand_groups_for_target(groups, 8, 10, OPEN_FILE_COST, 1_000_000, &[1], true)
+            .expect("ok");
+        let found = windows(&out, "a.parquet");
+        assert_eq!(found.len(), 20);
+        assert_tiles(found, 20_000_000);
+    }
+
+    #[test]
+    fn split_pieces_inherit_deletes() {
+        use crate::scan::FileScanTaskDeleteFile;
+        use crate::spec::DataContentType;
+        let mut file = whole_file("a.parquet", 5_000_000);
+        file.deletes = Arc::from(vec![FileScanTaskDeleteFile {
+            file_path: "d.parquet".to_string(),
+            file_size_in_bytes: 100,
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        }]);
+        let groups = vec![CombinedScanTask::new(vec![file])];
+        let out = expand(groups, 2, &[1], true);
+        assert_eq!(out.len(), 2);
+        for group in &out {
+            for piece in group.tasks() {
+                assert_eq!(piece.deletes.len(), 1);
+                assert_eq!(piece.record_count, None);
+            }
+        }
+    }
+}
+
+fn split_window(task: &FileScanTask, start: u64, length: u64) -> FileScanTask {
+    FileScanTask {
+        file_size_in_bytes: task.file_size_in_bytes,
+        start,
+        length,
+        record_count: None,
+        data_file_path: Arc::clone(&task.data_file_path),
+        data_file_format: task.data_file_format,
+        schema: Arc::clone(&task.schema),
+        project_field_ids: Arc::clone(&task.project_field_ids),
+        predicate: task.predicate.as_ref().map(Arc::clone),
+        deletes: Arc::clone(&task.deletes),
+        partition: task.partition.clone(),
+        partition_spec: task.partition_spec.as_ref().map(Arc::clone),
+        name_mapping: task.name_mapping.as_ref().map(Arc::clone),
+        case_sensitive: task.case_sensitive,
+        split_offsets: None,
+        first_row_id: task.first_row_id,
+        file_sequence_number: task.file_sequence_number,
     }
 }
