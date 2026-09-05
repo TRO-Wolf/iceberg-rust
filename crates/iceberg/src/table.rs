@@ -55,7 +55,7 @@ impl TableBuilder {
         }
     }
 
-    /// Share one [`ObjectCache`] with every other table built from it.
+    /// Share one [`ObjectCache`] with every other table built from it; the cache must have been built on the same `FileIO` this builder is given.
     pub fn object_cache(mut self, object_cache: Arc<ObjectCache>) -> Self {
         self.object_cache = Some(object_cache);
         self
