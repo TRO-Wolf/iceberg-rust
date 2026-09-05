@@ -24,8 +24,9 @@ use typed_builder::TypedBuilder;
 use crate::avro::schema_to_avro_schema;
 use crate::error::Result;
 use crate::spec::{
-    DataContentType, DataFile, INITIAL_SEQUENCE_NUMBER, ListType, Literal, ManifestFile, MapType,
-    NestedField, NestedFieldRef, PrimitiveLiteral, PrimitiveType, Schema, StructType, Type,
+    DataContentType, DataFile, INITIAL_SEQUENCE_NUMBER, ListType, Literal, ManifestContentType,
+    ManifestFile, MapType, NestedField, NestedFieldRef, PrimitiveLiteral, PrimitiveType, Schema,
+    StructType, Type,
 };
 use crate::{Error, ErrorKind};
 
@@ -185,6 +186,26 @@ pub(crate) fn assign_first_row_ids(
             .ok_or_else(|| overflow_error(manifest_first_row_id, entry, "overflowed u64"))?;
     }
     Ok(())
+}
+
+pub(crate) fn apply_manifest_list_context(
+    entries: &mut [ManifestEntry],
+    manifest_file: &ManifestFile,
+) -> Result<()> {
+    // Let entries inherit values from the manifest list entry.
+    for entry in entries.iter_mut() {
+        entry.inherit_data(manifest_file);
+    }
+
+    // V3 row lineage: assign `first_row_id` from this manifest's range (Java
+    // `ManifestReader.idAssigner`). The ids are a running total, so entries must arrive in
+    // manifest order. A delete manifest never lends row ids and Java ignores a range on one, so
+    // `None` here matches; erroring would reject a table Java scans fine.
+    let manifest_range = match manifest_file.content {
+        ManifestContentType::Deletes => None,
+        ManifestContentType::Data => manifest_file.first_row_id,
+    };
+    assign_first_row_ids(entries, manifest_range)
 }
 
 /// Used to track additions and deletions in ManifestEntry.

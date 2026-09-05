@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use crate::io::FileIO;
 use crate::spec::{
-    FormatVersion, Manifest, ManifestFile, ManifestList, SchemaId, SchemaRef, SnapshotRef,
-    TableMetadataRef,
+    FormatVersion, Manifest, ManifestEntry, ManifestFile, ManifestList, SchemaId, SchemaRef,
+    SnapshotRef, TableMetadataRef, apply_manifest_list_context,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -162,13 +162,27 @@ impl ObjectCache {
             })?
             .into_value();
 
-        match cache_entry {
-            CachedItem::Manifest(arc_manifest) => Ok(arc_manifest),
-            _ => Err(Error::new(
-                ErrorKind::Unexpected,
-                format!("cached object for key '{key:?}' is not a Manifest"),
-            )),
-        }
+        let raw_manifest = match cache_entry {
+            CachedItem::Manifest(arc_manifest) => arc_manifest,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("cached object for key '{key:?}' is not a Manifest"),
+                ));
+            }
+        };
+
+        let mut entries: Vec<ManifestEntry> = raw_manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.as_ref().clone())
+            .collect();
+        apply_manifest_list_context(&mut entries, manifest_file)?;
+
+        Ok(Arc::new(Manifest::new(
+            raw_manifest.metadata().clone(),
+            entries,
+        )))
     }
 
     /// Retrieves an Arc [`ManifestList`] from the cache
@@ -223,11 +237,13 @@ impl ObjectCache {
         manifest_file: &ManifestFile,
         schema_fallback: Option<SchemaRef>,
     ) -> Result<CachedItem> {
-        let manifest = manifest_file
-            .load_manifest_with_schema_fallback(&self.file_io, schema_fallback)
+        let (metadata, entries) = manifest_file
+            .load_manifest_parts_with_schema_fallback(&self.file_io, schema_fallback)
             .await?;
 
-        Ok(CachedItem::Manifest(Arc::new(manifest)))
+        Ok(CachedItem::Manifest(Arc::new(Manifest::new(
+            metadata, entries,
+        ))))
     }
 
     async fn fetch_and_parse_manifest_list(
@@ -372,6 +388,52 @@ mod tests {
                 .add_manifests(vec![data_file_manifest].into_iter())
                 .unwrap();
             manifest_list_write.close().await.unwrap();
+        }
+
+        async fn write_two_entry_manifest(&self) -> ManifestFile {
+            let current_snapshot = self
+                .table
+                .metadata()
+                .current_snapshot()
+                .expect("fixture must have a current snapshot");
+            let current_schema = current_snapshot
+                .schema(self.table.metadata())
+                .expect("fixture snapshot must resolve its schema");
+            let current_partition_spec = self.table.metadata().default_partition_spec();
+
+            let mut writer = ManifestWriterBuilder::new(
+                self.next_manifest_file(),
+                None,
+                None,
+                current_schema.clone(),
+                current_partition_spec.as_ref().clone(),
+            )
+            .build_v2_data();
+            for (name, record_count) in [("10.parquet", 3u64), ("11.parquet", 5u64)] {
+                writer
+                    .add_entry(
+                        ManifestEntry::builder()
+                            .status(ManifestStatus::Added)
+                            .data_file(
+                                DataFileBuilder::default()
+                                    .partition_spec_id(0)
+                                    .content(DataContentType::Data)
+                                    .file_path(format!("{}/{name}", &self.table_location))
+                                    .file_format(DataFileFormat::Parquet)
+                                    .file_size_in_bytes(100)
+                                    .record_count(record_count)
+                                    .partition(Struct::from_iter([Some(Literal::long(100))]))
+                                    .build()
+                                    .expect("data file must build"),
+                            )
+                            .build(),
+                    )
+                    .expect("entry must append");
+            }
+            writer
+                .write_manifest_file()
+                .await
+                .expect("manifest must write")
         }
     }
 
@@ -603,5 +665,113 @@ mod tests {
                 .unwrap(),
             "1.parquet"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_manifest_rangeless_then_ranged_serves_each_callers_context() {
+        let fixture = TableTestFixture::new();
+        let base = fixture.write_two_entry_manifest().await;
+
+        let v2_entry = ManifestFile {
+            sequence_number: 11,
+            added_snapshot_id: 1001,
+            first_row_id: None,
+            ..base.clone()
+        };
+        let v3_entry = ManifestFile {
+            sequence_number: 22,
+            added_snapshot_id: 2002,
+            first_row_id: Some(100),
+            ..base
+        };
+
+        let object_cache = ObjectCache::new(fixture.table.file_io().clone());
+
+        let first = object_cache
+            .get_manifest(&v2_entry, None)
+            .await
+            .expect("rangeless read must load");
+        assert_eq!(first.entries().len(), 2);
+        for entry in first.entries() {
+            assert_eq!(entry.data_file().first_row_id(), None);
+            assert_eq!(entry.snapshot_id(), Some(1001));
+            assert_eq!(entry.sequence_number(), Some(11));
+            assert_eq!(entry.file_sequence_number, Some(11));
+        }
+
+        let second = object_cache
+            .get_manifest(&v3_entry, None)
+            .await
+            .expect("ranged read must load");
+        assert_eq!(second.entries().len(), 2);
+        let ids: Vec<Option<i64>> = second
+            .entries()
+            .iter()
+            .map(|entry| entry.data_file().first_row_id())
+            .collect();
+        assert_eq!(ids, vec![Some(100), Some(103)]);
+        for entry in second.entries() {
+            assert_eq!(entry.snapshot_id(), Some(2002));
+            assert_eq!(entry.sequence_number(), Some(22));
+            assert_eq!(entry.file_sequence_number, Some(22));
+        }
+
+        let third = object_cache
+            .get_manifest(&v2_entry, None)
+            .await
+            .expect("second rangeless read must load");
+        for entry in third.entries() {
+            assert_eq!(entry.data_file().first_row_id(), None);
+            assert_eq!(entry.snapshot_id(), Some(1001));
+            assert_eq!(entry.sequence_number(), Some(11));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_manifest_ranged_then_rangeless_serves_each_callers_context() {
+        let fixture = TableTestFixture::new();
+        let base = fixture.write_two_entry_manifest().await;
+
+        let v3_entry = ManifestFile {
+            sequence_number: 22,
+            added_snapshot_id: 2002,
+            first_row_id: Some(100),
+            ..base.clone()
+        };
+        let v2_entry = ManifestFile {
+            sequence_number: 11,
+            added_snapshot_id: 1001,
+            first_row_id: None,
+            ..base
+        };
+
+        let object_cache = ObjectCache::new(fixture.table.file_io().clone());
+
+        let first = object_cache
+            .get_manifest(&v3_entry, None)
+            .await
+            .expect("ranged read must load");
+        let ids: Vec<Option<i64>> = first
+            .entries()
+            .iter()
+            .map(|entry| entry.data_file().first_row_id())
+            .collect();
+        assert_eq!(ids, vec![Some(100), Some(103)]);
+        for entry in first.entries() {
+            assert_eq!(entry.snapshot_id(), Some(2002));
+            assert_eq!(entry.sequence_number(), Some(22));
+        }
+
+        let second = object_cache
+            .get_manifest(&v2_entry, None)
+            .await
+            .expect("rangeless read must load");
+        assert_eq!(second.entries().len(), 2);
+        for entry in second.entries() {
+            assert_eq!(entry.data_file().first_row_id(), None);
+            assert_eq!(entry.snapshot_id(), Some(1001));
+            assert_eq!(entry.sequence_number(), Some(11));
+            assert_eq!(entry.file_sequence_number, Some(11));
+        }
     }
 }

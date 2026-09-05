@@ -27,7 +27,7 @@ Manifest entries, data-file structs, and the V3 first-row-id reader/writer.
 
 | File | Role |
 |---|---|
-| `entry.rs` | `ManifestEntry`, `assign_first_row_ids` (Java `ManifestReader.idAssigner`) |
+| `entry.rs` | `ManifestEntry`, `assign_first_row_ids` (Java `ManifestReader.idAssigner`), `apply_manifest_list_context` (list-entry inherit + assign per caller) |
 | `data_file.rs` | on-disk data-file fields including `first_row_id` |
 | `writer.rs` | `ManifestWriter` / `ManifestWriterBuilder`. EXISTING/DELETED entries copy `data_file.first_row_id` verbatim. Manifest `first_row_id` stays null for the list writer. |
 | `metadata.rs` | manifest metadata |
