@@ -25,6 +25,7 @@ pub(crate) mod project;
 pub(crate) mod repartition;
 pub(crate) mod row_lineage;
 pub(crate) mod scan;
+pub(crate) mod scan_knobs;
 pub(crate) mod snapshot_target;
 pub(crate) mod sort;
 pub(crate) mod update;

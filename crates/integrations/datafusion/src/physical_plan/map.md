@@ -28,7 +28,8 @@ exec (row R169).
 
 | File | Role |
 |---|---|
-| `scan.rs` | `IcebergTableScan` (data files; projection by field id) |
+| `scan.rs` | `IcebergTableScan` (data files; projection by field id; exact whole-table `partition_statistics` from `total-records` + delete-free planned tasks, so DataFusion folds `count(*)` without a scan) |
+| `scan_knobs.rs` | F-27 size-gate split: the session scan knobs (`IcebergScanOptions`, `ScanKnobs`, `scan_knobs_from_context`, `clamp_scan_knob`, `ensure_iceberg_scan_options`), re-exported through `scan.rs` so every existing path is unchanged |
 | `metadata_scan.rs` | `IcebergMetadataScan` — projects inspect batches |
 | `project.rs` | partition-value projection |
 | `commit.rs` / `write.rs` | INSERT commit |
