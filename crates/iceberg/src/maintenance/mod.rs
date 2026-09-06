@@ -142,6 +142,8 @@ mod remove_dangling_delete_files;
 mod rewrite_data_files;
 mod rewrite_data_files_dv;
 #[cfg(test)]
+mod rewrite_data_files_evolved_schema_tests;
+#[cfg(test)]
 mod rewrite_data_files_evolved_spec_tests;
 #[cfg(test)]
 mod rewrite_data_files_lineage_tests;

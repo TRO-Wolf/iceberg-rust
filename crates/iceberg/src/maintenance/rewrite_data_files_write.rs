@@ -80,11 +80,20 @@ pub(crate) async fn write_compacted_files(
         DataFileWriterBuilder::new(rolling_builder).with_partition_spec(spec.clone());
 
     let carry_lineage = format_supports_row_lineage(table.metadata().format_version());
+    let current_schema = table.metadata().current_schema().clone();
+    let current_field_ids: Vec<i32> = current_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.id)
+        .collect();
     let tasks: Vec<Result<FileScanTask>> = group
         .iter()
         .cloned()
         .map(|mut task| {
             task.predicate = None;
+            task.schema = Arc::clone(&current_schema);
+            task.project_field_ids = Arc::from(current_field_ids.as_slice());
             if carry_lineage {
                 project_row_lineage(&mut task);
             }

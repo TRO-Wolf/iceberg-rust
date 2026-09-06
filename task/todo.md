@@ -25,6 +25,22 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-06): F-RDF-EVO-1 rewrite_data_files after schema evolution (row R135)
+
+Owner defect: after `ADD COLUMN` + `ADD PARTITION FIELD` with no later write, rewrite fails with
+`batch_columns: 7, expected_columns: 8` from `partition_value_calculator.rs`. Mechanism: scan tasks
+plan under the snapshot-pinned old schema while the calculator/writer build on the current schema.
+Fix: the compaction read path re-points each task at the current schema with the full current
+projection, so the Arrow reader evolves every file's batches (NULL-fill/omit/rename/promote) before
+the splitter and writer see them. No GAP_MATRIX status change; no interop runner (no flip).
+
+- [x] C-001 red: 9 tests — 6 RED on partitioned legs (add+spec width 3v4, add-only, drop width 3v2, rename z-vs-zz, promote Int32-vs-Int64, v3-DV width 5v6); 3 unpartitioned legs green pre-fix as controls
+- [x] C-002 fix: re-point compaction read tasks at the current schema in `rewrite_data_files_write.rs`
+- [x] C-003 green + mutation: 9 green; M1 6/9 red, M2 6/9, M3 5/9; rename-unpartitioned pure control
+- [x] C-005 commit leg (Spark-oracle-driven): promoting a partition source then rewriting fails in `construct_partition_summaries` (`value is not compatible with type`); Spark 4.1.2 succeeds 6→1 and writes LONG-typed manifests, so the fork coerces old tuples via `PrimitiveLiteral::promote_to` (int→long, float→double; `writer.rs` line-neutral at 1056/1058). Test `promote_partition_source_int_to_long_rewrites_old_files` + `promote_to` unit test. M4 1/10 red (commit revert), M5 7/10 red (read revert).
+- [x] C-004 gates + map.md lockstep + commit: resume session re-ran red (7 red / 3 controls green on stashed fix) and green (10/10) itself; made the `writer.rs` leg line-neutral (promotion folds into the existing `let-else`, ceiling holds at 1058); `make check`, clippy `-D warnings`, maintenance battery 332/332, `typos` all green
+- [ ] RePark lane: reproduce + Spark oracle + pins + registry + ledger (see brief step 1/3)
+
 ## ACTIVE (2026-09-04): F-26 in-tree MoR v3 DELETE/UPDATE hands known_partitions to the DV close (row R114)
 
 Ledger: [`f26-known-partitions-in-tree-ledger.md`](f26-known-partitions-in-tree-ledger.md). Row R114.
