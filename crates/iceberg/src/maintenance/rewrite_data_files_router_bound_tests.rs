@@ -172,7 +172,11 @@ async fn write_file_scoped_position_delete(
         .expect("one pos-delete file")
 }
 
-async fn write_dv(table: &Table, part_value: i64, deletes: &[(&str, &[u64])]) -> Vec<DataFile> {
+pub(crate) async fn write_dv(
+    table: &Table,
+    part_value: i64,
+    deletes: &[(&str, &[u64])],
+) -> Vec<DataFile> {
     let dv_path = format!(
         "{}/data/dv-{}.puffin",
         table.metadata().location(),

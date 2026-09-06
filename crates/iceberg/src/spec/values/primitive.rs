@@ -19,6 +19,8 @@
 
 use ordered_float::OrderedFloat;
 
+use crate::spec::PrimitiveType;
+
 /// Values present in iceberg type
 #[derive(Clone, Debug, PartialOrd, PartialEq, Hash, Eq)]
 pub enum PrimitiveLiteral {
@@ -55,5 +57,46 @@ impl PrimitiveLiteral {
             PrimitiveLiteral::Float(val) => val.is_nan(),
             _ => false,
         }
+    }
+
+    pub(crate) fn promote_to(&self, target: &PrimitiveType) -> Self {
+        match self {
+            PrimitiveLiteral::Int(v) if matches!(target, PrimitiveType::Long) => {
+                PrimitiveLiteral::Long(i64::from(*v))
+            }
+            PrimitiveLiteral::Float(v) if matches!(target, PrimitiveType::Double) => {
+                PrimitiveLiteral::Double(OrderedFloat(f64::from(v.0)))
+            }
+            value => value.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promote_to_widens_legal_pairs_and_keeps_the_rest() {
+        assert_eq!(
+            PrimitiveLiteral::Int(7).promote_to(&PrimitiveType::Long),
+            PrimitiveLiteral::Long(7)
+        );
+        assert_eq!(
+            PrimitiveLiteral::Float(OrderedFloat(1.5)).promote_to(&PrimitiveType::Double),
+            PrimitiveLiteral::Double(OrderedFloat(1.5))
+        );
+        assert_eq!(
+            PrimitiveLiteral::Long(7).promote_to(&PrimitiveType::Long),
+            PrimitiveLiteral::Long(7)
+        );
+        assert_eq!(
+            PrimitiveLiteral::Int(7).promote_to(&PrimitiveType::Int),
+            PrimitiveLiteral::Int(7)
+        );
+        assert_eq!(
+            PrimitiveLiteral::Int(7).promote_to(&PrimitiveType::String),
+            PrimitiveLiteral::Int(7)
+        );
     }
 }

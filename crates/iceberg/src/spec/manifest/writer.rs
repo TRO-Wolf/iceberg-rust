@@ -525,7 +525,7 @@ impl PartitionFieldStats {
     }
 
     pub(crate) fn update(&mut self, value: Option<PrimitiveLiteral>) -> Result<()> {
-        let Some(value) = value else {
+        let Some(value) = value.map(|literal| literal.promote_to(&self.partition_type)) else {
             self.contains_null = true;
             return Ok(());
         };

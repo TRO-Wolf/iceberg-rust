@@ -34,6 +34,7 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | `rewrite_data_files_write.rs` | Read a planned group with merge-on-read applied and write compacted data files under the current spec. |
 | `rewrite_data_files_router.rs` | Bounded LRU partition router for rewrite output. Default 64 open writers. Private to maintenance. |
 | `rewrite_data_files_evolved_spec_tests.rs` | Spec-evolution output routing pins: source-field, transform, unpartitioned, mixed specs. |
+| `rewrite_data_files_evolved_schema_tests.rs` | Schema-evolution compaction pins: add(+spec), add-only, drop, rename, promote, v3-DV, unpartitioned controls. |
 | `rewrite_data_files_router_bound_tests.rs` | Writer bound, eviction, V3 lineage, and evolved-spec delete-class pins. |
 | `rewrite_data_files_ratio_tests.rs` | Execute-path pins for `delete_ratio_threshold` and file-scoped delete removal. |
 | `rewrite_data_files_mw7_tests.rs` | The MW-7 pair (unpartitioned v2, one in-band data file, one PARTITION-scoped position delete covering every row): reclaimed when the delete carries EQUAL exact `file_path` bounds, a no-op when it does not — the bounds leg of Java `ContentFileUtil.referencedDataFile`, which is how Spark reclaims the shape. pins: task/f16-residue-2-partition-scoped-ratio-ledger.md |
@@ -53,6 +54,7 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | Change output rolling or the rewrite read | `rewrite_data_files_write.rs` |
 | Change how rewritten rows are routed after spec evolution | `rewrite_data_files_write.rs` + `rewrite_data_files_router.rs` |
 | Pin evolved-spec output tuples or the writer bound | `rewrite_data_files_evolved_spec_tests.rs`, `rewrite_data_files_router_bound_tests.rs` |
+| Pin evolved-schema compaction (add/drop/rename/promote/v3-DV) | `rewrite_data_files_evolved_schema_tests.rs` |
 | See why an all-void current spec (`void(x)`, one field, `is_unpartitioned`) fails rewrite | unsupported current-spec shape: `RecordBatchPartitionSplitter` refuses it (`Cannot create partition calculator for unpartitioned table`). Pin: `all_void_current_spec_is_refused` |
 | Pin delete-ratio or 100%-dead in-band rewrite | `rewrite_data_files_ratio_tests.rs` |
 
@@ -74,6 +76,8 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | A single-file group is skipped | `enough_input_files` and `enough_content` require `size > 1`. `any_too_high_delete_ratio` does not. A lone needs-rewrite candidate must still qualify. |
 | After spec evolution, partition-pruned scans miss live rows | Output used `group.first()` under the current spec. Routing must recompute tuples from rows (`rewrite_data_files_write.rs`). Pin: `source_field_identity_x_to_identity_y_rewrites_two_old_partitions`. |
 | Rewrite fails with `Cannot create partition calculator for unpartitioned table` | Current spec is all-void (`void(x)`, one field, `is_unpartitioned` but `fields()` is not empty). Unsupported current-spec shape. Pin: `all_void_current_spec_is_refused`. |
+| Rewrite after schema evolution fails with a batch/expected width, name, or type mismatch | Tasks plan under the snapshot-pinned old schema while the calculator/writer build on the current schema. The write path re-points each task at the current schema with the full current projection (`rewrite_data_files_write.rs`), so the reader evolves every file's batches first. Pins: `rewrite_data_files_evolved_schema_tests::*`. |
+| Manifest write after promoting a partition source fails with `value is not compatible with type` | Old carried tuples keep the narrow literal while summaries build against the current wide type. `PartitionFieldStats::update` widens via `PrimitiveLiteral::promote_to` (int→long, float→double; anything else still fails loud). Pin: `promote_partition_source_int_to_long_rewrites_old_files`. |
 
 ### First checks
 

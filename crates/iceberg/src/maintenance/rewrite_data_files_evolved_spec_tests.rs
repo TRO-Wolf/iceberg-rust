@@ -190,7 +190,11 @@ pub(crate) fn literal_from_long_transform(transform: Transform, value: i64) -> L
     Literal::from(datum)
 }
 
-fn assert_output_matches_current_spec(files: &[DataFile], table: &Table, expected: &[Struct]) {
+pub(crate) fn assert_output_matches_current_spec(
+    files: &[DataFile],
+    table: &Table,
+    expected: &[Struct],
+) {
     let spec_id = table.metadata().default_partition_spec().spec_id();
     assert!(!files.is_empty(), "rewrite must emit output data files");
     let actual: HashSet<Struct> = files
