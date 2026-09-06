@@ -1384,7 +1384,7 @@ impl ArrowReader {
         }
 
         if field_ids.is_empty() {
-            return Ok(ProjectionMask::all());
+            return Ok(ProjectionMask::leaves(parquet_schema, []));
         }
 
         if use_fallback {

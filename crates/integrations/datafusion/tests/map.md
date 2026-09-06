@@ -47,6 +47,8 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `f21_legacy_delete_merge.rs` | F-21 V2 MoR parquet → V3 DV merge (row R114): two file-scoped deletes on one data file, partition-scoped keep, sequence skip, UPDATE, untouched file |
 | `f21_legacy_delete_merge_measure.rs` | `#[ignore]` wall-clock: K=8 partition-scoped 100k positions; file-scoped 100k with a 200-byte `row` column. Not a CI pin |
 | `interop_f21_legacy_delete_merge.rs` | GEN for `run-interop-f21-legacy-delete-merge.sh`: file-scoped merge plus partition-scoped coexistence (two data files, parquet stays live beside one DV) |
+| `count_star_fold.rs` | F-27b (OFFLINE): `IcebergTableScan::partition_statistics` reports exact whole-table row counts (`total-records` + delete-free planned tasks) so DataFusion folds `count(*)` without a scan. Plain table: Exact(3), answer 3, physical plan has no `IcebergTableScan`; V3 MoR table with a DV: unknown, answer 2, plan still scans; residual filter / limit / per-partition query: unknown; empty table: Exact(0); COW DELETE (no delete files): Exact(2) |
+| `parallel_small_scan.rs` | F-27d (OFFLINE): a sub-split-size table scans in parallel when the session allows it. 8 single-row-group files at `target_partitions=8` → 8 partitions with the 24-row set intact; at 1 → 1 partition; an empty projection stays 1 partition (the `count(*)` fold exemption); a LIMIT at N=8 is cleared on the scan node (stats stay Exact(24), every partition emits its full 3 rows) while SQL LIMIT still answers from the top (GlobalLimitExec owns the cap) |
 
 ## I want to...
 

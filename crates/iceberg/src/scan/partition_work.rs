@@ -264,6 +264,19 @@ pub async fn plan_partition_work_from_scan(
     };
 
     let groups: Vec<CombinedScanTask> = scan.plan_tasks().await?.try_collect().await?;
+    let plan = scan.plan_context.as_ref();
+    let field_ids = plan
+        .map(|context| context.field_ids.as_slice())
+        .unwrap_or(&[]);
+    let groups = super::bin_pack::expand_groups_for_target(
+        groups,
+        t,
+        scan.split_config.split_lookback,
+        scan.split_config.split_open_file_cost,
+        scan.split_config.split_size,
+        field_ids,
+        filter_mode == ScanFilterMode::Residual,
+    )?;
     Ok(assign_partition_work(snapshot_id, filter_mode, groups, t))
 }
 
