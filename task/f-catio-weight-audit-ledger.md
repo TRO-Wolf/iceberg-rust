@@ -20,7 +20,7 @@
 # F-CATIO-WEIGHT audit ledger
 
 **Date:** 2026-09-07
-**State:** `REVIEWED_DRAFT_PR_READY`; Docker integration is blocked by local environment
+**State:** `FINALIZED_PENDING_CI_INTEGRATION`; Docker integration is blocked by local environment
 accessibility.
 **Branch:** `codex/fork-cache-weight-audit` at `85db42f285703682629b3b53bd1ebcd3091c6bc5`.
 **Scope:** `ObjectCache` accounting, read-only direct graph helpers, focused tests, and this ledger.
@@ -279,3 +279,28 @@ is denied, and port 9000 is
 occupied. The canonical `make test` attempt exited 2 in `docker-up` before test execution. It did
 not alter Docker resources. No Docker pass, R7 waiver, full R7 readiness, merge, or delivery is
 claimed.
+
+## Finalization (Grok 4.6, 2026-09-08)
+
+This pass re-ran the fork gates on a fresh clone. `git merge-base --is-ancestor origin/main HEAD`
+exited 0. `git log --oneline origin/main..HEAD` showed one commit,
+`993dfdc03bf97c689c6e0c68fdde7ff8847138db`. Commands used `CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=8`.
+Each cargo invocation waited until `pgrep -c cargo` was below 3. The crate registry was reachable,
+so no `--offline` flag was used.
+
+| Check | Result |
+|---|---|
+| `make check` | Exit 0. fmt, clippy `-D warnings`, taplo, cargo-machete, agent-artifacts, matrix-anchors, comment-blocks, and rust-file-size all OK. |
+| `cargo test -p iceberg --lib io::object_cache --all-features --locked` | Exit 0. `test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 3649 filtered out; finished in 0.04s` |
+| `cargo test -p iceberg --lib --all-features --locked` | Exit 0. `test result: ok. 3663 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 83.78s` |
+| `typos .` | Exit 0. |
+
+The integration gate is the PR's CI `Tests (default)` run after F-HMS merges. The orchestrator
+records the run id and head sha in the PR before merging. The current red `Tests (default)` leg is
+outside this branch: Debian 11 (`bullseye-security`) left long-term support on 2026-08-31 and its
+release file expired on 2026-09-07, so `dev/hms/Dockerfile` dies in `apt-get update`.
+
+A fresh-eyes re-read of `origin/main..HEAD` found no merge blocker. The unit adds no code comment
+beyond required ASF license headers on new files. It adds no literal home path and no dependency or
+lockfile change. The eviction, payload, and oversized-admission tests can fail. The ledger already
+records mutation reds against the baseline charge.
