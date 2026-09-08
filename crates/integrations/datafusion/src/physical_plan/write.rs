@@ -20,22 +20,26 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray};
+use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use datafusion::common::Result as DFResult;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexOrdering, OrderingRequirements, Partitioning, PhysicalSortExpr,
+};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-    execute_input_stream,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+    PlanProperties, execute_input_stream,
 };
 use futures::StreamExt;
-use iceberg::arrow::FieldMatchMode;
-use iceberg::spec::{DataFileFormat, serialize_data_file_to_json};
+use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN};
+use iceberg::spec::{DataFileFormat, TableProperties, serialize_data_file_to_json};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -62,6 +66,8 @@ use crate::to_datafusion_error;
 pub(crate) struct IcebergWriteExec {
     table: Table,
     input: Arc<dyn ExecutionPlan>,
+    input_distribution: Distribution,
+    input_ordering: Option<OrderingRequirements>,
     result_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
 }
@@ -74,15 +80,63 @@ impl IcebergWriteExec {
     /// schema it never emits is the BUG-011 skew in the write path. It also removes the last
     /// consumer of the provider's cached table schema from this branch of the plan.
     pub fn new(table: Table, input: Arc<dyn ExecutionPlan>) -> Self {
+        let (input_distribution, input_ordering) = Self::input_requirements(&table, &input);
+        Self::new_with_requirements(table, input, input_distribution, input_ordering)
+    }
+
+    fn new_with_requirements(
+        table: Table,
+        input: Arc<dyn ExecutionPlan>,
+        input_distribution: Distribution,
+        input_ordering: Option<OrderingRequirements>,
+    ) -> Self {
         let result_schema = Self::make_result_schema();
         let plan_properties = Self::compute_properties(&input, Arc::clone(&result_schema));
 
         Self {
             table,
             input,
+            input_distribution,
+            input_ordering,
             result_schema,
             plan_properties,
         }
+    }
+
+    fn input_requirements(
+        table: &Table,
+        input: &Arc<dyn ExecutionPlan>,
+    ) -> (Distribution, Option<OrderingRequirements>) {
+        if table.metadata().default_partition_spec().is_unpartitioned() {
+            return (Distribution::UnspecifiedDistribution, None);
+        }
+
+        let Ok(partition_column_index) = input.schema().index_of(PROJECTED_PARTITION_VALUE_COLUMN)
+        else {
+            return (Distribution::UnspecifiedDistribution, None);
+        };
+        let partition_column = Arc::new(Column::new(
+            PROJECTED_PARTITION_VALUE_COLUMN,
+            partition_column_index,
+        ));
+        let distribution = Distribution::HashPartitioned(vec![partition_column.clone()]);
+        let fanout_enabled = table
+            .metadata()
+            .properties()
+            .get(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED)
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT);
+        let ordering = if fanout_enabled {
+            None
+        } else {
+            LexOrdering::new(vec![PhysicalSortExpr {
+                expr: partition_column,
+                options: SortOptions::default(),
+            }])
+            .map(OrderingRequirements::from)
+        };
+
+        (distribution, ordering)
     }
 
     fn compute_properties(
@@ -150,6 +204,14 @@ impl ExecutionPlan for IcebergWriteExec {
         vec![false]
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![self.input_distribution.clone()]
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        vec![self.input_ordering.clone()]
+    }
+
     fn maintains_input_order(&self) -> Vec<bool> {
         // Maintains ordering in the sense that the written file will reflect the ordering of the input.
         vec![true; self.children().len()]
@@ -174,9 +236,11 @@ impl ExecutionPlan for IcebergWriteExec {
             )));
         }
 
-        Ok(Arc::new(Self::new(
+        Ok(Arc::new(Self::new_with_requirements(
             self.table.clone(),
             Arc::clone(&children[0]),
+            self.input_distribution.clone(),
+            self.input_ordering.clone(),
         )))
     }
 

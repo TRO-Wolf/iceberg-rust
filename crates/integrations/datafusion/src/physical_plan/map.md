@@ -32,13 +32,13 @@ exec (row R169).
 | `scan_knobs.rs` | F-27 size-gate split: the session scan knobs (`IcebergScanOptions`, `ScanKnobs`, `scan_knobs_from_context`, `clamp_scan_knob`, `ensure_iceberg_scan_options`), re-exported through `scan.rs` so every existing path is unchanged |
 | `metadata_scan.rs` | `IcebergMetadataScan` — projects inspect batches |
 | `project.rs` | partition-value projection |
-| `commit.rs` / `write.rs` | INSERT commit |
+| `commit.rs` / `write.rs` | INSERT commit; the write exec declares and preserves hash distribution on evaluated partition values, plus partition ordering for clustered writers |
 | `delete.rs` / `update.rs` | DELETE / UPDATE (F-26: both MoR paths scan once for batches plus the per-path partition map via `mor_scan` and hand it to the V3 close as `known_partitions`; both return the close alongside the row count so tests pin the threading; r2: the map is DV-only and retained to touched paths) |
 | `mor_scan.rs` | F-26 r2 size-gate split: the MoR scan seam (`mor_scan_stream`) plus the DV-only partition-map shaping (`dv_partitions_for`), called from `delete.rs` |
 | `delete_position_deletes.rs` | F-26 size-gate split: the V2 parquet position-delete writers (`write_position_deletes`, grouping, per-partition write), called from `delete.rs` |
 | `delete_tests.rs` | F-26 size-gate split: the `delete.rs` unit tests plus the MoR `known_partitions` pins, control and measure |
 | `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions_by_path` (R114). F-26: this wrapper takes the caller-supplied `known_partitions` map; the MoR DELETE/UPDATE plans carry it from their own scan tasks (`to_arrow_with_file_partitions`), so the F-23 skip fires in tree with no new walk (`live_data_file_partitions` untouched) |
-| `repartition.rs` / `sort.rs` | writer helpers |
+| `repartition.rs` / `sort.rs` | writer helpers; every partitioned spec hashes the projected `_partition` struct, while unpartitioned input stays round-robin |
 | `expr_to_predicate.rs` | filter pushdown |
 | `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`). |
 | `mod.rs` | module root |
@@ -74,6 +74,8 @@ exec (row R169).
 | Pure-DV close rereads every data manifest | F-23: skip the walk when `pending_legacy` is empty and `known_partitions` covers every touched path. F-26: the MoR DELETE/UPDATE plans supply that map from their scan tasks, so the skip fires in tree; a partial map still walks only the missed paths |
 | Partition-scoped parquet delete is dropped after a one-file DELETE | `referenced_data_file_location` is None: merge per touched file, do not add the parquet to `DvContainerClose::removed` |
 | Old parquet delete from an earlier snapshot is merged into a newer data file's DV | sequence filter: skip when `delete_seq < data_seq` |
+| Partitioned INSERT creates one file per source task for every partition value | `IcebergWriteExec` lost its hash requirement during `EnforceDistribution`; keep distribution and clustered ordering requirements across `with_new_children` |
+| Changing `write.distribution-mode` has no effect on DataFusion INSERT | The append path does not interpret the `none`, `hash`, or `range` property values; partitioned input uses evaluated-partition hash distribution and unpartitioned input uses round-robin. Property-controlled distribution semantics remain unsupported |
 
 ### First checks
 
