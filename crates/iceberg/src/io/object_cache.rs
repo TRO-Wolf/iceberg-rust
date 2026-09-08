@@ -15,57 +15,340 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::mem::size_of;
 use std::sync::Arc;
 
+use crate::expr::accessor::StructAccessor;
 use crate::io::FileIO;
 use crate::spec::{
-    FormatVersion, Manifest, ManifestEntry, ManifestFile, ManifestList, SchemaId, SchemaRef,
-    SnapshotRef, TableMetadataRef, apply_manifest_list_context,
+    DataFile, Datum, FieldSummary, FormatVersion, Literal, Manifest, ManifestEntry, ManifestFile,
+    ManifestList, NestedField, PrimitiveLiteral, Schema, SchemaId, SchemaRef, SnapshotRef,
+    StructType, TableMetadataRef, Type, apply_manifest_list_context,
 };
 use crate::{Error, ErrorKind, Result};
 
 const DEFAULT_CACHE_SIZE_BYTES: u64 = 32 * 1024 * 1024; // 32MB
 
-/// Rough per-entry memory estimate for a parsed [`Manifest`].
-///
-/// `size_of_val` only measures the shallow `Manifest` shell (metadata + `Vec` header), not
-/// the heap-backed entry list. Entry count × this constant is a stable capacity-accounting
-/// proxy so large manifests weigh more than tiny ones under moka's weighted eviction.
-///
-/// Note: 768 is intentionally a coarse under-account for large nested partition stats;
-/// correcting it is deferred (C1-SEC-003) — prefer re-tuning after real production
-/// eviction metrics rather than over-weighting every list entry.
-const ROUGH_MANIFEST_ENTRY_BYTES: u64 = 768;
-
-/// Per-entry resident estimate for a parsed [`ManifestList`].
-///
-/// A manifest list holds only [`ManifestFile`] metadata rows (path, counts, partition
-/// summaries) — not the child manifests themselves. Do **not** sum child
-/// `manifest_length` values: those are on-disk sizes of separate objects and would
-/// thrash the 32 MiB budget when one list points at many large manifests (C1-Q-001).
-const ROUGH_MANIFEST_LIST_ENTRY_BYTES: u64 = 256;
-
-/// Floor at 1 and clamp to `u32::MAX` for moka's weigher signature.
-/// Accumulation paths must use saturating arithmetic before calling this (C1-Q-002).
 fn clamp_cache_weight(bytes: u64) -> u32 {
     let clamped = bytes.clamp(1, u32::MAX as u64);
-    // Domain is bounded to `[1, u32::MAX]` by the clamp above.
     clamped as u32
 }
 
-/// Estimated resident weight of a parsed manifest for the object cache.
-fn estimate_manifest_weight(manifest: &Manifest) -> u32 {
-    let n = (manifest.entries().len() as u64).max(1);
-    clamp_cache_weight(n.saturating_mul(ROUGH_MANIFEST_ENTRY_BYTES))
+fn usize_charge(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-/// Estimated resident weight of a parsed manifest list for the object cache.
-///
-/// Weight = `entry_count.max(1) × ROUGH_MANIFEST_LIST_ENTRY_BYTES`, then clamped to
-/// `[1, u32::MAX]`. Uses saturating multiply so huge entry counts never panic.
-fn estimate_manifest_list_weight(list: &ManifestList) -> u32 {
-    let n = (list.entries().len() as u64).max(1);
-    clamp_cache_weight(n.saturating_mul(ROUGH_MANIFEST_LIST_ENTRY_BYTES))
+fn shallow_charge<T>() -> u64 {
+    usize_charge(size_of::<T>())
+}
+
+fn sequence_charge<T>(capacity: usize) -> u64 {
+    usize_charge(capacity).saturating_mul(shallow_charge::<T>())
+}
+
+fn hash_storage_charge<K, V>(capacity: usize) -> u64 {
+    sequence_charge::<(K, V)>(capacity).saturating_add(usize_charge(capacity))
+}
+
+fn arc_allocation_charge<T>() -> u64 {
+    shallow_charge::<T>().saturating_add(2u64.saturating_mul(shallow_charge::<usize>()))
+}
+
+fn primitive_literal_payload_charge(literal: &PrimitiveLiteral) -> u64 {
+    match literal {
+        PrimitiveLiteral::String(value) => usize_charge(value.capacity()),
+        PrimitiveLiteral::Binary(value) => sequence_charge::<u8>(value.capacity()),
+        _ => 0,
+    }
+}
+
+fn literal_payload_charge(literal: &Literal) -> u64 {
+    let mut charge = 0u64;
+    let mut pending = vec![(literal, 1u64)];
+    while let Some((value, copies)) = pending.pop() {
+        match value {
+            Literal::Primitive(value) => {
+                charge = charge
+                    .saturating_add(primitive_literal_payload_charge(value).saturating_mul(copies));
+            }
+            Literal::Struct(value) => {
+                charge = charge.saturating_add(
+                    sequence_charge::<Option<Literal>>(value.fields().len()).saturating_mul(copies),
+                );
+                pending.extend(value.fields().iter().flatten().map(|value| (value, copies)));
+            }
+            Literal::List(value) => {
+                charge = charge.saturating_add(
+                    sequence_charge::<Option<Literal>>(value.capacity()).saturating_mul(copies),
+                );
+                pending.extend(value.iter().flatten().map(|value| (value, copies)));
+            }
+            Literal::Map(value) => {
+                let (index_capacity, pair_capacity) = value.storage_capacities();
+                charge = charge
+                    .saturating_add(
+                        hash_storage_charge::<Literal, usize>(index_capacity)
+                            .saturating_mul(copies),
+                    )
+                    .saturating_add(
+                        sequence_charge::<(Literal, Option<Literal>)>(pair_capacity)
+                            .saturating_mul(copies),
+                    );
+                for (key, map_value) in value.pairs() {
+                    pending.push((key, copies.saturating_mul(2)));
+                    pending.extend(map_value.iter().map(|value| (value, copies)));
+                }
+            }
+        }
+    }
+    charge
+}
+
+fn schema_type_graph_charge(struct_type: &StructType) -> u64 {
+    let fields = struct_type.fields();
+    let mut charge = sequence_charge::<Arc<NestedField>>(fields.len())
+        .saturating_add(hash_storage_charge::<i32, usize>(fields.len()))
+        .saturating_add(hash_storage_charge::<String, usize>(fields.len()));
+    let mut pending_fields: Vec<_> = fields.iter().collect();
+    while let Some(field) = pending_fields.pop() {
+        charge = charge
+            .saturating_add(arc_allocation_charge::<NestedField>())
+            .saturating_add(usize_charge(field.name.capacity()))
+            .saturating_add(
+                field
+                    .doc
+                    .as_ref()
+                    .map_or(0, |value| usize_charge(value.capacity())),
+            )
+            .saturating_add(shallow_charge::<Type>())
+            .saturating_add(
+                field
+                    .initial_default
+                    .as_ref()
+                    .map_or(0, literal_payload_charge),
+            )
+            .saturating_add(
+                field
+                    .write_default
+                    .as_ref()
+                    .map_or(0, literal_payload_charge),
+            );
+        match field.field_type.as_ref() {
+            Type::Primitive(_) | Type::Variant => {}
+            Type::Struct(value) => {
+                let fields = value.fields();
+                charge = charge
+                    .saturating_add(sequence_charge::<Arc<NestedField>>(fields.len()))
+                    .saturating_add(hash_storage_charge::<i32, usize>(fields.len()))
+                    .saturating_add(hash_storage_charge::<String, usize>(fields.len()));
+                pending_fields.extend(fields);
+            }
+            Type::List(value) => pending_fields.push(&value.element_field),
+            Type::Map(value) => {
+                pending_fields.push(&value.key_field);
+                pending_fields.push(&value.value_field);
+            }
+        }
+    }
+    charge
+}
+
+fn schema_accessor_charge(schema: &Schema) -> u64 {
+    let mut box_count = 0u64;
+    let mut pending: Vec<_> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| (field.as_ref(), 0u64))
+        .collect();
+    while let Some((field, depth)) = pending.pop() {
+        match field.field_type.as_ref() {
+            Type::Primitive(_) => box_count = box_count.saturating_add(depth),
+            Type::Struct(value) => {
+                let child_depth = depth.saturating_add(1);
+                pending.extend(
+                    value
+                        .fields()
+                        .iter()
+                        .map(|field| (field.as_ref(), child_depth)),
+                );
+            }
+            Type::List(_) | Type::Map(_) | Type::Variant => {}
+        }
+    }
+    usize_charge(schema.accessor_count())
+        .saturating_mul(arc_allocation_charge::<StructAccessor>())
+        .saturating_add(box_count.saturating_mul(shallow_charge::<StructAccessor>()))
+}
+
+fn schema_charge(schema: &Schema) -> u64 {
+    let id_to_name = schema.field_id_to_name_map();
+    let id_to_field = schema.field_id_to_fields();
+    let identifier_capacity = schema.identifier_storage_capacity();
+    let (alias_capacity, name_capacity, lowercase_name_capacity, accessor_capacity) =
+        schema.hidden_index_capacities();
+    let mut charge = arc_allocation_charge::<Schema>()
+        .saturating_add(schema_type_graph_charge(schema.as_struct()))
+        .saturating_add(hash_storage_charge::<i32, String>(id_to_name.capacity()))
+        .saturating_add(hash_storage_charge::<String, i32>(name_capacity))
+        .saturating_add(hash_storage_charge::<String, i32>(lowercase_name_capacity))
+        .saturating_add(hash_storage_charge::<i32, Arc<NestedField>>(
+            id_to_field.capacity(),
+        ))
+        .saturating_add(hash_storage_charge::<i32, Arc<StructAccessor>>(
+            accessor_capacity,
+        ))
+        .saturating_add(schema_accessor_charge(schema))
+        .saturating_add(hash_storage_charge::<i32, ()>(identifier_capacity))
+        .saturating_add(hash_storage_charge::<String, i32>(alias_capacity).saturating_mul(2));
+    for name in id_to_name.values() {
+        charge = charge.saturating_add(usize_charge(name.capacity()));
+    }
+    for (name, _) in schema.name_index_entries() {
+        charge = charge.saturating_add(usize_charge(name.capacity()));
+    }
+    for (name, _) in schema.lowercase_name_index_entries() {
+        charge = charge.saturating_add(usize_charge(name.capacity()));
+    }
+    for (alias, _) in schema.alias_entries() {
+        charge = charge.saturating_add(usize_charge(alias.capacity()));
+    }
+    charge
+}
+
+fn datum_payload_charge(datum: &Datum) -> u64 {
+    primitive_literal_payload_charge(datum.literal())
+}
+
+fn data_file_payload_charge(data_file: &DataFile) -> u64 {
+    let partition = data_file.partition();
+    let mut charge = usize_charge(data_file.file_path.capacity())
+        .saturating_add(sequence_charge::<Option<Literal>>(partition.fields().len()));
+    for literal in partition.fields().iter().flatten() {
+        charge = charge.saturating_add(literal_payload_charge(literal));
+    }
+    for map in [
+        &data_file.column_sizes,
+        &data_file.value_counts,
+        &data_file.null_value_counts,
+        &data_file.nan_value_counts,
+    ] {
+        charge = charge.saturating_add(hash_storage_charge::<i32, u64>(map.capacity()));
+    }
+    for map in [&data_file.lower_bounds, &data_file.upper_bounds] {
+        charge = charge.saturating_add(hash_storage_charge::<i32, Datum>(map.capacity()));
+        for datum in map.values() {
+            charge = charge.saturating_add(datum_payload_charge(datum));
+        }
+    }
+    charge
+        .saturating_add(
+            data_file
+                .key_metadata
+                .as_ref()
+                .map_or(0, |value| sequence_charge::<u8>(value.capacity())),
+        )
+        .saturating_add(
+            data_file
+                .split_offsets
+                .as_ref()
+                .map_or(0, |value| sequence_charge::<i64>(value.capacity())),
+        )
+        .saturating_add(
+            data_file
+                .equality_ids
+                .as_ref()
+                .map_or(0, |value| sequence_charge::<i32>(value.capacity())),
+        )
+        .saturating_add(
+            data_file
+                .referenced_data_file
+                .as_ref()
+                .map_or(0, |value| usize_charge(value.capacity())),
+        )
+}
+
+fn manifest_entry_charge(entry: &ManifestEntry) -> u64 {
+    arc_allocation_charge::<ManifestEntry>()
+        .saturating_add(data_file_payload_charge(entry.data_file()))
+}
+
+fn manifest_charge(manifest: &Manifest) -> u64 {
+    let metadata = manifest.metadata();
+    manifest.entries().iter().fold(
+        arc_allocation_charge::<Manifest>()
+            .saturating_add(sequence_charge::<Arc<ManifestEntry>>(
+                manifest.entries().len(),
+            ))
+            .saturating_add(schema_charge(&metadata.schema))
+            .saturating_add(sequence_charge::<crate::spec::PartitionField>(
+                metadata.partition_spec.fields().len(),
+            ))
+            .saturating_add(
+                metadata
+                    .partition_spec
+                    .fields()
+                    .iter()
+                    .fold(0u64, |charge, field| {
+                        charge.saturating_add(usize_charge(field.name.capacity()))
+                    }),
+            ),
+        |charge, entry| charge.saturating_add(manifest_entry_charge(entry)),
+    )
+}
+
+fn field_summary_payload_charge(summary: &FieldSummary) -> u64 {
+    summary
+        .lower_bound
+        .as_ref()
+        .map_or(0, |value| usize_charge(value.len()))
+        .saturating_add(
+            summary
+                .upper_bound
+                .as_ref()
+                .map_or(0, |value| usize_charge(value.len())),
+        )
+}
+
+fn manifest_file_payload_charge(file: &ManifestFile) -> u64 {
+    let partitions = file.partitions.as_ref().map_or(0, |summaries| {
+        summaries.iter().fold(
+            sequence_charge::<FieldSummary>(summaries.capacity()),
+            |charge, summary| charge.saturating_add(field_summary_payload_charge(summary)),
+        )
+    });
+    usize_charge(file.manifest_path.capacity())
+        .saturating_add(partitions)
+        .saturating_add(
+            file.key_metadata
+                .as_ref()
+                .map_or(0, |value| sequence_charge::<u8>(value.capacity())),
+        )
+}
+
+fn manifest_list_charge(list: &ManifestList) -> u64 {
+    list.entries().iter().fold(
+        arc_allocation_charge::<ManifestList>()
+            .saturating_add(sequence_charge::<ManifestFile>(list.entries().len())),
+        |charge, file| charge.saturating_add(manifest_file_payload_charge(file)),
+    )
+}
+
+fn cache_key_charge(key: &CachedObjectKey) -> u64 {
+    let path_capacity = match key {
+        CachedObjectKey::ManifestList((path, _, _)) | CachedObjectKey::Manifest((path, _)) => {
+            path.capacity()
+        }
+    };
+    shallow_charge::<CachedObjectKey>().saturating_add(usize_charge(path_capacity))
+}
+
+fn cached_object_charge(key: &CachedObjectKey, item: &CachedItem) -> u32 {
+    let item_charge = shallow_charge::<CachedItem>().saturating_add(match item {
+        CachedItem::ManifestList(value) => manifest_list_charge(value),
+        CachedItem::RawManifest(value) => manifest_charge(value),
+    });
+    clamp_cache_weight(cache_key_charge(key).saturating_add(item_charge))
 }
 
 #[derive(Clone, Debug)]
@@ -105,10 +388,7 @@ impl ObjectCache {
         } else {
             Self {
                 cache: moka::future::Cache::builder()
-                    .weigher(|_, val: &CachedItem| match val {
-                        CachedItem::ManifestList(item) => estimate_manifest_list_weight(item),
-                        CachedItem::RawManifest(item) => estimate_manifest_weight(item),
-                    })
+                    .weigher(cached_object_charge)
                     .max_capacity(cache_size_bytes)
                     .build(),
                 file_io,
@@ -262,3 +542,7 @@ impl ObjectCache {
 #[cfg(test)]
 #[path = "object_cache_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "object_cache_charge_tests.rs"]
+mod charge_tests;

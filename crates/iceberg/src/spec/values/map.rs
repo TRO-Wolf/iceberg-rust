@@ -67,6 +67,14 @@ impl Map {
         self.pair.is_empty()
     }
 
+    pub(crate) fn pairs(&self) -> &[(Literal, Option<Literal>)] {
+        &self.pair
+    }
+
+    pub(crate) fn storage_capacities(&self) -> (usize, usize) {
+        (self.index.capacity(), self.pair.capacity())
+    }
+
     /// Inserts a key-value pair into the map.
     /// If the map did not have this key present, None is returned.
     /// If the map did have this key present, the value is updated, and the old value is returned.

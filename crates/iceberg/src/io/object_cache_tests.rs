@@ -18,6 +18,7 @@
 use std::fs;
 use std::sync::Arc;
 
+use bimap::BiHashMap;
 use minijinja::value::Value;
 use minijinja::{AutoEscape, Environment, context};
 use tempfile::TempDir;
@@ -27,9 +28,10 @@ use super::*;
 use crate::TableIdent;
 use crate::io::{FileIO, OutputFile};
 use crate::spec::{
-    DataContentType, DataFileBuilder, DataFileFormat, INITIAL_SEQUENCE_NUMBER, Literal,
-    ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus, ManifestWriterBuilder,
-    Snapshot, Struct, TableMetadata,
+    DataContentType, DataFileBuilder, DataFileFormat, Datum, FieldSummary, INITIAL_SEQUENCE_NUMBER,
+    Literal, ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus,
+    ManifestWriterBuilder, Map, NestedField, PartitionSpec, PrimitiveType, Schema, Snapshot,
+    Struct, TableMetadata, Transform, Type,
 };
 use crate::table::Table;
 
@@ -262,7 +264,6 @@ async fn test_get_manifest_list_from_default_cache_with_schemaless_snapshot() {
     assert_eq!(manifest_list.entries().len(), 1);
 }
 
-/// Wave A: weigher clamp floors at 1 and caps at `u32::MAX`.
 #[test]
 fn test_clamp_cache_weight_floor_and_cap() {
     assert_eq!(clamp_cache_weight(0), 1);
@@ -270,26 +271,26 @@ fn test_clamp_cache_weight_floor_and_cap() {
     assert_eq!(clamp_cache_weight(u32::MAX as u64), u32::MAX);
     assert_eq!(clamp_cache_weight(u32::MAX as u64 + 1), u32::MAX);
     assert_eq!(clamp_cache_weight(100), 100);
-
-    // Relative scale of the entry-count estimate used for manifests.
-    let one = clamp_cache_weight(1u64.saturating_mul(ROUGH_MANIFEST_ENTRY_BYTES));
-    let ten = clamp_cache_weight(10u64.saturating_mul(ROUGH_MANIFEST_ENTRY_BYTES));
-    assert!(
-        ten > one,
-        "more entries must weigh more: one={one} ten={ten}"
+    assert_eq!(
+        clamp_cache_weight(sequence_charge::<u128>(usize::MAX)),
+        u32::MAX
     );
-    assert_eq!(one, ROUGH_MANIFEST_ENTRY_BYTES as u32);
-
-    // Saturating multiply before clamp must not panic and must cap at u32::MAX.
-    let overflow_weight =
-        clamp_cache_weight(u64::MAX.saturating_mul(ROUGH_MANIFEST_LIST_ENTRY_BYTES));
-    assert_eq!(overflow_weight, u32::MAX);
 }
 
-/// Wave A: loaded manifest / manifest-list weights use real estimates (≥ 1, and
-/// manifest entry weight scales with the entry count for a 1-entry fixture).
+#[test]
+fn test_capacity_api_preserves_zero_and_values_above_item_weight_width() {
+    let file_io = FileIO::new_with_fs();
+    let large_capacity = u64::from(u32::MAX) + 1;
+    let large = ObjectCache::new_with_capacity(file_io.clone(), large_capacity);
+    assert_eq!(large.cache.policy().max_capacity(), Some(large_capacity));
+
+    let disabled = ObjectCache::new_with_capacity(file_io, 0);
+    assert!(disabled.cache_disabled);
+    assert_eq!(disabled.cache.policy().max_capacity(), Some(0));
+}
+
 #[tokio::test]
-async fn test_estimate_weights_on_loaded_manifests() {
+async fn test_loaded_manifest_and_list_charges_include_their_graphs() {
     let mut fixture = TableTestFixture::new();
     fixture.setup_manifest_files().await;
 
@@ -306,51 +307,340 @@ async fn test_estimate_weights_on_loaded_manifests() {
         .await
         .expect("manifest list must load");
 
-    let list_weight = estimate_manifest_list_weight(&manifest_list);
-    assert!(
-        list_weight >= 1,
-        "manifest list weight must floor at 1, got {list_weight}"
-    );
-    // List weight is entry_count × list-entry estimate — never the sum of child
-    // manifest_length values (those are separate cached objects).
+    let list_charge = manifest_list_charge(&manifest_list);
+    assert!(list_charge > shallow_charge::<ManifestList>());
     let entry = manifest_list
         .entries()
         .first()
         .expect("fixture list has one entry");
-    let expected_list = clamp_cache_weight(
-        (manifest_list.entries().len() as u64)
-            .max(1)
-            .saturating_mul(ROUGH_MANIFEST_LIST_ENTRY_BYTES),
-    );
-    assert_eq!(
-        list_weight, expected_list,
-        "list weight must be entry_count × list-entry estimate, not child manifest_length"
-    );
-    // Sanity: when the child has a declared length, it must NOT equal the list weight
-    // (unless by coincidence the length equals the list-entry constant).
-    if entry.manifest_length > 0 && entry.manifest_length as u64 != ROUGH_MANIFEST_LIST_ENTRY_BYTES
-    {
-        assert_ne!(
-            list_weight,
-            clamp_cache_weight(entry.manifest_length as u64),
-            "list weight must not use child manifest_length"
-        );
-    }
 
     let manifest = object_cache
         .get_manifest(entry, None)
         .await
         .expect("manifest must load");
-    let manifest_weight = estimate_manifest_weight(&manifest);
-    let expected = clamp_cache_weight(
-        (manifest.entries().len() as u64)
-            .max(1)
-            .saturating_mul(ROUGH_MANIFEST_ENTRY_BYTES),
+    let manifest_charge = manifest_charge(&manifest);
+    let empty_manifest = Manifest::new(manifest.metadata().clone(), Vec::new());
+    assert!(manifest_charge > shallow_charge::<Manifest>());
+    assert!(manifest_charge > super::manifest_charge(&empty_manifest));
+    assert!(manifest_charge > list_charge);
+}
+
+#[tokio::test]
+async fn test_a_budget_below_retained_charge_evicts_entries() {
+    let mut fixture = TableTestFixture::new();
+    fixture.setup_manifest_files().await;
+
+    let fixture_cache = ObjectCache::new(fixture.table.file_io().clone());
+    let manifest_list = fixture_cache
+        .get_manifest_list(
+            fixture.table.metadata().current_snapshot().unwrap(),
+            &fixture.table.metadata_ref(),
+        )
+        .await
+        .unwrap();
+    let manifest = fixture_cache
+        .get_manifest(manifest_list.entries().first().unwrap(), None)
+        .await
+        .unwrap();
+
+    let object_cache = ObjectCache::new_with_capacity(fixture.table.file_io().clone(), 280_000);
+    for index in 0..256 {
+        object_cache
+            .cache
+            .insert(
+                CachedObjectKey::ManifestList((
+                    format!("manifest-list-{index}"),
+                    FormatVersion::V2,
+                    Some(0),
+                )),
+                CachedItem::ManifestList(Arc::new(manifest_list.as_ref().clone())),
+            )
+            .await;
+        object_cache
+            .cache
+            .insert(
+                CachedObjectKey::Manifest((format!("manifest-{index}"), None)),
+                CachedItem::RawManifest(Arc::new(manifest.as_ref().clone())),
+            )
+            .await;
+    }
+    object_cache.cache.run_pending_tasks().await;
+
+    assert!(object_cache.cache.entry_count() > 0);
+    assert!(object_cache.cache.entry_count() < 512);
+    assert!(object_cache.cache.weighted_size() <= 280_000);
+}
+
+#[test]
+fn test_cache_key_charge_tracks_path_allocation() {
+    let short = CachedObjectKey::Manifest((String::from("m"), None));
+    let long = CachedObjectKey::Manifest(("m".repeat(4096), None));
+
+    assert!(cache_key_charge(&long) > cache_key_charge(&short));
+}
+
+#[tokio::test]
+async fn test_manifest_charge_tracks_variable_data_file_payloads() {
+    let mut fixture = TableTestFixture::new();
+    fixture.setup_manifest_files().await;
+    let object_cache = ObjectCache::new(fixture.table.file_io().clone());
+    let manifest_list = object_cache
+        .get_manifest_list(
+            fixture.table.metadata().current_snapshot().unwrap(),
+            &fixture.table.metadata_ref(),
+        )
+        .await
+        .unwrap();
+    let manifest = object_cache
+        .get_manifest(manifest_list.entries().first().unwrap(), None)
+        .await
+        .unwrap();
+    let baseline_charge = manifest_charge(&manifest);
+    let baseline_entry = manifest.entries().first().unwrap().as_ref();
+
+    let mut path = baseline_entry.data_file().clone();
+    path.file_path = "p".repeat(4096);
+
+    let mut column_sizes = baseline_entry.data_file().clone();
+    let mut value_counts = baseline_entry.data_file().clone();
+    let mut null_value_counts = baseline_entry.data_file().clone();
+    let mut nan_value_counts = baseline_entry.data_file().clone();
+    for field_id in 0..64 {
+        column_sizes.column_sizes.insert(field_id, 1);
+        value_counts.value_counts.insert(field_id, 1);
+        null_value_counts.null_value_counts.insert(field_id, 1);
+        nan_value_counts.nan_value_counts.insert(field_id, 1);
+    }
+
+    let mut lower_bounds = baseline_entry.data_file().clone();
+    let mut upper_bounds = baseline_entry.data_file().clone();
+    for field_id in 0..64 {
+        lower_bounds
+            .lower_bounds
+            .insert(field_id, Datum::string("l".repeat(128)));
+        upper_bounds
+            .upper_bounds
+            .insert(field_id, Datum::binary(vec![1; 128]));
+    }
+
+    let mut string_partition = baseline_entry.data_file().clone();
+    string_partition.partition = Struct::from_iter([Some(Literal::string("s".repeat(4096)))]);
+    let mut list_partition = baseline_entry.data_file().clone();
+    list_partition.partition =
+        Struct::from_iter([Some(Literal::List(vec![Some(Literal::binary(vec![
+            1;
+            4096
+        ]))]))]);
+    let mut map_partition = baseline_entry.data_file().clone();
+    map_partition.partition = Struct::from_iter([Some(Literal::Map(Map::from([(
+        Literal::string("k".repeat(4096)),
+        Some(Literal::string("v".repeat(4096))),
+    )])))]);
+
+    let mut key_metadata = baseline_entry.data_file().clone();
+    key_metadata.key_metadata = Some(vec![1; 4096]);
+    let mut split_offsets = baseline_entry.data_file().clone();
+    split_offsets.split_offsets = Some(vec![1; 512]);
+    let mut equality_ids = baseline_entry.data_file().clone();
+    equality_ids.equality_ids = Some(vec![1; 1024]);
+    let mut referenced_data_file = baseline_entry.data_file().clone();
+    referenced_data_file.referenced_data_file = Some("r".repeat(4096));
+
+    for data_file in [
+        path,
+        column_sizes,
+        value_counts,
+        null_value_counts,
+        nan_value_counts,
+        lower_bounds,
+        upper_bounds,
+        string_partition,
+        list_partition,
+        map_partition,
+        key_metadata,
+        split_offsets,
+        equality_ids,
+        referenced_data_file,
+    ] {
+        let mut entry = baseline_entry.clone();
+        entry.data_file = data_file;
+        let changed = Manifest::new(manifest.metadata().clone(), vec![entry]);
+        assert!(manifest_charge(&changed) > baseline_charge);
+    }
+}
+
+#[tokio::test]
+async fn test_manifest_charge_tracks_schema_payloads() {
+    let mut fixture = TableTestFixture::new();
+    fixture.setup_manifest_files().await;
+    let object_cache = ObjectCache::new(fixture.table.file_io().clone());
+    let manifest_list = object_cache
+        .get_manifest_list(
+            fixture.table.metadata().current_snapshot().unwrap(),
+            &fixture.table.metadata_ref(),
+        )
+        .await
+        .unwrap();
+    let manifest = object_cache
+        .get_manifest(manifest_list.entries().first().unwrap(), None)
+        .await
+        .unwrap();
+    let build_schema = |name: String, doc: String, initial: String, write: String| {
+        let field = NestedField::optional(1, name, Type::Primitive(PrimitiveType::String))
+            .with_doc(doc)
+            .with_initial_default(Literal::string(initial))
+            .with_write_default(Literal::string(write));
+        Schema::builder()
+            .with_fields([Arc::new(field)])
+            .build()
+            .unwrap()
+    };
+    let short = build_schema(
+        String::from("n"),
+        String::from("d"),
+        String::from("i"),
+        String::from("w"),
     );
+    for schema in [
+        build_schema(
+            "n".repeat(4096),
+            String::from("d"),
+            String::from("i"),
+            String::from("w"),
+        ),
+        build_schema(
+            String::from("n"),
+            "d".repeat(4096),
+            String::from("i"),
+            String::from("w"),
+        ),
+        build_schema(
+            String::from("n"),
+            String::from("d"),
+            "i".repeat(4096),
+            String::from("w"),
+        ),
+        build_schema(
+            String::from("n"),
+            String::from("d"),
+            String::from("i"),
+            "w".repeat(4096),
+        ),
+    ] {
+        assert!(schema_charge(&schema) > schema_charge(&short));
+    }
+    let aliased_schema = short
+        .clone()
+        .into_builder()
+        .with_alias(BiHashMap::from_iter([("a".repeat(4096), 1)]))
+        .build()
+        .unwrap();
+    assert!(schema_charge(&aliased_schema) > schema_charge(&short));
+    let entries = manifest
+        .entries()
+        .iter()
+        .map(|entry| entry.as_ref().clone())
+        .collect::<Vec<_>>();
+    let mut short_metadata = manifest.metadata().clone();
+    short_metadata.schema = Arc::new(short);
+    let short_manifest = Manifest::new(short_metadata, entries.clone());
+    let mut changed_metadata = manifest.metadata().clone();
+    changed_metadata.schema = Arc::new(aliased_schema);
+    let changed = Manifest::new(changed_metadata, entries);
+
+    assert!(manifest_charge(&changed) > manifest_charge(&short_manifest));
+
+    let schema = manifest.metadata().schema.clone();
+    let source_name = &schema.as_struct().fields()[0].name;
+    let short_spec = PartitionSpec::builder(schema.clone())
+        .add_partition_field(source_name, "p", Transform::Identity)
+        .unwrap()
+        .build()
+        .unwrap();
+    let long_spec = PartitionSpec::builder(schema.clone())
+        .add_partition_field(source_name, "p".repeat(4096), Transform::Identity)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut short_spec_metadata = manifest.metadata().clone();
+    short_spec_metadata.partition_spec = short_spec;
+    let short_spec_manifest = Manifest::new(short_spec_metadata, Vec::new());
+    let mut long_spec_metadata = manifest.metadata().clone();
+    long_spec_metadata.partition_spec = long_spec;
+    let long_spec_manifest = Manifest::new(long_spec_metadata, Vec::new());
+    assert!(manifest_charge(&long_spec_manifest) > manifest_charge(&short_spec_manifest));
+}
+
+#[tokio::test]
+async fn test_manifest_file_charge_tracks_list_payloads() {
+    let mut fixture = TableTestFixture::new();
+    fixture.setup_manifest_files().await;
+    let object_cache = ObjectCache::new(fixture.table.file_io().clone());
+    let manifest_list = object_cache
+        .get_manifest_list(
+            fixture.table.metadata().current_snapshot().unwrap(),
+            &fixture.table.metadata_ref(),
+        )
+        .await
+        .unwrap();
+    let baseline = manifest_list.entries().first().unwrap();
+    let baseline_charge = manifest_file_payload_charge(baseline);
+
+    let mut path = baseline.clone();
+    path.manifest_path = "p".repeat(4096);
+    assert!(manifest_file_payload_charge(&path) > baseline_charge);
+
+    let mut child_length = baseline.clone();
+    let unchanged_charge = manifest_file_payload_charge(&child_length);
+    child_length.manifest_length = i64::MAX;
     assert_eq!(
-        manifest_weight, expected,
-        "manifest weight must be entry_count × rough bytes (floored)"
+        manifest_file_payload_charge(&child_length),
+        unchanged_charge
     );
+
+    let mut summaries = baseline.clone();
+    summaries.partitions = Some(vec![FieldSummary {
+        contains_null: false,
+        contains_nan: Some(false),
+        lower_bound: Some(vec![1; 4096].into()),
+        upper_bound: Some(vec![2; 4096].into()),
+    }]);
+    assert!(manifest_file_payload_charge(&summaries) > baseline_charge);
+
+    let mut metadata = baseline.clone();
+    metadata.key_metadata = Some(vec![1; 4096]);
+    assert!(manifest_file_payload_charge(&metadata) > baseline_charge);
+}
+
+#[tokio::test]
+async fn test_oversized_charge_is_rejected_and_a_smaller_item_remains_cacheable() {
+    let mut fixture = TableTestFixture::new();
+    fixture.setup_manifest_files().await;
+    let fixture_cache = ObjectCache::new(fixture.table.file_io().clone());
+    let manifest_list = fixture_cache
+        .get_manifest_list(
+            fixture.table.metadata().current_snapshot().unwrap(),
+            &fixture.table.metadata_ref(),
+        )
+        .await
+        .unwrap();
+    let item = CachedItem::ManifestList(manifest_list);
+    let small_key =
+        CachedObjectKey::ManifestList((String::from("small"), FormatVersion::V2, Some(0)));
+    let capacity = cached_object_charge(&small_key, &item);
+    let object_cache =
+        ObjectCache::new_with_capacity(fixture.table.file_io().clone(), capacity.into());
+    let large_key =
+        CachedObjectKey::ManifestList(("large".repeat(4096), FormatVersion::V2, Some(0)));
+
+    object_cache.cache.insert(large_key, item.clone()).await;
+    object_cache.cache.run_pending_tasks().await;
+    assert_eq!(object_cache.cache.entry_count(), 0);
+
+    object_cache.cache.insert(small_key, item).await;
+    object_cache.cache.run_pending_tasks().await;
+    assert_eq!(object_cache.cache.entry_count(), 1);
+    assert_eq!(object_cache.cache.weighted_size(), u64::from(capacity));
 }
 
 #[tokio::test]
