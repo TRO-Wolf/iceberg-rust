@@ -21,7 +21,7 @@
 
 **Date:** 2026-09-07. **Branch:** `codex/fork-insert-dist-1`.
 **Base:** `origin/main` `85db42f285703682629b3b53bd1ebcd3091c6bc5`.
-**State:** `REVIEWED_DRAFT_PR_READY`; Docker integration is blocked by local environment
+**State:** `FINALIZED_PENDING_CI_INTEGRATION`; Docker integration is blocked by local environment
 accessibility.
 **Path:** STANDARD because this changes a data-write path.
 
@@ -294,3 +294,30 @@ pull request, or merge had occurred. The canonical `make test` attempt exited 2 
 before test execution and did not alter Docker resources. The Docker integration gate remains
 blocked by local environment accessibility. No Docker pass, R7 waiver, full R7 readiness, merge,
 or delivery is claimed.
+
+## Finalization (Grok 4.6, 2026-09-08)
+
+Fresh clone `/tmp/grok-insdist` on `codex/fork-insert-dist-1` at
+`aae7bd2cbb096dc33c3cee3924f53796e6b29551`. `git fetch origin main` left `origin/main` at
+`85db42f285703682629b3b53bd1ebcd3091c6bc5`. `git merge-base --is-ancestor origin/main HEAD`
+exited 0. `git log --oneline origin/main..HEAD` showed exactly one commit before this
+finalization commit. Registry reachable; no `--offline`.
+
+A fresh-eyes re-read of `origin/main...HEAD` found no merge-blocking comment in code, no
+literal home path, no dependency or `.github/` change, and no test that cannot fail.
+
+| Command | Result |
+|---|---|
+| `CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=8 make check` | exit 0; fmt, workspace all-target/all-feature clippy with denied warnings, TOML, machete, artifact, matrix, comment-block, and Rust-size gates passed. Python file-size unittest: `Ran 11 tests in 0.012s` / `OK`. No cargo `test result:` line. |
+| `CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --test insert_distribution --locked` | exit 0; `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s` |
+| `CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --lib physical_plan::repartition --locked` | exit 0; `test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 204 filtered out; finished in 0.01s` |
+| `CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --lib physical_plan::write --locked` | exit 0; `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 216 filtered out; finished in 0.01s` |
+| `CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --test partitioned_insert_select_test --locked` | exit 0; `test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s` |
+| `typos .` | exit 0 |
+
+The integration gate is the PR's CI `Tests (default)` run after F-HMS merges. The
+orchestrator records the run id and head sha in the PR before merging. The red `Tests
+(default)` leg on this draft is outside the branch: `dev/hms/Dockerfile` dies in
+`apt-get update` because Debian 11 (`bullseye-security`) left long-term support on
+2026-08-31 and its release file expired on 2026-09-07. F-HMS on `fix/hms-fixture-download`
+replaces that apt step with a checksum-pinned download stage.
