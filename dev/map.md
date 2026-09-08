@@ -27,6 +27,7 @@ Developer tools: Java interop oracles, Spark provisioner, and credentialed catal
 
 | Path | What it does |
 |---|---|
+| `hms/` | Builds the Hive 3.1.3 metastore fixture with checksum-pinned S3 connector JARs. |
 | `java-interop/` | Java 1.10.0 oracle harnesses. See `java-interop/map.md`. |
 | `pr5a-catalog-commit-outcomes.sh` | Credentialed PR-5A Glue + S3 Tables commit-outcome runner. Hard-fails unless `ICEBERG_PR5A_CREDENTIALED=1` and required config is present. Does not print credentials or object-store URLs. |
 | `spark/` | Spark provisioner for interop tables. |
@@ -36,6 +37,7 @@ Developer tools: Java interop oracles, Spark provisioner, and credentialed catal
 
 | Intent | Go to |
 |---|---|
+| Inspect the Hive metastore fixture | `hms/Dockerfile` |
 | Decode Java Glue / REST commit outcomes | `java-interop/run-interop-pr5a-catalog-commit-decode.sh` |
 | Run credentialed catalog commit smokes | `pr5a-catalog-commit-outcomes.sh` |
 | Run a table-format interop oracle | `java-interop/map.md` |
