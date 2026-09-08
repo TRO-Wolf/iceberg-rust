@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+mod cache_charge;
 mod utils;
 mod visitor;
 pub use self::visitor::*;
@@ -65,7 +66,6 @@ pub type SchemaId = i32;
 pub type SchemaRef = Arc<Schema>;
 /// Default schema id.
 pub const DEFAULT_SCHEMA_ID: SchemaId = 0;
-
 /// The first table format version that supports non-null column defaults.
 ///
 /// Mirrors Java `org.apache.iceberg.Schema.DEFAULT_VALUES_MIN_FORMAT_VERSION`: a non-null
