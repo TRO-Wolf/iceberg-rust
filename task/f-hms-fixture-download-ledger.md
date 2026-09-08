@@ -80,7 +80,7 @@ Audit date: 2026-09-08. Every proposition is `PROVEN`; there are no open or reje
 | Frozen SHA-256 negative check | PASS — changing one Hadoop checksum nibble produced `FAILED` and a nonzero exit. |
 | Independent Critic byte-corruption check | PASS — appending one byte to a separate Hadoop JAR copy produced `FAILED` and exit 1. The repository artifact remained unchanged. |
 | Independent Critic source review | PASS — no S0 or S1 functional defect; one S2 ledger claim gap was corrected in C-008 and C-010. |
-| Dockerfile source identity after documentation repair | PASS — SHA-256 remains `68bae9d233c1474e5beb2870b4f17a7e41ffed44fced180c6e60cdaa85a6f673`. |
+| Dockerfile source identity after documentation repair | PASS at that check — SHA-256 was `68bae9d233c1474e5beb2870b4f17a7e41ffed44fced180c6e60cdaa85a6f673`. Identity changed in the erratum after CI run 34286917894. |
 | Static fixture contract | PASS — exact versions, HTTPS-only curl flags, two pre-rename checks, two mode/owner copies, unchanged config path, unchanged final image, and final `USER hive` are present; APT and package installation are absent. |
 | `docker compose -f dev/docker-compose.yaml config` | PASS — HMS still resolves to `linux/amd64` and the existing `dev/hms` build context. |
 | `git diff --check` | PASS. |
@@ -130,3 +130,28 @@ This host was not used to build the image or run compose. The image build is pro
 | `which docker` | Binary exists at `/usr/local/bin/docker`. Per the brief, no image build and no compose run were invoked. |
 
 `make check` and cargo builds were not run. The change touches no Rust. `dev/spark/Dockerfile` still uses apt on an Ubuntu base and stays out of scope.
+
+## Errata (Grok 4.6, 2026-09-08, after CI run 34286917894)
+
+PR #275 `Tests (default)` job 102264522719 (run 34286917894) built the `artifacts` stage and failed inside it:
+
+```
+sha256sum: unrecognized option: check
+Usage: sha256sum [-c[sw]] [FILE]...
+```
+
+`curlimages/curl` is Alpine/BusyBox. BusyBox `sha256sum` accepts `-c` only. `--check` is a GNU coreutils long option. Every prior local check ran GNU `sha256sum`, so the failure was invisible until CI.
+
+The two-line fix replaces both `sha256sum --check` with `sha256sum -c`. `git diff` on `dev/hms/Dockerfile` shows exactly those two lines. New Dockerfile SHA-256: `84c4d237507961b02670b66ec7cd499ad449c6a9e98413034dbc796e2ed26159`.
+
+Proof used a temp copy of `/tmp/grok-worker/hmsfix/verify/hadoop-aws-3.1.0.jar`. Both GNU coreutils 9.4 and BusyBox v1.36.1 ran the stdin form with no FILE argument (`echo "<digest>  hadoop-aws-3.1.0.jar" | sha256sum -c`).
+
+| Check | Result |
+|---|---|
+| GNU `sha256sum -c` positive (stdin, no FILE) | PASS — `OK`, exit 0. |
+| GNU `sha256sum -c` flipped nibble (`a18508` → `b18508`) | PASS — `FAILED`, exit 1. |
+| BusyBox `sha256sum --check` | PASS as a negative — `unrecognized option '--check'`, usage `[-c[sw]] [FILE]...`, exit 1. Matches the CI line. |
+| BusyBox `sha256sum -c` positive (stdin, no FILE) | PASS — `OK`, exit 0. |
+| BusyBox `sha256sum -c` flipped nibble | PASS — `FAILED`, exit 1. |
+
+The image digest, Maven URLs, and JAR checksums stay as proven by that same CI log: `FROM docker.io/curlimages/curl:8.16.0@sha256:463e…` resolved and the `RUN` reached the check line. The image build after this erratum is proven by the PR's CI `Tests (default)` job after the orchestrator pushes.

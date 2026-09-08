@@ -27,12 +27,12 @@ USER root
 RUN curl --fail --show-error --location --proto '=https' --proto-redir '=https' \
         "https://repo.maven.apache.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
         --output "hadoop-aws-${HADOOP_AWS_VERSION}.jar.download" && \
-    echo "${HADOOP_AWS_SHA256}  hadoop-aws-${HADOOP_AWS_VERSION}.jar.download" | sha256sum --check && \
+    echo "${HADOOP_AWS_SHA256}  hadoop-aws-${HADOOP_AWS_VERSION}.jar.download" | sha256sum -c && \
     mv "hadoop-aws-${HADOOP_AWS_VERSION}.jar.download" "hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
     curl --fail --show-error --location --proto '=https' --proto-redir '=https' \
         "https://repo.maven.apache.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar" \
         --output "aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar.download" && \
-    echo "${AWS_SDK_BUNDLE_SHA256}  aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar.download" | sha256sum --check && \
+    echo "${AWS_SDK_BUNDLE_SHA256}  aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar.download" | sha256sum -c && \
     mv "aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar.download" "aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"
 
 FROM apache/hive:3.1.3
