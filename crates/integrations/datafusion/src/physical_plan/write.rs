@@ -42,11 +42,11 @@ use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN};
 use iceberg::spec::{DataFileFormat, TableProperties, serialize_data_file_to_json};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
 use iceberg::{Error, ErrorKind};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
@@ -290,9 +290,12 @@ impl ExecutionPlan for IcebergWriteExec {
             )));
         }
 
-        // Create data file writer builder
+        let compression = parquet_compression_from_properties(self.table.metadata().properties())
+            .map_err(to_datafusion_error)?;
         let parquet_file_writer_builder = ParquetWriterBuilder::new_with_match_mode(
-            WriterProperties::default(),
+            WriterProperties::builder()
+                .set_compression(compression)
+                .build(),
             self.table.metadata().current_schema().clone(),
             FieldMatchMode::Name,
         );

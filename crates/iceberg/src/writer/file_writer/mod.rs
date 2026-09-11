@@ -28,6 +28,8 @@ mod avro_writer;
 pub use avro_writer::{AvroWriter, AvroWriterBuilder};
 mod parquet_writer;
 pub use parquet_writer::{ParquetWriter, ParquetWriterBuilder};
+mod parquet_compression;
+pub use parquet_compression::parquet_compression_from_properties;
 
 use crate::io::OutputFile;
 
