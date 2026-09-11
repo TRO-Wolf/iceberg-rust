@@ -32,7 +32,7 @@ exec (row R169).
 | `scan_knobs.rs` | F-27 size-gate split: the session scan knobs (`IcebergScanOptions`, `ScanKnobs`, `scan_knobs_from_context`, `clamp_scan_knob`, `ensure_iceberg_scan_options`), re-exported through `scan.rs` so every existing path is unchanged |
 | `metadata_scan.rs` | `IcebergMetadataScan` — projects inspect batches |
 | `project.rs` | partition-value projection |
-| `commit.rs` / `write.rs` | INSERT commit; the write exec declares and preserves hash distribution on evaluated partition values, plus partition ordering for clustered writers |
+| `commit.rs` / `write.rs` | INSERT commit; the write exec declares and preserves hash distribution on evaluated partition values, plus partition ordering for clustered writers. INSERT parquet `WriterProperties` take compression from `parquet_compression_from_properties` (default zstd; table properties `write.parquet.compression-codec` / `write.parquet.compression-level`) |
 | `delete.rs` / `update.rs` | DELETE / UPDATE (F-26: both MoR paths scan once for batches plus the per-path partition map via `mor_scan` and hand it to the V3 close as `known_partitions`; both return the close alongside the row count so tests pin the threading; r2: the map is DV-only and retained to touched paths) |
 | `mor_scan.rs` | F-26 r2 size-gate split: the MoR scan seam (`mor_scan_stream`) plus the DV-only partition-map shaping (`dv_partitions_for`), called from `delete.rs` |
 | `delete_position_deletes.rs` | F-26 size-gate split: the V2 parquet position-delete writers (`write_position_deletes`, grouping, per-partition write), called from `delete.rs` |

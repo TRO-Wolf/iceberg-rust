@@ -228,6 +228,13 @@ impl TableProperties {
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED: &str = "write.datafusion.fanout.enabled";
     /// Default value for fanout writer enabled
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT: bool = true;
+
+    /// Property key for the parquet data-file compression codec.
+    pub const PROPERTY_PARQUET_COMPRESSION_CODEC: &str = "write.parquet.compression-codec";
+    /// Default parquet data-file compression codec.
+    pub const PROPERTY_PARQUET_COMPRESSION_CODEC_DEFAULT: &str = "zstd";
+    /// Property key for the parquet data-file compression level.
+    pub const PROPERTY_PARQUET_COMPRESSION_LEVEL: &str = "write.parquet.compression-level";
 }
 
 impl TryFrom<&HashMap<String, String>> for TableProperties {
