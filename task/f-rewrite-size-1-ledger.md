@@ -20,7 +20,7 @@
 # F-REWRITE-SIZE-1 step 1 — why `rewrite_data_files` output is ~1.5× its input's compressed bytes
 
 **Date:** 2026-09-13. **Branch:** `measure/f-rewrite-size-1`.
-**Base:** `origin/main` `41e25ba2b` (fork tip at branch).
+**Base:** `origin/main` `41e25ba2b99a0d90caf4317b4236f5e1d4b683f5` (fork tip at branch).
 **Model:** swe-2-high
 **Path:** MEASURE — no product code change in this round. Step 2 (the fix) opens on this
 measurement.
