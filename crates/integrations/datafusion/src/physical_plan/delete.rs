@@ -57,7 +57,7 @@ use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig, Part
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
 };
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{

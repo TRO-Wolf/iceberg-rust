@@ -40,7 +40,7 @@ exec (row R169).
 | `delete_legacy_merge.rs` | F-22: thin wrapper; close collects legacy deletes in one pass and merges via `load_legacy_positions_by_path` (R114). F-26: this wrapper takes the caller-supplied `known_partitions` map; the MoR DELETE/UPDATE plans carry it from their own scan tasks (`to_arrow_with_file_partitions`), so the F-23 skip fires in tree with no new walk (`live_data_file_partitions` untouched) |
 | `repartition.rs` / `sort.rs` | writer helpers; every partitioned spec hashes the projected `_partition` struct, while unpartitioned input stays round-robin |
 | `expr_to_predicate.rs` | filter pushdown |
-| `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`). |
+| `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`). Its `StreamingDataFileWriter` takes compression from `parquet_compression_from_properties` (F-WRITE-COMPRESS-2) |
 | `mod.rs` | module root |
 
 ## I want to...

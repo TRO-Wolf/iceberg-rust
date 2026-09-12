@@ -17,6 +17,7 @@
 
 //! Position-delete writer. Field ids in [`crate::metadata_columns`]. Write-as-given.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -27,9 +28,9 @@ use crate::arrow::schema_to_arrow_schema;
 use crate::metadata_columns::{delete_file_path_field, delete_file_pos_field};
 use crate::spec::{DataContentType, DataFile, PartitionKey, PartitionSpec, Schema, SchemaRef};
 use crate::writer::base_writer::data_file_writer::resolve_partition_spec_id;
-use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileWriterBuilder};
+use crate::writer::file_writer::{FileWriterBuilder, parquet_compression_from_properties};
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
@@ -54,6 +55,16 @@ pub fn position_delete_writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_statistics_truncate_length(None)
         .build()
+}
+
+/// Parquet [`WriterProperties`] for position-delete files under the given table properties.
+pub fn position_delete_writer_properties_for(
+    properties: &HashMap<String, String>,
+) -> Result<WriterProperties> {
+    Ok(WriterProperties::builder()
+        .set_statistics_truncate_length(None)
+        .set_compression(parquet_compression_from_properties(properties)?)
+        .build())
 }
 
 /// Config for [`PositionDeleteFileWriter`].

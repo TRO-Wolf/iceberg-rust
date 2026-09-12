@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use futures::TryStreamExt;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use tempfile::TempDir;
 
 use super::*;
@@ -892,4 +893,50 @@ async fn test_repair_of_a_clean_table_commits_nothing() {
         snapshot_before,
         "a clean table must not be committed to"
     );
+}
+
+#[tokio::test]
+async fn test_repair_rewritten_files_carry_the_table_codec() {
+    let (catalog, _tmp) = local_fs_catalog().await;
+    let (table, path_a, path_b, path_c) = miskeyed_fixture(&catalog).await;
+
+    let result = RepairPartitionKeys::new(table.clone())
+        .execute(&catalog)
+        .await
+        .expect("repair the miskeyed fixture");
+    assert_eq!(result.repaired_data_files_count, 2);
+    assert_eq!(result.added_data_files_count, 2);
+
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload the repaired table");
+    let rewritten: Vec<String> = live_data_files_by_path(&table)
+        .await
+        .expect("live data files after repair")
+        .into_keys()
+        .filter(|path| {
+            ![path_a.as_str(), path_b.as_str(), path_c.as_str()].contains(&path.as_str())
+        })
+        .collect();
+    assert_eq!(rewritten.len(), 2, "repair must add two rewritten files");
+    for path in &rewritten {
+        let local = path.strip_prefix("file://").unwrap_or(path);
+        let file =
+            std::fs::File::open(local).unwrap_or_else(|error| panic!("open {local}: {error}"));
+        let reader = SerializedFileReader::new(file)
+            .unwrap_or_else(|error| panic!("read parquet footer {local}: {error}"));
+        let mut chunks = 0;
+        for row_group in reader.metadata().row_groups() {
+            for column in row_group.columns() {
+                chunks += 1;
+                assert!(
+                    matches!(column.compression(), parquet::basic::Compression::ZSTD(_)),
+                    "unexpected column-chunk compression {:?} in {local}",
+                    column.compression()
+                );
+            }
+        }
+        assert!(chunks > 0, "parquet file {local} has no column chunks");
+    }
 }

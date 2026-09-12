@@ -51,6 +51,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `parallel_small_scan.rs` | F-27d (OFFLINE): a sub-split-size table scans in parallel when the session allows it. 8 single-row-group files at `target_partitions=8` → 8 partitions with the 24-row set intact; at 1 → 1 partition; an empty projection stays 1 partition (the `count(*)` fold exemption); a LIMIT at N=8 is cleared on the scan node (stats stay Exact(24), every partition emits its full 3 rows) while SQL LIMIT still answers from the top (GlobalLimitExec owns the cap) |
 | `insert_distribution.rs` | F-INSERT-DIST-1: optimized append keeps hash and clustered-order requirements across schema-preserving child replacement; identity/null and distinct bucket/day values from four source tasks reach one writer; zero-row, unpartitioned, and one-target controls stay intact; source failure commits no snapshot |
 | `insert_compression.rs` | F-WRITE-COMPRESS-1: INSERT parquet footers honour `write.parquet.compression-codec` (default `zstd`; `snappy`/`gzip`/`uncompressed`) and `write.parquet.compression-level` for zstd; unknown codec fails naming the key and value |
+| `rewrite_compression.rs` | F-WRITE-COMPRESS-2: `rewrite_data_files` output, CoW-DELETE rewritten data files, and MoR position-delete files all carry the table codec (default `zstd`) in every column chunk |
 
 ## I want to...
 
@@ -63,6 +64,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | Prove V3 MoR UPDATE lineage on a branch vs Java | `interop_mor_branch_lineage.rs` |
 | Pin default (no branch) DML | `integration_datafusion_test.rs` |
 | Pin INSERT parquet compression | `insert_compression.rs` |
+| Pin rewrite/CoW/MoR parquet compression | `rewrite_compression.rs` |
 
 ## Pointers
 
