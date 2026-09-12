@@ -21,12 +21,17 @@
 //! Each test uses unique file paths based on module path to avoid conflicts.
 #[cfg(feature = "opendal-s3")]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use iceberg::io::{
         FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
     };
+    use iceberg::maintenance::DeleteOrphanFiles;
+    use iceberg::memory::MemoryCatalogBuilder;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
     use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
     use iceberg_test_utils::{get_minio_endpoint, normalize_test_name_with_parts, set_up};
     use reqsign::{AwsCredential, AwsCredentialLoad};
@@ -73,6 +78,185 @@ mod tests {
             output_file.write("123".into()).await.unwrap();
         }
         assert!(file_io.exists(&output_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_file_io_s3_list_bucket_root() {
+        let file_io = get_file_io().await;
+        let tag = normalize_test_name_with_parts!("test_file_io_s3_list_bucket_root");
+        let file_path = format!("s3://bucket1/{tag}");
+        let output_file = file_io.new_output(&file_path).unwrap();
+        {
+            output_file.write("root".into()).await.unwrap();
+        }
+        assert!(file_io.exists(&file_path).await.unwrap());
+
+        let bare = file_io
+            .list("s3://bucket1")
+            .await
+            .expect("list the bare bucket root");
+        let slash = file_io
+            .list("s3://bucket1/")
+            .await
+            .expect("list the slash bucket root");
+
+        for location in bare.iter().map(|f| f.location.as_str()) {
+            assert!(
+                location.starts_with("s3://bucket1/"),
+                "bare-bucket list must re-prefix entries, got {location}"
+            );
+        }
+        assert!(bare.iter().any(|f| f.location == file_path));
+        assert!(slash.iter().any(|f| f.location == file_path));
+
+        let bare_set: HashSet<&str> = bare.iter().map(|f| f.location.as_str()).collect();
+        let slash_set: HashSet<&str> = slash.iter().map(|f| f.location.as_str()).collect();
+        assert_eq!(
+            bare_set, slash_set,
+            "bare and slash bucket roots must list the same set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_io_s3_delete_orphan_files_bucket_root() {
+        let file_io = get_file_io().await;
+        let tag =
+            normalize_test_name_with_parts!("test_file_io_s3_delete_orphan_files_bucket_root");
+
+        let catalog = MemoryCatalogBuilder::default()
+            .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+                configured_scheme: "s3".to_string(),
+                customized_credential_load: None,
+            }))
+            .load(
+                "memory",
+                HashMap::from([
+                    ("warehouse".to_string(), "s3://bucket1".to_string()),
+                    (S3_ENDPOINT.to_string(), get_minio_endpoint()),
+                    (S3_ACCESS_KEY_ID.to_string(), "admin".to_string()),
+                    (S3_SECRET_ACCESS_KEY.to_string(), "password".to_string()),
+                    (S3_REGION.to_string(), "us-east-1".to_string()),
+                ]),
+            )
+            .await
+            .expect("load s3 memory catalog");
+
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "x",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("build schema");
+
+        let bare_ns = NamespaceIdent::new(format!("ns_root_{tag}"));
+        catalog
+            .create_namespace(&bare_ns, HashMap::new())
+            .await
+            .expect("create namespace for the bucket-root table");
+        let bare_table = catalog
+            .create_table(
+                &bare_ns,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema.clone())
+                    .location("s3://bucket1".to_string())
+                    .build(),
+            )
+            .await
+            .expect("create the bucket-root table");
+        let bare_metadata_location = bare_table
+            .metadata_location()
+            .expect("metadata location")
+            .to_string();
+        assert!(
+            bare_metadata_location.starts_with("s3://bucket1/metadata/"),
+            "bucket-root table metadata must live under the bucket root, got {bare_metadata_location}"
+        );
+
+        let root_orphan = format!("s3://bucket1/{tag}-orphan.dat");
+        file_io
+            .new_output(&root_orphan)
+            .unwrap()
+            .write("x".into())
+            .await
+            .unwrap();
+
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&recorded);
+        let result = DeleteOrphanFiles::new(bare_table)
+            .older_than(i64::MAX)
+            .delete_with(
+                move |path: String| -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = iceberg::Result<()>> + Send>,
+                > {
+                    sink.lock().expect("recorder").push(path);
+                    Box::pin(async { Ok(()) })
+                },
+            )
+            .execute()
+            .await
+            .expect("orphan sweep over a bucket-root table");
+
+        assert!(
+            result.delete_failures.is_empty(),
+            "{:?}",
+            result.delete_failures
+        );
+        let mut root_orphans = result.orphan_file_locations.clone();
+        root_orphans.sort();
+        let mut recorded_paths = recorded.lock().expect("recorder").clone();
+        recorded_paths.sort();
+        assert_eq!(
+            root_orphans, recorded_paths,
+            "the recorded delete set is exactly the orphan set"
+        );
+        assert!(
+            root_orphans.iter().any(|o| o == &root_orphan),
+            "planted bucket-root orphan must be swept: {root_orphans:?}"
+        );
+        assert!(
+            !root_orphans.iter().any(|o| o == &bare_metadata_location),
+            "the live metadata file must never be swept"
+        );
+
+        let ctl_ns = NamespaceIdent::new(format!("ns_ctl_{tag}"));
+        catalog
+            .create_namespace(&ctl_ns, HashMap::new())
+            .await
+            .expect("create namespace for the control table");
+        let ctl_location = format!("s3://bucket1/{tag}-ctl/tbl");
+        let ctl_table = catalog
+            .create_table(
+                &ctl_ns,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .location(ctl_location.clone())
+                    .build(),
+            )
+            .await
+            .expect("create the nested control table");
+        let ctl_orphan = format!("{ctl_location}/{tag}-orphan.dat");
+        file_io
+            .new_output(&ctl_orphan)
+            .unwrap()
+            .write("x".into())
+            .await
+            .unwrap();
+
+        let ctl_result = DeleteOrphanFiles::new(ctl_table)
+            .older_than(i64::MAX)
+            .execute()
+            .await
+            .expect("orphan sweep over the nested control table");
+        assert!(ctl_result.delete_failures.is_empty());
+        assert_eq!(
+            ctl_result.orphan_file_locations,
+            vec![ctl_orphan],
+            "a nested table sweeps exactly its unreferenced files"
+        );
     }
 
     #[tokio::test]

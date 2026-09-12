@@ -55,3 +55,37 @@ pub(crate) fn oss_config_build(cfg: &OssConfig, path: &str) -> Result<Operator> 
 
     Ok(Operator::new(builder).map_err(from_opendal_error)?.finish())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use iceberg::io::OSS_ENDPOINT;
+
+    use super::oss_config_parse;
+    use crate::{OpenDalStorage, OperatorCache};
+
+    #[test]
+    fn test_create_operator_bucket_root_resolves_to_empty_key() {
+        let props: HashMap<String, String> =
+            [(OSS_ENDPOINT, "https://oss-cn-hangzhou.aliyuncs.com")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let storage = OpenDalStorage::Oss {
+            config: Arc::new(oss_config_parse(props).expect("offline oss config parses")),
+            operator_cache: OperatorCache::default(),
+        };
+        let (op, rel) = storage
+            .create_operator(&"oss://oss-bucket")
+            .expect("bare bucket root must resolve");
+        assert_eq!(rel, "");
+        assert_eq!(op.info().name(), "oss-bucket");
+        let (op2, rel2) = storage
+            .create_operator(&"oss://oss-bucket/")
+            .expect("slash bucket root must resolve");
+        assert_eq!(rel2, "");
+        assert!(Arc::ptr_eq(op.inner(), op2.inner()));
+    }
+}
