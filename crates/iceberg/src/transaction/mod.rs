@@ -1740,6 +1740,9 @@ pub(crate) mod tests {
 mod transaction_row_lineage_tests;
 
 #[cfg(test)]
+mod silver_s0_probe;
+
+#[cfg(test)]
 mod test_create_snapshot_event {
     //! A REAL commit genuinely fires a `CreateSnapshotEvent` — and only after success, only per
     //! added snapshot, and best-effort (a panicking listener never fails the commit).

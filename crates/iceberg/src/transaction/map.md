@@ -55,6 +55,7 @@ engine) parity work.
 | `update_partition_spec.rs` | `BaseUpdatePartitionSpec` | Partition evolution (✅ interop-proven) |
 | `sort_order.rs` | `BaseReplaceSortOrder` | **The template action** — mirror this when adding a new action |
 | `update_location.rs` / `update_properties.rs` / `update_statistics.rs` / `upgrade_format_version.rs` | misc `Base*` | Location / properties / statistics / format-version updates |
+| `silver_s0_probe.rs` | (probe, not a Java analogue) | SILVER-S0 contract probes at pin `3ebf7d36`: parquet stage without commit, overwrite rebase vs `validate_no_conflicting_data`, `commit.retry.num-retries=0` still rebases, run-key snapshot-summary lookup, `expire_snapshot_id` drops the marker, fast-append `UuidMatch`+`RefSnapshotIdMatch`, always-true overwrite replace, Arrow↔Iceberg MVP type round-trip |
 
 ## I want to...
 
