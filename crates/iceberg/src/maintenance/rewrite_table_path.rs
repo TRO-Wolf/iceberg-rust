@@ -83,7 +83,8 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+    position_delete_writer_properties_for,
 };
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
@@ -496,9 +497,11 @@ impl RewriteTablePath {
         );
         // Full bounds keep delete-file path pruning precise (Java
         // `MetricsConfig.forPositionDelete`). The default `truncate(16)` widens the path range.
-        let parquet_builder =
-            ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
-                .with_metrics_config(MetricsConfig::for_position_delete());
+        let parquet_builder = ParquetWriterBuilder::new(
+            position_delete_writer_properties_for(self.table.metadata().properties())?,
+            config.schema().clone(),
+        )
+        .with_metrics_config(MetricsConfig::for_position_delete());
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.table.file_io().clone(),

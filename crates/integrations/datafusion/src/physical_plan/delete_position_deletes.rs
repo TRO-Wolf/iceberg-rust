@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iceberg::writer::base_writer::position_delete_writer::position_delete_writer_properties_for;
+
 use super::*;
 
 /// Writes Parquet position-delete files from sorted `(path, pos)` pairs and returns EVERY file the
@@ -143,9 +145,12 @@ async fn write_position_deletes_for_partition(
     );
     // Keep the `file_path` and `pos` bounds FULL and EXACT: no parquet stats truncation, so
     // min_is_exact/max_is_exact stay true and equal-bounds path routing works for long S3 URIs.
-    let parquet_builder =
-        ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone())
-            .with_metrics_config(MetricsConfig::for_position_delete());
+    let parquet_builder = ParquetWriterBuilder::new(
+        position_delete_writer_properties_for(table.metadata().properties())
+            .map_err(to_datafusion_error)?,
+        config.schema().clone(),
+    )
+    .with_metrics_config(MetricsConfig::for_position_delete());
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_builder,
         table.file_io().clone(),

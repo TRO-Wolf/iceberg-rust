@@ -30,11 +30,11 @@ use crate::scan::FileScanTask;
 use crate::spec::{DataFile, DataFileFormat, SchemaRef};
 use crate::table::Table;
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use crate::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
 pub(crate) struct CompactedWrite {
@@ -65,8 +65,11 @@ pub(crate) async fn write_compacted_files(
         Some(uuid::Uuid::now_v7().to_string()),
         DataFileFormat::Parquet,
     );
+    let compression = parquet_compression_from_properties(table.metadata().properties())?;
     let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder().build(),
+        parquet::file::properties::WriterProperties::builder()
+            .set_compression(compression)
+            .build(),
         schema.clone(),
     );
     let rolling_builder = RollingFileWriterBuilder::new(

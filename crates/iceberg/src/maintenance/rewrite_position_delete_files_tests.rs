@@ -37,14 +37,14 @@ use crate::spec::{
 };
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
 };
 use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
-use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 
 #[path = "rewrite_position_delete_files_floor_tests.rs"]
 mod floor_tests;
@@ -126,7 +126,6 @@ async fn create_short_path_partitioned_table(
 async fn create_partitioned_table(catalog: &impl Catalog, format_version: FormatVersion) -> Table {
     let schema = three_long_schema();
     let spec = PartitionSpec::builder(schema.clone())
-        .with_spec_id(0)
         .add_partition_field("x", "x", Transform::Identity)
         .expect("add partition field")
         .build()
@@ -140,7 +139,6 @@ async fn create_unpartitioned_table(
 ) -> Table {
     let schema = three_long_schema();
     let spec = PartitionSpec::builder(schema.clone())
-        .with_spec_id(0)
         .build()
         .expect("build spec");
     create_table_with_spec(catalog, schema, spec, format_version).await
@@ -157,12 +155,14 @@ async fn create_table_with_spec(
         .create_namespace(&namespace, std::collections::HashMap::new())
         .await
         .expect("create namespace");
-    let table_ident = TableIdent::new(namespace.clone(), "t".to_string());
+    let codec_key = "write.parquet.compression-codec";
+    let props = [(codec_key.into(), "uncompressed".into())];
     let creation = TableCreation::builder()
-        .name(table_ident.name().to_string())
+        .name("t".to_string())
         .schema(schema)
         .partition_spec(spec)
         .format_version(format_version)
+        .properties(props)
         .build();
     catalog
         .create_table(&namespace, creation)

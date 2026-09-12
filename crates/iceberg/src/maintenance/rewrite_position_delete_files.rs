@@ -62,7 +62,8 @@ use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::deletion_vector_writer::DVFileWriter;
 use crate::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+    position_delete_writer_properties_for,
 };
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
@@ -650,7 +651,7 @@ impl RewritePositionDeleteFiles {
         );
         // Keep path bounds full. The default `truncate(16)` would widen the path range.
         let parquet_builder = ParquetWriterBuilder::new(
-            position_delete_writer_properties(),
+            position_delete_writer_properties_for(metadata.properties())?,
             writer_config.schema().clone(),
         )
         .with_metrics_config(MetricsConfig::for_position_delete());

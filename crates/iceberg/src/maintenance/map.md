@@ -42,6 +42,8 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | `rewrite_position_delete_files.rs` | Compact live parquet position deletes, or convert them to DVs on v3. The v3 arm gates legacy deletes by `(spec_id, partition)` through the same candidate/pack/group predicates; below-floor groups stay parquet with honest zeros. `rewrite_all(true)` bypasses both filters on both arms. |
 | `rewrite_position_delete_files_v3.rs` | The v3 parquet-to-DV arm: inventory, DV planning, shadow refusals. Child module of the action file (file-size split, no behavior seam). |
 | `rewrite_position_delete_files_floor_tests.rs` | Below-floor, at-floor, bypass, and gate-shadow pins. Child module of the action tests (file-size split). |
+| `partition_key_audit.rs` | Offline partition-key audit + repair: recomputes every live data file's partition tuple from its rows, and repair rewrites miskeyed files through `RewriteFiles`. Repair output compression comes from `parquet_compression_from_properties` (F-WRITE-COMPRESS-2). |
+| `partition_key_audit_tests.rs` | Audit/repair pins incl. `test_repair_rewritten_files_carry_the_table_codec` (F-WRITE-COMPRESS-2). |
 | `actions_provider.rs` | Java `ActionsProvider` factory. |
 
 ## I want to...

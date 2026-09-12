@@ -32,11 +32,11 @@ use iceberg::metadata_columns::{
 use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, SchemaRef as IcebergSchemaRef};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::task_writer::TaskWriter;
@@ -220,8 +220,12 @@ impl StreamingDataFileWriter {
         let schema = table_write_schema(table)?;
         let partition_spec = table.metadata().default_partition_spec().clone();
 
+        let compression = parquet_compression_from_properties(table.metadata().properties())
+            .map_err(to_datafusion_error)?;
         let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
-            parquet::file::properties::WriterProperties::default(),
+            parquet::file::properties::WriterProperties::builder()
+                .set_compression(compression)
+                .build(),
             schema.clone(),
             FieldMatchMode::Name,
         );

@@ -127,11 +127,11 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use crate::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
 use crate::writer::partitioning::PartitioningWriter;
 use crate::writer::partitioning::fanout_writer::FanoutWriter;
 use crate::{Catalog, Error, ErrorKind, Result};
@@ -514,8 +514,11 @@ async fn rewrite_under_computed_keys(
         Some(uuid::Uuid::now_v7().to_string()),
         DataFileFormat::Parquet,
     );
+    let compression = parquet_compression_from_properties(table.metadata().properties())?;
     let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder().build(),
+        parquet::file::properties::WriterProperties::builder()
+            .set_compression(compression)
+            .build(),
         schema.clone(),
     );
     let rolling_builder = RollingFileWriterBuilder::new(
