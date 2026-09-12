@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::basic::{Encoding, Type as PhysicalType};
+use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 
-use crate::arrow::{ArrowFileReader, ArrowReaderBuilder, RecordBatchPartitionSplitter};
+use crate::arrow::{
+    ArrowFileReader, ArrowReaderBuilder, ParquetReadOptions, RecordBatchPartitionSplitter,
+};
 use crate::error::{Error, ErrorKind, Result};
 use crate::io::{FileIO, FileMetadata};
 use crate::maintenance::rewrite_data_files_router::BoundedPartitionRouter;
@@ -73,8 +76,10 @@ pub(crate) async fn write_compacted_files(
         DataFileFormat::Parquet,
     );
     let compression = parquet_compression_from_properties(table.metadata().properties())?;
+    let (fallback_columns, input_footers) =
+        dictionary_fallback_columns(table.file_io(), group).await?;
     let mut writer_properties = WriterProperties::builder().set_compression(compression);
-    for path in dictionary_fallback_columns(table, group).await? {
+    for path in fallback_columns {
         writer_properties = writer_properties.set_column_dictionary_enabled(path, false);
     }
     let parquet_builder = ParquetWriterBuilder::new(writer_properties.build(), schema.clone());
@@ -111,6 +116,7 @@ pub(crate) async fn write_compacted_files(
         .collect();
     let task_stream = Box::pin(futures::stream::iter(tasks)) as crate::scan::FileScanTaskStream;
     let mut batch_stream = ArrowReaderBuilder::new(table.file_io().clone())
+        .with_prefetched_parquet_metadata(input_footers)
         .build()
         .read(task_stream)?;
 
@@ -183,58 +189,49 @@ fn expected_value_bytes(column: &ColumnChunkMetaData) -> u64 {
     }
 }
 
-async fn input_parquet_metadata(
+pub(super) async fn input_parquet_metadata(
     file_io: &FileIO,
     task: &FileScanTask,
-) -> Result<Arc<ParquetMetaData>> {
+) -> Result<(Arc<str>, Arc<ParquetMetaData>)> {
     let input = file_io.new_input(task.data_file_path.as_ref())?;
     let size = if task.file_size_in_bytes > 0 {
         task.file_size_in_bytes
     } else {
         input.metadata().await?.size
     };
-    let mut reader = ArrowFileReader::new(FileMetadata { size }, input.reader().await?);
-    Ok(reader.get_metadata(None).await?)
+    let mut reader = ArrowFileReader::new(FileMetadata { size }, input.reader().await?)
+        .with_parquet_read_options(
+            ParquetReadOptions::builder()
+                .with_metadata_size_hint(Some(FOOTER_SIZE))
+                .with_preload_page_index(false)
+                .with_preload_column_index(false)
+                .with_preload_offset_index(false)
+                .build(),
+        );
+    let metadata = reader.get_metadata(None).await?;
+    Ok((Arc::clone(&task.data_file_path), metadata))
 }
 
-async fn dictionary_fallback_columns(
-    table: &Table,
+pub(super) async fn dictionary_fallback_columns(
+    file_io: &FileIO,
     group: &[FileScanTask],
-) -> Result<Vec<ColumnPath>> {
-    let file_io = table.file_io();
-    let metas: Vec<Arc<ParquetMetaData>> = futures::stream::iter(
+) -> Result<(Vec<ColumnPath>, HashMap<Arc<str>, Arc<ParquetMetaData>>)> {
+    let mut seen: HashSet<Arc<str>> = HashSet::new();
+    let mut columns: HashMap<ColumnPath, ColumnDictionaryStats> = HashMap::new();
+    let mut footers: HashMap<Arc<str>, Arc<ParquetMetaData>> = HashMap::new();
+    let mut metadata_stream = futures::stream::iter(
         group
             .iter()
-            .filter(|task| task.data_file_format == DataFileFormat::Parquet)
+            .filter(|task| {
+                task.data_file_format == DataFileFormat::Parquet
+                    && seen.insert(Arc::clone(&task.data_file_path))
+            })
             .map(|task| input_parquet_metadata(file_io, task)),
     )
-    .buffered(8)
-    .try_collect()
-    .await?;
-
-    let mut columns: HashMap<ColumnPath, ColumnDictionaryStats> = HashMap::new();
-    for metadata in &metas {
-        for row_group in metadata.row_groups() {
-            for column in row_group.columns() {
-                let stats = columns
-                    .entry(column.column_descr().path().clone())
-                    .or_default();
-                stats.num_values += column.num_values().max(0) as u64;
-                stats.uncompressed_bytes += column.uncompressed_size().max(0) as u64;
-                stats.value_bytes = stats.value_bytes.max(expected_value_bytes(column));
-                match column.dictionary_page_offset() {
-                    None => stats.missing_dictionary_page = true,
-                    Some(_) => {
-                        if column
-                            .page_encoding_stats_mask()
-                            .is_some_and(|mask| mask.is_set(Encoding::PLAIN))
-                        {
-                            stats.plain_data_pages = true;
-                        }
-                    }
-                }
-            }
-        }
+    .buffered(8);
+    while let Some((path, metadata)) = metadata_stream.try_next().await? {
+        fold_column_dictionary_stats(&mut columns, &metadata);
+        footers.insert(path, metadata);
     }
 
     let mut paths: Vec<ColumnPath> = columns
@@ -248,7 +245,34 @@ async fn dictionary_fallback_columns(
         .map(|(path, _)| path)
         .collect();
     paths.sort_by_key(|path| path.string());
-    Ok(paths)
+    Ok((paths, footers))
+}
+
+fn fold_column_dictionary_stats(
+    columns: &mut HashMap<ColumnPath, ColumnDictionaryStats>,
+    metadata: &ParquetMetaData,
+) {
+    for row_group in metadata.row_groups() {
+        for column in row_group.columns() {
+            let stats = columns
+                .entry(column.column_descr().path().clone())
+                .or_default();
+            stats.num_values += column.num_values().max(0) as u64;
+            stats.uncompressed_bytes += column.uncompressed_size().max(0) as u64;
+            stats.value_bytes = stats.value_bytes.max(expected_value_bytes(column));
+            match column.dictionary_page_offset() {
+                None => stats.missing_dictionary_page = true,
+                Some(_) => {
+                    if column
+                        .page_encoding_stats_mask()
+                        .is_some_and(|mask| mask.is_set(Encoding::PLAIN))
+                    {
+                        stats.plain_data_pages = true;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn project_row_lineage(task: &mut FileScanTask) {

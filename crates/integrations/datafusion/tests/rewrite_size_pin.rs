@@ -17,8 +17,12 @@
 
 mod rewrite_size_shared;
 
+use std::collections::HashMap;
+use std::time::Instant;
+
 use iceberg::Catalog;
 use iceberg::spec::TableProperties;
+use rewrite_size_shared::counting::create_counting_fixture;
 use rewrite_size_shared::{
     build_bed, build_bed_n, build_low_cardinality_bed, column_dictionary_evidence, create_fixture,
     create_low_cardinality_fixture, live_file_paths, measure_set, remove_table_property,
@@ -131,5 +135,73 @@ async fn insert_without_level_property_writes_level_three_bytes() {
         default_totals.compressed, level1_totals.compressed,
         "the default-level INSERT must differ from a level-1 write or the pin proves nothing ({} vs {})",
         default_totals.compressed, level1_totals.compressed,
+    );
+}
+
+#[tokio::test]
+async fn rewrite_fetches_each_input_footer_once() {
+    let (fixture, reads) = create_counting_fixture(Some("3")).await;
+    build_bed(&fixture).await;
+    let input_paths = live_file_paths(&fixture.catalog, &fixture.table_ident).await;
+    let sizes: HashMap<String, u64> = input_paths
+        .iter()
+        .map(|path| {
+            let local = path.strip_prefix("file://").unwrap_or(path);
+            let size = std::fs::metadata(local)
+                .unwrap_or_else(|error| panic!("stat {local}: {error}"))
+                .len();
+            (path.clone(), size)
+        })
+        .collect();
+
+    let table = remove_table_property(
+        &fixture.catalog,
+        &fixture.table_ident,
+        TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL,
+    )
+    .await;
+    reads.lock().expect("read log").clear();
+    let started = Instant::now();
+    iceberg::maintenance::RewriteDataFiles::new(table)
+        .min_input_files(2)
+        .execute(fixture.catalog.as_ref())
+        .await
+        .expect("run rewrite_data_files");
+    let wall = started.elapsed();
+
+    let log = reads.lock().expect("read log");
+    let mut total_tail_fetches = 0usize;
+    let mut total_fetched = 0u64;
+    for path in &input_paths {
+        let size = sizes[path];
+        let ranges = log
+            .get(path)
+            .unwrap_or_else(|| panic!("no reads recorded for {path}"));
+        let fetched: u64 = ranges.iter().map(|range| range.end - range.start).sum();
+        total_tail_fetches += ranges.iter().filter(|range| range.end == size).count();
+        total_fetched += fetched;
+        let mut sorted = ranges.clone();
+        sorted.sort_by_key(|range| range.start);
+        for pair in sorted.windows(2) {
+            assert!(
+                pair[0].end <= pair[1].start,
+                "{path}: overlapping reads fetch bytes twice: {:?} then {:?}",
+                pair[0],
+                pair[1],
+            );
+        }
+        let tail_fetches = ranges.iter().filter(|range| range.end == size).count();
+        assert_eq!(
+            tail_fetches, 1,
+            "{path}: the footer tail must be fetched exactly once across the whole rewrite, got {tail_fetches} tail-reaching reads (ranges: {ranges:?})",
+        );
+    }
+    println!(
+        "footer-fuse pin: files={} tail_fetches={} fetched_bytes={} fetched_per_file={:.0} wall={:?}",
+        input_paths.len(),
+        total_tail_fetches,
+        total_fetched,
+        total_fetched as f64 / input_paths.len() as f64,
+        wall,
     );
 }

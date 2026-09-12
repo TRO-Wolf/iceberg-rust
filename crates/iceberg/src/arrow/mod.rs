@@ -33,6 +33,7 @@ pub(crate) mod equality_delete_set;
 
 mod int96;
 pub(crate) mod null_propagation;
+mod open_parquet;
 pub(crate) mod orc_reader;
 mod reader;
 pub(crate) mod record_batch_predicate;

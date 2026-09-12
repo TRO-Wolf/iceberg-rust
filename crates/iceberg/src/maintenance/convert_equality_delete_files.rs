@@ -605,6 +605,7 @@ async fn read_data_file_stream(
         file_io,
         file_size_in_bytes,
         parquet_read_options,
+        None,
     )
     .await?;
     let record_batch_stream = parquet::arrow::ParquetRecordBatchStreamBuilder::new_with_metadata(

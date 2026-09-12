@@ -57,11 +57,13 @@ async fn run_repark_scenario(fixture: &ProbeFixture) -> (SetTotals, SetTotals) {
         TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL,
     )
     .await;
+    let rewrite_started = std::time::Instant::now();
     let result = iceberg::maintenance::RewriteDataFiles::new(table.clone())
         .min_input_files(2)
         .execute(fixture.catalog.as_ref())
         .await
         .expect("run rewrite_data_files");
+    println!("== rewrite wall: {:?}", rewrite_started.elapsed());
     println!(
         "== rewrite_data_files at fork defaults (zstd level 3): rewritten={} added={} groups={}",
         result.rewritten_data_files_count,

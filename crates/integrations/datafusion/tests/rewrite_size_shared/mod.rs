@@ -29,7 +29,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use futures::TryStreamExt;
 use iceberg::arrow::{ArrowReaderBuilder, FieldMatchMode, RecordBatchPartitionSplitter};
-use iceberg::io::LocalFsStorageFactory;
+use iceberg::io::{LocalFsStorageFactory, StorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
 use iceberg::spec::{
@@ -57,6 +57,8 @@ pub const GROUP_COUNT: usize = 20;
 pub const BASE_US: i64 = 1_672_531_200_000_000;
 pub const SPAN_US: i64 = 730 * 86_400 * 1_000_000;
 
+pub mod counting;
+
 pub struct ProbeFixture {
     pub context: SessionContext,
     pub catalog: Arc<MemoryCatalog>,
@@ -80,7 +82,15 @@ pub async fn create_fixture(compression_level: Option<&str>) -> ProbeFixture {
         .add_partition_field(2, "grp", Transform::Identity)
         .expect("partition field")
         .build();
-    create_fixture_inner(schema, partition_spec, "probe", "bed", compression_level).await
+    create_fixture_inner(
+        schema,
+        partition_spec,
+        "probe",
+        "bed",
+        compression_level,
+        Arc::new(LocalFsStorageFactory),
+    )
+    .await
 }
 
 pub const LOW_CARD_BATCHES: usize = 100;
@@ -102,16 +112,18 @@ pub async fn create_low_cardinality_fixture(compression_level: Option<&str>) -> 
         "probe_low",
         "bed",
         compression_level,
+        Arc::new(LocalFsStorageFactory),
     )
     .await
 }
 
-async fn create_fixture_inner(
+pub(crate) async fn create_fixture_inner(
     schema: Schema,
     partition_spec: UnboundPartitionSpec,
     namespace: &str,
     table_name: &str,
     compression_level: Option<&str>,
+    storage_factory: Arc<dyn StorageFactory>,
 ) -> ProbeFixture {
     let warehouse = TempDir::new().expect("create warehouse");
     let warehouse_path = warehouse
@@ -120,7 +132,7 @@ async fn create_fixture_inner(
         .expect("warehouse path is UTF-8")
         .to_string();
     let catalog = MemoryCatalogBuilder::default()
-        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .with_storage_factory(storage_factory)
         .load(
             "memory",
             HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
