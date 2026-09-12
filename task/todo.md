@@ -1376,3 +1376,25 @@ Stage 2's named mutation now goes RED, but only through a V2-to-V3 upgrade fixtu
 rewrite reads its source through the assigning reader on both sides, so an ordinary rewrite's
 survivor already carries a stored id. NOT built and escalated: Java's `add(ManifestFile)`
 `first_row_id` precondition has no fork surface to land on (see the R166 residue).
+
+## F-REWRITE-SIZE-1 remediation — fuse decision-pass footers into the rewrite scan (2026-09-13)
+
+Branch `fix/f-rewrite-size-1`, base `224b4a4e3`. Review `/tmp/oc-worker/grok-rev-frs2/report.md`:
+decision pass reads each input's footer (512 KiB prefetch = whole small file) and the scan reads it
+again; `try_collect` retains all N metas WITH column/offset indexes; wide-file decision fetch is
+524 288 B for a KiB-scale footer.
+
+- [x] Red-first pins: counting `Storage`/`FileRead` harness; `rewrite_fetches_each_input_footer_once`
+      (end==size reads per file == 1, no overlapping ranges); unit pins — decision footers carry no
+      indexes and stay bounded to the group (200 files), wide-file decision fetch == footer_len + 8.
+      RED on base: 0..18267 fetched twice; column index retained; fetched=524 288 for a 37 654 B footer.
+- [x] Fuse: `input_parquet_metadata` returns (path, footer) with hint = FOOTER_SIZE and Skip index
+      policies; `dictionary_fallback_columns` folds per-meta into the column-decision map and retains
+      `HashMap<Arc<str>, Arc<ParquetMetaData>>` keyed by path; `ArrowReaderBuilder` carries
+      `prefetched_parquet_metadata` → `open_parquet_file` builds `ArrowReaderMetadata` from the
+      retained footer (`ParquetMetaDataReader::new_with_metadata` + `load_page_index` under the same
+      index policies `get_metadata` used) — no second footer fetch.
+- [x] Re-measure: 206-file rewrite wall 22.97 s (base 22.81 s same machine — localfs wall-neutral),
+      tail fetches 2 → 1 per file, fetched ~17 011 B/file vs 2 × file_size, wide-file decision bytes
+      524 288 → 37 662; ~25× less metadata I/O at the 2 000-file extrapolation.
+- [x] Ledger C-009/C-010/C-011 + gates; commit with TRO-Wolf identity + trailer; handback.json.

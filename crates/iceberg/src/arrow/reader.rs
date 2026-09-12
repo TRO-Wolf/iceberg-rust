@@ -155,6 +155,7 @@ pub struct ArrowReaderBuilder {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    prefetched_parquet_metadata: HashMap<Arc<str>, Arc<ParquetMetaData>>,
 }
 
 impl ArrowReaderBuilder {
@@ -169,6 +170,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
+            prefetched_parquet_metadata: HashMap::new(),
         }
     }
 
@@ -223,6 +225,14 @@ impl ArrowReaderBuilder {
         self
     }
 
+    pub(crate) fn with_prefetched_parquet_metadata(
+        mut self,
+        prefetched: HashMap<Arc<str>, Arc<ParquetMetaData>>,
+    ) -> Self {
+        self.prefetched_parquet_metadata = prefetched;
+        self
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
@@ -236,6 +246,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
+            prefetched_parquet_metadata: self.prefetched_parquet_metadata,
         }
     }
 }
@@ -253,6 +264,7 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    prefetched_parquet_metadata: HashMap<Arc<str>, Arc<ParquetMetaData>>,
 }
 
 impl ArrowReader {
@@ -265,6 +277,7 @@ impl ArrowReader {
         let row_group_filtering_enabled = self.row_group_filtering_enabled;
         let row_selection_enabled = self.row_selection_enabled;
         let parquet_read_options = self.parquet_read_options;
+        let prefetched_parquet_metadata = self.prefetched_parquet_metadata;
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
         let stream: ArrowRecordBatchStream = if concurrency_limit_data_files == 1 {
@@ -272,6 +285,9 @@ impl ArrowReader {
                 tasks
                     .and_then(move |task| {
                         let file_io = file_io.clone();
+                        let prefetched_metadata = prefetched_parquet_metadata
+                            .get(task.data_file_path.as_ref())
+                            .cloned();
 
                         Self::process_file_scan_task(
                             task,
@@ -281,6 +297,7 @@ impl ArrowReader {
                             row_group_filtering_enabled,
                             row_selection_enabled,
                             parquet_read_options,
+                            prefetched_metadata,
                         )
                     })
                     .map_err(|err| {
@@ -294,6 +311,9 @@ impl ArrowReader {
                 tasks
                     .map_ok(move |task| {
                         let file_io = file_io.clone();
+                        let prefetched_metadata = prefetched_parquet_metadata
+                            .get(task.data_file_path.as_ref())
+                            .cloned();
 
                         Self::process_file_scan_task(
                             task,
@@ -303,6 +323,7 @@ impl ArrowReader {
                             row_group_filtering_enabled,
                             row_selection_enabled,
                             parquet_read_options,
+                            prefetched_metadata,
                         )
                     })
                     .map_err(|err| {
@@ -325,6 +346,7 @@ impl ArrowReader {
     /// | `Avro` | [`Self::process_avro_file_scan_task`] | whole file materialized, then filtered post-decode |
     /// | `Orc` | [`Self::process_orc_file_scan_task`] | whole file materialized, then filtered post-decode |
     /// | `Puffin` | none | `FeatureUnsupported`: a sidecar is never a data file |
+    #[allow(clippy::too_many_arguments)]
     async fn process_file_scan_task(
         task: FileScanTask,
         batch_size: Option<usize>,
@@ -333,6 +355,7 @@ impl ArrowReader {
         row_group_filtering_enabled: bool,
         row_selection_enabled: bool,
         parquet_read_options: ParquetReadOptions,
+        prefetched_metadata: Option<Arc<ParquetMetaData>>,
     ) -> Result<ArrowRecordBatchStream> {
         Self::reject_variant_projection(&task)?;
         match task.data_file_format {
@@ -345,6 +368,7 @@ impl ArrowReader {
                     row_group_filtering_enabled,
                     row_selection_enabled,
                     parquet_read_options,
+                    prefetched_metadata,
                 )
                 .await
             }
@@ -394,6 +418,7 @@ impl ArrowReader {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_parquet_file_scan_task(
         task: FileScanTask,
         batch_size: Option<usize>,
@@ -402,6 +427,7 @@ impl ArrowReader {
         row_group_filtering_enabled: bool,
         row_selection_enabled: bool,
         parquet_read_options: ParquetReadOptions,
+        prefetched_metadata: Option<Arc<ParquetMetaData>>,
     ) -> Result<ArrowRecordBatchStream> {
         let should_load_page_index =
             (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
@@ -416,6 +442,7 @@ impl ArrowReader {
             &file_io,
             task.file_size_in_bytes,
             parquet_read_options,
+            prefetched_metadata,
         )
         .await?;
 
@@ -1171,34 +1198,6 @@ impl ArrowReader {
                 None => Ok(None),
             },
         }
-    }
-
-    /// Opens a Parquet file and loads its metadata, returning both the reader and metadata.
-    /// The reader can be reused to build a `ParquetRecordBatchStreamBuilder` without
-    /// reopening the file.
-    pub(crate) async fn open_parquet_file(
-        data_file_path: &str,
-        file_io: &FileIO,
-        file_size_in_bytes: u64,
-        parquet_read_options: ParquetReadOptions,
-    ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
-        let parquet_file = file_io.new_input(data_file_path)?;
-        let parquet_reader = parquet_file.reader().await?;
-        let mut reader = ArrowFileReader::new(
-            FileMetadata {
-                size: file_size_in_bytes,
-            },
-            parquet_reader,
-        )
-        .with_parquet_read_options(parquet_read_options);
-
-        let arrow_metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default())
-            .await
-            .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata").with_source(e)
-            })?;
-
-        Ok((reader, arrow_metadata))
     }
 
     /// computes a `RowSelection` from positional delete indices.

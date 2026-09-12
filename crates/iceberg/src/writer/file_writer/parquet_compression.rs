@@ -63,7 +63,7 @@ pub fn parquet_compression_from_properties(
     match codec.to_ascii_lowercase().as_str() {
         "zstd" => {
             let level = match level_raw {
-                None => ZstdLevel::default(),
+                None => ZstdLevel::try_new(3)?,
                 Some(value) => parse_zstd_level(value)?,
             };
             Ok(Compression::ZSTD(level))
@@ -110,7 +110,7 @@ mod tests {
         let compression = parse(&[]);
         match compression {
             Compression::ZSTD(level) => {
-                assert_eq!(level, ZstdLevel::default());
+                assert_eq!(level.compression_level(), 3);
             }
             other => panic!("expected default ZSTD, got {other:?}"),
         }
