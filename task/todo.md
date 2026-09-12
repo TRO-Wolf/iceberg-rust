@@ -1398,3 +1398,25 @@ again; `try_collect` retains all N metas WITH column/offset indexes; wide-file d
       tail fetches 2 → 1 per file, fetched ~17 011 B/file vs 2 × file_size, wide-file decision bytes
       524 288 → 37 662; ~25× less metadata I/O at the 2 000-file extrapolation.
 - [x] Ledger C-009/C-010/C-011 + gates; commit with TRO-Wolf identity + trailer; handback.json.
+
+## F-S3ROOT-1 step 1 — a bare-bucket S3 location is the bucket root (2026-09-12)
+
+Branch `fix/f-s3root-1`, base `9e3522e31`. Ledger `task/f-s3root-1-ledger.md`.
+An S3 Tables table whose `location` is the bare table bucket (`s3://<id>--table-s3`,
+no slash) fails before listing: `s3_relative_path` strips only `scheme://bucket/`,
+so `create_operator` refuses. Java's `S3URI` treats `s3://bucket` as the bucket
+root (empty key).
+
+- [x] C-001 parser pins, red first: every alias, `s3://b` and `s3://b/` -> `Some("")`;
+      `s3://bx` and `s3://b-other/...` -> `None`; keys still strip byte-exactly.
+      `create_operator` pins the same at the storage seam.
+- [x] Fix: shared whole-host resolver `scheme_relative_path` in `utils.rs`;
+      `s3_relative_path` delegates. Identical bare-bucket defect fixed in the GCS
+      (`gs://b`) and OSS (`oss://b`) arms, each with its own pin; azdls already
+      resolves its filesystem root (pin proves it). `list` gains the missing `/`
+      when neither base nor entry carries one.
+- [x] C-002 MinIO pin: `list("s3://bucket1")` == `list("s3://bucket1/")`.
+- [x] C-003 MinIO pin: `DeleteOrphanFiles` over a bucket-root table finds the
+      planted orphan, spares reachable files; nested control table exact set.
+- [x] Gates (units + compile of the MinIO suite; Docker excused), ledger, commit
+      with TRO-Wolf identity + trailer, `handback.json`.

@@ -32,7 +32,7 @@ pub use reqsign::{AwsCredential, AwsCredentialLoad};
 use reqwest::Client;
 use url::Url;
 
-use crate::utils::{from_opendal_error, is_truthy};
+use crate::utils::{from_opendal_error, is_truthy, scheme_relative_path};
 
 /// Parse iceberg props to s3 config.
 pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config> {
@@ -166,13 +166,7 @@ pub(crate) const S3_SCHEME_ALIASES: [&str; 3] = ["s3", "s3a", "s3n"];
 /// the location is for a different bucket or carries a non-S3 scheme, so the
 /// caller can reject it loudly.
 pub(crate) fn s3_relative_path<'a>(path: &'a str, bucket: &str) -> Option<&'a str> {
-    for scheme in S3_SCHEME_ALIASES {
-        let prefix = format!("{scheme}://{bucket}/");
-        if let Some(relative_path) = path.strip_prefix(&prefix) {
-            return Some(relative_path);
-        }
-    }
-    None
+    scheme_relative_path(path, &S3_SCHEME_ALIASES, bucket)
 }
 
 /// Custom AWS credential loader.
@@ -210,7 +204,7 @@ impl AwsCredentialLoad for CustomAwsCredentialLoader {
 
 #[cfg(test)]
 mod tests {
-    use super::{S3_SCHEME_ALIASES, s3_relative_path};
+    use super::{S3_SCHEME_ALIASES, s3_config_parse, s3_relative_path};
 
     /// Element F-A2-1/6: a location whose bucket differs from the operator's
     /// configured bucket must not resolve under ANY alias. `create_operator`
@@ -253,5 +247,86 @@ mod tests {
             s3_relative_path("s3a://warehouse/k", "warehouse"),
             Some("k")
         );
+    }
+
+    #[test]
+    fn test_s3_relative_path_bucket_root_is_empty_key() {
+        for scheme in S3_SCHEME_ALIASES {
+            let bare = format!("{scheme}://mybucket");
+            assert_eq!(
+                s3_relative_path(&bare, "mybucket"),
+                Some(""),
+                "{bare} must resolve to the empty key"
+            );
+            let slash = format!("{scheme}://mybucket/");
+            assert_eq!(
+                s3_relative_path(&slash, "mybucket"),
+                Some(""),
+                "{slash} must resolve to the empty key"
+            );
+        }
+    }
+
+    #[test]
+    fn test_s3_relative_path_bucket_name_is_whole_host() {
+        for scheme in S3_SCHEME_ALIASES {
+            let longer = format!("{scheme}://mybucketx");
+            assert_eq!(
+                s3_relative_path(&longer, "mybucket"),
+                None,
+                "{longer} must not resolve for bucket mybucket"
+            );
+            let other = format!("{scheme}://mybucket-other/key");
+            assert_eq!(
+                s3_relative_path(&other, "mybucket"),
+                None,
+                "{other} must not resolve for bucket mybucket"
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_operator_bucket_root_resolves_to_empty_key() {
+        use std::collections::HashMap;
+
+        use iceberg::io::{S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_REGION};
+
+        use crate::{OpenDalStorage, OperatorCache};
+
+        for configured in S3_SCHEME_ALIASES {
+            let props: HashMap<String, String> = [
+                (S3_REGION, "us-east-1"),
+                (S3_DISABLE_CONFIG_LOAD, "true"),
+                (S3_DISABLE_EC2_METADATA, "true"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            let storage = OpenDalStorage::S3 {
+                configured_scheme: configured.to_string(),
+                config: std::sync::Arc::new(
+                    s3_config_parse(props).expect("offline s3 config parses"),
+                ),
+                customized_credential_load: None,
+                operator_cache: OperatorCache::default(),
+            };
+            for scheme in S3_SCHEME_ALIASES {
+                let bare = format!("{scheme}://my-bucket");
+                let (op, rel) = storage
+                    .create_operator(&bare)
+                    .unwrap_or_else(|e| panic!("{bare} must resolve: {e}"));
+                assert_eq!(rel, "", "{bare}");
+                assert_eq!(op.info().name(), "my-bucket");
+                let slash = format!("{scheme}://my-bucket/");
+                let (op2, rel2) = storage
+                    .create_operator(&slash)
+                    .unwrap_or_else(|e| panic!("{slash} must resolve: {e}"));
+                assert_eq!(rel2, "", "{slash}");
+                assert!(
+                    std::sync::Arc::ptr_eq(op.inner(), op2.inner()),
+                    "{bare} and {slash} must share the bucket operator"
+                );
+            }
+        }
     }
 }

@@ -39,7 +39,7 @@ use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use opendal::raw::ConcurrentTasks;
 use opendal::{Executor, Operator};
 use serde::{Deserialize, Serialize};
-use utils::from_opendal_error;
+use utils::{from_opendal_error, join_list_location};
 
 /// Per-operator concurrent request cap applied once when an Operator is first cached.
 ///
@@ -552,15 +552,15 @@ impl OpenDalStorage {
                     None => {
                         let accepted = S3_SCHEME_ALIASES
                             .iter()
-                            .map(|&scheme| format!("{scheme}://{bucket}/"))
+                            .map(|&scheme| format!("{scheme}://{bucket}"))
                             .collect::<Vec<_>>()
                             .join(", ");
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
                             format!(
-                                "Invalid s3 url: {path}, should start with one of \
-                                 [{accepted}] (storage configured for scheme \
-                                 {configured_scheme})"
+                                "Invalid s3 url: {path}, should be one of \
+                                 [{accepted}] or a path under it (storage \
+                                 configured for scheme {configured_scheme})"
                             ),
                         ));
                     }
@@ -588,14 +588,13 @@ impl OpenDalStorage {
                         format!("Invalid gcs url: {path}, bucket is required"),
                     )
                 })?;
-                let prefix = format!("gs://{bucket}/");
-                if !path.starts_with(&prefix) {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid gcs url: {path}, should start with {prefix}"),
-                    ));
-                }
-                let relative_path = &path[prefix.len()..];
+                let relative_path = crate::utils::scheme_relative_path(path, &["gs"], bucket)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Invalid gcs url: {path}, should be under gs://{bucket}"),
+                        )
+                    })?;
                 let op = operator_cache
                     .get_or_insert_with(bucket.to_string(), || gcs_config_build(config, path))?;
                 Ok((op, relative_path))
@@ -617,14 +616,13 @@ impl OpenDalStorage {
                         format!("Invalid oss url: {path}, missing bucket"),
                     )
                 })?;
-                let prefix = format!("oss://{bucket}/");
-                if !path.starts_with(&prefix) {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid oss url: {path}, should start with {prefix}"),
-                    ));
-                }
-                let relative_path = &path[prefix.len()..];
+                let relative_path = crate::utils::scheme_relative_path(path, &["oss"], bucket)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Invalid oss url: {path}, should be under oss://{bucket}"),
+                        )
+                    })?;
                 let op = operator_cache
                     .get_or_insert_with(bucket.to_string(), || oss_config_build(config, path))?;
                 Ok((op, relative_path))
@@ -756,7 +754,7 @@ impl Storage for OpenDalStorage {
                 continue;
             }
 
-            let location = format!("{base}{}", entry.path());
+            let location = join_list_location(base, entry.path());
             if list_entry_metadata_complete(list_meta) {
                 locations.push(location);
                 ready_meta.push(Some(file_meta_from_complete_list_entry(list_meta)));

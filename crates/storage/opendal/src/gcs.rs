@@ -86,3 +86,49 @@ pub(crate) fn gcs_config_build(cfg: &GcsConfig, path: &str) -> Result<Operator> 
         .map_err(from_opendal_error)?
         .finish())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use iceberg::io::{GCS_DISABLE_CONFIG_LOAD, GCS_DISABLE_VM_METADATA, GCS_NO_AUTH};
+
+    use super::gcs_config_parse;
+    use crate::{OpenDalStorage, OperatorCache};
+
+    fn gcs_storage() -> OpenDalStorage {
+        let props: HashMap<String, String> = [
+            (GCS_NO_AUTH, "true"),
+            (GCS_DISABLE_CONFIG_LOAD, "true"),
+            (GCS_DISABLE_VM_METADATA, "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        OpenDalStorage::Gcs {
+            config: Arc::new(gcs_config_parse(props).expect("offline gcs config parses")),
+            operator_cache: OperatorCache::default(),
+        }
+    }
+
+    #[test]
+    fn test_create_operator_bucket_root_resolves_to_empty_key() {
+        let storage = gcs_storage();
+        let (op, rel) = storage
+            .create_operator(&"gs://gcs-bucket")
+            .expect("bare bucket root must resolve");
+        assert_eq!(rel, "");
+        assert_eq!(op.info().name(), "gcs-bucket");
+        let (op2, rel2) = storage
+            .create_operator(&"gs://gcs-bucket/")
+            .expect("slash bucket root must resolve");
+        assert_eq!(rel2, "");
+        assert!(Arc::ptr_eq(op.inner(), op2.inner()));
+        let (op3, rel3) = storage
+            .create_operator(&"gs://gcs-bucket/nested/k")
+            .expect("nested key must resolve");
+        assert_eq!(rel3, "nested/k");
+        assert!(Arc::ptr_eq(op.inner(), op3.inner()));
+    }
+}

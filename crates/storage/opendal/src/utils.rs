@@ -27,3 +27,69 @@ pub(crate) fn from_opendal_error(e: opendal::Error) -> iceberg::Error {
     )
     .with_source(e)
 }
+
+pub(crate) fn scheme_relative_path<'a>(
+    path: &'a str,
+    schemes: &[&str],
+    bucket: &str,
+) -> Option<&'a str> {
+    for scheme in schemes {
+        let prefix = format!("{scheme}://{bucket}");
+        if let Some(rest) = path.strip_prefix(&prefix) {
+            if rest.is_empty() {
+                return Some("");
+            }
+            if let Some(key) = rest.strip_prefix('/') {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn join_list_location(base: &str, entry_path: &str) -> String {
+    if base.ends_with('/') || entry_path.starts_with('/') {
+        format!("{base}{entry_path}")
+    } else {
+        format!("{base}/{entry_path}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_list_location, scheme_relative_path};
+
+    #[test]
+    fn test_scheme_relative_path_bucket_boundary() {
+        for scheme in ["s3", "gs", "oss"] {
+            let bare = format!("{scheme}://bucket");
+            assert_eq!(scheme_relative_path(&bare, &[scheme], "bucket"), Some(""));
+            let slash = format!("{scheme}://bucket/");
+            assert_eq!(scheme_relative_path(&slash, &[scheme], "bucket"), Some(""));
+            let key = format!("{scheme}://bucket/k");
+            assert_eq!(scheme_relative_path(&key, &[scheme], "bucket"), Some("k"));
+            let longer = format!("{scheme}://bucketx");
+            assert_eq!(scheme_relative_path(&longer, &[scheme], "bucket"), None);
+            let other = format!("{scheme}://bucket-other/k");
+            assert_eq!(scheme_relative_path(&other, &[scheme], "bucket"), None);
+        }
+    }
+
+    #[test]
+    fn test_join_list_location_separator_boundary() {
+        assert_eq!(join_list_location("s3://b", "k"), "s3://b/k");
+        assert_eq!(join_list_location("s3://b/", "k"), "s3://b/k");
+        assert_eq!(
+            join_list_location("abfss://fs@acct.dfs.core.windows.net", "/p/f"),
+            "abfss://fs@acct.dfs.core.windows.net/p/f"
+        );
+        assert_eq!(
+            join_list_location("memory:/", "dir/a.txt"),
+            "memory:/dir/a.txt"
+        );
+        assert_eq!(
+            join_list_location("s3://b", "metadata/00000-uuid.metadata.json"),
+            "s3://b/metadata/00000-uuid.metadata.json"
+        );
+    }
+}

@@ -534,6 +534,23 @@ mod tests {
     }
 
     #[test]
+    fn test_azdls_filesystem_root_resolves_to_empty_path() {
+        let config = AzdlsConfig {
+            account_name: Some("myaccount".to_string()),
+            endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
+            ..Default::default()
+        };
+        let (op, rel) = azdls_create_operator(
+            "abfss://myfs@myaccount.dfs.core.windows.net",
+            &config,
+            &AzureStorageScheme::Abfss,
+        )
+        .expect("filesystem root must resolve");
+        assert_eq!(op.info().name(), "myfs");
+        assert_eq!(rel, "");
+    }
+
+    #[test]
     fn test_azure_storage_path_parse() {
         let test_cases = vec![
             (
