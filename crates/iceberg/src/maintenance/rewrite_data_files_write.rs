@@ -15,12 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
+use parquet::arrow::async_reader::AsyncFileReader;
+use parquet::basic::{Encoding, Type as PhysicalType};
+use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
+use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 
-use crate::arrow::{ArrowReaderBuilder, RecordBatchPartitionSplitter};
+use crate::arrow::{ArrowFileReader, ArrowReaderBuilder, RecordBatchPartitionSplitter};
 use crate::error::{Error, ErrorKind, Result};
+use crate::io::{FileIO, FileMetadata};
 use crate::maintenance::rewrite_data_files_router::BoundedPartitionRouter;
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
@@ -66,12 +73,11 @@ pub(crate) async fn write_compacted_files(
         DataFileFormat::Parquet,
     );
     let compression = parquet_compression_from_properties(table.metadata().properties())?;
-    let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder()
-            .set_compression(compression)
-            .build(),
-        schema.clone(),
-    );
+    let mut writer_properties = WriterProperties::builder().set_compression(compression);
+    for path in dictionary_fallback_columns(table, group).await? {
+        writer_properties = writer_properties.set_column_dictionary_enabled(path, false);
+    }
+    let parquet_builder = ParquetWriterBuilder::new(writer_properties.build(), schema.clone());
     let rolling_builder = RollingFileWriterBuilder::new(
         parquet_builder,
         usize::try_from(target_file_size_bytes).unwrap_or(usize::MAX),
@@ -145,6 +151,104 @@ fn rewrite_write_schema(table: &Table) -> Result<SchemaRef> {
     } else {
         Ok(schema.clone())
     }
+}
+
+#[derive(Default)]
+struct ColumnDictionaryStats {
+    missing_dictionary_page: bool,
+    plain_data_pages: bool,
+    uncompressed_bytes: u64,
+    num_values: u64,
+    value_bytes: u64,
+}
+
+fn expected_value_bytes(column: &ColumnChunkMetaData) -> u64 {
+    let descr = column.column_descr();
+    match descr.physical_type() {
+        PhysicalType::BOOLEAN | PhysicalType::INT32 | PhysicalType::FLOAT => 4,
+        PhysicalType::INT64 | PhysicalType::DOUBLE => 8,
+        PhysicalType::INT96 => 12,
+        PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+            u64::try_from(descr.type_length()).unwrap_or(8).max(1)
+        }
+        PhysicalType::BYTE_ARRAY => column
+            .statistics()
+            .and_then(|stats| {
+                let min = stats.min_bytes_opt()?.len();
+                let max = stats.max_bytes_opt()?.len();
+                Some((min + max) as u64 / 2)
+            })
+            .map(|average| 4 + average.max(4))
+            .unwrap_or(12),
+    }
+}
+
+async fn input_parquet_metadata(
+    file_io: &FileIO,
+    task: &FileScanTask,
+) -> Result<Arc<ParquetMetaData>> {
+    let input = file_io.new_input(task.data_file_path.as_ref())?;
+    let size = if task.file_size_in_bytes > 0 {
+        task.file_size_in_bytes
+    } else {
+        input.metadata().await?.size
+    };
+    let mut reader = ArrowFileReader::new(FileMetadata { size }, input.reader().await?);
+    Ok(reader.get_metadata(None).await?)
+}
+
+async fn dictionary_fallback_columns(
+    table: &Table,
+    group: &[FileScanTask],
+) -> Result<Vec<ColumnPath>> {
+    let file_io = table.file_io();
+    let metas: Vec<Arc<ParquetMetaData>> = futures::stream::iter(
+        group
+            .iter()
+            .filter(|task| task.data_file_format == DataFileFormat::Parquet)
+            .map(|task| input_parquet_metadata(file_io, task)),
+    )
+    .buffered(8)
+    .try_collect()
+    .await?;
+
+    let mut columns: HashMap<ColumnPath, ColumnDictionaryStats> = HashMap::new();
+    for metadata in &metas {
+        for row_group in metadata.row_groups() {
+            for column in row_group.columns() {
+                let stats = columns
+                    .entry(column.column_descr().path().clone())
+                    .or_default();
+                stats.num_values += column.num_values().max(0) as u64;
+                stats.uncompressed_bytes += column.uncompressed_size().max(0) as u64;
+                stats.value_bytes = stats.value_bytes.max(expected_value_bytes(column));
+                match column.dictionary_page_offset() {
+                    None => stats.missing_dictionary_page = true,
+                    Some(_) => {
+                        if column
+                            .page_encoding_stats_mask()
+                            .is_some_and(|mask| mask.is_set(Encoding::PLAIN))
+                        {
+                            stats.plain_data_pages = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut paths: Vec<ColumnPath> = columns
+        .into_iter()
+        .filter(|(_, stats)| {
+            stats.missing_dictionary_page
+                || stats.plain_data_pages
+                || stats.uncompressed_bytes.saturating_mul(2)
+                    >= stats.num_values.saturating_mul(stats.value_bytes)
+        })
+        .map(|(path, _)| path)
+        .collect();
+    paths.sort_by_key(|path| path.string());
+    Ok(paths)
 }
 
 fn project_row_lineage(task: &mut FileScanTask) {

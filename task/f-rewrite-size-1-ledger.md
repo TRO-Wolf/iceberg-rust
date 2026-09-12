@@ -17,13 +17,14 @@
   ~ under the License.
 -->
 
-# F-REWRITE-SIZE-1 step 1 — why `rewrite_data_files` output is ~1.5× its input's compressed bytes
+# F-REWRITE-SIZE-1 — why `rewrite_data_files` output is ~1.5× its input's compressed bytes, and the fix
 
-**Date:** 2026-09-13. **Branch:** `measure/f-rewrite-size-1`.
+**Date:** 2026-09-13 (step 1, branch `measure/f-rewrite-size-1`); 2026-09-12 (step 2, branch
+`fix/f-rewrite-size-1`).
 **Base:** `origin/main` `41e25ba2b99a0d90caf4317b4236f5e1d4b683f5` (fork tip at branch).
 **Model:** swe-2-high
-**Path:** MEASURE — no product code change in this round. Step 2 (the fix) opens on this
-measurement.
+**Path:** step 1 MEASURE — no product code change. Step 2 (the fix) landed on this
+measurement; see the step-2 sections below.
 
 This ledger retires when the unit's fix lands or the owner removes the unit.
 
@@ -59,13 +60,25 @@ Probe targets (all `#[ignore]`d; CI does not run them):
 
 ## File allowlist
 
+Step 1 (measure only):
+
 - `crates/integrations/datafusion/tests/rewrite_size_probe.rs`
 - `crates/integrations/datafusion/tests/rewrite_size_pin.rs`
 - `crates/integrations/datafusion/tests/rewrite_size_shared/mod.rs`
 - `crates/integrations/datafusion/tests/map.md`
 - `task/f-rewrite-size-1-ledger.md`
 
-No product code, no `Cargo.toml`/`Cargo.lock`, no `.github/`.
+Step 2 adds:
+
+- `crates/iceberg/src/writer/file_writer/parquet_compression.rs`
+- `crates/iceberg/src/maintenance/rewrite_data_files_write.rs`
+- `crates/iceberg/src/maintenance/map.md`
+- `crates/iceberg/src/writer/map.md`
+
+No `Cargo.toml`/`Cargo.lock`, no `.github/`. `row_lineage.rs` was examined and left
+untouched: `StreamingDataFileWriter` writes new DML rows, not a rewrite of identified
+input files, so it has no input footers to consult; it inherits the D-2 level-3 default
+through `parquet_compression_from_properties` like every other writer path.
 
 ## Proposition ledger
 
@@ -75,6 +88,10 @@ No product code, no `Cargo.toml`/`Cargo.lock`, no `.github/`.
 | C-002 | Base-tree `rewrite_data_files` output is ≥ 1.4× the input's compressed bytes — the defect reproduces in the fork. | `rewrite_size_probe` asserts `out/in ≥ 1.4`; the `rewrite_size_pin` forward pin must FAIL on base. | PROVEN | Real `rewrite_data_files` (rewritten=206, added=20, groups=20): output Σ compressed **4 782 768–4 789 094 B** across runs → out/in **1.4656–1.4675**. Pin red output below. |
 | C-003 | Table of every `WriterProperties` value each writer path reaches. | Source diff of `write.rs` vs `rewrite_data_files_write.rs` + runtime dump of the built `WriterProperties`. | PROVEN | Both paths construct `WriterProperties::builder().set_compression(<parsed>).build()` — identical objects. Full property table below. The only construction differences are outside `WriterProperties`: `FieldMatchMode::Name` (insert) vs `Id` (rewrite), DataFusion 2 000-row batches vs 8 192-row reader batches, and TaskWriter fanout vs the splitter/router. |
 | C-004 | One-at-a-time flip table names the single property (or sort) bringing the rewrite within 10 % of input compressed bytes. | `manual_rewrite` replays the real input tasks through `ParquetWriterBuilder` with each candidate flipped once. | PROVEN | **`dictionary_enabled` is the named cause.** `set_dictionary_enabled(false)` alone: σ compressed **3 292 655 B → out/in 1.0090** (≤ 1.1). zstd level 3 alone: 1.1325; level 9: 1.1015 — the level mismatch contributes but does not reach 10 % by itself. Sorting by the input's `id` order: 1.4572 — order is not the cause. Every other candidate ≈ 1.472. Full table below. |
+|| C-005 | D-1: the rewrite writer disables dictionary encoding only on columns whose input chunks show fallback; the high-cardinality bed's rewrite output stays ≤ 1.05× input. | `rewrite_size_pin::rewrite_output_within_five_percent_of_input` (un-ignored, tightened from 1.1 to 1.05) green. | PROVEN | Red on base: `got 1.4654 (4782370 vs 3263419)`. Green with the fix: output Σ compressed **2 181 668 B** vs input **3 263 419 B** → out/in **0.6686** (20 files). `ts`/`id` footers show no dictionary page; `grp` keeps it. |
+|| C-006 | Low-cardinality columns keep the dictionary: a `grp`-like column with 8 values over 200 k rows rewrites ≤ 1.05× input with dict pages still on. | `rewrite_size_pin::rewrite_keeps_dictionary_on_low_cardinality_columns` green: size bound AND per-chunk dict-page/data-page-encoding assertions. | PROVEN | 100 input files × 2 000 rows (`id` unique, `grp` = `g{id % 8}`). Output: Σ compressed **208 559 B** vs input **500 834 B** → **0.4164**; every output `grp` chunk carries a dictionary page with dict-only data-page encodings (1/1); `id` chunks carry none (0/1). Red on base via the `id` leg (dict page present 1/1) — and on an earlier fix draft via size (1.0837) when the byte leg wrongly disabled `grp`. |
+|| C-007 | D-2: an unset `write.parquet.compression-level` writes zstd level 3 (Java/Spark default), explicit levels still win. | `rewrite_size_pin::insert_without_level_property_writes_level_three_bytes` green: byte equality with an explicit level-3 write + unit test on the parser. | PROVEN | No-level INSERT Σ compressed **634 636 B** == explicit level-3 INSERT **634 636 B**; level-1 control **831 806 B** differs. `parquet_compression_default_is_zstd` asserts `compression_level() == 3`. Red on base: no-level bytes equalled level-1 (831 806), not level-3. Footer carries no level field — proven by bytes only. |
+|| C-008 | Step-2 gates all green. | The card's gate list. | PROVEN | `rewrite_size_pin` 3 passed; `rewrite_compression` 3 passed; `insert_compression` 4 passed; `insert_distribution` 7 passed; `cargo test -p iceberg --lib` 3670 passed (8 ignored); `cargo test -p iceberg-datafusion --lib` 216 passed (1 ignored); `make check` exit 0 (fmt, clippy `-D warnings`, taplo, machete, artifacts, anchors, comment blocks, file size); comment fence clean. |
 
 ## Red evidence (forward pin, base tree)
 
@@ -92,6 +109,25 @@ test result: FAILED. 0 passed; 1 failed
 
 The pin lives in its own test target so the card's probe gate
 (`--test rewrite_size_probe`) stays green while this file stays red until step 2.
+
+## Red evidence (step-2 pins, base tree)
+
+`cargo test -p iceberg-datafusion --test rewrite_size_pin` exited 101 on the base tree
+(product code unchanged, pins un-ignored):
+
+```
+test insert_without_level_property_writes_level_three_bytes ... FAILED
+  assertion `left == right` failed: an INSERT without write.parquet.compression-level
+  must write the same compressed bytes as an explicit level-3 write (831806 vs 634636)
+  (the no-level bytes equal the level-1 control exactly: 831806 == 831806)
+test rewrite_keeps_dictionary_on_low_cardinality_columns ... FAILED
+  assertion `left == right` failed: the near-unique id column must not write a
+  dictionary page (1/1)
+test rewrite_output_within_five_percent_of_input ... FAILED
+  rewrite output must stay within 5% of input compressed bytes, got 1.4654
+  (4782370 vs 3263419)
+test result: FAILED. 0 passed; 3 failed
+```
 
 ## Mechanism (measured, not guessed)
 
@@ -218,7 +254,51 @@ regardless of the written level (already documented in
 `task/f-write-compress-1-ledger.md`). Written levels are proven by byte totals:
 level-3 INSERT input = 3 263 419 B vs 4 279 399 B at level 1 for identical rows.
 
+## Step 2 — the fix (2026-09-12, branch `fix/f-rewrite-size-1`)
+
+Two ruled changes:
+
+**D-2 — zstd default level 3.** `parquet_compression_from_properties` maps an unset
+`write.parquet.compression-level` to `ZstdLevel::try_new(3)` instead of
+`ZstdLevel::default()` (= 1). One line in
+`crates/iceberg/src/writer/file_writer/parquet_compression.rs`; every writer path that
+parses table properties inherits it. Proven by bytes (footers do not store the level):
+no-level INSERT output equals an explicit level-3 write byte-for-byte (634 636 B) and
+differs from level-1 (831 806 B) on identical 80 000-row beds.
+
+**D-1 — per-column dictionary from the input footers.**
+`rewrite_data_files_write.rs::dictionary_fallback_columns` loads the parquet footer of
+every file in the rewrite group (`ArrowFileReader::get_metadata`;
+`task.file_size_in_bytes` avoids a stat, with `input.metadata()` as the fallback), walks
+every column chunk, and calls `set_column_dictionary_enabled(path, false)` on the output
+`WriterProperties` for exactly the columns whose input chunks show the dictionary not
+paying. Three signals, any one disables:
+
+1. a chunk with a dictionary page whose data-page encoding mask contains PLAIN — the
+   literal fallback signature (the dead dict page + PLAIN data pages);
+2. a chunk with no dictionary page at all — the input writer already declined the dict;
+3. `2 × Σ uncompressed_size ≥ Σ num_values × value_bytes` over the column's chunks —
+   i.e. uncompressed bytes per value ≥ half the physical value width. A dictionary
+   chunk's uncompressed size ≈ U×v + N×w (U uniques × value width + N indices), so this
+   fires when U/N ≳ 0.5 — a near-unique column whose output-chunk dictionary would grow
+   linearly past `dictionary_page_size_limit` (1 MiB) and die as a dead page. `v` is the
+   physical width for fixed-width types; for BYTE_ARRAY it is `4 + (len(min)+len(max))/2`
+   from column statistics (default 12 when stats are absent).
+
+Signal 3 is the leg that catches the measured bed: the input files are 2 000-row chunks
+whose dictionaries are healthy (no literal fallback), yet `ts`/`id` run at
+~9.4 uncompressed B/row vs an 8-byte value — U/N ≈ 1, and the ~22 k-row output chunks
+overflow as measured in step 1. An earlier draft used `dict_page_bytes ≥ data_bytes`
+instead; it wrongly disabled `grp` on the low-cardinality bed (dict page ≈ 60 B vs
+period-8 indices that zstd crushes to ≈ 50 B, U/N = 0.004) and the C-006 size leg went
+red at 1.0837 — the per-value-width rule keeps `grp` at 0.43 B/row ≪ 3.5 B threshold.
+
+Output ordering of `paths` is sorted for determinism; `buffered(8)` bounds footer-fetch
+concurrency. Non-parquet group members are skipped.
+
 ## Gates
+
+Step 1 (measure):
 
 | gate | command | result |
 |---|---|---|
@@ -228,7 +308,20 @@ level-3 INSERT input = 3 263 419 B vs 4 279 399 B at level 1 for identical rows.
 | workspace gates | `make check` | exit 0 — fmt, clippy `-D warnings`, taplo, cargo-machete, agent artifacts, matrix anchors, comment blocks, file-size all green |
 | comment fence | `git diff --cached` fence | clean — the only added comment lines are ASF license headers |
 
-## Residue / observations for step 2
+Step 2 (fix):
+
+| gate | command | result |
+|---|---|---|
+| pin | `cargo test -p iceberg-datafusion --test rewrite_size_pin` | exit 0 — `3 passed` (117–133 s); main pin out/in **0.6686**, low-card pin **0.4164** with `grp` dict on, level-3 byte-match exact |
+| rewrite compression | `cargo test -p iceberg-datafusion --test rewrite_compression` | exit 0 — `3 passed` |
+| insert compression | `cargo test -p iceberg-datafusion --test insert_compression` | exit 0 — `4 passed` |
+| insert distribution | `cargo test -p iceberg-datafusion --test insert_distribution` | exit 0 — `7 passed` |
+| iceberg lib | `cargo test -p iceberg --lib` | exit 0 — `3670 passed; 8 ignored` |
+| datafusion lib | `cargo test -p iceberg-datafusion --lib` | exit 0 — `216 passed; 1 ignored` |
+| workspace gates | `make check` | exit 0 — fmt, clippy `-D warnings`, taplo, cargo-machete, agent artifacts, matrix anchors, comment blocks, file-size all green |
+| comment fence | `git diff --cached` fence | clean — no added comment lines outside the ASF header |
+
+## Residue / observations
 
 - `write.rs` builds `FieldMatchMode::Name` writers and the rewrite `Id`; measured no
   size effect on this bed.

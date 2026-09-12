@@ -63,7 +63,7 @@ async fn run_repark_scenario(fixture: &ProbeFixture) -> (SetTotals, SetTotals) {
         .await
         .expect("run rewrite_data_files");
     println!(
-        "== rewrite_data_files at fork defaults (zstd level 1): rewritten={} added={} groups={}",
+        "== rewrite_data_files at fork defaults (zstd level 3): rewritten={} added={} groups={}",
         result.rewritten_data_files_count,
         result.added_data_files_count,
         result.file_groups.len(),
@@ -107,7 +107,7 @@ async fn rewrite_size_probe() {
         "bed must reproduce the RePark zstd ratio (~0.38), got {input_ratio:.4}"
     );
     assert!(
-        ratio >= 1.4,
-        "defect check: rewrite output must be >= 1.4x input compressed on the base tree, got {ratio:.4}"
+        ratio <= 1.05,
+        "post-fix check: rewrite output must stay within 5% of input compressed bytes, got {ratio:.4}"
     );
 }

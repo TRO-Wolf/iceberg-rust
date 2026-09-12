@@ -66,25 +66,6 @@ pub struct ProbeFixture {
 }
 
 pub async fn create_fixture(compression_level: Option<&str>) -> ProbeFixture {
-    let warehouse = TempDir::new().expect("create warehouse");
-    let warehouse_path = warehouse
-        .path()
-        .to_str()
-        .expect("warehouse path is UTF-8")
-        .to_string();
-    let catalog = MemoryCatalogBuilder::default()
-        .with_storage_factory(Arc::new(LocalFsStorageFactory))
-        .load(
-            "memory",
-            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
-        )
-        .await
-        .expect("build memory catalog");
-    let namespace = NamespaceIdent::new("probe".to_string());
-    catalog
-        .create_namespace(&namespace, HashMap::new())
-        .await
-        .expect("create namespace");
     let schema = Schema::builder()
         .with_schema_id(0)
         .with_fields(vec![
@@ -99,6 +80,58 @@ pub async fn create_fixture(compression_level: Option<&str>) -> ProbeFixture {
         .add_partition_field(2, "grp", Transform::Identity)
         .expect("partition field")
         .build();
+    create_fixture_inner(schema, partition_spec, "probe", "bed", compression_level).await
+}
+
+pub const LOW_CARD_BATCHES: usize = 100;
+pub const LOW_CARD_VALUES: i64 = 8;
+
+pub async fn create_low_cardinality_fixture(compression_level: Option<&str>) -> ProbeFixture {
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "grp", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .expect("build schema");
+    let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
+    create_fixture_inner(
+        schema,
+        partition_spec,
+        "probe_low",
+        "bed",
+        compression_level,
+    )
+    .await
+}
+
+async fn create_fixture_inner(
+    schema: Schema,
+    partition_spec: UnboundPartitionSpec,
+    namespace: &str,
+    table_name: &str,
+    compression_level: Option<&str>,
+) -> ProbeFixture {
+    let warehouse = TempDir::new().expect("create warehouse");
+    let warehouse_path = warehouse
+        .path()
+        .to_str()
+        .expect("warehouse path is UTF-8")
+        .to_string();
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "memory",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
+        )
+        .await
+        .expect("build memory catalog");
+    let namespace = NamespaceIdent::new(namespace.to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
     let mut properties = HashMap::new();
     if let Some(level) = compression_level {
         properties.insert(
@@ -106,13 +139,13 @@ pub async fn create_fixture(compression_level: Option<&str>) -> ProbeFixture {
             level.to_string(),
         );
     }
-    let table_ident = TableIdent::new(namespace.clone(), "bed".to_string());
+    let table_ident = TableIdent::new(namespace.clone(), table_name.to_string());
     catalog
         .create_table(
             &namespace,
             TableCreation::builder()
-                .name("bed".to_string())
-                .location(format!("{warehouse_path}/bed"))
+                .name(table_name.to_string())
+                .location(format!("{warehouse_path}/{table_name}"))
                 .schema(schema)
                 .partition_spec(partition_spec)
                 .properties(properties)
@@ -175,8 +208,21 @@ async fn run_sql(context: &SessionContext, sql: &str) {
         .unwrap_or_else(|error| panic!("execute `{sql}`: {error}"));
 }
 
+fn table_sql_name(fixture: &ProbeFixture) -> String {
+    format!(
+        "catalog.{}.{}",
+        fixture.table_ident.namespace()[0],
+        fixture.table_ident.name()
+    )
+}
+
 pub async fn build_bed(fixture: &ProbeFixture) {
-    for batch in 0..BATCHES {
+    build_bed_n(fixture, BATCHES).await
+}
+
+pub async fn build_bed_n(fixture: &ProbeFixture, batches: usize) {
+    let target = table_sql_name(fixture);
+    for batch in 0..batches {
         let seed = seed_batch(batch);
         let source =
             MemTable::try_new(seed.schema(), vec![vec![seed]]).expect("build seed MemTable");
@@ -186,7 +232,43 @@ pub async fn build_bed(fixture: &ProbeFixture) {
             .expect("register seed table");
         run_sql(
             &fixture.context,
-            &format!("INSERT INTO catalog.probe.bed SELECT ts, grp, id FROM seed_{batch}"),
+            &format!("INSERT INTO {target} SELECT ts, grp, id FROM seed_{batch}"),
+        )
+        .await;
+    }
+}
+
+fn low_cardinality_seed_batch(batch: usize) -> RecordBatch {
+    let base = i64::try_from(batch).expect("batch index") * BATCH_ROWS;
+    let ids: Vec<i64> = (0..BATCH_ROWS).map(|row| base + row).collect();
+    let groups: Vec<String> = ids
+        .iter()
+        .map(|id| format!("g{:02}", id % LOW_CARD_VALUES))
+        .collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("grp", DataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(schema, vec![
+        Arc::new(Int64Array::from(ids)),
+        Arc::new(StringArray::from(groups)),
+    ])
+    .expect("build low-cardinality seed batch")
+}
+
+pub async fn build_low_cardinality_bed(fixture: &ProbeFixture) {
+    let target = table_sql_name(fixture);
+    for batch in 0..LOW_CARD_BATCHES {
+        let seed = low_cardinality_seed_batch(batch);
+        let source =
+            MemTable::try_new(seed.schema(), vec![vec![seed]]).expect("build seed MemTable");
+        fixture
+            .context
+            .register_table(format!("seed_low_{batch}"), Arc::new(source))
+            .expect("register seed table");
+        run_sql(
+            &fixture.context,
+            &format!("INSERT INTO {target} SELECT id, grp FROM seed_low_{batch}"),
         )
         .await;
     }
@@ -440,6 +522,36 @@ pub fn measure_set(label: &str, paths: &[String], detail_files: usize) -> SetTot
         println!("  column {name}: compressed={compressed} uncompressed={uncompressed}");
     }
     totals
+}
+
+pub fn column_dictionary_evidence(paths: &[String], column: &str) -> (usize, usize, usize) {
+    let mut chunks = 0;
+    let mut with_dict_page = 0;
+    let mut dict_only_data = 0;
+    for path in paths {
+        let local = local_fs_path(path);
+        let file = File::open(local).unwrap_or_else(|error| panic!("open {local}: {error}"));
+        let reader = SerializedFileReader::new(file)
+            .unwrap_or_else(|error| panic!("read footer {local}: {error}"));
+        for row_group in reader.metadata().row_groups() {
+            for column_chunk in row_group.columns() {
+                if column_chunk.column_descr().name() != column {
+                    continue;
+                }
+                chunks += 1;
+                if column_chunk.dictionary_page_offset().is_some() {
+                    with_dict_page += 1;
+                }
+                if column_chunk.page_encoding_stats_mask().is_some_and(|mask| {
+                    mask.is_only(Encoding::PLAIN_DICTIONARY)
+                        || mask.is_only(Encoding::RLE_DICTIONARY)
+                }) {
+                    dict_only_data += 1;
+                }
+            }
+        }
+    }
+    (chunks, with_dict_page, dict_only_data)
 }
 
 pub fn print_first_rows(path: &str, label: &str) {

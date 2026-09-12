@@ -31,7 +31,7 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | `rewrite_data_files.rs` | Bin-pack compaction. Java `RewriteDataFiles`. Plans candidates, rewrites live rows, commits per group through `RewriteFiles`. |
 | `rewrite_data_files_plan.rs` | Candidate and group predicates. Java `BinPackRewriteFilePlanner`. Size band, `tooManyDeletes`, `tooHighDeleteRatio`. |
 | `rewrite_data_files_dv.rs` | Drop file-scoped deletes whose referenced data file this rewrite removes. Java `isDanglingDV` is DV-only; parquet file-scoped drops are a fork extension. Rewrite Puffin siblings. |
-| `rewrite_data_files_write.rs` | Read a planned group with merge-on-read applied and write compacted data files under the current spec. |
+| `rewrite_data_files_write.rs` | Read a planned group with merge-on-read applied and write compacted data files under the current spec. **F-REWRITE-SIZE-1 step 2:** `dictionary_fallback_columns` reads the group's input footers (`ArrowFileReader::get_metadata`, `task.file_size_in_bytes` skips the stat) and `set_column_dictionary_enabled(path, false)`s only the columns whose chunks show fallback — dict page + PLAIN data pages, no dict page, or an uncompressed-bytes-per-value ≥ half the physical width (near-unique ⇒ the output dictionary would overflow its 1 MiB limit and write a dead page). |
 | `rewrite_data_files_router.rs` | Bounded LRU partition router for rewrite output. Default 64 open writers. Private to maintenance. |
 | `rewrite_data_files_evolved_spec_tests.rs` | Spec-evolution output routing pins: source-field, transform, unpartitioned, mixed specs. |
 | `rewrite_data_files_evolved_schema_tests.rs` | Schema-evolution compaction pins: add(+spec), add-only, drop, rename, promote, v3-DV, unpartitioned controls. |
