@@ -412,8 +412,12 @@ Engine recipe for atomic `CREATE [OR REPLACE] TABLE … AS SELECT` (GAP_MATRIX *
    published in **one** step (`publish_create_table` / `publish_replace_table`).
 3. Failure **before** `commit` returns: create → no table; replace → original snapshot current.
 4. `MemoryCatalog` implements replace CAS against the base metadata location observed at
-   `begin_replace`. Other catalogs default `publish_replace_table` to FeatureUnsupported until
-   wired.
+   `begin_replace`; `S3TablesCatalog` CASes on the service version token, and `GlueCatalog`
+   CASes on the Glue table `version_id` through `UpdateTable` after read-validating the
+   staged metadata file. Other catalogs default `publish_replace_table` to FeatureUnsupported
+   until wired. The staged path does not run `Transaction::commit`'s reconciliation — a lost
+   publish response surfaces `CommitStateUnknown` (non-retryable) with the staged file left
+   on disk.
 5. Bidirectional Java 1.10.0 interop is PROVEN (R158 ✅, 2026-07-16):
    `dev/java-interop/run-interop-staged-txn.sh` (`StagedTxnOracle` ⇄ `tests/interop_staged_txn.rs`)
    drives the engine-agnostic core surface these catalog methods wrap

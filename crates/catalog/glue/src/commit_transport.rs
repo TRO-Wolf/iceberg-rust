@@ -16,7 +16,7 @@
 // under the License.
 
 #[cfg(test)]
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -176,10 +176,18 @@ pub(crate) enum GlueCommitScript {
 }
 
 #[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct RecordedUpdateTableCall {
+    pub version_id: Option<String>,
+    pub parameters: HashMap<String, String>,
+}
+
+#[cfg(test)]
 pub(crate) struct ScriptedGlueCommitTransport {
     scripts: Mutex<VecDeque<GlueCommitScript>>,
     attempts: AtomicU64,
     observed_accepted_response_lost: AtomicBool,
+    last_call: Mutex<Option<RecordedUpdateTableCall>>,
 }
 
 #[cfg(test)]
@@ -198,19 +206,38 @@ impl ScriptedGlueCommitTransport {
             scripts: Mutex::new(scripts.into_iter().collect()),
             attempts: AtomicU64::new(0),
             observed_accepted_response_lost: AtomicBool::new(false),
+            last_call: Mutex::new(None),
         })
     }
 
     pub(crate) fn observed_accepted_response_lost(&self) -> bool {
         self.observed_accepted_response_lost.load(Ordering::SeqCst)
     }
+
+    pub(crate) fn last_call(&self) -> Option<RecordedUpdateTableCall> {
+        let guard = match self.last_call.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    }
 }
 
 #[cfg(test)]
 #[async_trait]
 impl GlueCommitTransport for ScriptedGlueCommitTransport {
-    async fn send_update_table(&self, _call: GlueUpdateTableCall) -> GlueCommitSend {
+    async fn send_update_table(&self, call: GlueUpdateTableCall) -> GlueCommitSend {
         self.attempts.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut guard = match self.last_call.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *guard = Some(RecordedUpdateTableCall {
+                version_id: call.version_id.clone(),
+                parameters: call.table_input.parameters().cloned().unwrap_or_default(),
+            });
+        }
         let script = {
             let mut queue = match self.scripts.lock() {
                 Ok(guard) => guard,

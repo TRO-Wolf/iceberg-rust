@@ -51,7 +51,6 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::io::FileIO;
 use crate::spec::{
     DataFile, FormatVersion, MAIN_BRANCH, SortOrder, TableMetadataBuilder, TableProperties,
-    UnboundPartitionSpec,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -170,13 +169,15 @@ impl StagedTableTransaction {
         // the catalog pointer until `commit`, not from a separate directory: the new metadata file
         // gets a fresh version+UUID under the stable location's `metadata/` dir and only becomes
         // current at publish. Data already written elsewhere stays readable — manifests are absolute.
-        let table_location = creation.location.clone().unwrap_or_else(|| {
-            existing
-                .metadata()
-                .location()
-                .trim_end_matches('/')
-                .to_string()
-        });
+        let existing_location = existing.metadata().location().trim_end_matches('/');
+        let table_location = creation
+            .location
+            .clone()
+            .unwrap_or_else(|| existing_location.to_string());
+        let keeps_location = creation
+            .location
+            .as_deref()
+            .is_none_or(|location| location.trim_end_matches('/') == existing_location);
 
         // D1: build the replacement ON TOP OF the existing metadata, mirroring Java
         // `TableMetadata.buildReplacement`:
@@ -215,10 +216,7 @@ impl StagedTableTransaction {
                 None => previous_format_version,
                 Some(raw) => parse_format_version_property(&raw)?,
             };
-        let partition_spec = partition_spec.unwrap_or(UnboundPartitionSpec {
-            spec_id: None,
-            fields: vec![],
-        });
+        let partition_spec = partition_spec.unwrap_or_default();
         let sort_order = sort_order.unwrap_or_else(SortOrder::unsorted_order);
 
         let metadata =
@@ -234,12 +232,10 @@ impl StagedTableTransaction {
                 .build()?
                 .metadata;
 
-        // NOTE: the staged metadata file restarts version numbering at v0 under the stable
-        // location's `metadata/` dir (a fresh version+UUID filename). Continuing monotonically from
-        // the existing table's file version is deferred to the real-catalog wiring (GAP_MATRIX
-        // R158 residue).
-        let metadata_location =
-            MetadataLocation::new_with_table_location(&table_location).to_string();
+        let metadata_location = match MetadataLocation::from_str(&base_metadata_location) {
+            Ok(base) if keeps_location => base.with_next_version_fresh_id().to_string(),
+            _ => MetadataLocation::new_with_table_location(&table_location).to_string(),
+        };
         metadata
             .write_to(existing.file_io(), &metadata_location)
             .await?;
@@ -366,6 +362,10 @@ fn parse_format_version_property(raw: &str) -> Result<FormatVersion> {
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "staged_table_version_tests.rs"]
+mod version_tests;
 
 #[cfg(test)]
 mod tests {

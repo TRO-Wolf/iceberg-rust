@@ -52,6 +52,12 @@ use crate::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, with_catalog_id,
 };
 
+mod replace_publish;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod tests;
+
 /// Glue catalog URI
 pub const GLUE_CATALOG_PROP_URI: &str = "uri";
 /// Glue catalog id
@@ -263,47 +269,6 @@ impl GlueCatalog {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn catalog_commit_attempts(&self) -> u64 {
-        self.commit_transport.catalog_commit_attempts()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_commit_transport(
-        mut self,
-        commit_transport: Arc<dyn GlueCommitTransport>,
-    ) -> Self {
-        self.commit_transport = commit_transport;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn live_commit_transport(&self) -> Arc<dyn GlueCommitTransport> {
-        Arc::clone(&self.commit_transport)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_commit_outcome_tests(
-        file_io: FileIO,
-        commit_transport: Arc<dyn GlueCommitTransport>,
-        table: Table,
-        client: aws_sdk_glue::Client,
-    ) -> Self {
-        let harness = GlueCommitHarness::new(table, Some("v0".to_string()));
-        GlueCatalog {
-            config: GlueCatalogConfig {
-                name: Some("pr5a-glue".to_string()),
-                uri: None,
-                catalog_id: None,
-                warehouse: "memory://pr5a".to_string(),
-                props: HashMap::new(),
-            },
-            client: GlueClient(client),
-            file_io,
-            commit_transport,
-            outcome_harness: Some(harness),
-        }
-    }
     /// Get the catalogs `FileIO`
     pub fn file_io(&self) -> FileIO {
         self.file_io.clone()
@@ -1057,6 +1022,14 @@ impl Catalog for GlueCatalog {
 
         Ok(staged_table)
     }
+
+    async fn publish_replace_table(
+        &self,
+        table: Table,
+        expected_base_metadata_location: Option<String>,
+    ) -> Result<Table> {
+        replace_publish::publish(self, table, expected_base_metadata_location).await
+    }
 }
 
 /// The typed error returned when a drop is refused because the Glue database still holds tables.
@@ -1072,141 +1045,4 @@ fn namespace_not_empty_error(db_name: &str) -> Error {
         ErrorKind::NamespaceNotEmpty,
         format!("Database with name: {db_name} is not empty"),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Offline: constructing a `GlueCatalog` builds the Glue SDK client but performs no
-    /// network call, so the `name()`/`properties()` accessors are testable without
-    /// credentials or a live Glue endpoint.
-    async fn build_glue_catalog(name: Option<&str>, props: HashMap<String, String>) -> GlueCatalog {
-        let config = GlueCatalogConfig {
-            name: name.map(str::to_string),
-            uri: None,
-            catalog_id: None,
-            warehouse: "s3://example-bucket/warehouse".to_string(),
-            props,
-        };
-        GlueCatalog::new(config, None).await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_name_and_properties_return_config() {
-        let catalog = build_glue_catalog(
-            Some("glue_cat"),
-            HashMap::from([("region_name".to_string(), "us-east-1".to_string())]),
-        )
-        .await;
-
-        assert_eq!(catalog.name(), "glue_cat");
-        // Mutation guard: the empty-map default fails this.
-        assert_eq!(
-            catalog.properties().get("region_name").map(String::as_str),
-            Some("us-east-1")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_name_defaults_to_sentinel_when_unset() {
-        let catalog = build_glue_catalog(None, HashMap::new()).await;
-        assert_eq!(catalog.name(), UNNAMED_CATALOG);
-    }
-
-    #[tokio::test]
-    async fn test_invalidate_defaults_are_noops() {
-        let catalog = build_glue_catalog(Some("glue_cat"), HashMap::new()).await;
-        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
-        // No network: the inherited no-op defaults return Ok.
-        catalog.invalidate_table(&ident).await.unwrap();
-        catalog.invalidate_view(&ident).await.unwrap();
-    }
-
-    const SECRET: &str = "SECRET_DO_NOT_LEAK";
-
-    /// Risk (#159 unit-D residue): `GlueCatalogConfig` holds the raw prop map — the AWS
-    /// `aws_secret_access_key` / `aws_session_token` credentials flow through it into `FileIO` —
-    /// so a plain-derived `Debug` prints live credentials. Pins that secret VALUES redact to
-    /// `"***"` while KEYS and non-secret values stay visible. Mutation: revert the manual `Debug`
-    /// to `#[derive(Debug)]` → the raw value prints → RED.
-    #[test]
-    fn test_config_debug_redacts_secret_prop_values() {
-        let config = GlueCatalogConfig {
-            name: Some("glue_cat".to_string()),
-            uri: None,
-            catalog_id: None,
-            warehouse: "s3://example-bucket/warehouse".to_string(),
-            props: HashMap::from([
-                ("aws_secret_access_key".to_string(), SECRET.to_string()),
-                ("aws_session_token".to_string(), SECRET.to_string()),
-                ("region_name".to_string(), "us-east-1".to_string()),
-            ]),
-        };
-
-        let debug = format!("{config:?}");
-
-        assert!(
-            !debug.contains(SECRET),
-            "GlueCatalogConfig Debug leaked a secret value: {debug}"
-        );
-        assert!(debug.contains("***"), "expected redaction marker: {debug}");
-        for key in ["aws_secret_access_key", "aws_session_token"] {
-            assert!(debug.contains(key), "secret key `{key}` dropped: {debug}");
-        }
-        assert!(
-            debug.contains("us-east-1"),
-            "non-secret value must stay visible: {debug}"
-        );
-    }
-
-    /// Risk (#159 unit-D residue, composition): `GlueCatalog`'s `Debug` renders the `config`
-    /// field, so the redaction must survive one level up. Pins that a `{:?}` of the whole catalog
-    /// does not leak a credential-bearing prop. Mutation: revert the config `Debug` to derived →
-    /// the raw value propagates through `GlueCatalog`'s Debug → RED.
-    #[tokio::test]
-    async fn test_catalog_debug_redacts_secret_prop_values() {
-        let catalog = build_glue_catalog(
-            Some("glue_cat"),
-            HashMap::from([("aws_secret_access_key".to_string(), SECRET.to_string())]),
-        )
-        .await;
-
-        let debug = format!("{catalog:?}");
-
-        assert!(
-            !debug.contains(SECRET),
-            "GlueCatalog Debug leaked a secret value: {debug}"
-        );
-        assert!(
-            debug.contains("aws_secret_access_key"),
-            "key dropped: {debug}"
-        );
-        assert!(debug.contains("***"), "expected redaction marker: {debug}");
-    }
-
-    /// Risk (G3b, GAP parity): dropping a non-empty Glue database must surface the dedicated
-    /// [`iceberg::ErrorKind::NamespaceNotEmpty`] (Java `GlueCatalog.dropNamespace` →
-    /// `NamespaceNotEmptyException`), not the generic `DataInvalid` — a caller retry/branch keys
-    /// on the kind. `drop_namespace` early-returns this error BEFORE calling `delete_database`, so
-    /// the namespace structurally survives the refused drop (the network drop path itself needs a
-    /// live Glue endpoint and is not exercised offline). Pins the kind, non-retryability, and the
-    /// preserved message. Mutation: revert the kind to `DataInvalid` → RED.
-    #[test]
-    fn test_namespace_not_empty_error_maps_to_namespace_not_empty() {
-        let err = namespace_not_empty_error("db1");
-        assert_eq!(err.kind(), iceberg::ErrorKind::NamespaceNotEmpty);
-        assert!(
-            !err.retryable(),
-            "a refused non-empty drop is not retryable"
-        );
-        assert!(
-            err.message().contains("db1"),
-            "message dropped db name: {err}"
-        );
-        assert!(
-            err.message().contains("is not empty"),
-            "message not preserved: {err}"
-        );
-    }
 }

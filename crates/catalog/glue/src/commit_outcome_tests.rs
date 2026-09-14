@@ -89,7 +89,7 @@ impl CommitClass {
 
 static TABLE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn schema() -> Schema {
+pub(crate) fn schema() -> Schema {
     Schema::builder()
         .with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
@@ -98,7 +98,7 @@ fn schema() -> Schema {
         .expect("schema")
 }
 
-fn data_file(path: &str) -> DataFile {
+pub(crate) fn data_file(path: &str) -> DataFile {
     DataFileBuilder::default()
         .content(DataContentType::Data)
         .file_path(path.to_string())
@@ -195,9 +195,23 @@ async fn seed_table(file_io: &FileIO, ident: &TableIdent, format: FormatVersion)
         .expect("seed table")
 }
 
-async fn catalog_with(
+pub(crate) async fn catalog_with(
     scripts: impl IntoIterator<Item = GlueCommitScript>,
     format: FormatVersion,
+) -> (
+    GlueCatalog,
+    Table,
+    Arc<ScriptedGlueCommitTransport>,
+    FileIO,
+    TableIdent,
+) {
+    catalog_with_version(scripts, format, Some("v0".to_string())).await
+}
+
+pub(crate) async fn catalog_with_version(
+    scripts: impl IntoIterator<Item = GlueCommitScript>,
+    format: FormatVersion,
+    version_id: Option<String>,
 ) -> (
     GlueCatalog,
     Table,
@@ -210,11 +224,12 @@ async fn catalog_with(
     let table = seed_table(&file_io, &ident, format).await;
     let scripted = ScriptedGlueCommitTransport::new(scripts);
     let client = dummy_glue_client().await;
-    let catalog = GlueCatalog::for_commit_outcome_tests(
+    let catalog = GlueCatalog::for_commit_outcome_tests_at_version(
         file_io.clone(),
         Arc::clone(&scripted) as Arc<dyn GlueCommitTransport>,
         table.clone(),
         client,
+        version_id,
     );
     (catalog, table, scripted, file_io, ident)
 }
