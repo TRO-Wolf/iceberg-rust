@@ -167,7 +167,7 @@ test result: FAILED. 0 passed; 8 failed; 0 ignored; 0 measured; 41 filtered out
   **3676 passed, 0 failed, 8 ignored**. D-3 landed with zero expectation
   edits: `staged_replace_continues_base_metadata_version` and
   `staged_replace_on_parseable_v3_continues_at_v4` green, the two
-  restart-on-unparseable/relocated controls confirm the fallback.
+  restart-on-unparsable/relocated controls confirm the fallback.
 - `cargo fmt --all -- --check` — clean.
 - `make check` — fmt + clippy `-D warnings` (workspace, all-features,
   all-targets) + taplo (34 files) + cargo-machete (no unused deps) +
@@ -280,7 +280,7 @@ green; restored.
 **Named residues (P3, no code change):**
 
 - **L-003**: a base at metadata version `i32::MAX` wraps
-  (`wrapping_add`) to a negative version, producing an unparseable name;
+  (`wrapping_add`) to a negative version, producing an unparsable name;
   the next replace then restarts at `00000-<uuid>`. No overwrite of the
   base file — `write_to` uniqueness is uuid-v4. Unrealistic for a
   shipping table.

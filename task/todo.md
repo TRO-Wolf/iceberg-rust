@@ -50,7 +50,7 @@ pointer's metadata-file version (N → N+1) when it parses.
       pins prove `version_id == Some("v0")`/`None` and
       `metadata_location`/`previous_metadata_location` wires (M1/M6 red-proven).
       Named residues for later units: (a) `i32::MAX` base version wraps to an
-      unparseable name — next replace restarts at `00000-<uuid>`, no overwrite;
+      unparsable name — next replace restarts at `00000-<uuid>`, no overwrite;
       (b) `publish_replace_table(table, None)` is a blind replace by trait contract
       (staged commit always passes `Some`); (c) replace/update_table rebuild the
       Glue `TableInput` and drop Glue-only parameters (Java `persistGlueTable`
