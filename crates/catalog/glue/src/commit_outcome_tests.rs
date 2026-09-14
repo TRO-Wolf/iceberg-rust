@@ -89,7 +89,7 @@ impl CommitClass {
 
 static TABLE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn schema() -> Schema {
+pub(crate) fn schema() -> Schema {
     Schema::builder()
         .with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
@@ -98,7 +98,7 @@ fn schema() -> Schema {
         .expect("schema")
 }
 
-fn data_file(path: &str) -> DataFile {
+pub(crate) fn data_file(path: &str) -> DataFile {
     DataFileBuilder::default()
         .content(DataContentType::Data)
         .file_path(path.to_string())
@@ -195,7 +195,7 @@ async fn seed_table(file_io: &FileIO, ident: &TableIdent, format: FormatVersion)
         .expect("seed table")
 }
 
-async fn catalog_with(
+pub(crate) async fn catalog_with(
     scripts: impl IntoIterator<Item = GlueCommitScript>,
     format: FormatVersion,
 ) -> (

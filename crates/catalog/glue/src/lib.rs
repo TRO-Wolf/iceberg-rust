@@ -48,6 +48,8 @@ mod catalog;
 mod commit_outcome_tests;
 mod commit_transport;
 mod error;
+#[cfg(test)]
+mod replace_publish_tests;
 mod schema;
 mod utils;
 pub use catalog::*;

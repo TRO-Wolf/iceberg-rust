@@ -27,9 +27,12 @@ AWS Glue catalog implementation. PR-5A owns the commit-transport seam on `update
 
 | File | What it does |
 |---|---|
-| `src/catalog.rs` | Glue `Catalog` impl. `update_table` writes metadata then sends through `GlueCommitTransport`. |
+| `src/catalog.rs` | Glue `Catalog` impl. `update_table` writes metadata then sends through `GlueCommitTransport`; `publish_replace_table` delegates to `catalog/replace_publish.rs`. |
+| `src/catalog/replace_publish.rs` | Staged replace publish: `get_table_pointer` → expected-base conflict (retryable, before any send) → staged-metadata read-validate (`read_from` + uuid match, `DataInvalid` before send) → `UpdateTable` through the commit transport with the stored version-id (the CAS). |
+| `src/catalog/tests.rs` | Unit tests extracted from `catalog.rs` (catalog ctor, config/`Debug` redaction, namespace-not-empty). |
 | `src/commit_transport.rs` | Narrow seam around the completed Glue `UpdateTable` SDK call. Live / discarding / scripted transports. Classifier feed + service-error mapping. |
 | `src/commit_outcome_tests.rs` | Offline outcome proofs for the seven commit classes on this one path. Credentialed tests arm on `ICEBERG_PR5A_CREDENTIALED`. |
+| `src/replace_publish_tests.rs` | Offline outcome pins for staged replace publish on the scripted transport: pointer swap + uuid/log retention, stale-base conflict before send, unreadable/foreign-uuid staged file refused before send, lost response typed `CommitStateUnknown` (no reconciliation), `ConcurrentModification` retryable, `AccessDenied` terminal. |
 | `src/error.rs` | `classify_commit_send_disposition` (NeverSent / MaybeSent / ResponseReceived). |
 | `src/schema.rs` | Iceberg schema to Glue columns. |
 | `src/utils.rs` | SDK config, `convert_to_glue_table`, namespace validation. |

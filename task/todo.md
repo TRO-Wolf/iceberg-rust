@@ -25,6 +25,22 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-14): F-GLUE-REPLACE-1 Glue staged replace publish (row R158, gap G-1)
+
+Ledger: [`f-glue-replace-1-ledger.md`](f-glue-replace-1-ledger.md). `GlueCatalog` inherited the
+`publish_replace_table` default (`FeatureUnsupported`), breaking every `CREATE OR REPLACE TABLE … AS`
+on an existing Glue table. Fix: version-id CAS through the `GlueCommitTransport` `UpdateTable` seam
+with staged-metadata read-validation before the send; `begin_replace` now continues the base
+pointer's metadata-file version (N → N+1) when it parses.
+
+- [x] C-001..C-005 red first: 8 pins in `replace_publish_tests.rs`, all red on `FeatureUnsupported`
+- [x] C-001..C-005 fix + green: `catalog/replace_publish.rs` + trait delegate; `mod tests` extracted
+      to `catalog/tests.rs` (catalog.rs ceiling 1212 → 1087)
+- [x] C-006 D-3 measured and landed: N → N+1 continuation pinned (`staged_table_version_tests.rs`),
+      `iceberg --lib` green; staged_table.rs stays at its 1229 ceiling
+- [x] C-007 docs: GAP_MATRIX R158 + ENGINE_CONTRACT §8a + both map.md files
+- [x] C-008 gates + commit
+
 ## ACTIVE (2026-09-06): F-RDF-EVO-1 rewrite_data_files after schema evolution (row R135)
 
 Owner defect: after `ADD COLUMN` + `ADD PARTITION FIELD` with no later write, rewrite fails with
