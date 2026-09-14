@@ -40,6 +40,11 @@ pointer's metadata-file version (N → N+1) when it parses.
       `iceberg --lib` green; staged_table.rs stays at its 1229 ceiling
 - [x] C-007 docs: GAP_MATRIX R158 + ENGINE_CONTRACT §8a + both map.md files
 - [x] C-008 gates + commit
+- [x] Round 2 audit P1: Hadoop-named base pointer (`vN.metadata.json`) under plain
+      `with_next_version` kept `id: None` — concurrent staged replaces collided on one
+      `v(N+1)` file. `MetadataLocation::with_next_version_fresh_id` (pub(crate), fresh uuid
+      always) + one-line `begin_replace` call-site change; collision pin red→green;
+      R158 residue (2) + map wording updated.
 
 ## ACTIVE (2026-09-06): F-RDF-EVO-1 rewrite_data_files after schema evolution (row R135)
 

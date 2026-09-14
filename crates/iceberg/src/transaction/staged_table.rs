@@ -233,7 +233,7 @@ impl StagedTableTransaction {
                 .metadata;
 
         let metadata_location = match MetadataLocation::from_str(&base_metadata_location) {
-            Ok(base) if keeps_location => base.with_next_version().to_string(),
+            Ok(base) if keeps_location => base.with_next_version_fresh_id().to_string(),
             _ => MetadataLocation::new_with_table_location(&table_location).to_string(),
         };
         metadata

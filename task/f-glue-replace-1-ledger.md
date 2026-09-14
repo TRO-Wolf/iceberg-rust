@@ -126,7 +126,7 @@ fails at publish. `S3TablesCatalog` and `MemoryCatalog` implement it.
 | C-003 | The staged metadata file is read-validated before the send: missing file and foreign-uuid file each fail `DataInvalid` with zero transport attempts and no pointer move. | Two pins; red on base, green after. | EXECUTION PROVEN |
 | C-004 | `MaybeSentLost` and `AcceptThenLose` surface `CommitStateUnknown` (never Ok, never retryable), one attempt, staged file still present; `AcceptThenLose` leaves the harness pointer at the staged location (no reconciliation). | Two pins; red on base, green after. | EXECUTION PROVEN |
 | C-005 | `ConcurrentModification` → retryable `CatalogCommitConflicts`; `AccessDenied` → terminal `Unexpected` ("Authorization denied"); one attempt each. | Two pins; red on base, green after. | EXECUTION PROVEN |
-| C-006 | D-3 measured: staged replace metadata filename continues the base pointer's version (N → N+1) when the base parses, else restarts. Fix confined to `begin_replace`; full `iceberg --lib` suite green; else the residue is documented. | Pin in `staged_table_version_tests.rs` + measurement; residue wording if not landed. | EXECUTION PROVEN |
+| C-006 | D-3 measured: staged replace metadata filename continues the base pointer's version (N → N+1) when the base parses, else restarts. Fix confined to `begin_replace`; full `iceberg --lib` suite green; else the residue is documented. Round 2 (audit P1): the continued name must ALWAYS carry a fresh uuid — a Hadoop-named base (`vN.metadata.json`, R167) under plain `with_next_version` keeps `id: None`, so concurrent staged replaces collide on one `v(N+1)` file. | Pin in `staged_table_version_tests.rs` + measurement; residue wording if not landed. | EXECUTION PROVEN |
 | C-007 | GAP_MATRIX R158 names Glue `publish_replace_table` (version-id CAS, read-validated), residue (1) closed for Glue / S3 Tables state named, residue (2) closed or kept, D-4 no-reconciliation residue added; ENGINE_CONTRACT §8a names the implementing catalogs. | Row rewritten, single 5-pipe line; `make check-matrix-anchors` green. | EXECUTION PROVEN |
 | C-008 | Gates: `cargo test -p iceberg-catalog-glue --lib`, `cargo test -p iceberg-catalog-s3tables --lib`, `cargo test -p iceberg --lib staged` (+ full `iceberg --lib` if staged_table.rs touched), `make check`, `make check-matrix-anchors`, file-size script, comment fence. | Run and paste counts below. | EXECUTION PROVEN |
 
@@ -191,3 +191,48 @@ read-validation ordering is swapped with the send.
 Named residue carried forward in R158: staged replace has no
 `CommitStateUnknown` reconciliation on Glue or S3 Tables; Java
 name-matching fresh field-ID assignment on replace remains open.
+
+## Round 2 — orchestrator audit P1 (Hadoop-named base collision)
+
+**Finding.** D-3 as landed staged `MetadataLocation::from_str(base)
+.with_next_version()`. `with_next_version` preserves `id: None` on a
+Hadoop-named base (`vN.metadata.json`, row R167 — what a Spark
+Hadoop-catalog writes and what `register_table` can install), so every
+staged replace from one base wrote the SAME `v(N+1).metadata.json`: two
+concurrent replaces overwrote each other's staged file, and a loser
+staging after the winner published rewrote the file the catalog pointer
+names — the winner's table silently becomes the loser's metadata.
+
+**Red (base tree of the fix, commit `19381fa3`):**
+`cargo test -p iceberg --lib staged_table::version_tests` exited 101 —
+2 red, 3 green:
+
+```
+test ...::replace_stages_next_version_after_a_hadoop_named_pointer ... FAILED
+a Hadoop-named pointer must continue the version under a fresh uuid, got
+memory://wh/ns/t/metadata/v8.metadata.json
+
+test ...::concurrent_replaces_from_a_hadoop_pointer_stage_distinct_files ... FAILED
+assertion `left != right` failed: two staged replaces from one base must
+not share a file
+  left: "memory://wh/ns/t/metadata/v4.metadata.json"
+ right: "memory://wh/ns/t/metadata/v4.metadata.json"
+```
+
+The two-`begin_replace` pin is the direct proof of the audit's collision
+claim: same base, same staged path, both writes landed on
+`v4.metadata.json`.
+
+**Fix.** `MetadataLocation::with_next_version_fresh_id` (`pub(crate)`,
+added beside `with_next_version` — that method and the public API are
+unchanged, so plain `update_table` commits still emit `v(N+1)` for
+Hadoop-convention tables per R167) continues the version and always sets
+`id: Some(Uuid::new_v4())`. `begin_replace` calls it at the kept-location
+arm, so a `vN` base stages `0000(N+1)-<uuid>` and every later
+`apply_locally` step regenerates a fresh uuid. Restart arms
+(`new_with_table_location`) already carry a uuid. `staged_table.rs` stays
+at its 1229 ceiling; the one-line call-site change keeps it there.
+
+**Green.** The collision pin and the updated Hadoop pin pass;
+`replace_stages_next_version_after_a_hive_named_pointer` (N → N+1 with a
+new uuid) is unchanged and still green. Full gate counts below.

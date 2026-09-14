@@ -118,11 +118,62 @@ async fn replace_stages_next_version_after_a_hadoop_named_pointer() {
     let staged_location = staged
         .table()
         .metadata_location_result()
-        .expect("staged location");
-    assert_eq!(
+        .expect("staged location")
+        .to_string();
+    assert!(
+        staged_location.starts_with(&format!("{table_location}/metadata/00008-")),
+        "a Hadoop-named pointer must continue the version under a fresh uuid, got {staged_location}"
+    );
+    assert!(staged_location.ends_with(".metadata.json"));
+    assert_ne!(
         staged_location,
         format!("{table_location}/metadata/v8.metadata.json"),
-        "a Hadoop-named pointer must continue as v(N+1)"
+        "a uuid-less staged name collides across concurrent replaces"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_replaces_from_a_hadoop_pointer_stage_distinct_files() {
+    let file_io = FileIO::new_with_memory();
+    let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "t".into());
+    let table_location = "memory://wh/ns/t";
+    let table = table_at(
+        &file_io,
+        &ident,
+        table_location,
+        &format!("{table_location}/metadata/v3.metadata.json"),
+    )
+    .await;
+
+    let first = StagedTableTransaction::begin_replace(&table, replace_creation(&ident))
+        .await
+        .expect("first begin replace")
+        .table()
+        .metadata_location_result()
+        .expect("first staged location")
+        .to_string();
+    let second = StagedTableTransaction::begin_replace(&table, replace_creation(&ident))
+        .await
+        .expect("second begin replace")
+        .table()
+        .metadata_location_result()
+        .expect("second staged location")
+        .to_string();
+
+    let colliding = format!("{table_location}/metadata/v4.metadata.json");
+    assert_ne!(
+        first, second,
+        "two staged replaces from one base must not share a file"
+    );
+    assert_ne!(first, colliding, "first staged to the colliding name");
+    assert_ne!(second, colliding, "second staged to the colliding name");
+    assert!(
+        file_io.exists(&first).await.expect("first exists"),
+        "the first staged file must be written"
+    );
+    assert!(
+        file_io.exists(&second).await.expect("second exists"),
+        "the second staged file must be written"
     );
 }
 
