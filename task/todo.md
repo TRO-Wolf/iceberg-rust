@@ -45,6 +45,16 @@ pointer's metadata-file version (N → N+1) when it parses.
       `v(N+1)` file. `MetadataLocation::with_next_version_fresh_id` (pub(crate), fresh uuid
       always) + one-line `begin_replace` call-site change; collision pin red→green;
       R158 residue (2) + map wording updated.
+- [x] Round 3 critic (Grok 4.6): L-001/L-002 closed — scripted transport records the
+      last `GlueUpdateTableCall` (`last_call()` → version_id + TableInput parameters);
+      pins prove `version_id == Some("v0")`/`None` and
+      `metadata_location`/`previous_metadata_location` wires (M1/M6 red-proven).
+      Named residues for later units: (a) `i32::MAX` base version wraps to an
+      unparseable name — next replace restarts at `00000-<uuid>`, no overwrite;
+      (b) `publish_replace_table(table, None)` is a blind replace by trait contract
+      (staged commit always passes `Some`); (c) replace/update_table rebuild the
+      Glue `TableInput` and drop Glue-only parameters (Java `persistGlueTable`
+      overlays onto the live map — pre-existing Glue residue).
 
 ## ACTIVE (2026-09-06): F-RDF-EVO-1 rewrite_data_files after schema evolution (row R135)
 

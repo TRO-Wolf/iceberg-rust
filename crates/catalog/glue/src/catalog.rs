@@ -54,6 +54,8 @@ use crate::{
 
 mod replace_publish;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 
 /// Glue catalog URI
@@ -267,47 +269,6 @@ impl GlueCatalog {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn catalog_commit_attempts(&self) -> u64 {
-        self.commit_transport.catalog_commit_attempts()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_commit_transport(
-        mut self,
-        commit_transport: Arc<dyn GlueCommitTransport>,
-    ) -> Self {
-        self.commit_transport = commit_transport;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn live_commit_transport(&self) -> Arc<dyn GlueCommitTransport> {
-        Arc::clone(&self.commit_transport)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_commit_outcome_tests(
-        file_io: FileIO,
-        commit_transport: Arc<dyn GlueCommitTransport>,
-        table: Table,
-        client: aws_sdk_glue::Client,
-    ) -> Self {
-        let harness = GlueCommitHarness::new(table, Some("v0".to_string()));
-        GlueCatalog {
-            config: GlueCatalogConfig {
-                name: Some("pr5a-glue".to_string()),
-                uri: None,
-                catalog_id: None,
-                warehouse: "memory://pr5a".to_string(),
-                props: HashMap::new(),
-            },
-            client: GlueClient(client),
-            file_io,
-            commit_transport,
-            outcome_harness: Some(harness),
-        }
-    }
     /// Get the catalogs `FileIO`
     pub fn file_io(&self) -> FileIO {
         self.file_io.clone()

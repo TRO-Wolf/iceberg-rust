@@ -236,3 +236,65 @@ at its 1229 ceiling; the one-line call-site change keeps it there.
 **Green.** The collision pin and the updated Hadoop pin pass;
 `replace_stages_next_version_after_a_hive_named_pointer` (N → N+1 with a
 new uuid) is unchanged and still green. Full gate counts below.
+
+## Critic round (Grok 4.6 critic-logic)
+
+Report: `/tmp/oc-worker/i-fcrit/report.md` (clone `/tmp/i-fcrit`, detached
+`334d063d5`, range `3ebf7d36c..334d063d5`, high risk tier). Verdict:
+**NEEDS_REMEDIATION** — no P1 silent-loss bug on the staged engine path;
+two P2 hollow oracles (L-001, L-002) and P3 residues.
+
+The critic's mutation arithmetic (one knob at a time, restore-green
+verified):
+
+| # | Mutation | Result | Red pins |
+|---|---|---|---|
+| M1 | `GlueUpdateTableCall.version_id = None` | 0 red / 8 | none — hollow oracle (L-001) |
+| M2 | delete expected-base conflict | 1 red / 8 | `replace_publish_stale_base_conflicts_retryable_before_any_send` |
+| M3 | delete uuid match | 1 red / 8 | `replace_publish_foreign_uuid_staged_metadata_refuses_before_send` |
+| M4 | send UpdateTable before `read_from` | 2 red / 8 | unreadable + foreign-uuid (`attempts` 1 ≠ 0) |
+| M5 | `begin_replace` uses `with_next_version` | 2 red / 5 | Hadoop next-version + concurrent distinct-files |
+| M6 | `convert_to_glue_table(..., None)` | 0 red / 8 | none — hollow oracle (L-002) |
+
+**L-001 closed.** `ScriptedGlueCommitTransport` now records the last
+`GlueUpdateTableCall` it received (`last_call()` → `version_id` +
+`TableInput` parameters; `#[cfg(test)]` only). The happy-path staged
+replace pin asserts `sent.version_id == Some("v0")` (the harness's
+GetTable version). A second pin seeds the harness pointer at
+`version_id: None` (`catalog_with_version` →
+`for_commit_outcome_tests_at_version`) and asserts the send carries
+`None` — matching `update_table`: no Glue OCC, last-writer-wins beyond
+the expected-base string check. Actor's own red proof: M1 applied in
+this tree (`version_id: None` in the send) →
+`staged_replace_commit_swaps_glue_pointer_and_retains_uuid` RED
+(`left: None, right: Some("v0")`), 8 others green; restored.
+
+**L-002 closed.** The same recording pins the sent `TableInput`
+parameters: `metadata_location == <staged location>` and
+`previous_metadata_location == <base location>` on the happy path (and
+`previous_metadata_location` on the none-version pin). Actor's own red
+proof: M6 applied (`Some(stored)` → `None`) → both pins RED
+(`left: None` on the `previous_metadata_location` assertion), 7 others
+green; restored.
+
+**Named residues (P3, no code change):**
+
+- **L-003**: a base at metadata version `i32::MAX` wraps
+  (`wrapping_add`) to a negative version, producing an unparseable name;
+  the next replace then restarts at `00000-<uuid>`. No overwrite of the
+  base file — `write_to` uniqueness is uuid-v4. Unrealistic for a
+  shipping table.
+- `Catalog::publish_replace_table(table, None)` is a blind replace (no
+  expected-base check) — same as MemoryCatalog and S3 Tables.
+  `StagedTableTransaction::commit` always passes `Some(base)`, so the
+  staged engine path is covered; the `None` arm is the public surface's
+  documented contract, not a path this unit changed.
+- Replace (like `update_table`) rebuilds the Glue `TableInput` from
+  Iceberg metadata and drops Glue-only parameters (Lake Formation
+  flags, classification, custom storage-descriptor extras); Java
+  `persistGlueTable` overlays onto the current Glue parameter map.
+  Pre-existing Glue-catalog residue, identical on `update_table`.
+
+**Stale glyph fixed.** `crates/iceberg/src/transaction/map.md` dropped
+the `🟡` next to the R158 row reference — status lives only in the
+matrix.

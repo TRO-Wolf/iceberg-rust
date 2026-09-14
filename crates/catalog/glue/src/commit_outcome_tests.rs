@@ -205,16 +205,31 @@ pub(crate) async fn catalog_with(
     FileIO,
     TableIdent,
 ) {
+    catalog_with_version(scripts, format, Some("v0".to_string())).await
+}
+
+pub(crate) async fn catalog_with_version(
+    scripts: impl IntoIterator<Item = GlueCommitScript>,
+    format: FormatVersion,
+    version_id: Option<String>,
+) -> (
+    GlueCatalog,
+    Table,
+    Arc<ScriptedGlueCommitTransport>,
+    FileIO,
+    TableIdent,
+) {
     let file_io = FileIO::new_with_memory();
     let ident = unique_ident();
     let table = seed_table(&file_io, &ident, format).await;
     let scripted = ScriptedGlueCommitTransport::new(scripts);
     let client = dummy_glue_client().await;
-    let catalog = GlueCatalog::for_commit_outcome_tests(
+    let catalog = GlueCatalog::for_commit_outcome_tests_at_version(
         file_io.clone(),
         Arc::clone(&scripted) as Arc<dyn GlueCommitTransport>,
         table.clone(),
         client,
+        version_id,
     );
     (catalog, table, scripted, file_io, ident)
 }

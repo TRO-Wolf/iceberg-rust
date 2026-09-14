@@ -20,7 +20,7 @@ use iceberg::table::Table;
 use iceberg::transaction::StagedTableTransaction;
 use iceberg::{Catalog, ErrorKind, TableCreation, TableIdent};
 
-use crate::commit_outcome_tests::{catalog_with, data_file, schema};
+use crate::commit_outcome_tests::{catalog_with, catalog_with_version, data_file, schema};
 use crate::commit_transport::GlueCommitScript;
 
 async fn begin_replace(table: &Table, ident: &TableIdent) -> StagedTableTransaction {
@@ -37,7 +37,7 @@ async fn begin_replace(table: &Table, ident: &TableIdent) -> StagedTableTransact
 
 #[tokio::test]
 async fn staged_replace_commit_swaps_glue_pointer_and_retains_uuid() {
-    let (catalog, table, _, file_io, ident) =
+    let (catalog, table, scripted, file_io, ident) =
         catalog_with([GlueCommitScript::Success], FormatVersion::V2).await;
     let base_location = table
         .metadata_location_result()
@@ -73,6 +73,54 @@ async fn staged_replace_commit_swaps_glue_pointer_and_retains_uuid() {
     );
     assert!(published.metadata().current_snapshot().is_some());
     assert_eq!(catalog.catalog_commit_attempts(), 1);
+    let sent = scripted.last_call().expect("one update call must be sent");
+    assert_eq!(
+        sent.version_id.as_deref(),
+        Some("v0"),
+        "the send must carry the pointer read's version id as the CAS token"
+    );
+    assert_eq!(
+        sent.parameters.get("metadata_location").map(String::as_str),
+        Some(published_location.as_str()),
+        "the sent TableInput must point at the staged metadata file"
+    );
+    assert_eq!(
+        sent.parameters
+            .get("previous_metadata_location")
+            .map(String::as_str),
+        Some(base_location.as_str()),
+        "the sent TableInput must record the base pointer"
+    );
+}
+
+#[tokio::test]
+async fn replace_publish_without_a_glue_version_id_sends_none() {
+    let (catalog, table, scripted, _, ident) =
+        catalog_with_version([GlueCommitScript::Success], FormatVersion::V2, None).await;
+    let base_location = table
+        .metadata_location_result()
+        .expect("base location")
+        .to_string();
+
+    let published = begin_replace(&table, &ident)
+        .await
+        .commit(&catalog)
+        .await
+        .expect("staged replace commit");
+
+    let sent = scripted.last_call().expect("one update call must be sent");
+    assert_eq!(
+        sent.version_id, None,
+        "a pointer read without a version id sends none, matching update_table (no Glue OCC)"
+    );
+    assert_eq!(
+        sent.parameters
+            .get("previous_metadata_location")
+            .map(String::as_str),
+        Some(base_location.as_str())
+    );
+    let loaded = catalog.load_table(&ident).await.expect("load");
+    assert_eq!(loaded.metadata_location(), published.metadata_location());
 }
 
 #[tokio::test]
