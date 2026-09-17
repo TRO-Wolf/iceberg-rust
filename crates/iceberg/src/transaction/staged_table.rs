@@ -48,6 +48,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind, Result};
+use crate::expr::Predicate;
 use crate::io::FileIO;
 use crate::spec::{
     DataFile, FormatVersion, MAIN_BRANCH, SortOrder, TableMetadataBuilder, TableProperties,
@@ -73,6 +74,7 @@ pub struct StagedTableTransaction {
     /// For replace: the catalog metadata location observed when the transaction began (CAS base).
     base_metadata_location: Option<String>,
     pending_data_files: Vec<DataFile>,
+    replace_write: bool,
 }
 
 impl StagedTableTransaction {
@@ -119,6 +121,7 @@ impl StagedTableTransaction {
             table,
             base_metadata_location: None,
             pending_data_files: Vec::new(),
+            replace_write: false,
         })
     }
 
@@ -252,6 +255,7 @@ impl StagedTableTransaction {
             table,
             base_metadata_location: Some(base_metadata_location),
             pending_data_files: Vec::new(),
+            replace_write: false,
         })
     }
 
@@ -281,7 +285,13 @@ impl StagedTableTransaction {
         self
     }
 
-    /// Apply pending appends to local metadata, write the final metadata file, then publish.
+    /// Commit pending files with replace semantics (Java RTAS overwrite).
+    pub fn with_replace_write(mut self, replace_write: bool) -> Self {
+        self.replace_write = replace_write;
+        self
+    }
+
+    /// Apply pending files to local metadata, write the final metadata file, then publish.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
         let mode = self.mode;
         let base = self.base_metadata_location.clone();
@@ -293,15 +303,24 @@ impl StagedTableTransaction {
     }
 
     async fn materialize_pending(self) -> Result<Table> {
-        if self.pending_data_files.is_empty() {
+        if self.pending_data_files.is_empty() && !self.replace_write {
             return Ok(self.table);
         }
         let tx = Transaction::new(&self.table);
-        let tx = tx
-            .fast_append()
-            .add_data_files(self.pending_data_files)
-            .apply(tx)?;
-        tx.apply_locally().await
+        if self.replace_write {
+            let tx = tx
+                .overwrite_files()
+                .overwrite_by_row_filter(Predicate::AlwaysTrue)
+                .add_files(self.pending_data_files)
+                .apply(tx)?;
+            tx.apply_locally().await
+        } else {
+            let tx = tx
+                .fast_append()
+                .add_data_files(self.pending_data_files)
+                .apply(tx)?;
+            tx.apply_locally().await
+        }
     }
 }
 

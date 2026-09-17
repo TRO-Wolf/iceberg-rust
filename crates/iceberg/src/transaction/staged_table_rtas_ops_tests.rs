@@ -123,16 +123,11 @@ async fn rtas_replace_existing_with_files_records_overwrite() {
     let (catalog, _) = rtas_catalog(&warehouse).await;
     let ns = NamespaceIdent::new("sales".into());
     catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
-    let seeded = rtas_seed_table(
-        &catalog,
-        &ns,
-        "orders",
-        vec![
-            rtas_data_file(&format!("{warehouse}/old/a.parquet"), 700),
-            rtas_data_file(&format!("{warehouse}/old/b.parquet"), 700),
-            rtas_data_file(&format!("{warehouse}/old/c.parquet"), 600),
-        ],
-    )
+    let seeded = rtas_seed_table(&catalog, &ns, "orders", vec![
+        rtas_data_file(&format!("{warehouse}/old/a.parquet"), 700),
+        rtas_data_file(&format!("{warehouse}/old/b.parquet"), 700),
+        rtas_data_file(&format!("{warehouse}/old/c.parquet"), 600),
+    ])
     .await;
     let loaded = catalog.load_table(seeded.identifier()).await.unwrap();
     assert_eq!(rtas_operation(&loaded), Operation::Append);
@@ -153,13 +148,28 @@ async fn rtas_replace_existing_with_files_records_overwrite() {
 
     assert_eq!(rtas_operation(&committed), Operation::Overwrite);
     let summary = rtas_summary(&committed);
-    assert_eq!(summary.get("added-data-files").map(String::as_str), Some("2"));
-    assert_eq!(summary.get("added-records").map(String::as_str), Some("100"));
-    assert_eq!(summary.get("total-data-files").map(String::as_str), Some("2"));
-    assert_eq!(summary.get("total-records").map(String::as_str), Some("100"));
+    assert_eq!(
+        summary.get("added-data-files").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        summary.get("added-records").map(String::as_str),
+        Some("100")
+    );
+    assert_eq!(
+        summary.get("total-data-files").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        summary.get("total-records").map(String::as_str),
+        Some("100")
+    );
     assert!(!summary.contains_key("deleted-data-files"), "{summary:?}");
     assert!(!summary.contains_key("deleted-records"), "{summary:?}");
-    assert!(summary.contains_key("changed-partition-count"), "{summary:?}");
+    assert!(
+        summary.contains_key("changed-partition-count"),
+        "{summary:?}"
+    );
 }
 
 #[tokio::test]
@@ -180,14 +190,23 @@ async fn rtas_create_new_with_files_records_overwrite() {
         .await
         .unwrap()
         .with_replace_write(true)
-        .add_data_files(vec![rtas_data_file(&format!("{location}/data/f.parquet"), 10)]);
+        .add_data_files(vec![rtas_data_file(
+            &format!("{location}/data/f.parquet"),
+            10,
+        )]);
     let committed = staged.commit(&catalog).await.unwrap();
 
     assert_eq!(rtas_operation(&committed), Operation::Overwrite);
     let summary = rtas_summary(&committed);
-    assert_eq!(summary.get("added-data-files").map(String::as_str), Some("1"));
+    assert_eq!(
+        summary.get("added-data-files").map(String::as_str),
+        Some("1")
+    );
     assert_eq!(summary.get("added-records").map(String::as_str), Some("10"));
-    assert_eq!(summary.get("total-data-files").map(String::as_str), Some("1"));
+    assert_eq!(
+        summary.get("total-data-files").map(String::as_str),
+        Some("1")
+    );
     assert_eq!(summary.get("total-records").map(String::as_str), Some("10"));
     assert!(!summary.contains_key("deleted-data-files"), "{summary:?}");
     assert!(!summary.contains_key("deleted-records"), "{summary:?}");
@@ -200,12 +219,10 @@ async fn rtas_replace_without_files_records_delete() {
     let (catalog, _) = rtas_catalog(&warehouse).await;
     let ns = NamespaceIdent::new("sales".into());
     catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
-    let seeded = rtas_seed_table(
-        &catalog,
-        &ns,
-        "orders",
-        vec![rtas_data_file(&format!("{warehouse}/old/a.parquet"), 5)],
-    )
+    let seeded = rtas_seed_table(&catalog, &ns, "orders", vec![rtas_data_file(
+        &format!("{warehouse}/old/a.parquet"),
+        5,
+    )])
     .await;
     let loaded = catalog.load_table(seeded.identifier()).await.unwrap();
 
@@ -223,7 +240,10 @@ async fn rtas_replace_without_files_records_delete() {
     let summary = rtas_summary(&committed);
     assert!(!summary.contains_key("added-data-files"), "{summary:?}");
     assert!(!summary.contains_key("added-records"), "{summary:?}");
-    assert_eq!(summary.get("total-data-files").map(String::as_str), Some("0"));
+    assert_eq!(
+        summary.get("total-data-files").map(String::as_str),
+        Some("0")
+    );
     assert_eq!(summary.get("total-records").map(String::as_str), Some("0"));
     assert_eq!(
         summary.get("changed-partition-count").map(String::as_str),
@@ -255,7 +275,10 @@ async fn rtas_create_new_without_files_records_delete() {
     let summary = rtas_summary(&committed);
     assert!(!summary.contains_key("added-data-files"), "{summary:?}");
     assert!(!summary.contains_key("added-records"), "{summary:?}");
-    assert_eq!(summary.get("total-data-files").map(String::as_str), Some("0"));
+    assert_eq!(
+        summary.get("total-data-files").map(String::as_str),
+        Some("0")
+    );
     assert_eq!(summary.get("total-records").map(String::as_str), Some("0"));
 }
 
@@ -276,7 +299,10 @@ async fn create_without_replace_write_stays_append() {
     let staged = StagedTableTransaction::begin_create(file_io, ident, creation)
         .await
         .unwrap()
-        .add_data_files(vec![rtas_data_file(&format!("{location}/data/f.parquet"), 4)]);
+        .add_data_files(vec![rtas_data_file(
+            &format!("{location}/data/f.parquet"),
+            4,
+        )]);
     let committed = staged.commit(&catalog).await.unwrap();
 
     assert_eq!(rtas_operation(&committed), Operation::Append);

@@ -83,6 +83,10 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
+
+    fn allows_empty_commit(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct DefaultManifestProcess;
@@ -1075,6 +1079,7 @@ impl<'a> SnapshotProducer<'a> {
             && removed_data_files.is_empty()
             && removed_delete_files.is_empty()
             && self.snapshot_properties.is_empty()
+            && !snapshot_produce_operation.allows_empty_commit()
         {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,

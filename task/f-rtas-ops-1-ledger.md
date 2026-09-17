@@ -96,8 +96,43 @@ plus the new `staged_table_rtas_ops_tests.rs` (6 tests, API absent):
 
 ## Implementation notes
 
-PENDING.
+- `staged_table.rs`: new `replace_write` flag (default false) + builder
+  `with_replace_write(bool)`. `materialize_pending` with the flag commits
+  pending files through `overwrite_files().overwrite_by_row_filter(AlwaysTrue)`
+  instead of `fast_append`. Without the flag the path is byte-identical to
+  before; empty non-flag commits still produce no snapshot (measured, kept).
+- `overwrite_files.rs`: `OverwriteFilesOperation::allows_empty_commit`
+  returns `row_filter.is_some()`. Classification already matched Java
+  (`containsDeletes` counts a set filter before resolution): adds + filter
+  gives `overwrite`, filter-only gives `delete`.
+- `snapshot.rs`: new `SnapshotProduceOperation::allows_empty_commit`
+  (default false) derives the truly-empty guard. Only the filter-requested
+  overwrite passes it; `test_empty_overwrite_is_rejected` still holds.
+- Totals work with no code change: the staged replace reset `main`, so the
+  producer seeds from zero. Added-only gives `total-*` equal to added and no
+  `deleted-*` keys; the empty commit gives `total-*` zero plus
+  `changed-partition-count` zero and no `added-*` keys.
+- C-002: the flag works from both `begin_create` and `begin_replace`; the
+  caller states it. C-004: no existing caller touches the flag.
+
+## Mutation proof (test-adequacy, one knob at a time)
+
+- Baseline: `cargo test -p iceberg --lib transaction::staged_table::rtas`,
+  6 passed.
+- M1 `materialize_pending`: `if self.replace_write` forced to `if false`:
+  4 red out of 6 (the four replace-write tests; the two CTAS pins green).
+- M2 `allows_empty_commit` override forced to `false`: 2 red out of 6 (the
+  two empty-delete tests; the rest green).
+- Both restored; suite back to 6 green.
 
 ## Gate output
 
-PENDING.
+All green 2026-09-17 (`CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8`):
+
+- `cargo test -p iceberg --lib transaction`: 652 passed, 0 failed.
+- `cargo test -p iceberg --lib catalog`: 190 passed, 0 failed.
+- `cargo test -p iceberg-catalog-glue --lib`: 50 passed, 0 failed.
+- `cargo clippy -p iceberg --all-targets -- -D warnings`: clean.
+- `make check`: exit 0 (fmt, clippy, taplo, machete, agent-artifacts,
+  matrix-anchors, comment-blocks, file-size all OK).
+- `typos .`: exit 0.

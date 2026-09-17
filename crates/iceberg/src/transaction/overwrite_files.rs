@@ -545,6 +545,10 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
         }
     }
 
+    fn allows_empty_commit(&self) -> bool {
+        self.row_filter.is_some()
+    }
+
     async fn delete_entries(
         &self,
         _snapshot_produce: &SnapshotProducer<'_>,
