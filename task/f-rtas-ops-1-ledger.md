@@ -169,6 +169,44 @@ Shipping code correct; pins too weak. Remediation: L-001 live keep-set pins
 with critic-mutation reds, L-002 covered by L-001, L-003 v3 row-id and
 partitioned/sort pins.
 
+## Round 3 remediation evidence
+
+- L-001: `rtas_replace_existing_with_files_records_overwrite` now asserts
+  `parent_snapshot_id()` None and live paths exactly `{new/a, new/b}`;
+  `rtas_replace_without_files_records_delete` asserts parent None and an
+  empty live set (manifest-list walk helpers, no new comments).
+- Critic M4 (`current_manifests` falls back to a historical snapshot):
+  4 red out of 26 (`transaction::staged_table` filter) — the two
+  strengthened tests plus the v3 and partitioned pins. Sample red: live set
+  `{old/a, old/b, old/c, new/a, new/b}` vs expected `{new/a, new/b}`.
+  Reverted; suite green.
+- L-002: M3 (`AlwaysTrue` to `AlwaysFalse` on the staged path) gives 0 red
+  out of 26 — the identity is unobservable on a reset main, as the critic
+  stated. Covered by keeping `AlwaysTrue` plus the L-001 pins: a forgotten
+  reset with `AlwaysTrue` would resolve old files (caught by `deleted-*`
+  absence); with `AlwaysFalse` it would keep them (caught by live-set pins).
+- L-003: `rtas_replace_v3_with_files_continues_row_ids` (seed 30 rows on V3,
+  replace 5: snapshot `first_row_id` Some(30), `next_row_id` 35, live is the
+  new file) and
+  `rtas_replace_partitioned_sorted_with_files_records_overwrite`
+  (identity(id) spec id 0 plus one ascending sort field: operation
+  overwrite, live paths and per-file partitions exactly the new set).
+  All 26 staged tests green.
+
+## Round 3 gate output
+
+All green 2026-09-17 (`CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8`):
+
+- `cargo test -p iceberg --lib transaction`: 655 passed, 0 failed.
+- `cargo test -p iceberg --lib catalog`: 190 passed, 0 failed.
+- `cargo test -p iceberg-datafusion`: all suites green (228 + 20 + 7 + 1 +
+  6 + 1 + 5 + 4 + 7 + 87 + 14 passed, 0 failed).
+- `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D
+  warnings`: clean.
+- `make check`: exit 0 (487 files clean, 98 legacy ceilings, anchors
+  sound, comment blocks clean).
+- `make check-matrix-anchors`: exit 0 (86 rows).
+
 ## Round 2 gate output
 
 All green 2026-09-17 (`CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8`):
