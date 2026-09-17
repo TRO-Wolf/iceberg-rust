@@ -63,8 +63,8 @@ reads renamed columns by field id). RePark fixed its own DML scans RePark-side
 | C-004 | Pinned scan keeps binding the snapshot schema (time travel). | new pinned pin + full lib suite green. | PROVEN |
 | C-005 | SQL `UPDATE … WHERE id = 1` and `DELETE … WHERE id = 1` after each of the three evolutions, two data files, CoW and MoR, assert post-statement rows. | `tests/evo_schema_dml.rs` (12 pins); red on base. | PROVEN |
 | C-006 | Gates per brief step 5. | Command → result below. | PROVEN |
-| C-007 | `use_ref("main")` is a no-op binding the current schema; a non-main ref still pins the snapshot schema. | `main_ref_*` pins (red on pre-fix tree) + tag guard; mirror of `BatchScan::use_ref`. | OPEN |
-| C-008 | C-004 pins are discriminating: forcing the current schema on pinned scans reds them. | three `snapshot_pinned_*` pins + hardened tag pin; `if false` mutation. | OPEN |
+| C-007 | `use_ref("main")` is a no-op binding the current schema; a non-main ref still pins the snapshot schema. | `main_ref_*` pins (red on pre-fix tree) + tag guard; mirror of `BatchScan::use_ref`. | PROVEN |
+| C-008 | C-004 pins are discriminating: forcing the current schema on pinned scans reds them. | three `snapshot_pinned_*` pins + hardened tag pin; `if false` mutation. | PROVEN |
 
 ## Red evidence
 
@@ -146,6 +146,11 @@ stay green. Restore `cmp` clean, re-green 10 / 10. The tag pin first stayed gree
 under this mutant (its `select(["id","v"])` names exist in both schemas) and was
 hardened with a `select(["extra"])` refusal assertion before the re-run.
 
+Out of scope, observed: `scan/incremental.rs:242` still reads "The `to` snapshot
+supplies the schema, as `TableScanBuilder::build` does" — true of the incremental
+behavior (unchanged) but now an incomplete description of `build` (snapshot schema
+only when pinned). Left untouched per scope; named for a follow-up.
+
 ## Implemented fix
 
 `crates/iceberg/src/scan/mod.rs` (`TableScanBuilder::build`): the bind schema is the
@@ -193,12 +198,28 @@ restore, re-green before the next leg.
 
 ## Gates
 
+Round 2 (critic-289, rebased onto fork main `96fc9f1f`):
+
+| Command | Result |
+|---|---|
+| `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg --lib` | ok. 3725 passed; 0 failed; 8 ignored |
+| `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --lib` | ok. 228 passed; 0 failed; 1 ignored |
+| `cargo clippy -p iceberg --all-targets -- -D warnings` | exit 0 |
+| `cargo clippy -p iceberg-datafusion --all-targets -- -D warnings` | exit 0 |
+| `python3 scripts/check_rust_file_size.py` | 485 files clean (99 legacy ceilings) |
+| `typos .` | exit 0 |
+| `./scripts/check_comment_blocks.sh` | OK |
+| `./scripts/check_agent_artifacts.sh` | OK |
+| `./scripts/check_matrix_anchors.sh` | OK (85 rows anchored) |
+
+Round 1 (pre-rebase):
+
 | Command | Result |
 |---|---|
 | `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg --lib` | ok. 3701 passed; 0 failed; 8 ignored |
 | `CARGO_BUILD_JOBS=10 cargo clippy -p iceberg --all-targets -- -D warnings` | exit 0 |
 | `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --lib` | ok. 228 passed; 0 failed; 1 ignored |
-| `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --tests` | ok. 476 passed; 0 failed; 7 ignored over 31 targets (lib 228; every integration suite incl. `evo_schema_dml` 12; the 7 ignores are the pre-existing measure/probe pins; no suite needs Docker) |
+| `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --tests` | round 1: ok. 476 passed; 0 failed; 7 ignored over 31 targets (lib 228; every integration suite incl. `evo_schema_dml` 12; the 7 ignores are the pre-existing measure/probe pins; no suite needs Docker). Round 2: ok. 504 passed; 0 failed; 7 ignored (same ignores; rebase added suites) |
 | `cargo clippy -p iceberg-datafusion --all-targets -- -D warnings` | exit 0 |
 | `cargo fmt --all -- --check` | clean |
 | `python3 scripts/check_rust_file_size.py` | 478 files clean (99 legacy ceilings) |

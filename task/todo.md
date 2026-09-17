@@ -41,7 +41,7 @@ ICE-EVO-DML-1 residual UPDATE red (run 20a).
 - [x] C-006 gates + docs commit
 - [x] Round 2 (critic-289): L-001 `use_ref("main")` no-op red (3 pins) then fix;
       L-002 discriminating C-004 pins + tag hardening, `if false` mutation reds 4
-- [ ] Round 2 gates + docs commit
+- [x] Round 2 gates + docs commit
 
 ## ACTIVE (2026-09-16): F-PROMOTE-READ-1 manifest values read under the promoted type
 
