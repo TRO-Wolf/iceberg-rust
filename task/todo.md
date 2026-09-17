@@ -44,7 +44,7 @@ Java retry defaults, and never-retry-unknown were already ported. Consumer: RePa
 - [x] C-004 gates + commit: `iceberg --lib` 3731 passed; datafusion lib 228 passed +
       32 integration targets 264 passed; clippy clean both crates; fmt/typos/size/
       comment-blocks/artifacts/anchors green; no GAP_MATRIX flip
-- [ ] C-005 RePark hand-back `/tmp/oc-worker/ja-occ/handback-1.md` + `handback.json`
+- [x] C-005 RePark hand-back `/tmp/oc-worker/ja-occ/handback-1.md` + `handback.json`
 
 ## ACTIVE (2026-09-17): F-EVO-SCAN-1 scans and DataFusion UPDATE after ADD / RENAME COLUMN
 
