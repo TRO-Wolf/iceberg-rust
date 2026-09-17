@@ -121,19 +121,10 @@ pub(crate) trait ManifestProcess: Send + Sync {
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
-/// What a producer does with the `first_row_id` an ADDED data file already carries.
-///
-/// Java splits this by base class, so the fork makes it a REQUIRED constructor argument: a new
-/// producer cannot inherit the wrong half by omission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FirstRowIdPolicy {
-    /// Write the value the caller supplied. Java `FastAppend` and `BaseRewriteManifests`, which
-    /// extend `SnapshotProducer` and never call `Delegates.suppressFirstRowId`.
-    Preserve,
-    /// Force the field absent. Java `MergingSnapshotProducer.add(DataFile)`. A stale id survives
-    /// read-side inheritance, so the file keeps a row-id range that describes other rows.
-    Suppress,
-}
+#[path = "snapshot/first_row_id_policy.rs"]
+mod first_row_id_policy;
+
+pub(crate) use first_row_id_policy::FirstRowIdPolicy;
 
 /// An ADDED delete file paired with its OPTIONAL explicit DATA sequence number — the Rust analogue of
 /// Java's `Delegates.PendingDeleteFile` (a delete file wrapped with a nullable `dataSequenceNumber()`).
