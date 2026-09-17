@@ -72,12 +72,12 @@ impl<'a> StrictMetricsEvaluator<'a> {
         self.data_file.value_counts.get(&field_id)
     }
 
-    fn lower_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.lower_bounds.get(&field_id)
+    fn lower(&self, reference: &BoundReference) -> Option<std::borrow::Cow<'_, Datum>> {
+        self.data_file.promoted_lower_bound(reference)
     }
 
-    fn upper_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.upper_bounds.get(&field_id)
+    fn upper(&self, reference: &BoundReference) -> Option<std::borrow::Cow<'_, Datum>> {
+        self.data_file.promoted_upper_bound(reference)
     }
 
     fn contains_nans_only(&self, field_id: i32) -> bool {
@@ -134,12 +134,12 @@ impl<'a> StrictMetricsEvaluator<'a> {
         }
 
         let bound = if use_lower_bound {
-            self.lower_bound(field_id)
+            self.lower(reference)
         } else {
-            self.upper_bound(field_id)
+            self.upper(reference)
         };
 
-        if let Some(bound) = bound
+        if let Some(bound) = bound.as_deref()
             && cmp_fn(bound, datum)
         {
             return ROWS_MUST_MATCH;
@@ -266,9 +266,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
-        if let Some(lower) = self.lower_bound(field_id)
+        if let Some(lower) = self.lower(reference)
             && lower.is_nan()
         {
             return ROWS_MIGHT_NOT_MATCH;
@@ -283,14 +281,12 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
         // Java `gtEq` (StrictMetricsEvaluator.java L285-291 @ 1.10.0, bytecode offsets
         // 93-105): a NaN lower bound indicates unreliable bounds (the ORC caveat in Java's
         // class javadoc) and can never prove a strict match. Without this guard `Datum`'s
         // total ordering (NaN largest) makes `NaN >= datum` true and would wrongly claim
         // ROWS_MUST_MATCH — the over-claim/data-loss direction.
-        if let Some(lower) = self.lower_bound(field_id)
+        if let Some(lower) = self.lower(reference)
             && lower.is_nan()
         {
             return ROWS_MIGHT_NOT_MATCH;
@@ -311,8 +307,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
-        if let (Some(lower), Some(upper)) = (self.lower_bound(field_id), self.upper_bound(field_id))
-        {
+        if let (Some(lower), Some(upper)) = (self.lower(reference), self.upper(reference)) {
             // For an equality predicate to hold strictly, we must have:
             //     lower == literal.value == upper.
             if lower.literal() == datum.literal() && upper.literal() == datum.literal() {
@@ -337,7 +332,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
             return ROWS_MUST_MATCH;
         }
 
-        if let Some(lower) = self.lower_bound(field_id) {
+        if let Some(lower) = self.lower(reference) {
             if lower.is_nan() {
                 return ROWS_MIGHT_NOT_MATCH;
             }
@@ -346,7 +341,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
             }
         }
 
-        if let Some(upper) = self.upper_bound(field_id) {
+        if let Some(upper) = self.upper(reference) {
             if upper.is_nan() {
                 return ROWS_MIGHT_NOT_MATCH;
             }
@@ -388,9 +383,8 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
-        if let (Some(lower), Some(upper)) = (self.lower_bound(field_id), self.upper_bound(field_id))
-        {
-            if !literals.contains(lower) || !literals.contains(upper) || lower != upper {
+        if let (Some(lower), Some(upper)) = (self.lower(reference), self.upper(reference)) {
+            if !literals.contains(&*lower) || !literals.contains(&*upper) || lower != upper {
                 return ROWS_MIGHT_NOT_MATCH;
             }
 
@@ -414,7 +408,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
 
         let mut filtered_literals = literals.clone();
 
-        if let Some(lower) = self.lower_bound(field_id) {
+        if let Some(lower) = self.lower(reference).as_deref() {
             if lower.is_nan() {
                 return ROWS_MIGHT_NOT_MATCH;
             }
@@ -425,7 +419,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
             }
         }
 
-        if let Some(upper) = self.upper_bound(field_id) {
+        if let Some(upper) = self.upper(reference) {
             filtered_literals.retain(|val| *val <= *upper);
             if filtered_literals.is_empty() {
                 return ROWS_MUST_MATCH;

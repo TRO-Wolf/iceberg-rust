@@ -30,7 +30,7 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
+    ManifestContentType, ManifestEntry, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
     PartitionSpecRef, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef, TableProperties,
 };
 use crate::{Error, ErrorKind, Result};
@@ -171,11 +171,17 @@ impl ManifestFileContext {
         let manifest = object_cache
             .get_manifest(&manifest_file, Some(snapshot_schema.clone()))
             .await?;
+        let partition_type = partition_spec
+            .as_ref()
+            .and_then(|spec| spec.partition_type(&snapshot_schema).ok());
 
         for manifest_entry in manifest.entries() {
             let manifest_entry_context = ManifestEntryContext {
                 // TODO: refactor to avoid the expensive ManifestEntry clone
-                manifest_entry: manifest_entry.clone(),
+                manifest_entry: ManifestEntry::with_promoted_partition(
+                    manifest_entry,
+                    partition_type.as_ref(),
+                ),
                 expression_evaluator_cache: expression_evaluator_cache.clone(),
                 field_ids: field_ids.clone(),
                 partition_spec_id: manifest_file.partition_spec_id,

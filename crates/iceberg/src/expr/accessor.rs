@@ -77,6 +77,14 @@ impl StructAccessor {
                 Some(Literal::Primitive(literal)) if self.r#type().compatible(literal) => {
                     Ok(Some(Datum::new(self.r#type().clone(), literal.clone())))
                 }
+                Some(Literal::Primitive(literal))
+                    if self.r#type().compatible(&literal.promote_to(self.r#type())) =>
+                {
+                    Ok(Some(Datum::new(
+                        self.r#type().clone(),
+                        literal.promote_to(self.r#type()),
+                    )))
+                }
                 Some(Literal::Primitive(literal)) => Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
@@ -289,7 +297,7 @@ mod tests {
     fn test_accessor_rejects_representation_incompatible_primitives() {
         let cases = [
             (PrimitiveType::Int, Literal::long(7)),
-            (PrimitiveType::Long, Literal::int(7)),
+            (PrimitiveType::Long, Literal::string("7")),
             (
                 PrimitiveType::Decimal {
                     precision: 9,

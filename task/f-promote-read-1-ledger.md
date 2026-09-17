@@ -77,19 +77,70 @@ Measured consequences in the fork, one per seam:
   line-neutral; helpers live in the new `spec/promotion.rs`, pins in
   `spec/promotion_tests.rs`.
 
+## Implemented fix
+
+`crates/iceberg/src/spec/promotion.rs` (new, `pub(crate)` only) holds the promotion helpers,
+all built on `is_promotion_allowed` and the existing `PrimitiveLiteral::promote_to`:
+
+- `Datum::promoted_to(&Type) -> Cow<Datum>` — the Java `fromByteBuffer(ref.type(), …)` step:
+  a legal promotion returns the widened datum, anything else borrows the original.
+- `DataFile::promoted_lower_bound` / `promoted_upper_bound(&BoundReference)` — a bound read
+  under the reference's type.
+- `Struct::promoted_to(&StructType) -> Option<Struct>` — re-types each slot whose literal is
+  not compatible with its partition field but becomes compatible after `promote_to`;
+  `None` when nothing changes, so the common path allocates nothing.
+- `PartitionSpec::validated_promoted_partition` — promote, then the unchanged
+  `validate_partition_data`.
+- `TableMetadata::current_partition_key(&DataFile)` — `(spec_id, tuple promoted to the spec's
+  partition type under the current schema)`.
+- `ManifestEntry::with_promoted_partition` — `Arc::clone` unless the tuple changes.
+- `Datum::physical(&PrimitiveType, PrimitiveLiteral)` — a page-index bound built under the
+  field type from the column index's physical literal.
+
+Seams (production edits in capped files are line-neutral or shrink):
+
+| File | Change |
+|---|---|
+| `expr/visitors/inclusive_metrics_evaluator.rs` | `lower_bound` / `upper_bound` take the `BoundReference` and return the promoted `Cow`; comparisons use `.as_deref()` |
+| `expr/visitors/strict_metrics_evaluator.rs` | same, renamed `lower` / `upper` so the two tuple `if let` lines fit one line; the `field_id` locals only those calls used are gone (1928 → 1922, ceiling lowered) |
+| `expr/accessor.rs` | a second arm returns the promoted datum when `promote_to` makes the literal compatible |
+| `spec/partition.rs` | `PartitionKey::new` stores `validated_promoted_partition(data, schema)` |
+| `transaction/snapshot.rs` | `resolve_partition_deletes` keys data files with `current_partition_key` |
+| `expr/visitors/page_index_evaluator.rs` | INT32 and FLOAT column-index arms build bounds with `Datum::physical` |
+| `scan/context.rs` | the partition type of each manifest's spec under the scan schema is computed once; every streamed entry (data and delete manifests) carries `with_promoted_partition` |
+
+Two existing pins encoded the pre-fix rule that an `int` literal under a `long` type is refused,
+which is exactly the Java-legal promotion this unit implements. Their rejection coverage now uses
+a genuinely incompatible kind instead: `accessor::tests::test_accessor_rejects_representation_incompatible_primitives`
+(`(Long, Literal::int(7))` → `(Long, Literal::string("7"))`) and
+`partition::partition_path_totalisation_tests::partition_key_new_rejects_incompatible_literal`
+(`Literal::int(7)` → `Literal::string("7")` in the `long` slot). The `(Int, Literal::long(7))`
+narrowing case stays refused.
+
+Named residue (not reachable from RePark's writers, recorded for a later unit):
+
+- `ReplacePartitionsAction::drop_partitions` keys the ADDED files' tuples as given. RePark and
+  every in-tree writer type new tuples under the current schema, so the promoted old side matches;
+  a caller that hands an `int` tuple for a promoted field would not.
+- `ConflictScope::contains` compares a concurrently committed file's tuple by exact equality; a
+  stale writer that committed an `int` tuple after the promotion would escape the
+  replace-partitions conflict check. Neither action has table metadata in scope today.
+- `get_parquet_stat_min_as_datum` answers `None` for `(Long, Int32)` / `(Double, Float)` row-group
+  statistics — correct (no pruning), not promoted.
+
 ## Proposition ledger
 
 | Clause | Checkable proposition | Proof obligation | Status |
 |---|---|---|---|
-| C-001 | `InclusiveMetricsEvaluator` keeps a file whose bounds were written as `int`/`float` for `<`, `<=`, `>`, `>=` and `IN` under a `long`/`double` reference, and still prunes it when the promoted bounds exclude the literal. | `inclusive_metrics_keep_an_int_bounded_file_for_long_predicates`, `inclusive_metrics_keep_a_float_bounded_file_for_double_predicates`; red on base. | OPEN |
-| C-002 | `StrictMetricsEvaluator` never claims `ROWS_MUST_MATCH` for `<>`/`NOT IN` on a pre-promotion file that holds the literal, and does claim it when the promoted bounds prove every row matches. | `strict_metrics_decide_an_int_bounded_file_under_long_predicates`; red on base. | OPEN |
-| C-003 | `StructAccessor::get` reads an `Int`/`Float` partition literal under a `long`/`double` accessor as the promoted datum and still refuses an unrelated kind. | `partition_accessor_reads_pre_promotion_literals_under_the_promoted_type`; red on base. | OPEN |
-| C-004 | `PartitionKey::new` accepts a tuple written before a legal promotion and stores the promoted tuple. | `partition_key_new_promotes_a_pre_promotion_tuple`; red on base. | OPEN |
-| C-005 | A mixed-era table (two pre-promotion files, one post-promotion file) answers `<`, `>`, long `IN` and — with row selection on — `<=` with every matching row. | `mixed_era_range_and_in_filters_return_pre_promotion_rows`; red on base. | OPEN |
-| C-006 | A promoted identity partition source answers `=` and `<` and plans every `FileScanTask.partition` as `long`. | `promoted_identity_partition_source_filters_and_plans_long_partitions`; red on base. | OPEN |
-| C-007 | An equality delete written after the promotion applies to a pre-promotion data file in the same partition. | `equality_delete_written_after_promotion_applies_to_a_pre_promotion_partition`; red on base. | OPEN |
-| C-008 | `ReplacePartitions` after the promotion drops the pre-promotion file of the replaced partition; `overwrite_by_row_filter(id = 7)` replaces the promoted identity partition and keeps the other one. | `replace_partitions_after_promotion_drops_the_pre_promotion_partition`, `overwrite_by_row_filter_on_a_promoted_identity_partition_replaces_it`; red on base. | OPEN |
-| C-009 | Gates: the pins green after the fix, `cargo test -p iceberg --lib`, `cargo clippy -p iceberg --all-targets -- -D warnings`, `cargo fmt`, the Rust file-size check, the comment fence. | Command -> result below. | OPEN |
+| C-001 | `InclusiveMetricsEvaluator` keeps a file whose bounds were written as `int`/`float` for `<`, `<=`, `>`, `>=` and `IN` under a `long`/`double` reference, and still prunes it when the promoted bounds exclude the literal. | `inclusive_metrics_keep_an_int_bounded_file_for_long_predicates`, `inclusive_metrics_keep_a_float_bounded_file_for_double_predicates`; red on base. | EXECUTION PROVEN |
+| C-002 | `StrictMetricsEvaluator` never claims `ROWS_MUST_MATCH` for `<>`/`NOT IN` on a pre-promotion file that holds the literal, and does claim it when the promoted bounds prove every row matches. | `strict_metrics_decide_an_int_bounded_file_under_long_predicates`; red on base. | EXECUTION PROVEN |
+| C-003 | `StructAccessor::get` reads an `Int`/`Float` partition literal under a `long`/`double` accessor as the promoted datum and still refuses an unrelated kind. | `partition_accessor_reads_pre_promotion_literals_under_the_promoted_type`; red on base. | EXECUTION PROVEN |
+| C-004 | `PartitionKey::new` accepts a tuple written before a legal promotion and stores the promoted tuple. | `partition_key_new_promotes_a_pre_promotion_tuple`; red on base. | EXECUTION PROVEN |
+| C-005 | A mixed-era table (two pre-promotion files, one post-promotion file) answers `<`, `>`, long `IN` and — with row selection on — `<=` with every matching row. | `mixed_era_range_and_in_filters_return_pre_promotion_rows`; red on base. | EXECUTION PROVEN |
+| C-006 | A promoted identity partition source answers `=` and `<` and plans every `FileScanTask.partition` as `long`. | `promoted_identity_partition_source_filters_and_plans_long_partitions`; red on base. | EXECUTION PROVEN |
+| C-007 | An equality delete written after the promotion applies to a pre-promotion data file in the same partition. | `equality_delete_written_after_promotion_applies_to_a_pre_promotion_partition`; red on base. | EXECUTION PROVEN |
+| C-008 | `ReplacePartitions` after the promotion drops the pre-promotion file of the replaced partition; `overwrite_by_row_filter(id = 7)` replaces the promoted identity partition and keeps the other one. | `replace_partitions_after_promotion_drops_the_pre_promotion_partition`, `overwrite_by_row_filter_on_a_promoted_identity_partition_replaces_it`; red on base. | EXECUTION PROVEN |
+| C-009 | Gates: the pins green after the fix, `cargo test -p iceberg --lib`, `cargo clippy -p iceberg --all-targets -- -D warnings`, `cargo fmt`, the Rust file-size check, the comment fence. | Command -> result below. | EXECUTION PROVEN |
 
 ## Base-red evidence
 
@@ -125,3 +176,51 @@ test result: FAILED. 0 passed; 10 failed; 0 ignored; 0 measured; 3685 filtered o
 
 The accessor, `PartitionKey::new` and range messages are byte-identical to the RePark
 run-19a reproduction (`p_promote_partition`, `p_promote_suspects`, `p_promote_read`).
+
+## Execution evidence
+
+`CARGO_BUILD_JOBS=10 cargo test -p iceberg --lib spec::promotion_tests` after the fix:
+
+```
+test spec::promotion_tests::partition_accessor_reads_pre_promotion_literals_under_the_promoted_type ... ok
+test spec::promotion_tests::partition_key_new_promotes_a_pre_promotion_tuple ... ok
+test spec::promotion_tests::inclusive_metrics_keep_a_float_bounded_file_for_double_predicates ... ok
+test spec::promotion_tests::inclusive_metrics_keep_an_int_bounded_file_for_long_predicates ... ok
+test spec::promotion_tests::strict_metrics_decide_an_int_bounded_file_under_long_predicates ... ok
+test spec::promotion_tests::equality_delete_written_after_promotion_applies_to_a_pre_promotion_partition ... ok
+test spec::promotion_tests::replace_partitions_after_promotion_drops_the_pre_promotion_partition ... ok
+test spec::promotion_tests::mixed_era_range_and_in_filters_return_pre_promotion_rows ... ok
+test spec::promotion_tests::overwrite_by_row_filter_on_a_promoted_identity_partition_replaces_it ... ok
+test spec::promotion_tests::promoted_identity_partition_source_filters_and_plans_long_partitions ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 3685 filtered out; finished in 0.12s
+```
+
+First full run after the fix: `3685 passed; 2 failed` — the two existing pins named under
+"Implemented fix" still asserted that an `int` literal under a `long` type is refused. After
+narrowing them to a string literal:
+
+```
+cargo test -p iceberg --lib                               -> 3687 passed; 0 failed; 8 ignored
+cargo clippy -p iceberg --all-targets -- -D warnings      -> exit 0
+cargo fmt --all -- --check                                -> exit 0
+python3 scripts/check_rust_file_size.py                   -> rust-file-size: 465 files clean (100 legacy ceilings)
+typos (touched files)                                     -> exit 0
+make check-comment-blocks check-agent-artifacts check-matrix-anchors -> all OK
+```
+
+Mutation proof — each seam reverted alone, `cargo test -p iceberg --lib spec::promotion_tests`,
+file restored from a byte copy (`/tmp/oc-worker/ia-build/fork-mutations.py`, a pattern that does
+not apply exactly once hard-fails):
+
+| Mutation | Red pins |
+|---|---|
+| M1 inclusive evaluator reads raw bounds | 4 — both inclusive unit pins, the mixed-era scan, the promoted identity partition scan |
+| M2 strict evaluator reads raw bounds | 1 — `strict_metrics_decide_an_int_bounded_file_under_long_predicates` |
+| M3 accessor promotion arm removed | 2 — the accessor pin, `overwrite_by_row_filter_on_a_promoted_identity_partition_replaces_it` |
+| M4 `PartitionKey::new` validates the raw tuple | 1 — `partition_key_new_promotes_a_pre_promotion_tuple` |
+| M5 `resolve_partition_deletes` compares raw tuples | 1 — `replace_partitions_after_promotion_drops_the_pre_promotion_partition` |
+| M6 page index builds `Datum::new(Long, Int)` | 1 — `mixed_era_range_and_in_filters_return_pre_promotion_rows` (the row-selection `<=` assertion) |
+| M7 scan planning streams raw tuples | 2 — the cross-era equality delete, the promoted identity partition plan |
+
+Consumer evidence (RePark ICE-PROMOTE-READ-1, local path override, not committed there): the
+RePark ledger records the Python pins against the recorded Spark 4.1.2 oracle.

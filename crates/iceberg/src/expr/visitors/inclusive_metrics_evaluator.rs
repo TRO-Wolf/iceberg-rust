@@ -64,12 +64,12 @@ impl<'a> InclusiveMetricsEvaluator<'a> {
         self.data_file.value_counts.get(&field_id)
     }
 
-    fn lower_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.lower_bounds.get(&field_id)
+    fn lower_bound(&self, reference: &BoundReference) -> Option<std::borrow::Cow<'_, Datum>> {
+        self.data_file.promoted_lower_bound(reference)
     }
 
-    fn upper_bound(&self, field_id: i32) -> Option<&Datum> {
-        self.data_file.upper_bounds.get(&field_id)
+    fn upper_bound(&self, reference: &BoundReference) -> Option<std::borrow::Cow<'_, Datum>> {
+        self.data_file.promoted_upper_bound(reference)
     }
 
     fn contains_nans_only(&self, field_id: i32) -> bool {
@@ -114,12 +114,12 @@ impl<'a> InclusiveMetricsEvaluator<'a> {
         }
 
         let bound = if use_lower_bound {
-            self.lower_bound(field_id)
+            self.lower_bound(reference)
         } else {
-            self.upper_bound(field_id)
+            self.upper_bound(reference)
         };
 
-        if let Some(bound) = bound {
+        if let Some(bound) = bound.as_deref() {
             if cmp_fn(bound, datum) {
                 return ROWS_MIGHT_MATCH;
             }
@@ -258,7 +258,7 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
             return ROWS_CANNOT_MATCH;
         }
 
-        if let Some(lower_bound) = self.lower_bound(field_id) {
+        if let Some(lower_bound) = self.lower_bound(reference).as_deref() {
             if lower_bound.is_nan() {
                 // NaN indicates unreliable bounds.
                 // See the InclusiveMetricsEvaluator docs for more.
@@ -268,7 +268,7 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
             }
         }
 
-        if let Some(upper_bound) = self.upper_bound(field_id) {
+        if let Some(upper_bound) = self.upper_bound(reference).as_deref() {
             if upper_bound.is_nan() {
                 // NaN indicates unreliable bounds.
                 // See the InclusiveMetricsEvaluator docs for more.
@@ -312,7 +312,7 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
             ));
         };
 
-        if let Some(lower_bound) = self.lower_bound(field_id) {
+        if let Some(lower_bound) = self.lower_bound(reference) {
             let PrimitiveLiteral::String(lower_bound) = lower_bound.literal() else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
@@ -330,7 +330,7 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
             }
         }
 
-        if let Some(upper_bound) = self.upper_bound(field_id) {
+        if let Some(upper_bound) = self.upper_bound(reference) {
             let PrimitiveLiteral::String(upper_bound) = upper_bound.literal() else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
@@ -373,7 +373,7 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
             ));
         };
 
-        let Some(lower_bound) = self.lower_bound(field_id) else {
+        let Some(lower_bound) = self.lower_bound(reference) else {
             return ROWS_MIGHT_MATCH;
         };
 
@@ -394,7 +394,7 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
         if lower_bound_str.chars().take(prefix_len).collect::<String>() == *prefix {
             // lower bound matches the prefix
 
-            let Some(upper_bound) = self.upper_bound(field_id) else {
+            let Some(upper_bound) = self.upper_bound(reference) else {
                 return ROWS_MIGHT_MATCH;
             };
 
@@ -437,7 +437,7 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
             return ROWS_MIGHT_MATCH;
         }
 
-        if let Some(lower_bound) = self.lower_bound(field_id) {
+        if let Some(lower_bound) = self.lower_bound(reference).as_deref() {
             if lower_bound.is_nan() {
                 // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
                 return ROWS_MIGHT_MATCH;
@@ -449,7 +449,7 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
             }
         }
 
-        if let Some(upper_bound) = self.upper_bound(field_id) {
+        if let Some(upper_bound) = self.upper_bound(reference).as_deref() {
             if upper_bound.is_nan() {
                 // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
                 return ROWS_MIGHT_MATCH;

@@ -706,7 +706,7 @@ impl<'a> SnapshotProducer<'a> {
                         continue;
                     }
                     let data_file = entry.data_file();
-                    let key = (data_file.partition_spec_id, data_file.partition().clone());
+                    let key = self.table.metadata().current_partition_key(data_file);
                     if drop_partitions.contains(&key) {
                         resolved.push(data_file.clone());
                     }

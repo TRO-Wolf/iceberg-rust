@@ -27,6 +27,7 @@ mod partition;
 #[cfg(test)]
 mod partition_key_new_tests;
 mod partitioning;
+mod promotion;
 #[cfg(test)]
 mod promotion_tests;
 mod schema;
