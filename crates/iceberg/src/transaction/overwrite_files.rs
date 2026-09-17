@@ -112,6 +112,7 @@ pub struct OverwriteFilesAction {
     /// Java `OverwriteFiles.validateAddedFilesMatchOverwriteFilter`. OFF by default. It asserts that every
     /// added data file lies inside `row_filter`, so it only means something with [`Self::row_filter`] set.
     validate_added_files_match_overwrite_filter: bool,
+    allow_empty_commit: bool,
     /// Case sensitivity for binding this action's predicates (Java `MergingSnapshotProducer.caseSensitive`).
     /// Defaults to `true`, the Java default. `false` switches EVERY filter binding this action performs to
     /// case-insensitive column resolution. See [`OverwriteFilesAction::case_sensitive`].
@@ -134,6 +135,7 @@ impl OverwriteFilesAction {
             validate_from_snapshot: None,
             row_filter: None,
             validate_added_files_match_overwrite_filter: false,
+            allow_empty_commit: false,
             // Java `MergingSnapshotProducer` defaults `caseSensitive` to true.
             case_sensitive: true,
             target_branch: MAIN_BRANCH.to_string(),
@@ -187,6 +189,12 @@ impl OverwriteFilesAction {
     /// requests a delete, so an add plus a row filter records `Overwrite`.
     pub fn overwrite_by_row_filter(mut self, predicate: Predicate) -> Self {
         self.row_filter = Some(predicate);
+        self
+    }
+
+    /// Commit even when the row filter resolves to zero files and nothing is added.
+    pub fn allow_empty_commit(mut self) -> Self {
+        self.allow_empty_commit = true;
         self
     }
 
@@ -409,6 +417,7 @@ impl TransactionAction for OverwriteFilesAction {
                     adds_data_files: !self.added_data_files.is_empty(),
                     // Case sensitivity for binding the row filter (Java default `true`).
                     case_sensitive: self.case_sensitive,
+                    allow_empty_commit: self.allow_empty_commit,
                 },
                 DefaultManifestProcess,
             )
@@ -529,6 +538,7 @@ struct OverwriteFilesOperation {
     adds_data_files: bool,
     /// Case sensitivity for binding `row_filter` (Java default `true`).
     case_sensitive: bool,
+    allow_empty_commit: bool,
 }
 
 impl SnapshotProduceOperation for OverwriteFilesOperation {
@@ -546,7 +556,7 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
     }
 
     fn allows_empty_commit(&self) -> bool {
-        self.row_filter.is_some()
+        self.allow_empty_commit
     }
 
     async fn delete_entries(
@@ -931,6 +941,23 @@ mod tests {
         let result = tx.commit(&catalog).await;
 
         assert!(result.is_err(), "a truly-empty overwrite must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_empty_overwrite_by_row_filter_is_rejected_without_opt_in() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite_files()
+            .overwrite_by_row_filter(Predicate::AlwaysTrue);
+        let tx = action.apply(tx).unwrap();
+        let error = tx
+            .commit(&catalog)
+            .await
+            .expect_err("a filter-only overwrite resolving to zero files must be rejected");
+        assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
     }
 
     /// A rewritten manifest must copy every surviving entry forward as `Existing` with its ORIGINAL

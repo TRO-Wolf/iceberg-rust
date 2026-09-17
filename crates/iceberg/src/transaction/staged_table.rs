@@ -312,6 +312,7 @@ impl StagedTableTransaction {
                 .overwrite_files()
                 .overwrite_by_row_filter(Predicate::AlwaysTrue)
                 .add_files(self.pending_data_files)
+                .allow_empty_commit()
                 .apply(tx)?;
             tx.apply_locally().await
         } else {
