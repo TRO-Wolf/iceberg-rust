@@ -91,16 +91,8 @@ async fn base_table(
             .expect("catalog provider");
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", Arc::new(provider));
-    run(
-        &ctx,
-        &format!("INSERT INTO catalog.ns.t VALUES {first}"),
-    )
-    .await;
-    run(
-        &ctx,
-        &format!("INSERT INTO catalog.ns.t VALUES {second}"),
-    )
-    .await;
+    run(&ctx, &format!("INSERT INTO catalog.ns.t VALUES {first}")).await;
+    run(&ctx, &format!("INSERT INTO catalog.ns.t VALUES {second}")).await;
     (ctx, warehouse, iceberg_catalog, namespace)
 }
 
@@ -253,11 +245,7 @@ async fn copy_on_write_delete_after_add_column_removes_the_matching_row() {
     run(&ctx, "DELETE FROM catalog.ns.t WHERE id = 1").await;
     assert_eq!(
         select_all(&ctx, "SELECT id, v, extra FROM catalog.ns.t", 3).await,
-        vec![vec![
-            "2".to_string(),
-            "b".to_string(),
-            "NULL".to_string()
-        ],]
+        vec![vec!["2".to_string(), "b".to_string(), "NULL".to_string()],]
     );
 }
 
@@ -267,11 +255,7 @@ async fn merge_on_read_delete_after_add_column_removes_the_matching_row() {
     run(&ctx, "DELETE FROM catalog.ns.t WHERE id = 1").await;
     assert_eq!(
         select_all(&ctx, "SELECT id, v, extra FROM catalog.ns.t", 3).await,
-        vec![vec![
-            "2".to_string(),
-            "b".to_string(),
-            "NULL".to_string()
-        ],]
+        vec![vec!["2".to_string(), "b".to_string(), "NULL".to_string()],]
     );
 }
 
@@ -281,10 +265,10 @@ async fn copy_on_write_update_after_rename_sets_the_renamed_column() {
     run(&ctx, "UPDATE catalog.ns.t SET v = 'x' WHERE id = 1").await;
     assert_eq!(
         select_all(&ctx, "SELECT id, v FROM catalog.ns.t", 2).await,
-        vec![
-            vec!["1".to_string(), "x".to_string()],
-            vec!["2".to_string(), "b".to_string()],
-        ]
+        vec![vec!["1".to_string(), "x".to_string()], vec![
+            "2".to_string(),
+            "b".to_string()
+        ],]
     );
 }
 
@@ -294,10 +278,10 @@ async fn merge_on_read_update_after_rename_sets_the_renamed_column() {
     run(&ctx, "UPDATE catalog.ns.t SET v = 'x' WHERE id = 1").await;
     assert_eq!(
         select_all(&ctx, "SELECT id, v FROM catalog.ns.t", 2).await,
-        vec![
-            vec!["1".to_string(), "x".to_string()],
-            vec!["2".to_string(), "b".to_string()],
-        ]
+        vec![vec!["1".to_string(), "x".to_string()], vec![
+            "2".to_string(),
+            "b".to_string()
+        ],]
     );
 }
 
@@ -353,11 +337,7 @@ async fn copy_on_write_delete_after_a_name_swap_keeps_each_value_under_its_field
     run(&ctx, "DELETE FROM catalog.ns.t WHERE id = 1").await;
     assert_eq!(
         select_all(&ctx, "SELECT id, v, extra FROM catalog.ns.t", 3).await,
-        vec![vec![
-            "2".to_string(),
-            "e2".to_string(),
-            "b".to_string()
-        ],]
+        vec![vec!["2".to_string(), "e2".to_string(), "b".to_string()],]
     );
 }
 
@@ -367,10 +347,6 @@ async fn merge_on_read_delete_after_a_name_swap_keeps_each_value_under_its_field
     run(&ctx, "DELETE FROM catalog.ns.t WHERE id = 1").await;
     assert_eq!(
         select_all(&ctx, "SELECT id, v, extra FROM catalog.ns.t", 3).await,
-        vec![vec![
-            "2".to_string(),
-            "e2".to_string(),
-            "b".to_string()
-        ],]
+        vec![vec!["2".to_string(), "e2".to_string(), "b".to_string()],]
     );
 }

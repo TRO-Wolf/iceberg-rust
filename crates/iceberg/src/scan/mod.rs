@@ -26,12 +26,12 @@ use context::*;
 mod incremental;
 pub use batch::*;
 pub use incremental::*;
+#[cfg(test)]
+mod evo_scan_tests;
 mod metrics_collector;
 mod partition_work;
 #[cfg(test)]
 pub mod partitioning_fixtures;
-#[cfg(test)]
-mod evo_scan_tests;
 mod task;
 mod task_group;
 

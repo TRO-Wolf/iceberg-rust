@@ -84,7 +84,10 @@ async fn write_string_file(
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ids.to_vec()))];
     for column in columns {
         arrays.push(Arc::new(StringArray::from(
-            column.iter().map(|value| value.to_string()).collect::<Vec<_>>(),
+            column
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
         )));
     }
     let batch = RecordBatch::try_new(arrow_schema, arrays).expect("batch");
@@ -167,13 +170,10 @@ async fn scan_batches(table: &Table, columns: &[&str]) -> Vec<RecordBatch> {
 
 async fn added_column_table() -> (Table, TempDir) {
     let (catalog, guard) = local_catalog().await;
-    let table = create_table(
-        &catalog,
-        vec![
-            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            string_field(2, "v"),
-        ],
-    )
+    let table = create_table(&catalog, vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+        string_field(2, "v"),
+    ])
     .await;
     let first = write_string_file(&table, "f1.parquet", &[1], &[&["a"]]).await;
     let second = write_string_file(&table, "f2.parquet", &[2], &[&["b"]]).await;
@@ -190,13 +190,10 @@ async fn added_column_table() -> (Table, TempDir) {
 
 async fn renamed_column_table() -> (Table, TempDir) {
     let (catalog, guard) = local_catalog().await;
-    let table = create_table(
-        &catalog,
-        vec![
-            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            string_field(2, "w"),
-        ],
-    )
+    let table = create_table(&catalog, vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+        string_field(2, "w"),
+    ])
     .await;
     let first = write_string_file(&table, "f1.parquet", &[1], &[&["a"]]).await;
     let second = write_string_file(&table, "f2.parquet", &[2], &[&["b"]]).await;
@@ -211,14 +208,11 @@ async fn renamed_column_table() -> (Table, TempDir) {
 
 async fn swapped_names_table() -> (Table, TempDir) {
     let (catalog, guard) = local_catalog().await;
-    let table = create_table(
-        &catalog,
-        vec![
-            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            string_field(2, "v"),
-            string_field(3, "extra"),
-        ],
-    )
+    let table = create_table(&catalog, vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+        string_field(2, "v"),
+        string_field(3, "extra"),
+    ])
     .await;
     let first = write_string_file(&table, "f1.parquet", &[1], &[&["a"], &["e1"]]).await;
     let second = write_string_file(&table, "f2.parquet", &[2], &[&["b"], &["e2"]]).await;
@@ -252,10 +246,7 @@ async fn unpinned_scan_after_add_column_null_fills_the_added_column() {
     }
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2]);
-    assert_eq!(
-        names,
-        vec![Some("a".to_string()), Some("b".to_string())]
-    );
+    assert_eq!(names, vec![Some("a".to_string()), Some("b".to_string())]);
     assert_eq!(extras, vec![None, None]);
 }
 
@@ -272,10 +263,7 @@ async fn unpinned_scan_after_rename_reads_the_renamed_column_by_field_id() {
     }
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2]);
-    assert_eq!(
-        names,
-        vec![Some("a".to_string()), Some("b".to_string())]
-    );
+    assert_eq!(names, vec![Some("a".to_string()), Some("b".to_string())]);
 }
 
 #[tokio::test]
@@ -289,23 +277,17 @@ async fn unpinned_scan_after_swapping_two_names_reads_each_field_by_id() {
         renamed.extend(string_values(batch, "v"));
         swapped.extend(string_values(batch, "extra"));
     }
-    assert_eq!(
-        renamed,
-        vec![Some("e1".to_string()), Some("e2".to_string())]
-    );
-    assert_eq!(
-        swapped,
-        vec![Some("a".to_string()), Some("b".to_string())]
-    );
+    assert_eq!(renamed, vec![
+        Some("e1".to_string()),
+        Some("e2".to_string())
+    ]);
+    assert_eq!(swapped, vec![Some("a".to_string()), Some("b".to_string())]);
 }
 
 #[tokio::test]
 async fn snapshot_pinned_scan_still_binds_the_snapshot_schema() {
     let (table, _guard) = added_column_table().await;
-    let snapshot_id = table
-        .metadata()
-        .current_snapshot_id()
-        .expect("snapshot");
+    let snapshot_id = table.metadata().current_snapshot_id().expect("snapshot");
     let batches: Vec<RecordBatch> = table
         .scan()
         .snapshot_id(snapshot_id)
