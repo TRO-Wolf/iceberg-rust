@@ -456,7 +456,7 @@ async fn merge_on_read_delete(
                         })
                     })
                     .collect::<DFResult<_>>()?;
-                let table_batch = RecordBatch::try_new(Arc::clone(table_schema), columns)
+                let table_batch = super::promotion::widened_batch(table_schema, columns)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 let evaluated = physical_expr.evaluate(&table_batch)?;
                 let array = evaluated.into_array(table_batch.num_rows())?;
@@ -847,7 +847,7 @@ fn table_column_batch(batch: &RecordBatch, table_schema: &SchemaRef) -> DFResult
             })
         })
         .collect::<DFResult<_>>()?;
-    RecordBatch::try_new(Arc::clone(table_schema), columns)
+    super::promotion::widened_batch(table_schema, columns)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 

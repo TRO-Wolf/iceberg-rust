@@ -388,7 +388,7 @@ impl PartitionKey {
     /// `StructTransform`.
     pub fn new(spec: PartitionSpec, schema: SchemaRef, data: Struct) -> Result<Self> {
         // Validate without building a path string, so the write path does not pay for rendering.
-        spec.validate_partition_data(&data, schema.as_ref())?;
+        let data = spec.validated_promoted_partition(data, schema.as_ref())?;
         Ok(Self { spec, schema, data })
     }
 
@@ -2393,9 +2393,9 @@ mod partition_path_totalisation_tests {
     #[test]
     fn partition_key_new_rejects_incompatible_literal() {
         let (schema, spec) = two_field_spec();
-        let data = Struct::from_iter([Some(Literal::long(5)), Some(Literal::int(7))]);
+        let data = Struct::from_iter([Some(Literal::long(5)), Some(Literal::string("7"))]);
         let err = PartitionKey::new(spec, schema, data)
-            .expect_err("an Int in a Long partition slot must not construct a PartitionKey");
+            .expect_err("a String in a Long partition slot must not construct a PartitionKey");
         assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
     }
 

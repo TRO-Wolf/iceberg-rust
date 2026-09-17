@@ -22,6 +22,7 @@ pub(crate) mod delete_legacy_merge;
 pub(crate) mod expr_to_predicate;
 pub(crate) mod metadata_scan;
 pub(crate) mod project;
+pub(crate) mod promotion;
 pub(crate) mod repartition;
 pub(crate) mod row_lineage;
 pub(crate) mod scan;

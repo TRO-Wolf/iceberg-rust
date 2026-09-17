@@ -29,8 +29,11 @@ mod manifests;
 mod metadata_log_entries;
 mod metadata_table;
 mod partition_summary;
+mod partition_values;
 mod partitions;
 mod position_deletes;
+#[cfg(test)]
+mod promoted_partition_tests;
 mod readable_metrics;
 mod refs;
 mod snapshots;

@@ -25,6 +25,21 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-16): F-PROMOTE-READ-1 manifest values read under the promoted type
+
+Ledger: [`f-promote-read-1-ledger.md`](f-promote-read-1-ledger.md). After a legal type
+promotion the fork compared manifest bounds and partition tuples written under the old type
+against current-schema literals: range and `IN` scans silently dropped pre-promotion files,
+promoted identity partition sources failed loud, cross-era equality deletes and
+`ReplacePartitions` silently kept old rows. Consumer: RePark ICE-PROMOTE-READ-1 (run 19a).
+
+- [x] C-001..C-008 red first: 10 pins in `spec/promotion_tests.rs`, 10 of 10 red on base
+- [x] C-001..C-008 fix + green: `spec/promotion.rs` helpers, line-neutral seams; two existing
+      pins narrowed from an `int` literal to a string literal (the legal promotion no longer refuses)
+- [x] C-009 gates + commit: `iceberg --lib` 3687 passed, clippy clean, 7 of 7 seam mutations red
+- [x] C-010 DataFusion UPDATE/DELETE on a single-era promoted table: 4 pins red on `7e027cca`,
+      `physical_plan/promotion.rs` `widened_batch`, 4 green, revert mutation red
+
 ## ACTIVE (2026-09-14): F-GLUE-REPLACE-1 Glue staged replace publish (row R158, gap G-1)
 
 Ledger: [`f-glue-replace-1-ledger.md`](f-glue-replace-1-ledger.md). `GlueCatalog` inherited the
