@@ -127,7 +127,7 @@ new private doc drafted on `write_group` was deleted before commit.
 | `cargo test -p iceberg --lib rewrite` | 0 | 278 passed, 0 failed |
 | `cargo test -p iceberg --lib maintenance` | 0 | 350 passed, 0 failed |
 | `cargo clippy -p iceberg --all-targets -- -D warnings` | 0 | clean |
-| `make check` | 0 | fmt, clippy, toml, machete, agent-artifacts, matrix-anchors, comment-blocks, rust-file-size (ceiling 2659 lowered to 2503) all green |
+| `make check` | 0 | fmt, clippy, toml, machete, agent-artifacts, matrix-anchors, comment-blocks, rust-file-size (ceiling 2659 lowered to 2501 — the round lowered it to 2503 and `make check` failed; the orchestrator re-ran it and corrected the ceiling) all green |
 
 ## 7. Open questions
 
