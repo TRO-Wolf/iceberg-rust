@@ -162,6 +162,13 @@ Round 1, all green 2026-09-17 (`CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8`):
 - Rebase on `origin/main` (`5a0666b9`): clean, no conflicts. #287 took row
   R171, so the RTAS row is now row R172 (map reference fixed; anchors green).
 
+## Round 3 (critic-logic NEEDS_REMEDIATION, rtas-logic-1-report.md)
+
+Base: orchestrator rebase onto fork main 96fc9f1f, pushed as f8e80333.
+Shipping code correct; pins too weak. Remediation: L-001 live keep-set pins
+with critic-mutation reds, L-002 covered by L-001, L-003 v3 row-id and
+partitioned/sort pins.
+
 ## Round 2 gate output
 
 All green 2026-09-17 (`CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8`):
