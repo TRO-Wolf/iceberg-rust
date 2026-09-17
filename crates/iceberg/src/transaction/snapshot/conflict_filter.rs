@@ -57,6 +57,36 @@ pub(crate) fn first_conflicting_file(
     Ok(None)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::first_conflicting_file;
+    use crate::expr::Reference;
+    use crate::memory::tests::new_memory_catalog;
+    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, Struct};
+    use crate::transaction::tests::make_v2_minimal_table_in_catalog;
+
+    #[tokio::test]
+    async fn unknown_spec_id_stays_conflicting() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/unknown-spec.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(999)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .build()
+            .expect("build unknown-spec file");
+        let filter = Reference::new("x").equal_to(Datum::long(1));
+        let conflicting = first_conflicting_file(&[file], &table, Some(&filter), true)
+            .expect("an unknown spec must not error")
+            .expect("an unknown spec must stay conflicting");
+        assert_eq!(conflicting.file_path(), "test/unknown-spec.parquet");
+    }
+}
+
 fn partition_might_match(
     current: &Table,
     bound_filter: &BoundPredicate,

@@ -136,3 +136,28 @@ was added during mutation, §6).
 ## 8. Open questions
 
 None yet.
+
+## Round 2 (2026-09-17, PR #291 reviews)
+
+**Findings in:** `critic-291-logic-report.md` (L-001 P2 `rewrite_not` missing before bind;
+L-002 P3 pin gaps) and `perf-291-rust-report.md` (P2 per-file projection rebuild; P3
+`AlwaysTrue` fast path and manifest-level pushdown noted, not taken).
+
+### R2 red
+
+`cargo test -p iceberg --lib occ_scoped` after adding 7 pins (3 NOT, truncate-range,
+older-spec, 2 promotion) plus 1 inline unknown-spec pin in `conflict_filter.rs`:
+
+```text
+test result: FAILED. 20 passed; 3 failed; 0 ignored; 0 measured; 3734 filtered out
+
+failures:
+    transaction::action::occ_scoped_tests::row_delta_compound_not_filter_commits_when_both_arms_excluded
+    transaction::action::occ_scoped_tests::row_delta_not_filter_disjoint_partition_append_conflicts
+    transaction::action::occ_scoped_tests::row_delta_not_filter_matching_partition_append_commits
+```
+
+All 3 fail with `Unexpected => InclusiveProjection should not be performed against Predicates
+that contain a Not operator` — L-001 reproduced. The other 4 new pins pass pre-fix as
+conservative-behaviour guards (truncate boundary conflicts, older-spec conflicts, promoted
+match conflicts / mismatch commits, unknown-spec fail-closed).
