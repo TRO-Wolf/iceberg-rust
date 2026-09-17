@@ -187,6 +187,46 @@ into `parquet.enable.dictionary=true` (new `enable_dictionary` param on
 `create_fixture_inner`; other fixtures pass false), which also exercises the dictionary
 opt-in knob end-to-end. Assertions identical. Pin re-run green (64 s).
 
+## Round 2 (2026-09-17): RPD tail-readmission pin
+
+CI failure: `test_two_bin_tails_over_target_are_readmitted`
+(`rewrite_position_delete_files_tests.rs:3048`): tails summed 60022, target 71114.
+Reproduced locally on the rebased head before any round-2 edit.
+
+What the pin pins: Java's below-floor readmission rule for
+`RewritePositionDeleteFiles` — a group of two sub-min tails with count below the
+`min_input_files` floor is admitted if and only if `enough_content` fires, i.e. the
+tails sum strictly over `target_file_size_bytes` and at most `max_file_size_bytes`.
+The test engineers exactly that window: knobs as fractions of measured input size `c`
+(min 55%, target 60%, max 75%, group 105%), two bins of one delete file each (16k rows
+after re-derivation), run 1 splitting each bin in two, run 2 readmitting the two tails
+in a single output.
+
+How it built sizes: inputs via `write_position_delete_file` at the default 512 MB
+rolling target (no roll under either cadence, so `c` is unchanged by round 1).
+Rewrite output rolls at `write_max = target + 0.5 * (max - target)` = 0.675c, fed in
+chunks of at most 256 pairs per `write` call.
+
+Why slicing changed them: the roll quantum moved from 256-row-chunk-aligned (old
+per-`write` check) to 1000-row-aligned (new). At 12k rows the first 1000-boundary at
+or past 0.675c is 9k, leaving 3k-row tails = 0.25c per bin, sum 0.506c, under the
+0.60c target. Old quantum left ~0.30-0.375c tails per bin, sum inside (0.60c, 0.75c].
+
+Writer verdict: the new behaviour is Java-correct, no writer fix. Verified against
+the 1.11.0 jar: `ClusteredPositionDeleteWriter` extends `ClusteredWriter` and
+`FanoutPositionOnlyDeleteWriter` extends `FanoutWriter`, the same per-record writers
+that feed `RollingFileWriter`'s 1000-row cadence. The pin's numbers were calibrated
+to the old per-batch cadence, so the fixture is re-derived, not the writer.
+
+Re-derivation: input count 12_000 to 16_000 (one line; knob fractions and all
+assertions untouched). Per-bin split becomes [11k, 5k]. Measured: c=157534, outputs
+[108788, 49640] per bin, tails 49640+49640=99280 vs target 94520 (+5.0%) and max
+118150; first files 108788 inside [min 86643, max]. Deterministic zstd output makes
+the 5% margin stable across platforms.
+
+Load-bearing: red pre-fix (60022 <= 71114 on the new code), green post-fix,
+assertions byte-identical. No new test needed; the existing pin covers the claim.
+
 ## Maps
 
 `crates/iceberg/src/writer/map.md` row for `rolling_writer.rs` ("size-based file rolling")

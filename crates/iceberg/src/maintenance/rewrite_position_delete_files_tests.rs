@@ -2996,7 +2996,7 @@ async fn test_two_bin_tails_over_target_are_readmitted() {
 
     let mut deletes = Vec::new();
     for k in 0..2i64 {
-        deletes.push(write_sized_pos_delete(&table, &x_path, 1 + k * 20_000, 12_000).await);
+        deletes.push(write_sized_pos_delete(&table, &x_path, 1 + k * 20_000, 16_000).await);
     }
     let c = deletes[0].file_size_in_bytes;
     let table = add_deletes(&catalog, &table, deletes).await;
