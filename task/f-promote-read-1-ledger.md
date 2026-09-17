@@ -140,7 +140,7 @@ Named residue (not reachable from RePark's writers, recorded for a later unit):
 | C-006 | A promoted identity partition source answers `=` and `<` and plans every `FileScanTask.partition` as `long`. | `promoted_identity_partition_source_filters_and_plans_long_partitions`; red on base. | EXECUTION PROVEN |
 | C-007 | An equality delete written after the promotion applies to a pre-promotion data file in the same partition. | `equality_delete_written_after_promotion_applies_to_a_pre_promotion_partition`; red on base. | EXECUTION PROVEN |
 | C-008 | `ReplacePartitions` after the promotion drops the pre-promotion file of the replaced partition; `overwrite_by_row_filter(id = 7)` replaces the promoted identity partition and keeps the other one. | `replace_partitions_after_promotion_drops_the_pre_promotion_partition`, `overwrite_by_row_filter_on_a_promoted_identity_partition_replaces_it`; red on base. | EXECUTION PROVEN |
-| C-010 | `iceberg-datafusion` `UPDATE` and `DELETE`, copy-on-write and merge-on-read, on a table holding only pre-promotion files update and delete the matching rows instead of failing `column types must match schema types, expected Int64 but found Int32`. | `tests/promoted_type_dml.rs` (4 pins); red on `7e027cca`. | OPEN |
+| C-010 | `iceberg-datafusion` `UPDATE` and `DELETE`, copy-on-write and merge-on-read, on a table holding only pre-promotion files update and delete the matching rows instead of failing `column types must match schema types, expected Int64 but found Int32`. | `tests/promoted_type_dml.rs` (4 pins); red on `7e027cca`. | EXECUTION PROVEN |
 | C-009 | Gates: the pins green after the fix, `cargo test -p iceberg --lib`, `cargo clippy -p iceberg --all-targets -- -D warnings`, `cargo fmt`, the Rust file-size check, the comment fence. | Command -> result below. | EXECUTION PROVEN |
 
 ## Base-red evidence
@@ -246,3 +246,20 @@ run DELETE FROM catalog.ns.t WHERE id = 6: Arrow error: Invalid argument error: 
 run UPDATE catalog.ns.t SET s = 'u5' WHERE id = 5: Arrow error: Invalid argument error: column types must match schema types, expected Int64 but found Int32 at column index 0
 test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
 ```
+
+Fix: `physical_plan/promotion.rs` (new) `widened_batch(table_schema, columns)` widens a legally
+promoted column (`Int32 → Int64`, `Float32 → Float64`, `Decimal128(p,s) → Decimal128(p',s)`) and
+then calls `RecordBatch::try_new`, so every other mismatch still fails there. `delete.rs` calls it
+at both rebuild sites (line-neutral; the file stays at its 1149 ceiling).
+
+```
+cargo test -p iceberg-datafusion --lib --test promoted_type_dml --test integration_datafusion_test
+  --test h7_p1_dml_prune --test commit_branch --test row_lineage_cow --test row_lineage_mor
+  --test count_star_fold
+    lib 216 passed (1 ignored); commit_branch 20; count_star_fold 7; h7_p1_dml_prune 5;
+    integration_datafusion_test 87; promoted_type_dml 4; row_lineage_cow 14; row_lineage_mor 5
+cargo clippy -p iceberg-datafusion --all-targets -- -D warnings -> exit 0
+```
+
+Mutation (`/tmp/oc-worker/ia-build/fork-df-mutation.py`): both `widened_batch` calls reverted to
+`RecordBatch::try_new` → `0 passed; 4 failed`; restored.
