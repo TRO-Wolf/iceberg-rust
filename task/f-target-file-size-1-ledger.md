@@ -227,6 +227,14 @@ the 5% margin stable across platforms.
 Load-bearing: red pre-fix (60022 <= 71114 on the new code), green post-fix,
 assertions byte-identical. No new test needed; the existing pin covers the claim.
 
+Round-2 review (rust-code-quality pass over the branch diff): verdict PASS, no
+findings. Scans clean (no new escape hatches, casts only in bounded test domains,
+no production panics, no stringly errors, no output macros, no atomics, no
+bytecode in comments). Format stability holds (fixture row count is test-only, no
+encoding change). Parity axis holds (delete-writer cadence verified against the
+1.11.0 jar class ancestry; COW dictionary divergence stays a named residue in
+row R172).
+
 ## Maps
 
 `crates/iceberg/src/writer/map.md` row for `rolling_writer.rs` ("size-based file rolling")
@@ -235,6 +243,7 @@ stays accurate; no new files or routing changes. No `map.md` exists in the touch
 
 ## Verification log
 
+Round 1:
 - `cargo test -p iceberg --lib writer`: 165 passed, 0 failed, 1 ignored.
 - `cargo test -p iceberg --lib spec`: 959 passed, 0 failed.
 - `cargo test -p iceberg --lib catalog`: 190 passed, 0 failed.
@@ -242,6 +251,13 @@ stays accurate; no new files or routing changes. No `map.md` exists in the touch
   `target_file_size` (3) and `rewrite_size_pin` (4, with the restored dict bed).
 - `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings`: clean
   (one finding fixed: `is_multiple_of`).
+- `make check`: exit 0.
+
+Round 2 (rebased onto fork main 5a0666b9):
+- `cargo test -p iceberg --lib`: 3703 passed, 0 failed, 8 ignored.
+- `cargo test -p iceberg-datafusion`: exit 0, zero non-ok targets (includes #287
+  sorted-insert suites and the re-derived RPD pin).
+- `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings`: clean.
 - `make check`: exit 0.
 - No `scripts/check_rust_file_size.py` change: at-ceiling files
   (`table_metadata_builder.rs`, `staged_table.rs`, `table_metadata.rs`,
