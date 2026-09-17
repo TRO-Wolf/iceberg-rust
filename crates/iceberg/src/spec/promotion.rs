@@ -67,28 +67,36 @@ impl DataFile {
     }
 }
 
+fn promotable_slot(slot: &Option<Literal>, field_type: &Type) -> Option<PrimitiveLiteral> {
+    match (slot, field_type) {
+        (Some(Literal::Primitive(literal)), Type::Primitive(target))
+            if !target.compatible(literal) =>
+        {
+            let promoted = literal.promote_to(target);
+            target.compatible(&promoted).then_some(promoted)
+        }
+        _ => None,
+    }
+}
+
 impl Struct {
     pub(crate) fn promoted_to(&self, partition_type: &StructType) -> Option<Struct> {
-        let mut promoted_any = false;
-        let fields: Vec<Option<Literal>> = self
-            .fields()
-            .iter()
-            .zip(partition_type.fields())
-            .map(|(slot, field)| match (slot, field.field_type.as_ref()) {
-                (Some(Literal::Primitive(literal)), Type::Primitive(target))
-                    if !target.compatible(literal)
-                        && target.compatible(&literal.promote_to(target)) =>
-                {
-                    promoted_any = true;
-                    Some(Literal::Primitive(literal.promote_to(target)))
-                }
-                _ => slot.clone(),
-            })
-            .collect();
-        if !promoted_any || fields.len() != self.fields().len() {
+        let fields = partition_type.fields();
+        if fields.len() < self.fields().len()
+            || !self
+                .fields()
+                .iter()
+                .zip(fields)
+                .any(|(slot, field)| promotable_slot(slot, &field.field_type).is_some())
+        {
             return None;
         }
-        Some(Struct::from_iter(fields))
+        Some(Struct::from_iter(self.fields().iter().zip(fields).map(
+            |(slot, field)| match promotable_slot(slot, &field.field_type) {
+                Some(promoted) => Some(Literal::Primitive(promoted)),
+                None => slot.clone(),
+            },
+        )))
     }
 }
 

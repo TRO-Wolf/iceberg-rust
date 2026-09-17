@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+};
 use futures::TryStreamExt;
 use tempfile::TempDir;
 
@@ -562,4 +564,120 @@ async fn overwrite_by_row_filter_on_a_promoted_identity_partition_replaces_it() 
         .add_file(new);
     let table = commit(&catalog, action.apply(tx).expect("apply overwrite")).await;
     assert_eq!(rows(&table, None, false).await, vec![(7, 999), (8, 200)]);
+}
+
+async fn write_float_file(table: &Table, name: &str, values: &[(f64, i64)]) -> DataFile {
+    let schema = table.metadata().current_schema().clone();
+    let arrow_schema = Arc::new(crate::arrow::schema_to_arrow_schema(&schema).expect("arrow"));
+    let floats: ArrayRef = match schema.field_by_id(1).map(|field| field.field_type.as_ref()) {
+        Some(Type::Primitive(PrimitiveType::Float)) => Arc::new(Float32Array::from(
+            values
+                .iter()
+                .map(|(value, _)| format!("{value}").parse::<f32>().expect("f32 value"))
+                .collect::<Vec<_>>(),
+        )),
+        _ => Arc::new(Float64Array::from(
+            values.iter().map(|(value, _)| *value).collect::<Vec<_>>(),
+        )),
+    };
+    let longs: ArrayRef = Arc::new(Int64Array::from(
+        values.iter().map(|(_, long)| *long).collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_new(arrow_schema, vec![floats, longs]).expect("float batch");
+    let location = format!("{}/data/{name}", table.metadata().location());
+    let output = table.file_io().new_output(location).expect("output");
+    let mut writer = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        schema,
+    )
+    .build(output)
+    .await
+    .expect("parquet writer");
+    writer.write(&batch).await.expect("write");
+    let mut builder = writer
+        .close()
+        .await
+        .expect("close")
+        .into_iter()
+        .next()
+        .expect("one data file");
+    builder
+        .content(DataContentType::Data)
+        .partition_spec_id(0)
+        .partition(Struct::empty())
+        .build()
+        .expect("float data file")
+}
+
+#[tokio::test]
+async fn row_selection_keeps_float_pages_under_a_promoted_double() {
+    let (catalog, _guard) = local_catalog().await;
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "f", Type::Primitive(PrimitiveType::Float)).into(),
+            NestedField::required(2, "v", Type::Primitive(PrimitiveType::Long)).into(),
+        ])
+        .build()
+        .expect("float schema");
+    let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+    let creation = TableCreation::builder()
+        .name("floats".to_string())
+        .schema(schema)
+        .partition_spec(
+            PartitionSpec::builder(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "f", Type::Primitive(PrimitiveType::Float)).into(),
+                    ])
+                    .build()
+                    .expect("spec schema"),
+            )
+            .with_spec_id(0)
+            .build()
+            .expect("unpartitioned spec"),
+        )
+        .format_version(FormatVersion::V2)
+        .build();
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create float table");
+    let old = write_float_file(&table, "old-f.parquet", &[(1.5, 10), (2.5, 20)]).await;
+    let table = append(&catalog, &table, vec![old]).await;
+    let tx = Transaction::new(&table);
+    let action = tx.update_schema().update_column("f", PrimitiveType::Double);
+    let table = commit(&catalog, action.apply(tx).expect("apply float promotion")).await;
+    let new = write_float_file(&table, "new-f.parquet", &[(3.5, 30)]).await;
+    let table = append(&catalog, &table, vec![new]).await;
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .select(["f", "v"])
+        .with_row_selection_enabled(true)
+        .with_filter(Reference::new("f").less_than(Datum::double(2.0)))
+        .build()
+        .expect("scan")
+        .to_arrow()
+        .await
+        .expect("to_arrow")
+        .try_collect()
+        .await
+        .expect("collect");
+    let values: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            let column = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("v long");
+            (0..column.len())
+                .map(|row| column.value(row))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(values, vec![10]);
 }

@@ -136,7 +136,7 @@ Named residue (not reachable from RePark's writers, recorded for a later unit):
 | C-002 | `StrictMetricsEvaluator` never claims `ROWS_MUST_MATCH` for `<>`/`NOT IN` on a pre-promotion file that holds the literal, and does claim it when the promoted bounds prove every row matches. | `strict_metrics_decide_an_int_bounded_file_under_long_predicates`; red on base. | EXECUTION PROVEN |
 | C-003 | `StructAccessor::get` reads an `Int`/`Float` partition literal under a `long`/`double` accessor as the promoted datum and still refuses an unrelated kind. | `partition_accessor_reads_pre_promotion_literals_under_the_promoted_type`; red on base. | EXECUTION PROVEN |
 | C-004 | `PartitionKey::new` accepts a tuple written before a legal promotion and stores the promoted tuple. | `partition_key_new_promotes_a_pre_promotion_tuple`; red on base. | EXECUTION PROVEN |
-| C-005 | A mixed-era table (two pre-promotion files, one post-promotion file) answers `<`, `>`, long `IN` and — with row selection on — `<=` with every matching row. | `mixed_era_range_and_in_filters_return_pre_promotion_rows`; red on base. | EXECUTION PROVEN |
+| C-005 | A mixed-era table (two pre-promotion files, one post-promotion file) answers `<`, `>`, long `IN` and — with row selection on — `<=` with every matching row; with row selection on, `f < 2.0` over a float column promoted to `double` keeps the pre-promotion page. | `mixed_era_range_and_in_filters_return_pre_promotion_rows` (red on base), `row_selection_keeps_float_pages_under_a_promoted_double` (added after the fix; red under the FLOAT-arm mutation). | EXECUTION PROVEN |
 | C-006 | A promoted identity partition source answers `=` and `<` and plans every `FileScanTask.partition` as `long`. | `promoted_identity_partition_source_filters_and_plans_long_partitions`; red on base. | EXECUTION PROVEN |
 | C-007 | An equality delete written after the promotion applies to a pre-promotion data file in the same partition. | `equality_delete_written_after_promotion_applies_to_a_pre_promotion_partition`; red on base. | EXECUTION PROVEN |
 | C-008 | `ReplacePartitions` after the promotion drops the pre-promotion file of the replaced partition; `overwrite_by_row_filter(id = 7)` replaces the promoted identity partition and keeps the other one. | `replace_partitions_after_promotion_drops_the_pre_promotion_partition`, `overwrite_by_row_filter_on_a_promoted_identity_partition_replaces_it`; red on base. | EXECUTION PROVEN |
@@ -263,3 +263,21 @@ cargo clippy -p iceberg-datafusion --all-targets -- -D warnings -> exit 0
 
 Mutation (`/tmp/oc-worker/ia-build/fork-df-mutation.py`): both `widened_batch` calls reverted to
 `RecordBatch::try_new` → `0 passed; 4 failed`; restored.
+
+## Refinement (self-review)
+
+- `Struct::promoted_to` first asks, without allocating, whether any slot needs a promotion
+  (`promotable_slot`), and returns `None` before building a tuple otherwise. The first version
+  collected a cloned tuple for every manifest entry of every scan and dropped it when nothing
+  changed.
+- The FLOAT column-index arm of the page-index evaluator had no pin.
+  `row_selection_keeps_float_pages_under_a_promoted_double` writes a `float` file, promotes the
+  column to `double`, appends a post-promotion file and scans `f < 2.0` with row selection on.
+
+```
+cargo test -p iceberg --lib spec::promotion_tests           -> 11 passed
+FLOAT arms reverted to Datum::new(field_type.clone(), Float) -> 10 passed; 1 failed
+                                                               (row_selection_keeps_float_pages_under_a_promoted_double)
+cargo test -p iceberg --lib                                 -> 3688 passed; 0 failed; 8 ignored
+cargo clippy -p iceberg --all-targets -- -D warnings        -> exit 0
+```
