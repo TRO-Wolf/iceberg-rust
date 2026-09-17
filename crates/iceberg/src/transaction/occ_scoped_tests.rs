@@ -644,3 +644,70 @@ async fn unknown_outcome_data_commit_surfaces_unretried() {
         "exactly one update_table attempt: the kind gate stops the retry even flagged retryable"
     );
 }
+
+#[tokio::test]
+async fn fast_append_conflicted_first_attempt_retries_and_commits() {
+    let memory_catalog = Arc::new(new_memory_catalog().await);
+    let table = make_v2_minimal_table_in_catalog(memory_catalog.as_ref()).await;
+
+    let fast_retry = Transaction::new(&table);
+    let fast_retry = fast_retry
+        .update_table_properties()
+        .set("commit.retry.num-retries".to_string(), "2".to_string())
+        .set("commit.retry.min-wait-ms".to_string(), "1".to_string())
+        .set("commit.retry.max-wait-ms".to_string(), "5".to_string())
+        .apply(fast_retry)
+        .expect("stage fast retry knobs");
+    let table = fast_retry
+        .commit(memory_catalog.as_ref())
+        .await
+        .expect("stage retry knobs");
+    let base_snapshots = snapshot_len(&table);
+
+    let mut mock_catalog = MockCatalog::new();
+    let load_table = table.clone();
+    mock_catalog.expect_load_table().returning_st(move |_| {
+        let table = load_table.clone();
+        Box::pin(async move { Ok(table) })
+    });
+    let update_calls = Arc::new(AtomicU32::new(0));
+    let update_calls_in_mock = Arc::clone(&update_calls);
+    let update_delegate = Arc::clone(&memory_catalog);
+    mock_catalog
+        .expect_update_table()
+        .returning_st(move |commit| {
+            let catalog = Arc::clone(&update_delegate);
+            let calls = Arc::clone(&update_calls_in_mock);
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(Error::new(
+                        ErrorKind::CatalogCommitConflicts,
+                        "injected concurrent commit conflict on first attempt",
+                    )
+                    .with_retryable(true));
+                }
+                catalog.update_table(commit).await
+            })
+        });
+
+    let tx = Transaction::new(&table);
+    let action = tx
+        .fast_append()
+        .add_data_files(vec![data_file("test/retried.parquet", 0)]);
+    let tx = action.apply(tx).unwrap();
+    let table = tx
+        .commit(&mock_catalog)
+        .await
+        .expect("a retryable first-attempt conflict must retry and commit");
+    assert_eq!(
+        update_calls.load(Ordering::SeqCst),
+        2,
+        "exactly two update_table attempts: one conflicted, one committed"
+    );
+    assert!(
+        live_file_paths(&table)
+            .await
+            .contains("test/retried.parquet")
+    );
+    assert_eq!(snapshot_len(&table), base_snapshots + 1);
+}

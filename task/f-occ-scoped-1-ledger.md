@@ -89,11 +89,31 @@ rebase, append-vs-append retry, and unknown-no-retry.
 
 ## 5. Fix (step 3)
 
-PASTE FIX SUMMARY HERE.
+`first_conflicting_file` moved from `crates/iceberg/src/transaction/snapshot.rs:2315`
+to the new `crates/iceberg/src/transaction/snapshot/conflict_filter.rs` (the move keeps
+`snapshot.rs` under its 3490-line legacy ceiling: 3490 → 3454). Each candidate file is
+now gated on its own spec's partition projection (`InclusiveProjection` + `ExpressionEvaluator`,
+the `overwrite_files.rs:340-377` pattern) before the unchanged `InclusiveMetricsEvaluator`
+check. `None` filter stays `AlwaysTrue`; unknown-spec files stay conflicting (fail-closed).
+The three `validate_*_on` wrappers keep their signatures; no public API changed
+(`RowDeltaAction::conflict_detection_filter`, `OverwriteFilesAction::conflict_detection_filter`
+are the engine seam). Result: `cargo test -p iceberg --lib transaction::occ_scoped` →
+16 passed, 0 failed (the 16th, `fast_append_conflicted_first_attempt_retries_and_commits`,
+was added during mutation, §6).
 
-## 6. Mutation (step 4)
+## 6. Mutation (step 4, one knob at a time)
 
-PASTE MUTATION RESULT HERE.
+- A. Filter neutralised (partition gate dropped, metrics-only): 4 red out of 15 — exactly the
+  disjoint-partition commit cases (`row_delta_serializable_disjoint_partition_append_commits`,
+  `row_delta_serializable_nonmatching_delete_file_commits`,
+  `overwrite_serializable_disjoint_partition_append_commits`,
+  `overwrite_row_filter_rewrite_of_unrelated_file_commits`). Restored → green.
+- B. Retry neutralised (`.when(|_| false)` in `Transaction::commit`): first attempt 0 red out
+  of 16 — the sequential race rebases on its first attempt and never reaches the retry loop,
+  so the battery could not observe the retry. Recorded as unkillable-through-harness, not as
+  coverage. Added `fast_append_conflicted_first_attempt_retries_and_commits` (MockCatalog fails
+  attempt 1 with retryable `CatalogCommitConflicts`, delegates attempt 2): re-applied B gives
+  1 red out of 16 (that test only). Restored → 16 green.
 
 ## 7. Gates (step 5)
 
