@@ -42,9 +42,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
-use iceberg::spec::TableProperties;
 use iceberg::table::Table;
-use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
+use iceberg::{Catalog, NamespaceIdent, Result, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 pub use static_provider::IcebergStaticTableProvider;
 
@@ -58,7 +57,7 @@ use crate::physical_plan::expr_to_predicate::convert_filters_to_predicate;
 use crate::physical_plan::project::project_with_partition;
 use crate::physical_plan::repartition::repartition;
 use crate::physical_plan::scan::IcebergTableScan;
-use crate::physical_plan::sort::sort_by_partition;
+use crate::physical_plan::sort::sort_for_write;
 use crate::physical_plan::update::IcebergUpdateExec;
 use crate::physical_plan::write::IcebergWriteExec;
 
@@ -200,35 +199,13 @@ impl TableProvider for IcebergTableProvider {
         let repartitioned_plan =
             repartition(plan_with_partition, table.metadata_ref(), target_partitions)?;
 
-        let fanout_enabled = table
-            .metadata()
-            .properties()
-            .get(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED)
-            .map(|value| {
-                value
-                    .parse::<bool>()
-                    .map_err(|e| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Invalid value for {}, expected 'true' or 'false'",
-                                TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED
-                            ),
-                        )
-                        .with_source(e)
-                    })
-                    .map_err(to_datafusion_error)
-            })
-            .transpose()?
-            .unwrap_or(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT);
+        let (write_input, sort_order_id) = sort_for_write(repartitioned_plan, &table)?;
 
-        let write_input = if fanout_enabled {
-            repartitioned_plan
-        } else {
-            sort_by_partition(repartitioned_plan)?
-        };
-
-        let write_plan = Arc::new(IcebergWriteExec::new(table.clone(), write_input));
+        let write_plan = Arc::new(IcebergWriteExec::new(
+            table.clone(),
+            write_input,
+            sort_order_id,
+        ));
 
         // Merge the outputs of write_plan into one so we can commit all files together
         let coalesce_partitions = Arc::new(CoalescePartitionsExec::new(write_plan));

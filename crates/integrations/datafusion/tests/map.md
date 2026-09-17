@@ -43,6 +43,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `interop_mor_branch_lineage.rs` | V3 merge-on-read UPDATE lineage on a DIVERGED BRANCH (row R168 / PR-6B). Offline: Rust seeds `main` 1/2/3 + branch `b` 10/11, runs two MoR UPDATE statements of id 10 through `with_commit_branch("b")`, and pins stable `_row_id`, a sequence that advances on each UPDATE, unmatched branch rows unchanged, `main` snapshot / files / lineage untouched and `next-row-id` advancing by one added row per UPDATE (5 → 6 → 7). `ICEBERG_INTEROP_MOR_BRANCH_LINEAGE_DIR` adds the Direction-1 read of the Java fixture; `..._GEN_DIR` adds the Direction-2 GEN that writes `rust_after/` for Java. Both env vars are set by `dev/java-interop/run-interop-mor-branch-lineage.sh`. pins: R168/C-006 |
 | `shared_puffin_dv/` | Shared-Puffin deletion-vector DML. `live.rs`/`extra.rs` are F-17 (T1–T23); F-19a re-aims concurrent sibling Replace/Delete to COMMIT (files-exist covers replacement blobs only). `container.rs` is F-18's Spark layout pin (touched blob moves, sibling entry unchanged, two containers, `removed-dvs`/`removed-delete-files`/`added-delete-files` = 1); `measure.rs` pins the rewrite amplification (a later single-row DELETE writes a ONE-blob container at 16 and 64 blobs) and carries the two `#[ignore]`d wall-clock/byte measurements |
 | `fanout_insert_order.rs` | F-20: ten shuffled identity-int partitioned INSERT statements; the committed manifest data-file order is always ascending (row R115) |
+| `sorted_insert.rs` | F-SORTED-INSERT-1: INSERT into a table with a default sort order writes per-file sorted data stamped with the order id (asc, desc, two-key nulls, partitioned, multi-stream, bucket transform; row R171). Unsorted tables add no `SortExec` and stamp 0 |
 | `interop_f18_dv_sibling_close.rs` | GEN for `run-interop-f18-dv-sibling-close.sh` (row R114 / F-18). Java `BaseDVFileWriter` writes the two-file seed and its two-blob delete; Rust runs the second DELETE and lands `before_dvs.json` / `after_dvs.json` / `summary.json` / `expected_rows.json` + `final.metadata.json` for the Java verify. Env `ICEBERG_INTEROP_F18_JAVA_SHARED`; a clean no-op when unset |
 | `f21_legacy_delete_merge.rs` | F-21 V2 MoR parquet → V3 DV merge (row R114): two file-scoped deletes on one data file, partition-scoped keep, sequence skip, UPDATE, untouched file |
 | `f21_legacy_delete_merge_measure.rs` | `#[ignore]` wall-clock: K=8 partition-scoped 100k positions; file-scoped 100k with a 200-byte `row` column. Not a CI pin |
@@ -64,6 +65,7 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | Pin `with_commit_branch` scan + commit | `commit_branch.rs` |
 | Pin the Spark-equal DV container layout | `shared_puffin_dv/container.rs`, `interop_f18_dv_sibling_close.rs` |
 | Pin fanout INSERT file order | `fanout_insert_order.rs` |
+| Pin sorted INSERT per-file order + stamp | `sorted_insert.rs` |
 | Prove Java/Rust branch DML interop | `interop_branch_dml.rs` |
 | Prove V3 MoR UPDATE lineage on a branch vs Java | `interop_mor_branch_lineage.rs` |
 | Pin default (no branch) DML | `integration_datafusion_test.rs` |
