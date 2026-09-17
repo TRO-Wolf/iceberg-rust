@@ -141,7 +141,7 @@ Named residue (not reachable from RePark's writers, recorded for a later unit):
 | C-007 | An equality delete written after the promotion applies to a pre-promotion data file in the same partition. | `equality_delete_written_after_promotion_applies_to_a_pre_promotion_partition`; red on base. | EXECUTION PROVEN |
 | C-008 | `ReplacePartitions` after the promotion drops the pre-promotion file of the replaced partition; `overwrite_by_row_filter(id = 7)` replaces the promoted identity partition and keeps the other one. | `replace_partitions_after_promotion_drops_the_pre_promotion_partition`, `overwrite_by_row_filter_on_a_promoted_identity_partition_replaces_it`; red on base. | EXECUTION PROVEN |
 | C-010 | `iceberg-datafusion` `UPDATE` and `DELETE`, copy-on-write and merge-on-read, on a table holding only pre-promotion files update and delete the matching rows instead of failing `column types must match schema types, expected Int64 but found Int32`. | `tests/promoted_type_dml.rs` (4 pins); red on `7e027cca`. | EXECUTION PROVEN |
-| C-011 | After a legal identity-source promotion (`p INT -> LONG`), the inspect tables `files`, `entries` and `partitions` answer pre-promotion tuples as promoted `Long` values (one partition row per value) instead of failing `DataInvalid`. | `inspect::promoted_partition_tests` (3 pins in `crates/iceberg/src/inspect/promoted_partition_tests.rs`); red below. | RED PROVEN |
+| C-011 | After a legal identity-source promotion (`p INT -> LONG`), the inspect tables `files`, `entries` and `partitions` answer pre-promotion tuples as promoted `Long` values (one partition row per value) instead of failing `DataInvalid`. | `inspect::promoted_partition_tests` (4 pins in `crates/iceberg/src/inspect/promoted_partition_tests.rs`); red + mutation below. | EXECUTION PROVEN |
 | C-009 | Gates: the pins green after the fix, `cargo test -p iceberg --lib`, `cargo clippy -p iceberg --all-targets -- -D warnings`, `cargo fmt`, the Rust file-size check, the comment fence. | Command -> result below. | EXECUTION PROVEN |
 
 ## Base-red evidence
@@ -347,3 +347,48 @@ no change needed.
 CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg --lib inspect::
   -> test result: ok. 134 passed; 0 failed; 0 ignored; 0 measured; 3570 filtered out
 ```
+
+A fourth pin (`..._merges_same_valued_pre_and_post_promotion_partitions_into_one_row`,
+pre `Int(7)` records 4 + post `Long(7)` records 6) was added after the fix because
+the prescribed distinct-valued fixture cannot observe the grouping key: with the
+`partitions.rs` key line reverted, the three prescribed pins stay green.
+
+Mutation proof, one knob at a time
+(`cargo test -p iceberg --lib inspect::promoted_partition_tests`, population 4):
+
+- M-A `partition_values.rs` promotion block neutralised
+  -> 3 red out of 4 (`files`, `entries`, `merges` via its files half);
+  `partitions`-distinct stays green because the promoted grouping key already
+  satisfies the append. Restored byte-identical (`cmp` clean), 4 green.
+- M-B `partitions.rs` key line
+  (`key.promoted_to(&partition_type).unwrap_or(key)`) removed
+  -> 1 red out of 4 (only `merges`: 2 rows instead of 1); the three prescribed
+  pins stay green, which is why the fourth exists. Restored, 4 green.
+
+## L-01 gates (run 20a, final tree)
+
+| Command | Result |
+|---|---|
+| `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg --lib` | ok. 3697 passed; 0 failed; 8 ignored |
+| `CARGO_BUILD_JOBS=10 cargo clippy -p iceberg --all-targets -- -D warnings` | exit 0 |
+| `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --lib` | ok. 228 passed; 0 failed; 1 ignored |
+| `CARGO_BUILD_JOBS=10 cargo clippy -p iceberg-datafusion --all-targets -- -D warnings` | exit 0 |
+| `cargo test -p iceberg-datafusion --test promoted_type_dml` | ok. 4 passed; 0 failed |
+| `cargo test -p iceberg --lib promotion` (post-trim re-proof) | ok. 44 passed; 0 failed |
+| `cargo fmt --all -- --check` | exit 0 |
+| `python3 scripts/check_rust_file_size.py` | 476 files clean (99 legacy ceilings) |
+| `typos .` | exit 0 |
+| `./scripts/check_comment_blocks.sh` | OK, self-tested |
+| `./scripts/check_agent_artifacts.sh` | OK |
+| `./scripts/check_matrix_anchors.sh` | OK (84 rows anchored) |
+| `taplo check` | clean (34 files) |
+| `cargo machete` | no unused dependencies |
+
+Follow-ups inside the round, recorded honestly: the file split rendered the
+moved 19-line `append_partition` doc block as added lines, which
+`check_comment_blocks.sh` refused; the block now takes its 4-prose-line short
+form (contract + Java pointer) and the gate is green. Three commits landed with
+author `John` (the `-c user.name` flag was dropped after the first commit);
+repaired to `TRO-Wolf` via a metadata-only rebase of the three unpushed commits
+(no tree change; stash round-trip clean). GAP_MATRIX row R94 carries the L-01
+follow-on sentence (one home per fact).

@@ -24,29 +24,11 @@ use arrow_array::builder::{
 use crate::spec::{Literal, PrimitiveLiteral, PrimitiveType, Struct, StructType};
 use crate::{Error, ErrorKind, Result};
 
-/// Appends one partition tuple to the partition [`StructBuilder`], dispatching each field on its
-/// primitive type.
+/// Appends one partition tuple to the partition [`StructBuilder`].
 ///
-/// `partition` is a bare tuple: its values are positionally aligned with `source_field_ids` — the
-/// partition-field ids of the spec the tuple was written under, in that spec's own field order (see
-/// [`partition_field_ids_by_spec`]). `partition_type` is the type the metadata table PROJECTS, which
-/// under partition evolution is a different spec's shape. Each projected field is therefore matched to
-/// the tuple BY FIELD ID; a projected field the source spec does not carry is null-filled.
-///
-/// This is the field-id half of Java `PartitionUtil.coercePartition`
-/// (`core/src/main/java/org/apache/iceberg/util/PartitionUtil.java`), which wraps the tuple in
-/// `StructProjection.createAllowMissing(spec.partitionType(), partitionType)` — a projection whose
-/// `positionMap` is built by matching field ids, and whose not-found entries read as null. Matching by
-/// POSITION instead silently writes one partition field's value into another field's column whenever
-/// the two specs agree on type but not on field id.
-///
-/// The other half of Java's coercion — projecting into the cross-spec UNIFIED partition type —
-/// is increment C: callers pass [`crate::spec::TableMetadata::unified_partition_type`] so a
-/// partition field that exists only in an older spec has a column to land in. `append_partition`
-/// itself is unchanged (PT-0 field-id walk; A1).
-///
-/// Shared in-module helper: `files`/`entries` reach it through [`DataFileStructBuilder::append`], and
-/// the `partitions` aggregating table reuses it directly for its `partition` column (Rule of Three).
+/// Values match BY FIELD ID against the spec the tuple was written under
+/// (Java `PartitionUtil.coercePartition`); absent fields null-fill. Each
+/// matched value widens through a legal promotion before extract.
 pub(super) fn append_partition(
     builder: &mut StructBuilder,
     partition_type: &StructType,
