@@ -44,6 +44,7 @@ pub(crate) fn first_conflicting_file(
     let bound_filter: BoundPredicate = conflict_filter
         .cloned()
         .unwrap_or(Predicate::AlwaysTrue)
+        .rewrite_not()
         .bind(schema, case_sensitive)?;
 
     for file in files {

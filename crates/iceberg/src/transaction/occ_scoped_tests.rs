@@ -862,7 +862,7 @@ async fn row_delta_compound_not_filter_commits_when_both_arms_excluded() {
     let table = make_v2_minimal_table_in_catalog(&catalog).await;
     let table = append_files(&catalog, &table, vec![data_file("test/base.parquet", 1)]).await;
 
-    let filter = !(x_equals(1).and(Reference::new("y").greater_than_or_equal_to(Datum::long(50))));
+    let filter = !(x_equals(1).or(Reference::new("y").greater_than_or_equal_to(Datum::long(50))));
     let tx = Transaction::new(&table);
     let action = tx
         .row_delta()
@@ -882,7 +882,7 @@ async fn row_delta_compound_not_filter_commits_when_both_arms_excluded() {
     let table = tx
         .commit(&catalog)
         .await
-        .expect("a file excluded by both arms of NOT (x = 1 AND y >= 50) must not conflict");
+        .expect("a file excluded by both arms of NOT (x = 1 OR y >= 50) must not conflict");
     let live = live_file_paths(&table).await;
     assert!(live.contains("test/op.parquet"));
     assert!(live.contains("test/high-y.parquet"));
