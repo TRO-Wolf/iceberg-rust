@@ -3799,7 +3799,7 @@ mod tests {
                 .len(),
             0
         );
-        assert_eq!(table_metadata.properties.len(), 0);
+        assert_eq!(table_metadata.properties.len(), 1);
         assert_eq!(
             table_metadata.partition_specs,
             HashMap::from([(

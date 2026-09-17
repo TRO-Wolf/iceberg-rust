@@ -26,6 +26,8 @@ use crate::writer::file_writer::location_generator::{FileNameGenerator, Location
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
+const ROWS_DIVISOR: usize = 1000;
+
 /// Builder for [`RollingFileWriter`].
 #[derive(Clone, Debug)]
 pub struct RollingFileWriterBuilder<
@@ -108,6 +110,7 @@ where
             inner: None,
             inner_builder: self.inner_builder.clone(),
             target_file_size: self.target_file_size,
+            current_file_rows: 0,
             data_file_builders: vec![],
             file_io: self.file_io.clone(),
             location_generator: self.location_generator.clone(),
@@ -130,6 +133,7 @@ pub struct RollingFileWriter<B: FileWriterBuilder, L: LocationGenerator, F: File
     inner: Option<B::R>,
     inner_builder: B,
     target_file_size: usize,
+    current_file_rows: usize,
     data_file_builders: Vec<DataFileBuilder>,
     file_io: FileIO,
     location_generator: L,
@@ -162,7 +166,7 @@ where
     ///
     /// `true` if a new file should be started, `false` otherwise
     fn should_roll(&self) -> bool {
-        self.current_written_size() > self.target_file_size
+        self.current_written_size() >= self.target_file_size
     }
 
     fn new_output_file(&self, partition_key: &Option<PartitionKey>) -> Result<OutputFile> {
@@ -192,37 +196,41 @@ where
         partition_key: &Option<PartitionKey>,
         input: &RecordBatch,
     ) -> Result<()> {
-        if self.inner.is_none() {
-            // initialize inner writer
-            self.inner = Some(
-                self.inner_builder
-                    .build(self.new_output_file(partition_key)?)
-                    .await?,
-            );
-        }
+        let mut offset = 0;
+        while offset < input.num_rows() {
+            if self.inner.is_none() {
+                // initialize inner writer
+                self.inner = Some(
+                    self.inner_builder
+                        .build(self.new_output_file(partition_key)?)
+                        .await?,
+                );
+            }
 
-        if self.should_roll()
-            && let Some(inner) = self.inner.take()
-        {
-            // close the current writer, roll to a new file
-            self.data_file_builders.extend(inner.close().await?);
+            let rows_to_boundary = ROWS_DIVISOR - self.current_file_rows % ROWS_DIVISOR;
+            let len = rows_to_boundary.min(input.num_rows() - offset);
 
-            // start a new writer
-            self.inner = Some(
-                self.inner_builder
-                    .build(self.new_output_file(partition_key)?)
-                    .await?,
-            );
-        }
+            if let Some(writer) = self.inner.as_mut() {
+                writer.write(&input.slice(offset, len)).await?;
+            } else {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Writer is not initialized!",
+                ));
+            }
+            self.current_file_rows += len;
+            offset += len;
 
-        if let Some(writer) = self.inner.as_mut() {
-            Ok(writer.write(input).await?)
-        } else {
-            Err(Error::new(
-                ErrorKind::Unexpected,
-                "Writer is not initialized!",
-            ))
+            if self.current_file_rows.is_multiple_of(ROWS_DIVISOR)
+                && self.should_roll()
+                && let Some(inner) = self.inner.take()
+            {
+                // close the current writer, roll to a new file on the next slice
+                self.data_file_builders.extend(inner.close().await?);
+                self.current_file_rows = 0;
+            }
         }
+        Ok(())
     }
 
     /// Closes the writer and returns all data file builders.
@@ -277,7 +285,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, StringArray};
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::file::properties::WriterProperties;
@@ -450,7 +458,7 @@ mod tests {
         ];
 
         let mut rng = rand::rng();
-        let batch_num = 10;
+        let batch_num = 25;
         let batch_rows = 100;
         let expected_rows = batch_num * batch_rows;
 
@@ -473,20 +481,111 @@ mod tests {
         // Close writer and get data files
         let data_files = writer.close().await?;
 
-        // Verify multiple files were created (at least 4)
-        assert!(
-            data_files.len() > 4,
-            "Expected at least 4 data files to be created, but got {}",
-            data_files.len()
-        );
+        let counts: Vec<u64> = data_files.iter().map(|file| file.record_count).collect();
+        assert_eq!(counts, vec![1000, 1000, 500]);
 
         // Verify total record count across all files
-        let total_records: u64 = data_files.iter().map(|file| file.record_count).sum();
+        let total_records: u64 = counts.iter().sum();
         assert_eq!(
             total_records, expected_rows as u64,
             "Expected {expected_rows} total records across all files"
         );
 
+        Ok(())
+    }
+
+    fn make_oracle_schema() -> Result<Schema> {
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "s", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+    }
+
+    fn make_oracle_arrow_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                1.to_string(),
+            )])),
+            Field::new("s", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                2.to_string(),
+            )])),
+        ]))
+    }
+
+    fn make_oracle_batch(arrow_schema: &Arc<ArrowSchema>, start: i64, rows: usize) -> RecordBatch {
+        let ids: Vec<i64> = (start..start + rows as i64).collect();
+        let strings: Vec<String> = ids.iter().map(|id| format!("row-{}", id * 7919)).collect();
+        RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int64Array::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(strings)) as ArrayRef,
+        ])
+        .expect("oracle batch builds")
+    }
+
+    async fn rolling_data_files(
+        target_file_size: usize,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<crate::spec::DataFile>> {
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let schema = make_oracle_schema()?;
+        let parquet_writer_builder =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), Arc::new(schema));
+        let rolling_writer_builder = RollingFileWriterBuilder::new(
+            parquet_writer_builder,
+            target_file_size,
+            file_io,
+            location_gen,
+            file_name_gen,
+        );
+        let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+        let mut writer = data_file_writer_builder.unpartitioned().build(None).await?;
+        for batch in batches {
+            writer.write(batch).await?;
+        }
+        writer.close().await
+    }
+
+    #[tokio::test]
+    async fn test_single_batch_rolls_mid_batch() -> Result<()> {
+        let arrow_schema = make_oracle_arrow_schema();
+        let data_files =
+            rolling_data_files(1, vec![make_oracle_batch(&arrow_schema, 0, 2500)]).await?;
+        let counts: Vec<u64> = data_files.iter().map(|file| file.record_count()).collect();
+        assert_eq!(counts, vec![1000, 1000, 500]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_roll_fires_on_boundary_crossing_across_writes() -> Result<()> {
+        let arrow_schema = make_oracle_arrow_schema();
+        let data_files = rolling_data_files(1, vec![
+            make_oracle_batch(&arrow_schema, 0, 600),
+            make_oracle_batch(&arrow_schema, 600, 600),
+        ])
+        .await?;
+        let counts: Vec<u64> = data_files.iter().map(|file| file.record_count()).collect();
+        assert_eq!(counts, vec![1000, 200]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_oracle_shape_rolls_every_ten_thousand_rows() -> Result<()> {
+        let arrow_schema = make_oracle_arrow_schema();
+        let data_files =
+            rolling_data_files(262_144, vec![make_oracle_batch(&arrow_schema, 0, 50_000)]).await?;
+        let counts: Vec<u64> = data_files.iter().map(|file| file.record_count()).collect();
+        assert_eq!(counts, vec![10_000, 10_000, 10_000, 10_000, 10_000]);
         Ok(())
     }
 }

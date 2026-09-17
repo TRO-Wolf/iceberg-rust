@@ -235,6 +235,15 @@ impl TableProperties {
     pub const PROPERTY_PARQUET_COMPRESSION_CODEC_DEFAULT: &str = "zstd";
     /// Property key for the parquet data-file compression level.
     pub const PROPERTY_PARQUET_COMPRESSION_LEVEL: &str = "write.parquet.compression-level";
+
+    pub(crate) fn persisted_properties(
+        mut properties: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        properties
+            .entry(Self::PROPERTY_PARQUET_COMPRESSION_CODEC.to_owned())
+            .or_insert_with(|| Self::PROPERTY_PARQUET_COMPRESSION_CODEC_DEFAULT.to_owned());
+        properties
+    }
 }
 
 impl TryFrom<&HashMap<String, String>> for TableProperties {
