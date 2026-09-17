@@ -265,3 +265,14 @@ Round 2 (rebased onto fork main 5a0666b9):
   (`rolling_writer.rs`, `table_properties.rs`, datafusion `write.rs`, new test files) sit
   under the 1000 default.
 - Comment grep (RULE 0) run before commit: clean.
+
+## Round 3 (2026-09-17, base 96fc9f1f): C-005 stamp across every catalog crate
+
+CI is red in `iceberg-catalog-sql`: `test_create_table_in_nested_namespace_falls_back_to_*`
+expects `{}` but the stamped default now reports
+`{"write.parquet.compression-codec": "zstd"}`. The stamp is correct Java parity
+(see J-003); every catalog crate's tests that compare a fresh table's properties need
+the same expectation update. Plan: Java bytecode for all four catalogs plus the REST
+client/server split; lib + non-Docker integration tests for every crate under
+`crates/catalog/` and `crates/integrations/`; exact-map assertions only, never
+"contains"; per-crate commits; workspace gates.
