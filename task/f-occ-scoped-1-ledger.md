@@ -61,7 +61,31 @@ No Java sources on this box (`/tmp/iceberg-java-ref` absent, no `iceberg-core*so
 
 Harness: fault-injected (load table, commit a concurrent snapshot between base load and operation commit, commit operation). File: `crates/iceberg/src/transaction/occ_scoped_tests.rs` (new).
 
-PASTE RED HERE (step 2 output, before fix).
+`cargo test -p iceberg --lib transaction::occ_scoped` at `37924577` + wiring, before fix:
+
+```text
+test result: FAILED. 11 passed; 4 failed; 0 ignored; 0 measured; 3723 filtered out
+
+failures:
+    transaction::occ_scoped_tests::overwrite_row_filter_rewrite_of_unrelated_file_commits
+    transaction::occ_scoped_tests::overwrite_serializable_disjoint_partition_append_commits
+    transaction::occ_scoped_tests::row_delta_serializable_disjoint_partition_append_commits
+    transaction::occ_scoped_tests::row_delta_serializable_nonmatching_delete_file_commits
+```
+
+Representative failure (`row_delta_serializable_disjoint_partition_append_commits`):
+
+```text
+a concurrent append into a disjoint partition must not conflict under filter x = 1:
+DataInvalid => Found conflicting files that can contain records matching x = 1:
+test/other-part.parquet
+```
+
+The 4 failures are all and only the disjoint-partition commit cases: the
+metrics-only `first_conflicting_file` cannot exclude a concurrent file by
+partition, so every concurrent file might-matches. The 11 passes cover the
+matching-partition conflicts, metrics exclusion, files-exist, snapshot-isolation
+rebase, append-vs-append retry, and unknown-no-retry.
 
 ## 5. Fix (step 3)
 

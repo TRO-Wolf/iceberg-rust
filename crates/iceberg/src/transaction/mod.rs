@@ -91,6 +91,9 @@ mod rewrite_manifests;
 // Re-exported so the action type is nameable as a return type — it is handed out by both
 // `Transaction::rewrite_manifests()` and `maintenance::Actions::rewrite_manifests()`.
 pub use rewrite_manifests::RewriteManifestsAction;
+#[cfg(test)]
+#[path = "occ_scoped_tests.rs"]
+mod occ_scoped_tests;
 mod row_delta;
 mod row_delta_fresh_dv;
 pub use row_delta::RowDeltaAction;
