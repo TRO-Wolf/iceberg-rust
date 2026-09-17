@@ -161,3 +161,55 @@ All 3 fail with `Unexpected => InclusiveProjection should not be performed again
 that contain a Not operator` — L-001 reproduced. The other 4 new pins pass pre-fix as
 conservative-behaviour guards (truncate boundary conflicts, older-spec conflicts, promoted
 match conflicts / mismatch commits, unknown-spec fail-closed).
+
+### R2 fix (L-001)
+
+One line in `first_conflicting_file`: `.rewrite_not()` before `.bind()`, matching
+`overwrite_files.rs:308-311` and `resolve_filter_deletes`. Post-fix the 2 simple NOT pins
+go green; the compound pin as first written (`NOT (x = 1 AND y >= 50)`, file x=1/y[60,70])
+fails with a real `DataInvalid` conflict — my expectation was wrong, not the code: the
+rewritten `x != 1 OR y < 50` is partition-True (y arm has no parts) and metrics-True
+(x arm has no bounds), exactly Java `ManifestGroup.filterData` semantics. Corrected to
+`NOT (x = 1 OR y >= 50)` (DeMorgan `x != 1 AND y < 50`, both gates exclude) → green.
+Battery: 23 passed.
+
+### R2 mutations (one knob at a time)
+
+- Strict-swap (`InclusiveProjection` → `StrictProjection` in `partition_might_match`):
+  2 red out of 23 — `row_delta_truncate_range_filter_conflicts_on_boundary_partition`
+  (strict `part > truncate(15)` drops partition 10) and
+  `row_delta_older_spec_file_without_filter_source_stays_conflicting` (strict folds
+  missing-source to `AlwaysFalse`). Re-run post-split with identical arithmetic.
+  Restored → green.
+- Filter-neutralise (round-1 mutation A, recorded pre-split): 4 red — the disjoint-commit
+  cases. Not re-run post-split; the strict-swap re-run above is the post-split arithmetic.
+
+### R2 perf (P2)
+
+`partition_might_match` takes `&mut HashMap<i32, ExpressionEvaluator>`: projection +
+partition schema + bound evaluator built once per spec id per validation call, `eval`
+per file; unknown specs return fail-closed without caching. The P3 `AlwaysTrue` fast
+path and manifest-level pushdown from the perf report are not taken (unrequested).
+All 23 + 1 pins green after the change.
+
+### R2 ceiling split
+
+Round-2 pins push `occ_scoped_tests.rs` to 1038 lines (ceiling 1000). Split: the 4
+projection pins + their exclusive fixtures move to `occ_scoped_projection_tests.rs`;
+shared helpers go `pub(crate)` (the `transaction::tests` pattern); both wired from
+`action.rs`. Sizes: 807 + 266 + `action.rs` 229. Clippy forced two cleanups in the
+same pass: dropped `use std::ops::Not` (unused) and moved `partition_might_match`
+above the inline test module (`items_after_test_module`).
+
+### R2 gates
+
+- `cargo test -p iceberg --lib`: 3749 passed, 0 failed, 8 ignored (final split tree).
+- `cargo clippy -p iceberg --all-targets -- -D warnings`: clean (after the 2 fixes above).
+- `cargo test -p iceberg-datafusion --lib`: 228 passed, 0 failed, 1 ignored.
+- `cargo clippy -p iceberg-datafusion --all-targets -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean. `typos .`: clean.
+- `./scripts/check_rust_file_size.sh`: clean. `./scripts/check_comment_blocks.sh`: OK.
+  `./scripts/check_agent_artifacts.sh`: OK. `./scripts/check_matrix_anchors.sh`: OK.
+- GAP_MATRIX: still no flip (unit-only evidence).
+- Comment grep over own diff: new-file ASF headers + the 5-line moved fn doc + edited
+  wrapper-doc lines only.

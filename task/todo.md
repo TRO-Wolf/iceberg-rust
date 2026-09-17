@@ -45,6 +45,9 @@ Java retry defaults, and never-retry-unknown were already ported. Consumer: RePa
       32 integration targets 264 passed; clippy clean both crates; fmt/typos/size/
       comment-blocks/artifacts/anchors green; no GAP_MATRIX flip
 - [x] C-005 RePark hand-back `/tmp/oc-worker/ja-occ/handback-1.md` + `handback.json`
+- [x] Round 2 (PR #291 reviews): `rewrite_not` before bind (L-001) + 8 new pins (NOT ×3,
+      truncate, older-spec, promotion ×2, unknown-spec) + per-spec evaluator cache (perf P2);
+      strict-swap mutation 2 red of 23; `iceberg --lib` 3749 passed; all gates green
 
 ## ACTIVE (2026-09-17): F-EVO-SCAN-1 scans and DataFusion UPDATE after ADD / RENAME COLUMN
 
