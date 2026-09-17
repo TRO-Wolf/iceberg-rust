@@ -767,7 +767,7 @@ impl Catalog for MemoryCatalog {
 
         staged_view
             .metadata()
-            .write_to(staged_view.file_io(), &new_metadata_location)
+            .write_commit_metadata(staged_view.file_io(), &new_metadata_location)
             .await?;
 
         // 3. Authoritative pointer CAS under a short lock.

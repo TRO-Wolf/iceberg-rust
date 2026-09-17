@@ -272,3 +272,174 @@ async fn hadoop_concurrent_commits_yield_exactly_one_winner() {
     let loser_err = loser.as_ref().expect_err("loser fails");
     assert_eq!(loser_err.kind(), ErrorKind::CatalogCommitConflicts);
 }
+
+async fn apply_locally_property(
+    catalog: &impl Catalog,
+    ident: &TableIdent,
+    key: &str,
+    value: &str,
+) -> Result<String, iceberg::Error> {
+    let table = catalog.load_table(ident).await.expect("load base");
+    let tx = Transaction::new(&table);
+    let staged = tx
+        .update_table_properties()
+        .set(key.to_string(), value.to_string())
+        .apply(tx)
+        .expect("apply stages");
+    let out = staged.apply_locally().await?;
+    Ok(out.metadata_location().expect("location").to_string())
+}
+
+async fn seed_and_register(
+    cat1: &impl Catalog,
+    cat2: &impl Catalog,
+    file_io: &FileIO,
+    table_location: &str,
+    ns: NamespaceIdent,
+    name: &str,
+) -> TableIdent {
+    let v2 = format!("{table_location}/metadata/v2.metadata.json");
+    let base = cat1
+        .load_table(&TableIdent::new(ns.clone(), "src".to_string()))
+        .await
+        .expect("load src");
+    base.metadata()
+        .write_to(file_io, &v2)
+        .await
+        .expect("seed v2");
+    let ident = TableIdent::new(ns, name.to_string());
+    cat1.register_table(&ident, v2.clone())
+        .await
+        .expect("cat1 registers v2");
+    cat2.register_table(&ident, v2)
+        .await
+        .expect("cat2 registers v2");
+    ident
+}
+
+#[tokio::test]
+async fn hadoop_gzip_sibling_v3_blocks_uncompressed_v3_commit() {
+    for sibling in ["v3.gz.metadata.json", "v3.metadata.json.gz"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = dir.path().to_str().expect("utf8 path").to_string();
+        let file_io = FileIO::new_with_fs();
+
+        let cat1 = new_local_catalog("one", &warehouse).await;
+        let ns = NamespaceIdent::new("ns".to_string());
+        let table_location = create_ns_and_source(&cat1, &ns).await;
+
+        let v2 = format!("{table_location}/metadata/v2.metadata.json");
+        let base = cat1
+            .load_table(&TableIdent::new(ns.clone(), "src".to_string()))
+            .await
+            .expect("load src");
+        base.metadata()
+            .write_to(&file_io, &v2)
+            .await
+            .expect("seed v2");
+        let sibling_path = format!("{table_location}/metadata/{sibling}");
+        std::fs::copy(&v2, &sibling_path).expect("seed sibling");
+        let sibling_bytes = std::fs::read(&sibling_path).expect("read sibling");
+
+        let ident = TableIdent::new(ns, "hadoop".to_string());
+        cat1.register_table(&ident, v2.clone())
+            .await
+            .expect("register v2");
+
+        let err = commit_property(&cat1, &ident, "writer", "one")
+            .await
+            .expect_err("sibling of same version must conflict");
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable());
+        assert_eq!(
+            std::fs::read(&sibling_path).expect("sibling intact"),
+            sibling_bytes
+        );
+        assert!(
+            !std::path::Path::new(&format!("{table_location}/metadata/v3.metadata.json")).exists(),
+            "no uncompressed v3 may appear next to {sibling}"
+        );
+        let table = cat1.load_table(&ident).await.expect("loads");
+        assert_eq!(table.metadata_location().expect("pointer"), v2.as_str());
+    }
+}
+
+#[tokio::test]
+async fn hadoop_apply_locally_collision_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let warehouse = dir.path().to_str().expect("utf8 path").to_string();
+    let file_io = FileIO::new_with_fs();
+
+    let cat1 = new_local_catalog("one", &warehouse).await;
+    let cat2 = new_local_catalog("two", &warehouse).await;
+    let ns = NamespaceIdent::new("ns".to_string());
+    let table_location = create_ns_and_source(&cat1, &ns).await;
+    create_ns_and_source(&cat2, &ns).await;
+    let ident = seed_and_register(&cat1, &cat2, &file_io, &table_location, ns, "hadoop").await;
+
+    let v3 = apply_locally_property(&cat1, &ident, "writer", "one")
+        .await
+        .expect("first apply_locally lands");
+    assert!(v3.ends_with("/metadata/v3.metadata.json"));
+    let winner_bytes = std::fs::read(&v3).expect("read v3");
+
+    let err = apply_locally_property(&cat2, &ident, "writer", "two")
+        .await
+        .expect_err("stale apply_locally to v3 must fail");
+    assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+    assert!(err.retryable());
+    assert_eq!(
+        std::fs::read(&v3).expect("re-read v3"),
+        winner_bytes,
+        "loser must not touch the winner file"
+    );
+}
+
+#[tokio::test]
+async fn orphan_v3_wedges_stale_pointer_loud_then_reregister_recovers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let warehouse = dir.path().to_str().expect("utf8 path").to_string();
+    let file_io = FileIO::new_with_fs();
+
+    let cat1 = new_local_catalog("one", &warehouse).await;
+    let ns = NamespaceIdent::new("ns".to_string());
+    let table_location = create_ns_and_source(&cat1, &ns).await;
+
+    let v2 = format!("{table_location}/metadata/v2.metadata.json");
+    let base = cat1
+        .load_table(&TableIdent::new(ns.clone(), "src".to_string()))
+        .await
+        .expect("load src");
+    base.metadata()
+        .write_to(&file_io, &v2)
+        .await
+        .expect("seed v2");
+    let ident = TableIdent::new(ns.clone(), "hadoop".to_string());
+    cat1.register_table(&ident, v2.clone())
+        .await
+        .expect("register v2");
+
+    let v3 = format!("{table_location}/metadata/v3.metadata.json");
+    std::fs::copy(&v2, &v3).expect("plant orphan v3");
+    let orphan_bytes = std::fs::read(&v3).expect("read orphan");
+
+    let err = commit_property(&cat1, &ident, "writer", "one")
+        .await
+        .expect_err("orphan v3 wedges the stale pointer loud");
+    assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+    assert_eq!(std::fs::read(&v3).expect("orphan intact"), orphan_bytes);
+    let stuck = cat1.load_table(&ident).await.expect("loads");
+    assert_eq!(stuck.metadata_location().expect("pointer"), v2.as_str());
+
+    let cat2 = new_local_catalog("two", &warehouse).await;
+    create_ns_and_source(&cat2, &ns).await;
+    cat2.register_table(&ident, v3)
+        .await
+        .expect("re-register at newest version");
+    let v4 = commit_property(&cat2, &ident, "writer", "two")
+        .await
+        .expect("commit resumes after re-register");
+    assert!(v4.ends_with("/metadata/v4.metadata.json"));
+    let resumed = cat2.load_table(&ident).await.expect("loads");
+    assert_eq!(table_property(&resumed, "writer").as_deref(), Some("two"));
+}

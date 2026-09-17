@@ -59,3 +59,7 @@
 mod catalog;
 mod error;
 pub use catalog::*;
+
+#[cfg(test)]
+#[path = "hadoop_commit_tests.rs"]
+mod hadoop_commit_tests;

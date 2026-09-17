@@ -192,7 +192,101 @@ No `map.md` covers any touched directory (maps exist only under `.agents/skills`
 `task/`-archives and `crates/sketches`), so per the navigation contract no map update
 was due.
 
-## 9. Open questions
+## 11. Round-2 gates and counts (2026-09-17, all green)
+
+| Gate | Result |
+|---|---|
+| `cargo test -p iceberg --lib` | 3682 passed, 0 failed, 8 ignored |
+| `cargo test -p iceberg --test hadoop_version_commit` | 6 passed (3 round-1 + sibling, apply_locally, orphan-recovery) |
+| `cargo test -p iceberg --lib io::storage` | 85 passed, incl. 3 new `stage_and_publish` helper tests |
+| `cargo test -p iceberg-storage-opendal --lib` | 47 passed, unchanged |
+| `cargo test -p iceberg-catalog-sql --lib` | 81 passed, incl. the new Hadoop sql pin |
+| `cargo clippy --all-targets --all-features --workspace -- -D warnings` | clean after fixing one `ptr_arg` (`&PathBuf` → `&Path`) |
+| `cargo fmt --all -- --check` | clean |
+| `make check-toml`, `cargo machete`, `make check-agent-artifacts` | clean |
+| `make check-matrix-anchors` | OK (84 rows) after the R167 round-2 sentence |
+| `make check-comment-blocks` | OK |
+| `make check-rust-file-size` | 468 files clean, 99 ceilings, no row changes |
+| `typos .` | clean |
+
+## 9. Round 2 (review remediation, 2026-09-17)
+
+Critic-logic report: `/tmp/oc-worker/ib-rv/reviews/vn-logic-report.md`, verdict PASS, five P2
+findings L-01..L-05 plus hygiene L-06. Orchestrator rulings Q-19b-2 fix L-01..L-03 per the
+rulings, correct the L-04 table, record the L-05 D-row, add the L-06 sql pin.
+
+### 9.1 Round-2 red-first evidence (pre-fix tree = 6627b1fd)
+
+`cargo test -p iceberg --test hadoop_version_commit`:
+
+```text
+test hadoop_gzip_sibling_v3_blocks_uncompressed_v3_commit ... FAILED
+test hadoop_apply_locally_collision_fails ... FAILED
+test orphan_v3_wedges_stale_pointer_loud_then_reregister_recovers ... ok
+test result: FAILED. 4 passed; 2 failed
+
+---- hadoop_gzip_sibling_v3_blocks_uncompressed_v3_commit stdout ----
+sibling of same version must conflict: "/tmp/.tmpwrP2HS/ns/src/metadata/v3.metadata.json"
+
+---- hadoop_apply_locally_collision_fails stdout ----
+stale apply_locally to v3 must fail: "/tmp/.tmpEB5X93/ns/src/metadata/v3.metadata.json"
+```
+
+L-01 and L-02 fail red exactly as diagnosed (commit returns `Ok`, second file lands).
+L-05 passes pre-round-2: the exact-name orphan already fails loud from the round-1 guard
+(its red state was the pre-round-1 tree, which overwrote); the pin documents the wedge
+plus the re-register recovery.
+
+L-03 helper pins (`stage_and_publish` success / collision / body-failure) fail pre-fix at
+compile time — the helper does not exist:
+
+```text
+error[E0425]: cannot find function `stage_and_publish` in module `super`
+```
+
+L-06 sql pin passed on first green run after a harness fix (missing `create_namespace`;
+setup failure `NamespaceNotFound`, not a product red). The sql `update_table` seam was
+already guarded in round 1; the pin documents per-catalog wiring.
+
+### 9.2 D-2: orphan `v(N+1)` wedges later commits loud (L-05)
+
+A successfully written `v(N+1)` whose catalog pointer never advanced (write-success plus
+CAS failure elsewhere, or a planted file) makes every later commit from the stale pointer
+fail with typed retryable `CatalogCommitConflicts`, pointer unchanged. This is fail-loud,
+never silent: the alternative (overwriting the orphan) is the round-1 defect. Java's
+HadoopCatalog would list past the orphan and continue at `v(N+2)`; this fork has no
+Hadoop version listing (R167 `version-hint.text` residue), so recovery is re-registering
+the table at the newest version file, after which commits resume (`v(N+2)`). Pinned by
+`orphan_v3_wedges_stale_pointer_loud_then_reregister_recovers`.
+
+### 9.3 Corrected per-backend atomicity (L-04)
+
+Verified against opendal 0.55.0 service sources (`capability()` in each
+`services/<name>/backend.rs`): `write_with_if_not_exists` is set for fs, s3, gcs, azdls,
+azblob; oss sets it only when versioning is off (`!enable_versioning`); memory omits it.
+
+| Backend | Mechanism | Atomic |
+|---|---|---|
+| Local filesystem, temp-then-link publish (round 2) | unique temp in the same directory, body written there, `hard_link` temp to dest (fails `AlreadyExists` when dest exists), temp removed on every path | yes: the final name appears atomically or not at all; a failed body never leaves a partial final file |
+| In-memory (`MemoryStorage`) | single write-lock check-and-insert | yes within one process |
+| OpenDAL fs / s3 / gcs / azdls / azblob | `write_with(...).if_not_exists(true)` native (`If-None-Match: *` on S3, generation 0 on GCS, `create_new` on fs) | yes |
+| OpenDAL memory | capability absent, takes the `Unsupported` fallback | no: exists-then-write TOCTOU between tasks |
+| OpenDAL oss with versioning on | capability off, takes the fallback | no: exists-then-write TOCTOU |
+| Any other `Storage` implementor (default trait body) | exists-check then write | no: TOCTOU; fail-closed only when the file already exists |
+
+The round-1 table wrongly listed OpenDAL memory as native; corrected here. No code change
+was needed for the table: the fallback branch already exists and the memory-backend unit
+test pins its fail-closed behaviour sequentially.
+
+### 9.4 Sibling pre-check is non-atomic (L-01)
+
+The gzip-sibling existence check runs before the exclusive create as two separate
+`exists` calls. A concurrent writer planting the sibling between the check and the
+create is not detected by this seam; the dest-filename create itself stays atomic.
+Same-version mixed-codec writes therefore fail loud only when the sibling is already
+visible at check time.
+
+## 10. Open questions
 
 1. RePark-side retry budget (see §3): confirm RePark bounds retries on retryable commit
    conflicts so a cross-instance stale pointer surfaces instead of spinning. For the

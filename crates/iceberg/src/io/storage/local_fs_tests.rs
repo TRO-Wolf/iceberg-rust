@@ -599,4 +599,47 @@ async fn test_local_fs_storage_write_new_refuses_existing() {
         storage.read(path_str).await.expect("winner bytes intact"),
         first
     );
+    let residue: Vec<String> = std::fs::read_dir(tmp_dir.path().join("nested"))
+        .expect("list dir")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(residue, vec!["new.txt".to_string()]);
+}
+
+#[test]
+fn test_stage_and_publish_success_removes_temp() {
+    let tmp_dir = TempDir::new().expect("tempdir");
+    let dest = tmp_dir.path().join("v3.metadata.json");
+    let temp = tmp_dir.path().join("staged.tmp");
+    super::stage_and_publish(&temp, &dest, b"winner").expect("publish lands");
+    assert_eq!(std::fs::read(&dest).expect("read dest"), b"winner");
+    assert!(!temp.exists(), "temp is removed after publish");
+}
+
+#[test]
+fn test_stage_and_publish_collision_keeps_dest_removes_temp() {
+    let tmp_dir = TempDir::new().expect("tempdir");
+    let dest = tmp_dir.path().join("v3.metadata.json");
+    let temp = tmp_dir.path().join("staged.tmp");
+    std::fs::write(&dest, b"winner").expect("seed dest");
+    let err = super::stage_and_publish(&temp, &dest, b"loser").expect_err("collision fails");
+    assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(std::fs::read(&dest).expect("dest intact"), b"winner");
+    assert!(!temp.exists(), "temp is removed after collision");
+}
+
+#[test]
+fn test_stage_and_publish_body_failure_leaves_no_dest() {
+    let tmp_dir = TempDir::new().expect("tempdir");
+    let dest = tmp_dir.path().join("v3.metadata.json");
+    let temp = tmp_dir.path().join("blocked.tmp");
+    std::fs::create_dir(&temp).expect("temp path is a directory");
+    super::stage_and_publish(&temp, &dest, b"loser").expect_err("body write fails");
+    assert!(!dest.exists(), "no partial final file remains");
 }

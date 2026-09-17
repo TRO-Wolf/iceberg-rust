@@ -31,6 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::io::{
     FileInfo, FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
@@ -177,31 +178,8 @@ impl Storage for LocalFsStorage {
             })?;
         }
 
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    Error::new(
-                        ErrorKind::PreconditionFailed,
-                        format!("Cannot create {}: file already exists", path.display()),
-                    )
-                    .with_source(e)
-                } else {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        format!("Failed to create file {}: {}", path.display(), e),
-                    )
-                }
-            })?;
-        file.write_all(&bs).map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("Failed to write file {}: {}", path.display(), e),
-            )
-        })?;
-        Ok(())
+        let temp = staged_temp_path(&path)?;
+        stage_and_publish(&temp, &path, &bs)
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
@@ -362,6 +340,65 @@ impl Storage for LocalFsStorage {
     fn new_output(&self, path: &str) -> Result<OutputFile> {
         Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
     }
+}
+
+fn staged_temp_path(dest: &std::path::Path) -> Result<PathBuf> {
+    let name = dest.file_name().ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot stage temp file for directory path {}",
+                dest.display()
+            ),
+        )
+    })?;
+    let mut temp = dest.to_path_buf();
+    temp.set_file_name(format!(
+        ".{}-tmp-{}",
+        name.to_string_lossy(),
+        Uuid::new_v4()
+    ));
+    Ok(temp)
+}
+
+fn stage_and_publish(temp: &std::path::Path, dest: &std::path::Path, bs: &[u8]) -> Result<()> {
+    let staged = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp)
+        .and_then(|mut file| file.write_all(bs));
+    if let Err(io_err) = staged {
+        let _ = fs::remove_file(temp);
+        return Err(Error::new(
+            ErrorKind::Unexpected,
+            format!("Failed to stage temp file {}: {io_err}", temp.display()),
+        ));
+    }
+    match fs::hard_link(temp, dest) {
+        Ok(()) => {}
+        Err(io_err) if io_err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(temp);
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                format!("Cannot create {}: file already exists", dest.display()),
+            )
+            .with_source(io_err));
+        }
+        Err(io_err) => {
+            let _ = fs::remove_file(temp);
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to publish {}: {io_err}", dest.display()),
+            ));
+        }
+    }
+    fs::remove_file(temp).map_err(|io_err| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("Failed to remove temp file {}: {io_err}", temp.display()),
+        )
+    })?;
+    Ok(())
 }
 
 /// File reader for local filesystem storage.
