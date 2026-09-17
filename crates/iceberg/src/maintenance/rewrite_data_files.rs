@@ -52,10 +52,7 @@
 //!
 //! | not ported | consequence |
 //! |---|---|
-//! | partial progress | each group commits alone; one failure aborts |
-//! | concurrency | sequential |
 //! | sort and Z-order | only bin-pack is ported |
-//! | `output_spec_id`, `rewrite_all`, job order | current default spec; plan order |
 //! | oversized-file splitting | an input over `max_file_size` is rewritten whole |
 
 use std::collections::{HashMap, HashSet};
@@ -63,8 +60,11 @@ use std::collections::{HashMap, HashSet};
 use crate::Catalog;
 use crate::error::{Error, ErrorKind, Result};
 use crate::expr::Predicate;
+pub use crate::maintenance::rewrite_data_files_plan::RewriteJobOrder;
 use crate::maintenance::rewrite_data_files_plan::{
-    DELETE_FILE_THRESHOLD_DEFAULT, DELETE_RATIO_THRESHOLD_DEFAULT, ResolvedConfig, plan_file_groups,
+    DELETE_FILE_THRESHOLD_DEFAULT, DELETE_RATIO_THRESHOLD_DEFAULT,
+    PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT, ResolvedConfig, format_java_double, order_groups,
+    plan_commit_batches, plan_file_groups,
 };
 pub(super) use crate::maintenance::rewrite_data_files_plan::{
     MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO,
@@ -75,7 +75,7 @@ pub(super) use crate::maintenance::rewrite_data_files_plan::{
 use crate::maintenance::rewrite_data_files_plan::{group_qualifies, is_candidate};
 use crate::maintenance::{RemoveDanglingDeleteFiles, rewrite_data_files_dv as rewrite_dv};
 use crate::scan::FileScanTask;
-use crate::spec::DataFile;
+use crate::spec::{DataFile, PartitionSpecRef};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 
@@ -128,6 +128,12 @@ pub struct RewriteDataFiles {
     remove_dangling_deletes: bool,
     max_open_partition_writers: Option<usize>,
     filter: Predicate,
+    rewrite_all: bool,
+    partial_progress: bool,
+    partial_progress_max_commits: usize,
+    output_spec_id: Option<i32>,
+    rewrite_job_order: RewriteJobOrder,
+    max_concurrent_file_group_rewrites: usize,
 }
 
 impl RewriteDataFiles {
@@ -147,6 +153,12 @@ impl RewriteDataFiles {
             remove_dangling_deletes: false,
             max_open_partition_writers: None,
             filter: Predicate::AlwaysTrue,
+            rewrite_all: false,
+            partial_progress: false,
+            partial_progress_max_commits: PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT,
+            output_spec_id: None,
+            rewrite_job_order: RewriteJobOrder::None,
+            max_concurrent_file_group_rewrites: 1,
         }
     }
 
@@ -227,12 +239,53 @@ impl RewriteDataFiles {
         self
     }
 
-    /// Plans the compaction, rewrites each group into target-sized files, and commits each group
-    /// through [`RewriteFilesAction`](crate::transaction::rewrite_files). Each group is read with
-    /// merge-on-read deletes applied, so the output carries only live rows. When no file qualifies
-    /// it returns zero counts and commits nothing.
+    /// Rewrites every file and qualifies every group, bypassing all size filters (Java `REWRITE_ALL`).
+    pub fn rewrite_all(mut self, rewrite_all: bool) -> Self {
+        self.rewrite_all = rewrite_all;
+        self
+    }
+
+    /// Commits rewritten groups in batches instead of one atomic commit (Java `PARTIAL_PROGRESS_ENABLED`).
+    pub fn partial_progress(mut self, partial_progress: bool) -> Self {
+        self.partial_progress = partial_progress;
+        self
+    }
+
+    /// Caps the commit count under partial progress; groups per commit round up (Java `PARTIAL_PROGRESS_MAX_COMMITS`).
+    pub fn partial_progress_max_commits(mut self, partial_progress_max_commits: usize) -> Self {
+        self.partial_progress_max_commits = partial_progress_max_commits;
+        self
+    }
+
+    /// Writes and groups output files under this partition spec id (Java `OUTPUT_SPEC_ID`).
+    pub fn output_spec_id(mut self, output_spec_id: i32) -> Self {
+        self.output_spec_id = Some(output_spec_id);
+        self
+    }
+
+    /// Rewrites and commits groups in this order (Java `REWRITE_JOB_ORDER`).
+    pub fn rewrite_job_order(mut self, rewrite_job_order: RewriteJobOrder) -> Self {
+        self.rewrite_job_order = rewrite_job_order;
+        self
+    }
+
+    /// Accepted group-rewrite parallelism; the fork rewrites sequentially (Java `MAX_CONCURRENT_FILE_GROUP_REWRITES`).
+    pub fn max_concurrent_file_group_rewrites(
+        mut self,
+        max_concurrent_file_group_rewrites: usize,
+    ) -> Self {
+        self.max_concurrent_file_group_rewrites = max_concurrent_file_group_rewrites;
+        self
+    }
+
+    /// Plans the compaction, rewrites each group into target-sized files, and commits through
+    /// [`RewriteFilesAction`](crate::transaction::rewrite_files): one commit for all groups by
+    /// default, batched commits under partial progress. Each group is read with merge-on-read
+    /// deletes applied, so the output carries only live rows. When no file qualifies it returns
+    /// zero counts and commits nothing.
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RewriteDataFilesResult> {
         let mut config = self.resolve_config()?;
+        let output_spec = self.resolve_output_spec_in(&self.table)?;
 
         let Some(starting_snapshot) = self.table.metadata().current_snapshot().cloned() else {
             return Ok(RewriteDataFilesResult::default());
@@ -244,43 +297,65 @@ impl RewriteDataFiles {
         let data_files_by_path = self.collect_live_data_files().await?;
         let live_deletes = rewrite_dv::live_file_scoped_position_deletes(&self.table).await?;
         config.file_scoped_delete_paths = rewrite_dv::file_scoped_delete_paths_from(&live_deletes);
-        let groups = plan_file_groups(
-            tasks,
-            &config,
-            self.table.metadata().default_partition_spec(),
-        );
+        let mut groups = plan_file_groups(tasks, &config, &output_spec);
 
         if groups.is_empty() {
             return Ok(RewriteDataFilesResult::default());
         }
+        order_groups(&mut groups, self.rewrite_job_order);
 
+        let batches = plan_commit_batches(
+            groups.len(),
+            self.partial_progress,
+            self.partial_progress_max_commits,
+        );
         let mut result = RewriteDataFilesResult::default();
         let mut table = self.table.clone();
-        for group in groups {
-            let group_result = self
-                .rewrite_group(
-                    catalog,
-                    &table,
-                    &group,
-                    &data_files_by_path,
-                    &live_deletes,
-                    starting_snapshot_id,
-                    starting_sequence_number,
-                    &config,
-                )
-                .await?;
-
-            result.added_data_files_count += group_result.0.added_data_files_count;
-            result.rewritten_data_files_count += group_result.0.rewritten_data_files_count;
-            result.rewritten_bytes_count += group_result.0.rewritten_bytes_count;
-            result.removed_delete_files_count += group_result.2;
-            result.file_groups.push(group_result.0);
-            // The committed table is the base for the next group's commit.
-            table = group_result.1;
+        let mut cursor = 0;
+        for batch_size in batches {
+            let mut batch_deletes: Vec<DataFile> = Vec::new();
+            let mut batch_adds: Vec<DataFile> = Vec::new();
+            let mut batch_dv_removed: Vec<DataFile> = Vec::new();
+            let mut batch_dv_count = 0;
+            for _ in 0..batch_size {
+                let written = self
+                    .write_group(
+                        &table,
+                        &groups[cursor],
+                        &data_files_by_path,
+                        &live_deletes,
+                        &config,
+                        &output_spec,
+                    )
+                    .await?;
+                cursor += 1;
+                result.added_data_files_count += written.result.added_data_files_count;
+                result.rewritten_data_files_count += written.result.rewritten_data_files_count;
+                result.rewritten_bytes_count += written.result.rewritten_bytes_count;
+                result.file_groups.push(written.result);
+                batch_dv_count += written.dv_removed_count;
+                batch_deletes.extend(written.files_to_delete);
+                batch_adds.extend(written.added_files);
+                batch_dv_removed.extend(written.dv_removed);
+            }
+            let transaction = Transaction::new(&table);
+            let mut action = transaction
+                .rewrite_files(batch_deletes, batch_adds)
+                .validate_from_snapshot(starting_snapshot_id);
+            if self.use_starting_sequence_number {
+                action = action.data_sequence_number(starting_sequence_number);
+            }
+            if !batch_dv_removed.is_empty() {
+                action = action.delete_delete_files(batch_dv_removed);
+            }
+            let transaction = action.apply(transaction)?;
+            // The committed table is the base for the next batch's commit.
+            table = transaction.commit(catalog).await?;
+            result.removed_delete_files_count += batch_dv_count;
         }
 
         // Java's two empty-result early returns precede this step, so it runs only on a non-empty
-        // plan. `table` is the last group's committed table, which is what Java's own handle
+        // plan. `table` is the last batch's committed table, which is what Java's own handle
         // observes. A failure propagates and fails the whole action, as it does in Java.
         if self.remove_dangling_deletes {
             let removed = RemoveDanglingDeleteFiles::new(table)
@@ -347,7 +422,7 @@ impl RewriteDataFiles {
                 ErrorKind::DataInvalid,
                 format!(
                     "'delete-ratio-threshold' is set to {} but must be > 0",
-                    self.delete_ratio_threshold
+                    format_java_double(self.delete_ratio_threshold)
                 ),
             ));
         }
@@ -356,7 +431,7 @@ impl RewriteDataFiles {
                 ErrorKind::DataInvalid,
                 format!(
                     "'delete-ratio-threshold' is set to {} but must be <= 1",
-                    self.delete_ratio_threshold
+                    format_java_double(self.delete_ratio_threshold)
                 ),
             ));
         }
@@ -370,6 +445,24 @@ impl RewriteDataFiles {
                 "'max-open-partition-writers' is set to 0 but must be > 0",
             ));
         }
+        if self.max_concurrent_file_group_rewrites == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot set max-concurrent-file-group-rewrites to {}, the value must be positive.",
+                    self.max_concurrent_file_group_rewrites
+                ),
+            ));
+        }
+        if self.partial_progress && self.partial_progress_max_commits == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot set partial-progress.max-commits to {}, the value must be positive when partial-progress.enabled is true",
+                    self.partial_progress_max_commits
+                ),
+            ));
+        }
 
         Ok(ResolvedConfig {
             target_file_size_bytes: target,
@@ -380,8 +473,28 @@ impl RewriteDataFiles {
             delete_ratio_threshold: self.delete_ratio_threshold,
             max_file_group_size_bytes: self.max_file_group_size_bytes,
             max_open_partition_writers,
+            rewrite_all: self.rewrite_all,
             file_scoped_delete_paths: HashSet::new(),
         })
+    }
+
+    fn resolve_output_spec_in(&self, table: &Table) -> Result<PartitionSpecRef> {
+        match self.output_spec_id {
+            None => Ok(table.metadata().default_partition_spec().clone()),
+            Some(spec_id) => table
+                .metadata()
+                .partition_specs_iter()
+                .find(|spec| spec.spec_id() == spec_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot use output spec id {spec_id} because the table does not contain a reference to this spec-id."
+                        ),
+                    )
+                }),
+        }
     }
 
     /// Plan live data-file scan tasks. The filter selects files only; no residual applies.
@@ -423,22 +536,24 @@ impl RewriteDataFiles {
     }
 }
 
+struct WrittenGroup {
+    result: FileGroupRewriteResult,
+    files_to_delete: Vec<DataFile>,
+    added_files: Vec<DataFile>,
+    dv_removed: Vec<DataFile>,
+    dv_removed_count: usize,
+}
+
 impl RewriteDataFiles {
-    /// Rewrites one planned group and commits a single `RewriteFiles` that replaces exactly its
-    /// data files. Returns the group result, the committed table, and the number of file-scoped
-    /// deletes dropped because they referenced a rewritten file.
-    #[allow(clippy::too_many_arguments)]
-    async fn rewrite_group(
+    async fn write_group(
         &self,
-        catalog: &dyn Catalog,
         table: &Table,
         group: &[FileScanTask],
         data_files_by_path: &HashMap<String, DataFile>,
         live_file_scoped_deletes: &[(DataFile, String)],
-        starting_snapshot_id: i64,
-        starting_sequence_number: i64,
         config: &ResolvedConfig,
-    ) -> Result<(FileGroupRewriteResult, Table, usize)> {
+        output_spec: &PartitionSpecRef,
+    ) -> Result<WrittenGroup> {
         // A path that vanished since planning means a concurrent commit removed it. Fail here,
         // naming the file, rather than in the writer's own missing-path check.
         let mut files_to_delete: Vec<DataFile> = Vec::with_capacity(group.len());
@@ -465,11 +580,12 @@ impl RewriteDataFiles {
             group,
             config.target_file_size_bytes,
             config.max_open_partition_writers,
+            output_spec,
         )
         .await?
         .files;
 
-        let group_result = FileGroupRewriteResult {
+        let result = FileGroupRewriteResult {
             added_data_files_count: added_files.len(),
             rewritten_data_files_count: files_to_delete.len(),
             rewritten_bytes_count,
@@ -481,20 +597,13 @@ impl RewriteDataFiles {
             .collect();
         let dv_plan = rewrite_dv::plan_dv_removal(live_file_scoped_deletes, &rewritten_paths);
 
-        let transaction = Transaction::new(table);
-        let mut action = transaction
-            .rewrite_files(files_to_delete, added_files)
-            .validate_from_snapshot(starting_snapshot_id);
-        if self.use_starting_sequence_number {
-            action = action.data_sequence_number(starting_sequence_number);
-        }
-        if !dv_plan.removed.is_empty() {
-            action = action.delete_delete_files(dv_plan.removed);
-        }
-        let transaction = action.apply(transaction)?;
-        let committed = transaction.commit(catalog).await?;
-
-        Ok((group_result, committed, dv_plan.removed_count))
+        Ok(WrittenGroup {
+            result,
+            files_to_delete,
+            added_files,
+            dv_removed: dv_plan.removed,
+            dv_removed_count: dv_plan.removed_count,
+        })
     }
 }
 
@@ -506,12 +615,14 @@ impl RewriteDataFiles {
         group: &[FileScanTask],
         target_file_size_bytes: u64,
     ) -> Result<Vec<DataFile>> {
+        let output_spec = self.resolve_output_spec_in(table)?;
         crate::maintenance::rewrite_data_files_write::write_compacted_files(
             table,
             group,
             target_file_size_bytes,
             self.max_open_partition_writers
                 .unwrap_or(MAX_OPEN_PARTITION_WRITERS_DEFAULT),
+            &output_spec,
         )
         .await
         .map(|compacted| compacted.files)
@@ -852,7 +963,7 @@ pub(crate) mod tests {
     }
 
     /// The current snapshot id (or `None` for a fresh table).
-    fn current_snapshot_id(table: &Table) -> Option<i64> {
+    pub(crate) fn current_snapshot_id(table: &Table) -> Option<i64> {
         table.metadata().current_snapshot_id()
     }
 
@@ -2201,6 +2312,7 @@ pub(crate) mod tests {
             delete_ratio_threshold: DELETE_RATIO_THRESHOLD_DEFAULT,
             max_file_group_size_bytes: 1_000_000,
             max_open_partition_writers: MAX_OPEN_PARTITION_WRITERS_DEFAULT,
+            rewrite_all: false,
             file_scoped_delete_paths: HashSet::new(),
         }
     }
@@ -2385,275 +2497,5 @@ pub(crate) mod tests {
             }
         }
         paths
-    }
-
-    /// Drops `removed` data files in one `RewriteFiles` commit.
-    async fn remove_data_files(
-        catalog: &impl Catalog,
-        table: &Table,
-        removed: Vec<DataFile>,
-    ) -> Table {
-        let tx = Transaction::new(table);
-        // A delete-only rewrite adds nothing.
-        let action = tx.rewrite_files(removed, Vec::new());
-        let tx = action.apply(tx).unwrap();
-        tx.commit(catalog).await.unwrap()
-    }
-
-    /// A fixture whose lone position delete genuinely dangles after compaction.
-    ///
-    /// Everything sits in partition `x = 0`, so the table is one bin-pack group. Sequence 1 appends
-    /// five files, sequence 2 adds a position delete, and sequence 3 appends a sixth. The rewrite
-    /// starts from sequence 3, so the restamped data lifts the partition minimum to 3 and the
-    /// delete at 2 falls under Java's strict `<` dangling clause.
-    async fn dangling_after_compaction_fixture(catalog: &impl Catalog) -> (Table, String) {
-        let table = create_partitioned_table(catalog, crate::spec::FormatVersion::V2).await;
-
-        let mut files = Vec::new();
-        let two_row =
-            write_data_file(&table, "two-row.parquet", 0, &[(0, 11, 110), (0, 22, 220)]).await;
-        let two_row_path = two_row.file_path().to_string();
-        files.push(two_row);
-        for index in 0..4i64 {
-            files.push(
-                write_data_file(&table, &format!("one-{index}.parquet"), 0, &[(
-                    0,
-                    30 + index,
-                    300,
-                )])
-                .await,
-            );
-        }
-        let table = append_files(catalog, &table, files).await;
-
-        let pos_delete = write_position_delete_file(&table, 0, &[(two_row_path, 0)]).await;
-        let pos_delete_path = pos_delete.file_path().to_string();
-        let table = add_deletes(catalog, &table, vec![pos_delete]).await;
-
-        // This bump is what makes the delete dangle once the data is restamped.
-        let later = write_data_file(&table, "later.parquet", 0, &[(0, 99, 990)]).await;
-        let table = append_files(catalog, &table, vec![later]).await;
-
-        assert_eq!(
-            live_delete_file_paths(&table).await,
-            HashSet::from([pos_delete_path.clone()]),
-            "fixture: exactly one live delete file before compaction"
-        );
-        (table, pos_delete_path)
-    }
-
-    /// The flag defaults off, so no caller gets a delete-file GC pass it did not ask for. On a
-    /// genuinely dangling fixture the count stays 0, the delete file stays live, and exactly one
-    /// snapshot is added.
-    #[tokio::test]
-    async fn test_remove_dangling_deletes_defaults_off() {
-        let (catalog, _temp) = local_fs_catalog().await;
-        let (table, pos_delete_path) = dangling_after_compaction_fixture(&catalog).await;
-
-        let rows_before = scan_rows(&table).await;
-        let snapshots_before = table.metadata().snapshots().count();
-
-        let result = RewriteDataFiles::new(table.clone())
-            .target_file_size_bytes(1_000_000)
-            .execute(&catalog)
-            .await
-            .expect("compaction must succeed");
-
-        assert_eq!(
-            result.rewritten_data_files_count, 6,
-            "fixture: all 6 files formed one group and were rewritten"
-        );
-        assert_eq!(
-            result.removed_delete_files_count, 0,
-            "the sub-action did not run, so nothing was removed"
-        );
-
-        let table = catalog.load_table(table.identifier()).await.unwrap();
-        assert_eq!(
-            live_delete_file_paths(&table).await,
-            HashSet::from([pos_delete_path]),
-            "the dangling delete file survives (population: the table's 1 delete file)"
-        );
-        assert_eq!(
-            table.metadata().snapshots().count(),
-            snapshots_before + 1,
-            "exactly one new snapshot — the lone group's rewrite commit, no GC commit \
-             (population: 1 partition ⇒ 1 group ⇒ 1 commit)"
-        );
-        assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
-    }
-
-    /// The flag must compose something, not just be accepted. With it set, the count is 1, the
-    /// delete file is gone, a second snapshot lands, and the rows read identically.
-    #[tokio::test]
-    async fn test_remove_dangling_deletes_on_removes_the_dangling_delete() {
-        let (catalog, _temp) = local_fs_catalog().await;
-        let (table, pos_delete_path) = dangling_after_compaction_fixture(&catalog).await;
-
-        let rows_before = scan_rows(&table).await;
-        let snapshots_before = table.metadata().snapshots().count();
-
-        let result = RewriteDataFiles::new(table.clone())
-            .target_file_size_bytes(1_000_000)
-            .remove_dangling_deletes(true)
-            .execute(&catalog)
-            .await
-            .expect("compaction + dangling removal must succeed");
-
-        assert_eq!(
-            result.rewritten_data_files_count, 6,
-            "fixture: all 6 files formed one group and were rewritten"
-        );
-        assert_eq!(
-            result.removed_delete_files_count, 1,
-            "the one dangling delete file was removed (population: the table's 1 delete file)"
-        );
-
-        let table = catalog.load_table(table.identifier()).await.unwrap();
-        assert!(
-            live_delete_file_paths(&table).await.is_empty(),
-            "no delete file is live any more; the removed one was {pos_delete_path}"
-        );
-        assert_eq!(
-            table.metadata().snapshots().count(),
-            snapshots_before + 2,
-            "two new snapshots: the group's rewrite commit, then the GC commit"
-        );
-        assert_eq!(
-            scan_rows(&table).await,
-            rows_before,
-            "row conservation: dangling-delete GC never changes the read result"
-        );
-    }
-
-    /// The flag must not force an empty extra snapshot, nor remove a delete Java keeps. Without the
-    /// sequence bump the data restamps to the delete's own number, so Java's strict `<` clause does
-    /// not fire even though the referenced data file is gone. The sub-action finds and commits
-    /// nothing.
-    #[tokio::test]
-    async fn test_remove_dangling_deletes_on_with_nothing_dangling_commits_no_snapshot() {
-        let (catalog, _temp) = local_fs_catalog().await;
-        let table = create_partitioned_table(&catalog, crate::spec::FormatVersion::V2).await;
-
-        let mut files = Vec::new();
-        let two_row =
-            write_data_file(&table, "two-row.parquet", 0, &[(0, 11, 110), (0, 22, 220)]).await;
-        let two_row_path = two_row.file_path().to_string();
-        files.push(two_row);
-        for index in 0..4i64 {
-            files.push(
-                write_data_file(&table, &format!("one-{index}.parquet"), 0, &[(
-                    0,
-                    30 + index,
-                    300,
-                )])
-                .await,
-            );
-        }
-        let table = append_files(&catalog, &table, files).await;
-        let pos_delete = write_position_delete_file(&table, 0, &[(two_row_path, 0)]).await;
-        let pos_delete_path = pos_delete.file_path().to_string();
-        let table = add_deletes(&catalog, &table, vec![pos_delete]).await;
-
-        let rows_before = scan_rows(&table).await;
-        let snapshots_before = table.metadata().snapshots().count();
-
-        let result = RewriteDataFiles::new(table.clone())
-            .target_file_size_bytes(1_000_000)
-            .remove_dangling_deletes(true)
-            .execute(&catalog)
-            .await
-            .expect("compaction must succeed");
-
-        assert_eq!(
-            result.rewritten_data_files_count, 5,
-            "fixture: all 5 files formed one group and were rewritten"
-        );
-        assert_eq!(
-            result.removed_delete_files_count, 0,
-            "nothing dangled by Java's predicate (population: the table's 1 delete file)"
-        );
-
-        let table = catalog.load_table(table.identifier()).await.unwrap();
-        assert_eq!(
-            live_delete_file_paths(&table).await,
-            HashSet::from([pos_delete_path]),
-            "the same-sequence delete is KEPT — Java's position clause is STRICT `<`"
-        );
-        assert_eq!(
-            table.metadata().snapshots().count(),
-            snapshots_before + 1,
-            "exactly one new snapshot: the group's rewrite commit. The sub-action ran and found \
-             nothing, and an empty dangling set commits NOTHING (Java commits only when the set is \
-             non-empty) — so there is no empty GC snapshot"
-        );
-        assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
-    }
-
-    /// An empty plan must not run the GC pass, because Java returns its empty result first. The
-    /// table carries a genuinely dangling delete, so "nothing ran" is observable: a non-empty plan
-    /// would remove that same delete.
-    #[tokio::test]
-    async fn test_empty_plan_skips_the_dangling_step_entirely() {
-        let (catalog, _temp) = local_fs_catalog().await;
-        let table = create_partitioned_table(&catalog, crate::spec::FormatVersion::V2).await;
-
-        // Partition x=0: one well-sized file that is not a rewrite candidate.
-        let rows: Vec<(i64, i64, i64)> = (0..100).map(|n| (0, n, n)).collect();
-        let well_sized = write_data_file(&table, "ok.parquet", 0, &rows).await;
-        let well_sized_size = well_sized.file_size_in_bytes();
-        // Partition x=1: a small file that will be dropped, orphaning its position delete.
-        let doomed = write_data_file(&table, "doomed.parquet", 1, &[(1, 5, 50), (1, 6, 60)]).await;
-        let doomed_path = doomed.file_path().to_string();
-        let table = append_files(&catalog, &table, vec![well_sized, doomed.clone()]).await;
-
-        let pos_delete = write_position_delete_file(&table, 1, &[(doomed_path, 0)]).await;
-        let pos_delete_path = pos_delete.file_path().to_string();
-        let table = add_deletes(&catalog, &table, vec![pos_delete]).await;
-        let table = remove_data_files(&catalog, &table, vec![doomed]).await;
-
-        assert_eq!(
-            live_delete_file_paths(&table).await,
-            HashSet::from([pos_delete_path.clone()]),
-            "fixture: the delete file is live and its partition now has NO live data"
-        );
-
-        let rows_before = scan_rows(&table).await;
-        let snapshots_before = table.metadata().snapshots().count();
-        let snapshot_id_before = current_snapshot_id(&table);
-
-        let result = RewriteDataFiles::new(table.clone())
-            .target_file_size_bytes(well_sized_size)
-            .min_file_size_bytes(well_sized_size / 2)
-            .max_file_size_bytes(well_sized_size * 2)
-            .remove_dangling_deletes(true)
-            .execute(&catalog)
-            .await
-            .expect("execute must succeed (no-op)");
-
-        assert_eq!(
-            result,
-            RewriteDataFilesResult::default(),
-            "an empty plan returns a zero-count result even with the flag on"
-        );
-
-        let table = catalog.load_table(table.identifier()).await.unwrap();
-        assert_eq!(
-            live_delete_file_paths(&table).await,
-            HashSet::from([pos_delete_path]),
-            "the dangling delete is UNTOUCHED — the sub-action never ran (population: the \
-             table's 1 delete file)"
-        );
-        assert_eq!(
-            table.metadata().snapshots().count(),
-            snapshots_before,
-            "no snapshot at all was committed"
-        );
-        assert_eq!(
-            current_snapshot_id(&table),
-            snapshot_id_before,
-            "the current snapshot is unchanged"
-        );
-        assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
     }
 }
