@@ -25,6 +25,27 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-17): F-OCC-SCOPED-1 filter-scoped conflict detection and retry-on-rebase (fork half)
+
+Ledger: [`f-occ-scoped-1-ledger.md`](f-occ-scoped-1-ledger.md). Rating V2-20a: a serializable
+MERGE aborts on any concurrent append because the conflict test is metrics-only (no partition
+projection), so a partition filter can never exclude a disjoint file. Fix:
+`first_conflicting_file` moves to `transaction/snapshot/conflict_filter.rs` and gates each
+concurrent file on its own spec partition projection before metrics. Retry-on-rebase,
+Java retry defaults, and never-retry-unknown were already ported. Consumer: RePark DML-5
+(run 20a, RePark half passes the MERGE/UPDATE/DELETE target filters).
+
+- [x] C-001 commit-path map + Java rule (ledger §§1–3; no Java sources on box, rule from
+      class/method names + documented contract)
+- [x] C-002 red first: 16 fault-injected pins in `transaction/occ_scoped_tests.rs`
+      (wired from `action.rs`: `mod.rs` sits on its 1948-line ceiling); 4 partition cases red
+- [x] C-003 fix + green: 16 passed; mutation A (metrics-only) 4 red of 15; mutation B
+      (no-retry) unkillable sequentially → added fail-first retry pin, B 1 red of 16
+- [x] C-004 gates + commit: `iceberg --lib` 3731 passed; datafusion lib 228 passed +
+      32 integration targets 264 passed; clippy clean both crates; fmt/typos/size/
+      comment-blocks/artifacts/anchors green; no GAP_MATRIX flip
+- [ ] C-005 RePark hand-back `/tmp/oc-worker/ja-occ/handback-1.md` + `handback.json`
+
 ## ACTIVE (2026-09-17): F-EVO-SCAN-1 scans and DataFusion UPDATE after ADD / RENAME COLUMN
 
 Ledger: [`f-evo-scan-1-ledger.md`](f-evo-scan-1-ledger.md). After `ADD COLUMN` or

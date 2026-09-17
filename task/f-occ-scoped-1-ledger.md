@@ -117,7 +117,21 @@ was added during mutation, §6).
 
 ## 7. Gates (step 5)
 
-PASTE GATE LINES HERE.
+- `cargo test -p iceberg --lib`: 3731 passed, 0 failed, 8 ignored.
+- `cargo clippy -p iceberg --all-targets -- -D warnings`: clean, no warnings.
+- `cargo test -p iceberg-datafusion --lib`: 228 passed, 0 failed, 1 ignored.
+- `cargo test -p iceberg-datafusion --tests` (all 32 non-Docker integration targets;
+  interop suites run their offline legs, Java legs no-op without env): 264 passed,
+  0 failed, 6 ignored.
+- `cargo clippy -p iceberg-datafusion --all-targets -- -D warnings`: clean, no warnings.
+- `cargo fmt --all -- --check`: clean. `typos .`: clean.
+- `./scripts/check_rust_file_size.sh`: 485 files clean, 99 legacy ceilings
+  (`snapshot.rs` ceiling lowered 3490 → 3454; `mod.rs` wiring moved to `action.rs`
+  to hold its 1948 ceiling).
+- `./scripts/check_comment_blocks.sh`: OK. `./scripts/check_agent_artifacts.sh`: OK.
+- `./scripts/check_matrix_anchors.sh`: OK, 85 rows anchored.
+- GAP_MATRIX: no row flipped (unit-only evidence; conflict-validation interop residue on
+  rows R103/R106/R110/R146 remains). `task/todo.md`: ACTIVE F-OCC-SCOPED-1 section added.
 
 ## 8. Open questions
 

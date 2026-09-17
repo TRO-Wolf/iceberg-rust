@@ -27,18 +27,9 @@ use crate::table::Table;
 
 /// Return the first file in `files` that COULD contain records matching `conflict_filter` — the shared
 /// per-file conflict test behind the added-data, added-delete, and deleted-data validation walks.
-///
-/// Binds `conflict_filter` to `current`'s current schema ONCE (the caller's filter when `Some`, else
-/// `AlwaysTrue` = any file conflicts — the most conservative serializable check, Java
-/// `dataConflictDetectionFilter()` returning `alwaysTrue()` when no filter is set), then tests each file
-/// in two gates: the file's own spec partition projection first, the existing
-/// [`InclusiveMetricsEvaluator`] second (Java `ManifestGroup.filterData` = partition pruning plus
-/// inclusive-metrics evaluation over the file's bounds / null / nan stats). Returns the FIRST matching
-/// file (Java throws on the first conflict entry), or `None` when nothing can match (including an empty
-/// `files`).
-///
-/// `include_empty_files = true` keeps a zero-record file's evaluation conservative (it never excludes on
-/// emptiness alone). The bind happens once for the whole set, not per file.
+/// Binds the filter once (`None` = `AlwaysTrue`); per file, the file's own spec partition projection
+/// runs first, then [`InclusiveMetricsEvaluator`] (Java `ManifestGroup.filterData`). Unknown-spec files
+/// stay conflicting. Returns the first match, or `None` when nothing can match.
 pub(crate) fn first_conflicting_file(
     files: &[DataFile],
     current: &Table,
