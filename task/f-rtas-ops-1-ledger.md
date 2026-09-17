@@ -65,11 +65,34 @@ Verification record below.
 
 ## Bytecode verification
 
-PENDING.
+Verified 2026-09-17 against
+`/tmp/ic-build/.ivy2/jars/org.apache.iceberg_iceberg-spark-runtime-4.1_2.13-1.11.0.jar`
+with `/usr/lib/jvm/zulu-17-amd64/bin/javap -c -p`:
+
+- `BaseOverwriteFiles.operation()`: `delete` iff deletes && !adds; `append`
+  iff adds && !deletes; else `overwrite`.
+- `MergingSnapshotProducer.deletesDataFiles()` forwards to
+  `ManifestFilterManager.containsDeletes()`: true when deletePaths non-empty,
+  deleteFiles non-empty, deleteExpression != alwaysFalse, or dropPartitions
+  non-empty. A SET row filter counts as a delete BEFORE any file resolves.
+- `SparkWrite$OverwriteByFilter.commit` calls `table.newOverwrite()`,
+  then `overwriteByRowFilter(overwriteExpr)`, then `addFile` per file.
+- `SnapshotProducer` bytecode carries no empty-commit rejection string: Java
+  commits the filter-requested empty overwrite as a `delete` snapshot. The
+  fork's `manifest_file` truly-empty guard is Rust-side and must yield when a
+  row filter was requested.
 
 ## Red run (base tree)
 
-PENDING.
+`cargo test -p iceberg --lib transaction::staged_table` on the base tree
+plus the new `staged_table_rtas_ops_tests.rs` (6 tests, API absent):
+
+- 4x `error[E0599]: no method named with_replace_write found for struct
+  StagedTableTransaction` (the four replace-write tests).
+- The two no-flag tests
+  (`create_without_replace_write_stays_append`,
+  `create_empty_without_flag_commits_no_snapshot`) compile; they pin C-004
+  and measure empty-CTAS behavior.
 
 ## Implementation notes
 

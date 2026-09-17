@@ -368,6 +368,10 @@ fn parse_format_version_property(raw: &str) -> Result<FormatVersion> {
 mod version_tests;
 
 #[cfg(test)]
+#[path = "staged_table_rtas_ops_tests.rs"]
+mod rtas_ops_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
