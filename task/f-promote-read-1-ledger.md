@@ -141,6 +141,7 @@ Named residue (not reachable from RePark's writers, recorded for a later unit):
 | C-007 | An equality delete written after the promotion applies to a pre-promotion data file in the same partition. | `equality_delete_written_after_promotion_applies_to_a_pre_promotion_partition`; red on base. | EXECUTION PROVEN |
 | C-008 | `ReplacePartitions` after the promotion drops the pre-promotion file of the replaced partition; `overwrite_by_row_filter(id = 7)` replaces the promoted identity partition and keeps the other one. | `replace_partitions_after_promotion_drops_the_pre_promotion_partition`, `overwrite_by_row_filter_on_a_promoted_identity_partition_replaces_it`; red on base. | EXECUTION PROVEN |
 | C-010 | `iceberg-datafusion` `UPDATE` and `DELETE`, copy-on-write and merge-on-read, on a table holding only pre-promotion files update and delete the matching rows instead of failing `column types must match schema types, expected Int64 but found Int32`. | `tests/promoted_type_dml.rs` (4 pins); red on `7e027cca`. | EXECUTION PROVEN |
+| C-011 | After a legal identity-source promotion (`p INT -> LONG`), the inspect tables `files`, `entries` and `partitions` answer pre-promotion tuples as promoted `Long` values (one partition row per value) instead of failing `DataInvalid`. | `inspect::promoted_partition_tests` (3 pins in `crates/iceberg/src/inspect/promoted_partition_tests.rs`); red below. | RED PROVEN |
 | C-009 | Gates: the pins green after the fix, `cargo test -p iceberg --lib`, `cargo clippy -p iceberg --all-targets -- -D warnings`, `cargo fmt`, the Rust file-size check, the comment fence. | Command -> result below. | EXECUTION PROVEN |
 
 ## Base-red evidence
@@ -297,3 +298,24 @@ CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --test 
 ```
 
 The rebase kept the unit green; the L-01 inspect seam below is still open.
+
+## L-01 red evidence (run 20a)
+
+New pins `crates/iceberg/src/inspect/promoted_partition_tests.rs` (test-only
+module, wired `#[cfg(test)]` in `inspect/mod.rs`; the `files.rs` / `entries.rs` /
+`partitions.rs` / `data_file.rs` files sit exactly at their size ceilings, so a
+sibling file is the ceiling-respecting home): identity `p INT`, two files
+(`Int(1)` records 1, `Int(22)` records 2), `update_column("p", Long)`, one file
+(`Long(3000000000)` records 3).
+
+```
+CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg --lib inspect::promoted_partition_tests
+  -> test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 3701 filtered out
+  files scan: DataInvalid => partition literal Int(1) does not match its partition field type
+  partitions scan: DataInvalid => partition literal Int(1) does not match its partition field type
+  (entries fails on the same extract)
+```
+
+Byte-identical to the critic's measured L-01 error. First run also caught a
+fixture bug of mine (TempDir guard dropped at helper return → missing `.avro`);
+fixed by returning the guard, so the red above is the seam, not the harness.

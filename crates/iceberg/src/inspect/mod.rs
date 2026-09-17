@@ -31,6 +31,8 @@ mod metadata_table;
 mod partition_summary;
 mod partitions;
 mod position_deletes;
+#[cfg(test)]
+mod promoted_partition_tests;
 mod readable_metrics;
 mod refs;
 mod snapshots;
