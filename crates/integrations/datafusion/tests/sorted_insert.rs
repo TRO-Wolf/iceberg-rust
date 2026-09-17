@@ -15,232 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod sorted_insert_shared;
+
 use std::collections::HashMap;
-use std::ops::Not;
 use std::sync::Arc;
 
 use anyhow::Result;
-use datafusion::arrow::array::{Array, Int32Array, Int64Array, RecordBatch};
+use datafusion::arrow::array::{
+    Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::datasource::MemTable;
-use datafusion::execution::context::SessionContext;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionConfig;
-use iceberg::io::LocalFsStorageFactory;
-use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::spec::{
-    DataContentType, FormatVersion, ManifestContentType, NestedField, NullOrder, PrimitiveType,
-    Schema, SortDirection, SortField, SortOrder, TableProperties, Transform, Type,
-    UnboundPartitionSpec,
+    NestedField, NullOrder, PrimitiveType, Schema, SortDirection, SortOrder, TableProperties,
+    Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::transform::create_transform_function;
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_datafusion::IcebergCatalogProvider;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use tempfile::TempDir;
-
-fn sort_field(
-    source_id: i32,
-    transform: Transform,
-    direction: SortDirection,
-    null_order: NullOrder,
-) -> SortField {
-    SortField::builder()
-        .source_id(source_id)
-        .transform(transform)
-        .direction(direction)
-        .null_order(null_order)
-        .build()
-}
-
-fn id_schema() -> Schema {
-    Schema::builder()
-        .with_schema_id(0)
-        .with_fields(vec![
-            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            NestedField::required(2, "p", Type::Primitive(PrimitiveType::Int)).into(),
-        ])
-        .build()
-        .expect("id schema")
-}
-
-fn id_arrow_schema() -> Arc<ArrowSchema> {
-    Arc::new(ArrowSchema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("p", DataType::Int32, false),
-    ]))
-}
-
-fn shuffled_ids(count: i64) -> Vec<i64> {
-    (0..count).map(|index| (index * 7919) % count).collect()
-}
-
-fn id_batches(ids: &[i64]) -> Vec<RecordBatch> {
-    let batch = RecordBatch::try_new(id_arrow_schema(), vec![
-        Arc::new(Int64Array::from(ids.to_vec())),
-        Arc::new(Int32Array::from(
-            ids.iter()
-                .map(|id| i32::try_from(id % 2).expect("partition value fits i32"))
-                .collect::<Vec<_>>(),
-        )),
-    ])
-    .expect("id batch");
-    vec![batch]
-}
-
-struct Fixture {
-    context: SessionContext,
-    catalog: Arc<MemoryCatalog>,
-    ident: TableIdent,
-    namespace: String,
-    table: String,
-    _warehouse: TempDir,
-}
-
-async fn fixture(
-    namespace: &str,
-    table: &str,
-    schema: Schema,
-    partition_spec: UnboundPartitionSpec,
-    sort_order: Option<SortOrder>,
-    target_partitions: usize,
-) -> Result<Fixture> {
-    let warehouse = TempDir::new().expect("warehouse");
-    let warehouse_path = warehouse
-        .path()
-        .to_str()
-        .expect("warehouse path is UTF-8")
-        .to_string();
-    let catalog = MemoryCatalogBuilder::default()
-        .with_storage_factory(Arc::new(LocalFsStorageFactory))
-        .load(
-            "memory",
-            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
-        )
-        .await?;
-    let namespace_ident = NamespaceIdent::new(namespace.to_string());
-    catalog
-        .create_namespace(&namespace_ident, HashMap::new())
-        .await?;
-    let creation = TableCreation::builder()
-        .name(table.to_string())
-        .location(format!("{warehouse_path}/{table}"))
-        .schema(schema)
-        .partition_spec(partition_spec)
-        .sort_order_opt(sort_order)
-        .format_version(FormatVersion::V2)
-        .properties(HashMap::from([(
-            TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED.to_string(),
-            "true".to_string(),
-        )]));
-    catalog
-        .create_table(&namespace_ident, creation.build())
-        .await?;
-    let catalog = Arc::new(catalog);
-    let provider = Arc::new(IcebergCatalogProvider::try_new(catalog.clone()).await?);
-    let context = SessionContext::new_with_config(
-        SessionConfig::new().with_target_partitions(target_partitions),
-    );
-    context.register_catalog("catalog", provider);
-    Ok(Fixture {
-        context,
-        catalog,
-        ident: TableIdent::new(namespace_ident, table.to_string()),
-        namespace: namespace.to_string(),
-        table: table.to_string(),
-        _warehouse: warehouse,
-    })
-}
-
-async fn run_insert(fixture: &Fixture, source: MemTable, select: &str) -> Result<()> {
-    fixture
-        .context
-        .register_table("source", Arc::new(source))
-        .expect("register source");
-    fixture
-        .context
-        .sql(&format!(
-            "INSERT INTO catalog.{}.{} {select}",
-            fixture.namespace, fixture.table
-        ))
-        .await?
-        .collect()
-        .await?;
-    Ok(())
-}
-
-fn local_path(file_path: &str) -> &str {
-    file_path.strip_prefix("file://").unwrap_or(file_path)
-}
-
-async fn live_files(fixture: &Fixture) -> Result<Vec<(String, Option<i32>)>> {
-    let table = fixture.catalog.load_table(&fixture.ident).await?;
-    let snapshot = table
-        .metadata()
-        .current_snapshot()
-        .expect("insert commits one snapshot");
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), table.metadata())
-        .await?;
-    let mut files = Vec::new();
-    for manifest_file in manifest_list.entries() {
-        if manifest_file.content != ManifestContentType::Data {
-            continue;
-        }
-        let manifest = manifest_file.load_manifest(table.file_io()).await?;
-        for entry in manifest.entries() {
-            if !entry.is_alive() || entry.data_file().content_type() != DataContentType::Data {
-                continue;
-            }
-            files.push((
-                entry.data_file().file_path().to_string(),
-                entry.data_file().sort_order_id(),
-            ));
-        }
-    }
-    Ok(files)
-}
-
-async fn default_order_id(fixture: &Fixture) -> Result<i32> {
-    let table = fixture.catalog.load_table(&fixture.ident).await?;
-    i32::try_from(table.metadata().default_sort_order_id()).map_err(anyhow::Error::from)
-}
-
-fn read_long_column(path: &str, index: usize) -> Vec<i64> {
-    let file = std::fs::File::open(local_path(path)).expect("open data file");
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .expect("parquet reader")
-        .build()
-        .expect("build reader");
-    let mut values = Vec::new();
-    for batch in reader {
-        let batch = batch.expect("read batch");
-        let column = batch
-            .column(index)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("long column");
-        for row in 0..batch.num_rows() {
-            assert!(!column.is_null(row), "expected non-null id in {path}");
-            values.push(column.value(row));
-        }
-    }
-    values
-}
-
-fn writer_input_is_sort(plan: &Arc<dyn ExecutionPlan>) -> Option<bool> {
-    if plan.name() == "IcebergWriteExec" {
-        return plan
-            .children()
-            .first()
-            .map(|child| child.name() == "SortExec");
-    }
-    plan.children().into_iter().find_map(writer_input_is_sort)
-}
-
-fn unpartitioned_spec() -> UnboundPartitionSpec {
-    UnboundPartitionSpec::builder().with_spec_id(0).build()
-}
+use sorted_insert_shared::{
+    default_order_id, fixture, fixture_with_props, id_arrow_schema, id_batches, id_schema,
+    live_files, read_int_column, read_long_column, read_nullable_long_column, run_insert,
+    shuffled_ids, sort_field, unpartitioned_spec, writer_input_is_sort,
+};
 
 fn nulls_schema() -> Schema {
     Schema::builder()
@@ -258,48 +53,6 @@ fn nulls_arrow_schema() -> Arc<ArrowSchema> {
         Field::new("a", DataType::Int32, true),
         Field::new("b", DataType::Int64, true),
     ]))
-}
-
-fn read_int_column(path: &str, index: usize) -> Vec<Option<i32>> {
-    let file = std::fs::File::open(local_path(path)).expect("open data file");
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .expect("parquet reader")
-        .build()
-        .expect("build reader");
-    let mut values = Vec::new();
-    for batch in reader {
-        let batch = batch.expect("read batch");
-        let column = batch
-            .column(index)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("int column");
-        for row in 0..batch.num_rows() {
-            values.push(column.is_null(row).not().then(|| column.value(row)));
-        }
-    }
-    values
-}
-
-fn read_nullable_long_column(path: &str, index: usize) -> Vec<Option<i64>> {
-    let file = std::fs::File::open(local_path(path)).expect("open data file");
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .expect("parquet reader")
-        .build()
-        .expect("build reader");
-    let mut values = Vec::new();
-    for batch in reader {
-        let batch = batch.expect("read batch");
-        let column = batch
-            .column(index)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("long column");
-        for row in 0..batch.num_rows() {
-            values.push(column.is_null(row).not().then(|| column.value(row)));
-        }
-    }
-    values
 }
 
 #[tokio::test]
@@ -653,5 +406,316 @@ async fn insert_into_bucket_order_sorts_by_bucket_then_id() -> Result<()> {
         Some(default_order_id(&fixture).await?),
         "data file stamps the default sort order id"
     );
+    Ok(())
+}
+
+fn float_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "k", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "f", Type::Primitive(PrimitiveType::Float)).into(),
+        ])
+        .build()
+        .expect("float schema")
+}
+
+fn double_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "k", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "f", Type::Primitive(PrimitiveType::Double)).into(),
+        ])
+        .build()
+        .expect("double schema")
+}
+
+fn float_arrow_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("f", DataType::Float32, true),
+    ]))
+}
+
+fn double_arrow_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("f", DataType::Float64, true),
+    ]))
+}
+
+fn spark_float_keys() -> Vec<Option<f32>> {
+    vec![
+        Some(f32::NAN),
+        Some(-1.0),
+        Some(f32::from_bits(0xFFC0_0000)),
+        Some(1.0),
+        Some(f32::INFINITY),
+        Some(-0.0),
+        Some(0.0),
+        None,
+        Some(f32::NEG_INFINITY),
+    ]
+}
+
+fn spark_double_keys() -> Vec<Option<f64>> {
+    vec![
+        Some(f64::NAN),
+        Some(-1.0),
+        Some(f64::from_bits(0xFFF8_0000_0000_0000)),
+        Some(1.0),
+        Some(f64::INFINITY),
+        Some(-0.0),
+        Some(0.0),
+        None,
+        Some(f64::NEG_INFINITY),
+    ]
+}
+
+fn float_source() -> MemTable {
+    let batch = RecordBatch::try_new(float_arrow_schema(), vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9])),
+        Arc::new(Float32Array::from(spark_float_keys())),
+    ])
+    .expect("float batch");
+    MemTable::try_new(float_arrow_schema(), vec![vec![batch]]).expect("float source")
+}
+
+fn double_source() -> MemTable {
+    let batch = RecordBatch::try_new(double_arrow_schema(), vec![
+        Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9])),
+        Arc::new(Float64Array::from(spark_double_keys())),
+    ])
+    .expect("double batch");
+    MemTable::try_new(double_arrow_schema(), vec![vec![batch]]).expect("double source")
+}
+
+fn read_key_order(path: &str) -> Vec<i32> {
+    read_int_column(path, 0)
+        .into_iter()
+        .map(|key| key.expect("non-null k"))
+        .collect()
+}
+
+#[tokio::test]
+async fn insert_into_float_order_sorts_nan_last_asc() -> Result<()> {
+    let order = SortOrder::builder()
+        .with_sort_field(sort_field(
+            2,
+            Transform::Identity,
+            SortDirection::Ascending,
+            NullOrder::First,
+        ))
+        .build(&float_schema())?;
+    let fixture = fixture(
+        "sorted_float",
+        "t",
+        float_schema(),
+        unpartitioned_spec(),
+        Some(order),
+        1,
+    )
+    .await?;
+    run_insert(&fixture, float_source(), "SELECT k, f FROM source").await?;
+
+    let files = live_files(&fixture).await?;
+    assert_eq!(files.len(), 1, "one writer stream writes one file");
+    let keys = read_key_order(&files[0].0);
+    let mut nan_pair = keys[7..].to_vec();
+    nan_pair.sort_unstable();
+    assert_eq!(
+        nan_pair,
+        vec![1, 3],
+        "both NaN rows sort last under ASC, sign and payload ignored"
+    );
+    assert_eq!(
+        keys[..7],
+        vec![8, 9, 2, 6, 7, 4, 5],
+        "float ASC NULLS FIRST matches the Spark file order"
+    );
+    assert_eq!(
+        files[0].1,
+        Some(default_order_id(&fixture).await?),
+        "data file stamps the default sort order id"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_into_double_order_sorts_nan_last_asc() -> Result<()> {
+    let order = SortOrder::builder()
+        .with_sort_field(sort_field(
+            2,
+            Transform::Identity,
+            SortDirection::Ascending,
+            NullOrder::First,
+        ))
+        .build(&double_schema())?;
+    let fixture = fixture(
+        "sorted_double",
+        "t",
+        double_schema(),
+        unpartitioned_spec(),
+        Some(order),
+        1,
+    )
+    .await?;
+    run_insert(&fixture, double_source(), "SELECT k, f FROM source").await?;
+
+    let files = live_files(&fixture).await?;
+    assert_eq!(files.len(), 1, "one writer stream writes one file");
+    let keys = read_key_order(&files[0].0);
+    let mut nan_pair = keys[7..].to_vec();
+    nan_pair.sort_unstable();
+    assert_eq!(
+        nan_pair,
+        vec![1, 3],
+        "both NaN rows sort last under ASC, sign and payload ignored"
+    );
+    assert_eq!(
+        keys[..7],
+        vec![8, 9, 2, 6, 7, 4, 5],
+        "double ASC NULLS FIRST matches the Spark file order"
+    );
+    assert_eq!(
+        files[0].1,
+        Some(default_order_id(&fixture).await?),
+        "data file stamps the default sort order id"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_into_float_order_sorts_nan_first_desc() -> Result<()> {
+    let order = SortOrder::builder()
+        .with_sort_field(sort_field(
+            2,
+            Transform::Identity,
+            SortDirection::Descending,
+            NullOrder::Last,
+        ))
+        .build(&float_schema())?;
+    let fixture = fixture(
+        "sorted_float_desc",
+        "t",
+        float_schema(),
+        unpartitioned_spec(),
+        Some(order),
+        1,
+    )
+    .await?;
+    run_insert(&fixture, float_source(), "SELECT k, f FROM source").await?;
+
+    let files = live_files(&fixture).await?;
+    assert_eq!(files.len(), 1, "one writer stream writes one file");
+    let keys = read_key_order(&files[0].0);
+    let mut nan_pair = keys[..2].to_vec();
+    nan_pair.sort_unstable();
+    assert_eq!(
+        nan_pair,
+        vec![1, 3],
+        "both NaN rows sort first under DESC, sign and payload ignored"
+    );
+    assert_eq!(
+        keys[2..],
+        vec![5, 4, 7, 6, 2, 9, 8],
+        "float DESC NULLS LAST mirrors the ASC Spark order"
+    );
+    assert_eq!(
+        files[0].1,
+        Some(default_order_id(&fixture).await?),
+        "data file stamps the default sort order id"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_into_double_order_sorts_nan_first_desc() -> Result<()> {
+    let order = SortOrder::builder()
+        .with_sort_field(sort_field(
+            2,
+            Transform::Identity,
+            SortDirection::Descending,
+            NullOrder::Last,
+        ))
+        .build(&double_schema())?;
+    let fixture = fixture(
+        "sorted_double_desc",
+        "t",
+        double_schema(),
+        unpartitioned_spec(),
+        Some(order),
+        1,
+    )
+    .await?;
+    run_insert(&fixture, double_source(), "SELECT k, f FROM source").await?;
+
+    let files = live_files(&fixture).await?;
+    assert_eq!(files.len(), 1, "one writer stream writes one file");
+    let keys = read_key_order(&files[0].0);
+    let mut nan_pair = keys[..2].to_vec();
+    nan_pair.sort_unstable();
+    assert_eq!(
+        nan_pair,
+        vec![1, 3],
+        "both NaN rows sort first under DESC, sign and payload ignored"
+    );
+    assert_eq!(
+        keys[2..],
+        vec![5, 4, 7, 6, 2, 9, 8],
+        "double DESC NULLS LAST mirrors the ASC Spark order"
+    );
+    assert_eq!(
+        files[0].1,
+        Some(default_order_id(&fixture).await?),
+        "data file stamps the default sort order id"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_into_unknown_transform_order_writes_with_zero_stamp() -> Result<()> {
+    let order = SortOrder::builder()
+        .with_sort_field(sort_field(
+            1,
+            Transform::Unknown,
+            SortDirection::Ascending,
+            NullOrder::First,
+        ))
+        .build(&id_schema())?;
+    let fixture = fixture_with_props(
+        "sorted_unknown",
+        "t",
+        id_schema(),
+        unpartitioned_spec(),
+        Some(order),
+        1,
+        HashMap::from([(
+            TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED.to_string(),
+            "false".to_string(),
+        )]),
+    )
+    .await?;
+    let plan = fixture
+        .context
+        .sql("INSERT INTO catalog.sorted_unknown.t SELECT CAST(1 AS BIGINT) AS id, 1 AS p")
+        .await?
+        .create_physical_plan()
+        .await?;
+    assert_eq!(
+        writer_input_is_sort(&plan),
+        Some(false),
+        "an unresolvable order adds no SortExec"
+    );
+    let ids = shuffled_ids(100);
+    let source = MemTable::try_new(id_arrow_schema(), vec![id_batches(&ids)])?;
+    run_insert(&fixture, source, "SELECT id, p FROM source").await?;
+
+    let files = live_files(&fixture).await?;
+    assert_eq!(files.len(), 1);
+    for (_, stamp) in &files {
+        assert_eq!(*stamp, Some(0), "unresolvable order stamps order id 0");
+    }
     Ok(())
 }

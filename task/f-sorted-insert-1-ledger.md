@@ -133,3 +133,108 @@ default sort order writes UNSORTED files with manifest `sort_order_id` NULL.
   checker requires).
 - Neighbour suites: `insert_distribution` 7 passed, `fanout_insert_order` 1 passed,
   `partitioned_insert_select_test` 12 passed.
+
+## Round 2 (remediation, 2026-09-17, base `27afcba4`)
+
+Model: muse-spark-1.3-contributor. Critic report `/tmp/oc-worker/ic-rv/sort-logic-1-report.md`
+(Grok 4.6 critic-logic, run 19c). Oracle float measurement
+`/tmp/oc-worker/ic-build/nan_sort_spark.json` (probe `nan_sort_probe.py` beside it; PySpark 4.1.2
++ Iceberg 1.11.0, single task): table `(k INT, f FLOAT|DOUBLE)` `WRITE ORDERED BY f ASC NULLS
+FIRST`, appended k→f 1→NaN, 2→-1.0, 3→-NaN (`0xFFC00000` / `0xFFF8000000000000`), 4→1.0, 5→+Inf,
+6→-0.0, 7→0.0, 8→NULL, 9→-Inf. Spark file order by k: **[8, 9, 2, 6, 7, 4, 5, 1, 3]** for both
+types — NULL, -Inf, -1, -0.0, 0.0, 1, +Inf, then every NaN (any sign/payload) as one greatest
+value, ties in input order.
+
+- L-01 [P1]: float/double keys now sort through `CanonicalFloatExpr`
+  (`physical_plan/sort.rs`), which maps every NaN to +NaN before the sort and passes all other
+  values (including -0.0) through. The wrap applies to any key whose Arrow type is Float32/Float64
+  (identity today; no Iceberg transform yields a float — bucket→int, temporal→int/date,
+  truncate rejects float/double — so the wrap is future-proofing, not a live second path). ASC
+  puts the canonical NaN last under Arrow totalOrder; DESC (same key, reversed `SortOptions`)
+  puts it first, which is Java's reversed comparator. Pins: `insert_into_float/double_order_sorts_nan_last_asc`
+  (first seven keys exact `[8, 9, 2, 6, 7, 4, 5]`, NaN pair as a set) and the DESC twins
+  (`insert_into_float/double_order_sorts_nan_first_desc`: NaN pair first as a set, tail exact
+  `[5, 4, 7, 6, 2, 9, 8]`). The NaN pair is asserted as a set because Arrow `sort` is documented
+  unstable and Iceberg requires no tie stability (critic §attack-1, not a finding); the measured
+  run orders them `[1, 3]`, matching the oracle's input-order tie.
+- L-02 [P2]: `write_sort_plan` resolves `source_id` with `Schema::field_by_id` (nested struct
+  children included) and locates the top-level Arrow column through `sort_source_path`, an
+  explicit-stack walk that returns the top name plus the child path (iterative, so no depth
+  argument is needed). A nested key sorts through `NestedFieldExpr`, which extracts the child
+  per row and nulls the key where any enclosing struct is null (`nullif` with the parent
+  validity, mirroring Java `SortKey` on a null parent). A two-key order with one nested key
+  sorts by both keys. Pins: `insert_into_nested_identity_order_sorts_by_child` (null parent
+  sorts as null first; the garbage child value 999 under the null parent proves the
+  propagation) and `insert_into_two_key_order_with_nested_key_sorts_by_both`. Fanout-off
+  regression fixed: `write_input_without_default_sort` returns the input as-is when the plan
+  carries no `_partition` column (unpartitioned tables never project one), instead of erroring
+  `_partition not found`. Pin: `insert_into_unknown_transform_order_writes_with_zero_stamp`
+  runs with `fanout.enabled=false` on an unpartitioned table.
+- L-03 [P2]: new pins in `sorted_insert_types.rs` (string, decimal, timestamptz, boolean, binary
+  identity; truncate on string and decimal; day/hour on timestamp; NULL through bucket) and
+  `sorted_insert_writer.rs` (nested ×2, rolling split, Overwrite, fanout disabled). Shared
+  fixture/readers live in `tests/sorted_insert_shared/mod.rs`, reused by all three binaries via
+  `mod sorted_insert_shared` (the `rewrite_size_shared` pattern). `javap -c -p` of
+  `org.apache.iceberg.types.Comparators` in
+  `/tmp/ic-build/.ivy2/jars/org.apache.iceberg_iceberg-spark-runtime-4.1_2.13-1.11.0.jar`
+  (this lane, 1.11.0): `<clinit>` maps Boolean/Integer/Long/Float/Double/Date/Time/Timestamp
+  with and without zone (plus nano variants)/UUID to `naturalOrder`, String to `charSequences`,
+  Binary to `unsignedBytes`, Decimal to `naturalOrder` (the `forType(PrimitiveType)` fallback),
+  Unknown to `naturalOrder` wrapped `nullsFirst`. `CharSeqComparator.compare` walks `charAt`
+  with a high-surrogate bias (lone high surrogate sorts after a non-surrogate; both-high or
+  neither compares `Character.compare`), which orders well-formed strings exactly like UTF-8
+  unsigned bytes — the string pin (`a < b < ä < 𝄞`, BMP before supplementary) rests on that
+  equivalence, verified, not recalled. Spark's file order is Spark SQL's ordering for the sort
+  expression, not the Iceberg comparator: for identity keys over these types both orders agree
+  (Spark float ordering is `Float.compare`; Spark 4 strings are `UTF8_BINARY`; decimals compare
+  numerically; timestamps compare instants; booleans `false < true`; binaries compare unsigned).
+  Where they could differ: bucket/temporal/truncate keys sort by the Spark expression result —
+  the fork sorts the same Iceberg transform result, and the bucket/decimal-truncate pins assert
+  sortedness-by-key (same-function key oracle, independent order property), not Spark's exact
+  bytes. No Spark oracle cell covers these types in this lane; the pins are unit-level.
+- L-04 [P3]: every unresolvable-order fallback in `write_sort_plan` now stamps `Some(0)` (was
+  `None`), matching Java `DataFiles.Builder` defaulting `sortOrderId` to 0. After L-02 the only
+  reachable fallback is `Unknown` (plus truly missing columns, which a bound default order
+  cannot name). Pin: the unknown-transform test asserts `Some(0)` with no `SortExec`.
+
+## Round 2 red phase (base `27afcba4`, before the fix)
+
+- `insert_into_float_order_sorts_nan_last_asc`: tail `[1, 5]` vs `{1, 3}` — +NaN and +Inf last,
+  -NaN (k=3) displaced forward (Arrow totalOrder). All four float/double ASC/DESC pins red.
+- `insert_into_nested_identity_order_sorts_by_child` and
+  `insert_into_two_key_order_with_nested_key_sorts_by_both`: file rows in input order, stamp
+  `None` (nested miss aborted the whole order).
+- `insert_into_unknown_transform_order_writes_with_zero_stamp`: `Error during planning:
+  Partition column '_partition' not found in schema` (fanout-off unpartitioned fallback).
+- Green on base (regression pins, not divergence pins): string, decimal, timestamptz, boolean,
+  day, hour, truncate string/decimal, null-through-bucket, rolling, overwrite, fanout-off,
+  plus all 8 round-1 tests. Two test-authoring defects found while going red, both fixed in the
+  tests (no production change): a helper that returned file paths after dropping the fixture's
+  `TempDir` (paths dangle — helper now returns the fixture), and a `BinaryArray` downcast where
+  the parquet read-back is `LargeBinary`.
+
+## Round 2 test adequacy (one knob at a time)
+
+- M1 — `CanonicalFloatExpr` wrap removed (key passes through): 4 red out of 13
+  (`sorted_insert`; exactly the float/double ASC/DESC pins).
+- M2 — nested resolution reverted to top-level-only lookup: 2 red out of 5
+  (`sorted_insert_writer`; exactly the two nested pins).
+- M3 — unknown-transform fallback stamp back to `None`: 1 red out of 13 (the stamp assert).
+- M4 — `_partition`-presence guard removed: 1 red out of 13, failing with the exact
+  `_partition not found` planning error.
+- Restore + re-run after each: 13/10/5 green.
+- Vacuity sweep: order asserts compare production-written file bytes against hand-computed
+  oracle orders (float k-order, nested pairs, type value orders); same-function key oracles
+  (bucket, decimal-truncate) assert the independent sortedness-by-key property plus null
+  placement; stamps compare manifest entries against table-metadata read-back; shape asserts
+  (file counts, row counts, `SortExec` absence) distinguish action from read identity
+  (overwrite asserts the replaced row count 100, rolling asserts ≥2 files and 20 000 rows).
+  No `=`-null predicates. The NaN tie pair is asserted as a set (Arrow unstable sort; Iceberg
+  requires no stability) — recorded, not hidden.
+
+## Round 2 gates
+
+- `cargo test -p iceberg-datafusion --test sorted_insert`: 13 passed, 0 failed.
+- `cargo test -p iceberg-datafusion --test sorted_insert_types`: 10 passed, 0 failed.
+- `cargo test -p iceberg-datafusion --test sorted_insert_writer`: 5 passed, 0 failed.
+- (Neighbour lib/integration gates re-run at commit time; see handback.)
