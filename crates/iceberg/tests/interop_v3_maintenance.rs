@@ -50,8 +50,8 @@ use tempfile::TempDir;
 type Row = (i64, i64, i64);
 
 const SEED_NEXT_ROW_ID: i64 = 12;
-const M1_NEXT_ROW_ID: i64 = 30;
-const M2_NEXT_ROW_ID: i64 = 42;
+const M1_NEXT_ROW_ID: i64 = 24;
+const M2_NEXT_ROW_ID: i64 = 36;
 const M3_NEXT_ROW_ID: i64 = 12;
 const M4_NEXT_ROW_ID: i64 = 24;
 

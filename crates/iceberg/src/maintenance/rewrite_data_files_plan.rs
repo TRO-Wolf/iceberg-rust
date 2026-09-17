@@ -18,6 +18,7 @@
 //! Planner predicates for [`super::RewriteDataFiles`]. Java `BinPackRewriteFilePlanner`.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
@@ -44,6 +45,8 @@ pub(super) const DELETE_RATIO_THRESHOLD_DEFAULT: f64 = 0.3;
 
 pub(super) const MAX_OPEN_PARTITION_WRITERS_DEFAULT: usize = 64;
 
+pub(super) const PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT: usize = 10;
+
 /// Thresholds after defaults and preconditions.
 pub(super) struct ResolvedConfig {
     pub(super) target_file_size_bytes: u64,
@@ -54,7 +57,107 @@ pub(super) struct ResolvedConfig {
     pub(super) delete_ratio_threshold: f64,
     pub(super) max_file_group_size_bytes: u64,
     pub(super) max_open_partition_writers: usize,
+    pub(super) rewrite_all: bool,
     pub(super) file_scoped_delete_paths: HashSet<String>,
+}
+
+/// Rewrite group order (Java `RewriteDataFilesSparkAction.RewriteJobOrder`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RewriteJobOrder {
+    /// Plan order.
+    #[default]
+    None,
+    /// Ascending total input bytes.
+    BytesAsc,
+    /// Descending total input bytes.
+    BytesDesc,
+    /// Ascending input file count.
+    FilesAsc,
+    /// Descending input file count.
+    FilesDesc,
+}
+
+impl FromStr for RewriteJobOrder {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        match name.to_ascii_lowercase().replace('-', "_").as_str() {
+            "none" => Ok(RewriteJobOrder::None),
+            "bytes_asc" => Ok(RewriteJobOrder::BytesAsc),
+            "bytes_desc" => Ok(RewriteJobOrder::BytesDesc),
+            "files_asc" => Ok(RewriteJobOrder::FilesAsc),
+            "files_desc" => Ok(RewriteJobOrder::FilesDesc),
+            _ => Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Invalid rewrite job order name: {name}"),
+            )),
+        }
+    }
+}
+
+pub(crate) fn order_groups(groups: &mut [Vec<FileScanTask>], order: RewriteJobOrder) {
+    let group_bytes = |group: &Vec<FileScanTask>| {
+        group.iter().fold(0u64, |sum, task| {
+            sum.saturating_add(task.file_size_in_bytes)
+        })
+    };
+    match order {
+        RewriteJobOrder::None => {}
+        RewriteJobOrder::BytesAsc => groups.sort_by_key(group_bytes),
+        RewriteJobOrder::BytesDesc => {
+            groups.sort_by_key(|group| std::cmp::Reverse(group_bytes(group)));
+        }
+        RewriteJobOrder::FilesAsc => groups.sort_by_key(Vec::len),
+        RewriteJobOrder::FilesDesc => {
+            groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
+        }
+    }
+}
+
+pub(crate) fn plan_commit_batches(
+    group_count: usize,
+    partial_progress: bool,
+    max_commits: usize,
+) -> Vec<usize> {
+    if group_count == 0 {
+        return Vec::new();
+    }
+    if !partial_progress {
+        return vec![group_count];
+    }
+    let per_commit = group_count.div_ceil(max_commits.max(1));
+    let mut batches = Vec::new();
+    let mut remaining = group_count;
+    while remaining > 0 {
+        let take = remaining.min(per_commit);
+        batches.push(take);
+        remaining -= take;
+    }
+    batches
+}
+
+pub(crate) fn format_java_double(value: f64) -> String {
+    if value.is_nan() {
+        String::from("NaN")
+    } else if value.is_infinite() {
+        if value.is_sign_negative() {
+            String::from("-Infinity")
+        } else {
+            String::from("Infinity")
+        }
+    } else if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
+pub(super) fn plan_file_groups_for_table(
+    table: &crate::table::Table,
+    tasks: Vec<FileScanTask>,
+    config: &ResolvedConfig,
+) -> Vec<Vec<FileScanTask>> {
+    plan_file_groups(tasks, config, table.metadata().default_partition_spec())
 }
 
 /// Groups scan tasks by partition, filters candidates, bin-packs, and filters groups. Java
@@ -62,16 +165,16 @@ pub(super) struct ResolvedConfig {
 pub(super) fn plan_file_groups(
     tasks: Vec<FileScanTask>,
     config: &ResolvedConfig,
-    default_spec: &crate::spec::PartitionSpecRef,
+    grouping_spec: &crate::spec::PartitionSpecRef,
 ) -> Vec<Vec<FileScanTask>> {
-    let default_spec_id = default_spec.spec_id();
+    let grouping_spec_id = grouping_spec.spec_id();
 
-    // Java `groupByPartition` keys on the file's partition only when its spec id is the table's
-    // current default. Anything else goes in the unpartitioned bucket.
+    // Java `groupByPartition` keys on the file's partition only when its spec id is the
+    // table's current default spec. Anything else goes in the unpartitioned bucket.
     let mut by_partition: HashMap<Struct, Vec<FileScanTask>> = HashMap::new();
     for task in tasks {
         let key = match (&task.partition, task_spec_id(&task)) {
-            (Some(partition), Some(spec_id)) if spec_id == default_spec_id => partition.clone(),
+            (Some(partition), Some(spec_id)) if spec_id == grouping_spec_id => partition.clone(),
             _ => Struct::empty(),
         };
         by_partition.entry(key).or_default().push(task);
@@ -79,10 +182,14 @@ pub(super) fn plan_file_groups(
 
     let mut groups: Vec<Vec<FileScanTask>> = Vec::new();
     for (_partition, partition_tasks) in by_partition {
-        let candidates: Vec<FileScanTask> = partition_tasks
-            .into_iter()
-            .filter(|task| is_candidate(task, config))
-            .collect();
+        let candidates: Vec<FileScanTask> = if config.rewrite_all {
+            partition_tasks
+        } else {
+            partition_tasks
+                .into_iter()
+                .filter(|task| is_candidate(task, config))
+                .collect()
+        };
         if candidates.is_empty() {
             continue;
         }
@@ -94,7 +201,7 @@ pub(super) fn plan_file_groups(
         );
 
         for bin in bins {
-            if group_qualifies(&bin, config) {
+            if config.rewrite_all || group_qualifies(&bin, config) {
                 groups.push(bin);
             }
         }
