@@ -319,3 +319,31 @@ CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg --lib inspect::pro
 Byte-identical to the critic's measured L-01 error. First run also caught a
 fixture bug of mine (TempDir guard dropped at helper return → missing `.avro`);
 fixed by returning the guard, so the red above is the seam, not the harness.
+
+## L-01 fix (run 20a)
+
+New `crates/iceberg/src/inspect/partition_values.rs` (255 lines) holds the
+shared partition-tuple projection, split out of `data_file.rs` because both
+`data_file.rs` (1353) and `partitions.rs` (1508) sat exactly at their size
+ceilings: `append_partition` + `append_partition_field` + the eight extracts
+moved verbatim, plus the three `compare_*` ordering helpers moved from
+`partitions.rs`. Ceilings lowered to the new actuals (`data_file.rs` 1179,
+`partitions.rs` 1466).
+
+Two seam changes, no new coercion beyond D-1:
+
+- `append_partition` promotes the field-id-matched literal under the projected
+  primitive type (`compatible` → keep; else `promote_to` → keep iff compatible,
+  else the original loud error). Zero allocation on the compatible hot path.
+- `partitions.rs` scan promotes the coerced grouping key with the existing
+  `Struct::promoted_to` (`unwrap_or` keeps the key when nothing promotes), so
+  `Int(1)` and `Long(1)` land in one row.
+
+`partition_summary.rs` checked: it renders per-field `FieldSummary` bound
+strings through the manifest's own spec type, with no `Struct` grouping key —
+no change needed.
+
+```
+CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg --lib inspect::
+  -> test result: ok. 134 passed; 0 failed; 0 ignored; 0 measured; 3570 filtered out
+```

@@ -53,12 +53,12 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Fields};
 use futures::{StreamExt, stream};
 
-use super::data_file::append_partition;
+use super::partition_values::{append_partition, compare_partition_values};
 use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{
-    DataContentType, Literal, NestedField, PrimitiveLiteral, PrimitiveType, Schema, Struct,
-    StructType, Type, coerce_partition, select,
+    DataContentType, NestedField, PrimitiveType, Schema, Struct, StructType, Type,
+    coerce_partition, select,
 };
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
@@ -246,6 +246,7 @@ impl<'a> PartitionsTable<'a> {
                         current_schema,
                         data_file.partition(),
                     )?;
+                    let key = key.promoted_to(&partition_type).unwrap_or(key);
                     let partition = partitions
                         .entry(key.clone())
                         .or_insert_with(|| Partition::new(key));
@@ -428,49 +429,6 @@ fn partition_arrow_fields(arrow_schema: &arrow_schema::Schema) -> Result<Fields>
             format!("partitions metadata table `partition` column is not a struct: {other:?}"),
         )),
     }
-}
-
-/// Compares two partition tuples field-by-field for a deterministic row order.
-///
-/// Mirrors Java's `Comparators.forType(partitionType)` ordering for the common case: nulls sort first,
-/// then each field's primitive value is compared via [`PrimitiveLiteral`]'s `PartialOrd`. Any incomparable
-/// pair (e.g. a `NaN`, or a non-primitive partition literal — neither of which is a valid partition value)
-/// falls back to `Equal`, so the order stays total + deterministic under a stable sort. The first field
-/// that differs decides the order.
-fn compare_partition_values(left: &Struct, right: &Struct) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    let left_fields = left.fields();
-    let right_fields = right.fields();
-    let len = left_fields.len().min(right_fields.len());
-    for index in 0..len {
-        let ordering = compare_partition_field(&left_fields[index], &right_fields[index]);
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-    left_fields.len().cmp(&right_fields.len())
-}
-
-/// Compares one optional partition field value; `None` (null) sorts before any value.
-fn compare_partition_field(left: &Option<Literal>, right: &Option<Literal>) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(Literal::Primitive(left)), Some(Literal::Primitive(right))) => {
-            compare_primitive(left, right)
-        }
-        // Non-primitive partition literals are not valid partition values; keep order stable.
-        _ => Ordering::Equal,
-    }
-}
-
-/// Compares two [`PrimitiveLiteral`]s, falling back to `Equal` for an incomparable pair.
-fn compare_primitive(left: &PrimitiveLiteral, right: &PrimitiveLiteral) -> std::cmp::Ordering {
-    left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 #[cfg(test)]

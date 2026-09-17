@@ -40,16 +40,15 @@ use std::sync::Arc;
 
 use arrow_array::StructArray;
 use arrow_array::builder::{
-    ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-    Float64Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, ListBuilder, MapBuilder,
-    StringBuilder, StructBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
-    TimestampNanosecondBuilder,
+    ArrayBuilder, Int32Builder, Int64Builder, LargeBinaryBuilder, ListBuilder, MapBuilder,
+    StringBuilder, StructBuilder,
 };
 use arrow_schema::Fields;
 
+use super::partition_values::append_partition;
 use crate::spec::{
-    Datum, ListType, Literal, MapType, NestedField, NestedFieldRef, PrimitiveLiteral,
-    PrimitiveType, Schema, StructType, TableMetadata, Type, select_not,
+    Datum, ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType,
+    TableMetadata, Type, select_not,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -529,180 +528,6 @@ fn append_i32_list(builder: &mut DynListBuilder, values: Option<&[i32]>) -> Resu
     Ok(())
 }
 
-/// Appends one partition tuple to the partition [`StructBuilder`], dispatching each field on its
-/// primitive type.
-///
-/// `partition` is a bare tuple: its values are positionally aligned with `source_field_ids` — the
-/// partition-field ids of the spec the tuple was written under, in that spec's own field order (see
-/// [`partition_field_ids_by_spec`]). `partition_type` is the type the metadata table PROJECTS, which
-/// under partition evolution is a different spec's shape. Each projected field is therefore matched to
-/// the tuple BY FIELD ID; a projected field the source spec does not carry is null-filled.
-///
-/// This is the field-id half of Java `PartitionUtil.coercePartition`
-/// (`core/src/main/java/org/apache/iceberg/util/PartitionUtil.java`), which wraps the tuple in
-/// `StructProjection.createAllowMissing(spec.partitionType(), partitionType)` — a projection whose
-/// `positionMap` is built by matching field ids, and whose not-found entries read as null. Matching by
-/// POSITION instead silently writes one partition field's value into another field's column whenever
-/// the two specs agree on type but not on field id.
-///
-/// The other half of Java's coercion — projecting into the cross-spec UNIFIED partition type —
-/// is increment C: callers pass [`crate::spec::TableMetadata::unified_partition_type`] so a
-/// partition field that exists only in an older spec has a column to land in. `append_partition`
-/// itself is unchanged (PT-0 field-id walk; A1).
-///
-/// Shared in-module helper: `files`/`entries` reach it through [`DataFileStructBuilder::append`], and
-/// the `partitions` aggregating table reuses it directly for its `partition` column (Rule of Three).
-pub(super) fn append_partition(
-    builder: &mut StructBuilder,
-    partition_type: &StructType,
-    source_field_ids: &[i32],
-    partition: &crate::spec::Struct,
-) -> Result<()> {
-    for (index, field) in partition_type.fields().iter().enumerate() {
-        let primitive_type = field.field_type.as_primitive_type().ok_or_else(|| {
-            Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "partition field '{}' has non-primitive type {:?}; not supported in the data_file metadata projection",
-                    field.name, field.field_type
-                ),
-            )
-        })?;
-        let value = source_field_ids
-            .iter()
-            .position(|source_field_id| *source_field_id == field.id)
-            .and_then(|source_index| partition.fields().get(source_index))
-            .and_then(|value| value.as_ref());
-        append_partition_field(builder, index, primitive_type, value)?;
-    }
-    builder.append(true);
-    Ok(())
-}
-
-/// Appends a single partition-field value (or null) to the struct child builder at `index`, dispatching
-/// on the field's primitive type. Mirrors the Arrow types produced by `type_to_arrow_type`.
-fn append_partition_field(
-    builder: &mut StructBuilder,
-    index: usize,
-    primitive_type: &PrimitiveType,
-    value: Option<&Literal>,
-) -> Result<()> {
-    let primitive = match value {
-        Some(Literal::Primitive(primitive)) => Some(primitive),
-        Some(other) => {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!("non-primitive partition literal {other:?} is not supported"),
-            ));
-        }
-        None => None,
-    };
-
-    macro_rules! append_typed {
-        ($builder_ty:ty, $extract:expr) => {{
-            let child = builder.field_builder::<$builder_ty>(index).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("partition child builder at index {index} has an unexpected type"),
-                )
-            })?;
-            match primitive {
-                Some(primitive) => child.append_value($extract(primitive)?),
-                None => child.append_null(),
-            }
-        }};
-    }
-
-    match primitive_type {
-        PrimitiveType::Boolean => append_typed!(BooleanBuilder, extract_bool),
-        PrimitiveType::Int => append_typed!(Int32Builder, extract_i32),
-        PrimitiveType::Long => append_typed!(Int64Builder, extract_i64),
-        PrimitiveType::Float => append_typed!(Float32Builder, extract_f32),
-        PrimitiveType::Double => append_typed!(Float64Builder, extract_f64),
-        PrimitiveType::Date => append_typed!(Date32Builder, extract_i32),
-        PrimitiveType::Time => append_typed!(Time64MicrosecondBuilder, extract_i64),
-        PrimitiveType::Timestamp => append_typed!(TimestampMicrosecondBuilder, extract_i64),
-        PrimitiveType::Timestamptz => append_typed!(TimestampMicrosecondBuilder, extract_i64),
-        PrimitiveType::TimestampNs => append_typed!(TimestampNanosecondBuilder, extract_i64),
-        PrimitiveType::TimestamptzNs => append_typed!(TimestampNanosecondBuilder, extract_i64),
-        PrimitiveType::String => append_typed!(StringBuilder, extract_string),
-        PrimitiveType::Binary => append_typed!(BinaryBuilder, extract_binary),
-        PrimitiveType::Decimal { .. } => append_typed!(Decimal128Builder, extract_i128),
-        other => {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "partition field type {other:?} is not supported in the data_file metadata projection"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn type_mismatch(primitive: &PrimitiveLiteral) -> Error {
-    Error::new(
-        ErrorKind::DataInvalid,
-        format!("partition literal {primitive:?} does not match its partition field type"),
-    )
-}
-
-fn extract_bool(primitive: &PrimitiveLiteral) -> Result<bool> {
-    match primitive {
-        PrimitiveLiteral::Boolean(value) => Ok(*value),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_i32(primitive: &PrimitiveLiteral) -> Result<i32> {
-    match primitive {
-        PrimitiveLiteral::Int(value) => Ok(*value),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_i64(primitive: &PrimitiveLiteral) -> Result<i64> {
-    match primitive {
-        PrimitiveLiteral::Long(value) => Ok(*value),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_f32(primitive: &PrimitiveLiteral) -> Result<f32> {
-    match primitive {
-        PrimitiveLiteral::Float(value) => Ok(value.into_inner()),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_f64(primitive: &PrimitiveLiteral) -> Result<f64> {
-    match primitive {
-        PrimitiveLiteral::Double(value) => Ok(value.into_inner()),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_string(primitive: &PrimitiveLiteral) -> Result<&str> {
-    match primitive {
-        PrimitiveLiteral::String(value) => Ok(value.as_str()),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_binary(primitive: &PrimitiveLiteral) -> Result<&[u8]> {
-    match primitive {
-        PrimitiveLiteral::Binary(value) => Ok(value.as_slice()),
-        other => Err(type_mismatch(other)),
-    }
-}
-
-fn extract_i128(primitive: &PrimitiveLiteral) -> Result<i128> {
-    match primitive {
-        PrimitiveLiteral::Int128(value) => Ok(*value),
-        other => Err(type_mismatch(other)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -715,7 +540,8 @@ mod tests {
     use arrow_schema::{DataType, TimeUnit};
     use futures::TryStreamExt;
 
-    use super::{append_partition, data_file_fields};
+    use super::super::partition_values::append_partition;
+    use super::data_file_fields;
     use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
     use crate::scan::tests::TableTestFixture;
     use crate::spec::{
