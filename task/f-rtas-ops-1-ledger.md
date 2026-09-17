@@ -127,7 +127,7 @@ plus the new `staged_table_rtas_ops_tests.rs` (6 tests, API absent):
 
 ## Gate output
 
-All green 2026-09-17 (`CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8`):
+Round 1, all green 2026-09-17 (`CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8`):
 
 - `cargo test -p iceberg --lib transaction`: 652 passed, 0 failed.
 - `cargo test -p iceberg --lib catalog`: 190 passed, 0 failed.
@@ -136,3 +136,41 @@ All green 2026-09-17 (`CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8`):
 - `make check`: exit 0 (fmt, clippy, taplo, machete, agent-artifacts,
   matrix-anchors, comment-blocks, file-size all OK).
 - `typos .`: exit 0.
+
+## Round 2 (orchestrator review of round 1)
+
+- Q-20c-1: ceilings only move DOWN. Restored the three round-1 raises and
+  moved code out instead: `staged_table.rs` inline `mod tests` (minus the F-1
+  test) into `staged_table_tests.rs` wired with `#[path]` (`mod
+  staged_tests`); `FirstRowIdPolicy` into
+  `snapshot/first_row_id_policy.rs` with a re-export;
+  `OverwriteFilesOperation` into `overwrite_files_operation.rs` as a
+  `pub(crate)` child-module struct. The F-1 test (whose 7-line comment block
+  the comment gate counts as added when moved) stays inline in
+  `staged_table.rs` verbatim with the two helpers it needs. Final ceilings:
+  staged_table row REMOVED (510 lines, under the 1000 default), snapshot
+  3490 to 3486, overwrite_files 3429 to 3383.
+- Q-20c-2: `allows_empty_commit` is now an explicit opt-in on
+  `OverwriteFilesAction` (default false, builder `allow_empty_commit()`),
+  threaded into the operation; only `StagedTableTransaction` sets it, and
+  only on the `replace_write` path. Pin test
+  `test_empty_overwrite_by_row_filter_is_rejected_without_opt_in` proves a
+  plain filter-only empty overwrite still fails `PreconditionFailed`.
+  Mutation proof: action default flipped to true gives 2 red out of 2 (the
+  pin plus the pre-existing truly-empty rejection — the flag permits any
+  empty commit when set, which only the staged path requests).
+- Rebase on `origin/main` (`5a0666b9`): clean, no conflicts. #287 took row
+  R171, so the RTAS row is now row R172 (map reference fixed; anchors green).
+
+## Round 2 gate output
+
+All green 2026-09-17 (`CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8`):
+
+- `cargo test -p iceberg --lib transaction`: 653 passed, 0 failed.
+- `cargo test -p iceberg --lib catalog`: 190 passed, 0 failed.
+- `cargo test -p iceberg-datafusion`: all suites green (228 + 20 + 7 + 1 +
+  6 + 1 + 5 + 4 + 7 passed, 0 failed).
+- `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D
+  warnings`: clean.
+- `make check`: exit 0 (fmt, clippy, taplo, machete, agent-artifacts,
+  matrix-anchors, comment-blocks, file-size 481 clean / 98 ceilings).
