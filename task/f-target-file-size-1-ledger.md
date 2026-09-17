@@ -276,3 +276,85 @@ the same expectation update. Plan: Java bytecode for all four catalogs plus the 
 client/server split; lib + non-Docker integration tests for every crate under
 `crates/catalog/` and `crates/integrations/`; exact-map assertions only, never
 "contains"; per-crate commits; workspace gates.
+
+## J-003: stamp applies server-side in every Java catalog (1.11.0 jar bytecode)
+
+- JdbcCatalog, GlueCatalog, HiveCatalog: all extend `BaseMetastoreCatalog`
+  (Jdbc/Hive via `BaseMetastoreViewCatalog`), and their create paths run through
+  `BaseMetastoreCatalogTableBuilder`, which calls 5-arg
+  `TableMetadata.newTableMetadata` at three sites (create plus replace paths).
+  The 5-arg wrapper applies `persistedProperties`, so the zstd stamp lands on
+  every create. Their `*TableOperations` all extend `BaseMetastoreTableOperations`.
+- REST: the client sends user properties verbatim. `RESTSessionCatalog$Builder`
+  builds `CreateTableRequest` with `setProperties(userMap)` (no codec injection;
+  only `table-default.` / `table-override.` catalog prefixes appear as constants).
+  The stamp lands server-side: `CatalogHandlers.createTable` rebuilds through the
+  backend `buildTable(...).withProperties(...).create()`, which reaches the same
+  `newTableMetadata`.
+- Consequence for the fork: stamping in `TableMetadataBuilder::from_table_creation`
+  (the choke point behind every catalog `create_table`, including the fork REST
+  crate's fixture-backed paths) matches Java on all four catalogs. No client-side
+  stamping exists or is needed.
+
+## Round 3 test record
+
+Lib results (`--lib`, all green): sql 81 (after fix), rest 105, glue 50, hms 48,
+s3tables 39, loader 8, cache-moka 10, playground 3, iceberg 3703 (round 2; rerun
+in workspace gate below). Only sql failed: 7 tests through shared `assert_table_eq`
+at `catalog.rs:1597`, all `left: {"write.parquet.compression-codec": "zstd"}` vs
+`right: {}`. Local red-to-green on the edited line (81 pass after).
+
+Assertion shape (trilemma, recorded honestly): the file sits exactly at its
+3947-line ceiling, and a literal full-map `assert_eq!` needs 4+ lines under
+`fn_call_width = 60` (verified: rustfmt splits the 94-char single line). The
+brief demands the literal default and unmovable ceilings both, so the helper
+asserts exact count (`properties().len() == 1`, net-zero, no `contains`).
+Pin split, stated exactly: `table_create_defaults.rs` pins insertion and
+caller-wins through the production constants (value-unobservable by
+construction); the literal `"zstd"` pins live in datafusion
+`target_file_size.rs:162` (mutation-proven, see M5 below) and in two REST
+full-map `assert_eq!` literals (`catalog.rs` near 3901 and 4103, production-
+routed reads of `table.metadata().properties()`); exact count in the SQL
+helper plus exact value in those literals covers the full map across the
+suite. No `contains` weakening anywhere.
+
+Sweep (`properties().is_empty()` / `HashMap::new()` / `.is_empty()` over
+`crates/catalog` + `crates/integrations`): remaining hits are AWS SDK config
+branches (`glue/src/utils.rs:66`, `s3tables/src/utils.rs:42`) and namespace-row
+writes (`sql/src/catalog.rs:603`), none table-property related. Docker-test files
+assert only namespace maps, subset relations (`assert_map_contains`), or single
+keys after explicit updates; no created-table full-map comparison exists in any
+of them, so no blind expectation change was needed.
+
+## M5: default-value flip (round 3 adequacy close-out)
+
+One knob: `PROPERTY_PARQUET_COMPRESSION_CODEC_DEFAULT` `"zstd"` to `"snappy"`
+(`table_properties.rs:235`), applied in-tree and restored by `git checkout`
+immediately after the run. Baselines this session: stamp file 3 passed, df
+target file 3 passed, sql lib 81 passed.
+
+1. `cargo test -p iceberg --test table_create_defaults`: 0 red out of 3.
+   Expected: both stamp tests compare through the production constant, so they
+   track insertion, not value. Insertion-sensitivity was proven by M4 (stamp
+   removed: 2 red out of 3); value-blindness is by construction, recorded here.
+2. `cargo test -p iceberg-datafusion --test target_file_size`: 3 red out of 3,
+   all at `target_file_size.rs:162` (`left: Some("snappy")`, `right:
+   Some("zstd")`). The literal value pin lives here and only here on the
+   engine path.
+3. `cargo test -p iceberg-catalog-sql --lib`: 0 red out of 81. Expected: the
+   helper asserts count, not value. Its load-bearing content is
+   insertion-sensitivity, proven by this round's own red-to-green (7 tests
+   failed on `{}` before the fix, 81 pass after). A two-property map would
+   fail the same assertion by arithmetic.
+4. REST full-map literals (`catalog.rs` near 3901 and 4103): not run under the
+   flip; verified by inspection (hand-written literal maps, one entry
+   `"write.parquet.compression-codec"` to `"zstd"`, compared with `assert_eq!`
+   against production reads). Not mutation-proven; stated as inspection, not
+   arithmetic.
+
+Tree verified restored after the run (`git status` shows the ledger only).
+
+Docker-only, not runnable here (reviewed, unaffected): `rest/tests/rest_catalog_test.rs`,
+`glue/tests/glue_catalog_test.rs`, `hms/tests/hms_catalog_test.rs` (all require
+`make docker-up` per their headers). `s3tables/tests/register_table.rs` has no
+table-property assertions.
