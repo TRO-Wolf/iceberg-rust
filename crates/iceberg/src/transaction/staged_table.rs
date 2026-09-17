@@ -231,7 +231,7 @@ impl StagedTableTransaction {
                 .add_sort_order(sort_order)?
                 .set_default_sort_order(TableMetadataBuilder::LAST_ADDED as i64)?
                 .set_location(table_location.clone())
-                .set_properties(properties)?
+                .set_properties(TableProperties::persisted_properties(properties))?
                 .build()?
                 .metadata;
 

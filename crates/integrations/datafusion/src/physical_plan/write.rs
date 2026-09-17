@@ -309,9 +309,16 @@ impl ExecutionPlan for IcebergWriteExec {
 
         let compression = parquet_compression_from_properties(self.table.metadata().properties())
             .map_err(to_datafusion_error)?;
+        let dictionary_enabled = self
+            .table
+            .metadata()
+            .properties()
+            .get("parquet.enable.dictionary")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
         let parquet_file_writer_builder = ParquetWriterBuilder::new_with_match_mode(
             WriterProperties::builder()
                 .set_compression(compression)
+                .set_dictionary_enabled(dictionary_enabled)
                 .build(),
             self.table.metadata().current_schema().clone(),
             FieldMatchMode::Name,

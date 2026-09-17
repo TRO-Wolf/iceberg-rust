@@ -907,7 +907,7 @@ pub(crate) mod tests {
             vec![&expected_sorted_order]
         );
 
-        assert_eq!(metadata.properties(), &HashMap::new());
+        assert_eq!(metadata.properties().len(), 1);
 
         assert!(!table.readonly());
     }

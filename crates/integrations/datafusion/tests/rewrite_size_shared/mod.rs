@@ -88,6 +88,7 @@ pub async fn create_fixture(compression_level: Option<&str>) -> ProbeFixture {
         "probe",
         "bed",
         compression_level,
+        false,
         Arc::new(LocalFsStorageFactory),
     )
     .await
@@ -112,6 +113,7 @@ pub async fn create_low_cardinality_fixture(compression_level: Option<&str>) -> 
         "probe_low",
         "bed",
         compression_level,
+        true,
         Arc::new(LocalFsStorageFactory),
     )
     .await
@@ -123,6 +125,7 @@ pub(crate) async fn create_fixture_inner(
     namespace: &str,
     table_name: &str,
     compression_level: Option<&str>,
+    enable_dictionary: bool,
     storage_factory: Arc<dyn StorageFactory>,
 ) -> ProbeFixture {
     let warehouse = TempDir::new().expect("create warehouse");
@@ -150,6 +153,9 @@ pub(crate) async fn create_fixture_inner(
             TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL.to_string(),
             level.to_string(),
         );
+    }
+    if enable_dictionary {
+        properties.insert("parquet.enable.dictionary".to_string(), "true".to_string());
     }
     let table_ident = TableIdent::new(namespace.clone(), table_name.to_string());
     catalog

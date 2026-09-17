@@ -181,7 +181,7 @@ impl TableMetadataBuilder {
             sort_order.unwrap_or(SortOrder::unsorted_order()),
             location,
             format_version,
-            properties,
+            TableProperties::persisted_properties(properties),
         )
     }
 

@@ -182,6 +182,7 @@ pub async fn create_counting_fixture(compression_level: Option<&str>) -> (ProbeF
         "probe",
         "bed",
         compression_level,
+        false,
         Arc::new(CountingStorageFactory {
             reads: Arc::clone(&reads),
         }),
