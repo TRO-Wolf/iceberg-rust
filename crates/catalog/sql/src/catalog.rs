@@ -1133,7 +1133,7 @@ impl Catalog for SqlCatalog {
 
         staged_table
             .metadata()
-            .write_to(staged_table.file_io(), &staged_metadata_location)
+            .write_commit_metadata(staged_table.file_io(), &staged_metadata_location)
             .await?;
 
         // SQL CAS bound to the BASE location; a post-send failure maps to `CommitStateUnknown`.

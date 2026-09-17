@@ -70,7 +70,6 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/inspect/entries.rs": 1281,
     "crates/iceberg/src/inspect/files.rs": 1785,
     "crates/iceberg/src/inspect/partitions.rs": 1508,
-    "crates/iceberg/src/io/storage/local_fs.rs": 1063,
     "crates/iceberg/src/maintenance/compute_table_stats.rs": 1248,
     "crates/iceberg/src/maintenance/partition_stats.rs": 4665,
     "crates/iceberg/src/maintenance/remove_dangling_delete_files.rs": 1804,
@@ -135,7 +134,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/integrations/datafusion/src/table/mod.rs": 2243,
     "crates/integrations/datafusion/tests/integration_datafusion_test.rs": 6874,
     "crates/sketches/src/theta.rs": 1024,
-    "crates/storage/opendal/src/lib.rs": 2078,
+    "crates/storage/opendal/src/lib.rs": 1939,
 }
 
 

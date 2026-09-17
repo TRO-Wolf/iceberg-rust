@@ -84,6 +84,17 @@ pub trait Storage: Debug + Send + Sync {
     /// Write bytes to an output path
     async fn write(&self, path: &str, bs: Bytes) -> Result<()>;
 
+    /// Write bytes to a path that must not exist yet.
+    async fn write_new(&self, path: &str, bs: Bytes) -> Result<()> {
+        if self.exists(path).await? {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                format!("Cannot create {path}: file already exists"),
+            ));
+        }
+        self.write(path, bs).await
+    }
+
     /// Get FileWrite from a path
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>>;
 
