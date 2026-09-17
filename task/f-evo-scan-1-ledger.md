@@ -66,7 +66,39 @@ reads renamed columns by field id). RePark fixed its own DML scans RePark-side
 
 ## Red evidence
 
-Pending.
+`CARGO_BUILD_JOBS=10 cargo test -p iceberg --lib scan::evo_scan_tests`:
+
+```
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 3705 filtered out
+```
+
+- `unpinned_scan_after_add_column_null_fills_the_added_column` → `scan: DataInvalid
+  => Column extra not found in table. Schema: table { 1: id: required long, 2: v:
+  optional string }`
+- `unpinned_scan_after_rename_reads_the_renamed_column_by_field_id` → `Column v not
+  found in table` against the `w` schema
+- `unpinned_scan_after_swapping_two_names_reads_each_field_by_id` → plans, then
+  `left: [Some("a"), Some("b")] right: [Some("e1"), Some("e2")]` (the other field's
+  values — the silent arm)
+- `snapshot_pinned_scan_still_binds_the_snapshot_schema` green on base and stays green.
+
+`CARGO_BUILD_JOBS=10 cargo test -p iceberg-datafusion --test evo_schema_dml`:
+
+```
+test result: FAILED. 2 passed; 10 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+- 8 loud: every add-column and rename UPDATE/DELETE refuses `Column extra` /
+  `Column v not found in table` (the fork UPDATE/DELETE execs select the full current
+  projection against the pinned snapshot schema).
+- 2 silent: both swap UPDATEs commit `["1", "x", "e1"]` where the field holds `"a"`.
+- 2 green on base: both swap DELETEs — a position delete writes no values and the
+  final SELECT is evolution-aware, so they stand as regression guards per the brief's
+  required 12.
+
+Fixture note: three renames that swap two names need three sequential schema commits;
+one action cannot see the `tmp` name it just created
+(`Cannot rename missing column: tmp`).
 
 ## Execution evidence
 
