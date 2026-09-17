@@ -204,7 +204,12 @@ async fn select_all(ctx: &SessionContext, sql: &str, columns: usize) -> Vec<Vec<
         for row in 0..batch.num_rows() {
             let mut rendered = vec![];
             for column in 0..columns {
-                rendered.push(array_value_to_string(batch.column(column), row).expect("renders"));
+                if batch.column(column).is_null(row) {
+                    rendered.push("NULL".to_string());
+                } else {
+                    rendered
+                        .push(array_value_to_string(batch.column(column), row).expect("renders"));
+                }
             }
             out.push(rendered);
         }

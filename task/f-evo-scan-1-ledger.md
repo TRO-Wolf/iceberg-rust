@@ -100,9 +100,36 @@ Fixture note: three renames that swap two names need three sequential schema com
 one action cannot see the `tmp` name it just created
 (`Cannot rename missing column: tmp`).
 
+## Implemented fix
+
+`crates/iceberg/src/scan/mod.rs` (`TableScanBuilder::build`): the bind schema is the
+snapshot's schema only for an explicit pin (`snapshot_id` / `snapshot_ref`, Java
+`useSnapshot`); otherwise it is the table's current schema (Java `newScan` binds
+`table.schema()`). File planning still reads the resolved snapshot's manifests, and the
+Arrow reader already projects by field id with NULL-fill, so older files read under the
+current schema. New public `project_current_schema()` (one-line doc) opts a pinned scan
+into current-schema binding — Spark `project(expectedSchema)` — over the pinned
+snapshot's files. `crates/integrations/datafusion`: `mor_scan_stream` (`mor_scan.rs`)
+and `cow_scan_stream` (`row_lineage.rs`) set it; both keep pinning the snapshot for
+conflict detection. The SELECT path (`scan.rs`) keeps translating names snapshot-side
+and is untouched, as is `resolve_affected_data_files` (manifest walk, no name binding).
+
+`scan/mod.rs` sat exactly at its size ceiling: the pre-existing name-validation loop
+was removed (the field-id loop below reports the identical missing-column error on the
+identical condition — `field_by_name` and `field_id_by_name` read the same map), and
+the ceiling follows the file 6879 → 6878.
+
+Test determinism note: the first evo-scan pins asserted per-column encounter order and
+failed once under full-suite load (batch order varies); all three now collect
+id-keyed row tuples and sort.
+
 ## Execution evidence
 
-Pending.
+`CARGO_BUILD_JOBS=10 cargo test -p iceberg --lib scan::evo_scan_tests` → 4 passed.
+`CARGO_BUILD_JOBS=10 cargo test -p iceberg-datafusion --test evo_schema_dml` → 12 passed.
+`cargo clippy -p iceberg --all-targets -- -D warnings` → exit 0.
+`cargo clippy -p iceberg-datafusion --all-targets -- -D warnings` → exit 0.
+`cargo fmt --all -- --check` → clean.
 
 ## Mutation evidence
 

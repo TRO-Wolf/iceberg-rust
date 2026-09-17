@@ -26,8 +26,7 @@ use crate::arrow::schema_to_arrow_schema;
 use crate::io::LocalFsStorageFactory;
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema,
-    Struct, Type,
+    DataContentType, DataFile, FormatVersion, NestedField, PrimitiveType, Schema, Struct, Type,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -236,18 +235,20 @@ async fn unpinned_scan_after_add_column_null_fills_the_added_column() {
     let (table, _guard) = added_column_table().await;
     let batches = scan_batches(&table, &["id", "v", "extra"]).await;
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
-    let mut ids = vec![];
-    let mut names = vec![];
-    let mut extras = vec![];
+    let mut rows = vec![];
     for batch in &batches {
-        ids.extend(long_values(batch, "id"));
-        names.extend(string_values(batch, "v"));
-        extras.extend(string_values(batch, "extra"));
+        let ids = long_values(batch, "id");
+        let names = string_values(batch, "v");
+        let extras = string_values(batch, "extra");
+        for index in 0..ids.len() {
+            rows.push((ids[index], names[index].clone(), extras[index].clone()));
+        }
     }
-    ids.sort_unstable();
-    assert_eq!(ids, vec![1, 2]);
-    assert_eq!(names, vec![Some("a".to_string()), Some("b".to_string())]);
-    assert_eq!(extras, vec![None, None]);
+    rows.sort();
+    assert_eq!(rows, vec![
+        (1, Some("a".to_string()), None),
+        (2, Some("b".to_string()), None),
+    ]);
 }
 
 #[tokio::test]
@@ -255,15 +256,19 @@ async fn unpinned_scan_after_rename_reads_the_renamed_column_by_field_id() {
     let (table, _guard) = renamed_column_table().await;
     let batches = scan_batches(&table, &["id", "v"]).await;
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
-    let mut ids = vec![];
-    let mut names = vec![];
+    let mut rows = vec![];
     for batch in &batches {
-        ids.extend(long_values(batch, "id"));
-        names.extend(string_values(batch, "v"));
+        let ids = long_values(batch, "id");
+        let names = string_values(batch, "v");
+        for index in 0..ids.len() {
+            rows.push((ids[index], names[index].clone()));
+        }
     }
-    ids.sort_unstable();
-    assert_eq!(ids, vec![1, 2]);
-    assert_eq!(names, vec![Some("a".to_string()), Some("b".to_string())]);
+    rows.sort();
+    assert_eq!(rows, vec![
+        (1, Some("a".to_string())),
+        (2, Some("b".to_string())),
+    ]);
 }
 
 #[tokio::test]
@@ -271,17 +276,20 @@ async fn unpinned_scan_after_swapping_two_names_reads_each_field_by_id() {
     let (table, _guard) = swapped_names_table().await;
     let batches = scan_batches(&table, &["id", "v", "extra"]).await;
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
-    let mut renamed = vec![];
-    let mut swapped = vec![];
+    let mut rows = vec![];
     for batch in &batches {
-        renamed.extend(string_values(batch, "v"));
-        swapped.extend(string_values(batch, "extra"));
+        let ids = long_values(batch, "id");
+        let renamed = string_values(batch, "v");
+        let swapped = string_values(batch, "extra");
+        for index in 0..ids.len() {
+            rows.push((ids[index], renamed[index].clone(), swapped[index].clone()));
+        }
     }
-    assert_eq!(renamed, vec![
-        Some("e1".to_string()),
-        Some("e2".to_string())
+    rows.sort();
+    assert_eq!(rows, vec![
+        (1, Some("e1".to_string()), Some("a".to_string())),
+        (2, Some("e2".to_string()), Some("b".to_string())),
     ]);
-    assert_eq!(swapped, vec![Some("a".to_string()), Some("b".to_string())]);
 }
 
 #[tokio::test]

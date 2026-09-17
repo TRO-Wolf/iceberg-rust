@@ -158,7 +158,7 @@ pub(super) async fn cow_scan_stream(
     projection.push(RESERVED_COL_NAME_FILE.to_string());
     push_lineage_scan_columns(&mut projection, table.metadata().format_version());
 
-    let mut builder = table.scan().select(projection);
+    let mut builder = table.scan().select(projection).project_current_schema();
     if let Some(snapshot_id) = scan_snapshot_id {
         builder = builder.snapshot_id(snapshot_id);
     }
