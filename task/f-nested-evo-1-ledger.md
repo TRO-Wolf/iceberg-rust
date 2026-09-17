@@ -99,7 +99,7 @@ expected 2 got 1` through the real reader) and green after restore — 7/7.
 
 | Command | Exit |
 |---|---|
-| `cargo test -p iceberg --lib` | 0 — 3743 passed, 0 failed, 8 ignored |
+| `cargo test -p iceberg --lib` | 0 — 3744 passed, 0 failed, 8 ignored (final tree) |
 | `cargo clippy -p iceberg --all-targets -- -D warnings` | 0 |
 | `cargo test -p iceberg-datafusion --lib` | 0 — 228 passed, 0 failed, 1 ignored |
 | `cargo fmt --all -- --check` | 0 |
