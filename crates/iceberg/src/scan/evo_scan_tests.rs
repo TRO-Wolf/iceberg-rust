@@ -518,4 +518,14 @@ async fn tag_ref_on_the_pre_ddl_snapshot_binds_the_snapshot_schema() {
         (1, Some("a".to_string())),
         (2, Some("b".to_string())),
     ]);
+    let error = table
+        .scan()
+        .use_ref("pre-ddl")
+        .select(["extra"])
+        .build()
+        .expect_err("added column is absent from the tagged snapshot schema");
+    assert!(
+        error.to_string().contains("Column extra not found"),
+        "unexpected error: {error}"
+    );
 }

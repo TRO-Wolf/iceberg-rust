@@ -63,6 +63,8 @@ reads renamed columns by field id). RePark fixed its own DML scans RePark-side
 | C-004 | Pinned scan keeps binding the snapshot schema (time travel). | new pinned pin + full lib suite green. | PROVEN |
 | C-005 | SQL `UPDATE … WHERE id = 1` and `DELETE … WHERE id = 1` after each of the three evolutions, two data files, CoW and MoR, assert post-statement rows. | `tests/evo_schema_dml.rs` (12 pins); red on base. | PROVEN |
 | C-006 | Gates per brief step 5. | Command → result below. | PROVEN |
+| C-007 | `use_ref("main")` is a no-op binding the current schema; a non-main ref still pins the snapshot schema. | `main_ref_*` pins (red on pre-fix tree) + tag guard; mirror of `BatchScan::use_ref`. | OPEN |
+| C-008 | C-004 pins are discriminating: forcing the current schema on pinned scans reds them. | three `snapshot_pinned_*` pins + hardened tag pin; `if false` mutation. | OPEN |
 
 ## Red evidence
 
@@ -124,6 +126,25 @@ test result: FAILED. 7 passed; 3 failed; 0 ignored; 0 measured; 3723 filtered ou
 Fixture note: DDL writes no snapshot, so the pre-DDL snapshot is the current one at
 tag time — the first tag-fixture draft searched for a non-current snapshot and found
 none.
+
+## Round 2 fix (critic-289 L-001)
+
+`TableScanBuilder::use_ref` returns `self` unchanged for `"main"`
+(`crate::spec::MAIN_BRANCH`), mirroring `BatchScan::use_ref` — `"main"` never reaches
+`snapshot_ref`, so `build` treats the scan as unpinned and binds the current schema,
+and `use_ref("main")` alongside `snapshot_id` no longer conflicts (Java no-op parity
+with the batch adapter). Non-main refs store and pin as before. The existing `use_ref`
+doc gains the `"main"` sentence (edited, not added). `scan/mod.rs` stays at its 6878
+ceiling: the new body uses one declarative assignment instead of a branch block.
+
+## Round 2 mutation (critic-289 L-002)
+
+`if pinned && !self.project_current_schema` → `if false` (current schema for every
+scan): `scan::evo_scan_tests` 6 passed / 4 failed — exactly the three
+`snapshot_pinned_*` pins plus the hardened tag pin; all unpinned and `main`-ref pins
+stay green. Restore `cmp` clean, re-green 10 / 10. The tag pin first stayed green
+under this mutant (its `select(["id","v"])` names exist in both schemas) and was
+hardened with a `select(["extra"])` refusal assertion before the re-run.
 
 ## Implemented fix
 

@@ -263,11 +263,11 @@ impl<'a> TableScanBuilder<'a> {
         self.table
     }
 
-    /// Scan the snapshot that a branch or tag reference points to. Mirrors Java `TableScan.useRef`.
-    /// [`build`](Self::build) resolves the name, and rejects both an unknown name and a
-    /// [`snapshot_id`](Self::snapshot_id) set alongside it.
+    /// Scan the snapshot a branch or tag points to (`"main"` pins nothing).
+    /// [`build`](Self::build) rejects an unknown name and a clashing [`snapshot_id`](Self::snapshot_id).
     pub fn use_ref(mut self, ref_name: impl Into<String>) -> Self {
-        self.snapshot_ref = Some(ref_name.into());
+        let ref_name = ref_name.into();
+        self.snapshot_ref = (ref_name != crate::spec::MAIN_BRANCH).then_some(ref_name);
         self
     }
 
