@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -47,8 +48,9 @@ pub(crate) fn first_conflicting_file(
         .rewrite_not()
         .bind(schema, case_sensitive)?;
 
+    let mut partition_evaluators: HashMap<i32, ExpressionEvaluator> = HashMap::new();
     for file in files {
-        if partition_might_match(current, &bound_filter, file)?
+        if partition_might_match(current, &bound_filter, file, &mut partition_evaluators)?
             && InclusiveMetricsEvaluator::eval(&bound_filter, file, true)?
         {
             return Ok(Some(file.clone()));
@@ -92,7 +94,11 @@ fn partition_might_match(
     current: &Table,
     bound_filter: &BoundPredicate,
     file: &DataFile,
+    partition_evaluators: &mut HashMap<i32, ExpressionEvaluator>,
 ) -> Result<bool> {
+    if let Some(evaluator) = partition_evaluators.get(&file.partition_spec_id) {
+        return evaluator.eval(file);
+    }
     let Some(partition_spec) = current
         .metadata()
         .partition_spec_by_id(file.partition_spec_id)
@@ -111,5 +117,8 @@ fn partition_might_match(
         .project(bound_filter)?
         .rewrite_not()
         .bind(partition_schema, true)?;
-    ExpressionEvaluator::new(projected).eval(file)
+    let evaluator = ExpressionEvaluator::new(projected);
+    let matches = evaluator.eval(file)?;
+    partition_evaluators.insert(file.partition_spec_id, evaluator);
+    Ok(matches)
 }
