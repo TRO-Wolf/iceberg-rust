@@ -57,6 +57,22 @@ impl MetadataLocation {
         }
     }
 
+    /// Reports whether this location uses the Hadoop `vN.metadata.json` convention.
+    pub fn is_hadoop_convention(&self) -> bool {
+        self.id.is_none()
+    }
+
+    pub(crate) fn hadoop_version_siblings(&self) -> Option<[String; 2]> {
+        if !self.is_hadoop_convention() {
+            return None;
+        }
+        let dir = format!("{}/metadata", self.table_location);
+        Some([
+            format!("{}/v{}.gz.metadata.json", dir, self.version),
+            format!("{}/v{}.metadata.json.gz", dir, self.version),
+        ])
+    }
+
     pub(crate) fn with_next_version_fresh_id(&self) -> Self {
         Self {
             id: Some(Uuid::new_v4()),
