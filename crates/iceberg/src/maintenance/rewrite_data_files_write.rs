@@ -37,7 +37,7 @@ use crate::metadata_columns::{
     format_supports_row_lineage, schema_with_row_lineage,
 };
 use crate::scan::FileScanTask;
-use crate::spec::{DataFile, DataFileFormat, SchemaRef};
+use crate::spec::{DataFile, DataFileFormat, PartitionSpecRef, SchemaRef};
 use crate::table::Table;
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::location_generator::{
@@ -58,6 +58,7 @@ pub(crate) async fn write_compacted_files(
     group: &[FileScanTask],
     target_file_size_bytes: u64,
     max_open_partition_writers: usize,
+    output_spec: &PartitionSpecRef,
 ) -> Result<CompactedWrite> {
     if max_open_partition_writers == 0 {
         return Err(Error::new(
@@ -67,7 +68,7 @@ pub(crate) async fn write_compacted_files(
     }
 
     let schema = rewrite_write_schema(table)?;
-    let spec = table.metadata().default_partition_spec().as_ref().clone();
+    let spec = output_spec.as_ref().clone();
 
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
     let file_name_generator = DefaultFileNameGenerator::new(
@@ -134,7 +135,7 @@ pub(crate) async fn write_compacted_files(
 
     let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
         schema.clone(),
-        table.metadata().default_partition_spec().clone(),
+        output_spec.clone(),
     )?;
     let mut router = BoundedPartitionRouter::new(writer_builder, max_open_partition_writers)?;
     while let Some(batch) = batch_stream.try_next().await? {

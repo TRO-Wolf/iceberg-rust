@@ -140,6 +140,8 @@ mod partition_key_audit;
 pub mod partition_stats;
 mod remove_dangling_delete_files;
 mod rewrite_data_files;
+#[cfg(test)]
+mod rewrite_data_files_dangling_tests;
 mod rewrite_data_files_dv;
 #[cfg(test)]
 mod rewrite_data_files_evolved_schema_tests;
@@ -151,7 +153,11 @@ mod rewrite_data_files_fuse_tests;
 mod rewrite_data_files_lineage_tests;
 #[cfg(test)]
 mod rewrite_data_files_mw7_tests;
+#[cfg(test)]
+mod rewrite_data_files_options_tests;
 mod rewrite_data_files_plan;
+#[cfg(test)]
+mod rewrite_data_files_plan_tests;
 #[cfg(test)]
 mod rewrite_data_files_ratio_tests;
 mod rewrite_data_files_router;
@@ -186,7 +192,9 @@ pub use partition_stats::{
 pub use remove_dangling_delete_files::{
     RemoveDanglingDeleteFiles, RemoveDanglingDeleteFilesResult,
 };
-pub use rewrite_data_files::{FileGroupRewriteResult, RewriteDataFiles, RewriteDataFilesResult};
+pub use rewrite_data_files::{
+    FileGroupRewriteResult, RewriteDataFiles, RewriteDataFilesResult, RewriteJobOrder,
+};
 pub use rewrite_position_delete_files::{
     RewritePositionDeleteFiles, RewritePositionDeleteFilesResult,
 };

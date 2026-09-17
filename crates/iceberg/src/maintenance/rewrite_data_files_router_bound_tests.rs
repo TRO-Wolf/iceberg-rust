@@ -226,9 +226,15 @@ async fn default_max_open_partition_writers_is_64_and_peak_obeys_it() {
     );
 
     let tasks = plan_tasks(&table).await;
-    let compacted = write_compacted_files(&table, &tasks, 1_000_000, 64)
-        .await
-        .expect("write");
+    let compacted = write_compacted_files(
+        &table,
+        &tasks,
+        1_000_000,
+        64,
+        table.metadata().default_partition_spec(),
+    )
+    .await
+    .expect("write");
     assert!(
         compacted.peak_open_partition_writers <= 64,
         "peak {} must obey default 64",
@@ -329,9 +335,15 @@ async fn high_cardinality_eviction_keeps_rows_and_obeys_bound() {
     assert_eq!(before.len(), key_count);
 
     let tasks = plan_tasks(&table).await;
-    let compacted = write_compacted_files(&table, &tasks, 1_000_000, max_open)
-        .await
-        .expect("bounded write");
+    let compacted = write_compacted_files(
+        &table,
+        &tasks,
+        1_000_000,
+        max_open,
+        table.metadata().default_partition_spec(),
+    )
+    .await
+    .expect("bounded write");
     assert!(
         compacted.peak_open_partition_writers <= max_open,
         "peak {} exceeds bound {max_open}",
