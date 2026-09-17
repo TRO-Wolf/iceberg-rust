@@ -57,12 +57,12 @@ reads renamed columns by field id). RePark fixed its own DML scans RePark-side
 
 | Clause | Checkable proposition | Proof obligation | Status |
 |---|---|---|---|
-| C-001 | Unpinned `table.scan().select(current names)` after ADD COLUMN with no write since reads NULL for the added column. | `scan::evo_scan_tests` add-column pin; red on base. | OPEN |
-| C-002 | Same after RENAME COLUMN: the renamed column's values read by field id. | rename pin; red on base. | OPEN |
-| C-003 | Same after a name swap: each swapped name reads its own field. | swap pin; red on base. | OPEN |
-| C-004 | Pinned scan keeps binding the snapshot schema (time travel). | existing time-travel pins stay green. | OPEN |
-| C-005 | SQL `UPDATE … WHERE id = 1` and `DELETE … WHERE id = 1` after each of the three evolutions, two data files, CoW and MoR, assert post-statement rows. | `tests/evo_schema_dml.rs` (12 pins); red on base. | OPEN |
-| C-006 | Gates per brief step 5. | Command → result below. | OPEN |
+| C-001 | Unpinned `table.scan().select(current names)` after ADD COLUMN with no write since reads NULL for the added column. | `scan::evo_scan_tests` add-column pin; red on base. | PROVEN |
+| C-002 | Same after RENAME COLUMN: the renamed column's values read by field id. | rename pin; red on base. | PROVEN |
+| C-003 | Same after a name swap: each swapped name reads its own field. | swap pin; red on base. | PROVEN |
+| C-004 | Pinned scan keeps binding the snapshot schema (time travel). | new pinned pin + full lib suite green. | PROVEN |
+| C-005 | SQL `UPDATE … WHERE id = 1` and `DELETE … WHERE id = 1` after each of the three evolutions, two data files, CoW and MoR, assert post-statement rows. | `tests/evo_schema_dml.rs` (12 pins); red on base. | PROVEN |
+| C-006 | Gates per brief step 5. | Command → result below. | PROVEN |
 
 ## Red evidence
 
@@ -91,8 +91,8 @@ test result: FAILED. 2 passed; 10 failed; 0 ignored; 0 measured; 0 filtered out
 - 8 loud: every add-column and rename UPDATE/DELETE refuses `Column extra` /
   `Column v not found in table` (the fork UPDATE/DELETE execs select the full current
   projection against the pinned snapshot schema).
-- 2 silent: both swap UPDATEs commit `["1", "x", "e1"]` where the field holds `"a"`.
-- 2 green on base: both swap DELETEs — a position delete writes no values and the
+- 2 silent: both swap UPDATE statements commit `["1", "x", "e1"]` where the field holds `"a"`.
+- 2 green on base: both swap DELETE statements — a position delete writes no values and the
   final SELECT is evolution-aware, so they stand as regression guards per the brief's
   required 12.
 
@@ -133,11 +133,33 @@ id-keyed row tuples and sort.
 
 ## Mutation evidence
 
-Pending.
+Backups via plain `cp` (never `-p`), restore verified with `cmp`, `touch` after
+restore, re-green before the next leg.
+
+- M1 `scan/mod.rs`: `if pinned && !self.project_current_schema` → `if true` —
+  `scan::evo_scan_tests` 1 passed / 3 failed (exactly the three unpinned pins; the
+  pinned pin stays green). Restore `cmp` clean, re-green 4 / 4.
+- M2a `mor_scan.rs`: `.project_current_schema()` removed — `evo_schema_dml` 7 passed /
+  5 failed (exactly the five MoR pins that red on base; all six CoW green). Restore
+  `cmp` clean.
+- M2b `row_lineage.rs` (`cow_scan_stream`): same removal — 7 passed / 5 failed
+  (exactly the five CoW pins; all six MoR green). Restore `cmp` clean, re-green 12 / 12.
 
 ## Gates
 
-Pending.
+| Command | Result |
+|---|---|
+| `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg --lib` | ok. 3701 passed; 0 failed; 8 ignored |
+| `CARGO_BUILD_JOBS=10 cargo clippy -p iceberg --all-targets -- -D warnings` | exit 0 |
+| `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --lib` | ok. 228 passed; 0 failed; 1 ignored |
+| `CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --tests` | ok. 476 passed; 0 failed; 7 ignored over 31 targets (lib 228; every integration suite incl. `evo_schema_dml` 12; the 7 ignores are the pre-existing measure/probe pins; no suite needs Docker) |
+| `cargo clippy -p iceberg-datafusion --all-targets -- -D warnings` | exit 0 |
+| `cargo fmt --all -- --check` | clean |
+| `python3 scripts/check_rust_file_size.py` | 478 files clean (99 legacy ceilings) |
+| `typos .` | exit 0 |
+| `./scripts/check_comment_blocks.sh` | OK |
+| `./scripts/check_agent_artifacts.sh` | OK |
+| `./scripts/check_matrix_anchors.sh` | OK (84 rows anchored) |
 
 ## Open questions
 
