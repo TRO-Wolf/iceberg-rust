@@ -85,7 +85,7 @@ Bytecode via `/usr/lib/jvm/zulu-17-amd64/bin/javap -p -c`. Live Spark re-probes 
   parity, J-001e). The DataFusion engine write path (`IcebergWriteExec`, the Spark analogue)
   writes dictionary-OFF, honoring table property `parquet.enable.dictionary` (Java key, no Java
   constant exists) with engine default false. COW `StreamingDataFileWriter` and rewrite paths
-  unchanged (residue, row R172).
+  unchanged (residue, row R174).
 - D-002 roll check placement: write-slice-then-maybe-roll (Java order), boundary-crossing test
   `file_rows / 1000 != before / 1000` (exactly equivalent to Java per-record `% 1000 == 0`,
   including partial-slice misalignment). Comparison `>=` (Java; fork was `>`). Post-write
@@ -233,7 +233,7 @@ no production panics, no stringly errors, no output macros, no atomics, no
 bytecode in comments). Format stability holds (fixture row count is test-only, no
 encoding change). Parity axis holds (delete-writer cadence verified against the
 1.11.0 jar class ancestry; COW dictionary divergence stays a named residue in
-row R172).
+row R174).
 
 ## Maps
 
