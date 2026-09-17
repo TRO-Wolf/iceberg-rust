@@ -140,6 +140,7 @@ Named residue (not reachable from RePark's writers, recorded for a later unit):
 | C-006 | A promoted identity partition source answers `=` and `<` and plans every `FileScanTask.partition` as `long`. | `promoted_identity_partition_source_filters_and_plans_long_partitions`; red on base. | EXECUTION PROVEN |
 | C-007 | An equality delete written after the promotion applies to a pre-promotion data file in the same partition. | `equality_delete_written_after_promotion_applies_to_a_pre_promotion_partition`; red on base. | EXECUTION PROVEN |
 | C-008 | `ReplacePartitions` after the promotion drops the pre-promotion file of the replaced partition; `overwrite_by_row_filter(id = 7)` replaces the promoted identity partition and keeps the other one. | `replace_partitions_after_promotion_drops_the_pre_promotion_partition`, `overwrite_by_row_filter_on_a_promoted_identity_partition_replaces_it`; red on base. | EXECUTION PROVEN |
+| C-010 | `iceberg-datafusion` `UPDATE` and `DELETE`, copy-on-write and merge-on-read, on a table holding only pre-promotion files update and delete the matching rows instead of failing `column types must match schema types, expected Int64 but found Int32`. | `tests/promoted_type_dml.rs` (4 pins); red on `7e027cca`. | OPEN |
 | C-009 | Gates: the pins green after the fix, `cargo test -p iceberg --lib`, `cargo clippy -p iceberg --all-targets -- -D warnings`, `cargo fmt`, the Rust file-size check, the comment fence. | Command -> result below. | EXECUTION PROVEN |
 
 ## Base-red evidence
@@ -224,3 +225,24 @@ not apply exactly once hard-fails):
 
 Consumer evidence (RePark ICE-PROMOTE-READ-1, local path override, not committed there): the
 RePark ledger records the Python pins against the recorded Spark 4.1.2 oracle.
+
+## Second seam — the DataFusion DML execs (found by the RePark pins)
+
+The RePark pin module on the first fix went 157 of 169 green; the 12 red cells were every
+single-era `UPDATE`. RePark routes a plain `UPDATE` to this crate's `IcebergUpdateExec`, whose
+copy-on-write and merge-on-read paths scan at the snapshot (`Int32` for a pre-promotion file)
+and rebuild each batch under the current table schema without widening
+(`physical_plan/delete.rs` `table_column_batch`, and the merge-on-read delete's predicate
+batch). The same rebuild serves this crate's own `DELETE`.
+
+`CARGO_BUILD_JOBS=10 cargo test -p iceberg-datafusion --test promoted_type_dml` on `7e027cca`:
+
+```
+test copy_on_write_delete_after_a_promotion_removes_the_matching_row ... FAILED
+test merge_on_read_delete_after_a_promotion_removes_the_matching_row ... FAILED
+test copy_on_write_update_after_a_promotion_updates_pre_promotion_rows ... FAILED
+test merge_on_read_update_after_a_promotion_updates_pre_promotion_rows ... FAILED
+run DELETE FROM catalog.ns.t WHERE id = 6: Arrow error: Invalid argument error: column types must match schema types, expected Int64 but found Int32 at column index 0
+run UPDATE catalog.ns.t SET s = 'u5' WHERE id = 5: Arrow error: Invalid argument error: column types must match schema types, expected Int64 but found Int32 at column index 0
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+```
