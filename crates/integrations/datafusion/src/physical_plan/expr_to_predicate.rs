@@ -74,6 +74,9 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
         Expr::BinaryExpr(binary) => {
             let left = to_iceberg_predicate(&binary.left);
             let right = to_iceberg_predicate(&binary.right);
+            if let Some(nan) = nan_comparison(binary.op, &left, &right) {
+                return nan;
+            }
             let op = to_iceberg_operation(binary.op);
             match op {
                 OpTransformedResult::Operator(op) => to_iceberg_binary_predicate(left, right, op),
@@ -114,10 +117,7 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
 
             let expr = to_iceberg_predicate(&inlist.expr);
             match expr {
-                TransformedResult::Column(r) => match inlist.negated {
-                    false => TransformedResult::Predicate(r.is_in(datums)),
-                    true => TransformedResult::Predicate(r.is_not_in(datums)),
-                },
+                TransformedResult::Column(r) => in_list_predicate(r, datums, inlist.negated),
                 _ => TransformedResult::NotTransformed,
             }
         }
@@ -261,6 +261,49 @@ fn to_iceberg_or_predicate(left: TransformedResult, right: TransformedResult) ->
             TransformedResult::Predicate(left.or(right))
         }
         _ => TransformedResult::NotTransformed,
+    }
+}
+
+fn nan_comparison(
+    op: Operator,
+    left: &TransformedResult,
+    right: &TransformedResult,
+) -> Option<TransformedResult> {
+    let (column, is_nan) = match (left, right) {
+        (TransformedResult::Column(r), TransformedResult::Literal(d)) => (r, d.is_nan()),
+        (TransformedResult::Literal(d), TransformedResult::Column(r)) => (r, d.is_nan()),
+        _ => return None,
+    };
+    if !is_nan {
+        return None;
+    }
+    match op {
+        Operator::Eq | Operator::IsNotDistinctFrom => {
+            Some(TransformedResult::Predicate(column.clone().is_nan()))
+        }
+        Operator::NotEq => Some(TransformedResult::Predicate(column.clone().is_not_nan())),
+        _ => Some(TransformedResult::NotTransformed),
+    }
+}
+
+fn in_list_predicate(column: Reference, datums: Vec<Datum>, negated: bool) -> TransformedResult {
+    let has_nan = datums.iter().any(Datum::is_nan);
+    if negated {
+        if has_nan {
+            TransformedResult::NotTransformed
+        } else {
+            TransformedResult::Predicate(column.is_not_in(datums))
+        }
+    } else if !has_nan {
+        TransformedResult::Predicate(column.is_in(datums))
+    } else {
+        let rest: Vec<Datum> = datums.into_iter().filter(|d| !d.is_nan()).collect();
+        let is_nan = column.clone().is_nan();
+        if rest.is_empty() {
+            TransformedResult::Predicate(is_nan)
+        } else {
+            TransformedResult::Predicate(Predicate::or(is_nan, column.is_in(rest)))
+        }
     }
 }
 
@@ -903,3 +946,7 @@ mod tests {
         assert_eq!(predicate, None);
     }
 }
+
+#[cfg(test)]
+#[path = "expr_to_predicate_nan_tests.rs"]
+mod nan_tests;
