@@ -52,6 +52,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use crate::physical_plan::DATA_FILES_COL_NAME;
+use crate::physical_plan::sort::write_sort_plan;
 use crate::task_writer::TaskWriter;
 use crate::to_datafusion_error;
 
@@ -68,6 +69,7 @@ pub(crate) struct IcebergWriteExec {
     input: Arc<dyn ExecutionPlan>,
     input_distribution: Distribution,
     input_ordering: Option<OrderingRequirements>,
+    sort_order_id: Option<i32>,
     result_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
 }
@@ -79,9 +81,15 @@ impl IcebergWriteExec {
     /// table's: `execute` emits result batches, and a node whose parents are planned against a
     /// schema it never emits is the BUG-011 skew in the write path. It also removes the last
     /// consumer of the provider's cached table schema from this branch of the plan.
-    pub fn new(table: Table, input: Arc<dyn ExecutionPlan>) -> Self {
+    pub fn new(table: Table, input: Arc<dyn ExecutionPlan>, sort_order_id: Option<i32>) -> Self {
         let (input_distribution, input_ordering) = Self::input_requirements(&table, &input);
-        Self::new_with_requirements(table, input, input_distribution, input_ordering)
+        Self::new_with_requirements(
+            table,
+            input,
+            input_distribution,
+            input_ordering,
+            sort_order_id,
+        )
     }
 
     fn new_with_requirements(
@@ -89,6 +97,7 @@ impl IcebergWriteExec {
         input: Arc<dyn ExecutionPlan>,
         input_distribution: Distribution,
         input_ordering: Option<OrderingRequirements>,
+        sort_order_id: Option<i32>,
     ) -> Self {
         let result_schema = Self::make_result_schema();
         let plan_properties = Self::compute_properties(&input, Arc::clone(&result_schema));
@@ -98,6 +107,7 @@ impl IcebergWriteExec {
             input,
             input_distribution,
             input_ordering,
+            sort_order_id,
             result_schema,
             plan_properties,
         }
@@ -107,34 +117,40 @@ impl IcebergWriteExec {
         table: &Table,
         input: &Arc<dyn ExecutionPlan>,
     ) -> (Distribution, Option<OrderingRequirements>) {
+        let sort = write_sort_plan(table, input.schema().as_ref());
+        let sort_ordering = sort
+            .exprs
+            .and_then(|exprs| LexOrdering::new(exprs).map(OrderingRequirements::from));
         if table.metadata().default_partition_spec().is_unpartitioned() {
-            return (Distribution::UnspecifiedDistribution, None);
+            return (Distribution::UnspecifiedDistribution, sort_ordering);
         }
 
         let Ok(partition_column_index) = input.schema().index_of(PROJECTED_PARTITION_VALUE_COLUMN)
         else {
-            return (Distribution::UnspecifiedDistribution, None);
+            return (Distribution::UnspecifiedDistribution, sort_ordering);
         };
         let partition_column = Arc::new(Column::new(
             PROJECTED_PARTITION_VALUE_COLUMN,
             partition_column_index,
         ));
         let distribution = Distribution::HashPartitioned(vec![partition_column.clone()]);
-        let fanout_enabled = table
-            .metadata()
-            .properties()
-            .get(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED)
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT);
-        let ordering = if fanout_enabled {
-            None
-        } else {
-            LexOrdering::new(vec![PhysicalSortExpr {
-                expr: partition_column,
-                options: SortOptions::default(),
-            }])
-            .map(OrderingRequirements::from)
-        };
+        let ordering = sort_ordering.or_else(|| {
+            let fanout_enabled = table
+                .metadata()
+                .properties()
+                .get(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED)
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT);
+            (!fanout_enabled)
+                .then(|| {
+                    LexOrdering::new(vec![PhysicalSortExpr {
+                        expr: partition_column,
+                        options: SortOptions::default(),
+                    }])
+                    .map(OrderingRequirements::from)
+                })
+                .flatten()
+        });
 
         (distribution, ordering)
     }
@@ -241,6 +257,7 @@ impl ExecutionPlan for IcebergWriteExec {
             Arc::clone(&children[0]),
             self.input_distribution.clone(),
             self.input_ordering.clone(),
+            self.sort_order_id,
         )))
     }
 
@@ -321,8 +338,11 @@ impl ExecutionPlan for IcebergWriteExec {
         let partition_spec = self.table.metadata().default_partition_spec().clone();
         // Stamp the real default_spec_id when built without a PartitionKey (post–DROP empty
         // default may be non-zero; bare new() would fabricate 0 — C5-L-001 / C6-L-001).
-        let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder)
+        let mut data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder)
             .with_partition_spec(partition_spec.as_ref().clone());
+        if let Some(sort_order_id) = self.sort_order_id {
+            data_file_writer_builder = data_file_writer_builder.with_sort_order_id(sort_order_id);
+        }
         let task_writer = TaskWriter::try_new(
             data_file_writer_builder,
             fanout_enabled,
@@ -568,7 +588,7 @@ mod tests {
         ]));
 
         // 4. Create IcebergWriteExec
-        let write_exec = IcebergWriteExec::new(table.clone(), input_plan);
+        let write_exec = IcebergWriteExec::new(table.clone(), input_plan, None);
 
         // The node must advertise the schema it actually emits — the serialized data files, not the
         // table's schema (which is what it used to advertise while emitting result batches).

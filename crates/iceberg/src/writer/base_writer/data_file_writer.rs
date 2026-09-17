@@ -102,6 +102,7 @@ pub(crate) fn resolve_partition_spec_id(
 pub struct DataFileWriterBuilder<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator> {
     inner: RollingFileWriterBuilder<B, L, F>,
     partition_spec: Option<PartitionSpec>,
+    sort_order_id: Option<i32>,
 }
 
 impl<B, L, F> DataFileWriterBuilder<B, L, F>
@@ -118,7 +119,14 @@ where
         Self {
             inner,
             partition_spec: None,
+            sort_order_id: None,
         }
+    }
+
+    /// Stamp `sort_order_id` on every produced file.
+    pub fn with_sort_order_id(mut self, sort_order_id: i32) -> Self {
+        self.sort_order_id = Some(sort_order_id);
+        self
     }
 
     /// Stamp [`PartitionSpec::unpartition_spec`] (spec id 0, no fields).
@@ -160,6 +168,7 @@ where
             inner: Some(self.inner.build()),
             partition_key,
             partition_spec_id,
+            sort_order_id: self.sort_order_id,
             schema: self.inner.iceberg_schema().cloned(),
         })
     }
@@ -173,6 +182,7 @@ pub struct DataFileWriter<B: FileWriterBuilder, L: LocationGenerator, F: FileNam
     /// The spec id stamped on every produced file, resolved once at build time by
     /// `resolve_partition_spec_id`.
     partition_spec_id: i32,
+    sort_order_id: Option<i32>,
     schema: Option<SchemaRef>,
 }
 
@@ -209,6 +219,9 @@ where
                     // ALWAYS stamp the spec id (Java `DataFiles.Builder(spec)` does), never only when
                     // a partition key happens to be present — see `resolve_partition_spec_id`.
                     res.partition_spec_id(self.partition_spec_id);
+                    if let Some(sort_order_id) = self.sort_order_id {
+                        res.sort_order_id(sort_order_id);
+                    }
                     if let Some(pk) = self.partition_key.as_ref() {
                         res.partition(pk.data().clone());
                     }
