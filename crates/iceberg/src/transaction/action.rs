@@ -25,6 +25,13 @@ use crate::table::Table;
 use crate::transaction::Transaction;
 use crate::{Result, TableRequirement, TableUpdate};
 
+#[cfg(test)]
+#[path = "occ_scoped_projection_tests.rs"]
+mod occ_scoped_projection_tests;
+#[cfg(test)]
+#[path = "occ_scoped_tests.rs"]
+pub(crate) mod occ_scoped_tests;
+
 /// A boxed, thread-safe reference to a `TransactionAction`.
 pub(crate) type BoxedTransactionAction = Arc<dyn TransactionAction>;
 

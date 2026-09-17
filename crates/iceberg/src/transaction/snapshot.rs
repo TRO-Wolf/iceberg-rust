@@ -133,8 +133,10 @@ pub(crate) use first_row_id_policy::FirstRowIdPolicy;
 /// `addFile(DeleteFile, long)` → `writeDeleteFileGroup`'s `writer.add(file, dataSeq)`).
 pub(crate) type PendingDeleteFile = (DataFile, Option<i64>);
 
+mod conflict_filter;
 mod removal_targets;
 
+use conflict_filter::first_conflicting_file;
 use removal_targets::{DeleteFileMatcher, RemovalHits, RemovalTargets};
 
 pub(crate) fn latest_snapshot<'a>(
@@ -2223,7 +2225,8 @@ pub(crate) async fn validate_no_conflicting_added_data_files_on(
 ///
 /// Arguments mirror [`validate_no_conflicting_added_data_files`]. The only differences from the data-file
 /// check are (1) the DELETE-manifest walk + V2 guard (in [`added_delete_files_after`]) and (2) the
-/// DELETE-specific error message — the per-file conflict test is shared.
+/// DELETE-specific error message — the per-file conflict test (partition projection, then the
+/// existing [`InclusiveMetricsEvaluator`]) is shared.
 ///
 /// **Over-scan vs Java (documented):** see [`added_delete_files_after`] — this port omits Java's
 /// `DeleteFileIndex` `startingSequenceNumber` refinement, a conservative over-scan (can only over-reject).
@@ -2293,45 +2296,6 @@ pub(crate) async fn validate_deleted_data_files_on(
     }
 
     Ok(())
-}
-
-/// Return the first file in `files` that COULD contain records matching `conflict_filter` — the shared
-/// per-file conflict test behind both [`validate_no_conflicting_added_data_files`] and
-/// [`validate_no_conflicting_added_delete_files`].
-///
-/// Binds `conflict_filter` to `current`'s current schema ONCE (the caller's filter when `Some`, else
-/// `AlwaysTrue` = any file conflicts — the most conservative serializable check, Java
-/// `dataConflictDetectionFilter()` returning `alwaysTrue()` when no filter is set), then tests each file
-/// with the existing [`InclusiveMetricsEvaluator`] (Java `ManifestGroup.filterData` = inclusive-metrics
-/// evaluation over the file's bounds / null / nan stats). Returns the FIRST matching file (Java throws on
-/// the first conflict entry), or `None` when nothing can match (including an empty `files`).
-///
-/// `include_empty_files = true` keeps a zero-record file's evaluation conservative (it never excludes on
-/// emptiness alone). The bind happens once for the whole set, not per file.
-fn first_conflicting_file(
-    files: &[DataFile],
-    current: &Table,
-    conflict_filter: Option<&Predicate>,
-    case_sensitive: bool,
-) -> Result<Option<DataFile>> {
-    if files.is_empty() {
-        // No concurrently-added file of the relevant content — nothing can conflict.
-        return Ok(None);
-    }
-
-    let schema = current.metadata().current_schema().clone();
-    let bound_filter: BoundPredicate = conflict_filter
-        .cloned()
-        .unwrap_or(Predicate::AlwaysTrue)
-        .bind(schema, case_sensitive)?;
-
-    for file in files {
-        if InclusiveMetricsEvaluator::eval(&bound_filter, file, true)? {
-            return Ok(Some(file.clone()));
-        }
-    }
-
-    Ok(None)
 }
 
 #[cfg(test)]
