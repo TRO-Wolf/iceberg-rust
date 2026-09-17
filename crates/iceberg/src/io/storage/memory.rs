@@ -207,6 +207,27 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
+    async fn write_new(&self, path: &str, bs: Bytes) -> Result<()> {
+        let normalized = Self::normalize_path(path);
+        let mut data = self.data.write().map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to acquire write lock: {e}"),
+            )
+        })?;
+        if data.contains_key(&normalized) {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                format!("Cannot create {path}: file already exists"),
+            ));
+        }
+        data.insert(normalized, MemoryEntry {
+            bytes: bs,
+            created_at_millis: now_millis(),
+        });
+        Ok(())
+    }
+
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
         let normalized = Self::normalize_path(path);
         Ok(Box::new(MemoryFileWrite::new(
@@ -489,6 +510,27 @@ mod tests {
 
         // File exists now
         assert!(storage.exists(path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_memory_storage_write_new_refuses_existing() {
+        let storage = MemoryStorage::new();
+        let path = "memory://test/new.txt";
+        let first = Bytes::from("first");
+        storage
+            .write_new(path, first.clone())
+            .await
+            .expect("create-new on absent path succeeds");
+        assert_eq!(storage.read(path).await.expect("read back"), first);
+        let err = storage
+            .write_new(path, Bytes::from("second"))
+            .await
+            .expect_err("create-new on existing path fails");
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+        assert_eq!(
+            storage.read(path).await.expect("winner bytes intact"),
+            first
+        );
     }
 
     #[tokio::test]

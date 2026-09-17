@@ -167,6 +167,11 @@ impl FileIO {
         self.get_storage()?.new_output(path.as_ref())
     }
 
+    /// Write bytes to a path that must not exist yet.
+    pub async fn write_new(&self, path: impl AsRef<str>, bs: Bytes) -> Result<()> {
+        self.get_storage()?.write_new(path.as_ref(), bs).await
+    }
+
     /// Recursively list all files under a prefix.
     ///
     /// This mirrors Java's `SupportsPrefixOperations.listPrefix`

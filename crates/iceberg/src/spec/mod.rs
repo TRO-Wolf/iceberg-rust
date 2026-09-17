@@ -34,6 +34,7 @@ mod sort;
 mod statistic_file;
 mod table_metadata;
 mod table_metadata_builder;
+mod table_metadata_commit;
 mod table_properties;
 mod transform;
 mod values;

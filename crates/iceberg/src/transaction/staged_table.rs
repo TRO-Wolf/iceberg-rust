@@ -337,7 +337,7 @@ impl Transaction {
             .to_string();
         current_table
             .metadata()
-            .write_to(current_table.file_io(), &next_location)
+            .write_commit_metadata(current_table.file_io(), &next_location)
             .await?;
         Ok(current_table.with_metadata_location(next_location))
     }

@@ -729,7 +729,7 @@ impl Catalog for S3TablesCatalog {
 
         staged_table
             .metadata()
-            .write_to(staged_table.file_io(), staged_metadata_location)
+            .write_commit_metadata(staged_table.file_io(), staged_metadata_location)
             .await?;
 
         self.cas_update_metadata_location(

@@ -22,6 +22,7 @@
 //! [`StorageFactory`](iceberg::io::StorageFactory) traits from the `iceberg` crate
 //! using [OpenDAL](https://opendal.apache.org/) as the backend.
 
+mod storage_impl;
 mod utils;
 
 use std::collections::HashMap;
@@ -31,15 +32,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cfg_if::cfg_if;
 use iceberg::io::{
-    CLIENT_LIST_STAT_CONCURRENCY, DEFAULT_LIST_STAT_CONCURRENCY, FileInfo, FileMetadata, FileRead,
-    FileWrite, InputFile, OutputFile, Storage, StorageConfig, StorageFactory,
+    CLIENT_LIST_STAT_CONCURRENCY, DEFAULT_LIST_STAT_CONCURRENCY, FileRead, FileWrite, Storage,
+    StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer};
 use opendal::raw::ConcurrentTasks;
 use opendal::{Executor, Operator};
 use serde::{Deserialize, Serialize};
-use utils::{from_opendal_error, join_list_location};
+use utils::from_opendal_error;
 
 /// Per-operator concurrent request cap applied once when an Operator is first cached.
 ///
@@ -65,7 +66,7 @@ fn parse_list_stat_concurrency(props: &HashMap<String, String>) -> usize {
 /// [`opendal::Buffer::to_bytes`] is zero-copy for a contiguous buffer. A multi-part buffer must
 /// consolidate, because the Iceberg `FileRead` API returns one contiguous buffer.
 #[inline]
-fn buffer_to_bytes(buf: opendal::Buffer) -> Bytes {
+pub(crate) fn buffer_to_bytes(buf: opendal::Buffer) -> Bytes {
     buf.to_bytes()
 }
 
@@ -97,7 +98,7 @@ fn list_stat_task(
 /// Run `stat` for incomplete list entries with a bounded concurrency window.
 ///
 /// The slot index preserves the parent list order, not the completion order.
-async fn stat_incomplete_list_entries(
+pub(crate) async fn stat_incomplete_list_entries(
     op: &Operator,
     need_stat: &[(usize, String)],
     concurrency: usize,
@@ -228,14 +229,14 @@ fn opendal_timestamp_to_millis(timestamp: opendal::raw::Timestamp) -> i64 {
 /// Whether list-entry metadata is complete enough to skip a per-file `stat`. Trust list metadata
 /// only when `content_length` is positive. OpenDAL returns `0` both for an unset size and for a
 /// genuinely empty object, so a zero length always falls back to `stat`.
-fn list_entry_metadata_complete(meta: &opendal::Metadata) -> bool {
+pub(crate) fn list_entry_metadata_complete(meta: &opendal::Metadata) -> bool {
     !meta.is_deleted() && meta.content_length() > 0
 }
 
 /// Size + created-at millis taken from a **complete** list entry (no `stat`).
 ///
 /// Call only when [`list_entry_metadata_complete`] is true.
-fn file_meta_from_complete_list_entry(meta: &opendal::Metadata) -> (u64, i64) {
+pub(crate) fn file_meta_from_complete_list_entry(meta: &opendal::Metadata) -> (u64, i64) {
     let size = meta.content_length();
     let created_at_millis = meta
         .last_modified()
@@ -655,146 +656,6 @@ impl OpenDalStorage {
                 "No storage service has been enabled",
             )),
         }
-    }
-}
-
-#[typetag::serde(name = "OpenDalStorage")]
-#[async_trait]
-impl Storage for OpenDalStorage {
-    async fn exists(&self, path: &str) -> Result<bool> {
-        let (op, relative_path) = self.create_operator(&path)?;
-        Ok(op.exists(relative_path).await.map_err(from_opendal_error)?)
-    }
-
-    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        let (op, relative_path) = self.create_operator(&path)?;
-        let meta = op.stat(relative_path).await.map_err(from_opendal_error)?;
-        Ok(FileMetadata {
-            size: meta.content_length(),
-        })
-    }
-
-    async fn read(&self, path: &str) -> Result<Bytes> {
-        let (op, relative_path) = self.create_operator(&path)?;
-        Ok(buffer_to_bytes(
-            op.read(relative_path).await.map_err(from_opendal_error)?,
-        ))
-    }
-
-    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        let (op, relative_path) = self.create_operator(&path)?;
-        Ok(Box::new(OpenDalReader(
-            op.reader(relative_path).await.map_err(from_opendal_error)?,
-        )))
-    }
-
-    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-        let (op, relative_path) = self.create_operator(&path)?;
-        op.write(relative_path, bs)
-            .await
-            .map_err(from_opendal_error)?;
-        Ok(())
-    }
-
-    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        let (op, relative_path) = self.create_operator(&path)?;
-        Ok(Box::new(OpenDalWriter(
-            op.writer(relative_path).await.map_err(from_opendal_error)?,
-        )))
-    }
-
-    async fn delete(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self.create_operator(&path)?;
-        Ok(op.delete(relative_path).await.map_err(from_opendal_error)?)
-    }
-
-    async fn delete_prefix(&self, path: &str) -> Result<()> {
-        let (op, relative_path) = self.create_operator(&path)?;
-        let path = if relative_path.ends_with('/') {
-            relative_path.to_string()
-        } else {
-            format!("{relative_path}/")
-        };
-        Ok(op.remove_all(&path).await.map_err(from_opendal_error)?)
-    }
-
-    /// Recursively list every file under `prefix`, as Java `HadoopFileIO.listPrefix` does. # Notes
-    /// The prefix is normalized to a trailing `/`, so prefix `ab` never reports a sibling key
-    /// `ab2/...`. Size and last-modified come from the list entry when
-    /// [`list_entry_metadata_complete`] allows it, and from `stat` otherwise, so size 0 stays
-    /// authoritative.
-    async fn list(&self, path: &str) -> Result<Vec<FileInfo>> {
-        let (op, relative_path) = self.create_operator(&path)?;
-        // The base re-prefixes each entry back into the scheme-qualified location the
-        // caller knows.
-        let base = &path[..path.len() - relative_path.len()];
-
-        let list_root = if relative_path.is_empty() || relative_path.ends_with('/') {
-            relative_path.to_string()
-        } else {
-            format!("{relative_path}/")
-        };
-
-        let entries = op
-            .list_with(&list_root)
-            .recursive(true)
-            .await
-            .map_err(from_opendal_error)?;
-
-        // Incomplete entries queue a `stat` keyed by slot index, so the result order does
-        // not follow HEAD completion order.
-        let mut locations: Vec<String> = Vec::with_capacity(entries.len());
-        let mut ready_meta: Vec<Option<(u64, i64)>> = Vec::with_capacity(entries.len());
-        let mut need_stat: Vec<(usize, String)> = Vec::new();
-
-        for entry in entries {
-            let list_meta = entry.metadata();
-            // Skip directory markers and delete-marker entries (not live files).
-            if !list_meta.is_file() || list_meta.is_deleted() {
-                continue;
-            }
-
-            let location = join_list_location(base, entry.path());
-            if list_entry_metadata_complete(list_meta) {
-                locations.push(location);
-                ready_meta.push(Some(file_meta_from_complete_list_entry(list_meta)));
-            } else {
-                let slot_idx = locations.len();
-                need_stat.push((slot_idx, entry.path().to_string()));
-                locations.push(location);
-                ready_meta.push(None);
-            }
-        }
-
-        stat_incomplete_list_entries(
-            &op,
-            &need_stat,
-            self.list_stat_concurrency(),
-            &mut ready_meta,
-        )
-        .await?;
-
-        let mut files = Vec::with_capacity(locations.len());
-        for (location, meta) in locations.into_iter().zip(ready_meta) {
-            let (size, created_at_millis) = meta.ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("list stat did not produce metadata for {location}"),
-                )
-            })?;
-            files.push(FileInfo::new(location, size, created_at_millis));
-        }
-        Ok(files)
-    }
-
-    #[allow(unreachable_code, unused_variables)]
-    fn new_input(&self, path: &str) -> Result<InputFile> {
-        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
-    }
-
-    #[allow(unreachable_code, unused_variables)]
-    fn new_output(&self, path: &str) -> Result<OutputFile> {
-        Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
     }
 }
 
