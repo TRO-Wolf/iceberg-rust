@@ -281,3 +281,19 @@ FLOAT arms reverted to Datum::new(field_type.clone(), Float) -> 10 passed; 1 fai
 cargo test -p iceberg --lib                                 -> 3688 passed; 0 failed; 8 ignored
 cargo clippy -p iceberg --all-targets -- -D warnings        -> exit 0
 ```
+
+## Re-proof after rebase onto 75da2b58 (run 20a follow-on F-PROMOTE-READ-1, L-01)
+
+**Date:** 2026-09-17. **Model:** muse-spark-1.3-contributor.
+**Branch:** `fix/ice-promote-read-1`, rebased onto fork main `75da2b58`
+(F-ICE-NAN-PUSHDOWN-1 #284 + F-ICE-HADOOP-VN-1 #286). `git status --short` clean
+before any edit.
+
+```
+CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg --lib spec::promotion_tests
+  -> test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 3690 filtered out
+CARGO_BUILD_JOBS=10 RUST_TEST_THREADS=8 cargo test -p iceberg-datafusion --test promoted_type_dml
+  -> test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The rebase kept the unit green; the L-01 inspect seam below is still open.
