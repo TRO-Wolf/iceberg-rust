@@ -100,6 +100,31 @@ Fixture note: three renames that swap two names need three sequential schema com
 one action cannot see the `tmp` name it just created
 (`Cannot rename missing column: tmp`).
 
+## Round 2 red evidence (critic-289 L-001 / L-002, 2026-09-17)
+
+`CARGO_BUILD_JOBS=10 cargo test -p iceberg --lib scan::evo_scan_tests`:
+
+```
+test result: FAILED. 7 passed; 3 failed; 0 ignored; 0 measured; 3723 filtered out
+```
+
+- L-001: `main_ref_scan_after_add_column_null_fills_the_added_column`,
+  `main_ref_select_all_after_add_column_includes_the_added_column`,
+  `main_ref_scan_after_swapping_two_names_reads_each_field_by_id` — all
+  `DataInvalid => Column extra not found` (or the snapshot-name bind on swap):
+  `use_ref("main")` counts as a pin and binds the snapshot schema.
+- L-002: the hollow C-004 row-count pin is replaced by three discriminating pins
+  (`snapshot_pinned_select_of_an_added_column_fails`,
+  `snapshot_pinned_select_of_a_pre_rename_name_reads_the_field`,
+  `snapshot_pinned_scan_after_a_name_swap_reads_snapshot_names`) — green on this
+  tree, proven by the round-2 mutation below.
+- Guard `tag_ref_on_the_pre_ddl_snapshot_binds_the_snapshot_schema` green throughout
+  (non-main refs already bind the snapshot schema).
+
+Fixture note: DDL writes no snapshot, so the pre-DDL snapshot is the current one at
+tag time — the first tag-fixture draft searched for a non-current snapshot and found
+none.
+
 ## Implemented fix
 
 `crates/iceberg/src/scan/mod.rs` (`TableScanBuilder::build`): the bind schema is the

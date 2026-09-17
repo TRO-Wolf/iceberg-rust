@@ -293,13 +293,29 @@ async fn unpinned_scan_after_swapping_two_names_reads_each_field_by_id() {
 }
 
 #[tokio::test]
-async fn snapshot_pinned_scan_still_binds_the_snapshot_schema() {
+async fn snapshot_pinned_select_of_an_added_column_fails() {
     let (table, _guard) = added_column_table().await;
+    let snapshot_id = table.metadata().current_snapshot_id().expect("snapshot");
+    let error = table
+        .scan()
+        .snapshot_id(snapshot_id)
+        .select(["extra"])
+        .build()
+        .expect_err("added column is absent from the snapshot schema");
+    assert!(
+        error.to_string().contains("Column extra not found"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_pinned_select_of_a_pre_rename_name_reads_the_field() {
+    let (table, _guard) = renamed_column_table().await;
     let snapshot_id = table.metadata().current_snapshot_id().expect("snapshot");
     let batches: Vec<RecordBatch> = table
         .scan()
         .snapshot_id(snapshot_id)
-        .select(["id", "v"])
+        .select(["id", "w"])
         .build()
         .expect("pinned scan")
         .to_arrow()
@@ -309,4 +325,197 @@ async fn snapshot_pinned_scan_still_binds_the_snapshot_schema() {
         .await
         .expect("collect");
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let mut rows = vec![];
+    for batch in &batches {
+        let ids = long_values(batch, "id");
+        let names = string_values(batch, "w");
+        for index in 0..ids.len() {
+            rows.push((ids[index], names[index].clone()));
+        }
+    }
+    rows.sort();
+    assert_eq!(rows, vec![
+        (1, Some("a".to_string())),
+        (2, Some("b".to_string())),
+    ]);
+}
+
+#[tokio::test]
+async fn snapshot_pinned_scan_after_a_name_swap_reads_snapshot_names() {
+    let (table, _guard) = swapped_names_table().await;
+    let snapshot_id = table.metadata().current_snapshot_id().expect("snapshot");
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .snapshot_id(snapshot_id)
+        .select(["id", "v", "extra"])
+        .build()
+        .expect("pinned scan")
+        .to_arrow()
+        .await
+        .expect("to_arrow")
+        .try_collect()
+        .await
+        .expect("collect");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let mut rows = vec![];
+    for batch in &batches {
+        let ids = long_values(batch, "id");
+        let names = string_values(batch, "v");
+        let extras = string_values(batch, "extra");
+        for index in 0..ids.len() {
+            rows.push((ids[index], names[index].clone(), extras[index].clone()));
+        }
+    }
+    rows.sort();
+    assert_eq!(rows, vec![
+        (1, Some("a".to_string()), Some("e1".to_string())),
+        (2, Some("b".to_string()), Some("e2".to_string())),
+    ]);
+}
+
+async fn tagged_pre_ddl_table() -> (Table, TempDir) {
+    let (catalog, guard) = local_catalog().await;
+    let table = create_table(&catalog, vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+        string_field(2, "v"),
+    ])
+    .await;
+    let first = write_string_file(&table, "f1.parquet", &[1], &[&["a"]]).await;
+    let second = write_string_file(&table, "f2.parquet", &[2], &[&["b"]]).await;
+    let table = append(&catalog, &table, vec![first, second]).await;
+    let pre_ddl = table.metadata().current_snapshot_id().expect("snapshot");
+    let tx = Transaction::new(&table);
+    let table = commit(
+        &catalog,
+        tx.manage_snapshots()
+            .create_tag("pre-ddl", pre_ddl)
+            .apply(tx)
+            .expect("apply create tag"),
+    )
+    .await;
+    let tx = Transaction::new(&table);
+    let action = tx
+        .update_schema()
+        .add_column("extra", Type::Primitive(PrimitiveType::String));
+    (
+        commit(&catalog, action.apply(tx).expect("apply add column")).await,
+        guard,
+    )
+}
+
+#[tokio::test]
+async fn main_ref_scan_after_add_column_null_fills_the_added_column() {
+    let (table, _guard) = added_column_table().await;
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .use_ref("main")
+        .select(["id", "v", "extra"])
+        .build()
+        .expect("main ref scan")
+        .to_arrow()
+        .await
+        .expect("to_arrow")
+        .try_collect()
+        .await
+        .expect("collect");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let mut rows = vec![];
+    for batch in &batches {
+        let ids = long_values(batch, "id");
+        let names = string_values(batch, "v");
+        let extras = string_values(batch, "extra");
+        for index in 0..ids.len() {
+            rows.push((ids[index], names[index].clone(), extras[index].clone()));
+        }
+    }
+    rows.sort();
+    assert_eq!(rows, vec![
+        (1, Some("a".to_string()), None),
+        (2, Some("b".to_string()), None),
+    ]);
+}
+
+#[tokio::test]
+async fn main_ref_select_all_after_add_column_includes_the_added_column() {
+    let (table, _guard) = added_column_table().await;
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .use_ref("main")
+        .select_all()
+        .build()
+        .expect("main ref scan")
+        .to_arrow()
+        .await
+        .expect("to_arrow")
+        .try_collect()
+        .await
+        .expect("collect");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    for batch in &batches {
+        let extras = string_values(batch, "extra");
+        assert_eq!(extras, vec![None; extras.len()]);
+    }
+}
+
+#[tokio::test]
+async fn main_ref_scan_after_swapping_two_names_reads_each_field_by_id() {
+    let (table, _guard) = swapped_names_table().await;
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .use_ref("main")
+        .select(["id", "v", "extra"])
+        .build()
+        .expect("main ref scan")
+        .to_arrow()
+        .await
+        .expect("to_arrow")
+        .try_collect()
+        .await
+        .expect("collect");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let mut rows = vec![];
+    for batch in &batches {
+        let ids = long_values(batch, "id");
+        let renamed = string_values(batch, "v");
+        let swapped = string_values(batch, "extra");
+        for index in 0..ids.len() {
+            rows.push((ids[index], renamed[index].clone(), swapped[index].clone()));
+        }
+    }
+    rows.sort();
+    assert_eq!(rows, vec![
+        (1, Some("e1".to_string()), Some("a".to_string())),
+        (2, Some("e2".to_string()), Some("b".to_string())),
+    ]);
+}
+
+#[tokio::test]
+async fn tag_ref_on_the_pre_ddl_snapshot_binds_the_snapshot_schema() {
+    let (table, _guard) = tagged_pre_ddl_table().await;
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .use_ref("pre-ddl")
+        .select(["id", "v"])
+        .build()
+        .expect("tag ref scan")
+        .to_arrow()
+        .await
+        .expect("to_arrow")
+        .try_collect()
+        .await
+        .expect("collect");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let mut rows = vec![];
+    for batch in &batches {
+        let ids = long_values(batch, "id");
+        let names = string_values(batch, "v");
+        for index in 0..ids.len() {
+            rows.push((ids[index], names[index].clone()));
+        }
+    }
+    rows.sort();
+    assert_eq!(rows, vec![
+        (1, Some("a".to_string())),
+        (2, Some("b".to_string())),
+    ]);
 }
