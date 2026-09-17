@@ -25,6 +25,24 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-17): F-EVO-SCAN-1 scans and DataFusion UPDATE after ADD / RENAME COLUMN
+
+Ledger: [`f-evo-scan-1-ledger.md`](f-evo-scan-1-ledger.md). After `ADD COLUMN` or
+`RENAME COLUMN` with no write since, the unpinned scan bound current names against the
+snapshot schema (loud refusal; silent wrong values on a name swap), and the DataFusion
+UPDATE/DELETE execs did the same through their pinned scan. Consumer: RePark
+ICE-EVO-DML-1 residual UPDATE red (run 20a).
+
+- [x] C-001..C-004 red first: 4 pins in `scan/evo_scan_tests.rs`, 3 of 4 red on base
+- [x] C-005 red first: 12 pins in `tests/evo_schema_dml.rs`, 10 of 12 red on base
+- [x] Fix + green: unpinned scan binds the current schema, pinned keeps the snapshot
+      schema, new `project_current_schema()` for the DML seams; 4 + 12 green
+- [x] Mutation: build-bind revert reds 3, each DML seam revert reds its own 5
+- [x] C-006 gates + docs commit
+- [x] Round 2 (critic-289): L-001 `use_ref("main")` no-op red (3 pins) then fix;
+      L-002 discriminating C-004 pins + tag hardening, `if false` mutation reds 4
+- [x] Round 2 gates + docs commit
+
 ## ACTIVE (2026-09-16): F-PROMOTE-READ-1 manifest values read under the promoted type
 
 Ledger: [`f-promote-read-1-ledger.md`](f-promote-read-1-ledger.md). After a legal type

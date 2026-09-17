@@ -36,7 +36,7 @@ pub(super) async fn mor_scan_stream(
     ArrowRecordBatchStream,
     Arc<Mutex<HashMap<String, (i32, Struct)>>>,
 )> {
-    let mut builder = table.scan().select(projection);
+    let mut builder = table.scan().select(projection).project_current_schema();
     if let Some(snapshot_id) = scan_snapshot_id {
         builder = builder.snapshot_id(snapshot_id);
     }

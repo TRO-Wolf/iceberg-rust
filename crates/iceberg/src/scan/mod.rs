@@ -26,6 +26,8 @@ use context::*;
 mod incremental;
 pub use batch::*;
 pub use incremental::*;
+#[cfg(test)]
+mod evo_scan_tests;
 mod metrics_collector;
 mod partition_work;
 #[cfg(test)]
@@ -92,6 +94,7 @@ pub struct TableScanBuilder<'a> {
     column_names: Option<Vec<String>>,
     snapshot_id: Option<i64>,
     snapshot_ref: Option<String>,
+    project_current_schema: bool,
     batch_size: Option<usize>,
     case_sensitive: bool,
     filter: Option<Predicate>,
@@ -135,6 +138,7 @@ impl<'a> TableScanBuilder<'a> {
             column_names: None,
             snapshot_id: None,
             snapshot_ref: None,
+            project_current_schema: false,
             batch_size: None,
             case_sensitive: true,
             filter: None,
@@ -246,6 +250,12 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
+    /// Scan the pinned snapshot's files under the table's current schema.
+    pub fn project_current_schema(mut self) -> Self {
+        self.project_current_schema = true;
+        self
+    }
+
     /// Returns the [`Table`] this builder scans. Used by the [`BatchScan`](crate::scan::BatchScan)
     /// adapter to resolve `as_of_time` over the table's snapshot log before pinning the snapshot
     /// id via [`snapshot_id`](Self::snapshot_id).
@@ -253,11 +263,11 @@ impl<'a> TableScanBuilder<'a> {
         self.table
     }
 
-    /// Scan the snapshot that a branch or tag reference points to. Mirrors Java `TableScan.useRef`.
-    /// [`build`](Self::build) resolves the name, and rejects both an unknown name and a
-    /// [`snapshot_id`](Self::snapshot_id) set alongside it.
+    /// Scan the snapshot a branch or tag points to (`"main"` pins nothing).
+    /// [`build`](Self::build) rejects an unknown name and a clashing [`snapshot_id`](Self::snapshot_id).
     pub fn use_ref(mut self, ref_name: impl Into<String>) -> Self {
-        self.snapshot_ref = Some(ref_name.into());
+        let ref_name = ref_name.into();
+        self.snapshot_ref = (ref_name != crate::spec::MAIN_BRANCH).then_some(ref_name);
         self
     }
 
@@ -444,23 +454,12 @@ impl<'a> TableScanBuilder<'a> {
             }
         };
 
-        let schema = snapshot.schema(self.table.metadata())?;
-
-        // Check that all column names exist in the schema (skip reserved columns).
-        if let Some(column_names) = self.column_names.as_ref() {
-            for column_name in column_names {
-                // Skip reserved columns that don't exist in the schema
-                if is_metadata_column_name(column_name) {
-                    continue;
-                }
-                if schema.field_by_name(column_name).is_none() {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Column {column_name} not found in table. Schema: {schema}"),
-                    ));
-                }
-            }
-        }
+        let pinned = self.snapshot_id.is_some() || self.snapshot_ref.is_some();
+        let schema = if pinned && !self.project_current_schema {
+            snapshot.schema(self.table.metadata())?
+        } else {
+            self.table.metadata().current_schema().clone()
+        };
 
         let mut field_ids = vec![];
         let column_names = self.column_names.clone().unwrap_or_else(|| {
