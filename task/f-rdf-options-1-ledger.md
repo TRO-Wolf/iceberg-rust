@@ -287,3 +287,14 @@ Comment-grep triage (RULE 0): the `+//` lines are (a) a keep-true edit of the ex
 into `rewrite_data_files_plan_tests.rs` (2-line doc, 4 inline comments, moved unchanged —
 round-1 F-24 split precedent), (c) assert-message string literals in the new pins (code, not
 comments). No new comment is authored. Verified with the RULE 0 grep before commit.
+
+### 9e. Q1 ruling (orchestrator, Q-19c-3, 2026-09-17)
+
+Measured before ruling. PySpark 4.1.2 + Iceberg 1.11.0, v3 table `(id BIGINT, grp BIGINT) PARTITIONED BY (grp)`, two
+INSERT statements of six rows over two partitions (4 data files, `next-row-id` 12), then `rewrite_data_files` with
+`rewrite-all`: default → 1 new snapshot, `next-row-id` **24**; with `partial-progress.enabled` → 2 new snapshots,
+`next-row-id` **30** (orchestrator probe `rowid_probe.py`, output `rowid_spark.json`). Java's one-commit default
+consumes only the added rows, as §9b's manifest rule says. `M1_NEXT_ROW_ID` / `M2_NEXT_ROW_ID` in
+`crates/iceberg/tests/interop_v3_maintenance.rs` move to the one-commit chain 24 / 36. Residue (P3):
+`dev/java-interop/run-interop-v3-maintenance.sh` confirms with one `newRewrite` per partition (the two-commit
+shape); its replay is Docker-only and was not re-run on this box.
