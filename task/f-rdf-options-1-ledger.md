@@ -50,7 +50,7 @@ Fixture shape throughout the oracle: `(id BIGINT, p INT, v STRING) PARTITIONED B
 | `Cannot set max-concurrent-file-group-rewrites to 0, the value must be positive.` | `err_concurrent_0` error |
 | `'delete-ratio-threshold' is set to 2.0 but must be <= 1` (Java `Double.toString` keeps `.0`) | `err_delete_ratio` error |
 | Unknown/empty/upper-case option keys are rejected, not ignored | `err_unknown_key`, `err_empty_key`, `err_upper_key` |
-| Unparseable bool (`rewrite-all=maybe`) is a silent no-op (result zeros, no error) | `err_bad_bool` |
+| Unparsable bool (`rewrite-all=maybe`) is a silent no-op (result zeros, no error) | `err_bad_bool` |
 
 ## 3. Red-first
 
@@ -141,3 +141,149 @@ new private doc drafted on `write_group` was deleted before commit.
 - `Result.failedDataFilesCount`: the oracle result tuple carries it (always 0 here); the fork `RewriteDataFilesResult` has no such field and the brief does not ask for one. A failure fails the action (default) or the batch (partial), so the count is only observable mid-partial-run.
 - Orphan cleanup of written-but-uncommitted files on failure: unchanged from the base tree (neither the old per-group path nor Java's default path is modified here).
 - Sort / Z-order strategies and oversized-file splitting stay deferred (R135 Deferred row unchanged for those).
+
+## 9. Round 2 (remediation of fork PR TRO-Wolf/iceberg-rust#283)
+
+Model: muse-spark-1.3-contributor. Branch `fix/ice-rdf-options-1` at `48599aa1`.
+Oracle for L-001: `/tmp/oc-worker/ic-build/l001_spark.json` (probe `l001_probe.py` beside it):
+table `(id, p, v)` PARTITIONED BY (p), 2 partitions x 4 files x 50 rows, DROP PARTITION FIELD p.
+
+### 9a. Clauses
+
+| id | finding | verdict | evidence |
+|---|---|---|---|
+| CI-1 | V3 lineage regression under the one-commit default: `test_v3_rewrite_matrix_preserves_rows_and_lineage`, `plain/m1: next_row_id left: 24 right: 30` | OPEN, needs owner ruling (Q1 below); product code unchanged | §9b |
+| L-001 | grouping keyed on `output_spec_id` instead of the table's current default spec | FIXED in product code; round-1 pin corrected; 3 oracle-cell pins added | §9c |
+| CI-2 | bool-wording typo at §2 | FIXED (now `Unparsable`) | §2 line 53 |
+| COV | whole default-suite run minus Docker-backed tests | see §9d | §9d |
+
+### 9b. CI-1 red evidence and mechanism (no product-code change)
+
+Reproduce on the round-1 tree (no Docker needed):
+
+```
+cargo test -p iceberg --test interop_v3_maintenance test_v3_rewrite_matrix_preserves_rows_and_lineage
+thread 'test_v3_rewrite_matrix_preserves_rows_and_lineage' panicked at
+crates/iceberg/tests/interop_v3_maintenance.rs:503:5:
+assertion `left == right` failed: plain/m1: next_row_id
+  left: 24
+ right: 30
+```
+
+Manifest dump of the M1 combined commit (one commit, 2 groups, 12 live rows): the added
+manifest takes `first_row_id` 12 and advances `next_row_id` by its 12 added rows to 24; the 3
+rewritten manifests are all-`Deleted` (`existing + added = 0`) and advance it by 0. Final 24.
+M2 then advances 24 by its 12 added rows to 36. The single-commit chain is 12 → 24 → 36.
+
+The same matrix with per-group commits (the pre-round-1 shape, via `partial_progress(true)`)
+gives 12 → 30 → 42: commit 1 consumes 6 added + 6 carried-existing rows (the other partition's
+live files re-ranged in the rewritten manifests) to reach 24, commit 2 adds 6 more to reach 30.
+A scratch probe reproduced exactly 30 this way, with the added files at `first_row_id` 12 and 24.
+
+PR-4's own commit message (`8efa8cd7`) establishes that 30 is the TWO-commit value: the fork
+then "commit[ted] one snapshot per bin" and the Java confirmation ran "one
+newRewrite().rewriteFiles per partition over the m0 table" — two commits on each side, agreeing
+at 30. No Java single-combined-commit value was ever measured. Under PR-4's bytecode-verified
+rule (an unassigned V3 DATA manifest advances `next_row_id` by `existing + added`, an assigned
+carried manifest by 0), a single combined commit has no carried-existing rows, so it must consume
+exactly the 12 added rows: 24. The fork's 24 matches that rule; reaching 30 in one commit would
+need fabricated row-id consumption. Hence Q1.
+
+| id | question | premise | recommendation |
+|---|---|---|---|
+| Q1 | CI-1: update the `M1_NEXT_ROW_ID` / `M2_NEXT_ROW_ID` pins to the single-commit chain 24 / 36, or keep 30 / 42? | §9b shows 30 / 42 is the two-commit shape and the one-commit default (C-001, Spark-oracle-proven) forces 24 / 36 under the verified manifest rule. The brief forbids editing the expectation, and no Java-faithful product change reaches 30 in one commit. | Update the pins to 24 / 36 (product code already Java-faithful). |
+
+### 9c. L-001 red evidence, fix, and pins
+
+Red on the round-1 tree (product files stashed, new pins kept):
+
+```
+test_output_spec_id_0_after_drop_writes_two_files_under_spec_0 ... FAILED
+  left: 2
+ right: 1
+test_output_spec_id_0_partial_progress_matches_java_single_group ... FAILED
+  left: 2
+ right: 1
+test_output_spec_id_0_size_split_fans_mixed_bins_out_by_partition ... FAILED
+  left: 4
+ right: 6
+  (groups: 4 pure bins of [added 1, rewritten 2] — per-partition buckets under the bug)
+```
+
+Fix: `plan_file_groups` took the resolved output spec as its grouping key; grouping now keys
+on the table's current default spec. New `plan_file_groups_for_table(&table, tasks, config)`
+in `rewrite_data_files_plan.rs` resolves the default spec and delegates; `execute` and the two
+internal hand-driven call sites route through it. The spec-explicit `plan_file_groups` keeps
+serving the unit test; its parameter is renamed `output_spec` → `grouping_spec` with its
+comment kept true. The write path still uses the resolved output spec. The module doc already
+described the fixed rule ("or empty struct when the spec is not the table default").
+The partition-isolation unit test moved verbatim to new
+`rewrite_data_files_plan_tests.rs` (registered in `mod.rs`; helpers imported from
+`rewrite_data_files::tests`, the codebase's split-test precedent), which drops
+`rewrite_data_files.rs` 2501 → 2449 lines; the ceiling in
+`scripts/check_rust_file_size.py` moves down to 2449. `map.md` gains the new file's row and
+names current-spec grouping.
+
+Measured fork cells with the oracle fixture shape (`(id BIGINT, p INT, v STRING)`, 2 x 4 x 50
+rows with 20-char values, DROP p; fork files are 1694 bytes each):
+
+| cell | Java oracle | fork after fix |
+|---|---|---|
+| `out0_pp` (output-spec 0 + partial progress) | 1 snapshot, 2 files spec 0 | 1 snapshot, 1 group, 2 files spec 0, rows 200 + 200 |
+| `out0_pp_smallgroups` (plus `max-file-group-size-bytes` 2500) | 4 snapshots, 6 files spec 0, mixed bins | knob 4000 (2 fork files per bin) over arranged order `[0,1,0,0,1,1,0,1]`: 4 snapshots, 4 groups, 6 files spec 0 (two mixed bins fan out to 2 + 2, two pure bins to 1 + 1) |
+| `cur_pp` (partial progress, no output spec) | 1 snapshot, 1 file spec 1 | 1 snapshot, 1 group, 1 file spec 1, 400 rows |
+
+The knob differs (2500 vs 4000) because fork-written files (1694 bytes) are larger than Spark's
+(~1150 bytes); the bin SHAPE the knob produces (4 bins x 2 files, 2 mixed + 2 pure) matches the
+oracle's fan-out exactly. The arranged insertion order is what lets the pin tell grouping apart:
+under the bug the same knob yields 4 pure bins and 4 added files (red, pasted above).
+
+Pins: `test_output_spec_id_0_after_drop_writes_two_files_under_spec_0` now asserts 1 group plus
+5 snapshots (4 appends + 1 commit; the spec drop adds no snapshot);
+`test_default_spec_after_drop_writes_one_file_under_spec_1` gains the 5-snapshot assert;
+new `test_output_spec_id_0_partial_progress_matches_java_single_group` (9 snapshots),
+`test_output_spec_id_0_size_split_fans_mixed_bins_out_by_partition` (12 snapshots),
+`test_default_spec_partial_progress_matches_java_single_file` (9 snapshots). All assert row
+conservation over the `(id, p, v)` scan.
+
+### 9d. Coverage (finding 4)
+
+CI `Tests (default)` runs `cargo nextest run --all-targets --all-features --workspace` with
+`make docker-up`. Docker is unavailable here, so the run below excludes only the 8
+Docker-backed test binaries (`glue_catalog_test`, `hms_catalog_test`, `rest_catalog_test`,
+`conflict_commit_test`, `read_evolved_schema`, `read_positional_deletes`, `file_io_s3_test`,
+`file_io_gcs_test`) via nextest `-E`. Minimums (`cargo test -p iceberg --lib --tests`,
+`cargo test -p iceberg-datafusion`) are subsumed by it.
+
+Command (CI's, minus the 8 Docker binaries via nextest `-E`):
+
+```
+RUSTFLAGS="-C debuginfo=0" CARGO_BUILD_JOBS=10 cargo nextest run --no-fail-fast \
+  --all-targets --all-features --workspace -E 'not (binary(glue_catalog_test) or \
+  binary(hms_catalog_test) or binary(rest_catalog_test) or binary(conflict_commit_test) or \
+  binary(read_evolved_schema) or binary(read_positional_deletes) or binary(file_io_s3_test) or \
+  binary(file_io_gcs_test))'
+```
+
+Summary: `4812 tests run: 4811 passed (9 slow), 1 failed, 17 skipped`. The single failure is
+the CI-1 interop test (`interop_v3_maintenance
+test_v3_rewrite_matrix_preserves_rows_and_lineage`, `plain/m1: next_row_id left: 24 right:
+30`). No other red from the one-commit default anywhere in the workspace. The brief's minimums
+(`cargo test -p iceberg --lib --tests`, `cargo test -p iceberg-datafusion`) are subsumed: the
+nextest run covers `--all-targets` of every workspace member. An earlier fail-fast run stopped
+at `4229/4812: 4228 passed, 1 failed, 17 skipped` with the same single failure.
+
+### 9e. Gates
+
+| command | exit | evidence |
+|---|---|---|
+| suite of §9d | 1 (one known failure) | 4811 passed, 1 failed (CI-1), 17 skipped; failure is the CI-1 interop test only |
+| `cargo clippy -p iceberg --all-targets -- -D warnings` | 0 | clean |
+| `make check` | 0 | fmt, workspace clippy, toml, machete, agent-artifacts, matrix-anchors, comment-blocks, rust-file-size (466 files, 100 ceilings, `rewrite_data_files.rs` ceiling lowered 2501 → 2449) all green |
+| `typos` (CI-adjacent) | 0 | clean over the touched files; also fixed one self-trigger on the word being corrected |
+
+Comment-grep triage (RULE 0): the `+//` lines are (a) a keep-true edit of the existing
+`plan_file_groups` bucket comment, (b) a verbatim move of the partition-isolation unit test
+into `rewrite_data_files_plan_tests.rs` (2-line doc, 4 inline comments, moved unchanged —
+round-1 F-24 split precedent), (c) assert-message string literals in the new pins (code, not
+comments). No new comment is authored. Verified with the RULE 0 grep before commit.

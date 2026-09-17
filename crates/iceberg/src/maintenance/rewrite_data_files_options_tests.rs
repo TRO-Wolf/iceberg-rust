@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::Arc;
 
-use crate::Catalog;
+use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+use futures::TryStreamExt;
+
 use crate::error::ErrorKind;
 use crate::maintenance::RewriteJobOrder;
 use crate::maintenance::rewrite_data_files::RewriteDataFiles;
@@ -27,9 +30,20 @@ use crate::maintenance::rewrite_data_files::tests::{
     write_data_file,
 };
 use crate::maintenance::rewrite_data_files_plan::{format_java_double, plan_commit_batches};
-use crate::spec::DataContentType;
+use crate::spec::{
+    DataContentType, DataFile, DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec,
+    PrimitiveType, Schema, Struct, Transform, Type,
+};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use crate::writer::file_writer::ParquetWriterBuilder;
+use crate::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+use crate::{Catalog, NamespaceIdent, TableCreation};
 
 pub(crate) async fn two_partitions_by_four_files(catalog: &impl Catalog) -> crate::table::Table {
     let table = create_partitioned_table(catalog, crate::spec::FormatVersion::V2).await;
@@ -48,6 +62,172 @@ pub(crate) async fn two_partitions_by_four_files(catalog: &impl Catalog) -> crat
         .load_table(table.identifier())
         .await
         .expect("reload oracle-shape table")
+}
+
+fn l001_schema() -> Schema {
+    Schema::builder()
+        .with_fields(vec![
+            Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::required(
+                2,
+                "p",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::required(
+                3,
+                "v",
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ])
+        .build()
+        .expect("build (id, p, v) schema")
+}
+
+async fn create_l001_table(catalog: &impl Catalog, name: &str) -> Table {
+    let schema = l001_schema();
+    let spec = PartitionSpec::builder(schema.clone())
+        .with_spec_id(0)
+        .add_partition_field("p", "p", Transform::Identity)
+        .expect("add partition field")
+        .build()
+        .expect("build spec");
+    let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+    let creation = TableCreation::builder()
+        .name(name.to_string())
+        .schema(schema)
+        .partition_spec(spec)
+        .format_version(crate::spec::FormatVersion::V2)
+        .build();
+    catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create table")
+}
+
+async fn write_l001_file(table: &Table, tag: &str, p: i32, start: i64) -> DataFile {
+    use crate::arrow::schema_to_arrow_schema;
+
+    let schema = table.metadata().current_schema();
+    let arrow_schema = Arc::new(schema_to_arrow_schema(schema).expect("iceberg schema to arrow"));
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int64Array::from_iter_values(start..start + 50)) as ArrayRef,
+        Arc::new(Int32Array::from(vec![p; 50])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["x".repeat(20); 50])) as ArrayRef,
+    ])
+    .expect("build (id, p, v) batch");
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        format!("data-{tag}"),
+        Some(uuid::Uuid::now_v7().to_string()),
+        DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        schema.clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    let partition_key = PartitionKey::new(
+        table.metadata().default_partition_spec().as_ref().clone(),
+        schema.clone(),
+        Struct::from_iter([Some(Literal::int(p))]),
+    )
+    .expect("build partition key");
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(Some(partition_key))
+        .await
+        .expect("build data file writer");
+    writer.write(batch).await.expect("write data batch");
+    writer
+        .close()
+        .await
+        .expect("close data writer")
+        .into_iter()
+        .next()
+        .expect("exactly one data file")
+}
+
+async fn l001_dropped_table(catalog: &impl Catalog, name: &str, order: &[i32]) -> Table {
+    let table = create_l001_table(catalog, name).await;
+    let mut next_id = 0i64;
+    for (file_index, p) in order.iter().enumerate() {
+        let file = write_l001_file(&table, &format!("{name}-{file_index}"), *p, next_id).await;
+        next_id += 50;
+        append_files(catalog, &table, vec![file]).await;
+    }
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload oracle-shape table");
+    drop_partition_field_named(catalog, &table, "p").await
+}
+
+async fn drop_partition_field_named(catalog: &impl Catalog, table: &Table, name: &str) -> Table {
+    let action = Transaction::new(table)
+        .update_partition_spec()
+        .remove_field(name);
+    let tx = Transaction::new(table);
+    action
+        .apply(tx)
+        .expect("apply spec drop")
+        .commit(catalog)
+        .await
+        .expect("commit spec drop")
+}
+
+async fn scan_l001_rows(table: &Table) -> Vec<(i64, i32, String)> {
+    let stream = table
+        .scan()
+        .select(["id", "p", "v"])
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to arrow");
+    let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect batches");
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is long");
+        let ps = batch
+            .column_by_name("p")
+            .expect("p column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("p is int");
+        let vs = batch
+            .column_by_name("v")
+            .expect("v column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("v is string");
+        for index in 0..batch.num_rows() {
+            rows.push((
+                ids.value(index),
+                ps.value(index),
+                vs.value(index).to_string(),
+            ));
+        }
+    }
+    rows.sort();
+    rows
 }
 
 async fn live_data_spec_ids(table: &Table) -> HashSet<i32> {
@@ -311,8 +491,17 @@ async fn test_output_spec_id_0_after_drop_writes_two_files_under_spec_0() {
 
     assert_eq!(result.rewritten_data_files_count, 4);
     assert_eq!(result.added_data_files_count, 2);
-    assert_eq!(result.file_groups.len(), 2);
+    assert_eq!(
+        result.file_groups.len(),
+        1,
+        "files of spec 0 mismatch the current spec 1, so Java groups them in one empty-struct bucket"
+    );
     let table = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        snapshot_count(&table),
+        5,
+        "4 appends plus one rewrite commit; the spec drop adds no snapshot"
+    );
     assert_eq!(live_data_spec_ids(&table).await, HashSet::from([0]));
     assert_eq!(scan_rows(&table).await, rows_before);
 }
@@ -344,6 +533,11 @@ async fn test_default_spec_after_drop_writes_one_file_under_spec_1() {
     assert_eq!(result.added_data_files_count, 1);
     assert_eq!(result.file_groups.len(), 1);
     let table = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        snapshot_count(&table),
+        5,
+        "4 appends plus one rewrite commit; the spec drop adds no snapshot"
+    );
     assert_eq!(live_data_spec_ids(&table).await, HashSet::from([1]));
     assert_eq!(scan_rows(&table).await, rows_before);
 }
@@ -520,4 +714,106 @@ fn test_format_java_double() {
     assert_eq!(format_java_double(f64::NAN), "NaN");
     assert_eq!(format_java_double(f64::INFINITY), "Infinity");
     assert_eq!(format_java_double(f64::NEG_INFINITY), "-Infinity");
+}
+
+#[tokio::test]
+async fn test_output_spec_id_0_partial_progress_matches_java_single_group() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = l001_dropped_table(&catalog, "out0_pp", &[0, 0, 0, 0, 1, 1, 1, 1]).await;
+    assert_eq!(
+        snapshot_count(&table),
+        8,
+        "fixture: 8 appends; the spec drop adds no snapshot"
+    );
+    let rows_before = scan_l001_rows(&table).await;
+    assert_eq!(rows_before.len(), 400);
+
+    let result = RewriteDataFiles::new(table.clone())
+        .rewrite_all(true)
+        .output_spec_id(0)
+        .partial_progress(true)
+        .execute(&catalog)
+        .await
+        .expect("output-spec-id 0 with partial progress must succeed");
+
+    assert_eq!(result.rewritten_data_files_count, 8);
+    assert_eq!(result.added_data_files_count, 2);
+    assert_eq!(
+        result.file_groups.len(),
+        1,
+        "Java groups files of spec 0 against the current spec 1 into one bucket"
+    );
+    let table = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        snapshot_count(&table),
+        9,
+        "8 appends plus one rewrite commit; the spec drop adds no snapshot"
+    );
+    assert_eq!(live_data_spec_ids(&table).await, HashSet::from([0]));
+    assert_eq!(scan_l001_rows(&table).await, rows_before);
+}
+
+#[tokio::test]
+async fn test_output_spec_id_0_size_split_fans_mixed_bins_out_by_partition() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = l001_dropped_table(&catalog, "out0_pp_small", &[0, 1, 0, 0, 1, 1, 0, 1]).await;
+    let rows_before = scan_l001_rows(&table).await;
+    assert_eq!(rows_before.len(), 400);
+
+    let result = RewriteDataFiles::new(table.clone())
+        .rewrite_all(true)
+        .output_spec_id(0)
+        .partial_progress(true)
+        .max_file_group_size_bytes(4000)
+        .execute(&catalog)
+        .await
+        .expect("output-spec-id 0 with split groups must succeed");
+
+    assert_eq!(result.rewritten_data_files_count, 8);
+    assert_eq!(
+        result.file_groups.len(),
+        4,
+        "the limit must pack the files two per bin: {:?}",
+        result.file_groups
+    );
+    assert_eq!(
+        result.added_data_files_count, 6,
+        "two mixed bins fan out to two files each, two pure bins to one: {:?}",
+        result.file_groups
+    );
+    let table = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        snapshot_count(&table),
+        12,
+        "8 appends plus 4 rewrite commits; the spec drop adds no snapshot"
+    );
+    assert_eq!(live_data_spec_ids(&table).await, HashSet::from([0]));
+    assert_eq!(scan_l001_rows(&table).await, rows_before);
+}
+
+#[tokio::test]
+async fn test_default_spec_partial_progress_matches_java_single_file() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = l001_dropped_table(&catalog, "cur_pp", &[0, 0, 0, 0, 1, 1, 1, 1]).await;
+    let rows_before = scan_l001_rows(&table).await;
+    assert_eq!(rows_before.len(), 400);
+
+    let result = RewriteDataFiles::new(table.clone())
+        .rewrite_all(true)
+        .partial_progress(true)
+        .execute(&catalog)
+        .await
+        .expect("default-spec rewrite with partial progress must succeed");
+
+    assert_eq!(result.rewritten_data_files_count, 8);
+    assert_eq!(result.added_data_files_count, 1);
+    assert_eq!(result.file_groups.len(), 1);
+    let table = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        snapshot_count(&table),
+        9,
+        "8 appends plus one rewrite commit; the spec drop adds no snapshot"
+    );
+    assert_eq!(live_data_spec_ids(&table).await, HashSet::from([1]));
+    assert_eq!(scan_l001_rows(&table).await, rows_before);
 }

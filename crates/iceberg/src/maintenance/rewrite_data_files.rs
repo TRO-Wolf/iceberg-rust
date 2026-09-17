@@ -64,7 +64,7 @@ pub use crate::maintenance::rewrite_data_files_plan::RewriteJobOrder;
 use crate::maintenance::rewrite_data_files_plan::{
     DELETE_FILE_THRESHOLD_DEFAULT, DELETE_RATIO_THRESHOLD_DEFAULT,
     PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT, ResolvedConfig, format_java_double, order_groups,
-    plan_commit_batches, plan_file_groups,
+    plan_commit_batches, plan_file_groups_for_table,
 };
 pub(super) use crate::maintenance::rewrite_data_files_plan::{
     MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO,
@@ -297,7 +297,7 @@ impl RewriteDataFiles {
         let data_files_by_path = self.collect_live_data_files().await?;
         let live_deletes = rewrite_dv::live_file_scoped_position_deletes(&self.table).await?;
         config.file_scoped_delete_paths = rewrite_dv::file_scoped_delete_paths_from(&live_deletes);
-        let mut groups = plan_file_groups(tasks, &config, &output_spec);
+        let mut groups = plan_file_groups_for_table(&self.table, tasks, &config);
 
         if groups.is_empty() {
             return Ok(RewriteDataFilesResult::default());
@@ -2012,7 +2012,7 @@ pub(crate) mod tests {
         let starting = table.metadata().current_snapshot().unwrap().clone();
         let tasks = action.plan_scan_tasks().await.unwrap();
         let data_files_by_path = action.collect_live_data_files().await.unwrap();
-        let groups = plan_file_groups(tasks, &config, table.metadata().default_partition_spec());
+        let groups = plan_file_groups_for_table(&table, tasks, &config);
         assert_eq!(groups.len(), 1, "fixture: one qualifying group");
 
         // Build the rewrite tx for the group (read + write new files), but do NOT commit yet.
@@ -2088,7 +2088,7 @@ pub(crate) mod tests {
         let starting = table.metadata().current_snapshot().unwrap().clone();
         let tasks = action.plan_scan_tasks().await.unwrap();
         let data_files_by_path = action.collect_live_data_files().await.unwrap();
-        let groups = plan_file_groups(tasks, &config, table.metadata().default_partition_spec());
+        let groups = plan_file_groups_for_table(&table, tasks, &config);
         assert_eq!(groups.len(), 1, "fixture: one qualifying group");
 
         let group = &groups[0];
@@ -2422,58 +2422,6 @@ pub(crate) mod tests {
         assert!(
             group_qualifies(&two_over_target, &config),
             "2 small files summing > target qualify via enoughContent"
-        );
-    }
-
-    /// Partition grouping. Different partition values never share a group, and a task of a
-    /// non-default spec buckets as unpartitioned.
-    #[test]
-    fn test_plan_file_groups_partition_isolation_and_incompatible_spec() {
-        let (spec, schema) = synthetic_spec_and_schema();
-        let config = config_for(100, 75, 180, 2);
-
-        // 2 undersized files in x=0, 2 in x=1 ⇒ two groups, one per partition.
-        let tasks = vec![
-            synthetic_task("p0a", 10, 0, 0, &spec, &schema),
-            synthetic_task("p0b", 10, 0, 0, &spec, &schema),
-            synthetic_task("p1a", 10, 1, 0, &spec, &schema),
-            synthetic_task("p1b", 10, 1, 0, &spec, &schema),
-        ];
-        let groups = plan_file_groups(tasks, &config, &spec);
-        assert_eq!(groups.len(), 2, "two partitions ⇒ two groups");
-        for group in &groups {
-            let partitions: HashSet<String> = group
-                .iter()
-                .map(|task| format!("{:?}", task.partition))
-                .collect();
-            assert_eq!(
-                partitions.len(),
-                1,
-                "each group holds ONE partition value only"
-            );
-        }
-
-        // A task of an incompatible spec buckets under the empty struct.
-        let old_spec = Arc::new(
-            PartitionSpec::builder(schema.clone())
-                .with_spec_id(1)
-                .add_partition_field("y", "y", Transform::Identity)
-                .unwrap()
-                .build()
-                .unwrap(),
-        );
-        // Both tasks carry the byte-identical partition struct `[0]`, so a naive "always key by
-        // partition" co-groups them. Correct bucketing keeps them apart.
-        let mut incompatible = synthetic_task("old", 10, 0, 0, &old_spec, &schema);
-        incompatible.partition = Some(Struct::from_iter([Some(Literal::long(0))]));
-        let current_file = synthetic_task("cur", 10, 0, 0, &spec, &schema);
-        // A co-grouped 2-file bucket would qualify at min_input_files 2. Correct bucketing gives
-        // two single-file buckets and zero groups, so dropping the spec check reddens this.
-        let groups = plan_file_groups(vec![incompatible, current_file], &config, &spec);
-        assert!(
-            groups.is_empty(),
-            "an incompatible-spec file and a current-spec file with the SAME partition struct are \
-             bucketed SEPARATELY (incompatible ⇒ empty struct), never merged into a qualifying group"
         );
     }
 

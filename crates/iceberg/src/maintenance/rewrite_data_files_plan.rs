@@ -152,21 +152,29 @@ pub(crate) fn format_java_double(value: f64) -> String {
     }
 }
 
+pub(super) fn plan_file_groups_for_table(
+    table: &crate::table::Table,
+    tasks: Vec<FileScanTask>,
+    config: &ResolvedConfig,
+) -> Vec<Vec<FileScanTask>> {
+    plan_file_groups(tasks, config, table.metadata().default_partition_spec())
+}
+
 /// Groups scan tasks by partition, filters candidates, bin-packs, and filters groups. Java
 /// `BinPackRewriteFilePlanner.planFileGroups`.
 pub(super) fn plan_file_groups(
     tasks: Vec<FileScanTask>,
     config: &ResolvedConfig,
-    output_spec: &crate::spec::PartitionSpecRef,
+    grouping_spec: &crate::spec::PartitionSpecRef,
 ) -> Vec<Vec<FileScanTask>> {
-    let output_spec_id = output_spec.spec_id();
+    let grouping_spec_id = grouping_spec.spec_id();
 
-    // Java `groupByPartition` keys on the file's partition only when its spec id is the output
-    // spec. Anything else goes in the unpartitioned bucket.
+    // Java `groupByPartition` keys on the file's partition only when its spec id is the
+    // table's current default spec. Anything else goes in the unpartitioned bucket.
     let mut by_partition: HashMap<Struct, Vec<FileScanTask>> = HashMap::new();
     for task in tasks {
         let key = match (&task.partition, task_spec_id(&task)) {
-            (Some(partition), Some(spec_id)) if spec_id == output_spec_id => partition.clone(),
+            (Some(partition), Some(spec_id)) if spec_id == grouping_spec_id => partition.clone(),
             _ => Struct::empty(),
         };
         by_partition.entry(key).or_default().push(task);

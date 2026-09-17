@@ -157,6 +157,8 @@ mod rewrite_data_files_mw7_tests;
 mod rewrite_data_files_options_tests;
 mod rewrite_data_files_plan;
 #[cfg(test)]
+mod rewrite_data_files_plan_tests;
+#[cfg(test)]
 mod rewrite_data_files_ratio_tests;
 mod rewrite_data_files_router;
 #[cfg(test)]
