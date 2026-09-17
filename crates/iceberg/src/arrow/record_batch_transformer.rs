@@ -18,17 +18,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{
-    Array as ArrowArray, ArrayRef, Int32Array, Int64Array, RecordBatch, RecordBatchOptions,
-    RunArray,
-};
+use arrow_array::{Array as ArrowArray, Int64Array, RecordBatch, RecordBatchOptions};
 use arrow_cast::cast;
 use arrow_schema::{
     DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, SchemaRef,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
+use crate::arrow::nested_projection::{
+    create_constant_column, nested_projection_applies, project_nested_column,
+};
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_POS,
@@ -137,6 +136,11 @@ pub(crate) enum ColumnSource {
     /// Promote the file's column to the type the table schema now declares.
     Promote {
         target_type: DataType,
+        source_index: usize,
+    },
+
+    NestedProject {
+        target_field: FieldRef,
         source_index: usize,
     },
 
@@ -688,7 +692,12 @@ impl RecordBatchTransformer {
                 // fallback, so no conflict detection is needed here.
                 let field_by_id = field_id_to_source_schema_map.get(field_id).map(
                     |(source_field, source_index)| {
-                        if source_field.data_type().equals_datatype(target_type) {
+                        if nested_projection_applies(source_field.data_type(), target_type) {
+                            ColumnSource::NestedProject {
+                                target_field: target_field.clone(),
+                                source_index: *source_index,
+                            }
+                        } else if source_field.data_type().equals_datatype(target_type) {
                             ColumnSource::PassThrough {
                                 source_index: *source_index,
                             }
@@ -804,8 +813,13 @@ impl RecordBatchTransformer {
                         source_index,
                     } => cast(&*columns[*source_index], target_type)?,
 
+                    ColumnSource::NestedProject {
+                        target_field,
+                        source_index,
+                    } => project_nested_column(columns[*source_index].as_ref(), target_field)?,
+
                     ColumnSource::Add { target_type, value } => {
-                        Self::create_column(target_type, value, num_rows)?
+                        create_constant_column(target_type, value, num_rows)?
                     }
 
                     ColumnSource::RowPosition => {
@@ -888,38 +902,6 @@ impl RecordBatchTransformer {
                 })
             })
             .collect()
-    }
-
-    fn create_column(
-        target_type: &DataType,
-        prim_lit: &Option<PrimitiveLiteral>,
-        num_rows: usize,
-    ) -> Result<ArrayRef> {
-        if let DataType::RunEndEncoded(_, values_field) = target_type {
-            let create_ree_array = |values_array: ArrayRef| -> Result<ArrayRef> {
-                let run_ends = if num_rows == 0 {
-                    Int32Array::from(Vec::<i32>::new())
-                } else {
-                    Int32Array::from(vec![num_rows as i32])
-                };
-                Ok(Arc::new(
-                    RunArray::try_new(&run_ends, &values_array).map_err(|e| {
-                        Error::new(
-                            ErrorKind::Unexpected,
-                            "Failed to create RunArray for constant value",
-                        )
-                        .with_source(e)
-                    })?,
-                ))
-            };
-
-            let values_array =
-                create_primitive_array_single_element(values_field.data_type(), prim_lit)?;
-
-            create_ree_array(values_array)
-        } else {
-            create_primitive_array_repeated(target_type, prim_lit, num_rows)
-        }
     }
 }
 
