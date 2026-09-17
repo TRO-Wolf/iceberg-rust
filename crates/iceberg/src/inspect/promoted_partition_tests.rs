@@ -160,6 +160,51 @@ fn long_partition_values(partition: &arrow_array::StructArray) -> Vec<i64> {
     out
 }
 
+async fn same_value_mixed_era_table() -> (Table, TempDir) {
+    let (catalog, guard) = local_catalog().await;
+    let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+    let table = catalog
+        .create_table(&namespace, identity_partitioned_table_creation())
+        .await
+        .expect("create table");
+    let location = table.metadata().location().to_string();
+    let old = partition_file(
+        "old-7.parquet",
+        &location,
+        Struct::from_iter([Some(Literal::int(7))]),
+        4,
+    );
+    let transaction = Transaction::new(&table);
+    let action = transaction.fast_append().add_data_files(vec![old]);
+    let table = commit(&catalog, action.apply(transaction).expect("apply append")).await;
+    let transaction = Transaction::new(&table);
+    let action = transaction
+        .update_schema()
+        .update_column("p", PrimitiveType::Long);
+    let table = commit(
+        &catalog,
+        action.apply(transaction).expect("apply promotion"),
+    )
+    .await;
+    let location = table.metadata().location().to_string();
+    let new = partition_file(
+        "new-7.parquet",
+        &location,
+        Struct::from_iter([Some(Literal::long(7))]),
+        6,
+    );
+    let transaction = Transaction::new(&table);
+    let action = transaction.fast_append().add_data_files(vec![new]);
+    (
+        commit(&catalog, action.apply(transaction).expect("apply append")).await,
+        guard,
+    )
+}
+
 #[tokio::test]
 async fn inspect_files_answers_long_partitions_after_identity_source_promotion() {
     let (table, _guard) = mixed_era_identity_table().await;
@@ -242,4 +287,39 @@ async fn inspect_partitions_groups_promoted_identity_partitions_into_typed_rows(
         .collect();
     rows.sort_unstable();
     assert_eq!(rows, vec![(1, 1, 1), (22, 2, 1), (3_000_000_000_i64, 3, 1)]);
+}
+
+#[tokio::test]
+async fn inspect_partitions_merges_same_valued_pre_and_post_promotion_partitions_into_one_row() {
+    let (table, _guard) = same_value_mixed_era_table().await;
+    let batch = scan_single_batch(
+        PartitionsTable::new(&table)
+            .scan()
+            .await
+            .expect("partitions scan"),
+    )
+    .await;
+    assert_eq!(batch.num_rows(), 1);
+    let partition = batch
+        .column_by_name("partition")
+        .expect("partition")
+        .as_struct();
+    assert_eq!(long_partition_values(partition), vec![7]);
+    let record_count = batch
+        .column_by_name("record_count")
+        .expect("record_count")
+        .as_primitive::<Int64Type>();
+    let file_count = batch
+        .column_by_name("file_count")
+        .expect("file_count")
+        .as_primitive::<Int32Type>();
+    assert_eq!(record_count.value(0), 10);
+    assert_eq!(file_count.value(0), 2);
+    let files = scan_single_batch(FilesTable::all(&table).scan().await.expect("files scan")).await;
+    assert_eq!(files.num_rows(), 2);
+    let files_partition = files
+        .column_by_name("partition")
+        .expect("partition")
+        .as_struct();
+    assert_eq!(long_partition_values(files_partition), vec![7, 7]);
 }
