@@ -365,3 +365,235 @@ Restored → 56 / 15 green.
 - No pre-existing test expectation was weakened; every prior test passes
   unmodified.
 
+## Round 3 — L-01..L-04: exact casts only, float sentinels, signed zero, `!= NaN`, typed-domain literals
+
+Commits: `19cdd5b60` (red cells), `f3dccbc41` (fix).
+
+### Correction to the round-1 "superset by construction" claim
+
+Section 5's claim that "`prune` … is a superset filter by construction" held only
+for the conversions the critic had audited. Round 3 found four `Expr` forms whose
+converted predicate could select a strictly narrower file set than the exact
+DataFusion `WHERE`. The rule of record is now: **every pushed predicate must
+select a superset of the files that hold a row where the exact DataFusion
+predicate is true; when in doubt, drop the conjunct** — dropping is always sound
+because the exact `PhysicalExpr` still filters every row of every surviving
+file, and a dropped conflict conjunct only widens OCC validation.
+
+### Engine semantics discovered (changes the severity of L-03/L-04)
+
+The critic's repro assumed IEEE partial ordering in the DataFusion residual
+(`-0.0 == +0.0`, `NaN != NaN` true). This build compares floats under IEEE-754
+**total order**, verified directly through `ctx.sql`:
+
+```text
+SELECT 0.0 <= -0.0          → false
+SELECT -0.0 < 0.0           → true
+SELECT 0.0 = -0.0           → false
+SELECT f = f   (NaN row)    → true      (NaN = NaN)
+SELECT f != f  (NaN row)    → false
+SELECT f != CAST('NaN' AS DOUBLE)  (NaN row) → false
+```
+
+`Datum` ordering (`iceberg_float_cmp`) is the same total order, so the pushed
+±0.0 bounds and the `is_not_nan` unary agree with the residual for files whose
+stats are trustworthy — under this engine's own writer, L-03/L-04's stated
+repros are consistent rather than unsound:
+
+- `f <= -0.0` over a `+0.0`-only file: pushed bound prunes (`+0.0 <= -0.0`
+  false) AND the residual rejects the row — same outcome.
+- `f != NaN` over a NaN-only file: `is_not_nan` prunes on
+  `contains_nans_only` (`inclusive_metrics_evaluator.rs:199`) AND the residual
+  rejects every row — same outcome.
+
+The drops are still correct to make, on two grounds. First, bound trust is not
+guaranteed for files written by other producers: a writer that records `+0.0`
+stats for a `-0.0` row makes the pushed `f <= -0.0` bound prune a file whose
+rows the residual accepts. Second, the pushed `!(is_nan)` form reaches the OCC
+conflict filter, whose evaluation path does not visibly normalize `NOT` (the
+scan paths call `rewrite_not()` in `scan/mod.rs:210,219`; the row_delta
+validation binds the raw predicate). A dropped conjunct is the uniform safe
+answer for both consumers.
+
+Accordingly the two dictated e2e cells were rewritten to pin this engine's real
+semantics instead of the IEEE premise: a `+0.0` row does *not* satisfy
+`f <= -0.0` and a NaN row does *not* satisfy `f != NaN`, so the cells assert
+mixed-file outcomes (the `-0.0` row deletes, the `+0.0` row survives; the `0.0`
+row deletes, the NaN row survives). They pin user-visible correctness; the unit
+cells carry the drop itself.
+
+### L-01 — the CAST strip also strips truncating and non-injective casts
+
+The `Expr::Cast` arm refused only `Date32`/`Date64` and stripped everything
+else. `CAST(f AS INT) = 2` on a `FLOAT` column pushed `f = 2` and pruned a file
+whose only row is `2.5` (e2e red: deleted 0, correct 1). The arm now consults
+the Iceberg column type via `cast_source_type` (column → Iceberg field type →
+`iceberg_arrow_type`; nested `CAST` → inner target type) and strips only casts
+that are injective and order-preserving on the column's whole domain
+(`cast_strips_lossless`). Anything else, and any non-column non-literal operand
+(complex expressions), returns `NotTransformed`.
+
+`Expr::Cast` over a `Literal` is a constant fold, not a per-row conversion: it
+is evaluated via `ScalarValue::cast_to` and the result becomes the pushed
+literal (downstream exactness still applies). Exception: a `Utf8`-family
+literal cast to `Timestamp` is stripped instead — evaluation produces a
+`TimestampNs` datum whose bind against a micros column would need the
+reinterpretation guard below, while the raw string binds through the
+`String→Timestamp` parse to the same instant
+(`test_predicate_conversion_with_cast` keeps its `ts >= string` pin).
+
+### Cast table (`cast_strips_lossless`, `expr_to_predicate.rs`)
+
+| Shape | Strips? | Reason |
+|---|---|---|
+| identity | yes | no conversion |
+| int8/16/32 → wider signed int; uint → wider int (signed or unsigned) | yes | injective, monotone |
+| int8/16/32, uint8/16/32 → `Float64` | yes | every value ≤ 2^53 |
+| `Float32 → Float64` | yes | injective widening |
+| `Utf8 ↔ LargeUtf8/Utf8View` | yes | same domain |
+| `Timestamp/Time` widening unit (s→ms→µs→ns), any zone relabel | yes | value-preserving; a tz relabel does not change the µs value in Arrow |
+| `Int64 → Float64` | no | |v| > 2^53 rounds |
+| `Float64 → Float32` | no | narrows |
+| float → any integer | no | truncates |
+| `Float64 → Int64`, `Float32 → Int32`, `Float32 → Utf8` | no | truncating / non-injective |
+| `Int32 → Int16`, `Int64 → Int32` | no | narrows |
+| any `Date`/`Decimal`/rescale/to-string target | no | not order-preserving or ambiguous |
+
+### L-02 — AboveMax/BelowMin on float columns folds to AlwaysFalse
+
+`Datum::to` maps a `DOUBLE` beyond `±f32::MAX` (and `±Inf`) to the sentinels for
+a `FLOAT` column; `Eq`/`Gt`/`GtEq` then fold to `AlwaysFalse` and prune a file
+holding `+Inf` (e2e red: `f = +Inf` row, `DELETE WHERE f > 3.5e38`, deleted 0,
+correct 1 — DataFusion total order has `+Inf > 3.5e38` true). Sentinels on
+`FLOAT`/`DOUBLE` targets now drop the conjunct; integer targets keep them —
+`i64_to_i32` and `Long→Date` sentinels fold to the correct constant bound and
+are sound. The round-2 pin
+`cast_wrapped_float_column_out_of_range_literal_keeps_sentinel_push` encoded
+the unsound keep and was changed to pin the drop (renamed
+`cast_wrapped_float_column_out_of_range_literal_is_not_pushed`).
+
+### L-03 — signed zero
+
+Any float/double literal converting to `0.0` or `-0.0` against a `FLOAT` or
+`DOUBLE` column drops the conjunct — a `0.0`-valued bound is exactly where
+producer-dependent stats semantics can diverge from the pushed comparison
+(see "Engine semantics" above; under total order the push would agree with the
+residual, but bound trust across producers is not provable). Integer zero
+literals hit the same check after conversion and also drop — uniform and
+conservative.
+
+### L-04 — `!= NaN` and `NOT` over float predicates
+
+`nan_comparison` no longer translates `NotEq` to `is_not_nan` — conservative
+drop; under this engine `is_not_nan` was in fact consistent (it prunes only
+all-NaN files, which the residual also rejects), but the drop is the uniform
+safe rule and covers engines/stats the consistency argument cannot see. The
+`Eq`/`IsNotDistinctFrom` → `is_nan` direction stays: it is a superset for NaN
+matches.
+
+`Expr::Not` now gates its converted operand through `not_operand_is_sound`:
+`!(is_nan)` and `NOT` over any float-column comparison are not pushed
+(`rewrite_not` would normalize `!(is_nan)` to `is_not_nan` on the scan path,
+but not visibly on the conflict-validation path — drop covers both). `NOT`
+over non-float leaves still pushes.
+
+Two existing pins changed to the drop:
+- `test_predicate_conversion_with_not_isnan` — `NOT isnan(qux)` → `None`
+  (was `!(is_nan)`).
+- `cast_wrapped_double_column_with_long_literal_checks_exactness` — renamed
+  `cast_wrapped_double_column_to_int64_is_not_pushed`: `CAST(qux AS INT64)` is
+  a truncating cast; both arms now assert `None` (the `2^53` arm previously
+  pinned the strip).
+
+### Typed-domain reinterpretation guard (new)
+
+`Datum::to` preserves the scalar value while reinterpreting units for typed
+datums: `{TimestampNs, Long}` → `Timestamp` reads nanos as micros (1000× wrong
+bound), `{Date, Int}` → `Int`/`Long` reads days as a count, `{Time, Long}` →
+`Timestamp` reads micros-of-day as micros-of-epoch, `{Fixed}` → `Binary`. A
+literal whose datum type is not in the untyped set
+(`Boolean|Int|Long|Float|Double|String|Binary`) must now bind by identity —
+`converted == literal` — or the conjunct drops. The `TimestampNs`-vs-`Timestamp`
+case is also caught by the fail-closed arm below (`Long→Long` is not a listed
+exact pair); the guard additionally covers listed-variant wrong-domain pairs
+(e.g. `{Date, Int}` → `Long`, which the `(Int, Long)` arm would otherwise
+admit).
+
+### Fail-closed `converts_exactly`
+
+The `_ => true` fallback now returns `false`: an unlisted pair whose value
+changed in conversion counts as inexact. This is what kills the
+`TimestampNs → Timestamp` push in the dedicated red cell.
+
+### Red output (commit `19cdd5b60`, under the round-2 implementation)
+
+```text
+cargo test -p iceberg-datafusion --lib expr_to_predicate → 53 passed, 9 failed
+    lossy_column_casts_are_not_stripped
+    cast_wrapped_float_column_out_of_range_literal_is_not_pushed
+    float_column_out_of_range_and_infinite_literals_are_not_pushed
+    float_comparisons_with_zero_literals_are_not_pushed
+    not_over_float_comparison_is_not_pushed
+    timestamp_nanos_literal_against_micros_column_is_not_pushed
+    nan_tests::nan_not_eq_either_side_is_not_pushed
+    nan_tests::float32_nan_takes_the_same_arms_as_float64_nan
+    nan_tests::nan_eq_composes_under_and_or_not
+cargo test -p iceberg-datafusion --lib occ_exec_tests     → 15 passed, 4 failed
+    delete_where_cast_to_int_eq_deletes_the_row          (deleted 0)
+    delete_where_float_gt_beyond_f32_max_deletes_the_row (deleted 0)
+    delete_where_float_le_negative_zero_deletes_the_row  (deleted 0 —
+      under total order deleted 0 is the CORRECT outcome; see engine note)
+    delete_where_float_ne_nan_deletes_the_row            (deleted 0 — same)
+```
+
+### Green output
+
+```text
+cargo test -p iceberg-datafusion --lib expr_to_predicate  → 62 passed, 0 failed
+cargo test -p iceberg-datafusion --lib occ_exec_tests     → 19 passed, 0 failed
+cargo test -p iceberg-datafusion --lib                    → 261 passed, 0 failed, 1 ignored
+cargo test -p iceberg --lib expr                          → 406 passed, 0 failed
+```
+
+### Mutation output (each fix reverted alone, uncommitted)
+
+- L-01 — cast whitelist replaced by the old strip-all-but-Date arm:
+  `lossy_column_casts_are_not_stripped` and
+  `cast_wrapped_double_column_to_int64_is_not_pushed` FAILED; e2e
+  `delete_where_cast_to_int_eq_deletes_the_row` deleted 0. Restored green.
+- L-02 — sentinel arm reverted to `=> true`:
+  `float_column_out_of_range_and_infinite_literals_are_not_pushed` and
+  `cast_wrapped_float_column_out_of_range_literal_is_not_pushed` FAILED; e2e
+  `delete_where_float_gt_beyond_f32_max_deletes_the_row` deleted 0 (AboveMax →
+  AlwaysFalse prune). Restored green.
+- L-03 — the two `±0.0` arms removed:
+  `float_comparisons_with_zero_literals_are_not_pushed` FAILED. The rewritten
+  e2e passes either way by design (total-order residual is the decider).
+  Restored green.
+- L-04 — `NotEq → is_not_nan` restored AND the `Not` gate removed:
+  `nan_not_eq_either_side_is_not_pushed`,
+  `float32_nan_takes_the_same_arms_as_float64_nan`,
+  `nan_eq_composes_under_and_or_not`,
+  `not_over_float_comparison_is_not_pushed`,
+  `test_predicate_conversion_with_not_isnan` FAILED. Restored green.
+- Typed-domain guard removed: no red — the `TimestampNs` case is independently
+  caught by the fail-closed arm (`Long→Long` unlisted). Guard retained as
+  defense-in-depth for listed-variant wrong-domain pairs.
+- Fail-closed `_ => false` reverted to `_ => true`:
+  `timestamp_nanos_literal_against_micros_column_is_not_pushed` FAILED
+  (pushed `ts >= Datum{TimestampNs(…500)}`, a bound 1000× too large).
+  Restored green.
+
+### Additional shapes audited
+
+- `f IN (NaN, …)` builds `or(is_nan, is_in(rest))` — superset for NaN and
+  non-NaN members; `NOT IN (…NaN…)` already refuses (`in_list_predicate`).
+- `CAST(literal AS T)` on non-string literals evaluates through
+  `ScalarValue::cast_to`; cast errors and unmapped scalars drop.
+- `CAST('…' AS Date)` evaluates to a `Date` datum whose `Datum::to` has no
+  `Int→Timestamp` arm → drops (`test_predicate_conversion_with_date_cast`
+  still `None`).
+- `isnan(col)` scalar-function path unchanged — the only supported NaN push.
+- `NOT` over a bare boolean column still produces `col = false`.
+- `LIKE` prefix pushes unchanged — `Datum::to` identity on `String`.
+
