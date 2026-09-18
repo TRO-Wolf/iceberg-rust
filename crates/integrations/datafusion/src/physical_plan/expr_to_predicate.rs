@@ -400,8 +400,9 @@ mod tests {
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::DFSchema;
+    use datafusion::logical_expr::expr::Cast;
     use datafusion::logical_expr::utils::split_conjunction;
-    use datafusion::prelude::{Expr, SessionContext};
+    use datafusion::prelude::{Expr, SessionContext, col, lit};
     use iceberg::expr::{Predicate, Reference};
     use iceberg::spec::Datum;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -424,6 +425,10 @@ mod tests {
             Field::new("qux", DataType::Float64, true).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 "4".to_string(),
+            )])),
+            Field::new("flt", DataType::Float32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "5".to_string(),
             )])),
         ]);
         DFSchema::try_from_qualified_schema("my_table", &arrow_schema).unwrap()
@@ -944,6 +949,104 @@ mod tests {
         let sql = "isnan(qux + 1)";
         let predicate = convert_to_iceberg_predicate(sql);
         assert_eq!(predicate, None);
+    }
+
+    fn push(expr: Expr) -> Option<Predicate> {
+        convert_filters_to_predicate(&[expr])
+    }
+
+    fn cast_col(name: &str, data_type: DataType) -> Expr {
+        Expr::Cast(Cast::new(Box::new(col(name)), data_type))
+    }
+
+    #[test]
+    fn cast_wrapped_float_column_with_inexact_literal_is_not_pushed() {
+        for literal in [1e-50_f64, 0.1, 3.4e38, -1e-50] {
+            let expr = cast_col("flt", DataType::Float64).lt(lit(literal));
+            assert_eq!(
+                push(expr),
+                None,
+                "literal {literal} does not round-trip through f32 and must not be pushed"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_wrapped_float_column_with_exact_literal_is_pushed() {
+        let expr = cast_col("flt", DataType::Float64).lt(lit(0.5_f64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("flt").less_than(Datum::double(0.5)))
+        );
+        let expr = cast_col("flt", DataType::Float64).gt_eq(lit(-2.0_f64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("flt").greater_than_or_equal_to(Datum::double(-2.0)))
+        );
+        let expr = cast_col("flt", DataType::Float64).eq(lit(0.0_f64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("flt").equal_to(Datum::double(0.0)))
+        );
+    }
+
+    #[test]
+    fn cast_wrapped_float_column_out_of_range_literal_keeps_sentinel_push() {
+        let expr = cast_col("flt", DataType::Float64).gt(lit(3.5e38_f64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("flt").greater_than(Datum::double(3.5e38)))
+        );
+        let expr = cast_col("flt", DataType::Float64).lt(lit(-3.5e38_f64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("flt").less_than(Datum::double(-3.5e38)))
+        );
+    }
+
+    #[test]
+    fn cast_wrapped_int_column_with_double_literal_is_not_pushed() {
+        for literal in [2.5_f64, 2.0] {
+            let expr = cast_col("foo", DataType::Float64).lt(lit(literal));
+            assert_eq!(
+                push(expr),
+                None,
+                "literal {literal} cannot reach Datum::to(Int) and must not be pushed"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_wrapped_int_column_out_of_range_long_keeps_sentinel_push() {
+        let expr = cast_col("foo", DataType::Int64).lt(lit(3_000_000_000_i64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("foo").less_than(Datum::long(3_000_000_000_i64)))
+        );
+        let expr = cast_col("foo", DataType::Int64).gt(lit(-3_000_000_000_i64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("foo").greater_than(Datum::long(-3_000_000_000_i64)))
+        );
+    }
+
+    #[test]
+    fn cast_wrapped_float_column_in_list_with_inexact_element_is_not_pushed() {
+        let expr =
+            cast_col("flt", DataType::Float64).in_list(vec![lit(0.5_f64), lit(1e-50_f64)], false);
+        assert_eq!(push(expr), None);
+        let expr =
+            cast_col("flt", DataType::Float64).in_list(vec![lit(0.5_f64), lit(-2.0_f64)], false);
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("flt").is_in([Datum::double(0.5), Datum::double(-2.0)]))
+        );
+    }
+
+    #[test]
+    fn bare_float_column_with_inexact_literal_is_not_pushed() {
+        let expr = col("flt").lt(lit(1e-50_f64));
+        assert_eq!(push(expr), None);
     }
 }
 

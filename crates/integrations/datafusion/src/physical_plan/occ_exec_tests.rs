@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use datafusion::arrow::array::UInt64Array;
+use datafusion::arrow::array::{Int64Array, UInt64Array};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
@@ -129,6 +129,82 @@ async fn occ_fixture(merge_on_read: bool) -> OccFixture {
     .collect()
     .await
     .expect("seed insert");
+
+    let provider = IcebergTableProvider::try_new(catalog.clone(), namespace, "t")
+        .await
+        .expect("table provider");
+    OccFixture {
+        catalog,
+        provider,
+        ident,
+        ctx,
+        _warehouse: warehouse,
+    }
+}
+
+async fn float_fixture(merge_on_read: bool) -> OccFixture {
+    let warehouse = TempDir::new().expect("warehouse");
+    let catalog = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().expect("utf8").to_string(),
+                )]),
+            )
+            .await
+            .expect("catalog"),
+    );
+    let namespace = NamespaceIdent::new("ns".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("namespace");
+    let schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "f", Type::Primitive(PrimitiveType::Float)).into(),
+        ])
+        .build()
+        .expect("schema");
+    let spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
+    let properties = if merge_on_read {
+        HashMap::from([
+            ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+            ("write.update.mode".to_string(), "merge-on-read".to_string()),
+        ])
+    } else {
+        HashMap::new()
+    };
+    let ident = TableIdent::new(namespace.clone(), "t".to_string());
+    catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("t".to_string())
+                .location(format!("{}/t", warehouse.path().to_str().expect("utf8")))
+                .schema(schema)
+                .partition_spec(spec)
+                .format_version(FormatVersion::V2)
+                .properties(properties)
+                .build(),
+        )
+        .await
+        .expect("table");
+
+    let catalog_provider = IcebergCatalogProvider::try_new(catalog.clone())
+        .await
+        .expect("catalog provider");
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", Arc::new(catalog_provider));
+    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 1.0)")
+        .await
+        .expect("plan seed insert")
+        .collect()
+        .await
+        .expect("seed insert");
 
     let provider = IcebergTableProvider::try_new(catalog.clone(), namespace, "t")
         .await
@@ -538,4 +614,93 @@ async fn cow_update_no_predicate_keeps_always_true() {
         "expected AlwaysTrue: {text}"
     );
     assert_conflict(&err, "b-new.parquet");
+}
+
+async fn count_rows(ctx: &SessionContext, sql: &str) -> i64 {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .expect("plan count query")
+        .collect()
+        .await
+        .expect("run count query");
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count column")
+                .values()
+                .iter()
+                .copied()
+        })
+        .sum()
+}
+
+async fn dml_count(ctx: &SessionContext, sql: &str) -> u64 {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .expect("plan DML")
+        .collect()
+        .await
+        .expect("DML commits");
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("count column")
+                .values()
+                .iter()
+                .copied()
+        })
+        .sum()
+}
+
+#[tokio::test]
+async fn delete_where_float_lt_inexact_double_deletes_the_row() {
+    for merge_on_read in [true, false] {
+        let fixture = float_fixture(merge_on_read).await;
+        let deleted =
+            dml_count(&fixture.ctx, "DELETE FROM catalog.ns.t WHERE f < 1.00000001").await;
+        assert_eq!(
+            deleted, 1,
+            "merge_on_read={merge_on_read}: f = 1.0 satisfies f < 1.00000001"
+        );
+        let remaining = count_rows(&fixture.ctx, "SELECT COUNT(*) FROM catalog.ns.t").await;
+        assert_eq!(
+            remaining, 0,
+            "merge_on_read={merge_on_read}: the row must be deleted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_where_float_lt_inexact_double_updates_the_row() {
+    for merge_on_read in [true, false] {
+        let fixture = float_fixture(merge_on_read).await;
+        let updated = dml_count(
+            &fixture.ctx,
+            "UPDATE catalog.ns.t SET id = 9 WHERE f < 1.00000001",
+        )
+        .await;
+        assert_eq!(
+            updated, 1,
+            "merge_on_read={merge_on_read}: f = 1.0 satisfies f < 1.00000001"
+        );
+        let matched = count_rows(
+            &fixture.ctx,
+            "SELECT COUNT(*) FROM catalog.ns.t WHERE id = 9",
+        )
+        .await;
+        assert_eq!(
+            matched, 1,
+            "merge_on_read={merge_on_read}: the row must carry id = 9"
+        );
+    }
 }
