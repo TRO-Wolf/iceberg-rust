@@ -25,6 +25,14 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-18): F-SHED-295 — relocated code sheds its comments
+
+Ledger: [`f-shed-295-ledger.md`](f-shed-295-ledger.md). Branch `fix/f-shed-295` off fork `main`.
+Owner ruling 2026-09-18: comments do not travel with moved code.
+
+- [x] 203 comment lines carried by #294 and #295 into new files deleted; no code token changed
+- [x] comment gate over `8477b249..HEAD` reports 0; `iceberg-datafusion` and `data_file_writer` tests
+
 ## ACTIVE (2026-09-17): F-FORK-ASKS-22A — three RePark fork asks (hour on ns, COW UPDATE sort+stamp, binpack sort+stamp)
 
 Ledger: [`f-fork-asks-22a-ledger.md`](f-fork-asks-22a-ledger.md). Branch `fix/fork-asks-22a` off
