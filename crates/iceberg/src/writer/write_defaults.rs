@@ -346,7 +346,7 @@ pub(crate) mod tests {
             Arc::new(Field::new(name, data_type, nullable))
         };
         let stamp = |field: Field, id: i32| {
-            let meta = top_ids.then(|| id_meta(id)).unwrap_or_default();
+            let meta = if top_ids { id_meta(id) } else { HashMap::new() };
             field.with_metadata(meta)
         };
         let nums = int_list(element_name, vec![

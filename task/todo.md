@@ -47,6 +47,22 @@ binpack sort+stamp (Spark 4.1.2 measured answers).
       not committed
 - [x] Ledger + todo entry; gates below
 
+## ACTIVE (2026-09-18): F-LIST-INSERT-1 nested Arrow field relabel on writes
+
+Ledger: [`f-list-insert-1-ledger.md`](f-list-insert-1-ledger.md). Branch `fix/list-insert-1`.
+Consumer: RePark ARRAY-column inserts (`writeTo().append()`, `insertInto`, `saveAsTable(append)`,
+SQL INSERT) all failed on `RecordBatch::try_new` nested-label mismatch.
+
+- [x] red cells: `unstamped_nested_fields_are_relabelled_to_iceberg_types`,
+      `incompatible_nested_data_is_data_invalid`,
+      `data_file_writer_stamps_nested_field_ids_in_parquet_footer` (red committed `3f090a8eb`)
+- [x] fix: `relabel_column` metadata-only nested rebuild in `write_defaults.rs` + deep-equality
+      borrowed fast path (`1db44546e`); 168 writer tests green
+- [x] mutation: full revert → all 3 red; fast-path-only revert → 2 unit cells red (d green by
+      construction — idless batch can't reach the borrowed path); restored green
+- [x] ledger + todo entry + writer `try_new` audit
+
+
 ## ACTIVE (2026-09-17): F-ICE-RESIDUES-21B fork-residue lane, five closures vs Java 1.10.0
 
 Ledger: [`f-ice-residues-21b-ledger.md`](f-ice-residues-21b-ledger.md). Run 21b residue items on
