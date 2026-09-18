@@ -77,8 +77,6 @@
 //!    [`ROWS_PER_FILE`] constant and confining the match to file 0 makes the written volume identical
 //!    at both scales, so it cancels. Writer-side row-group buffering is real and still unbounded —
 //!    follow-up, same QB unit.
-//! 3. **One test function.** The counters are process-global, so anything running concurrently in
-//!    this binary would pollute them. The nine measured runs are sequential inside one test.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
@@ -405,7 +403,7 @@ async fn measure_dml(ns: &str, rows: usize, sql: &str) -> Measured {
     measure_dml_mode(ns, rows, sql, false, false).await
 }
 
-/// As [`measure_dml`], but selects the table's row-level write mode and sort order.
+/// As [`measure_dml`], but selects the table's row-level write mode.
 async fn measure_dml_mode(
     ns: &str,
     rows: usize,
