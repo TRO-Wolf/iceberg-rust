@@ -515,3 +515,50 @@ fn top_level_time_initial_default_reads_time64() {
     assert_eq!(t.value(0), 999);
     assert_eq!(t.value(1), 999);
 }
+
+#[test]
+fn later_batch_with_a_richer_nested_layout_rebuilds_the_plan() {
+    let snapshot_schema = table_schema_with_struct_a_b();
+    let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+    let result = transformer
+        .process_record_batch(file_batch_with_struct_a_only())
+        .unwrap();
+    let s = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let b = s.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    assert!(b.is_null(0));
+
+    let s_fields = Fields::from(vec![
+        id_field("a", DataType::Int32, true, 3),
+        id_field("b", DataType::Utf8, true, 4),
+    ]);
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        id_field("id", DataType::Int32, false, 1),
+        id_field("s", DataType::Struct(s_fields.clone()), true, 2),
+    ]));
+    let s = StructArray::new(
+        s_fields,
+        vec![
+            Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["keep", "kept"])) as ArrayRef,
+        ],
+        None,
+    );
+    let batch = RecordBatch::try_new(file_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(s) as ArrayRef,
+    ])
+    .unwrap();
+    let result = transformer.process_record_batch(batch).unwrap();
+    let s = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let b = s.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(b.value(0), "keep");
+    assert_eq!(b.value(1), "kept");
+}
