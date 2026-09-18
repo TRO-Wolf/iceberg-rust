@@ -139,7 +139,7 @@ pub(crate) enum ColumnSource {
         source_index: usize,
     },
 
-    NestedProject { plan: NestedProjectionPlan, source_index: usize },
+    NestedProject(NestedProjectionPlan, usize),
 
     /// Insert a new constant column that the file does not carry.
     Add {
@@ -691,16 +691,15 @@ impl RecordBatchTransformer {
                     .get(field_id)
                     .map(|(source_field, source_index)| {
                         let source_type = source_field.data_type();
-                        if source_type == target_type {
-                            Ok(ColumnSource::PassThrough { source_index: *source_index })
-                        } else if nested_projection_applies(source_type, target_type) {
+                        if nested_projection_applies(source_type, target_type)
+                            && source_type != target_type
+                        {
                             NestedProjectionPlan::build(source_type, target_type, snapshot_schema)
-                                .map(|plan| ColumnSource::NestedProject {
-                                    plan,
-                                    source_index: *source_index,
-                                })
+                                .map(|plan| ColumnSource::NestedProject(plan, *source_index))
                         } else if source_type.equals_datatype(target_type) {
-                            Ok(ColumnSource::PassThrough { source_index: *source_index })
+                            Ok(ColumnSource::PassThrough {
+                                source_index: *source_index,
+                            })
                         } else {
                             Ok(ColumnSource::Promote {
                                 target_type: target_type.clone(),
@@ -813,7 +812,7 @@ impl RecordBatchTransformer {
                         source_index,
                     } => cast(&*columns[*source_index], target_type)?,
 
-                    ColumnSource::NestedProject { plan, source_index } => {
+                    ColumnSource::NestedProject(plan, source_index) => {
                         plan.apply(columns[*source_index].clone())?
                     }
 

@@ -242,9 +242,7 @@ impl PlanNode {
         schema: &IcebergSchema,
         depth: usize,
     ) -> Result<Self> {
-        if !source_fields.is_empty()
-            && source_fields.iter().all(|f| field_id_of(f).is_none())
-        {
+        if !source_fields.is_empty() && source_fields.iter().all(|f| field_id_of(f).is_none()) {
             let source_type = DataType::Struct(source_fields.clone());
             let target_type = DataType::Struct(target_fields.clone());
             return Ok(if source_type.equals_datatype(&target_type) {
@@ -354,28 +352,27 @@ impl PlanNode {
                 children,
             } => {
                 let source = source.ok_or_else(missing_source)?;
-                let source_struct = source
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            "struct column is not a StructArray".to_string(),
-                        )
-                    })?;
+                let source_struct =
+                    source
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                "struct column is not a StructArray".to_string(),
+                            )
+                        })?;
                 let len = source_struct.len();
                 let mut columns: Vec<ArrayRef> = Vec::with_capacity(children.len());
                 for child in children.iter_mut() {
                     let child_source = match child.source_index {
                         Some(index) => {
-                            Some(source_struct.columns().get(index).cloned().ok_or_else(
-                                || {
-                                    Error::new(
-                                        ErrorKind::DataInvalid,
-                                        "nested column index out of bounds".to_string(),
-                                    )
-                                },
-                            )?)
+                            Some(source_struct.columns().get(index).cloned().ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    "nested column index out of bounds".to_string(),
+                                )
+                            })?)
                         }
                         None => None,
                     };
@@ -430,10 +427,8 @@ impl PlanNode {
                         .with_source(e)
                     })
                 } else {
-                    let source_list = source
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .ok_or_else(|| {
+                    let source_list =
+                        source.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
                             Error::new(
                                 ErrorKind::DataInvalid,
                                 "list column is not a ListArray".to_string(),
@@ -466,10 +461,8 @@ impl PlanNode {
             } => {
                 let source = source.ok_or_else(missing_source)?;
                 if *from_small {
-                    let source_list = source
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .ok_or_else(|| {
+                    let source_list =
+                        source.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
                             Error::new(
                                 ErrorKind::DataInvalid,
                                 "large list column is not a ListArray".to_string(),
@@ -565,23 +558,15 @@ impl PlanNode {
                 value,
             } => {
                 let source = source.ok_or_else(missing_source)?;
-                let source_map = source
-                    .as_any()
-                    .downcast_ref::<MapArray>()
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            "map column is not a MapArray".to_string(),
-                        )
-                    })?;
-                let keys = key.apply(
-                    Some(source_map.keys().clone()),
-                    source_map.keys().len(),
-                )?;
-                let values = value.apply(
-                    Some(source_map.values().clone()),
-                    source_map.values().len(),
-                )?;
+                let source_map = source.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "map column is not a MapArray".to_string(),
+                    )
+                })?;
+                let keys = key.apply(Some(source_map.keys().clone()), source_map.keys().len())?;
+                let values =
+                    value.apply(Some(source_map.values().clone()), source_map.values().len())?;
                 let entries = StructArray::try_new(
                     entries_children.clone(),
                     vec![keys, values],

@@ -459,10 +459,8 @@ fn required_list_element_with_null_projected_values_errors() {
     ])
     .unwrap();
     let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 5]).build();
-    match transformer.process_record_batch(file_batch) {
-        Ok(_) => panic!("expected a non-nullable-element error"),
-        Err(_) => {}
-    }
+    let result = transformer.process_record_batch(file_batch);
+    assert!(result.is_err());
 }
 
 fn list_projection_schema() -> Arc<Schema> {
