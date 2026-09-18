@@ -24,7 +24,7 @@
 //!
 //! The original DataFusion `WHERE` is the contract. Iceberg pushdown is inexact and would over-delete.
 //! Copy-on-write is two-pass: the affected set must be complete before the first survivor is written.
-//! Both passes read one frozen snapshot. Conflict filter is `AlwaysTrue`. A zero-match DML commits nothing.
+//! Both passes read one frozen snapshot. Conflict filter is the scan's `prune`, `AlwaysTrue` when none. A zero-match DML commits nothing.
 //! | Path | Always validates | Serializable adds |
 //! |---|---|---|
 //! | copy-on-write DELETE and UPDATE | no conflicting deletes | no conflicting data |
@@ -436,7 +436,7 @@ async fn merge_on_read_delete(
     projection.push(RESERVED_COL_NAME_POS.to_string());
 
     let (mut stream, shared_partitions) =
-        mor_scan_stream(table, projection, prune, scan_snapshot_id).await?;
+        mor_scan_stream(table, projection, prune.clone(), scan_snapshot_id).await?;
 
     let mut pairs: Vec<(String, i64)> = Vec::new();
     while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
@@ -524,13 +524,13 @@ async fn merge_on_read_delete(
     .await?;
     let referenced_files = files_exist_set(&close, &pairs);
 
-    // §5 row-delta recipe, MoR DELETE. `AlwaysTrue` is Java-exact because this path pushes no filter
-    // into the scan. V3 shared-Puffin closure arms deleted-files checks (F-17 C-013); V2 keeps
-    // Java's skip-delete default.
+    // §5 row-delta recipe, MoR DELETE. The conflict filter is the scan's own `prune` (`AlwaysTrue`
+    // when nothing was pushed). V3 shared-Puffin closure arms deleted-files checks (F-17 C-013);
+    // V2 keeps Java's skip-delete default.
     let tx = Transaction::new(table);
     let mut action = tx
         .row_delta()
-        .conflict_detection_filter(Predicate::AlwaysTrue)
+        .conflict_detection_filter(prune.unwrap_or(Predicate::AlwaysTrue))
         .validate_data_files_exist(referenced_files);
     if delete_kind == MergeOnReadDeleteKind::DeletionVectors {
         action = action.validate_deleted_files();
@@ -671,7 +671,7 @@ async fn copy_on_write_delete(
         .overwrite_files()
         .delete_data_files(removed_data_files)
         .add_files(new_files)
-        .conflict_detection_filter(Predicate::AlwaysTrue)
+        .conflict_detection_filter(prune.unwrap_or(Predicate::AlwaysTrue))
         .validate_no_conflicting_deletes();
     action = maybe_validate_from_snapshot(action, scan_snapshot_id, |action, snapshot_id| {
         action.validate_from_snapshot(snapshot_id)
@@ -914,7 +914,7 @@ pub(crate) async fn merge_on_read_update(
     push_lineage_scan_columns(&mut projection, table.metadata().format_version());
 
     let (mut stream, shared_partitions) =
-        mor_scan_stream(table, projection, prune, scan_snapshot_id).await?;
+        mor_scan_stream(table, projection, prune.clone(), scan_snapshot_id).await?;
 
     // The delete side buffers the matched pairs, because `write_position_deletes` must group and
     // sort them. The new-row side streams into the writer per batch.
@@ -987,7 +987,7 @@ pub(crate) async fn merge_on_read_update(
     let mut action = tx
         .row_delta()
         .add_data_files(data_files)
-        .conflict_detection_filter(Predicate::AlwaysTrue)
+        .conflict_detection_filter(prune.unwrap_or(Predicate::AlwaysTrue))
         .validate_data_files_exist(referenced_files)
         .validate_deleted_files()
         .validate_no_conflicting_delete_files();
@@ -1124,7 +1124,7 @@ pub(crate) async fn copy_on_write_update(
         .overwrite_files()
         .delete_data_files(removed_data_files)
         .add_files(new_files)
-        .conflict_detection_filter(Predicate::AlwaysTrue)
+        .conflict_detection_filter(prune.unwrap_or(Predicate::AlwaysTrue))
         .validate_no_conflicting_deletes();
     action = maybe_validate_from_snapshot(action, scan_snapshot_id, |action, snapshot_id| {
         action.validate_from_snapshot(snapshot_id)
