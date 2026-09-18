@@ -18,7 +18,7 @@
 use arrow_array::{Decimal128Array, FixedSizeListArray, Int64Array, LargeListArray};
 use arrow_buffer::NullBuffer;
 
-use super::project_nested_column;
+use super::NestedProjectionPlan;
 use crate::spec::Literal;
 
 #[test]
@@ -505,7 +505,7 @@ fn list_projection_schema() -> Arc<Schema> {
 
 #[test]
 fn list_source_projects_into_large_list_target() {
-    let _schema = list_projection_schema();
+    let schema = list_projection_schema();
     let element_fields = Fields::from(vec![id_field("x", DataType::Int32, true, 7)]);
     let element_field = Arc::new(id_field(
         "element",
@@ -524,20 +524,17 @@ fn list_source_projects_into_large_list_target() {
         Arc::new(values) as ArrayRef,
         None,
     );
-    let target_field = Field::new(
-        "arrs",
-        DataType::LargeList(Arc::new(id_field(
-            "element",
-            DataType::Struct(Fields::from(vec![
-                id_field("x", DataType::Int32, true, 7),
-                id_field("y", DataType::Utf8, true, 8),
-            ])),
-            true,
-            6,
-        ))),
+    let target_type = DataType::LargeList(Arc::new(id_field(
+        "element",
+        DataType::Struct(Fields::from(vec![
+            id_field("x", DataType::Int32, true, 7),
+            id_field("y", DataType::Utf8, true, 8),
+        ])),
         true,
-    );
-    let result = project_nested_column(&arrs, &target_field).unwrap();
+        6,
+    )));
+    let mut plan = NestedProjectionPlan::build(arrs.data_type(), &target_type, &schema).unwrap();
+    let result = plan.apply(Arc::new(arrs) as ArrayRef).unwrap();
     let arrs = result.as_any().downcast_ref::<LargeListArray>().unwrap();
     let elements = arrs
         .values()
@@ -561,8 +558,62 @@ fn list_source_projects_into_large_list_target() {
 }
 
 #[test]
+fn large_list_source_projects_into_list_target() {
+    let schema = list_projection_schema();
+    let element_fields = Fields::from(vec![id_field("x", DataType::Int32, true, 7)]);
+    let element_field = Arc::new(id_field(
+        "element",
+        DataType::Struct(element_fields.clone()),
+        true,
+        6,
+    ));
+    let values = StructArray::new(
+        element_fields,
+        vec![Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef],
+        None,
+    );
+    let arrs = LargeListArray::new(
+        element_field,
+        OffsetBuffer::new(vec![0i64, 2].into()),
+        Arc::new(values) as ArrayRef,
+        None,
+    );
+    let target_type = DataType::List(Arc::new(id_field(
+        "element",
+        DataType::Struct(Fields::from(vec![
+            id_field("x", DataType::Int32, true, 7),
+            id_field("y", DataType::Utf8, true, 8),
+        ])),
+        true,
+        6,
+    )));
+    let mut plan = NestedProjectionPlan::build(arrs.data_type(), &target_type, &schema).unwrap();
+    let result = plan.apply(Arc::new(arrs) as ArrayRef).unwrap();
+    let arrs = result.as_any().downcast_ref::<ListArray>().unwrap();
+    let elements = arrs
+        .values()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert_eq!(elements.num_columns(), 2);
+    let x = elements
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(x.values(), &[10, 20]);
+    let y = elements
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(y.is_null(0));
+    assert!(y.is_null(1));
+}
+
+#[test]
 fn fixed_size_list_rebuild_uses_target_size() {
-    let _schema = list_projection_schema();
+    let schema = list_projection_schema();
     let element_fields = Fields::from(vec![id_field("x", DataType::Int32, true, 7)]);
     let source = FixedSizeListArray::new(
         Arc::new(id_field(
@@ -579,24 +630,52 @@ fn fixed_size_list_rebuild_uses_target_size() {
         )) as ArrayRef,
         None,
     );
-    let target_field = Field::new(
-        "fsl",
-        DataType::FixedSizeList(
-            Arc::new(id_field(
-                "element",
-                DataType::Struct(Fields::from(vec![
-                    id_field("x", DataType::Int32, true, 7),
-                    id_field("z", DataType::Int32, true, 9),
-                ])),
-                true,
-                6,
-            )),
-            3,
-        ),
-        true,
+    let target_type = DataType::FixedSizeList(
+        Arc::new(id_field(
+            "element",
+            DataType::Struct(Fields::from(vec![
+                id_field("x", DataType::Int32, true, 7),
+                id_field("z", DataType::Int32, true, 9),
+            ])),
+            true,
+            6,
+        )),
+        3,
     );
-    let result = project_nested_column(&source, &target_field);
+    let mut plan = NestedProjectionPlan::build(source.data_type(), &target_type, &schema).unwrap();
+    let result = plan.apply(Arc::new(source) as ArrayRef);
     assert!(result.is_err());
+}
+
+#[test]
+fn nested_projection_plan_errors_past_max_depth() {
+    let mut source_type = DataType::Struct(Fields::from(vec![id_field(
+        "a",
+        DataType::Int32,
+        true,
+        1000,
+    )]));
+    let mut target_type = DataType::Struct(Fields::from(vec![
+        id_field("a", DataType::Int32, true, 1000),
+        id_field("b", DataType::Utf8, true, 1001),
+    ]));
+    for i in 0..130i32 {
+        source_type = DataType::Struct(Fields::from(vec![id_field(
+            "f",
+            source_type,
+            true,
+            10 + i,
+        )]));
+        target_type = DataType::Struct(Fields::from(vec![id_field(
+            "f",
+            target_type,
+            true,
+            10 + i,
+        )]));
+    }
+    let err = NestedProjectionPlan::build(&source_type, &target_type, &list_projection_schema())
+        .unwrap_err();
+    assert!(err.to_string().contains("exceeds depth"), "{err}");
 }
 
 #[test]

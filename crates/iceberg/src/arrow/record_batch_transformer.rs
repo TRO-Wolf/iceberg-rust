@@ -26,7 +26,7 @@ use arrow_schema::{
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::nested_projection::{
-    create_constant_column, nested_projection_applies, project_nested_column,
+    NestedProjectionPlan, create_constant_column, nested_projection_applies,
 };
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
 use crate::metadata_columns::{
@@ -140,7 +140,7 @@ pub(crate) enum ColumnSource {
     },
 
     NestedProject {
-        target_field: FieldRef,
+        plan: NestedProjectionPlan,
         source_index: usize,
     },
 
@@ -358,7 +358,7 @@ impl RecordBatchTransformer {
 
         let result = match self
             .batch_transform
-            .as_ref()
+            .as_mut()
             .expect("batch_transform was just initialized")
         {
             BatchTransform::PassThrough => record_batch,
@@ -690,25 +690,26 @@ impl RecordBatchTransformer {
                 // Every field id in the source schema is already resolved and trustworthy.
                 // `reader.rs` applied the embedded ids, the name mapping, or the position
                 // fallback, so no conflict detection is needed here.
-                let field_by_id = field_id_to_source_schema_map.get(field_id).map(
-                    |(source_field, source_index)| {
-                        if nested_projection_applies(source_field.data_type(), target_type) {
-                            ColumnSource::NestedProject {
-                                target_field: target_field.clone(),
-                                source_index: *source_index,
-                            }
-                        } else if source_field.data_type().equals_datatype(target_type) {
-                            ColumnSource::PassThrough {
-                                source_index: *source_index,
-                            }
+                let field_by_id = field_id_to_source_schema_map
+                    .get(field_id)
+                    .map(|(source_field, source_index)| {
+                        let source_type = source_field.data_type();
+                        if nested_projection_applies(source_type, target_type) {
+                            NestedProjectionPlan::build(source_type, target_type, snapshot_schema)
+                                .map(|plan| ColumnSource::NestedProject {
+                                    plan,
+                                    source_index: *source_index,
+                                })
+                        } else if source_type.equals_datatype(target_type) {
+                            Ok(ColumnSource::PassThrough { source_index: *source_index })
                         } else {
-                            ColumnSource::Promote {
+                            Ok(ColumnSource::Promote {
                                 target_type: target_type.clone(),
                                 source_index: *source_index,
-                            }
+                            })
                         }
-                    },
-                );
+                    })
+                    .transpose()?;
 
                 let column_source = if let Some(source) = field_by_id {
                     source
@@ -798,12 +799,12 @@ impl RecordBatchTransformer {
 
     fn transform_columns(
         columns: &[Arc<dyn ArrowArray>],
-        operations: &[ColumnSource],
+        operations: &mut [ColumnSource],
         num_rows: usize,
         start_row_position: u64,
     ) -> Result<Vec<Arc<dyn ArrowArray>>> {
         operations
-            .iter()
+            .iter_mut()
             .map(|op| {
                 Ok(match op {
                     ColumnSource::PassThrough { source_index } => columns[*source_index].clone(),
@@ -813,10 +814,9 @@ impl RecordBatchTransformer {
                         source_index,
                     } => cast(&*columns[*source_index], target_type)?,
 
-                    ColumnSource::NestedProject {
-                        target_field,
-                        source_index,
-                    } => project_nested_column(columns[*source_index].as_ref(), target_field)?,
+                    ColumnSource::NestedProject { plan, source_index } => {
+                        plan.apply(columns[*source_index].clone())?
+                    }
 
                     ColumnSource::Add { target_type, value } => {
                         create_constant_column(target_type, value, num_rows)?
