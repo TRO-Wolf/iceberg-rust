@@ -874,3 +874,77 @@ fn view_and_dictionary_encodings_write_as_plain_leaves() {
         ["d1", "d2", "d1"]
     );
 }
+
+#[test]
+fn null_elements_inside_null_parent_rows_are_accepted() {
+    let element = Arc::new(Field::new("element", DataType::Int32, true));
+    let nums = ListArray::new(
+        element.clone(),
+        OffsetBuffer::new(vec![0, 1, 2].into()),
+        Arc::new(Int32Array::from(vec![None, Some(1)])),
+        Some(NullBuffer::from(vec![false, true])),
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("nums", DataType::List(element), true),
+        ])),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(nums)],
+    )
+    .expect("batch");
+    let filled = apply_write_defaults(&nested_ids_schema_with(true), &batch)
+        .expect("nulls inside null parent rows are arrow-valid");
+    let nums = filled
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("nums list");
+    assert!(nums.is_null(0));
+    assert_eq!(
+        nums.value(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("i32 values")
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some(1)]
+    );
+}
+
+#[test]
+fn null_elements_outside_the_sliced_offsets_are_accepted() {
+    let element = Arc::new(Field::new("element", DataType::Int32, true));
+    let nums = ListArray::new(
+        element.clone(),
+        OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+        Arc::new(Int32Array::from(vec![None, Some(1), Some(2)])),
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("nums", DataType::List(element), true),
+        ])),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(nums)],
+    )
+    .expect("batch")
+    .slice(1, 2);
+    let filled = apply_write_defaults(&nested_ids_schema_with(true), &batch)
+        .expect("nulls outside the sliced offsets are arrow-valid");
+    let nums = filled
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("nums list");
+    for (row, expected) in [(0, 1), (1, 2)] {
+        assert_eq!(
+            nums.value(row)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("i32 values")
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some(expected)]
+        );
+    }
+}

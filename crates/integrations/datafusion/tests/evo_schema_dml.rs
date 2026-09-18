@@ -27,7 +27,7 @@ use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_datafusion::IcebergCatalogProvider;
+use iceberg_datafusion::{IcebergCatalogProvider, IcebergStaticTableProvider};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use tempfile::TempDir;
 
@@ -492,5 +492,65 @@ async fn insert_values_into_list_struct_and_map_columns_writes() {
             ],
             vec!["9".to_string(), "NULL".to_string(), "NULL".to_string()],
         ]
+    );
+}
+
+#[tokio::test]
+async fn insert_select_from_a_static_provider_into_nested_columns_writes() {
+    let (ctx, warehouse, catalog, namespace) = catalog_ctx("copy-on-write", nested_fields()).await;
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t VALUES (1, make_array(1, 2), NULL, NULL)",
+    )
+    .await;
+    let table = load(&namespace, &catalog).await;
+    let source = IcebergStaticTableProvider::try_new_from_table(table)
+        .await
+        .expect("static provider");
+    ctx.register_table("src", Arc::new(source))
+        .expect("register src");
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t SELECT id, xs, pairs, props FROM src",
+    )
+    .await;
+    for leaf_ids in parquet_leaf_ids(warehouse.path()) {
+        assert_eq!(leaf_ids, NESTED_LEAF_IDS);
+    }
+    assert_eq!(
+        select_all(&ctx, "SELECT id, xs FROM catalog.ns.t", 2).await,
+        vec![vec!["1".to_string(), "[1, 2]".to_string()], vec![
+            "1".to_string(),
+            "[1, 2]".to_string()
+        ],]
+    );
+}
+
+#[tokio::test]
+async fn insert_values_into_a_static_provider_fails_on_write_not_planning() {
+    let (ctx, _warehouse, catalog, namespace) = catalog_ctx("copy-on-write", nested_fields()).await;
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t VALUES (1, make_array(1, 2), NULL, NULL)",
+    )
+    .await;
+    let table = load(&namespace, &catalog).await;
+    let source = IcebergStaticTableProvider::try_new_from_table(table)
+        .await
+        .expect("static provider");
+    ctx.register_table("src", Arc::new(source))
+        .expect("register src");
+    let df = ctx
+        .sql("INSERT INTO src VALUES (5, make_array(6), NULL, NULL), (6, NULL, NULL, NULL)")
+        .await
+        .expect("plan");
+    let msg = df
+        .collect()
+        .await
+        .expect_err("static provider refuses writes")
+        .to_string();
+    assert!(
+        msg.contains("Write operations are not supported"),
+        "expected the write refusal, got: {msg}"
     );
 }
