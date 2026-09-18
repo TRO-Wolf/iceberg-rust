@@ -21,7 +21,9 @@ use std::sync::Arc;
 use crate::maintenance::rewrite_data_files::tests::{
     config_for, synthetic_spec_and_schema, synthetic_task,
 };
-use crate::maintenance::rewrite_data_files_plan::plan_file_groups;
+use crate::maintenance::rewrite_data_files_plan::{
+    input_split_size, plan_file_groups, plan_read_tasks,
+};
 use crate::spec::{Literal, PartitionSpec, Struct, Transform};
 
 /// Partition grouping. Different partition values never share a group, and a task of a
@@ -73,5 +75,66 @@ fn test_plan_file_groups_partition_isolation_and_incompatible_spec() {
         groups.is_empty(),
         "an incompatible-spec file and a current-spec file with the SAME partition struct are \
          bucketed SEPARATELY (incompatible ⇒ empty struct), never merged into a qualifying group"
+    );
+}
+
+#[test]
+fn test_plan_read_tasks_spark_sizes_pack_two_files_per_split() {
+    let (spec, schema) = synthetic_spec_and_schema();
+    let config = config_for(2_000, 1_500, 3_600, 1);
+    let tasks = vec![
+        synthetic_task("p0a", 1_153, 0, 0, &spec, &schema),
+        synthetic_task("p0b", 1_153, 0, 0, &spec, &schema),
+        synthetic_task("p0c", 1_153, 0, 0, &spec, &schema),
+        synthetic_task("p0d", 1_153, 0, 0, &spec, &schema),
+        synthetic_task("p1a", 1_153, 1, 0, &spec, &schema),
+        synthetic_task("p1b", 1_153, 1, 0, &spec, &schema),
+        synthetic_task("p1c", 1_153, 1, 0, &spec, &schema),
+        synthetic_task("p1d", 1_153, 1, 0, &spec, &schema),
+    ];
+    let groups = plan_file_groups(tasks, &config, &spec);
+    assert_eq!(groups.len(), 2, "one group per partition");
+    let mut total_read_tasks = 0usize;
+    for group in &groups {
+        let input_size: u64 = group.iter().map(|task| task.length).sum();
+        assert_eq!(input_size, 4_612);
+        let split_size = input_split_size(input_size, &config);
+        assert_eq!(
+            split_size, 2_800,
+            "4612/3 + 5120 = 6657 clamps at writeMaxFileSize 2000 + (3600-2000)*0.5"
+        );
+        let read_tasks = plan_read_tasks(group.clone(), split_size).unwrap();
+        assert_eq!(
+            read_tasks.len(),
+            2,
+            "4 x 1153 B files pack two per 2800 B read split"
+        );
+        total_read_tasks += read_tasks.len();
+    }
+    assert_eq!(total_read_tasks, 4, "Spark's four output files");
+}
+
+#[test]
+fn test_plan_read_tasks_default_target_is_one_task_per_group() {
+    let (spec, schema) = synthetic_spec_and_schema();
+    let config = config_for(512 * 1024 * 1024, 384 * 1024 * 1024, 966_367_641, 5);
+    let tasks = vec![
+        synthetic_task("a", 1_153, 0, 0, &spec, &schema),
+        synthetic_task("b", 1_153, 0, 0, &spec, &schema),
+        synthetic_task("c", 1_153, 0, 0, &spec, &schema),
+        synthetic_task("d", 1_153, 0, 0, &spec, &schema),
+    ];
+    let input_size: u64 = tasks.iter().map(|task| task.length).sum();
+    let split_size = input_split_size(input_size, &config);
+    assert_eq!(
+        split_size,
+        512 * 1024 * 1024,
+        "input below target ⇒ the split size is the target itself"
+    );
+    let read_tasks = plan_read_tasks(tasks, split_size).unwrap();
+    assert_eq!(
+        read_tasks.len(),
+        1,
+        "one read task per group ⇒ one output file, the pre-F-RDF-GRANULARITY-1 answer"
     );
 }

@@ -18,7 +18,7 @@
 //! Table scan api.
 
 mod batch;
-mod bin_pack;
+pub(crate) mod bin_pack;
 mod cache;
 use cache::*;
 mod context;
