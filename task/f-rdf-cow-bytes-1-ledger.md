@@ -26,11 +26,11 @@
 
 | Item | Commits | Subject |
 |---|---|---|
-| 0 | this commit | step-0 measurement |
-| 1 | | `test: F-RDF-COW-BYTES-1 — red delete-survival cells` |
-| 2 | | `fix: F-RDF-COW-BYTES-1 — the rewrite keeps a position delete that still applies, as Java does` |
-| 3 | | (mutation proof — no commit) |
-| 4 | | `docs: F-RDF-COW-BYTES-1 — ledger, mutation proof` |
+| 0 | `66299118` | `docs: F-RDF-COW-BYTES-1 — step 0 measurement` |
+| 1 | `194503d4` | `test: F-RDF-COW-BYTES-1 — red delete-survival cells` |
+| 2 | `5e7455f2` | `fix: F-RDF-COW-BYTES-1 — the rewrite keeps a position delete that still applies, as Java does` |
+| 3 | — | (mutation proof — no commit) |
+| 4 | this commit | `docs: F-RDF-COW-BYTES-1 — ledger, mutation proof` |
 
 ## Defect
 
@@ -174,20 +174,130 @@ file-scoped parquet deletes through a DV-shaped path — Java's reclaim is Puffi
 
 Both must be restricted to `is_deletion_vector(data_file)` (Puffin).
 
-## Pins to re-pin (asserted the refuted f16 inference)
+## Step 1 — red cells
 
-Pins asserting a parquet position delete is removed after its referenced file is
-rewritten were written from the f16 "Spark reclaims file-scoped parquet deletes"
-inference, which the MERGE probe above refutes end-to-end. Each is changed to the
-Java/Spark answer (delete kept, `removed_delete_files_count` 0) in step 2 and named
-here when changed — none is deleted.
+`crates/iceberg/src/maintenance/rewrite_data_files_cow_bytes_tests.rs` (new file, 432
+lines, under the directory ceiling; ASF header copied from a sibling, no other
+comments), wired in `crates/iceberg/src/maintenance/mod.rs`. Eight tests over the
+shape above; the five file-scoped cells were red pre-fix (`removed_delete_files_count`
+1 vs 0 — exact assertion: `left: 1, right: 0`), the two partition-scoped controls and
+the genuinely-dangling sequence control were already green:
 
-Candidates identified so far (confirmed against the suite in step 2):
+| test | cell | pre-fix |
+|---|---|---|
+| `test_cow_bytes_partition_delete_threshold_keeps_applicable_delete` | partition-scoped `delete-file-threshold=1` | green (rewritten 4, added 1, removed 0) |
+| `test_cow_bytes_file_scoped_delete_threshold_keeps_applicable_delete` | file-scoped `delete-file-threshold=1` | RED (removed 1) |
+| `test_cow_bytes_rewrite_all_keeps_applicable_delete` | file-scoped `rewrite-all=true` | RED (removed 1) |
+| `test_cow_bytes_remove_dangling_keeps_applicable_delete` | file-scoped `rewrite-all` + `remove-dangling-deletes` | RED (removed 1) |
+| `test_cow_bytes_remove_dangling_single_row_keeps_applicable_delete` | file-scoped, one deleted row | RED (removed 1) |
+| `test_cow_bytes_partition_delete_survives_dangling_cleanup` | partition-scoped `rewrite-all` + cleanup | green |
+| `test_cow_bytes_new_sequence_keeps_delete_without_cleanup` | file-scoped, `use-starting-sequence-number=false` | RED (removed 1 — Java keeps it: no cleanup asked) |
+| `test_cow_bytes_new_sequence_dangling_cleanup_removes_delete` | file-scoped, new seq + cleanup | green (removed 1 — genuinely dangling, seq `2 < 3`) |
+
+Each cell asserts the Spark/Java answer: the delete file stays in
+`live_delete_file_paths`, `removed_delete_files_count == 0`, the deleted rows stay
+deleted through `scan_rows`, and the output data files carry the starting snapshot's
+data sequence number (2; file seq 3) under the default, or the new sequence (3/3)
+under `use-starting-sequence-number=false`.
+
+## Step 2 — the fix
+
+Two removal paths restricted to `is_deletion_vector` (Puffin), matching Java's
+`danglingDVs` / `ContentFileUtil.isDV`:
+
+- `rewrite_data_files_dv.rs::plan_dv_removal` — the drop predicate gains
+  `is_deletion_vector(delete_file) &&`: a file-scoped PARQUET position delete whose
+  referenced data file was rewritten is no longer dropped in the `RewriteFiles`
+  commit. Puffin DVs still are. The stale doc sentence claiming the parquet extension
+  is deleted.
+- `remove_dangling_delete_files.rs::find_dangling_deletes` — the reference arm is
+  split: a Puffin DV with a dead or missing `referenced_data_file` dangles
+  immediately (Java's left-join-null semantics for DVs); a NON-DV file-scoped delete
+  with a LIVE referenced path is kept (the reader still honors it by path —
+  `delete_file_index` routes it, resurrecting masked rows if dropped); a non-DV
+  delete with a dead reference falls through to the Java partition `(spec_id,
+  partition)` min-seq rule instead of being dropped on path alone. Net effect: Java's
+  seq rule judges parquet deletes; the dead-reference shortcut judges only DVs. The
+  change is line-negative (1804 → 1798; ceiling lowered in
+  `scripts/check_rust_file_size.py`).
+
+`map.md` rows updated in the same change (AGENTS.md `map_md_navigation`): the
+"parquet delete file stays" symptom now documents the kept delete as expected
+behavior, and the partition-scoped row records the Puffin-only drop.
+
+### Pins re-pinned to the Java/Spark answer (names preserved, none deleted)
+
+Each asserted the refuted f16 "Spark reclaims file-scoped parquet deletes" inference
+and now asserts the kept delete:
 
 - `rewrite_data_files_mw7_tests.rs::test_mw7_unpartitioned_single_file_partition_scoped_full_bounds_is_reclaimed`
-- `remove_dangling_delete_files.rs::test_dangling_position_delete_parquet_removed_after_data_rewritten_away`
+  — `removed_delete_files_count` 1 → 0; the delete stays live.
+- `rewrite_data_files_ratio_tests.rs::test_bounds_only_file_scoped_parquet_fires_ratio`
+  — 1 → 0.
+- `rewrite_data_files_ratio_tests.rs::test_fully_deleted_in_band_parquet_file_is_rewritten_and_drops_its_delete`
+  — 1 → 0.
+- `rewrite_data_files_ratio_tests.rs::test_fully_deleted_2500_row_in_band_parquet_file_ends_at_zero_delete_files`
+  — 1 → 0.
 - `rewrite_data_files_ratio_tests.rs::test_partition_scoped_delete_survives_partial_rewrite`
-  (expects one file-scoped parquet delete removed)
+  — 1 → 0 (the file-scoped delete on the rewritten file also stays live).
+- `rewrite_data_files_router_bound_tests.rs::evolved_spec_rewrite_drops_file_scoped_position_deletes`
+  — the parquet position delete stays live; the DV sibling assertions unchanged.
+
+Candidate `remove_dangling_delete_files.rs::test_dangling_position_delete_parquet_removed_after_data_rewritten_away`
+was left UNCHANGED and stays green: its delete has no live referenced path AND no live
+data file in its stamped partition, so the Java seq rule drops it either way — the
+pin proves the seq arm still fires for a genuinely orphaned parquet delete.
+
+Post-fix suite (`CARGO_BUILD_JOBS=6 RUST_TEST_THREADS=6`):
+
+- `cargo test -p iceberg --lib cow_bytes` — 8/8 green.
+- `cargo test -p iceberg --lib rewrite_data_files` — 104/104 green (includes every
+  re-pinned test and all DV cells; `evolved_spec_rewrite_drops_file_scoped_dv_and_keeps_sibling`
+  and `test_rewriting_one_file_keeps_sibling_dv_in_same_puffin` still prove the DV arm).
+- `cargo test -p iceberg --lib remove_dangling` — 23/23 green.
+- `cargo test -p iceberg --lib rewrite_position_delete` — 93/93 green (RPD's own DV
+  handling untouched).
+
+## Step 3 — mutation proof
+
+`git checkout 194503d4 -- remove_dangling_delete_files.rs rewrite_data_files_dv.rs`
+(reverts ONLY the fix; the re-pinned tests and new file stay), then
+`cargo test -p iceberg --lib cow_bytes`:
+
+RED, exactly the five file-scoped cells, all `removed_delete_files_count` 1 vs 0:
+
+- `test_cow_bytes_file_scoped_delete_threshold_keeps_applicable_delete` — FAILED
+- `test_cow_bytes_rewrite_all_keeps_applicable_delete` — FAILED
+- `test_cow_bytes_remove_dangling_keeps_applicable_delete` — FAILED
+- `test_cow_bytes_remove_dangling_single_row_keeps_applicable_delete` — FAILED
+- `test_cow_bytes_new_sequence_keeps_delete_without_cleanup` — FAILED (the delete is
+  dropped by `plan_dv_removal` in the commit itself — proof the rewrite-commit path,
+  not only the cleanup sub-action, carried the defect)
+
+GREEN through the mutation (correct controls):
+
+- `test_cow_bytes_partition_delete_threshold_keeps_applicable_delete`
+- `test_cow_bytes_partition_delete_survives_dangling_cleanup`
+- `test_cow_bytes_new_sequence_dangling_cleanup_removes_delete` (the seq arm still
+  removes a genuinely dangling delete — the mutation does not over-keep)
+
+`git checkout HEAD -- <the two files>` → 8/8 green. Revert not committed.
+
+## Step 4 — RePark xfail forecast after the bump
+
+- `delete_file_threshold` VALUE cell (ICE-RDF-COW-BYTES-1): the vanished-sum now
+  contains only the rewritten data file — the delete survives — so
+  `rewritten_bytes_count` should match Spark. The rewritten-count half depends on
+  RePark's delete shape (see the reconcile note): file-scoped → 1 vs Spark's 4 stays
+  an xfail on the count; partition-scoped → 4/1 matches and the cell flips to pass.
+- `remove_dangling` value cell + BOTH removed-count cells (ICE-RDF-DANGLE-2): flip to
+  Spark's answer — `removed_delete_files_count` 0, the delete file live.
+- `test_residue_matches_spark_zero_delete_files`: unchanged by this lane where the
+  deletes are Puffin DVs (still removed when their referenced file goes) or
+  partition-scoped (still seq-judged). If any residue cell relied on the over-broad
+  removal of file-scoped PARQUET deletes to reach Spark's zero, it could newly
+  diverge — flagged, not expected: Spark's zero comes from seq-GC
+  (`dropDeleteFilesOlderThan`), a different mechanism.
 
 ## RePark reconcile note
 
