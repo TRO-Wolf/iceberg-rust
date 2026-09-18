@@ -436,7 +436,7 @@ fn parquet_leaf_ids(dir: &Path) -> Vec<Vec<i32>> {
     out
 }
 
-const NESTED_LEAF_IDS: [i32; 6] = [1, 3, 6, 7, 9, 11];
+const NESTED_LEAF_IDS: [i32; 6] = [1, 5, 7, 8, 9, 11];
 
 #[tokio::test]
 async fn insert_values_into_a_list_column_writes_and_stamps_the_element_id() {

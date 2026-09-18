@@ -40,7 +40,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::arrow::{schema_to_arrow_schema, strip_metadata_from_schema};
 use iceberg::inspect::MetadataTableType;
 use iceberg::table::Table;
 use iceberg::{Catalog, NamespaceIdent, Result, TableIdent};
@@ -126,7 +126,9 @@ impl IcebergTableProvider {
 #[async_trait]
 impl TableProvider for IcebergTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
-        self.schema.clone()
+        strip_metadata_from_schema(&self.schema)
+            .map(Arc::new)
+            .expect("provider schema is produced by schema_to_arrow_schema")
     }
 
     fn table_type(&self) -> TableType {
