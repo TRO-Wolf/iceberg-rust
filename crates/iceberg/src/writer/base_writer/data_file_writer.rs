@@ -277,7 +277,8 @@ mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::cast::AsArray;
+    use arrow_array::{Array, Int32Array, StringArray};
     use arrow_schema::{DataType, Field};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::{
@@ -298,7 +299,7 @@ mod test {
     };
     use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
     use crate::writer::write_defaults::tests::{
-        assert_nested_field_ids, assert_nested_values, idless_nested_batch, nested_ids_schema,
+        assert_nested_field_ids, nested_batch, nested_ids_schema,
     };
     use crate::writer::{IcebergWriter, IcebergWriterBuilder, RecordBatch};
     use crate::{ErrorKind, Result};
@@ -972,7 +973,7 @@ mod test {
             .await
             .expect("build writer");
         writer
-            .write(idless_nested_batch("item"))
+            .write(nested_batch("item", false))
             .await
             .expect("write");
         let bytes = file_io
@@ -989,6 +990,8 @@ mod test {
             .next()
             .expect("one batch")
             .expect("batch");
-        assert_nested_values(&batch);
+        let nums = batch.column(1).as_list::<i32>();
+        assert!(nums.is_null(1) && nums.values().is_null(1) && nums.value_length(2) == 0);
+        assert!(batch.column(3).as_map().is_null(2));
     }
 }
