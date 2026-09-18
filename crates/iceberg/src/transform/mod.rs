@@ -76,12 +76,16 @@ mod test {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use arrow_array::{Array, ArrayRef, Int32Array, TimestampNanosecondArray};
+
     use crate::Result;
     use crate::expr::accessor::StructAccessor;
     use crate::expr::{
         BinaryExpression, BoundPredicate, BoundReference, PredicateOperator, SetExpression,
     };
-    use crate::spec::{Datum, NestedField, NestedFieldRef, PrimitiveType, Transform, Type};
+    use crate::spec::{
+        Datum, NestedField, NestedFieldRef, PrimitiveLiteral, PrimitiveType, Transform, Type,
+    };
 
     /// A utitily struct, test fixture
     /// used for testing the projection on `Transform`
@@ -184,6 +188,58 @@ mod test {
             let error = super::create_transform_function(&transform)
                 .expect_err("parameter above the Java int maximum must be rejected");
             assert_eq!(error.kind(), crate::ErrorKind::DataInvalid, "{transform}");
+        }
+    }
+
+    #[test]
+    fn test_hour_transform_accepts_nanosecond_timestamp_arrays() {
+        let hour = super::create_transform_function(&Transform::Hour)
+            .expect("hour transform function must exist");
+        let values: Vec<Option<i64>> = vec![
+            Some(0),
+            Some(3_599_999_999_999),
+            Some(3_600_000_000_000),
+            Some(-1),
+            Some(-3_600_000_000_001),
+            None,
+        ];
+        let scalars = [
+            0,
+            3_599_999_999_999,
+            3_600_000_000_000,
+            -1,
+            -3_600_000_000_001,
+        ];
+        for (array, datum) in [
+            (
+                Arc::new(TimestampNanosecondArray::from(values.clone())) as ArrayRef,
+                Datum::timestamp_nanos as fn(i64) -> Datum,
+            ),
+            (
+                Arc::new(TimestampNanosecondArray::from(values).with_timezone("UTC")) as ArrayRef,
+                Datum::timestamptz_nanos as fn(i64) -> Datum,
+            ),
+        ] {
+            let res = hour
+                .transform(array)
+                .expect("hour transform must accept nanosecond timestamp arrays");
+            let res = res
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("hour transform must produce int32 hours");
+            assert_eq!(res.len(), 6);
+            for (row, scalar) in scalars.iter().enumerate() {
+                let literal = hour
+                    .transform_literal(&datum(*scalar))
+                    .expect("hour transform must accept nanosecond timestamp literals")
+                    .expect("hour on a non-null literal must not be null");
+                let expected = match literal.literal() {
+                    PrimitiveLiteral::Int(v) => *v,
+                    other => panic!("hour literal must be an int, got {other:?}"),
+                };
+                assert_eq!(res.value(row), expected, "row {row} input {scalar}");
+            }
+            assert!(res.is_null(5), "the null row must stay null");
         }
     }
 

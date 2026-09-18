@@ -22,17 +22,22 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use datafusion::arrow::array::{
-    Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::datasource::MemTable;
+use iceberg::Catalog;
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{
-    NestedField, NullOrder, PrimitiveType, Schema, SortDirection, SortOrder, TableProperties,
-    Transform, Type, UnboundPartitionSpec,
+    DataContentType, Literal, NestedField, NullOrder, PrimitiveType, Schema, SortDirection,
+    SortOrder, Struct, TableProperties, Transform, Type, UnboundPartitionSpec,
 };
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::transform::create_transform_function;
+use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
+use parquet::file::properties::WriterProperties;
 use sorted_insert_shared::{
-    default_order_id, fixture, fixture_with_props, id_arrow_schema, id_batches, id_schema,
+    Fixture, default_order_id, fixture, fixture_with_props, id_arrow_schema, id_batches, id_schema,
     live_files, read_int_column, read_long_column, read_nullable_long_column, run_insert,
     shuffled_ids, sort_field, unpartitioned_spec, writer_input_is_sort,
 };
@@ -716,6 +721,279 @@ async fn insert_into_unknown_transform_order_writes_with_zero_stamp() -> Result<
     assert_eq!(files.len(), 1);
     for (_, stamp) in &files {
         assert_eq!(*stamp, Some(0), "unresolvable order stamps order id 0");
+    }
+    Ok(())
+}
+
+fn partitioned_p_spec() -> UnboundPartitionSpec {
+    UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "p", Transform::Identity)
+        .expect("partition field")
+        .build()
+}
+
+fn nullable_id_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "p", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()
+        .expect("nullable id schema")
+}
+
+async fn seed_unsorted_file(fixture: &Fixture, ids: &[Option<i64>], part: i32) -> Result<()> {
+    let table = fixture.catalog.load_table(&fixture.ident).await?;
+    let schema = table.metadata().current_schema().clone();
+    let arrow_schema = Arc::new(schema_to_arrow_schema(&schema)?);
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+        Arc::new(Int32Array::from(vec![part; ids.len()])) as ArrayRef,
+    ])?;
+    let file_path = format!("{}/data/seed.parquet", table.metadata().location());
+    let output = table.file_io().new_output(file_path)?;
+    let mut writer = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+        .build(output)
+        .await?;
+    writer.write(&batch).await?;
+    let mut file_builder = writer
+        .close()
+        .await?
+        .into_iter()
+        .next()
+        .expect("one written file");
+    file_builder
+        .content(DataContentType::Data)
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .partition(Struct::from_iter([Some(Literal::int(part))]));
+    let file = file_builder.build()?;
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(vec![file])
+        .apply(tx)?
+        .commit(fixture.catalog.as_ref())
+        .await?;
+    Ok(())
+}
+
+async fn run_sql(fixture: &Fixture, sql: &str) -> Result<()> {
+    fixture.context.sql(sql).await?.collect().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cow_update_rewrites_file_sorted_by_default_order_and_stamps_it() -> Result<()> {
+    let order = SortOrder::builder()
+        .with_sort_field(sort_field(
+            1,
+            Transform::Identity,
+            SortDirection::Ascending,
+            NullOrder::First,
+        ))
+        .build(&id_schema())?;
+    let fixture = fixture(
+        "cow_update_sort",
+        "t",
+        id_schema(),
+        partitioned_p_spec(),
+        Some(order),
+        1,
+    )
+    .await?;
+    seed_unsorted_file(&fixture, &[Some(5), Some(1), Some(4), Some(2), Some(3)], 0).await?;
+    run_sql(
+        &fixture,
+        "UPDATE catalog.cow_update_sort.t SET id = id WHERE p = 0",
+    )
+    .await?;
+
+    let files = live_files(&fixture).await?;
+    assert_eq!(files.len(), 1, "the one affected file rewrites to one file");
+    let rows = read_long_column(&files[0].0, 0);
+    assert_eq!(rows, vec![1, 2, 3, 4, 5], "rewritten file ascends by id");
+    assert_eq!(
+        files[0].1,
+        Some(default_order_id(&fixture).await?),
+        "rewritten file stamps the default sort order id"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cow_update_desc_nulls_last_orders_nulls_last() -> Result<()> {
+    let schema = nullable_id_schema();
+    let order = SortOrder::builder()
+        .with_sort_field(sort_field(
+            1,
+            Transform::Identity,
+            SortDirection::Descending,
+            NullOrder::Last,
+        ))
+        .build(&schema)?;
+    let fixture = fixture(
+        "cow_update_desc",
+        "t",
+        schema,
+        partitioned_p_spec(),
+        Some(order),
+        1,
+    )
+    .await?;
+    seed_unsorted_file(&fixture, &[Some(3), None, Some(1), None, Some(5)], 0).await?;
+    run_sql(
+        &fixture,
+        "UPDATE catalog.cow_update_desc.t SET id = id WHERE p = 0",
+    )
+    .await?;
+
+    let files = live_files(&fixture).await?;
+    assert_eq!(files.len(), 1);
+    let rows = read_nullable_long_column(&files[0].0, 0);
+    assert_eq!(rows, vec![Some(5), Some(3), Some(1), None, None]);
+    assert_eq!(files[0].1, Some(default_order_id(&fixture).await?));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cow_update_on_unsorted_table_stamps_zero_and_keeps_scan_order() -> Result<()> {
+    let fixture = fixture(
+        "cow_update_unsorted",
+        "t",
+        id_schema(),
+        partitioned_p_spec(),
+        None,
+        1,
+    )
+    .await?;
+    seed_unsorted_file(&fixture, &[Some(5), Some(1), Some(4), Some(2), Some(3)], 0).await?;
+    run_sql(
+        &fixture,
+        "UPDATE catalog.cow_update_unsorted.t SET id = id WHERE p = 0",
+    )
+    .await?;
+
+    let files = live_files(&fixture).await?;
+    assert_eq!(files.len(), 1);
+    let rows = read_long_column(&files[0].0, 0);
+    assert_eq!(rows, vec![5, 1, 4, 2, 3], "unsorted table keeps scan order");
+    assert_eq!(files[0].1, Some(0), "unsorted table stamps order id 0");
+    Ok(())
+}
+
+fn float_p_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "p", Type::Primitive(PrimitiveType::Float)).into(),
+        ])
+        .build()
+        .expect("float p schema")
+}
+
+fn float_p_arrow_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("p", DataType::Float32, false),
+    ]))
+}
+
+async fn seed_float_p_file(
+    fixture: &Fixture,
+    name: &str,
+    ids: &[i64],
+    parts: &[f32],
+    partition: f32,
+) -> Result<()> {
+    let table = fixture.catalog.load_table(&fixture.ident).await?;
+    let schema = table.metadata().current_schema().clone();
+    let batch = RecordBatch::try_new(Arc::new(schema_to_arrow_schema(&schema)?), vec![
+        Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+        Arc::new(Float32Array::from(parts.to_vec())) as ArrayRef,
+    ])?;
+    let file_path = format!("{}/data/{name}.parquet", table.metadata().location());
+    let output = table.file_io().new_output(file_path)?;
+    let mut writer = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+        .build(output)
+        .await?;
+    writer.write(&batch).await?;
+    let mut file_builder = writer
+        .close()
+        .await?
+        .into_iter()
+        .next()
+        .expect("one written file");
+    file_builder
+        .content(DataContentType::Data)
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .partition(Struct::from_iter([Some(Literal::float(partition))]));
+    let file = file_builder.build()?;
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(vec![file])
+        .apply(tx)?
+        .commit(fixture.catalog.as_ref())
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn float_partition_signed_zero_stays_sorted_by_id() -> Result<()> {
+    let schema = float_p_schema();
+    let order = SortOrder::builder()
+        .with_sort_field(sort_field(
+            1,
+            Transform::Identity,
+            SortDirection::Ascending,
+            NullOrder::First,
+        ))
+        .build(&schema)?;
+    let insert_fixture = fixture(
+        "insert_signed_zero",
+        "t",
+        schema.clone(),
+        partitioned_p_spec(),
+        Some(order.clone()),
+        1,
+    )
+    .await?;
+    let batch = RecordBatch::try_new(float_p_arrow_schema(), vec![
+        Arc::new(Int64Array::from(vec![2, 1, 3])) as ArrayRef,
+        Arc::new(Float32Array::from(vec![-0.0, 0.0, 0.0])) as ArrayRef,
+    ])?;
+    let source = MemTable::try_new(float_p_arrow_schema(), vec![vec![batch]])?;
+    run_insert(&insert_fixture, source, "SELECT id, p FROM source").await?;
+
+    let cow_fixture = fixture(
+        "cow_update_signed_zero",
+        "t",
+        schema,
+        partitioned_p_spec(),
+        Some(order),
+        1,
+    )
+    .await?;
+    seed_float_p_file(&cow_fixture, "neg", &[2], &[-0.0], -0.0).await?;
+    seed_float_p_file(&cow_fixture, "pos", &[1, 3], &[0.0, 0.0], 0.0).await?;
+    let update = "UPDATE catalog.cow_update_signed_zero.t SET id = id";
+    run_sql(&cow_fixture, update).await?;
+
+    for (label, fixture) in [("COW UPDATE", &cow_fixture), ("INSERT", &insert_fixture)] {
+        let files = live_files(fixture).await?;
+        assert_eq!(files.len(), 1, "{label}: one file in the merged partition");
+        let rows = read_long_column(&files[0].0, 0);
+        assert_eq!(
+            rows,
+            vec![1, 2, 3],
+            "{label}: signed-zero partition values are one partition, so id order decides"
+        );
+        assert_eq!(
+            files[0].1,
+            Some(default_order_id(fixture).await?),
+            "{label}: file stamps the default sort order id"
+        );
     }
     Ok(())
 }

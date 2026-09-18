@@ -25,6 +25,28 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-17): F-FORK-ASKS-22A — three RePark fork asks (hour on ns, COW UPDATE sort+stamp, binpack sort+stamp)
+
+Ledger: [`f-fork-asks-22a-ledger.md`](f-fork-asks-22a-ledger.md). Branch `fix/fork-asks-22a` off
+fork `main`. Consumer: RePark fork asks — nanosecond hour transform, DML rewrite sort+stamp,
+binpack sort+stamp (Spark 4.1.2 measured answers).
+
+- [x] F-TSNS-HOUR-1: `Hour::transform` accepts `Timestamp(Nanosecond, _)` arrays via
+      `hour_timestamp_nano`/`div_euclid`; `Hour::unsupported` dedupe kept `temporal.rs` under its
+      legacy ceiling (2796→2792). Red→green `test_hour_transform_accepts_nanosecond_timestamp_arrays`;
+      mutation red→restored green. `52bb9f387` / `9aba4ebe5`
+- [x] F-COW-UPDATE-STAMP-1: shared `StreamingDataFileWriter` computes `write_sort_plan` lazily,
+      buffers only when a real sort key exists, sorts via arrow lexsort at `finish()`, and stamps
+      `with_sort_order_id` (0 for unsorted). COW UPDATE + COW DELETE survivors + MoR UPDATE new
+      rows covered; `cow_memory_bound` still green. `b4851f80b` / `7e945ef4b`
+- [x] F-RDF-SORT-STAMP-1: `rewrite_sort_plan` mirrors `write_sort_plan` on plain arrow (nested
+      paths, transform fields, canonical NaN, direction/null order); group concat →
+      `lexsort_to_indices` → `take_record_batch` → unchanged writer/router/roller path; every
+      file stamped incl. `0` unsorted. 96/96 maintenance tests. `165760ab0` / `3ffe3b92e`
+- [x] Mutation proof all three asks (revert impl file → red cells red → restore → green); reverts
+      not committed
+- [x] Ledger + todo entry; gates below
+
 ## ACTIVE (2026-09-17): F-ICE-RESIDUES-21B fork-residue lane, five closures vs Java 1.10.0
 
 Ledger: [`f-ice-residues-21b-ledger.md`](f-ice-residues-21b-ledger.md). Run 21b residue items on

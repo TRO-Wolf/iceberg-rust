@@ -18,6 +18,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow_arith::boolean::is_null;
+use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, RecordBatch, StructArray};
+use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
+use arrow_schema::{ArrowError, Schema as ArrowSchema};
+use arrow_select::concat::concat_batches;
+use arrow_select::nullif::nullif;
+use arrow_select::take::take_record_batch;
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::basic::{Encoding, Type as PhysicalType};
@@ -28,6 +35,7 @@ use parquet::schema::types::ColumnPath;
 
 use crate::arrow::{
     ArrowFileReader, ArrowReaderBuilder, ParquetReadOptions, RecordBatchPartitionSplitter,
+    schema_to_arrow_schema,
 };
 use crate::error::{Error, ErrorKind, Result};
 use crate::io::{FileIO, FileMetadata};
@@ -37,8 +45,12 @@ use crate::metadata_columns::{
     format_supports_row_lineage, schema_with_row_lineage,
 };
 use crate::scan::FileScanTask;
-use crate::spec::{DataFile, DataFileFormat, PartitionSpecRef, SchemaRef};
+use crate::spec::{
+    DataFile, DataFileFormat, NestedFieldRef, NullOrder, PartitionSpec, PartitionSpecRef,
+    PrimitiveType, Schema as IcebergSchema, SchemaRef, SortDirection, Transform, Type,
+};
 use crate::table::Table;
+use crate::transform::{BoxedTransformFunction, create_transform_function};
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
@@ -68,6 +80,8 @@ pub(crate) async fn write_compacted_files(
     }
 
     let schema = rewrite_write_schema(table)?;
+    let arrow_schema = Arc::new(schema_to_arrow_schema(&schema)?);
+    let sort = rewrite_sort_plan(table, &arrow_schema);
     let spec = output_spec.as_ref().clone();
 
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
@@ -91,8 +105,6 @@ pub(crate) async fn write_compacted_files(
         location_generator,
         file_name_generator,
     );
-    let writer_builder =
-        DataFileWriterBuilder::new(rolling_builder).with_partition_spec(spec.clone());
 
     let carry_lineage = format_supports_row_lineage(table.metadata().format_version());
     let current_schema = table.metadata().current_schema().clone();
@@ -120,6 +132,63 @@ pub(crate) async fn write_compacted_files(
         .with_prefetched_parquet_metadata(input_footers)
         .build()
         .read(task_stream)?;
+
+    if let Some(keys) = &sort.keys {
+        let splitter = (!spec.fields().is_empty())
+            .then(|| {
+                RecordBatchPartitionSplitter::try_new_with_computed_values(
+                    schema.clone(),
+                    output_spec.clone(),
+                )
+            })
+            .transpose()?;
+        let run_target = usize::try_from(target_file_size_bytes).unwrap_or(usize::MAX);
+        let mut files = Vec::new();
+        let mut peak = 0usize;
+        let mut run: Vec<RecordBatch> = Vec::new();
+        let mut run_bytes = 0usize;
+        while let Some(batch) = batch_stream.try_next().await? {
+            run_bytes += batch.get_array_memory_size();
+            run.push(batch);
+            if run_bytes >= run_target {
+                write_sorted_run(
+                    &arrow_schema,
+                    std::mem::take(&mut run),
+                    keys,
+                    splitter.as_ref(),
+                    &rolling_builder,
+                    &spec,
+                    sort.stamp,
+                    max_open_partition_writers,
+                    &mut files,
+                    &mut peak,
+                )
+                .await?;
+                run_bytes = 0;
+            }
+        }
+        write_sorted_run(
+            &arrow_schema,
+            run,
+            keys,
+            splitter.as_ref(),
+            &rolling_builder,
+            &spec,
+            sort.stamp,
+            max_open_partition_writers,
+            &mut files,
+            &mut peak,
+        )
+        .await?;
+        return Ok(CompactedWrite {
+            files,
+            peak_open_partition_writers: peak,
+        });
+    }
+
+    let writer_builder = DataFileWriterBuilder::new(rolling_builder)
+        .with_partition_spec(spec.clone())
+        .with_sort_order_id(sort.stamp);
 
     if spec.fields().is_empty() {
         let mut writer = writer_builder.build(None).await?;
@@ -151,6 +220,50 @@ pub(crate) async fn write_compacted_files(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn write_sorted_run(
+    arrow_schema: &arrow_schema::SchemaRef,
+    run: Vec<RecordBatch>,
+    keys: &[RewriteSortKey],
+    splitter: Option<&RecordBatchPartitionSplitter>,
+    rolling_builder: &RollingFileWriterBuilder<
+        ParquetWriterBuilder,
+        DefaultLocationGenerator,
+        DefaultFileNameGenerator,
+    >,
+    spec: &PartitionSpec,
+    stamp: i32,
+    max_open_partition_writers: usize,
+    files: &mut Vec<DataFile>,
+    peak_open_partition_writers: &mut usize,
+) -> Result<()> {
+    if run.is_empty() {
+        return Ok(());
+    }
+    let sorted = {
+        let run_batch = concat_batches(arrow_schema, &run).map_err(arrow_sort_err)?;
+        sort_group_batch(&run_batch, keys)?
+    };
+    let writer_builder = DataFileWriterBuilder::new(rolling_builder.clone())
+        .with_partition_spec(spec.clone())
+        .with_sort_order_id(stamp);
+    if let Some(splitter) = splitter {
+        let mut router = BoundedPartitionRouter::new(writer_builder, max_open_partition_writers)?;
+        for (partition_key, partition_batch) in splitter.split(&sorted)? {
+            router.write(partition_key, partition_batch).await?;
+        }
+        *peak_open_partition_writers =
+            (*peak_open_partition_writers).max(router.peak_open_partition_writers());
+        files.extend(router.close().await?);
+    } else {
+        let mut writer = writer_builder.build(None).await?;
+        writer.write(sorted).await?;
+        *peak_open_partition_writers = (*peak_open_partition_writers).max(1);
+        files.extend(writer.close().await?);
+    }
+    Ok(())
+}
+
 fn rewrite_write_schema(table: &Table) -> Result<SchemaRef> {
     let schema = table.metadata().current_schema();
     if format_supports_row_lineage(table.metadata().format_version()) {
@@ -158,6 +271,160 @@ fn rewrite_write_schema(table: &Table) -> Result<SchemaRef> {
     } else {
         Ok(schema.clone())
     }
+}
+
+struct RewriteSortKey {
+    column: usize,
+    nested_path: Vec<String>,
+    transform: Option<BoxedTransformFunction>,
+    canonical_nan: bool,
+    options: SortOptions,
+}
+
+struct RewriteSort {
+    keys: Option<Vec<RewriteSortKey>>,
+    stamp: i32,
+}
+
+fn rewrite_sort_plan(table: &Table, input_schema: &ArrowSchema) -> RewriteSort {
+    let order = table.metadata().default_sort_order();
+    let unsorted = || RewriteSort {
+        keys: None,
+        stamp: 0,
+    };
+    if order.is_unsorted() {
+        return unsorted();
+    }
+    let Ok(order_id) = i32::try_from(order.order_id) else {
+        return unsorted();
+    };
+    let iceberg_schema = table.metadata().current_schema();
+    let mut keys = Vec::with_capacity(order.fields.len());
+    for field in &order.fields {
+        if field.transform == Transform::Void {
+            continue;
+        }
+        let Some(source) = iceberg_schema.field_by_id(field.source_id) else {
+            return unsorted();
+        };
+        let Some((top_name, nested_path)) = sort_source_path(iceberg_schema, field.source_id)
+        else {
+            return unsorted();
+        };
+        let Ok(column) = input_schema.index_of(&top_name) else {
+            return unsorted();
+        };
+        let (transform, key_type) = if field.transform == Transform::Identity {
+            (None, source.field_type.as_ref().clone())
+        } else {
+            let (Ok(result_type), Ok(function)) = (
+                field.transform.result_type(source.field_type.as_ref()),
+                create_transform_function(&field.transform),
+            ) else {
+                return unsorted();
+            };
+            (Some(function), result_type)
+        };
+        keys.push(RewriteSortKey {
+            column,
+            nested_path,
+            transform,
+            canonical_nan: matches!(
+                key_type,
+                Type::Primitive(PrimitiveType::Float | PrimitiveType::Double)
+            ),
+            options: SortOptions {
+                descending: field.direction == SortDirection::Descending,
+                nulls_first: field.null_order == NullOrder::First,
+            },
+        });
+    }
+    RewriteSort {
+        keys: (!keys.is_empty()).then_some(keys),
+        stamp: order_id,
+    }
+}
+
+fn sort_source_path(schema: &IcebergSchema, source_id: i32) -> Option<(String, Vec<String>)> {
+    let mut stack: Vec<(Vec<String>, &[NestedFieldRef])> =
+        vec![(Vec::new(), schema.as_struct().fields())];
+    while let Some((prefix, fields)) = stack.pop() {
+        for field in fields {
+            if field.id == source_id {
+                let mut full = prefix.clone();
+                full.push(field.name.clone());
+                let mut names = full.into_iter();
+                return Some((names.next()?, names.collect()));
+            }
+            if let Type::Struct(inner) = field.field_type.as_ref() {
+                let mut child_prefix = prefix.clone();
+                child_prefix.push(field.name.clone());
+                stack.push((child_prefix, inner.fields()));
+            }
+        }
+    }
+    None
+}
+
+fn sort_group_batch(batch: &RecordBatch, keys: &[RewriteSortKey]) -> Result<RecordBatch> {
+    let mut sort_columns = Vec::with_capacity(keys.len());
+    for key in keys {
+        let mut array = batch.column(key.column).clone();
+        for segment in &key.nested_path {
+            let Some(parent) = array.as_any().downcast_ref::<StructArray>() else {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("sort key column '{segment}' is not a struct"),
+                ));
+            };
+            let Some(child) = parent.column_by_name(segment) else {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("sort key struct field '{segment}' not found"),
+                ));
+            };
+            array = if parent.null_count() > 0 {
+                nullif(child.as_ref(), &is_null(parent).map_err(arrow_sort_err)?)
+                    .map_err(arrow_sort_err)?
+            } else {
+                child.clone()
+            };
+        }
+        if let Some(function) = &key.transform {
+            array = function.transform(array)?;
+        }
+        if key.canonical_nan {
+            array = canonicalize_nan(array);
+        }
+        sort_columns.push(SortColumn {
+            values: array,
+            options: Some(key.options),
+        });
+    }
+    let indices = lexsort_to_indices(&sort_columns, None).map_err(arrow_sort_err)?;
+    take_record_batch(batch, &indices).map_err(arrow_sort_err)
+}
+
+fn canonicalize_nan(array: ArrayRef) -> ArrayRef {
+    if let Some(floats) = array.as_any().downcast_ref::<Float32Array>() {
+        return Arc::new(Float32Array::from_iter(floats.iter().map(|value| {
+            value.map(|float| if float.is_nan() { f32::NAN } else { float })
+        })));
+    }
+    if let Some(floats) = array.as_any().downcast_ref::<Float64Array>() {
+        return Arc::new(Float64Array::from_iter(floats.iter().map(|value| {
+            value.map(|float| if float.is_nan() { f64::NAN } else { float })
+        })));
+    }
+    array
+}
+
+fn arrow_sort_err(error: ArrowError) -> Error {
+    Error::new(
+        ErrorKind::Unexpected,
+        "Failed to sort compacted rows by the table's default sort order",
+    )
+    .with_source(error)
 }
 
 #[derive(Default)]

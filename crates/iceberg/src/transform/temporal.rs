@@ -353,6 +353,13 @@ impl Hour {
     fn hour_timestamp_nano(v: i64) -> i32 {
         v.div_euclid(NANOSECONDS_PER_HOUR) as i32
     }
+
+    fn unsupported(ty: impl std::fmt::Debug) -> Error {
+        Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Unsupported data type for hour transform: {ty:?}"),
+        )
+    }
 }
 
 impl TransformFunction for Hour {
@@ -363,15 +370,12 @@ impl TransformFunction for Hour {
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap()
                 .unary(|v| -> i32 { Self::hour_timestamp_micro(v) }),
-            _ => {
-                return Err(crate::Error::new(
-                    crate::ErrorKind::FeatureUnsupported,
-                    format!(
-                        "Unsupported data type for hour transform: {:?}",
-                        input.data_type()
-                    ),
-                ));
-            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => input
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .unary(|v| -> i32 { Self::hour_timestamp_nano(v) }),
+            _ => return Err(Self::unsupported(input.data_type())),
         };
         Ok(Arc::new(res))
     }
@@ -388,15 +392,7 @@ impl TransformFunction for Hour {
             (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(v)) => {
                 Self::hour_timestamp_nano(*v)
             }
-            _ => {
-                return Err(crate::Error::new(
-                    crate::ErrorKind::FeatureUnsupported,
-                    format!(
-                        "Unsupported data type for hour transform: {:?}",
-                        input.data_type()
-                    ),
-                ));
-            }
+            _ => return Err(Self::unsupported(input.data_type())),
         };
         Ok(Some(Datum::int(val)))
     }

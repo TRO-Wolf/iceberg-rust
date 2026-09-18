@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Builder, RecordBatch};
-use datafusion::arrow::compute::filter;
+use datafusion::arrow::compute::{
+    SortColumn, concat_batches, filter, lexsort_to_indices, take_record_batch,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator};
@@ -29,7 +31,9 @@ use iceberg::metadata_columns::{
     RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     RESERVED_FIELD_ID_ROW_ID, format_supports_row_lineage, schema_with_row_lineage,
 };
-use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, SchemaRef as IcebergSchemaRef};
+use iceberg::spec::{
+    DataFile, DataFileFormat, FormatVersion, SchemaRef as IcebergSchemaRef, TableProperties,
+};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -39,6 +43,7 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use super::sort::{WriteSort, write_sort_plan};
 use crate::task_writer::TaskWriter;
 use crate::to_datafusion_error;
 
@@ -204,13 +209,25 @@ fn lineage_arrow_field(name: &'static str, field_id: i32) -> Field {
 type DmlDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
+type DmlRollingBuilder = RollingFileWriterBuilder<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
+
 pub(super) struct StreamingDataFileWriter {
     writer: Option<TaskWriter<DmlDataFileWriterBuilder>>,
     schema: IcebergSchemaRef,
     table_field_count: usize,
     partition_spec: iceberg::spec::PartitionSpecRef,
     calculator: Option<PartitionValueCalculator>,
-    builder: Option<DmlDataFileWriterBuilder>,
+    rolling_builder: DmlRollingBuilder,
+    run_target: usize,
+    table: Table,
+    sort: Option<WriteSort>,
+    buffered: Vec<RecordBatch>,
+    buffered_bytes: usize,
+    closed_files: Vec<DataFile>,
 }
 
 impl StreamingDataFileWriter {
@@ -236,14 +253,28 @@ impl StreamingDataFileWriter {
             None,
             DataFileFormat::Parquet,
         );
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        let run_target = table
+            .metadata()
+            .properties()
+            .get(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES)
+            .map(|value| {
+                value.parse::<u64>().map_err(|error| {
+                    DataFusionError::Plan(format!(
+                        "Invalid value '{value}' for table property '{}': {error}",
+                        TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES
+                    ))
+                })
+            })
+            .transpose()?
+            .map(|target| usize::try_from(target).unwrap_or(usize::MAX))
+            .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
+        let rolling_builder = RollingFileWriterBuilder::new(
             parquet_builder,
+            run_target,
             table.file_io().clone(),
             location_gen,
             file_name_gen,
         );
-        let builder = DataFileWriterBuilder::new(rolling)
-            .with_partition_spec(partition_spec.as_ref().clone());
 
         let calculator = if partition_spec.is_unpartitioned() {
             None
@@ -260,17 +291,23 @@ impl StreamingDataFileWriter {
             table_field_count,
             partition_spec,
             calculator,
-            builder: Some(builder),
+            rolling_builder,
+            run_target,
+            table: table.clone(),
+            sort: None,
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+            closed_files: Vec::new(),
         })
     }
 
     fn ensure_writer(&mut self) -> DFResult<&mut TaskWriter<DmlDataFileWriterBuilder>> {
         if self.writer.is_none() {
-            let builder = self.builder.take().ok_or_else(|| {
-                DataFusionError::Internal(
-                    "StreamingDataFileWriter builder already consumed".to_string(),
-                )
-            })?;
+            let mut builder = DataFileWriterBuilder::new(self.rolling_builder.clone())
+                .with_partition_spec(self.partition_spec.as_ref().clone());
+            if let Some(sort_order_id) = self.sort.as_ref().and_then(|sort| sort.sort_order_id) {
+                builder = builder.with_sort_order_id(sort_order_id);
+            }
             let writer = TaskWriter::try_new(
                 builder,
                 true,
@@ -285,53 +322,106 @@ impl StreamingDataFileWriter {
         })
     }
 
-    pub(super) async fn write_batch(&mut self, batch: RecordBatch) -> DFResult<()> {
+    fn prepare_for_write(&self, batch: RecordBatch) -> DFResult<RecordBatch> {
         if self.partition_spec.is_unpartitioned() {
-            self.ensure_writer()?
-                .write(batch)
-                .await
-                .map_err(to_datafusion_error)
-        } else {
-            let calculator = self.calculator.as_ref().ok_or_else(|| {
-                DataFusionError::Internal(
-                    "StreamingDataFileWriter partition calculator missing".to_string(),
-                )
-            })?;
-            let partition_source = table_prefix_batch(&batch, self.table_field_count)?;
-            let partition_array = calculator
-                .calculate(&partition_source)
-                .map_err(to_datafusion_error)?;
-
-            let partition_field = Field::new(
-                PROJECTED_PARTITION_VALUE_COLUMN,
-                partition_array.data_type().clone(),
-                false,
-            );
-            let extended_schema = Arc::new(ArrowSchema::new(
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(Arc::new(partition_field)))
-                    .collect::<Vec<_>>(),
-            ));
-            let mut extended_columns: Vec<ArrayRef> = batch.columns().to_vec();
-            extended_columns.push(partition_array);
-            let extended_batch = RecordBatch::try_new(extended_schema, extended_columns)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-            self.ensure_writer()?
-                .write(extended_batch)
-                .await
-                .map_err(to_datafusion_error)
+            return Ok(batch);
         }
+        let calculator = self.calculator.as_ref().ok_or_else(|| {
+            DataFusionError::Internal(
+                "StreamingDataFileWriter partition calculator missing".to_string(),
+            )
+        })?;
+        let partition_source = table_prefix_batch(&batch, self.table_field_count)?;
+        let partition_array = calculator
+            .calculate(&partition_source)
+            .map_err(to_datafusion_error)?;
+
+        let partition_field = Field::new(
+            PROJECTED_PARTITION_VALUE_COLUMN,
+            partition_array.data_type().clone(),
+            false,
+        );
+        let extended_schema = Arc::new(ArrowSchema::new(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .cloned()
+                .chain(std::iter::once(Arc::new(partition_field)))
+                .collect::<Vec<_>>(),
+        ));
+        let mut extended_columns: Vec<ArrayRef> = batch.columns().to_vec();
+        extended_columns.push(partition_array);
+        RecordBatch::try_new(extended_schema, extended_columns)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
-    pub(super) async fn finish(self) -> DFResult<Vec<DataFile>> {
-        match self.writer {
-            None => Ok(Vec::new()),
-            Some(writer) => writer.close().await.map_err(to_datafusion_error),
+    async fn write_prepared(&mut self, batch: RecordBatch) -> DFResult<()> {
+        self.ensure_writer()?
+            .write(batch)
+            .await
+            .map_err(to_datafusion_error)
+    }
+
+    pub(super) async fn write_batch(&mut self, batch: RecordBatch) -> DFResult<()> {
+        let batch = self.prepare_for_write(batch)?;
+        if self.sort.is_none() {
+            self.sort = Some(write_sort_plan(&self.table, batch.schema().as_ref()));
         }
+        if self.sort.as_ref().is_some_and(|sort| sort.exprs.is_some()) {
+            self.buffered_bytes += batch.get_array_memory_size();
+            self.buffered.push(batch);
+            if self.buffered_bytes >= self.run_target {
+                self.flush_sorted_run().await?;
+            }
+            return Ok(());
+        }
+        self.write_prepared(batch).await
+    }
+
+    async fn flush_sorted_run(&mut self) -> DFResult<()> {
+        if self.buffered.is_empty() {
+            return Ok(());
+        }
+        let Some(exprs) = self.sort.as_ref().and_then(|sort| sort.exprs.as_ref()) else {
+            return Err(DataFusionError::Internal(
+                "buffered rows imply a sort plan".to_string(),
+            ));
+        };
+        let sorted = {
+            let schema = self.buffered[0].schema();
+            let batch = concat_batches(&schema, &self.buffered)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let sort_columns = exprs
+                .iter()
+                .map(|expr| {
+                    Ok(SortColumn {
+                        values: expr.expr.evaluate(&batch)?.into_array(batch.num_rows())?,
+                        options: Some(expr.options),
+                    })
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+            let indices = lexsort_to_indices(&sort_columns, None)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            take_record_batch(&batch, &indices)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+        };
+        self.buffered.clear();
+        self.buffered_bytes = 0;
+        self.write_prepared(sorted).await?;
+        if let Some(writer) = self.writer.take() {
+            self.closed_files
+                .extend(writer.close().await.map_err(to_datafusion_error)?);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn finish(mut self) -> DFResult<Vec<DataFile>> {
+        self.flush_sorted_run().await?;
+        let mut files = std::mem::take(&mut self.closed_files);
+        if let Some(writer) = self.writer.take() {
+            files.extend(writer.close().await.map_err(to_datafusion_error)?);
+        }
+        Ok(files)
     }
 }
