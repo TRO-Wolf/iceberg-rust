@@ -109,9 +109,10 @@ Rationale:
   contract at every call site (`delete_from`/`update` build the PhysicalExpr from
   the raw filters; the scan attaches residuals), so dropping the unbindable term
   cannot lose or keep a wrong row: it only widens the scan.
-- `s.a IS NULL` (a primitive leaf inside a struct) still pushes — the leaf has an
-  accessor; `struct IS NULL` does not — the container has none. Both answers match
-  the oracle.
+- A term naming the struct leaf `s.a` directly still converts, because the leaf has an
+  accessor (the conversion-level cell). Real SQL `s.a IS NULL` plans as `get_field` and is
+  evaluated as a residual (round 2, section 9). `struct IS NULL` does not convert, because
+  the container has no accessor. Both SQL answers match the oracle.
 
 ## 5. Red (step 1, commit `d744ac15`)
 
