@@ -25,6 +25,22 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-19): F-LIST-NULL-ACCESSOR-1 — `IS NULL` / `IS NOT NULL` on list, map, struct columns
+
+Ledger: [`f-list-null-accessor-1-ledger.md`](f-list-null-accessor-1-ledger.md). Branch
+`fix/f-list-null-accessor-1` off fork `main` (`9e67e000`). Consumer: RePark DML on
+nested columns — `WHERE xs IS NULL` failed with `Accessor for Field xs not found`
+(#295 logic critic).
+
+- [x] red cells: 9 e2e in new `physical_plan/list_null_tests.rs` (4 shapes × v2/v3 ×
+      CoW/MoR × DELETE/UPDATE/SELECT, exact surviving ids vs the run-23a list-null
+      oracle) + 8 conversion cells in `expr_to_predicate_tests.rs` (`d744ac15`)
+- [x] fix (choice a): `term_binds_soundly` mirrors `Reference::bind` — field +
+      accessor — for `Unary`/`Binary`/`Set` terms in `predicate_binds_soundly`
+      (`d7a4e6d0`); container null tests drop to residual evaluation
+- [x] mutation: revert `expr_to_predicate.rs` → all 14 cells red; restore → 29 green
+- [x] ledger + todo entry + `physical_plan/map.md` row
+
 ## ACTIVE (2026-09-18): F-RP-SUMMARY-USER-1 — caller's `replace-partitions` summary value wins
 
 Ledger: [`f-rp-summary-user-1-ledger.md`](f-rp-summary-user-1-ledger.md). Branch

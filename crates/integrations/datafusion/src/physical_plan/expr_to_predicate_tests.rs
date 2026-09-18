@@ -745,8 +745,7 @@ fn nested_iceberg_schema() -> SchemaRef {
                 2,
                 "xs",
                 Type::List(ListType::new(
-                    NestedField::list_element(3, Type::Primitive(PrimitiveType::Int), false)
-                        .into(),
+                    NestedField::list_element(3, Type::Primitive(PrimitiveType::Int), false).into(),
                 )),
             )
             .into(),
@@ -754,26 +753,18 @@ fn nested_iceberg_schema() -> SchemaRef {
                 4,
                 "m",
                 Type::Map(MapType::new(
-                    NestedField::map_key_element(5, Type::Primitive(PrimitiveType::String))
+                    NestedField::map_key_element(5, Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::map_value_element(6, Type::Primitive(PrimitiveType::Int), false)
                         .into(),
-                    NestedField::map_value_element(
-                        6,
-                        Type::Primitive(PrimitiveType::Int),
-                        false,
-                    )
-                    .into(),
                 )),
             )
             .into(),
             NestedField::optional(
                 7,
                 "s",
-                Type::Struct(StructType::new(vec![NestedField::optional(
-                    8,
-                    "a",
-                    Type::Primitive(PrimitiveType::Int),
-                )
-                .into()])),
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(8, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                ])),
             )
             .into(),
         ])
@@ -789,43 +780,34 @@ fn push_nested(exprs: &[Expr]) -> Option<Predicate> {
 #[test]
 fn is_null_on_a_list_column_is_not_pushed() {
     assert_eq!(push_nested(&[Expr::IsNull(Box::new(col("xs")))]), None);
-    assert_eq!(
-        push_nested(&[Expr::IsNotNull(Box::new(col("xs")))]),
-        None
-    );
+    assert_eq!(push_nested(&[Expr::IsNotNull(Box::new(col("xs")))]), None);
 }
 
 #[test]
 fn is_null_on_a_map_column_is_not_pushed() {
     assert_eq!(push_nested(&[Expr::IsNull(Box::new(col("m")))]), None);
-    assert_eq!(
-        push_nested(&[Expr::IsNotNull(Box::new(col("m")))]),
-        None
-    );
+    assert_eq!(push_nested(&[Expr::IsNotNull(Box::new(col("m")))]), None);
 }
 
 #[test]
 fn is_null_on_a_struct_column_is_not_pushed() {
     assert_eq!(push_nested(&[Expr::IsNull(Box::new(col("s")))]), None);
-    assert_eq!(
-        push_nested(&[Expr::IsNotNull(Box::new(col("s")))]),
-        None
-    );
+    assert_eq!(push_nested(&[Expr::IsNotNull(Box::new(col("s")))]), None);
 }
 
 #[test]
 fn is_null_on_a_list_element_name_is_not_pushed() {
     let column = Column::new_unqualified("xs.element");
-    assert_eq!(push_nested(&[Expr::IsNull(Box::new(Expr::Column(column)))]), None);
+    assert_eq!(
+        push_nested(&[Expr::IsNull(Box::new(Expr::Column(column)))]),
+        None
+    );
 }
 
 #[test]
 fn is_null_on_a_nested_column_drops_only_its_own_conjunction() {
     assert_eq!(
-        push_nested(&[
-            col("id").gt(lit(1_i64)),
-            Expr::IsNull(Box::new(col("xs")))
-        ]),
+        push_nested(&[col("id").gt(lit(1_i64)), Expr::IsNull(Box::new(col("xs")))]),
         Some(Reference::new("id").greater_than(Datum::long(1)))
     );
     assert_eq!(

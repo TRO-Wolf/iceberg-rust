@@ -68,12 +68,9 @@ impl NullShape {
             NullShape::ListStruct => Type::List(ListType::new(
                 NestedField::list_element(
                     3,
-                    Type::Struct(StructType::new(vec![NestedField::optional(
-                        4,
-                        "a",
-                        Type::Primitive(PrimitiveType::Int),
-                    )
-                    .into()])),
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(4, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])),
                     false,
                 )
                 .into(),
@@ -83,12 +80,9 @@ impl NullShape {
                 NestedField::map_value_element(4, Type::Primitive(PrimitiveType::Int), false)
                     .into(),
             )),
-            NullShape::StructInt => Type::Struct(StructType::new(vec![NestedField::optional(
-                3,
-                "a",
-                Type::Primitive(PrimitiveType::Int),
-            )
-            .into()])),
+            NullShape::StructInt => Type::Struct(StructType::new(vec![
+                NestedField::optional(3, "a", Type::Primitive(PrimitiveType::Int)).into(),
+            ])),
         }
     }
 
@@ -170,15 +164,12 @@ async fn null_fixture(
         .expect("catalog provider");
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", Arc::new(catalog_provider));
-    ctx.sql(&format!(
-        "INSERT INTO catalog.ns.t VALUES {}",
-        shape.seed()
-    ))
-    .await
-    .expect("plan seed insert")
-    .collect()
-    .await
-    .expect("seed insert");
+    ctx.sql(&format!("INSERT INTO catalog.ns.t VALUES {}", shape.seed()))
+        .await
+        .expect("plan seed insert")
+        .collect()
+        .await
+        .expect("seed insert");
 
     NullFixture {
         ctx,
@@ -263,11 +254,8 @@ async fn delete_where_xs_is_null_removes_only_the_null_row() {
         for format_version in [FormatVersion::V2, FormatVersion::V3] {
             for merge_on_read in [true, false] {
                 let fixture = null_fixture(merge_on_read, format_version, shape).await;
-                let deleted = dml_count(
-                    &fixture.ctx,
-                    "DELETE FROM catalog.ns.t WHERE xs IS NULL",
-                )
-                .await;
+                let deleted =
+                    dml_count(&fixture.ctx, "DELETE FROM catalog.ns.t WHERE xs IS NULL").await;
                 assert_eq!(
                     deleted,
                     1,
@@ -488,11 +476,7 @@ async fn select_where_xs_is_null_returns_the_null_row() {
             for merge_on_read in [true, false] {
                 let fixture = null_fixture(merge_on_read, format_version, shape).await;
                 assert_eq!(
-                    select_ids(
-                        &fixture.ctx,
-                        "SELECT id FROM catalog.ns.t WHERE xs IS NULL"
-                    )
-                    .await,
+                    select_ids(&fixture.ctx, "SELECT id FROM catalog.ns.t WHERE xs IS NULL").await,
                     vec![2],
                     "{} {format_version:?} merge_on_read={merge_on_read}",
                     shape.name()
