@@ -32,10 +32,10 @@ Ledger: [`f-rp-summary-user-1-ledger.md`](f-rp-summary-user-1-ledger.md). Branch
 (run 22b, PySpark 4.1.2 + Iceberg 1.11.0) that a caller-set `replace-partitions`
 snapshot property lands verbatim in Java — the fork overwrote it with `"true"`.
 
-- [x] red cells (`aed405f1`): four summary-prop cells appended to the existing
+- [x] red cells (`77d8870d`): four summary-prop cells appended to the existing
       `replace_partitions_extracted.rs` module (no `mod` line; the source file held
       its exact 2801 ceiling); only the caller-`"false"` cell red
-- [x] fix (`513dcb64`): `commit` layers the marker under the caller's map via
+- [x] fix (`75cde964`): `commit` layers the marker under the caller's map via
       `entry().or_insert_with`; stale setter doc deleted under the comment ban
       (`#[allow(missing_docs)]`); file 2801 → 2800, legacy ceiling lowered to match
 - [x] mutation: `insert`-overwrite revert → (a) red with the identical signature;
@@ -50,12 +50,12 @@ snapshot property lands verbatim in Java — the fork overwrote it with `"true"`
 Round 2 (same lane): the residual folded in — round 1 makes caller values
 reachable, so the gate must read them the way Java does.
 
-- [x] red cells (`5074157e`): `cherry_pick_case_insensitive.rs` beside the
+- [x] red cells (`7de9ab5a`): `cherry_pick_case_insensitive.rs` beside the
       cherry-pick tests — `"TRUE"` staged marker must replay like `"true"`;
       `" true"` (leading space) pins the non-replace path (parseBoolean does not
       trim). `mod` line paid for by the semantics-preserving
       `map→is_some_and` collapse; file at exact 2106 ceiling
-- [x] fix (`543ba0a6`): `value == "true"` → `eq_ignore_ascii_case("true")`, the
+- [x] fix (`ce36f58a`): `value == "true"` → `eq_ignore_ascii_case("true")`, the
       fork's `propertyAsBoolean` idiom; 27/27 cherry_pick tests green
 - [x] mutation: `eq_ignore_ascii_case` revert → (a) red with the identical
       rejection signature; restored, both green, revert uncommitted

@@ -22,7 +22,7 @@
 **Branch:** `fix/f-rp-summary-user-1` off fork `main` `9e67e000`.
 **Scope:** `ReplacePartitionsAction::commit` overwrote a caller-supplied `replace-partitions`
 snapshot-summary value with the literal `"true"`. Java lets the caller's later `set` win.
-**Commits:** `aed405f1` red cells · `513dcb64` fix · docs commit (this ledger + todo).
+**Commits:** `77d8870d` red cells · `75cde964` fix · docs commit (this ledger + todo).
 
 ## 1. The defect
 
@@ -87,7 +87,7 @@ catalog and reads `current_snapshot().summary().additional_properties`.
 | (c) | `{"k": "v"}` | `test_replace_partitions_summary_unrelated_key_keeps_default` | `"true"` and `k == "v"` |
 | (d) | none | `test_replace_partitions_summary_default_is_true` | `"true"` |
 
-## 5. Red output (pre-fix, commit `aed405f1`)
+## 5. Red output (pre-fix, commit `77d8870d`)
 
 ```
 running 4 tests
@@ -107,7 +107,7 @@ test result: FAILED. 3 passed; 1 failed; 3823 filtered out
 
 Exactly cell (a) is red — the caller's `"false"` was overwritten by the inserted `"true"`.
 
-## 6. Green output (post-fix, commit `513dcb64`)
+## 6. Green output (post-fix, commit `75cde964`)
 
 ```
 cargo test -p iceberg --lib replace_partitions
@@ -176,7 +176,7 @@ reachability. Closed in round 2 below.
 
 ## Round 2 — case-insensitive `replace-partitions` read in cherry-pick
 
-**Commits:** `5074157e` red cells · `543ba0a6` fix · docs commit (this section + todo).
+**Commits:** `7de9ab5a` red cells · `ce36f58a` fix · docs commit (this section + todo).
 
 Round 1's own audit finding, folded in because round 1 is what makes a caller-set value reachable:
 `CherryPickAction::is_replace_partitions` gated the OVERWRITE replay on `value == "true"`. Java
@@ -205,7 +205,7 @@ through the replace-partitions action with
 `set_snapshot_properties({"replace-partitions": marker_value})` — which is exactly how a caller's
 value reaches a real summary post-round-1.
 
-### Red output (pre-fix, commit `5074157e`)
+### Red output (pre-fix, commit `7de9ab5a`)
 
 ```
 test ...::cherry_pick_case_insensitive::test_cherrypick_replace_partitions_marker_is_case_insensitive ... FAILED
@@ -215,7 +215,7 @@ test ...::cherry_pick_case_insensitive::test_cherrypick_replace_partitions_marke
 test result: FAILED. 26 passed; 1 failed; 3802 filtered out
 ```
 
-### Fix and green (commit `543ba0a6`)
+### Fix and green (commit `ce36f58a`)
 
 `is_replace_partitions` now reads `.is_some_and(|value| value.eq_ignore_ascii_case("true"))` — the
 fork's `propertyAsBoolean` idiom (`crates/catalog/rest/src/catalog.rs:393-398`).
