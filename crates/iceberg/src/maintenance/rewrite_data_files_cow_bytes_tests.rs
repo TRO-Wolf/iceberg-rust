@@ -41,7 +41,7 @@ use crate::writer::file_writer::location_generator::{
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
-async fn write_position_delete(
+pub(super) async fn write_position_delete(
     table: &Table,
     part_value: i64,
     deletes: &[(String, i64)],
@@ -132,11 +132,11 @@ async fn delete_partition_zero(
     (table, delete_path)
 }
 
-fn file_scoped_metrics() -> MetricsConfig {
+pub(super) fn file_scoped_metrics() -> MetricsConfig {
     MetricsConfig::for_position_delete()
 }
 
-fn partition_scoped_metrics() -> MetricsConfig {
+pub(super) fn partition_scoped_metrics() -> MetricsConfig {
     MetricsConfig::from_properties(&HashMap::from([(
         "write.metadata.metrics.column.file_path".to_string(),
         "none".to_string(),
