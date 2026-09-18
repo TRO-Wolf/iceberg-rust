@@ -17,10 +17,6 @@
 
 //! Drop file-scoped deletes that reference data files this rewrite removes.
 //!
-//! Java 1.10.0 `ManifestFilterManager.isDanglingDV` is `ContentFileUtil.isDV` and
-//! `removedDataFilePaths.contains(referencedDataFile())`. The apply path drops DVs
-//! only.
-//!
 //! Delete-file removal is keyed by the Java `DeleteFileSet` triple, so a drop leaves
 //! a sibling blob at the same Puffin path in place.
 

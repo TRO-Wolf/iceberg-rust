@@ -30,7 +30,8 @@
 | 1 | `194503d4` | `test: F-RDF-COW-BYTES-1 — red delete-survival cells` |
 | 2 | `5e7455f2` | `fix: F-RDF-COW-BYTES-1 — the rewrite keeps a position delete that still applies, as Java does` |
 | 3 | — | (mutation proof — no commit) |
-| 4 | this commit | `docs: F-RDF-COW-BYTES-1 — ledger, mutation proof` |
+| 4 | `292c4f71` | `docs: F-RDF-COW-BYTES-1 — ledger, mutation proof` |
+| 5 | this commit | `docs: F-RDF-COW-BYTES-1 — delete the stale module sentence; seq-GC audit` |
 
 ## Defect
 
@@ -298,6 +299,42 @@ GREEN through the mutation (correct controls):
   removal of file-scoped PARQUET deletes to reach Spark's zero, it could newly
   diverge — flagged, not expected: Spark's zero comes from seq-GC
   (`dropDeleteFilesOlderThan`), a different mechanism.
+
+## Round 3 — comment-gate remediation + seq-GC audit (read-only)
+
+The mechanical comment gate rejected round 2 on one hit: step 2 had truncated the
+`rewrite_data_files_dv.rs` module-doc line `//! only. File-scoped parquet position
+deletes are a fork extension of that predicate.` to `//! only.`, and an edited
+comment line counts as an added one. Round 3 deletes the whole three-line sentence
+(`//! Java 1.10.0 ManifestFilterManager.isDanglingDV is …`, `//!
+removedDataFilePaths.contains(…). The apply path drops DVs`, `//! only. …`) — pure
+deletion, no comment line added or changed. The fact the sentence carried is already
+recorded in "Java rules confirmed from source" above (`danglingDVs`/`isDanglingDV`
+drops only `isDV` deletes whose referenced data file was rewritten; Puffin-only).
+
+### Seq-GC audit — does the fork port `MergingSnapshotProducer.dropDeleteFilesOlderThan`?
+
+**No.** Java's `MergingSnapshotProducer.apply` runs
+`filterManager.dropDeleteFilesOlderThan(minDataSequenceNumber)` on every commit that
+rewrites data: delete files whose data sequence number is below the minimum data
+sequence number of the surviving live data files are dropped silently inside the
+commit — `removed_delete_files_count` stays 0 because the drop never surfaces in the
+action result. The fork's port point is `SnapshotProducer::current_manifests`
+(`crates/iceberg/src/transaction/snapshot.rs`), whose own doc records the divergence
+verbatim: Java's `apply` "also drops delete files older than the surviving data's
+minimum sequence number, and removes DVs orphaned by the data files it deleted.
+This port carries every delete manifest forward UNCHANGED." `process_deletes` (same
+file) tombstones only entries for explicitly requested `removed_data_files` /
+`removed_delete_files`; no sequence-based GC of delete entries exists anywhere in
+the commit path. The only seq-based removal the fork has is
+`RemoveDanglingDeleteFiles` / `find_dangling_deletes`, which runs only under the
+`remove-dangling-deletes=true` option.
+
+Consequence: Spark's `residue_rpd_then_rdf` sequence reaches ZERO delete files
+through that Java channel (RPD re-stamps rewritten deletes at
+`maxRewrittenDataSequenceNumber`, then the RDF commit's seq-GC drops them), which
+the fork cannot reproduce until `dropDeleteFilesOlderThan` is ported. That port is
+the remaining ICE-RDF-DANGLE-2 residue — the next fork ask, not this PR.
 
 ## RePark reconcile note
 
