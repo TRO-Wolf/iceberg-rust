@@ -60,9 +60,6 @@ use crate::to_datafusion_error;
 ///
 /// This execution plan takes input data from a child execution plan and writes it to an Iceberg table.
 /// It handles the creation of data files in the appropriate format and returns information about the written files as its output.
-///
-/// The output of this execution plan is a record batch containing a single column with serialized
-/// data file information that can be used for committing the write operation to the table.
 #[derive(Debug)]
 pub(crate) struct IcebergWriteExec {
     table: Table,
@@ -171,7 +168,7 @@ impl IcebergWriteExec {
     fn make_result_batch(data_files: Vec<String>, partition: u64) -> DFResult<RecordBatch> {
         let len = data_files.len();
         let files_array = Arc::new(StringArray::from(data_files)) as ArrayRef;
-        let index_array = Arc::new(UInt64Array::from(vec![partition; len])) as ArrayRef;
+        let index_array = Arc::new(UInt64Array::from_value(partition, len)) as ArrayRef;
 
         RecordBatch::try_new(Self::make_result_schema(), vec![files_array, index_array]).map_err(
             |e| {
@@ -271,20 +268,6 @@ impl ExecutionPlan for IcebergWriteExec {
     /// 2. Processes input data from the child execution plan
     /// 3. Writes the data to files using the configured writer
     /// 4. Returns a stream containing information about the written data files
-    ///
-    /// The output of this function is a stream of record batches with the following structure:
-    ///
-    /// ```text
-    /// +------------------+
-    /// | data_files       |
-    /// +------------------+
-    /// | "{"file_path":.. |  <- JSON string representing a data file
-    /// +------------------+
-    /// ```
-    ///
-    /// Each row in the output contains a JSON string representing a data file that was written.
-    ///
-    /// This output can be used by a subsequent operation to commit the added files to the table.
     fn execute(
         &self,
         partition: usize,
