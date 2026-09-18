@@ -28,7 +28,8 @@ exec (row R169).
 
 | File | Role |
 |---|---|
-| `scan.rs` | `IcebergTableScan` (data files; projection by field id; exact whole-table `partition_statistics` from `total-records` + delete-free planned tasks, so DataFusion folds `count(*)` without a scan) |
+| `scan.rs` | `IcebergTableScan` (data files; projection by field id; exact whole-table `partition_statistics` from `total-records` + delete-free planned tasks, so DataFusion folds `count(*)` without a scan). F-LIST-INSERT-1 r4: keeps the stamped `conform_schema` for field-id binding/evolution while `PlanProperties` and emitted batches carry the nested-stripped schema the provider advertises |
+| `conform.rs` | F-LIST-INSERT-1 r4 size-gate split: the scanned-batch conformance block (`conform_batch` / `conform_column` — null-fill, reorder, id-matched nested evolution) plus `strip_nested_metadata_from_schema` / `strip_nested_metadata_from_record_batch` — top-level `PARQUET:field_id` kept, nested field metadata stripped so the advertised schema and the emitted batches agree |
 | `scan_knobs.rs` | F-27 size-gate split: the session scan knobs (`IcebergScanOptions`, `ScanKnobs`, `scan_knobs_from_context`, `clamp_scan_knob`, `ensure_iceberg_scan_options`), re-exported through `scan.rs` so every existing path is unchanged |
 | `metadata_scan.rs` | `IcebergMetadataScan` — projects inspect batches |
 | `project.rs` | partition-value projection |

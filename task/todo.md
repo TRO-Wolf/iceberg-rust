@@ -47,6 +47,69 @@ binpack sort+stamp (Spark 4.1.2 measured answers).
       not committed
 - [x] Ledger + todo entry; gates below
 
+## ACTIVE (2026-09-18): F-LIST-INSERT-1 nested Arrow field relabel on writes
+
+Ledger: [`f-list-insert-1-ledger.md`](f-list-insert-1-ledger.md). Branch `fix/list-insert-1`.
+Consumer: RePark ARRAY-column inserts (`writeTo().append()`, `insertInto`, `saveAsTable(append)`,
+SQL INSERT) all failed on `RecordBatch::try_new` nested-label mismatch.
+
+- [x] red cells: `unstamped_nested_fields_are_relabelled_to_iceberg_types`,
+      `incompatible_nested_data_is_data_invalid`,
+      `data_file_writer_stamps_nested_field_ids_in_parquet_footer` (red committed `3f090a8eb`)
+- [x] fix: `relabel_column` metadata-only nested rebuild in `write_defaults.rs` + deep-equality
+      borrowed fast path (`1db44546e`); 168 writer tests green
+- [x] mutation: full revert → all 3 red; fast-path-only revert → 2 unit cells red (d green by
+      construction — idless batch can't reach the borrowed path); restored green
+- [x] ledger + todo entry + writer `try_new` audit
+
+Round 2 (same lane): SQL `INSERT … VALUES` still failed — the stamped `TableProvider::schema()`
+was feeding DataFusion's `insert_to_plan`/`Values` exec, not the writer.
+
+- [x] red e2e cells in `evo_schema_dml.rs` (`6b11d0dd9`): `INSERT … VALUES` into list /
+      `list<struct>` / `map<string,list<int>>` columns through a real `SessionContext` +
+      `IcebergTableProvider`, incl. multi-row, NULL row, null element; footer leaf ids pinned
+- [x] fix: `IcebergTableProvider::schema()` returns `strip_metadata_from_schema` output; the
+      internal stamped schema still feeds the write path (`63a907d82`)
+- [x] mutation: revert `schema()` to stamped → both cells red with the two measured failure
+      modes; restored green
+- [x] Grok R-01..R-04 remediation (`74d6b23ec`): UTC-alias timestamps layout-compatible via
+      `is_utc_time_zone`; view/dictionary leaves cast via `arrow_cast`; per-writer cached target
+      Arrow schema; relaxed borrowed-path equality; `build_unchecked` under the layout proof +
+      `disallowed_nulls` (unsafe justified in the ledger)
+- [x] `project_batch` audit: write path but equality-delete projection is primitive-only — the
+      nested-mismatch class cannot fire; recorded in the ledger
+
+Round 3 (same lane): Grok logic-critic P2s — `disallowed_nulls` ignored the parent mask for
+List/LargeList/Map, and `IcebergStaticTableProvider::schema()` still advertised the stamped
+schema.
+
+- [x] red cells (`418bf0032`): `null_elements_inside_null_parent_rows_are_accepted`,
+      `null_elements_outside_the_sliced_offsets_are_accepted`,
+      `insert_values_into_a_static_provider_fails_on_write_not_planning`
+- [x] fix (`50bb3843f`): `disallowed_nulls` builds a used-range validity mask over non-null
+      parent rows for every container; static provider `schema()` strips metadata like the
+      catalog provider (stamped schema kept for `scan`); `test_schema_of_created_table` +
+      `test_schema_of_created_external_table_sql` re-pinned to the stripped schema
+- [x] mutation: each fix reverted alone → its cells red with the measured signatures; restored
+      green
+- [x] ledger Round 3 section + residue note (`DELETE … WHERE xs IS NULL` on a list column,
+      `expr/term.rs` accessor gap, pre-existing)
+
+Round 4 (same lane): the fully-stripped `schema()` broke DataFusion's physical/logical check —
+five `insert_distribution` cells red on the rebased head.
+
+- [x] red cell (`88da55f8e`): `select_and_insert_select_across_catalog_tables_agree_on_the_advertised_schema`
+      — `SELECT *` / `SELECT max(id)` (the aggregate routes through the check) / `INSERT INTO
+      t2 SELECT * FROM t` across two catalog tables with a list column
+- [x] fix (`89f8f9ac0`): approach A — providers keep top-level `PARQUET:field_id`, strip nested
+      field metadata; `IcebergTableScan` keeps the stamped `conform_schema` for field-id
+      binding/evolution and emits nested-stripped batches; conform block moved verbatim to
+      `physical_plan/conform.rs` (size gate), `scan.rs` ceiling 1851 → 1598
+- [x] mutation: fix reverted alone → the five distribution cells + the e2e cell red with the
+      measured signature; restored green
+- [x] ledger Round 4 section + `physical_plan/map.md` row
+
+
 ## ACTIVE (2026-09-17): F-ICE-RESIDUES-21B fork-residue lane, five closures vs Java 1.10.0
 
 Ledger: [`f-ice-residues-21b-ledger.md`](f-ice-residues-21b-ledger.md). Run 21b residue items on

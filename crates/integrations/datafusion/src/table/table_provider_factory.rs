@@ -226,6 +226,7 @@ mod tests {
     use datafusion::sql::TableReference;
 
     use super::*;
+    use crate::physical_plan::conform::strip_nested_metadata_from_schema;
 
     fn table_metadata_v2_schema() -> Schema {
         Schema::new(vec![
@@ -285,7 +286,7 @@ mod tests {
             .await
             .expect("create table failed");
 
-        let expected_schema = table_metadata_v2_schema();
+        let expected_schema = strip_nested_metadata_from_schema(&table_metadata_v2_schema());
         let actual_schema = table_provider.schema();
 
         assert_eq!(actual_schema.as_ref(), &expected_schema);
@@ -319,7 +320,7 @@ mod tests {
             .expect("table not found");
 
         // Check the schema of the created table
-        let expected_schema = table_metadata_v2_schema();
+        let expected_schema = strip_nested_metadata_from_schema(&table_metadata_v2_schema());
         let actual_schema = table_provider.schema();
 
         assert_eq!(actual_schema.as_ref(), &expected_schema);

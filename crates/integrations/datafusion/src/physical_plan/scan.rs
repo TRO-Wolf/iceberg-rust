@@ -20,12 +20,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, ListArray, MapArray, RecordBatch, RecordBatchOptions, StructArray,
-    new_null_array,
-};
-use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Field as ArrowField, SchemaRef as ArrowSchemaRef};
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::stats::{Precision, Statistics};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -39,23 +35,17 @@ use iceberg::expr::Predicate;
 use iceberg::metadata_columns::is_metadata_column_name;
 use iceberg::scan::{PartitionWork, stream_partition_work};
 use iceberg::table::Table;
-use iceberg::{Error, ErrorKind};
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use super::conform::{
+    ColumnSource, advertised_field_id, conform_batch, strip_nested_metadata_from_record_batch,
+    strip_nested_metadata_from_schema,
+};
+#[cfg(test)]
+use super::conform::{conform_column, is_arrow_promotion_allowed};
 use super::expr_to_predicate::scan_predicates;
 pub use super::scan_knobs::{IcebergScanOptions, ensure_iceberg_scan_options};
 pub(crate) use super::scan_knobs::{ScanKnobs, clamp_scan_knob, scan_knobs_from_context};
 use crate::to_datafusion_error;
-
-/// How one advertised output column is produced from the scanned data. Resolution is by FIELD ID:
-/// `RENAME COLUMN` keeps the id, so a name-keyed binding reads the wrong column after a rename.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ColumnSource {
-    /// Take the scanned column under the name the SCANNED snapshot gives the advertised field id.
-    Scanned(String),
-    /// The scanned snapshot has no such field id, so emit NULLs, as Java does.
-    Absent,
-}
 
 /// Manages the scanning process of an Iceberg [`Table`]. [`IcebergTableScan::plan`] assigns the
 /// work of core `plan_tasks` into `N` [`PartitionWork`] units, as `UnknownPartitioning(N)`.
@@ -72,6 +62,7 @@ pub struct IcebergTableScan {
     scan_columns: Vec<String>,
     /// How each advertised output column is produced, parallel to the advertised schema's fields.
     sources: Vec<ColumnSource>,
+    conform_schema: ArrowSchemaRef,
     predicates: Option<Predicate>,
     /// Optional row limit. It applies only when `N = 1`, because a per-partition cap over-counts,
     /// so `GlobalLimitExec` owns the limit above that.
@@ -111,7 +102,8 @@ impl IcebergTableScan {
             }
         };
         let (scan_columns, sources) = project_bindings(&output_schema, &bindings)?;
-        let plan_properties = Self::compute_properties(output_schema, 1);
+        let emit_schema = Arc::new(strip_nested_metadata_from_schema(&output_schema));
+        let plan_properties = Self::compute_properties(emit_schema, 1);
         let predicates = scan_predicates(&table, snapshot_id, filters, &bindings)?;
 
         let resolved_snapshot_id = match snapshot_id {
@@ -131,6 +123,7 @@ impl IcebergTableScan {
             projection,
             scan_columns,
             sources,
+            conform_schema: output_schema,
             predicates,
             limit,
             partition_work: Vec::new(),
@@ -296,7 +289,7 @@ impl ExecutionPlan for IcebergTableScan {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let advertised_schema = self.schema();
+        let conform_schema = self.conform_schema.clone();
         let sources = self.sources.clone();
 
         if !self.partition_work.is_empty() {
@@ -323,7 +316,10 @@ impl ExecutionPlan for IcebergTableScan {
                     .map_err(to_datafusion_error)?
                     .map_err(to_datafusion_error)
                     .and_then(move |batch| {
-                        futures::future::ready(conform_batch(batch, &advertised_schema, &sources))
+                        futures::future::ready(
+                            conform_batch(batch, &conform_schema, &sources)
+                                .and_then(strip_nested_metadata_from_record_batch),
+                        )
                     });
 
             // GlobalLimitExec owns the limit when N > 1.
@@ -372,7 +368,10 @@ impl ExecutionPlan for IcebergTableScan {
         let stream = futures::stream::once(fut)
             .try_flatten()
             .and_then(move |batch| {
-                futures::future::ready(conform_batch(batch, &advertised_schema, &sources))
+                futures::future::ready(
+                    conform_batch(batch, &conform_schema, &sources)
+                        .and_then(strip_nested_metadata_from_record_batch),
+                )
             });
 
         let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
@@ -558,264 +557,11 @@ fn project_bindings(
     Ok((scan_columns, sources))
 }
 
-/// The Iceberg field id an advertised Arrow field carries, or a loud error.
-fn advertised_field_id(field: &ArrowField) -> DFResult<i32> {
-    let raw = field
-        .metadata()
-        .get(PARQUET_FIELD_ID_META_KEY)
-        .ok_or_else(|| {
-            to_datafusion_error(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "column '{}' carries no `{PARQUET_FIELD_ID_META_KEY}` metadata, so it cannot be \
-                     bound to a table field: an Iceberg column is identified by its field id, and \
-                     matching on the name instead would read the wrong column after a rename",
-                    field.name()
-                ),
-            ))
-        })?;
-    raw.parse::<i32>().map_err(|e| {
-        to_datafusion_error(
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "column '{}' carries an unparsable `{PARQUET_FIELD_ID_META_KEY}` metadata value '{raw}'",
-                    field.name()
-                ),
-            )
-            .with_source(e),
-        )
-    })
-}
-
-/// Whether an Arrow type change is one of Iceberg's LEGAL type promotions. It mirrors
-/// [`iceberg::spec::is_promotion_allowed`], pinned by the mirror test below.
-fn is_arrow_promotion_allowed(from: &DataType, to: &DataType) -> bool {
-    if from == to {
-        return true;
-    }
-    match (from, to) {
-        (DataType::Int32, DataType::Int64) => true,
-        (DataType::Float32, DataType::Float64) => true,
-        (
-            DataType::Decimal128(from_precision, from_scale),
-            DataType::Decimal128(to_precision, to_scale),
-        )
-        | (
-            DataType::Decimal256(from_precision, from_scale),
-            DataType::Decimal256(to_precision, to_scale),
-        ) => from_scale == to_scale && from_precision <= to_precision,
-        _ => false,
-    }
-}
-
-/// Coerces a scanned batch to the schema the plan advertised.
-///
-/// A DataFusion operator addresses its input by ORDINAL, so a batch carrying the right columns in
-/// the wrong order, or one extra, is silent corruption. This rebuilds the batch in advertised order
-/// from the bindings [`resolve_projection`] computed:
-///
-/// | Binding | Result |
-/// |---|---|
-/// | bound, same type | taken as is |
-/// | bound under a different name | the same values, under the advertised name |
-/// | bound with a legal promotion | cast to the advertised type |
-/// | unbound and nullable | an all-NULL column, as Java's readers null-fill |
-/// | unbound and not nullable, or an illegal type change | a typed error naming the column |
-///
-/// The row count is carried explicitly, so a zero-column `SELECT count(*)` keeps it.
-fn conform_batch(
-    batch: RecordBatch,
-    advertised: &ArrowSchemaRef,
-    sources: &[ColumnSource],
-) -> DFResult<RecordBatch> {
-    if batch.schema_ref() == advertised {
-        return Ok(batch);
-    }
-    if sources.len() != advertised.fields().len() {
-        return Err(datafusion::error::DataFusionError::Internal(format!(
-            "the scan bound {} columns but advertises {}",
-            sources.len(),
-            advertised.fields().len()
-        )));
-    }
-
-    let num_rows = batch.num_rows();
-    let mut columns = Vec::with_capacity(advertised.fields().len());
-    for (field, source) in advertised.fields().iter().zip(sources) {
-        match source {
-            ColumnSource::Scanned(name) => {
-                let column = batch.column_by_name(name).ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(format!(
-                        "the scan selected column '{name}' for advertised column '{}' but the \
-                         scanned batch does not carry it",
-                        field.name()
-                    ))
-                })?;
-                columns.push(conform_column(column, field, field.name())?);
-            }
-            ColumnSource::Absent if field.is_nullable() => {
-                columns.push(new_null_array(field.data_type(), num_rows))
-            }
-            ColumnSource::Absent => {
-                return Err(to_datafusion_error(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "required column '{}' has no field with its id in the snapshot being \
-                         scanned, so there is no data to read for it and a required column cannot \
-                         be null-filled",
-                        field.name()
-                    ),
-                )));
-            }
-        }
-    }
-
-    RecordBatch::try_new_with_options(
-        advertised.clone(),
-        columns,
-        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
-    )
-    .map_err(|e| {
-        datafusion::error::DataFusionError::ArrowError(
-            Box::new(e),
-            Some("failed to conform a scanned batch to the schema the plan advertised".to_string()),
-        )
-    })
-}
-
-/// Coerces ONE scanned column to its advertised field, recursing through nested types. Iceberg
-/// evolves a nested field as it evolves a top-level one, and none of those DDLs creates a snapshot.
-/// A nested Arrow field carries `PARQUET:field_id`, and `path` names the offending field on error.
-fn conform_column(column: &ArrayRef, target: &ArrowField, path: &str) -> DFResult<ArrayRef> {
-    if column.data_type() == target.data_type() {
-        return Ok(column.clone());
-    }
-    if is_arrow_promotion_allowed(column.data_type(), target.data_type()) {
-        return cast(column, target.data_type()).map_err(|e| {
-            datafusion::error::DataFusionError::ArrowError(
-                Box::new(e),
-                Some(format!("promoting column '{path}'")),
-            )
-        });
-    }
-
-    match (column.data_type(), target.data_type()) {
-        (DataType::Struct(scanned_fields), DataType::Struct(target_fields)) => {
-            let scanned = downcast::<StructArray>(column, path)?;
-            let len = scanned.len();
-
-            // An unidentifiable scanned child is indistinguishable from an absent one.
-            let scanned_ids = scanned_fields
-                .iter()
-                .map(|field| advertised_field_id(field))
-                .collect::<DFResult<Vec<_>>>()?;
-
-            let mut children = Vec::with_capacity(target_fields.len());
-            for target_child in target_fields {
-                let child_path = format!("{path}.{}", target_child.name());
-                let target_id = advertised_field_id(target_child)?;
-                match scanned_ids.iter().position(|id| *id == target_id) {
-                    Some(index) => children.push(conform_column(
-                        scanned.column(index),
-                        target_child,
-                        &child_path,
-                    )?),
-                    None if target_child.is_nullable() => {
-                        children.push(new_null_array(target_child.data_type(), len))
-                    }
-                    None => {
-                        return Err(to_datafusion_error(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "required field '{child_path}' has no field with its id in the \
-                                 snapshot being scanned, so there is no data to read for it and a \
-                                 required field cannot be null-filled"
-                            ),
-                        )));
-                    }
-                }
-            }
-            Ok(Arc::new(
-                StructArray::try_new_with_length(
-                    target_fields.clone(),
-                    children,
-                    scanned.nulls().cloned(),
-                    len,
-                )
-                .map_err(|e| {
-                    datafusion::error::DataFusionError::ArrowError(
-                        Box::new(e),
-                        Some(format!("conforming struct column '{path}'")),
-                    )
-                })?,
-            ))
-        }
-        (DataType::List(_), DataType::List(target_element)) => {
-            let scanned = downcast::<ListArray>(column, path)?;
-            let values =
-                conform_column(scanned.values(), target_element, &format!("{path}.element"))?;
-            Ok(Arc::new(
-                ListArray::try_new(
-                    target_element.clone(),
-                    scanned.offsets().clone(),
-                    values,
-                    scanned.nulls().cloned(),
-                )
-                .map_err(|e| {
-                    datafusion::error::DataFusionError::ArrowError(
-                        Box::new(e),
-                        Some(format!("conforming list column '{path}'")),
-                    )
-                })?,
-            ))
-        }
-        (DataType::Map(_, _), DataType::Map(target_entries, ordered)) => {
-            let scanned = downcast::<MapArray>(column, path)?;
-            let entries: ArrayRef = Arc::new(scanned.entries().clone());
-            let conformed = conform_column(&entries, target_entries, path)?;
-            let conformed = downcast::<StructArray>(&conformed, path)?.clone();
-            Ok(Arc::new(
-                MapArray::try_new(
-                    target_entries.clone(),
-                    scanned.offsets().clone(),
-                    conformed,
-                    scanned.nulls().cloned(),
-                    *ordered,
-                )
-                .map_err(|e| {
-                    datafusion::error::DataFusionError::ArrowError(
-                        Box::new(e),
-                        Some(format!("conforming map column '{path}'")),
-                    )
-                })?,
-            ))
-        }
-        (scanned_type, target_type) => Err(to_datafusion_error(Error::new(
-            ErrorKind::DataInvalid,
-            format!(
-                "column '{path}' is {scanned_type} in the snapshot being scanned but {target_type} \
-                 in the schema this query was planned against, and that is not a legal Iceberg type \
-                 promotion — the data cannot be read as the planned type"
-            ),
-        ))),
-    }
-}
-
-/// Downcasts an array whose `DataType` already matched. A failure is a broken Arrow invariant.
-fn downcast<'a, T: 'static>(column: &'a ArrayRef, path: &str) -> DFResult<&'a T> {
-    column.as_any().downcast_ref::<T>().ok_or_else(|| {
-        datafusion::error::DataFusionError::Internal(format!(
-            "column '{path}' has type {} but is not backed by the matching array kind",
-            column.data_type()
-        ))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
+    use datafusion::arrow::array::{Array, ArrayRef};
     use datafusion::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
@@ -825,6 +571,7 @@ mod tests {
         FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
         TableMetadataBuilder, Type,
     };
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::*;
 

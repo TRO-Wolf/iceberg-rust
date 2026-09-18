@@ -16,16 +16,19 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::path::Path;
 use std::sync::Arc;
 
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::execution::context::SessionContext;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_datafusion::IcebergCatalogProvider;
+use iceberg_datafusion::{IcebergCatalogProvider, IcebergStaticTableProvider};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use tempfile::TempDir;
 
 async fn run(ctx: &SessionContext, sql: &str) {
@@ -45,11 +48,16 @@ fn long_id_field() -> Arc<NestedField> {
     NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into()
 }
 
-async fn base_table(
+async fn catalog_ctx(
     mode: &str,
     fields: Vec<Arc<NestedField>>,
-    first: &str,
-    second: &str,
+) -> (SessionContext, TempDir, Arc<dyn Catalog>, NamespaceIdent) {
+    catalog_ctx_with_tables(mode, vec![("t", fields)]).await
+}
+
+async fn catalog_ctx_with_tables(
+    mode: &str,
+    tables: Vec<(&str, Vec<Arc<NestedField>>)>,
 ) -> (SessionContext, TempDir, Arc<dyn Catalog>, NamespaceIdent) {
     let warehouse = TempDir::new().expect("warehouse");
     let path = warehouse.path().to_str().expect("utf-8 path").to_string();
@@ -68,32 +76,44 @@ async fn base_table(
         .create_namespace(&namespace, HashMap::new())
         .await
         .expect("namespace");
-    let schema = Schema::builder()
-        .with_schema_id(0)
-        .with_fields(fields)
-        .build()
-        .expect("evo schema");
-    let creation = TableCreation::builder()
-        .name("t".to_string())
-        .properties(HashMap::from([
-            ("write.delete.mode".to_string(), mode.to_string()),
-            ("write.update.mode".to_string(), mode.to_string()),
-        ]))
-        .schema(schema)
-        .build();
-    iceberg_catalog
-        .create_table(&namespace, creation)
-        .await
-        .expect("create table");
+    for (name, fields) in tables {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(fields)
+            .build()
+            .expect("evo schema");
+        let creation = TableCreation::builder()
+            .name(name.to_string())
+            .properties(HashMap::from([
+                ("write.delete.mode".to_string(), mode.to_string()),
+                ("write.update.mode".to_string(), mode.to_string()),
+            ]))
+            .schema(schema)
+            .build();
+        iceberg_catalog
+            .create_table(&namespace, creation)
+            .await
+            .expect("create table");
+    }
     let provider =
         IcebergCatalogProvider::try_new(Arc::clone(&iceberg_catalog) as Arc<dyn Catalog>)
             .await
             .expect("catalog provider");
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", Arc::new(provider));
+    (ctx, warehouse, iceberg_catalog, namespace)
+}
+
+async fn base_table(
+    mode: &str,
+    fields: Vec<Arc<NestedField>>,
+    first: &str,
+    second: &str,
+) -> (SessionContext, TempDir, Arc<dyn Catalog>, NamespaceIdent) {
+    let (ctx, warehouse, catalog, namespace) = catalog_ctx(mode, fields).await;
     run(&ctx, &format!("INSERT INTO catalog.ns.t VALUES {first}")).await;
     run(&ctx, &format!("INSERT INTO catalog.ns.t VALUES {second}")).await;
-    (ctx, warehouse, iceberg_catalog, namespace)
+    (ctx, warehouse, catalog, namespace)
 }
 
 async fn load(namespace: &NamespaceIdent, catalog: &Arc<dyn Catalog>) -> iceberg::table::Table {
@@ -353,5 +373,224 @@ async fn merge_on_read_delete_after_a_name_swap_keeps_each_value_under_its_field
     assert_eq!(
         select_all(&ctx, "SELECT id, v, extra FROM catalog.ns.t", 3).await,
         vec![vec!["2".to_string(), "e2".to_string(), "b".to_string()],]
+    );
+}
+
+fn int_list(element_id: i32) -> Type {
+    Type::List(ListType::new(
+        NestedField::list_element(element_id, Type::Primitive(PrimitiveType::Int), false).into(),
+    ))
+}
+
+fn nested_fields() -> Vec<Arc<NestedField>> {
+    vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+        NestedField::optional(2, "xs", int_list(3)).into(),
+        NestedField::optional(
+            4,
+            "pairs",
+            Type::List(ListType::new(
+                NestedField::list_element(
+                    5,
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(6, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(7, "b", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    ])),
+                    false,
+                )
+                .into(),
+            )),
+        )
+        .into(),
+        NestedField::optional(
+            8,
+            "props",
+            Type::Map(MapType::new(
+                NestedField::map_key_element(9, Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::map_value_element(10, int_list(11), false).into(),
+            )),
+        )
+        .into(),
+    ]
+}
+
+async fn nested_table() -> (SessionContext, TempDir) {
+    let (ctx, warehouse, _, _) = catalog_ctx("copy-on-write", nested_fields()).await;
+    (ctx, warehouse)
+}
+
+fn parquet_leaf_ids(dir: &Path) -> Vec<Vec<i32>> {
+    let mut out = vec![];
+    for entry in std::fs::read_dir(dir).expect("list warehouse dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            out.extend(parquet_leaf_ids(&path));
+        } else if path.extension().is_some_and(|ext| ext == "parquet") {
+            let reader = ArrowReaderMetadata::load(
+                &File::open(&path).expect("open data file"),
+                ArrowReaderOptions::default(),
+            )
+            .expect("read parquet footer");
+            out.push(
+                reader
+                    .parquet_schema()
+                    .columns()
+                    .iter()
+                    .map(|column| column.self_type().get_basic_info().id())
+                    .collect(),
+            );
+        }
+    }
+    out
+}
+
+const NESTED_LEAF_IDS: [i32; 6] = [1, 5, 7, 8, 9, 11];
+
+#[tokio::test]
+async fn insert_values_into_a_list_column_writes_and_stamps_the_element_id() {
+    let (ctx, warehouse) = nested_table().await;
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t VALUES (1, make_array(1, 2), NULL, NULL), (2, make_array(3), NULL, NULL)",
+    )
+    .await;
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t VALUES (5, make_array(6), NULL, NULL), (6, NULL, NULL, NULL)",
+    )
+    .await;
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t VALUES (7, make_array(5, NULL, 7), NULL, NULL)",
+    )
+    .await;
+    for leaf_ids in parquet_leaf_ids(warehouse.path()) {
+        assert_eq!(leaf_ids, NESTED_LEAF_IDS);
+    }
+    assert_eq!(
+        select_all(&ctx, "SELECT id, xs FROM catalog.ns.t", 2).await,
+        vec![
+            vec!["1".to_string(), "[1, 2]".to_string()],
+            vec!["2".to_string(), "[3]".to_string()],
+            vec!["5".to_string(), "[6]".to_string()],
+            vec!["6".to_string(), "NULL".to_string()],
+            vec!["7".to_string(), "[5, , 7]".to_string()],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn insert_values_into_list_struct_and_map_columns_writes() {
+    let (ctx, warehouse) = nested_table().await;
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t VALUES (8, NULL, make_array(named_struct('a', CAST(10 AS INT), 'b', 'x'), named_struct('a', CAST(20 AS INT), 'b', NULL)), map('k1', make_array(CAST(5 AS INT), CAST(6 AS INT)))), (9, NULL, NULL, NULL)",
+    )
+    .await;
+    for leaf_ids in parquet_leaf_ids(warehouse.path()) {
+        assert_eq!(leaf_ids, NESTED_LEAF_IDS);
+    }
+    assert_eq!(
+        select_all(&ctx, "SELECT id, pairs, props FROM catalog.ns.t", 3).await,
+        vec![
+            vec![
+                "8".to_string(),
+                "[{a: 10, b: x}, {a: 20, b: }]".to_string(),
+                "{k1: [5, 6]}".to_string(),
+            ],
+            vec!["9".to_string(), "NULL".to_string(), "NULL".to_string()],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn insert_select_from_a_static_provider_into_nested_columns_writes() {
+    let (ctx, warehouse, catalog, namespace) = catalog_ctx("copy-on-write", nested_fields()).await;
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t VALUES (1, make_array(1, 2), NULL, NULL)",
+    )
+    .await;
+    let table = load(&namespace, &catalog).await;
+    let source = IcebergStaticTableProvider::try_new_from_table(table)
+        .await
+        .expect("static provider");
+    ctx.register_table("src", Arc::new(source))
+        .expect("register src");
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t SELECT id, xs, pairs, props FROM src",
+    )
+    .await;
+    for leaf_ids in parquet_leaf_ids(warehouse.path()) {
+        assert_eq!(leaf_ids, NESTED_LEAF_IDS);
+    }
+    assert_eq!(
+        select_all(&ctx, "SELECT id, xs FROM catalog.ns.t", 2).await,
+        vec![vec!["1".to_string(), "[1, 2]".to_string()], vec![
+            "1".to_string(),
+            "[1, 2]".to_string()
+        ],]
+    );
+}
+
+#[tokio::test]
+async fn select_and_insert_select_across_catalog_tables_agree_on_the_advertised_schema() {
+    let (ctx, _warehouse, _catalog, _namespace) = catalog_ctx_with_tables("copy-on-write", vec![
+        ("t", nested_fields()),
+        ("t2", nested_fields()),
+    ])
+    .await;
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t VALUES (1, make_array(1, 2), NULL, NULL)",
+    )
+    .await;
+    assert_eq!(
+        select_all(&ctx, "SELECT id, xs FROM catalog.ns.t", 2).await,
+        vec![vec!["1".to_string(), "[1, 2]".to_string()]]
+    );
+    assert_eq!(
+        select_all(&ctx, "SELECT max(id) FROM catalog.ns.t", 1).await,
+        vec![vec!["1".to_string()]]
+    );
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t2 SELECT id, xs, pairs, props FROM catalog.ns.t",
+    )
+    .await;
+    assert_eq!(
+        select_all(&ctx, "SELECT id, xs FROM catalog.ns.t2", 2).await,
+        vec![vec!["1".to_string(), "[1, 2]".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn insert_values_into_a_static_provider_fails_on_write_not_planning() {
+    let (ctx, _warehouse, catalog, namespace) = catalog_ctx("copy-on-write", nested_fields()).await;
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t VALUES (1, make_array(1, 2), NULL, NULL)",
+    )
+    .await;
+    let table = load(&namespace, &catalog).await;
+    let source = IcebergStaticTableProvider::try_new_from_table(table)
+        .await
+        .expect("static provider");
+    ctx.register_table("src", Arc::new(source))
+        .expect("register src");
+    let df = ctx
+        .sql("INSERT INTO src VALUES (5, make_array(6), NULL, NULL), (6, NULL, NULL, NULL)")
+        .await
+        .expect("plan");
+    let msg = df
+        .collect()
+        .await
+        .expect_err("static provider refuses writes")
+        .to_string();
+    assert!(
+        msg.contains("Write operations are not supported"),
+        "expected the write refusal, got: {msg}"
     );
 }

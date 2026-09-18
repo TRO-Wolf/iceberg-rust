@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod commit;
+pub(crate) mod conform;
 pub(crate) mod cow_affected;
 pub(crate) mod delete;
 pub(crate) mod delete_legacy_merge;
