@@ -189,24 +189,22 @@ impl Transaction {
     /// Applies an [`ActionCommit`] to the given [`Table`], returning a new [`Table`] with updated metadata.
     /// Also appends any derived [`TableUpdate`]s and [`TableRequirement`]s to the provided vectors.
     fn apply(
-        table: Table,
+        mut table: Table,
         mut action_commit: ActionCommit,
         existing_updates: &mut Vec<TableUpdate>,
         existing_requirements: &mut Vec<TableRequirement>,
     ) -> Result<Table> {
         let updates = action_commit.take_updates();
         let requirements = action_commit.take_requirements();
-
         for requirement in &requirements {
             requirement.check(Some(table.metadata()))?;
         }
-
-        let updated_table = Self::update_table_metadata(table, &updates)?;
-
+        if !updates.is_empty() {
+            table = Self::update_table_metadata(table, &updates)?;
+        }
         existing_updates.extend(updates);
         existing_requirements.extend(requirements);
-
-        Ok(updated_table)
+        Ok(table)
     }
 
     /// Sets table to a new version.

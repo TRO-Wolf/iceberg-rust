@@ -930,3 +930,35 @@ async fn hadoop_replace_without_files_publishes_only_next_version() {
         "a no-files staged replace must not leave a v4 behind"
     );
 }
+
+#[tokio::test]
+async fn apply_locally_empty_updates_keep_the_metadata_arc() {
+    let tmp = TempDir::new().unwrap();
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let (catalog, _) = shared_fs_catalog(&warehouse).await;
+    let ns = NamespaceIdent::new("sales".into());
+    catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+    let table = catalog
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name("orders".into())
+                .schema(schema_id_name())
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_schema()
+        .move_before("id", "name")
+        .apply(tx)
+        .expect("apply no-op move");
+    let applied = tx.apply_locally().await.expect("apply_locally");
+
+    assert!(
+        Arc::ptr_eq(&table.metadata_ref(), &applied.metadata_ref()),
+        "an action with zero updates must return the same metadata, not a rebuild"
+    );
+}
