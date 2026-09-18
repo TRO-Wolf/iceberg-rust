@@ -514,7 +514,6 @@ impl Transaction {
         // before its own `update_table` call, stale ids from an attempt that provably did not
         // land (e.g. a requirement conflict) must not feed reconciliation.
         self.latest_attempt_snapshot_ids.clear();
-
         let refreshed = catalog.load_table(self.table.identifier()).await?;
 
         // Location first (cheap string compare), then deep TableMetadata PartialEq only when
@@ -525,7 +524,6 @@ impl Transaction {
             // current base is stale, use refreshed as base and re-apply transaction actions
             self.table = refreshed;
         }
-
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
@@ -542,7 +540,6 @@ impl Transaction {
                 .validate(starting, &current_table)
                 .await?;
         }
-
         for action in &self.actions {
             let action_commit = Arc::clone(action).commit(&current_table).await?;
             // apply action commit to current_table
@@ -553,7 +550,9 @@ impl Transaction {
                 &mut existing_requirements,
             )?;
         }
-
+        if existing_updates.is_empty() {
+            return Ok(current_table);
+        }
         // Capture, BEFORE `existing_updates` is moved into the commit, the snapshots added by
         // this commit — one `CreateSnapshotEvent` is fired per `AddSnapshot` AFTER the commit
         // succeeds (Java `SnapshotProducer.notifyListeners`, called from `commit()` once
