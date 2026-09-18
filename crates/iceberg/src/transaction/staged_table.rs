@@ -306,13 +306,13 @@ impl StagedTableTransaction {
                 .add_files(self.pending_data_files)
                 .allow_empty_commit()
                 .apply(tx)?;
-            tx.apply_locally().await
+            tx.apply_locally_in_place().await
         } else {
             let tx = tx
                 .fast_append()
                 .add_data_files(self.pending_data_files)
                 .apply(tx)?;
-            tx.apply_locally().await
+            tx.apply_locally_in_place().await
         }
     }
 }
@@ -323,6 +323,28 @@ impl Transaction {
     /// Used by [`StagedTableTransaction`]: the engine finishes FileIO work first, then publishes
     /// the pointer in one catalog step.
     pub async fn apply_locally(self) -> Result<Table> {
+        let current_table = self.run_actions_locally().await?;
+        let next_location = MetadataLocation::from_str(current_table.metadata_location_result()?)?
+            .with_next_version()
+            .to_string();
+        current_table
+            .metadata()
+            .write_commit_metadata(current_table.file_io(), &next_location)
+            .await?;
+        Ok(current_table.with_metadata_location(next_location))
+    }
+
+    pub(crate) async fn apply_locally_in_place(self) -> Result<Table> {
+        let current_table = self.run_actions_locally().await?;
+        let staged_location = current_table.metadata_location_result()?.to_string();
+        current_table
+            .metadata()
+            .write_to(current_table.file_io(), &staged_location)
+            .await?;
+        Ok(current_table)
+    }
+
+    async fn run_actions_locally(self) -> Result<Table> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<crate::TableUpdate> = vec![];
         let mut existing_requirements: Vec<crate::TableRequirement> = vec![];
@@ -343,15 +365,7 @@ impl Transaction {
             )?;
         }
 
-        let current_location = current_table.metadata_location_result()?;
-        let next_location = MetadataLocation::from_str(current_location)?
-            .with_next_version()
-            .to_string();
-        current_table
-            .metadata()
-            .write_commit_metadata(current_table.file_io(), &next_location)
-            .await?;
-        Ok(current_table.with_metadata_location(next_location))
+        Ok(current_table)
     }
 }
 

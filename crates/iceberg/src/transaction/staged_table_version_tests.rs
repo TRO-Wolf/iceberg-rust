@@ -244,6 +244,35 @@ async fn replace_restarts_versioning_when_base_pointer_does_not_parse() {
 }
 
 #[tokio::test]
+async fn replace_stages_uncompressed_next_version_after_a_gzip_hadoop_pointer() {
+    let file_io = FileIO::new_with_memory();
+    let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "t".into());
+    let table_location = "memory://wh/ns/t";
+    let table = table_at(
+        &file_io,
+        &ident,
+        table_location,
+        &format!("{table_location}/metadata/v7.gz.metadata.json"),
+    )
+    .await;
+
+    let staged = StagedTableTransaction::begin_replace(&table, replace_creation(&ident))
+        .await
+        .expect("begin replace");
+    let staged_location = staged
+        .table()
+        .metadata_location_result()
+        .expect("staged location")
+        .to_string();
+    assert_eq!(
+        staged_location,
+        format!("{table_location}/metadata/v8.metadata.json"),
+        "a gzip Hadoop pointer must stage the next uncompressed version, got {staged_location}"
+    );
+    assert!(file_io.exists(&staged_location).await.expect("exists"));
+}
+
+#[tokio::test]
 async fn replace_restarts_versioning_under_a_different_caller_location() {
     let file_io = FileIO::new_with_memory();
     let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "t".into());
