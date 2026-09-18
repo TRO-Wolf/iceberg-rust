@@ -228,6 +228,7 @@ async fn test_bounds_only_file_scoped_parquet_fires_ratio() {
 
     let deletes: Vec<(String, i64)> = (0..9).map(|pos| (data_path.clone(), pos)).collect();
     let pos_delete = write_file_scoped_position_delete(&table, 0, &deletes).await;
+    let pos_delete_path = pos_delete.file_path().to_string();
     let table = add_deletes(&catalog, &table, vec![pos_delete]).await;
 
     let rows_before = scan_rows(&table).await;
@@ -239,7 +240,7 @@ async fn test_bounds_only_file_scoped_parquet_fires_ratio() {
         .expect("compaction must succeed");
 
     assert_eq!(result.rewritten_data_files_count, 1);
-    assert_eq!(result.removed_delete_files_count, 1);
+    assert_eq!(result.removed_delete_files_count, 0);
     assert_eq!(result.added_data_files_count, 1);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
@@ -248,8 +249,10 @@ async fn test_bounds_only_file_scoped_parquet_fires_ratio() {
         "the 90% deleted in-band file was rewritten"
     );
     assert!(
-        live_delete_file_paths(&table).await.is_empty(),
-        "the file-scoped parquet position delete left with the rewritten file"
+        live_delete_file_paths(&table)
+            .await
+            .contains(&pos_delete_path),
+        "the file-scoped parquet position delete stays live: Java's reclaim is Puffin-only"
     );
     assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
 }
@@ -266,6 +269,7 @@ async fn test_fully_deleted_in_band_parquet_file_is_rewritten_and_drops_its_dele
 
     let deletes: Vec<(String, i64)> = (0..10).map(|pos| (data_path.clone(), pos)).collect();
     let pos_delete = write_file_scoped_position_delete(&table, 0, &deletes).await;
+    let pos_delete_path = pos_delete.file_path().to_string();
     let table = add_deletes(&catalog, &table, vec![pos_delete]).await;
     assert!(scan_rows(&table).await.is_empty());
 
@@ -276,7 +280,7 @@ async fn test_fully_deleted_in_band_parquet_file_is_rewritten_and_drops_its_dele
 
     assert_eq!(result.rewritten_data_files_count, 1);
     assert_eq!(result.added_data_files_count, 0);
-    assert_eq!(result.removed_delete_files_count, 1);
+    assert_eq!(result.removed_delete_files_count, 0);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
     assert!(
@@ -284,8 +288,10 @@ async fn test_fully_deleted_in_band_parquet_file_is_rewritten_and_drops_its_dele
         "the 100% deleted in-band file was rewritten away"
     );
     assert!(
-        live_delete_file_paths(&table).await.is_empty(),
-        "its parquet position delete left with it"
+        live_delete_file_paths(&table)
+            .await
+            .contains(&pos_delete_path),
+        "its parquet position delete stays live: Java's reclaim is Puffin-only"
     );
     assert!(scan_rows(&table).await.is_empty());
 }
@@ -343,6 +349,7 @@ async fn test_fully_deleted_2500_row_in_band_parquet_file_ends_at_zero_delete_fi
 
     let deletes: Vec<(String, i64)> = (0..row_count).map(|pos| (data_path.clone(), pos)).collect();
     let pos_delete = write_file_scoped_position_delete(&table, 0, &deletes).await;
+    let pos_delete_path = pos_delete.file_path().to_string();
     let table = add_deletes(&catalog, &table, vec![pos_delete]).await;
     assert!(scan_rows(&table).await.is_empty());
     let result = RewriteDataFiles::new(table.clone())
@@ -352,10 +359,15 @@ async fn test_fully_deleted_2500_row_in_band_parquet_file_ends_at_zero_delete_fi
         .expect("compaction must succeed");
     assert_eq!(result.rewritten_data_files_count, 1);
     assert_eq!(result.added_data_files_count, 0);
-    assert_eq!(result.removed_delete_files_count, 1);
+    assert_eq!(result.removed_delete_files_count, 0);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
-    assert!(live_delete_file_paths(&table).await.is_empty());
+    assert!(
+        live_delete_file_paths(&table)
+            .await
+            .contains(&pos_delete_path),
+        "the parquet position delete stays live: Java's reclaim is Puffin-only"
+    );
     assert!(scan_rows(&table).await.is_empty());
 }
 
@@ -566,8 +578,8 @@ async fn test_partition_scoped_delete_survives_partial_rewrite() {
         "only A is a ratio candidate"
     );
     assert_eq!(
-        result.removed_delete_files_count, 1,
-        "only A's file-scoped parquet delete is dropped"
+        result.removed_delete_files_count, 0,
+        "Java's reclaim is Puffin-only, so no parquet delete is dropped"
     );
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
@@ -576,14 +588,14 @@ async fn test_partition_scoped_delete_survives_partial_rewrite() {
     assert!(live_data.contains(&path_b), "B was left in place");
     let live_deletes = live_delete_file_paths(&table).await;
     assert!(
-        !live_deletes.contains(&scoped_a_path),
-        "A's file-scoped delete left with A"
+        live_deletes.contains(&scoped_a_path),
+        "A's file-scoped parquet delete stays live: Java's reclaim is Puffin-only"
     );
     assert!(
         live_deletes.contains(&shared_path),
         "the shared two-path delete must survive"
     );
-    assert_eq!(live_deletes.len(), 1);
+    assert_eq!(live_deletes.len(), 2);
     assert_eq!(
         scan_rows(&table).await,
         rows_before,

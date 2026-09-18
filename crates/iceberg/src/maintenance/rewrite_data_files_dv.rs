@@ -19,7 +19,7 @@
 //!
 //! Java 1.10.0 `ManifestFilterManager.isDanglingDV` is `ContentFileUtil.isDV` and
 //! `removedDataFilePaths.contains(referencedDataFile())`. The apply path drops DVs
-//! only. File-scoped parquet position deletes are a fork extension of that predicate.
+//! only.
 //!
 //! Delete-file removal is keyed by the Java `DeleteFileSet` triple, so a drop leaves
 //! a sibling blob at the same Puffin path in place.
@@ -29,7 +29,7 @@ use std::collections::HashSet;
 use futures::{StreamExt, TryStreamExt, stream};
 
 use crate::Result;
-use crate::delete_file_index::referenced_data_file_location;
+use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};
 use crate::io::FileIO;
 use crate::spec::{DataContentType, DataFile, Manifest, ManifestContentType, ManifestList};
 use crate::table::Table;
@@ -48,7 +48,7 @@ pub(super) fn plan_dv_removal(
     let mut removed = Vec::new();
     let mut removed_count: usize = 0;
     for (delete_file, referenced) in live {
-        if rewritten_data_paths.contains(referenced) {
+        if is_deletion_vector(delete_file) && rewritten_data_paths.contains(referenced) {
             removed_count = removed_count.saturating_add(1);
             removed.push(delete_file.clone());
         }

@@ -21,19 +21,18 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 
 use crate::Catalog;
+use crate::maintenance::rewrite_data_files::RewriteDataFiles;
 use crate::maintenance::rewrite_data_files::tests::{
     add_deletes, append_files, create_partitioned_table, live_delete_file_paths, local_fs_catalog,
     scan_rows, write_data_file,
 };
-use crate::maintenance::rewrite_data_files::RewriteDataFiles;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Literal, MetricsConfig, PartitionKey,
     Struct,
 };
 use crate::table::Table;
 use crate::writer::base_writer::position_delete_writer::{
-    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
-    position_delete_writer_properties,
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
 };
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
@@ -100,8 +99,7 @@ async fn cow_bytes_shape(catalog: &impl Catalog) -> (Table, Vec<String>, u64) {
     for part in 0..2i64 {
         for fileno in 0..4i64 {
             let base = (part * 4 + fileno) * 50;
-            let rows: Vec<(i64, i64, i64)> =
-                (0..50).map(|n| (part, base + n, base + n)).collect();
+            let rows: Vec<(i64, i64, i64)> = (0..50).map(|n| (part, base + n, base + n)).collect();
             let file = write_data_file(
                 &table,
                 &format!("part-{part}-file-{fileno}.parquet"),
@@ -125,8 +123,9 @@ async fn delete_partition_zero(
     last_id_exclusive: i64,
     metrics_config: MetricsConfig,
 ) -> (Table, String) {
-    let deletes: Vec<(String, i64)> =
-        (0..last_id_exclusive).map(|pos| (paths[0].clone(), pos)).collect();
+    let deletes: Vec<(String, i64)> = (0..last_id_exclusive)
+        .map(|pos| (paths[0].clone(), pos))
+        .collect();
     let pos_delete = write_position_delete(&table, 0, &deletes, metrics_config).await;
     let delete_path = pos_delete.file_path().to_string();
     let table = add_deletes(catalog, &table, vec![pos_delete]).await;
@@ -169,12 +168,7 @@ async fn live_data_sequences(table: &Table) -> Vec<(String, i64, i64)> {
     out
 }
 
-async fn assert_output_sequences(
-    table: &Table,
-    data_seq: i64,
-    file_seq: i64,
-    output_count: usize,
-) {
+async fn assert_output_sequences(table: &Table, data_seq: i64, file_seq: i64, output_count: usize) {
     let outputs: Vec<(i64, i64)> = live_data_sequences(table)
         .await
         .into_iter()

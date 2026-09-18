@@ -467,8 +467,8 @@ async fn evolved_spec_rewrite_drops_file_scoped_position_deletes() {
     assert_eq!(scan_rows(&table).await, vec![(1, 10, 100), (2, 20, 200)]);
     let deletes = live_delete_file_paths(&table).await;
     assert!(
-        !deletes.contains(&pos_path),
-        "file-scoped position delete of a rewritten file must be removed"
+        deletes.contains(&pos_path),
+        "the file-scoped parquet position delete stays live: Java's reclaim is Puffin-only"
     );
 }
 
