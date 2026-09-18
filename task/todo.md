@@ -79,6 +79,22 @@ was feeding DataFusion's `insert_to_plan`/`Values` exec, not the writer.
 - [x] `project_batch` audit: write path but equality-delete projection is primitive-only — the
       nested-mismatch class cannot fire; recorded in the ledger
 
+Round 3 (same lane): Grok logic-critic P2s — `disallowed_nulls` ignored the parent mask for
+List/LargeList/Map, and `IcebergStaticTableProvider::schema()` still advertised the stamped
+schema.
+
+- [x] red cells (`418bf0032`): `null_elements_inside_null_parent_rows_are_accepted`,
+      `null_elements_outside_the_sliced_offsets_are_accepted`,
+      `insert_values_into_a_static_provider_fails_on_write_not_planning`
+- [x] fix (`50bb3843f`): `disallowed_nulls` builds a used-range validity mask over non-null
+      parent rows for every container; static provider `schema()` strips metadata like the
+      catalog provider (stamped schema kept for `scan`); `test_schema_of_created_table` +
+      `test_schema_of_created_external_table_sql` re-pinned to the stripped schema
+- [x] mutation: each fix reverted alone → its cells red with the measured signatures; restored
+      green
+- [x] ledger Round 3 section + residue note (`DELETE … WHERE xs IS NULL` on a list column,
+      `expr/term.rs` accessor gap, pre-existing)
+
 
 ## ACTIVE (2026-09-17): F-ICE-RESIDUES-21B fork-residue lane, five closures vs Java 1.10.0
 

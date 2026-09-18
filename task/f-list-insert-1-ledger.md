@@ -395,3 +395,68 @@ fix, and `data_file_writer.rs` crossed 1000 under R-02/R-04. Resolutions, no cei
 - Verification after the split: `cargo test -p iceberg-datafusion --lib` 228/228 + 1 ignored,
   `cargo test -p iceberg-datafusion --test evo_schema_dml` 14/14, fmt/clippy clean, file-size gate
   green across 506 files.
+
+---
+
+## Round 3 — Grok logic-critic P2s L-01/L-02
+
+### L-01 — required-element null check honoured no parent mask for List/LargeList/Map
+
+`disallowed_nulls` (write_defaults.rs) treated `List`/`LargeList`/`Map` children with a flat
+`child.null_count() > 0` while `Struct`/`FixedSizeList` honoured the parent mask. Arrow-valid data
+was refused:
+
+- **(a)** `list<int not null>`, row0 a NULL list whose values slot holds a null, row1 `[1]` — the
+  null sits inside a null parent row and is invisible.
+- **(b)** `[[null],[1],[2]]` then `RecordBatch::slice(1, 2)` — the null lies outside the sliced
+  offsets of every logical row.
+
+Fix: `disallowed_nulls(target, column, child)` builds a required-validity bitmap over the child
+positions actually addressed by non-null parent rows — `value_offsets()` logical offsets for
+`List`/`LargeList`/`Map` (physical child positions), `(base + i) * width` for `FixedSizeList`,
+`base + i` for `Struct`, `base` the parent's `offset()` — then `mask.contains(child_nulls)` decides.
+A downcast that fails (layout proof already passed, so unreachable) fails closed as disallowed. This
+replaces the R-04 wording "strict `null_count` for List/Map entries": the used-range-of-valid-rows
+rule now applies uniformly to every container, matching what Arrow itself accepts.
+
+Cells: `null_elements_inside_null_parent_rows_are_accepted` (a) and
+`null_elements_outside_the_sliced_offsets_are_accepted` (b), both under
+`writer::write_defaults_tests`.
+
+### L-02 — `IcebergStaticTableProvider::schema()` still advertised the stamped schema
+
+The catalog provider was fixed in round 2 but the static provider kept returning the stamped
+schema, so `INSERT … VALUES` into it died in DataFusion's `Values` exec — mixed-metadata list
+concat — before `insert_into`'s `FeatureUnsupported` refusal could fire.
+
+Fix: `schema()` returns `strip_metadata_from_schema(&self.schema)` exactly as
+`IcebergTableProvider` does; the stamped `self.schema` still feeds `scan`. Cell:
+`insert_values_into_a_static_provider_fails_on_write_not_planning` (evo_schema_dml.rs) — the
+statement now reaches `insert_into` and fails with the intended
+`Write operations are not supported on IcebergStaticTableProvider` refusal instead of the
+planning-time concat error.
+
+Pinned-schema tests updated as the brief anticipated: `test_schema_of_created_table` **and**
+`test_schema_of_created_external_table_sql` (both compare `provider.schema()` against the stamped
+`table_metadata_v2_schema()`) now expect `strip_metadata_from_schema(&table_metadata_v2_schema())`.
+
+### Mutation proof
+
+- `write_defaults.rs` reverted to `418bf0032`: both L-01 cells red with the measured
+  `DataInvalid => Column type List(Int32, field: 'element') is not compatible with the table schema
+  type List(non-null Int32, …)`; restored, both green.
+- `static_provider.rs` reverted to `418bf0032`: the L-02 cell red with the measured
+  `It is not possible to concatenate arrays of different data types (List(Int32, field: 'element'),
+  List(Int32, field: 'element', metadata: {"PARQUET:field_id": "5"}))`; restored, green.
+
+### Gates
+
+`cargo test -p iceberg --lib writer` 172/172 + 1 ignored; `cargo test -p iceberg-datafusion --lib`
+228/228 + 1 ignored; `cargo test -p iceberg-datafusion --test evo_schema_dml` 16/16; `cargo fmt`,
+`cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings` clean;
+`python3 scripts/check_rust_file_size.py` 506 files clean.
+
+### Residue (pre-existing, out of lane)
+
+`DELETE … WHERE xs IS NULL` on a list column fails `Accessor for Field xs not found` —
+`expr/term.rs:326-330`, `accessor_by_field_id` has no accessor for nested/list columns. Not touched.
