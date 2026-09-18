@@ -25,6 +25,21 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-18): F-ROWID-ORDER-1 — INSERT commits data files in ascending partition order
+
+Ledger: [`f-rowid-order-1-ledger.md`](f-rowid-order-1-ledger.md). Branch `fix/f-rowid-order-1`
+off fork `main`. Consumer: RePark rating row C-3 / V3-02 (registry V3-COV-3).
+
+- [x] RED: `insert_row_id_order.rs` — five real-SQL cells over a four-partition `MemTable` on a
+      multi-thread runtime, 20 fresh v3 tables each; the SELECT / overwrite / eight-partition
+      cells red at run 0 pre-fix. `1920c8833`
+- [x] FIX: `IcebergWriteExec` emits `write_partition_index`; `IcebergCommitExec` stable-sorts
+      the collected list by `ascending_partition_order` then that index — writer order within
+      one input partition, then input partition index. `01b1a2f4`
+- [x] Mutation: revert → the same three cells red on assertion; restore → 5/5 green; revert not
+      committed.
+- [x] Ledger + this entry; `typos .`, `cargo fmt --all --check`, clippy, size checker green.
+
 ## ACTIVE (2026-09-19): F-LIST-NULL-ACCESSOR-1 — `IS NULL` / `IS NOT NULL` on list, map, struct columns
 
 Ledger: [`f-list-null-accessor-1-ledger.md`](f-list-null-accessor-1-ledger.md). Branch
