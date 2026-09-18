@@ -216,3 +216,152 @@ to `physical_plan/mod.rs` where the sibling file needs no `#[path]`.
 - C-009 PROVEN — SQL-level controls still bite: the three s5 serializable pins reject a
   concurrent append whose file metrics match `foo1 = 1` (§6).
 
+## Round 2 — F-01: a literal that does not convert exactly to the column type is not pushed
+
+Commits: `d8dbaf944` (red cells), `85e30d001` (fix).
+
+### Defect (critic F-01)
+
+`DELETE FROM t WHERE f < 1e-50` on a `FLOAT` column `f`. DataFusion coerces the
+comparison to `CAST(f AS DOUBLE) < Float64(1e-50)` — or leaves the column bare; the
+logical plan observed in the e2e probe carried no CAST at all. Either way the
+converter pushes `f < Datum::double(1e-50)`. At bind,
+`Datum::to` (`datum.rs:1143`, Double→Float) bounds-checks to ±f32::MAX and then
+`as f32`-narrows: `1e-50 → 0.0`, `1.00000001 → 1.0`, `0.1 → 0.10000000149…`.
+The bound predicate can therefore be *stronger* than what was pushed — `f <
+1.00000001` binds as `f < 1.0` — and the inclusive metrics evaluator prunes a file
+whose only row satisfies the exact DataFusion predicate. Result: silent wrong
+DELETE/UPDATE. Since round 1 the same predicate scopes serializable conflict
+detection, the narrowing can also under-scope OCC and miss a real conflict.
+
+The defect is not CAST-specific: any pushed literal whose `Datum::to` conversion
+loses precision has the same failure shape (bare Float64 vs Float, Int64 vs
+Float/Double, timestamp strings beyond microsecond precision).
+
+### Site, and why
+
+`convert_filters_to_predicate` now takes the Iceberg `&Schema` the produced
+predicate will bind against and runs a `predicate_binds_soundly` post-pass over
+every converted conjunct: each leaf's column must resolve in that schema, each
+literal must convert under `Datum::to` without error, and a literal whose value
+changes in conversion must round-trip exactly. `AboveMax`/`BelowMin` sentinels are
+kept — binding folds them to the correct constant result.
+
+Sites rejected:
+
+- **`Datum::to` itself.** Java `Literals.*Literal.to` deliberately rounds
+  (`datum.rs:1108-1110` ports that accept-set); other callers may rely on it.
+  Pushdown is the only path that needs exactness.
+- **The `Expr::Cast` arm.** The narrowing happens at bind against the *Iceberg*
+  type, which the cast arm cannot see; a bare (uncasted) literal has the same bug.
+- **Checking in `Expr` space.** A post-pass on the converted `Predicate` covers
+  every producer uniformly: cast-stripped columns, bare literals, IN-list
+  elements, and nested `AND`/`OR`/`NOT` (any unsound leaf drops the whole
+  conjunct — partial drops inside `OR`/`NOT` would change semantics).
+
+Callers pass the schema the predicate actually binds: `delete_from`/`update` use
+`table.metadata().current_schema()`; `IcebergTableScan::new` selects the pinned
+snapshot's schema when pinned, else the current schema — the same selection its
+binding path makes.
+
+### Exactness rule per pair (`converts_exactly`)
+
+Only pairs where `Datum::to` rewrites the literal reach the table; unchanged
+literals (`Int→Date`, `Long→Timestamp[tz]`, `Int128→Decimal`, `Binary↔Fixed`) are
+accepted by identity, and a `Datum::to` error drops the conjunct.
+
+| Pair | `Datum::to` does | Pushed iff |
+|---|---|---|
+| Int → Long / Int → Double / Float → Double | widening | always |
+| Int → Float | `v as f32` | `(v as f32) as f64 == v` |
+| Long → Int | `i64_to_i32` sentinels | in range; else sentinel kept |
+| Long → Date | sentinel or `v as i32` | in range; else sentinel kept |
+| Long → Float | `v as f32` | `(v as f32) as i128 == v` |
+| Long → Double | `v as f64` | `(v as f64) as i128 == v` |
+| Double → Float | sentinel beyond ±f32::MAX, else `v as f32` | `(v as f32) as f64 == v` |
+| String → Timestamp/Timestamptz/Time | parse → micros `Long` | ≤ 6 sub-second digits (a 7th truncates) |
+| String → Date / Uuid | parse or error | the parsed datum is canonical; parse errors drop |
+
+The `Long→{Float,Double}` arms compare through `i128` because `v as f64` itself
+rounds for |v| > 2^53 — comparing two rounded values would admit `2^53+1` as
+"exact" (`cast_wrapped_double_column_with_long_literal_checks_exactness` pins
+this). NaN never round-trips (`f64::from(NaN) != NaN`) so NaN literals drop — the
+explicit `isnan` path stays the only NaN producer (nan tests green). `as f32`
+preserves the sign of zero, so `±0.0` literals push with the sign intact, which
+the totalOrder metrics comparison respects.
+
+### Red output (commit `d8dbaf944`)
+
+Unit — `cargo test -p iceberg-datafusion --lib expr_to_predicate`:
+
+```text
+test result: FAILED. 51 passed; 4 failed
+    cast_wrapped_float_column_with_inexact_literal_is_not_pushed
+      — pushed Some(f < Datum{Double(1e-50)}) where None required
+    bare_float_column_with_inexact_literal_is_not_pushed
+    cast_wrapped_float_column_in_list_with_inexact_element_is_not_pushed
+    cast_wrapped_int_column_with_double_literal_is_not_pushed
+```
+
+E2E — the `f = 0.0` / `f < 1e-50` fixture was *masked*: the written file's lower
+bound is `-0.0` and `Datum` comparison is IEEE totalOrder, so `-0.0 < 0.0` kept
+the file. The load-bearing red uses `f = 1.0` vs `f < 1.00000001`
+(`1.00000001 as f32` rounds to `1.0`; the bound `f < 1.0` prunes the file):
+
+```text
+test result: FAILED. 13 passed; 2 failed
+    delete_where_float_lt_inexact_double_deletes_the_row — deleted 0, not 1
+    update_where_float_lt_inexact_double_updates_the_row — updated 0, not 1
+    (assertion: merge_on_read=true: f = 1.0 satisfies f < 1.00000001)
+```
+
+### Green output
+
+```text
+cargo test -p iceberg-datafusion --lib expr_to_predicate  → 56 passed, 0 failed
+cargo test -p iceberg-datafusion --lib occ_exec_tests     → 15 passed, 0 failed
+cargo test -p iceberg-datafusion --lib                    → 251 passed, 0 failed, 1 ignored
+cargo test -p iceberg --lib expr                          → 406 passed, 0 failed
+```
+
+### Mutation output
+
+Reverted only the fix (removed the `.filter(predicate_binds_soundly)` call; tests
+and signature kept), uncommitted:
+
+```text
+expr_to_predicate: FAILED. 51 passed; 5 failed
+    bare_float_column_with_inexact_literal_is_not_pushed
+    cast_wrapped_double_column_with_long_literal_checks_exactness
+    cast_wrapped_float_column_in_list_with_inexact_element_is_not_pushed
+    cast_wrapped_float_column_with_inexact_literal_is_not_pushed
+    cast_wrapped_int_column_with_double_literal_is_not_pushed
+occ_exec_tests:    FAILED. 13 passed; 2 failed
+    delete_where_float_lt_inexact_double_deletes_the_row
+    update_where_float_lt_inexact_double_updates_the_row
+```
+
+Restored → 56 / 15 green.
+
+### Cast-shape audit (every other conversion shape and its verdict)
+
+- `CAST(foo AS INT64)` vs out-of-range Int64 literal → `i64_to_i32` sentinel →
+  kept; binding folds `x < AboveMax` / `x > BelowMin` to the correct constant —
+  pruning degenerates to keep-all, which is sound.
+- `CAST(foo AS FLOAT64)` vs `Float64(2.5)`/`Float64(2.0)` → `Datum::to(Int)`
+  errors → dropped. Previously the same shape was a loud mid-scan bind error;
+  dropping is strictly safer and now also covers the OCC path.
+- IN lists: one inexact element drops the whole set predicate — dropping a single
+  element would change semantics.
+- `String → Timestamp` beyond 6 sub-second digits → micros truncation → dropped;
+  ≤ 6 digits pushed.
+- Decimal literal vs Decimal column → `Datum::to` returns `self` (Java ignores
+  target scale) → unchanged literal → pushed; Java-identical.
+- `Long → Timestamp[tz]`, `Int → Date` reinterpret the i64/i32 verbatim → pushed.
+- Any leaf on a column the binding schema lacks (unary included) → dropped;
+  previously a bind error.
+- ±0.0: sign survives `as f32` and the pushed datum carries it → pushed, correct
+  under totalOrder metrics.
+- No pre-existing test expectation was weakened; every prior test passes
+  unmodified.
+
