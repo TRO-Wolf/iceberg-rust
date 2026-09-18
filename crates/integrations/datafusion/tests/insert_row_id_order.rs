@@ -324,6 +324,57 @@ async fn insert_overwrite_first_row_id_follows_ascending_partition_order() {
     }
 }
 
+fn unequal_source_table(sizes: &[i64]) -> MemTable {
+    let partitions = sizes
+        .iter()
+        .enumerate()
+        .map(|(partition, size)| {
+            let start = partition as i64 * 1000;
+            let ids: Vec<i64> = (start..start + size).collect();
+            let batch = RecordBatch::try_new(arrow_schema(), vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(
+                    ids.iter().map(|id| cat_for(*id, 3)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    ids.iter().map(|id| *id as f64 + 0.5).collect::<Vec<_>>(),
+                )),
+            ])
+            .expect("batch");
+            vec![batch]
+        })
+        .collect();
+    MemTable::try_new(arrow_schema(), partitions).expect("memtable")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_unpartitioned_first_row_id_follows_input_partition_index() {
+    let fixture = write_fixture("rowid_unpart_idx", false).await;
+    fixture
+        .ctx
+        .register_table("source", Arc::new(unequal_source_table(&[10, 20, 30, 40])))
+        .expect("register source");
+    let expected = vec![
+        (String::new(), 10, 0),
+        (String::new(), 20, 10),
+        (String::new(), 30, 30),
+        (String::new(), 40, 60),
+    ];
+    for run in 0..RUNS {
+        let table = format!("t{run}");
+        run_sql(
+            &fixture,
+            &format!("INSERT INTO catalog.rowid_unpart_idx.{table} SELECT id, cat, v FROM source"),
+        )
+        .await;
+        let files = committed_files(&fixture, &table).await;
+        assert_eq!(
+            files, expected,
+            "run {run} committed files out of input-partition order"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn insert_unpartitioned_first_row_id_tiles_the_write() {
     let fixture = write_fixture("rowid_unpart", false).await;
