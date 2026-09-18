@@ -56,9 +56,10 @@ impl NestedProjectionPlan {
         source_type: &DataType,
         target_type: &DataType,
         schema: &IcebergSchema,
+        name: &str,
     ) -> Result<Self> {
         Ok(Self {
-            root: PlanNode::build(source_type, target_type, schema, 0)?,
+            root: PlanNode::build(source_type, target_type, schema, 0, name)?,
         })
     }
 
@@ -125,6 +126,7 @@ impl PlanNode {
         target_type: &DataType,
         schema: &IcebergSchema,
         depth: usize,
+        path: &str,
     ) -> Result<Self> {
         if depth > MAX_NESTED_PROJECTION_DEPTH {
             return Err(Error::new(
@@ -137,7 +139,7 @@ impl PlanNode {
         }
         match (source_type, target_type) {
             (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
-                Self::build_struct(source_fields, target_fields, schema, depth)
+                Self::build_struct(source_fields, target_fields, schema, depth, path)
             }
             (DataType::List(source_element), DataType::List(target_element)) => {
                 Ok(PlanNode::List {
@@ -147,6 +149,7 @@ impl PlanNode {
                         target_element.data_type(),
                         schema,
                         depth + 1,
+                        &format!("{path}.{}", target_element.name()),
                     )?),
                     from_large: false,
                 })
@@ -159,6 +162,7 @@ impl PlanNode {
                         target_element.data_type(),
                         schema,
                         depth + 1,
+                        &format!("{path}.{}", target_element.name()),
                     )?),
                     from_small: false,
                 })
@@ -171,6 +175,7 @@ impl PlanNode {
                         target_element.data_type(),
                         schema,
                         depth + 1,
+                        &format!("{path}.{}", target_element.name()),
                     )?),
                     from_small: true,
                 })
@@ -183,6 +188,7 @@ impl PlanNode {
                         target_element.data_type(),
                         schema,
                         depth + 1,
+                        &format!("{path}.{}", target_element.name()),
                     )?),
                     from_large: true,
                 })
@@ -198,6 +204,7 @@ impl PlanNode {
                     target_element.data_type(),
                     schema,
                     depth + 1,
+                    &format!("{path}.{}", target_element.name()),
                 )?),
             }),
             (DataType::Map(source_entries, _), DataType::Map(target_entries, ordered)) => {
@@ -221,12 +228,14 @@ impl PlanNode {
                         target_key.data_type(),
                         schema,
                         depth + 1,
+                        &format!("{path}.{}", target_key.name()),
                     )?),
                     value: Box::new(Self::build(
                         source_value.data_type(),
                         target_value.data_type(),
                         schema,
                         depth + 1,
+                        &format!("{path}.{}", target_value.name()),
                     )?),
                 })
             }
@@ -241,6 +250,7 @@ impl PlanNode {
         target_fields: &Fields,
         schema: &IcebergSchema,
         depth: usize,
+        path: &str,
     ) -> Result<Self> {
         if !source_fields.is_empty() && source_fields.iter().all(|f| field_id_of(f).is_none()) {
             let source_type = DataType::Struct(source_fields.clone());
@@ -253,24 +263,31 @@ impl PlanNode {
         }
         let mut source_by_id: HashMap<i32, usize> = HashMap::with_capacity(source_fields.len());
         let mut source_by_name: HashMap<&str, usize> = HashMap::new();
-        let mut max_source_id = i32::MIN;
         for (pos, field) in source_fields.iter().enumerate() {
             if let Some(id) = field_id_of(field) {
                 source_by_id.insert(id, pos);
-                max_source_id = max_source_id.max(id);
             } else {
                 source_by_name.entry(field.name().as_str()).or_insert(pos);
             }
         }
         let mut children = Vec::with_capacity(target_fields.len());
         for target_child in target_fields.iter() {
-            let source_index = match field_id_of(target_child) {
-                Some(id) => source_by_id.get(&id).copied().or_else(|| {
-                    (id <= max_source_id)
-                        .then(|| source_by_name.get(target_child.name().as_str()).copied())
-                        .flatten()
-                }),
-                None => source_by_name.get(target_child.name().as_str()).copied(),
+            let source_index =
+                field_id_of(target_child).and_then(|id| source_by_id.get(&id).copied());
+            let source_index = match source_index {
+                Some(index) => Some(index),
+                None => {
+                    if source_by_name.contains_key(target_child.name().as_str()) {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "file mixes stamped and unstamped nested field ids in struct '{path}' at child '{}'; set a name mapping (schema.name-mapping.default) to resolve it",
+                                target_child.name()
+                            ),
+                        ));
+                    }
+                    None
+                }
             };
             let node = match source_index {
                 Some(index) => Self::build(
@@ -278,6 +295,7 @@ impl PlanNode {
                     target_child.data_type(),
                     schema,
                     depth + 1,
+                    &format!("{path}.{}", target_child.name()),
                 )?,
                 None => Self::build_fill(target_child, schema)?,
             };

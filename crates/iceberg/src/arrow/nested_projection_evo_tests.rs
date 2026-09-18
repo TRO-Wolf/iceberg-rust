@@ -58,7 +58,7 @@ fn nested_child_with_initial_default_reads_default() {
 }
 
 #[test]
-fn mixed_field_id_struct_matches_idless_child_by_name() {
+fn mixed_field_id_struct_with_unstamped_same_named_child_errors_loud() {
     let snapshot_schema = Arc::new(
         Schema::builder()
             .with_schema_id(1)
@@ -71,7 +71,6 @@ fn mixed_field_id_struct_matches_idless_child_by_name() {
                         NestedField::optional(3, "a", Type::Primitive(PrimitiveType::Int)).into(),
                         NestedField::optional(4, "b", Type::Primitive(PrimitiveType::String))
                             .into(),
-                        NestedField::optional(5, "c", Type::Primitive(PrimitiveType::Int)).into(),
                     ])),
                 )
                 .into(),
@@ -82,7 +81,6 @@ fn mixed_field_id_struct_matches_idless_child_by_name() {
     let s_fields = Fields::from(vec![
         Arc::new(id_field("a", DataType::Int32, true, 3)) as Arc<Field>,
         Arc::new(Field::new("b", DataType::Utf8, true)),
-        Arc::new(id_field("c", DataType::Int32, true, 5)),
     ]);
     let file_schema = Arc::new(ArrowSchema::new(vec![
         id_field("id", DataType::Int32, false, 1),
@@ -93,7 +91,6 @@ fn mixed_field_id_struct_matches_idless_child_by_name() {
         vec![
             Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef,
             Arc::new(StringArray::from(vec!["keep", "kept"])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![11, 12])) as ArrayRef,
         ],
         None,
     );
@@ -103,19 +100,12 @@ fn mixed_field_id_struct_matches_idless_child_by_name() {
     ])
     .unwrap();
     let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
-    let result = transformer.process_record_batch(file_batch).unwrap();
-    let s = result
-        .column(1)
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .unwrap();
-    let a = s.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    assert_eq!(a.values(), &[7, 8]);
-    let b = s.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(b.value(0), "keep");
-    assert_eq!(b.value(1), "kept");
-    let c = s.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
-    assert_eq!(c.values(), &[11, 12]);
+    let err = transformer.process_record_batch(file_batch).unwrap_err();
+    assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+    assert!(
+        err.to_string().contains("'b'") && err.to_string().contains("stamped and unstamped"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -554,7 +544,7 @@ fn list_source_projects_into_large_list_target() {
         true,
         6,
     )));
-    let mut plan = NestedProjectionPlan::build(arrs.data_type(), &target_type, &schema).unwrap();
+    let mut plan = NestedProjectionPlan::build(arrs.data_type(), &target_type, &schema, "list").unwrap();
     let result = plan.apply(Arc::new(arrs) as ArrayRef).unwrap();
     let arrs = result.as_any().downcast_ref::<LargeListArray>().unwrap();
     let elements = arrs
@@ -608,7 +598,7 @@ fn large_list_source_projects_into_list_target() {
         true,
         6,
     )));
-    let mut plan = NestedProjectionPlan::build(arrs.data_type(), &target_type, &schema).unwrap();
+    let mut plan = NestedProjectionPlan::build(arrs.data_type(), &target_type, &schema, "list").unwrap();
     let result = plan.apply(Arc::new(arrs) as ArrayRef).unwrap();
     let arrs = result.as_any().downcast_ref::<ListArray>().unwrap();
     let elements = arrs
@@ -663,7 +653,7 @@ fn fixed_size_list_rebuild_uses_target_size() {
         )),
         3,
     );
-    let mut plan = NestedProjectionPlan::build(source.data_type(), &target_type, &schema).unwrap();
+    let mut plan = NestedProjectionPlan::build(source.data_type(), &target_type, &schema, "list").unwrap();
     let result = plan.apply(Arc::new(source) as ArrayRef);
     assert!(result.is_err());
 }
@@ -694,7 +684,7 @@ fn nested_projection_plan_errors_past_max_depth() {
             10 + i,
         )]));
     }
-    let err = NestedProjectionPlan::build(&source_type, &target_type, &list_projection_schema())
+    let err = NestedProjectionPlan::build(&source_type, &target_type, &list_projection_schema(), "s")
         .unwrap_err();
     assert!(err.to_string().contains("exceeds depth"), "{err}");
 }

@@ -79,7 +79,7 @@ fn identical_nested_column_on_a_modify_batch_uses_pass_through() {
 }
 
 #[test]
-fn idless_source_child_named_like_a_readded_field_reads_null() {
+fn idless_source_child_named_like_a_readded_field_errors_loud() {
     let snapshot_schema = Arc::new(
         Schema::builder()
             .with_schema_id(1)
@@ -121,15 +121,142 @@ fn idless_source_child_named_like_a_readded_field_reads_null() {
     ])
     .unwrap();
     let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+    let err = transformer.process_record_batch(file_batch).unwrap_err();
+    assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+    assert!(
+        err.to_string().contains("'b'") && err.to_string().contains("stamped and unstamped"),
+        "{err}"
+    );
+}
+
+#[test]
+fn idless_child_when_sibling_struct_consumed_higher_ids_errors_loud() {
+    let snapshot_schema = Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    2,
+                    "other",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "x", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(4, "y", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(5, "z", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])),
+                )
+                .into(),
+                NestedField::optional(
+                    6,
+                    "s",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(7, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(8, "b", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let other_fields = Fields::from(vec![
+        id_field("x", DataType::Int32, true, 3),
+        id_field("y", DataType::Int32, true, 4),
+        id_field("z", DataType::Int32, true, 5),
+    ]);
+    let s_fields = Fields::from(vec![
+        Arc::new(id_field("a", DataType::Int32, true, 7)) as Arc<Field>,
+        Arc::new(Field::new("b", DataType::Utf8, true)),
+    ]);
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        id_field("id", DataType::Int32, false, 1),
+        id_field("other", DataType::Struct(other_fields.clone()), true, 2),
+        id_field("s", DataType::Struct(s_fields.clone()), true, 6),
+    ]));
+    let other = StructArray::new(
+        other_fields,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![5, 6])) as ArrayRef,
+        ],
+        None,
+    );
+    let s = StructArray::new(
+        s_fields,
+        vec![
+            Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["keep", "kept"])) as ArrayRef,
+        ],
+        None,
+    );
+    let file_batch = RecordBatch::try_new(file_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(other) as ArrayRef,
+        Arc::new(s) as ArrayRef,
+    ])
+    .unwrap();
+    let mut transformer =
+        RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2, 6]).build();
+    let err = transformer.process_record_batch(file_batch).unwrap_err();
+    assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+    assert!(
+        err.to_string().contains("'b'") && err.to_string().contains("stamped and unstamped"),
+        "{err}"
+    );
+}
+
+#[test]
+fn idless_source_child_matching_no_target_child_is_ignored() {
+    let snapshot_schema = Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    2,
+                    "s",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let s_fields = Fields::from(vec![
+        Arc::new(id_field("a", DataType::Int32, true, 3)) as Arc<Field>,
+        Arc::new(Field::new("b", DataType::Utf8, true)),
+    ]);
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        id_field("id", DataType::Int32, false, 1),
+        id_field("s", DataType::Struct(s_fields.clone()), true, 2),
+    ]));
+    let s = StructArray::new(
+        s_fields,
+        vec![
+            Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["old", "vals"])) as ArrayRef,
+        ],
+        None,
+    );
+    let file_batch = RecordBatch::try_new(file_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(s) as ArrayRef,
+    ])
+    .unwrap();
+    let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
     let result = transformer.process_record_batch(file_batch).unwrap();
     let s = result
         .column(1)
         .as_any()
         .downcast_ref::<StructArray>()
         .unwrap();
-    let b = s.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-    assert!(b.is_null(0));
-    assert!(b.is_null(1));
+    assert_eq!(s.num_columns(), 1);
+    let a = s.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(a.values(), &[7, 8]);
 }
 
 #[test]
@@ -255,7 +382,7 @@ fn list_element_field_named_differently_still_projects() {
         true,
         6,
     )));
-    let mut plan = NestedProjectionPlan::build(arrs.data_type(), &target_type, &schema).unwrap();
+    let mut plan = NestedProjectionPlan::build(arrs.data_type(), &target_type, &schema, "list").unwrap();
     let result = plan.apply(Arc::new(arrs) as ArrayRef).unwrap();
     assert_eq!(result.data_type(), &target_type);
     let arrs = result.as_any().downcast_ref::<ListArray>().unwrap();
