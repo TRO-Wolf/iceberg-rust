@@ -38,9 +38,8 @@ use crate::{Error, ErrorKind, Result};
 
 /// Project `batch` onto `schema`, filling any missing field from `write-default`.
 ///
-/// `target_schema` is `schema`'s Arrow projection, precomputed once per writer. A complete
-/// batch in Iceberg field order is returned borrowed. Extra batch columns are dropped.
-/// Nested `write-default` fill is refused (row R92 residue).
+/// A complete batch in Iceberg field order is returned borrowed. Extra batch columns
+/// are dropped. Nested `write-default` fill is refused (row R92 residue).
 ///
 /// # Errors
 ///
