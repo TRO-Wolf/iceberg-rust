@@ -204,41 +204,14 @@ impl CherryPickAction {
             .cloned()
     }
 
-    /// Decide the published shape against the refreshed `table`, mirroring Java `cherrypick(long)` (L69-141)
-    /// with the `apply()` fast-forward precedence (L193-204). The fast-forward check runs FIRST, so an APPEND
-    /// or replace-partitions OVERWRITE whose parent == head fast-forwards (no replay) — exactly Java's
-    /// `requireFastForward || isFastForward(base)` ordering.
     async fn plan(&self, table: &Table) -> Result<CherryPickPlan> {
         let metadata = table.metadata();
         let picked = self.require_picked(metadata)?.clone();
-
-        // Fast-forward PRECEDENCE (Java `apply` L193-204): if the staged snapshot's parent is the current head
-        // (or both null), publish it as-is with no replay, regardless of its operation.
-        if Self::is_fast_forward(&picked, metadata) {
-            return Ok(CherryPickPlan::FastForward {
-                picked_id: picked.snapshot_id(),
-            });
-        }
-
         let operation = picked.summary().operation.clone();
         let published_wap_id = Self::published_wap_id(&picked);
+        let replace_partitions = Self::is_replace_partitions(&picked);
 
-        if operation == Operation::Append {
-            // APPEND replay (Java L78-92): replay the picked snapshot's ADDED data files only.
-            let changes = picked_snapshot_changes(table, &picked).await?;
-            return Ok(CherryPickPlan::Replay {
-                operation: Operation::Append,
-                added_data_files: changes.added,
-                removed_data_file_paths: HashSet::new(),
-                replaced_partitions: HashSet::new(),
-                published_wap_id,
-            });
-        }
-
-        if Self::is_replace_partitions(&picked) {
-            // OVERWRITE + replace-partitions replay (Java L93-129). The picked snapshot's parent must be null
-            // (overwrite based on an empty table) or an ancestor of the current state — otherwise the
-            // since-parent change detection in `validateReplacedPartitions` is meaningless (Java L101-105).
+        if replace_partitions {
             let parent_ok = match picked.parent_snapshot_id() {
                 None => true,
                 Some(parent_id) => is_current_ancestor(metadata, parent_id),
@@ -249,7 +222,29 @@ impl CherryPickAction {
                     self.snapshot_id
                 )));
             }
+            self.validate_wap_publish(metadata)?;
+        } else if operation == Operation::Append {
+            self.validate_wap_publish(metadata)?;
+        }
 
+        if Self::is_fast_forward(&picked, metadata) {
+            return Ok(CherryPickPlan::FastForward {
+                picked_id: picked.snapshot_id(),
+            });
+        }
+
+        if operation == Operation::Append {
+            let changes = picked_snapshot_changes(table, &picked).await?;
+            return Ok(CherryPickPlan::Replay {
+                operation: Operation::Append,
+                added_data_files: changes.added,
+                removed_data_file_paths: HashSet::new(),
+                replaced_partitions: HashSet::new(),
+                published_wap_id,
+            });
+        }
+
+        if replace_partitions {
             let changes = picked_snapshot_changes(table, &picked).await?;
             let replaced_partitions = changes
                 .added
@@ -1359,7 +1354,7 @@ mod tests {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
         let (table, staged_id, _s0) =
-            stage_append_for_replay(&catalog, &table, "test/staged.parquet", 0, "wap-dedup").await;
+            stage_append_for_replay(&catalog, &table, "test/staged.parquet", 0, "").await;
 
         // First publish: succeeds, tags the published snapshot with source-snapshot-id = staged_id.
         let table = cherry_pick(&catalog, &table, staged_id).await;
@@ -1978,16 +1973,8 @@ mod tests {
         );
     }
 
-    /// ORDERING PIN (both dedup paths apply). When a staged snapshot is BOTH already an ancestor of the head
-    /// AND carries a `wap.id` already published among the ancestors, Java's `validate` runs
-    /// `validateNonAncestor` BEFORE `validateWapPublish` (1.10.0 bytecode `CherryPickOperation.validate`
-    /// offsets 8-55), so the ANCESTRY error fires first. Here we re-pick the SAME staged snapshot after it was
-    /// fast-forwarded onto main: it is now an ancestor (ancestry path) AND its own `wap.id` is published (WAP
-    /// path) — both conditions hold. The error must be the ancestry one ("already an ancestor"), NOT the WAP
-    /// one. Risk pinned: mirroring Java's rejection ORDER — a port that ran the WAP check first would surface
-    /// the wrong (DuplicateWAPCommitException-shaped) message for an already-ancestor pick.
     #[tokio::test]
-    async fn test_cherrypick_both_dedup_paths_ancestry_error_fires_first() {
+    async fn test_cherrypick_both_dedup_paths_wap_error_fires_first() {
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
@@ -2008,21 +1995,18 @@ mod tests {
         let table = cherry_pick(&catalog, &table, s1).await;
         assert_eq!(table.metadata().current_snapshot_id(), Some(s1));
 
-        // Re-pick S1: it is BOTH already an ancestor AND its wap id (Z) is published (on S1 itself). Java's
-        // validate runs validateNonAncestor FIRST ⇒ the ancestry error wins, NOT the duplicate-WAP error.
         let err = cherry_pick_err(&catalog, &table, s1).await;
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(
-            err.message().contains(&format!(
-                "Cannot cherrypick snapshot {s1}: already an ancestor"
-            )),
-            "the ANCESTRY error must fire first (Java order), got: {}",
+            err.message().contains(
+                "Duplicate request to cherry pick wap id that was published already: wap-Z"
+            ),
+            "the WAP error must fire first (Java order), got: {}",
             err.message()
         );
         assert!(
-            !err.message()
-                .contains("Duplicate request to cherry pick wap id"),
-            "the WAP error must NOT be the one surfaced when both paths apply, got: {}",
+            !err.message().contains("already an ancestor"),
+            "the ancestry error must NOT be the one surfaced when both paths apply, got: {}",
             err.message()
         );
     }

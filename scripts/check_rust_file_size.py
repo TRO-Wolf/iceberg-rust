@@ -96,7 +96,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/spec/values/tests.rs": 2367,
     "crates/iceberg/src/spec/view_metadata_builder.rs": 1661,
     "crates/iceberg/src/transaction/append.rs": 1542,
-    "crates/iceberg/src/transaction/cherry_pick.rs": 2132,
+    "crates/iceberg/src/transaction/cherry_pick.rs": 2116,
     "crates/iceberg/src/transaction/delete_files.rs": 2261,
     "crates/iceberg/src/transaction/expire_cleanup.rs": 1857,
     "crates/iceberg/src/transaction/expire_snapshots.rs": 1388,
