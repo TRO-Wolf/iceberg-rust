@@ -1166,20 +1166,19 @@ impl TransactionAction for UpdateSchemaAction {
         let schema = metadata.current_schema();
         let current_schema_id = metadata.current_schema_id();
         let last_column_id = metadata.last_column_id();
-
         let mut evolution = SchemaEvolution::new(
             schema,
             last_column_id,
             self.case_sensitive,
             self.allow_incompatible_changes,
         )?;
-
         for op in &self.ops {
             evolution.replay(op)?;
         }
-
         let new_schema = evolution.apply()?;
-
+        if new_schema.is_same_schema(schema) {
+            return Ok(ActionCommit::new(vec![], vec![]));
+        }
         let updates = vec![
             TableUpdate::AddSchema { schema: new_schema },
             TableUpdate::SetCurrentSchema {
@@ -1771,11 +1770,7 @@ mod tests {
     async fn test_no_op_rebuilds_equal_schema() {
         let table = v2_table();
         let updates = run(UpdateSchemaAction::new(), &table).await;
-        let schema = added_schema(&updates);
-        assert_eq!(
-            schema.as_struct(),
-            table.metadata().current_schema().as_struct()
-        );
+        assert!(updates.is_empty(), "a no-op must emit no updates");
     }
 
     // ----- addColumn: top-level -----
@@ -2072,8 +2067,7 @@ mod tests {
     async fn test_require_already_required_column_is_noop() {
         let table = v2_table(); // x required
         let updates = run(UpdateSchemaAction::new().require_column("x"), &table).await;
-        let schema = added_schema(&updates);
-        assert!(schema.field_by_name("x").expect("x").required);
+        assert!(updates.is_empty(), "a no-op must emit no updates");
     }
 
     // RISK: requireColumn on an optional field WITH the flag must succeed and make it required.
@@ -3066,12 +3060,7 @@ mod tests {
         let table = nested_table();
         let mirror = table.metadata().current_schema().as_ref().clone();
         let updates = run(UpdateSchemaAction::new().union_by_name_with(mirror), &table).await;
-        let schema = added_schema(&updates);
-        assert_eq!(
-            schema.as_struct(),
-            table.metadata().current_schema().as_struct(),
-            "union of a schema with itself must not change it"
-        );
+        assert!(updates.is_empty(), "a no-op must emit no updates");
     }
 
     // RISK: union must apply a doc-only change without touching type or nullability.

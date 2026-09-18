@@ -73,13 +73,6 @@ impl MetadataLocation {
         ])
     }
 
-    pub(crate) fn with_next_version_fresh_id(&self) -> Self {
-        Self {
-            id: Some(Uuid::new_v4()),
-            ..self.with_next_version()
-        }
-    }
-
     fn parse_metadata_path_prefix(path: &str) -> Result<String> {
         let prefix = path.strip_suffix("/metadata").ok_or(Error::new(
             ErrorKind::Unexpected,

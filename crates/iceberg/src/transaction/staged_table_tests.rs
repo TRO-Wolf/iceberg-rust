@@ -805,3 +805,160 @@ async fn replace_with_different_schema_keeps_caller_ids() {
     );
     assert!(s1_schema.field_by_id(2).is_some_and(|f| f.name == "name"));
 }
+
+async fn seed_hadoop_v2(
+    catalog: &impl Catalog,
+    file_io: &FileIO,
+    warehouse: &str,
+    name: &str,
+) -> (TableIdent, Table, String) {
+    let ns = NamespaceIdent::new("sales".into());
+    catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+    let original = catalog
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name("seed".into())
+                .schema(schema_id_name())
+                .build(),
+        )
+        .await
+        .unwrap();
+    let table_location = format!("{warehouse}/sales/{name}");
+    let v2 = format!("{table_location}/metadata/v2.metadata.json");
+    original
+        .metadata()
+        .write_to(file_io, &v2)
+        .await
+        .expect("seed v2");
+    let ident = TableIdent::new(ns, name.into());
+    let registered = catalog
+        .register_table(&ident, v2)
+        .await
+        .expect("register v2");
+    (ident, registered, table_location)
+}
+
+fn replace_orders_creation(name: &str) -> TableCreation {
+    TableCreation::builder()
+        .name(name.to_string())
+        .schema(schema_id_name())
+        .build()
+}
+
+#[tokio::test]
+async fn hadoop_replace_with_files_publishes_only_next_version() {
+    let tmp = TempDir::new().unwrap();
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let (catalog, file_io) = shared_fs_catalog(&warehouse).await;
+    let (_ident, registered, table_location) =
+        seed_hadoop_v2(&catalog, &file_io, &warehouse, "orders").await;
+
+    let staged =
+        StagedTableTransaction::begin_replace(&registered, replace_orders_creation("orders"))
+            .await
+            .expect("begin replace");
+    let staged_location = staged
+        .table()
+        .metadata_location_result()
+        .expect("staged location")
+        .to_string();
+    assert_eq!(
+        staged_location,
+        format!("{table_location}/metadata/v3.metadata.json")
+    );
+
+    let published = staged
+        .add_data_files(vec![data_file(
+            &format!("{table_location}/data/f.parquet"),
+            4,
+        )])
+        .commit(&catalog)
+        .await
+        .expect("publish replace");
+
+    assert_eq!(
+        published.metadata_location_result().expect("location"),
+        staged_location.as_str(),
+        "a staged replace with pending files must publish the staged version, not the next one"
+    );
+    assert!(
+        published.metadata().current_snapshot().is_some(),
+        "the pending files must be appended in the published metadata"
+    );
+    assert!(
+        !file_io
+            .exists(format!("{table_location}/metadata/v4.metadata.json"))
+            .await
+            .expect("v4 exists check"),
+        "a single staged replace must not leave a v4 behind"
+    );
+}
+
+#[tokio::test]
+async fn hadoop_replace_without_files_publishes_only_next_version() {
+    let tmp = TempDir::new().unwrap();
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let (catalog, file_io) = shared_fs_catalog(&warehouse).await;
+    let (_ident, registered, table_location) =
+        seed_hadoop_v2(&catalog, &file_io, &warehouse, "orders").await;
+
+    let staged =
+        StagedTableTransaction::begin_replace(&registered, replace_orders_creation("orders"))
+            .await
+            .expect("begin replace");
+    let staged_location = staged
+        .table()
+        .metadata_location_result()
+        .expect("staged location")
+        .to_string();
+    assert_eq!(
+        staged_location,
+        format!("{table_location}/metadata/v3.metadata.json")
+    );
+
+    let published = staged.commit(&catalog).await.expect("publish replace");
+    assert_eq!(
+        published.metadata_location_result().expect("location"),
+        staged_location.as_str()
+    );
+    assert!(
+        !file_io
+            .exists(format!("{table_location}/metadata/v4.metadata.json"))
+            .await
+            .expect("v4 exists check"),
+        "a no-files staged replace must not leave a v4 behind"
+    );
+}
+
+#[tokio::test]
+async fn apply_locally_empty_updates_keep_the_metadata_arc() {
+    let tmp = TempDir::new().unwrap();
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let (catalog, _) = shared_fs_catalog(&warehouse).await;
+    let ns = NamespaceIdent::new("sales".into());
+    catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+    let table = catalog
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name("orders".into())
+                .schema(schema_id_name())
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_schema()
+        .move_before("id", "name")
+        .apply(tx)
+        .expect("apply no-op move");
+    let applied = tx.apply_locally().await.expect("apply_locally");
+
+    assert!(
+        Arc::ptr_eq(&table.metadata_ref(), &applied.metadata_ref()),
+        "an action with zero updates must return the same metadata, not a rebuild"
+    );
+}

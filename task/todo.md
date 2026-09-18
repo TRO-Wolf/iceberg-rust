@@ -25,6 +25,48 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-17): F-ICE-RESIDUES-21B fork-residue lane, five closures vs Java 1.10.0
+
+Ledger: [`f-ice-residues-21b-ledger.md`](f-ice-residues-21b-ledger.md). Run 21b residue items on
+`fix/ice-residues-21b` (cut off `8fb44a39`). Consumer: RePark round-21b residue closures.
+
+- [x] I-1 F-HADOOP-VN-REPLACE-1: staged replace on a `vN` base stages `v(N+1)` via
+      `with_next_version` + `write_commit_metadata` exclusive create; `with_next_version_fresh_id`
+      deleted. Red→green: staged_table_version_tests + hadoop_version_commit. `f91b1287`
+- [x] I-2 F-CHERRYPICK-WAP-ORDER-1: `validate_wap_publish` runs at dispatch inside `plan` for
+      APPEND/replace-partitions (RP after parent check), before fast-forward — Java
+      `CherryPickOperation.cherrypick` builder-time order. Red→green, 23/23. `83584125`
+- [x] I-3 F-UPDATE-SCHEMA-SAME-1: structurally equal schema update emits zero updates +
+      `do_commit` skips `catalog.update_table` on empty updates (Java `ops.commit` `base ==
+      metadata`); fixed `is_same_schema` order-sensitive HashSet-iterator `eq` on
+      identifier-field ids. Red→green, `tests/hadoop_version_commit.rs::update_schema_noop` 6 pins. `f0ea7e9b`
+- [x] I-4 Q-20b-C: `rollback_to_time` walk already Java-exact (strict `<`, current ancestry);
+      residual gap closed — snapshotless table now fails with Java's
+      "no valid snapshot older than" (empty ancestry), not the missing-current message.
+      Red→green, interop pin added. `d3979d80`
+- [x] I-5 R-01: `cached_plan` — `validate`/`commit` share one `plan` keyed on base
+      `Arc<TableMetadata>` identity; re-plans on any rebuilt base. 23/23 identical
+      before/after. `a7849bf5`
+- [x] I-6 ledger + `todo.md` entry + GAP_MATRIX R94/R98/R110/R158/R167 dated sentences
+- [x] I-7 gates: `cargo test -p iceberg --lib` 3762/0 fail, the three interop tests
+      + the three lane tests all green, workspace clippy `-D warnings` (both
+      feature flavors) clean, `fmt --check`, taplo/machete/artifacts/anchors/
+      comment-blocks/file-size all clean, `git log`/`status`/Rule-1 grep
+      verified → `handback.json` written
+- [x] Round 2 (mechanical rejection fix): the 6 schema no-op pins folded into
+      `tests/hadoop_version_commit.rs::update_schema_noop`, the new file deleted
+      (comment-ban gate), ` (#292)` stripped from every subject. `5ac429a8`
+- [x] Round 3 (Grok reviews — logic NEEDS_REMEDIATION, perf PASS+2×P2):
+      L-001 deterministic `is_same_schema` set pins + schema-id reuse (`e2524fb5`);
+      L-002+L-004 staged replace publishes exactly `v(N+1)` via
+      `apply_locally_in_place` + gzip-base pin (`e4ce33a2`); R-01 `Arc<CherryPickPlan>`
+      cache + R-02 empty-apply early return + L-003 cache-consume pin (`3d143992`);
+      ledger/Q2 ruled final
+- [x] Round 4 (verification critic — one P2): V-001 — `apply_locally_in_place`'s
+      `write_to` clobbered a live `v(N+1)` before the CAS; Java-shaped fix defers
+      the Hadoop stage write to `commit` (probe for early conflict, exclusive
+      create once with final bytes). Red pin `a3c06a8c`, fix `436e7bde`
+
 ## ACTIVE (2026-09-17): F-OCC-SCOPED-1 filter-scoped conflict detection and retry-on-rebase (fork half)
 
 Ledger: [`f-occ-scoped-1-ledger.md`](f-occ-scoped-1-ledger.md). Rating V2-20a: a serializable

@@ -223,6 +223,50 @@ async fn register_and_commit(
         .clone()
 }
 
+async fn register_and_try_commit(
+    table_name: &str,
+    base: TableMetadata,
+    queue_action: impl FnOnce(Transaction) -> Transaction,
+) -> iceberg::Result<TableMetadata> {
+    let warehouse = tempfile::tempdir().expect("create temp warehouse dir");
+    let warehouse_path = warehouse.path().to_str().expect("utf-8 warehouse path");
+
+    let file_io = FileIOBuilder::new(Arc::new(LocalFsStorageFactory)).build();
+    let base_location = format!(
+        "{warehouse_path}/{table_name}/metadata/00000-00000000-0000-0000-0000-000000000000.metadata.json"
+    );
+    base.write_to(&file_io, &base_location)
+        .await
+        .expect("write base metadata to warehouse");
+
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .load(
+            "interop",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                warehouse_path.to_string(),
+            )]),
+        )
+        .await
+        .expect("build memory catalog");
+
+    let namespace = NamespaceIdent::new("interop".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+
+    let table_ident = TableIdent::new(namespace, table_name.to_string());
+    let table = catalog
+        .register_table(&table_ident, base_location)
+        .await
+        .expect("register table from base metadata");
+
+    let transaction = queue_action(Transaction::new(&table));
+    Ok(transaction.commit(&catalog).await?.metadata().clone())
+}
+
 /// Run the Rust evolution for a scenario through a real in-memory-catalog commit: write the exact
 /// Java-written base metadata into a temp warehouse, register it, queue the scenario's op-sequence,
 /// commit, and return the evolved metadata. The base round-trips through `serde_json` (the registration
@@ -410,4 +454,34 @@ async fn test_remove_and_rename_drops_tag_and_moves_branch() {
     );
     assert!(feature.is_branch(), "the renamed ref stays a branch");
     assert!(refs.contains_key(MAIN_BRANCH), "main is untouched");
+}
+
+#[tokio::test]
+async fn test_rollback_to_time_on_snapshotless_table_fails_with_java_message() {
+    let base = load_metadata(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/table_metadata"),
+        "TableMetadataV2ValidMinimal.json",
+    );
+    assert!(
+        base.current_snapshot_id().is_none(),
+        "the minimal fixture must carry no current snapshot"
+    );
+    let error = register_and_try_commit("rollback_to_time_empty", base, |transaction| {
+        let action = transaction
+            .manage_snapshots()
+            .rollback_to_time(ROOT_TS_MS + 1);
+        action
+            .apply(transaction)
+            .expect("queue rollback_to_time on a snapshotless table")
+    })
+    .await
+    .map(|_| ())
+    .expect_err("rollback_to_time on a snapshotless table must fail");
+    assert!(
+        error
+            .message()
+            .contains("Cannot roll back, no valid snapshot older than"),
+        "unexpected message: {}",
+        error.message()
+    );
 }

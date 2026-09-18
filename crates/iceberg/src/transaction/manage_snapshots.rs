@@ -382,15 +382,11 @@ impl TransactionAction for ManageSnapshotsAction {
                     mark_touched(MAIN_BRANCH, &mut touched_order, &mut touched_set);
                 }
                 SnapshotOp::RollbackToTime { timestamp_ms } => {
-                    let current =
-                        refs.get(MAIN_BRANCH)
-                            .map(|r| r.snapshot_id)
-                            .ok_or_else(|| {
-                                data_invalid(
-                                    "Cannot roll back: table has no current snapshot".to_string(),
-                                )
-                            })?;
-                    let target = find_latest_ancestor_older_than(metadata, current, *timestamp_ms)
+                    let target = refs
+                        .get(MAIN_BRANCH)
+                        .and_then(|r| {
+                            find_latest_ancestor_older_than(metadata, r.snapshot_id, *timestamp_ms)
+                        })
                         .ok_or_else(|| {
                             data_invalid(format!(
                                 "Cannot roll back, no valid snapshot older than: {timestamp_ms}"

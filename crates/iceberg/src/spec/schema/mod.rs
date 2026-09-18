@@ -484,7 +484,7 @@ impl Schema {
     /// Check if this schema is identical to another schema semantically - excluding schema id.
     pub(crate) fn is_same_schema(&self, other: &SchemaRef) -> bool {
         self.as_struct().eq(other.as_struct())
-            && self.identifier_field_ids().eq(other.identifier_field_ids())
+            && self.identifier_field_ids == other.identifier_field_ids
     }
 
     /// Change the schema id of this schema.

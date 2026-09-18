@@ -164,14 +164,6 @@ impl StagedTableTransaction {
             ));
         }
         let base_metadata_location = existing.metadata_location_result()?.to_string();
-        // A replace keeps the table's root location STABLE: reuse the caller-provided location if
-        // any, else the existing table's current location. Do NOT derive a `__staged_replace`
-        // suffix — baking a stage suffix into the metadata relocated the table on every replace and
-        // compounded it (orders__staged_replace__staged_replace…), sending future writers to a
-        // drifted path and orphaning intent (finding N2). Staging isolation comes from NOT moving
-        // the catalog pointer until `commit`, not from a separate directory: the new metadata file
-        // gets a fresh version+UUID under the stable location's `metadata/` dir and only becomes
-        // current at publish. Data already written elsewhere stays readable — manifests are absolute.
         let existing_location = existing.metadata().location().trim_end_matches('/');
         let table_location = creation
             .location
@@ -236,12 +228,16 @@ impl StagedTableTransaction {
                 .metadata;
 
         let metadata_location = match MetadataLocation::from_str(&base_metadata_location) {
-            Ok(base) if keeps_location => base.with_next_version_fresh_id().to_string(),
+            Ok(base) if keeps_location => base.with_next_version().to_string(),
             _ => MetadataLocation::new_with_table_location(&table_location).to_string(),
         };
-        metadata
-            .write_to(existing.file_io(), &metadata_location)
-            .await?;
+        if hadoop_staged_location(&metadata_location) {
+            ensure_staged_version_absent(existing.file_io(), &metadata_location).await?;
+        } else {
+            metadata
+                .write_commit_metadata(existing.file_io(), &metadata_location)
+                .await?;
+        }
 
         let table = Table::builder()
             .file_io(existing.file_io().clone())
@@ -304,7 +300,15 @@ impl StagedTableTransaction {
 
     async fn materialize_pending(self) -> Result<Table> {
         if self.pending_data_files.is_empty() && !self.replace_write {
-            return Ok(self.table);
+            let table = self.table;
+            let staged_location = table.metadata_location_result()?.to_string();
+            if hadoop_staged_location(&staged_location) {
+                table
+                    .metadata()
+                    .write_commit_metadata(table.file_io(), &staged_location)
+                    .await?;
+            }
+            return Ok(table);
         }
         let tx = Transaction::new(&self.table);
         if self.replace_write {
@@ -314,13 +318,13 @@ impl StagedTableTransaction {
                 .add_files(self.pending_data_files)
                 .allow_empty_commit()
                 .apply(tx)?;
-            tx.apply_locally().await
+            tx.apply_locally_in_place().await
         } else {
             let tx = tx
                 .fast_append()
                 .add_data_files(self.pending_data_files)
                 .apply(tx)?;
-            tx.apply_locally().await
+            tx.apply_locally_in_place().await
         }
     }
 }
@@ -331,6 +335,28 @@ impl Transaction {
     /// Used by [`StagedTableTransaction`]: the engine finishes FileIO work first, then publishes
     /// the pointer in one catalog step.
     pub async fn apply_locally(self) -> Result<Table> {
+        let current_table = self.run_actions_locally().await?;
+        let next_location = MetadataLocation::from_str(current_table.metadata_location_result()?)?
+            .with_next_version()
+            .to_string();
+        current_table
+            .metadata()
+            .write_commit_metadata(current_table.file_io(), &next_location)
+            .await?;
+        Ok(current_table.with_metadata_location(next_location))
+    }
+
+    pub(crate) async fn apply_locally_in_place(self) -> Result<Table> {
+        let current_table = self.run_actions_locally().await?;
+        let staged_location = current_table.metadata_location_result()?.to_string();
+        current_table
+            .metadata()
+            .write_commit_metadata(current_table.file_io(), &staged_location)
+            .await?;
+        Ok(current_table)
+    }
+
+    async fn run_actions_locally(self) -> Result<Table> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<crate::TableUpdate> = vec![];
         let mut existing_requirements: Vec<crate::TableRequirement> = vec![];
@@ -351,15 +377,7 @@ impl Transaction {
             )?;
         }
 
-        let current_location = current_table.metadata_location_result()?;
-        let next_location = MetadataLocation::from_str(current_location)?
-            .with_next_version()
-            .to_string();
-        current_table
-            .metadata()
-            .write_commit_metadata(current_table.file_io(), &next_location)
-            .await?;
-        Ok(current_table.with_metadata_location(next_location))
+        Ok(current_table)
     }
 }
 
@@ -381,6 +399,39 @@ fn parse_format_version_property(raw: &str) -> Result<FormatVersion> {
             ),
         )),
     }
+}
+
+fn hadoop_staged_location(metadata_location: &str) -> bool {
+    MetadataLocation::from_str(metadata_location).is_ok_and(|parsed| parsed.is_hadoop_convention())
+}
+
+async fn ensure_staged_version_absent(file_io: &FileIO, metadata_location: &str) -> Result<()> {
+    let mut occupied = if file_io.exists(metadata_location).await? {
+        Some(metadata_location.to_string())
+    } else {
+        None
+    };
+    if occupied.is_none()
+        && let Ok(parsed) = MetadataLocation::from_str(metadata_location)
+        && let Some(siblings) = parsed.hadoop_version_siblings()
+    {
+        for sibling in siblings {
+            if file_io.exists(&sibling).await? {
+                occupied = Some(sibling);
+                break;
+            }
+        }
+    }
+    if let Some(existing) = occupied {
+        return Err(Error::new(
+            ErrorKind::CatalogCommitConflicts,
+            format!(
+                "Cannot stage replace to {metadata_location}: version file already exists ({existing})"
+            ),
+        )
+        .with_retryable(true));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

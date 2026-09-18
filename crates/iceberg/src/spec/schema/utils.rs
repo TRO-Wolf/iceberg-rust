@@ -800,4 +800,85 @@ mod tests {
         assert_eq!(index.get(&3).map(String::as_str), Some("`point`.`x`"));
         assert_eq!(index.get(&4).map(String::as_str), Some("`point`.`y`"));
     }
+
+    #[test]
+    fn test_is_same_schema_identifier_ids_compare_as_set() {
+        let fields = || -> Vec<NestedFieldRef> {
+            (1..=64)
+                .map(|id| {
+                    NestedField::required(id, format!("f{id}"), Type::Primitive(PrimitiveType::Int))
+                        .into()
+                })
+                .collect()
+        };
+        for _ in 0..512 {
+            let forward = Schema::builder()
+                .with_fields(fields())
+                .with_identifier_field_ids(1..=32)
+                .build()
+                .unwrap();
+            let reverse = Schema::builder()
+                .with_fields(fields())
+                .with_identifier_field_ids((1..=32).rev())
+                .build()
+                .unwrap();
+            assert!(
+                forward.is_same_schema(&std::sync::Arc::new(reverse)),
+                "equal identifier-field-id sets must compare equal regardless of insertion order"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reused_schema_id_for_equal_schema_with_reordered_identifier_ids() {
+        for _ in 0..64 {
+            let forward = Schema::builder()
+                .with_fields(
+                    (1..=64)
+                        .map(|id| {
+                            NestedField::required(
+                                id,
+                                format!("f{id}"),
+                                Type::Primitive(PrimitiveType::Int),
+                            )
+                            .into()
+                        })
+                        .collect::<Vec<NestedFieldRef>>(),
+                )
+                .with_identifier_field_ids(1..=32)
+                .build()
+                .unwrap();
+            let metadata = crate::spec::TableMetadataBuilder::new(
+                forward,
+                crate::spec::PartitionSpec::unpartition_spec(),
+                crate::spec::SortOrder::unsorted_order(),
+                "s3://bucket/t".to_string(),
+                crate::spec::FormatVersion::V2,
+                HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+            let stored = metadata.current_schema();
+            let mut reversed: Vec<i32> = stored.identifier_field_ids().collect();
+            reversed.reverse();
+            let reordered = Schema::builder()
+                .with_fields(stored.as_struct().fields().to_vec())
+                .with_identifier_field_ids(reversed)
+                .build()
+                .unwrap();
+            let rebuilt = crate::spec::TableMetadataBuilder::new_from_metadata(metadata, None)
+                .add_schema(reordered)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+            assert_eq!(
+                rebuilt.schemas_iter().count(),
+                1,
+                "a structurally equal schema must reuse the existing schema id"
+            );
+        }
+    }
 }
