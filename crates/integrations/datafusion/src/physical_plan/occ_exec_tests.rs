@@ -199,7 +199,7 @@ async fn float_fixture(merge_on_read: bool, f_seed: &str) -> OccFixture {
         .expect("catalog provider");
     let ctx = SessionContext::new();
     ctx.register_catalog("catalog", Arc::new(catalog_provider));
-    ctx.sql(&format!("INSERT INTO catalog.ns.t VALUES (1, {f_seed})"))
+    ctx.sql(&format!("INSERT INTO catalog.ns.t VALUES {f_seed}"))
         .await
         .expect("plan seed insert")
         .collect()
@@ -665,7 +665,7 @@ async fn dml_count(ctx: &SessionContext, sql: &str) -> u64 {
 #[tokio::test]
 async fn delete_where_float_lt_inexact_double_deletes_the_row() {
     for merge_on_read in [true, false] {
-        let fixture = float_fixture(merge_on_read, "1.0").await;
+        let fixture = float_fixture(merge_on_read, "(1, 1.0)").await;
         let deleted = dml_count(
             &fixture.ctx,
             "DELETE FROM catalog.ns.t WHERE f < 1.00000001",
@@ -686,7 +686,7 @@ async fn delete_where_float_lt_inexact_double_deletes_the_row() {
 #[tokio::test]
 async fn update_where_float_lt_inexact_double_updates_the_row() {
     for merge_on_read in [true, false] {
-        let fixture = float_fixture(merge_on_read, "1.0").await;
+        let fixture = float_fixture(merge_on_read, "(1, 1.0)").await;
         let updated = dml_count(
             &fixture.ctx,
             "UPDATE catalog.ns.t SET id = 9 WHERE f < 1.00000001",
@@ -711,7 +711,7 @@ async fn update_where_float_lt_inexact_double_updates_the_row() {
 #[tokio::test]
 async fn delete_where_cast_to_int_eq_deletes_the_row() {
     for merge_on_read in [true, false] {
-        let fixture = float_fixture(merge_on_read, "2.5").await;
+        let fixture = float_fixture(merge_on_read, "(1, 2.5)").await;
         let deleted = dml_count(
             &fixture.ctx,
             "DELETE FROM catalog.ns.t WHERE CAST(f AS INT) = 2",
@@ -732,12 +732,8 @@ async fn delete_where_cast_to_int_eq_deletes_the_row() {
 #[tokio::test]
 async fn delete_where_float_gt_beyond_f32_max_deletes_the_row() {
     for merge_on_read in [true, false] {
-        let fixture = float_fixture(merge_on_read, "CAST('inf' AS REAL)").await;
-        let deleted = dml_count(
-            &fixture.ctx,
-            "DELETE FROM catalog.ns.t WHERE f > 3.5e38",
-        )
-        .await;
+        let fixture = float_fixture(merge_on_read, "(1, CAST('inf' AS REAL))").await;
+        let deleted = dml_count(&fixture.ctx, "DELETE FROM catalog.ns.t WHERE f > 3.5e38").await;
         assert_eq!(
             deleted, 1,
             "merge_on_read={merge_on_read}: f = +Inf satisfies f > 3.5e38"
@@ -751,30 +747,30 @@ async fn delete_where_float_gt_beyond_f32_max_deletes_the_row() {
 }
 
 #[tokio::test]
-async fn delete_where_float_le_negative_zero_deletes_the_row() {
+async fn delete_where_float_le_negative_zero_deletes_only_negative_zero() {
     for merge_on_read in [true, false] {
-        let fixture = float_fixture(merge_on_read, "0.0").await;
-        let deleted = dml_count(
+        let fixture = float_fixture(merge_on_read, "(1, -0.0), (2, 0.0)").await;
+        let deleted = dml_count(&fixture.ctx, "DELETE FROM catalog.ns.t WHERE f <= -0.0").await;
+        assert_eq!(
+            deleted, 1,
+            "merge_on_read={merge_on_read}: DataFusion total order matches only the -0.0 row"
+        );
+        let remaining = count_rows(
             &fixture.ctx,
-            "DELETE FROM catalog.ns.t WHERE f <= -0.0",
+            "SELECT COUNT(*) FROM catalog.ns.t WHERE f = 0.0",
         )
         .await;
         assert_eq!(
-            deleted, 1,
-            "merge_on_read={merge_on_read}: f = +0.0 satisfies f <= -0.0"
-        );
-        let remaining = count_rows(&fixture.ctx, "SELECT COUNT(*) FROM catalog.ns.t").await;
-        assert_eq!(
-            remaining, 0,
-            "merge_on_read={merge_on_read}: the row must be deleted"
+            remaining, 1,
+            "merge_on_read={merge_on_read}: the +0.0 row must survive"
         );
     }
 }
 
 #[tokio::test]
-async fn delete_where_float_ne_nan_deletes_the_row() {
+async fn delete_where_float_ne_nan_deletes_only_non_nan_rows() {
     for merge_on_read in [true, false] {
-        let fixture = float_fixture(merge_on_read, "CAST('NaN' AS REAL)").await;
+        let fixture = float_fixture(merge_on_read, "(1, 0.0), (2, CAST('NaN' AS REAL))").await;
         let deleted = dml_count(
             &fixture.ctx,
             "DELETE FROM catalog.ns.t WHERE f != CAST('NaN' AS DOUBLE)",
@@ -782,12 +778,16 @@ async fn delete_where_float_ne_nan_deletes_the_row() {
         .await;
         assert_eq!(
             deleted, 1,
-            "merge_on_read={merge_on_read}: f = NaN satisfies f != NaN"
+            "merge_on_read={merge_on_read}: only the 0.0 row satisfies f != NaN"
         );
-        let remaining = count_rows(&fixture.ctx, "SELECT COUNT(*) FROM catalog.ns.t").await;
+        let remaining = count_rows(
+            &fixture.ctx,
+            "SELECT COUNT(*) FROM catalog.ns.t WHERE f = CAST('NaN' AS DOUBLE)",
+        )
+        .await;
         assert_eq!(
-            remaining, 0,
-            "merge_on_read={merge_on_read}: the row must be deleted"
+            remaining, 1,
+            "merge_on_read={merge_on_read}: the NaN row must survive"
         );
     }
 }

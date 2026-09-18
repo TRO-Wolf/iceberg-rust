@@ -17,12 +17,12 @@
 
 use std::vec;
 
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{Expr, Like, Operator};
 use datafusion::scalar::ScalarValue;
 use iceberg::expr::{BinaryExpression, Predicate, PredicateOperator, Reference, UnaryExpression};
-use iceberg::spec::{Datum, PrimitiveLiteral, Schema};
+use iceberg::spec::{Datum, PrimitiveLiteral, PrimitiveType, Schema, Type};
 
 // A datafusion expression could be an Iceberg predicate, column, or literal.
 enum TransformedResult {
@@ -46,7 +46,7 @@ pub fn convert_filters_to_predicate(filters: &[Expr], schema: &Schema) -> Option
     filters
         .iter()
         .filter_map(|expr| {
-            convert_filter_to_predicate(expr)
+            convert_filter_to_predicate(expr, schema)
                 .filter(|predicate| predicate_binds_soundly(predicate, schema))
         })
         .reduce(Predicate::and)
@@ -76,10 +76,29 @@ fn literal_binds_soundly(schema: &Schema, column: &Reference, literal: &Datum) -
     let Ok(converted) = literal.clone().to(&field.field_type) else {
         return false;
     };
+    let float_column = matches!(
+        field.field_type.as_ref(),
+        Type::Primitive(PrimitiveType::Float | PrimitiveType::Double)
+    );
+    let untyped_literal = matches!(
+        literal.data_type(),
+        PrimitiveType::Boolean
+            | PrimitiveType::Int
+            | PrimitiveType::Long
+            | PrimitiveType::Float
+            | PrimitiveType::Double
+            | PrimitiveType::String
+            | PrimitiveType::Binary
+    );
+    if !untyped_literal && converted != *literal {
+        return false;
+    }
     match converted.literal() {
-        PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => true,
-        converted if converted == literal.literal() => true,
-        converted => converts_exactly(literal.literal(), converted),
+        PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => !float_column,
+        PrimitiveLiteral::Float(value) if float_column && value.0 == 0.0 => false,
+        PrimitiveLiteral::Double(value) if float_column && value.0 == 0.0 => false,
+        _ if converted == *literal => true,
+        converted_literal => converts_exactly(literal.literal(), converted_literal),
     }
 }
 
@@ -94,7 +113,7 @@ fn converts_exactly(original: &PrimitiveLiteral, converted: &PrimitiveLiteral) -
         (PrimitiveLiteral::Float(v), PrimitiveLiteral::Double(w)) => w.0 == f64::from(v.0),
         (PrimitiveLiteral::Double(v), PrimitiveLiteral::Float(w)) => f64::from(w.0) == v.0,
         (PrimitiveLiteral::String(s), PrimitiveLiteral::Long(_)) => sub_second_digits(s) <= 6,
-        _ => true,
+        _ => false,
     }
 }
 
@@ -108,8 +127,8 @@ fn sub_second_digits(s: &str) -> usize {
     }
 }
 
-fn convert_filter_to_predicate(expr: &Expr) -> Option<Predicate> {
-    match to_iceberg_predicate(expr) {
+fn convert_filter_to_predicate(expr: &Expr, schema: &Schema) -> Option<Predicate> {
+    match to_iceberg_predicate(expr, schema) {
         TransformedResult::Predicate(predicate) => Some(predicate),
         TransformedResult::Column(column) => {
             // A bare column in a filter context represents a boolean column check
@@ -128,11 +147,11 @@ fn convert_filter_to_predicate(expr: &Expr) -> Option<Predicate> {
     }
 }
 
-fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
+fn to_iceberg_predicate(expr: &Expr, schema: &Schema) -> TransformedResult {
     match expr {
         Expr::BinaryExpr(binary) => {
-            let left = to_iceberg_predicate(&binary.left);
-            let right = to_iceberg_predicate(&binary.right);
+            let left = to_iceberg_predicate(&binary.left, schema);
+            let right = to_iceberg_predicate(&binary.right, schema);
             if let Some(nan) = nan_comparison(binary.op, &left, &right) {
                 return nan;
             }
@@ -145,9 +164,15 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             }
         }
         Expr::Not(exp) => {
-            let expr = to_iceberg_predicate(exp);
+            let expr = to_iceberg_predicate(exp, schema);
             match expr {
-                TransformedResult::Predicate(p) => TransformedResult::Predicate(!p),
+                TransformedResult::Predicate(p) => {
+                    if not_operand_is_sound(&p, schema) {
+                        TransformedResult::Predicate(!p)
+                    } else {
+                        TransformedResult::NotTransformed
+                    }
+                }
                 TransformedResult::Column(column) => {
                     // NOT of a bare boolean column: NOT col => col = false
                     TransformedResult::Predicate(Predicate::Binary(BinaryExpression::new(
@@ -167,21 +192,21 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
         Expr::InList(inlist) => {
             let mut datums = vec![];
             for expr in &inlist.list {
-                let p = to_iceberg_predicate(expr);
+                let p = to_iceberg_predicate(expr, schema);
                 match p {
                     TransformedResult::Literal(l) => datums.push(l),
                     _ => return TransformedResult::NotTransformed,
                 }
             }
 
-            let expr = to_iceberg_predicate(&inlist.expr);
+            let expr = to_iceberg_predicate(&inlist.expr, schema);
             match expr {
                 TransformedResult::Column(r) => in_list_predicate(r, datums, inlist.negated),
                 _ => TransformedResult::NotTransformed,
             }
         }
         Expr::IsNull(expr) => {
-            let p = to_iceberg_predicate(expr);
+            let p = to_iceberg_predicate(expr, schema);
             match p {
                 TransformedResult::Column(r) => TransformedResult::Predicate(Predicate::Unary(
                     UnaryExpression::new(PredicateOperator::IsNull, r),
@@ -190,7 +215,7 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             }
         }
         Expr::IsNotNull(expr) => {
-            let p = to_iceberg_predicate(expr);
+            let p = to_iceberg_predicate(expr, schema);
             match p {
                 TransformedResult::Column(r) => TransformedResult::Predicate(Predicate::Unary(
                     UnaryExpression::new(PredicateOperator::NotNull, r),
@@ -199,13 +224,30 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             }
         }
         Expr::Cast(c) => {
-            if *c.field.data_type() == DataType::Date32 || *c.field.data_type() == DataType::Date64
-            {
-                // Casts to date truncate the expression, we cannot simply extract it as it
-                // can create erroneous predicates.
+            if let Expr::Literal(value, _) = c.expr.as_ref() {
+                if matches!(c.field.data_type(), DataType::Timestamp(..))
+                    && matches!(
+                        value,
+                        ScalarValue::Utf8(_) | ScalarValue::LargeUtf8(_) | ScalarValue::Utf8View(_)
+                    )
+                {
+                    return to_iceberg_predicate(&c.expr, schema);
+                }
+                return match value.cast_to(c.field.data_type()) {
+                    Ok(value) => match scalar_value_to_datum(&value) {
+                        Some(datum) => TransformedResult::Literal(datum),
+                        None => TransformedResult::NotTransformed,
+                    },
+                    Err(_) => TransformedResult::NotTransformed,
+                };
+            }
+            let Some(source) = cast_source_type(&c.expr, schema) else {
+                return TransformedResult::NotTransformed;
+            };
+            if !cast_strips_lossless(&source, c.field.data_type()) {
                 return TransformedResult::NotTransformed;
             }
-            to_iceberg_predicate(&c.expr)
+            to_iceberg_predicate(&c.expr, schema)
         }
         Expr::Like(Like {
             negated,
@@ -223,7 +265,7 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             }
 
             // Extract the pattern string
-            let pattern_str = match to_iceberg_predicate(pattern) {
+            let pattern_str = match to_iceberg_predicate(pattern, schema) {
                 TransformedResult::Literal(d) => match d.literal() {
                     PrimitiveLiteral::String(s) => s.clone(),
                     _ => return TransformedResult::NotTransformed,
@@ -239,7 +281,7 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
                 let prefix = pattern_str[..pattern_str.len() - 1].to_string();
 
                 // Get the column reference
-                let column = match to_iceberg_predicate(expr) {
+                let column = match to_iceberg_predicate(expr, schema) {
                     TransformedResult::Column(r) => r,
                     _ => return TransformedResult::NotTransformed,
                 };
@@ -258,9 +300,125 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             }
         }
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
-            scalar_function_to_iceberg_predicate(func.name(), args)
+            scalar_function_to_iceberg_predicate(func.name(), args, schema)
         }
         _ => TransformedResult::NotTransformed,
+    }
+}
+
+fn cast_source_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
+    match expr {
+        Expr::Column(column) => schema
+            .field_by_name(column.name())
+            .and_then(|field| iceberg_arrow_type(&field.field_type)),
+        Expr::Cast(cast) => Some(cast.field.data_type().clone()),
+        _ => None,
+    }
+}
+
+fn iceberg_arrow_type(field_type: &Type) -> Option<DataType> {
+    let Type::Primitive(primitive) = field_type else {
+        return None;
+    };
+    Some(match primitive {
+        PrimitiveType::Boolean => DataType::Boolean,
+        PrimitiveType::Int => DataType::Int32,
+        PrimitiveType::Long => DataType::Int64,
+        PrimitiveType::Float => DataType::Float32,
+        PrimitiveType::Double => DataType::Float64,
+        PrimitiveType::Date => DataType::Date32,
+        PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
+        PrimitiveType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+        PrimitiveType::Timestamptz => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        }
+        PrimitiveType::TimestampNs => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        PrimitiveType::TimestamptzNs => {
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+        }
+        PrimitiveType::String => DataType::Utf8,
+        PrimitiveType::Uuid => DataType::FixedSizeBinary(16),
+        PrimitiveType::Fixed(length) => DataType::FixedSizeBinary(*length as i32),
+        PrimitiveType::Binary => DataType::Binary,
+        PrimitiveType::Decimal { precision, scale } => {
+            DataType::Decimal128(*precision as u8, *scale as i8)
+        }
+        _ => return None,
+    })
+}
+
+fn time_unit_widens(from: &TimeUnit, to: &TimeUnit) -> bool {
+    matches!(
+        (from, to),
+        (
+            TimeUnit::Second,
+            TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond
+        ) | (
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond | TimeUnit::Nanosecond
+        ) | (TimeUnit::Microsecond, TimeUnit::Nanosecond)
+    )
+}
+
+fn cast_strips_lossless(from: &DataType, to: &DataType) -> bool {
+    if from == to {
+        return true;
+    }
+    match (from, to) {
+        (DataType::Int8, DataType::Int16 | DataType::Int32 | DataType::Int64)
+        | (DataType::Int16, DataType::Int32 | DataType::Int64)
+        | (DataType::Int32, DataType::Int64)
+        | (DataType::UInt8, DataType::Int16 | DataType::Int32 | DataType::Int64)
+        | (DataType::UInt16, DataType::Int32 | DataType::Int64)
+        | (DataType::UInt32, DataType::Int64)
+        | (DataType::UInt8, DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
+        | (DataType::UInt16, DataType::UInt32 | DataType::UInt64)
+        | (DataType::UInt32, DataType::UInt64)
+        | (
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32,
+            DataType::Float64,
+        )
+        | (DataType::Float32, DataType::Float64)
+        | (
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+        ) => true,
+        (DataType::Timestamp(from_unit, _), DataType::Timestamp(to_unit, _)) => {
+            time_unit_widens(from_unit, to_unit)
+        }
+        (DataType::Time32(from_unit), DataType::Time64(to_unit))
+        | (DataType::Time64(from_unit), DataType::Time64(to_unit)) => {
+            time_unit_widens(from_unit, to_unit)
+        }
+        _ => false,
+    }
+}
+
+fn float_field(schema: &Schema, column: &Reference) -> bool {
+    schema.field_by_name(column.name()).is_some_and(|field| {
+        matches!(
+            field.field_type.as_ref(),
+            Type::Primitive(PrimitiveType::Float | PrimitiveType::Double)
+        )
+    })
+}
+
+fn not_operand_is_sound(predicate: &Predicate, schema: &Schema) -> bool {
+    match predicate {
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse => true,
+        Predicate::And(expr) | Predicate::Or(expr) => {
+            let [left, right] = expr.inputs();
+            not_operand_is_sound(left, schema) && not_operand_is_sound(right, schema)
+        }
+        Predicate::Not(expr) => not_operand_is_sound(expr.inputs()[0], schema),
+        Predicate::Unary(expr) => expr.op() != PredicateOperator::IsNan,
+        Predicate::Binary(expr) => !float_field(schema, expr.term()),
+        Predicate::Set(expr) => !float_field(schema, expr.term()),
     }
 }
 
@@ -283,11 +441,15 @@ fn to_iceberg_operation(op: Operator) -> OpTransformedResult {
 /// Translates a DataFusion scalar function into an Iceberg predicate.
 /// Unlike dedicated Expr variants (e.g. `Expr::IsNull`), scalar functions are
 /// identified by name at runtime, so we need to handle them here.
-fn scalar_function_to_iceberg_predicate(func_name: &str, args: &[Expr]) -> TransformedResult {
+fn scalar_function_to_iceberg_predicate(
+    func_name: &str,
+    args: &[Expr],
+    schema: &Schema,
+) -> TransformedResult {
     match func_name {
         // TODO: support complex expression arguments to scalar functions
         "isnan" if args.len() == 1 => {
-            let operand = to_iceberg_predicate(&args[0]);
+            let operand = to_iceberg_predicate(&args[0], schema);
             match operand {
                 TransformedResult::Column(r) => TransformedResult::Predicate(Predicate::Unary(
                     UnaryExpression::new(PredicateOperator::IsNan, r),
@@ -340,7 +502,6 @@ fn nan_comparison(
         Operator::Eq | Operator::IsNotDistinctFrom => {
             Some(TransformedResult::Predicate(column.clone().is_nan()))
         }
-        Operator::NotEq => Some(TransformedResult::Predicate(column.clone().is_not_nan())),
         _ => Some(TransformedResult::NotTransformed),
     }
 }
@@ -1015,8 +1176,8 @@ mod tests {
 
     #[test]
     fn test_predicate_conversion_with_not_isnan() {
-        let predicate = convert_to_iceberg_predicate("NOT isnan(qux)").unwrap();
-        assert_eq!(predicate, !Reference::new("qux").is_nan());
+        let predicate = convert_to_iceberg_predicate("NOT isnan(qux)");
+        assert_eq!(predicate, None);
     }
 
     #[test]
@@ -1107,18 +1268,11 @@ mod tests {
     }
 
     #[test]
-    fn cast_wrapped_double_column_with_long_literal_checks_exactness() {
+    fn cast_wrapped_double_column_to_int64_is_not_pushed() {
         let expr = cast_col("qux", DataType::Int64).lt(lit(9_007_199_254_740_993_i64));
-        assert_eq!(
-            push(expr),
-            None,
-            "2^53+1 does not round-trip through f64 and must not be pushed"
-        );
+        assert_eq!(push(expr), None);
         let expr = cast_col("qux", DataType::Int64).lt(lit(9_007_199_254_740_992_i64));
-        assert_eq!(
-            push(expr),
-            Some(Reference::new("qux").less_than(Datum::long(9_007_199_254_740_992_i64)))
-        );
+        assert_eq!(push(expr), None);
     }
 
     #[test]
@@ -1220,14 +1374,8 @@ mod tests {
 
     #[test]
     fn not_over_float_comparison_is_not_pushed() {
-        assert_eq!(
-            push(Expr::Not(Box::new(col("flt").lt(lit(5.0_f64))))),
-            None
-        );
-        assert_eq!(
-            push(Expr::Not(Box::new(col("flt").eq(lit(5.0_f64))))),
-            None
-        );
+        assert_eq!(push(Expr::Not(Box::new(col("flt").lt(lit(5.0_f64))))), None);
+        assert_eq!(push(Expr::Not(Box::new(col("flt").eq(lit(5.0_f64))))), None);
         assert_eq!(
             push(Expr::Not(Box::new(col("foo").eq(lit(5_i64))))),
             Some(!Reference::new("foo").equal_to(Datum::long(5)))
