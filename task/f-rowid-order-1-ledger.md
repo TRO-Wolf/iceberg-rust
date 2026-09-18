@@ -28,7 +28,10 @@
 |---|---|---|
 | red cells | `1920c8833` | `test: F-ROWID-ORDER-1 — red partition-order first_row_id cells` |
 | fix | `01b1a2f4` | `fix: F-ROWID-ORDER-1 — INSERT commits data files in ascending partition order` |
-| ledger | this commit | `docs: F-ROWID-ORDER-1 — ledger, mutation proof` |
+| ledger | `9161407a` | `docs: F-ROWID-ORDER-1 — ledger, mutation proof` |
+| round-2 test | `85f4492a` | `test: F-ROWID-ORDER-1 — pin the write_partition_index tie-break` |
+| round-2 fix | `0840f0e5` | `fix: F-ROWID-ORDER-1 — drop the stale one-column docs, build the index column without a temporary vec` |
+| round-2 ledger | this commit | `docs: F-ROWID-ORDER-1 — round 2` |
 
 ## Defect
 
@@ -121,8 +124,68 @@ cell, committed manifest entries read back through `load_manifest` (whose
 
 - `IcebergCatalogProvider` resolves a namespace's table list at provider construction, so the
   test fixture creates all 20 fresh tables before registering the provider.
-- Two stale doc comments are accepted under the comment ban, evidence routed here:
-  `IcebergWriteExec`'s struct and `execute` docs still describe a one-column result batch; the
-  result schema is now `(data_files Utf8, write_partition_index UInt64)`.
+- `IcebergWriteExec`'s struct and `execute` docs described a one-column result batch after the
+  schema became `(data_files Utf8, write_partition_index UInt64)`; round 2 deleted them (see
+  below).
 - `IcebergCommitExec` fails loud (`Internal`) when the `write_partition_index` column is absent
   or mistyped — the same contract style as the `data_files` column.
+
+## Round 2 — Grok review remediations (L-001, L-002) and perf dispositions (R-01, R-02)
+
+### L-001 (P2) — the tie-break is now pinned by a load-bearing cell
+
+`insert_unpartitioned_first_row_id_follows_input_partition_index` in
+`crates/integrations/datafusion/tests/insert_row_id_order.rs`: an unpartitioned v3 table over a
+four-partition `MemTable` whose partitions carry UNEQUAL counts — 10 / 20 / 30 / 40 rows, each
+partition's ids drawn from a disjoint 1000-wide band so the files are identifiable. With
+`target_partitions = 4`, DataFusion's `RoundRobinBatch` seeds
+`next_idx = (input_partition * num_partitions) / num_input_partitions`, so input partition `p`
+deterministically feeds write task `p`; the expected committed order is 10 / 20 / 30 / 40 rows
+with `first_row_id` 0 / 10 / 30 / 60, asserted on each of 20 fresh tables. Because the counts
+differ, every ordering produces a distinct cumulative-id sequence — unlike the equal-count
+control, which tiles `0, 75, 150, 225` under any order and cannot go red. The cell is
+load-bearing.
+
+Mutation proof (round 2): dropping only `.then_with(|| left.0.cmp(&right.0))` from the commit
+sort leaves the partition comparator in place and fails the new cell on assertion —
+
+```text
+left:  [("", 20, 0), ("", 40, 20), ("", 10, 60), ("", 30, 70)]
+right: [("", 10, 0), ("", 20, 10), ("", 30, 30), ("", 40, 60)]
+```
+
+— i.e. raw arrival order instead of input-partition-index order. Restoring the tie-break
+returns the full six-cell file to green. The revert was not committed.
+
+### Doc deletions and perf dispositions
+
+- Stale docs deleted: `IcebergWriteExec`'s struct doc line and the `execute` doc's
+  one-column `data_files` table both described a single-column result batch; both are gone.
+  Deleting was permitted; nothing was reworded or added.
+- R-01 (P3): `make_result_batch` now builds the index column with
+  `UInt64Array::from_value(partition, len)` — one allocation, no temporary `Vec`.
+- R-02 (P3): the tie-break was flagged as unpinned; the L-001 cell above now pins it.
+
+### L-002 (P2) — what this does not claim
+
+The run-23a rowid-order measurement (orchestrator-measured, `record_rowid_order.py`:
+Spark 4.1.2 + Iceberg 1.11.0, eight categories `d, a, z, m, b, q, c, x`, `local[8]`, four
+shuffle partitions, six runs each) shows Spark does NOT commit files in partition-value order:
+
+- `write.distribution-mode=hash` (the default), AQE on, at both 400 and 200,000 rows: every
+  run commits `z, x, m, a, q, b, c, d` — deterministic, but it is the shuffle-task (hash)
+  order, not lexical order;
+- hash with AQE off: `b, z, x, m, a, q, c, d`;
+- `range`: `a, b, c, d, m, q, z, x`, plus three variants at 200,000 rows;
+- `none`: one file per partition per task, repeated per task.
+
+So run 23b's `a: 0, b: 100, c: 200` on the three-value shape was the hash order coinciding
+with lexical order on those three keys, not evidence of a partition-value ordering rule.
+Spark's committed file order is an engine detail — hash partitioner × shuffle-partition count
+× AQE — which a table-format library cannot reproduce and this fork does not attempt to.
+
+The fork's rule is deterministic: ascending partition value, then input partition index. It
+equals Spark's answer on the measured three-value `a`/`b`/`c` shape only because the hash
+order coincided with lexical order there. Nothing in this lane claims the fork implements
+"Spark's rule"; it claims a deterministic order that matches Spark's observed output on the
+shapes run 23b measured.

@@ -39,6 +39,16 @@ off fork `main`. Consumer: RePark rating row C-3 / V3-02 (registry V3-COV-3).
 - [x] Mutation: revert → the same three cells red on assertion; restore → 5/5 green; revert not
       committed.
 - [x] Ledger + this entry; `typos .`, `cargo fmt --all --check`, clippy, size checker green.
+- [x] ROUND 2 (Grok remediations): `85f4492a` pins the tie-break — an unequal-count (10/20/30/40)
+      unpartitioned cell goes red on assertion when only `.then_with(index)` is dropped;
+      `0840f0e5` deletes the stale one-column `IcebergWriteExec` docs and builds the index
+      column via `UInt64Array::from_value`.
+- [x] L-002 correction: Spark does NOT commit files in partition-value order — run-23a measured
+      hash-distribution commits in shuffle-task order (`z, x, m, a, q, b, c, d` at 8
+      categories), an engine detail a table-format library cannot reproduce. The fork's rule is
+      deterministic — ascending partition value, then input partition index — and equals
+      Spark's answer on the three-value `a`/`b`/`c` shape only because hash order coincided
+      with lexical order there. This is not "Spark's rule".
 
 ## ACTIVE (2026-09-19): F-LIST-NULL-ACCESSOR-1 — `IS NULL` / `IS NOT NULL` on list, map, struct columns
 
