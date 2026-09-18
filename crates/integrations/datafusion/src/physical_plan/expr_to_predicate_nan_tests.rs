@@ -49,7 +49,7 @@ fn null_safe_eq(left: Expr, right: Expr) -> Expr {
 }
 
 fn push(expr: Expr) -> Option<Predicate> {
-    convert_filters_to_predicate(&[expr])
+    convert_filters_to_predicate(&[expr], &super::tests::test_iceberg_schema())
 }
 
 #[test]

@@ -22,7 +22,7 @@ use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{Expr, Like, Operator};
 use datafusion::scalar::ScalarValue;
 use iceberg::expr::{BinaryExpression, Predicate, PredicateOperator, Reference, UnaryExpression};
-use iceberg::spec::{Datum, PrimitiveLiteral};
+use iceberg::spec::{Datum, PrimitiveLiteral, Schema};
 
 // A datafusion expression could be an Iceberg predicate, column, or literal.
 enum TransformedResult {
@@ -42,11 +42,70 @@ enum OpTransformedResult {
 /// Converts DataFusion filters ([`Expr`]) to an iceberg [`Predicate`].
 /// If none of the filters could be converted, return `None` which adds no predicates to the scan operation.
 /// If the conversion was successful, return the converted predicates combined with an AND operator.
-pub fn convert_filters_to_predicate(filters: &[Expr]) -> Option<Predicate> {
+pub fn convert_filters_to_predicate(filters: &[Expr], schema: &Schema) -> Option<Predicate> {
     filters
         .iter()
-        .filter_map(convert_filter_to_predicate)
+        .filter_map(|expr| {
+            convert_filter_to_predicate(expr)
+                .filter(|predicate| predicate_binds_soundly(predicate, schema))
+        })
         .reduce(Predicate::and)
+}
+
+fn predicate_binds_soundly(predicate: &Predicate, schema: &Schema) -> bool {
+    match predicate {
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse => true,
+        Predicate::And(expr) | Predicate::Or(expr) => {
+            let [left, right] = expr.inputs();
+            predicate_binds_soundly(left, schema) && predicate_binds_soundly(right, schema)
+        }
+        Predicate::Not(expr) => predicate_binds_soundly(expr.inputs()[0], schema),
+        Predicate::Unary(expr) => schema.field_by_name(expr.term().name()).is_some(),
+        Predicate::Binary(expr) => literal_binds_soundly(schema, expr.term(), expr.literal()),
+        Predicate::Set(expr) => expr
+            .literals()
+            .iter()
+            .all(|literal| literal_binds_soundly(schema, expr.term(), literal)),
+    }
+}
+
+fn literal_binds_soundly(schema: &Schema, column: &Reference, literal: &Datum) -> bool {
+    let Some(field) = schema.field_by_name(column.name()) else {
+        return false;
+    };
+    let Ok(converted) = literal.clone().to(&field.field_type) else {
+        return false;
+    };
+    match converted.literal() {
+        PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => true,
+        converted if converted == literal.literal() => true,
+        converted => converts_exactly(literal.literal(), converted),
+    }
+}
+
+fn converts_exactly(original: &PrimitiveLiteral, converted: &PrimitiveLiteral) -> bool {
+    match (original, converted) {
+        (PrimitiveLiteral::Int(v), PrimitiveLiteral::Long(w)) => *w == i64::from(*v),
+        (PrimitiveLiteral::Int(v), PrimitiveLiteral::Float(w)) => f64::from(w.0) == f64::from(*v),
+        (PrimitiveLiteral::Int(v), PrimitiveLiteral::Double(w)) => w.0 == f64::from(*v),
+        (PrimitiveLiteral::Long(v), PrimitiveLiteral::Int(w)) => i64::from(*w) == *v,
+        (PrimitiveLiteral::Long(v), PrimitiveLiteral::Float(w)) => w.0 as i128 == i128::from(*v),
+        (PrimitiveLiteral::Long(v), PrimitiveLiteral::Double(w)) => w.0 as i128 == i128::from(*v),
+        (PrimitiveLiteral::Float(v), PrimitiveLiteral::Double(w)) => w.0 == f64::from(v.0),
+        (PrimitiveLiteral::Double(v), PrimitiveLiteral::Float(w)) => f64::from(w.0) == v.0,
+        (PrimitiveLiteral::String(s), PrimitiveLiteral::Long(_)) => sub_second_digits(s) <= 6,
+        _ => true,
+    }
+}
+
+fn sub_second_digits(s: &str) -> usize {
+    match s.find('.') {
+        Some(index) => s[index + 1..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .count(),
+        None => 0,
+    }
 }
 
 fn convert_filter_to_predicate(expr: &Expr) -> Option<Predicate> {
@@ -404,7 +463,9 @@ mod tests {
     use datafusion::logical_expr::utils::split_conjunction;
     use datafusion::prelude::{Expr, SessionContext, col, lit};
     use iceberg::expr::{Predicate, Reference};
-    use iceberg::spec::Datum;
+    use iceberg::spec::{
+        Datum, NestedField, PrimitiveType, Schema as IcebergSchema, SchemaRef, Type,
+    };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::convert_filters_to_predicate;
@@ -430,8 +491,33 @@ mod tests {
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 "5".to_string(),
             )])),
+            Field::new("bin", DataType::Binary, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "6".to_string(),
+            )])),
+            Field::new("d", DataType::Date32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "7".to_string(),
+            )])),
         ]);
         DFSchema::try_from_qualified_schema("my_table", &arrow_schema).unwrap()
+    }
+
+    pub(super) fn test_iceberg_schema() -> SchemaRef {
+        IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::optional(1, "foo", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "bar", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+                NestedField::optional(4, "qux", Type::Primitive(PrimitiveType::Double)).into(),
+                NestedField::optional(5, "flt", Type::Primitive(PrimitiveType::Float)).into(),
+                NestedField::optional(6, "bin", Type::Primitive(PrimitiveType::Binary)).into(),
+                NestedField::optional(7, "d", Type::Primitive(PrimitiveType::Date)).into(),
+            ])
+            .build()
+            .unwrap()
+            .into()
     }
 
     fn convert_to_iceberg_predicate(sql: &str) -> Option<Predicate> {
@@ -440,7 +526,7 @@ mod tests {
             .parse_sql_expr(sql, &df_schema)
             .unwrap();
         let exprs: Vec<Expr> = split_conjunction(&expr).into_iter().cloned().collect();
-        convert_filters_to_predicate(&exprs[..])
+        convert_filters_to_predicate(&exprs[..], &test_iceberg_schema())
     }
 
     #[test]
@@ -765,9 +851,9 @@ mod tests {
         use datafusion::prelude::col;
 
         let millis = (i64::from(i32::MAX) + 1) * super::MILLIS_PER_DAY;
-        let filter = col("foo").lt(Expr::Literal(ScalarValue::Date64(Some(millis)), None));
+        let filter = col("d").lt(Expr::Literal(ScalarValue::Date64(Some(millis)), None));
 
-        let predicate = convert_filters_to_predicate(&[filter]);
+        let predicate = convert_filters_to_predicate(&[filter], &test_iceberg_schema());
         assert_eq!(
             predicate, None,
             "an out-of-range Date64 must not reach the scan as a predicate"
@@ -776,10 +862,10 @@ mod tests {
         // The same shape with a representable Date64 still pushes down, so the assertion above
         // is about the range check and not about `Date64` comparisons in general.
         let millis = 19362i64 * super::MILLIS_PER_DAY;
-        let filter = col("foo").lt(Expr::Literal(ScalarValue::Date64(Some(millis)), None));
+        let filter = col("d").lt(Expr::Literal(ScalarValue::Date64(Some(millis)), None));
         assert_eq!(
-            convert_filters_to_predicate(&[filter]),
-            Some(Reference::new("foo").less_than(Datum::date(19362)))
+            convert_filters_to_predicate(&[filter], &test_iceberg_schema()),
+            Some(Reference::new("d").less_than(Datum::date(19362)))
         );
     }
 
@@ -800,13 +886,13 @@ mod tests {
 
     #[test]
     fn test_predicate_conversion_with_binary() {
-        let sql = "foo = 1 and bar = X'0102'";
+        let sql = "foo = 1 and bin = X'0102'";
         let predicate = convert_to_iceberg_predicate(sql).unwrap();
         // Binary literals are converted to Datum::binary
         // Note: SQL literal 1 is converted to Long by DataFusion
         let expected_predicate = Reference::new("foo")
             .equal_to(Datum::long(1))
-            .and(Reference::new("bar").equal_to(Datum::binary(vec![1u8, 2u8])));
+            .and(Reference::new("bin").equal_to(Datum::binary(vec![1u8, 2u8])));
         assert_eq!(predicate, expected_predicate);
     }
 
@@ -952,7 +1038,7 @@ mod tests {
     }
 
     fn push(expr: Expr) -> Option<Predicate> {
-        convert_filters_to_predicate(&[expr])
+        convert_filters_to_predicate(&[expr], &test_iceberg_schema())
     }
 
     fn cast_col(name: &str, data_type: DataType) -> Expr {
@@ -1027,6 +1113,21 @@ mod tests {
         assert_eq!(
             push(expr),
             Some(Reference::new("foo").greater_than(Datum::long(-3_000_000_000_i64)))
+        );
+    }
+
+    #[test]
+    fn cast_wrapped_double_column_with_long_literal_checks_exactness() {
+        let expr = cast_col("qux", DataType::Int64).lt(lit(9_007_199_254_740_993_i64));
+        assert_eq!(
+            push(expr),
+            None,
+            "2^53+1 does not round-trip through f64 and must not be pushed"
+        );
+        let expr = cast_col("qux", DataType::Int64).lt(lit(9_007_199_254_740_992_i64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("qux").less_than(Datum::long(9_007_199_254_740_992_i64)))
         );
     }
 

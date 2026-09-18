@@ -235,7 +235,7 @@ impl TableProvider for IcebergTableProvider {
         let isolation = IsolationLevel::for_row_level_op(&table, WRITE_DELETE_ISOLATION_LEVEL)?;
 
         // Exact PhysicalExpr is the row contract. Iceberg gets prune-only.
-        let prune = convert_filters_to_predicate(&filters);
+        let prune = convert_filters_to_predicate(&filters, table.metadata().current_schema());
         let predicate = match filters.into_iter().reduce(Expr::and) {
             None => None,
             Some(combined) => {
@@ -271,7 +271,7 @@ impl TableProvider for IcebergTableProvider {
 
         let df_schema = DFSchema::try_from(current_schema.as_ref().clone())?;
 
-        let prune = convert_filters_to_predicate(&filters);
+        let prune = convert_filters_to_predicate(&filters, table.metadata().current_schema());
         let predicate = match filters.into_iter().reduce(Expr::and) {
             None => None,
             Some(combined) => Some(state.create_physical_expr(combined, &df_schema)?),

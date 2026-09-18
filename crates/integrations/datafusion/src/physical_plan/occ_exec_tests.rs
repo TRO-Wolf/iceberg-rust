@@ -666,8 +666,11 @@ async fn dml_count(ctx: &SessionContext, sql: &str) -> u64 {
 async fn delete_where_float_lt_inexact_double_deletes_the_row() {
     for merge_on_read in [true, false] {
         let fixture = float_fixture(merge_on_read).await;
-        let deleted =
-            dml_count(&fixture.ctx, "DELETE FROM catalog.ns.t WHERE f < 1.00000001").await;
+        let deleted = dml_count(
+            &fixture.ctx,
+            "DELETE FROM catalog.ns.t WHERE f < 1.00000001",
+        )
+        .await;
         assert_eq!(
             deleted, 1,
             "merge_on_read={merge_on_read}: f = 1.0 satisfies f < 1.00000001"

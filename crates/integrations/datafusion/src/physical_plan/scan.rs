@@ -114,7 +114,15 @@ impl IcebergTableScan {
         };
         let (scan_columns, sources) = project_bindings(&output_schema, &bindings)?;
         let plan_properties = Self::compute_properties(output_schema, 1);
-        let predicates = convert_filters_to_predicate(&rebind_filters(filters, &bindings));
+        let predicate_schema = match snapshot_id.and_then(|id| table.metadata().snapshot_by_id(id))
+        {
+            Some(snapshot) => snapshot
+                .schema(table.metadata())
+                .map_err(to_datafusion_error)?,
+            None => table.metadata().current_schema().clone(),
+        };
+        let predicates =
+            convert_filters_to_predicate(&rebind_filters(filters, &bindings), &predicate_schema);
 
         let resolved_snapshot_id = match snapshot_id {
             Some(id) => id,
