@@ -164,14 +164,6 @@ impl StagedTableTransaction {
             ));
         }
         let base_metadata_location = existing.metadata_location_result()?.to_string();
-        // A replace keeps the table's root location STABLE: reuse the caller-provided location if
-        // any, else the existing table's current location. Do NOT derive a `__staged_replace`
-        // suffix — baking a stage suffix into the metadata relocated the table on every replace and
-        // compounded it (orders__staged_replace__staged_replace…), sending future writers to a
-        // drifted path and orphaning intent (finding N2). Staging isolation comes from NOT moving
-        // the catalog pointer until `commit`, not from a separate directory: the new metadata file
-        // gets a fresh version+UUID under the stable location's `metadata/` dir and only becomes
-        // current at publish. Data already written elsewhere stays readable — manifests are absolute.
         let existing_location = existing.metadata().location().trim_end_matches('/');
         let table_location = creation
             .location
@@ -236,11 +228,11 @@ impl StagedTableTransaction {
                 .metadata;
 
         let metadata_location = match MetadataLocation::from_str(&base_metadata_location) {
-            Ok(base) if keeps_location => base.with_next_version_fresh_id().to_string(),
+            Ok(base) if keeps_location => base.with_next_version().to_string(),
             _ => MetadataLocation::new_with_table_location(&table_location).to_string(),
         };
         metadata
-            .write_to(existing.file_io(), &metadata_location)
+            .write_commit_metadata(existing.file_io(), &metadata_location)
             .await?;
 
         let table = Table::builder()

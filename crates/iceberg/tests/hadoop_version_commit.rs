@@ -21,7 +21,7 @@ use std::sync::Arc;
 use iceberg::io::{FileIO, LocalFsStorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::transaction::{ApplyTransactionAction, StagedTableTransaction, Transaction};
 use iceberg::{
     Catalog, CatalogBuilder, ErrorKind, MetadataLocation, NamespaceIdent, TableCreation, TableIdent,
 };
@@ -442,4 +442,136 @@ async fn orphan_v3_wedges_stale_pointer_loud_then_reregister_recovers() {
     assert!(v4.ends_with("/metadata/v4.metadata.json"));
     let resumed = cat2.load_table(&ident).await.expect("loads");
     assert_eq!(table_property(&resumed, "writer").as_deref(), Some("two"));
+}
+
+#[tokio::test]
+async fn hadoop_staged_replace_second_stager_fails_and_preserves_winner() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let warehouse = dir.path().to_str().expect("utf8 path").to_string();
+    let file_io = FileIO::new_with_fs();
+
+    let cat1 = new_local_catalog("one", &warehouse).await;
+    let cat2 = new_local_catalog("two", &warehouse).await;
+    let ns = NamespaceIdent::new("ns".to_string());
+    let table_location = create_ns_and_source(&cat1, &ns).await;
+    create_ns_and_source(&cat2, &ns).await;
+
+    let v2 = format!("{table_location}/metadata/v2.metadata.json");
+    let base = cat1
+        .load_table(&TableIdent::new(ns.clone(), "src".to_string()))
+        .await
+        .expect("load src");
+    base.metadata()
+        .write_to(&file_io, &v2)
+        .await
+        .expect("seed v2");
+
+    let ident = TableIdent::new(ns, "hadoop".to_string());
+    let table1 = cat1
+        .register_table(&ident, v2.clone())
+        .await
+        .expect("cat1 registers v2");
+    let table2 = cat2
+        .register_table(&ident, v2.clone())
+        .await
+        .expect("cat2 registers v2");
+
+    let creation = || {
+        TableCreation::builder()
+            .name("hadoop".to_string())
+            .schema(test_schema())
+            .build()
+    };
+    let staged = StagedTableTransaction::begin_replace(&table1, creation())
+        .await
+        .expect("first replace stages");
+    let staged_location = staged
+        .table()
+        .metadata_location_result()
+        .expect("staged location")
+        .to_string();
+    assert_eq!(
+        staged_location,
+        format!("{table_location}/metadata/v3.metadata.json"),
+        "a Hadoop base must stage vN+1, not a uuid name"
+    );
+    let winner_bytes = std::fs::read(&staged_location).expect("read staged v3");
+    staged.commit(&cat1).await.expect("publish replace");
+
+    let err = match StagedTableTransaction::begin_replace(&table2, creation()).await {
+        Ok(_) => panic!("a second stager onto the existing v3 must fail"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+    assert!(err.retryable());
+    assert_eq!(
+        std::fs::read(&staged_location).expect("re-read v3"),
+        winner_bytes,
+        "loser must not overwrite the winner's staged file"
+    );
+    let loser = cat2.load_table(&ident).await.expect("loser loads");
+    assert_eq!(
+        loser.metadata_location().expect("loser pointer"),
+        v2.as_str(),
+        "losing catalog pointer stays at v2"
+    );
+}
+
+#[tokio::test]
+async fn uuid_staged_replace_bases_keep_distinct_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let warehouse = dir.path().to_str().expect("utf8 path").to_string();
+    let file_io = FileIO::new_with_fs();
+
+    let cat1 = new_local_catalog("one", &warehouse).await;
+    let cat2 = new_local_catalog("two", &warehouse).await;
+    let ns = NamespaceIdent::new("ns".to_string());
+    let table_location = create_ns_and_source(&cat1, &ns).await;
+    create_ns_and_source(&cat2, &ns).await;
+
+    let uuid_base = MetadataLocation::new_with_table_location(&table_location).to_string();
+    let base = cat1
+        .load_table(&TableIdent::new(ns.clone(), "src".to_string()))
+        .await
+        .expect("load src");
+    base.metadata()
+        .write_to(&file_io, &uuid_base)
+        .await
+        .expect("seed uuid base");
+
+    let ident = TableIdent::new(ns, "hive".to_string());
+    let table1 = cat1
+        .register_table(&ident, uuid_base.clone())
+        .await
+        .expect("cat1 registers uuid base");
+    let table2 = cat2
+        .register_table(&ident, uuid_base)
+        .await
+        .expect("cat2 registers uuid base");
+
+    let creation = || {
+        TableCreation::builder()
+            .name("hive".to_string())
+            .schema(test_schema())
+            .build()
+    };
+    let first = StagedTableTransaction::begin_replace(&table1, creation())
+        .await
+        .expect("first replace stages");
+    let second = StagedTableTransaction::begin_replace(&table2, creation())
+        .await
+        .expect("second replace stages");
+    let first_loc = first
+        .table()
+        .metadata_location_result()
+        .expect("first location")
+        .to_string();
+    let second_loc = second
+        .table()
+        .metadata_location_result()
+        .expect("second location")
+        .to_string();
+    assert_ne!(first_loc, second_loc, "uuid staged names cannot collide");
+    first.commit(&cat1).await.expect("first publishes");
+    second.commit(&cat2).await.expect("second publishes");
 }
