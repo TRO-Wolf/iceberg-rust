@@ -462,6 +462,7 @@ mod tests {
     use datafusion::logical_expr::expr::Cast;
     use datafusion::logical_expr::utils::split_conjunction;
     use datafusion::prelude::{Expr, SessionContext, col, lit};
+    use datafusion::scalar::ScalarValue;
     use iceberg::expr::{Predicate, Reference};
     use iceberg::spec::{
         Datum, NestedField, PrimitiveType, Schema as IcebergSchema, SchemaRef, Type,
@@ -1069,25 +1070,14 @@ mod tests {
             push(expr),
             Some(Reference::new("flt").greater_than_or_equal_to(Datum::double(-2.0)))
         );
-        let expr = cast_col("flt", DataType::Float64).eq(lit(0.0_f64));
-        assert_eq!(
-            push(expr),
-            Some(Reference::new("flt").equal_to(Datum::double(0.0)))
-        );
     }
 
     #[test]
-    fn cast_wrapped_float_column_out_of_range_literal_keeps_sentinel_push() {
+    fn cast_wrapped_float_column_out_of_range_literal_is_not_pushed() {
         let expr = cast_col("flt", DataType::Float64).gt(lit(3.5e38_f64));
-        assert_eq!(
-            push(expr),
-            Some(Reference::new("flt").greater_than(Datum::double(3.5e38)))
-        );
+        assert_eq!(push(expr), None);
         let expr = cast_col("flt", DataType::Float64).lt(lit(-3.5e38_f64));
-        assert_eq!(
-            push(expr),
-            Some(Reference::new("flt").less_than(Datum::double(-3.5e38)))
-        );
+        assert_eq!(push(expr), None);
     }
 
     #[test]
@@ -1147,6 +1137,109 @@ mod tests {
     #[test]
     fn bare_float_column_with_inexact_literal_is_not_pushed() {
         let expr = col("flt").lt(lit(1e-50_f64));
+        assert_eq!(push(expr), None);
+    }
+
+    #[test]
+    fn lossy_column_casts_are_not_stripped() {
+        for (column, data_type) in [
+            ("flt", DataType::Int32),
+            ("flt", DataType::Utf8),
+            ("qux", DataType::Float32),
+            ("foo", DataType::Int16),
+            ("flt", DataType::Int64),
+            ("qux", DataType::Int64),
+        ] {
+            let expr = cast_col(column, data_type.clone()).eq(lit(2_i64));
+            assert_eq!(
+                push(expr),
+                None,
+                "CAST({column} AS {data_type}) is lossy and must not strip"
+            );
+        }
+        let expr = Expr::Cast(Cast::new(
+            Box::new(cast_col("foo", DataType::Int64)),
+            DataType::Float64,
+        ))
+        .eq(lit(9_007_199_254_740_993_i64));
+        assert_eq!(
+            push(expr),
+            None,
+            "int64 -> float64 cast is not injective and must not strip"
+        );
+    }
+
+    #[test]
+    fn lossless_column_casts_still_strip() {
+        let expr = cast_col("foo", DataType::Int64).lt(lit(5_i64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("foo").less_than(Datum::long(5)))
+        );
+        let expr = cast_col("flt", DataType::Float64).lt(lit(0.5_f64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("flt").less_than(Datum::double(0.5)))
+        );
+        let expr = cast_col("qux", DataType::Float64).eq(lit(1.5_f64));
+        assert_eq!(
+            push(expr),
+            Some(Reference::new("qux").equal_to(Datum::double(1.5)))
+        );
+    }
+
+    #[test]
+    fn float_column_out_of_range_and_infinite_literals_are_not_pushed() {
+        for expr in [
+            cast_col("flt", DataType::Float64).gt(lit(3.5e38_f64)),
+            cast_col("flt", DataType::Float64).lt(lit(-3.5e38_f64)),
+            col("flt").eq(lit(f64::INFINITY)),
+            col("flt").eq(lit(f64::NEG_INFINITY)),
+            col("flt").lt(lit(f64::INFINITY)),
+            col("flt").gt(lit(f64::NEG_INFINITY)),
+        ] {
+            assert_eq!(push(expr), None);
+        }
+    }
+
+    #[test]
+    fn float_comparisons_with_zero_literals_are_not_pushed() {
+        for expr in [
+            col("flt").eq(lit(0.0_f64)),
+            col("flt").lt_eq(lit(-0.0_f64)),
+            col("flt").gt_eq(lit(0.0_f64)),
+            col("flt").lt(lit(0.0_f64)),
+            col("flt").not_eq(lit(0.0_f64)),
+            col("qux").eq(lit(-0.0_f64)),
+            col("flt").eq(lit(0_i64)),
+            col("flt").eq(lit(0.0_f32)),
+        ] {
+            assert_eq!(push(expr), None);
+        }
+    }
+
+    #[test]
+    fn not_over_float_comparison_is_not_pushed() {
+        assert_eq!(
+            push(Expr::Not(Box::new(col("flt").lt(lit(5.0_f64))))),
+            None
+        );
+        assert_eq!(
+            push(Expr::Not(Box::new(col("flt").eq(lit(5.0_f64))))),
+            None
+        );
+        assert_eq!(
+            push(Expr::Not(Box::new(col("foo").eq(lit(5_i64))))),
+            Some(!Reference::new("foo").equal_to(Datum::long(5)))
+        );
+    }
+
+    #[test]
+    fn timestamp_nanos_literal_against_micros_column_is_not_pushed() {
+        let expr = col("ts").gt_eq(lit(ScalarValue::TimestampNanosecond(
+            Some(1_672_876_800_000_000_500),
+            None,
+        )));
         assert_eq!(push(expr), None);
     }
 }
