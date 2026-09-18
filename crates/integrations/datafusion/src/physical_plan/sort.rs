@@ -19,7 +19,9 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Float32Array, Float64Array, RecordBatch};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Float32Array, Float64Array, RecordBatch, StructArray,
+};
 use datafusion::arrow::compute::{SortOptions, cast, is_null, nullif};
 use datafusion::arrow::datatypes::{DataType, Schema as ArrowSchema};
 use datafusion::common::Result as DFResult;
@@ -242,6 +244,93 @@ impl PhysicalExpr for CanonicalFloatExpr {
             ))
         })?;
         Ok(Arc::new(CanonicalFloatExpr { inner }))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalPartitionExpr {
+    inner: Arc<dyn PhysicalExpr>,
+}
+
+impl PartialEq for CanonicalPartitionExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.eq(&other.inner)
+    }
+}
+
+impl Eq for CanonicalPartitionExpr {}
+
+impl std::fmt::Display for CanonicalPartitionExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "canonical_partition({})", self.inner)
+    }
+}
+
+impl std::hash::Hash for CanonicalPartitionExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.inner.hash(state);
+    }
+}
+
+fn canonical_partition_child(child: &ArrayRef) -> ArrayRef {
+    if let Some(floats) = child.as_any().downcast_ref::<Float32Array>() {
+        return Arc::new(Float32Array::from_iter(floats.iter().map(|value| {
+            value.map(|float| if float.is_nan() { f32::NAN } else { float + 0.0 })
+        })));
+    }
+    if let Some(floats) = child.as_any().downcast_ref::<Float64Array>() {
+        return Arc::new(Float64Array::from_iter(floats.iter().map(|value| {
+            value.map(|float| if float.is_nan() { f64::NAN } else { float + 0.0 })
+        })));
+    }
+    child.clone()
+}
+
+impl PhysicalExpr for CanonicalPartitionExpr {
+    fn data_type(&self, input_schema: &ArrowSchema) -> DFResult<DataType> {
+        self.inner.data_type(input_schema)
+    }
+
+    fn nullable(&self, _input_schema: &ArrowSchema) -> DFResult<bool> {
+        Ok(true)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
+        let array = self.inner.evaluate(batch)?.into_array(batch.num_rows())?;
+        let Some(structs) = array.as_any().downcast_ref::<StructArray>() else {
+            return Ok(ColumnarValue::Array(array));
+        };
+        let children = structs
+            .columns()
+            .iter()
+            .map(canonical_partition_child)
+            .collect();
+        Ok(ColumnarValue::Array(Arc::new(StructArray::new(
+            structs.fields().clone(),
+            children,
+            structs.nulls().cloned(),
+        ))))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.inner]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> DFResult<Arc<dyn PhysicalExpr>> {
+        let [inner] = children.try_into().map_err(|children: Vec<_>| {
+            DataFusionError::Internal(format!(
+                "CanonicalPartitionExpr expects exactly one child, got {}",
+                children.len()
+            ))
+        })?;
+        Ok(Arc::new(CanonicalPartitionExpr { inner }))
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -478,10 +567,12 @@ pub(crate) fn write_sort_plan(table: &Table, input_schema: &ArrowSchema) -> Writ
     }
     if let Ok(partition_index) = input_schema.index_of(PROJECTED_PARTITION_VALUE_COLUMN) {
         keys.insert(0, PhysicalSortExpr {
-            expr: Arc::new(Column::new(
-                PROJECTED_PARTITION_VALUE_COLUMN,
-                partition_index,
-            )),
+            expr: Arc::new(CanonicalPartitionExpr {
+                inner: Arc::new(Column::new(
+                    PROJECTED_PARTITION_VALUE_COLUMN,
+                    partition_index,
+                )),
+            }),
             options: SortOptions::default(),
         });
     }
