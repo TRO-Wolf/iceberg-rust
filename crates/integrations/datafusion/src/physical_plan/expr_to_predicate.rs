@@ -67,13 +67,25 @@ fn predicate_binds_soundly(predicate: &Predicate, schema: &Schema) -> bool {
             predicate_binds_soundly(left, schema) && predicate_binds_soundly(right, schema)
         }
         Predicate::Not(expr) => predicate_binds_soundly(expr.inputs()[0], schema),
-        Predicate::Unary(expr) => schema.field_by_name(expr.term().name()).is_some(),
-        Predicate::Binary(expr) => literal_binds_soundly(schema, expr.term(), expr.literal()),
-        Predicate::Set(expr) => expr
-            .literals()
-            .iter()
-            .all(|literal| literal_binds_soundly(schema, expr.term(), literal)),
+        Predicate::Unary(expr) => term_binds_soundly(schema, expr.term()),
+        Predicate::Binary(expr) => {
+            term_binds_soundly(schema, expr.term())
+                && literal_binds_soundly(schema, expr.term(), expr.literal())
+        }
+        Predicate::Set(expr) => {
+            term_binds_soundly(schema, expr.term())
+                && expr
+                    .literals()
+                    .iter()
+                    .all(|literal| literal_binds_soundly(schema, expr.term(), literal))
+        }
     }
+}
+
+fn term_binds_soundly(schema: &Schema, column: &Reference) -> bool {
+    schema
+        .field_by_name(column.name())
+        .is_some_and(|field| schema.accessor_by_field_id(field.id).is_some())
 }
 
 fn literal_binds_soundly(schema: &Schema, column: &Reference, literal: &Datum) -> bool {
