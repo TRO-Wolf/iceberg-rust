@@ -1682,7 +1682,7 @@ async fn test_insert_into_nested() -> Result<()> {
         expect![[r#"
             Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
             Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "profile": nullable Struct("address": Struct("street": Utf8, metadata: {"PARQUET:field_id": "6"}, "city": Utf8, metadata: {"PARQUET:field_id": "7"}, "zip": Int32, metadata: {"PARQUET:field_id": "8"}), metadata: {"PARQUET:field_id": "4"}, "contact": Struct("email": Utf8, metadata: {"PARQUET:field_id": "9"}, "phone": Utf8, metadata: {"PARQUET:field_id": "10"}), metadata: {"PARQUET:field_id": "5"}), metadata: {"PARQUET:field_id": "3"} }"#]],
+            Field { "profile": nullable Struct("address": Struct("street": Utf8, "city": Utf8, "zip": Int32), "contact": Struct("email": Utf8, "phone": Utf8)), metadata: {"PARQUET:field_id": "3"} }"#]],
         expect![[r#"
             id: PrimitiveArray<Int32>
             [
@@ -1701,7 +1701,7 @@ async fn test_insert_into_nested() -> Result<()> {
               valid,
             ]
             [
-            -- child 0: "address" (Struct([Field { name: "street", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "6"} }, Field { name: "city", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "7"} }, Field { name: "zip", data_type: Int32, nullable: true, metadata: {"PARQUET:field_id": "8"} }]))
+            -- child 0: "address" (Struct([Field { name: "street", data_type: Utf8, nullable: true }, Field { name: "city", data_type: Utf8, nullable: true }, Field { name: "zip", data_type: Int32, nullable: true }]))
             StructArray
             -- validity:
             [
@@ -1728,7 +1728,7 @@ async fn test_insert_into_nested() -> Result<()> {
               95113,
             ]
             ]
-            -- child 1: "contact" (Struct([Field { name: "email", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "9"} }, Field { name: "phone", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "10"} }]))
+            -- child 1: "contact" (Struct([Field { name: "email", data_type: Utf8, nullable: true }, Field { name: "phone", data_type: Utf8, nullable: true }]))
             StructArray
             -- validity:
             [
@@ -1779,11 +1779,11 @@ async fn test_insert_into_nested() -> Result<()> {
         expect![[r#"
             Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
             Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][street]": nullable Utf8, metadata: {"PARQUET:field_id": "6"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][city]": nullable Utf8, metadata: {"PARQUET:field_id": "7"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][zip]": nullable Int32, metadata: {"PARQUET:field_id": "8"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[contact][email]": nullable Utf8, metadata: {"PARQUET:field_id": "9"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[contact][phone]": nullable Utf8, metadata: {"PARQUET:field_id": "10"} }"#]],
+            Field { "catalog.test_insert_nested.nested_table.profile[address][street]": nullable Utf8 },
+            Field { "catalog.test_insert_nested.nested_table.profile[address][city]": nullable Utf8 },
+            Field { "catalog.test_insert_nested.nested_table.profile[address][zip]": nullable Int32 },
+            Field { "catalog.test_insert_nested.nested_table.profile[contact][email]": nullable Utf8 },
+            Field { "catalog.test_insert_nested.nested_table.profile[contact][phone]": nullable Utf8 }"#]],
         expect![[r#"
             id: PrimitiveArray<Int32>
             [

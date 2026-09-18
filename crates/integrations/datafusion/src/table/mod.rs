@@ -40,7 +40,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use iceberg::arrow::{schema_to_arrow_schema, strip_metadata_from_schema};
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::table::Table;
 use iceberg::{Catalog, NamespaceIdent, Result, TableIdent};
@@ -49,6 +49,7 @@ pub use static_provider::IcebergStaticTableProvider;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
+use crate::physical_plan::conform::strip_nested_metadata_from_schema;
 use crate::physical_plan::delete::{
     IcebergDeleteExec, IsolationLevel, WRITE_DELETE_ISOLATION_LEVEL, WRITE_DELETE_MODE,
     WRITE_UPDATE_ISOLATION_LEVEL, WRITE_UPDATE_MODE, WriteMode,
@@ -125,8 +126,7 @@ impl IcebergTableProvider {
 #[async_trait]
 impl TableProvider for IcebergTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
-        let schema = strip_metadata_from_schema(&self.schema);
-        Arc::new(schema.expect("planning schema strips cleanly"))
+        Arc::new(strip_nested_metadata_from_schema(&self.schema))
     }
 
     fn table_type(&self) -> TableType {
