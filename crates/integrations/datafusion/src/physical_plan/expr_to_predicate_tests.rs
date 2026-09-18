@@ -17,13 +17,16 @@
 use std::collections::HashMap;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::common::DFSchema;
+use datafusion::common::{Column, DFSchema};
 use datafusion::logical_expr::expr::Cast;
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::prelude::{Expr, SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use iceberg::expr::{Predicate, Reference};
-use iceberg::spec::{Datum, NestedField, PrimitiveType, Schema as IcebergSchema, SchemaRef, Type};
+use iceberg::spec::{
+    Datum, ListType, MapType, NestedField, PrimitiveType, Schema as IcebergSchema, SchemaRef,
+    StructType, Type,
+};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::convert_filters_to_predicate;
@@ -731,4 +734,147 @@ fn timestamp_nanos_literal_against_micros_column_is_not_pushed() {
         None,
     )));
     assert_eq!(push(expr), None);
+}
+
+fn nested_iceberg_schema() -> SchemaRef {
+    IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(
+                2,
+                "xs",
+                Type::List(ListType::new(
+                    NestedField::list_element(3, Type::Primitive(PrimitiveType::Int), false).into(),
+                )),
+            )
+            .into(),
+            NestedField::optional(
+                4,
+                "m",
+                Type::Map(MapType::new(
+                    NestedField::map_key_element(5, Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::map_value_element(6, Type::Primitive(PrimitiveType::Int), false)
+                        .into(),
+                )),
+            )
+            .into(),
+            NestedField::optional(
+                7,
+                "s",
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(8, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                ])),
+            )
+            .into(),
+        ])
+        .build()
+        .unwrap()
+        .into()
+}
+
+fn push_nested(exprs: &[Expr]) -> Option<Predicate> {
+    convert_filters_to_predicate(exprs, &nested_iceberg_schema())
+}
+
+#[test]
+fn is_null_on_a_list_column_is_not_pushed() {
+    assert_eq!(push_nested(&[Expr::IsNull(Box::new(col("xs")))]), None);
+    assert_eq!(push_nested(&[Expr::IsNotNull(Box::new(col("xs")))]), None);
+}
+
+#[test]
+fn is_null_on_a_map_column_is_not_pushed() {
+    assert_eq!(push_nested(&[Expr::IsNull(Box::new(col("m")))]), None);
+    assert_eq!(push_nested(&[Expr::IsNotNull(Box::new(col("m")))]), None);
+}
+
+#[test]
+fn is_null_on_a_struct_column_is_not_pushed() {
+    assert_eq!(push_nested(&[Expr::IsNull(Box::new(col("s")))]), None);
+    assert_eq!(push_nested(&[Expr::IsNotNull(Box::new(col("s")))]), None);
+}
+
+#[test]
+fn is_null_on_a_list_element_name_is_not_pushed() {
+    let column = Column::new_unqualified("xs.element");
+    assert_eq!(
+        push_nested(&[Expr::IsNull(Box::new(Expr::Column(column)))]),
+        None
+    );
+}
+
+#[test]
+fn binary_on_an_accessorless_leaf_is_not_pushed() {
+    for (name, literal) in [
+        ("xs.element", lit(1_i64)),
+        ("m.value", lit(1_i64)),
+        ("m.key", lit("k")),
+    ] {
+        let column = Column::new_unqualified(name);
+        assert_eq!(
+            push_nested(&[Expr::Column(column).eq(literal)]),
+            None,
+            "{name} resolves to a field with no accessor and must not push"
+        );
+    }
+}
+
+#[test]
+fn in_list_on_an_accessorless_leaf_is_not_pushed() {
+    for (name, literals) in [
+        ("xs.element", vec![lit(1_i64), lit(2_i64)]),
+        ("m.value", vec![lit(1_i64), lit(2_i64)]),
+        ("m.key", vec![lit("k"), lit("v")]),
+    ] {
+        let column = Column::new_unqualified(name);
+        assert_eq!(
+            push_nested(&[Expr::Column(column).in_list(literals, false)]),
+            None,
+            "{name} resolves to a field with no accessor and must not push"
+        );
+    }
+}
+
+#[test]
+fn is_null_on_a_nested_column_drops_only_its_own_conjunction() {
+    assert_eq!(
+        push_nested(&[col("id").gt(lit(1_i64)), Expr::IsNull(Box::new(col("xs")))]),
+        Some(Reference::new("id").greater_than(Datum::long(1)))
+    );
+    assert_eq!(
+        push_nested(&[col("id")
+            .gt(lit(1_i64))
+            .and(Expr::IsNull(Box::new(col("xs"))))]),
+        None
+    );
+    assert_eq!(
+        push_nested(&[Expr::IsNull(Box::new(col("xs"))).or(col("id").eq(lit(1_i64)))]),
+        None
+    );
+    assert_eq!(
+        push_nested(&[Expr::Not(Box::new(Expr::IsNull(Box::new(col("xs")))))]),
+        None
+    );
+}
+
+#[test]
+fn is_null_on_a_primitive_column_still_pushes() {
+    assert_eq!(
+        push_nested(&[Expr::IsNull(Box::new(col("id")))]),
+        Some(Reference::new("id").is_null())
+    );
+    assert_eq!(
+        push_nested(&[Expr::IsNotNull(Box::new(col("id")))]),
+        Some(Reference::new("id").is_not_null())
+    );
+}
+
+#[test]
+fn is_null_on_a_struct_leaf_still_pushes() {
+    let column = Column::new_unqualified("s.a");
+    assert_eq!(
+        push_nested(&[Expr::IsNull(Box::new(Expr::Column(column)))]),
+        Some(Reference::new("s.a").is_null())
+    );
 }
