@@ -24,10 +24,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, FixedSizeBinaryArray, LargeBinaryArray, RecordBatch, Time64MicrosecondArray,
-    make_array, new_null_array,
+    Array, ArrayRef, FixedSizeBinaryArray, LargeBinaryArray, LargeListArray, ListArray, MapArray,
+    RecordBatch, Time64MicrosecondArray, make_array, new_null_array,
 };
-use arrow_buffer::NullBuffer;
+use arrow_buffer::{BooleanBuffer, MutableBuffer, NullBuffer, bit_util};
 use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use uuid::Uuid;
@@ -152,7 +152,7 @@ fn relabel_column(column: &ArrayRef, target: &DataType, depth: usize) -> Result<
             return Err(incompatible_type(actual, target));
         }
         let child_array = make_array(child_data.clone());
-        if !target_field.is_nullable() && disallowed_nulls(target, column.nulls(), &child_array) {
+        if !target_field.is_nullable() && disallowed_nulls(target, column, &child_array) {
             return Err(incompatible_type(actual, target));
         }
         children.push(relabel_column(&child_array, target_field.data_type(), depth + 1)?.to_data());
@@ -165,24 +165,69 @@ fn relabel_column(column: &ArrayRef, target: &DataType, depth: usize) -> Result<
     }))
 }
 
-fn disallowed_nulls(
-    target: &DataType,
-    parent_nulls: Option<&NullBuffer>,
-    child: &ArrayRef,
-) -> bool {
+fn disallowed_nulls(target: &DataType, column: &ArrayRef, child: &ArrayRef) -> bool {
+    let Some(child_nulls) = child.nulls() else {
+        return false;
+    };
+    if child_nulls.null_count() == 0 {
+        return false;
+    }
+    let mut bits = MutableBuffer::new_null(child.len());
+    let base = column.offset();
     match target {
-        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => child.null_count() > 0,
-        _ => match (parent_nulls, child.nulls()) {
-            (_, None) => false,
-            (Some(parent_nulls), Some(child_nulls)) => {
-                let mask = match target {
-                    DataType::FixedSizeList(_, len) => parent_nulls.expand(*len as usize),
-                    _ => parent_nulls.clone(),
-                };
-                !mask.contains(child_nulls)
+        DataType::List(_) => {
+            let Some(list) = column.as_any().downcast_ref::<ListArray>() else {
+                return true;
+            };
+            let offsets = list.value_offsets();
+            mark_valid_ranges(&mut bits, column, |i| {
+                offsets[i] as usize..offsets[i + 1] as usize
+            });
+        }
+        DataType::LargeList(_) => {
+            let Some(list) = column.as_any().downcast_ref::<LargeListArray>() else {
+                return true;
+            };
+            let offsets = list.value_offsets();
+            mark_valid_ranges(&mut bits, column, |i| {
+                offsets[i] as usize..offsets[i + 1] as usize
+            });
+        }
+        DataType::FixedSizeList(_, width) => {
+            let width = *width as usize;
+            mark_valid_ranges(&mut bits, column, |i| {
+                (base + i) * width..(base + i + 1) * width
+            });
+        }
+        DataType::Map(_, _) => {
+            let Some(map) = column.as_any().downcast_ref::<MapArray>() else {
+                return true;
+            };
+            let offsets = map.value_offsets();
+            mark_valid_ranges(&mut bits, column, |i| {
+                offsets[i] as usize..offsets[i + 1] as usize
+            });
+        }
+        DataType::Struct(_) => {
+            mark_valid_ranges(&mut bits, column, |i| base + i..base + i + 1);
+        }
+        _ => return true,
+    }
+    let mask = NullBuffer::new(BooleanBuffer::new(bits.into(), 0, child.len()));
+    !mask.contains(child_nulls)
+}
+
+fn mark_valid_ranges(
+    bits: &mut MutableBuffer,
+    parent: &ArrayRef,
+    range: impl Fn(usize) -> std::ops::Range<usize>,
+) {
+    for i in 0..parent.len() {
+        if parent.is_valid(i) {
+            for j in range(i) {
+                bit_util::set_bit(bits.as_mut(), j);
             }
-            (None, Some(_)) => child.null_count() > 0,
-        },
+        }
     }
 }
 

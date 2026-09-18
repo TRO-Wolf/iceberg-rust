@@ -224,6 +224,7 @@ mod tests {
     use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use datafusion::prelude::SessionContext;
     use datafusion::sql::TableReference;
+    use iceberg::arrow::strip_metadata_from_schema;
 
     use super::*;
 
@@ -285,7 +286,8 @@ mod tests {
             .await
             .expect("create table failed");
 
-        let expected_schema = table_metadata_v2_schema();
+        let expected_schema =
+            strip_metadata_from_schema(&table_metadata_v2_schema()).expect("schema strips cleanly");
         let actual_schema = table_provider.schema();
 
         assert_eq!(actual_schema.as_ref(), &expected_schema);
@@ -319,7 +321,8 @@ mod tests {
             .expect("table not found");
 
         // Check the schema of the created table
-        let expected_schema = table_metadata_v2_schema();
+        let expected_schema =
+            strip_metadata_from_schema(&table_metadata_v2_schema()).expect("schema strips cleanly");
         let actual_schema = table_provider.schema();
 
         assert_eq!(actual_schema.as_ref(), &expected_schema);

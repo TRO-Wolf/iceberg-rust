@@ -25,7 +25,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
-use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::arrow::{schema_to_arrow_schema, strip_metadata_from_schema};
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind, Result};
 
@@ -80,7 +80,8 @@ impl IcebergStaticTableProvider {
 #[async_trait]
 impl TableProvider for IcebergStaticTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
-        self.schema.clone()
+        let schema = strip_metadata_from_schema(&self.schema);
+        Arc::new(schema.expect("planning schema strips cleanly"))
     }
 
     fn table_type(&self) -> TableType {
