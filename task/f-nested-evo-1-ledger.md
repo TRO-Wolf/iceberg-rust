@@ -148,17 +148,18 @@ new tests in `nested_projection_evo_tests.rs` → 8 passed, 10 failed:
   `DataInvalid` "Missing required field" error for a required field without one — the same
   priority the Avro reader's `missing_column_source` applies, minus the identity-partition
   constant step (partition values only exist at the top level).
-- **D-7 (L-002)** — an id-less source child in a partially id-carrying struct matches its
-  target child by NAME. Java's fallback-id path (`ApplyNameMapping` / `addFallbackFieldIds`,
-  already ported in this crate's reader for the top level) assigns synthetic ids so that
-  name-identical children line up; matching the id-less child by name reproduces that observable
-  behavior without inventing ids. The name fallback cannot leak a dropped-then-readded name:
-  `source_by_name` holds only id-less source children, and the fallback runs only when the
-  target child's id lookup misses, so a file child that carries an old id is never claimed by a
-  target child with a new id (pinned by
-  `nested_field_dropped_then_readded_same_name_new_id_reads_null`). The vacuous-`all()` hole is
-  closed by an explicit `!source_fields.is_empty()` guard: a zero-child file struct fills every
-  target child instead of taking the legacy cast path.
+- **D-7 (L-002, amended by D-24)** — an id-less source child in a partially id-carrying struct
+  matches its target child by NAME. Java's fallback-id path (`ApplyNameMapping` /
+  `addFallbackFieldIds`, already ported in this crate's reader for the top level) assigns
+  synthetic ids so that name-identical children line up; matching the id-less child by name
+  reproduces that observable behavior without inventing ids. The name fallback cannot leak a
+  dropped-then-readded name: `source_by_name` holds only id-less source children, the fallback
+  runs only when the target child's id lookup misses, and — added in round 3 — the target
+  child's id must not exceed the largest stamped sibling id (a field id allocated after every
+  id the file carries could not have existed when the file was written, so the id-less child is
+  a stale same-named field and null-fills; see D-24). The vacuous-`all()` hole is closed by an
+  explicit `!source_fields.is_empty()` guard: a zero-child file struct fills every target child
+  instead of taking the legacy cast path.
 - **D-8 (L-003)** — map keys project through the same `PlanNode` machinery as map values. The
   `DataType::Map` plan arm builds independent key and value plans, so an added key-struct child
   null-fills and a key-struct child rename resolves by field id.

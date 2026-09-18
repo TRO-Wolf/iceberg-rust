@@ -53,6 +53,60 @@ fn identical_nested_column_on_a_modify_batch_uses_pass_through() {
 }
 
 #[test]
+fn idless_source_child_named_like_a_readded_field_reads_null() {
+    let snapshot_schema = Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    2,
+                    "s",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(5, "b", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let s_fields = Fields::from(vec![
+        Arc::new(id_field("a", DataType::Int32, true, 3)) as Arc<Field>,
+        Arc::new(Field::new("b", DataType::Utf8, true)),
+    ]);
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        id_field("id", DataType::Int32, false, 1),
+        id_field("s", DataType::Struct(s_fields.clone()), true, 2),
+    ]));
+    let s = StructArray::new(
+        s_fields,
+        vec![
+            Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["old", "vals"])) as ArrayRef,
+        ],
+        None,
+    );
+    let file_batch = RecordBatch::try_new(file_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(s) as ArrayRef,
+    ])
+    .unwrap();
+    let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+    let result = transformer.process_record_batch(file_batch).unwrap();
+    let s = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let b = s.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    assert!(b.is_null(0));
+    assert!(b.is_null(1));
+}
+
+#[test]
 fn null_parent_struct_propagates_null_rows() {
     let snapshot_schema = table_schema_with_struct_a_b();
     let file_schema = Arc::new(ArrowSchema::new(vec![

@@ -253,19 +253,25 @@ impl PlanNode {
         }
         let mut source_by_id: HashMap<i32, usize> = HashMap::with_capacity(source_fields.len());
         let mut source_by_name: HashMap<&str, usize> = HashMap::new();
+        let mut max_source_id = i32::MIN;
         for (pos, field) in source_fields.iter().enumerate() {
             if let Some(id) = field_id_of(field) {
                 source_by_id.insert(id, pos);
+                max_source_id = max_source_id.max(id);
             } else {
                 source_by_name.entry(field.name().as_str()).or_insert(pos);
             }
         }
         let mut children = Vec::with_capacity(target_fields.len());
         for target_child in target_fields.iter() {
-            let source_index = field_id_of(target_child)
-                .and_then(|id| source_by_id.get(&id))
-                .copied()
-                .or_else(|| source_by_name.get(target_child.name().as_str()).copied());
+            let source_index = match field_id_of(target_child) {
+                Some(id) => source_by_id.get(&id).copied().or_else(|| {
+                    (id <= max_source_id)
+                        .then(|| source_by_name.get(target_child.name().as_str()).copied())
+                        .flatten()
+                }),
+                None => source_by_name.get(target_child.name().as_str()).copied(),
+            };
             let node = match source_index {
                 Some(index) => Self::build(
                     source_fields[index].data_type(),
