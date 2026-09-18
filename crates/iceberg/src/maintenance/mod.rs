@@ -141,6 +141,8 @@ pub mod partition_stats;
 mod remove_dangling_delete_files;
 mod rewrite_data_files;
 #[cfg(test)]
+mod rewrite_data_files_cow_bytes_tests;
+#[cfg(test)]
 mod rewrite_data_files_dangling_tests;
 mod rewrite_data_files_dv;
 #[cfg(test)]
