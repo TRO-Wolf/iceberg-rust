@@ -106,7 +106,6 @@ async fn test_parquet_writer() -> Result<()> {
     assert_eq!(data_file.content, DataContentType::Data);
     assert_eq!(data_file.partition, Struct::empty());
 
-    // Post-close CurrentFileStatus must not panic (inner writer is taken on close).
     assert_eq!(
         data_file_writer.current_file_path(),
         "",
@@ -231,15 +230,6 @@ async fn test_parquet_writer_with_partition() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================================
-// Partition-spec-id stamping (`resolve_partition_spec_id`).
-//
-// Java takes the spec as a REQUIRED builder argument and stamps `spec.specId()` unconditionally
-// (`DataFiles.Builder(spec)` / `FileMetadata.Builder(spec)`); Rust's `DataFileBuilder` defaults
-// the field to `DEFAULT_PARTITION_SPEC_ID` (0). These pin the precedence and the rejections.
-// ============================================================================================
-
-/// `1: id long`, `2: dept string`, both required — the fixture schema for the stamping tests.
 fn stamp_test_schema() -> Arc<Schema> {
     Arc::new(
         Schema::builder()
@@ -253,7 +243,6 @@ fn stamp_test_schema() -> Arc<Schema> {
     )
 }
 
-/// A one-field spec over `dept` under `spec_id`, with the given transform.
 fn dept_spec(schema: &Arc<Schema>, spec_id: i32, transform: Transform) -> PartitionSpec {
     PartitionSpec::builder(schema.as_ref().clone())
         .with_spec_id(spec_id)
@@ -269,7 +258,6 @@ fn dept_spec(schema: &Arc<Schema>, spec_id: i32, transform: Transform) -> Partit
         .expect("build spec")
 }
 
-/// A `DataFileWriterBuilder` writing one-row files under `temp_dir`.
 fn stamp_writer_builder(
     file_io: &FileIO,
     temp_dir: &TempDir,
@@ -295,7 +283,6 @@ fn stamp_writer_builder(
     ))
 }
 
-/// One row `(1, "eng")` in the fixture schema.
 fn stamp_test_batch() -> RecordBatch {
     let arrow_schema = arrow_schema::Schema::new(vec![
         Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
@@ -314,17 +301,11 @@ fn stamp_test_batch() -> RecordBatch {
     .expect("build stamp test batch")
 }
 
-/// CONFIGURED SPEC, NO KEY. An unpartitioned spec whose id is NOT 0 must be stamped as itself.
-/// Before the stamp fix this produced a file claiming spec 0 — which the commit path then
-/// validates against spec 0's (possibly partitioned) type, and which no reader ever pairs with
-/// data files under the real spec.
 #[tokio::test]
 async fn test_data_file_writer_stamps_configured_unpartitioned_spec_id() -> Result<()> {
     let temp_dir = TempDir::new().expect("temp dir");
     let file_io = FileIO::new_with_fs();
     let schema = stamp_test_schema();
-    // An UNPARTITIONED spec with a NON-ZERO id — reachable by evolving a partitioned spec's only
-    // field away on V2.
     let spec = PartitionSpec::builder(schema.as_ref().clone())
         .with_spec_id(7)
         .build()
@@ -352,8 +333,6 @@ async fn test_data_file_writer_stamps_configured_unpartitioned_spec_id() -> Resu
     Ok(())
 }
 
-/// CONFIGURED PARTITIONED SPEC, NO KEY. Rejected at build time: the file would claim a spec whose
-/// partition type has fields while carrying the builder's empty tuple.
 #[tokio::test]
 async fn test_data_file_writer_rejects_partitioned_spec_without_partition_key() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -377,10 +356,6 @@ async fn test_data_file_writer_rejects_partitioned_spec_without_partition_key() 
     );
 }
 
-/// ALL-VOID SPEC, NO KEY. `is_unpartitioned()` is TRUE for an all-void spec, but its partition
-/// TYPE still has one field — so a file under it still needs a (null) tuple. The rejection is
-/// keyed on partition-field ARITY, not on `is_unpartitioned()`; keying it on the latter would
-/// wave this case through into the commit-time arity failure the check exists to prevent.
 #[tokio::test]
 async fn test_data_file_writer_rejects_all_void_spec_without_partition_key() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -388,7 +363,6 @@ async fn test_data_file_writer_rejects_all_void_spec_without_partition_key() {
     let schema = stamp_test_schema();
     let void_spec = dept_spec(&schema, 5, Transform::Void);
 
-    // Fixture sanity: this is the trap shape — unpartitioned by the predicate, 1-field by arity.
     assert!(
         void_spec.is_unpartitioned(),
         "fixture: an all-void spec reports is_unpartitioned() == true"
@@ -420,8 +394,6 @@ async fn test_data_file_writer_rejects_all_void_spec_without_partition_key() {
     );
 }
 
-/// ALL-VOID SPEC WITH A KEY. The legal counterpart of the leg above: a one-field null tuple is
-/// accepted and stamped under the void spec's own id.
 #[tokio::test]
 async fn test_data_file_writer_accepts_all_void_spec_with_null_tuple_key() -> Result<()> {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -446,9 +418,6 @@ async fn test_data_file_writer_accepts_all_void_spec_with_null_tuple_key() -> Re
     Ok(())
 }
 
-/// PRECEDENCE. The `PartitionKey`'s own spec wins over the configured spec — the key carries the
-/// spec its tuple was produced from, and a file may legitimately be written under an OLDER spec
-/// than the one the builder was configured with.
 #[tokio::test]
 async fn test_data_file_writer_partition_key_spec_wins_over_configured_spec() -> Result<()> {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -482,7 +451,6 @@ async fn test_data_file_writer_partition_key_spec_wins_over_configured_spec() ->
     Ok(())
 }
 
-/// Neither spec nor key is now an error. `unpartitioned()` is the opt-in that stamps spec 0.
 #[tokio::test]
 async fn test_data_file_writer_without_spec_or_key_errors() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -549,8 +517,6 @@ fn unknown_column_batch() -> RecordBatch {
     .expect("batch with Null unknown column")
 }
 
-/// Pin (row R91): a Null/`unknown` column is refused loud. Risk: a silent parquet commit
-/// leaves a file the Iceberg reader cannot visit (`Cannot visit Arrow data type: Null`).
 #[tokio::test]
 async fn data_file_writer_refuses_unknown_null_column_loud() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -591,7 +557,6 @@ async fn data_file_writer_refuses_unknown_null_column_loud() {
     );
 }
 
-/// Pin: `apply_write_defaults` filling a missing optional `unknown` as Null is still refused.
 #[tokio::test]
 async fn data_file_writer_refuses_omitted_optional_unknown_column() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -626,7 +591,6 @@ async fn data_file_writer_refuses_omitted_optional_unknown_column() {
     );
 }
 
-/// Neighbouring pin: a batch with no unknown/Null column still writes and reads back.
 #[tokio::test]
 async fn data_file_writer_writes_and_reads_back_int_string_batch() -> Result<()> {
     let temp_dir = TempDir::new().expect("temp dir");

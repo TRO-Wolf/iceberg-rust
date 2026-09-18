@@ -31,17 +31,12 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::to_datafusion_error;
 
-/// How one advertised output column is produced from the scanned data. Resolution is by FIELD ID:
-/// `RENAME COLUMN` keeps the id, so a name-keyed binding reads the wrong column after a rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ColumnSource {
-    /// Take the scanned column under the name the SCANNED snapshot gives the advertised field id.
     Scanned(String),
-    /// The scanned snapshot has no such field id, so emit NULLs, as Java does.
     Absent,
 }
 
-/// The Iceberg field id an advertised Arrow field carries, or a loud error.
 pub(crate) fn advertised_field_id(field: &ArrowField) -> DFResult<i32> {
     let raw = field
         .metadata()
@@ -71,8 +66,6 @@ pub(crate) fn advertised_field_id(field: &ArrowField) -> DFResult<i32> {
     })
 }
 
-/// Whether an Arrow type change is one of Iceberg's LEGAL type promotions. It mirrors
-/// [`iceberg::spec::is_promotion_allowed`], pinned by the mirror test below.
 pub(crate) fn is_arrow_promotion_allowed(from: &DataType, to: &DataType) -> bool {
     if from == to {
         return true;
@@ -92,21 +85,6 @@ pub(crate) fn is_arrow_promotion_allowed(from: &DataType, to: &DataType) -> bool
     }
 }
 
-/// Coerces a scanned batch to the schema the plan advertised.
-///
-/// A DataFusion operator addresses its input by ORDINAL, so a batch carrying the right columns in
-/// the wrong order, or one extra, is silent corruption. This rebuilds the batch in advertised order
-/// from the bindings [`resolve_projection`] computed:
-///
-/// | Binding | Result |
-/// |---|---|
-/// | bound, same type | taken as is |
-/// | bound under a different name | the same values, under the advertised name |
-/// | bound with a legal promotion | cast to the advertised type |
-/// | unbound and nullable | an all-NULL column, as Java's readers null-fill |
-/// | unbound and not nullable, or an illegal type change | a typed error naming the column |
-///
-/// The row count is carried explicitly, so a zero-column `SELECT count(*)` keeps it.
 pub(crate) fn conform_batch(
     batch: RecordBatch,
     advertised: &ArrowSchemaRef,
@@ -167,9 +145,6 @@ pub(crate) fn conform_batch(
     })
 }
 
-/// Coerces ONE scanned column to its advertised field, recursing through nested types. Iceberg
-/// evolves a nested field as it evolves a top-level one, and none of those DDLs creates a snapshot.
-/// A nested Arrow field carries `PARQUET:field_id`, and `path` names the offending field on error.
 pub(crate) fn conform_column(
     column: &ArrayRef,
     target: &ArrowField,
@@ -192,7 +167,6 @@ pub(crate) fn conform_column(
             let scanned = downcast::<StructArray>(column, path)?;
             let len = scanned.len();
 
-            // An unidentifiable scanned child is indistinguishable from an absent one.
             let scanned_ids = scanned_fields
                 .iter()
                 .map(|field| advertised_field_id(field))
@@ -289,7 +263,6 @@ pub(crate) fn conform_column(
     }
 }
 
-/// Downcasts an array whose `DataType` already matched. A failure is a broken Arrow invariant.
 fn downcast<'a, T: 'static>(column: &'a ArrayRef, path: &str) -> DFResult<&'a T> {
     column.as_any().downcast_ref::<T>().ok_or_else(|| {
         datafusion::error::DataFusionError::Internal(format!(

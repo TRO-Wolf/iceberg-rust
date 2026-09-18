@@ -94,8 +94,6 @@ pub(super) async fn get_test_catalog_and_table()
     )
 }
 
-// Tests for IcebergStaticTableProvider
-
 #[tokio::test]
 async fn test_static_provider_from_table() {
     let table = get_test_table_from_metadata_file().await;
@@ -168,7 +166,6 @@ async fn test_static_provider_rejects_writes() {
 
 #[tokio::test]
 async fn test_static_provider_scan() {
-    // A real empty table: an incomplete fixture must fail closed at plan time, not demote.
     let (_catalog, _ns, _name, table, _tmp) = get_static_test_table().await;
     let table_provider = IcebergStaticTableProvider::try_new_from_table(table)
         .await
@@ -181,8 +178,6 @@ async fn test_static_provider_scan() {
     let physical_plan = df.create_physical_plan().await;
     assert!(physical_plan.is_ok());
 }
-
-// Tests for IcebergTableProvider
 
 #[tokio::test]
 async fn test_catalog_backed_provider_creation() {
@@ -246,7 +241,6 @@ async fn test_catalog_backed_provider_insert() {
     assert!(execution_result.is_ok());
 }
 
-/// Pin 13 DF: multi_partition_scan=false forces T=1 (N=1) while target_partitions > 1.
 #[tokio::test]
 async fn test_pin13_off_switch_forces_n1_with_target_partitions_gt1() {
     use datafusion::prelude::SessionConfig;
@@ -268,7 +262,6 @@ async fn test_pin13_off_switch_forces_n1_with_target_partitions_gt1() {
     ctx.register_table("test_table", Arc::new(provider))
         .expect("register");
 
-    // Multiple files so multi-partition would otherwise engage when ON.
     for sql in [
         "INSERT INTO test_table VALUES (1, 'a')",
         "INSERT INTO test_table VALUES (2, 'b')",
@@ -307,7 +300,6 @@ async fn test_pin13_off_switch_forces_n1_with_target_partitions_gt1() {
         "pin 13: off-switch must force N=1 even with multi-file + target_partitions=8"
     );
     assert_eq!(scan.properties().output_partitioning().partition_count(), 1);
-    // Multiset still complete (pin 4 under off-switch)
     let rows: usize = ctx
         .sql("SELECT id FROM test_table")
         .await
@@ -321,7 +313,6 @@ async fn test_pin13_off_switch_forces_n1_with_target_partitions_gt1() {
     assert_eq!(rows, 3, "pin 13/4: off-switch must not drop rows");
 }
 
-/// Pins 1 + 5 (DF): multi-file + tiny split props force N>1; LIMIT k card + sub-multiset.
 #[tokio::test]
 async fn test_pin1_pin5_multi_file_partitioning_and_limit() {
     use datafusion::prelude::SessionConfig;
@@ -644,7 +635,6 @@ async fn test_insert_plan_fanout_disabled_has_sort() {
     );
 }
 
-/// Empty table with a local warehouse path — safe for eager `plan_tasks` (G1 fail-closed).
 pub(super) async fn get_static_test_table()
 -> (Arc<dyn Catalog>, NamespaceIdent, String, Table, TempDir) {
     let (catalog, namespace, table_name, temp_dir) = get_test_catalog_and_table().await;
@@ -710,26 +700,13 @@ async fn test_limit_pushdown_catalog_backed_provider() {
     );
 }
 
-// ===== Live-schema regressions =====
-//
-// Two halves of one defect class. A provider that caches the Arrow schema forever plans every
-// later query against a schema that no longer describes the table. And a scan that reloads the
-// table while the adapter advertises the construction-time schema emits mismatched batches.
-
-/// An out-of-band schema evolution. None of these creates a snapshot, so the CURRENT schema
-/// and the schema the data is read with disagree.
 pub(super) enum SchemaOp<'a> {
-    /// `ALTER TABLE ADD COLUMN <name> int` (optional).
     AddOptionalInt(&'a str),
-    /// `ALTER TABLE RENAME COLUMN <from> TO <to>`, which keeps the field id.
     Rename(&'a str, &'a str),
-    /// `ALTER TABLE ALTER COLUMN <name> TYPE bigint`, a legal int to long promotion.
     PromoteToLong(&'a str),
-    /// `ALTER TABLE DROP COLUMN <name>`.
     Drop(&'a str),
 }
 
-/// Applies an evolution through a SECOND catalog handle. The provider under test never sees it.
 pub(super) async fn evolve_schema(
     catalog: &Arc<dyn Catalog>,
     ident: &TableIdent,
@@ -772,7 +749,6 @@ pub(super) async fn query_through(
         .unwrap_or_else(|e| panic!("execute `{sql}`: {e}"))
 }
 
-/// Seeds `rows` through a provider resolved fresh against the table's current schema.
 pub(super) async fn seed(
     catalog: &Arc<dyn Catalog>,
     namespace: &NamespaceIdent,
@@ -787,7 +763,6 @@ pub(super) async fn seed(
     assert!(!batches.is_empty(), "a write must report its row count");
 }
 
-/// An advertised schema is STABLE, and freshness comes from `refreshed()`.
 #[tokio::test]
 async fn test_provider_schema_is_stable_and_refreshed_serves_the_current_schema() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -801,7 +776,6 @@ async fn test_provider_schema_is_stable_and_refreshed_serves_the_current_schema(
 
     evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("extra")).await;
 
-    // An ordinary operation must NOT move the advertised schema.
     let ctx = SessionContext::new();
     let state = ctx.state();
     provider
@@ -814,7 +788,6 @@ async fn test_provider_schema_is_stable_and_refreshed_serves_the_current_schema(
         "an instance's advertised schema must not move under the plans built on it"
     );
 
-    // A NEW instance carries the current schema.
     let refreshed = provider
         .refreshed()
         .await
@@ -833,8 +806,6 @@ async fn test_provider_schema_is_stable_and_refreshed_serves_the_current_schema(
     );
 }
 
-/// A catalog query resolves a provider per planning round, as `SparkCatalog.loadTable` does,
-/// so the next query sees an evolution with no refresh call.
 #[tokio::test]
 async fn test_catalog_resolves_a_fresh_provider_per_query() {
     use datafusion::catalog::SchemaProvider;
@@ -875,14 +846,11 @@ async fn test_catalog_resolves_a_fresh_provider_per_query() {
     );
 }
 
-/// `ADD COLUMN` creates no snapshot, so the advertised schema has a column the scanned one
-/// lacks. The batches must still match it, with that column read as NULL, as Java null-fills.
 #[tokio::test]
 async fn test_scan_batches_match_advertised_schema_after_add_column() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
     let ident = TableIdent::new(namespace.clone(), table_name.clone());
 
-    // One committed row, so the snapshot schema is the 2-column original.
     {
         let provider =
             IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
