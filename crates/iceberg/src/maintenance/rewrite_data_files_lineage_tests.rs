@@ -420,9 +420,8 @@ fn desc_nulls_last(values: &[Option<i64>]) -> Vec<Option<i64>> {
     sorted
 }
 
-fn asc_nulls_first_nan_last(values: &[Option<f32>]) -> Vec<Option<f32>> {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| match (a, b) {
+fn float_asc_nulls_first_nan_last(a: &Option<f32>, b: &Option<f32>) -> Ordering {
+    match (a, b) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
@@ -432,8 +431,7 @@ fn asc_nulls_first_nan_last(values: &[Option<f32>]) -> Vec<Option<f32>> {
             (false, true) => Ordering::Less,
             (false, false) => x.partial_cmp(y).expect("no NaN"),
         },
-    });
-    sorted
+    }
 }
 
 #[tokio::test]
@@ -597,15 +595,26 @@ async fn binpack_float_sort_places_nan_last_and_honors_nulls_first() {
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
     let files = live_data_files(&table).await;
+    let mut all = Vec::new();
     for file in &files {
         assert_eq!(file.sort_order_id(), Some(order_id));
         let fs = file_f32_column(&table, file, "f").await;
-        assert_eq!(
-            fs,
-            asc_nulls_first_nan_last(&fs),
-            "nulls first, values ascending, NaN last"
+        assert!(
+            fs.windows(2)
+                .all(|pair| float_asc_nulls_first_nan_last(&pair[0], &pair[1])
+                    != Ordering::Greater),
+            "nulls first, values ascending, NaN last: {fs:?}"
         );
+        all.extend(fs);
     }
+    assert_eq!(all.len(), 8);
+    assert_eq!(all.iter().filter(|value| value.is_none()).count(), 2);
+    assert_eq!(
+        all.iter()
+            .filter(|value| value.is_some_and(|float| float.is_nan()))
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
