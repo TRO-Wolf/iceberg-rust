@@ -280,11 +280,7 @@ impl StreamingDataFileWriter {
                     "StreamingDataFileWriter builder already consumed".to_string(),
                 )
             })?;
-            if let Some(sort_order_id) = self
-                .sort
-                .as_ref()
-                .and_then(|sort| sort.sort_order_id)
-            {
+            if let Some(sort_order_id) = self.sort.as_ref().and_then(|sort| sort.sort_order_id) {
                 builder = builder.with_sort_order_id(sort_order_id);
             }
             let writer = TaskWriter::try_new(
@@ -347,11 +343,7 @@ impl StreamingDataFileWriter {
         if self.sort.is_none() {
             self.sort = Some(write_sort_plan(&self.table, batch.schema().as_ref()));
         }
-        if self
-            .sort
-            .as_ref()
-            .is_some_and(|sort| sort.exprs.is_some())
-        {
+        if self.sort.as_ref().is_some_and(|sort| sort.exprs.is_some()) {
             self.buffered.push(batch);
             return Ok(());
         }

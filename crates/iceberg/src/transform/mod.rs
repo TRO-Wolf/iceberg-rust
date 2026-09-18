@@ -203,7 +203,13 @@ mod test {
             Some(-3_600_000_000_001),
             None,
         ];
-        let scalars = [0, 3_599_999_999_999, 3_600_000_000_000, -1, -3_600_000_000_001];
+        let scalars = [
+            0,
+            3_599_999_999_999,
+            3_600_000_000_000,
+            -1,
+            -3_600_000_000_001,
+        ];
         for (array, datum) in [
             (
                 Arc::new(TimestampNanosecondArray::from(values.clone())) as ArrayRef,

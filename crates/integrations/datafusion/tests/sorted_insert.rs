@@ -802,12 +802,7 @@ async fn cow_update_rewrites_file_sorted_by_default_order_and_stamps_it() -> Res
         1,
     )
     .await?;
-    seed_unsorted_file(
-        &fixture,
-        &[Some(5), Some(1), Some(4), Some(2), Some(3)],
-        0,
-    )
-    .await?;
+    seed_unsorted_file(&fixture, &[Some(5), Some(1), Some(4), Some(2), Some(3)], 0).await?;
     run_sql(
         &fixture,
         "UPDATE catalog.cow_update_sort.t SET id = id WHERE p = 0",
@@ -872,12 +867,7 @@ async fn cow_update_on_unsorted_table_stamps_zero_and_keeps_scan_order() -> Resu
         1,
     )
     .await?;
-    seed_unsorted_file(
-        &fixture,
-        &[Some(5), Some(1), Some(4), Some(2), Some(3)],
-        0,
-    )
-    .await?;
+    seed_unsorted_file(&fixture, &[Some(5), Some(1), Some(4), Some(2), Some(3)], 0).await?;
     run_sql(
         &fixture,
         "UPDATE catalog.cow_update_unsorted.t SET id = id WHERE p = 0",

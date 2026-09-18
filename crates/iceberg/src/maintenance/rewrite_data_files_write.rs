@@ -49,8 +49,8 @@ use crate::spec::{
     DataFile, DataFileFormat, NestedFieldRef, NullOrder, PartitionSpecRef, PrimitiveType,
     Schema as IcebergSchema, SchemaRef, SortDirection, Transform, Type,
 };
-use crate::transform::{BoxedTransformFunction, create_transform_function};
 use crate::table::Table;
+use crate::transform::{BoxedTransformFunction, create_transform_function};
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,

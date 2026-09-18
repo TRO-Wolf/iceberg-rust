@@ -19,11 +19,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Float32Array, Int64Array, RecordBatch};
 use arrow_array::cast::AsArray;
+use arrow_array::{Array, ArrayRef, Float32Array, Int64Array, RecordBatch};
 use futures::TryStreamExt;
 
-use crate::Catalog;
 use crate::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
 use crate::maintenance::rewrite_data_files::RewriteDataFiles;
 use crate::maintenance::rewrite_data_files::tests::{
@@ -40,7 +39,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
-use crate::{NamespaceIdent, TableCreation};
+use crate::{Catalog, NamespaceIdent, TableCreation};
 
 async fn scan_lineage(table: &Table) -> Vec<(i64, i64, i64)> {
     let stream = table
@@ -510,20 +509,10 @@ async fn binpack_desc_nulls_last_orders_nulls_last() {
     let table = create_sort_table(&catalog, nullable_yz_schema(), order).await;
     let order_id = i32::try_from(table.metadata().default_sort_order_id()).unwrap();
 
-    let file_a = write_nullable_y_file(
-        &table,
-        "a.parquet",
-        0,
-        &[Some(3), None, Some(9), Some(1)],
-    )
-    .await;
-    let file_b = write_nullable_y_file(
-        &table,
-        "b.parquet",
-        0,
-        &[Some(7), Some(2), None, Some(5)],
-    )
-    .await;
+    let file_a =
+        write_nullable_y_file(&table, "a.parquet", 0, &[Some(3), None, Some(9), Some(1)]).await;
+    let file_b =
+        write_nullable_y_file(&table, "b.parquet", 0, &[Some(7), Some(2), None, Some(5)]).await;
     let table = append_files(&catalog, &table, vec![file_a, file_b]).await;
 
     RewriteDataFiles::new(table.clone())
@@ -541,19 +530,16 @@ async fn binpack_desc_nulls_last_orders_nulls_last() {
         assert_eq!(ys, desc_nulls_last(&ys), "desc nulls-last per file");
         all.extend(ys);
     }
-    assert_eq!(
-        desc_nulls_last(&all),
-        vec![
-            Some(9),
-            Some(7),
-            Some(5),
-            Some(3),
-            Some(2),
-            Some(1),
-            None,
-            None
-        ]
-    );
+    assert_eq!(desc_nulls_last(&all), vec![
+        Some(9),
+        Some(7),
+        Some(5),
+        Some(3),
+        Some(2),
+        Some(1),
+        None,
+        None
+    ]);
 }
 
 #[tokio::test]
