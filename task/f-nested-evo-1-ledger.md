@@ -199,9 +199,9 @@ new tests in `nested_projection_evo_tests.rs` → 8 passed, 10 failed:
   one scan stay unmeasured: `RecordBatchTransformer` builds its `BatchTransform` lazily from the
   first batch's schema per instance, so each file gets its own plan — correct by construction.
 - **D-16 (L-011)** — OPEN. Duplicate nested field ids keep last-wins `HashMap` behavior;
-  unparseable `PARQUET:field_id` metadata degrades to "no id" and now reaches the name fallback
+  unparsable `PARQUET:field_id` metadata degrades to "no id" and now reaches the name fallback
   rather than an immediate null-fill. Corrupt-input edge the review rated P3; the top-level id
-  map errors on unparseable ids while the nested path stays quiet — deferred hardening, no
+  map errors on unparsable ids while the nested path stays quiet — deferred hardening, no
   writer-produced file is affected.
 - **D-17 (R-01)** — `generate_transform_operations` selects `NestedProject` only when
   `nested_projection_applies(source_type, target_type) && source_type != target_type`;
@@ -236,8 +236,8 @@ new tests in `nested_projection_evo_tests.rs` → 8 passed, 10 failed:
 
 ### What is not closed
 
-L-011 (D-16) — duplicate/unparseable nested field-id hardening deferred; current behavior is
-deterministic (last-wins on duplicates; unparseable degrades to the id-less name fallback).
+L-011 (D-16) — duplicate/unparsable nested field-id hardening deferred; current behavior is
+deterministic (last-wins on duplicates; unparsable degrades to the id-less name fallback).
 Everything else in L-001..L-010 and R-01..R-06 is closed on the final tree.
 
 ## Round 3 — verification remediation (devin-worker / SWE-2)
@@ -315,7 +315,7 @@ per-finding decisions (continuing the D-n numbering), and gate output.
 
 ### What is not closed (round 3)
 
-L-011 (D-16) — unchanged, still deferred: duplicate/unparseable nested field-id
+L-011 (D-16) — unchanged, still deferred: duplicate/unparsable nested field-id
 hardening. Everything the verification critic left open (R-01 pin, V-01..V-03)
 is closed on the final tree.
 
@@ -389,7 +389,7 @@ unbounded fallback produces:
 
 ### What is not closed (round 4)
 
-L-011 (D-16) — unchanged, still deferred: duplicate/unparseable nested field-id
+L-011 (D-16) — unchanged, still deferred: duplicate/unparsable nested field-id
 hardening. `F-NESTED-MIXED-ID-1` is recorded residue (Java mixed-id oracle
 unmeasured). Everything else the verification critics raised is closed on the
 final tree.
