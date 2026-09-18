@@ -31,7 +31,9 @@ use iceberg::metadata_columns::{
     RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     RESERVED_FIELD_ID_ROW_ID, format_supports_row_lineage, schema_with_row_lineage,
 };
-use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, SchemaRef as IcebergSchemaRef};
+use iceberg::spec::{
+    DataFile, DataFileFormat, FormatVersion, SchemaRef as IcebergSchemaRef, TableProperties,
+};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -207,16 +209,22 @@ fn lineage_arrow_field(name: &'static str, field_id: i32) -> Field {
 type DmlDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
+type DmlRollingBuilder =
+    RollingFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
 pub(super) struct StreamingDataFileWriter {
     writer: Option<TaskWriter<DmlDataFileWriterBuilder>>,
     schema: IcebergSchemaRef,
     table_field_count: usize,
     partition_spec: iceberg::spec::PartitionSpecRef,
     calculator: Option<PartitionValueCalculator>,
-    builder: Option<DmlDataFileWriterBuilder>,
+    rolling_builder: DmlRollingBuilder,
+    run_target: usize,
     table: Table,
     sort: Option<WriteSort>,
     buffered: Vec<RecordBatch>,
+    buffered_bytes: usize,
+    closed_files: Vec<DataFile>,
 }
 
 impl StreamingDataFileWriter {
@@ -242,14 +250,28 @@ impl StreamingDataFileWriter {
             None,
             DataFileFormat::Parquet,
         );
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        let run_target = table
+            .metadata()
+            .properties()
+            .get(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES)
+            .map(|value| {
+                value.parse::<u64>().map_err(|error| {
+                    DataFusionError::Plan(format!(
+                        "Invalid value '{value}' for table property '{}': {error}",
+                        TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES
+                    ))
+                })
+            })
+            .transpose()?
+            .map(|target| usize::try_from(target).unwrap_or(usize::MAX))
+            .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
+        let rolling_builder = RollingFileWriterBuilder::new(
             parquet_builder,
+            run_target,
             table.file_io().clone(),
             location_gen,
             file_name_gen,
         );
-        let builder = DataFileWriterBuilder::new(rolling)
-            .with_partition_spec(partition_spec.as_ref().clone());
 
         let calculator = if partition_spec.is_unpartitioned() {
             None
@@ -266,20 +288,20 @@ impl StreamingDataFileWriter {
             table_field_count,
             partition_spec,
             calculator,
-            builder: Some(builder),
+            rolling_builder,
+            run_target,
             table: table.clone(),
             sort: None,
             buffered: Vec::new(),
+            buffered_bytes: 0,
+            closed_files: Vec::new(),
         })
     }
 
     fn ensure_writer(&mut self) -> DFResult<&mut TaskWriter<DmlDataFileWriterBuilder>> {
         if self.writer.is_none() {
-            let mut builder = self.builder.take().ok_or_else(|| {
-                DataFusionError::Internal(
-                    "StreamingDataFileWriter builder already consumed".to_string(),
-                )
-            })?;
+            let mut builder = DataFileWriterBuilder::new(self.rolling_builder.clone())
+                .with_partition_spec(self.partition_spec.as_ref().clone());
             if let Some(sort_order_id) = self.sort.as_ref().and_then(|sort| sort.sort_order_id) {
                 builder = builder.with_sort_order_id(sort_order_id);
             }
@@ -344,22 +366,29 @@ impl StreamingDataFileWriter {
             self.sort = Some(write_sort_plan(&self.table, batch.schema().as_ref()));
         }
         if self.sort.as_ref().is_some_and(|sort| sort.exprs.is_some()) {
+            self.buffered_bytes += batch.get_array_memory_size();
             self.buffered.push(batch);
+            if self.buffered_bytes >= self.run_target {
+                self.flush_sorted_run().await?;
+            }
             return Ok(());
         }
         self.write_prepared(batch).await
     }
 
-    pub(super) async fn finish(mut self) -> DFResult<Vec<DataFile>> {
-        if !self.buffered.is_empty() {
+    async fn flush_sorted_run(&mut self) -> DFResult<()> {
+        if self.buffered.is_empty() {
+            return Ok(());
+        }
+        let Some(exprs) = self.sort.as_ref().and_then(|sort| sort.exprs.as_ref()) else {
+            return Err(DataFusionError::Internal(
+                "buffered rows imply a sort plan".to_string(),
+            ));
+        };
+        let sorted = {
             let schema = self.buffered[0].schema();
             let batch = concat_batches(&schema, &self.buffered)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            let Some(exprs) = self.sort.as_ref().and_then(|sort| sort.exprs.as_ref()) else {
-                return Err(DataFusionError::Internal(
-                    "buffered rows imply a sort plan".to_string(),
-                ));
-            };
             let sort_columns = exprs
                 .iter()
                 .map(|expr| {
@@ -371,14 +400,25 @@ impl StreamingDataFileWriter {
                 .collect::<DFResult<Vec<_>>>()?;
             let indices = lexsort_to_indices(&sort_columns, None)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            let sorted = take_record_batch(&batch, &indices)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            self.buffered.clear();
-            self.write_prepared(sorted).await?;
+            take_record_batch(&batch, &indices)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+        };
+        self.buffered.clear();
+        self.buffered_bytes = 0;
+        self.write_prepared(sorted).await?;
+        if let Some(writer) = self.writer.take() {
+            self.closed_files
+                .extend(writer.close().await.map_err(to_datafusion_error)?);
         }
-        match self.writer {
-            None => Ok(Vec::new()),
-            Some(writer) => writer.close().await.map_err(to_datafusion_error),
+        Ok(())
+    }
+
+    pub(super) async fn finish(mut self) -> DFResult<Vec<DataFile>> {
+        self.flush_sorted_run().await?;
+        let mut files = std::mem::take(&mut self.closed_files);
+        if let Some(writer) = self.writer.take() {
+            files.extend(writer.close().await.map_err(to_datafusion_error)?);
         }
+        Ok(files)
     }
 }
