@@ -279,12 +279,24 @@ impl std::hash::Hash for CanonicalPartitionExpr {
 fn canonical_partition_child(child: &ArrayRef) -> ArrayRef {
     if let Some(floats) = child.as_any().downcast_ref::<Float32Array>() {
         return Arc::new(Float32Array::from_iter(floats.iter().map(|value| {
-            value.map(|float| if float.is_nan() { f32::NAN } else { float + 0.0 })
+            value.map(|float| {
+                if float.is_nan() {
+                    f32::NAN
+                } else {
+                    float + 0.0
+                }
+            })
         })));
     }
     if let Some(floats) = child.as_any().downcast_ref::<Float64Array>() {
         return Arc::new(Float64Array::from_iter(floats.iter().map(|value| {
-            value.map(|float| if float.is_nan() { f64::NAN } else { float + 0.0 })
+            value.map(|float| {
+                if float.is_nan() {
+                    f64::NAN
+                } else {
+                    float + 0.0
+                }
+            })
         })));
     }
     child.clone()

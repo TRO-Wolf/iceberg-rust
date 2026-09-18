@@ -192,3 +192,96 @@ bound is unchanged (each partition is written once, so evicted writers are never
 | `cargo test -p iceberg-datafusion --test cow_memory_bound` | 1/1 |
 | `scripts/check_rust_file_size.py` | `temporal.rs` ceiling lowered 2796→2792 alongside the shrink; clean |
 | `cargo fmt --all` / `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings` | see close-out run |
+
+## Round 2
+
+Follow-up to fork #296: two perf P1s (R-01 sorted COW buffers the whole DML, R-02 binpack buffers a
+whole file group), one P2 test gap (R-03 the memory-bound fixture was unsorted), one logic P1
+(L-001 the `_partition` sort prefix can disagree with partition grouping on signed zero), P3s
+R-05/R-06 optional and not taken.
+
+### R-01/R-04 — `StreamingDataFileWriter` sorted runs
+
+Defect: with a sort key the writer appended every prepared batch to `buffered` and sorted once in
+`finish()`, holding roughly 3× the decoded rewrite at peak. R-04: the concat batch, key columns and
+indices also stayed live across the write.
+
+Fix (`row_lineage.rs`): the writer now keeps `rolling_builder` (a `RollingFileWriterBuilder`
+configured with `write.target-file-size-bytes`), `run_target`, `buffered_bytes` and `closed_files`.
+Each sorted-path batch is counted by `get_array_memory_size()`; once a run reaches the target,
+`flush_sorted_run` concatenates the run, evaluates the sort expressions, lexsorts and takes the
+sorted batch inside a scope that drops the temporaries before writing, writes it through a fresh
+`TaskWriter` built from the cloned rolling builder, closes it, and appends its `DataFile`s.
+`finish` flushes the tail run and closes any live writer. Memory is bounded by one target file plus
+the sort-key columns; each output file is individually sorted, matching Spark's per-task sorting.
+
+Design choice: sort-and-roll in bounded runs over routing through a DataFusion `SortExec`. The COW
+path has no `ExecutionPlan` to attach a `SortExec` to — batches arrive from the delete exec's
+partition loop already prepared — so the spilling exec is not reachable here; bounded in-memory runs
+give the same per-file-sorted output Spark produces.
+
+### R-02 — binpack sorted runs
+
+Defect: `write_compacted_files` collected the whole file group, concatenated, lexsorted and took —
+one group's rows live at once, and `pack_bins` admits a singleton larger than the 100 GiB default
+group cap.
+
+Fix (`rewrite_data_files_write.rs`): when `rewrite_sort_plan` yields keys, batches accumulate into a
+run until `run_bytes >= target_file_size_bytes`, then `write_sorted_run` concatenates and sorts the
+run in a scope that drops the temporaries, and writes it through a fresh `DataFileWriterBuilder`
+(cloned rolling builder, same spec and `sort_order_id` stamp): the partition splitter +
+`BoundedPartitionRouter` for partitioned tables, or a single writer unpartitioned. Each output file
+is sorted within itself — the measured Spark shape — and memory is bounded by one target file. The
+unsorted path is unchanged.
+
+### R-03 — sorted memory-bound twin
+
+`cow_memory_bound.rs` gained `sort_order: Option<SortOrder>` plumbing through the fixture and a
+SORTED UPDATE measured run against an `id ASC` table. On round-1 code it measured a 76,976,805 B
+excess over the MoR baseline against a 10,368,000 B threshold — red.
+
+### L-001 — partition prefix canonicalization
+
+Defect: `write_sort_plan` prepends the `_partition` struct to the sort key. Arrow's float ordering
+distinguishes `-0.0 < +0.0` (and NaN payloads), while `split_row_wise` groups by `Literal` equality
+(`-0.0 == +0.0`, all NaNs equal). A mixed-sign partition was therefore split into one group by the
+writer but into two runs by the sort, producing files stamped `sort_order_id = 1` whose rows are not
+sorted by that order. Reproduced on both INSERT (raw `-0.0` values) and COW UPDATE (two seed files
+whose identity-partition literals are `-0.0` and `+0.0`; the scan materialises the column from the
+file's partition literal, so both literals survive to the sort while the splitter merges them).
+
+Fix (`sort.rs`): `CanonicalPartitionExpr` wraps the `_partition` column in `write_sort_plan`, so
+INSERT and COW are fixed at the shared seam. It evaluates the inner column and rebuilds the struct
+with each float child canonicalized — `NaN` payloads to one `NAN`, `-0.0` to `+0.0` via `+ 0.0` —
+matching the splitter's grouping exactly. Non-struct or non-float children pass through. Data-side
+sort keys are untouched: within-file `-0.0 < +0.0` ordering already agrees with the total order.
+
+### Red → green → mutation
+
+- RED (`46928a9ef`): `float_partition_signed_zero_stays_sorted_by_id` (COW `[2,1,3]`, INSERT
+  `[2,1,3]` — merged into one function to keep `sorted_insert.rs` under its ceiling, 998 lines) and
+  the SORTED UPDATE arm of `copy_on_write_peak_memory_does_not_scale_with_row_count` (excess
+  76,976,805 B vs threshold 10,368,000 B).
+- GREEN: sorted UPDATE excess 3,762,876 B; `sorted_insert` 17/17; `binpack_` 4/4;
+  `rewrite_data_files` 96/96; `iceberg-datafusion --lib` 228/228.
+- MUTATION (each fix reverted alone to `b512a8ec`, not committed):
+  - R-01/R-04: `cow_memory_bound` SORTED UPDATE excess back to 76,976,205 B — red. Restored, green.
+  - R-02: `binpack_` 4/4 stay green on revert. Expected and recorded honestly: the fix is a memory
+    bound, not a behavior change — within a run the round-1 code produced byte-identical sorted
+    output, so no existing cell can go red. The bound holds by construction (one run ≈ one target
+    file), and the identical sort-and-roll pattern is mutation-proven on the COW side by the R-03
+    cell.
+  - L-001: `float_partition_signed_zero_stays_sorted_by_id` red on revert (`[2,1,3]`). Restored,
+    green.
+
+### Gates
+
+| Gate | Result |
+|---|---|
+| `cargo test -p iceberg --lib rewrite_data_files` | 96/96 |
+| `cargo test -p iceberg --lib binpack_` | 4/4 |
+| `cargo test -p iceberg-datafusion --lib` | 228/228, 1 ignored |
+| `cargo test -p iceberg-datafusion --test sorted_insert` | 17/17 |
+| `cargo test -p iceberg-datafusion --test cow_memory_bound` | 1/1 |
+| `scripts/check_rust_file_size.py` | clean |
+| `cargo fmt --all` / `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings` | see close-out run |

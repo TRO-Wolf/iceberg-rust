@@ -977,7 +977,8 @@ async fn float_partition_signed_zero_stays_sorted_by_id() -> Result<()> {
     .await?;
     seed_float_p_file(&cow_fixture, "neg", &[2], &[-0.0], -0.0).await?;
     seed_float_p_file(&cow_fixture, "pos", &[1, 3], &[0.0, 0.0], 0.0).await?;
-    run_sql(&cow_fixture, "UPDATE catalog.cow_update_signed_zero.t SET id = id").await?;
+    let update = "UPDATE catalog.cow_update_signed_zero.t SET id = id";
+    run_sql(&cow_fixture, update).await?;
 
     for (label, fixture) in [("COW UPDATE", &cow_fixture), ("INSERT", &insert_fixture)] {
         let files = live_files(fixture).await?;

@@ -209,8 +209,11 @@ fn lineage_arrow_field(name: &'static str, field_id: i32) -> Field {
 type DmlDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
-type DmlRollingBuilder =
-    RollingFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+type DmlRollingBuilder = RollingFileWriterBuilder<
+    ParquetWriterBuilder,
+    DefaultLocationGenerator,
+    DefaultFileNameGenerator,
+>;
 
 pub(super) struct StreamingDataFileWriter {
     writer: Option<TaskWriter<DmlDataFileWriterBuilder>>,
