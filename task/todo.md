@@ -95,6 +95,20 @@ schema.
 - [x] ledger Round 3 section + residue note (`DELETE … WHERE xs IS NULL` on a list column,
       `expr/term.rs` accessor gap, pre-existing)
 
+Round 4 (same lane): the fully-stripped `schema()` broke DataFusion's physical/logical check —
+five `insert_distribution` cells red on the rebased head.
+
+- [x] red cell (`88da55f8e`): `select_and_insert_select_across_catalog_tables_agree_on_the_advertised_schema`
+      — `SELECT *` / `SELECT max(id)` (the aggregate routes through the check) / `INSERT INTO
+      t2 SELECT * FROM t` across two catalog tables with a list column
+- [x] fix (`89f8f9ac0`): approach A — providers keep top-level `PARQUET:field_id`, strip nested
+      field metadata; `IcebergTableScan` keeps the stamped `conform_schema` for field-id
+      binding/evolution and emits nested-stripped batches; conform block moved verbatim to
+      `physical_plan/conform.rs` (size gate), `scan.rs` ceiling 1851 → 1598
+- [x] mutation: fix reverted alone → the five distribution cells + the e2e cell red with the
+      measured signature; restored green
+- [x] ledger Round 4 section + `physical_plan/map.md` row
+
 
 ## ACTIVE (2026-09-17): F-ICE-RESIDUES-21B fork-residue lane, five closures vs Java 1.10.0
 

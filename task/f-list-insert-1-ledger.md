@@ -460,3 +460,118 @@ Pinned-schema tests updated as the brief anticipated: `test_schema_of_created_ta
 
 `DELETE … WHERE xs IS NULL` on a list column fails `Accessor for Field xs not found` —
 `expr/term.rs:326-330`, `accessor_by_field_id` has no accessor for nested/list columns. Not touched.
+
+## Round 4 — the stripped `schema()` broke DataFusion's physical/logical check
+
+Round 2 made `TableProvider::schema()` return `strip_metadata_from_schema` output, but
+`IcebergTableScan` still built its `PlanProperties` schema and its emitted batches from the
+stamped schema. DataFusion's logical/physical check (the `Aggregate` physical-planning arm)
+compares the exec's schema against the schema converted from the logical input and fails on
+the first differing field metadata:
+
+```
+Internal error: Physical input schema should be the same as the one converted from logical
+input schema. Differences:
+- field metadata at index 0 [id]: (physical) {"PARQUET:field_id": "1"} vs (logical) {}
+- field metadata at index 1 [part]: (physical) {"PARQUET:field_id": "2"} vs (logical) {}.
+```
+
+Five `insert_distribution.rs` tests went red on the rebased head
+(`unpartitioned_insert_keeps_unspecified_writer_distribution`,
+`bucket_and_day_values_co_locate_across_source_tasks`,
+`single_target_partition_preserves_rows_and_partition_files`,
+`clustered_insert_hashes_then_sorts_each_writer_input`,
+`fanout_insert_hashes_each_partition_value_to_one_writer`). Rounds 2-3 ran only `--lib` and
+`--test evo_schema_dml`, so this integration target was never exercised.
+
+### Approach — (A) top-level ids stay, nested metadata strips
+
+Chosen (A): `schema()` advertises a schema that keeps top-level `PARQUET:field_id` and strips
+nested field metadata (list element, map key/value/entries, struct children), and the scan
+exec emits exactly that shape.
+
+Why not (B): reverting `schema()` to fully stamped reintroduces the round-2
+`INSERT … VALUES` failures — DataFusion types `VALUES` literals and concatenates their arrays
+against the advertised nested types, and a `List(element{})` literal never equals
+`List(element{meta})`. The strip is not optional; only its scope was wrong. Keeping top-level
+ids is what lets `resolve_bindings` keep binding by field id — the rename-safe identity the
+scan is built on — and stripping nested ids is what the `VALUES` concat needs.
+
+### The provider/scan contract
+
+- `IcebergTableProvider::schema()` and `IcebergStaticTableProvider::schema()` both return
+  `strip_nested_metadata_from_schema(&self.schema)` (conform.rs) — top-level field metadata
+  kept, nested field metadata dropped recursively, bounded at depth 128.
+- `IcebergTableScan::new` still receives the STAMPED provider schema: `resolve_bindings`
+  needs the top-level ids and `conform_column` matches nested struct children by
+  `PARQUET:field_id` for schema evolution — stripping there would break rename/evolution
+  reads. The scan stores that stamped output schema as `conform_schema`, while
+  `PlanProperties` — and therefore `ExecutionPlan::schema()` — carries the nested-stripped
+  emit schema.
+- `execute` conforms each reader batch to `conform_schema` exactly as before (null-fill,
+  reorder, legal promotion), then applies `strip_nested_metadata_from_record_batch`, a
+  metadata-only relabel (`ArrayData::into_builder` + `build_unchecked`, no value copy — the
+  same safety argument as the round-1 writer relabel: the input array is valid, the layout is
+  identical, only child-field metadata changes). `RecordBatchStreamAdapter` declares the emit
+  schema, so the exec's declared schema and its batch schemas agree.
+- Projection: `strip ∘ project = project ∘ strip` (the strip preserves names, order,
+  nullability, types), so `scan.schema()` under a pushed projection equals DataFusion's
+  `project(provider.schema(), indices)` exactly.
+
+### Consumer audit — `PARQUET:field_id` readers on scan output
+
+- `resolve_bindings` / `conform_column`: internal to the scan, operate on `conform_schema`
+  (stamped) before the emit strip — unchanged.
+- `cow_scan_stream` / `mor_scan_stream` (row_lineage.rs, delete.rs, update.rs): raw core
+  `table.scan()` streams, not `IcebergTableScan` exec output — unchanged, still stamped.
+- `attach_lineage`: appends reserved `_row_id` / `_last_updated_sequence_number` / `_file` /
+  `_pos` fields to cow batches — unaffected.
+- `project_with_partition` / `ProjectionExec` (`insert_into`): binds by name and index, and
+  compares the input schema against a fully-stripped expectation — the nested-stripped input
+  satisfies it.
+- `sort_for_write` / `repartition`: resolve keys by name (`NestedFieldExpr`) — unaffected.
+- DataFusion DML `insert_to_plan` and the `insert_distribution` distribution checks: the exec
+  schema now equals the advertised schema — the failure class this round fixes.
+- `IcebergMetadataTableProvider`: a separate provider with its own `IcebergMetadataScan` exec
+  and no `PARQUET:field_id` contract — untouched.
+
+### Metadata columns and projection
+
+Reserved metadata columns (`_file`, `_pos`, …) resolve by NAME in `resolve_bindings`, not by
+field id; their top-level fields keep whatever metadata they carry. Nested-projection leaves
+(`profile[address][street]`): DataFusion builds those output fields from the nested child
+fields, so they now carry no `PARQUET:field_id` — identical on the logical and physical sides
+(the `test_insert_into_nested` expect blocks re-pinned accordingly).
+
+### Cells, red → green
+
+Red (pre-fix head `5af55342`): the five `insert_distribution` failures above plus the new cell
+`select_and_insert_select_across_catalog_tables_agree_on_the_advertised_schema`
+(evo_schema_dml.rs) — `SELECT *` and `INSERT INTO t2 SELECT * FROM t` across two catalog
+tables, both carrying a list column, plus `SELECT max(id)`: an aggregate is what routes the
+scan through the physical/logical check (`SELECT *` alone passes a bare TableScan through
+unharmed, and `count(*)` folds to statistics without a scan). All red with the measured
+physical/logical metadata mismatch.
+
+Green: `cargo test -p iceberg-datafusion` — all 34 targets (lib 261, `insert_distribution` 7,
+`integration_datafusion_test` 87, `evo_schema_dml` 17, the DML/lineage/puffin suites);
+`cargo test -p iceberg --lib writer` 172/172 + 1 ignored.
+
+### Mutation
+
+`git revert --no-commit` of the round-4 fix alone: the five `insert_distribution` cells and
+the new e2e cell all red with the measured `Physical input schema should be the same as the
+one converted from logical input schema` signature; restored (`git reset --hard`), all green.
+
+### File-size fallout
+
+`scan.rs` sat at its 1851-line legacy ceiling, so the batch-conformance block
+(`ColumnSource`, `advertised_field_id`, `is_arrow_promotion_allowed`, `conform_batch`,
+`conform_column`, `downcast`) moved verbatim into the new `physical_plan/conform.rs`, which
+also carries the two strip helpers. The `scan.rs` ceiling lowered 1851 → 1598; the moved
+items are `pub(crate)` and reach the `scan.rs` test module through its `use super::*` (the
+test-only pair `conform_column` / `is_arrow_promotion_allowed` is imported under
+`#[cfg(test)]`). The `unsafe` emit relabel mirrors round 1's justification: the input
+`ArrayRef` is valid, the strip proves child-for-child shape identity (`nested_metadata_fields`
+pairs `child_data` slots with target fields and errors on any count mismatch), and only field
+metadata changes — no buffer, offset, or null bitmap is touched.
