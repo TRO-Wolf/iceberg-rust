@@ -60,7 +60,7 @@
 //! staged-WAP interop fixture.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -69,6 +69,7 @@ use crate::error::Result;
 use crate::spec::{
     DataFile, MAIN_BRANCH, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
     Operation, SnapshotRef, SnapshotReference, SnapshotRetention, Struct, TableMetadata,
+    TableMetadataRef,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::{
@@ -97,15 +98,11 @@ fn data_invalid(message: String) -> Error {
 
 /// A transaction action that PUBLISHES a staged snapshot onto `main` (write-audit-publish), mirroring Java
 /// `CherryPickOperation`.
-///
-/// Use [`crate::transaction::Transaction::cherry_pick`] to create one. The action stores only the staged
-/// snapshot id; everything else resolves at commit/validate time against the refreshed table (the stateless
-/// retry pattern). See the module docs for the three published shapes and the fast-forward precedence.
 pub struct CherryPickAction {
-    /// The id of the STAGED snapshot to publish.
     snapshot_id: i64,
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
+    plan_cache: Mutex<Option<(TableMetadataRef, CherryPickPlan)>>,
 }
 
 impl CherryPickAction {
@@ -114,6 +111,7 @@ impl CherryPickAction {
             snapshot_id,
             commit_uuid: None,
             key_metadata: None,
+            plan_cache: Mutex::new(None),
         }
     }
 
@@ -133,6 +131,7 @@ impl CherryPickAction {
 
 /// The decision the cherry-pick dispatch reaches against a refreshed base — Java's `cherrypick(long)`
 /// case split (L78-138) combined with the `apply()` fast-forward precedence (L193-204).
+#[derive(Clone)]
 enum CherryPickPlan {
     /// Fast-forward `main` to the staged snapshot AS-IS — no new snapshot (Java `apply` returns
     /// `base.snapshot(picked.id)`). Carries the picked snapshot's id.
@@ -204,6 +203,19 @@ impl CherryPickAction {
             .cloned()
     }
 
+    async fn cached_plan(&self, table: &Table) -> Result<CherryPickPlan> {
+        let base = table.metadata_ref();
+        if let Some((cached_base, plan)) =
+            &*self.plan_cache.lock().unwrap_or_else(|p| p.into_inner())
+            && Arc::ptr_eq(cached_base, &base)
+        {
+            return Ok(plan.clone());
+        }
+        let plan = self.plan(table).await?;
+        *self.plan_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some((base, plan.clone()));
+        Ok(plan)
+    }
+
     async fn plan(&self, table: &Table) -> Result<CherryPickPlan> {
         let metadata = table.metadata();
         let picked = self.require_picked(metadata)?.clone();
@@ -265,7 +277,6 @@ impl CherryPickAction {
             });
         }
 
-        // Not append, not a dynamic overwrite, and not a fast-forward (Java L131-138).
         Err(data_invalid(format!(
             "Cannot cherry-pick snapshot {}: not append, dynamic overwrite, or fast-forward",
             picked.snapshot_id()
@@ -388,47 +399,35 @@ impl CherryPickAction {
 
 #[async_trait]
 impl TransactionAction for CherryPickAction {
-    /// Serializable-isolation validation. Java `CherryPickOperation.validate`. It runs against the
-    /// REFRESHED base before the commit produces anything, and is skipped for the fast-forward
-    /// shape. The replay shapes run `validateNonAncestor`, `validateReplacedPartitions`, and the
-    /// WAP-publish re-check.
-    ///
-    /// `starting_snapshot_id` is intentionally unused. Cherry-pick's window comes from the PICKED
-    /// snapshot's parent. The dispatch errors come from [`Self::plan`], so a failing plan propagates
-    /// non-retryably before any update is emitted.
     async fn validate(
         self: Arc<Self>,
         _starting_snapshot_id: Option<i64>,
         current: &Table,
     ) -> Result<()> {
-        let plan = self.plan(current).await?;
+        let plan = self.cached_plan(current).await?;
 
         let CherryPickPlan::Replay {
             replaced_partitions,
             ..
         } = &plan
         else {
-            // Fast-forward: Java skips validate entirely.
             return Ok(());
         };
 
         let metadata = current.metadata();
-        // Java L166: already-an-ancestor / already-cherry-picked dedup.
         self.validate_non_ancestor(metadata)?;
-        // Java L167-168: a concurrent change in a replaced partition (replace-partitions shape only).
         let picked_parent_id = metadata
             .snapshot_by_id(self.snapshot_id)
             .and_then(|snapshot| snapshot.parent_snapshot_id());
         self.validate_replaced_partitions(current, picked_parent_id, replaced_partitions)
             .await?;
-        // Java L169: the WAP id must not already be staged/published among current ancestors.
         self.validate_wap_publish(metadata)?;
 
         Ok(())
     }
 
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        match self.plan(table).await? {
+        match self.cached_plan(table).await? {
             CherryPickPlan::FastForward { picked_id } => {
                 Ok(Self::fast_forward_commit(table, picked_id))
             }
