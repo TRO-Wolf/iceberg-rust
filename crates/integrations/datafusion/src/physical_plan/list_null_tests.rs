@@ -470,6 +470,24 @@ async fn update_where_xs_is_null_or_id_eq_1_updates_matching_rows() {
 }
 
 #[tokio::test]
+async fn select_where_xs_dot_a_is_null_returns_the_null_leaf_rows() {
+    for format_version in [FormatVersion::V2, FormatVersion::V3] {
+        for merge_on_read in [true, false] {
+            let fixture = null_fixture(merge_on_read, format_version, NullShape::StructInt).await;
+            assert_eq!(
+                select_ids(
+                    &fixture.ctx,
+                    "SELECT id FROM catalog.ns.t WHERE xs.a IS NULL ORDER BY id"
+                )
+                .await,
+                vec![2, 3],
+                "{format_version:?} merge_on_read={merge_on_read}: a NULL struct and {{a:NULL}} both have xs.a NULL"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn select_where_xs_is_null_returns_the_null_row() {
     for shape in NullShape::ALL {
         for format_version in [FormatVersion::V2, FormatVersion::V3] {

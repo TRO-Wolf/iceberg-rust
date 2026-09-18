@@ -805,6 +805,38 @@ fn is_null_on_a_list_element_name_is_not_pushed() {
 }
 
 #[test]
+fn binary_on_an_accessorless_leaf_is_not_pushed() {
+    for (name, literal) in [
+        ("xs.element", lit(1_i64)),
+        ("m.value", lit(1_i64)),
+        ("m.key", lit("k")),
+    ] {
+        let column = Column::new_unqualified(name);
+        assert_eq!(
+            push_nested(&[Expr::Column(column).eq(literal)]),
+            None,
+            "{name} resolves to a field with no accessor and must not push"
+        );
+    }
+}
+
+#[test]
+fn in_list_on_an_accessorless_leaf_is_not_pushed() {
+    for (name, literals) in [
+        ("xs.element", vec![lit(1_i64), lit(2_i64)]),
+        ("m.value", vec![lit(1_i64), lit(2_i64)]),
+        ("m.key", vec![lit("k"), lit("v")]),
+    ] {
+        let column = Column::new_unqualified(name);
+        assert_eq!(
+            push_nested(&[Expr::Column(column).in_list(literals, false)]),
+            None,
+            "{name} resolves to a field with no accessor and must not push"
+        );
+    }
+}
+
+#[test]
 fn is_null_on_a_nested_column_drops_only_its_own_conjunction() {
     assert_eq!(
         push_nested(&[col("id").gt(lit(1_i64)), Expr::IsNull(Box::new(col("xs")))]),
