@@ -691,4 +691,5 @@ pub(crate) fn create_constant_column(
 mod test {
     include!("nested_projection_tests.rs");
     include!("nested_projection_evo_tests.rs");
+    include!("nested_projection_evo_pin_tests.rs");
 }
