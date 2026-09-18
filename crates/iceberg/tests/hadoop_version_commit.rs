@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use iceberg::io::{FileIO, LocalFsStorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{
+    DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema, Type,
+};
 use iceberg::transaction::{ApplyTransactionAction, StagedTableTransaction, Transaction};
 use iceberg::{
     Catalog, CatalogBuilder, ErrorKind, MetadataLocation, NamespaceIdent, TableCreation, TableIdent,
@@ -514,6 +516,99 @@ async fn hadoop_staged_replace_second_stager_fails_and_preserves_winner() {
         loser.metadata_location().expect("loser pointer"),
         v2.as_str(),
         "losing catalog pointer stays at v2"
+    );
+}
+
+#[tokio::test]
+async fn hadoop_staged_replace_never_overwrites_a_live_next_version() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let warehouse = dir.path().to_str().expect("utf8 path").to_string();
+    let file_io = FileIO::new_with_fs();
+
+    let cat1 = new_local_catalog("one", &warehouse).await;
+    let ns = NamespaceIdent::new("ns".to_string());
+    let table_location = create_ns_and_source(&cat1, &ns).await;
+
+    let v2 = format!("{table_location}/metadata/v2.metadata.json");
+    let base = cat1
+        .load_table(&TableIdent::new(ns.clone(), "src".to_string()))
+        .await
+        .expect("load src");
+    base.metadata()
+        .write_to(&file_io, &v2)
+        .await
+        .expect("seed v2");
+
+    let ident = TableIdent::new(ns, "hadoop".to_string());
+    let registered = cat1
+        .register_table(&ident, v2.clone())
+        .await
+        .expect("register v2");
+
+    let creation = TableCreation::builder()
+        .name("hadoop".to_string())
+        .schema(test_schema())
+        .build();
+    let staged = StagedTableTransaction::begin_replace(&registered, creation)
+        .await
+        .expect("begin replace");
+    let staged_location = staged
+        .table()
+        .metadata_location_result()
+        .expect("staged location")
+        .to_string();
+    assert_eq!(
+        staged_location,
+        format!("{table_location}/metadata/v3.metadata.json")
+    );
+
+    let winner = iceberg::table::Table::builder()
+        .identifier(ident.clone())
+        .metadata(registered.metadata().clone())
+        .metadata_location(staged_location.clone())
+        .file_io(file_io.clone())
+        .build()
+        .expect("winner table");
+    winner
+        .metadata()
+        .write_to(&file_io, &staged_location)
+        .await
+        .expect("winner writes v3");
+    let winner_bytes = std::fs::read(&staged_location).expect("read winner v3");
+    cat1.publish_replace_table(winner, Some(v2))
+        .await
+        .expect("winner CAS lands v3");
+
+    let file = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(format!("{table_location}/data/f.parquet"))
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(100)
+        .record_count(4)
+        .partition_spec_id(0)
+        .partition(iceberg::spec::Struct::empty())
+        .build()
+        .expect("build data file");
+    let err = staged
+        .add_data_files(vec![file])
+        .commit(&cat1)
+        .await
+        .expect_err("a replace losing the v3 slot must fail");
+    assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+    assert!(err.retryable());
+    assert_eq!(
+        std::fs::read(&staged_location).expect("re-read v3"),
+        winner_bytes,
+        "a losing replace must never overwrite a live Hadoop version file"
+    );
+    let current = cat1.load_table(&ident).await.expect("loads");
+    assert_eq!(
+        current.metadata_location().expect("pointer"),
+        staged_location.as_str()
+    );
+    assert!(
+        !std::path::Path::new(&format!("{table_location}/metadata/v4.metadata.json")).exists(),
+        "a losing replace must not leave a v4 behind"
     );
 }
 
