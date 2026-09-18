@@ -497,8 +497,8 @@ async fn hadoop_staged_replace_second_stager_fails_and_preserves_winner() {
         format!("{table_location}/metadata/v3.metadata.json"),
         "a Hadoop base must stage vN+1, not a uuid name"
     );
-    let winner_bytes = std::fs::read(&staged_location).expect("read staged v3");
     staged.commit(&cat1).await.expect("publish replace");
+    let winner_bytes = std::fs::read(&staged_location).expect("read staged v3");
 
     let err = match StagedTableTransaction::begin_replace(&table2, creation()).await {
         Ok(_) => panic!("a second stager onto the existing v3 must fail"),

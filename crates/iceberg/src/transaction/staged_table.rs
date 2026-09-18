@@ -231,9 +231,13 @@ impl StagedTableTransaction {
             Ok(base) if keeps_location => base.with_next_version().to_string(),
             _ => MetadataLocation::new_with_table_location(&table_location).to_string(),
         };
-        metadata
-            .write_commit_metadata(existing.file_io(), &metadata_location)
-            .await?;
+        if hadoop_staged_location(&metadata_location) {
+            ensure_staged_version_absent(existing.file_io(), &metadata_location).await?;
+        } else {
+            metadata
+                .write_commit_metadata(existing.file_io(), &metadata_location)
+                .await?;
+        }
 
         let table = Table::builder()
             .file_io(existing.file_io().clone())
@@ -296,7 +300,15 @@ impl StagedTableTransaction {
 
     async fn materialize_pending(self) -> Result<Table> {
         if self.pending_data_files.is_empty() && !self.replace_write {
-            return Ok(self.table);
+            let table = self.table;
+            let staged_location = table.metadata_location_result()?.to_string();
+            if hadoop_staged_location(&staged_location) {
+                table
+                    .metadata()
+                    .write_commit_metadata(table.file_io(), &staged_location)
+                    .await?;
+            }
+            return Ok(table);
         }
         let tx = Transaction::new(&self.table);
         if self.replace_write {
@@ -339,7 +351,7 @@ impl Transaction {
         let staged_location = current_table.metadata_location_result()?.to_string();
         current_table
             .metadata()
-            .write_to(current_table.file_io(), &staged_location)
+            .write_commit_metadata(current_table.file_io(), &staged_location)
             .await?;
         Ok(current_table)
     }
@@ -387,6 +399,39 @@ fn parse_format_version_property(raw: &str) -> Result<FormatVersion> {
             ),
         )),
     }
+}
+
+fn hadoop_staged_location(metadata_location: &str) -> bool {
+    MetadataLocation::from_str(metadata_location).is_ok_and(|parsed| parsed.is_hadoop_convention())
+}
+
+async fn ensure_staged_version_absent(file_io: &FileIO, metadata_location: &str) -> Result<()> {
+    let mut occupied = if file_io.exists(metadata_location).await? {
+        Some(metadata_location.to_string())
+    } else {
+        None
+    };
+    if occupied.is_none()
+        && let Ok(parsed) = MetadataLocation::from_str(metadata_location)
+        && let Some(siblings) = parsed.hadoop_version_siblings()
+    {
+        for sibling in siblings {
+            if file_io.exists(&sibling).await? {
+                occupied = Some(sibling);
+                break;
+            }
+        }
+    }
+    if let Some(existing) = occupied {
+        return Err(Error::new(
+            ErrorKind::CatalogCommitConflicts,
+            format!(
+                "Cannot stage replace to {metadata_location}: version file already exists ({existing})"
+            ),
+        )
+        .with_retryable(true));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

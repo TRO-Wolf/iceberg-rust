@@ -149,6 +149,11 @@ async fn concurrent_replace_from_a_hadoop_pointer_fails_on_exclusive_create() {
         .expect("first staged location")
         .to_string();
     assert_eq!(first, format!("{table_location}/metadata/v4.metadata.json"));
+    table
+        .metadata()
+        .write_commit_metadata(&file_io, &first)
+        .await
+        .expect("winner lands v4");
     let winner = file_io
         .new_input(&first)
         .expect("open winner")
@@ -269,7 +274,10 @@ async fn replace_stages_uncompressed_next_version_after_a_gzip_hadoop_pointer() 
         format!("{table_location}/metadata/v8.metadata.json"),
         "a gzip Hadoop pointer must stage the next uncompressed version, got {staged_location}"
     );
-    assert!(file_io.exists(&staged_location).await.expect("exists"));
+    assert!(
+        !file_io.exists(&staged_location).await.expect("exists"),
+        "a Hadoop staged target is written once at commit, not at begin"
+    );
 }
 
 #[tokio::test]
