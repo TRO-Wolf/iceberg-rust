@@ -270,53 +270,39 @@ fn test_predicate_conversion_with_date_cast() {
 fn test_scalar_value_to_datum_timestamp() {
     use datafusion::common::ScalarValue;
 
-    // Test TimestampMicrosecond - maps directly to Datum::timestamp_micros
-    let ts_micros = 1672876800000000i64; // 2023-01-05 00:00:00 UTC in microseconds
+    let ts_micros = 1672876800000000i64;
     let datum =
         super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(Some(ts_micros), None));
     assert_eq!(datum, Some(Datum::timestamp_micros(ts_micros)));
 
-    // Test TimestampNanosecond - maps to Datum::timestamp_nanos to preserve precision
-    let ts_nanos = 1672876800000000500i64; // 2023-01-05 00:00:00.000000500 UTC in nanoseconds
+    let ts_nanos = 1672876800000000500i64;
     let datum =
         super::scalar_value_to_datum(&ScalarValue::TimestampNanosecond(Some(ts_nanos), None));
     assert_eq!(datum, Some(Datum::timestamp_nanos(ts_nanos)));
 
-    // Test None timestamp
     let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(None, None));
     assert_eq!(datum, None);
 
-    // Note: TimestampSecond and TimestampMillisecond are not supported because
-    // DataFusion's type coercion converts them to TimestampMicrosecond or TimestampNanosecond
-    // before they reach scalar_value_to_datum in SQL queries.
-    // These return None (not pushed down):
-    let ts_seconds = 1672876800i64; // 2023-01-05 00:00:00 UTC in seconds
+    let ts_seconds = 1672876800i64;
     let datum = super::scalar_value_to_datum(&ScalarValue::TimestampSecond(Some(ts_seconds), None));
     assert_eq!(datum, None);
 
-    let ts_millis = 1672876800000i64; // 2023-01-05 00:00:00 UTC in milliseconds
+    let ts_millis = 1672876800000i64;
     let datum =
         super::scalar_value_to_datum(&ScalarValue::TimestampMillisecond(Some(ts_millis), None));
     assert_eq!(datum, None);
 }
 
-/// Control: a `Date64` literal that IS a whole number of days and fits the Iceberg `date`
-/// range converts to exactly that day, and a `Date32` literal is passed through unchanged.
-///
-/// This is the leg that keeps the two guards below from being a blanket "never push down a
-/// Date64" — it goes RED under a mutation that returns `None` unconditionally.
 #[test]
 fn test_scalar_value_to_datum_date64_day_aligned_in_range() {
     use datafusion::common::ScalarValue;
 
-    // 2023-01-05, 19362 days after the epoch.
     let days = 19362i32;
     let millis = i64::from(days) * super::MILLIS_PER_DAY;
 
     let datum = super::scalar_value_to_datum(&ScalarValue::Date64(Some(millis)));
     assert_eq!(datum, Some(Datum::date(days)));
 
-    // The epoch itself, and a pre-epoch day, are both day-aligned and in range.
     assert_eq!(
         super::scalar_value_to_datum(&ScalarValue::Date64(Some(0))),
         Some(Datum::date(0))
@@ -326,7 +312,6 @@ fn test_scalar_value_to_datum_date64_day_aligned_in_range() {
         Some(Datum::date(-1))
     );
 
-    // Date32 is already a day count and never goes through the millisecond conversion.
     assert_eq!(
         super::scalar_value_to_datum(&ScalarValue::Date32(Some(days))),
         Some(Datum::date(days))
@@ -337,18 +322,10 @@ fn test_scalar_value_to_datum_date64_day_aligned_in_range() {
     );
 }
 
-/// A `Date64` whose day count does not fit `i32` must NOT be pushed down.
-///
-/// `(millis / MILLIS_PER_DAY) as i32` wrapped: one day past `i32::MAX` became `i32::MIN`,
-/// i.e. a far-future literal was pushed down as a far-PAST date. `TableProvider::scan` takes
-/// the resulting predicate as the only file/row filter it applies, and the fork reports
-/// `TableProviderFilterPushDown::Inexact`, so DataFusion re-checks the rows the scan RETURNS
-/// but can never resurrect rows the wrapped predicate pruned away.
 #[test]
 fn test_scalar_value_to_datum_date64_out_of_date_range_is_not_pushed_down() {
     use datafusion::common::ScalarValue;
 
-    // One day past `i32::MAX` days: the old cast wrapped this to `i32::MIN`.
     let millis = (i64::from(i32::MAX) + 1) * super::MILLIS_PER_DAY;
     assert_eq!(
         ((millis / super::MILLIS_PER_DAY) as i32),
@@ -360,7 +337,6 @@ fn test_scalar_value_to_datum_date64_out_of_date_range_is_not_pushed_down() {
         None
     );
 
-    // ... and symmetrically one day below `i32::MIN`.
     let millis = (i64::from(i32::MIN) - 1) * super::MILLIS_PER_DAY;
     assert_eq!(
         super::scalar_value_to_datum(&ScalarValue::Date64(Some(millis))),
@@ -368,7 +344,6 @@ fn test_scalar_value_to_datum_date64_out_of_date_range_is_not_pushed_down() {
     );
 }
 
-/// A `Date64` that is not a whole number of days must NOT be pushed down.
 #[test]
 fn test_scalar_value_to_datum_date64_not_day_aligned_is_not_pushed_down() {
     use datafusion::common::ScalarValue;
@@ -390,9 +365,6 @@ fn test_scalar_value_to_datum_date64_not_day_aligned_is_not_pushed_down() {
     }
 }
 
-/// End of the seam: an out-of-range `Date64` comparison drops the WHOLE filter rather than
-/// pushing a wrapped one. With `<` the wrapped date was `i32::MIN`, which prunes every file
-/// in the table — a silent empty result for a filter that matches everything.
 #[test]
 fn test_predicate_conversion_date64_out_of_range_is_dropped_not_wrapped() {
     use datafusion::common::ScalarValue;
@@ -407,8 +379,6 @@ fn test_predicate_conversion_date64_out_of_range_is_dropped_not_wrapped() {
         "an out-of-range Date64 must not reach the scan as a predicate"
     );
 
-    // The same shape with a representable Date64 still pushes down, so the assertion above
-    // is about the range check and not about `Date64` comparisons in general.
     let millis = 19362i64 * super::MILLIS_PER_DAY;
     let filter = col("d").lt(Expr::Literal(ScalarValue::Date64(Some(millis)), None));
     assert_eq!(
@@ -436,8 +406,6 @@ fn test_scalar_value_to_datum_binary() {
 fn test_predicate_conversion_with_binary() {
     let sql = "foo = 1 and bin = X'0102'";
     let predicate = convert_to_iceberg_predicate(sql).unwrap();
-    // Binary literals are converted to Datum::binary
-    // Note: SQL literal 1 is converted to Long by DataFusion
     let expected_predicate = Reference::new("foo")
         .equal_to(Datum::long(1))
         .and(Reference::new("bin").equal_to(Datum::binary(vec![1u8, 2u8])));
@@ -448,15 +416,12 @@ fn test_predicate_conversion_with_binary() {
 fn test_scalar_value_to_datum_boolean() {
     use datafusion::common::ScalarValue;
 
-    // Test boolean true
     let datum = super::scalar_value_to_datum(&ScalarValue::Boolean(Some(true)));
     assert_eq!(datum, Some(Datum::bool(true)));
 
-    // Test boolean false
     let datum = super::scalar_value_to_datum(&ScalarValue::Boolean(Some(false)));
     assert_eq!(datum, Some(Datum::bool(false)));
 
-    // Test None boolean
     let datum = super::scalar_value_to_datum(&ScalarValue::Boolean(None));
     assert_eq!(datum, None);
 }
@@ -493,7 +458,6 @@ fn test_predicate_conversion_with_like_empty_prefix() {
 
 #[test]
 fn test_predicate_conversion_with_like_complex_pattern() {
-    // Patterns with wildcards in the middle cannot be pushed down
     let sql = "bar LIKE 'te%st'";
     let predicate = convert_to_iceberg_predicate(sql);
     assert_eq!(predicate, None);
@@ -501,7 +465,6 @@ fn test_predicate_conversion_with_like_complex_pattern() {
 
 #[test]
 fn test_predicate_conversion_with_like_underscore_wildcard() {
-    // Patterns with underscore wildcard cannot be pushed down
     let sql = "bar LIKE 'test_'";
     let predicate = convert_to_iceberg_predicate(sql);
     assert_eq!(predicate, None);
@@ -509,7 +472,6 @@ fn test_predicate_conversion_with_like_underscore_wildcard() {
 
 #[test]
 fn test_predicate_conversion_with_like_no_wildcard() {
-    // Patterns without trailing % cannot be pushed down as StartsWith
     let sql = "bar LIKE 'test'";
     let predicate = convert_to_iceberg_predicate(sql);
     assert_eq!(predicate, None);
@@ -517,7 +479,6 @@ fn test_predicate_conversion_with_like_no_wildcard() {
 
 #[test]
 fn test_predicate_conversion_with_ilike() {
-    // Case-insensitive LIKE (ILIKE) is not supported
     let sql = "bar ILIKE 'test%'";
     let predicate = convert_to_iceberg_predicate(sql);
     assert_eq!(predicate, None);
@@ -536,16 +497,13 @@ fn test_predicate_conversion_with_like_and_other_conditions() {
 
 #[test]
 fn test_predicate_conversion_with_like_special_characters() {
-    // Test LIKE with special characters in prefix
     let sql = "bar LIKE 'test-abc_123%'";
     let predicate = convert_to_iceberg_predicate(sql);
-    // This should not be pushed down because it contains underscore
     assert_eq!(predicate, None);
 }
 
 #[test]
 fn test_predicate_conversion_with_like_unicode() {
-    // Test LIKE with unicode characters in prefix
     let sql = "bar LIKE '测试%'";
     let predicate = convert_to_iceberg_predicate(sql).unwrap();
     assert_eq!(
@@ -579,7 +537,6 @@ fn test_predicate_conversion_with_isnan_and_other_condition() {
 
 #[test]
 fn test_predicate_conversion_with_isnan_unsupported_arg() {
-    // isnan on a complex expression (not a bare column) cannot be pushed down
     let sql = "isnan(qux + 1)";
     let predicate = convert_to_iceberg_predicate(sql);
     assert_eq!(predicate, None);

@@ -639,11 +639,6 @@ pub(crate) fn scan_predicates(
     ))
 }
 
-/// Rewrites pushed-down filters onto the scanned snapshot's names, dropping the rest.
-///
-/// A pushed filter runs against the DATA. After a rename the advertised name fails to bind, or
-/// binds to a DIFFERENT column that now carries it, which prunes rows DataFusion cannot get back.
-/// A filter over a column the snapshot lacks is not pushed at all, because that column reads NULL.
 fn rebind_filters(filters: &[Expr], bindings: &HashMap<String, Option<String>>) -> Vec<Expr> {
     filters
         .iter()
@@ -651,7 +646,6 @@ fn rebind_filters(filters: &[Expr], bindings: &HashMap<String, Option<String>>) 
         .collect()
 }
 
-/// One filter rewritten onto the scanned snapshot's names, or `None` if a column cannot bind.
 fn rebind_filter(filter: &Expr, bindings: &HashMap<String, Option<String>>) -> Option<Expr> {
     let mut unbound = false;
     let rewritten = filter
@@ -666,7 +660,6 @@ fn rebind_filter(filter: &Expr, bindings: &HashMap<String, Option<String>>) -> O
                         ))));
                     }
                     Some(Some(_)) => {}
-                    // The scanned snapshot has no such column, so refuse to push rather than guess.
                     Some(None) | None => unbound = true,
                 }
             }

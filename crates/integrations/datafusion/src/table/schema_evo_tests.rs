@@ -27,8 +27,6 @@ use tempfile::TempDir;
 use super::tests::*;
 use super::*;
 
-/// A provider built before an evolution advertises the OLD schema, while the scan reloads the
-/// table and would otherwise `select_all()` the NEW column set.
 #[tokio::test]
 async fn test_stale_provider_scan_is_self_consistent() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -40,7 +38,6 @@ async fn test_stale_provider_scan_is_self_consistent() {
             .expect("construct the provider BEFORE the evolution"),
     );
 
-    // The current snapshot carries 3 columns while `stale_provider` advertises 2.
     evolve_schema(&catalog, &ident, SchemaOp::AddOptionalInt("extra")).await;
     {
         let fresh =
@@ -84,8 +81,6 @@ async fn test_stale_provider_scan_is_self_consistent() {
         );
     }
 
-    // The advertised schema does not move, so a second query through the SAME provider is
-    // planned and answered identically.
     assert_eq!(
         stale_provider.schema().fields().len(),
         2,
@@ -103,8 +98,6 @@ async fn test_stale_provider_scan_is_self_consistent() {
     }
 }
 
-/// The silent path: with NO projection the scan once asked the reloaded table for
-/// `select_all()`. DataFusion addresses batch columns by ordinal, so an extra one corrupts.
 #[tokio::test]
 async fn test_unprojected_scan_advertises_the_schema_it_emits() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -134,7 +127,6 @@ async fn test_unprojected_scan_advertises_the_schema_it_emits() {
 
     let ctx = SessionContext::new();
     let state = ctx.state();
-    // `projection: None` is the path that once became `select_all()`.
     let plan = stale_provider
         .scan(&state, None, &[], None)
         .await
@@ -160,8 +152,6 @@ async fn test_unprojected_scan_advertises_the_schema_it_emits() {
     }
 }
 
-/// Builds a table whose snapshot carries an out-of-band `extra` column, plus a provider
-/// constructed BEFORE that evolution.
 async fn stale_provider_over_evolved_table(
     catalog: &Arc<dyn Catalog>,
     namespace: &NamespaceIdent,
@@ -206,8 +196,6 @@ fn dml_row_count(batches: &[datafusion::arrow::array::RecordBatch]) -> u64 {
         .sum()
 }
 
-/// `delete_from` binds its row filter and projection base to the CURRENT schema. A filter over
-/// a column added out of band cannot bind against the cached one.
 #[tokio::test]
 async fn test_delete_binds_to_current_schema_not_the_cached_one() {
     use datafusion::prelude::{col, lit};
@@ -231,8 +219,6 @@ async fn test_delete_binds_to_current_schema_not_the_cached_one() {
     );
 }
 
-/// `update` resolves each `SET` target against the CURRENT schema, so the column index and the
-/// projection base describe one state. The cached schema calls a new column unknown.
 #[tokio::test]
 async fn test_update_binds_to_current_schema_not_the_cached_one() {
     use datafusion::prelude::{col, lit};
@@ -258,8 +244,6 @@ async fn test_update_binds_to_current_schema_not_the_cached_one() {
     );
 }
 
-/// `RENAME COLUMN` keeps the field id and creates NO snapshot, so the advertised name and the
-/// snapshot's name differ. Name binding null-fills over live data; field-id binding does not.
 #[tokio::test]
 async fn test_rename_preserves_values_under_the_new_name() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -274,7 +258,6 @@ async fn test_rename_preserves_values_under_the_new_name() {
     )
     .await;
 
-    // The rename lands AFTER the write, so the data sits under the old name.
     evolve_schema(&catalog, &ident, SchemaOp::Rename("opt", "opt2")).await;
 
     let provider =
@@ -310,7 +293,6 @@ async fn test_rename_preserves_values_under_the_new_name() {
     assert_eq!(seen, 1, "the seeded row must be readable");
 }
 
-/// A renamed REQUIRED column has no null-fill escape, so name binding fails the query outright.
 #[tokio::test]
 async fn test_required_column_rename_preserves_values() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -323,7 +305,6 @@ async fn test_required_column_rename_preserves_values() {
         "INSERT INTO t VALUES (1, 'a')",
     )
     .await;
-    // `name` is REQUIRED in the fixture schema.
     evolve_schema(&catalog, &ident, SchemaOp::Rename("name", "full_name")).await;
 
     let provider =
@@ -349,8 +330,6 @@ async fn test_required_column_rename_preserves_values() {
     assert_eq!(seen, 1, "the seeded row must be readable");
 }
 
-/// A VIEW captures the provider and its projection ORDINALS. A schema that shrank under it
-/// makes `TableScan::try_new` index it with a stale ordinal and PANIC.
 #[tokio::test]
 async fn test_view_survives_an_out_of_band_column_drop() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -378,8 +357,6 @@ async fn test_view_survives_an_out_of_band_column_drop() {
         .await
         .expect("create the view");
 
-    // The drop lands BEFORE round 1, so a provider that republished its schema there leaves
-    // round 2 indexing a SHORTER schema with round-1 ordinals, which panics.
     evolve_schema(&catalog, &ident, SchemaOp::Drop("id")).await;
 
     let round1 = ctx
@@ -409,7 +386,6 @@ async fn test_view_survives_an_out_of_band_column_drop() {
     }
 }
 
-/// A DataFrame collected after an evolution holds planning-time ordinals, and must not panic.
 #[tokio::test]
 async fn test_deferred_dataframe_survives_an_out_of_band_evolution() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -435,8 +411,6 @@ async fn test_deferred_dataframe_survives_an_out_of_band_evolution() {
 
     evolve_schema(&catalog, &ident, SchemaOp::Drop("id")).await;
 
-    // Execute twice: the second physical-planning round re-indexes the provider schema with
-    // the plan's stored ordinals.
     let first = df
         .clone()
         .collect()
@@ -453,8 +427,6 @@ async fn test_deferred_dataframe_survives_an_out_of_band_evolution() {
     }
 }
 
-/// `int` to `long` is a legal promotion and creates no snapshot, so the scanned data is still
-/// `int` while the plan advertises `long`. The values must be read, widened.
 #[tokio::test]
 async fn test_legal_int_to_long_promotion_reads_widened_values() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -500,9 +472,6 @@ async fn test_legal_int_to_long_promotion_reads_widened_values() {
     assert_eq!(seen, 1, "the seeded row must be readable");
 }
 
-/// In the steady state the scanned batch's schema is IDENTICAL to the advertised one, metadata
-/// included, so `conform_batch` rebuilds nothing. A reader change would move every scan onto
-/// the rebuild path.
 #[tokio::test]
 async fn test_steady_state_batch_schema_is_identical_to_the_advertised_schema() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -538,8 +507,6 @@ async fn test_steady_state_batch_schema_is_identical_to_the_advertised_schema() 
     }
 }
 
-/// The nested-evolution fixture `(id int, s struct<a int>)`. `s.a` is field 3, so an added
-/// `s.b` takes field 4, as Iceberg assigns.
 async fn get_test_catalog_and_struct_table() -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir)
 {
     use iceberg::spec::StructType;
@@ -596,7 +563,6 @@ async fn get_test_catalog_and_struct_table() -> (Arc<dyn Catalog>, NamespaceIden
     )
 }
 
-/// Adds a NESTED column out of band: `ALTER TABLE ADD COLUMN <parent>.<name> int`.
 async fn evolve_add_nested_column(
     catalog: &Arc<dyn Catalog>,
     ident: &TableIdent,
@@ -625,8 +591,6 @@ async fn evolve_add_nested_column(
         .expect("commit the nested add-column");
 }
 
-/// `ADD COLUMN s.b` creates no snapshot, so the scanned struct holds only `a` while the plan
-/// advertises `{a, b}`. Conforming must recurse into the struct, as Spark does.
 #[tokio::test]
 async fn test_nested_add_column_reads_null_for_the_new_field() {
     use datafusion::arrow::array::{Array, Int32Array, StructArray};
@@ -680,7 +644,6 @@ async fn test_nested_add_column_reads_null_for_the_new_field() {
     assert_eq!(seen, 1, "the seeded row must be readable");
 }
 
-/// Renames a column out of band; `name` may be a dotted path for a nested field.
 async fn evolve_rename(catalog: &Arc<dyn Catalog>, ident: &TableIdent, name: &str, to: &str) {
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
@@ -699,7 +662,6 @@ async fn evolve_rename(catalog: &Arc<dyn Catalog>, ident: &TableIdent, name: &st
         .expect("commit the rename");
 }
 
-/// The nested rename: the child keeps its field id, so its value comes back under the new name.
 #[tokio::test]
 async fn test_nested_rename_preserves_values() {
     use datafusion::arrow::array::{Array, Int32Array, StructArray};
@@ -749,13 +711,6 @@ async fn test_nested_rename_preserves_values() {
     assert_eq!(seen, 1, "the seeded row must be readable");
 }
 
-// ===== Pushed-down-filter rebinding =====
-//
-// A pushed filter PRUNES rows before DataFusion sees them, and `Inexact` pushdown only discards
-// false positives. These three pin how a name-keyed filter fails once names and ids disagree.
-
-/// A table `(a int, b int)` for the name-swap case: one shared type, so a filter bound to the
-/// wrong column type-checks and returns the wrong rows.
 async fn get_test_catalog_and_two_int_table() -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir)
 {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -803,8 +758,6 @@ async fn get_test_catalog_and_two_int_table() -> (Arc<dyn Catalog>, NamespaceIde
     )
 }
 
-/// After a rename, a filter over the NEW name must go down under the snapshot's name. The
-/// advertised name fails to bind, so the query dies instead of returning the row.
 #[tokio::test]
 async fn test_pushdown_after_a_rename_binds_the_snapshot_name() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -832,8 +785,6 @@ async fn test_pushdown_after_a_rename_binds_the_snapshot_name() {
     );
 }
 
-/// After DROP and re-ADD the advertised column has a FRESH field id the snapshot lacks, so
-/// every row reads NULL. Pushing under the old name prunes rows DataFusion cannot get back.
 #[tokio::test]
 async fn test_pushdown_after_drop_and_readd_keeps_the_rows() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
@@ -862,8 +813,6 @@ async fn test_pushdown_after_drop_and_readd_keeps_the_rows() {
     );
 }
 
-/// The silent one: swap two names, and a filter pushed under the advertised name binds to the
-/// OTHER column's data. Same type, no error, wrong rows.
 #[tokio::test]
 async fn test_pushdown_after_a_name_swap_filters_the_right_column() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_two_int_table().await;
@@ -877,7 +826,6 @@ async fn test_pushdown_after_a_name_swap_filters_the_right_column() {
     )
     .await;
 
-    // a -> tmp, b -> a, tmp -> b: field 1 is now called `b` and field 2 is now called `a`.
     evolve_rename(&catalog, &ident, "a", "tmp").await;
     evolve_rename(&catalog, &ident, "b", "a").await;
     evolve_rename(&catalog, &ident, "tmp", "b").await;
@@ -886,8 +834,6 @@ async fn test_pushdown_after_a_name_swap_filters_the_right_column() {
         IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
             .await
             .expect("construct a provider on the swapped table");
-    // Only the NAMES moved. The column advertised as `a` is field id 2, which the snapshot
-    // still calls `b`, holding the value 2.
     assert_eq!(provider.schema().field(0).name(), "b");
     assert_eq!(provider.schema().field(1).name(), "a");
 
@@ -899,10 +845,6 @@ async fn test_pushdown_after_a_name_swap_filters_the_right_column() {
     );
 }
 
-/// The scan must read ONLY the projected column. It drives
-/// [`crate::physical_plan::scan::get_batch_stream`] with the resolved column set, so a revert
-/// to `select_all()` widens the pre-conform batch and REDs here. `conform_batch` would
-/// otherwise hide it, because it narrows the batch again.
 #[tokio::test]
 async fn test_scan_reads_only_the_projected_column() {
     use futures::TryStreamExt;
@@ -972,7 +914,6 @@ async fn test_no_limit_pushdown() {
     );
 }
 
-/// Incomplete metadata must surface a planning error, not demote to `UnknownPartitioning(1)`.
 #[tokio::test]
 async fn test_plan_tasks_failure_fail_closed_not_n1_demote() {
     use datafusion::datasource::TableProvider;
