@@ -44,10 +44,10 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
     format_supports_row_lineage, schema_with_row_lineage,
 };
-use crate::scan::{ArrowRecordBatchStream, FileScanTask};
+use crate::scan::FileScanTask;
 use crate::spec::{
-    DataFile, DataFileFormat, NestedFieldRef, NullOrder, PartitionSpecRef, PrimitiveType,
-    Schema as IcebergSchema, SchemaRef, SortDirection, Transform, Type,
+    DataFile, DataFileFormat, NestedFieldRef, NullOrder, PartitionSpec, PartitionSpecRef,
+    PrimitiveType, Schema as IcebergSchema, SchemaRef, SortDirection, Transform, Type,
 };
 use crate::table::Table;
 use crate::transform::{BoxedTransformFunction, create_transform_function};
@@ -105,9 +105,6 @@ pub(crate) async fn write_compacted_files(
         location_generator,
         file_name_generator,
     );
-    let writer_builder = DataFileWriterBuilder::new(rolling_builder)
-        .with_partition_spec(spec.clone())
-        .with_sort_order_id(sort.stamp);
 
     let carry_lineage = format_supports_row_lineage(table.metadata().format_version());
     let current_schema = table.metadata().current_schema().clone();
@@ -136,21 +133,62 @@ pub(crate) async fn write_compacted_files(
         .build()
         .read(task_stream)?;
 
-    let mut batch_stream: ArrowRecordBatchStream = match &sort.keys {
-        Some(keys) => {
-            let mut batches = Vec::new();
-            while let Some(batch) = batch_stream.try_next().await? {
-                batches.push(batch);
+    if let Some(keys) = &sort.keys {
+        let splitter = (!spec.fields().is_empty())
+            .then(|| {
+                RecordBatchPartitionSplitter::try_new_with_computed_values(
+                    schema.clone(),
+                    output_spec.clone(),
+                )
+            })
+            .transpose()?;
+        let run_target = usize::try_from(target_file_size_bytes).unwrap_or(usize::MAX);
+        let mut files = Vec::new();
+        let mut peak = 0usize;
+        let mut run: Vec<RecordBatch> = Vec::new();
+        let mut run_bytes = 0usize;
+        while let Some(batch) = batch_stream.try_next().await? {
+            run_bytes += batch.get_array_memory_size();
+            run.push(batch);
+            if run_bytes >= run_target {
+                write_sorted_run(
+                    &arrow_schema,
+                    std::mem::take(&mut run),
+                    keys,
+                    splitter.as_ref(),
+                    &rolling_builder,
+                    &spec,
+                    sort.stamp,
+                    max_open_partition_writers,
+                    &mut files,
+                    &mut peak,
+                )
+                .await?;
+                run_bytes = 0;
             }
-            let mut items = Vec::new();
-            if !batches.is_empty() {
-                let group = concat_batches(&arrow_schema, &batches).map_err(arrow_sort_err)?;
-                items.push(sort_group_batch(&group, keys)?);
-            }
-            Box::pin(futures::stream::iter(items.into_iter().map(Ok)))
         }
-        None => batch_stream,
-    };
+        write_sorted_run(
+            &arrow_schema,
+            run,
+            keys,
+            splitter.as_ref(),
+            &rolling_builder,
+            &spec,
+            sort.stamp,
+            max_open_partition_writers,
+            &mut files,
+            &mut peak,
+        )
+        .await?;
+        return Ok(CompactedWrite {
+            files,
+            peak_open_partition_writers: peak,
+        });
+    }
+
+    let writer_builder = DataFileWriterBuilder::new(rolling_builder)
+        .with_partition_spec(spec.clone())
+        .with_sort_order_id(sort.stamp);
 
     if spec.fields().is_empty() {
         let mut writer = writer_builder.build(None).await?;
@@ -180,6 +218,50 @@ pub(crate) async fn write_compacted_files(
         files,
         peak_open_partition_writers,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_sorted_run(
+    arrow_schema: &arrow_schema::SchemaRef,
+    run: Vec<RecordBatch>,
+    keys: &[RewriteSortKey],
+    splitter: Option<&RecordBatchPartitionSplitter>,
+    rolling_builder: &RollingFileWriterBuilder<
+        ParquetWriterBuilder,
+        DefaultLocationGenerator,
+        DefaultFileNameGenerator,
+    >,
+    spec: &PartitionSpec,
+    stamp: i32,
+    max_open_partition_writers: usize,
+    files: &mut Vec<DataFile>,
+    peak_open_partition_writers: &mut usize,
+) -> Result<()> {
+    if run.is_empty() {
+        return Ok(());
+    }
+    let sorted = {
+        let run_batch = concat_batches(arrow_schema, &run).map_err(arrow_sort_err)?;
+        sort_group_batch(&run_batch, keys)?
+    };
+    let writer_builder = DataFileWriterBuilder::new(rolling_builder.clone())
+        .with_partition_spec(spec.clone())
+        .with_sort_order_id(stamp);
+    if let Some(splitter) = splitter {
+        let mut router = BoundedPartitionRouter::new(writer_builder, max_open_partition_writers)?;
+        for (partition_key, partition_batch) in splitter.split(&sorted)? {
+            router.write(partition_key, partition_batch).await?;
+        }
+        *peak_open_partition_writers =
+            (*peak_open_partition_writers).max(router.peak_open_partition_writers());
+        files.extend(router.close().await?);
+    } else {
+        let mut writer = writer_builder.build(None).await?;
+        writer.write(sorted).await?;
+        *peak_open_partition_writers = (*peak_open_partition_writers).max(1);
+        files.extend(writer.close().await?);
+    }
+    Ok(())
 }
 
 fn rewrite_write_schema(table: &Table) -> Result<SchemaRef> {
