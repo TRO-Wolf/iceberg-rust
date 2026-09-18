@@ -18,6 +18,8 @@
 //! Base writer module contains the basic writer provide by iceberg: `DataFileWriter`, `PositionDeleteFileWriter`, `EqualityDeleteFileWriter`, `DVFileWriter`.
 
 pub mod data_file_writer;
+#[cfg(test)]
+pub(crate) mod data_file_writer_tests;
 pub mod deletion_vector_writer;
 pub mod equality_delete_writer;
 pub mod position_delete_writer;

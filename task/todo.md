@@ -62,6 +62,23 @@ SQL INSERT) all failed on `RecordBatch::try_new` nested-label mismatch.
       construction — idless batch can't reach the borrowed path); restored green
 - [x] ledger + todo entry + writer `try_new` audit
 
+Round 2 (same lane): SQL `INSERT … VALUES` still failed — the stamped `TableProvider::schema()`
+was feeding DataFusion's `insert_to_plan`/`Values` exec, not the writer.
+
+- [x] red e2e cells in `evo_schema_dml.rs` (`6b11d0dd9`): `INSERT … VALUES` into list /
+      `list<struct>` / `map<string,list<int>>` columns through a real `SessionContext` +
+      `IcebergTableProvider`, incl. multi-row, NULL row, null element; footer leaf ids pinned
+- [x] fix: `IcebergTableProvider::schema()` returns `strip_metadata_from_schema` output; the
+      internal stamped schema still feeds the write path (`63a907d82`)
+- [x] mutation: revert `schema()` to stamped → both cells red with the two measured failure
+      modes; restored green
+- [x] Grok R-01..R-04 remediation (`74d6b23ec`): UTC-alias timestamps layout-compatible via
+      `is_utc_time_zone`; view/dictionary leaves cast via `arrow_cast`; per-writer cached target
+      Arrow schema; relaxed borrowed-path equality; `build_unchecked` under the layout proof +
+      `disallowed_nulls` (unsafe justified in the ledger)
+- [x] `project_batch` audit: write path but equality-delete projection is primitive-only — the
+      nested-mismatch class cannot fire; recorded in the ledger
+
 
 ## ACTIVE (2026-09-17): F-ICE-RESIDUES-21B fork-residue lane, five closures vs Java 1.10.0
 
