@@ -284,6 +284,8 @@ pub mod base_writer;
 pub mod file_writer;
 pub mod partitioning;
 pub(crate) mod write_defaults;
+#[cfg(test)]
+pub(crate) mod write_defaults_tests;
 
 use arrow_array::RecordBatch;
 

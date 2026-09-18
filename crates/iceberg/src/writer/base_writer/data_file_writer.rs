@@ -21,9 +21,12 @@
 //! three base writers (data, position-delete, equality-delete).
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef as ArrowSchemaRef;
 
+use crate::arrow::schema_to_arrow_schema;
 use crate::spec::{DataContentType, DataFile, PartitionKey, PartitionSpec, SchemaRef};
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
@@ -164,12 +167,19 @@ where
     async fn build(&self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
         let partition_spec_id =
             resolve_partition_spec_id(self.partition_spec.as_ref(), partition_key.as_ref())?;
+        let arrow_schema = self
+            .inner
+            .iceberg_schema()
+            .map(|schema| schema_to_arrow_schema(schema))
+            .transpose()?
+            .map(Arc::new);
         Ok(DataFileWriter {
             inner: Some(self.inner.build()),
             partition_key,
             partition_spec_id,
             sort_order_id: self.sort_order_id,
             schema: self.inner.iceberg_schema().cloned(),
+            arrow_schema,
         })
     }
 }
@@ -184,6 +194,7 @@ pub struct DataFileWriter<B: FileWriterBuilder, L: LocationGenerator, F: FileNam
     partition_spec_id: i32,
     sort_order_id: Option<i32>,
     schema: Option<SchemaRef>,
+    arrow_schema: Option<ArrowSchemaRef>,
 }
 
 #[async_trait::async_trait]
@@ -194,9 +205,11 @@ where
     F: FileNameGenerator,
 {
     async fn write(&mut self, batch: RecordBatch) -> Result<()> {
-        let filled = match &self.schema {
-            Some(schema) => apply_write_defaults(schema, &batch)?,
-            None => Cow::Borrowed(&batch),
+        let filled = match (&self.schema, &self.arrow_schema) {
+            (Some(schema), Some(arrow_schema)) => {
+                apply_write_defaults(schema, arrow_schema, &batch)?
+            }
+            _ => Cow::Borrowed(&batch),
         };
         if let Some(writer) = self.inner.as_mut() {
             writer.write(&self.partition_key, filled.as_ref()).await
@@ -298,7 +311,7 @@ mod test {
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-    use crate::writer::write_defaults::tests::{
+    use crate::writer::write_defaults_tests::{
         assert_nested_field_ids, nested_batch, nested_ids_schema,
     };
     use crate::writer::{IcebergWriter, IcebergWriterBuilder, RecordBatch};

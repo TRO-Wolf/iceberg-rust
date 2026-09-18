@@ -24,21 +24,23 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, FixedSizeBinaryArray, LargeBinaryArray, RecordBatch, Time64MicrosecondArray,
+    Array, ArrayRef, FixedSizeBinaryArray, LargeBinaryArray, RecordBatch, Time64MicrosecondArray,
     make_array, new_null_array,
 };
-use arrow_schema::{DataType, Field, Fields, TimeUnit};
+use arrow_buffer::NullBuffer;
+use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use uuid::Uuid;
 
-use crate::arrow::{create_primitive_array_repeated, schema_to_arrow_schema};
+use crate::arrow::{create_primitive_array_repeated, is_utc_time_zone};
 use crate::spec::{Literal, NestedField, PrimitiveLiteral, Schema};
 use crate::{Error, ErrorKind, Result};
 
 /// Project `batch` onto `schema`, filling any missing field from `write-default`.
 ///
-/// A complete batch in Iceberg field order is returned borrowed. Extra batch columns
-/// are dropped. Nested `write-default` fill is refused (row R92 residue).
+/// `target_schema` is `schema`'s Arrow projection, precomputed once per writer. A complete
+/// batch in Iceberg field order is returned borrowed. Extra batch columns are dropped.
+/// Nested `write-default` fill is refused (row R92 residue).
 ///
 /// # Errors
 ///
@@ -46,14 +48,13 @@ use crate::{Error, ErrorKind, Result};
 /// [`ErrorKind::FeatureUnsupported`] when a missing field's `write-default` is not primitive.
 pub(crate) fn apply_write_defaults<'a>(
     schema: &Schema,
+    target_schema: &ArrowSchemaRef,
     batch: &'a RecordBatch,
 ) -> Result<Cow<'a, RecordBatch>> {
     let iceberg_fields = schema.as_struct().fields();
     if batch.num_rows() == 0 {
-        let target_schema = schema_to_arrow_schema(schema)?;
-        return Ok(Cow::Owned(RecordBatch::new_empty(Arc::new(target_schema))));
+        return Ok(Cow::Owned(RecordBatch::new_empty(target_schema.clone())));
     }
-    let target_schema = schema_to_arrow_schema(schema)?;
     if batch_matches_schema_order(target_schema.fields(), batch) {
         return Ok(Cow::Borrowed(batch));
     }
@@ -73,13 +74,54 @@ pub(crate) fn apply_write_defaults<'a>(
     }
 
     Ok(Cow::Owned(RecordBatch::try_new(
-        Arc::new(target_schema),
+        target_schema.clone(),
         columns,
     )?))
 }
 
 fn batch_matches_schema_order(target_fields: &Fields, batch: &RecordBatch) -> bool {
-    batch.schema().fields().iter().eq(target_fields.iter())
+    let batch_schema = batch.schema();
+    let batch_fields = batch_schema.fields();
+    batch_fields.len() == target_fields.len()
+        && batch_fields
+            .iter()
+            .zip(target_fields.iter())
+            .all(|(batch_field, target_field)| borrow_field_eq(batch_field, target_field))
+}
+
+fn borrow_field_eq(batch_field: &Field, target_field: &Field) -> bool {
+    batch_field.name() == target_field.name()
+        && batch_field.is_nullable() == target_field.is_nullable()
+        && batch_field_id(batch_field) == batch_field_id(target_field)
+        && borrow_type_eq(batch_field.data_type(), target_field.data_type())
+}
+
+fn borrow_type_eq(batch_type: &DataType, target_type: &DataType) -> bool {
+    match (batch_type, target_type) {
+        (DataType::Struct(batch_fields), DataType::Struct(target_fields)) => {
+            batch_fields.len() == target_fields.len()
+                && batch_fields
+                    .iter()
+                    .zip(target_fields.iter())
+                    .all(|(batch_field, target_field)| borrow_field_eq(batch_field, target_field))
+        }
+        (DataType::List(batch_field), DataType::List(target_field))
+        | (DataType::LargeList(batch_field), DataType::LargeList(target_field)) => {
+            borrow_field_eq(batch_field, target_field)
+        }
+        (
+            DataType::FixedSizeList(batch_field, batch_len),
+            DataType::FixedSizeList(target_field, target_len),
+        ) => batch_len == target_len && borrow_field_eq(batch_field, target_field),
+        (DataType::Map(batch_field, batch_sorted), DataType::Map(target_field, target_sorted)) => {
+            batch_sorted == target_sorted && borrow_field_eq(batch_field, target_field)
+        }
+        (
+            DataType::Dictionary(batch_key, batch_value),
+            DataType::Dictionary(target_key, target_value),
+        ) => batch_key == target_key && borrow_type_eq(batch_value, target_value),
+        _ => batch_type == target_type,
+    }
 }
 
 const MAX_RELABEL_DEPTH: usize = 128;
@@ -96,7 +138,10 @@ fn relabel_column(column: &ArrayRef, target: &DataType, depth: usize) -> Result<
     let target_children = nested_fields(target);
     let data = column.to_data();
     if !compatible_layout(actual, target) || actual_children.len() != data.child_data().len() {
-        return Err(incompatible_type(actual, target));
+        return match cast_leaf_encoding(column, actual, target) {
+            Some(array) => array,
+            None => Err(incompatible_type(actual, target)),
+        };
     }
     let mut children = Vec::with_capacity(target_children.len());
     for ((actual_field, target_field), child_data) in actual_children
@@ -107,22 +152,39 @@ fn relabel_column(column: &ArrayRef, target: &DataType, depth: usize) -> Result<
         if matches!(target, DataType::Struct(_)) && actual_field.name() != target_field.name() {
             return Err(incompatible_type(actual, target));
         }
-        children.push(
-            relabel_column(
-                &make_array(child_data.clone()),
-                target_field.data_type(),
-                depth + 1,
-            )?
-            .to_data(),
-        );
+        let child_array = make_array(child_data.clone());
+        if !target_field.is_nullable() && disallowed_nulls(target, column.nulls(), &child_array) {
+            return Err(incompatible_type(actual, target));
+        }
+        children.push(relabel_column(&child_array, target_field.data_type(), depth + 1)?.to_data());
     }
-    Ok(make_array(
+    Ok(make_array(unsafe {
         data.into_builder()
             .data_type(target.clone())
             .child_data(children)
-            .build()
-            .map_err(|err| incompatible_type(actual, target).with_source(err))?,
-    ))
+            .build_unchecked()
+    }))
+}
+
+fn disallowed_nulls(
+    target: &DataType,
+    parent_nulls: Option<&NullBuffer>,
+    child: &ArrayRef,
+) -> bool {
+    match target {
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => child.null_count() > 0,
+        _ => match (parent_nulls, child.nulls()) {
+            (_, None) => false,
+            (Some(parent_nulls), Some(child_nulls)) => {
+                let mask = match target {
+                    DataType::FixedSizeList(_, len) => parent_nulls.expand(*len as usize),
+                    _ => parent_nulls.clone(),
+                };
+                !mask.contains(child_nulls)
+            }
+            (None, Some(_)) => child.null_count() > 0,
+        },
+    }
 }
 
 fn nested_fields(data_type: &DataType) -> Vec<&Field> {
@@ -143,8 +205,51 @@ fn compatible_layout(actual: &DataType, target: &DataType) -> bool {
         | (DataType::LargeList(_), DataType::LargeList(_)) => true,
         (DataType::FixedSizeList(_, a), DataType::FixedSizeList(_, b)) => a == b,
         (DataType::Map(_, a), DataType::Map(_, b)) => a == b,
+        (
+            DataType::Timestamp(actual_unit, Some(actual_tz)),
+            DataType::Timestamp(target_unit, Some(target_tz)),
+        ) => {
+            actual_unit == target_unit
+                && is_utc_time_zone(actual_tz.as_ref())
+                && is_utc_time_zone(target_tz.as_ref())
+        }
         _ => false,
     }
+}
+
+fn cast_leaf_encoding(
+    column: &ArrayRef,
+    actual: &DataType,
+    target: &DataType,
+) -> Option<Result<ArrayRef>> {
+    if parquet_leaf_equivalent(actual, target) {
+        Some(
+            arrow_cast::cast(column, target)
+                .map_err(|err| incompatible_type(actual, target).with_source(err)),
+        )
+    } else {
+        None
+    }
+}
+
+fn parquet_leaf_equivalent(actual: &DataType, target: &DataType) -> bool {
+    let actual = match actual {
+        DataType::Dictionary(_, value) => value.as_ref(),
+        other => other,
+    };
+    if actual == target {
+        return true;
+    }
+    matches!(
+        (actual, target),
+        (
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) | (
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        )
+    )
 }
 
 fn incompatible_type(actual: &DataType, target: &DataType) -> Error {
@@ -241,759 +346,5 @@ fn repeat_write_default(
             LargeBinaryArray::from_iter_values(std::iter::repeat_n(bytes.as_slice(), num_rows)),
         )),
         _ => create_primitive_array_repeated(data_type, &Some(prim.clone()), num_rows),
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    use arrow_array::{
-        Array, ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
-        make_array,
-    };
-    use arrow_buffer::{NullBuffer, OffsetBuffer};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use parquet::file::properties::WriterProperties;
-    use tempfile::TempDir;
-
-    use super::*;
-    use crate::io::FileIO;
-    use crate::spec::{DataFileFormat, NestedField, PrimitiveLiteral, PrimitiveType, Schema, Type};
-    use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-    use crate::writer::file_writer::ParquetWriterBuilder;
-    use crate::writer::file_writer::location_generator::{
-        DefaultFileNameGenerator, DefaultLocationGenerator,
-    };
-    use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-    use crate::writer::{IcebergWriter, IcebergWriterBuilder};
-
-    fn id_meta(id: i32) -> HashMap<String, String> {
-        HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())])
-    }
-
-    fn schema_id_and_name() -> Schema {
-        Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))
-                    .with_write_default(Literal::string("anon"))
-                    .into(),
-            ])
-            .build()
-            .expect("schema")
-    }
-
-    fn id_only_batch() -> RecordBatch {
-        let arrow_schema = ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(id_meta(1)),
-        ]);
-        RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(Int32Array::from(
-            vec![1, 2, 3],
-        ))])
-        .expect("id-only batch")
-    }
-
-    fn complete_batch() -> RecordBatch {
-        let arrow_schema = ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(id_meta(1)),
-            Field::new("name", DataType::Utf8, true).with_metadata(id_meta(2)),
-        ]);
-        RecordBatch::try_new(Arc::new(arrow_schema), vec![
-            Arc::new(Int32Array::from(vec![1, 2])),
-            Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
-        ])
-        .expect("complete batch")
-    }
-
-    fn nested_ids_schema_with(element_required: bool) -> Schema {
-        serde_json::from_str(&format!(
-            r#"{{"type":"struct","schema-id":0,"fields":[
-                {{"id":1,"name":"id","required":true,"type":"int"}},
-                {{"id":2,"name":"nums","required":false,"type":{{"type":"list","element-id":3,"element":"int","element-required":{element_required}}}}},
-                {{"id":4,"name":"pairs","required":false,"type":{{"type":"list","element-id":5,"element-required":false,"element":{{"type":"struct","fields":[{{"id":6,"name":"a","required":true,"type":"int"}},{{"id":7,"name":"b","required":false,"type":"string"}}]}}}}}},
-                {{"id":8,"name":"props","required":false,"type":{{"type":"map","key-id":9,"key":"string","value-id":10,"value-required":false,"value":{{"type":"list","element-id":11,"element":"int","element-required":false}}}}}}
-            ]}}"#
-        ))
-        .expect("nested schema")
-    }
-
-    pub(crate) fn nested_ids_schema() -> Schema {
-        nested_ids_schema_with(false)
-    }
-
-    fn int_list(element_name: &str, rows: Vec<Option<Vec<Option<i32>>>>) -> ArrayRef {
-        let element = Arc::new(Field::new(element_name, DataType::Int32, true));
-        make_array(
-            ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(rows)
-                .into_data()
-                .into_builder()
-                .data_type(DataType::List(element))
-                .build()
-                .expect("named element list"),
-        )
-    }
-
-    fn boxed<A: Array + 'static>(array: A) -> ArrayRef {
-        Arc::new(array)
-    }
-
-    pub(crate) fn nested_batch(element_name: &str, top_ids: bool) -> RecordBatch {
-        let fld = |name: &str, data_type: DataType, nullable: bool| {
-            Arc::new(Field::new(name, data_type, nullable))
-        };
-        let stamp = |field: Field, id: i32| {
-            let meta = if top_ids { id_meta(id) } else { HashMap::new() };
-            field.with_metadata(meta)
-        };
-        let nums = int_list(element_name, vec![
-            Some(vec![Some(1), None]),
-            None,
-            Some(vec![]),
-        ]);
-        let pair_values = StructArray::from(vec![
-            (
-                fld("a", DataType::Int32, false),
-                boxed(Int32Array::from(vec![10, 20])),
-            ),
-            (
-                fld("b", DataType::Utf8, true),
-                boxed(StringArray::from(vec![Some("x"), None])),
-            ),
-        ]);
-        let pairs = ListArray::new(
-            fld(element_name, pair_values.data_type().clone(), true),
-            OffsetBuffer::new(vec![0, 1, 1, 2].into()),
-            Arc::new(pair_values),
-            Some(NullBuffer::from(vec![true, false, true])),
-        );
-        let inner = int_list(element_name, vec![
-            Some(vec![Some(5), Some(6)]),
-            Some(vec![]),
-        ]);
-        let entries = StructArray::from(vec![
-            (
-                fld("key", DataType::Utf8, false),
-                boxed(StringArray::from(vec!["k1", "k2"])),
-            ),
-            (fld("value", inner.data_type().clone(), true), inner),
-        ]);
-        let props = MapArray::new(
-            fld("entries", entries.data_type().clone(), false),
-            OffsetBuffer::new(vec![0, 1, 2, 2].into()),
-            entries,
-            Some(NullBuffer::from(vec![true, true, false])),
-            false,
-        );
-        RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
-                stamp(Field::new("id", DataType::Int32, false), 1),
-                stamp(Field::new("nums", nums.data_type().clone(), true), 2),
-                stamp(Field::new("pairs", pairs.data_type().clone(), true), 4),
-                stamp(Field::new("props", props.data_type().clone(), true), 8),
-            ])),
-            vec![
-                boxed(Int32Array::from(vec![1, 2, 3])),
-                nums,
-                Arc::new(pairs),
-                Arc::new(props),
-            ],
-        )
-        .expect("unstamped batch")
-    }
-
-    pub(crate) fn assert_nested_field_ids(schema: &ArrowSchema) {
-        for (path, id) in [
-            (&[1, 0][..], 3),
-            (&[2, 0], 5),
-            (&[2, 0, 0], 6),
-            (&[2, 0, 1], 7),
-            (&[3, 0, 0], 9),
-            (&[3, 0, 1], 10),
-            (&[3, 0, 1, 0], 11),
-        ] {
-            let mut field = schema.fields()[path[0]].as_ref();
-            for &index in &path[1..] {
-                field = match field.data_type() {
-                    DataType::List(child) | DataType::Map(child, _) if index == 0 => child.as_ref(),
-                    DataType::Struct(children) => children[index].as_ref(),
-                    _ => panic!("expected a nested field"),
-                };
-            }
-            assert_eq!(batch_field_id(field), Some(id));
-        }
-    }
-
-    #[test]
-    fn unstamped_nested_fields_are_relabelled_to_iceberg_types() {
-        let schema = nested_ids_schema();
-        let target = schema_to_arrow_schema(&schema).expect("arrow schema");
-        for (element_name, column) in [("element", 1), ("item", 1), ("element", 2), ("item", 3)] {
-            let batch = nested_batch(element_name, true);
-            let filled = apply_write_defaults(&schema, &batch).expect("fill");
-            assert!(matches!(filled, Cow::Owned(_)));
-            assert_eq!(
-                filled.column(column).data_type(),
-                target.field(column).data_type()
-            );
-        }
-        let batch = nested_batch("item", false);
-        assert!(matches!(
-            apply_write_defaults(&schema, &batch).expect("fill"),
-            Cow::Owned(_)
-        ));
-    }
-
-    fn int64_nums_batch() -> RecordBatch {
-        let int64_list: ArrayRef = Arc::new(ListArray::new(
-            Arc::new(Field::new("element", DataType::Int64, true)),
-            OffsetBuffer::new(vec![0, 1, 1, 1].into()),
-            Arc::new(Int64Array::from(vec![9])),
-            None,
-        ));
-        RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
-                Field::new("id", DataType::Int32, false).with_metadata(id_meta(1)),
-                Field::new("nums", int64_list.data_type().clone(), true).with_metadata(id_meta(2)),
-            ])),
-            vec![boxed(Int32Array::from(vec![1, 2, 3])), int64_list],
-        )
-        .expect("int64 batch")
-    }
-
-    #[test]
-    fn incompatible_nested_data_is_data_invalid() {
-        for (schema, batch) in [
-            (nested_ids_schema(), int64_nums_batch()),
-            (nested_ids_schema_with(true), nested_batch("element", true)),
-        ] {
-            assert_eq!(
-                apply_write_defaults(&schema, &batch)
-                    .expect_err("must refuse")
-                    .kind(),
-                ErrorKind::DataInvalid
-            );
-        }
-    }
-
-    #[test]
-    fn missing_optional_write_default_is_filled() {
-        let schema = schema_id_and_name();
-        let batch = id_only_batch();
-        let filled = apply_write_defaults(&schema, &batch).expect("fill");
-        let names = filled
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name col");
-        assert_eq!(names.value(0), "anon");
-        assert_eq!(names.value(1), "anon");
-        assert_eq!(names.value(2), "anon");
-    }
-
-    #[test]
-    fn supplied_column_is_not_replaced() {
-        let schema = schema_id_and_name();
-        let batch = complete_batch();
-        let filled = apply_write_defaults(&schema, &batch).expect("fill");
-        let names = filled
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name col");
-        assert_eq!(names.value(0), "a");
-        assert_eq!(names.value(1), "b");
-        assert!(matches!(filled, Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn missing_required_without_write_default_fails() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-            ])
-            .build()
-            .expect("schema");
-        let err = apply_write_defaults(&schema, &id_only_batch()).expect_err("must fail");
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.message().contains("write-default"),
-            "got {}",
-            err.message()
-        );
-    }
-
-    #[test]
-    fn missing_optional_without_write_default_is_null() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-            ])
-            .build()
-            .expect("schema");
-        let batch = id_only_batch();
-        let filled = apply_write_defaults(&schema, &batch).expect("null fill");
-        let names = filled
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name col");
-        assert!(names.is_null(0));
-        assert!(names.is_null(1));
-        assert!(names.is_null(2));
-    }
-
-    #[test]
-    fn missing_required_write_default_is_filled() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
-                    .with_write_default(Literal::string("x"))
-                    .into(),
-            ])
-            .build()
-            .expect("schema");
-        let batch = id_only_batch();
-        let filled = apply_write_defaults(&schema, &batch).expect("fill");
-        let names = filled
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name col");
-        assert_eq!(names.value(0), "x");
-    }
-
-    #[test]
-    fn name_fallback_matches_when_field_id_is_absent() {
-        let schema = schema_id_and_name();
-        let arrow_schema = ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, true),
-        ]);
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![
-            Arc::new(Int32Array::from(vec![9])),
-            Arc::new(StringArray::from(vec![Some("kept")])),
-        ])
-        .expect("name-only batch");
-        let filled = apply_write_defaults(&schema, &batch).expect("name match");
-        let names = filled
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name col");
-        assert_eq!(names.value(0), "kept");
-    }
-
-    #[test]
-    fn non_primitive_write_default_on_missing_field_fails() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(
-                    2,
-                    "s",
-                    Type::Struct(crate::spec::StructType::new(vec![
-                        NestedField::optional(3, "n", Type::Primitive(PrimitiveType::Int)).into(),
-                    ])),
-                )
-                .with_write_default(Literal::Struct(crate::spec::Struct::from_iter([Some(
-                    Literal::int(1),
-                )])))
-                .into(),
-            ])
-            .build()
-            .expect("schema");
-        let err = apply_write_defaults(&schema, &id_only_batch()).expect_err("nested");
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-        assert!(err.message().contains("non-primitive"));
-    }
-
-    #[tokio::test]
-    async fn data_file_writer_writes_write_default_into_parquet() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let file_io = FileIO::new_with_fs();
-        let schema = Arc::new(schema_id_and_name());
-        let location_gen = DefaultLocationGenerator::with_data_location(
-            temp_dir.path().to_str().expect("utf8 path").to_string(),
-        );
-        let file_name_gen =
-            DefaultFileNameGenerator::new("wd".to_string(), None, DataFileFormat::Parquet);
-        let parquet = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema);
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet,
-            file_io.clone(),
-            location_gen,
-            file_name_gen,
-        );
-        let mut writer = DataFileWriterBuilder::new(rolling)
-            .unpartitioned()
-            .build(None)
-            .await
-            .expect("build writer");
-        writer
-            .write(id_only_batch())
-            .await
-            .expect("write missing name");
-        let data_files = writer.close().await.expect("close");
-        assert_eq!(data_files.len(), 1, "one data file");
-
-        let input = file_io
-            .new_input(data_files[0].file_path.clone())
-            .expect("input")
-            .read()
-            .await
-            .expect("read parquet");
-        let reader = ParquetRecordBatchReaderBuilder::try_new(input)
-            .expect("parquet reader")
-            .build()
-            .expect("build reader");
-        let batches: Vec<_> = reader.map(|b| b.expect("batch")).collect();
-        assert_eq!(batches.len(), 1);
-        let names = batches[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name col");
-        assert_eq!(names.value(0), "anon");
-        assert_eq!(names.value(1), "anon");
-        assert_eq!(names.value(2), "anon");
-        let ids = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("id col");
-        assert_eq!(ids.value(0), 1);
-        assert_eq!(ids.value(1), 2);
-        assert_eq!(ids.value(2), 3);
-    }
-
-    #[test]
-    fn missing_binary_write_default_is_filled() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "payload", Type::Primitive(PrimitiveType::Binary))
-                    .with_write_default(Literal::Primitive(PrimitiveLiteral::Binary(vec![
-                        0x01, 0x02,
-                    ])))
-                    .into(),
-            ])
-            .build()
-            .expect("schema");
-        let batch = id_only_batch();
-        let filled = apply_write_defaults(&schema, &batch).expect("binary fill");
-        let col = filled
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow_array::LargeBinaryArray>()
-            .expect("large binary");
-        assert_eq!(col.value(0), &[0x01, 0x02]);
-        assert_eq!(col.value(1), &[0x01, 0x02]);
-    }
-
-    #[test]
-    fn missing_time_write_default_is_filled() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "t", Type::Primitive(PrimitiveType::Time))
-                    .with_write_default(Literal::Primitive(PrimitiveLiteral::Long(1_000)))
-                    .into(),
-            ])
-            .build()
-            .expect("schema");
-        let batch = id_only_batch();
-        let filled = apply_write_defaults(&schema, &batch).expect("time fill");
-        let col = filled
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow_array::Time64MicrosecondArray>()
-            .expect("time");
-        assert_eq!(col.value(0), 1_000);
-    }
-
-    #[test]
-    fn missing_uuid_write_default_is_filled() {
-        let uuid = uuid::Uuid::parse_str("ec5911be-b0a7-458c-8438-c9a3e53cffae").expect("uuid");
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Uuid))
-                    .with_write_default(Literal::Primitive(PrimitiveLiteral::UInt128(
-                        uuid.as_u128(),
-                    )))
-                    .into(),
-            ])
-            .build()
-            .expect("schema");
-        let batch = id_only_batch();
-        let filled = apply_write_defaults(&schema, &batch).expect("uuid fill");
-        let col = filled
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
-            .expect("uuid bytes");
-        assert_eq!(col.value(0), uuid.as_bytes());
-    }
-
-    #[test]
-    fn missing_fixed_write_default_is_filled() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "f", Type::Primitive(PrimitiveType::Fixed(4)))
-                    .with_write_default(Literal::Primitive(PrimitiveLiteral::Binary(vec![
-                        9, 8, 7, 6,
-                    ])))
-                    .into(),
-            ])
-            .build()
-            .expect("schema");
-        let batch = id_only_batch();
-        let filled = apply_write_defaults(&schema, &batch).expect("fixed fill");
-        let col = filled
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
-            .expect("fixed");
-        assert_eq!(col.value(0), &[9, 8, 7, 6]);
-    }
-
-    #[test]
-    fn zero_row_omitted_uuid_write_default_is_empty_not_error() {
-        let uuid = uuid::Uuid::parse_str("ec5911be-b0a7-458c-8438-c9a3e53cffae").expect("uuid");
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Uuid))
-                    .with_write_default(Literal::Primitive(PrimitiveLiteral::UInt128(
-                        uuid.as_u128(),
-                    )))
-                    .into(),
-            ])
-            .build()
-            .expect("schema");
-        let arrow_schema = ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(id_meta(1)),
-        ]);
-        let batch = RecordBatch::new_empty(Arc::new(arrow_schema));
-        let filled = apply_write_defaults(&schema, &batch).expect("0-row uuid fill");
-        assert_eq!(filled.num_rows(), 0);
-        assert_eq!(filled.num_columns(), 2);
-        assert_eq!(
-            filled.schema().field(1).data_type(),
-            &DataType::FixedSizeBinary(16)
-        );
-    }
-
-    #[test]
-    fn zero_row_omitted_fixed_write_default_is_empty_not_error() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "f", Type::Primitive(PrimitiveType::Fixed(4)))
-                    .with_write_default(Literal::Primitive(PrimitiveLiteral::Binary(vec![
-                        9, 8, 7, 6,
-                    ])))
-                    .into(),
-            ])
-            .build()
-            .expect("schema");
-        let arrow_schema = ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(id_meta(1)),
-        ]);
-        let batch = RecordBatch::new_empty(Arc::new(arrow_schema));
-        let filled = apply_write_defaults(&schema, &batch).expect("0-row fixed fill");
-        assert_eq!(filled.num_rows(), 0);
-        assert_eq!(filled.num_columns(), 2);
-        assert_eq!(
-            filled.schema().field(1).data_type(),
-            &DataType::FixedSizeBinary(4)
-        );
-    }
-
-    #[test]
-    fn type_mismatched_write_default_is_data_invalid() {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))
-                    .with_write_default(Literal::int(7))
-                    .into(),
-            ])
-            .build()
-            .expect("schema");
-        let batch = id_only_batch();
-        let err = apply_write_defaults(&schema, &batch).expect_err("mismatch");
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.message().contains("Cannot apply write-default"),
-            "got {}",
-            err.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn data_file_writer_writes_binary_write_default_into_parquet() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let file_io = FileIO::new_with_fs();
-        let schema = Arc::new(
-            Schema::builder()
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::optional(2, "payload", Type::Primitive(PrimitiveType::Binary))
-                        .with_write_default(Literal::Primitive(PrimitiveLiteral::Binary(vec![
-                            0xaa, 0xbb,
-                        ])))
-                        .into(),
-                ])
-                .build()
-                .expect("schema"),
-        );
-        let location_gen = DefaultLocationGenerator::with_data_location(
-            temp_dir.path().to_str().expect("utf8 path").to_string(),
-        );
-        let file_name_gen =
-            DefaultFileNameGenerator::new("bin".to_string(), None, DataFileFormat::Parquet);
-        let parquet = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema);
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet,
-            file_io.clone(),
-            location_gen,
-            file_name_gen,
-        );
-        let mut writer = DataFileWriterBuilder::new(rolling)
-            .unpartitioned()
-            .build(None)
-            .await
-            .expect("build writer");
-        writer.write(id_only_batch()).await.expect("write");
-        let data_files = writer.close().await.expect("close");
-        let input = file_io
-            .new_input(data_files[0].file_path.clone())
-            .expect("input")
-            .read()
-            .await
-            .expect("read");
-        let reader = ParquetRecordBatchReaderBuilder::try_new(input)
-            .expect("parquet reader")
-            .build()
-            .expect("build reader");
-        let batches: Vec<_> = reader.map(|b| b.expect("batch")).collect();
-        let payload = batches[0].column(1);
-        let bytes = if let Some(array) = payload.as_any().downcast_ref::<arrow_array::BinaryArray>()
-        {
-            array.value(0).to_vec()
-        } else if let Some(array) = payload
-            .as_any()
-            .downcast_ref::<arrow_array::LargeBinaryArray>()
-        {
-            array.value(0).to_vec()
-        } else {
-            panic!("payload not binary, type {:?}", payload.data_type());
-        };
-        assert_eq!(bytes, vec![0xaa, 0xbb]);
-    }
-
-    #[tokio::test]
-    async fn equality_delete_writer_with_projected_schema_writes_only_equality_ids() {
-        use crate::arrow::arrow_schema_to_schema;
-        use crate::writer::base_writer::equality_delete_writer::{
-            EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
-        };
-
-        let temp_dir = TempDir::new().expect("temp dir");
-        let file_io = FileIO::new_with_fs();
-        let schema = Arc::new(schema_id_and_name());
-        let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone()).expect("eq config");
-        let projected = Arc::new(
-            arrow_schema_to_schema(config.projected_arrow_schema_ref())
-                .expect("projected iceberg schema"),
-        );
-        let parquet = ParquetWriterBuilder::new(WriterProperties::builder().build(), projected);
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet,
-            file_io.clone(),
-            DefaultLocationGenerator::with_data_location(
-                temp_dir.path().to_str().expect("utf8 path").to_string(),
-            ),
-            DefaultFileNameGenerator::new("eq".to_string(), None, DataFileFormat::Parquet),
-        );
-        let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
-            .unpartitioned()
-            .build(None)
-            .await
-            .expect("build eq writer");
-        writer
-            .write(id_only_batch())
-            .await
-            .expect("id-only equality delete");
-        let files = writer.close().await.expect("close");
-        assert_eq!(files.len(), 1);
-        let input = file_io
-            .new_input(files[0].file_path.clone())
-            .expect("input")
-            .read()
-            .await
-            .expect("read");
-        let reader = ParquetRecordBatchReaderBuilder::try_new(input)
-            .expect("parquet reader")
-            .build()
-            .expect("build reader");
-        let batches: Vec<_> = reader.map(|b| b.expect("batch")).collect();
-        assert_eq!(
-            batches[0].num_columns(),
-            1,
-            "must not add write-default name"
-        );
-        assert_eq!(batches[0].schema().field(0).name(), "id");
-    }
-
-    #[tokio::test]
-    async fn equality_delete_writer_does_not_fill_omitted_equality_key() {
-        use crate::arrow::arrow_schema_to_schema;
-        use crate::writer::base_writer::equality_delete_writer::{
-            EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
-        };
-
-        let temp_dir = TempDir::new().expect("temp dir");
-        let file_io = FileIO::new_with_fs();
-        let schema = Arc::new(schema_id_and_name());
-        let config =
-            EqualityDeleteWriterConfig::new(vec![1, 2], schema.clone()).expect("eq config");
-        let projected = Arc::new(
-            arrow_schema_to_schema(config.projected_arrow_schema_ref())
-                .expect("projected iceberg schema"),
-        );
-        let parquet = ParquetWriterBuilder::new(WriterProperties::builder().build(), projected);
-        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet,
-            file_io,
-            DefaultLocationGenerator::with_data_location(
-                temp_dir.path().to_str().expect("utf8 path").to_string(),
-            ),
-            DefaultFileNameGenerator::new("eq2".to_string(), None, DataFileFormat::Parquet),
-        );
-        let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
-            .unpartitioned()
-            .build(None)
-            .await
-            .expect("build eq writer");
-        let err = writer
-            .write(id_only_batch())
-            .await
-            .expect_err("omitted equality key must not be filled from write-default");
-        assert_ne!(err.kind(), ErrorKind::FeatureUnsupported);
-        let rendered = format!("{err:?}");
-        assert!(
-            !rendered.contains("anon"),
-            "must not have filled name=anon into equality keys, got {rendered}"
-        );
     }
 }
