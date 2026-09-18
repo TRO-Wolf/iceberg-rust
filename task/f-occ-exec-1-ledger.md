@@ -108,3 +108,111 @@ Observed while probing controls: the MoR DELETE commit does not arm
 `validate_no_conflicting_delete_files` (`delete.rs:532-543`), so a concurrent `a` delete file
 never conflicts it — a test asserting that conflict was dropped; that is the armed surface,
 not a defect of this unit.
+
+## 5. Fix (step 3)
+
+All four commit sites now pass the exec's own scan predicate:
+
+```rust
+.conflict_detection_filter(prune.unwrap_or(Predicate::AlwaysTrue))
+```
+
+- `merge_on_read_delete` and `merge_on_read_update` pass `prune.clone()` into
+  `mor_scan_stream` and consume the original at the commit site.
+- `copy_on_write_delete` and `copy_on_write_update` already cloned `prune` into both
+  `cow_scan_stream` calls; the commit site consumes the original.
+- The two stale comments were edited in place (same line counts): the module doc's
+  "Conflict filter is `AlwaysTrue`" and the MoR-DELETE recipe's "`AlwaysTrue` is Java-exact
+  because this path pushes no filter". Both now state the filter is the scan's `prune`,
+  `AlwaysTrue` when nothing was pushed.
+- `case_sensitive` needs no threading: the scan builder defaults `case_sensitive: true`
+  (`scan/mod.rs`) and `RowDeltaAction` / `OverwriteFilesAction` default the same
+  (`row_delta.rs:159` and the overwrite sibling), so the predicate binds identically on
+  both sides.
+
+### Soundness of `prune` as the conflict filter
+
+`prune` is `convert_filters_to_predicate(&filters)` (`expr_to_predicate.rs`): each DataFusion
+`Expr` that converts contributes one conjunct; anything that cannot convert (type-promoted
+comparisons, NaN-sensitive comparisons, unsupported function forms, one side of a partial
+`AND`) is DROPPED, never approximated downward. A conjunction can only lose clauses, so the
+result is logically weaker than or equal to the exact `WHERE` — a superset of the rows the
+DML reads. `None` iff the caller pushed no filter, which is exactly Java's `alwaysTrue`
+case.
+
+The scan consumes it through `with_file_prune_only` (`scan/mod.rs`): `rewrite_not()` pushes
+`NOT` inward before binding, the predicate prunes manifests/files with INCLUSIVE evaluators
+(partition projection, then `InclusiveMetricsEvaluator` — the same evaluators
+`first_conflicting_file` runs on the validation side), and no residual row filter is
+attached. Every row of every surviving file reaches the exact DataFusion `predicate`, which
+alone decides matches. So `prune` cannot exclude a file whose rows the DML can match — it
+is a superset filter by construction, and passing it to `conflict_detection_filter` narrows
+concurrent-file validation to the same file set the operation actually read. No
+construction of `prune` can be narrower than the rows read; no `AlwaysTrue` fallback is
+needed.
+
+## 6. Existing pins updated (step 4 fallout)
+
+Three `tests/integration_datafusion_test.rs` pins asserted the defect itself: an
+unpartitioned table, `WHERE foo1 = 1`, concurrent `INSERT (3,'c')` — the appended file's
+metrics cannot match `foo1 = 1`, so Java (`filterData` → inclusive metrics) commits. Under
+`AlwaysTrue` they rejected; under the fix they committed and the tests failed:
+
+- `test_s5_cow_delete_serializable_default_rejects_concurrent_append`
+- `test_s5_cow_update_serializable_default_rejects_concurrent_append`
+- `test_s5_merge_on_read_delete_serializable_default_rejects_concurrent_append`
+
+Each now inserts `(1,'c')` — a file whose metrics DO match the filter — so the rejection
+pin is preserved as a same-scope control rather than deleted. The
+"matching the AlwaysTrue conflict filter" comment was edited to stay true. No other test
+carried the premise (`INSERT OVERWRITE`'s row filter is genuinely `AlwaysTrue`).
+
+Clippy (`err_expect`) rewrote `.err().expect(..)` to `.expect_err(..)`; `cargo fmt`
+re-wrapped; `mod occ_exec_tests` moved from `delete.rs` (1149-line legacy ceiling, +4 over)
+to `physical_plan/mod.rs` where the sibling file needs no `#[path]`.
+
+## 7. Gates (step 4)
+
+- `CARGO_BUILD_JOBS=10 cargo test -p iceberg-datafusion`: 521 passed, 0 failed, 12 ignored
+  (241 lib + 34 test targets + doctests).
+- `cargo test -p iceberg --lib conflict`: 70 passed, 0 failed.
+- `make check`: fmt clean; clippy `-D warnings` clean; taplo clean; cargo-machete clean;
+  `check_agent_artifacts` OK; `check_matrix_anchors` OK (88 rows); `check_comment_blocks` OK;
+  `check_rust_file_size` 495 files clean.
+- `python3 /tmp/oc-worker/_lib/comment_ban.py . origin/main HEAD`: hits=22 — 16 ASF-header
+  lines in the new test file + 6 stay-true edits of existing comments (the two the brief
+  names in `delete.rs`, one in `integration_datafusion_test.rs`).
+
+## 8. Clauses
+
+- C-001 PROVEN — MoR DELETE scopes validation by `prune`:
+  `mor_delete_disjoint_partition_commit_commits` — RED
+  (`Found conflicting files … matching TRUE: test/b-new.parquet`) → GREEN, `b` append +
+  `b` delete file committed concurrently.
+- C-002 PROVEN — CoW DELETE: `cow_delete_disjoint_partition_commit_commits` — same RED
+  message → GREEN.
+- C-003 PROVEN — MoR UPDATE: `mor_update_disjoint_partition_commit_commits` — same RED
+  message → GREEN.
+- C-004 PROVEN — CoW UPDATE: `cow_update_disjoint_partition_commit_commits` — same RED
+  message → GREEN.
+- C-005 PROVEN — the fix does not over-narrow (per-path control):
+  `mor_delete_matching_partition_commit_conflicts`,
+  `cow_delete_matching_partition_commit_conflicts`,
+  `mor_update_matching_partition_commit_conflicts`,
+  `cow_update_matching_partition_commit_conflicts` — concurrent `a` appends still abort,
+  naming `a-new.parquet`; and `mor_update_matching_partition_delete_file_conflicts` — a
+  concurrent `a` delete file still aborts the UPDATE.
+- C-006 PROVEN — `prune == None` keeps `AlwaysTrue`:
+  `mor_delete_no_predicate_keeps_always_true`,
+  `cow_delete_no_predicate_keeps_always_true`,
+  `mor_update_no_predicate_keeps_always_true`,
+  `cow_update_no_predicate_keeps_always_true` — `DELETE FROM t` / predicate-less `UPDATE`
+  abort on any concurrent commit, error contains `matching TRUE`.
+- C-007 PROVEN — `prune` is a superset filter by construction (§5 soundness): conversion
+  drops unconvertible conjuncts; `with_file_prune_only` is inclusive and attaches no
+  residual; the exact DataFusion predicate remains the row contract. No fallback needed.
+- C-008 PROVEN — `case_sensitive` parity: scan and action both bind case-sensitively by
+  default; nothing threads an alternate setting.
+- C-009 PROVEN — SQL-level controls still bite: the three s5 serializable pins reject a
+  concurrent append whose file metrics match `foo1 = 1` (§6).
+
