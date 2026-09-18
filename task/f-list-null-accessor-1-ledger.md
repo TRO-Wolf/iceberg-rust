@@ -187,11 +187,79 @@ five conversion pins and all nine e2e cells.
 
 - `struct IS NULL` / `struct.a IS NULL`: the container `s` has no accessor —
   `s IS NULL` converts pre-fix and raised at bind, like list/map; post-fix it drops
-  to residual evaluation and answers correctly. The leaf `s.a` has an accessor —
-  `s.a IS NULL` binds today and still pushes post-fix (real SQL emits
-  `GetField(s, a)`, which conversion already leaves as NotTransformed → residual).
+  to residual evaluation and answers correctly. The leaf `s.a` has an accessor, so
+  a term that resolves to it is bindable — but no real SQL produces that term:
+  `s.a` plans as `GetField(s, a)`, which conversion already leaves as
+  NotTransformed → residual (round 2 pins the real-SQL cell answering `[2, 3]`;
+  see §9). The synthetic `Column("s.a")` unit cell is a conversion-level control
+  only: it proves a term naming a field WITH an accessor still pushes, not that
+  SQL `s.a IS NULL` pushes.
 - No row is silently kept/dropped: pushdown is prune-only and the exact DataFusion
   predicate decides every row at every call site; the mutation run proves the
   cells fail without the fix.
 - `SELECT … WHERE xs IS NULL` goes through the same `with_filter` bind and raised
   identically pre-fix.
+
+## 9. Round 2 — pin the Binary/Set arms, settle the P3s (commit `f6e89406`)
+
+Grok reviews on round 1: perf LOOKS-GOOD, logic PASS with two P3s.
+
+### L-001 (P3): Binary and Set arms of `term_binds_soundly` were unpinned
+
+Every round-1 cell was a `Unary` null test, so deleting the `term_binds_soundly`
+conjunct from the `Binary` or `Set` arm alone left the suite green.
+
+Reachability: no real SQL produces a Binary/Set `Expr::Column` term on an
+accessorless field. The DFSchema exposes only top-level columns — `xs.element`,
+`m.key`, `m.value` resolve inside the Iceberg schema (`field_by_name` walks
+collection children) but are not DataFusion columns; `xs.element = 1` parses as a
+qualified name and the quoted identifier `"xs.element"` fails at planning. The
+pins are therefore at conversion level (`Column::new_unqualified`, the same
+surface the `Unary` leaf pin uses), covering `xs.element`, `m.value` (Int) and
+`m.key` (String) — all name-resolvable, all accessorless:
+
+```text
+binary_on_an_accessorless_leaf_is_not_pushed     xs.element|m.value = 1, m.key = 'k'  → None
+in_list_on_an_accessorless_leaf_is_not_pushed    xs.element|m.value IN (1,2), m.key IN ('k','v') → None
+```
+
+Both cells pass post-fix (`cargo test -p iceberg-datafusion --lib accessorless`
+→ ok. 2 passed). Mutation proof, each arm reverted alone, not committed:
+
+```text
+Binary arm reverted (term_binds_soundly removed from Predicate::Binary):
+    binary_on_an_accessorless_leaf_is_not_pushed   FAILED left: Some(Binary(Eq, xs.element, Long(1)))
+    in_list_on_an_accessorless_leaf_is_not_pushed  ok (control)
+Set arm reverted (term_binds_soundly removed from Predicate::Set):
+    in_list_on_an_accessorless_leaf_is_not_pushed  FAILED left: Some(Set(In, xs.element, {1,2}))
+    binary_on_an_accessorless_leaf_is_not_pushed   ok (control)
+restored (git checkout + touch → rebuild):
+    accessorless filter  ok. 2 passed; 0 failed
+    null filter          ok. 30 passed; 0 failed
+```
+
+Each arm's conjunct is now load-bearing: its own cell reds, the sibling cell
+stays green.
+
+### L-002 (P3): the struct-leaf pin used a synthetic `Column("s.a")`
+
+Corrected in §8. Real SQL `s.a IS NULL` plans as `get_field` and is evaluated as
+a residual; a NULL struct makes `s.a` NULL too. Real-SQL cell added in
+`list_null_tests.rs`:
+
+```text
+select_where_xs_dot_a_is_null_returns_the_null_leaf_rows
+    SELECT id FROM t WHERE xs.a IS NULL → [2, 3]  (struct shape, v2/v3 × CoW/MoR)
+```
+
+### R-01 (P3, recorded — no code change)
+
+An `AND` mixing a primitive conjunct and an accessorless null test inside ONE
+`Expr` drops as a whole — `to_iceberg_and_predicate` requires both sides to
+convert, and the surviving `And` predicate fails `predicate_binds_soundly` on the
+unbindable child, so the sound primitive half is lost to pushdown too (the exact
+DataFusion predicate still decides every row; only the prune is weaker). A
+top-level split AND — separate conjuncts in `filters` — keeps the sound half,
+because `convert_filters_to_predicate` drops per-filter. Pinned by
+`is_null_on_a_nested_column_drops_only_its_own_conjunction`:
+`[id > 1, xs IS NULL]` → `Some(id > 1)`; `[id > 1 AND xs IS NULL]` → `None`.
