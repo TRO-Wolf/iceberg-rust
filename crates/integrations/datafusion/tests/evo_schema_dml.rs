@@ -52,6 +52,13 @@ async fn catalog_ctx(
     mode: &str,
     fields: Vec<Arc<NestedField>>,
 ) -> (SessionContext, TempDir, Arc<dyn Catalog>, NamespaceIdent) {
+    catalog_ctx_with_tables(mode, vec![("t", fields)]).await
+}
+
+async fn catalog_ctx_with_tables(
+    mode: &str,
+    tables: Vec<(&str, Vec<Arc<NestedField>>)>,
+) -> (SessionContext, TempDir, Arc<dyn Catalog>, NamespaceIdent) {
     let warehouse = TempDir::new().expect("warehouse");
     let path = warehouse.path().to_str().expect("utf-8 path").to_string();
     let iceberg_catalog: Arc<dyn Catalog> = Arc::new(
@@ -69,23 +76,25 @@ async fn catalog_ctx(
         .create_namespace(&namespace, HashMap::new())
         .await
         .expect("namespace");
-    let schema = Schema::builder()
-        .with_schema_id(0)
-        .with_fields(fields)
-        .build()
-        .expect("evo schema");
-    let creation = TableCreation::builder()
-        .name("t".to_string())
-        .properties(HashMap::from([
-            ("write.delete.mode".to_string(), mode.to_string()),
-            ("write.update.mode".to_string(), mode.to_string()),
-        ]))
-        .schema(schema)
-        .build();
-    iceberg_catalog
-        .create_table(&namespace, creation)
-        .await
-        .expect("create table");
+    for (name, fields) in tables {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(fields)
+            .build()
+            .expect("evo schema");
+        let creation = TableCreation::builder()
+            .name(name.to_string())
+            .properties(HashMap::from([
+                ("write.delete.mode".to_string(), mode.to_string()),
+                ("write.update.mode".to_string(), mode.to_string()),
+            ]))
+            .schema(schema)
+            .build();
+        iceberg_catalog
+            .create_table(&namespace, creation)
+            .await
+            .expect("create table");
+    }
     let provider =
         IcebergCatalogProvider::try_new(Arc::clone(&iceberg_catalog) as Arc<dyn Catalog>)
             .await
@@ -523,6 +532,37 @@ async fn insert_select_from_a_static_provider_into_nested_columns_writes() {
             "1".to_string(),
             "[1, 2]".to_string()
         ],]
+    );
+}
+
+#[tokio::test]
+async fn select_and_insert_select_across_catalog_tables_agree_on_the_advertised_schema() {
+    let (ctx, _warehouse, _catalog, _namespace) = catalog_ctx_with_tables("copy-on-write", vec![
+        ("t", nested_fields()),
+        ("t2", nested_fields()),
+    ])
+    .await;
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t VALUES (1, make_array(1, 2), NULL, NULL)",
+    )
+    .await;
+    assert_eq!(
+        select_all(&ctx, "SELECT id, xs FROM catalog.ns.t", 2).await,
+        vec![vec!["1".to_string(), "[1, 2]".to_string()]]
+    );
+    assert_eq!(
+        select_all(&ctx, "SELECT max(id) FROM catalog.ns.t", 1).await,
+        vec![vec!["1".to_string()]]
+    );
+    run(
+        &ctx,
+        "INSERT INTO catalog.ns.t2 SELECT id, xs, pairs, props FROM catalog.ns.t",
+    )
+    .await;
+    assert_eq!(
+        select_all(&ctx, "SELECT id, xs FROM catalog.ns.t2", 2).await,
+        vec![vec!["1".to_string(), "[1, 2]".to_string()]]
     );
 }
 
