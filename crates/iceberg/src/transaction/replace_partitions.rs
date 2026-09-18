@@ -165,8 +165,7 @@ impl ReplacePartitionsAction {
         self
     }
 
-    /// Set snapshot summary properties. The `replace-partitions` marker is added on top of these (Java
-    /// sets it in the action constructor), so an explicit value here does not clear it.
+    #[allow(missing_docs)]
     pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
         self.snapshot_properties = snapshot_properties;
         self
@@ -338,10 +337,10 @@ impl TransactionAction for ReplacePartitionsAction {
     }
 
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        // Mark the snapshot as a dynamic partition overwrite (Java `BaseReplacePartitions` constructor
-        // sets `replace-partitions=true`). Layer it on top of any caller-provided properties.
         let mut snapshot_properties = self.snapshot_properties.clone();
-        snapshot_properties.insert(REPLACE_PARTITIONS_PROP.to_string(), "true".to_string());
+        snapshot_properties
+            .entry(REPLACE_PARTITIONS_PROP.to_string())
+            .or_insert_with(|| "true".to_string());
 
         let snapshot_producer = SnapshotProducer::new(
             table,
