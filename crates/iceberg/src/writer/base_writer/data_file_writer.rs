@@ -280,7 +280,9 @@ mod test {
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+    use parquet::arrow::arrow_reader::{
+        ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    };
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
 
@@ -295,6 +297,9 @@ mod test {
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use crate::writer::write_defaults::tests::{
+        assert_nested_field_ids, assert_nested_values, idless_nested_batch, nested_ids_schema,
+    };
     use crate::writer::{IcebergWriter, IcebergWriterBuilder, RecordBatch};
     use crate::{ErrorKind, Result};
 
@@ -954,5 +959,36 @@ mod test {
         assert_eq!(names.value(1), "Bob");
         assert_eq!(names.value(2), "Charlie");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_file_writer_stamps_nested_field_ids_in_parquet_footer() {
+        let file_io = FileIO::new_with_fs();
+        let temp_dir = TempDir::new().expect("temp dir");
+        let schema = Arc::new(nested_ids_schema());
+        let mut writer = stamp_writer_builder(&file_io, &temp_dir, &schema)
+            .unpartitioned()
+            .build(None)
+            .await
+            .expect("build writer");
+        writer
+            .write(idless_nested_batch("item"))
+            .await
+            .expect("write");
+        let bytes = file_io
+            .new_input(writer.close().await.expect("close")[0].file_path.clone())
+            .expect("input")
+            .read()
+            .await
+            .expect("read");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).expect("open parquet");
+        assert_nested_field_ids(builder.schema());
+        let batch = builder
+            .build()
+            .expect("build reader")
+            .next()
+            .expect("one batch")
+            .expect("batch");
+        assert_nested_values(&batch);
     }
 }

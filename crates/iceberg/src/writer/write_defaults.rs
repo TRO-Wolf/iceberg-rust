@@ -84,7 +84,7 @@ fn batch_matches_schema_order(fields: &[crate::spec::NestedFieldRef], batch: &Re
         .all(|(i, field)| batch_field_id(batch.schema().field(i)) == Some(field.id))
 }
 
-fn batch_field_id(field: &Field) -> Option<i32> {
+pub(crate) fn batch_field_id(field: &Field) -> Option<i32> {
     field
         .metadata()
         .get(PARQUET_FIELD_ID_META_KEY)
@@ -175,12 +175,17 @@ fn repeat_write_default(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{Array, Int32Array, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_array::cast::AsArray;
+    use arrow_array::{
+        Array, ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
+        make_array,
+    };
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::properties::WriterProperties;
@@ -233,6 +238,211 @@ mod tests {
             Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
         ])
         .expect("complete batch")
+    }
+
+    fn nested_ids_schema_with(element_required: bool) -> Schema {
+        serde_json::from_str(&format!(
+            r#"{{"type":"struct","schema-id":0,"fields":[
+                {{"id":1,"name":"id","required":true,"type":"int"}},
+                {{"id":2,"name":"nums","required":false,"type":{{"type":"list","element-id":3,"element":"int","element-required":{element_required}}}}},
+                {{"id":4,"name":"pairs","required":false,"type":{{"type":"list","element-id":5,"element-required":false,"element":{{"type":"struct","fields":[{{"id":6,"name":"a","required":true,"type":"int"}},{{"id":7,"name":"b","required":false,"type":"string"}}]}}}}}},
+                {{"id":8,"name":"props","required":false,"type":{{"type":"map","key-id":9,"key":"string","value-id":10,"value-required":false,"value":{{"type":"list","element-id":11,"element":"int","element-required":false}}}}}}
+            ]}}"#
+        ))
+        .expect("nested schema")
+    }
+
+    pub(crate) fn nested_ids_schema() -> Schema {
+        nested_ids_schema_with(false)
+    }
+
+    fn int_list(element_name: &str, rows: Vec<Option<Vec<Option<i32>>>>) -> ArrayRef {
+        make_array(
+            ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(rows)
+                .into_data()
+                .into_builder()
+                .data_type(DataType::List(Arc::new(Field::new(
+                    element_name,
+                    DataType::Int32,
+                    true,
+                ))))
+                .build()
+                .expect("named element list"),
+        )
+    }
+
+    fn nested_batch(element_name: &str, nums: ArrayRef, top_ids: bool) -> RecordBatch {
+        let fld = |name: &str, data_type: DataType, nullable: bool| {
+            Arc::new(Field::new(name, data_type, nullable))
+        };
+        let pair_values = StructArray::from(vec![
+            (
+                fld("a", DataType::Int32, false),
+                Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+            ),
+            (
+                fld("b", DataType::Utf8, true),
+                Arc::new(StringArray::from(vec![Some("x"), None])) as ArrayRef,
+            ),
+        ]);
+        let pairs = ListArray::new(
+            fld(element_name, pair_values.data_type().clone(), true),
+            OffsetBuffer::new(vec![0, 1, 1, 2].into()),
+            Arc::new(pair_values),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let entries = StructArray::from(vec![
+            (
+                fld("key", DataType::Utf8, false),
+                Arc::new(StringArray::from(vec!["k1", "k2"])) as ArrayRef,
+            ),
+            (
+                fld(
+                    "value",
+                    DataType::List(fld(element_name, DataType::Int32, true)),
+                    true,
+                ),
+                int_list(element_name, vec![
+                    Some(vec![Some(5), Some(6)]),
+                    Some(vec![]),
+                ]),
+            ),
+        ]);
+        let props = MapArray::new(
+            fld("entries", entries.data_type().clone(), false),
+            OffsetBuffer::new(vec![0, 1, 2, 2].into()),
+            entries,
+            Some(NullBuffer::from(vec![true, true, false])),
+            false,
+        );
+        let top = |name: &str, data_type: DataType, nullable: bool, id: i32| {
+            let field = Field::new(name, data_type, nullable);
+            if top_ids {
+                field.with_metadata(id_meta(id))
+            } else {
+                field
+            }
+        };
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                top("id", DataType::Int32, false, 1),
+                top("nums", nums.data_type().clone(), true, 2),
+                top("pairs", pairs.data_type().clone(), true, 4),
+                top("props", props.data_type().clone(), true, 8),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                nums,
+                Arc::new(pairs),
+                Arc::new(props),
+            ],
+        )
+        .expect("unstamped batch")
+    }
+
+    fn unstamped_nums(element_name: &str) -> ArrayRef {
+        int_list(element_name, vec![
+            Some(vec![Some(1), None]),
+            None,
+            Some(vec![]),
+        ])
+    }
+
+    pub(crate) fn unstamped_nested_batch(element_name: &str) -> RecordBatch {
+        nested_batch(element_name, unstamped_nums(element_name), true)
+    }
+
+    pub(crate) fn idless_nested_batch(element_name: &str) -> RecordBatch {
+        nested_batch(element_name, unstamped_nums(element_name), false)
+    }
+
+    fn nested_child(data_type: &DataType) -> &Field {
+        match data_type {
+            DataType::List(field) | DataType::Map(field, _) => field.as_ref(),
+            _ => panic!("expected a nested type"),
+        }
+    }
+
+    fn struct_fields(data_type: &DataType) -> &Fields {
+        match data_type {
+            DataType::Struct(fields) => fields,
+            _ => panic!("expected a struct"),
+        }
+    }
+
+    pub(crate) fn assert_nested_field_ids(schema: &ArrowSchema) {
+        let element_id =
+            |column: usize| batch_field_id(nested_child(schema.field(column).data_type()));
+        assert_eq!(element_id(1), Some(3));
+        assert_eq!(element_id(2), Some(5));
+        let pair_fields = struct_fields(nested_child(schema.field(2).data_type()).data_type());
+        assert_eq!(batch_field_id(pair_fields[0].as_ref()), Some(6));
+        assert_eq!(batch_field_id(pair_fields[1].as_ref()), Some(7));
+        let key_value = struct_fields(nested_child(schema.field(3).data_type()).data_type());
+        assert_eq!(batch_field_id(key_value[0].as_ref()), Some(9));
+        assert_eq!(batch_field_id(key_value[1].as_ref()), Some(10));
+        assert_eq!(
+            batch_field_id(nested_child(key_value[1].data_type())),
+            Some(11)
+        );
+    }
+
+    pub(crate) fn assert_nested_values(batch: &RecordBatch) {
+        let nums = batch.column(1).as_list::<i32>();
+        assert!(nums.is_null(1) && nums.values().is_null(1) && nums.value_length(2) == 0);
+        assert!(batch.column(3).as_map().is_null(2));
+    }
+
+    fn assert_nested_batch_relabelled(element_name: &str, column: usize) {
+        let schema = nested_ids_schema();
+        let target = schema_to_arrow_schema(&schema).expect("arrow schema");
+        let batch = unstamped_nested_batch(element_name);
+        let filled = apply_write_defaults(&schema, &batch).expect("fill");
+        assert!(matches!(filled, Cow::Owned(_)));
+        assert_eq!(
+            filled.column(column).data_type(),
+            target.field(column).data_type()
+        );
+    }
+
+    #[test]
+    fn unstamped_nested_fields_are_relabelled_to_iceberg_types() {
+        for (element_name, column) in [("element", 1), ("item", 1), ("element", 2), ("item", 3)] {
+            assert_nested_batch_relabelled(element_name, column);
+        }
+        let schema = nested_ids_schema();
+        let target = schema_to_arrow_schema(&schema).expect("arrow schema");
+        let batch = idless_nested_batch("item");
+        let filled = apply_write_defaults(&schema, &batch).expect("fill");
+        assert_eq!(filled.column(1).data_type(), target.field(1).data_type());
+    }
+
+    #[test]
+    fn incompatible_nested_data_is_data_invalid() {
+        let int64_list: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new("element", DataType::Int64, true)),
+            OffsetBuffer::new(vec![0, 1, 1, 1].into()),
+            Arc::new(Int64Array::from(vec![9])),
+            None,
+        ));
+        let err = apply_write_defaults(
+            &nested_ids_schema(),
+            &nested_batch("element", int64_list, true),
+        )
+        .expect_err("mismatch");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+
+        let null_element = int_list("element", vec![
+            Some(vec![Some(1), None]),
+            None,
+            Some(vec![]),
+        ]);
+        let err = apply_write_defaults(
+            &nested_ids_schema_with(true),
+            &nested_batch("element", null_element, true),
+        )
+        .expect_err("null element");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
     }
 
     #[test]
