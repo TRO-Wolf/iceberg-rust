@@ -53,6 +53,15 @@ Ledger: [`f-ice-residues-21b-ledger.md`](f-ice-residues-21b-ledger.md). Run 21b 
       feature flavors) clean, `fmt --check`, taplo/machete/artifacts/anchors/
       comment-blocks/file-size all clean, `git log`/`status`/Rule-1 grep
       verified → `handback.json` written
+- [x] Round 2 (mechanical rejection fix): the 6 schema no-op pins folded into
+      `tests/hadoop_version_commit.rs::update_schema_noop`, the new file deleted
+      (comment-ban gate), ` (#292)` stripped from every subject. `5ac429a8`
+- [x] Round 3 (Grok reviews — logic NEEDS_REMEDIATION, perf PASS+2×P2):
+      L-001 deterministic `is_same_schema` set pins + schema-id reuse (`e2524fb5`);
+      L-002+L-004 staged replace publishes exactly `v(N+1)` via
+      `apply_locally_in_place` + gzip-base pin (`e4ce33a2`); R-01 `Arc<CherryPickPlan>`
+      cache + R-02 empty-apply early return + L-003 cache-consume pin (`3d143992`);
+      ledger/Q2 ruled final
 
 ## ACTIVE (2026-09-17): F-OCC-SCOPED-1 filter-scoped conflict detection and retry-on-rebase (fork half)
 

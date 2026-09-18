@@ -295,6 +295,126 @@ branch; this branch has no PR). `cargo test -p iceberg --test hadoop_version_com
 14/14 — the same 8 + the same 6 under `update_schema_noop::*`. References updated in this
 ledger, `task/todo.md`, `crates/iceberg/src/transaction/map.md`, and GAP_MATRIX R94.
 
+## Round 3 (2026-09-18 early): the Grok reviews — logic NEEDS_REMEDIATION, perf PASS with two P2s
+
+Round 2 was accepted and pushed as fork PR #293 (draft). Two Grok reviews read it:
+`/tmp/oc-worker/kb-rv/reviews/fork-logic-report.md` (read the Java 1.10.0 sources directly and
+mutation-tested every item) and `/tmp/oc-worker/kb-rv/reviews/fork-rustperf-report.md`. Verdicts:
+logic NEEDS_REMEDIATION on four findings (L-001..L-004); Rust perf PASS with two P2
+recommendations (R-01 Arc cache, R-02 empty-apply early return).
+
+| Item | Tag | Commit | Subject |
+|---|---|---|---|
+| 7 | L-001 | `e2524fb5` | deterministic `is_same_schema` identifier-set pins + schema-id reuse |
+| 8 | L-002 + L-004 | `e4ce33a2` | a staged replace publishes the staged version, not the next one |
+| 9 | R-01/R-02 + L-003 | `3d143992` | `Arc` plan cache, empty-updates early return, cache-consume pin |
+| 10 | ledger | this commit | round-3 evidence + rulings |
+
+### L-001 (P1) — the `is_same_schema` set fix had a hollow pin
+
+The logic critic reverted ONLY the `HashSet ==` in `Schema::is_same_schema` back to
+`Iterator::eq` and `test_no_op_rebuilds_equal_schema` stayed green — `identifier_field_ids:
+[1, 2]` iterates in the same order on both sides under most hash seeds, so the pin could not
+fail. Java citation (the critic's reading of 1.10.0): `Schema.sameSchema` compares
+`identifierFieldIds` as a `Set<Integer>` — `Set.equals` is order-insensitive.
+
+Pins added in `spec/schema/utils.rs` (the only schema file with headroom under its ceiling):
+
+- `test_is_same_schema_identifier_ids_compare_as_set` — two schemas with identical 64 fields
+  and identifier ids inserted `1..=32` vs `32..=1` into independent `HashSet`s; 512 fresh pairs
+  per process run; asserts `is_same_schema` is true.
+- `test_reused_schema_id_for_equal_schema_with_reordered_identifier_ids` — 64 iterations
+  through `TableMetadataBuilder::new_from_metadata(...).add_schema(...)` asserting
+  `reuse_or_create_new_schema_id` keeps one schema (the id is reused, not appended).
+
+Mutation evidence: with `is_same_schema` reverted to `Iterator::eq`, BOTH pins failed on 5/5
+consecutive `cargo test -p iceberg --lib identifier_ids` process runs (each process re-seeds
+`RandomState`; the failures panic inside the first loop iterations). With `HashSet ==`
+restored, both pass — 2/2. Recorded runs: 5 process runs × (512 + 64 fresh-set iterations).
+
+### L-002 (P2) — a staged Hadoop replace with pending files consumed two version slots
+
+`begin_replace` staged `v(N+1)` under exclusive create, but `commit` → `materialize_pending` →
+`Transaction::apply_locally` called `with_next_version` AGAIN off the staged location and
+published `v(N+2)`, leaving `v(N+1)` a never-current orphan. Java `BaseTransaction` keeps the
+replacement in memory and writes exactly one `nextVersion` at commit
+(`BaseMetastoreTableOperations.commit` / `HadoopTableOperations.commit`).
+
+Fix: the action loop is extracted into `run_actions_locally`; `apply_locally` keeps its
+`with_next_version` contract for direct callers (the stale-`v3` collision pin depends on it),
+and `materialize_pending` uses the new `pub(crate) apply_locally_in_place`, which OVERWRITES
+the transaction's own staged file via `write_to`. Safe because the exclusive create at stage
+time already proved this transaction owns that name — no other writer can hold it; a
+concurrent writer that beat us to `v(N+1)` still fails our `begin_replace` retryable, and the
+catalog CAS at publish is unchanged. The same path covers `begin_create` (the orphan
+`00000-<uuid>` is likewise gone) and the `replace_write` overwrite arm.
+
+Pins (`staged_table_tests.rs`): `hadoop_replace_with_files_publishes_only_next_version` (v2
+pointer → `add_data_files` → commit publishes `v3`, the appended snapshot is present, no `v4`
+exists) and `hadoop_replace_without_files_publishes_only_next_version` (same minus files).
+The exclusive-create conflict pins
+(`concurrent_replace_from_a_hadoop_pointer_fails_on_exclusive_create`,
+`hadoop_staged_replace_second_stager_fails_and_preserves_winner`) pass unchanged. Mutation:
+reverting `materialize_pending` to `apply_locally` fails the with-files pin exactly —
+published `v4`, expected `v3` (`left: ".../v4.metadata.json", right: ".../v3.metadata.json"`).
+
+### R-01 (P2) — the cached cherry-pick plan is `Arc<CherryPickPlan>`
+
+`plan_cache` now holds `Arc<CherryPickPlan>`: a `validate`/`commit` cache hit is a refcount
+bump, not a clone of every `DataFile` in the replay set. `commit` clones only the fields the
+`SnapshotProducer` consumes, once, in the Replay arm; `CherryPickPlan` dropped its `Clone`
+derive (the enum itself is no longer cloned). Key unchanged — `Arc::ptr_eq` on the base
+`TableMetadataRef`, the entry retaining the base Arc so a rebuilt or refreshed base still
+misses; the lock is never held across `.await`.
+
+### R-02 (P2) — `Transaction::apply` returns the table unchanged on zero updates
+
+`Self::apply` still runs every requirement's `check` against the current metadata and extends
+`existing_updates`/`existing_requirements`, but skips `update_table_metadata` when the action's
+update list is empty — previously it rebuilt `TableMetadata` unconditionally, bumping the
+in-memory `last_updated_ms` even on a no-op action. This is the in-memory complement of the
+`do_commit` empty-union skip (which suppresses the catalog write); requirement validation is
+preserved at apply time, matching Java's `ops.commit` `base == metadata` early return which
+fires before the catalog write while Java's requirement checks happen earlier on the action's
+`validate`/`commit` path.
+Pin: `staged_table_tests.rs::apply_locally_empty_updates_keep_the_metadata_arc` asserts
+`Arc::ptr_eq` between the input and `apply_locally` output metadata for a no-op
+`update_schema` move — red under revert (the unconditional rebuild produces a fresh Arc).
+
+Before/after (identical, per the brief): `transaction::cherry_pick` ran 23 tests before and
+the same 23 pass after, plus the new L-003 pin (24 total);
+`cargo test -p iceberg --test hadoop_version_commit` ran 14/14 before and after (the schema
+no-op suite unchanged).
+
+### L-003 (P3) — plan-once pin, landed with no new production API
+
+`cherry_pick.rs::tests::commit_uses_the_plan_cached_by_validate`: `validate` populates
+`plan_cache`, the test poisons the entry (same base Arc, sentinel
+`FastForward { picked_id: 7 }`), and asserts `commit` emits the poisoned `SetSnapshotRef`
+shape — proof that `commit` consumes the cached plan rather than re-planning. The same-module
+test reaches the private field directly, so no production seam was added; the ~20 lines were
+funded at the file's exact 2115-line ceiling by compacting six private-helper doc blocks —
+their Java citations are preserved in `transaction/map.md` (cherry_pick row) and this ledger.
+Mutation: making `cached_plan` unconditionally re-plan fails the pin.
+
+### L-004 (P3) — gzip-base staged naming
+
+`staged_table_version_tests.rs::replace_stages_uncompressed_next_version_after_a_gzip_hadoop_pointer`:
+a `v7.gz.metadata.json` base stages `v8.metadata.json` (uncompressed). `MetadataLocation`
+already parsed both gzip spellings and `with_next_version` already emitted the uncompressed
+next version (pinned at that level by `gzip_hadoop_next_version_is_uncompressed`); this pin
+covers the `begin_replace` level, matching Java
+`HadoopTableOperations.metadataFilePath` writing `v` + `version` + `.metadata.json`.
+
+### Q2 — RULED FINAL by the Grok logic review
+
+The critic confirmed the item-3 widening: Java `TableMetadata.commit` early-returns on
+`base == metadata` for EVERY action — `BaseMetastoreTableOperations.commit` and
+`HadoopTableOperations.commit` both open with `if (base == metadata) return;`. The fork's
+`do_commit` empty-union skip is the same signal at the same seam, so the enumeration below
+stands as the complete zero-update surface. R-02 adds the complementary in-memory seam: even
+before `do_commit`, `Self::apply` no longer rebuilds metadata on an empty action.
+
 ### Q2 ruling addendum — every action that can emit ZERO updates, and what happens to each
 
 `Transaction::do_commit` now returns `Ok(current_table)` without calling
@@ -323,10 +443,12 @@ reconcile — no write was attempted).
    asked the ledger be added to `task/map.md`; the repo's actual index convention for lane
    ledgers is an `## ACTIVE` section in `task/todo.md`, and map.md files live only in
    `.agents/skills`, the two task archives, `crates/sketches`, and per-directory code maps.)
-2. **R110 adjacency — RULED 2026-09-17 (orchestrator, round-2 brief):** the `do_commit`
-   empty-updates skip (item 3) is accepted for now as Java's `base == metadata` early return;
-   the Grok logic critic will attack it explicitly. The full enumeration of zero-update-capable
-   actions and the consequence for each lives in "Q2 ruling addendum" above.
+2. **R110 adjacency — RULED FINAL 2026-09-18 (Grok logic review, round-3 brief):** the
+   `do_commit` empty-updates skip (item 3) is confirmed as Java's `base == metadata` early
+   return — `BaseMetastoreTableOperations.commit` / `HadoopTableOperations.commit` open with
+   `if (base == metadata) return;` for every action. Keep it. The full enumeration of
+   zero-update-capable actions and the consequence for each lives in "Q2 ruling addendum"
+   above; R-02 (round 3) adds the complementary `Self::apply` early return.
 3. `rollback_to` / `set_current` message wordings still diverge from Java's
    (`Cannot roll back to snapshot, not an ancestor of the current state: %s` /
    `Cannot roll back to unknown snapshot id: %s`) — pre-existing, outside this item's scope,
