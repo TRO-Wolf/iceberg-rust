@@ -289,7 +289,6 @@ fn test_scalar_value_to_datum_timestamp() {
     // Note: TimestampSecond and TimestampMillisecond are not supported because
     // DataFusion's type coercion converts them to TimestampMicrosecond or TimestampNanosecond
     // before they reach scalar_value_to_datum in SQL queries.
-    //
     // These return None (not pushed down):
     let ts_seconds = 1672876800i64; // 2023-01-05 00:00:00 UTC in seconds
     let datum = super::scalar_value_to_datum(&ScalarValue::TimestampSecond(Some(ts_seconds), None));
@@ -370,11 +369,6 @@ fn test_scalar_value_to_datum_date64_out_of_date_range_is_not_pushed_down() {
 }
 
 /// A `Date64` that is not a whole number of days must NOT be pushed down.
-///
-/// Truncation is UNDER-inclusive for `<` and `<>`: for `millis = 1 day + 1 ms` the true set of
-/// matching days for `col < millis` is `{0, 1}` (day 1 starts before the literal), while the
-/// pushed `col < date(1)` is `{0}`, so every day-1 row is silently dropped. This function does
-/// not know the operator, so the only sound answer is "cannot be pushed down".
 #[test]
 fn test_scalar_value_to_datum_date64_not_day_aligned_is_not_pushed_down() {
     use datafusion::common::ScalarValue;
