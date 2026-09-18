@@ -49,7 +49,7 @@ fn null_safe_eq(left: Expr, right: Expr) -> Expr {
 }
 
 fn push(expr: Expr) -> Option<Predicate> {
-    convert_filters_to_predicate(&[expr])
+    convert_filters_to_predicate(&[expr], &super::tests::test_iceberg_schema())
 }
 
 #[test]
@@ -77,15 +77,9 @@ fn nan_null_safe_eq_either_side_converts_to_is_nan() {
 }
 
 #[test]
-fn nan_not_eq_either_side_converts_to_not_nan() {
-    assert_eq!(
-        push(col("qux").not_eq(nan_f64())),
-        Some(Reference::new("qux").is_not_nan())
-    );
-    assert_eq!(
-        push(nan_f64().not_eq(col("qux"))),
-        Some(Reference::new("qux").is_not_nan())
-    );
+fn nan_not_eq_either_side_is_not_pushed() {
+    assert_eq!(push(col("qux").not_eq(nan_f64())), None);
+    assert_eq!(push(nan_f64().not_eq(col("qux"))), None);
 }
 
 #[test]
@@ -136,10 +130,7 @@ fn float32_nan_takes_the_same_arms_as_float64_nan() {
         push(null_safe_eq(col("flt"), nan_f32())),
         Some(Reference::new("flt").is_nan())
     );
-    assert_eq!(
-        push(col("flt").not_eq(nan_f32())),
-        Some(Reference::new("flt").is_not_nan())
-    );
+    assert_eq!(push(col("flt").not_eq(nan_f32())), None);
     assert_eq!(push(col("flt").lt(nan_f32())), None);
     assert_eq!(
         push(col("flt").in_list(vec![nan_f32(), double_lit(1.5)], false)),
@@ -166,10 +157,7 @@ fn nan_eq_composes_under_and_or_not() {
             Reference::new("foo").equal_to(Datum::long(1))
         ))
     );
-    assert_eq!(
-        push(Expr::Not(Box::new(col("qux").eq(nan_f64())))),
-        Some(!Reference::new("qux").is_nan())
-    );
+    assert_eq!(push(Expr::Not(Box::new(col("qux").eq(nan_f64())))), None);
 }
 
 #[test]

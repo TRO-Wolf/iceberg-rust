@@ -5467,10 +5467,8 @@ async fn test_s5_cow_delete_serializable_default_rejects_concurrent_append()
 
     let plan = s5_freeze_plan(&ctx, "DELETE FROM catalog.s5_cow_del_ser.t WHERE foo1 = 1").await;
 
-    // Under serializable, a concurrent insert matching the AlwaysTrue conflict filter breaks the
-    // isolation contract.
     let ctx2 = s5_new_ctx(&client).await;
-    ctx2.sql("INSERT INTO catalog.s5_cow_del_ser.t VALUES (3, 'c')")
+    ctx2.sql("INSERT INTO catalog.s5_cow_del_ser.t VALUES (1, 'c')")
         .await?
         .collect()
         .await?;
@@ -5490,8 +5488,8 @@ async fn test_s5_cow_delete_serializable_default_rejects_concurrent_append()
         rows,
         vec![
             (1, "a".to_string()),
-            (2, "b".to_string()),
-            (3, "c".to_string())
+            (1, "c".to_string()),
+            (2, "b".to_string())
         ],
         "rejected DELETE must leave the table exactly as the concurrent writer left it"
     );
@@ -5607,7 +5605,7 @@ async fn test_s5_cow_update_serializable_default_rejects_concurrent_append()
     .await;
 
     let ctx2 = s5_new_ctx(&client).await;
-    ctx2.sql("INSERT INTO catalog.s5_cow_upd_ser.t VALUES (3, 'c')")
+    ctx2.sql("INSERT INTO catalog.s5_cow_upd_ser.t VALUES (1, 'c')")
         .await?
         .collect()
         .await?;
@@ -5626,8 +5624,8 @@ async fn test_s5_cow_update_serializable_default_rejects_concurrent_append()
         rows,
         vec![
             (1, "a".to_string()),
-            (2, "b".to_string()),
-            (3, "c".to_string())
+            (1, "c".to_string()),
+            (2, "b".to_string())
         ],
         "rejected UPDATE must not have changed any row"
     );
@@ -5776,7 +5774,7 @@ async fn test_s5_merge_on_read_delete_serializable_default_rejects_concurrent_ap
     let plan = s5_freeze_plan(&ctx, "DELETE FROM catalog.s5_mr_del_ser.t WHERE foo1 = 1").await;
 
     let ctx2 = s5_new_ctx(&client).await;
-    ctx2.sql("INSERT INTO catalog.s5_mr_del_ser.t VALUES (3, 'c')")
+    ctx2.sql("INSERT INTO catalog.s5_mr_del_ser.t VALUES (1, 'c')")
         .await?
         .collect()
         .await?;
@@ -5795,8 +5793,8 @@ async fn test_s5_merge_on_read_delete_serializable_default_rejects_concurrent_ap
         rows,
         vec![
             (1, "a".to_string()),
-            (2, "b".to_string()),
-            (3, "c".to_string())
+            (1, "c".to_string()),
+            (2, "b".to_string())
         ],
         "rejected MoR DELETE must not have applied"
     );

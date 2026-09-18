@@ -21,6 +21,8 @@ pub(crate) mod delete;
 pub(crate) mod delete_legacy_merge;
 pub(crate) mod expr_to_predicate;
 pub(crate) mod metadata_scan;
+#[cfg(test)]
+mod occ_exec_tests;
 pub(crate) mod project;
 pub(crate) mod promotion;
 pub(crate) mod repartition;
