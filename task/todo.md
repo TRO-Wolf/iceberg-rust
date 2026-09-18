@@ -25,6 +25,42 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-18): F-RP-SUMMARY-USER-1 — caller's `replace-partitions` summary value wins
+
+Ledger: [`f-rp-summary-user-1-ledger.md`](f-rp-summary-user-1-ledger.md). Branch
+`fix/f-rp-summary-user-1` off fork `main` `9e67e000`. Consumer: RePark measured
+(run 22b, PySpark 4.1.2 + Iceberg 1.11.0) that a caller-set `replace-partitions`
+snapshot property lands verbatim in Java — the fork overwrote it with `"true"`.
+
+- [x] red cells (`77d8870d`): four summary-prop cells appended to the existing
+      `replace_partitions_extracted.rs` module (no `mod` line; the source file held
+      its exact 2801 ceiling); only the caller-`"false"` cell red
+- [x] fix (`75cde964`): `commit` layers the marker under the caller's map via
+      `entry().or_insert_with`; stale setter doc deleted under the comment ban
+      (`#[allow(missing_docs)]`); file 2801 → 2800, legacy ceiling lowered to match
+- [x] mutation: `insert`-overwrite revert → (a) red with the identical signature;
+      restored, 4/4 green, revert uncommitted
+- [x] audit: `cherry_pick.rs` `is_replace_partitions` treats caller-`"false"`
+      exactly as Java `propertyAsBoolean` does (non-replace path); oracles copy the
+      value verbatim. Named residual: the gate is case-sensitive `== "true"` vs
+      Java's case-insensitive `parseBoolean` — pre-existing, widened in
+      reachability, follow-up candidate (ledger §8)
+- [x] ledger + todo entry; gates below
+
+Round 2 (same lane): the residual folded in — round 1 makes caller values
+reachable, so the gate must read them the way Java does.
+
+- [x] red cells (`7de9ab5a`): `cherry_pick_case_insensitive.rs` beside the
+      cherry-pick tests — `"TRUE"` staged marker must replay like `"true"`;
+      `" true"` (leading space) pins the non-replace path (parseBoolean does not
+      trim). `mod` line paid for by the semantics-preserving
+      `map→is_some_and` collapse; file at exact 2106 ceiling
+- [x] fix (`ce36f58a`): `value == "true"` → `eq_ignore_ascii_case("true")`, the
+      fork's `propertyAsBoolean` idiom; 27/27 cherry_pick tests green
+- [x] mutation: `eq_ignore_ascii_case` revert → (a) red with the identical
+      rejection signature; restored, both green, revert uncommitted
+- [x] ledger Round 2 section (residual → fixed) + todo entry; gates below
+
 ## ACTIVE (2026-09-18): F-SHED-295 — relocated code sheds its comments
 
 Ledger: [`f-shed-295-ledger.md`](f-shed-295-ledger.md). Branch `fix/f-shed-295` off fork `main`.

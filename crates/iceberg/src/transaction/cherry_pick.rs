@@ -181,8 +181,7 @@ impl CherryPickAction {
                 .summary()
                 .additional_properties
                 .get(REPLACE_PARTITIONS_PROP)
-                .map(|value| value == "true")
-                .unwrap_or(false)
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
     }
 
     fn published_wap_id(picked: &SnapshotRef) -> Option<String> {
@@ -2103,4 +2102,5 @@ mod tests {
             [TableUpdate::SetSnapshotRef { reference, .. }] if reference.snapshot_id == 7
         ));
     }
+    mod cherry_pick_case_insensitive;
 }
