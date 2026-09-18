@@ -181,7 +181,7 @@ impl CherryPickAction {
                 .summary()
                 .additional_properties
                 .get(REPLACE_PARTITIONS_PROP)
-                .is_some_and(|value| value == "true")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
     }
 
     fn published_wap_id(picked: &SnapshotRef) -> Option<String> {
