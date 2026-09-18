@@ -238,3 +238,82 @@ new tests in `nested_projection_evo_tests.rs` → 8 passed, 10 failed:
 L-011 (D-16) — duplicate/unparseable nested field-id hardening deferred; current behavior is
 deterministic (last-wins on duplicates; unparseable degrades to the id-less name fallback).
 Everything else in L-001..L-010 and R-01..R-06 is closed on the final tree.
+
+## Round 3 — verification remediation (devin-worker / SWE-2)
+
+The verification critic's mutation pass on `c1bc78864`
+(`/tmp/oc-worker/ka-rv/reviews/nest-verify-report.md`) confirmed every round-2 pin
+turns red under revert, and left R-01 without a correctness pin plus findings
+V-01..V-03. This section records the round-3 remediation: red-first evidence,
+per-finding decisions (continuing the D-n numbering), and gate output.
+
+### RED (round 3)
+
+| Test | Finding | Observed failure on `c1bc78864` |
+|---|---|---|
+| `identical_nested_column_on_a_modify_batch_uses_pass_through` | R-01 | correctness pin, not a red-first fix: on the guarded tree it passes; reverting `source_type != target_type` turns it red (`operations[1]` becomes `NestedProject`) |
+| `idless_source_child_named_like_a_readded_field_reads_null` | V-01 | the id-less file child `b` read `"old"` into the re-added field id 5 |
+| `nested_time_initial_default_reads_time64` | V-02 | `unexpected target column type Time64(Microsecond)` |
+| `nested_uuid_initial_default_reads_fixed_size_binary` | V-02 | `unexpected target column type FixedSizeBinary(16)` |
+| `nested_binary_initial_default_reads_large_binary` | V-02 | `unexpected target column type LargeBinary` |
+| `nested_fixed_initial_default_reads_fixed_size_binary` | V-02 | `unexpected target column type FixedSizeBinary(4)` |
+| `top_level_time_initial_default_reads_time64` | V-02 | same unsupported-type error through the top-level `ColumnSource::Add` path |
+| `later_batch_with_a_richer_nested_layout_rebuilds_the_plan` | V-03 | second batch's `b` read `""` (null-filled by the first batch's cached plan) instead of `"keep"` |
+
+### Decisions (round 3)
+
+- **D-23 (R-01)** — the `PassThrough` guard gains a correctness pin:
+  `identical_nested_column_on_a_modify_batch_uses_pass_through` forces a `Modify`
+  batch with a reordered top-level projection (`[2, 1]`) and asserts every
+  operation, including the byte-identical nested struct, is
+  `ColumnSource::PassThrough`. Reverting the `source_type != target_type` guard
+  was verified to turn the pin red. `RecordBatchTransformer::generate_batch_transform`
+  and `BatchTransform` are `pub(crate)` so the test observes the source choice
+  directly rather than inferring it from timing.
+- **D-24 (V-01)** — the id-less name fallback is bounded by write-time id space.
+  `build_struct` tracks `max_source_id`, the largest stamped field id among the
+  source struct's children; an id-less source child may bind by name only to a
+  target child whose id does not exceed it. A target id newer than every id the
+  file carries could not have existed when the file was written, so the
+  same-named file child belongs to a dropped field and null-fills — the critic's
+  repro (`b:utf8` id-less in file, `b:string` id 5 in table with `a` id 3 the
+  only stamped sibling) now reads null. The L-002 fixture gained a stamped
+  sibling `c` id 5 so the intended fallback (target `b` id 4, within the file's
+  observed id space) stays exercised. D-7's wording is amended to match.
+- **D-25 (V-02)** — `create_primitive_array_repeated` covers the remaining
+  Iceberg primitive defaults: `Time64(Microsecond)` from a `Long` literal,
+  `LargeBinary` from a `Binary` literal, and `FixedSizeBinary(n)` from `Binary`
+  or `UInt128` (the `PrimitiveLiteral` representation of Iceberg `uuid`, which
+  maps to `FixedSizeBinary(16)`); a null literal produces `new_null_array` for
+  the fixed-width type. `fixed_size_binary_column` validates the literal byte
+  length against the target width instead of trusting it. The helper is shared
+  with top-level `ColumnSource::Add`, so the top-level path gained the same
+  types — pinned by `top_level_time_initial_default_reads_time64`. The
+  `value.rs` tail tests moved to `value_tail_tests.rs` (include-split, same
+  pattern as the nested-projection test files) and its ceiling moved down with
+  it.
+- **D-26 (V-03)** — the transformer stores its `BatchTransform` together with
+  the `SchemaRef` it was built for. Each `process_record_batch` compares the
+  incoming schema by pointer first (`Arc::ptr_eq` — the unchanged-schema
+  per-batch cost is one pointer compare) and rebuilds only when the pointer
+  differs AND the schema value differs, so a differently-allocated but equal
+  schema still reuses the plan. The critic's two-batch repro is pinned. The
+  row-lineage test block moved to
+  `record_batch_transformer_row_lineage_tests.rs` (include-split) and the
+  transformer's legacy ceiling moved down with it.
+
+### Gates (final tree, round 3)
+
+| Command | Exit |
+|---|---|
+| `cargo test -p iceberg --lib` | 0 — 3769 passed, 0 failed, 8 ignored |
+| `cargo test -p iceberg --lib nested_projection` | 0 — 32 passed, 0 failed |
+| `cargo fmt --all -- --check` | 0 |
+| `make check` | 0 — fmt, workspace clippy `-D warnings`, taplo, cargo-machete, agent-artifacts, matrix-anchors, comment-blocks all OK; `rust-file-size: 497 files clean (98 legacy ceilings)` |
+| `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/ka-fork origin/main HEAD` | 96 hits, all ASF license headers of the six new files (the allowed exception); the two pre-existing comments the V-03 change touched were removed outright rather than edited, keeping every hit inside the header exception |
+
+### What is not closed (round 3)
+
+L-011 (D-16) — unchanged, still deferred: duplicate/unparseable nested field-id
+hardening. Everything the verification critic left open (R-01 pin, V-01..V-03)
+is closed on the final tree.

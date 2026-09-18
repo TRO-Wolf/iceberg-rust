@@ -312,8 +312,6 @@ pub(crate) struct RecordBatchTransformer {
     first_row_id: Option<i64>,
     file_sequence_number: Option<i64>,
 
-    // Built lazily from the first batch's schema and rebuilt when a later batch carries a
-    // different source schema.
     batch_transform: Option<(SchemaRef, BatchTransform)>,
 
     // The 0-based physical position of the NEXT row. It feeds `ColumnSource::RowPosition`, and it
@@ -337,8 +335,6 @@ impl RecordBatchTransformer {
         &mut self,
         record_batch: RecordBatch,
     ) -> Result<RecordBatch> {
-        // Lazily build the transform from the first batch's schema; rebuild it when a later
-        // batch carries a different source schema.
         if self.batch_transform.as_ref().is_none_or(|(schema, _)| {
             !Arc::ptr_eq(schema, record_batch.schema_ref())
                 && **schema != **record_batch.schema_ref()
