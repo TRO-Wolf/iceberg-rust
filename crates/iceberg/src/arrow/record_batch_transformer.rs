@@ -179,7 +179,7 @@ pub(crate) enum ColumnSource {
 }
 
 #[derive(Debug)]
-enum BatchTransform {
+pub(crate) enum BatchTransform {
     /// The incoming batches already match. Pass them through.
     PassThrough,
 
@@ -398,7 +398,7 @@ impl RecordBatchTransformer {
 
     /// Compares the incoming batch schema with the snapshot schema and picks the transform to
     /// apply.
-    fn generate_batch_transform(
+    pub(crate) fn generate_batch_transform(
         source_schema: &ArrowSchemaRef,
         snapshot_schema: &IcebergSchema,
         projected_iceberg_field_ids: &[i32],

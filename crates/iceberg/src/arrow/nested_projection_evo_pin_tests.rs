@@ -15,6 +15,43 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::arrow::record_batch_transformer::{
+    BatchTransform, ColumnSource, RecordBatchTransformer,
+};
+
+#[test]
+fn identical_nested_column_on_a_modify_batch_uses_pass_through() {
+    let snapshot_schema = table_schema_with_struct_a_b();
+    let s_fields = Fields::from(vec![
+        id_field("a", DataType::Int32, true, 3),
+        id_field("b", DataType::Utf8, true, 4),
+    ]);
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        id_field("id", DataType::Int32, false, 1),
+        id_field("s", DataType::Struct(s_fields), true, 2),
+    ]));
+    let transform = RecordBatchTransformer::generate_batch_transform(
+        &file_schema,
+        snapshot_schema.as_ref(),
+        &[2, 1],
+        &HashMap::new(),
+        None,
+        None,
+    )
+    .unwrap();
+    let BatchTransform::Modify { operations, .. } = transform else {
+        panic!("a reordered projection must take the Modify transform")
+    };
+    assert!(matches!(
+        operations[0],
+        ColumnSource::PassThrough { .. }
+    ));
+    assert!(matches!(
+        operations[1],
+        ColumnSource::PassThrough { .. }
+    ));
+}
+
 #[test]
 fn null_parent_struct_propagates_null_rows() {
     let snapshot_schema = table_schema_with_struct_a_b();
