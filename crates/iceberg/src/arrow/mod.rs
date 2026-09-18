@@ -23,6 +23,7 @@ pub use schema::*;
 pub(crate) mod avro_reader;
 
 mod nan_val_cnt_visitor;
+mod nested_projection;
 pub(crate) use nan_val_cnt_visitor::{NanValueCountVisitor, schema_needs_nan_value_counts};
 pub(crate) mod caching_delete_file_loader;
 /// Delete File loader
