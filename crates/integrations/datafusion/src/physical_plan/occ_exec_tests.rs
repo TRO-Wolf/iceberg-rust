@@ -33,7 +33,9 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, CatalogBuilder, Error, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::{
+    Catalog, CatalogBuilder, Error, ErrorKind, NamespaceIdent, TableCreation, TableIdent,
+};
 use tempfile::TempDir;
 
 use crate::IcebergCatalogProvider;
@@ -91,14 +93,8 @@ async fn occ_fixture(merge_on_read: bool) -> OccFixture {
         .build();
     let properties = if merge_on_read {
         HashMap::from([
-            (
-                "write.delete.mode".to_string(),
-                "merge-on-read".to_string(),
-            ),
-            (
-                "write.update.mode".to_string(),
-                "merge-on-read".to_string(),
-            ),
+            ("write.delete.mode".to_string(), "merge-on-read".to_string()),
+            ("write.update.mode".to_string(), "merge-on-read".to_string()),
         ])
     } else {
         HashMap::new()
@@ -191,7 +187,12 @@ async fn concurrent_append(fixture: &OccFixture, base: &Table, file: DataFile) {
         .expect("concurrent append commits");
 }
 
-async fn concurrent_row_delta(fixture: &OccFixture, base: &Table, data: DataFile, delete: DataFile) {
+async fn concurrent_row_delta(
+    fixture: &OccFixture,
+    base: &Table,
+    data: DataFile,
+    delete: DataFile,
+) {
     let tx = Transaction::new(base);
     tx.row_delta()
         .add_data_files(vec![data])
@@ -241,7 +242,9 @@ fn assert_conflict(err: &DataFusionError, needle: &str) {
     let DataFusionError::External(source) = err else {
         panic!("expected an iceberg error, got: {err:?}");
     };
-    let inner = source.downcast_ref::<Error>().expect("iceberg error source");
+    let inner = source
+        .downcast_ref::<Error>()
+        .expect("iceberg error source");
     assert_eq!(inner.kind(), ErrorKind::DataInvalid);
     assert!(!inner.retryable());
 }
@@ -306,10 +309,9 @@ async fn mor_delete_matching_partition_commit_conflicts() {
         .expect("plan DELETE WHERE k = 'a' AND id < 8");
     let base = fixture.load_table().await;
     concurrent_append(&fixture, &base, concurrent_data_file("a-new", "a")).await;
-    let err = run_dml(exec)
-        .await
-        .err()
-        .expect("a concurrent commit in the filtered partition must conflict the k = 'a' DELETE");
+    let err = run_dml(exec).await.expect_err(
+        "a concurrent commit in the filtered partition must conflict the k = 'a' DELETE",
+    );
     assert_conflict(&err, "a-new.parquet");
 }
 
@@ -343,10 +345,9 @@ async fn cow_delete_matching_partition_commit_conflicts() {
         .expect("plan DELETE WHERE k = 'a' AND id < 8");
     let base = fixture.load_table().await;
     concurrent_append(&fixture, &base, concurrent_data_file("a-new", "a")).await;
-    let err = run_dml(exec)
-        .await
-        .err()
-        .expect("a concurrent commit in the filtered partition must conflict the k = 'a' DELETE");
+    let err = run_dml(exec).await.expect_err(
+        "a concurrent commit in the filtered partition must conflict the k = 'a' DELETE",
+    );
     assert_conflict(&err, "a-new.parquet");
 }
 
@@ -392,10 +393,9 @@ async fn mor_update_matching_partition_commit_conflicts() {
         concurrent_delete_file("a-del", "a"),
     )
     .await;
-    let err = run_dml(exec)
-        .await
-        .err()
-        .expect("a concurrent commit in the filtered partition must conflict the k = 'a' UPDATE");
+    let err = run_dml(exec).await.expect_err(
+        "a concurrent commit in the filtered partition must conflict the k = 'a' UPDATE",
+    );
     assert_conflict(&err, "a-new.parquet");
 }
 
@@ -410,7 +410,7 @@ async fn mor_update_matching_partition_delete_file_conflicts() {
         .expect("plan UPDATE WHERE k = 'a' AND id < 8");
     let base = fixture.load_table().await;
     concurrent_deletes(&fixture, &base, concurrent_delete_file("a-del", "a")).await;
-    let err = run_dml(exec).await.err().expect(
+    let err = run_dml(exec).await.expect_err(
         "a concurrent delete file in the filtered partition must conflict the k = 'a' UPDATE",
     );
     assert_conflict(&err, "a-del.parquet");
@@ -446,10 +446,9 @@ async fn cow_update_matching_partition_commit_conflicts() {
         .expect("plan UPDATE WHERE k = 'a' AND id < 8");
     let base = fixture.load_table().await;
     concurrent_append(&fixture, &base, concurrent_data_file("a-new", "a")).await;
-    let err = run_dml(exec)
-        .await
-        .err()
-        .expect("a concurrent commit in the filtered partition must conflict the k = 'a' UPDATE");
+    let err = run_dml(exec).await.expect_err(
+        "a concurrent commit in the filtered partition must conflict the k = 'a' UPDATE",
+    );
     assert_conflict(&err, "a-new.parquet");
 }
 
@@ -464,12 +463,14 @@ async fn mor_delete_no_predicate_keeps_always_true() {
         .expect("plan DELETE FROM t");
     let base = fixture.load_table().await;
     concurrent_append(&fixture, &base, concurrent_data_file("b-new", "b")).await;
-    let err = run_dml(exec)
-        .await
-        .err()
-        .expect("a predicate-less DELETE keeps AlwaysTrue and must conflict any concurrent commit");
+    let err = run_dml(exec).await.expect_err(
+        "a predicate-less DELETE keeps AlwaysTrue and must conflict any concurrent commit",
+    );
     let text = err.to_string();
-    assert!(text.contains("matching TRUE"), "expected AlwaysTrue: {text}");
+    assert!(
+        text.contains("matching TRUE"),
+        "expected AlwaysTrue: {text}"
+    );
     assert_conflict(&err, "b-new.parquet");
 }
 
@@ -484,12 +485,14 @@ async fn cow_delete_no_predicate_keeps_always_true() {
         .expect("plan DELETE FROM t");
     let base = fixture.load_table().await;
     concurrent_append(&fixture, &base, concurrent_data_file("b-new", "b")).await;
-    let err = run_dml(exec)
-        .await
-        .err()
-        .expect("a predicate-less DELETE keeps AlwaysTrue and must conflict any concurrent commit");
+    let err = run_dml(exec).await.expect_err(
+        "a predicate-less DELETE keeps AlwaysTrue and must conflict any concurrent commit",
+    );
     let text = err.to_string();
-    assert!(text.contains("matching TRUE"), "expected AlwaysTrue: {text}");
+    assert!(
+        text.contains("matching TRUE"),
+        "expected AlwaysTrue: {text}"
+    );
     assert_conflict(&err, "b-new.parquet");
 }
 
@@ -504,12 +507,14 @@ async fn mor_update_no_predicate_keeps_always_true() {
         .expect("plan UPDATE FROM t");
     let base = fixture.load_table().await;
     concurrent_append(&fixture, &base, concurrent_data_file("b-new", "b")).await;
-    let err = run_dml(exec)
-        .await
-        .err()
-        .expect("a predicate-less UPDATE keeps AlwaysTrue and must conflict any concurrent commit");
+    let err = run_dml(exec).await.expect_err(
+        "a predicate-less UPDATE keeps AlwaysTrue and must conflict any concurrent commit",
+    );
     let text = err.to_string();
-    assert!(text.contains("matching TRUE"), "expected AlwaysTrue: {text}");
+    assert!(
+        text.contains("matching TRUE"),
+        "expected AlwaysTrue: {text}"
+    );
     assert_conflict(&err, "b-new.parquet");
 }
 
@@ -524,11 +529,13 @@ async fn cow_update_no_predicate_keeps_always_true() {
         .expect("plan UPDATE FROM t");
     let base = fixture.load_table().await;
     concurrent_append(&fixture, &base, concurrent_data_file("b-new", "b")).await;
-    let err = run_dml(exec)
-        .await
-        .err()
-        .expect("a predicate-less UPDATE keeps AlwaysTrue and must conflict any concurrent commit");
+    let err = run_dml(exec).await.expect_err(
+        "a predicate-less UPDATE keeps AlwaysTrue and must conflict any concurrent commit",
+    );
     let text = err.to_string();
-    assert!(text.contains("matching TRUE"), "expected AlwaysTrue: {text}");
+    assert!(
+        text.contains("matching TRUE"),
+        "expected AlwaysTrue: {text}"
+    );
     assert_conflict(&err, "b-new.parquet");
 }
