@@ -62,6 +62,10 @@ Ledger: [`f-ice-residues-21b-ledger.md`](f-ice-residues-21b-ledger.md). Run 21b 
       `apply_locally_in_place` + gzip-base pin (`e4ce33a2`); R-01 `Arc<CherryPickPlan>`
       cache + R-02 empty-apply early return + L-003 cache-consume pin (`3d143992`);
       ledger/Q2 ruled final
+- [x] Round 4 (verification critic — one P2): V-001 — `apply_locally_in_place`'s
+      `write_to` clobbered a live `v(N+1)` before the CAS; Java-shaped fix defers
+      the Hadoop stage write to `commit` (probe for early conflict, exclusive
+      create once with final bytes). Red pin `a3c06a8c`, fix `436e7bde`
 
 ## ACTIVE (2026-09-17): F-OCC-SCOPED-1 filter-scoped conflict detection and retry-on-rebase (fork half)
 

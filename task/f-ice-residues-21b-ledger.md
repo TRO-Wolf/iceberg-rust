@@ -415,6 +415,74 @@ The critic confirmed the item-3 widening: Java `TableMetadata.commit` early-retu
 stands as the complete zero-update surface. R-02 adds the complementary in-memory seam: even
 before `do_commit`, `Self::apply` no longer rebuilds metadata on an empty action.
 
+## Round 4 (2026-09-18): the verification critic — one P2, V-001
+
+Round 3 was accepted and pushed (#293 head `8c43a027`; fork CI 14/14 green). The verification
+critic (`/tmp/oc-worker/kb-rv/reviews/fork-verify-report.md`) re-proved every item by mutation —
+L-001 (10/10 red), L-002, L-003, R-01, R-02 all CLOSED — and found one new P2 introduced by the
+L-002 fix.
+
+| Item | Tag | Commit | Subject |
+|---|---|---|---|
+| 11 | V-001 pin (red-first) | `a3c06a8c` | a losing staged replace never overwrites a live vN |
+| 12 | V-001 fix | `436e7bde` | a Hadoop staged replace writes its vN once, at commit, with final bytes |
+| 13 | ledger | this commit | round-4 evidence + decision |
+
+### V-001 (P2) — `apply_locally_in_place` `write_to` clobbered a live `v(N+1)` before the CAS
+
+The L-002 fix made `commit` → `materialize_pending` → `apply_locally_in_place` write the final
+metadata with `TableMetadata::write_to` — an OVERWRITE — onto the staged `v(N+1)` path, before
+`publish_replace_table`'s pointer CAS. The exclusive create at `begin_replace` proved we owned
+the NAME, but not that the file stayed uncommitted: a writer that landed `v(N+1)` as the live
+pointer between `begin_replace` and `commit` had its bytes overwritten, after which our CAS
+failed retryable — the live pointer then named a file holding this transaction's uncommitted
+metadata (critic's reproduction: `v3_unchanged=false`, winner property gone, our appended
+snapshot present). Java never overwrites a version file: `HadoopTableOperations.commit`
+(L157-162) writes a temp file and `renameToFinal` (L368-377) refuses an existing destination
+(`CommitFailedException("Version %d already exists")`); `BaseTransaction` keeps the replacement
+in memory until one `ops.commit` (L516-526).
+
+**Decision — option (a), the Java shape.** On a Hadoop-named staged target `begin_replace`
+writes nothing: it probes `v(N+1)` and its gzip siblings (`ensure_staged_version_absent`) for
+an early retryable `CatalogCommitConflicts` — preserving stage-time failure when the slot is
+already taken — and otherwise holds the metadata in memory like `BaseTransaction`. `commit`
+then writes the FINAL materialized bytes exactly once through `write_commit_metadata`'s
+exclusive create (sibling pre-check + `write_new`) before the pointer CAS; a winner occupying
+the slot makes that write fail retryable with the winner's bytes untouched. Uuid-named targets
+are untouched: `write_commit_metadata` dispatches to `write_to` for them, so `begin_create`,
+uuid/relocated bases, and the eager stage write all behave exactly as before. Option (b) —
+materialize to a different slot — was rejected outright (reintroduces L-002's two-slot
+publish); an early-reservation plus pointer-guard was rejected because any second write to a
+`vN` name is an overwrite the rule forbids, and the stage-time file cannot hold final bytes
+when pending files arrive later.
+
+**Caller survey** (`grep -rn "begin_replace|StagedTableTransaction|apply_locally_in_place|
+publish_replace_table" crates/`): the only production caller surface is `commit` →
+`publish_create_table`/`publish_replace_table`. MemoryCatalog CASes the pointer under one
+lock; S3 Tables does a pointer-only `GetTable` + version-token CAS to
+`table.metadata_location()`; Glue's `replace_publish` read-validates the staged file before
+`UpdateTable` — all three read the staged file (if at all) only at publish time, and under the
+deferred design the file exists by then (written inside `materialize_pending`, before the
+publish call). `apply_locally_in_place` is `pub(crate)` with `materialize_pending` as its
+sole caller. No caller reads the staged file between `begin_replace` and `commit`.
+
+**Red-first evidence:** `tests/hadoop_version_commit.rs::hadoop_staged_replace_never_overwrites_a_live_next_version`
+(commit `a3c06a8c`) seeds a `v2` pointer, opens a staged replace, has a winner write `v3` and
+CAS the pointer `v2→v3`, then commits the staged replace with pending files. On head
+`8c43a027` it FAILED — the file held the loser's replace+append bytes (an `append` snapshot
+with `added-data-files: 1`), not the winner's pristine metadata. Under the fix it passes:
+`commit`'s exclusive create of `v3` fails retryable `CatalogCommitConflicts` before the CAS
+and the winner's `v3` is byte-identical; no `v4` is written; the pointer stays `v3`.
+
+**Pin mechanics adjusted to the deferred shape** (assertions preserved): in
+`hadoop_staged_replace_second_stager_fails_and_preserves_winner` the `winner_bytes` read moved
+after the winner's `commit` (the second `begin_replace` still fails retryable, now via the
+probe); `concurrent_replace_from_a_hadoop_pointer_fails_on_exclusive_create` seeds the landed
+`v4` explicitly through `write_commit_metadata` before asserting the second `begin_replace`
+fails; `replace_stages_uncompressed_next_version_after_a_gzip_hadoop_pointer` now asserts the
+staged target does NOT exist at begin (the deferred-write contract) — the
+`v7.gz → v8.metadata.json` naming pin is unchanged.
+
 ### Q2 ruling addendum — every action that can emit ZERO updates, and what happens to each
 
 `Transaction::do_commit` now returns `Ok(current_table)` without calling
