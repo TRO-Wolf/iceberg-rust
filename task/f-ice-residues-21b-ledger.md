@@ -155,7 +155,8 @@ any schema with more than one identifier field.
 
 ### Red-first evidence (unfixed tree)
 
-`cargo test -p iceberg --test update_schema_noop`: `noop_move_commits_nothing`,
+`cargo test -p iceberg --test update_schema_noop` (the file has since been folded into
+`tests/hadoop_version_commit.rs::update_schema_noop` — see "Round 2" below): `noop_move_commits_nothing`,
 `same_doc_reapply_commits_nothing`, `same_default_reapply_commits_nothing` FAILED — the commit
 emitted `AddSchema`/`SetCurrentSchema`, wrote a `v2` metadata file, and moved the pointer. The
 unit-level red surfaced a second layer: the empty-op rebuild compared UNEQUAL on the two-
@@ -256,7 +257,7 @@ added; the reuse itself is exercised by every one of the 23 tests, each of which
 | `cargo test -p iceberg --lib transaction::cherry_pick` | 23 passed before AND after R-01 |
 | `cargo test -p iceberg --lib transaction::manage_snapshots` | 37 passed after item 4 |
 | `cargo test -p iceberg --test interop_manage_snapshots` | 5 passed (incl. new snapshotless pin) |
-| `cargo test -p iceberg --test update_schema_noop` | 6 passed |
+| `cargo test -p iceberg --test hadoop_version_commit update_schema_noop` | 6 passed (as `update_schema_noop::*` inside `hadoop_version_commit.rs`) |
 | `cargo test -p iceberg --test hadoop_version_commit` | 8 passed (incl. staged-replace pin) |
 | `cargo clippy -p iceberg --all-targets -- -D warnings` | clean (one `collapsible_if` fixed in R-01) |
 | `cargo fmt --all -- --check` | clean |
@@ -269,7 +270,7 @@ added; the reuse itself is exercised by every one of the 23 tests, each of which
 |---|---|
 | `cargo test -p iceberg --lib` | 3762 passed, 0 failed, 8 ignored (381s) |
 | `cargo test -p iceberg --test interop_cherrypick --test interop_wap_data --test interop_staged_wap` | 2 + 2 + 2 passed, 0 failed |
-| `cargo test -p iceberg --test hadoop_version_commit --test update_schema_noop --test interop_manage_snapshots` | 8 + 6 + 5 passed, 0 failed |
+| `cargo test -p iceberg --test hadoop_version_commit --test update_schema_noop --test interop_manage_snapshots` | 8 + 6 + 5 passed, 0 failed (pre-move; post-move `hadoop_version_commit` alone runs 14/14) |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo clippy --all-targets --all-features --workspace -- -D warnings` (make-check flavor) | clean |
 | `cargo fmt --all -- --check` | clean |
@@ -281,18 +282,51 @@ added; the reuse itself is exercised by every one of the 23 tests, each of which
 | Rule-1 grep over `origin/main` diff | 0 non-header hits; the 16 matched lines are the verbatim ASF header of the one new test file (named exception) |
 | `git status --short` | clean |
 
+## Round 2 (2026-09-17 late): mechanical gate rejection — file fold + subject fix
+
+The orchestrator's mechanical comment-ban gate (`python3 /tmp/oc-worker/_lib/comment_ban.py
+/tmp/kb-fork origin/main`) rejected round 1 on the 16 ASF-header lines of the NEW file
+`crates/iceberg/tests/update_schema_noop.rs` — the named exception is not honored by that
+gate. Resolution: the 6 pins moved VERBATIM into `crates/iceberg/tests/hadoop_version_commit.rs`
+as `mod update_schema_noop { ... }` (reusing that file's `new_local_catalog`/`tempfile`
+infrastructure; only `iceberg::spec::Literal` needed importing), the standalone file was
+deleted, and every commit subject lost its ` (#292)` suffix (that PR belongs to another run's
+branch; this branch has no PR). `cargo test -p iceberg --test hadoop_version_commit` now runs
+14/14 — the same 8 + the same 6 under `update_schema_noop::*`. References updated in this
+ledger, `task/todo.md`, `crates/iceberg/src/transaction/map.md`, and GAP_MATRIX R94.
+
+### Q2 ruling addendum — every action that can emit ZERO updates, and what happens to each
+
+`Transaction::do_commit` now returns `Ok(current_table)` without calling
+`catalog.update_table` whenever the union of all action updates (`existing_updates`) is empty —
+the Java `ops.commit` `base == metadata` early return at the transaction seam. The actions
+that can reach that state:
+
+| Action | Zero-update path | What the skip does |
+|---|---|---|
+| `UpdateSchemaAction` | The rebuilt schema `is_same_schema` the current one (item 3 fix) — `update_schema.rs` returns `ActionCommit::new(vec![], vec![])` | No `AddSchema`/`SetCurrentSchema`, no metadata file, no catalog-pointer move; `current-schema-id` and the schema list untouched |
+| `ExpireSnapshotsAction` | (a) the table has zero snapshots — `expire_snapshots.rs` "Java `internalApply`: a table with no snapshots is a no-op"; (b) nothing expired and no refs to remove — the existing no-op-suppression return | Previously wrote a fresh metadata file bumping `last-updated-ms` and moved the pointer; now commits nothing. Both empty paths also carry zero requirements, so no guard is skipped |
+| `ManageSnapshotsAction` | Per-ref net no-op suppression: every resolved ref equals its original (e.g., `rollback_to_time` resolving to the CURRENT snapshot, `set_current` to the already-current id, a create-then-remove within one action) leaves `updates` empty | Same skip: no file, no pointer move; the per-ref `RefSnapshotIdMatch` requirements are also not emitted (they are pushed only for refs that changed), so nothing is lost |
+| `UpdateStatisticsAction` | `statistics_to_set` empty (action queued with no `set`/`remove` calls) | Emitted `ActionCommit::new(vec![], vec![])` — no requirements either; now writes nothing |
+| `UpdatePartitionStatisticsAction` | `statistics_to_set` empty | Emits empty updates BUT a non-empty `UuidMatch` requirement; on the skip that requirement is never checked — which is also Java's order (`BaseTransaction` skips `ops.commit` on `base == metadata` BEFORE requirement validation, which lives inside `ops.commit`). Reachable only by queueing the action with zero stat entries; named here for the Critic to attack |
+| Multi-action transaction | Every queued action emits zero updates (e.g., a no-op `update_schema` + a no-op `expire_snapshots` in one `Transaction`) | The union is empty → one skip; a non-empty sibling still commits normally (the skip is on the UNION, not per action) |
+
+On the skip `do_commit` still returns the re-applied `current_table` — `Self::apply` over empty
+updates produces identical metadata in memory; no `AddSnapshot` means no `CreateSnapshotEvent`,
+no `latest_attempt_snapshot_ids` captured, and no reconciliation surface (there is nothing to
+reconcile — no write was attempted).
+
 ## Open questions
 
-1. **`task/map.md` does not exist.** The brief asks the ledger be added to `task/map.md`; the
-   repo's actual index convention for lane ledgers is an `## ACTIVE` section in `task/todo.md`
-   (map.md files live only in `.agents/skills`, the two task archives, `crates/sketches`, and
-   per-directory code maps). This lane wrote the `todo.md` entry instead and updated
-   `crates/iceberg/src/transaction/map.md` per the navigation contract. If the orchestrator
-   wants a real `task/map.md` created, that is a one-line ruling.
-2. **R110 adjacency:** the `do_commit` empty-updates skip (item 3) is a transaction-seam
-   behaviour change beyond schema updates — any action emitting zero updates now writes no
-   metadata file (Java `ops.commit` `base == metadata`). Recorded on R110; worth a Critic
-   double-check that no action relied on the old always-write.
+1. **`task/map.md` does not exist.** RULED 2026-09-17 (orchestrator, round-2 brief): accepted as
+   leaned — no `task/map.md`; the `task/todo.md` ACTIVE entry stands. (Original note: the brief
+   asked the ledger be added to `task/map.md`; the repo's actual index convention for lane
+   ledgers is an `## ACTIVE` section in `task/todo.md`, and map.md files live only in
+   `.agents/skills`, the two task archives, `crates/sketches`, and per-directory code maps.)
+2. **R110 adjacency — RULED 2026-09-17 (orchestrator, round-2 brief):** the `do_commit`
+   empty-updates skip (item 3) is accepted for now as Java's `base == metadata` early return;
+   the Grok logic critic will attack it explicitly. The full enumeration of zero-update-capable
+   actions and the consequence for each lives in "Q2 ruling addendum" above.
 3. `rollback_to` / `set_current` message wordings still diverge from Java's
    (`Cannot roll back to snapshot, not an ancestor of the current state: %s` /
    `Cannot roll back to unknown snapshot id: %s`) — pre-existing, outside this item's scope,

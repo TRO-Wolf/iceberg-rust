@@ -39,7 +39,7 @@ Ledger: [`f-ice-residues-21b-ledger.md`](f-ice-residues-21b-ledger.md). Run 21b 
 - [x] I-3 F-UPDATE-SCHEMA-SAME-1: structurally equal schema update emits zero updates +
       `do_commit` skips `catalog.update_table` on empty updates (Java `ops.commit` `base ==
       metadata`); fixed `is_same_schema` order-sensitive HashSet-iterator `eq` on
-      identifier-field ids. Red→green, `tests/update_schema_noop.rs` 6 pins. `f0ea7e9b`
+      identifier-field ids. Red→green, `tests/hadoop_version_commit.rs::update_schema_noop` 6 pins. `f0ea7e9b`
 - [x] I-4 Q-20b-C: `rollback_to_time` walk already Java-exact (strict `<`, current ancestry);
       residual gap closed — snapshotless table now fails with Java's
       "no valid snapshot older than" (empty ancestry), not the missing-current message.
