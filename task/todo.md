@@ -25,6 +25,28 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-18): F-RP-SUMMARY-USER-1 — caller's `replace-partitions` summary value wins
+
+Ledger: [`f-rp-summary-user-1-ledger.md`](f-rp-summary-user-1-ledger.md). Branch
+`fix/f-rp-summary-user-1` off fork `main` `9e67e000`. Consumer: RePark measured
+(run 22b, PySpark 4.1.2 + Iceberg 1.11.0) that a caller-set `replace-partitions`
+snapshot property lands verbatim in Java — the fork overwrote it with `"true"`.
+
+- [x] red cells (`aed405f1`): four summary-prop cells appended to the existing
+      `replace_partitions_extracted.rs` module (no `mod` line; the source file held
+      its exact 2801 ceiling); only the caller-`"false"` cell red
+- [x] fix (`513dcb64`): `commit` layers the marker under the caller's map via
+      `entry().or_insert_with`; stale setter doc deleted under the comment ban
+      (`#[allow(missing_docs)]`); file 2801 → 2800, legacy ceiling lowered to match
+- [x] mutation: `insert`-overwrite revert → (a) red with the identical signature;
+      restored, 4/4 green, revert uncommitted
+- [x] audit: `cherry_pick.rs` `is_replace_partitions` treats caller-`"false"`
+      exactly as Java `propertyAsBoolean` does (non-replace path); oracles copy the
+      value verbatim. Named residual: the gate is case-sensitive `== "true"` vs
+      Java's case-insensitive `parseBoolean` — pre-existing, widened in
+      reachability, follow-up candidate (ledger §8)
+- [x] ledger + todo entry; gates below
+
 ## ACTIVE (2026-09-18): F-SHED-295 — relocated code sheds its comments
 
 Ledger: [`f-shed-295-ledger.md`](f-shed-295-ledger.md). Branch `fix/f-shed-295` off fork `main`.

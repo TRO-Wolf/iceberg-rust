@@ -115,11 +115,8 @@ async fn test_replace_partitions_summary_caller_true_wins() {
 
 #[tokio::test]
 async fn test_replace_partitions_summary_unrelated_key_keeps_default() {
-    let table = replace_commit_with(Some(HashMap::from([(
-        "k".to_string(),
-        "v".to_string(),
-    )])))
-    .await;
+    let table =
+        replace_commit_with(Some(HashMap::from([("k".to_string(), "v".to_string())]))).await;
 
     assert_eq!(
         summary_property(&table, "replace-partitions").as_deref(),
