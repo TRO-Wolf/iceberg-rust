@@ -410,10 +410,10 @@ The drops are still correct to make, on two grounds. First, bound trust is not
 guaranteed for files written by other producers: a writer that records `+0.0`
 stats for a `-0.0` row makes the pushed `f <= -0.0` bound prune a file whose
 rows the residual accepts. Second, the pushed `!(is_nan)` form reaches the OCC
-conflict filter, whose evaluation path does not visibly normalize `NOT` (the
-scan paths call `rewrite_not()` in `scan/mod.rs:210,219`; the row_delta
-validation binds the raw predicate). A dropped conjunct is the uniform safe
-answer for both consumers.
+conflict filter as well as scan pruning, and a dropped conjunct is the uniform
+safe answer for both consumers. (Round-4 correction: `conflict_filter.rs` does
+normalize `NOT` — see the corrections section below; this paragraph originally
+also cited an un-normalized conflict path, which was wrong.)
 
 Accordingly the two dictated e2e cells were rewritten to pin this engine's real
 semantics instead of the IEEE premise: a `+0.0` row does *not* satisfy
@@ -493,9 +493,9 @@ matches.
 
 `Expr::Not` now gates its converted operand through `not_operand_is_sound`:
 `!(is_nan)` and `NOT` over any float-column comparison are not pushed
-(`rewrite_not` would normalize `!(is_nan)` to `is_not_nan` on the scan path,
-but not visibly on the conflict-validation path — drop covers both). `NOT`
-over non-float leaves still pushes.
+(`rewrite_not` normalizes `!(is_nan)` to `is_not_nan` on both the scan and the
+conflict-validation paths — `conflict_filter.rs:48,88`; the drop stands on
+producer-stats trust). `NOT` over non-float leaves still pushes.
 
 Two existing pins changed to the drop:
 - `test_predicate_conversion_with_not_isnan` — `NOT isnan(qux)` → `None`
@@ -579,10 +579,12 @@ cargo test -p iceberg --lib expr                          → 406 passed, 0 fail
 - Typed-domain guard removed: no red — the `TimestampNs` case is independently
   caught by the fail-closed arm (`Long→Long` unlisted). Guard retained as
   defense-in-depth for listed-variant wrong-domain pairs.
-- Fail-closed `_ => false` reverted to `_ => true`:
+- Fail-closed `_ => false` reverted to `_ => true` while the typed-domain
+  guard was still out from the previous revert:
   `timestamp_nanos_literal_against_micros_column_is_not_pushed` FAILED
   (pushed `ts >= Datum{TimestampNs(…500)}`, a bound 1000× too large).
-  Restored green.
+  Restored green. (Round-4 correction: this revert was not isolated — with the
+  guard in place it does not red the cell; see the corrections section below.)
 
 ### Additional shapes audited
 
@@ -597,3 +599,17 @@ cargo test -p iceberg --lib expr                          → 406 passed, 0 fail
 - `NOT` over a bare boolean column still produces `col = false`.
 - `LIKE` prefix pushes unchanged — `Datum::to` identity on `String`.
 
+
+### Round 4 verification corrections
+
+- The verifier found that the isolated fail-closed revert (`_ => false` →
+  `_ => true`) does NOT red the nanos cell: with the typed-domain guard in
+  place, `TimestampNs` vs `Timestamp` already fails the datum-identity check
+  before `converts_exactly` runs, and without the guard the unlisted
+  `Long→Long` pair fails closed. The two are independent backstops, not a
+  chain — the round-3 mutation entry above recorded a red only because the
+  guard was still out from the preceding revert.
+- `conflict_filter.rs:48` calls `rewrite_not()` before binding the conflict
+  filter, and `:88` calls it on the projected partition predicate — the
+  round-3 "NOT-unrewritten conflict path" justification for the L-04 `NOT`
+  drop was stale. The drop stays on producer-stats trust alone.
