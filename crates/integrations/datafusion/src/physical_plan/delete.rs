@@ -24,7 +24,6 @@
 //!
 //! The original DataFusion `WHERE` is the contract. Iceberg pushdown is inexact and would over-delete.
 //! Copy-on-write is two-pass: the affected set must be complete before the first survivor is written.
-//! Both passes read one frozen snapshot. Conflict filter is the scan's `prune`, `AlwaysTrue` when none. A zero-match DML commits nothing.
 //! | Path | Always validates | Serializable adds |
 //! |---|---|---|
 //! | copy-on-write DELETE and UPDATE | no conflicting deletes | no conflicting data |
@@ -524,9 +523,6 @@ async fn merge_on_read_delete(
     .await?;
     let referenced_files = files_exist_set(&close, &pairs);
 
-    // §5 row-delta recipe, MoR DELETE. The conflict filter is the scan's own `prune` (`AlwaysTrue`
-    // when nothing was pushed). V3 shared-Puffin closure arms deleted-files checks (F-17 C-013);
-    // V2 keeps Java's skip-delete default.
     let tx = Transaction::new(table);
     let mut action = tx
         .row_delta()

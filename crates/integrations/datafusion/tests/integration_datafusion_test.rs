@@ -5467,8 +5467,6 @@ async fn test_s5_cow_delete_serializable_default_rejects_concurrent_append()
 
     let plan = s5_freeze_plan(&ctx, "DELETE FROM catalog.s5_cow_del_ser.t WHERE foo1 = 1").await;
 
-    // Under serializable, a concurrent insert whose file can contain records matching foo1 = 1
-    // breaks the isolation contract.
     let ctx2 = s5_new_ctx(&client).await;
     ctx2.sql("INSERT INTO catalog.s5_cow_del_ser.t VALUES (1, 'c')")
         .await?
