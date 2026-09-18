@@ -15,9 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow_array::{FixedSizeBinaryArray, LargeBinaryArray, Time64MicrosecondArray};
+use uuid::Uuid;
+
 use crate::arrow::record_batch_transformer::{
     BatchTransform, ColumnSource, RecordBatchTransformer,
 };
+
+fn snapshot_schema_with_typed_struct_b(b_type: PrimitiveType, default: Literal) -> Arc<Schema> {
+    Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    2,
+                    "s",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                        NestedField::optional(4, "b", Type::Primitive(b_type))
+                            .with_initial_default(default)
+                            .into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap(),
+    )
+}
 
 #[test]
 fn identical_nested_column_on_a_modify_batch_uses_pass_through() {
@@ -360,4 +386,132 @@ fn list_of_list_element_struct_child_added_reads_null() {
         .unwrap();
     assert!(y.is_null(0));
     assert!(y.is_null(1));
+}
+
+#[test]
+fn nested_time_initial_default_reads_time64() {
+    let snapshot_schema =
+        snapshot_schema_with_typed_struct_b(PrimitiveType::Time, Literal::time(123456789));
+    let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+    let result = transformer
+        .process_record_batch(file_batch_with_struct_a_only())
+        .unwrap();
+    let s = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let b = s
+        .column(1)
+        .as_any()
+        .downcast_ref::<Time64MicrosecondArray>()
+        .unwrap();
+    assert_eq!(b.value(0), 123456789);
+    assert_eq!(b.value(1), 123456789);
+}
+
+#[test]
+fn nested_uuid_initial_default_reads_fixed_size_binary() {
+    let uuid = Uuid::from_u128(0xa1a2a3a4b1b2c1c2d1d2d3d4d5d6d7d8);
+    let snapshot_schema =
+        snapshot_schema_with_typed_struct_b(PrimitiveType::Uuid, Literal::uuid(uuid));
+    let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+    let result = transformer
+        .process_record_batch(file_batch_with_struct_a_only())
+        .unwrap();
+    let s = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let b = s
+        .column(1)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(b.value(0), uuid.as_bytes().as_slice());
+    assert_eq!(b.value(1), uuid.as_bytes().as_slice());
+}
+
+#[test]
+fn nested_binary_initial_default_reads_large_binary() {
+    let snapshot_schema = snapshot_schema_with_typed_struct_b(
+        PrimitiveType::Binary,
+        Literal::binary([1u8, 2, 3]),
+    );
+    let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+    let result = transformer
+        .process_record_batch(file_batch_with_struct_a_only())
+        .unwrap();
+    let s = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let b = s
+        .column(1)
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .unwrap();
+    assert_eq!(b.value(0), &[1u8, 2, 3]);
+    assert_eq!(b.value(1), &[1u8, 2, 3]);
+}
+
+#[test]
+fn nested_fixed_initial_default_reads_fixed_size_binary() {
+    let snapshot_schema = snapshot_schema_with_typed_struct_b(
+        PrimitiveType::Fixed(4),
+        Literal::fixed([9u8, 8, 7, 6]),
+    );
+    let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+    let result = transformer
+        .process_record_batch(file_batch_with_struct_a_only())
+        .unwrap();
+    let s = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let b = s
+        .column(1)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(b.value(0), &[9u8, 8, 7, 6]);
+    assert_eq!(b.value(1), &[9u8, 8, 7, 6]);
+}
+
+#[test]
+fn top_level_time_initial_default_reads_time64() {
+    let snapshot_schema = Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "t", Type::Primitive(PrimitiveType::Time))
+                    .with_initial_default(Literal::time(999))
+                    .into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let file_schema = Arc::new(ArrowSchema::new(vec![id_field(
+        "id",
+        DataType::Int32,
+        false,
+        1,
+    )]));
+    let file_batch = RecordBatch::try_new(file_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+    ])
+    .unwrap();
+    let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+    let result = transformer.process_record_batch(file_batch).unwrap();
+    let t = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<Time64MicrosecondArray>()
+        .unwrap();
+    assert_eq!(t.value(0), 999);
+    assert_eq!(t.value(1), 999);
 }
