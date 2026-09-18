@@ -123,7 +123,8 @@ where
     }
 }
 
-fn ascending_partition_order(left: &Struct, right: &Struct) -> Ordering {
+#[allow(missing_docs)]
+pub fn ascending_partition_order(left: &Struct, right: &Struct) -> Ordering {
     use crate::spec::Literal;
     for (left_field, right_field) in left.iter().zip(right.iter()) {
         match (left_field, right_field) {

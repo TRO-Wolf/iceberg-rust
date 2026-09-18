@@ -36,9 +36,10 @@ use iceberg::expr::Predicate;
 use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::writer::partitioning::fanout_writer::ascending_partition_order;
 
-use crate::physical_plan::DATA_FILES_COL_NAME;
 use crate::physical_plan::delete::IsolationLevel;
+use crate::physical_plan::{DATA_FILES_COL_NAME, WRITE_PARTITION_INDEX_COL_NAME};
 use crate::to_datafusion_error;
 
 /// Snapshot-summary key stamping every `IcebergCommitExec` commit with a unique id — the
@@ -247,7 +248,7 @@ impl ExecutionPlan for IcebergCommitExec {
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
-            let mut data_files: Vec<DataFile> = Vec::new();
+            let mut data_files: Vec<(u64, DataFile)> = Vec::new();
             let mut total_record_count: u64 = 0;
 
             // Execute and collect results from the input coalesced plan
@@ -271,28 +272,59 @@ impl ExecutionPlan for IcebergCommitExec {
                         )
                     })?;
 
+                let index_array = batch
+                    .column_by_name(WRITE_PARTITION_INDEX_COL_NAME)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected 'write_partition_index' column in input batch".to_string(),
+                        )
+                    })?
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected 'write_partition_index' column to be UInt64Array".to_string(),
+                        )
+                    })?;
+
                 // Deserialize all data files from the StringArray
-                let batch_files: Vec<DataFile> = files_array
-                    .into_iter()
-                    .flatten()
-                    .map(|f| -> DFResult<DataFile> {
+                let batch_files: Vec<(u64, DataFile)> = files_array
+                    .iter()
+                    .zip(index_array.iter())
+                    .filter_map(|(file, index)| file.map(|file| (file, index)))
+                    .map(|(file, index)| -> DFResult<(u64, DataFile)> {
+                        let index = index.ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "Expected non-null 'write_partition_index' value".to_string(),
+                            )
+                        })?;
                         // Parse JSON to DataFileSerde and convert to DataFile
                         deserialize_data_file_from_json(
-                            f,
+                            file,
                             spec_id,
                             &partition_type,
                             &current_schema,
                         )
                         .map_err(to_datafusion_error)
+                        .map(|data_file| (index, data_file))
                     })
                     .collect::<datafusion::common::Result<_>>()?;
 
                 // add record_counts from the current batch to total record count
-                total_record_count += batch_files.iter().map(|f| f.record_count()).sum::<u64>();
+                total_record_count += batch_files.iter().map(|f| f.1.record_count()).sum::<u64>();
 
                 // Add all deserialized files to our collection
                 data_files.extend(batch_files);
             }
+
+            data_files.sort_by(|left, right| {
+                ascending_partition_order(left.1.partition(), right.1.partition())
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            let data_files: Vec<DataFile> = data_files
+                .into_iter()
+                .map(|(_, data_file)| data_file)
+                .collect();
 
             // NOTE (empty-commit semantics, BUG-001/BUG-004): there is deliberately NO
             // `if data_files.is_empty() { return empty }` short-circuit here. A blanket early

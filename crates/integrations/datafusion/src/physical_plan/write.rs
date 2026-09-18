@@ -19,7 +19,7 @@ use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray};
+use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -51,8 +51,8 @@ use iceberg::{Error, ErrorKind};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
-use crate::physical_plan::DATA_FILES_COL_NAME;
 use crate::physical_plan::sort::write_sort_plan;
+use crate::physical_plan::{DATA_FILES_COL_NAME, WRITE_PARTITION_INDEX_COL_NAME};
 use crate::task_writer::TaskWriter;
 use crate::to_datafusion_error;
 
@@ -168,24 +168,27 @@ impl IcebergWriteExec {
     }
 
     // Create a record batch with serialized data files
-    fn make_result_batch(data_files: Vec<String>) -> DFResult<RecordBatch> {
+    fn make_result_batch(data_files: Vec<String>, partition: u64) -> DFResult<RecordBatch> {
+        let len = data_files.len();
         let files_array = Arc::new(StringArray::from(data_files)) as ArrayRef;
+        let index_array = Arc::new(UInt64Array::from(vec![partition; len])) as ArrayRef;
 
-        RecordBatch::try_new(Self::make_result_schema(), vec![files_array]).map_err(|e| {
-            DataFusionError::ArrowError(
-                Box::new(e),
-                Some("Failed to make result batch".to_string()),
-            )
-        })
+        RecordBatch::try_new(Self::make_result_schema(), vec![files_array, index_array]).map_err(
+            |e| {
+                DataFusionError::ArrowError(
+                    Box::new(e),
+                    Some("Failed to make result batch".to_string()),
+                )
+            },
+        )
     }
 
     fn make_result_schema() -> ArrowSchemaRef {
         // Define a schema.
-        Arc::new(ArrowSchema::new(vec![Field::new(
-            DATA_FILES_COL_NAME,
-            DataType::Utf8,
-            false,
-        )]))
+        Arc::new(ArrowSchema::new(vec![
+            Field::new(DATA_FILES_COL_NAME, DataType::Utf8, false),
+            Field::new(WRITE_PARTITION_INDEX_COL_NAME, DataType::UInt64, false),
+        ]))
     }
 }
 
@@ -390,7 +393,7 @@ impl ExecutionPlan for IcebergWriteExec {
                 })
                 .collect::<DFResult<Vec<String>>>()?;
 
-            Self::make_result_batch(data_files_strs)
+            Self::make_result_batch(data_files_strs, partition as u64)
         })
         .boxed();
 
@@ -601,7 +604,10 @@ mod tests {
         // table's schema (which is what it used to advertise while emitting result batches).
         assert_eq!(
             write_exec.schema().as_ref(),
-            &ArrowSchema::new(vec![Field::new(DATA_FILES_COL_NAME, DataType::Utf8, false)]),
+            &ArrowSchema::new(vec![
+                Field::new(DATA_FILES_COL_NAME, DataType::Utf8, false),
+                Field::new(WRITE_PARTITION_INDEX_COL_NAME, DataType::UInt64, false),
+            ]),
             "IcebergWriteExec must advertise its result schema"
         );
 
@@ -630,7 +636,10 @@ mod tests {
         // Check schema
         assert_eq!(
             result_batch.schema().as_ref(),
-            &ArrowSchema::new(vec![Field::new(DATA_FILES_COL_NAME, DataType::Utf8, false)])
+            &ArrowSchema::new(vec![
+                Field::new(DATA_FILES_COL_NAME, DataType::Utf8, false),
+                Field::new(WRITE_PARTITION_INDEX_COL_NAME, DataType::UInt64, false),
+            ])
         );
 
         // Check data

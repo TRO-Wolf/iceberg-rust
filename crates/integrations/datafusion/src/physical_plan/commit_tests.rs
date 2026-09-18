@@ -38,7 +38,7 @@ use iceberg::spec::{
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
 use super::*;
-use crate::physical_plan::DATA_FILES_COL_NAME;
+use crate::physical_plan::{DATA_FILES_COL_NAME, WRITE_PARTITION_INDEX_COL_NAME};
 use crate::table::IcebergTableProvider;
 
 // A mock execution plan that returns record batches with serialized data files
@@ -51,11 +51,10 @@ struct MockWriteExec {
 
 impl MockWriteExec {
     fn new(data_files_json: Vec<String>) -> Self {
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            DATA_FILES_COL_NAME,
-            DataType::Utf8,
-            false,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(DATA_FILES_COL_NAME, DataType::Utf8, false),
+            Field::new(WRITE_PARTITION_INDEX_COL_NAME, DataType::UInt64, false),
+        ]));
 
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -103,7 +102,8 @@ impl ExecutionPlan for MockWriteExec {
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
         // Create a record batch with the serialized data files
         let array = Arc::new(StringArray::from(self.data_files_json.clone())) as ArrayRef;
-        let batch = RecordBatch::try_new(self.schema.clone(), vec![array])?;
+        let index = Arc::new(UInt64Array::from(vec![0; self.data_files_json.len()])) as ArrayRef;
+        let batch = RecordBatch::try_new(self.schema.clone(), vec![array, index])?;
 
         // Create a stream that returns this batch
         let stream = futures::stream::once(async move { Ok(batch) }).boxed();
