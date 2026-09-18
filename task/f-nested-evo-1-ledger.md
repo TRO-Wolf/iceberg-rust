@@ -139,3 +139,101 @@ new tests in `nested_projection_evo_tests.rs` → 8 passed, 10 failed:
 | `list_source_projects_into_large_list_target` | L-007 | `failed to cast nested column`, `expected 2 got 1` |
 | `fixed_size_list_rebuild_uses_target_size` | L-007 | returned `Ok` with a `FixedSizeList(2)` against a `FixedSizeList(3)` target |
 | `nested_add_with_sibling_promotion_and_decimal_widen` | L-008 | passed pre-fix (pin for untested composition, kept as guard) |
+
+### Decisions (round 2)
+
+- **D-6 (L-001)** — nested fills are schema-aware. `NestedProjectionPlan::build` resolves each
+  missing target child's `NestedField` by field id via `Schema::field_by_id`; the fill is the
+  field's `initial_default` primitive literal when present, null for an optional field, and a
+  `DataInvalid` "Missing required field" error for a required field without one — the same
+  priority the Avro reader's `missing_column_source` applies, minus the identity-partition
+  constant step (partition values only exist at the top level).
+- **D-7 (L-002)** — an id-less source child in a partially id-carrying struct matches its
+  target child by NAME. Java's fallback-id path (`ApplyNameMapping` / `addFallbackFieldIds`,
+  already ported in this crate's reader for the top level) assigns synthetic ids so that
+  name-identical children line up; matching the id-less child by name reproduces that observable
+  behavior without inventing ids. The name fallback cannot leak a dropped-then-readded name:
+  `source_by_name` holds only id-less source children, and the fallback runs only when the
+  target child's id lookup misses, so a file child that carries an old id is never claimed by a
+  target child with a new id (pinned by
+  `nested_field_dropped_then_readded_same_name_new_id_reads_null`). The vacuous-`all()` hole is
+  closed by an explicit `!source_fields.is_empty()` guard: a zero-child file struct fills every
+  target child instead of taking the legacy cast path.
+- **D-8 (L-003)** — map keys project through the same `PlanNode` machinery as map values. The
+  `DataType::Map` plan arm builds independent key and value plans, so an added key-struct child
+  null-fills and a key-struct child rename resolves by field id.
+- **D-9 (L-004)** — the depth bound is 128, matching the crate's other schema-walk bounds
+  (`spec::schema::visitor` `MAX_SCHEMA_NESTING_DEPTH`, `arrow::null_propagation`,
+  `variant::value`). The bound is enforced at plan build; a 40-deep schema projects and a
+  130-deep schema errors at build, pinning both sides of the boundary.
+- **D-10 (L-005)** — a required missing nested child without a default fails `DataInvalid` at
+  plan build, before any batch is touched; a required missing child with `initial_default` reads
+  the default. Both directions pinned.
+- **D-11 (L-006)** — every container rebuild uses Arrow's `try_new` (`StructArray`,
+  `ListArray`, `LargeListArray`, `FixedSizeListArray`, `MapArray`) and wraps Arrow errors in
+  `ErrorKind::DataInvalid`. No panic path remains on projected input: a required list element
+  whose projected values carry a null returns an error instead of panicking inside
+  `ListArray::new`.
+- **D-12 (L-007)** — `nested_projection_applies` accepts the `List` ↔ `LargeList` pair in both
+  directions; the apply path rebuilds the values array and constructs fresh `OffsetBuffer`s of
+  the target width (i32 ↔ i64 conversion is checked inside `try_new`). `FixedSizeList` rebuilds
+  with the TARGET size; a size mismatch surfaces as a `try_new` error rather than a wrong-typed
+  array.
+- **D-13 (L-008)** — composition pinned by `nested_add_with_sibling_promotion_and_decimal_widen`:
+  one transformer run carries a nested struct ADD, a sibling int→long promotion and a decimal
+  precision widen together.
+- **D-14 (L-009)** — container element/key/value FIELD ids stay un-compared and positional:
+  `ListArray` has exactly one element field and `MapArray::try_new` enforces key-then-value, so
+  there is nothing to match those ids against; Java's `PruneColumns` treats them as structural
+  too. Element field NAME differences are ignored by construction (pinned by
+  `list_element_field_named_differently_still_projects`).
+- **D-15 (L-010)** — the reorder clause is no longer vacuous: the `==` guard (D-17) only
+  short-circuits byte-identical fields, so a reordered struct takes `NestedProject` and the
+  projector itself performs the id-based reorder. New pins cover the remaining unmeasured
+  nestings the review named: null parent bitmap propagation
+  (`null_parent_struct_propagates_null_rows`), drop-then-readd same-name-new-id
+  (`nested_field_dropped_then_readded_same_name_new_id_reads_null`), differently-named element
+  field, and list-of-list-of-struct recursion. Two files written at different schema versions in
+  one scan stay unmeasured: `RecordBatchTransformer` builds its `BatchTransform` lazily from the
+  first batch's schema per instance, so each file gets its own plan — correct by construction.
+- **D-16 (L-011)** — OPEN. Duplicate nested field ids keep last-wins `HashMap` behavior;
+  unparseable `PARQUET:field_id` metadata degrades to "no id" and now reaches the name fallback
+  rather than an immediate null-fill. Corrupt-input edge the review rated P3; the top-level id
+  map errors on unparseable ids while the nested path stays quiet — deferred hardening, no
+  writer-produced file is affected.
+- **D-17 (R-01)** — `generate_transform_operations` selects `NestedProject` only when
+  `nested_projection_applies(source_type, target_type) && source_type != target_type`;
+  byte-identical fields (name, type, nullability and metadata all equal) take `PassThrough` as
+  before. `equals_datatype` is deliberately NOT used for this guard — it ignores field names and
+  would smuggle the rename clause back onto the pass-through path. The rename and reorder tests
+  pin the distinction.
+- **D-18 (R-02)** — the field-id maps and per-child plans are built once per file inside
+  `NestedProjectionPlan::build` and stored on `ColumnSource::NestedProject(NestedProjectionPlan,
+  usize)`; `process_record_batch` mutably borrows the cached transform (`as_mut`) so the plan
+  persists across batches.
+- **D-19 (R-03)** — a `source_type == target_type` pair inside the plan produces
+  `PlanNode::Passthrough`; `apply` returns the source `ArrayRef` by `Arc` clone. Identical
+  leaves no longer pay a `cast` round trip.
+- **D-20 (R-04)** — `PlanNode::Fill` caches the materialized fill array keyed by row count, so
+  repeated same-length batches reuse the null or constant column instead of rebuilding it.
+- **D-21 (R-05)** — source-child lookup is a `HashMap` by field id plus a `HashMap` by name for
+  id-less children, both built once at plan time: O(children) build, O(1) expected lookup.
+- **D-22 (R-06)** — recursion happens at plan build, once per file, bounded at 128; `apply`
+  walks the pre-built plan with the same bound. The stack bound matches the crate's other
+  schema-walk limits.
+
+### Gates (final tree)
+
+| Command | Exit |
+|---|---|
+| `cargo test -p iceberg --lib` | 0 — 3761 passed, 0 failed, 8 ignored |
+| `cargo test -p iceberg --lib nested_projection` | 0 — 24 passed, 0 failed |
+| `cargo fmt --all -- --check` | 0 |
+| `make check` | 0 — fmt, workspace clippy `-D warnings`, taplo, cargo-machete, agent-artifacts, matrix-anchors, comment-blocks all OK; `rust-file-size: 495 files clean (98 legacy ceilings)` |
+| `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/ka-fork origin/main HEAD` | 64 hits, all ASF license headers of the four new files (the allowed exception) |
+
+### What is not closed
+
+L-011 (D-16) — duplicate/unparseable nested field-id hardening deferred; current behavior is
+deterministic (last-wins on duplicates; unparseable degrades to the id-less name fallback).
+Everything else in L-001..L-010 and R-01..R-06 is closed on the final tree.
