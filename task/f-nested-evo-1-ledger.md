@@ -113,3 +113,29 @@ expected 2 got 1` through the real reader) and green after restore — 7/7.
 None inside this unit. Out of scope by brief: the RePark side (adopting a
 Spark-evolved table; nested CREATE / `ADD COLUMN s.b` DDL) belongs to the next
 run.
+
+## Round 2 — review remediation (devin-worker / SWE-2, 2026-09-17)
+
+Two read-only reviews of `136c3da09` (`/tmp/oc-worker/ka-rv/reviews/nest-logic-report.md`,
+`nest-rustperf-report.md`) returned findings L-001..L-011 and R-01..R-04. This
+section records the round-2 remediation: red-first evidence, per-finding
+decisions (continuing the D-n numbering), and gate output.
+
+### RED (test commit, before the fix)
+
+`cargo test -p iceberg --lib arrow::nested_projection` on `136c3da09` plus the
+new tests in `nested_projection_evo_tests.rs` → 8 passed, 10 failed:
+
+| Test | Clause | Observed failure |
+|---|---|---|
+| `nested_child_with_initial_default_reads_default` | L-001 | `b` read `""` (NULL), not default `"x"` |
+| `mixed_field_id_struct_matches_idless_child_by_name` | L-002 | id-less child `b` read `""` (NULL) instead of file values |
+| `zero_child_file_struct_fills_target_children` | L-002 | vacuous `all()` → legacy cast → `StructArray` arity error |
+| `map_key_struct_child_added_after_file_written_reads_null` | L-003 | `failed to cast map keys`, `expected 2 got 1` |
+| `deeply_nested_struct_child_add_projects_within_bound` | L-004 | `nested schema projection exceeds depth 32` |
+| `required_nested_child_missing_without_default_errors` | L-005 | Arrow's `Found unmasked nulls for non-nullable StructArray field`, not the Iceberg missing-required error |
+| `required_nested_child_missing_with_default_reads_default` | L-005 | same Arrow error instead of reading the default |
+| `required_list_element_with_null_projected_values_errors` | L-006 | panic inside `ListArray::new` (`Non-nullable field ... cannot contain nulls`) |
+| `list_source_projects_into_large_list_target` | L-007 | `failed to cast nested column`, `expected 2 got 1` |
+| `fixed_size_list_rebuild_uses_target_size` | L-007 | returned `Ok` with a `FixedSizeList(2)` against a `FixedSizeList(3)` target |
+| `nested_add_with_sibling_promotion_and_decimal_widen` | L-008 | passed pre-fix (pin for untested composition, kept as guard) |

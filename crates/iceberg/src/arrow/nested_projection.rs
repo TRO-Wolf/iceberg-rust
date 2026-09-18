@@ -965,4 +965,6 @@ mod test {
         assert_eq!(a.value(0), 1);
         assert_eq!(a.value(1), 2);
     }
+
+    include!("nested_projection_evo_tests.rs");
 }
