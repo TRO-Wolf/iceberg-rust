@@ -47,6 +47,20 @@ snapshot property lands verbatim in Java — the fork overwrote it with `"true"`
       reachability, follow-up candidate (ledger §8)
 - [x] ledger + todo entry; gates below
 
+Round 2 (same lane): the residual folded in — round 1 makes caller values
+reachable, so the gate must read them the way Java does.
+
+- [x] red cells (`5074157e`): `cherry_pick_case_insensitive.rs` beside the
+      cherry-pick tests — `"TRUE"` staged marker must replay like `"true"`;
+      `" true"` (leading space) pins the non-replace path (parseBoolean does not
+      trim). `mod` line paid for by the semantics-preserving
+      `map→is_some_and` collapse; file at exact 2106 ceiling
+- [x] fix (`543ba0a6`): `value == "true"` → `eq_ignore_ascii_case("true")`, the
+      fork's `propertyAsBoolean` idiom; 27/27 cherry_pick tests green
+- [x] mutation: `eq_ignore_ascii_case` revert → (a) red with the identical
+      rejection signature; restored, both green, revert uncommitted
+- [x] ledger Round 2 section (residual → fixed) + todo entry; gates below
+
 ## ACTIVE (2026-09-18): F-SHED-295 — relocated code sheds its comments
 
 Ledger: [`f-shed-295-ledger.md`](f-shed-295-ledger.md). Branch `fix/f-shed-295` off fork `main`.

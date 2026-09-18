@@ -30,14 +30,10 @@ async fn stage_replace_partitions_with_marker(
     table: &Table,
     marker_value: &str,
 ) -> (Table, i64) {
-    let table = append(
-        catalog,
-        table,
-        vec![
-            data_file("test/a.parquet", 0),
-            data_file("test/b.parquet", 1),
-        ],
-    )
+    let table = append(catalog, table, vec![
+        data_file("test/a.parquet", 0),
+        data_file("test/b.parquet", 1),
+    ])
     .await;
     let s0 = table.metadata().current_snapshot_id().unwrap();
 
@@ -62,8 +58,7 @@ async fn stage_replace_partitions_with_marker(
 async fn test_cherrypick_replace_partitions_marker_is_case_insensitive() {
     let catalog = new_memory_catalog().await;
     let table = make_v3_minimal_table_in_catalog(&catalog).await;
-    let (table, staged_id) =
-        stage_replace_partitions_with_marker(&catalog, &table, "TRUE").await;
+    let (table, staged_id) = stage_replace_partitions_with_marker(&catalog, &table, "TRUE").await;
 
     let before = snapshot_count(&table);
     let table = cherry_pick(&catalog, &table, staged_id).await;
@@ -103,8 +98,7 @@ async fn test_cherrypick_replace_partitions_marker_is_case_insensitive() {
 async fn test_cherrypick_replace_partitions_marker_leading_space_is_not_replace() {
     let catalog = new_memory_catalog().await;
     let table = make_v3_minimal_table_in_catalog(&catalog).await;
-    let (table, staged_id) =
-        stage_replace_partitions_with_marker(&catalog, &table, " true").await;
+    let (table, staged_id) = stage_replace_partitions_with_marker(&catalog, &table, " true").await;
 
     let err = cherry_pick_err(&catalog, &table, staged_id).await;
     assert_eq!(err.kind(), ErrorKind::DataInvalid);

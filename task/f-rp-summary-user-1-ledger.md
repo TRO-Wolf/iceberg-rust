@@ -156,15 +156,13 @@ this box).
 **Verdict:** for the caller-`"false"` defect every site already does what Java does; no site needed a
 change beyond the fix.
 
-**Named residual (pre-existing, not changed in this lane):** `cherry_pick.rs`'s gate is
+**Named residual (pre-existing, FIXED in round 2):** `cherry_pick.rs`'s gate was
 `value == "true"` (case-sensitive); Java's `PropertyUtil.propertyAsBoolean` is
-`Boolean.parseBoolean` = case-INSENSITIVE `equalsIgnoreCase("true")`. Before this fix a Rust caller
-could not leave a case-variant value in the summary (always overwritten to `"true"`); post-fix a
-caller CAN write `"TRUE"`, which Java's cherry-pick reads as a replace and this gate does not. The
-divergence itself predates the lane for externally-authored metadata — the fix only widens its
-reachability. The fork's own `propertyAsBoolean` port idiom is `eq_ignore_ascii_case("true")`
-(`crates/catalog/rest/src/catalog.rs:393-398`). Candidate follow-up lane; recorded per the brief's
-audit instruction rather than changed here.
+`Boolean.parseBoolean` = case-INSENSITIVE `equalsIgnoreCase("true")`. Before round 1 a Rust caller
+could not leave a case-variant value in the summary (always overwritten to `"true"`); post-round-1 a
+caller CAN write `"TRUE"`, which Java's cherry-pick reads as a replace and this gate did not. The
+divergence itself predated the lane for externally-authored metadata — round 1 only widened its
+reachability. Closed in round 2 below.
 
 ## 9. Notes
 
@@ -173,3 +171,77 @@ audit instruction rather than changed here.
   reason cannot live in code (it would be a comment), so it lives here.
 - No GAP_MATRIX row flips: this is a behavior fix inside an existing capability, not a new
   capability closure, and no interop runner covers caller-supplied summary props.
+
+---
+
+## Round 2 — case-insensitive `replace-partitions` read in cherry-pick
+
+**Commits:** `5074157e` red cells · `543ba0a6` fix · docs commit (this section + todo).
+
+Round 1's own audit finding, folded in because round 1 is what makes a caller-set value reachable:
+`CherryPickAction::is_replace_partitions` gated the OVERWRITE replay on `value == "true"`. Java
+`CherryPickOperation` reads the property with `PropertyUtil.propertyAsBoolean(…, false)` =
+`Boolean.parseBoolean` — case-insensitive `equalsIgnoreCase("true")`, no trimming. So `"TRUE"` /
+`"True"` are replace in Java but were non-replace here; `" true"` (leading space) and `"yes"` are
+non-replace on both sides.
+
+### Cells
+
+New module `crates/iceberg/src/transaction/cherry_pick/tests/cherry_pick_case_insensitive.rs`,
+wired as `mod cherry_pick_case_insensitive;` inside `cherry_pick.rs`'s `mod tests` (the
+`replace_partitions/tests/` pattern). `cherry_pick.rs` was AT its 2106 legacy ceiling, so the `mod`
+line is paid for by collapsing `.map(|value| value == "true").unwrap_or(false)` to
+`.is_some_and(|value| value == "true")` in the RED commit — a semantics-preserving refactor that is
+also the shape the fixed code takes; the file sits at exactly 2106 at every commit and the ceiling
+is untouched.
+
+| Cell | Staged marker | Test | Expected |
+|---|---|---|---|
+| (a) | `"TRUE"` (caller-set, survives round-1 layering) | `test_cherrypick_replace_partitions_marker_is_case_insensitive` | replays exactly like the `"true"` cell: new Overwrite snapshot, `a2` live, `a` dropped, `source-snapshot-id` set |
+| (b) | `" true"` (leading space) | `test_cherrypick_replace_partitions_marker_leading_space_is_not_replace` | non-replace path: `Cannot cherry-pick snapshot %s: not append, dynamic overwrite, or fast-forward` (green pre-fix too — boundary control) |
+
+The staging helper mirrors `stage_replace_partitions_for_replay` but commits the staged snapshot
+through the replace-partitions action with
+`set_snapshot_properties({"replace-partitions": marker_value})` — which is exactly how a caller's
+value reaches a real summary post-round-1.
+
+### Red output (pre-fix, commit `5074157e`)
+
+```
+test ...::cherry_pick_case_insensitive::test_cherrypick_replace_partitions_marker_is_case_insensitive ... FAILED
+  called `Result::unwrap()` on an `Err` value: DataInvalid =>
+  Cannot cherry-pick snapshot <id>: not append, dynamic overwrite, or fast-forward
+test ...::cherry_pick_case_insensitive::test_cherrypick_replace_partitions_marker_leading_space_is_not_replace ... ok
+test result: FAILED. 26 passed; 1 failed; 3802 filtered out
+```
+
+### Fix and green (commit `543ba0a6`)
+
+`is_replace_partitions` now reads `.is_some_and(|value| value.eq_ignore_ascii_case("true"))` — the
+fork's `propertyAsBoolean` idiom (`crates/catalog/rest/src/catalog.rs:393-398`).
+
+```
+cargo test -p iceberg --lib cherry_pick
+test result: ok. 27 passed; 0 failed; 3802 filtered out
+```
+
+### Mutation proof
+
+Reverted only `eq_ignore_ascii_case("true")` → `== "true"` (tests kept):
+
+```
+test ...::test_cherrypick_replace_partitions_marker_is_case_insensitive ... FAILED
+  Cannot cherry-pick snapshot <id>: not append, dynamic overwrite, or fast-forward
+test ...::test_cherrypick_replace_partitions_marker_leading_space_is_not_replace ... ok
+test result: FAILED. 1 passed; 1 failed; 3827 filtered out
+```
+
+Identical red signature to the pre-fix run. Restored; both cells green again. Revert never
+committed (`git status` clean after restore).
+
+### Round-2 audit delta
+
+The §8 verdict is unchanged for every other site — the only behavioral read of the property is this
+gate, now `parseBoolean`-faithful. Remaining semantic gap, if any, is nil: Java writes exactly
+`"true"` itself, so case variants reach a summary only via caller `set` (Rust now) or
+externally-authored metadata — both now read identically on the replay gate.
