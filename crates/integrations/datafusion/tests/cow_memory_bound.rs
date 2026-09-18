@@ -78,7 +78,7 @@
 //!    at both scales, so it cancels. Writer-side row-group buffering is real and still unbounded —
 //!    follow-up, same QB unit.
 //! 3. **One test function.** The counters are process-global, so anything running concurrently in
-//!    this binary would pollute them. The seven measured runs are sequential inside one test.
+//!    this binary would pollute them. The nine measured runs are sequential inside one test.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
@@ -91,7 +91,10 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{
+    NestedField, NullOrder, PrimitiveType, Schema, SortDirection, SortField, SortOrder, Transform,
+    Type,
+};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_datafusion::IcebergCatalogProvider;
 use tempfile::TempDir;
@@ -232,6 +235,7 @@ async fn setup(
     ns: &str,
     rows: usize,
     merge_on_read: bool,
+    sorted: bool,
 ) -> (SessionContext, usize, Vec<TempDir>) {
     let (warehouse_path, warehouse_dir) = temp_dir();
     let (table_path, table_dir) = temp_dir();
@@ -260,6 +264,19 @@ async fn setup(
         .build()
         .expect("build schema");
 
+    let sort_order = sorted.then(|| {
+        SortOrder::builder()
+            .with_sort_field(
+                SortField::builder()
+                    .source_id(1)
+                    .transform(Transform::Identity)
+                    .direction(SortDirection::Ascending)
+                    .null_order(NullOrder::First)
+                    .build(),
+            )
+            .build(&schema)
+            .expect("sorted fixture sort order")
+    });
     let creation = TableCreation::builder()
         .name("t".to_string())
         .location(table_path)
@@ -271,9 +288,15 @@ async fn setup(
                 ("write.delete.mode".to_string(), "merge-on-read".to_string()),
                 ("write.update.mode".to_string(), "merge-on-read".to_string()),
             ])
+        } else if sorted {
+            HashMap::from([(
+                "write.target-file-size-bytes".to_string(),
+                "8388608".to_string(),
+            )])
         } else {
             HashMap::new()
         })
+        .sort_order_opt(sort_order)
         .build();
     iceberg_catalog
         .create_table(&namespace, creation)
@@ -379,12 +402,18 @@ struct Measured {
 
 /// Run one DML statement against a freshly loaded `rows`-row table.
 async fn measure_dml(ns: &str, rows: usize, sql: &str) -> Measured {
-    measure_dml_mode(ns, rows, sql, false).await
+    measure_dml_mode(ns, rows, sql, false, false).await
 }
 
-/// As [`measure_dml`], but selects the table's row-level write mode.
-async fn measure_dml_mode(ns: &str, rows: usize, sql: &str, merge_on_read: bool) -> Measured {
-    let (ctx, files_before, temp_dirs) = setup(ns, rows, merge_on_read).await;
+/// As [`measure_dml`], but selects the table's row-level write mode and sort order.
+async fn measure_dml_mode(
+    ns: &str,
+    rows: usize,
+    sql: &str,
+    merge_on_read: bool,
+    sorted: bool,
+) -> Measured {
+    let (ctx, files_before, temp_dirs) = setup(ns, rows, merge_on_read, sorted).await;
 
     let base = begin_measure();
     let batches = ctx.sql(sql).await.expect("plan dml").collect().await;
@@ -525,6 +554,7 @@ async fn copy_on_write_peak_memory_does_not_scale_with_row_count() {
         N,
         "DELETE FROM catalog.cow_mem_base_small.t WHERE id < 0",
         true,
+        false,
     )
     .await;
     let base_large = measure_dml_mode(
@@ -532,6 +562,7 @@ async fn copy_on_write_peak_memory_does_not_scale_with_row_count() {
         4 * N,
         "DELETE FROM catalog.cow_mem_base_large.t WHERE id < 0",
         true,
+        false,
     )
     .await;
     assert_eq!(
@@ -590,14 +621,43 @@ async fn copy_on_write_peak_memory_does_not_scale_with_row_count() {
     assert_fixture("small UPDATE", &upd_small, N);
     assert_fixture("large UPDATE", &upd_large, 4 * N);
 
+    let sorted_small = measure_dml_mode(
+        "cow_mem_sorted_small",
+        N,
+        "UPDATE catalog.cow_mem_sorted_small.t SET payload = 'updated' WHERE id % 2 = 0",
+        false,
+        true,
+    )
+    .await;
+    let sorted_large = measure_dml_mode(
+        "cow_mem_sorted_large",
+        4 * N,
+        "UPDATE catalog.cow_mem_sorted_large.t SET payload = 'updated' WHERE id % 2 = 0",
+        false,
+        true,
+    )
+    .await;
+    assert_eq!(
+        (sorted_small.affected, sorted_large.affected),
+        ((N / 2) as u64, (2 * N) as u64),
+        "the sorted fixture must match half of every file so the rewritten set scales with rows"
+    );
+    assert_eq!(
+        (sorted_small.files_before, sorted_large.files_before),
+        (files(N), files(4 * N)),
+        "the sorted fixture must have the same file layout as the measured runs"
+    );
+
     // Printed so a `--nocapture` run (and the mutation proof in the ledger) has the real numbers.
     let del_delta = del_large.peak.saturating_sub(del_small.peak);
     let upd_delta = upd_large.peak.saturating_sub(upd_small.peak);
+    let sorted_delta = sorted_large.peak.saturating_sub(sorted_small.peak);
     println!(
         "H7-S2 marginal peak — added={added_bytes} B, threshold={} B\n  \
          BASELINE (merge-on-read, zero match): peak(N)={} peak(4N)={} delta={baseline_delta}\n  \
          DELETE: peak(N)={} peak(4N)={} delta={del_delta} excess={}\n  \
-         UPDATE: peak(N)={} peak(4N)={} delta={upd_delta} excess={}",
+         UPDATE: peak(N)={} peak(4N)={} delta={upd_delta} excess={}\n  \
+         SORTED UPDATE: peak(N)={} peak(4N)={} delta={sorted_delta} excess={}",
         added_bytes / 4,
         base_small.peak,
         base_large.peak,
@@ -607,6 +667,9 @@ async fn copy_on_write_peak_memory_does_not_scale_with_row_count() {
         upd_small.peak,
         upd_large.peak,
         upd_delta.saturating_sub(baseline_delta),
+        sorted_small.peak,
+        sorted_large.peak,
+        sorted_delta.saturating_sub(baseline_delta),
     );
 
     assert_marginal_bound(
@@ -620,6 +683,13 @@ async fn copy_on_write_peak_memory_does_not_scale_with_row_count() {
         "copy-on-write UPDATE",
         upd_small.peak,
         upd_large.peak,
+        baseline_delta,
+        added_bytes,
+    );
+    assert_marginal_bound(
+        "sorted copy-on-write UPDATE",
+        sorted_small.peak,
+        sorted_large.peak,
         baseline_delta,
         added_bytes,
     );

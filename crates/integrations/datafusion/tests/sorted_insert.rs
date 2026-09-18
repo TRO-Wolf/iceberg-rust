@@ -881,3 +881,118 @@ async fn cow_update_on_unsorted_table_stamps_zero_and_keeps_scan_order() -> Resu
     assert_eq!(files[0].1, Some(0), "unsorted table stamps order id 0");
     Ok(())
 }
+
+fn float_p_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "p", Type::Primitive(PrimitiveType::Float)).into(),
+        ])
+        .build()
+        .expect("float p schema")
+}
+
+fn float_p_arrow_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("p", DataType::Float32, false),
+    ]))
+}
+
+async fn seed_float_p_file(
+    fixture: &Fixture,
+    name: &str,
+    ids: &[i64],
+    parts: &[f32],
+    partition: f32,
+) -> Result<()> {
+    let table = fixture.catalog.load_table(&fixture.ident).await?;
+    let schema = table.metadata().current_schema().clone();
+    let batch = RecordBatch::try_new(Arc::new(schema_to_arrow_schema(&schema)?), vec![
+        Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+        Arc::new(Float32Array::from(parts.to_vec())) as ArrayRef,
+    ])?;
+    let file_path = format!("{}/data/{name}.parquet", table.metadata().location());
+    let output = table.file_io().new_output(file_path)?;
+    let mut writer = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+        .build(output)
+        .await?;
+    writer.write(&batch).await?;
+    let mut file_builder = writer
+        .close()
+        .await?
+        .into_iter()
+        .next()
+        .expect("one written file");
+    file_builder
+        .content(DataContentType::Data)
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .partition(Struct::from_iter([Some(Literal::float(partition))]));
+    let file = file_builder.build()?;
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(vec![file])
+        .apply(tx)?
+        .commit(fixture.catalog.as_ref())
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn float_partition_signed_zero_stays_sorted_by_id() -> Result<()> {
+    let schema = float_p_schema();
+    let order = SortOrder::builder()
+        .with_sort_field(sort_field(
+            1,
+            Transform::Identity,
+            SortDirection::Ascending,
+            NullOrder::First,
+        ))
+        .build(&schema)?;
+    let insert_fixture = fixture(
+        "insert_signed_zero",
+        "t",
+        schema.clone(),
+        partitioned_p_spec(),
+        Some(order.clone()),
+        1,
+    )
+    .await?;
+    let batch = RecordBatch::try_new(float_p_arrow_schema(), vec![
+        Arc::new(Int64Array::from(vec![2, 1, 3])) as ArrayRef,
+        Arc::new(Float32Array::from(vec![-0.0, 0.0, 0.0])) as ArrayRef,
+    ])?;
+    let source = MemTable::try_new(float_p_arrow_schema(), vec![vec![batch]])?;
+    run_insert(&insert_fixture, source, "SELECT id, p FROM source").await?;
+
+    let cow_fixture = fixture(
+        "cow_update_signed_zero",
+        "t",
+        schema,
+        partitioned_p_spec(),
+        Some(order),
+        1,
+    )
+    .await?;
+    seed_float_p_file(&cow_fixture, "neg", &[2], &[-0.0], -0.0).await?;
+    seed_float_p_file(&cow_fixture, "pos", &[1, 3], &[0.0, 0.0], 0.0).await?;
+    run_sql(&cow_fixture, "UPDATE catalog.cow_update_signed_zero.t SET id = id").await?;
+
+    for (label, fixture) in [("COW UPDATE", &cow_fixture), ("INSERT", &insert_fixture)] {
+        let files = live_files(fixture).await?;
+        assert_eq!(files.len(), 1, "{label}: one file in the merged partition");
+        let rows = read_long_column(&files[0].0, 0);
+        assert_eq!(
+            rows,
+            vec![1, 2, 3],
+            "{label}: signed-zero partition values are one partition, so id order decides"
+        );
+        assert_eq!(
+            files[0].1,
+            Some(default_order_id(fixture).await?),
+            "{label}: file stamps the default sort order id"
+        );
+    }
+    Ok(())
+}
