@@ -26,9 +26,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field as ArrowField, SchemaRef as ArrowSchemaRef};
-use datafusion::common::Column;
 use datafusion::common::stats::{Precision, Statistics};
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -44,7 +42,7 @@ use iceberg::table::Table;
 use iceberg::{Error, ErrorKind};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use super::expr_to_predicate::convert_filters_to_predicate;
+use super::expr_to_predicate::scan_predicates;
 pub use super::scan_knobs::{IcebergScanOptions, ensure_iceberg_scan_options};
 pub(crate) use super::scan_knobs::{ScanKnobs, clamp_scan_knob, scan_knobs_from_context};
 use crate::to_datafusion_error;
@@ -114,15 +112,7 @@ impl IcebergTableScan {
         };
         let (scan_columns, sources) = project_bindings(&output_schema, &bindings)?;
         let plan_properties = Self::compute_properties(output_schema, 1);
-        let predicate_schema = match snapshot_id.and_then(|id| table.metadata().snapshot_by_id(id))
-        {
-            Some(snapshot) => snapshot
-                .schema(table.metadata())
-                .map_err(to_datafusion_error)?,
-            None => table.metadata().current_schema().clone(),
-        };
-        let predicates =
-            convert_filters_to_predicate(&rebind_filters(filters, &bindings), &predicate_schema);
+        let predicates = scan_predicates(&table, snapshot_id, filters, &bindings)?;
 
         let resolved_snapshot_id = match snapshot_id {
             Some(id) => id,
@@ -566,43 +556,6 @@ fn project_bindings(
         }
     }
     Ok((scan_columns, sources))
-}
-
-/// Rewrites pushed-down filters onto the scanned snapshot's names, dropping the rest.
-///
-/// A pushed filter runs against the DATA. After a rename the advertised name fails to bind, or
-/// binds to a DIFFERENT column that now carries it, which prunes rows DataFusion cannot get back.
-/// A filter over a column the snapshot lacks is not pushed at all, because that column reads NULL.
-fn rebind_filters(filters: &[Expr], bindings: &HashMap<String, Option<String>>) -> Vec<Expr> {
-    filters
-        .iter()
-        .filter_map(|filter| rebind_filter(filter, bindings))
-        .collect()
-}
-
-/// One filter rewritten onto the scanned snapshot's names, or `None` if a column cannot bind.
-fn rebind_filter(filter: &Expr, bindings: &HashMap<String, Option<String>>) -> Option<Expr> {
-    let mut unbound = false;
-    let rewritten = filter
-        .clone()
-        .transform(|node| {
-            if let Expr::Column(column) = &node {
-                match bindings.get(&column.name) {
-                    Some(Some(scanned_name)) if scanned_name != &column.name => {
-                        return Ok(Transformed::yes(Expr::Column(Column::new(
-                            column.relation.clone(),
-                            scanned_name,
-                        ))));
-                    }
-                    Some(Some(_)) => {}
-                    // The scanned snapshot has no such column, so refuse to push rather than guess.
-                    Some(None) | None => unbound = true,
-                }
-            }
-            Ok(Transformed::no(node))
-        })
-        .ok()?;
-    (!unbound).then_some(rewritten.data)
 }
 
 /// The Iceberg field id an advertised Arrow field carries, or a loud error.
