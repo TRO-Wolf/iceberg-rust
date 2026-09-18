@@ -139,10 +139,7 @@ pub(crate) enum ColumnSource {
         source_index: usize,
     },
 
-    NestedProject {
-        plan: NestedProjectionPlan,
-        source_index: usize,
-    },
+    NestedProject { plan: NestedProjectionPlan, source_index: usize },
 
     /// Insert a new constant column that the file does not carry.
     Add {
@@ -694,7 +691,9 @@ impl RecordBatchTransformer {
                     .get(field_id)
                     .map(|(source_field, source_index)| {
                         let source_type = source_field.data_type();
-                        if nested_projection_applies(source_type, target_type) {
+                        if source_type == target_type {
+                            Ok(ColumnSource::PassThrough { source_index: *source_index })
+                        } else if nested_projection_applies(source_type, target_type) {
                             NestedProjectionPlan::build(source_type, target_type, snapshot_schema)
                                 .map(|plan| ColumnSource::NestedProject {
                                     plan,
