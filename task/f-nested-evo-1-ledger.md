@@ -148,18 +148,19 @@ new tests in `nested_projection_evo_tests.rs` → 8 passed, 10 failed:
   `DataInvalid` "Missing required field" error for a required field without one — the same
   priority the Avro reader's `missing_column_source` applies, minus the identity-partition
   constant step (partition values only exist at the top level).
-- **D-7 (L-002, amended by D-24)** — an id-less source child in a partially id-carrying struct
-  matches its target child by NAME. Java's fallback-id path (`ApplyNameMapping` /
-  `addFallbackFieldIds`, already ported in this crate's reader for the top level) assigns
-  synthetic ids so that name-identical children line up; matching the id-less child by name
-  reproduces that observable behavior without inventing ids. The name fallback cannot leak a
-  dropped-then-readded name: `source_by_name` holds only id-less source children, the fallback
-  runs only when the target child's id lookup misses, and — added in round 3 — the target
-  child's id must not exceed the largest stamped sibling id (a field id allocated after every
-  id the file carries could not have existed when the file was written, so the id-less child is
-  a stale same-named field and null-fills; see D-24). The vacuous-`all()` hole is closed by an
-  explicit `!source_fields.is_empty()` guard: a zero-child file struct fills every target child
-  instead of taking the legacy cast path.
+- **D-7 (L-002, amended by D-24, superseded by D-27)** — an id-less source child in a partially
+  id-carrying struct matches its target child by NAME. Java's fallback-id path
+  (`ApplyNameMapping` / `addFallbackFieldIds`, already ported in this crate's reader for the
+  top level) assigns synthetic ids so that name-identical children line up; matching the
+  id-less child by name reproduces that observable behavior without inventing ids. Round 3
+  bounded the fallback by write-time id space (D-24); the second verification critic proved no
+  struct-local bound can separate "the id-less child IS the live field" from "the id-less
+  child is a dropped same-named field" (W-01), so the orchestrator ruled (Q-21a-4) that the
+  ambiguous bind fails loud instead (D-27): a mixed stamped/unstamped struct that could only
+  resolve a target child by name now returns `DataInvalid` pointing at
+  `schema.name-mapping.default`. The vacuous-`all()` hole stays closed by the explicit
+  `!source_fields.is_empty()` guard: a zero-child file struct fills every target child instead
+  of taking the legacy cast path.
 - **D-8 (L-003)** — map keys project through the same `PlanNode` machinery as map values. The
   `DataType::Map` plan arm builds independent key and value plans, so an added key-struct child
   null-fills and a key-struct child rename resolves by field id.
@@ -270,7 +271,7 @@ per-finding decisions (continuing the D-n numbering), and gate output.
   was verified to turn the pin red. `RecordBatchTransformer::generate_batch_transform`
   and `BatchTransform` are `pub(crate)` so the test observes the source choice
   directly rather than inferring it from timing.
-- **D-24 (V-01)** — the id-less name fallback is bounded by write-time id space.
+- **D-24 (V-01, superseded by D-27)** — the id-less name fallback is bounded by write-time id space.
   `build_struct` tracks `max_source_id`, the largest stamped field id among the
   source struct's children; an id-less source child may bind by name only to a
   target child whose id does not exceed it. A target id newer than every id the
@@ -317,3 +318,78 @@ per-finding decisions (continuing the D-n numbering), and gate output.
 L-011 (D-16) — unchanged, still deferred: duplicate/unparseable nested field-id
 hardening. Everything the verification critic left open (R-01 pin, V-01..V-03)
 is closed on the final tree.
+
+## Round 4 — W-01 remediation, orchestrator ruling Q-21a-4 (devin-worker / SWE-2)
+
+The second verification critic
+(`/tmp/oc-worker/ka-rv/reviews/nest-verify2-report.md`) confirmed R-01, V-02 and
+V-03 closed with mutation-proof pins and returned one finding: **W-01 (P2)** —
+the round-3 `target_id <= max_source_id` bound (D-24) null-fills a legitimate
+id-less child whose true id sits above the largest stamped sibling at that
+struct level. The original L-002 fixture (`s{a:3, b id-less}` vs table
+`s{a:3, b:4}`) reads NULL under the bound, and round 3 kept its pin green only
+by stamping an extra sibling `c` id 5 into the fixture — a fixture dodge, since
+no struct-local information can separate "the id-less child IS the live field"
+from "the id-less child is a dropped field with the same name".
+
+### Mutation evidence (round 4)
+
+Reverting the new check (`None` arm binds by name again instead of erroring)
+turns all three loud-error pins red — `unwrap_err` panics on the `Ok` the
+unbounded fallback produces:
+
+| Test | After revert |
+|---|---|
+| `mixed_field_id_struct_with_unstamped_same_named_child_errors_loud` | RED — read returned `Ok`, `b` bound by name |
+| `idless_source_child_named_like_a_readded_field_errors_loud` | RED — read returned `Ok`, `b` bound by name |
+| `idless_child_when_sibling_struct_consumed_higher_ids_errors_loud` | RED — read returned `Ok`, `b` bound by name |
+| `idless_source_child_matching_no_target_child_is_ignored` | stayed green — unchanged behavior, pin for the "ignored" branch |
+
+### Decisions (round 4)
+
+- **D-27 (W-01, ruling Q-21a-4)** — no guess in either direction. In a struct
+  that carries field ids on some children and not others, when a target child
+  has no id match in the file and an id-less source child has the same name,
+  plan build returns `ErrorKind::DataInvalid` naming the struct path and the
+  child name, stating the file mixes stamped and unstamped nested field ids and
+  pointing at a name mapping (`schema.name-mapping.default`) as the remedy.
+  `NestedProjectionPlan::build` and `PlanNode::build` carry a dotted `path`
+  (rooted at the target column's name, extended with element/key/value names)
+  so the message can locate the struct. Every other case is unchanged: a fully
+  id-less source struct keeps the legacy `equals_datatype`/cast path (D-7's
+  early return), a fully stamped struct binds by id only, an id-less source
+  child whose name matches no missing target child is ignored
+  (`idless_source_child_matching_no_target_child_is_ignored`), and a missing
+  target child with no same-named id-less source still takes the
+  default/null/required fill. The former `mixed_field_id_struct_...` test is
+  restored to its round-2 fixture (no stamped `c` sibling) and repurposed as a
+  loud-error pin; `idless_source_child_named_like_a_readded_field_...` keeps
+  its fixture and now asserts the same error; the critic's second probe
+  (sibling struct holding ids 3–5, `s.a` id 7 stamped, `s.b` id-less, table
+  `s.b` id 8) is pinned as
+  `idless_child_when_sibling_struct_consumed_higher_ids_errors_loud`.
+  Production Spark/Iceberg writers stamp `PARQUET:field_id` on every nested
+  child, so mixed nested ids only arrive via incomplete metadata — exactly the
+  case a name mapping exists to repair. D-7's wording is amended; D-24 is
+  superseded.
+- **Residue `F-NESTED-MIXED-ID-1`** — Java's exact behavior on a hand-built
+  mixed-stamped/unstamped nested file is unmeasured (no JVM in this lane).
+  Follow-up: measure Java's reader on such a file and adopt its answer if it
+  differs from the loud-error ruling.
+
+### Gates (final tree, round 4)
+
+| Command | Exit |
+|---|---|
+| `cargo test -p iceberg --lib` | 0 — 3771 passed, 0 failed, 8 ignored |
+| `cargo test -p iceberg --lib nested_projection` | 0 — 34 passed, 0 failed |
+| `cargo fmt --all -- --check` | 0 |
+| `make check` | 0 — fmt, workspace clippy `-D warnings`, taplo, cargo-machete, agent-artifacts, matrix-anchors, comment-blocks all OK; `rust-file-size: 499 files clean (97 legacy ceilings)` |
+| `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/ka-fork origin/main HEAD` | 128 hits, all ASF license headers of the eight new files (the allowed exception); comments moved verbatim into extracted test files net out as moves, not additions |
+
+### What is not closed (round 4)
+
+L-011 (D-16) — unchanged, still deferred: duplicate/unparseable nested field-id
+hardening. `F-NESTED-MIXED-ID-1` is recorded residue (Java mixed-id oracle
+unmeasured). Everything else the verification critics raised is closed on the
+final tree.
