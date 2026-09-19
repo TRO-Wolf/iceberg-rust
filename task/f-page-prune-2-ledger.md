@@ -171,9 +171,50 @@ Round-2 mutation evidence:
   stays green because the caller re-derives the byte-range restriction, which is
   itself the contract that pin documents. Restored; both pins green.
 
+## Round 3 — verification remediation
+
+Review report: verification critic NEEDS_REMEDIATION — no wrong-row bug found, two
+stated invariants unpinned in the committed suite.
+
+| Finding | Severity | Remediation | Evidence |
+|---|---|---|---|
+| V-001 — strip-when-deletes unpinned: removing `task.deletes.is_empty()` from `decide_early` left every committed pin green | S2 | `all_keep_predicate_with_position_deletes_keeps_index` in `open_parquet_tests.rs` | pin red under the deletes-guard mutation below |
+| V-002 — all-keep strip must not poison a shared footer-cache entry | S2 | `v_all_keep_strip_leaves_cached_index_for_later_prune` in `footer_cache_v_tests.rs` | pin red under the cache write-back mutation below |
+
+Pin shapes:
+
+- `all_keep_predicate_with_position_deletes_keeps_index`: `id >= 0` (all-keep,
+  prunable) on a file with two position deletes. Asserts `ROWS - 2` rows, one
+  selection applied (the intersected delete selection), zero strips.
+- `v_all_keep_strip_leaves_cached_index_for_later_prune`: through one shared
+  `ParquetFooterCache`, an `id >= 0` scan of file F (takes the strip path,
+  1 strip), then a direct `footer_or_fetch` probe asserting the cached entry
+  still carries column and offset indexes, then an `id = 64` scan of F asserting
+  1 row, rows equal to an uncached scan, and exactly one selection applied.
+
+Round-3 mutation evidence:
+
+- V-001: `task.deletes.is_empty()` dropped from `decide_early` → the pin fails on
+  the strip count (1 vs 0); rows stay `ROWS - 2` because the intersected delete
+  selection is still applied. Restored; pin green.
+- V-002, equivalent mutation: strip via `Arc::make_mut` in place instead of
+  `try_unwrap` + `ParquetMetaData::new` copy → the pin stays green. `make_mut`
+  clones the inner `ParquetMetaData` while the cache holds a ref, so by
+  construction no mutation of the cached Arc can occur; this mutation class
+  cannot be detected by any scan-level pin and is recorded as equivalent.
+- V-002, poisoning mutation: `prune_indexed_metadata_for_scan` made async, given
+  the `TableFooterCache`, and the strip arm writes the stripped
+  `ArrowReaderMetadata` back into the shared entry keeping the entry's index
+  flags → the pin fails on the cached-index assert (the served entry's column
+  index is `None`); a pruning rescan would also see zero selections applied.
+  Restored; pin green.
+
 ## Gates
 
-- `cargo fmt --all` clean
-- filtered suites: `open_parquet` 16, `page_prune` 31+1 ignored, `page_index` 17,
-  `spark_fixture` 9, `arrow::` lib 458+2 ignored — all green
-- `crates/iceberg/src/arrow/reader.rs` 10,156 lines (ceiling 10,157)
+- `cargo fmt --all` clean; `cargo clippy -p iceberg -p iceberg-datafusion
+  --all-targets -- -D warnings` clean
+- filtered suites: `open_parquet` 19, `page_prune` 31+1 ignored,
+  `footer_cache` 24, `spark_fixture` 10, `iceberg-datafusion page_prune` 6 —
+  all green
+- comment-ban gate `hits=0`; `scripts/check_rust_file_size.py` 573 files clean
+- `crates/iceberg/src/arrow/reader.rs` 10,139 lines (ceiling 10,139)
