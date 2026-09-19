@@ -46,6 +46,8 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder};
 use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 
+#[path = "rewrite_position_delete_files_commits_tests.rs"]
+mod commits_tests;
 #[path = "rewrite_position_delete_files_floor_tests.rs"]
 mod floor_tests;
 
@@ -3453,11 +3455,8 @@ fn delete_file_counters(snapshot: &Snapshot) -> (Option<String>, Option<String>)
     )
 }
 
-// C-011 — exactly ONE `RewriteFiles` (one Replace snapshot) per admitted BIN.
-
-/// C-011: `execute` iterates bins, not partitions, and commits one `RewriteFiles` per bin. one partition packed into two.
 #[tokio::test]
-async fn test_one_rewrite_files_commit_per_bin() {
+async fn test_one_replace_commit_for_all_bins() {
     let (catalog, _temp, fixture) = recipe_7_two_bin_fixture().await;
     let config = recipe_7_action(&fixture)
         .resolve_config()
@@ -3487,29 +3486,20 @@ async fn test_one_rewrite_files_commit_per_bin() {
     let new_snapshots = snapshots_after(&reloaded, history_before);
     assert_eq!(
         new_snapshots.len(),
-        2,
-        "TWO admitted bins ⇒ TWO commits, never one batched `RewriteFiles`"
+        1,
+        "TWO admitted bins still make ONE replace commit — Java's non-partial path is a single `RewriteFiles`"
     );
-    for snapshot in &new_snapshots {
-        assert_eq!(
-            snapshot.summary().operation,
-            Operation::Replace,
-            "every bin commit is a Replace snapshot (Java `newRewrite()`)"
-        );
-        assert_eq!(
-            delete_file_counters(snapshot),
-            (Some("1".to_string()), Some("2".to_string())),
-            "each snapshot replaces exactly ITS OWN bin: 2 position-deletes out, 1 in"
-        );
-    }
     assert_eq!(
-        new_snapshots[1].parent_snapshot_id(),
-        Some(new_snapshots[0].snapshot_id()),
-        "the two bin commits CHAIN — the second's parent is the first, so the bins do not FORK \
-         from a common base. This does NOT pin the base-advance optimisation; see the rustdoc."
+        new_snapshots[0].summary().operation,
+        Operation::Replace,
+        "the whole-rewrite commit is a Replace snapshot (Java `newRewrite()`)"
+    );
+    assert_eq!(
+        delete_file_counters(&new_snapshots[0]),
+        (Some("2".to_string()), Some("4".to_string())),
+        "the one snapshot replaces ALL admitted bins: 4 position-deletes out, 2 outputs in"
     );
 
-    // The bins the packer actually formed, MEASURED off the outputs.
     assert_eq!(
         output_blocks(&reloaded).await,
         vec![vec![1, 2], vec![3, 4]],
@@ -3519,11 +3509,26 @@ async fn test_one_rewrite_files_commit_per_bin() {
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
-// C-037 — the abort contract: earlier bins STAND, no partial result reaches the caller.
+fn count_parquet_files(table: &Table) -> usize {
+    fn walk(dir: &std::path::Path, count: &mut usize) {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(&path, count);
+            } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                *count += 1;
+            }
+        }
+    }
+    let location = table.metadata().location().to_string();
+    let location = location.strip_prefix("file://").unwrap_or(&location);
+    let mut count = 0;
+    walk(std::path::Path::new(location), &mut count);
+    count
+}
 
-/// C-037: a bin commit failure aborts `execute`. Earlier bins stay committed. No rollback.
 #[tokio::test]
-async fn test_bin_commit_failure_leaves_earlier_bins_committed() {
+async fn test_bin_failure_aborts_the_whole_rewrite() {
     let (catalog, _temp, fixture) = recipe_7_two_bin_fixture().await;
     let config = recipe_7_action(&fixture)
         .resolve_config()
@@ -3532,6 +3537,11 @@ async fn test_bin_commit_failure_leaves_earlier_bins_committed() {
 
     let before = scan_y_values(&fixture.table).await;
     let history_before = fixture.table.metadata().history().len();
+    let parquet_before = count_parquet_files(&fixture.table);
+    assert_eq!(
+        parquet_before, 5,
+        "fixture: one data file plus the four input deletes on disk"
+    );
 
     let victim = fixture.paths[2]
         .strip_prefix("file://")
@@ -3551,7 +3561,7 @@ async fn test_bin_commit_failure_leaves_earlier_bins_committed() {
     let error = recipe_7_action(&fixture)
         .execute(&catalog)
         .await
-        .expect_err("bin 2 cannot be read, so execute ABORTS");
+        .expect_err("bin 2 cannot be read, so the WHOLE rewrite aborts");
     assert_eq!(
         error.kind(),
         ErrorKind::DataInvalid,
@@ -3559,81 +3569,29 @@ async fn test_bin_commit_failure_leaves_earlier_bins_committed() {
     );
     assert!(
         error.to_string().contains(&victim),
-        "and it names the file the sabotage removed, so the test cannot pass on some unrelated \
-         failure (victim {victim}, error {error})"
+        "and it names the file the sabotage removed (victim {victim}, error {error})"
     );
 
     let reloaded = catalog
         .load_table(fixture.table.identifier())
         .await
         .expect("reload");
-    let new_snapshots = snapshots_after(&reloaded, history_before);
-    assert_eq!(
-        new_snapshots.len(),
-        1,
-        "bin 1 committed and STANDS; bin 2 never did, and NOTHING was rolled back"
-    );
-    assert_eq!(
-        new_snapshots[0].summary().operation,
-        Operation::Replace,
-        "the surviving commit is bin 1's Replace snapshot"
-    );
-    assert_eq!(
-        delete_file_counters(&new_snapshots[0]),
-        (Some("1".to_string()), Some("2".to_string())),
-        "and it replaced exactly BIN 1: A and B out, one compacted output in"
-    );
-
-    let live = live_pos_delete_paths(&reloaded).await;
-    assert_eq!(
-        live.len(),
-        3,
-        "bin 1's output plus bin 2's two untouched inputs (live: {live:?})"
-    );
     assert!(
-        !live.contains(&fixture.paths[0]) && !live.contains(&fixture.paths[1]),
-        "bin 1's rewritten files are GONE — its commit was not undone (live: {live:?})"
-    );
-    assert!(
-        live.contains(&fixture.paths[2]) && live.contains(&fixture.paths[3]),
-        "bin 2's inputs are still live — the failed bin changed nothing (live: {live:?})"
-    );
-    let survivor = live
-        .iter()
-        .find(|path| !fixture.paths.contains(path))
-        .expect("bin 1's new file is live");
-    let survivor_file = live_pos_delete_files(&reloaded)
-        .await
-        .into_iter()
-        .find(|f| f.file_path() == survivor)
-        .expect("the new file resolves");
-    let mut blocks: Vec<i64> = read_pos_delete_pairs(&reloaded, &survivor_file)
-        .await
-        .iter()
-        .map(|(_, pos)| pos / 1_000)
-        .collect();
-    blocks.sort();
-    blocks.dedup();
-    assert_eq!(
-        blocks,
-        vec![1, 2],
-        "the live new file is BIN 1's output — it carries A's and B's blocks and nothing else"
+        snapshots_after(&reloaded, history_before).is_empty(),
+        "Java's non-partial path is atomic: NOTHING commits when a bin fails"
     );
     assert_eq!(
-        read_pos_delete_pairs(&reloaded, &survivor_file).await.len(),
-        3,
-        "and it carries EVERY pair bin 1's two inputs held — A's 1 plus B's 2 — so bin 1's commit \
-         masks exactly what it replaced"
+        live_pos_delete_paths(&reloaded).await,
+        fixture.paths.to_vec(),
+        "all four inputs are still live — the failed run changed nothing"
     );
-
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
     assert_eq!(
-        before,
-        HashSet::from([10, 20, 30, 40, 50]),
-        "fixture: the inputs mask positions no row occupies, so the pre-execute row set is full"
+        count_parquet_files(&reloaded),
+        parquet_before - 1,
+        "bin 1's already-written output is cleaned up, as Java's abort does"
     );
 }
-
-// C-040 — an admitted BIN yielding ZERO pairs is skipped PER BIN.
 
 /// Write a genuinely ZERO-ROW parquet position-delete file into `table`'s data directory, in partition `part_value`, and return the [`DataFile`] describing it.
 async fn write_zero_row_pos_delete(table: &Table, part_value: i64, name: &str) -> DataFile {
@@ -3676,9 +3634,8 @@ async fn write_zero_row_pos_delete(table: &Table, part_value: i64, name: &str) -
     file
 }
 
-/// C-040: an admitted bin with zero pairs is skipped. Later bins still run. zero to all four counts, commits.
 #[tokio::test]
-async fn test_admitted_bin_with_zero_pairs_is_skipped() {
+async fn test_admitted_bin_with_zero_pairs_loses_its_inputs() {
     let (catalog, _temp) = local_fs_catalog().await;
     let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
 
@@ -3687,7 +3644,6 @@ async fn test_admitted_bin_with_zero_pairs_is_skipped() {
     let p1_path = p1.file_path().to_string();
     let table = append_files(&catalog, &table, vec![p0, p1]).await;
 
-    // Partition 0: FIVE zero-row position-deletes and NOTHING else.
     let mut empties = Vec::new();
     for index in 0..5 {
         empties.push(write_zero_row_pos_delete(&table, 0, &format!("empty-{index}.parquet")).await);
@@ -3695,7 +3651,6 @@ async fn test_admitted_bin_with_zero_pairs_is_skipped() {
     let empty_paths: Vec<String> = empties.iter().map(|f| f.file_path().to_string()).collect();
     let empty_sizes: Vec<u64> = empties.iter().map(|f| f.file_size_in_bytes).collect();
 
-    // Partition 1: a normal admissible group of FIVE, masking p1's row at position 1 (y = 40).
     let mut normals = Vec::new();
     for _ in 0..5 {
         normals.push(write_position_delete_file(&table, Some(1), &[(&p1_path, 1)]).await);
@@ -3718,20 +3673,13 @@ async fn test_admitted_bin_with_zero_pairs_is_skipped() {
     }
     assert_eq!(
         config.min_input_files, 5,
-        "fixture: the zero-pairs bin must be admitted at Java's DEFAULT floor of FIVE, not a \
-         lowered one — the literal, so a moved constant reds here rather than silently re-shaping \
-         the fixture"
+        "fixture: the zero-pairs partition must clear `enough_input_files` at Java's DEFAULT floor \
+         of FIVE, not a lowered one — the literal, so a moved constant reds here rather than \
+         silently re-shaping the fixture"
     );
     assert!(
-        empty_paths.len() >= config.min_input_files,
-        "fixture: the zero-pairs partition must clear `enough_input_files` on its own \
-         ({} files, floor {})",
-        empty_paths.len(),
-        config.min_input_files
-    );
-    assert!(
-        normal_paths.len() >= config.min_input_files,
-        "fixture: the second partition must be admissible too"
+        empty_paths.len() >= config.min_input_files && normal_paths.len() >= config.min_input_files,
+        "fixture: both partitions must be admissible"
     );
 
     let before = scan_y_values(&table).await;
@@ -3746,18 +3694,21 @@ async fn test_admitted_bin_with_zero_pairs_is_skipped() {
     let result = action()
         .execute(&catalog)
         .await
-        .expect("the zero-pairs bin is SKIPPED, not an error — and the other bin still commits");
+        .expect("both bins are admitted; the zero-pairs bin simply writes no output");
 
-    // All four counts reflect ONLY the second partition.
     assert_eq!(
-        result.rewritten_delete_files_count, 5,
-        "only the SECOND partition's five files are rewritten"
+        result.rewritten_delete_files_count, 10,
+        "BOTH partitions' inputs are rewritten away — Java removes an empty-output group's input \
+         files in the commit"
     );
-    assert_eq!(result.added_delete_files_count, 1, "one compacted output");
+    assert_eq!(
+        result.added_delete_files_count, 1,
+        "the zero-pairs bin writes no output; only partition 1 produces one"
+    );
     assert_eq!(
         result.rewritten_bytes_count,
-        normal_sizes.iter().sum::<u64>(),
-        "the rewritten BYTES are the second partition's alone — the skipped bin adds none"
+        empty_sizes.iter().sum::<u64>() + normal_sizes.iter().sum::<u64>(),
+        "the rewritten BYTES are ALL TEN inputs' — the empty bin's files count as rewritten too"
     );
 
     let reloaded = catalog
@@ -3768,78 +3719,37 @@ async fn test_admitted_bin_with_zero_pairs_is_skipped() {
     assert_eq!(
         new_snapshots.len(),
         1,
-        "exactly ONE commit: the skipped bin commits nothing, and the other bin is unaffected"
+        "exactly ONE commit covers BOTH admitted bins"
     );
     assert_eq!(new_snapshots[0].summary().operation, Operation::Replace);
+    assert_eq!(
+        delete_file_counters(&new_snapshots[0]),
+        (Some("1".to_string()), Some("10".to_string())),
+        "the one snapshot removes all ten inputs and adds the single output"
+    );
 
     let live = live_pos_delete_paths(&reloaded).await;
-    for path in &empty_paths {
-        assert!(
-            live.contains(path),
-            "every zero-row file is STILL LIVE — the skipped bin was left untouched, not dropped"
-        );
-    }
-    for path in &normal_paths {
-        assert!(
-            !live.contains(path),
-            "the second partition's inputs were replaced"
-        );
-    }
     assert_eq!(
         live.len(),
-        empty_paths.len() + 1,
-        "five untouched zero-row files plus the second partition's one output (live: {live:?})"
+        1,
+        "only partition 1's output survives — the five zero-row files are garbage-collected \
+         (live: {live:?})"
     );
-    let added_bytes: u64 = live_pos_delete_files(&reloaded)
-        .await
-        .into_iter()
-        .filter(|f| !empty_paths.contains(&f.file_path().to_string()))
-        .map(|f| f.file_size_in_bytes)
-        .sum();
+    for path in empty_paths.iter().chain(normal_paths.iter()) {
+        assert!(
+            !live.contains(path),
+            "every input is gone: {path}"
+        );
+    }
     assert_eq!(
-        result.added_bytes_count, added_bytes,
-        "the added BYTES are the one real output's, and nothing from the skipped bin"
+        result.added_bytes_count,
+        live_pos_delete_files(&reloaded).await[0].file_size_in_bytes,
+        "the added BYTES are the one real output's"
     );
     assert_eq!(
         scan_y_values(&reloaded).await,
         before,
-        "read identity — and the scan still reads the five untouched zero-row position-deletes"
-    );
-
-    let entries: Vec<LiveDeleteEntry> = live_pos_delete_files(&reloaded)
-        .await
-        .into_iter()
-        .filter(|f| empty_paths.contains(&f.file_path().to_string()))
-        .map(|data_file| LiveDeleteEntry {
-            data_file,
-            sequence_number: 1,
-        })
-        .collect();
-    assert_eq!(
-        entries.len(),
-        5,
-        "the five zero-row entries are still there"
-    );
-    let bin: AdmittedBin = ((0, Struct::from_iter([Some(Literal::long(0))])), entries);
-    let starting = reloaded
-        .metadata()
-        .current_snapshot()
-        .expect("a current snapshot")
-        .snapshot_id();
-    let mut counters = RewritePositionDeleteFilesResult::default();
-    let returned = action()
-        .compact_group(&catalog, &reloaded, &bin, &config, starting, &mut counters)
-        .await
-        .expect("the zero-pairs bin returns Ok so the bin loop CONTINUES");
-    assert_eq!(
-        returned.metadata().current_snapshot_id(),
-        reloaded.metadata().current_snapshot_id(),
-        "the skip returns the table UNCHANGED — nothing was committed for this bin"
-    );
-    assert_eq!(
-        counters,
-        RewritePositionDeleteFilesResult::default(),
-        "and it contributed zero to ALL FOUR counts"
+        "read identity"
     );
 }
 

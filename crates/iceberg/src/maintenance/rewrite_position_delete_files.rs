@@ -45,6 +45,7 @@ use super::rewrite_data_files::{
     MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO, MIN_FILE_SIZE_DEFAULT_RATIO,
     MIN_INPUT_FILES_DEFAULT, pack_bins,
 };
+use super::rewrite_data_files_plan::PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT;
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::delete_file_index::referenced_data_file_location;
 use crate::delete_vector::load_delete_vector;
@@ -214,6 +215,8 @@ pub struct RewritePositionDeleteFiles {
     min_input_files: usize,
     max_file_group_size_bytes: u64,
     rewrite_all: bool,
+    partial_progress: bool,
+    partial_progress_max_commits: usize,
 }
 
 impl RewritePositionDeleteFiles {
@@ -228,6 +231,8 @@ impl RewritePositionDeleteFiles {
             min_input_files: MIN_INPUT_FILES_DEFAULT,
             max_file_group_size_bytes: MAX_FILE_GROUP_SIZE_BYTES_DEFAULT,
             rewrite_all: false,
+            partial_progress: false,
+            partial_progress_max_commits: PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT,
         }
     }
 
@@ -264,6 +269,18 @@ impl RewritePositionDeleteFiles {
     /// Rewrite every group regardless of size (Java `REWRITE_ALL`, default false).
     pub fn rewrite_all(mut self, rewrite_all: bool) -> Self {
         self.rewrite_all = rewrite_all;
+        self
+    }
+
+    /// Commits rewritten bins in batches instead of one atomic commit (Java `PARTIAL_PROGRESS_ENABLED`).
+    pub fn partial_progress(mut self, partial_progress: bool) -> Self {
+        self.partial_progress = partial_progress;
+        self
+    }
+
+    /// Caps the commit count under partial progress; bins per commit round up (Java `PARTIAL_PROGRESS_MAX_COMMITS`).
+    pub fn partial_progress_max_commits(mut self, partial_progress_max_commits: usize) -> Self {
+        self.partial_progress_max_commits = partial_progress_max_commits;
         self
     }
 
@@ -420,6 +437,16 @@ impl RewritePositionDeleteFiles {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 "'max-file-group-size-bytes' is set to 0 but must be > 0",
+            ));
+        }
+        if self.partial_progress && self.partial_progress_max_commits == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot set partial-progress.max-commits to {}, the value must be positive \
+                     when partial-progress.enabled is true",
+                    self.partial_progress_max_commits
+                ),
             ));
         }
 
