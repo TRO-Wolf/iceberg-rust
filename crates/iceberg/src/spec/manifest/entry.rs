@@ -22,7 +22,7 @@ use once_cell::sync::Lazy;
 use typed_builder::TypedBuilder;
 
 use crate::avro::name::strictify_avro_field_names;
-use crate::avro::schema_to_avro_schema;
+use crate::avro::{schema_to_avro_schema, schema_to_avro_schema_for_read};
 use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, FormatVersion, INITIAL_SEQUENCE_NUMBER, ListType, Literal,
@@ -598,11 +598,14 @@ fn data_file_fields_v3(partition_type: &StructType) -> Vec<NestedFieldRef> {
     ]
 }
 
-pub(super) fn data_file_schema_v3(partition_type: &StructType) -> Result<AvroSchema> {
+pub(super) fn data_file_schema_v3(
+    partition_type: &StructType,
+    for_read: bool,
+) -> Result<AvroSchema> {
     let schema = Schema::builder()
         .with_fields(data_file_fields_v3(partition_type))
         .build()?;
-    schema_to_avro_schema("data_file", &schema)
+    avro_data_file_schema(&schema, for_read)
 }
 
 fn data_file_fields_v2(partition_type: &StructType) -> Vec<NestedFieldRef> {
@@ -636,14 +639,20 @@ fn data_file_fields_v2(partition_type: &StructType) -> Vec<NestedFieldRef> {
     ]
 }
 
-pub(super) fn data_file_schema_v2(partition_type: &StructType) -> Result<AvroSchema> {
+pub(super) fn data_file_schema_v2(
+    partition_type: &StructType,
+    for_read: bool,
+) -> Result<AvroSchema> {
     let schema = Schema::builder()
         .with_fields(data_file_fields_v2(partition_type))
         .build()?;
-    schema_to_avro_schema("data_file", &schema)
+    avro_data_file_schema(&schema, for_read)
 }
 
-pub(super) fn manifest_schema_v2(partition_type: &StructType) -> Result<AvroSchema> {
+pub(super) fn manifest_schema_v2(
+    partition_type: &StructType,
+    for_read: bool,
+) -> Result<AvroSchema> {
     let fields = vec![
         STATUS.clone(),
         SNAPSHOT_ID_V2.clone(),
@@ -656,7 +665,7 @@ pub(super) fn manifest_schema_v2(partition_type: &StructType) -> Result<AvroSche
         )),
     ];
     let schema = Schema::builder().with_fields(fields).build()?;
-    schema_to_avro_schema("manifest_entry", &schema)
+    avro_manifest_entry_schema(&schema, for_read)
 }
 
 fn data_file_fields_v1(partition_type: &StructType) -> Vec<NestedFieldRef> {
@@ -683,14 +692,20 @@ fn data_file_fields_v1(partition_type: &StructType) -> Vec<NestedFieldRef> {
     ]
 }
 
-pub(super) fn data_file_schema_v1(partition_type: &StructType) -> Result<AvroSchema> {
+pub(super) fn data_file_schema_v1(
+    partition_type: &StructType,
+    for_read: bool,
+) -> Result<AvroSchema> {
     let schema = Schema::builder()
         .with_fields(data_file_fields_v1(partition_type))
         .build()?;
-    schema_to_avro_schema("data_file", &schema)
+    avro_data_file_schema(&schema, for_read)
 }
 
-pub(super) fn manifest_schema_v1(partition_type: &StructType) -> Result<AvroSchema> {
+pub(super) fn manifest_schema_v1(
+    partition_type: &StructType,
+    for_read: bool,
+) -> Result<AvroSchema> {
     let fields = vec![
         STATUS.clone(),
         SNAPSHOT_ID_V1.clone(),
@@ -701,7 +716,23 @@ pub(super) fn manifest_schema_v1(partition_type: &StructType) -> Result<AvroSche
         )),
     ];
     let schema = Schema::builder().with_fields(fields).build()?;
-    schema_to_avro_schema("manifest_entry", &schema)
+    avro_manifest_entry_schema(&schema, for_read)
+}
+
+fn avro_data_file_schema(schema: &Schema, for_read: bool) -> Result<AvroSchema> {
+    if for_read {
+        schema_to_avro_schema_for_read("data_file", schema)
+    } else {
+        schema_to_avro_schema("data_file", schema)
+    }
+}
+
+fn avro_manifest_entry_schema(schema: &Schema, for_read: bool) -> Result<AvroSchema> {
+    if for_read {
+        schema_to_avro_schema_for_read("manifest_entry", schema)
+    } else {
+        schema_to_avro_schema("manifest_entry", schema)
+    }
 }
 
 pub(crate) fn manifest_entries_from_avro<R: std::io::Read>(
@@ -710,8 +741,8 @@ pub(crate) fn manifest_entries_from_avro<R: std::io::Read>(
 ) -> Result<Vec<ManifestEntry>> {
     let partition_type = metadata.partition_spec.partition_type(&metadata.schema)?;
     let mut avro_schema = match metadata.format_version {
-        FormatVersion::V1 => manifest_schema_v1(&partition_type)?,
-        FormatVersion::V2 | FormatVersion::V3 => manifest_schema_v2(&partition_type)?,
+        FormatVersion::V1 => manifest_schema_v1(&partition_type, true)?,
+        FormatVersion::V2 | FormatVersion::V3 => manifest_schema_v2(&partition_type, true)?,
     };
     strictify_avro_field_names(&mut avro_schema);
     let spec_id = metadata.partition_spec.spec_id();

@@ -24,7 +24,6 @@ pub(crate) mod _serde {
     use serde_bytes::ByteBuf;
     use serde_derive::{Deserialize as DeserializeDerive, Serialize as SerializeDerive};
 
-    use crate::avro::name::strict_avro_name;
     use crate::spec::values::{Literal, Map, PrimitiveLiteral, Struct};
     use crate::spec::{MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, PrimitiveType, Type};
     use crate::{Error, ErrorKind};
@@ -753,13 +752,7 @@ pub(crate) mod _serde {
                             .into_iter()
                             .map(|(field_name, value)| {
                                 let field = struct_ty
-                                    .field_by_name(field_name.as_str())
-                                    .or_else(|| {
-                                        struct_ty.fields().iter().find(|f| {
-                                            strict_avro_name(&f.name).as_ref()
-                                                == field_name.as_str()
-                                        })
-                                    })
+                                    .field_by_avro_name(field_name.as_str())
                                     .ok_or_else(|| {
                                         invalid_err_with_reason(
                                             "record",

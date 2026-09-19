@@ -20,7 +20,7 @@ use std::io::{BufReader, Chain, Cursor, Read};
 
 use serde_json::Value as JsonValue;
 
-use crate::avro::name::{ICEBERG_FIELD_NAME_PROP, repair_target_name};
+use crate::avro::name::{ICEBERG_FIELD_NAME_PROP, repair_target_name, uniquified_avro_names};
 use crate::{Error, ErrorKind, Result};
 
 const OCF_MAGIC: &[u8; 4] = b"Obj\x01";
@@ -361,39 +361,43 @@ fn schema_names_need_repair(schema: &[u8]) -> bool {
     }
 }
 
-fn patch_record_field(field: &mut serde_json::Map<String, JsonValue>) -> bool {
-    let Some(name) = field
-        .get("name")
-        .and_then(JsonValue::as_str)
-        .map(str::to_owned)
-    else {
-        return false;
-    };
-    let original = field
-        .get(ICEBERG_FIELD_NAME_PROP)
-        .and_then(JsonValue::as_str)
-        .unwrap_or(name.as_str())
-        .to_owned();
-    let target = repair_target_name(&original);
-    if name == target.as_ref() {
-        return false;
-    }
-    field.insert("name".to_string(), JsonValue::String(target.into_owned()));
-    field
-        .entry(ICEBERG_FIELD_NAME_PROP.to_string())
-        .or_insert(JsonValue::String(original));
-    true
-}
-
 fn patch_schema_node(node: &mut JsonValue) -> bool {
     match node {
         JsonValue::Object(map) => {
             let mut changed = false;
             if let Some(JsonValue::Array(fields)) = map.get_mut("fields") {
-                for field in fields.iter_mut() {
-                    if let JsonValue::Object(field) = field {
-                        changed |= patch_record_field(field);
+                let entries: Vec<(String, String)> = fields
+                    .iter()
+                    .map(|field| {
+                        let name = field
+                            .get("name")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let original = field
+                            .get(ICEBERG_FIELD_NAME_PROP)
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| name.clone());
+                        (name, original)
+                    })
+                    .collect();
+                for ((field, (_, original)), name) in fields
+                    .iter_mut()
+                    .zip(entries.iter())
+                    .zip(uniquified_avro_names(&entries))
+                {
+                    let JsonValue::Object(field) = field else {
+                        continue;
+                    };
+                    if field.get("name").and_then(JsonValue::as_str) == Some(name.as_str()) {
+                        continue;
                     }
+                    field.insert("name".to_string(), JsonValue::String(name));
+                    field
+                        .entry(ICEBERG_FIELD_NAME_PROP.to_string())
+                        .or_insert_with(|| JsonValue::String(original.clone()));
+                    changed = true;
                 }
             }
             for value in map.values_mut() {

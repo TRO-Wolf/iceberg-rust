@@ -16,7 +16,7 @@
 // under the License.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use apache_avro::Schema as AvroSchema;
@@ -536,6 +536,9 @@ fn sanitize_name(
 }
 
 pub(crate) fn java_avro_name(name: &str) -> Cow<'_, str> {
+    if is_apache_avro_name(name) {
+        return Cow::Borrowed(name);
+    }
     sanitize_name(name, is_java_letter, is_java_letter_or_digit, is_java_digit)
 }
 
@@ -548,7 +551,7 @@ pub(crate) fn strict_avro_name(name: &str) -> Cow<'_, str> {
     )
 }
 
-fn is_apache_avro_name(name: &str) -> bool {
+pub(crate) fn is_apache_avro_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
@@ -583,18 +586,59 @@ fn sanitize_avro_value_names_in_place(value: &mut AvroValue) {
     }
 }
 
+pub(crate) fn uniquified_avro_names(fields: &[(String, String)]) -> Vec<String> {
+    let keeper = |(name, original): &(String, String)| {
+        original == name && repair_target_name(original) == *name
+    };
+    let mut assigned: HashSet<String> = fields
+        .iter()
+        .filter(|field| keeper(field))
+        .map(|(name, _)| name.clone())
+        .collect();
+    fields
+        .iter()
+        .map(|field @ (name, original)| {
+            if keeper(field) {
+                return name.clone();
+            }
+            let target = repair_target_name(original);
+            let mut candidate = target.clone().into_owned();
+            let mut suffix = 1;
+            while assigned.contains(&candidate) {
+                candidate = format!("{target}_{suffix}");
+                suffix += 1;
+            }
+            assigned.insert(candidate.clone());
+            candidate
+        })
+        .collect()
+}
+
 pub(crate) fn strictify_avro_field_names(schema: &mut AvroSchema) {
+    strictify_avro_names(schema);
+}
+
+fn strictify_avro_names(schema: &mut AvroSchema) -> bool {
     match schema {
         AvroSchema::Record(record) => {
-            let mut renamed = false;
-            for field in &mut record.fields {
-                if let Cow::Owned(name) = strict_avro_name(&field.name) {
+            let entries: Vec<(String, String)> = record
+                .fields
+                .iter()
+                .map(|field| (field.name.clone(), iceberg_field_name(field).to_string()))
+                .collect();
+            let mut changed = false;
+            for (field, name) in record
+                .fields
+                .iter_mut()
+                .zip(uniquified_avro_names(&entries))
+            {
+                if field.name != name {
                     field.name = name;
-                    renamed = true;
+                    changed = true;
                 }
-                strictify_avro_field_names(&mut field.schema);
+                changed |= strictify_avro_names(&mut field.schema);
             }
-            if renamed {
+            if changed {
                 record.lookup = record
                     .fields
                     .iter()
@@ -602,19 +646,22 @@ pub(crate) fn strictify_avro_field_names(schema: &mut AvroSchema) {
                     .map(|(i, f)| (f.name.clone(), i))
                     .collect();
             }
+            changed
         }
         AvroSchema::Union(union) => {
             let mut variants = union.variants().to_vec();
+            let mut changed = false;
             for variant in &mut variants {
-                strictify_avro_field_names(variant);
+                changed |= strictify_avro_names(variant);
             }
-            if let Ok(union) = UnionSchema::new(variants) {
+            if changed && let Ok(union) = UnionSchema::new(variants) {
                 *schema = AvroSchema::Union(union);
             }
+            changed
         }
-        AvroSchema::Array(array) => strictify_avro_field_names(&mut array.items),
-        AvroSchema::Map(map) => strictify_avro_field_names(&mut map.types),
-        _ => {}
+        AvroSchema::Array(array) => strictify_avro_names(&mut array.items),
+        AvroSchema::Map(map) => strictify_avro_names(&mut map.types),
+        _ => false,
     }
 }
 

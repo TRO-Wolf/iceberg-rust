@@ -18,6 +18,7 @@
 //! Spec for Iceberg.
 
 mod datatypes;
+mod datatypes_de;
 mod encrypted_key;
 mod manifest;
 mod manifest_list;

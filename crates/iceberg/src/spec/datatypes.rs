@@ -24,9 +24,8 @@ use std::fmt;
 use std::ops::Index;
 use std::sync::{Arc, OnceLock};
 
-use ::serde::de::{MapAccess, Visitor};
 use serde::de::{Error, IntoDeserializer};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
 use super::values::Literal;
@@ -495,61 +494,11 @@ pub struct StructType {
     fields: Vec<NestedFieldRef>,
     /// Lookup for index by field id
     #[serde(skip_serializing)]
-    id_lookup: OnceLock<HashMap<i32, usize>>,
+    id_lookup: OnceLock<Arc<HashMap<i32, usize>>>,
     #[serde(skip_serializing)]
-    name_lookup: OnceLock<HashMap<String, usize>>,
-}
-
-impl<'de> Deserialize<'de> for StructType {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where D: Deserializer<'de> {
-        #[derive(Deserialize)]
-        #[serde(field_identifier, rename_all = "lowercase")]
-        enum Field {
-            Type,
-            Fields,
-        }
-
-        struct StructTypeVisitor;
-
-        impl<'de> Visitor<'de> for StructTypeVisitor {
-            type Value = StructType;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("struct")
-            }
-
-            fn visit_map<V>(self, mut map: V) -> std::result::Result<StructType, V::Error>
-            where V: MapAccess<'de> {
-                let mut fields = None;
-                while let Some(key) = map.next_key()? {
-                    match key {
-                        Field::Type => {
-                            let type_val: String = map.next_value()?;
-                            if type_val != "struct" {
-                                return Err(serde::de::Error::custom(format!(
-                                    "expected type 'struct', got '{type_val}'"
-                                )));
-                            }
-                        }
-                        Field::Fields => {
-                            if fields.is_some() {
-                                return Err(serde::de::Error::duplicate_field("fields"));
-                            }
-                            fields = Some(map.next_value()?);
-                        }
-                    }
-                }
-                let fields: Vec<NestedFieldRef> =
-                    fields.ok_or_else(|| de::Error::missing_field("fields"))?;
-
-                Ok(StructType::new(fields))
-            }
-        }
-
-        const FIELDS: &[&str] = &["type", "fields"];
-        deserializer.deserialize_struct("struct", FIELDS, StructTypeVisitor)
-    }
+    name_lookup: OnceLock<Arc<HashMap<String, usize>>>,
+    #[serde(skip_serializing)]
+    avro_lookup: OnceLock<Arc<HashMap<String, usize>>>,
 }
 
 impl StructType {
@@ -559,6 +508,7 @@ impl StructType {
             fields,
             id_lookup: OnceLock::new(),
             name_lookup: OnceLock::new(),
+            avro_lookup: OnceLock::new(),
         }
     }
 
@@ -570,7 +520,9 @@ impl StructType {
     fn field_id_to_index(&self, field_id: i32) -> Option<usize> {
         self.id_lookup
             .get_or_init(|| {
-                HashMap::from_iter(self.fields.iter().enumerate().map(|(i, x)| (x.id, i)))
+                Arc::new(HashMap::from_iter(
+                    self.fields.iter().enumerate().map(|(i, x)| (x.id, i)),
+                ))
             })
             .get(&field_id)
             .copied()
@@ -584,15 +536,43 @@ impl StructType {
     fn field_name_to_index(&self, name: &str) -> Option<usize> {
         self.name_lookup
             .get_or_init(|| {
-                HashMap::from_iter(
+                Arc::new(HashMap::from_iter(
                     self.fields
                         .iter()
                         .enumerate()
                         .map(|(i, x)| (x.name.clone(), i)),
-                )
+                ))
             })
             .get(name)
             .copied()
+    }
+
+    pub(crate) fn field_by_avro_name(&self, name: &str) -> Option<&NestedFieldRef> {
+        self.avro_lookup
+            .get_or_init(|| {
+                let entries: Vec<(String, String)> = self
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        (
+                            crate::avro::name::java_avro_name(&f.name).into_owned(),
+                            f.name.clone(),
+                        )
+                    })
+                    .collect();
+                let mut lookup: HashMap<String, usize> =
+                    crate::avro::name::uniquified_avro_names(&entries)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, n)| (n, i))
+                        .collect();
+                for (i, f) in self.fields.iter().enumerate() {
+                    lookup.entry(f.name.clone()).or_insert(i);
+                }
+                Arc::new(lookup)
+            })
+            .get(name)
+            .map(|idx| &self.fields[*idx])
     }
 
     /// Get fields.
@@ -1148,6 +1128,7 @@ mod tests {
                 ],
                 id_lookup: OnceLock::default(),
                 name_lookup: OnceLock::default(),
+                avro_lookup: OnceLock::default(),
             }),
         )
     }
@@ -1193,8 +1174,13 @@ mod tests {
                         .into(),
                     NestedField::optional(2, "data", Type::Primitive(PrimitiveType::Int)).into(),
                 ],
-                id_lookup: HashMap::from([(1, 0), (2, 1)]).into(),
-                name_lookup: HashMap::from([("id".to_string(), 0), ("data".to_string(), 1)]).into(),
+                id_lookup: Arc::new(HashMap::from([(1, 0), (2, 1)])).into(),
+                name_lookup: Arc::new(HashMap::from([
+                    ("id".to_string(), 0),
+                    ("data".to_string(), 1),
+                ]))
+                .into(),
+                avro_lookup: OnceLock::default(),
             }),
         )
     }

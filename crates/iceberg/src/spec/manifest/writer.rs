@@ -427,8 +427,8 @@ impl ManifestWriter {
             .partition_type(&self.metadata.schema)?;
         let table_schema = &self.metadata.schema;
         let avro_schema = match self.metadata.format_version {
-            FormatVersion::V1 => manifest_schema_v1(&partition_type)?,
-            FormatVersion::V2 | FormatVersion::V3 => manifest_schema_v2(&partition_type)?,
+            FormatVersion::V1 => manifest_schema_v1(&partition_type, false)?,
+            FormatVersion::V2 | FormatVersion::V3 => manifest_schema_v2(&partition_type, false)?,
         };
         let mut avro_writer = AvroWriter::new(&avro_schema, Vec::new());
         avro_writer.add_user_metadata(

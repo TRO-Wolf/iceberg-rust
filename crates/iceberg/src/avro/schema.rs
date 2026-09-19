@@ -20,13 +20,17 @@ use std::collections::BTreeMap;
 
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::{
-    ArraySchema, DecimalSchema, FixedSchema, MapSchema, Name, RecordField as AvroRecordField,
-    RecordFieldOrder, RecordSchema, UnionSchema,
+    ArraySchema, MapSchema, Name, RecordField as AvroRecordField, RecordFieldOrder, RecordSchema,
+    UnionSchema,
 };
 use itertools::{Either, Itertools};
 use serde_json::{Number, Value};
 
 use crate::avro::name::{avro_field_name, iceberg_field_name, set_record_name};
+use crate::avro::schema_build::{
+    AvroNameCollision, avro_decimal_schema, avro_fixed_schema, avro_optional, avro_record_schema,
+    is_avro_optional,
+};
 use crate::spec::{
     ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, SchemaVisitor,
     StructType, Type, visit_schema,
@@ -49,6 +53,7 @@ const LOGICAL_TYPE: &str = "logicalType";
 
 struct SchemaToAvroSchema {
     schema: String,
+    collision: AvroNameCollision,
 }
 
 type AvroSchemaOrField = Either<AvroSchema, AvroRecordField>;
@@ -121,7 +126,7 @@ impl SchemaVisitor for SchemaToAvroSchema {
         Ok(Either::Left(
             // The name of this record schema should be determined later, by schema name or field
             // name, here we use a temporary placeholder to do it.
-            avro_record_schema("null", avro_fields)?,
+            avro_record_schema("null", avro_fields, self.collision)?,
         ))
     }
 
@@ -221,6 +226,7 @@ impl SchemaVisitor for SchemaToAvroSchema {
             let item_avro_schema = avro_record_schema(
                 format!("k{}_v{}", map.key_field.id, map.value_field.id).as_str(),
                 fields,
+                self.collision,
             )?;
 
             Ok(Either::Left(AvroSchema::Array(ArraySchema {
@@ -267,28 +273,29 @@ impl SchemaVisitor for SchemaToAvroSchema {
 
 /// Converting iceberg schema to avro schema.
 pub(crate) fn schema_to_avro_schema(name: impl ToString, schema: &Schema) -> Result<AvroSchema> {
+    schema_to_avro_schema_with(name, schema, AvroNameCollision::Fail)
+}
+
+/// Converting iceberg schema to a reader-side avro schema; colliding Avro field
+/// names are made unique with `_N` suffixes instead of failing.
+pub(crate) fn schema_to_avro_schema_for_read(
+    name: impl ToString,
+    schema: &Schema,
+) -> Result<AvroSchema> {
+    schema_to_avro_schema_with(name, schema, AvroNameCollision::Uniquify)
+}
+
+fn schema_to_avro_schema_with(
+    name: impl ToString,
+    schema: &Schema,
+    collision: AvroNameCollision,
+) -> Result<AvroSchema> {
     let mut converter = SchemaToAvroSchema {
         schema: name.to_string(),
+        collision,
     };
 
     visit_schema(schema, &mut converter).map(Either::unwrap_left)
-}
-
-fn avro_record_schema(name: &str, fields: Vec<AvroRecordField>) -> Result<AvroSchema> {
-    let lookup = fields
-        .iter()
-        .enumerate()
-        .map(|f| (f.1.name.clone(), f.0))
-        .collect();
-
-    Ok(AvroSchema::Record(RecordSchema {
-        name: Name::new(name)?,
-        aliases: None,
-        doc: None,
-        fields,
-        lookup,
-        attributes: Default::default(),
-    }))
 }
 
 /// Builds the Avro schema Java 1.10.0 emits for an Iceberg `variant` column
@@ -329,8 +336,11 @@ fn avro_variant_schema() -> Result<AvroSchema> {
         custom_attributes: Default::default(),
     };
 
-    let mut avro_schema =
-        avro_record_schema(VARIANT_LOGICAL_TYPE, vec![metadata_field, value_field])?;
+    let mut avro_schema = avro_record_schema(
+        VARIANT_LOGICAL_TYPE,
+        vec![metadata_field, value_field],
+        AvroNameCollision::Fail,
+    )?;
     if let AvroSchema::Record(record) = &mut avro_schema {
         record.attributes.insert(
             LOGICAL_TYPE.to_string(),
@@ -378,52 +388,6 @@ fn is_variant_record_shape(record: &RecordSchema) -> bool {
             .is_some_and(|field| matches!(field.schema, AvroSchema::Bytes))
     };
     field_is_bytes(VARIANT_METADATA_FIELD) && field_is_bytes(VARIANT_VALUE_FIELD)
-}
-
-pub(crate) fn avro_fixed_schema(len: usize) -> Result<AvroSchema> {
-    Ok(AvroSchema::Fixed(FixedSchema {
-        name: Name::new(format!("fixed_{len}").as_str())?,
-        aliases: None,
-        doc: None,
-        size: len,
-        attributes: Default::default(),
-        default: None,
-    }))
-}
-
-pub(crate) fn avro_decimal_schema(precision: usize, scale: usize) -> Result<AvroSchema> {
-    // Avro decimal logical type annotates Avro bytes _or_ fixed types.
-    // https://avro.apache.org/docs/1.11.1/specification/_print/#decimal
-    // Iceberg spec: Stored as _fixed_ using the minimum number of bytes for the given precision.
-    // https://iceberg.apache.org/spec/#avro
-    Ok(AvroSchema::Decimal(DecimalSchema {
-        precision,
-        scale,
-        inner: Box::new(AvroSchema::Fixed(FixedSchema {
-            // Name is not restricted by the spec.
-            // Refer to iceberg-python https://github.com/apache/iceberg-python/blob/d8bc1ca9af7957ce4d4db99a52c701ac75db7688/pyiceberg/utils/schema_conversion.py#L574-L582
-            name: Name::new(&format!("decimal_{precision}_{scale}")).unwrap(),
-            aliases: None,
-            doc: None,
-            size: crate::spec::Type::decimal_required_bytes(precision as u32)? as usize,
-            attributes: Default::default(),
-            default: None,
-        })),
-    }))
-}
-
-fn avro_optional(avro_schema: AvroSchema) -> Result<AvroSchema> {
-    Ok(AvroSchema::Union(UnionSchema::new(vec![
-        AvroSchema::Null,
-        avro_schema,
-    ])?))
-}
-
-fn is_avro_optional(avro_schema: &AvroSchema) -> bool {
-    match avro_schema {
-        AvroSchema::Union(union) => union.is_nullable(),
-        _ => false,
-    }
 }
 
 /// Post order avro schema visitor.
@@ -1317,6 +1281,7 @@ mod tests {
         // The visitor `primitive()` is the unit under test; assert it directly.
         let mut visitor = SchemaToAvroSchema {
             schema: "unknown_schema".to_string(),
+            collision: AvroNameCollision::Fail,
         };
         let avro = visitor
             .primitive(&PrimitiveType::Unknown)

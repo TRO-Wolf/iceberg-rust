@@ -361,9 +361,9 @@ pub fn write_data_files_to_avro<W: Write>(
     version: FormatVersion,
 ) -> Result<usize> {
     let avro_schema = match version {
-        FormatVersion::V1 => data_file_schema_v1(partition_type).unwrap(),
-        FormatVersion::V2 => data_file_schema_v2(partition_type).unwrap(),
-        FormatVersion::V3 => data_file_schema_v3(partition_type).unwrap(),
+        FormatVersion::V1 => data_file_schema_v1(partition_type, false).unwrap(),
+        FormatVersion::V2 => data_file_schema_v2(partition_type, false).unwrap(),
+        FormatVersion::V3 => data_file_schema_v3(partition_type, false).unwrap(),
     };
     let mut writer = AvroWriter::new(&avro_schema, writer);
 
@@ -389,9 +389,9 @@ pub fn read_data_files_from_avro<R: Read>(
     version: FormatVersion,
 ) -> Result<Vec<DataFile>> {
     let mut avro_schema = match version {
-        FormatVersion::V1 => data_file_schema_v1(partition_type).unwrap(),
-        FormatVersion::V2 => data_file_schema_v2(partition_type).unwrap(),
-        FormatVersion::V3 => data_file_schema_v3(partition_type).unwrap(),
+        FormatVersion::V1 => data_file_schema_v1(partition_type, true).unwrap(),
+        FormatVersion::V2 => data_file_schema_v2(partition_type, true).unwrap(),
+        FormatVersion::V3 => data_file_schema_v3(partition_type, true).unwrap(),
     };
     crate::avro::name::strictify_avro_field_names(&mut avro_schema);
 

@@ -610,11 +610,11 @@ fn unfix_schema_name(node: &mut JsonValue, good: &str, broken: &str) {
 fn unfix_schema_names(node: &mut JsonValue, renames: &[(String, String)]) {
     match node {
         JsonValue::Object(map) => {
-            if let Some(name) = map.get("name").and_then(JsonValue::as_str) {
-                if let Some((_, broken)) = renames.iter().find(|(good, _)| good == name) {
-                    map.insert("name".to_string(), JsonValue::String(broken.clone()));
-                    map.remove("iceberg-field-name");
-                }
+            if let Some(name) = map.get("name").and_then(JsonValue::as_str)
+                && let Some((_, broken)) = renames.iter().find(|(good, _)| good == name)
+            {
+                map.insert("name".to_string(), JsonValue::String(broken.clone()));
+                map.remove("iceberg-field-name");
             }
             for value in map.values_mut() {
                 unfix_schema_names(value, renames);
@@ -843,10 +843,10 @@ fn colliding_avro_field_names_fail_at_schema_build() {
 #[test]
 fn repaired_colliding_names_bind_distinctly() {
     for (ice_a, ice_b, avro_a, avro_b) in [
-        ("a b", "a_x20b", "a_x20b", "a_x20b_1"),
-        ("1a", "_1a", "_1a", "_1a_1"),
-        ("é", "_xE9", "_xE9", "_xE9_1"),
-        ("列", "_x5217", "_x5217", "_x5217_1"),
+        ("a b", "a_x20b", "a_x20b_1", "a_x20b"),
+        ("1a", "_1a", "_1a_1", "_1a"),
+        ("é", "_xE9", "_xE9_1", "_xE9"),
+        ("列", "_x5217", "_x5217_1", "_x5217"),
     ] {
         let (broken, read_type) = broken_container(
             &["f1", "f2"],
@@ -868,7 +868,7 @@ fn repaired_colliding_names_bind_distinctly() {
             fields,
             vec![
                 (avro_a.to_string(), Some(ice_a.to_string())),
-                (avro_b.to_string(), Some(ice_b.to_string())),
+                (avro_b.to_string(), None),
             ],
             "repaired names for {ice_a}/{ice_b}"
         );
@@ -893,11 +893,11 @@ fn unique_avro_names_bind_before_literal_names() {
     let ty = Type::Struct(struct_of(&["a b", "a_x20b"]));
     let value = apache_avro::types::Value::Record(vec![
         (
-            "a_x20b".to_string(),
+            "a_x20b_1".to_string(),
             apache_avro::types::Value::String("v_ab".to_string()),
         ),
         (
-            "a_x20b_1".to_string(),
+            "a_x20b".to_string(),
             apache_avro::types::Value::String("v_lit".to_string()),
         ),
     ]);
