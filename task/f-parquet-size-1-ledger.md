@@ -220,3 +220,49 @@ restored; `cargo test -p iceberg --lib writer::` 162/162 green.
 
 **Test-run coverage.** `writer::` 162/162, `arrow:: + scan:: + maintenance:: +
 inspect::` 1 181/1 181, `iceberg-datafusion` write-filtered 15/15.
+
+## Round 2 — R-01 perf + optional delete-type parity
+
+**R-01 (P2).** The per-file lazy init used to re-run `writer_options` — and with it
+`serde_json::to_string(schema)` plus the name/id-map clone inside `Schema`
+serialisation — for every rolled file. `ParquetWriterBuilder` now stores the prepared
+`ArrowWriterOptions` built once in `new_with_match_mode` and clones it into each
+`ParquetWriter`; the lazy init calls `try_new_with_options` with the clone. A rolling
+writer producing N files serialises the schema once, not N times. The builder boundary
+is non-fallible (`new_with_match_mode -> Self`), so the serialisation `Result`
+collapsed to an `expect` inside `writer_options` — `Schema` JSON serialisation is
+infallible in practice and the old site could only have propagated the same failure
+as a writer-build error. `parquet_writer.rs` stayed at its 3 391-line ceiling by
+inlining the one-use `async_writer` local into the call.
+
+Footer bytes are unchanged by construction: the same `WriterProperties` kv list and
+the same `skip_arrow_metadata` flag reach every file. Pinned by the new
+`rolled_files_from_one_builder_have_identical_bytes` cell — two `ParquetWriter`s
+built from one `ParquetWriterBuilder` produce byte-identical files.
+
+**Optional item — delete-type, taken.** Java's `Parquet.DeleteWriteBuilder` stamps
+`delete-type=position|equality` on delete-file footers (observed on the run-23a
+oracle's position deletes: `{delete-type, iceberg.schema}`). Because `writer_options`
+preserves caller key-values ahead of the canonical `iceberg.schema`, the key rides in
+through `WriterProperties` with no plumbing through the writer layers:
+`position_delete_writer_properties[_for]` stamp `delete-type=position`, and new
+public `equality_delete_writer_properties[_for]` helpers (re-exported from
+`file_writer`) stamp `delete-type=equality` — the latter needed because no in-tree
+production path builds equality-delete properties yet, so there was no existing
+function to stamp. Footer key order matches Java: `{delete-type, iceberg.schema}`.
+Cells `position_delete_footer_carries_delete_type` and
+`equality_delete_footer_carries_delete_type` write real delete files through the
+rolling writer and assert the two-key footer.
+
+**Mutation re-run.** Same revert as round 1 — `new_with_match_mode` bypassed to a
+plain `ArrowWriterOptions::new().with_properties(props)`: 5 of 8 footer cells red
+(`footer_key_values_match_java`, `footer_iceberg_schema_round_trips_all_types`,
+`repark_shape_file_size_matches_java_scale`, and now both delete-type cells, since
+each asserts `iceberg.schema` at kv position 1). `rolled_files…identical_bytes` and
+`all_types_values_round_trip` stay green by design — files are identical either way
+and values read back either way. Fix restored; 8/8 green.
+
+**Gates.** `writer::` 165/165, `arrow:: + scan::` 655/655, `iceberg-datafusion`
+write-filtered 15/15, fmt clean, `clippy -p iceberg --all-targets -- -D warnings`
+clean, size checker clean (`parquet_writer.rs` back at the 3 391 ceiling),
+comment-ban `hits=0`.
