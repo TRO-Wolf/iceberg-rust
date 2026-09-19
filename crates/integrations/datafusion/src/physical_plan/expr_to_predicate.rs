@@ -407,8 +407,8 @@ fn cast_strips_lossless(from: &DataType, to: &DataType) -> bool {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
         ) => true,
-        (DataType::Timestamp(from_unit, _), DataType::Timestamp(to_unit, _)) => {
-            time_unit_widens(from_unit, to_unit)
+        (DataType::Timestamp(from_unit, from_tz), DataType::Timestamp(to_unit, to_tz)) => {
+            from_unit == to_unit && from_tz.is_some() == to_tz.is_some()
         }
         (DataType::Time32(from_unit), DataType::Time64(to_unit))
         | (DataType::Time64(from_unit), DataType::Time64(to_unit)) => {
@@ -622,14 +622,29 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::LargeBinary(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),
         ScalarValue::Date64(Some(v)) => date64_millis_to_datum(*v),
-        // Timestamp conversions
-        // Note: TimestampSecond and TimestampMillisecond are not handled here because
-        // DataFusion's type coercion always converts them to match the column type
-        // (either TimestampMicrosecond or TimestampNanosecond) before predicate pushdown.
-        // See unit tests for how those conversions would work if needed.
-        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(Datum::timestamp_micros(*v)),
-        ScalarValue::TimestampNanosecond(Some(v), _) => Some(Datum::timestamp_nanos(*v)),
+        ScalarValue::TimestampSecond(Some(v), timezone) => v
+            .checked_mul(1_000_000)
+            .map(|micros| timestamp_micros_datum(micros, timezone.is_some())),
+        ScalarValue::TimestampMillisecond(Some(v), timezone) => v
+            .checked_mul(1_000)
+            .map(|micros| timestamp_micros_datum(micros, timezone.is_some())),
+        ScalarValue::TimestampMicrosecond(Some(v), timezone) => {
+            Some(timestamp_micros_datum(*v, timezone.is_some()))
+        }
+        ScalarValue::TimestampNanosecond(Some(v), timezone) => Some(if timezone.is_some() {
+            Datum::timestamptz_nanos(*v)
+        } else {
+            Datum::timestamp_nanos(*v)
+        }),
         _ => None,
+    }
+}
+
+fn timestamp_micros_datum(micros: i64, zoned: bool) -> Datum {
+    if zoned {
+        Datum::timestamptz_micros(micros)
+    } else {
+        Datum::timestamp_micros(micros)
     }
 }
 

@@ -288,12 +288,12 @@ fn test_scalar_value_to_datum_timestamp() {
 
     let ts_seconds = 1672876800i64;
     let datum = super::scalar_value_to_datum(&ScalarValue::TimestampSecond(Some(ts_seconds), None));
-    assert_eq!(datum, None);
+    assert_eq!(datum, Some(Datum::timestamp_micros(ts_seconds * 1_000_000)));
 
     let ts_millis = 1672876800000i64;
     let datum =
         super::scalar_value_to_datum(&ScalarValue::TimestampMillisecond(Some(ts_millis), None));
-    assert_eq!(datum, None);
+    assert_eq!(datum, Some(Datum::timestamp_micros(ts_millis * 1_000)));
 }
 
 #[test]

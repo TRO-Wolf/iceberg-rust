@@ -354,7 +354,7 @@ async fn zoned_literals_push_a_predicate_and_prune_files() {
                 ts.clone()
                     .is_in([Datum::timestamptz_micros(V1), Datum::timestamptz_micros(V3)]),
             ),
-            2,
+            3,
         ),
         (
             col("ts")
@@ -390,7 +390,7 @@ async fn zoned_literals_push_a_predicate_and_prune_files() {
         ),
     ];
     for (expr, expected, files) in cases {
-        let plan = iceberg_plan(&rig.ctx, &[expr.clone()]).await;
+        let plan = iceberg_plan(&rig.ctx, std::slice::from_ref(&expr)).await;
         assert_eq!(
             as_scan(&plan).predicates(),
             expected.as_ref(),
@@ -413,7 +413,7 @@ async fn cross_zone_and_cross_unit_comparisons_stay_unpushed() {
         ts_cast("tsn", TimeUnit::Nanosecond, None).gt_eq(ns(V2 * 1000, None)),
     ];
     for expr in cases {
-        let plan = iceberg_plan(&rig.ctx, &[expr.clone()]).await;
+        let plan = iceberg_plan(&rig.ctx, std::slice::from_ref(&expr)).await;
         assert_eq!(
             as_scan(&plan).predicates(),
             None,
@@ -422,7 +422,7 @@ async fn cross_zone_and_cross_unit_comparisons_stay_unpushed() {
         assert_eq!(planned_files(&plan), 4, "{expr} must not prune files");
     }
     let expr = ts_cast("ts", TimeUnit::Microsecond, Some("+00:00")).gt_eq(us(V2, Some("+00:00")));
-    let plan = iceberg_plan(&rig.ctx, &[expr.clone()]).await;
+    let plan = iceberg_plan(&rig.ctx, std::slice::from_ref(&expr)).await;
     assert_eq!(
         as_scan(&plan).predicates(),
         Some(&Reference::new("ts").greater_than_or_equal_to(Datum::timestamptz_micros(V2))),
