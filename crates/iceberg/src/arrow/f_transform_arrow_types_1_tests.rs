@@ -718,3 +718,75 @@ async fn test_not_starts_with_binary_partitioned_write_scan_v2() -> Result<()> {
 async fn test_not_starts_with_binary_partitioned_write_scan_v3() -> Result<()> {
     not_starts_with_longer_than_width_keeps_every_partition(FormatVersion::V3).await
 }
+
+async fn starts_with_empty_prefix_keeps_every_partition(
+    format_version: FormatVersion,
+) -> Result<()> {
+    let (catalog, _tmp) = local_fs_catalog().await;
+    let table = create_table(&catalog, format_version).await;
+
+    let batch = batch_for("b", Arc::new(LargeBinaryArray::from(BINARY_ROWS.to_vec())));
+    let files = write_computed_files(&table, &batch).await;
+    assert_eq!(files.len(), 5);
+    let table = append_files(&catalog, &table, files).await;
+
+    let predicate = Reference::new("b").starts_with(Datum::binary(vec![]));
+    let task_count = table
+        .scan()
+        .with_filter(predicate.clone())
+        .build()
+        .expect("build filtered scan")
+        .plan_files()
+        .await
+        .expect("plan files")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect tasks")
+        .len();
+    assert_eq!(
+        task_count, 4,
+        "STARTS WITH on an empty literal through truncate[1] keeps every non-null partition"
+    );
+
+    let mut filtered_ids: Vec<i32> = Vec::new();
+    for batch in table
+        .scan()
+        .with_filter(predicate)
+        .build()
+        .expect("build filtered scan")
+        .to_arrow()
+        .await
+        .expect("filtered scan to arrow")
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .expect("collect filtered batches")
+    {
+        filtered_ids.extend(
+            batch
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 id")
+                .iter()
+                .map(|v| v.expect("id required")),
+        );
+    }
+    filtered_ids.sort();
+    assert_eq!(
+        filtered_ids,
+        vec![1, 2, 3, 4, 5, 7],
+        "every non-null row starts with the empty prefix; the NULL row drops"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_starts_with_binary_partitioned_write_scan_v2() -> Result<()> {
+    starts_with_empty_prefix_keeps_every_partition(FormatVersion::V2).await
+}
+
+#[tokio::test]
+async fn test_starts_with_binary_partitioned_write_scan_v3() -> Result<()> {
+    starts_with_empty_prefix_keeps_every_partition(FormatVersion::V3).await
+}

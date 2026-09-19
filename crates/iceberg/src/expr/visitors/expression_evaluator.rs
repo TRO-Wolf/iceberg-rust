@@ -281,8 +281,8 @@ mod tests {
     };
     use crate::spec::{
         DataContentType, DataFile, DataFileFormat, Datum, Literal, NestedField, PartitionSpec,
-        PartitionSpecRef, PrimitiveType, Schema, SchemaRef, Struct, Transform, Type,
-        UnboundPartitionField,
+        PartitionSpecRef, PrimitiveLiteral, PrimitiveType, Schema, SchemaRef, Struct, Transform,
+        Type, UnboundPartitionField,
     };
 
     fn create_partition_spec(r#type: PrimitiveType) -> Result<(PartitionSpecRef, SchemaRef)> {
@@ -553,6 +553,36 @@ mod tests {
         let result = expression_evaluator.eval(&data_file)?;
 
         assert!(result);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_expr_starts_with_binary() -> Result<()> {
+        let case_sensitive = true;
+        let (partition_spec, schema) = create_partition_spec(PrimitiveType::Binary)?;
+
+        let predicate = Predicate::Binary(BinaryExpression::new(
+            PredicateOperator::StartsWith,
+            Reference::new("a"),
+            Datum::binary(vec![0x01]),
+        ))
+        .bind(schema.clone(), case_sensitive)?;
+
+        let expression_evaluator =
+            create_expression_evaluator(partition_spec, &schema, &predicate, case_sensitive)?;
+
+        let mut matching = create_data_file_string();
+        matching.partition = Struct::from_iter([Some(Literal::Primitive(
+            PrimitiveLiteral::Binary(vec![0x01, 0x02]),
+        ))]);
+        assert!(expression_evaluator.eval(&matching)?);
+
+        let mut non_matching = create_data_file_string();
+        non_matching.partition = Struct::from_iter([Some(Literal::Primitive(
+            PrimitiveLiteral::Binary(vec![0x02]),
+        ))]);
+        assert!(!expression_evaluator.eval(&non_matching)?);
 
         Ok(())
     }
