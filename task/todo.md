@@ -25,6 +25,46 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-19): F-DANGLING-DV-COMMIT-1 — every merging commit drops the DVs of the data files it removes
+
+Ledger: [`f-dangling-dv-commit-1-ledger.md`](f-dangling-dv-commit-1-ledger.md). Branch
+`fix/f-dangling-dv-commit-1` off fork `main` (`587d3592`). Consumer: the #301
+verification-critic gap — Java 1.11.0 `MergingSnapshotProducer.apply` L994-5 calls
+`deleteFilterManager.removeDanglingDeletesFor(filesToBeDeleted)` so a data-file-removing
+commit drops its DVs; the fork only dropped them inside `RewriteDataFiles`.
+
+- [x] RED: `maintenance/dangling_dv_commit_tests.rs` — 5 drop cells (delete_files /
+      overwrite_files / replace_partitions / row_delta / rewrite_files) + 5 controls
+      (no-DV removal, fast append, merge append, row-delta adds-only, parquet position
+      delete; the sibling-blob control is structural — the surviving entry must be the
+      sibling blob) + `physical_plan/dangling_dv_delete_tests.rs` e2e v3 COW DELETE cell.
+      5 red / 5 green iceberg, 1 red datafusion. `2c8bb888`
+- [x] FIX: `manifest_filter.rs::is_dangling_dv` inside `process_deletes` — a Puffin DV
+      whose `referenced_data_file` names a removed data file is `hits.expire`d per entry;
+      op set is `drops_old_delete_files` (FastAppend + RewriteManifests excluded); the
+      `test_..._rewritten_away` pin flipped to assert the drop. `9bcf2375`
+- [x] MUTATION: full fix-file revert → 6 red (5 cells + e2e), all controls green;
+      restore → green; revert uncommitted
+- [x] Ledger + this entry + map.md updates (transaction / maintenance / physical_plan)
+- [x] Gates: fmt, clippy `-D warnings`, size checker, comment-ban `hits=0`
+- [x] Round 2 perf (`4f2902d0`): R-01 borrowed `&str` path match (bounds helper only when
+      `referenced_data_file` is None), R-03 `RemovalTargets::data_paths` reused (no second
+      owned set), R-04 three entry scans folded to one pass, R-02 delete-manifest load+scan
+      on `buffer_unordered(8)` with indexed reassembly — rewrites stay sequential for
+      `manifest_counter`; round-1 mutation rerun → 6 red / controls green, identical
+      signatures
+- [x] Round 3 (V-01 order pin): `test_dangling_dv_delete_manifest_order_survives_concurrent_loads`
+      — 3 delete manifests (128-blob first, 2 single) all rewritten; committed order pinned
+      to sequential. Mutation: completion-order push unobservable on local fs (in-issue-order
+      arrival); `reverse()` arm red, restore green
+- [x] Round 4 (fork CI red): `build_snapshot_delete_indexes` in `scan/incremental.rs` — a
+      `Deleted` delete-manifest entry attributed to the snapshot being planned routes to
+      `existing` (Java `DeletedDataFileScanTask.existingDeletes` = deletes live when the file
+      was removed = parent delete set); earlier tombstones still skipped. Pin unchanged —
+      it was already Java's answer. `8d1a5299`. Mutation rerun → 7 red / 12 (5 drop cells +
+      order pin + e2e), controls green; `scan::incremental` 32, `scan::` 250, `inspect::` 135,
+      datafusion `metadata` 6 all green
+
 ## ACTIVE (2026-09-19): F-RPD-COMMITS-1 — `rewrite_position_delete_files` commits once and keeps file scope, as Java does
 
 Ledger: [`f-rpd-commits-1-ledger.md`](f-rpd-commits-1-ledger.md). Branch `fix/f-rpd-commits-1`
@@ -143,8 +183,9 @@ min-seq rule.
       `RewriteManifests` opt out). Red `c7c45299` (`delete_file_seq_gc_tests.rs`, 6 red /
       5 green), fix `b273d097` (3 pins re-examined: 1 re-pinned to Java, 2 fixtures kept
       their assertions), R-02/R-04/nits `47d767d8`, mutation ×3 in the ledger
-- [ ] Next unit: `removeDanglingDeletesFor` on every merging commit (DV drop outside
-      `RewriteDataFiles`); R-03 (RPD packing dead file-scoped deletes)
+- [x] `removeDanglingDeletesFor` on every merging commit shipped as
+      F-DANGLING-DV-COMMIT-1 (see its ledger); R-03 (RPD packing dead file-scoped
+      deletes) remains open
 
 ## ACTIVE (2026-09-18): F-ROWID-ORDER-1 — INSERT commits data files in ascending partition order
 
