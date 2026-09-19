@@ -16,7 +16,6 @@
 // under the License.
 
 //! Compacts live PARQUET position-delete files of the current snapshot.
-//! Java `RewritePositionDeleteFiles`. One `Replace` snapshot per admitted bin.
 //!
 //! Each added file carries that bin's max rewritten data sequence number.
 //! An over-high stamp deletes rows the bin never masked. An under-low stamp
@@ -40,17 +39,20 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use futures::StreamExt;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::file::properties::WriterProperties;
 
 use super::rewrite_data_files::{
     MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO, MIN_FILE_SIZE_DEFAULT_RATIO,
     MIN_INPUT_FILES_DEFAULT, pack_bins,
 };
+use super::rewrite_data_files_plan::{PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT, plan_commit_batches};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::delete_file_index::referenced_data_file_location;
 use crate::delete_vector::load_delete_vector;
 use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
 use crate::expr::visitors::inclusive_projection::InclusiveProjection;
 use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::io::FileIO;
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
@@ -73,8 +75,12 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Catalog, Error, ErrorKind, Result};
 
+#[path = "rewrite_position_delete_files_commit.rs"]
+mod commit_path;
 #[path = "rewrite_position_delete_files_v3.rs"]
 mod v3;
+
+use commit_path::{RewrittenBin, delete_uncommitted_files};
 
 /// The `(spec_id, partition)` group a position-delete file belongs to (Java's
 /// `BinPackRewritePositionDeletePlanner` groups by partition + spec).
@@ -191,6 +197,28 @@ struct ResolvedConfig {
     write_max_file_size: u64,
     /// Per-chunk measured-byte cap, derived from candidate-filter headroom.
     chunk_budget: u64,
+    delete_granularity: DeleteGranularity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteGranularity {
+    File,
+    Partition,
+}
+
+fn parse_delete_granularity(properties: &HashMap<String, String>) -> Result<DeleteGranularity> {
+    match properties.get(TableProperties::PROPERTY_DELETE_GRANULARITY) {
+        None => Ok(DeleteGranularity::File),
+        Some(value) if value.eq_ignore_ascii_case("file") => Ok(DeleteGranularity::File),
+        Some(value) if value.eq_ignore_ascii_case("partition") => Ok(DeleteGranularity::Partition),
+        Some(value) => Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Invalid value '{value}' for table property '{}'",
+                TableProperties::PROPERTY_DELETE_GRANULARITY
+            ),
+        )),
+    }
 }
 
 /// Compacts live parquet position deletes. Java `RewritePositionDeleteFiles`.
@@ -198,7 +226,6 @@ struct ResolvedConfig {
 /// | Deferred option | Why it is not emulable here |
 /// |---|---|
 /// | `rewrite-job-order` | Bins commit in plan order. |
-/// | `partial-progress.*` / `max-concurrent-file-group-rewrites` | Sequential, one commit per bin. Failure is not atomic. |
 /// | `output-spec-id` | Each bin writes under its group spec. Java never consults this option. |
 /// | Per-group `Result` list | [`RewritePositionDeleteFilesResult`] carries four aggregates only. |
 pub struct RewritePositionDeleteFiles {
@@ -214,6 +241,8 @@ pub struct RewritePositionDeleteFiles {
     min_input_files: usize,
     max_file_group_size_bytes: u64,
     rewrite_all: bool,
+    partial_progress: bool,
+    partial_progress_max_commits: usize,
 }
 
 impl RewritePositionDeleteFiles {
@@ -228,6 +257,8 @@ impl RewritePositionDeleteFiles {
             min_input_files: MIN_INPUT_FILES_DEFAULT,
             max_file_group_size_bytes: MAX_FILE_GROUP_SIZE_BYTES_DEFAULT,
             rewrite_all: false,
+            partial_progress: false,
+            partial_progress_max_commits: PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT,
         }
     }
 
@@ -267,14 +298,25 @@ impl RewritePositionDeleteFiles {
         self
     }
 
+    #[allow(missing_docs)]
+    pub fn partial_progress(mut self, partial_progress: bool) -> Self {
+        self.partial_progress = partial_progress;
+        self
+    }
+
+    #[allow(missing_docs)]
+    pub fn partial_progress_max_commits(mut self, partial_progress_max_commits: usize) -> Self {
+        self.partial_progress_max_commits = partial_progress_max_commits;
+        self
+    }
+
     /// Compact only partitions matching `filter`. Java `RewritePositionDeleteFiles.filter`.
     pub fn filter(mut self, filter: Predicate) -> Self {
         self.filter = filter;
         self
     }
 
-    /// Compact admitted bins, one `Replace` snapshot each. Sequential, so a mid-loop failure
-    /// leaves earlier bins committed. Re-run to continue. Java's non-partial path is one commit.
+    #[allow(missing_docs)]
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RewritePositionDeleteFilesResult> {
         // Validate thresholds before any IO, as Java's `sizeThresholds` does at planner `init`.
         let config = self.resolve_config()?;
@@ -301,27 +343,54 @@ impl RewritePositionDeleteFiles {
                 .await;
         }
 
-        let groups = self
+        let (groups, live_paths) = self
             .collect_position_delete_groups(&snapshot, &mut partition_filter)
             .await?;
 
         let (bins, _) = plan_bins(groups, &config);
+        let per_commit = plan_commit_batches(
+            bins.len(),
+            self.partial_progress,
+            self.partial_progress_max_commits,
+        )
+        .first()
+        .copied()
+        .unwrap_or(usize::MAX);
 
-        // Advance the base after each commit so later bins skip a full stale-base re-apply.
         let mut table = self.table.clone();
         let mut result = RewritePositionDeleteFilesResult::default();
+        let mut pending: Vec<RewrittenBin> = Vec::new();
         for bin in bins {
-            table = self
-                .compact_group(
+            let live = live_paths.get(&bin.0);
+            match self.rewrite_bin(&table, bin, live, &config).await {
+                Ok(rewritten) => pending.push(rewritten),
+                Err(error) => {
+                    if self.partial_progress {
+                        continue;
+                    }
+                    delete_uncommitted_files(&table, &pending).await;
+                    return Err(error);
+                }
+            }
+            if pending.len() >= per_commit {
+                self.commit_bins(
                     catalog,
-                    &table,
-                    &bin,
-                    &config,
+                    &mut table,
+                    &mut pending,
                     starting_snapshot_id,
                     &mut result,
                 )
                 .await?;
+            }
         }
+        self.commit_bins(
+            catalog,
+            &mut table,
+            &mut pending,
+            starting_snapshot_id,
+            &mut result,
+        )
+        .await?;
 
         Ok(result)
     }
@@ -422,6 +491,16 @@ impl RewritePositionDeleteFiles {
                 "'max-file-group-size-bytes' is set to 0 but must be > 0",
             ));
         }
+        if self.partial_progress && self.partial_progress_max_commits == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot set partial-progress.max-commits to {}, the value must be positive \
+                     when partial-progress.enabled is true",
+                    self.partial_progress_max_commits
+                ),
+            ));
+        }
 
         // Derived after every precondition: both need `target < max`. Rolls at writeMax, not target.
         // `RewriteDataFiles` still rolls at its resolved target.
@@ -447,6 +526,7 @@ impl RewritePositionDeleteFiles {
             rewrite_all: self.rewrite_all,
             write_max_file_size,
             chunk_budget,
+            delete_granularity: parse_delete_granularity(self.table.metadata().properties())?,
         })
     }
 
@@ -456,13 +536,17 @@ impl RewritePositionDeleteFiles {
         &self,
         snapshot: &Snapshot,
         partition_filter: &mut PartitionFilter,
-    ) -> Result<HashMap<GroupKey, Vec<LiveDeleteEntry>>> {
+    ) -> Result<(
+        HashMap<GroupKey, Vec<LiveDeleteEntry>>,
+        HashMap<GroupKey, HashSet<Arc<str>>>,
+    )> {
         let metadata = self.table.metadata();
         let manifest_list = snapshot
             .load_manifest_list(self.table.file_io(), metadata)
             .await?;
 
         let mut groups: HashMap<GroupKey, Vec<LiveDeleteEntry>> = HashMap::new();
+        let mut data_paths: Vec<(GroupKey, Arc<str>)> = Vec::new();
         for manifest_file in manifest_list.entries() {
             let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
             for entry in manifest.entries() {
@@ -470,25 +554,39 @@ impl RewritePositionDeleteFiles {
                     continue;
                 }
                 let data_file = entry.data_file();
-                if data_file.content_type() != DataContentType::PositionDeletes {
-                    continue;
+                match data_file.content_type() {
+                    DataContentType::Data => {
+                        data_paths.push((
+                            (data_file.partition_spec_id, data_file.partition().clone()),
+                            Arc::from(data_file.file_path()),
+                        ));
+                    }
+                    DataContentType::PositionDeletes => {
+                        if data_file.file_format() != DataFileFormat::Parquet {
+                            continue;
+                        }
+                        if !partition_filter.matches(metadata, data_file)? {
+                            continue;
+                        }
+                        let key = (data_file.partition_spec_id, data_file.partition().clone());
+                        groups.entry(key).or_default().push(LiveDeleteEntry {
+                            data_file: data_file.clone(),
+                            sequence_number: entry.sequence_number().unwrap_or(0),
+                        });
+                    }
+                    _ => {}
                 }
-                // Fork divergence: skip Puffin DVs and V2 ORC/Avro. Java's planner is format-blind.
-                if data_file.file_format() != DataFileFormat::Parquet {
-                    continue;
-                }
-                if !partition_filter.matches(metadata, data_file)? {
-                    continue;
-                }
-                let key = (data_file.partition_spec_id, data_file.partition().clone());
-                groups.entry(key).or_default().push(LiveDeleteEntry {
-                    data_file: data_file.clone(),
-                    sequence_number: entry.sequence_number().unwrap_or(0),
-                });
             }
         }
 
-        Ok(groups)
+        let mut live_paths: HashMap<GroupKey, HashSet<Arc<str>>> = HashMap::new();
+        for (key, path) in data_paths {
+            if groups.contains_key(&key) {
+                live_paths.entry(key).or_default().insert(path);
+            }
+        }
+
+        Ok((groups, live_paths))
     }
 
     /// Bind [`Self::filter`] once before the walk. `AlwaysTrue` never binds.
@@ -505,86 +603,6 @@ impl RewritePositionDeleteFiles {
             .with_source(e)
         })?;
         Ok(PartitionFilter::bound(bound_row_filter))
-    }
-
-    /// Compact one admitted bin. Stamp every output with THIS bin's max rewritten data-seq.
-    /// Ranging over the partition or reusing another bin's max is a stamping error.
-    async fn compact_group(
-        &self,
-        catalog: &dyn Catalog,
-        table: &Table,
-        bin: &AdmittedBin,
-        config: &ResolvedConfig,
-        starting_snapshot_id: i64,
-        result: &mut RewritePositionDeleteFilesResult,
-    ) -> Result<Table> {
-        let (key, entries) = bin;
-
-        let mut pairs: Vec<(String, i64)> = Vec::new();
-        for entry in entries {
-            self.read_position_pairs(table, &entry.data_file, &mut pairs)
-                .await?;
-        }
-
-        // Per-bin skip. An early return in `execute` would drop every later bin.
-        if pairs.is_empty() {
-            return Ok(table.clone());
-        }
-
-        // Sort once, before any split. Per-chunk sort still writes every pair but breaks range pruning.
-        pairs.sort();
-
-        let new_files = self
-            .write_compacted_file(table, key, &pairs, config)
-            .await?;
-
-        // THIS bin's max. Over-high over-applies; under-low resurrects.
-        let max_seq = entries
-            .iter()
-            .map(|e| e.sequence_number)
-            .max()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "compact_group called with an empty group (no sequence numbers)",
-                )
-            })?;
-
-        let rewritten_bytes: u64 = entries.iter().map(|e| e.data_file.file_size_in_bytes).sum();
-        let rewritten_count = entries.len();
-        let added_count = new_files.len();
-        let mut added_bytes: u64 = 0;
-        for file in &new_files {
-            added_bytes = added_bytes
-                .checked_add(file.file_size_in_bytes)
-                .ok_or_else(|| Error::new(ErrorKind::Unexpected, "added bytes count overflow"))?;
-        }
-        let rewritten_files: Vec<DataFile> = entries.iter().map(|e| e.data_file.clone()).collect();
-
-        // Stamp through the explicit-seq add, not the inherit add.
-        let transaction = Transaction::new(table);
-        let mut action = transaction
-            .rewrite_files(Vec::new(), Vec::new())
-            .delete_delete_files(rewritten_files);
-        for file in new_files {
-            action = action.add_delete_file_with_sequence_number(file, max_seq);
-        }
-        let action = action.validate_from_snapshot(starting_snapshot_id);
-        let transaction = action.apply(transaction)?;
-        let committed = transaction.commit(catalog).await?;
-
-        result.rewritten_delete_files_count += rewritten_count;
-        result.added_delete_files_count += added_count;
-        result.rewritten_bytes_count = result
-            .rewritten_bytes_count
-            .checked_add(rewritten_bytes)
-            .ok_or_else(|| Error::new(ErrorKind::Unexpected, "rewritten bytes count overflow"))?;
-        result.added_bytes_count = result
-            .added_bytes_count
-            .checked_add(added_bytes)
-            .ok_or_else(|| Error::new(ErrorKind::Unexpected, "added bytes count overflow"))?;
-
-        Ok(committed)
     }
 
     /// Read reserved `file_path` and `pos` by field id, so a renamed column still reads.
@@ -619,17 +637,12 @@ impl RewritePositionDeleteFiles {
         Ok(())
     }
 
-    /// Write globally sorted pairs under the group spec. One rolling writer, bounded chunks.
-    /// Do not use `new_with_default_file_size`: that hard-wires the 512 MiB data default.
-    async fn write_compacted_file(
-        &self,
+    fn group_writer_factory(
         table: &Table,
         key: &GroupKey,
-        pairs: &[(String, i64)],
         config: &ResolvedConfig,
-    ) -> Result<Vec<DataFile>> {
+    ) -> Result<GroupWriteFactory> {
         let metadata = table.metadata();
-        let schema = metadata.current_schema().clone();
         let (spec_id, partition) = key;
         let spec = metadata
             .partition_spec_by_id(*spec_id)
@@ -642,40 +655,58 @@ impl RewritePositionDeleteFiles {
             .as_ref()
             .clone();
 
-        let writer_config = PositionDeleteWriterConfig::new()?;
-        let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
-        let file_name_gen = DefaultFileNameGenerator::new(
-            "compacted-pos-del".to_string(),
-            Some(uuid::Uuid::now_v7().to_string()),
-            DataFileFormat::Parquet,
-        );
+        Ok(GroupWriteFactory {
+            partition_key: PartitionKey::new(
+                spec,
+                metadata.current_schema().clone(),
+                partition.clone(),
+            )?,
+            writer_config: PositionDeleteWriterConfig::new()?,
+            parquet_properties: position_delete_writer_properties_for(metadata.properties())?,
+            location_gen: DefaultLocationGenerator::new(metadata.clone())?,
+            file_name_gen: DefaultFileNameGenerator::new(
+                "compacted-pos-del".to_string(),
+                Some(uuid::Uuid::now_v7().to_string()),
+                DataFileFormat::Parquet,
+            ),
+            file_io: table.file_io().clone(),
+            write_max_file_size: config.write_max_file_size,
+            chunk_budget: config.chunk_budget,
+        })
+    }
+
+    async fn write_compacted_file(
+        &self,
+        factory: &GroupWriteFactory,
+        pairs: &[(String, i64)],
+    ) -> Result<Vec<DataFile>> {
         // Keep path bounds full. The default `truncate(16)` would widen the path range.
         let parquet_builder = ParquetWriterBuilder::new(
-            position_delete_writer_properties_for(metadata.properties())?,
-            writer_config.schema().clone(),
+            factory.parquet_properties.clone(),
+            factory.writer_config.schema().clone(),
         )
         .with_metrics_config(MetricsConfig::for_position_delete());
         // writeMax, not the resolved target. On 32-bit a larger bound saturates to "never roll".
         let rolling = RollingFileWriterBuilder::new(
             parquet_builder,
-            usize::try_from(config.write_max_file_size).unwrap_or(usize::MAX),
-            table.file_io().clone(),
-            location_gen,
-            file_name_gen,
+            usize::try_from(factory.write_max_file_size).unwrap_or(usize::MAX),
+            factory.file_io.clone(),
+            factory.location_gen.clone(),
+            factory.file_name_gen.clone(),
         );
 
-        let partition_key = PartitionKey::new(spec, schema.clone(), partition.clone())?;
-        let mut writer = PositionDeleteFileWriterBuilder::new(rolling, writer_config.clone())
-            .build(Some(partition_key))
-            .await?;
+        let mut writer =
+            PositionDeleteFileWriterBuilder::new(rolling, factory.writer_config.clone())
+                .build(Some(factory.partition_key.clone()))
+                .await?;
 
         let mut start = 0usize;
         while start < pairs.len() {
-            let end = chunk_end(pairs, start, config.chunk_budget);
+            let end = chunk_end(pairs, start, factory.chunk_budget);
             let chunk = &pairs[start..end];
             let paths: Vec<&str> = chunk.iter().map(|(path, _)| path.as_str()).collect();
             let positions: Vec<i64> = chunk.iter().map(|(_, pos)| *pos).collect();
-            let batch = RecordBatch::try_new(writer_config.arrow_schema().clone(), vec![
+            let batch = RecordBatch::try_new(factory.writer_config.arrow_schema().clone(), vec![
                 Arc::new(StringArray::from(paths)) as ArrayRef,
                 Arc::new(Int64Array::from(positions)) as ArrayRef,
             ])
@@ -940,6 +971,17 @@ fn locate_reserved_columns<'a>(
 struct LiveDeleteEntry {
     data_file: DataFile,
     sequence_number: i64,
+}
+
+struct GroupWriteFactory {
+    partition_key: PartitionKey,
+    writer_config: PositionDeleteWriterConfig,
+    parquet_properties: WriterProperties,
+    location_gen: DefaultLocationGenerator,
+    file_name_gen: DefaultFileNameGenerator,
+    file_io: FileIO,
+    write_max_file_size: u64,
+    chunk_budget: u64,
 }
 
 #[cfg(test)]

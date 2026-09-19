@@ -223,6 +223,8 @@ impl TableProperties {
     /// `usize` sibling is `usize` only because `RollingFileWriter`'s `target_file_size` field is
     /// `usize`; that is a writer-side accident, not the parity type.
     pub const PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT: u64 = 67108864;
+    #[allow(missing_docs)]
+    pub const PROPERTY_DELETE_GRANULARITY: &str = "write.delete.granularity";
     /// Whether to use `FanoutWriter` for partitioned tables (handles unsorted data).
     /// If false, uses `ClusteredWriter` (requires sorted data, more memory efficient).
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED: &str = "write.datafusion.fanout.enabled";

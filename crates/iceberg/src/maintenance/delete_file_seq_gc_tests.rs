@@ -107,12 +107,12 @@ async fn test_seq_gc_residue_rpd_then_rdf_reaches_zero_delete_files() {
         .await
         .expect("rewrite_position_delete_files must succeed");
     assert_eq!(rpd.rewritten_delete_files_count(), 16);
-    assert_eq!(rpd.added_delete_files_count(), 2);
+    assert_eq!(rpd.added_delete_files_count(), 16);
     let table = catalog
         .load_table(table.identifier())
         .await
         .expect("reload after rpd");
-    assert_eq!(live_delete_file_paths(&table).await.len(), 2);
+    assert_eq!(live_delete_file_paths(&table).await.len(), 16);
     assert_eq!(scan_rows(&table).await, rows_before);
 
     let rdf = RewriteDataFiles::new(table.clone())
@@ -135,11 +135,11 @@ async fn test_seq_gc_residue_rpd_then_rdf_reaches_zero_delete_files() {
     assert_eq!(scan_rows(&table).await, rows_before);
     assert_eq!(
         summary_value(&table, "removed-position-delete-files").as_deref(),
-        Some("2")
+        Some("16")
     );
     assert_eq!(
         summary_value(&table, "removed-delete-files").as_deref(),
-        Some("2")
+        Some("16")
     );
     assert_eq!(
         summary_value(&table, "total-delete-files").as_deref(),
