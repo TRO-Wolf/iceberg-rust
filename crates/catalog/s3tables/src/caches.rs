@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use iceberg::arrow::{ParquetFooterCache, TableFooterCache};
 use iceberg::io::FileIO;
 use iceberg::io::object_cache::ObjectCache;
 use iceberg::spec::TableMetadataRef;
@@ -41,6 +42,11 @@ impl S3TablesCatalogBuilder {
         self.cache_credential_context = Some(context);
         self
     }
+
+    pub fn with_shared_footer_cache(mut self, cache: Arc<ParquetFooterCache>) -> Self {
+        self.shared_footer_cache = Some(cache);
+        self
+    }
 }
 
 impl S3TablesCatalog {
@@ -49,9 +55,11 @@ impl S3TablesCatalog {
         table_metadata_cache: Option<Arc<TableMetadataCache>>,
         shared_object_cache_bytes: Option<u64>,
         cache_credential_context: Option<String>,
+        shared_footer_cache: Option<Arc<ParquetFooterCache>>,
     ) -> Self {
         self.table_metadata_cache = table_metadata_cache;
         self.shared_object_cache = build_object_cache(&self.file_io, shared_object_cache_bytes);
+        self.shared_footer_cache = shared_footer_cache;
         if let Some(context) = cache_credential_context {
             self.cache_scope =
                 CacheScope::new(self.cache_scope.catalog_identity().to_string(), context);
@@ -61,8 +69,15 @@ impl S3TablesCatalog {
 
     pub(crate) fn table_builder(&self) -> TableBuilder {
         let builder = Table::builder().file_io(self.file_io.clone());
-        match self.shared_object_cache.as_ref() {
+        let builder = match self.shared_object_cache.as_ref() {
             Some(cache) => builder.object_cache(cache.clone()),
+            None => builder,
+        };
+        match self.shared_footer_cache.as_ref() {
+            Some(cache) => builder.footer_cache(TableFooterCache::new(
+                cache.clone(),
+                self.cache_scope.clone(),
+            )),
             None => builder,
         }
     }

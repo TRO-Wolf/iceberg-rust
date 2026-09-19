@@ -35,7 +35,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use super::task::FileScanTask;
 use super::task_group::CombinedScanTask;
 use super::{ArrowRecordBatchStream, FileScanTaskStream, TableScan};
-use crate::arrow::ArrowReaderBuilder;
+use crate::arrow::{ArrowReaderBuilder, TableFooterCache};
 use crate::io::FileIO;
 use crate::spec::Struct;
 use crate::{Error, ErrorKind, Result};
@@ -227,6 +227,7 @@ pub fn stream_partition_work(
     batch_size: Option<usize>,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    footer_cache: Option<TableFooterCache>,
 ) -> Result<ArrowRecordBatchStream> {
     let tasks: Vec<FileScanTask> = work.tasks().cloned().collect();
     let task_stream = Box::pin(stream::iter(tasks.into_iter().map(Ok)));
@@ -235,6 +236,9 @@ pub fn stream_partition_work(
         .with_data_file_concurrency_limit(data_file_concurrency.max(1))
         .with_row_group_filtering_enabled(row_group_filtering_enabled)
         .with_row_selection_enabled(row_selection_enabled);
+    if let Some(cache) = footer_cache {
+        builder = builder.with_footer_cache(cache);
+    }
     if let Some(bs) = batch_size {
         builder = builder.with_batch_size(bs.max(1));
     }
@@ -312,6 +316,7 @@ impl TableScan {
             self.batch_size,
             self.row_group_filtering_enabled,
             self.row_selection_enabled,
+            self.footer_cache.clone(),
         )
     }
 
@@ -320,6 +325,9 @@ impl TableScan {
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
             .with_row_selection_enabled(self.row_selection_enabled);
+        if let Some(cache) = self.footer_cache.clone() {
+            configured = configured.with_footer_cache(cache);
+        }
         if let Some(batch_size) = self.batch_size {
             configured = configured.with_batch_size(batch_size);
         }

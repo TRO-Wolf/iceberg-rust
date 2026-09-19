@@ -57,6 +57,7 @@ impl GlueCatalog {
             table_metadata_cache: None,
             cache_scope: CacheScope::isolated("glue:test"),
             shared_object_cache: None,
+            shared_footer_cache: None,
             outcome_harness: Some(harness),
             pointer_source: None,
             drop_source: None,

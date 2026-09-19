@@ -25,6 +25,7 @@ use aws_sdk_s3tables::operation::get_namespace::GetNamespaceOutput;
 use aws_sdk_s3tables::operation::get_table::GetTableOutput;
 use aws_sdk_s3tables::operation::list_tables::ListTablesOutput;
 use aws_sdk_s3tables::types::OpenTableFormat;
+use iceberg::arrow::ParquetFooterCache;
 use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::TableMetadataBuilder;
@@ -45,7 +46,7 @@ use crate::commit_transport::{
     LiveS3TablesCommitTransport, S3TablesCommitSend, S3TablesCommitTransport, S3TablesUpdateCall,
     map_s3tables_commit_send,
 };
-use crate::utils::create_sdk_config;
+use crate::utils::{create_sdk_config, from_aws_sdk_error};
 
 /// S3Tables table bucket ARN property
 pub const S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN: &str = "table_bucket_arn";
@@ -109,6 +110,7 @@ pub struct S3TablesCatalogBuilder {
     pub(crate) table_metadata_cache: Option<Arc<TableMetadataCache>>,
     pub(crate) shared_object_cache_bytes: Option<u64>,
     pub(crate) cache_credential_context: Option<String>,
+    pub(crate) shared_footer_cache: Option<Arc<ParquetFooterCache>>,
 }
 
 /// Default builder for [`S3TablesCatalog`].
@@ -126,6 +128,7 @@ impl Default for S3TablesCatalogBuilder {
             table_metadata_cache: None,
             shared_object_cache_bytes: None,
             cache_credential_context: None,
+            shared_footer_cache: None,
         }
     }
 }
@@ -209,6 +212,7 @@ impl CatalogBuilder for S3TablesCatalogBuilder {
                             self.table_metadata_cache,
                             self.shared_object_cache_bytes,
                             self.cache_credential_context,
+                            self.shared_footer_cache,
                         )
                     })
             }
@@ -225,6 +229,7 @@ pub struct S3TablesCatalog {
     pub(crate) table_metadata_cache: Option<Arc<TableMetadataCache>>,
     pub(crate) cache_scope: CacheScope,
     pub(crate) shared_object_cache: Option<Arc<ObjectCache>>,
+    pub(crate) shared_footer_cache: Option<Arc<ParquetFooterCache>>,
     #[cfg(test)]
     pub(crate) pointer_source: Option<PointerSource>,
     #[cfg(test)]
@@ -273,14 +278,11 @@ impl S3TablesCatalog {
 
         let commit_transport = Arc::new(LiveS3TablesCommitTransport::new(s3tables_client.clone()));
 
+        let identity = format!("s3tables:{}", config.table_bucket_arn);
         let cache_scope = if injected_io {
-            CacheScope::isolated(format!("s3tables:{}", config.table_bucket_arn))
+            CacheScope::isolated(identity)
         } else {
-            CacheScope::for_catalog(
-                format!("s3tables:{}", config.table_bucket_arn),
-                None,
-                &config.props,
-            )
+            CacheScope::for_catalog(identity, None, &config.props)
         };
 
         Ok(Self {
@@ -291,6 +293,7 @@ impl S3TablesCatalog {
             table_metadata_cache: None,
             cache_scope,
             shared_object_cache: None,
+            shared_footer_cache: None,
             #[cfg(test)]
             pointer_source: None,
             #[cfg(test)]
@@ -359,6 +362,7 @@ impl S3TablesCatalog {
             table_metadata_cache: None,
             cache_scope: CacheScope::isolated("s3tables:test"),
             shared_object_cache: None,
+            shared_footer_cache: None,
             pointer_source: None,
             drop_source: None,
             outcome_harness: Some(harness),
@@ -975,15 +979,6 @@ impl S3TablesCatalog {
             harness.publish(table.clone());
         }
     }
-}
-
-/// Format AWS SDK error into iceberg error
-pub(crate) fn from_aws_sdk_error<T>(error: aws_sdk_s3tables::error::SdkError<T>) -> Error
-where T: std::fmt::Debug {
-    Error::new(
-        ErrorKind::Unexpected,
-        format!("Operation failed for hitting aws sdk error: {error:?}"),
-    )
 }
 
 #[cfg(test)]

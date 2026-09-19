@@ -572,3 +572,17 @@ async fn test_invalidate_table_without_cache_is_noop_and_view_is_noop() {
     catalog.invalidate_table(&ident).await.unwrap();
     catalog.invalidate_view(&ident).await.unwrap();
 }
+
+#[tokio::test]
+async fn l001_footer_cache_default_off() {
+    assert!(S3TablesCatalogBuilder::default().shared_footer_cache.is_none());
+    let config = S3TablesCatalogConfig {
+        name: Some("s3t_cat".to_string()),
+        table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string(),
+        endpoint_url: None,
+        client: None,
+        props: HashMap::new(),
+    };
+    let catalog = S3TablesCatalog::new(config, None).await.unwrap();
+    assert!(catalog.shared_footer_cache.is_none());
+}

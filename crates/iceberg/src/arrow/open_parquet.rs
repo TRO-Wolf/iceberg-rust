@@ -22,6 +22,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowS
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 
+use crate::arrow::footer_cache::TableFooterCache;
 use crate::arrow::reader::{
     ArrowFileReader, ArrowReader, CollectFieldIdVisitor, ParquetReadOptions,
 };
@@ -43,6 +44,7 @@ pub(crate) fn page_index_policy(needed: bool) -> PageIndexPolicy {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum OpenParquetError {
     Footer(Error),
     Other(Error),
@@ -64,12 +66,32 @@ impl ArrowReader {
         parquet_read_options: ParquetReadOptions,
         prefetched_metadata: Option<Arc<ParquetMetaData>>,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
+        Self::open_parquet_file_cached(
+            &Arc::from(data_file_path),
+            file_io,
+            file_size_in_bytes,
+            parquet_read_options,
+            prefetched_metadata,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn open_parquet_file_cached(
+        data_file_path: &Arc<str>,
+        file_io: &FileIO,
+        file_size_in_bytes: u64,
+        parquet_read_options: ParquetReadOptions,
+        prefetched_metadata: Option<Arc<ParquetMetaData>>,
+        footer_cache: Option<TableFooterCache>,
+    ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let first_error = match Self::open_parquet_file_sized(
             data_file_path,
             file_io,
             file_size_in_bytes,
             parquet_read_options,
             prefetched_metadata.clone(),
+            footer_cache.as_ref(),
         )
         .await
         {
@@ -94,6 +116,7 @@ impl ArrowReader {
             actual_size,
             parquet_read_options,
             prefetched_metadata,
+            footer_cache.as_ref(),
         )
         .await
         {
@@ -153,11 +176,12 @@ impl ArrowReader {
     }
 
     async fn open_parquet_file_sized(
-        data_file_path: &str,
+        data_file_path: &Arc<str>,
         file_io: &FileIO,
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
         prefetched_metadata: Option<Arc<ParquetMetaData>>,
+        footer_cache: Option<&TableFooterCache>,
     ) -> std::result::Result<(ArrowFileReader, ArrowReaderMetadata), OpenParquetError> {
         let parquet_file = file_io
             .new_input(data_file_path)
@@ -174,58 +198,82 @@ impl ArrowReader {
         )
         .with_parquet_read_options(parquet_read_options);
 
-        let arrow_metadata = match prefetched_metadata {
-            Some(metadata) => {
-                let mut metadata_reader = ParquetMetaDataReader::new_with_metadata(
-                    ParquetMetaData::clone(metadata.as_ref()),
+        let arrow_metadata = if let Some(footer_cache) = footer_cache {
+            if let Some(prefetched) = prefetched_metadata {
+                footer_cache
+                    .seed(data_file_path, file_size_in_bytes, prefetched)
+                    .await;
+            }
+            footer_cache
+                .footer_or_fetch(
+                    data_file_path,
+                    file_size_in_bytes,
+                    parquet_read_options,
+                    &mut reader,
                 )
-                .with_page_index_policy(page_index_policy(
-                    parquet_read_options.preload_page_index(),
-                ))
-                .with_column_index_policy(page_index_policy(
-                    parquet_read_options.preload_column_index(),
-                ))
-                .with_offset_index_policy(page_index_policy(
-                    parquet_read_options.preload_offset_index(),
-                ));
-                metadata_reader
-                    .load_page_index(&mut reader)
-                    .await
-                    .map_err(|e| {
-                        OpenParquetError::Other(
-                            Error::new(ErrorKind::Unexpected, "Failed to load Parquet page index")
-                                .with_source(e),
-                        )
-                    })?;
-                let metadata = metadata_reader.finish().map_err(|e| {
-                    OpenParquetError::Other(
-                        Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
-                            .with_source(e),
+                .await?
+                .as_ref()
+                .clone()
+        } else {
+            match prefetched_metadata {
+                Some(metadata) => {
+                    let mut metadata_reader = ParquetMetaDataReader::new_with_metadata(
+                        ParquetMetaData::clone(metadata.as_ref()),
                     )
-                })?;
-                ArrowReaderMetadata::try_new(Arc::new(metadata), Default::default()).map_err(
-                    |e| {
+                    .with_page_index_policy(page_index_policy(
+                        parquet_read_options.preload_page_index(),
+                    ))
+                    .with_column_index_policy(page_index_policy(
+                        parquet_read_options.preload_column_index(),
+                    ))
+                    .with_offset_index_policy(page_index_policy(
+                        parquet_read_options.preload_offset_index(),
+                    ));
+                    metadata_reader
+                        .load_page_index(&mut reader)
+                        .await
+                        .map_err(|e| {
+                            OpenParquetError::Other(
+                                Error::new(
+                                    ErrorKind::Unexpected,
+                                    "Failed to load Parquet page index",
+                                )
+                                .with_source(e),
+                            )
+                        })?;
+                    let metadata = metadata_reader.finish().map_err(|e| {
                         OpenParquetError::Other(
                             Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
                                 .with_source(e),
                         )
-                    },
-                )?
-            }
-            None => {
-                let options = ArrowReaderOptions::default();
-                let metadata = reader.get_metadata(Some(&options)).await.map_err(|e| {
-                    OpenParquetError::Footer(
-                        Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
-                            .with_source(e),
-                    )
-                })?;
-                ArrowReaderMetadata::try_new(metadata, options).map_err(|e| {
-                    OpenParquetError::Other(
-                        Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
-                            .with_source(e),
-                    )
-                })?
+                    })?;
+                    ArrowReaderMetadata::try_new(Arc::new(metadata), Default::default()).map_err(
+                        |e| {
+                            OpenParquetError::Other(
+                                Error::new(
+                                    ErrorKind::Unexpected,
+                                    "Failed to load Parquet metadata",
+                                )
+                                .with_source(e),
+                            )
+                        },
+                    )?
+                }
+                None => {
+                    let options = ArrowReaderOptions::default();
+                    let metadata = reader.get_metadata(Some(&options)).await.map_err(|e| {
+                        OpenParquetError::Footer(
+                            Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
+                                .with_source(e),
+                        )
+                    })?;
+                    ArrowReaderMetadata::try_new(metadata, options).map_err(|e| {
+                        OpenParquetError::Other(
+                            Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
+                                .with_source(e),
+                        )
+                    })?
+                }
             }
         };
 

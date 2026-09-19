@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::page_prune_fixture::{field_id_map, file_metadata, selected_rows};
+use crate::arrow::footer_cache::{ParquetFooterCache, TableFooterCache};
 use crate::arrow::reader::ArrowReader;
+use crate::catalog::CacheScope;
 use crate::expr::{Bind, Predicate, Reference};
 use crate::io::{
     FileIO, FileIOBuilder, FileInfo, FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorage,
@@ -125,6 +127,14 @@ fn truth() -> Value {
 }
 
 fn load_table(truth: &Value, name: &str) -> Table {
+    load_table_with_cache(truth, name, None)
+}
+
+fn load_table_with_cache(
+    truth: &Value,
+    name: &str,
+    footer_cache: Option<TableFooterCache>,
+) -> Table {
     let location = truth["tables"][name]["metadata_file"]
         .as_str()
         .expect("metadata_file");
@@ -134,13 +144,15 @@ fn load_table(truth: &Value, name: &str) -> Table {
     let json = std::fs::read_to_string(fixture_root().join(rel.trim_start_matches('/')))
         .expect("metadata json");
     let metadata: TableMetadata = serde_json::from_str(&json).expect("parse metadata");
-    Table::builder()
+    let mut builder = Table::builder()
         .metadata(metadata)
         .metadata_location(location.to_string())
         .identifier(TableIdent::from_strs(["ns", name]).expect("ident"))
-        .file_io(fixture_io())
-        .build()
-        .expect("table")
+        .file_io(fixture_io());
+    if let Some(handle) = footer_cache {
+        builder = builder.footer_cache(handle);
+    }
+    builder.build().expect("table")
 }
 
 fn datum_string(s: &str) -> Datum {
@@ -397,6 +409,42 @@ async fn spark_del_v3_queries_match_dvs_and_lineage() {
 async fn spark_evo_v2_queries_match_evolved_schema() {
     let truth = truth();
     assert_table_queries(&truth, "evo_v2", &["id"], evo_queries()).await;
+}
+
+#[tokio::test]
+async fn spark_base_v2_cached_rescan_zero_footer_fetches_matches_truth() {
+    let truth = truth();
+    let cache = Arc::new(ParquetFooterCache::new());
+    let handle = TableFooterCache::new(cache.clone(), CacheScope::isolated("spark-base-v2"));
+    let table = load_table_with_cache(&truth, "base_v2", Some(handle));
+    assert!(table.footer_cache().is_some());
+    let expected = expected_rows(&truth, "base_v2", "_unfiltered");
+    let first = scan_rows(&table, &["id"], None, true).await;
+    assert_eq!(first, expected, "cached cold scan != Spark");
+    let cold_fetches = cache.stats().fetches;
+    assert!(cold_fetches >= 1, "cold scan must read footers");
+    let second = scan_rows(&table, &["id"], None, true).await;
+    assert_eq!(second, expected, "cached warm scan != Spark");
+    assert_eq!(
+        cache.stats().fetches,
+        cold_fetches,
+        "second scan must issue zero footer fetches"
+    );
+    let id_range = base_queries()
+        .into_iter()
+        .find(|(name, _)| *name == "id_range")
+        .and_then(|(_, pred)| pred);
+    let expected_range = expected_rows(&truth, "base_v2", "id_range");
+    let filtered = scan_rows(&table, &["id"], id_range.clone(), true).await;
+    assert_eq!(filtered, expected_range, "cached filtered scan != Spark");
+    let after_filter = cache.stats().fetches;
+    let filtered_again = scan_rows(&table, &["id"], id_range, true).await;
+    assert_eq!(filtered_again, expected_range);
+    assert_eq!(
+        cache.stats().fetches,
+        after_filter,
+        "second filtered scan must issue zero footer fetches"
+    );
 }
 
 async fn assert_kept_rows_subset(truth: &Value, table_name: &str, query: &str) {

@@ -25,6 +25,7 @@ use futures::lock::Mutex;
 use itertools::Itertools;
 
 use super::namespace_state::NamespaceState;
+use crate::arrow::ParquetFooterCache;
 use crate::catalog::table_metadata_cache::{
     CacheScope, TableMetadataCache, load_or_fetch_table_metadata,
 };
@@ -45,29 +46,14 @@ pub const MEMORY_CATALOG_WAREHOUSE: &str = "warehouse";
 const LOCATION: &str = "location";
 
 /// Builder for [`MemoryCatalog`].
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MemoryCatalogBuilder {
     config: MemoryCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
     table_metadata_cache: Option<Arc<TableMetadataCache>>,
     pub(crate) cache_credential_context: Option<String>,
     pub(crate) shared_object_cache_bytes: Option<u64>,
-}
-
-impl Default for MemoryCatalogBuilder {
-    fn default() -> Self {
-        Self {
-            config: MemoryCatalogConfig {
-                name: None,
-                warehouse: "".to_string(),
-                props: HashMap::new(),
-            },
-            storage_factory: None,
-            table_metadata_cache: None,
-            cache_credential_context: None,
-            shared_object_cache_bytes: None,
-        }
-    }
+    pub(crate) shared_footer_cache: Option<Arc<ParquetFooterCache>>,
 }
 
 impl MemoryCatalogBuilder {
@@ -109,33 +95,30 @@ impl CatalogBuilder for MemoryCatalogBuilder {
             .filter(|(k, _)| k != MEMORY_CATALOG_WAREHOUSE)
             .collect();
 
-        let result = {
-            if self.config.name.is_none() {
-                Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Catalog name is required",
-                ))
-            } else if self.config.warehouse.is_empty() {
-                Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Catalog warehouse is required",
-                ))
-            } else {
-                MemoryCatalog::new(
-                    self.config,
-                    self.storage_factory,
-                    self.table_metadata_cache,
-                    self.cache_credential_context,
-                    self.shared_object_cache_bytes,
-                )
-            }
-        };
-
-        std::future::ready(result)
+        std::future::ready(if self.config.name.is_none() {
+            Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Catalog name is required",
+            ))
+        } else if self.config.warehouse.is_empty() {
+            Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Catalog warehouse is required",
+            ))
+        } else {
+            MemoryCatalog::new(
+                self.config,
+                self.storage_factory,
+                self.table_metadata_cache,
+                self.cache_credential_context,
+                self.shared_object_cache_bytes,
+                self.shared_footer_cache,
+            )
+        })
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct MemoryCatalogConfig {
     name: Option<String>,
     warehouse: String,
@@ -153,6 +136,7 @@ pub struct MemoryCatalog {
     pub(crate) table_metadata_cache: Option<Arc<TableMetadataCache>>,
     pub(crate) cache_scope: CacheScope,
     pub(crate) shared_object_cache: Option<Arc<ObjectCache>>,
+    pub(crate) shared_footer_cache: Option<Arc<ParquetFooterCache>>,
 }
 
 impl MemoryCatalog {
@@ -163,6 +147,7 @@ impl MemoryCatalog {
         table_metadata_cache: Option<Arc<TableMetadataCache>>,
         cache_credential_context: Option<String>,
         shared_object_cache_bytes: Option<u64>,
+        shared_footer_cache: Option<Arc<ParquetFooterCache>>,
     ) -> Result<Self> {
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
 
@@ -186,6 +171,7 @@ impl MemoryCatalog {
             table_metadata_cache,
             cache_scope,
             shared_object_cache,
+            shared_footer_cache,
         })
     }
 

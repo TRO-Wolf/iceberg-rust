@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use super::catalog::{MemoryCatalog, MemoryCatalogBuilder};
+use crate::arrow::{ParquetFooterCache, TableFooterCache};
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::spec::TableMetadataRef;
@@ -35,6 +36,12 @@ impl MemoryCatalogBuilder {
         self.cache_credential_context = Some(context);
         self
     }
+
+    #[allow(missing_docs)]
+    pub fn with_shared_footer_cache(mut self, cache: Arc<ParquetFooterCache>) -> Self {
+        self.shared_footer_cache = Some(cache);
+        self
+    }
 }
 
 impl MemoryCatalog {
@@ -46,8 +53,15 @@ impl MemoryCatalog {
 
     pub(crate) fn table_builder(&self) -> TableBuilder {
         let builder = Table::builder().file_io(self.file_io.clone());
-        match self.shared_object_cache.as_ref() {
+        let builder = match self.shared_object_cache.as_ref() {
             Some(cache) => builder.object_cache(cache.clone()),
+            None => builder,
+        };
+        match self.shared_footer_cache.as_ref() {
+            Some(cache) => builder.footer_cache(TableFooterCache::new(
+                cache.clone(),
+                self.cache_scope.clone(),
+            )),
             None => builder,
         }
     }
