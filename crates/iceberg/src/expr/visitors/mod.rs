@@ -22,6 +22,8 @@ pub(crate) mod inclusive_metrics_evaluator;
 pub(crate) mod inclusive_projection;
 pub(crate) mod manifest_evaluator;
 pub(crate) mod page_index_evaluator;
+#[cfg(test)]
+mod page_index_evaluator_tests;
 /// The **unbound** predicate visitor is test-only as of the iterative `rewrite_not` rewrite.
 ///
 /// `RewriteNotVisitor` was its only implementor and `Predicate::rewrite_not` its only caller;

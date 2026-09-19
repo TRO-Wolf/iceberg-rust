@@ -40,7 +40,7 @@ enum MissingColBehavior {
     MightMatch,
 }
 
-enum PageNullCount {
+pub(crate) enum PageNullCount {
     AllNull,
     NoneNull,
     SomeNull,
@@ -170,32 +170,24 @@ impl<'a> PageIndexEvaluator<'a> {
         let row_counts = {
             // Caches row count calculations for columns that appear multiple times in
             // the predicate
-            match self.row_count_cache.get(&parquet_column_index) {
-                Some(count) => count.clone(),
-                None => {
-                    let Some(offset_index) = self.offset_index.get(parquet_column_index) else {
-                        // if we have a column index, we should always have an offset index.
-                        return Err(Error::new(
-                            ErrorKind::Unexpected,
-                            format!("Missing offset index for field id {field_id}"),
-                        ));
-                    };
+            if !self.row_count_cache.contains_key(&parquet_column_index) {
+                let Some(offset_index) = self.offset_index.get(parquet_column_index) else {
+                    return Err(Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Missing offset index for field id {field_id}"),
+                    ));
+                };
 
-                    let count = self.calc_row_counts(offset_index);
-                    self.row_count_cache
-                        .insert(parquet_column_index, count.clone());
-
-                    count
-                }
+                let count = self.calc_row_counts(offset_index);
+                self.row_count_cache.insert(parquet_column_index, count);
             }
+            self.row_count_cache
+                .get(&parquet_column_index)
+                .expect("row counts just cached")
         };
 
-        let Some(page_filter) = Self::apply_predicate_to_column_index(
-            predicate,
-            field_type,
-            column_index,
-            &row_counts,
-        )?
+        let Some(page_filter) =
+            Self::apply_predicate_to_column_index(predicate, field_type, column_index, row_counts)?
         else {
             return self.select_all_rows();
         };
@@ -218,7 +210,7 @@ impl<'a> PageIndexEvaluator<'a> {
     /// Returns a list of row counts per page
     fn calc_row_counts(&self, offset_index: &OffsetIndexMetaData) -> Vec<usize> {
         let mut remaining_rows = self.row_group_metadata.num_rows() as usize;
-        let mut row_counts = Vec::with_capacity(self.offset_index.len());
+        let mut row_counts = Vec::with_capacity(offset_index.page_locations().len());
 
         let page_locations = offset_index.page_locations();
         for (idx, page_location) in page_locations.iter().enumerate() {
@@ -247,136 +239,188 @@ impl<'a> PageIndexEvaluator<'a> {
         F: Fn(Option<Datum>, Option<Datum>, PageNullCount) -> Result<bool>,
     {
         let result: Result<Vec<bool>> = match column_index {
-            ColumnIndexMetaData::NONE => {
+            ColumnIndexMetaData::NONE | ColumnIndexMetaData::INT96(_) => {
                 return Ok(None);
             }
-            ColumnIndexMetaData::BOOLEAN(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| {
-                            Datum::new(field_type.clone(), PrimitiveLiteral::Boolean(val))
-                        }),
-                        max.map(|&val| {
-                            Datum::new(field_type.clone(), PrimitiveLiteral::Boolean(val))
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
+            ColumnIndexMetaData::BOOLEAN(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |&val| Self::bound_datum(field_type, PrimitiveLiteral::Boolean(val)),
+            ),
+            ColumnIndexMetaData::INT32(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |&val| Self::bound_datum(field_type, PrimitiveLiteral::Int(val)),
+            ),
+            ColumnIndexMetaData::INT64(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |&val| Self::bound_datum(field_type, PrimitiveLiteral::Long(val)),
+            ),
+            ColumnIndexMetaData::FLOAT(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |&val| {
+                    Self::bound_datum(field_type, PrimitiveLiteral::Float(OrderedFloat::from(val)))
+                },
+            ),
+            ColumnIndexMetaData::DOUBLE(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |&val| {
+                    Self::bound_datum(
+                        field_type,
+                        PrimitiveLiteral::Double(OrderedFloat::from(val)),
                     )
-                })
-                .collect(),
-            ColumnIndexMetaData::INT32(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| Datum::physical(field_type, PrimitiveLiteral::Int(val))),
-                        max.map(|&val| Datum::physical(field_type, PrimitiveLiteral::Int(val))),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::INT64(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| Datum::new(field_type.clone(), PrimitiveLiteral::Long(val))),
-                        max.map(|&val| Datum::new(field_type.clone(), PrimitiveLiteral::Long(val))),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::FLOAT(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| {
-                            Datum::physical(
-                                field_type,
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
-                        max.map(|&val| {
-                            Datum::physical(
-                                field_type,
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::DOUBLE(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Double(OrderedFloat::from(val)),
-                            )
-                        }),
-                        max.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Double(OrderedFloat::from(val)),
-                            )
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::BYTE_ARRAY(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::String(String::from_utf8(val.to_vec()).unwrap()),
-                            )
-                        }),
-                        max.map(|val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::String(String::from_utf8(val.to_vec()).unwrap()),
-                            )
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_) => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "unsupported 'FIXED_LEN_BYTE_ARRAY' index type in column_index",
-                ));
-            }
-            ColumnIndexMetaData::INT96(_) => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "unsupported 'INT96' index type in column_index",
-                ));
-            }
+                },
+            ),
+            ColumnIndexMetaData::BYTE_ARRAY(idx)
+            | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |val| Self::bound_datum_bytes(field_type, val),
+            ),
         };
 
         Ok(Some(result?))
+    }
+
+    fn apply_to_pages<'v, F, V>(
+        predicate: &F,
+        min_values: impl Iterator<Item = Option<&'v V>>,
+        max_values: impl Iterator<Item = Option<&'v V>>,
+        null_count: impl Fn(usize) -> Option<i64>,
+        row_counts: &[usize],
+        bound: impl Fn(&'v V) -> Option<Datum>,
+    ) -> Result<Vec<bool>>
+    where
+        F: Fn(Option<Datum>, Option<Datum>, PageNullCount) -> Result<bool>,
+        V: ?Sized + 'v,
+    {
+        min_values
+            .zip(max_values)
+            .enumerate()
+            .zip(row_counts.iter())
+            .map(|((i, (min, max)), &row_count)| {
+                predicate(
+                    min.and_then(&bound),
+                    max.and_then(&bound),
+                    PageNullCount::from_row_and_null_counts(row_count, null_count(i)),
+                )
+            })
+            .collect()
+    }
+
+    fn bound_datum(field_type: &PrimitiveType, literal: PrimitiveLiteral) -> Option<Datum> {
+        match (field_type, &literal) {
+            (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Int(value)) => Some(Datum::new(
+                field_type.clone(),
+                PrimitiveLiteral::Int128(i128::from(*value)),
+            )),
+            (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Long(value)) => Some(Datum::new(
+                field_type.clone(),
+                PrimitiveLiteral::Int128(i128::from(*value)),
+            )),
+            _ if field_type.compatible(&literal) => Some(Datum::new(field_type.clone(), literal)),
+            _ => {
+                let promoted = literal.promote_to(field_type);
+                field_type
+                    .compatible(&promoted)
+                    .then(|| Datum::new(field_type.clone(), promoted))
+            }
+        }
+    }
+
+    fn bound_datum_bytes(field_type: &PrimitiveType, bytes: &[u8]) -> Option<Datum> {
+        Datum::try_from_bytes(bytes, field_type.clone()).ok()
+    }
+
+    pub(crate) fn eq_keeps_page(
+        min: Option<Datum>,
+        max: Option<Datum>,
+        nulls: PageNullCount,
+        datum: &Datum,
+    ) -> bool {
+        if matches!(nulls, PageNullCount::AllNull) {
+            return false;
+        }
+
+        if datum.is_nan()
+            || min.as_ref().is_some_and(|bound| bound.is_nan())
+            || max.as_ref().is_some_and(|bound| bound.is_nan())
+        {
+            return true;
+        }
+
+        if let Some(min) = min
+            && min.gt(datum)
+        {
+            return false;
+        }
+
+        if let Some(max) = max
+            && max.lt(datum)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    pub(crate) fn in_keeps_page(
+        min: Option<Datum>,
+        max: Option<Datum>,
+        nulls: PageNullCount,
+        literals: &FnvHashSet<Datum>,
+    ) -> bool {
+        if matches!(nulls, PageNullCount::AllNull) {
+            return false;
+        }
+
+        if min.as_ref().is_some_and(|bound| bound.is_nan())
+            || max.as_ref().is_some_and(|bound| bound.is_nan())
+            || literals.iter().any(|literal| literal.is_nan())
+        {
+            return true;
+        }
+
+        match (min, max) {
+            (Some(min), Some(max))
+                if literals
+                    .iter()
+                    .all(|datum| datum.lt(&min) || datum.gt(&max)) =>
+            {
+                return false;
+            }
+            (Some(min), _) if !literals.iter().any(|datum| datum.ge(&min)) => {
+                return false;
+            }
+            (_, Some(max)) if !literals.iter().any(|datum| datum.le(&max)) => {
+                return false;
+            }
+
+            _ => {}
+        }
+
+        true
     }
 
     fn visit_inequality(
@@ -391,29 +435,46 @@ impl<'a> PageIndexEvaluator<'a> {
         self.calc_row_selection(
             field_id,
             |min, max, null_count| {
-                if matches!(null_count, PageNullCount::AllNull) {
-                    return Ok(false);
-                }
-
-                if datum.is_nan() {
-                    // NaN indicates unreliable bounds.
-                    return Ok(true);
-                }
-
-                let bound = if use_lower_bound { min } else { max };
-
-                if let Some(bound) = bound {
-                    if cmp_fn(&bound, datum) {
-                        return Ok(true);
-                    }
-
-                    return Ok(false);
-                }
-
-                Ok(true)
+                Ok(Self::inequality_keeps_page(
+                    min,
+                    max,
+                    null_count,
+                    datum,
+                    cmp_fn,
+                    use_lower_bound,
+                ))
             },
             MissingColBehavior::MightMatch,
         )
+    }
+
+    pub(crate) fn inequality_keeps_page(
+        min: Option<Datum>,
+        max: Option<Datum>,
+        nulls: PageNullCount,
+        datum: &Datum,
+        cmp_fn: fn(&Datum, &Datum) -> bool,
+        use_lower_bound: bool,
+    ) -> bool {
+        if matches!(nulls, PageNullCount::AllNull) {
+            return false;
+        }
+
+        if datum.is_nan() {
+            return true;
+        }
+
+        let bound = if use_lower_bound { min } else { max };
+
+        if let Some(bound) = bound {
+            if bound.partial_cmp(datum).is_none() || cmp_fn(&bound, datum) {
+                return true;
+            }
+
+            return false;
+        }
+
+        true
     }
 }
 
@@ -540,25 +601,7 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
 
         self.calc_row_selection(
             field_id,
-            |min, max, nulls| {
-                if matches!(nulls, PageNullCount::AllNull) {
-                    return Ok(false);
-                }
-
-                if let Some(min) = min
-                    && min.gt(datum)
-                {
-                    return Ok(false);
-                }
-
-                if let Some(max) = max
-                    && max.lt(datum)
-                {
-                    return Ok(false);
-                }
-
-                Ok(true)
-            },
+            |min, max, nulls| Ok(Self::eq_keeps_page(min, max, nulls, datum)),
             MissingColBehavior::CantMatch,
         )
     }
@@ -730,34 +773,7 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
         }
         self.calc_row_selection(
             field_id,
-            |min, max, nulls| {
-                if matches!(nulls, PageNullCount::AllNull) {
-                    return Ok(false);
-                }
-
-                match (min, max) {
-                    (Some(min), Some(max))
-                        if literals
-                            .iter()
-                            .all(|datum| datum.lt(&min) || datum.gt(&max)) =>
-                    {
-                        // if all values are outside the bounds, rows cannot match.
-                        return Ok(false);
-                    }
-                    (Some(min), _) if !literals.iter().any(|datum| datum.ge(&min)) => {
-                        // if none of the values are greater than the min bound, rows cant match
-                        return Ok(false);
-                    }
-                    (_, Some(max)) if !literals.iter().any(|datum| datum.le(&max)) => {
-                        // if all values are greater than upper bound, rows cannot match.
-                        return Ok(false);
-                    }
-
-                    _ => {}
-                }
-
-                Ok(true)
-            },
+            |min, max, nulls| Ok(Self::in_keeps_page(min, max, nulls, literals)),
             MissingColBehavior::CantMatch,
         )
     }
@@ -775,591 +791,150 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
+struct PrunableLeafVisitor;
 
-    use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use parquet::arrow::ArrowWriter;
-    use parquet::arrow::arrow_reader::{
-        ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelector,
-    };
-    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
-    use parquet::file::properties::WriterProperties;
-    use rand::Rng;
-    use tempfile::NamedTempFile;
+impl BoundPredicateVisitor for PrunableLeafVisitor {
+    type T = bool;
 
-    use super::PageIndexEvaluator;
-    use crate::expr::{Bind, Reference};
-    use crate::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
-    use crate::{ErrorKind, Result};
-
-    /// Helper function to create a test parquet file with page indexes
-    /// and return the metadata needed for testing
-    fn create_test_parquet_file() -> Result<(Arc<ParquetMetaData>, NamedTempFile)> {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("col_float", DataType::Float32, true),
-            Field::new("col_string", DataType::Utf8, true),
-        ]));
-
-        let temp_file = NamedTempFile::new().unwrap();
-        let file = temp_file.reopen().unwrap();
-
-        let props = WriterProperties::builder()
-            .set_data_page_row_count_limit(1024)
-            .set_write_batch_size(512)
-            .build();
-
-        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
-
-        let mut batches = vec![];
-
-        // Batch 1: 1024 rows - strings with AARDVARK, BEAR, BISON
-        let float_vals: Vec<Option<f32>> = vec![None; 1024];
-        let mut string_vals = vec![];
-        string_vals.push(Some("AARDVARK".to_string()));
-        for _ in 1..1023 {
-            string_vals.push(Some("BEAR".to_string()));
-        }
-        string_vals.push(Some("BISON".to_string()));
-
-        batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
-            .unwrap(),
-        );
-
-        // Batch 2: 1024 rows - all DEER
-        let float_vals: Vec<Option<f32>> = vec![None; 1024];
-        let string_vals = vec![Some("DEER".to_string()); 1024];
-
-        batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
-            .unwrap(),
-        );
-
-        // Batch 3: 1024 rows - float 0-10
-        let mut float_vals = vec![];
-        for i in 0..1024 {
-            float_vals.push(Some(i as f32 * 10.0 / 1024.0));
-        }
-        let mut string_vals = vec![];
-        string_vals.push(Some("GIRAFFE".to_string()));
-        string_vals.push(None);
-        for _ in 2..1024 {
-            string_vals.push(Some("HIPPO".to_string()));
-        }
-
-        batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
-            .unwrap(),
-        );
-
-        // Batch 4: 1024 rows - float 10-20
-        let mut float_vals = vec![None];
-        for i in 1..1024 {
-            float_vals.push(Some(10.0 + i as f32 * 10.0 / 1024.0));
-        }
-        let string_vals = vec![Some("HIPPO".to_string()); 1024];
-
-        batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
-            .unwrap(),
-        );
-
-        // Write rows one at a time to give the writer a chance to split into pages
-        for batch in &batches {
-            for i in 0..batch.num_rows() {
-                writer.write(&batch.slice(i, 1)).unwrap();
-            }
-        }
-
-        writer.close().unwrap();
-
-        let file = temp_file.reopen().unwrap();
-        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
-        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
-        let metadata = reader.metadata().clone();
-
-        Ok((metadata, temp_file))
+    fn always_true(&mut self) -> Result<bool> {
+        Ok(false)
     }
 
-    /// Get the test metadata components for testing
-    fn get_test_metadata(
-        metadata: &ParquetMetaData,
-    ) -> (
-        Vec<parquet::file::page_index::column_index::ColumnIndexMetaData>,
-        Vec<parquet::file::page_index::offset_index::OffsetIndexMetaData>,
-        &parquet::file::metadata::RowGroupMetaData,
-    ) {
-        let row_group_metadata = metadata.row_group(0);
-        let column_index = metadata.column_index().unwrap()[0].to_vec();
-        let offset_index = metadata.offset_index().unwrap()[0].to_vec();
-        (column_index, offset_index, row_group_metadata)
+    fn always_false(&mut self) -> Result<bool> {
+        Ok(true)
     }
 
-    #[test]
-    fn eval_matches_no_rows_for_empty_row_group() -> Result<()> {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("col_float", DataType::Float32, true),
-            Field::new("col_string", DataType::Utf8, true),
-        ]));
-
-        let empty_float: ArrayRef = Arc::new(Float32Array::from(Vec::<Option<f32>>::new()));
-        let empty_string: ArrayRef = Arc::new(StringArray::from(Vec::<Option<String>>::new()));
-        let empty_batch =
-            RecordBatch::try_new(arrow_schema.clone(), vec![empty_float, empty_string]).unwrap();
-
-        let temp_file = NamedTempFile::new().unwrap();
-        let file = temp_file.reopen().unwrap();
-
-        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
-        writer.write(&empty_batch).unwrap();
-        writer.close().unwrap();
-
-        let file = temp_file.reopen().unwrap();
-        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
-        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
-        let metadata = reader.metadata();
-
-        if metadata.num_row_groups() == 0 || metadata.row_group(0).num_rows() == 0 {
-            return Ok(());
-        }
-
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .greater_than(Datum::float(1.0))
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let row_group_metadata = metadata.row_group(0);
-        let column_index = metadata.column_index().unwrap()[0].to_vec();
-        let offset_index = metadata.offset_index().unwrap()[0].to_vec();
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        assert_eq!(result.len(), 0);
-
-        Ok(())
+    fn and(&mut self, lhs: bool, rhs: bool) -> Result<bool> {
+        Ok(lhs || rhs)
     }
 
-    #[test]
-    fn eval_is_null_select_only_pages_with_nulls() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .is_null()
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        let expected = vec![
-            RowSelector::select(2048),
-            RowSelector::skip(1024),
-            RowSelector::select(1024),
-        ];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn or(&mut self, lhs: bool, rhs: bool) -> Result<bool> {
+        Ok(lhs && rhs)
     }
 
-    #[test]
-    fn eval_is_not_null_dont_select_pages_with_all_nulls() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .is_not_null()
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        let expected = vec![RowSelector::skip(2048), RowSelector::select(2048)];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn not(&mut self, _inner: bool) -> Result<bool> {
+        Ok(true)
     }
 
-    #[test]
-    fn eval_is_nan_select_all() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .is_nan()
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        let expected = vec![RowSelector::select(4096)];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn is_null(
+        &mut self,
+        _reference: &BoundReference,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
     }
 
-    #[test]
-    fn eval_not_nan_select_all() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .is_not_nan()
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        let expected = vec![RowSelector::select(4096)];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn not_null(
+        &mut self,
+        _reference: &BoundReference,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
     }
 
-    #[test]
-    fn eval_inequality_nan_datum_all_rows_except_all_null_pages() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .less_than(Datum::float(f32::NAN))
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        let expected = vec![RowSelector::skip(2048), RowSelector::select(2048)];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn is_nan(&mut self, reference: &BoundReference, _predicate: &BoundPredicate) -> Result<bool> {
+        Ok(!reference.field().field_type.is_floating_type())
     }
 
-    #[test]
-    fn eval_inequality_pages_containing_value_except_all_null_pages() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .less_than(Datum::float(5.0))
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        let expected = vec![
-            RowSelector::skip(2048),
-            RowSelector::select(1024),
-            RowSelector::skip(1024),
-        ];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn not_nan(
+        &mut self,
+        _reference: &BoundReference,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
-    #[test]
-    fn eval_eq_pages_containing_value_except_all_null_pages() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .equal_to(Datum::float(5.0))
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        // Pages 0-1: all null (skip)
-        // Page 2: 0-10 (select, might contain 5.0)
-        // Page 3: 10-20 (skip, min > 5.0)
-        let expected = vec![
-            RowSelector::skip(2048),
-            RowSelector::select(1024),
-            RowSelector::skip(1024),
-        ];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn less_than(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
     }
 
-    #[test]
-    fn eval_not_eq_all_rows() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .not_equal_to(Datum::float(5.0))
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        let expected = vec![RowSelector::select(4096)];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn less_than_or_eq(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
     }
 
-    #[test]
-    fn eval_starts_with_error_float_col() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .starts_with(Datum::float(5.0))
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        );
-
-        assert_eq!(result.unwrap_err().kind(), ErrorKind::Unexpected);
-
-        Ok(())
+    fn greater_than(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
     }
 
-    #[test]
-    fn eval_starts_with_pages_containing_value_except_all_null_pages() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        // Test starts_with on string column where only some pages match
-        // Our file has 4 pages: ["AARDVARK".."BISON"], ["DEER"], ["GIRAFFE".."HIPPO"], ["HIPPO"]
-        // Testing starts_with("B") should select only page 0
-        let filter = Reference::new("col_string")
-            .starts_with(Datum::string("B"))
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        // Page 0 has "BEAR" and "BISON" (starts with B), rest don't
-        let expected = vec![RowSelector::select(1024), RowSelector::skip(3072)];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn greater_than_or_eq(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
     }
 
-    #[test]
-    fn eval_not_starts_with_pages_containing_value_except_pages_with_min_and_max_equal_to_prefix_and_all_null_pages()
-    -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        // Test not_starts_with where one page has ALL values starting with prefix
-        // Our file has page 1 with all "DEER" (min="DEER", max="DEER")
-        // Testing not_starts_with("DE") should skip page 1 where all values start with "DE"
-        let filter = Reference::new("col_string")
-            .not_starts_with(Datum::string("DE"))
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        // Page 0: mixed values (select)
-        // Page 1: all "DEER" starting with "DE" (skip)
-        // Pages 2-3: other values not all starting with "DE" (select)
-        let expected = vec![
-            RowSelector::select(1024),
-            RowSelector::skip(1024),
-            RowSelector::select(2048),
-        ];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn eq(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
     }
 
-    #[test]
-    fn eval_in_length_of_set_above_limit_all_rows() -> Result<()> {
-        let mut rng = rand::rng();
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        let filter = Reference::new("col_float")
-            .is_in(std::iter::repeat_with(|| Datum::float(rng.random_range(0.0..10.0))).take(1000))
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        let expected = vec![RowSelector::select(4096)];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn not_eq(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
-    #[test]
-    fn eval_in_valid_set_size_some_rows() -> Result<()> {
-        let (metadata, _temp_file) = create_test_parquet_file()?;
-        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
-        let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
-
-        // Test is_in with multiple values using min/max bounds
-        // Our file has 4 pages: ["AARDVARK".."BISON"], ["DEER"], ["GIRAFFE".."HIPPO"], ["HIPPO"]
-        // Testing is_in(["AARDVARK", "GIRAFFE"]) - both are in different pages
-        let filter = Reference::new("col_string")
-            .is_in([Datum::string("AARDVARK"), Datum::string("GIRAFFE")])
-            .bind(iceberg_schema_ref.clone(), false)?;
-
-        let result = PageIndexEvaluator::eval(
-            &filter,
-            &column_index,
-            &offset_index,
-            row_group_metadata,
-            &field_id_map,
-            iceberg_schema_ref.as_ref(),
-        )?;
-
-        // Page 0 contains "AARDVARK", page 1 doesn't contain either, page 2 contains "GIRAFFE", page 3 doesn't
-        let expected = vec![
-            RowSelector::select(1024),
-            RowSelector::skip(1024),
-            RowSelector::select(1024),
-            RowSelector::skip(1024),
-        ];
-
-        assert_eq!(result, expected);
-
-        Ok(())
+    fn starts_with(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
     }
 
-    fn build_iceberg_schema_and_field_map() -> Result<(Arc<Schema>, HashMap<i32, usize>)> {
-        let iceberg_schema = Schema::builder()
-            .with_fields([
-                Arc::new(NestedField::new(
-                    1,
-                    "col_float",
-                    Type::Primitive(PrimitiveType::Float),
-                    false,
-                )),
-                Arc::new(NestedField::new(
-                    2,
-                    "col_string",
-                    Type::Primitive(PrimitiveType::String),
-                    false,
-                )),
-            ])
-            .build()?;
-        let iceberg_schema_ref = Arc::new(iceberg_schema);
-
-        let field_id_map = HashMap::from_iter([(1, 0), (2, 1)]);
-
-        Ok((iceberg_schema_ref, field_id_map))
+    fn not_starts_with(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(false)
     }
+
+    fn r#in(
+        &mut self,
+        _reference: &BoundReference,
+        literals: &FnvHashSet<Datum>,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(literals.len() <= IN_PREDICATE_LIMIT)
+    }
+
+    fn not_in(
+        &mut self,
+        _reference: &BoundReference,
+        _literals: &FnvHashSet<Datum>,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+pub(crate) fn predicate_can_prune_pages(predicate: &BoundPredicate) -> bool {
+    visit(&mut PrunableLeafVisitor, predicate).unwrap_or(true)
 }
