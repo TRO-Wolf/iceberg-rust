@@ -17,13 +17,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::ArrayRef;
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 
 use super::TransformFunction;
 use crate::Error;
 use crate::spec::decimal_utils::decimal_from_i128_with_scale;
-use crate::spec::{Datum, PrimitiveLiteral};
+use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType};
 
 #[derive(Debug)]
 pub struct Truncate {
@@ -87,6 +87,104 @@ impl Truncate {
     fn truncate_decimal_i128(v: i128, width: i128) -> i128 {
         v - (((v % width) + width) % width)
     }
+
+    fn truncate_string_generic<O: arrow_array::OffsetSizeTrait>(
+        &self,
+        input: &ArrayRef,
+    ) -> crate::Result<ArrayRef> {
+        let len = self.width as usize;
+        let mut builder = arrow_array::builder::GenericByteBuilder::<
+            arrow_array::types::GenericStringType<O>,
+        >::with_capacity(input.len(), input.len().saturating_mul(len));
+        match input.data_type() {
+            DataType::Utf8 => {
+                let array = downcast_input::<arrow_array::StringArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_str(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            DataType::LargeUtf8 => {
+                let array = downcast_input::<arrow_array::LargeStringArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_str(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            DataType::Utf8View => {
+                let array = downcast_input::<arrow_array::StringViewArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_str(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            other => {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::FeatureUnsupported,
+                    format!("Unsupported data type for truncate transform: {other:?}"),
+                ));
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+
+    fn truncate_binary_generic<O: arrow_array::OffsetSizeTrait>(
+        &self,
+        input: &ArrayRef,
+    ) -> crate::Result<ArrayRef> {
+        let len = self.width as usize;
+        let mut builder = arrow_array::builder::GenericByteBuilder::<
+            arrow_array::types::GenericBinaryType<O>,
+        >::with_capacity(input.len(), input.len().saturating_mul(len));
+        match input.data_type() {
+            DataType::Binary => {
+                let array = downcast_input::<arrow_array::BinaryArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_binary(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            DataType::LargeBinary => {
+                let array = downcast_input::<arrow_array::LargeBinaryArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_binary(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            DataType::BinaryView => {
+                let array = downcast_input::<arrow_array::BinaryViewArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_binary(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            other => {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::FeatureUnsupported,
+                    format!("Unsupported data type for truncate transform: {other:?}"),
+                ));
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }
 }
 
 /// Downcast a transform input to the concrete Arrow array its [`DataType`] implies, or return a
@@ -143,32 +241,39 @@ impl TransformFunction for Truncate {
                     .map_err(|err| Error::new(crate::ErrorKind::Unexpected, format!("{err}")))?;
                 Ok(Arc::new(res))
             }
-            DataType::Utf8 => {
+            DataType::Utf8 => self.truncate_string_generic::<i32>(&input),
+            DataType::LargeUtf8 => self.truncate_string_generic::<i64>(&input),
+            DataType::Binary => self.truncate_binary_generic::<i32>(&input),
+            DataType::LargeBinary => self.truncate_binary_generic::<i64>(&input),
+            DataType::BinaryView => {
                 let len = self.width as usize;
-                let res: arrow_array::StringArray = arrow_array::StringArray::from_iter(
-                    downcast_input::<arrow_array::StringArray>(&input)?
-                        .iter()
-                        .map(|v| v.map(|v| Self::truncate_str(v, len))),
-                );
-                Ok(Arc::new(res))
+                let array = downcast_input::<arrow_array::BinaryViewArray>(&input)?;
+                let mut builder = arrow_array::builder::GenericByteViewBuilder::<
+                    arrow_array::types::BinaryViewType,
+                >::with_capacity(array.len());
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_binary(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
             }
-            DataType::LargeUtf8 => {
+            DataType::Utf8View => {
                 let len = self.width as usize;
-                let res: arrow_array::LargeStringArray = arrow_array::LargeStringArray::from_iter(
-                    downcast_input::<arrow_array::LargeStringArray>(&input)?
-                        .iter()
-                        .map(|v| v.map(|v| Self::truncate_str(v, len))),
-                );
-                Ok(Arc::new(res))
-            }
-            DataType::Binary => {
-                let len = self.width as usize;
-                let res: arrow_array::BinaryArray = arrow_array::BinaryArray::from_iter(
-                    downcast_input::<arrow_array::BinaryArray>(&input)?
-                        .iter()
-                        .map(|v| v.map(|v| Self::truncate_binary(v, len))),
-                );
-                Ok(Arc::new(res))
+                let array = downcast_input::<arrow_array::StringViewArray>(&input)?;
+                let mut builder = arrow_array::builder::GenericByteViewBuilder::<
+                    arrow_array::types::StringViewType,
+                >::with_capacity(array.len());
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_str(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
             }
             _ => Err(crate::Error::new(
                 crate::ErrorKind::FeatureUnsupported,
@@ -177,6 +282,20 @@ impl TransformFunction for Truncate {
                     input.data_type()
                 ),
             )),
+        }
+    }
+
+    fn transform_to_type(
+        &self,
+        input: &ArrayRef,
+        expected: &DataType,
+    ) -> Option<crate::Result<ArrayRef>> {
+        match expected {
+            DataType::Utf8 => Some(self.truncate_string_generic::<i32>(input)),
+            DataType::LargeUtf8 => Some(self.truncate_string_generic::<i64>(input)),
+            DataType::Binary => Some(self.truncate_binary_generic::<i32>(input)),
+            DataType::LargeBinary => Some(self.truncate_binary_generic::<i64>(input)),
+            _ => None,
         }
     }
 
@@ -206,6 +325,10 @@ impl TransformFunction for Truncate {
                 let len = self.width as usize;
                 Datum::string(Self::truncate_str(v, len).to_string())
             })),
+            PrimitiveLiteral::Binary(v) if matches!(input.data_type(), PrimitiveType::Binary) => {
+                let len = self.width as usize;
+                Ok(Some(Datum::binary(Self::truncate_binary(v, len).to_vec())))
+            }
             _ => Err(crate::Error::new(
                 crate::ErrorKind::FeatureUnsupported,
                 format!(
@@ -218,770 +341,5 @@ impl TransformFunction for Truncate {
 }
 
 #[cfg(test)]
-mod test {
-    use std::sync::Arc;
-
-    use arrow_array::builder::PrimitiveBuilder;
-    use arrow_array::types::Decimal128Type;
-    use arrow_array::{ArrayRef, Decimal128Array, Int32Array, Int64Array};
-
-    use crate::Result;
-    use crate::expr::PredicateOperator;
-    use crate::spec::PrimitiveType::{
-        Binary, Date, Decimal, Fixed, Int, Long, String as StringType, Time, Timestamp,
-        TimestampNs, Timestamptz, TimestamptzNs, Uuid,
-    };
-    use crate::spec::Type::{Primitive, Struct};
-    use crate::spec::decimal_utils::decimal_new;
-    use crate::spec::{Datum, NestedField, PrimitiveType, StructType, Transform, Type};
-    use crate::transform::TransformFunction;
-    use crate::transform::test::{TestProjectionFixture, TestTransformFixture};
-
-    #[test]
-    fn test_truncate_transform() {
-        let trans = Transform::Truncate(4);
-
-        let fixture = TestTransformFixture {
-            display: "truncate[4]".to_string(),
-            json: r#""truncate[4]""#.to_string(),
-            dedup_name: "truncate[4]".to_string(),
-            preserves_order: true,
-            satisfies_order_of: vec![
-                (Transform::Truncate(4), true),
-                (Transform::Truncate(2), false),
-                (Transform::Bucket(4), false),
-                (Transform::Void, false),
-                (Transform::Day, false),
-            ],
-            trans_types: vec![
-                (Primitive(Binary), Some(Primitive(Binary))),
-                (Primitive(Date), None),
-                (
-                    Primitive(Decimal {
-                        precision: 8,
-                        scale: 5,
-                    }),
-                    Some(Primitive(Decimal {
-                        precision: 8,
-                        scale: 5,
-                    })),
-                ),
-                (Primitive(Fixed(8)), None),
-                (Primitive(Int), Some(Primitive(Int))),
-                (Primitive(Long), Some(Primitive(Long))),
-                (Primitive(StringType), Some(Primitive(StringType))),
-                (Primitive(Uuid), None),
-                (Primitive(Time), None),
-                (Primitive(Timestamp), None),
-                (Primitive(Timestamptz), None),
-                (Primitive(TimestampNs), None),
-                (Primitive(TimestamptzNs), None),
-                (
-                    Struct(StructType::new(vec![
-                        NestedField::optional(1, "a", Primitive(Timestamp)).into(),
-                    ])),
-                    None,
-                ),
-            ],
-        };
-
-        fixture.assert_transform(trans);
-    }
-
-    #[test]
-    fn test_projection_truncate_string_rewrite_op() -> Result<()> {
-        let value = "abcde";
-
-        let fixture = TestProjectionFixture::new(
-            Transform::Truncate(5),
-            "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::String)),
-        );
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::StartsWith, Datum::string(value)),
-            Some(r#"name = "abcde""#),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::NotStartsWith, Datum::string(value)),
-            Some(r#"name != "abcde""#),
-        )?;
-
-        let value = "abcdefg";
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::StartsWith, Datum::string(value)),
-            Some(r#"name STARTS WITH "abcde""#),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::NotStartsWith, Datum::string(value)),
-            None,
-        )?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_projection_truncate_string() -> Result<()> {
-        let value = "abcdefg";
-
-        let fixture = TestProjectionFixture::new(
-            Transform::Truncate(5),
-            "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::String)),
-        );
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThan, Datum::string(value)),
-            Some(r#"name <= "abcde""#),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThanOrEq, Datum::string(value)),
-            Some(r#"name <= "abcde""#),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::GreaterThan, Datum::string(value)),
-            Some(r#"name >= "abcde""#),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::GreaterThanOrEq, Datum::string(value)),
-            Some(r#"name >= "abcde""#),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::Eq, Datum::string(value)),
-            Some(r#"name = "abcde""#),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::string(value),
-                Datum::string(format!("{value}abc")),
-            ]),
-            Some(r#"name IN ("abcde")"#),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::string(value),
-                Datum::string(format!("{value}abc")),
-            ]),
-            None,
-        )?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_projection_truncate_upper_bound_decimal() -> Result<()> {
-        let prev = "98.99";
-        let curr = "99.99";
-        let next = "100.99";
-
-        let fixture = TestProjectionFixture::new(
-            Transform::Truncate(10),
-            "name",
-            NestedField::required(
-                1,
-                "value",
-                Type::Primitive(PrimitiveType::Decimal {
-                    precision: 9,
-                    scale: 2,
-                }),
-            ),
-        );
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThan, Datum::decimal_from_str(curr)?),
-            Some("name <= 9990"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(
-                PredicateOperator::LessThanOrEq,
-                Datum::decimal_from_str(curr)?,
-            ),
-            Some("name <= 9990"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(
-                PredicateOperator::GreaterThanOrEq,
-                Datum::decimal_from_str(curr)?,
-            ),
-            Some("name >= 9990"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::Eq, Datum::decimal_from_str(curr)?),
-            Some("name = 9990"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::NotEq, Datum::decimal_from_str(curr)?),
-            None,
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::decimal_from_str(prev)?,
-                Datum::decimal_from_str(curr)?,
-                Datum::decimal_from_str(next)?,
-            ]),
-            Some("name IN (9890, 9990, 10090)"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::decimal_from_str(curr)?,
-                Datum::decimal_from_str(next)?,
-            ]),
-            None,
-        )?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_projection_truncate_lower_bound_decimal() -> Result<()> {
-        let prev = "99.00";
-        let curr = "100.00";
-        let next = "101.00";
-
-        let fixture = TestProjectionFixture::new(
-            Transform::Truncate(10),
-            "name",
-            NestedField::required(
-                1,
-                "value",
-                Type::Primitive(PrimitiveType::Decimal {
-                    precision: 9,
-                    scale: 2,
-                }),
-            ),
-        );
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThan, Datum::decimal_from_str(curr)?),
-            Some("name <= 9990"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(
-                PredicateOperator::LessThanOrEq,
-                Datum::decimal_from_str(curr)?,
-            ),
-            Some("name <= 10000"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(
-                PredicateOperator::GreaterThanOrEq,
-                Datum::decimal_from_str(curr)?,
-            ),
-            Some("name >= 10000"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::Eq, Datum::decimal_from_str(curr)?),
-            Some("name = 10000"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::NotEq, Datum::decimal_from_str(curr)?),
-            None,
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::decimal_from_str(prev)?,
-                Datum::decimal_from_str(curr)?,
-                Datum::decimal_from_str(next)?,
-            ]),
-            Some("name IN (10000, 10100, 9900)"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::decimal_from_str(curr)?,
-                Datum::decimal_from_str(next)?,
-            ]),
-            None,
-        )?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_projection_truncate_upper_bound_long() -> Result<()> {
-        let value = 99i64;
-
-        let fixture = TestProjectionFixture::new(
-            Transform::Truncate(10),
-            "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Long)),
-        );
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThan, Datum::long(value)),
-            Some("name <= 90"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThanOrEq, Datum::long(value)),
-            Some("name <= 90"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::GreaterThanOrEq, Datum::long(value)),
-            Some("name >= 90"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::Eq, Datum::long(value)),
-            Some("name = 90"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::NotEq, Datum::long(value)),
-            None,
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::long(value - 1),
-                Datum::long(value),
-                Datum::long(value + 1),
-            ]),
-            Some("name IN (100, 90)"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::long(value),
-                Datum::long(value + 1),
-            ]),
-            None,
-        )?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_projection_truncate_lower_bound_long() -> Result<()> {
-        let value = 100i64;
-
-        let fixture = TestProjectionFixture::new(
-            Transform::Truncate(10),
-            "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Long)),
-        );
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThan, Datum::long(value)),
-            Some("name <= 90"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThanOrEq, Datum::long(value)),
-            Some("name <= 100"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::GreaterThanOrEq, Datum::long(value)),
-            Some("name >= 100"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::Eq, Datum::long(value)),
-            Some("name = 100"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::NotEq, Datum::long(value)),
-            None,
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::long(value - 1),
-                Datum::long(value),
-                Datum::long(value + 1),
-            ]),
-            Some("name IN (100, 90)"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::long(value),
-                Datum::long(value + 1),
-            ]),
-            None,
-        )?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_projection_truncate_upper_bound_integer() -> Result<()> {
-        let value = 99;
-
-        let fixture = TestProjectionFixture::new(
-            Transform::Truncate(10),
-            "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Int)),
-        );
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThan, Datum::int(value)),
-            Some("name <= 90"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThanOrEq, Datum::int(value)),
-            Some("name <= 90"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::GreaterThanOrEq, Datum::int(value)),
-            Some("name >= 90"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::Eq, Datum::int(value)),
-            Some("name = 90"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::NotEq, Datum::int(value)),
-            None,
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::int(value - 1),
-                Datum::int(value),
-                Datum::int(value + 1),
-            ]),
-            Some("name IN (100, 90)"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::int(value),
-                Datum::int(value + 1),
-            ]),
-            None,
-        )?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_projection_truncate_lower_bound_integer() -> Result<()> {
-        let value = 100;
-
-        let fixture = TestProjectionFixture::new(
-            Transform::Truncate(10),
-            "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Int)),
-        );
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThan, Datum::int(value)),
-            Some("name <= 90"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::LessThanOrEq, Datum::int(value)),
-            Some("name <= 100"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::GreaterThanOrEq, Datum::int(value)),
-            Some("name >= 100"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::Eq, Datum::int(value)),
-            Some("name = 100"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.binary_predicate(PredicateOperator::NotEq, Datum::int(value)),
-            None,
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::In, vec![
-                Datum::int(value - 1),
-                Datum::int(value),
-                Datum::int(value + 1),
-            ]),
-            Some("name IN (100, 90)"),
-        )?;
-
-        fixture.assert_projection(
-            &fixture.set_predicate(PredicateOperator::NotIn, vec![
-                Datum::int(value),
-                Datum::int(value + 1),
-            ]),
-            None,
-        )?;
-
-        Ok(())
-    }
-
-    // RISK: Truncate { width: 0 } reaching truncate_i32/i64/decimal_i128 aborts the process with
-    // a divide/modulo-by-zero — the constructor is the defense-in-depth door (independent of the
-    // Transform parse bound) and must reject with the Java precondition message
-    // (Truncate.java:42, 1.10.0).
-    #[test]
-    fn test_truncate_new_rejects_zero_width() {
-        let error = super::Truncate::new(0).expect_err("truncate width 0 must be rejected");
-        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
-        assert!(
-            error
-                .message()
-                .contains("Invalid truncate width: 0 (must be > 0)"),
-            "message must match the Java precondition text, got: {}",
-            error.message()
-        );
-    }
-
-    // RISK: widths above i32::MAX are unrepresentable in Java's int (Transforms.java parses with
-    // Integer.parseInt) — accepting one here silently diverges from every Java-written table.
-    #[test]
-    fn test_truncate_new_rejects_width_above_java_int_max() {
-        let error = super::Truncate::new(2147483648)
-            .expect_err("truncate width above i32::MAX must be rejected");
-        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
-        assert!(
-            error.message().contains("must be <= 2147483647"),
-            "message must name the Java int bound, got: {}",
-            error.message()
-        );
-    }
-
-    // RISK (over-broadened guard + golden value at the legal maximum): truncate[i32::MAX] is the
-    // largest Java-representable width and must stay accepted AND produce the exact spec value
-    // (v - v.rem_euclid(W): 1 - 1 = 0 for W = 2147483647).
-    #[test]
-    fn test_truncate_at_java_int_max_accepted_and_produces_exact_value() {
-        let truncate = super::Truncate::new(2147483647).expect("truncate[i32::MAX] is legal");
-        assert_eq!(
-            truncate
-                .transform_literal(&Datum::int(1))
-                .expect("int is truncatable")
-                .expect("truncate of a non-null value is non-null"),
-            Datum::int(0)
-        );
-    }
-
-    /// A mismatch between an input's `DataType` and its concrete Arrow type is answered with a
-    /// typed error, not a panic.
-    ///
-    /// The six call sites in `transform` cannot reach this branch with an arrow-native array —
-    /// `arrow_array::make_array` maps each `DataType` to exactly one array struct — but
-    /// `transform` takes `Arc<dyn Array>`, whose trait is public, so the pairing is a property
-    /// of arrow's constructors rather than of this crate's types. Replacing the `ok_or_else`
-    /// with the `.unwrap()` that used to be at each site turns this test into a panic.
-    ///
-    /// The per-arm behaviour of the six rewritten sites is held by `test_truncate_simple`
-    /// below, which transforms one array of every supported type.
-    #[test]
-    fn test_downcast_input_is_a_typed_error_not_a_panic() {
-        let mislabelled: ArrayRef = Arc::new(arrow_array::StringArray::from(vec!["not an int"]));
-        let error = super::downcast_input::<Int32Array>(&mislabelled)
-            .expect_err("a StringArray is not an Int32Array");
-
-        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
-        assert!(
-            error.to_string().contains("Utf8"),
-            "the error must name the data type it was given: {error}"
-        );
-        assert!(
-            error.to_string().contains("Int32"),
-            "the error must name the array type it expected: {error}"
-        );
-    }
-
-    // Test case ref from: https://iceberg.apache.org/spec/#truncate-transform-details
-    #[test]
-    fn test_truncate_simple() {
-        // test truncate int
-        let input = Arc::new(Int32Array::from(vec![1, -1]));
-        let res = super::Truncate::new(10)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform(input)
-            .unwrap();
-        assert_eq!(
-            res.as_any().downcast_ref::<Int32Array>().unwrap().value(0),
-            0
-        );
-        assert_eq!(
-            res.as_any().downcast_ref::<Int32Array>().unwrap().value(1),
-            -10
-        );
-
-        // test truncate long
-        let input = Arc::new(Int64Array::from(vec![1, -1]));
-        let res = super::Truncate::new(10)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform(input)
-            .unwrap();
-        assert_eq!(
-            res.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
-            0
-        );
-        assert_eq!(
-            res.as_any().downcast_ref::<Int64Array>().unwrap().value(1),
-            -10
-        );
-
-        // test decimal
-        let mut builder = PrimitiveBuilder::<Decimal128Type>::new()
-            .with_precision_and_scale(20, 2)
-            .unwrap();
-        builder.append_value(1065);
-        let input = Arc::new(builder.finish());
-        let res = super::Truncate::new(50)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform(input)
-            .unwrap();
-        assert_eq!(
-            res.as_any()
-                .downcast_ref::<Decimal128Array>()
-                .unwrap()
-                .value(0),
-            1050
-        );
-
-        // test string
-        let input = Arc::new(arrow_array::StringArray::from(vec!["iceberg"]));
-        let res = super::Truncate::new(3)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform(input)
-            .unwrap();
-        assert_eq!(
-            res.as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .unwrap()
-                .value(0),
-            "ice"
-        );
-
-        // test large string
-        let input = Arc::new(arrow_array::LargeStringArray::from(vec!["iceberg"]));
-        let res = super::Truncate::new(3)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform(input)
-            .unwrap();
-        assert_eq!(
-            res.as_any()
-                .downcast_ref::<arrow_array::LargeStringArray>()
-                .unwrap()
-                .value(0),
-            "ice"
-        );
-
-        // test binary
-        let input = Arc::new(arrow_array::BinaryArray::from_vec(vec![b"iceberg"]));
-        let res = super::Truncate::new(3)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform(input)
-            .unwrap();
-        assert_eq!(
-            res.as_any()
-                .downcast_ref::<arrow_array::BinaryArray>()
-                .unwrap()
-                .value(0),
-            b"ice"
-        );
-    }
-
-    #[test]
-    fn test_string_truncate() {
-        let test1 = "イロハニホヘト";
-        let test1_2_expected = "イロ";
-        assert_eq!(super::Truncate::truncate_str(test1, 2), test1_2_expected);
-
-        let test1_3_expected = "イロハ";
-        assert_eq!(super::Truncate::truncate_str(test1, 3), test1_3_expected);
-
-        let test2 = "щщаεはчωいにπάほхεろへσκζ";
-        let test2_7_expected = "щщаεはчω";
-        assert_eq!(super::Truncate::truncate_str(test2, 7), test2_7_expected);
-
-        let test3 = "\u{FFFF}\u{FFFF}";
-        assert_eq!(super::Truncate::truncate_str(test3, 2), test3);
-
-        let test4 = "\u{10000}\u{10000}";
-        let test4_1_expected = "\u{10000}";
-        assert_eq!(super::Truncate::truncate_str(test4, 1), test4_1_expected);
-    }
-
-    #[test]
-    fn test_literal_int() {
-        let input = Datum::int(1);
-        let res = super::Truncate::new(10)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform_literal(&input)
-            .unwrap()
-            .unwrap();
-        assert_eq!(res, Datum::int(0),);
-
-        let input = Datum::int(-1);
-        let res = super::Truncate::new(10)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform_literal(&input)
-            .unwrap()
-            .unwrap();
-        assert_eq!(res, Datum::int(-10),);
-    }
-
-    #[test]
-    fn test_literal_long() {
-        let input = Datum::long(1);
-        let res = super::Truncate::new(10)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform_literal(&input)
-            .unwrap()
-            .unwrap();
-        assert_eq!(res, Datum::long(0),);
-
-        let input = Datum::long(-1);
-        let res = super::Truncate::new(10)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform_literal(&input)
-            .unwrap()
-            .unwrap();
-        assert_eq!(res, Datum::long(-10),);
-    }
-
-    #[test]
-    fn test_decimal_literal() {
-        let input = Datum::decimal(decimal_new(1065, 0)).unwrap();
-        let res = super::Truncate::new(50)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform_literal(&input)
-            .unwrap()
-            .unwrap();
-        assert_eq!(res, Datum::decimal(decimal_new(1050, 0)).unwrap(),);
-    }
-
-    #[test]
-    fn test_string_literal() {
-        let input = Datum::string("iceberg".to_string());
-        let res = super::Truncate::new(3)
-            .expect("truncate width is within 1..=i32::MAX")
-            .transform_literal(&input)
-            .unwrap()
-            .unwrap();
-        assert_eq!(res, Datum::string("ice".to_string()),);
-    }
-}
+#[path = "truncate_tests.rs"]
+mod truncate_tests;
