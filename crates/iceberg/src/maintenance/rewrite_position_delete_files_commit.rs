@@ -21,22 +21,24 @@ impl RewritePositionDeleteFiles {
     pub(super) async fn rewrite_bin(
         &self,
         table: &Table,
-        bin: &AdmittedBin,
-        live_paths: Option<&HashSet<String>>,
+        bin: AdmittedBin,
+        live_paths: Option<&HashSet<Arc<str>>>,
         config: &ResolvedConfig,
     ) -> Result<RewrittenBin> {
         let (key, entries) = bin;
 
         let mut pairs: Vec<(String, i64)> = Vec::new();
-        for entry in entries {
+        for entry in &entries {
             self.read_position_pairs(table, &entry.data_file, &mut pairs)
                 .await?;
         }
 
-        pairs.retain(|(path, _)| live_paths.is_some_and(|live| live.contains(path)));
-        pairs.sort();
+        pairs.retain(|(path, _)| live_paths.is_some_and(|live| live.contains(path.as_str())));
+        pairs.sort_unstable();
 
-        let added = self.write_group_outputs(table, key, &pairs, config).await?;
+        let added = self
+            .write_group_outputs(table, &key, &pairs, config)
+            .await?;
 
         let max_seq = entries
             .iter()
@@ -50,7 +52,7 @@ impl RewritePositionDeleteFiles {
             })?;
 
         Ok(RewrittenBin {
-            deleted: entries.iter().map(|e| e.data_file.clone()).collect(),
+            deleted: entries.into_iter().map(|e| e.data_file).collect(),
             added: added.into_iter().map(|file| (file, max_seq)).collect(),
         })
     }
@@ -63,6 +65,10 @@ impl RewritePositionDeleteFiles {
         config: &ResolvedConfig,
     ) -> Result<Vec<DataFile>> {
         let mut written: Vec<DataFile> = Vec::new();
+        if pairs.is_empty() {
+            return Ok(written);
+        }
+        let factory = Self::group_writer_factory(table, key, config)?;
         let mut start = 0;
         while start < pairs.len() {
             let mut end = pairs.len();
@@ -73,7 +79,7 @@ impl RewritePositionDeleteFiles {
                 }
             }
             match self
-                .write_compacted_file(table, key, &pairs[start..end], config)
+                .write_compacted_file(&factory, &pairs[start..end])
                 .await
             {
                 Ok(files) => written.extend(files),

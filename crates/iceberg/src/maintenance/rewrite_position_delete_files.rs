@@ -39,6 +39,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use futures::StreamExt;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::file::properties::WriterProperties;
 
 use super::rewrite_data_files::{
     MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO, MIN_FILE_SIZE_DEFAULT_RATIO,
@@ -51,6 +52,7 @@ use crate::delete_vector::load_delete_vector;
 use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
 use crate::expr::visitors::inclusive_projection::InclusiveProjection;
 use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::io::FileIO;
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
@@ -359,10 +361,8 @@ impl RewritePositionDeleteFiles {
         let mut result = RewritePositionDeleteFilesResult::default();
         let mut pending: Vec<RewrittenBin> = Vec::new();
         for bin in bins {
-            match self
-                .rewrite_bin(&table, &bin, live_paths.get(&bin.0), &config)
-                .await
-            {
+            let live = live_paths.get(&bin.0);
+            match self.rewrite_bin(&table, bin, live, &config).await {
                 Ok(rewritten) => pending.push(rewritten),
                 Err(error) => {
                     if self.partial_progress {
@@ -538,7 +538,7 @@ impl RewritePositionDeleteFiles {
         partition_filter: &mut PartitionFilter,
     ) -> Result<(
         HashMap<GroupKey, Vec<LiveDeleteEntry>>,
-        HashMap<GroupKey, HashSet<String>>,
+        HashMap<GroupKey, HashSet<Arc<str>>>,
     )> {
         let metadata = self.table.metadata();
         let manifest_list = snapshot
@@ -546,7 +546,7 @@ impl RewritePositionDeleteFiles {
             .await?;
 
         let mut groups: HashMap<GroupKey, Vec<LiveDeleteEntry>> = HashMap::new();
-        let mut live_paths: HashMap<GroupKey, HashSet<String>> = HashMap::new();
+        let mut data_paths: Vec<(GroupKey, Arc<str>)> = Vec::new();
         for manifest_file in manifest_list.entries() {
             let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
             for entry in manifest.entries() {
@@ -556,10 +556,10 @@ impl RewritePositionDeleteFiles {
                 let data_file = entry.data_file();
                 match data_file.content_type() {
                     DataContentType::Data => {
-                        live_paths
-                            .entry((data_file.partition_spec_id, data_file.partition().clone()))
-                            .or_default()
-                            .insert(data_file.file_path().to_string());
+                        data_paths.push((
+                            (data_file.partition_spec_id, data_file.partition().clone()),
+                            Arc::from(data_file.file_path()),
+                        ));
                     }
                     DataContentType::PositionDeletes => {
                         if data_file.file_format() != DataFileFormat::Parquet {
@@ -576,6 +576,13 @@ impl RewritePositionDeleteFiles {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        let mut live_paths: HashMap<GroupKey, HashSet<Arc<str>>> = HashMap::new();
+        for (key, path) in data_paths {
+            if groups.contains_key(&key) {
+                live_paths.entry(key).or_default().insert(path);
             }
         }
 
@@ -630,17 +637,12 @@ impl RewritePositionDeleteFiles {
         Ok(())
     }
 
-    /// Write globally sorted pairs under the group spec. One rolling writer, bounded chunks.
-    /// Do not use `new_with_default_file_size`: that hard-wires the 512 MiB data default.
-    async fn write_compacted_file(
-        &self,
+    fn group_writer_factory(
         table: &Table,
         key: &GroupKey,
-        pairs: &[(String, i64)],
         config: &ResolvedConfig,
-    ) -> Result<Vec<DataFile>> {
+    ) -> Result<GroupWriteFactory> {
         let metadata = table.metadata();
-        let schema = metadata.current_schema().clone();
         let (spec_id, partition) = key;
         let spec = metadata
             .partition_spec_by_id(*spec_id)
@@ -653,40 +655,58 @@ impl RewritePositionDeleteFiles {
             .as_ref()
             .clone();
 
-        let writer_config = PositionDeleteWriterConfig::new()?;
-        let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
-        let file_name_gen = DefaultFileNameGenerator::new(
-            "compacted-pos-del".to_string(),
-            Some(uuid::Uuid::now_v7().to_string()),
-            DataFileFormat::Parquet,
-        );
+        Ok(GroupWriteFactory {
+            partition_key: PartitionKey::new(
+                spec,
+                metadata.current_schema().clone(),
+                partition.clone(),
+            )?,
+            writer_config: PositionDeleteWriterConfig::new()?,
+            parquet_properties: position_delete_writer_properties_for(metadata.properties())?,
+            location_gen: DefaultLocationGenerator::new(metadata.clone())?,
+            file_name_gen: DefaultFileNameGenerator::new(
+                "compacted-pos-del".to_string(),
+                Some(uuid::Uuid::now_v7().to_string()),
+                DataFileFormat::Parquet,
+            ),
+            file_io: table.file_io().clone(),
+            write_max_file_size: config.write_max_file_size,
+            chunk_budget: config.chunk_budget,
+        })
+    }
+
+    async fn write_compacted_file(
+        &self,
+        factory: &GroupWriteFactory,
+        pairs: &[(String, i64)],
+    ) -> Result<Vec<DataFile>> {
         // Keep path bounds full. The default `truncate(16)` would widen the path range.
         let parquet_builder = ParquetWriterBuilder::new(
-            position_delete_writer_properties_for(metadata.properties())?,
-            writer_config.schema().clone(),
+            factory.parquet_properties.clone(),
+            factory.writer_config.schema().clone(),
         )
         .with_metrics_config(MetricsConfig::for_position_delete());
         // writeMax, not the resolved target. On 32-bit a larger bound saturates to "never roll".
         let rolling = RollingFileWriterBuilder::new(
             parquet_builder,
-            usize::try_from(config.write_max_file_size).unwrap_or(usize::MAX),
-            table.file_io().clone(),
-            location_gen,
-            file_name_gen,
+            usize::try_from(factory.write_max_file_size).unwrap_or(usize::MAX),
+            factory.file_io.clone(),
+            factory.location_gen.clone(),
+            factory.file_name_gen.clone(),
         );
 
-        let partition_key = PartitionKey::new(spec, schema.clone(), partition.clone())?;
-        let mut writer = PositionDeleteFileWriterBuilder::new(rolling, writer_config.clone())
-            .build(Some(partition_key))
-            .await?;
+        let mut writer =
+            PositionDeleteFileWriterBuilder::new(rolling, factory.writer_config.clone())
+                .build(Some(factory.partition_key.clone()))
+                .await?;
 
         let mut start = 0usize;
         while start < pairs.len() {
-            let end = chunk_end(pairs, start, config.chunk_budget);
+            let end = chunk_end(pairs, start, factory.chunk_budget);
             let chunk = &pairs[start..end];
             let paths: Vec<&str> = chunk.iter().map(|(path, _)| path.as_str()).collect();
             let positions: Vec<i64> = chunk.iter().map(|(_, pos)| *pos).collect();
-            let batch = RecordBatch::try_new(writer_config.arrow_schema().clone(), vec![
+            let batch = RecordBatch::try_new(factory.writer_config.arrow_schema().clone(), vec![
                 Arc::new(StringArray::from(paths)) as ArrayRef,
                 Arc::new(Int64Array::from(positions)) as ArrayRef,
             ])
@@ -951,6 +971,17 @@ fn locate_reserved_columns<'a>(
 struct LiveDeleteEntry {
     data_file: DataFile,
     sequence_number: i64,
+}
+
+struct GroupWriteFactory {
+    partition_key: PartitionKey,
+    writer_config: PositionDeleteWriterConfig,
+    parquet_properties: WriterProperties,
+    location_gen: DefaultLocationGenerator,
+    file_name_gen: DefaultFileNameGenerator,
+    file_io: FileIO,
+    write_max_file_size: u64,
+    chunk_budget: u64,
 }
 
 #[cfg(test)]
