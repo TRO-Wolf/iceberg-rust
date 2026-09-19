@@ -26,8 +26,8 @@
 
 | Item | Tag | Commits | Subject |
 |---|---|---|---|
-| 1 | F-RDF-GRANULARITY-1 | `62d3a595` / `f963f6c5` | red output-count cells, then per-read-split output planning |
-| 2 | ledger | this commit | this file + `task/todo.md` entry |
+| 1 | F-RDF-GRANULARITY-1 | `34dea9bb` / `d635ccf9` / `7c4b45db` | red output-count cells, per-read-split output planning, ledger (round 1, rebased onto `9f36da97`) |
+| 2 | F-RDF-GRANULARITY-1 round 2 | `9cf50d1b` / `9ff89f5d` / this commit | footer-map + delete-loader sharing, planner remainder cells, ledger |
 
 ## 1. Step 0 — measured sizes (fork writer, RePark shape)
 
@@ -122,7 +122,7 @@ produced one file — 8→2 where Java gives 8→8 on the same input.
 
 ## 5. Red → green → mutation
 
-- RED cells (commit `62d3a595`):
+- RED cells (commit `34dea9bb`):
   - `rewrite_data_files_options_tests::test_target_small_output_count_follows_java_read_splits`
     — RePark shape on fork-written files; prints measured sizes and computes the expected count
     from `input_split_size` + `plan_read_tasks`. **RED:** `left: 2, right: 8`.
@@ -132,12 +132,12 @@ produced one file — 8→2 where Java gives 8→8 on the same input.
     it pins the new planning function, not the write path.
   - `rewrite_data_files_plan_tests::test_plan_read_tasks_default_target_is_one_task_per_group`
     — control: default 512 MiB target ⇒ 1 read task per group. Green at RED commit (control).
-- GREEN (commit `f963f6c5`): `cargo test -p iceberg --lib rewrite_data_files` — **99 passed, 0
+- GREEN (commit `d635ccf9`): `cargo test -p iceberg --lib rewrite_data_files` — **99 passed, 0
   failed**; `test_target_small_output_count_follows_java_read_splits` reports
   `added_data_files_count = 8` (= the Java formula's answer on the measured sizes).
-- MUTATION: fix-commit files restored to `62d3a595` (uncommitted) →
+- MUTATION: fix-commit files restored to `34dea9bb` (uncommitted) →
   `test_target_small_output_count_follows_java_read_splits` **FAILED** with the identical
-  signature (`left: 2, right: 8`); restored to `f963f6c5` → 99/99 green. Revert not committed.
+  signature (`left: 2, right: 8`); restored to `d635ccf9` → 99/99 green. Revert not committed.
   The planner-level cells stay green under the revert by construction (they exercise
   `plan_read_tasks`, which the revert leaves in place); the E2E cell is the load-bearing one
   and it is the one that went red.
@@ -157,3 +157,91 @@ files, all three flip — the synthetic planner cell already pins the 1,153 B �
   unchanged.
 - `pack_bins` (group planning) stays a separate lookback-1 packer rather than being re-expressed
   through `PackingIterator`; behavior identical, refactor not needed for this lane.
+
+## 8. Round 2 — review follow-ups (fork #302)
+
+Round 1 was accepted, rebased onto fork `main` `9f36da97` (replay ids `34dea9bb`,
+`d635ccf9`, `7c4b45db` — corrected throughout this ledger), and pushed as fork #302. The
+Grok logic review passed; the perf review returned two P2s and one P3 (plus one ledger-only
+P3). This round lands all of them.
+
+### 8.1 Perf R-01 (P2) — footer map shared, not cloned per read task
+
+Pre-fix, `write_compacted_files` built a fresh `ArrowReader` inside the read-task loop and
+passed `input_footers.clone()` — an O(group files) `HashMap` clone per read task (the
+reviewer's arithmetic: 100k one-file tasks × a 100k-entry map). Fix: `ArrowReader`'s
+`prefetched_parquet_metadata` field is now `Arc<HashMap<Arc<str>, Arc<ParquetMetaData>>>`
+(`arrow/reader.rs`; `ArrowReaderBuilder::build` wraps the builder's map in `Arc`), and the
+write path builds ONE reader per group (`reader.rs` `read(self)` still consumes `self`, so
+the loop calls `reader.clone().read(task_stream)` — the clone is now O(1): `FileIO`,
+`CachingDeleteFileLoader`, `ParquetReadOptions` (Copy) and the footer `Arc`). The builder's
+public `with_prefetched_parquet_metadata(HashMap)` signature is unchanged; the write path
+was its only caller.
+
+### 8.2 Perf R-02 (P2) — one delete loader per group, not per read task
+
+The same hoist fixes the loader regression the read-split planning introduced: a new
+`ArrowReaderBuilder` per read task meant a new `CachingDeleteFileLoader` per task, so a
+partition-scoped delete that loaded once per GROUP loaded once per read TASK.
+`CachingDeleteFileLoader`'s `delete_filter` is `Arc<RwLock<DeleteFileFilterState>>` — clones
+share the claim/loaded state — so `reader.clone()` per read task gives every task the same
+cache while `DeleteFilter::resolve_delete_vector` still scopes application to each task's
+own delete list. No behavior change; the count below is the proof.
+
+Proof cell `rewrite_data_files_delete_loader_tests.rs` (new `#[cfg(test)]` sibling wired in
+`maintenance/mod.rs`; the counting `Storage`/`StorageFactory` wraps `LocalFsStorage` and
+records `Storage::reader(path)` per path — the one seam every delete-file load crosses,
+via `BasicDeleteFileLoader` → `open_parquet_file` → `new_input().reader()`, exactly once
+per load): V2 table, 4 × 50-row files (2,104 B each) in partition `x=0`, one
+partition-scoped equality delete on `y`. `input_split_size` on the measured sizes is
+`8416/4 + 5120 →` clamp 2,800 < 2 × 2,104 ⇒ **4 read tasks**. The counter is cleared after
+the fixture's pre-rewrite MoR scan so only rewrite loads are measured. Asserts:
+`added_data_files_count = 4`, `reader(eq-del path) == 1`, and `scan_rows` after == before
+(199 live rows — the delete drops `y=20`).
+
+- MUTATION R-02: per-task `ArrowReaderBuilder` restored inside the loop (uncommitted;
+  `input_footers.clone()` kept so only the loader sharing is reverted) → the cell **FAILED**
+  `left: 4, right: 1` — one load per read task, the exact regression signature. Restored →
+  green.
+
+### 8.3 Logic L-001 (P3) — planner cells for the remainder rule and unclamped split size
+
+The E2E fixture always clamps `input_split_size` to `writeMaxFileSize`, so it cannot catch a
+wrong remainder rule. Two planner-level cells were added in
+`rewrite_data_files_plan_tests.rs`:
+
+- `test_expected_output_files_remainder_rule_cells` — the reviewer's nine cases at
+  target 2,000 / min 1,500 / max 3,600 (writeMax 2,800): 6776→4, 4612→3, 1999→1, 2000→1,
+  4000→2, 18000→9, 3500→2, 4398→2, 4400→3 — **plus 17500→8**, the discriminating case
+  explained below.
+- `test_input_split_size_between_target_and_write_max` — with a larger target (1,000,000,
+  min 750,000, max 1,800,000 ⇒ writeMax 1,400,000), two inputs whose
+  `input/expected + 5120` lands strictly inside (target, writeMax): 10,500,000 → expected 10
+  → split **1,055,120**; 2,994,000 → remainder 994,000 > min ⇒ expected 3 → split
+  **1,003,120**. Both asserted exactly AND asserted `target < split < write_max`.
+
+- MUTATION L-001: `input_size % target > min_file_size` flipped to `>=` →
+  `expected_output_files(17500)` **FAILED** `left: 9, right: 8`. Restored → green.
+  **Correction to the review premise:** the review expected the *3500* case to redden. It
+  cannot: 3500's remainder (1,500) equals `min_file_size`, so `>=` takes the first branch —
+  but 3500's else-branch *also* returns `withRemainder = 2` (avg-without 3,500 ≥ 2,200), so
+  the operator flip is invisible there. The discriminating input needs `rem == min` AND
+  `avg_without < min(1.1·target, writeMax)` — i.e. `n·2000 + 1500` with `1500/n < 200`, first
+  satisfiable at `n = 8` → 17,500: `>` gives `without = 8` (avg 2,187.5 < 2,200), `>=` gives
+  `with = 9`. That cell is what the mutation killed.
+
+### 8.4 Logic L-002 (P3 residual, no code change)
+
+`plan_read_tasks` packs read splits at `PROPERTY_SPLIT_LOOKBACK_DEFAULT` (**10**) and does
+not read `read.split.planning-lookback` from table properties; Java's Spark runner honors
+that property in `TableScanUtil.planTaskGroups`. Recorded as a residual — the default
+matches Java's own default, so behavior diverges only when a table overrides the property.
+
+### 8.5 Round-2 residual notes
+
+- The exactly-once guarantee is a property of the shared `DeleteFilter` state inside the
+  cloned `CachingDeleteFileLoader` — the load-count cell is the regression alarm if loader
+  cloning ever stops sharing that `Arc<RwLock>` state.
+- Gates after round 2: `cargo fmt --all`, `cargo clippy -p iceberg -p iceberg-datafusion
+  --all-targets -- -D warnings`, `python3 scripts/check_rust_file_size.py`, and
+  `cargo test -p iceberg --lib rewrite_data_files` → **102 passed, 0 failed**.

@@ -37,19 +37,34 @@ streamed one writer chain per group at the plain target.
       (Spark's were ≈1,153 B); Java-on-those-sizes answers 8 / 8 / 8+3 commits —
       `max_group_size` and `partial_progress` were already Java's count on fork files;
       only `target_small` diverged (2 vs 8)
-- [x] red cells (`62d3a595`): E2E `target_small` cell computes the formula's count on
+- [x] red cells (`34dea9bb`): E2E `target_small` cell computes the formula's count on
       the measured sizes (RED `left: 2, right: 8`); planner-level synthetic cell pins
       Spark's 1,153 B ⇒ 2 tasks/partition; control pins 1 task at the default target.
       New tests went into `rewrite_data_files_options_tests.rs` (819 → 878/1000) and
       `rewrite_data_files_plan_tests.rs` (77 → 142/1000), no new `mod` lines
-- [x] fix (`f963f6c5`): `plan_read_tasks` reuses `scan::bin_pack::PackingIterator`
+- [x] fix (`d635ccf9`): `plan_read_tasks` reuses `scan::bin_pack::PackingIterator`
       (lookback 10, largestBinFirst, `weight(0)`); `write_compacted_files` takes
       `&ResolvedConfig`, writes each read task's rows through its own writer chain at
       `writeMaxFileSize`; sort+stamp, router bound, lineage, deletes unchanged;
       `rewrite_data_files.rs` 2449 → 2440, ceiling lowered
-- [x] mutation: fix files restored to `62d3a595` → E2E cell red with the identical
+- [x] mutation: fix files restored to `34dea9bb` → E2E cell red with the identical
       signature; restored → 99/99 `rewrite_data_files` green, revert uncommitted
-- [x] ledger + todo entry; gates below
+- [x] ledger + todo entry (`7c4b45db`); gates below; rebased onto fork main `9f36da97`,
+      pushed as fork #302
+- [x] Round 2 perf R-01/R-02 (`9cf50d1b`): `ArrowReader` footer map now
+      `Arc<HashMap>`; `write_compacted_files` builds ONE reader per group and
+      `reader.clone().read()`s each read task — footer map Arc-shared (O(1) clone),
+      `CachingDeleteFileLoader` cache shared across tasks. New sibling test file
+      `rewrite_data_files_delete_loader_tests.rs` (`mod` line added) counts
+      `Storage::reader(delete path)` — 4 read tasks, 1 partition-scoped eq delete ⇒
+      exactly 1 load, rows conserved; mutation (per-task builder) → `left: 4, right: 1`
+- [x] Round 2 logic L-001 (`9ff89f5d`): planner cells pin `expected_output_files` on
+      all nine review cases + 17_500→8 (the actual `>`/`>=` discriminator — 3500's
+      else-branch also yields 2, so it cannot redden that mutation; ledger §8.3) and
+      `input_split_size` on two strictly unclamped inputs; mutation `>`→`>=` →
+      `expected_output_files(17500)` red `left: 9, right: 8`
+- [x] Round 2 ledger §8 + L-002 recorded as P3 residual (rewrite path uses default
+      lookback 10, not `read.split.planning-lookback`); gates green, 102/102
 - prognosis: all three RePark xfails stay — on RePark-written ≈1,694 B files the fork
       now answers Java's 8/8/8+3, still ≠ Spark's 4/4/4+2 measured on Spark-written
       ≈1,153 B files; residual is writer file size, not planning
