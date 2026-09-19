@@ -203,8 +203,8 @@ mod test {
 
     use uuid::Uuid;
 
-    use crate::MetadataLocation;
     use crate::spec::{FormatVersion, PartitionSpec, StructType, TableMetadata};
+    use crate::{ErrorKind, MetadataLocation};
 
     fn table_metadata(location: &str, properties: HashMap<String, String>) -> TableMetadata {
         TableMetadata {
@@ -591,6 +591,116 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn hadoop_pointer_commit_refuses_write_metadata_path() {
+        use std::collections::HashMap;
+
+        use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use crate::spec::{NestedField, PrimitiveType, Schema, Type};
+        use crate::transaction::{ApplyTransactionAction, Transaction};
+        use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "mem",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "/f14-hadoop-wh".to_string(),
+                )]),
+            )
+            .await
+            .expect("load catalog");
+
+        let ns = NamespaceIdent::new("ns".into());
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .expect("namespace");
+        let source = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("src".into())
+                    .schema(
+                        Schema::builder()
+                            .with_fields(vec![
+                                NestedField::required(
+                                    1,
+                                    "id",
+                                    Type::Primitive(PrimitiveType::Long),
+                                )
+                                .into(),
+                            ])
+                            .build()
+                            .expect("schema"),
+                    )
+                    .build(),
+            )
+            .await
+            .expect("create source");
+
+        let v3 = format!("{}/metadata/v3.metadata.json", source.metadata().location());
+        source
+            .metadata()
+            .write_to(source.file_io(), &v3)
+            .await
+            .expect("write v3");
+
+        let ident = TableIdent::new(ns, "hadoop".into());
+        let registered = catalog
+            .register_table(&ident, v3.clone())
+            .await
+            .expect("register v3");
+
+        let tx = Transaction::new(&registered);
+        let err = match tx
+            .update_table_properties()
+            .set("write.metadata.path".to_string(), "/alt-meta".to_string())
+            .apply(tx)
+            .expect("apply")
+            .commit(&catalog)
+            .await
+        {
+            Ok(_) => {
+                panic!("a hadoop-convention commit carrying write.metadata.path must fail")
+            }
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message()
+                .contains("Hadoop path-based tables cannot relocate metadata"),
+            "the refusal must carry Java's message, got: {err}"
+        );
+
+        let loaded = catalog.load_table(&ident).await.expect("load back");
+        assert_eq!(
+            loaded.metadata_location().expect("location"),
+            v3,
+            "a refused commit must not move the catalog pointer"
+        );
+        assert!(
+            registered
+                .file_io()
+                .list("/alt-meta")
+                .await
+                .expect("list /alt-meta")
+                .is_empty(),
+            "no metadata file may land under write.metadata.path"
+        );
+        assert!(
+            !registered
+                .file_io()
+                .exists(format!(
+                    "{}/metadata/v4.metadata.json",
+                    source.metadata().location()
+                ))
+                .await
+                .expect("v4 exists check"),
+            "no next-version file may land under the pointer directory either"
+        );
+    }
+
     #[test]
     fn from_file_path_accepts_relocated_metadata_dir() {
         let parsed = MetadataLocation::from_file_path(
@@ -685,19 +795,24 @@ mod test {
             "/wh/sales/orders/metadata/v3.metadata.json",
             "a hadoop-convention pointer keeps its own directory, not the metadata location"
         );
+    }
 
+    #[test]
+    fn rebased_refuses_write_metadata_path_for_hadoop_convention() {
+        let base = MetadataLocation::from_file_path("/wh/sales/orders/metadata/v2.metadata.json")
+            .expect("parse hadoop base");
         let relocated = table_metadata(
             "/wh/sales/seed",
             HashMap::from([("write.metadata.path".to_string(), "/alt-meta/".to_string())]),
         );
-        let moved = base
+        let err = base
             .with_next_version()
             .rebased(&relocated)
-            .expect("rebased hadoop with property");
+            .expect_err("a hadoop-convention pointer carrying write.metadata.path must refuse");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert_eq!(
-            moved.to_string(),
-            "/alt-meta/v3.metadata.json",
-            "write.metadata.path wins over the pointer dir even for the hadoop convention"
+            err.message(),
+            "Hadoop path-based tables cannot relocate metadata"
         );
     }
 
