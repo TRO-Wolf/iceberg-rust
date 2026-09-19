@@ -445,3 +445,98 @@ All reverted; filtered suites green again.
 - `cargo test -p iceberg --lib -- location convert_equality
   rewrite_table_path` — 84/84; `cargo test -p iceberg-catalog-s3tables`
   — 43/43 + register_table + doctest.
+
+## Round 4 — V-001: `rebased` dropped the hadoop pointer's directory
+
+### Root cause
+
+`MetadataLocation::rebased` routed every convention through
+`write_metadata_dir`, so absent `write.metadata.path` the next file
+always landed under `{metadata.location()}/metadata`. A Hadoop-named
+`vN` pointer whose own directory differs from `metadata.location()/metadata`
+(a `register_table` pointer, e.g. `seed_hadoop_v2`: v2 registered under
+`{wh}/sales/orders/metadata` while the JSON `location` is
+`{wh}/sales/seed`) lost its directory — `origin/main`'s `with_next_version`
+kept the parsed pointer dir for every convention.
+
+### Java 1.11.0 bytecode (spark-runtime 4.1_2.13-1.11.0.jar, `javap -c -p`)
+
+- `HadoopTableOperations.commit`: offsets 71–92 —
+  `checkArgument(!metadata.properties().containsKey("write.metadata.path"),
+  "Hadoop path-based tables cannot relocate metadata")`. Hadoop path
+  tables REFUSE `write.metadata.path` outright (and refuse any
+  `metadata.location()` change at offsets 48–68, "cannot be relocated").
+- `HadoopTableOperations.metadataRoot()` = `new Path(this.location,
+  "metadata")` — `this.location` is the constructor's loaded-from table
+  path, NOT `metadata.location()`. `metadataFilePath(version, codec)` =
+  `{metadataRoot}/v{version}{ext}` — new metadata lands under the
+  loaded-path root's `metadata/` = the fork's pointer directory.
+- `BaseMetastoreTableOperations.metadataFileLocation(metadata, fileName)`
+  re-verified: `write.metadata.path` → `{stripTrailingSlash(prop)}/{file}`;
+  else `{metadata.location()}/metadata/{file}`.
+
+### Fork rule after the fix (`MetadataLocation::rebased`)
+
+- `write.metadata.path` set → `{strip(prop)}` for EVERY convention.
+  Brief-mandated extension of the property to hadoop-convention pointers,
+  where Java's `HadoopTableOperations` refuses the property — named
+  residue (the fork's staged/metastore paths have no Java hadoop-ops
+  analogue that could honor it; refusing would break the
+  `write.metadata.path`-every-catalog contract).
+- Hadoop convention (`id == None`), property absent → keep the pointer's
+  own `metadata_dir`. Java: `HadoopTableOperations` writes under the
+  loaded-from root's `metadata/`; restores `origin/main` behavior.
+- Uuid convention, property absent → `{metadata.location()}/metadata`.
+  Java `metadataFileLocation` else-arm — this is the metastore rule, so
+  the "unless Java says otherwise" clause fires over the
+  keep-the-pointer-dir default; the two differ only for a relocated uuid
+  pointer, where `metadata.location()/metadata` is what Java writes.
+
+### Per-catalog effect (all update paths funnel through `TableCommit::apply` → `rebased`)
+
+- Memory / Glue / SQL / HMS / REST / S3 Tables `update_table`: uuid
+  pointers write under `metadata.location()/metadata` absent the property
+  (Java metastore parity; identical to the pointer dir whenever the
+  pointer sits at the standard place); registered hadoop pointers keep
+  their own dir (fork's hadoop-pointer feature, Java `HadoopTableOperations`
+  semantics).
+- `StagedTableTransaction::begin_replace` keeps-location path and
+  `Transaction::apply_locally`: same rule — the two V-001 tests go green.
+- Catalog `create_table` paths use `for_metadata` (unchanged); view
+  version advance untouched; `for_metadata` and the three
+  `SnapshotProducer` manifest sites still route through
+  `write_metadata_dir` unconditionally.
+
+### Pins and mutation evidence
+
+- New unit pin `rebased_keeps_pointer_dir_for_hadoop_convention`:
+  hadoop + no property → `/wh/sales/orders/metadata/v3.metadata.json`
+  (pointer dir, not the seed location); hadoop + property →
+  `/alt-meta/v3.metadata.json`.
+- Existing pins cover the other arms:
+  `rebased_moves_dir_with_write_metadata_path` (uuid + property →
+  `/alt-meta/00001-*`; uuid + no property + moved location →
+  `/wh/moved/metadata/00001-*`).
+- Mutation: `rebased` reverted to unconditional `write_metadata_dir` →
+  3 red out of 46 (`rebased_keeps_pointer_dir_for_hadoop_convention`,
+  `hadoop_replace_with_files_publishes_only_next_version`,
+  `hadoop_replace_without_files_publishes_only_next_version`); restored →
+  46/46. The two end-to-end tests were already red on this head before
+  the fix — the bug state is the mutation.
+
+### Round-4 gates
+
+- `cargo test -p iceberg --lib -- location_generator metadata_location
+  snapshot staged_table rewrite_table_path catalog::memory` — 423/423.
+- `cargo test -p iceberg-catalog-s3tables --lib --test register_table` —
+  43/43 + 1/1.
+- `cargo test -p iceberg-catalog-glue -p iceberg-catalog-hms
+  -p iceberg-catalog-sql --lib` — 50/50, 48/48, 81/81.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p iceberg --all-targets --all-features -- -D warnings` —
+  clean (only `crates/iceberg` touched).
+- `./scripts/check_rust_file_size.sh` — 539 files clean
+  (`metadata_location.rs` 848 < 1000 default).
+- `./scripts/check_agent_artifacts.sh`, `check_matrix_anchors.sh`,
+  `check_comment_blocks.sh`, `typos .` — all clean.
+- `comment_ban.py` over `origin/main..HEAD` — `comment-ban hits=0`.
