@@ -614,3 +614,96 @@ async fn position_delete_footer_matches_java_layout() -> Result<()> {
     assert!(pos_encodings.contains(&parquet::basic::Encoding::PLAIN));
     Ok(())
 }
+
+const SPARK_M_DEFAULT_SCHEMA_JSON: &str = "{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"required\":true,\"type\":\"long\"},{\"id\":2,\"name\":\"s\",\"required\":true,\"type\":\"string\"},{\"id\":3,\"name\":\"d\",\"required\":true,\"type\":\"double\"},{\"id\":4,\"name\":\"st\",\"required\":true,\"type\":{\"type\":\"struct\",\"fields\":[{\"id\":6,\"name\":\"a\",\"required\":true,\"type\":\"string\"},{\"id\":7,\"name\":\"b\",\"required\":true,\"type\":\"int\"}]}},{\"id\":5,\"name\":\"xs\",\"required\":true,\"type\":{\"type\":\"list\",\"element-id\":8,\"element\":\"int\",\"element-required\":true}}]}";
+
+const JAVA_NESTED_SCHEMA_JSON: &str = "{\"type\":\"struct\",\"schema-id\":0,\"identifier-field-ids\":[1,2],\"fields\":[{\"id\":1,\"name\":\"id\",\"required\":true,\"type\":\"long\"},{\"id\":2,\"name\":\"key_col\",\"required\":true,\"type\":\"string\",\"doc\":\"the key\"},{\"id\":3,\"name\":\"tags\",\"required\":false,\"type\":{\"type\":\"list\",\"element-id\":4,\"element\":\"string\",\"element-required\":false}},{\"id\":5,\"name\":\"props\",\"required\":false,\"type\":{\"type\":\"map\",\"key-id\":6,\"key\":\"string\",\"value-id\":7,\"value\":{\"type\":\"struct\",\"fields\":[{\"id\":9,\"name\":\"a\",\"required\":false,\"type\":\"int\"}]},\"value-required\":false}},{\"id\":8,\"name\":\"n\",\"required\":true,\"type\":\"int\",\"initial-default\":0}]}";
+
+fn spark_m_default_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "s", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "d", Type::Primitive(PrimitiveType::Double)).into(),
+            NestedField::required(
+                4,
+                "st",
+                Type::Struct(crate::spec::StructType::new(vec![
+                    NestedField::required(6, "a", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::required(7, "b", Type::Primitive(PrimitiveType::Int)).into(),
+                ])),
+            )
+            .into(),
+            NestedField::required(
+                5,
+                "xs",
+                Type::List(ListType::new(NestedFieldRef::new(
+                    NestedField::list_element(8, Type::Primitive(PrimitiveType::Int), true),
+                ))),
+            )
+            .into(),
+        ])
+        .build()
+        .unwrap()
+}
+
+fn nested_doc_default_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(0)
+        .with_identifier_field_ids([1, 2])
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "key_col", Type::Primitive(PrimitiveType::String))
+                .with_doc("the key")
+                .into(),
+            NestedField::optional(
+                3,
+                "tags",
+                Type::List(ListType::new(NestedFieldRef::new(
+                    NestedField::list_element(4, Type::Primitive(PrimitiveType::String), false),
+                ))),
+            )
+            .into(),
+            NestedField::optional(
+                5,
+                "props",
+                Type::Map(MapType::new(
+                    NestedFieldRef::new(NestedField::map_key_element(
+                        6,
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    NestedFieldRef::new(NestedField::map_value_element(
+                        7,
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::optional(9, "a", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                        ])),
+                        false,
+                    )),
+                )),
+            )
+            .into(),
+            NestedField::required(8, "n", Type::Primitive(PrimitiveType::Int))
+                .with_initial_default(Literal::int(0))
+                .into(),
+        ])
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn iceberg_schema_json_matches_java_nested_key_order() {
+    let oracle = super::parquet_footer::java_ordered_schema_json(&spark_m_default_schema())
+        .expect("schema serializes");
+    assert_eq!(
+        oracle, SPARK_M_DEFAULT_SCHEMA_JSON,
+        "the footer schema kv must equal the Spark oracle file's iceberg.schema byte-for-byte"
+    );
+    let nested = super::parquet_footer::java_ordered_schema_json(&nested_doc_default_schema())
+        .expect("schema serializes");
+    assert_eq!(
+        nested, JAVA_NESTED_SCHEMA_JSON,
+        "map, doc, identifier-field-ids and initial-default must serialize in Java's key order"
+    );
+}

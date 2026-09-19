@@ -40,7 +40,7 @@ struct JavaOrderedSchema<'a> {
     fields: &'a [NestedFieldRef],
 }
 
-fn java_ordered_schema_json(schema: &Schema) -> Result<String> {
+pub(crate) fn java_ordered_schema_json(schema: &Schema) -> Result<String> {
     let mut identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
     identifier_field_ids.sort_unstable();
     serde_json::to_string(&JavaOrderedSchema {
