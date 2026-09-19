@@ -323,7 +323,7 @@ impl Table {
         let metadata = self.metadata();
         let schema = metadata.current_schema().clone();
 
-        if selects_partitions(predicate, metadata, schema.as_ref(), case_sensitive)? {
+        if selects_partitions(predicate, metadata, &schema, case_sensitive)? {
             return Ok(true);
         }
 
@@ -334,12 +334,12 @@ impl Table {
         if let Some(branch) = branch {
             builder = builder.use_ref(branch);
         }
-        let data_files = builder.build()?.matching_data_files().await?;
+        let scan = builder.build()?;
 
         let strict_bound = predicate.clone().rewrite_not().bind(schema.clone(), true)?;
 
         let mut evaluators: HashMap<i32, ExpressionEvaluator> = HashMap::new();
-        for data_file in &data_files {
+        scan.try_for_each_data_file(|data_file| {
             let spec_id = data_file.partition_spec_id;
             let evaluator = match evaluators.entry(spec_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
@@ -363,13 +363,10 @@ impl Table {
                     entry.insert(ExpressionEvaluator::new(projected))
                 }
             };
-            if evaluator.eval(data_file)? || StrictMetricsEvaluator::eval(&strict_bound, data_file)?
-            {
-                continue;
-            }
-            return Ok(false);
-        }
-        Ok(true)
+            Ok(evaluator.eval(data_file)?
+                || StrictMetricsEvaluator::eval(&strict_bound, data_file)?)
+        })
+        .await
     }
 
     /// Returns the current schema as a shared reference.
@@ -386,13 +383,13 @@ impl Table {
 fn selects_partitions(
     predicate: &Predicate,
     metadata: &TableMetadata,
-    schema: &Schema,
+    schema: &SchemaRef,
     case_sensitive: bool,
 ) -> Result<bool> {
     let bound = predicate
         .clone()
         .rewrite_not()
-        .bind(Arc::new(schema.clone()), case_sensitive)?;
+        .bind(schema.clone(), case_sensitive)?;
     for spec in metadata.partition_specs_iter() {
         if spec.is_unpartitioned() {
             return Ok(false);

@@ -962,10 +962,13 @@ impl TableScan {
         self.plan_context.as_ref().map(|x| &x.snapshot)
     }
 
-    pub(crate) async fn matching_data_files(&self) -> Result<Vec<DataFile>> {
+    pub(crate) async fn try_for_each_data_file<F>(&self, f: F) -> Result<bool>
+    where
+        F: FnMut(&DataFile) -> Result<bool>,
+    {
         match self.plan_context.as_ref() {
-            Some(plan_context) => plan_context.matching_data_files().await,
-            None => Ok(vec![]),
+            Some(plan_context) => plan_context.try_for_each_data_file(f).await,
+            None => Ok(true),
         }
     }
 

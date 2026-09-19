@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cmp::Ordering;
+
 use crate::expr::BoundReference;
 use crate::spec::{DataFile, Datum, PrimitiveLiteral};
 use crate::{Error, ErrorKind, Result};
@@ -32,8 +34,43 @@ fn contains_nulls_only(data_file: &DataFile, field_id: i32) -> bool {
     null_count.is_some() && null_count == value_count
 }
 
-fn utf16(value: &str) -> Vec<u16> {
-    value.encode_utf16().collect()
+fn cmp_utf16_prefix(bound: &str, prefix: &str) -> Ordering {
+    let limit = bound
+        .encode_utf16()
+        .count()
+        .min(prefix.encode_utf16().count());
+    let mut bound_chars = bound.chars();
+    let mut prefix_chars = prefix.chars();
+    let (mut bound_units, mut prefix_units) = (0usize, 0usize);
+    loop {
+        let bound_char = (bound_units < limit).then(|| bound_chars.next()).flatten();
+        let prefix_char = (prefix_units < limit)
+            .then(|| prefix_chars.next())
+            .flatten();
+        match (bound_char, prefix_char) {
+            (Some(bound), Some(prefix)) => {
+                bound_units += bound.len_utf16();
+                prefix_units += prefix.len_utf16();
+                match bound.cmp(&prefix) {
+                    Ordering::Equal => {}
+                    ordering => return ordering,
+                }
+            }
+            (None, None) => return Ordering::Equal,
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+        }
+    }
+}
+
+fn string_literal<'a>(datum: &'a Datum, operator: &str) -> Result<&'a str> {
+    let PrimitiveLiteral::String(value) = datum.literal() else {
+        return Err(Error::new(
+            ErrorKind::Unexpected,
+            format!("Cannot use {operator} operator on non-string values"),
+        ));
+    };
+    Ok(value.as_str())
 }
 
 pub(crate) fn eval_starts_with(
@@ -47,12 +84,7 @@ pub(crate) fn eval_starts_with(
         return Ok(false);
     }
 
-    let PrimitiveLiteral::String(prefix) = datum.literal() else {
-        return Err(Error::new(
-            ErrorKind::Unexpected,
-            "Cannot use StartsWith operator on non-string values",
-        ));
-    };
+    let prefix = string_literal(datum, "StartsWith")?;
 
     let (Some(lower), Some(upper)) = (
         data_file.promoted_lower_bound(reference),
@@ -60,35 +92,24 @@ pub(crate) fn eval_starts_with(
     ) else {
         return Ok(false);
     };
-    let PrimitiveLiteral::String(lower) = lower.literal() else {
+    let lower = string_literal_of(lower.literal(), "StartsWith", "lower_bound")?;
+    let upper = string_literal_of(upper.literal(), "StartsWith", "upper_bound")?;
+
+    Ok(lower.starts_with(prefix) && upper.starts_with(prefix))
+}
+
+fn string_literal_of<'a>(
+    literal: &'a PrimitiveLiteral,
+    operator: &str,
+    bound: &str,
+) -> Result<&'a str> {
+    let PrimitiveLiteral::String(value) = literal else {
         return Err(Error::new(
             ErrorKind::Unexpected,
-            "Cannot use StartsWith operator on non-string lower_bound value",
+            format!("Cannot use {operator} operator on non-string {bound} value"),
         ));
     };
-    let PrimitiveLiteral::String(upper) = upper.literal() else {
-        return Err(Error::new(
-            ErrorKind::Unexpected,
-            "Cannot use StartsWith operator on non-string upper_bound value",
-        ));
-    };
-
-    let prefix_units = utf16(prefix);
-    let lower_units = utf16(lower);
-    if lower_units.len() < prefix_units.len()
-        || lower_units[..prefix_units.len()] != prefix_units[..]
-    {
-        return Ok(false);
-    }
-
-    let upper_units = utf16(upper);
-    if upper_units.len() < prefix_units.len()
-        || upper_units[..prefix_units.len()] != prefix_units[..]
-    {
-        return Ok(false);
-    }
-
-    Ok(true)
+    Ok(value.as_str())
 }
 
 pub(crate) fn eval_not_starts_with(
@@ -105,40 +126,24 @@ pub(crate) fn eval_not_starts_with(
         return Ok(true);
     }
 
-    let PrimitiveLiteral::String(prefix) = datum.literal() else {
-        return Err(Error::new(
-            ErrorKind::Unexpected,
-            "Cannot use NotStartsWith operator on non-string values",
-        ));
-    };
-    let prefix_units = utf16(prefix);
+    let prefix = string_literal(datum, "NotStartsWith")?;
 
-    if let Some(lower) = data_file.promoted_lower_bound(reference) {
-        let PrimitiveLiteral::String(lower) = lower.literal() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Cannot use NotStartsWith operator on non-string lower_bound value",
-            ));
-        };
-        let lower_units = utf16(lower);
-        let trunc = prefix_units.len().min(lower_units.len());
-        if lower_units[..trunc] > prefix_units[..] {
-            return Ok(true);
-        }
+    if let Some(lower) = data_file.promoted_lower_bound(reference)
+        && cmp_utf16_prefix(
+            string_literal_of(lower.literal(), "NotStartsWith", "lower_bound")?,
+            prefix,
+        ) == Ordering::Greater
+    {
+        return Ok(true);
     }
 
-    if let Some(upper) = data_file.promoted_upper_bound(reference) {
-        let PrimitiveLiteral::String(upper) = upper.literal() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Cannot use NotStartsWith operator on non-string upper_bound value",
-            ));
-        };
-        let upper_units = utf16(upper);
-        let trunc = prefix_units.len().min(upper_units.len());
-        if upper_units[..trunc] < prefix_units[..] {
-            return Ok(true);
-        }
+    if let Some(upper) = data_file.promoted_upper_bound(reference)
+        && cmp_utf16_prefix(
+            string_literal_of(upper.literal(), "NotStartsWith", "upper_bound")?,
+            prefix,
+        ) == Ordering::Less
+    {
+        return Ok(true);
     }
 
     Ok(false)

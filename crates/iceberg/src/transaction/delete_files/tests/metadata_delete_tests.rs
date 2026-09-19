@@ -1208,8 +1208,8 @@ async fn can_delete_using_metadata_nested_field_metrics_are_not_provable() {
 async fn can_delete_using_metadata_short_circuits_before_unreadable_manifest() {
     let catalog = new_memory_catalog().await;
     let table = make_oracle_table_in_catalog(&catalog, FormatVersion::V2, None).await;
-    let table = append_files(&catalog, &table, vec![oracle_file1()]).await;
     let table = append_files(&catalog, &table, vec![oracle_file2()]).await;
+    let table = append_files(&catalog, &table, vec![oracle_file1()]).await;
 
     let snapshot = table
         .metadata()
@@ -1240,6 +1240,6 @@ async fn can_delete_using_metadata_short_circuits_before_unreadable_manifest() {
         .await;
     assert!(
         matches!(decision, Ok(false)),
-        "id >= 2 on file1 [1,3] is an unproven candidate in the FIRST manifest: the walk must answer Ok(false) without opening the deleted second manifest — a collect-then-decide walk errors instead, got {decision:?}"
+        "id >= 2 on file1 [1,3] is an unproven candidate in the FIRST manifest of the list (newest first): the walk must answer Ok(false) without opening the deleted second manifest — a collect-then-decide walk errors instead, got {decision:?}"
     );
 }

@@ -125,7 +125,10 @@ impl<'a> StrictMetricsEvaluator<'a> {
     ) -> crate::Result<bool> {
         let field_id = reference.field().id;
 
-        if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
+        if reference.accessor().is_nested()
+            || self.may_contain_null(field_id)
+            || self.may_contain_nan(field_id)
+        {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
@@ -178,6 +181,10 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
     ) -> crate::Result<bool> {
         let field_id = reference.field().id;
 
+        if reference.accessor().is_nested() {
+            return ROWS_MIGHT_NOT_MATCH;
+        }
+
         if self.contains_nulls_only(field_id) {
             return ROWS_MUST_MATCH;
         }
@@ -191,6 +198,10 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
         let field_id = reference.field().id;
+
+        if reference.accessor().is_nested() {
+            return ROWS_MIGHT_NOT_MATCH;
+        }
 
         if let Some(&count) = self.null_count(field_id) {
             if count == 0 {
@@ -299,7 +310,10 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
     ) -> crate::Result<bool> {
         let field_id = reference.field().id;
 
-        if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
+        if reference.accessor().is_nested()
+            || self.may_contain_null(field_id)
+            || self.may_contain_nan(field_id)
+        {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
@@ -323,6 +337,10 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
         let field_id = reference.field().id;
+
+        if reference.accessor().is_nested() {
+            return ROWS_MIGHT_NOT_MATCH;
+        }
 
         if self.contains_nulls_only(field_id) || self.contains_nans_only(field_id) {
             return ROWS_MUST_MATCH;
@@ -375,7 +393,10 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
     ) -> crate::Result<bool> {
         let field_id = reference.field().id;
 
-        if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
+        if reference.accessor().is_nested()
+            || self.may_contain_null(field_id)
+            || self.may_contain_nan(field_id)
+        {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
@@ -397,6 +418,10 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
         let field_id = reference.field().id;
+
+        if reference.accessor().is_nested() {
+            return ROWS_MIGHT_NOT_MATCH;
+        }
 
         if self.contains_nulls_only(field_id) || self.contains_nans_only(field_id) {
             return ROWS_MUST_MATCH;
@@ -978,11 +1003,14 @@ mod test {
         assert!(!result, "Should skip: equal on all-null column");
 
         let result = StrictMetricsEvaluator::eval(&starts_with("all_nulls", "a"), &file).unwrap();
-        assert!(!result, "Strict eval: startsWith always returns false");
+        assert!(
+            !result,
+            "Should skip: startsWith on a column that can contain nulls"
+        );
 
         let result =
             StrictMetricsEvaluator::eval(&not_starts_with("all_nulls", "a"), &file).unwrap();
-        assert!(!result, "Strict eval: notStartsWith always returns false");
+        assert!(result, "Should read: notStartsWith on an all-null column");
 
         // "some_nulls" (field 5) has some nulls.
         let result = StrictMetricsEvaluator::eval(&not_null("some_nulls"), &file).unwrap();
@@ -1468,10 +1496,13 @@ mod test {
         let result = StrictMetricsEvaluator::eval(&starts_with("required", "a"), &file1).unwrap();
         assert!(
             !result,
-            "strict eval: startsWith always false (no metrics support)"
+            "strict eval: startsWith is unproven without both bounds"
         );
         let result = StrictMetricsEvaluator::eval(&starts_with("required", "a"), &file2).unwrap();
-        assert!(!result, "strict eval: startsWith always false");
+        assert!(
+            !result,
+            "strict eval: startsWith is unproven when the column can contain nulls"
+        );
     }
 
     #[test]
@@ -1481,10 +1512,16 @@ mod test {
 
         let result =
             StrictMetricsEvaluator::eval(&not_starts_with("required", "a"), &file1).unwrap();
-        assert!(!result, "Strict eval: notStartsWith always false");
+        assert!(
+            !result,
+            "Strict eval: notStartsWith is unproven without both bounds"
+        );
         let result =
             StrictMetricsEvaluator::eval(&not_starts_with("required", "a"), &file2).unwrap();
-        assert!(!result, "Strict eval: notStartsWith always false");
+        assert!(
+            !result,
+            "Strict eval: notStartsWith is unproven when the bounds interval overlaps the prefix range"
+        );
     }
 
     #[test]
