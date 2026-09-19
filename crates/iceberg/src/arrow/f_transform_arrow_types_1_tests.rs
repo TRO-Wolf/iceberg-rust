@@ -35,7 +35,7 @@ use crate::io::LocalFsStorageFactory;
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
     DataFileFormat, Datum, FormatVersion, Literal, NestedField, PartitionSpec, PrimitiveLiteral,
-    PrimitiveType, Schema, Transform, Type,
+    PrimitiveType, Schema, Struct, Transform, Type,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -394,26 +394,44 @@ fn test_splitter_truncate_binary_every_layout() {
 
 #[test]
 fn test_arrow_struct_to_literal_view_layouts() {
-    for (schema, spec, leaf, field_name) in [
+    let binary_expected: Vec<Option<Literal>> = BINARY_ROWS
+        .iter()
+        .map(|v| {
+            Some(Literal::Struct(Struct::from_iter([v.map(|v| {
+                Literal::Primitive(PrimitiveLiteral::Binary(v.to_vec()))
+            })])))
+        })
+        .collect();
+    let string_expected: Vec<Option<Literal>> = STRING_ROWS
+        .iter()
+        .map(|v| {
+            Some(Literal::Struct(Struct::from_iter([v.map(|v| {
+                Literal::Primitive(PrimitiveLiteral::String(v.to_string()))
+            })])))
+        })
+        .collect();
+    for (schema, spec, leaf, field_name, expected) in [
         (
             id_binary_schema(),
             binary_spec(Transform::Identity),
             Arc::new(BinaryViewArray::from(BINARY_ROWS.to_vec())) as ArrayRef,
             "b_part",
+            binary_expected,
         ),
         (
             id_string_schema(),
             string_spec(Transform::Identity),
             Arc::new(StringViewArray::from(STRING_ROWS.to_vec())) as ArrayRef,
             "s_part",
+            string_expected,
         ),
     ] {
         let partition_type = spec.partition_type(&schema).expect("partition type");
         let field_id = partition_type.fields()[0].id;
         let field = Arc::new(
-            Field::new(field_name, leaf.data_type().clone(), true).with_metadata(HashMap::from([
-                (PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string()),
-            ])),
+            Field::new(field_name, leaf.data_type().clone(), true).with_metadata(HashMap::from(
+                [(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string())],
+            )),
         );
         let layout = leaf.data_type().clone();
         let struct_array: ArrayRef = Arc::new(
@@ -421,7 +439,10 @@ fn test_arrow_struct_to_literal_view_layouts() {
         );
         let literals = arrow_struct_to_literal(&struct_array, &partition_type)
             .unwrap_or_else(|e| panic!("arrow_struct_to_literal must read a {layout:?} leaf: {e}"));
-        assert_eq!(literals.len(), 7, "literal count for {layout:?}");
+        assert_eq!(
+            literals, expected,
+            "decoded values for {layout:?}: empty vs NULL vs bytes must round-trip"
+        );
     }
 }
 
@@ -624,4 +645,76 @@ async fn test_large_binary_truncate_partitioned_write_scan_v2() -> Result<()> {
 #[tokio::test]
 async fn test_large_binary_truncate_partitioned_write_scan_v3() -> Result<()> {
     large_binary_partitioned_write_scan(FormatVersion::V3).await
+}
+
+async fn not_starts_with_longer_than_width_keeps_every_partition(
+    format_version: FormatVersion,
+) -> Result<()> {
+    let (catalog, _tmp) = local_fs_catalog().await;
+    let table = create_table(&catalog, format_version).await;
+
+    let batch = batch_for("b", Arc::new(LargeBinaryArray::from(BINARY_ROWS.to_vec())));
+    let files = write_computed_files(&table, &batch).await;
+    assert_eq!(files.len(), 5);
+    let table = append_files(&catalog, &table, files).await;
+
+    let predicate = Reference::new("b").not_starts_with(Datum::binary(vec![0x01, 0x02]));
+    let task_count = table
+        .scan()
+        .with_filter(predicate.clone())
+        .build()
+        .expect("build filtered scan")
+        .plan_files()
+        .await
+        .expect("plan files")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect tasks")
+        .len();
+    assert_eq!(
+        task_count, 5,
+        "NOT STARTS WITH on a 2-byte literal through truncate[1] cannot prune any partition"
+    );
+
+    let mut filtered_ids: Vec<i32> = Vec::new();
+    for batch in table
+        .scan()
+        .with_filter(predicate)
+        .build()
+        .expect("build filtered scan")
+        .to_arrow()
+        .await
+        .expect("filtered scan to arrow")
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .expect("collect filtered batches")
+    {
+        filtered_ids.extend(
+            batch
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 id")
+                .iter()
+                .map(|v| v.expect("id required")),
+        );
+    }
+    filtered_ids.sort();
+    assert_eq!(
+        filtered_ids,
+        vec![1, 2, 5, 6, 7],
+        "rows X'', X'01', X'FF00FF', NULL, X'E4B8AD' do not start with X'0102'; X'0102' and X'010203' drop"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_not_starts_with_binary_partitioned_write_scan_v2() -> Result<()> {
+    not_starts_with_longer_than_width_keeps_every_partition(FormatVersion::V2).await
+}
+
+#[tokio::test]
+async fn test_not_starts_with_binary_partitioned_write_scan_v3() -> Result<()> {
+    not_starts_with_longer_than_width_keeps_every_partition(FormatVersion::V3).await
 }
