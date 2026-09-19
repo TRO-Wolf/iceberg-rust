@@ -26,7 +26,7 @@ use futures::TryStreamExt;
 use crate::Catalog;
 use crate::error::ErrorKind;
 use crate::maintenance::rewrite_data_files::tests::{
-    add_deletes, append_files, create_partitioned_table, live_data_file_paths,
+    add_deletes, append_files, config_for, create_partitioned_table, live_data_file_paths,
     live_delete_file_paths, local_fs_catalog, scan_rows, write_data_file,
     write_equality_delete_file,
 };
@@ -226,11 +226,11 @@ async fn default_max_open_partition_writers_is_64_and_peak_obeys_it() {
     );
 
     let tasks = plan_tasks(&table).await;
+    let config = config_for(1_000_000, 750_000, 1_800_000, 5);
     let compacted = write_compacted_files(
         &table,
         &tasks,
-        1_000_000,
-        64,
+        &config,
         table.metadata().default_partition_spec(),
     )
     .await
@@ -335,11 +335,12 @@ async fn high_cardinality_eviction_keeps_rows_and_obeys_bound() {
     assert_eq!(before.len(), key_count);
 
     let tasks = plan_tasks(&table).await;
+    let mut config = config_for(1_000_000, 750_000, 1_800_000, 5);
+    config.max_open_partition_writers = max_open;
     let compacted = write_compacted_files(
         &table,
         &tasks,
-        1_000_000,
-        max_open,
+        &config,
         table.metadata().default_partition_spec(),
     )
     .await

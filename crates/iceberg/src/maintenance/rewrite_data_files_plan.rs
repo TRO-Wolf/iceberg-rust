@@ -321,15 +321,12 @@ pub(super) fn pack_bins<T>(
     bins
 }
 
-#[allow(dead_code)]
 pub(super) const SPLIT_OVERHEAD: u64 = 5 * 1024;
 
-#[allow(dead_code)]
 pub(super) fn write_max_file_size(target: u64, max: u64) -> u64 {
     (target as f64 + (max as f64 - target as f64) * 0.5) as u64
 }
 
-#[allow(dead_code)]
 pub(super) fn expected_output_files(input_size: u64, config: &ResolvedConfig) -> u64 {
     let target = config.target_file_size_bytes;
     if input_size < target {
@@ -349,7 +346,6 @@ pub(super) fn expected_output_files(input_size: u64, config: &ResolvedConfig) ->
     }
 }
 
-#[allow(dead_code)]
 pub(super) fn input_split_size(input_size: u64, config: &ResolvedConfig) -> u64 {
     let estimated =
         (input_size / expected_output_files(input_size, config)).saturating_add(SPLIT_OVERHEAD);
@@ -363,7 +359,6 @@ pub(super) fn input_split_size(input_size: u64, config: &ResolvedConfig) -> u64 
     }
 }
 
-#[allow(dead_code)]
 pub(super) fn plan_read_tasks(
     tasks: Vec<FileScanTask>,
     split_size: u64,

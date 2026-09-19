@@ -578,8 +578,7 @@ impl RewriteDataFiles {
         let added_files = crate::maintenance::rewrite_data_files_write::write_compacted_files(
             table,
             group,
-            config.target_file_size_bytes,
-            config.max_open_partition_writers,
+            config,
             output_spec,
         )
         .await?
@@ -613,15 +612,13 @@ impl RewriteDataFiles {
         &self,
         table: &Table,
         group: &[FileScanTask],
-        target_file_size_bytes: u64,
     ) -> Result<Vec<DataFile>> {
         let output_spec = self.resolve_output_spec_in(table)?;
+        let config = self.resolve_config()?;
         crate::maintenance::rewrite_data_files_write::write_compacted_files(
             table,
             group,
-            target_file_size_bytes,
-            self.max_open_partition_writers
-                .unwrap_or(MAX_OPEN_PARTITION_WRITERS_DEFAULT),
+            &config,
             &output_spec,
         )
         .await
@@ -2026,10 +2023,7 @@ pub(crate) mod tests {
                     .clone(),
             );
         }
-        let added = action
-            .write_compacted_files(&table, group, config.target_file_size_bytes)
-            .await
-            .unwrap();
+        let added = action.write_compacted_files(&table, group).await.unwrap();
         let transaction = Transaction::new(&table);
         let rewrite = transaction
             .rewrite_files(files_to_delete, added)
@@ -2102,10 +2096,7 @@ pub(crate) mod tests {
             );
         }
         // Read from the starting snapshot, which has no deletes yet, so y=20 is carried.
-        let added = action
-            .write_compacted_files(&table, group, config.target_file_size_bytes)
-            .await
-            .unwrap();
+        let added = action.write_compacted_files(&table, group).await.unwrap();
 
         // The concurrent delete lands after the starting snapshot and before the commit.
         let eq_delete = write_equality_delete_file(&table, 0, &[20]).await;
