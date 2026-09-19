@@ -429,9 +429,9 @@ fn test_arrow_struct_to_literal_view_layouts() {
         let partition_type = spec.partition_type(&schema).expect("partition type");
         let field_id = partition_type.fields()[0].id;
         let field = Arc::new(
-            Field::new(field_name, leaf.data_type().clone(), true).with_metadata(HashMap::from(
-                [(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string())],
-            )),
+            Field::new(field_name, leaf.data_type().clone(), true).with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string()),
+            ])),
         );
         let layout = leaf.data_type().clone();
         let struct_array: ArrayRef = Arc::new(

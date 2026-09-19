@@ -519,17 +519,15 @@ fn test_project_truncate_binary_not_starts_with_longer_than_width_is_none() {
 #[test]
 fn test_project_truncate_binary_not_starts_with_width_boundaries() {
     let fixture = binary_fixture(Transform::Truncate(1));
-    let (op, datum) = projected_binary(fixture.binary_predicate(
-        PredicateOperator::NotStartsWith,
-        Datum::binary(vec![0x01]),
-    ))
+    let (op, datum) = projected_binary(
+        fixture.binary_predicate(PredicateOperator::NotStartsWith, Datum::binary(vec![0x01])),
+    )
     .expect("len == width must project to NotEq");
     assert_eq!(op, PredicateOperator::NotEq);
     assert_eq!(datum, Datum::binary(vec![0x01]));
-    let (op, datum) = projected_binary(fixture.binary_predicate(
-        PredicateOperator::NotStartsWith,
-        Datum::binary(vec![]),
-    ))
+    let (op, datum) = projected_binary(
+        fixture.binary_predicate(PredicateOperator::NotStartsWith, Datum::binary(vec![])),
+    )
     .expect("len < width must project to NotStartsWith on the literal");
     assert_eq!(op, PredicateOperator::NotStartsWith);
     assert_eq!(datum, Datum::binary(vec![]));
@@ -538,17 +536,15 @@ fn test_project_truncate_binary_not_starts_with_width_boundaries() {
 #[test]
 fn test_project_truncate_binary_starts_with_width_boundaries() {
     let fixture = binary_fixture(Transform::Truncate(1));
-    let (op, datum) = projected_binary(fixture.binary_predicate(
-        PredicateOperator::StartsWith,
-        Datum::binary(vec![0x01]),
-    ))
+    let (op, datum) = projected_binary(
+        fixture.binary_predicate(PredicateOperator::StartsWith, Datum::binary(vec![0x01])),
+    )
     .expect("len == width must project to Eq");
     assert_eq!(op, PredicateOperator::Eq);
     assert_eq!(datum, Datum::binary(vec![0x01]));
-    let (op, datum) = projected_binary(fixture.binary_predicate(
-        PredicateOperator::StartsWith,
-        Datum::binary(vec![]),
-    ))
+    let (op, datum) = projected_binary(
+        fixture.binary_predicate(PredicateOperator::StartsWith, Datum::binary(vec![])),
+    )
     .expect("len < width must project to StartsWith on the literal");
     assert_eq!(op, PredicateOperator::StartsWith);
     assert_eq!(datum, Datum::binary(vec![]));

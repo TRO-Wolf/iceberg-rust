@@ -481,13 +481,7 @@ impl Transform {
                                 Reference::new(name),
                                 expr.literal().to_owned(),
                             )))),
-                            Ordering::Greater => {
-                                Ok(Some(Predicate::Binary(BinaryExpression::new(
-                                    expr.op(),
-                                    Reference::new(name),
-                                    func.transform_literal_result(expr.literal())?,
-                                ))))
-                            }
+                            Ordering::Greater => Ok(None),
                         }
                     } else {
                         self.truncate_array_strict(name, expr, &func)
@@ -767,36 +761,40 @@ impl Transform {
         match op {
             PredicateOperator::LessThan => Some(PredicateOperator::LessThanOrEq),
             PredicateOperator::GreaterThan => Some(PredicateOperator::GreaterThanOrEq),
-            PredicateOperator::StartsWith => match datum.literal() {
-                PrimitiveLiteral::String(s) => {
-                    if let Some(w) = width
-                        && s.len() == w as usize
-                    {
-                        return Some(PredicateOperator::Eq);
-                    };
-                    Some(*op)
-                }
-                _ => Some(*op),
-            },
-            PredicateOperator::NotStartsWith => match datum.literal() {
-                PrimitiveLiteral::String(s) => {
-                    if let Some(w) = width {
-                        let w = w as usize;
+            PredicateOperator::StartsWith => {
+                let len = match datum.literal() {
+                    PrimitiveLiteral::String(s) => s.len(),
+                    PrimitiveLiteral::Binary(b) => b.len(),
+                    _ => return Some(*op),
+                };
+                if let Some(w) = width
+                    && len == w as usize
+                {
+                    return Some(PredicateOperator::Eq);
+                };
+                Some(*op)
+            }
+            PredicateOperator::NotStartsWith => {
+                let len = match datum.literal() {
+                    PrimitiveLiteral::String(s) => s.len(),
+                    PrimitiveLiteral::Binary(b) => b.len(),
+                    _ => return Some(*op),
+                };
+                if let Some(w) = width {
+                    let w = w as usize;
 
-                        if s.len() == w {
-                            return Some(PredicateOperator::NotEq);
-                        }
+                    if len == w {
+                        return Some(PredicateOperator::NotEq);
+                    }
 
-                        if s.len() < w {
-                            return Some(*op);
-                        }
+                    if len < w {
+                        return Some(*op);
+                    }
 
-                        return None;
-                    };
-                    Some(*op)
-                }
-                _ => Some(*op),
-            },
+                    return None;
+                };
+                Some(*op)
+            }
             _ => Some(*op),
         }
     }
@@ -1125,159 +1123,5 @@ enum AdjustedProjection {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // RISK: variant must not be transformable by any VALUE-PRODUCING transform — Java 1.10.0
-    // `Identity.UNSUPPORTED_TYPES` explicitly lists VARIANT (with GEOMETRY/GEOGRAPHY), and
-    // bucket/truncate/year/month/day/hour all reject non-primitive inputs in `canTransform`. A
-    // transform that accepted variant would produce partition/sort values from a type with no
-    // single-value representation.
-    #[test]
-    fn test_variant_rejected_by_value_producing_transforms() {
-        for transform in [
-            Transform::Identity,
-            Transform::Bucket(16),
-            Transform::Truncate(4),
-            Transform::Year,
-            Transform::Month,
-            Transform::Day,
-            Transform::Hour,
-        ] {
-            let error = transform
-                .result_type(&Type::Variant)
-                .expect_err("variant must not be a transform input");
-            assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
-            assert!(
-                error.message().contains("variant"),
-                "{transform} rejection must name the variant input, got: {}",
-                error.message()
-            );
-        }
-    }
-
-    // RISK: bucket[0] / truncate[0] parsed fine from table-metadata JSON and later crashed the
-    // process with a divide/modulo-by-zero on the apply path. Java rejects them at construction
-    // (1.10.0 Bucket.java:41-42 / Truncate.java:42): checkArgument(n > 0, "Invalid number of
-    // buckets: %s (must be > 0)") / checkArgument(width > 0, "Invalid truncate width: %s
-    // (must be > 0)") — so acceptance here was a parity divergence, not just a hardening gap.
-    #[test]
-    fn test_from_str_rejects_zero_bucket_and_zero_truncate() {
-        let error = "bucket[0]"
-            .parse::<Transform>()
-            .expect_err("bucket[0] must be rejected at parse");
-        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
-        assert!(
-            error
-                .message()
-                .contains("Invalid number of buckets: 0 (must be > 0)"),
-            "message must match the Java precondition text, got: {}",
-            error.message()
-        );
-
-        let error = "truncate[0]"
-            .parse::<Transform>()
-            .expect_err("truncate[0] must be rejected at parse");
-        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
-        assert!(
-            error
-                .message()
-                .contains("Invalid truncate width: 0 (must be > 0)"),
-            "message must match the Java precondition text, got: {}",
-            error.message()
-        );
-    }
-
-    // RISK: Java parses both parameters with Integer.parseInt (1.10.0 Transforms.java:39,45), so
-    // values above Integer.MAX_VALUE are unrepresentable there and fail at parse. Pre-fix, an
-    // accepted u32 above i32::MAX wrapped negative through `as i32` in bucket_n and produced
-    // silently WRONG bucket values — a partition-routing divergence vs Java.
-    #[test]
-    fn test_from_str_rejects_parameters_above_java_int_max() {
-        // i32::MAX + 1 = 2147483648: fits in u32, so only the explicit bound rejects it.
-        // 4294967296 (> u32::MAX) exercises the integer-parse rejection of the same door.
-        for input in [
-            "bucket[2147483648]",
-            "truncate[2147483648]",
-            "bucket[4294967296]",
-            "truncate[4294967296]",
-        ] {
-            let error = input
-                .parse::<Transform>()
-                .expect_err("parameters above the Java int maximum must be rejected at parse");
-            assert_eq!(
-                error.kind(),
-                crate::ErrorKind::DataInvalid,
-                "input: {input}"
-            );
-        }
-    }
-
-    // RISK (over-broadened guard): the legal boundaries 1 and i32::MAX must stay accepted — a
-    // `> 0` check mutated to `> 1`, or `<= i32::MAX` mutated to `< i32::MAX`, would reject
-    // partition specs Java writes.
-    #[test]
-    fn test_from_str_accepts_boundary_legal_parameters() {
-        assert_eq!(
-            "bucket[1]"
-                .parse::<Transform>()
-                .expect("bucket[1] is legal"),
-            Transform::Bucket(1)
-        );
-        assert_eq!(
-            "bucket[2147483647]"
-                .parse::<Transform>()
-                .expect("bucket[i32::MAX] is legal"),
-            Transform::Bucket(2147483647)
-        );
-        assert_eq!(
-            "truncate[1]"
-                .parse::<Transform>()
-                .expect("truncate[1] is legal"),
-            Transform::Truncate(1)
-        );
-        assert_eq!(
-            "truncate[2147483647]"
-                .parse::<Transform>()
-                .expect("truncate[i32::MAX] is legal"),
-            Transform::Truncate(2147483647)
-        );
-    }
-
-    // RISK: serde is the bytes-on-disk entry (table metadata, partition specs, sort orders all
-    // carry transforms as JSON strings) — the FromStr bound must hold through Deserialize too.
-    #[test]
-    fn test_serde_rejects_zero_parameter_transforms() {
-        for json in [
-            r#""bucket[0]""#,
-            r#""truncate[0]""#,
-            r#""bucket[2147483648]""#,
-        ] {
-            assert!(
-                serde_json::from_str::<Transform>(json).is_err(),
-                "{json} must fail deserialization"
-            );
-        }
-    }
-
-    // RISK: VOID and UNKNOWN must keep ACCEPTING variant — Java `VoidTransform.canTransform` and
-    // `UnknownTransform.canTransform` both return true for every type (void is how V1 drops a
-    // partition field; unknown preserves forward compatibility). Over-firing would break spec
-    // evolution on variant-bearing schemas. Result types mirror Java: void returns the source
-    // type, unknown returns string.
-    #[test]
-    fn test_variant_accepted_by_void_and_unknown_transforms() {
-        assert_eq!(
-            Transform::Void
-                .result_type(&Type::Variant)
-                .expect("void accepts any source type"),
-            Type::Variant,
-        );
-        assert_eq!(
-            Transform::Unknown
-                .result_type(&Type::Variant)
-                .expect("unknown accepts any source type"),
-            Type::Primitive(PrimitiveType::String),
-        );
-    }
-}
+#[path = "transform_tests.rs"]
+mod tests;
