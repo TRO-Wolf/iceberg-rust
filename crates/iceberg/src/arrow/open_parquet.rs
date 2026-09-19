@@ -21,11 +21,16 @@ use std::sync::Arc;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, RowSelection};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 
-use crate::arrow::reader::{ArrowFileReader, ArrowReader, ParquetReadOptions};
+use crate::arrow::reader::{
+    ArrowFileReader, ArrowReader, CollectFieldIdVisitor, ParquetReadOptions,
+};
 use crate::error::Result;
 use crate::expr::BoundPredicate;
+use crate::expr::visitors::bound_predicate_visitor::visit;
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::io::{FileIO, FileMetadata};
+use crate::metadata_columns::{get_metadata_field, is_metadata_field, is_row_lineage_field};
+use crate::scan::FileScanTask;
 use crate::spec::Schema;
 use crate::{Error, ErrorKind};
 
@@ -39,6 +44,89 @@ pub(crate) fn page_index_policy(needed: bool) -> PageIndexPolicy {
 
 impl ArrowReader {
     pub(crate) async fn open_parquet_file(
+        data_file_path: &str,
+        file_io: &FileIO,
+        file_size_in_bytes: u64,
+        parquet_read_options: ParquetReadOptions,
+        prefetched_metadata: Option<Arc<ParquetMetaData>>,
+    ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
+        let opened = Self::open_parquet_file_sized(
+            data_file_path,
+            file_io,
+            file_size_in_bytes,
+            parquet_read_options,
+            prefetched_metadata.clone(),
+        )
+        .await;
+        let Err(first_error) = opened else {
+            return opened;
+        };
+        let actual_size = match file_io.new_input(data_file_path) {
+            Ok(input) => input
+                .metadata()
+                .await
+                .map(|meta| meta.size)
+                .unwrap_or(file_size_in_bytes),
+            Err(_) => file_size_in_bytes,
+        };
+        if actual_size == file_size_in_bytes {
+            return Err(first_error);
+        }
+        Self::open_parquet_file_sized(
+            data_file_path,
+            file_io,
+            actual_size,
+            parquet_read_options,
+            prefetched_metadata,
+        )
+        .await
+    }
+
+    pub(crate) fn build_expected_schema(task: &FileScanTask) -> Result<Arc<Schema>> {
+        let mut field_ids: Vec<i32> = task.project_field_ids().to_vec();
+        if let Some(predicate) = task.predicate.as_deref() {
+            let mut collector = CollectFieldIdVisitor::default();
+            visit(&mut collector, predicate)?;
+            field_ids.extend(collector.field_ids());
+        }
+        for delete in task.deletes.iter() {
+            if let Some(equality_ids) = &delete.equality_ids {
+                field_ids.extend(equality_ids.iter().copied());
+            }
+        }
+        field_ids.sort_unstable();
+        field_ids.dedup();
+        let mut fields = Vec::new();
+        for &field_id in &field_ids {
+            let field = if is_row_lineage_field(field_id) {
+                get_metadata_field(field_id)?.clone()
+            } else if is_metadata_field(field_id) {
+                continue;
+            } else {
+                task.schema
+                    .field_by_id(field_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Projected field id {field_id} is not present in the scan schema \
+                                 for data file '{}'",
+                                task.data_file_path
+                            ),
+                        )
+                    })?
+                    .clone()
+            };
+            fields.push(field);
+        }
+        let schema = Schema::builder()
+            .with_schema_id(task.schema.schema_id())
+            .with_fields(fields)
+            .build()?;
+        Ok(Arc::new(schema))
+    }
+
+    async fn open_parquet_file_sized(
         data_file_path: &str,
         file_io: &FileIO,
         file_size_in_bytes: u64,

@@ -521,14 +521,33 @@ impl ArrowReader {
         let mut record_batch_stream_builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
+        let needs_physical_ordinals = task.project_field_ids().contains(&RESERVED_FIELD_ID_POS)
+            || task.project_field_ids().contains(&RESERVED_FIELD_ID_ROW_ID);
+
         // Metadata fields are not in the file. The V3 row-lineage pair is the exception: it can be
         // stored, and Java prefers the stored value.
-        let project_field_ids_without_metadata: Vec<i32> = task
+        let mut project_field_ids_without_metadata: Vec<i32> = task
             .project_field_ids
             .iter()
             .filter(|&&id| !is_metadata_field(id) || is_row_lineage_field(id))
             .copied()
             .collect();
+        if needs_physical_ordinals {
+            if let Some(predicate) = task.predicate.as_deref() {
+                let mut collector = CollectFieldIdVisitor {
+                    field_ids: HashSet::default(),
+                };
+                visit(&mut collector, predicate)?;
+                project_field_ids_without_metadata.extend(collector.field_ids());
+            }
+            for delete in task.deletes.iter() {
+                if let Some(equality_ids) = &delete.equality_ids {
+                    project_field_ids_without_metadata.extend(equality_ids.iter().copied());
+                }
+            }
+            project_field_ids_without_metadata.sort_unstable();
+            project_field_ids_without_metadata.dedup();
+        }
 
         // Only fallback ids project by position. Both other branches project by field id.
         let projection_mask = Self::get_arrow_projection_mask(
@@ -541,14 +560,6 @@ impl ArrowReader {
 
         record_batch_stream_builder =
             record_batch_stream_builder.with_projection(projection_mask.clone());
-
-        // A `_pos` projection needs each row's true physical ordinal, to write position deletes.
-        // `RowSelection` skips rows at the decode layer and loses those ordinals, so this path
-        // decodes in order with no RowFilter, RowSelection, or row-group prune. Batches still
-        // stream, so memory stays O(batch). `_row_id` needs the same, because its fallback is
-        // `first_row_id + pos`. A scan that does not project either keeps full pushdown.
-        let needs_physical_ordinals = task.project_field_ids().contains(&RESERVED_FIELD_ID_POS)
-            || task.project_field_ids().contains(&RESERVED_FIELD_ID_ROW_ID);
         if needs_physical_ordinals {
             // This path decodes the whole file with ordinals from 0. A ranged split task would
             // re-emit every row per split, with wrong `_pos`, which corrupts written position
@@ -1011,7 +1022,7 @@ impl ArrowReader {
     ) -> Result<RecordBatch> {
         let row_count = batch.num_rows();
         let batch_base = *absolute_pos;
-        let transformed = transformer.process_record_batch(batch)?;
+        let transformed = transformer.process_record_batch(batch.clone())?;
         // `absolute_pos` and the transformer's `next_row_position` must stay aligned. Under a
         // `_pos` projection the first ordinal in the batch equals `batch_base`. A desync corrupts
         // written position deletes.
@@ -1031,7 +1042,7 @@ impl ArrowReader {
             "absolute_pos desynced from transformer _pos (batch_base={batch_base}, rows={row_count})"
         );
         let mask = Self::survival_mask(
-            &transformed,
+            &batch,
             row_count,
             batch_base,
             positional_deletes,
@@ -1051,41 +1062,6 @@ impl ArrowReader {
                 .with_source(e)
             }),
         }
-    }
-
-    /// The projected Iceberg [`Schema`] a whole-file reader resolves against: the projected field
-    /// ids present in the file, plus the V3 row-lineage pair, whose stored value wins. Every other
-    /// reserved column is synthesized. Field order follows the projection.
-    fn build_expected_schema(task: &FileScanTask) -> Result<Arc<Schema>> {
-        let mut fields = Vec::new();
-        for &field_id in task.project_field_ids() {
-            // The row-lineage pair is the one stored metadata pair, and the stored value wins.
-            let field = if is_row_lineage_field(field_id) {
-                get_metadata_field(field_id)?.clone()
-            } else if is_metadata_field(field_id) {
-                continue;
-            } else {
-                task.schema
-                    .field_by_id(field_id)
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Projected field id {field_id} is not present in the scan schema \
-                                 for data file '{}'",
-                                task.data_file_path
-                            ),
-                        )
-                    })?
-                    .clone()
-            };
-            fields.push(field);
-        }
-        let schema = Schema::builder()
-            .with_schema_id(task.schema.schema_id())
-            .with_fields(fields)
-            .build()?;
-        Ok(Arc::new(schema))
     }
 
     /// Builds the per-row survival mask for a transformed batch, from the positional deletes over
@@ -1831,12 +1807,13 @@ fn add_fallback_field_ids_to_arrow_schema(arrow_schema: &ArrowSchemaRef) -> Arc<
 }
 
 /// A visitor to collect field ids from bound predicates.
-struct CollectFieldIdVisitor {
+#[derive(Default)]
+pub(crate) struct CollectFieldIdVisitor {
     field_ids: HashSet<i32>,
 }
 
 impl CollectFieldIdVisitor {
-    fn field_ids(self) -> HashSet<i32> {
+    pub(crate) fn field_ids(self) -> HashSet<i32> {
         self.field_ids
     }
 }

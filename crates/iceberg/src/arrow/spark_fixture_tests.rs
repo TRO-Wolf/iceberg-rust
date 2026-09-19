@@ -25,7 +25,7 @@ use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::page_prune_fixture::{file_metadata, field_id_map, selected_rows};
+use super::page_prune_fixture::{field_id_map, file_metadata, selected_rows};
 use crate::arrow::reader::ArrowReader;
 use crate::expr::{Bind, Predicate, Reference};
 use crate::io::{
@@ -37,7 +37,8 @@ use crate::table::Table;
 use crate::{Result, TableIdent};
 
 const FIXTURE_PREFIX: &str = "/iceberg-fixtures/page-prune";
-const STRING_PREFIX: &str = "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp";
+const STRING_PREFIX: &str =
+    "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp";
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/interop/page_prune")
@@ -149,78 +150,119 @@ fn datum_string(s: &str) -> Datum {
 fn base_queries() -> Vec<(&'static str, Option<Predicate>)> {
     let id = || Reference::new("id");
     vec![
-        ("id_range", Some(
-            id()
-                .greater_than_or_equal_to(Datum::long(400))
-                .and(id().less_than_or_equal_to(Datum::long(520))),
-        )),
+        (
+            "id_range",
+            Some(
+                id().greater_than_or_equal_to(Datum::long(400))
+                    .and(id().less_than_or_equal_to(Datum::long(520))),
+            ),
+        ),
         ("id_eq", Some(id().equal_to(Datum::long(1234)))),
         ("id_lt", Some(id().less_than(Datum::long(150)))),
-        ("i_gt", Some(Reference::new("i").greater_than(Datum::int(1800)))),
-        ("s_eq", Some(
-            Reference::new("s").equal_to(datum_string("001234")),
-        )),
-        ("s_ge", Some(
-            Reference::new("s").greater_than_or_equal_to(datum_string("001900")),
-        )),
-        ("s_starts", Some(
-            Reference::new("s").starts_with(datum_string("0019")),
-        )),
-        ("s_not_starts", Some(
-            Reference::new("s").not_starts_with(datum_string("0")),
-        )),
+        (
+            "i_gt",
+            Some(Reference::new("i").greater_than(Datum::int(1800))),
+        ),
+        (
+            "s_eq",
+            Some(Reference::new("s").equal_to(datum_string("001234"))),
+        ),
+        (
+            "s_ge",
+            Some(Reference::new("s").greater_than_or_equal_to(datum_string("001900"))),
+        ),
+        (
+            "s_starts",
+            Some(Reference::new("s").starts_with(datum_string("0019"))),
+        ),
+        (
+            "s_not_starts",
+            Some(Reference::new("s").not_starts_with(datum_string("0"))),
+        ),
         ("n_is_null", Some(Reference::new("n").is_null())),
         ("n_not_null", Some(Reference::new("n").is_not_null())),
         ("n_eq", Some(Reference::new("n").equal_to(Datum::int(900)))),
-        ("n_ne", Some(Reference::new("n").not_equal_to(Datum::int(900)))),
-        ("n_not_in", Some(
-            Reference::new("n").is_not_in([Datum::int(900), Datum::int(901)]),
-        )),
+        (
+            "n_ne",
+            Some(Reference::new("n").not_equal_to(Datum::int(900))),
+        ),
+        (
+            "n_not_in",
+            Some(Reference::new("n").is_not_in([Datum::int(900), Datum::int(901)])),
+        ),
         ("d_isnan", Some(Reference::new("d").is_nan())),
         ("d_not_nan", Some(Reference::new("d").is_not_nan())),
-        ("d_lt", Some(Reference::new("d").less_than(Datum::double(100.0)))),
-        ("d_gt", Some(
-            Reference::new("d").greater_than(Datum::double(1000.0)),
-        )),
-        ("d_not_lt", Some(
-            Reference::new("d").less_than(Datum::double(1000.0)).negate(),
-        )),
-        ("f_gt", Some(Reference::new("f").greater_than(Datum::float(2000.0)))),
-        ("ts_range", Some(
-            Reference::new("ts")
-                .greater_than_or_equal_to(Datum::timestamptz_micros(1_767_226_200_000_000))
-                .and(
-                    Reference::new("ts")
-                        .less_than(Datum::timestamptz_micros(1_767_226_320_000_000)),
-                ),
-        )),
+        (
+            "d_lt",
+            Some(Reference::new("d").less_than(Datum::double(100.0))),
+        ),
+        (
+            "d_gt",
+            Some(Reference::new("d").greater_than(Datum::double(1000.0))),
+        ),
+        (
+            "d_not_lt",
+            Some(
+                Reference::new("d")
+                    .less_than(Datum::double(1000.0))
+                    .negate(),
+            ),
+        ),
+        (
+            "f_gt",
+            Some(Reference::new("f").greater_than(Datum::float(2000.0))),
+        ),
+        (
+            "ts_range",
+            Some(
+                Reference::new("ts")
+                    .greater_than_or_equal_to(Datum::timestamptz_micros(1_767_226_200_000_000))
+                    .and(
+                        Reference::new("ts")
+                            .less_than(Datum::timestamptz_micros(1_767_226_320_000_000)),
+                    ),
+            ),
+        ),
         ("_unfiltered", None),
     ]
 }
 
 fn evo_queries() -> Vec<(&'static str, Option<Predicate>)> {
     vec![
-        ("i_promoted_gt", Some(
-            Reference::new("i").greater_than(Datum::long(1800)),
-        )),
-        ("i_promoted_big", Some(
-            Reference::new("i").greater_than(Datum::long(3_000_000_000i64)),
-        )),
-        ("f_promoted_gt", Some(
-            Reference::new("f").greater_than(Datum::double(2000.0)),
-        )),
-        ("dec_promoted_gt", Some(
-            Reference::new("dec")
-                .greater_than(Datum::decimal_from_str("1500.00").expect("decimal")),
-        )),
-        ("renamed_eq", Some(
-            Reference::new("s2").equal_to(datum_string("001234")),
-        )),
+        (
+            "i_promoted_gt",
+            Some(Reference::new("i").greater_than(Datum::long(1800))),
+        ),
+        (
+            "i_promoted_big",
+            Some(Reference::new("i").greater_than(Datum::long(3_000_000_000i64))),
+        ),
+        (
+            "f_promoted_gt",
+            Some(Reference::new("f").greater_than(Datum::double(2000.0))),
+        ),
+        (
+            "dec_promoted_gt",
+            Some(
+                Reference::new("dec")
+                    .greater_than(Datum::decimal_from_str("1500.00").expect("decimal")),
+            ),
+        ),
+        (
+            "renamed_eq",
+            Some(Reference::new("s2").equal_to(datum_string("001234"))),
+        ),
         ("added_is_null", Some(Reference::new("addc").is_null())),
-        ("added_eq", Some(Reference::new("addc").equal_to(Datum::int(7)))),
+        (
+            "added_eq",
+            Some(Reference::new("addc").equal_to(Datum::int(7))),
+        ),
         ("added_not_null", Some(Reference::new("addc").is_not_null())),
         ("readded_is_null", Some(Reference::new("n").is_null())),
-        ("readded_eq", Some(Reference::new("n").equal_to(Datum::int(900)))),
+        (
+            "readded_eq",
+            Some(Reference::new("n").equal_to(Datum::int(900))),
+        ),
         ("_unfiltered", None),
     ]
 }
@@ -390,11 +432,7 @@ async fn assert_kept_rows_subset(truth: &Value, table_name: &str, query: &str) {
         let metadata = file_metadata(local.to_str().expect("utf8"));
         let map = field_id_map(&metadata);
         let selection = ArrowReader::get_row_selection_for_filter_predicate(
-            &bound,
-            &metadata,
-            &None,
-            &map,
-            &schema,
+            &bound, &metadata, &None, &map, &schema,
         )
         .expect("selection")
         .expect("index present on all columns this predicate uses");
@@ -460,11 +498,7 @@ async fn spark_base_v2_per_file_selection_prunes() {
         let metadata = file_metadata(local.to_str().expect("utf8"));
         let map = field_id_map(&metadata);
         let selection = ArrowReader::get_row_selection_for_filter_predicate(
-            &bound,
-            &metadata,
-            &None,
-            &map,
-            &schema,
+            &bound, &metadata, &None, &map, &schema,
         )
         .expect("selection")
         .expect("index");
