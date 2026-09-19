@@ -15,13 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 
+use super::parquet_compression_from_properties;
+use crate::Result;
 use crate::spec::Schema;
 
 pub(crate) const ICEBERG_SCHEMA_META_KEY: &str = "iceberg.schema";
+
+pub(crate) const DELETE_TYPE_META_KEY: &str = "delete-type";
 
 pub(super) fn writer_options(props: &WriterProperties, schema: &Schema) -> ArrowWriterOptions {
     let schema_json = serde_json::to_string(schema).expect("the Iceberg schema serializes to JSON");
@@ -39,4 +45,27 @@ pub(super) fn writer_options(props: &WriterProperties, schema: &Schema) -> Arrow
     ArrowWriterOptions::new()
         .with_properties(props)
         .with_skip_arrow_metadata(true)
+}
+
+#[allow(missing_docs)]
+pub fn equality_delete_writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_key_value_metadata(Some(vec![KeyValue::new(
+            DELETE_TYPE_META_KEY.to_string(),
+            "equality".to_string(),
+        )]))
+        .build()
+}
+
+#[allow(missing_docs)]
+pub fn equality_delete_writer_properties_for(
+    properties: &HashMap<String, String>,
+) -> Result<WriterProperties> {
+    Ok(WriterProperties::builder()
+        .set_key_value_metadata(Some(vec![KeyValue::new(
+            DELETE_TYPE_META_KEY.to_string(),
+            "equality".to_string(),
+        )]))
+        .set_compression(parquet_compression_from_properties(properties)?)
+        .build())
 }

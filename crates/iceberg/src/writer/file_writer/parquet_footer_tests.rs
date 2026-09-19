@@ -41,13 +41,19 @@ use super::{
     FileWriter, FileWriterBuilder, ParquetWriterBuilder, parquet_compression_from_properties,
 };
 use crate::Result;
-use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
+use crate::arrow::{UTC_TIME_ZONE, arrow_schema_to_schema, schema_to_arrow_schema};
 use crate::io::FileIO;
 use crate::spec::{
     DataFileFormat, ListType, Literal, MapType, NestedField, NestedFieldRef, PartitionKey,
     PartitionSpec, PrimitiveType, Schema, Struct, Transform, Type, UnboundPartitionField,
 };
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use crate::writer::base_writer::equality_delete_writer::{
+    EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+};
+use crate::writer::base_writer::position_delete_writer::{
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig, position_delete_writer_properties,
+};
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
 fn repark_schema() -> Schema {
@@ -441,6 +447,95 @@ async fn rolled_files_from_one_builder_have_identical_bytes() -> Result<()> {
         std::fs::read(&paths[0]).unwrap(),
         std::fs::read(&paths[1]).unwrap(),
         "files rolled from one writer builder must be byte-identical"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn position_delete_footer_carries_delete_type() -> Result<()> {
+    let dir = TempDir::new().unwrap();
+    let file_io = FileIO::new_with_fs();
+    let location_gen =
+        DefaultLocationGenerator::with_data_location(dir.path().to_str().unwrap().to_string());
+    let file_name_gen =
+        DefaultFileNameGenerator::new("pos-del".to_string(), None, DataFileFormat::Parquet);
+    let config = PositionDeleteWriterConfig::new()?;
+    let parquet_builder =
+        ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone());
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        file_io,
+        location_gen,
+        file_name_gen,
+    );
+    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .unpartitioned()
+        .build(None)
+        .await?;
+    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+        Arc::new(StringArray::from(vec!["file-a.parquet"])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![4])) as ArrayRef,
+    ])?;
+    writer.write(batch).await?;
+    let files = writer.close().await?;
+    assert_eq!(files.len(), 1);
+    let key_values = footer_key_values(files[0].file_path());
+    assert_eq!(key_values.len(), 2);
+    assert_eq!(
+        key_values[0].key,
+        super::parquet_footer::DELETE_TYPE_META_KEY
+    );
+    assert_eq!(key_values[0].value.as_deref(), Some("position"));
+    assert_eq!(
+        key_values[1].key,
+        super::parquet_footer::ICEBERG_SCHEMA_META_KEY
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn equality_delete_footer_carries_delete_type() -> Result<()> {
+    let dir = TempDir::new().unwrap();
+    let file_io = FileIO::new_with_fs();
+    let location_gen =
+        DefaultLocationGenerator::with_data_location(dir.path().to_str().unwrap().to_string());
+    let file_name_gen =
+        DefaultFileNameGenerator::new("eq-del".to_string(), None, DataFileFormat::Parquet);
+    let schema = Arc::new(repark_schema());
+    let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())?;
+    let parquet_builder = ParquetWriterBuilder::new(
+        super::equality_delete_writer_properties(),
+        Arc::new(arrow_schema_to_schema(config.projected_arrow_schema_ref())?),
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        file_io,
+        location_gen,
+        file_name_gen,
+    );
+    let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+        .unpartitioned()
+        .build(None)
+        .await?;
+    let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int64Array::from(vec![7])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+    ])?;
+    writer.write(batch).await?;
+    let files = writer.close().await?;
+    assert_eq!(files.len(), 1);
+    let key_values = footer_key_values(files[0].file_path());
+    assert_eq!(key_values.len(), 2);
+    assert_eq!(
+        key_values[0].key,
+        super::parquet_footer::DELETE_TYPE_META_KEY
+    );
+    assert_eq!(key_values[0].value.as_deref(), Some("equality"));
+    assert_eq!(
+        key_values[1].key,
+        super::parquet_footer::ICEBERG_SCHEMA_META_KEY
     );
     Ok(())
 }
