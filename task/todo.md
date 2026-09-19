@@ -25,6 +25,35 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-18): F-RDF-GRANULARITY-1 — rewrite output is planned per read split
+
+Ledger: [`f-rdf-granularity-1-ledger.md`](f-rdf-granularity-1-ledger.md). Branch
+`fix/f-rdf-granularity-1` off fork `main`. Consumer: RePark row ICE-RDF-GRANULARITY-1 —
+Spark 4.1.2 + Iceberg 1.11.0 writes each group's output per Java read-split task
+(`inputSplitSize` + `TableScanUtil.planTaskGroups`, open cost 0, lookback 10); the fork
+streamed one writer chain per group at the plain target.
+
+- [x] step 0 measured (printed by the red cell): fork-written files are 8 × 1,694 B
+      (Spark's were ≈1,153 B); Java-on-those-sizes answers 8 / 8 / 8+3 commits —
+      `max_group_size` and `partial_progress` were already Java's count on fork files;
+      only `target_small` diverged (2 vs 8)
+- [x] red cells (`62d3a595`): E2E `target_small` cell computes the formula's count on
+      the measured sizes (RED `left: 2, right: 8`); planner-level synthetic cell pins
+      Spark's 1,153 B ⇒ 2 tasks/partition; control pins 1 task at the default target.
+      New tests went into `rewrite_data_files_options_tests.rs` (819 → 878/1000) and
+      `rewrite_data_files_plan_tests.rs` (77 → 142/1000), no new `mod` lines
+- [x] fix (`f963f6c5`): `plan_read_tasks` reuses `scan::bin_pack::PackingIterator`
+      (lookback 10, largestBinFirst, `weight(0)`); `write_compacted_files` takes
+      `&ResolvedConfig`, writes each read task's rows through its own writer chain at
+      `writeMaxFileSize`; sort+stamp, router bound, lineage, deletes unchanged;
+      `rewrite_data_files.rs` 2449 → 2440, ceiling lowered
+- [x] mutation: fix files restored to `62d3a595` → E2E cell red with the identical
+      signature; restored → 99/99 `rewrite_data_files` green, revert uncommitted
+- [x] ledger + todo entry; gates below
+- prognosis: all three RePark xfails stay — on RePark-written ≈1,694 B files the fork
+      now answers Java's 8/8/8+3, still ≠ Spark's 4/4/4+2 measured on Spark-written
+      ≈1,153 B files; residual is writer file size, not planning
+
 ## ACTIVE (2026-09-18): F-RDF-COW-BYTES-1 — a data rewrite keeps a position delete that still applies, as Java does
 
 Ledger: [`f-rdf-cow-bytes-1-ledger.md`](f-rdf-cow-bytes-1-ledger.md). Branch
