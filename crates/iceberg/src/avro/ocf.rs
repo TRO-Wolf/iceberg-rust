@@ -28,11 +28,13 @@ const OCF_MAX_HEADER_LEN: usize = 64 * 1024 * 1024;
 const AVRO_SCHEMA_META_KEY: &[u8] = b"avro.schema";
 
 #[cfg(test)]
-static OCF_JSON_PARSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static OCF_JSON_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn ocf_json_parse_count() -> usize {
-    OCF_JSON_PARSES.load(std::sync::atomic::Ordering::Relaxed)
+    OCF_JSON_PARSES.with(|c| c.get())
 }
 
 pub(crate) struct OcfHeader {
@@ -431,7 +433,7 @@ pub(crate) fn repair_avro_container(bs: &[u8]) -> Result<Cow<'_, [u8]>> {
         return Ok(Cow::Borrowed(bs));
     }
     #[cfg(test)]
-    OCF_JSON_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    OCF_JSON_PARSES.with(|c| c.set(c.get() + 1));
     let Ok(mut json) = serde_json::from_slice::<JsonValue>(schema_bytes) else {
         return Ok(Cow::Borrowed(bs));
     };

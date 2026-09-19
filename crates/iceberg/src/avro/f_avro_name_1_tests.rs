@@ -911,3 +911,216 @@ fn unique_avro_names_bind_before_literal_names() {
         ])))
     );
 }
+
+fn varint_len(n: usize) -> usize {
+    let mut v = (n as u64) << 1;
+    let mut len = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        len += 1;
+    }
+    len
+}
+
+fn ocf_container_blocked(
+    entries: &OcfMeta,
+    blocks: &[i64],
+    sync: [u8; 16],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut out = b"Obj\x01".to_vec();
+    let mut i = 0;
+    for &n in blocks {
+        let count = n.unsigned_abs() as usize;
+        let chunk = &entries[i..i + count];
+        avro_long_out(&mut out, n);
+        if n < 0 {
+            let byte_size: usize = chunk
+                .iter()
+                .map(|(k, v)| varint_len(k.len()) + k.len() + varint_len(v.len()) + v.len())
+                .sum();
+            avro_long_out(&mut out, byte_size as i64);
+        }
+        for (k, v) in chunk {
+            avro_long_out(&mut out, k.len() as i64);
+            out.extend_from_slice(k);
+            avro_long_out(&mut out, v.len() as i64);
+            out.extend_from_slice(v);
+        }
+        i += count;
+    }
+    avro_long_out(&mut out, 0);
+    out.extend_from_slice(&sync);
+    out.extend_from_slice(body);
+    out
+}
+
+fn codec_container(codec: apache_avro::Codec, name: &str) -> Vec<u8> {
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::optional(1, name, Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .unwrap();
+    let avro = schema_to_avro_schema("data", &schema).unwrap();
+    let mut out = Vec::new();
+    let mut writer = apache_avro::Writer::with_codec(&avro, &mut out, codec);
+    let value = apache_avro::types::Value::Record(vec![(
+        crate::avro::name::java_avro_name(name).into_owned(),
+        apache_avro::types::Value::Union(
+            1,
+            Box::new(apache_avro::types::Value::String("v".to_string())),
+        ),
+    )]);
+    writer.append(value.resolve(&avro).unwrap()).unwrap();
+    writer.into_inner().unwrap();
+    out
+}
+
+#[test]
+fn ocf_metadata_multi_block_and_negative_blocks_decode() {
+    let partition_type = struct_of(&["my_col"]);
+    let partition = Struct::from_iter([Some(Literal::string("x"))]);
+    let mut good = Vec::new();
+    write_data_files_to_avro(
+        &mut good,
+        vec![one_data_file(partition)],
+        &partition_type,
+        FormatVersion::V2,
+    )
+    .unwrap();
+    let (entries, sync, body_off) = ocf_parts(&good);
+    let body = &good[body_off..];
+    let last = entries.len() as i64 - 1;
+    for (label, blocks) in [
+        ("two positive", &[1i64, last][..]),
+        ("negative", &[-(entries.len() as i64)][..]),
+        ("mixed", &[1i64, -last][..]),
+    ] {
+        let container = ocf_container_blocked(&entries, blocks, sync, body);
+        assert_eq!(ocf_parts(&container).0, entries, "{label}");
+        assert!(AvroReader::new(Cursor::new(&container)).is_ok(), "{label}");
+        assert!(
+            matches!(repair_avro_container(&container).unwrap(), Cow::Borrowed(_)),
+            "{label}"
+        );
+        let mut reader = Cursor::new(container);
+        let files = read_data_files_from_avro(
+            &mut reader,
+            &tiny_schema(),
+            0,
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+        assert_eq!(files[0].partition[0], Some(Literal::string("x")), "{label}");
+    }
+
+    let mut broken_entries = entries.clone();
+    let schema_entry = broken_entries
+        .iter_mut()
+        .find(|(k, _)| k == b"avro.schema")
+        .unwrap();
+    let mut json: JsonValue = serde_json::from_slice(&schema_entry.1).unwrap();
+    unfix_schema_name(&mut json, "my_col", "my col");
+    schema_entry.1 = serde_json::to_vec(&json).unwrap();
+    let broken = ocf_container_blocked(
+        &broken_entries,
+        &[1, -(entries.len() as i64 - 1)],
+        sync,
+        body,
+    );
+    let repaired = repair_avro_container(&broken).unwrap().into_owned();
+    let mut reader = Cursor::new(repaired);
+    let files = read_data_files_from_avro(
+        &mut reader,
+        &tiny_schema(),
+        0,
+        &struct_of(&["my col"]),
+        FormatVersion::V2,
+    )
+    .unwrap();
+    assert_eq!(files[0].partition[0], Some(Literal::string("x")));
+}
+
+#[test]
+fn ocf_repair_passes_through_valid_containers_byte_identical() {
+    for codec in [
+        apache_avro::Codec::Null,
+        apache_avro::Codec::Deflate(Default::default()),
+        apache_avro::Codec::Zstandard(Default::default()),
+    ] {
+        let container = codec_container(codec, "ok_col");
+        assert!(AvroReader::new(Cursor::new(&container)).is_ok());
+        let repaired = repair_avro_container(&container).unwrap();
+        assert!(matches!(repaired, Cow::Borrowed(_)));
+        assert_eq!(repaired.as_ref(), container.as_slice());
+    }
+}
+
+#[test]
+fn ocf_repair_fixes_schema_names_inside_snappy_and_zstd_containers() {
+    for codec in [
+        apache_avro::Codec::Null,
+        apache_avro::Codec::Zstandard(Default::default()),
+    ] {
+        let good = codec_container(codec, "my col");
+        let (mut entries, sync, body_off) = ocf_parts(&good);
+        let schema_entry = entries
+            .iter_mut()
+            .find(|(k, _)| k == b"avro.schema")
+            .unwrap();
+        let mut json: JsonValue = serde_json::from_slice(&schema_entry.1).unwrap();
+        unfix_schema_name(&mut json, "my_x20col", "my col");
+        schema_entry.1 = serde_json::to_vec(&json).unwrap();
+        let broken = ocf_container(&entries, sync, &good[body_off..]);
+        assert!(AvroReader::new(Cursor::new(&broken)).is_err());
+
+        let repaired = repair_avro_container(&broken).unwrap().into_owned();
+        let mut reader = AvroReader::new(Cursor::new(&repaired)).unwrap();
+        let value = reader.next().unwrap().unwrap();
+        assert_eq!(
+            value,
+            apache_avro::types::Value::Record(vec![(
+                "my_x20col".to_string(),
+                apache_avro::types::Value::Union(
+                    1,
+                    Box::new(apache_avro::types::Value::String("v".to_string()))
+                )
+            )])
+        );
+    }
+
+    let good = codec_container(apache_avro::Codec::Null, "my col");
+    let (mut entries, sync, body_off) = ocf_parts(&good);
+    let codec_entry = entries
+        .iter_mut()
+        .find(|(k, _)| k == b"avro.codec")
+        .unwrap();
+    codec_entry.1 = b"snappy".to_vec();
+    let schema_entry = entries
+        .iter_mut()
+        .find(|(k, _)| k == b"avro.schema")
+        .unwrap();
+    let mut json: JsonValue = serde_json::from_slice(&schema_entry.1).unwrap();
+    unfix_schema_name(&mut json, "my_x20col", "my col");
+    schema_entry.1 = serde_json::to_vec(&json).unwrap();
+    let broken = ocf_container(&entries, sync, &good[body_off..]);
+    let repaired = repair_avro_container(&broken).unwrap().into_owned();
+    let (rep_entries, _, _) = ocf_parts(&repaired);
+    let codec_entry = rep_entries
+        .iter()
+        .find(|(k, _)| k == b"avro.codec")
+        .unwrap();
+    assert_eq!(codec_entry.1, b"snappy");
+    let schema_entry = rep_entries
+        .iter()
+        .find(|(k, _)| k == b"avro.schema")
+        .unwrap();
+    let json: JsonValue = serde_json::from_slice(&schema_entry.1).unwrap();
+    let fields = record_fields(&json, "data").expect("root record");
+    assert_eq!(fields, vec![(
+        "my_x20col".to_string(),
+        Some("my col".to_string())
+    )]);
+}
