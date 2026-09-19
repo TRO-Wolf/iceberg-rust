@@ -174,3 +174,16 @@ restored byte-identically (`git status` clean before the step-5 commit).
 | id reuse removed | `reuse_or_create_new_sort_id` always returned `highest+1` | `cargo test -p iceberg --lib sort_order` | `test_reapplied_equal_sort_order_reuses_its_order_id` (reapplied order got id 3 instead of 1) |
 | width/unsupported validation removed | `to_sort_field` no longer called `check_supported_transform` | `cargo test -p iceberg --lib sort_order` | `test_sort_by_rejects_bad_transform_widths`, `test_sort_by_rejects_unsupported_transforms` (commits succeeded where Java refuses) |
 | cannot-bind validation removed | `to_sort_field` dropped the `result_type` check | `cargo test -p iceberg --lib sort_order` | `test_sort_by_rejects_transform_type_mismatch`, `test_sort_by_rejects_transform_on_struct_source` — the commit still erred, but via `check_compatibility` as `ErrorKind::Unexpected`, not `DataInvalid` with Java's `Cannot bind: …` shape; the pin proves the action-level check is what produces the Java surface |
+
+## Gates (step 6)
+
+| gate | result |
+|---|---|
+| `cargo test -p iceberg --lib sort_order` | 32 passed, 0 failed |
+| `cargo test -p iceberg --lib rewrite_data_files_lineage` | 7 passed, 0 failed |
+| `cargo test -p iceberg --lib binpack` (mutation-era run) | pin red under the write-path mutation, green after restore |
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy -p iceberg --all-targets -- -D warnings` | clean |
+| `./scripts/check_rust_file_size.sh` | 572 files clean (92 legacy ceilings) |
+| `typos` on touched files | clean |
+| `python3 comment_ban.py` vs `origin/main` | `comment-ban hits=0` before every commit |
