@@ -32,7 +32,8 @@ use iceberg::metadata_columns::{
     RESERVED_FIELD_ID_ROW_ID, format_supports_row_lineage, schema_with_row_lineage,
 };
 use iceberg::spec::{
-    DataFile, DataFileFormat, FormatVersion, SchemaRef as IcebergSchemaRef, TableProperties,
+    DataFile, DataFileFormat, FormatVersion, MetricsConfig, SchemaRef as IcebergSchemaRef,
+    TableProperties,
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -245,7 +246,8 @@ impl StreamingDataFileWriter {
                 .build(),
             schema.clone(),
             FieldMatchMode::Name,
-        );
+        )
+        .with_metrics_config(MetricsConfig::for_table(table.metadata()));
         let location_gen =
             DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
         let file_name_gen = DefaultFileNameGenerator::new(

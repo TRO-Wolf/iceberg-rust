@@ -39,7 +39,9 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN};
-use iceberg::spec::{DataFileFormat, TableProperties, serialize_data_file_to_json};
+use iceberg::spec::{
+    DataFileFormat, MetricsConfig, TableProperties, serialize_data_file_to_json,
+};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -308,7 +310,8 @@ impl ExecutionPlan for IcebergWriteExec {
                 .build(),
             self.table.metadata().current_schema().clone(),
             FieldMatchMode::Name,
-        );
+        )
+        .with_metrics_config(MetricsConfig::for_table(self.table.metadata()));
         let target_file_size = table_props.write_target_file_size_bytes;
 
         let file_io = self.table.file_io().clone();
