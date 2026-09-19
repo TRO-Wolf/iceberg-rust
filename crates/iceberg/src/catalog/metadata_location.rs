@@ -512,4 +512,265 @@ mod test {
             Some("v")
         );
     }
+
+    #[test]
+    fn from_file_path_accepts_relocated_metadata_dir() {
+        let parsed = MetadataLocation::from_file_path(
+            "/alt-meta/00000-a0c2e704-85a1-4368-8ed6-0b0b2a337ec9.metadata.json",
+        )
+        .expect("a write.metadata.path directory must parse");
+        assert_eq!(parsed.version, 0);
+        assert!(!parsed.is_hadoop_convention());
+        assert_eq!(
+            parsed.to_string(),
+            "/alt-meta/00000-a0c2e704-85a1-4368-8ed6-0b0b2a337ec9.metadata.json"
+        );
+
+        let hadoop = MetadataLocation::from_file_path("/alt-meta/v3.metadata.json")
+            .expect("a hadoop name under a relocated dir must parse");
+        assert_eq!(hadoop.version, 3);
+        assert!(hadoop.is_hadoop_convention());
+        assert_eq!(
+            hadoop.with_next_version().to_string(),
+            "/alt-meta/v4.metadata.json"
+        );
+    }
+
+    #[test]
+    fn new_with_table_location_and_properties_honors_write_metadata_path() {
+        use std::collections::HashMap;
+
+        let relocated = MetadataLocation::new_with_table_location_and_properties(
+            "/wh/ns/t",
+            &HashMap::from([(
+                "write.metadata.path".to_string(),
+                "/alt-meta/".to_string(),
+            )]),
+        )
+        .expect("relocated create location");
+        let rendered = relocated.to_string();
+        assert!(
+            rendered.starts_with("/alt-meta/00000-") && rendered.ends_with(".metadata.json"),
+            "write.metadata.path is the complete directory with trailing slash stripped, got {rendered}"
+        );
+
+        let plain = MetadataLocation::new_with_table_location_and_properties(
+            "/wh/ns/t",
+            &HashMap::new(),
+        )
+        .expect("default create location");
+        let rendered = plain.to_string();
+        assert!(
+            rendered.starts_with("/wh/ns/t/metadata/00000-"),
+            "absent property keeps the metadata subdirectory, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn rebased_moves_dir_with_write_metadata_path() {
+        use std::collections::HashMap;
+
+        use crate::spec::{FormatVersion, PartitionSpec, StructType, TableMetadata};
+
+        let base = MetadataLocation::from_str(
+            "/wh/ns/t/metadata/00000-a0c2e704-85a1-4368-8ed6-0b0b2a337ec9.metadata.json",
+        )
+        .expect("parse base");
+        let metadata = TableMetadata {
+            format_version: FormatVersion::V2,
+            table_uuid: Uuid::new_v4(),
+            location: "/wh/ns/t".to_string(),
+            last_updated_ms: 0,
+            last_column_id: 1,
+            schemas: HashMap::new(),
+            current_schema_id: 1,
+            partition_specs: HashMap::new(),
+            default_spec: PartitionSpec::unpartition_spec().into(),
+            default_partition_type: StructType::new(vec![]),
+            last_partition_id: 1000,
+            default_sort_order_id: 0,
+            sort_orders: HashMap::new(),
+            snapshots: HashMap::new(),
+            current_snapshot_id: None,
+            last_sequence_number: 1,
+            properties: HashMap::from([(
+                "write.metadata.path".to_string(),
+                "/alt-meta".to_string(),
+            )]),
+            snapshot_log: Vec::new(),
+            metadata_log: vec![],
+            refs: HashMap::new(),
+            statistics: HashMap::new(),
+            partition_statistics: HashMap::new(),
+            encryption_keys: HashMap::new(),
+            next_row_id: 0,
+        };
+        let moved = base.with_next_version().rebased(&metadata).expect("rebased");
+        let rendered = moved.to_string();
+        assert!(
+            rendered.starts_with("/alt-meta/00001-") && rendered.ends_with(".metadata.json"),
+            "the next version lands under write.metadata.path, got {rendered}"
+        );
+
+        let mut unrelocated = metadata.clone();
+        unrelocated.properties.clear();
+        unrelocated.location = "/wh/moved".to_string();
+        let next = base
+            .with_next_version()
+            .rebased(&unrelocated)
+            .expect("rebased to new table location");
+        let rendered = next.to_string();
+        assert!(
+            rendered.starts_with("/wh/moved/metadata/00001-"),
+            "absent the property the dir follows the new metadata location, got {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_metadata_path_relocates_metadata_files_on_memory_catalog() {
+        use std::collections::HashMap;
+
+        use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use crate::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, Literal, NestedField, PartitionSpec,
+            PrimitiveType, Schema, Struct, Transform, Type,
+        };
+        use crate::transaction::{ApplyTransactionAction, Transaction};
+        use crate::{
+            Catalog, CatalogBuilder, MetadataLocation, NamespaceIdent, TableCreation, TableIdent,
+        };
+
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "mem",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "/wh".to_string(),
+                )]),
+            )
+            .await
+            .expect("load catalog");
+
+        let ns = NamespaceIdent::new("ns".into());
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .expect("namespace");
+
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "cat", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("schema");
+        let spec = PartitionSpec::builder(schema.clone().into())
+            .add_partition_field("cat", "cat", Transform::Identity)
+            .expect("spec field")
+            .build()
+            .expect("spec");
+
+        let ident = TableIdent::new(ns, "metadata_path".into());
+        let table = catalog
+            .create_table(
+                ident.namespace(),
+                TableCreation::builder()
+                    .name("metadata_path".into())
+                    .schema(schema)
+                    .partition_spec(spec)
+                    .properties(HashMap::from([(
+                        "write.metadata.path".to_string(),
+                        "/alt-meta".to_string(),
+                    )]))
+                    .build(),
+            )
+            .await
+            .expect("create with write.metadata.path");
+
+        let create_location = table.metadata_location().expect("create location");
+        assert!(
+            create_location.starts_with("/alt-meta/00000-")
+                && create_location.ends_with(".metadata.json"),
+            "create metadata must land under write.metadata.path, got {create_location}"
+        );
+        let parsed = MetadataLocation::from_file_path(create_location)
+            .expect("the catalog pointer must round-trip through MetadataLocation parsing");
+        assert_eq!(parsed.version, 0);
+
+        let mut data_file = DataFileBuilder::default();
+        data_file
+            .content(DataContentType::Data)
+            .file_path("/wh/ns/metadata_path/data/cat=x/f1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::string("x"))]));
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .add_data_files(vec![data_file.build().expect("data file")])
+            .apply(tx)
+            .expect("apply")
+            .commit(&catalog)
+            .await
+            .expect("append commit");
+
+        let append_location = table.metadata_location().expect("append location");
+        assert!(
+            append_location.starts_with("/alt-meta/00001-"),
+            "commit metadata must land under write.metadata.path, got {append_location}"
+        );
+
+        let snapshot = table.metadata().current_snapshot().expect("snapshot");
+        assert!(
+            snapshot.manifest_list().starts_with("/alt-meta/snap-"),
+            "manifest list must land under write.metadata.path, got {}",
+            snapshot.manifest_list()
+        );
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .expect("manifest list");
+        let manifest_paths: Vec<&str> = manifest_list
+            .entries()
+            .iter()
+            .map(|entry| entry.manifest_path.as_str())
+            .collect();
+        assert!(!manifest_paths.is_empty());
+        for path in &manifest_paths {
+            assert!(
+                path.starts_with("/alt-meta/") && path.ends_with("-m0.avro"),
+                "manifest must land under write.metadata.path, got {path}"
+            );
+        }
+
+        let tx = Transaction::new(&table);
+        let committed = tx
+            .update_table_properties()
+            .set("k".to_string(), "v".to_string())
+            .apply(tx)
+            .expect("apply")
+            .commit(&catalog)
+            .await
+            .expect("update commit");
+        assert!(
+            committed
+                .metadata_location()
+                .expect("update location")
+                .starts_with("/alt-meta/00002-"),
+            "the next catalog update keeps writing under write.metadata.path"
+        );
+
+        let loaded = catalog.load_table(&ident).await.expect("load back");
+        let loaded_location = loaded.metadata_location().expect("loaded location");
+        let parsed = MetadataLocation::from_file_path(loaded_location)
+            .expect("the relocated pointer round-trips through MetadataLocation parsing");
+        assert_eq!(parsed.version, 2);
+        assert_eq!(
+            loaded.metadata().location(),
+            "/wh/ns/metadata_path",
+            "the table location itself never moves"
+        );
+    }
 }
