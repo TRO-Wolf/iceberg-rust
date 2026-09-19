@@ -18,8 +18,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::Int32Array;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::array::{Int32Array, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::Expr;
@@ -28,9 +28,16 @@ use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
-use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+use iceberg::spec::{
+    DataContentType, NestedField, PrimitiveType, Schema as IcebergSchema, Struct, Type,
+};
 use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use crate::IcebergCatalogProvider;
@@ -326,4 +333,174 @@ async fn plan_carries_row_selection_enabled_to_multi_partition_path() {
     .await
     .expect("plan off");
     assert!(!scan_off.row_selection_enabled);
+}
+
+const NULL_PAGE_ROWS: usize = 64;
+
+fn null_pages_batch() -> RecordBatch {
+    let field = |name: &str, data_type: DataType, nullable: bool, field_id: i32| {
+        Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            field_id.to_string(),
+        )]))
+    };
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        field("id", DataType::Int32, false, 1),
+        field("s", DataType::Utf8, true, 2),
+    ]));
+    let ids: Vec<i32> = (0..512).collect();
+    let strings: Vec<Option<String>> = (0..512)
+        .map(|i| {
+            if i < 128 {
+                None
+            } else if i < 256 {
+                (i % 2 == 0).then(|| format!("v{i}"))
+            } else {
+                Some(format!("v{i}"))
+            }
+        })
+        .collect();
+    RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(ids)) as _,
+        Arc::new(StringArray::from(strings)) as _,
+    ])
+    .expect("batch")
+}
+
+async fn null_pages_fixture() -> Fixture {
+    let warehouse = TempDir::new().expect("warehouse");
+    let catalog = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().expect("utf8").to_string(),
+                )]),
+            )
+            .await
+            .expect("catalog"),
+    );
+    let namespace = NamespaceIdent::new("ns".to_string());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("namespace");
+    let schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "s", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .expect("schema");
+    catalog
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("t".to_string())
+                .location(format!("{}/t", warehouse.path().to_str().expect("utf8")))
+                .schema(schema)
+                .build(),
+        )
+        .await
+        .expect("table");
+    let table = catalog
+        .load_table(&TableIdent::new(namespace, "t".to_string()))
+        .await
+        .expect("load table");
+    let file_path = format!("{}/data/null_pages.parquet", table.metadata().location());
+    let output = table.file_io().new_output(file_path).expect("output");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_data_page_row_count_limit(NULL_PAGE_ROWS)
+        .set_write_batch_size(NULL_PAGE_ROWS)
+        .build();
+    let parquet_builder =
+        ParquetWriterBuilder::new(props, table.metadata().current_schema().clone());
+    let mut writer = parquet_builder.build(output).await.expect("writer");
+    writer.write(&null_pages_batch()).await.expect("write");
+    let mut file_builder = writer
+        .close()
+        .await
+        .expect("close")
+        .into_iter()
+        .next()
+        .expect("file");
+    file_builder
+        .content(DataContentType::Data)
+        .partition_spec_id(0)
+        .partition(Struct::empty());
+    let data_file = file_builder.build().expect("data file");
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(vec![data_file])
+        .apply(tx)
+        .expect("apply")
+        .commit(catalog.as_ref())
+        .await
+        .expect("commit");
+    let provider = Arc::new(
+        IcebergCatalogProvider::try_new(catalog.clone())
+            .await
+            .expect("catalog provider"),
+    );
+    Fixture {
+        provider,
+        catalog,
+        _warehouse: warehouse,
+    }
+}
+
+async fn sql_ids(ctx: &SessionContext, sql: &str) -> Vec<i32> {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .expect("query plan")
+        .collect()
+        .await
+        .expect("query");
+    let mut ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id int")
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test]
+async fn sql_door_nulls_under_lt_le_not_gt_three_valued() {
+    let fixture = null_pages_fixture().await;
+    let expected_lt: Vec<i32> = (128..256).step_by(2).chain(256..512).collect();
+    for (sql, expected) in [
+        (
+            "SELECT id FROM catalog.ns.t WHERE s < 'v999'",
+            expected_lt.clone(),
+        ),
+        (
+            "SELECT id FROM catalog.ns.t WHERE s <= 'z'",
+            expected_lt,
+        ),
+        (
+            "SELECT id FROM catalog.ns.t WHERE NOT (s > 'a')",
+            Vec::new(),
+        ),
+    ] {
+        let off = session(&fixture, false);
+        let off_ids = sql_ids(&off, sql).await;
+        let on = session(&fixture, true);
+        let on_ids = sql_ids(&on, sql).await;
+        assert_eq!(off_ids, expected, "OFF must match SQL three-valued: {sql}");
+        assert_eq!(on_ids, expected, "ON must match SQL three-valued: {sql}");
+    }
 }

@@ -266,6 +266,53 @@ async fn n_is_not_null_matches_unfiltered() {
 }
 
 #[tokio::test]
+async fn n_all_null_pages_skipped_for_lt_declared_divergence() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    write_null_pages(&data_path);
+    let schema = id_s_schema();
+    let predicate = bound(
+        &schema,
+        Reference::new("s").less_than(Datum::string("v999")),
+    );
+    let metadata = file_metadata(&data_path);
+    let ci = metadata.column_index().expect("column index");
+    if let parquet::file::page_index::column_index::ColumnIndexMetaData::BYTE_ARRAY(idx) =
+        &ci[0][1]
+    {
+        for p in 0..2 {
+            assert!(
+                idx.is_null_page(p),
+                "fixture pages 0-1 must be all-null in the column index"
+            );
+        }
+    }
+    let selection =
+        page_selection(&file_metadata(&data_path), &schema, &predicate, &None).expect("selection");
+    let selectors: Vec<_> = selection.iter().collect();
+    assert!(
+        selectors[0].skip && selectors[0].row_count == 128,
+        "all-null pages must be skipped for < (column-index semantics)"
+    );
+    assert!(
+        selectors.iter().skip(1).all(|s| !s.skip),
+        "mixed and non-null pages must be kept for <"
+    );
+    let on = collect(
+        task(&data_path, schema.clone(), &[1, 2], Some(predicate.clone())),
+        true,
+    )
+    .await;
+    let off = collect(
+        task(&data_path, schema, &[1, 2], Some(predicate)),
+        false,
+    )
+    .await;
+    assert_eq!(dump(&on).len(), ROWS - 128);
+    assert_eq!(dump(&off).len(), ROWS);
+}
+
+#[tokio::test]
 async fn n_eq_not_eq_not_in_match_unfiltered() {
     let tmp = tmpdir();
     let data_path = path(&tmp, "data.parquet");
