@@ -22,8 +22,10 @@ use crate::maintenance::rewrite_data_files::tests::{
     config_for, synthetic_spec_and_schema, synthetic_task,
 };
 use crate::maintenance::rewrite_data_files_plan::{
-    expected_output_files, input_split_size, plan_file_groups, plan_read_tasks, write_max_file_size,
+    expected_output_files, input_split_size, pack_bins, plan_file_groups, plan_read_tasks,
+    write_max_file_size,
 };
+use crate::scan::FileScanTask;
 use crate::spec::{Literal, PartitionSpec, Struct, Transform};
 
 /// Partition grouping. Different partition values never share a group, and a task of a
@@ -177,4 +179,44 @@ fn test_input_split_size_between_target_and_write_max() {
             "split {split} must sit strictly between target and writeMaxFileSize (unclamped)"
         );
     }
+}
+
+#[test]
+fn test_pack_bins_forward_first_fit() {
+    let (spec, schema) = synthetic_spec_and_schema();
+    let sizes_of = |bins: &[Vec<FileScanTask>]| -> Vec<Vec<u64>> {
+        bins.iter()
+            .map(|bin| bin.iter().map(|task| task.file_size_in_bytes).collect())
+            .collect()
+    };
+
+    let tasks: Vec<FileScanTask> = [3u64, 3, 3, 3]
+        .iter()
+        .enumerate()
+        .map(|(index, &size)| synthetic_task(&format!("f{index}"), size, 0, 0, &spec, &schema))
+        .collect();
+    assert_eq!(
+        sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
+        vec![vec![3, 3], vec![3, 3]]
+    );
+
+    let tasks: Vec<FileScanTask> = [4u64, 3, 3]
+        .iter()
+        .enumerate()
+        .map(|(index, &size)| synthetic_task(&format!("g{index}"), size, 0, 0, &spec, &schema))
+        .collect();
+    assert_eq!(
+        sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
+        vec![vec![4], vec![3, 3]]
+    );
+
+    let tasks: Vec<FileScanTask> = [7u64, 2, 2]
+        .iter()
+        .enumerate()
+        .map(|(index, &size)| synthetic_task(&format!("h{index}"), size, 0, 0, &spec, &schema))
+        .collect();
+    assert_eq!(
+        sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
+        vec![vec![7], vec![2, 2]]
+    );
 }

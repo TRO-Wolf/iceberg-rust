@@ -43,6 +43,11 @@ use crate::maintenance::rewrite_data_files_plan::{
     ResolvedConfig, input_split_size, plan_read_tasks, write_max_file_size,
 };
 use crate::maintenance::rewrite_data_files_router::BoundedPartitionRouter;
+use crate::maintenance::rewrite_data_files_sort::ResolvedStrategy;
+use crate::maintenance::rewrite_data_files_sort_key::KeyPlan;
+use crate::maintenance::rewrite_data_files_sort_run::{
+    ExternalSorter, SortRunStats, SortedBatchSink,
+};
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
     format_supports_row_lineage, schema_with_row_lineage,
@@ -57,7 +62,7 @@ use crate::table::Table;
 use crate::transform::{BoxedTransformFunction, create_transform_function};
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, TableLocationGenerator,
+    DefaultFileNameGenerator, LocationGenerator, TableLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
@@ -67,6 +72,94 @@ pub(crate) struct CompactedWrite {
     pub files: Vec<DataFile>,
     #[allow(dead_code)]
     pub peak_open_partition_writers: usize,
+    #[allow(dead_code)]
+    pub sort_stats: SortRunStats,
+}
+
+const SORTED_OUTPUT_ROWS: usize = 8192;
+
+type RewriteWriterBuilder =
+    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+struct RewriteOutput {
+    chunk_rows: usize,
+    splitter: Option<RecordBatchPartitionSplitter>,
+    router: Option<BoundedPartitionRouter<RewriteWriterBuilder>>,
+    writer: Option<<RewriteWriterBuilder as IcebergWriterBuilder>::R>,
+    files: Vec<DataFile>,
+    peak_open_partition_writers: usize,
+}
+
+impl RewriteOutput {
+    async fn new(
+        builder: RewriteWriterBuilder,
+        splitter: Option<RecordBatchPartitionSplitter>,
+        max_open_partition_writers: usize,
+        chunk_rows: usize,
+    ) -> Result<RewriteOutput> {
+        match splitter {
+            Some(splitter) => Ok(RewriteOutput {
+                chunk_rows,
+                splitter: Some(splitter),
+                router: Some(BoundedPartitionRouter::new(
+                    builder,
+                    max_open_partition_writers,
+                )?),
+                writer: None,
+                files: Vec::new(),
+                peak_open_partition_writers: 0,
+            }),
+            None => Ok(RewriteOutput {
+                chunk_rows,
+                splitter: None,
+                router: None,
+                writer: Some(builder.build(None).await?),
+                files: Vec::new(),
+                peak_open_partition_writers: 1,
+            }),
+        }
+    }
+
+    async fn close(mut self) -> Result<(Vec<DataFile>, usize)> {
+        if let Some(router) = self.router.take() {
+            self.peak_open_partition_writers = router.peak_open_partition_writers();
+            self.files.extend(router.close().await?);
+        }
+        if let Some(mut writer) = self.writer.take() {
+            self.files.extend(writer.close().await?);
+        }
+        Ok((self.files, self.peak_open_partition_writers))
+    }
+}
+
+impl RewriteOutput {
+    async fn write_chunk(&mut self, batch: RecordBatch) -> Result<()> {
+        match (&self.splitter, &mut self.router, &mut self.writer) {
+            (Some(splitter), Some(router), _) => {
+                for (partition_key, partition_batch) in splitter.split(&batch)? {
+                    router.write(partition_key, partition_batch).await?;
+                }
+                Ok(())
+            }
+            (_, _, Some(writer)) => writer.write(batch).await,
+            _ => Err(Error::new(
+                ErrorKind::Unexpected,
+                "The rewrite output has no writer",
+            )),
+        }
+    }
+}
+
+impl SortedBatchSink for RewriteOutput {
+    async fn write_sorted(&mut self, batch: RecordBatch) -> Result<()> {
+        let mut offset = 0usize;
+        while offset < batch.num_rows() {
+            let length = self.chunk_rows.min(batch.num_rows() - offset);
+            self.write_chunk(batch.slice(offset, length)).await?;
+            offset += length;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) async fn write_compacted_files(
@@ -88,6 +181,10 @@ pub(crate) async fn write_compacted_files(
     let spec = output_spec.as_ref().clone();
 
     let location_generator = TableLocationGenerator::new(table.metadata())?;
+    let spill_prefix = location_generator.generate_location(
+        None,
+        &format!("rewrite-sort-spill-{}", uuid::Uuid::now_v7()),
+    );
     let file_name_generator = DefaultFileNameGenerator::new(
         "compacted".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -152,6 +249,41 @@ pub(crate) async fn write_compacted_files(
     let reader = ArrowReaderBuilder::new(table.file_io().clone())
         .with_prefetched_parquet_metadata(input_footers)
         .build();
+
+    if let Some(plan) = KeyPlan::build(&config.strategy, &schema, &arrow_schema)? {
+        let builder = DataFileWriterBuilder::new(rolling_builder.clone())
+            .with_partition_spec(spec.clone())
+            .with_sort_order_id(strategy_stamp(&config.strategy));
+        let mut output = RewriteOutput::new(
+            builder,
+            splitter,
+            config.max_open_partition_writers,
+            SORTED_OUTPUT_ROWS,
+        )
+        .await?;
+        let mut sorter = ExternalSorter::new(
+            table.file_io().clone(),
+            spill_prefix,
+            config.sort_memory_budget_bytes,
+            arrow_schema.clone(),
+            plan,
+        );
+        for read_task in read_tasks {
+            let task_stream = Box::pin(futures::stream::iter(read_task.into_iter().map(Ok)))
+                as crate::scan::FileScanTaskStream;
+            let mut batch_stream = reader.clone().read(task_stream)?;
+            while let Some(batch) = batch_stream.try_next().await? {
+                sorter.push(batch).await?;
+            }
+        }
+        let sort_stats = sorter.finish(&mut output).await?;
+        let (files, peak_open_partition_writers) = output.close().await?;
+        return Ok(CompactedWrite {
+            files,
+            peak_open_partition_writers,
+            sort_stats,
+        });
+    }
 
     let mut files = Vec::new();
     let mut peak = 0usize;
@@ -224,6 +356,7 @@ pub(crate) async fn write_compacted_files(
     Ok(CompactedWrite {
         files,
         peak_open_partition_writers: peak,
+        sort_stats: SortRunStats::default(),
     })
 }
 
@@ -269,6 +402,13 @@ async fn write_sorted_run(
         files.extend(writer.close().await?);
     }
     Ok(())
+}
+
+fn strategy_stamp(strategy: &ResolvedStrategy) -> i32 {
+    match strategy {
+        ResolvedStrategy::Sort { stamp, .. } => *stamp,
+        ResolvedStrategy::BinPack | ResolvedStrategy::ZOrder { .. } => 0,
+    }
 }
 
 fn rewrite_write_schema(table: &Table) -> Result<SchemaRef> {

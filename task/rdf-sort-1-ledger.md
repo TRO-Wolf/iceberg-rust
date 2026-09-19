@@ -263,9 +263,14 @@ multiset for conservation.
 | a z-order over a nested or differently-cased column | the fork refuses it; Spark passes validation and then fails the Spark column lookup (`FIELD_NOT_FOUND`). Both are errors |
 | Iceberg `time` in a z tuple | the fork encodes micros as a whole number; Spark has no mapping for it |
 
-## 5. Mutation proof
+## 5. Red-first evidence and the mutation proof
 
-Recorded at step 5.
+**Red first (step 2).** With the strategy dispatch neutralised (`KeyPlan::build` returning `None`
+for every strategy, i.e. the pre-unit behaviour), 11 of the 17 pins fail and 6 pass. The 6 that
+pass are the ones that must not depend on ordering: the four option preconditions, the
+unsorted-table refusal, and the bin-pack control. Restoring the dispatch turns all 17 green.
+
+The per-clause mutation table is recorded at step 5.
 
 ## 6. Gates
 

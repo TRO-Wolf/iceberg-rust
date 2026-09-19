@@ -173,7 +173,21 @@ mod rewrite_data_files_ratio_tests;
 mod rewrite_data_files_router;
 #[cfg(test)]
 mod rewrite_data_files_router_bound_tests;
+mod rewrite_data_files_sort;
+#[cfg(test)]
+mod rewrite_data_files_sort_bound_tests;
+#[cfg(test)]
+mod rewrite_data_files_sort_harness;
+mod rewrite_data_files_sort_key;
+mod rewrite_data_files_sort_run;
+#[cfg(test)]
+mod rewrite_data_files_sort_tests;
+#[cfg(test)]
+mod rewrite_data_files_sort_vectors;
 mod rewrite_data_files_write;
+mod rewrite_data_files_zorder;
+#[cfg(test)]
+mod rewrite_data_files_zorder_tests;
 mod rewrite_position_delete_files;
 mod rewrite_table_path;
 
@@ -205,6 +219,7 @@ pub use remove_dangling_delete_files::{
 pub use rewrite_data_files::{
     FileGroupRewriteResult, RewriteDataFiles, RewriteDataFilesResult, RewriteJobOrder,
 };
+pub use rewrite_data_files_sort::{RewriteStrategy, ZOrderSpec};
 pub use rewrite_position_delete_files::{
     RewritePositionDeleteFiles, RewritePositionDeleteFilesResult,
 };

@@ -52,7 +52,6 @@
 //!
 //! | not ported | consequence |
 //! |---|---|
-//! | sort and Z-order | only bin-pack is ported |
 //! | oversized-file splitting | an input over `max_file_size` is rewritten whole |
 
 use std::collections::{HashMap, HashSet};
@@ -73,6 +72,7 @@ pub(super) use crate::maintenance::rewrite_data_files_plan::{
 };
 #[cfg(test)]
 use crate::maintenance::rewrite_data_files_plan::{group_qualifies, is_candidate};
+use crate::maintenance::rewrite_data_files_sort::{StrategyConfig, resolve_strategy};
 use crate::maintenance::{RemoveDanglingDeleteFiles, rewrite_data_files_dv as rewrite_dv};
 use crate::scan::FileScanTask;
 use crate::spec::{DataFile, PartitionSpecRef};
@@ -134,6 +134,7 @@ pub struct RewriteDataFiles {
     output_spec_id: Option<i32>,
     rewrite_job_order: RewriteJobOrder,
     max_concurrent_file_group_rewrites: usize,
+    pub(super) strategy_config: StrategyConfig,
 }
 
 impl RewriteDataFiles {
@@ -159,6 +160,7 @@ impl RewriteDataFiles {
             output_spec_id: None,
             rewrite_job_order: RewriteJobOrder::None,
             max_concurrent_file_group_rewrites: 1,
+            strategy_config: StrategyConfig::default(),
         }
     }
 
@@ -475,6 +477,8 @@ impl RewriteDataFiles {
             max_open_partition_writers,
             rewrite_all: self.rewrite_all,
             file_scoped_delete_paths: HashSet::new(),
+            strategy: resolve_strategy(&self.table, &self.strategy_config)?,
+            sort_memory_budget_bytes: self.strategy_config.sort_memory_budget_bytes,
         })
     }
 
@@ -623,6 +627,22 @@ impl RewriteDataFiles {
         )
         .await
         .map(|compacted| compacted.files)
+    }
+
+    pub(crate) async fn write_group_for_test(
+        &self,
+        table: &Table,
+        group: &[FileScanTask],
+    ) -> Result<crate::maintenance::rewrite_data_files_write::CompactedWrite> {
+        let output_spec = self.resolve_output_spec_in(table)?;
+        let config = self.resolve_config()?;
+        crate::maintenance::rewrite_data_files_write::write_compacted_files(
+            table,
+            group,
+            &config,
+            &output_spec,
+        )
+        .await
     }
 
     pub(crate) fn resolved_max_open_partition_writers(&self) -> Result<usize> {
@@ -2306,51 +2326,9 @@ pub(crate) mod tests {
             max_open_partition_writers: MAX_OPEN_PARTITION_WRITERS_DEFAULT,
             rewrite_all: false,
             file_scoped_delete_paths: HashSet::new(),
+            strategy: crate::maintenance::rewrite_data_files_sort::ResolvedStrategy::BinPack,
+            sort_memory_budget_bytes: 128 * 1024 * 1024,
         }
-    }
-
-    /// Bin-packing parity with Java `ListPacker.pack`: `[3,3,3,3]` at target 6 gives `[[3,3],
-    /// [3,3]]`, and `[4,3,3]` gives `[[4],[3,3]]`. This pins the forward order, which `packEnd`
-    /// would reverse.
-    #[test]
-    fn test_pack_bins_forward_first_fit() {
-        let (spec, schema) = synthetic_spec_and_schema();
-        let sizes_of = |bins: &[Vec<FileScanTask>]| -> Vec<Vec<u64>> {
-            bins.iter()
-                .map(|bin| bin.iter().map(|task| task.file_size_in_bytes).collect())
-                .collect()
-        };
-
-        let tasks: Vec<FileScanTask> = [3u64, 3, 3, 3]
-            .iter()
-            .enumerate()
-            .map(|(index, &size)| synthetic_task(&format!("f{index}"), size, 0, 0, &spec, &schema))
-            .collect();
-        assert_eq!(
-            sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
-            vec![vec![3, 3], vec![3, 3]]
-        );
-
-        let tasks: Vec<FileScanTask> = [4u64, 3, 3]
-            .iter()
-            .enumerate()
-            .map(|(index, &size)| synthetic_task(&format!("g{index}"), size, 0, 0, &spec, &schema))
-            .collect();
-        assert_eq!(
-            sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
-            vec![vec![4], vec![3, 3]]
-        );
-
-        // A single item over target gets its own bin.
-        let tasks: Vec<FileScanTask> = [7u64, 2, 2]
-            .iter()
-            .enumerate()
-            .map(|(index, &size)| synthetic_task(&format!("h{index}"), size, 0, 0, &spec, &schema))
-            .collect();
-        assert_eq!(
-            sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
-            vec![vec![7], vec![2, 2]]
-        );
     }
 
     /// The candidate predicate. Undersized, oversized, or delete-laden qualifies; well-sized and
