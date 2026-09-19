@@ -337,3 +337,57 @@ async fn zorder_over_an_unsupported_type_is_refused_like_spark() {
         "Cannot use column d of type decimal(10,2) in ZOrdering, the type is unsupported"
     );
 }
+
+#[test]
+fn zorder_encodes_a_boolean_like_javas_udf_and_a_null_boolean_as_zero_bytes() {
+    use arrow_array::{BooleanArray, Int64Array, RecordBatch};
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            Arc::new(NestedField::optional(
+                1,
+                "b",
+                Type::Primitive(PrimitiveType::Boolean),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+        ])
+        .build()
+        .expect("build the boolean schema");
+    let arrow_schema =
+        Arc::new(crate::arrow::schema_to_arrow_schema(&schema).expect("arrow schema"));
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+        Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as arrow_array::ArrayRef,
+        Arc::new(Int64Array::from(vec![1i64, 2, 3])) as arrow_array::ArrayRef,
+    ])
+    .expect("boolean batch");
+
+    let encoder = crate::maintenance::rewrite_data_files_zorder::ZOrderEncoder::build(
+        &["b".to_string()],
+        &schema,
+        &arrow_schema,
+        8,
+        i32::MAX as usize,
+    )
+    .expect("z encoder");
+    let mut keys = vec![Vec::new(); 3];
+    encoder.encode(&batch, &mut keys).expect("encode");
+
+    let mut expected_true = vec![0u8; 8];
+    expected_true[0] = 0x81;
+    assert_eq!(keys[0], expected_true);
+    assert_eq!(keys[1], vec![0u8; 8]);
+    assert_eq!(
+        keys[2],
+        vec![0u8; 8],
+        "a NULL boolean encodes as zero bytes; Java instead fails the job on an unboxing NPE"
+    );
+    assert!(
+        keys[1] < keys[0],
+        "false must sort before true, as in Spark"
+    );
+}
