@@ -299,8 +299,7 @@ async fn write_data_file(table: &Table, part_value: i64, rows: &[(i64, i64)]) ->
     ])
     .expect("build the {x, y, z} data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "cdata".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -342,8 +341,7 @@ async fn write_equality_delete_file(table: &Table, part_value: i64, delete_y: i6
     let delete_schema =
         Arc::new(arrow_schema_to_schema(config.projected_arrow_schema_ref()).unwrap());
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "yeqdel".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -393,8 +391,7 @@ async fn write_position_delete_file(
     pos: i64,
 ) -> DataFile {
     let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "posdel".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

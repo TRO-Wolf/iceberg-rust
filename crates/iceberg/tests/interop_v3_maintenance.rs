@@ -132,8 +132,7 @@ async fn write_data_file(table: &Table, tag: &str, grp: i64, rows: &[Row]) -> Da
     ])
     .expect("build the {id, grp, y} batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         format!("data-{tag}"),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -170,8 +169,7 @@ async fn write_position_delete(
     pairs: &[(&str, i64)],
 ) -> DataFile {
     let config = PositionDeleteWriterConfig::new().expect("position-delete config");
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         format!("posdel-{tag}"),
         Some(uuid::Uuid::now_v7().to_string()),

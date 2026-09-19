@@ -43,7 +43,9 @@ use crate::commit_transport::{
     LiveS3TablesCommitTransport, S3TablesCommitTransport, S3TablesUpdateCall,
     map_s3tables_commit_send,
 };
-use crate::utils::create_sdk_config;
+use crate::utils::{
+    create_sdk_config, ensure_no_write_path_override, ensure_write_paths_under_warehouse,
+};
 
 /// S3Tables table bucket ARN property
 pub const S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN: &str = "table_bucket_arn";
@@ -585,8 +587,8 @@ impl Catalog for S3TablesCatalog {
         namespace: &NamespaceIdent,
         mut creation: TableCreation,
     ) -> Result<Table> {
+        ensure_no_write_path_override(&creation.properties)?;
         let table_ident = TableIdent::new(namespace.clone(), creation.name.clone());
-
         let create_resp: CreateTableOutput = self
             .s3tables_client
             .create_table()
@@ -620,13 +622,11 @@ impl Catalog for S3TablesCatalog {
                 get_resp.warehouse_location().to_string()
             }
         };
-
         creation.location = Some(table_location.clone());
         let metadata = TableMetadataBuilder::from_table_creation(creation)?
             .build()?
             .metadata;
-        let metadata_location =
-            MetadataLocation::new_with_table_location(table_location).to_string();
+        let metadata_location = MetadataLocation::for_metadata(&metadata)?.to_string();
         metadata.write_to(&self.file_io, &metadata_location).await?;
 
         self.s3tables_client
@@ -723,10 +723,9 @@ impl Catalog for S3TablesCatalog {
         // commit base and the Transaction supplied a base table.
         let (current_table, version_token) =
             self.resolve_commit_base(&table_ident, &mut commit).await?;
-
         let staged_table = commit.apply(current_table)?;
         let staged_metadata_location = staged_table.metadata_location_result()?;
-
+        ensure_write_paths_under_warehouse(staged_table.metadata(), staged_metadata_location)?;
         staged_table
             .metadata()
             .write_commit_metadata(staged_table.file_io(), staged_metadata_location)
@@ -771,8 +770,8 @@ impl Catalog for S3TablesCatalog {
             )
             .with_retryable(true));
         }
-
         let new_metadata_location = table.metadata_location_result()?.to_string();
+        ensure_write_paths_under_warehouse(table.metadata(), &new_metadata_location)?;
         // The staged replace already wrote the new metadata file. Only the pointer CAS remains.
         self.cas_update_metadata_location(
             &table_ident,

@@ -568,7 +568,7 @@ impl TransactionAction for RowDeltaAction {
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
-        )
+        )?
         .with_removed_delete_files(self.removed_delete_files.clone())
         .with_target_branch(self.target_branch.clone())?;
         let snapshot_producer = if self
@@ -1474,7 +1474,7 @@ mod tests {
     ) -> DataFile {
         let config = PositionDeleteWriterConfig::new().unwrap();
 
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let file_name_gen = DefaultFileNameGenerator::new(
             "pos-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),
@@ -4075,7 +4075,7 @@ mod tests {
             synthetic_delete_file("test/a-pos-del.parquet", 0),
             synthetic_equality_delete_file("test/a-eq-del.parquet", 0),
         ] {
-            let producer = SnapshotProducer::new(
+            let err = SnapshotProducer::new(
                 &table,
                 uuid::Uuid::now_v7(),
                 None,
@@ -4083,10 +4083,10 @@ mod tests {
                 vec![],
                 FirstRowIdPolicy::Suppress,
             )
-            .with_added_delete_files(vec![delete_file]);
-            let err = producer
-                .validate_added_delete_files()
-                .expect_err("a V1 table must reject every added delete file");
+            .unwrap()
+            .with_added_delete_files(vec![delete_file])
+            .validate_added_delete_files()
+            .expect_err("a V1 table must reject every added delete file");
             assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(
                 err.message(),
@@ -4404,7 +4404,7 @@ mod tests {
                 HashMap::new(),
                 vec![],
                 FirstRowIdPolicy::Suppress,
-            )
+            )?
             .with_added_delete_files(vec![self.dv.clone()])
             .commit(ReplaceOpAddDvOperation, DefaultManifestProcess)
             .await

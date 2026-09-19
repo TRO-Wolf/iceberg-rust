@@ -155,8 +155,7 @@ async fn write_data_file(table: &Table, cat: &str, rows: &[(i64, i64)]) -> DataF
     ])
     .expect("build {id, cat, y} batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         format!("data-{cat}"),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -196,8 +195,7 @@ async fn write_equality_delete(table: &Table, cat: &str, delete_ys: &[i64]) -> D
     let delete_schema =
         Arc::new(arrow_schema_to_schema(config.projected_arrow_schema_ref()).expect("eq schema"));
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         format!("eqdel-{cat}"),
         Some(uuid::Uuid::now_v7().to_string()),

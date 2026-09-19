@@ -252,8 +252,7 @@ async fn write_data_file(
     ])
     .expect("build the per-partition data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "wdata".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -465,8 +464,7 @@ async fn write_unpartitioned_data_file(table: &Table) -> DataFile {
     ])
     .expect("build unpartitioned data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "rdata".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -508,8 +506,7 @@ async fn write_partitioned_eq_delete_file(table: &Table, partition_key: &Partiti
     let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
         .expect("equality-delete writer config (equality_ids=[1])");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "pfeqdel".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -569,8 +566,7 @@ async fn write_unpartitioned_eq_delete_file(table: &Table) -> DataFile {
     let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
         .expect("equality-delete writer config (equality_ids=[1])");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "reqdel".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

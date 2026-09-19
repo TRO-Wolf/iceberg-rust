@@ -33,7 +33,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::writer::base_writer::deletion_vector_writer::{DVFileWriter, PreviousDeletes};
 use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
+    DefaultFileNameGenerator, FileNameGenerator, LocationGenerator, TableLocationGenerator,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -534,7 +534,7 @@ async fn write_dv_blobs(table: &Table, blobs: Vec<BlobWrite>) -> Result<Vec<Data
         return Ok(Vec::new());
     }
     let metadata = table.metadata();
-    let location_generator = DefaultLocationGenerator::new(metadata.clone())?;
+    let location_generator = TableLocationGenerator::new(metadata)?;
     let file_name_generator = DefaultFileNameGenerator::new(
         "dv".to_string(),
         Some(Uuid::now_v7().to_string()),

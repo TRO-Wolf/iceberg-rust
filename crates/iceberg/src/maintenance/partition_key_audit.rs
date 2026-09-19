@@ -128,7 +128,7 @@ use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, TableLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
@@ -508,7 +508,7 @@ async fn rewrite_under_computed_keys(
     schema: &SchemaRef,
     target_file_size_bytes: u64,
 ) -> Result<(u64, Vec<DataFile>)> {
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = TableLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(
         "repaired".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

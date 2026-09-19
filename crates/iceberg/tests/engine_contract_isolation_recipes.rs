@@ -135,8 +135,7 @@ async fn write_yid_file(table: &Table, ids: Vec<i64>, ys: Vec<i64>) -> DataFile 
     ])
     .expect("build the {id, y} data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "rdata".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -176,8 +175,7 @@ async fn write_position_delete_file(
 ) -> DataFile {
     let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

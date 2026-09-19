@@ -539,7 +539,7 @@ mod tests {
         let delete_schema =
             Arc::new(arrow_schema_to_schema(config.projected_arrow_schema_ref()).expect("schema"));
 
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).expect("locgen");
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("locgen");
         let file_name_gen = DefaultFileNameGenerator::new(
             "eq-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),

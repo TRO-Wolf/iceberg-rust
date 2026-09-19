@@ -227,7 +227,7 @@ async fn write_position_delete_file(
     let schema = table.metadata().current_schema().clone();
     let config = PositionDeleteWriterConfig::new().unwrap();
 
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -278,7 +278,7 @@ async fn write_file_scoped_position_delete_file(
 ) -> DataFile {
     let schema = table.metadata().current_schema().clone();
     let config = PositionDeleteWriterConfig::new().unwrap();
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
     let file_name_gen = DefaultFileNameGenerator::new(
         "fs-pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

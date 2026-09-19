@@ -620,3 +620,104 @@ async fn discarding_transport_marks_accepted_response_lost() {
     assert!(discarding.observed_accepted_response_lost());
     assert_eq!(discarding.catalog_commit_attempts(), 1);
 }
+
+#[tokio::test]
+async fn create_table_refuses_write_paths_that_cannot_be_under_the_managed_warehouse() {
+    let (catalog, _table, _scripted, _file_io, _ident) =
+        catalog_with(vec![S3TablesCommitScript::Success], FormatVersion::V2).await;
+    let ns = NamespaceIdent::new("pr5a".to_string());
+    for (key, value) in [
+        ("write.metadata.path", "memory://elsewhere/meta"),
+        ("write.data.path", "memory://elsewhere/data"),
+    ] {
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .schema(schema())
+            .properties([(key.to_string(), value.to_string())])
+            .build();
+        let err = catalog
+            .create_table(&ns, creation)
+            .await
+            .expect_err("an external write path must be refused before CreateTable");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid, "{key}");
+    }
+}
+
+#[tokio::test]
+async fn update_table_refuses_write_paths_outside_the_managed_warehouse() {
+    for (key, value) in [
+        ("write.metadata.path", "memory://elsewhere/meta"),
+        ("write.data.path", "memory://elsewhere/data"),
+    ] {
+        let (catalog, table, scripted, _file_io, _ident) =
+            catalog_with(vec![S3TablesCommitScript::Success], FormatVersion::V2).await;
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set(key.to_string(), value.to_string())
+            .apply(tx)
+            .expect("apply properties");
+        let err = tx.commit(&catalog).await.expect_err(key);
+        assert_eq!(err.kind(), ErrorKind::DataInvalid, "{key}");
+        assert_eq!(
+            scripted.catalog_commit_attempts(),
+            0,
+            "the metadata-pointer CAS must never run for {key}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_table_allows_write_paths_inside_the_managed_warehouse() {
+    let (catalog, table, scripted, _file_io, _ident) =
+        catalog_with(vec![S3TablesCommitScript::Success], FormatVersion::V2).await;
+    let warehouse = table.metadata().location().to_string();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_table_properties()
+        .set(
+            "write.metadata.path".to_string(),
+            format!("{warehouse}/alt-meta"),
+        )
+        .set(
+            "write.data.path".to_string(),
+            format!("{warehouse}/alt-data"),
+        )
+        .apply(tx)
+        .expect("apply properties");
+    let committed = tx
+        .commit(&catalog)
+        .await
+        .expect("under-warehouse write paths must commit");
+    assert!(
+        committed
+            .metadata_location_result()
+            .expect("metadata location")
+            .starts_with(&format!("{warehouse}/alt-meta/")),
+        "the staged metadata file must land under the relocated metadata dir"
+    );
+    assert_eq!(scripted.catalog_commit_attempts(), 1);
+}
+
+#[tokio::test]
+async fn publish_replace_table_refuses_write_paths_outside_the_managed_warehouse() {
+    let (catalog, table, scripted, _file_io, _ident) =
+        catalog_with(vec![S3TablesCommitScript::Success], FormatVersion::V2).await;
+    let creation = TableCreation::builder()
+        .name(table.identifier().name().to_string())
+        .schema(schema())
+        .properties([(
+            "write.metadata.path".to_string(),
+            "memory://elsewhere/meta".to_string(),
+        )])
+        .build();
+    let staged = iceberg::transaction::StagedTableTransaction::begin_replace(&table, creation)
+        .await
+        .expect("begin replace");
+    let err = staged
+        .commit(&catalog)
+        .await
+        .expect_err("an external metadata path must be refused at publish");
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert_eq!(scripted.catalog_commit_attempts(), 0);
+}

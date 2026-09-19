@@ -114,7 +114,7 @@ impl TransactionAction for FastAppendAction {
             self.added_data_files.clone(),
             // Java `FastAppend` extends `SnapshotProducer` and never suppresses.
             FirstRowIdPolicy::Preserve,
-        )
+        )?
         .with_stage_only(self.stage_only)
         .with_target_branch(self.target_branch.clone())?;
 

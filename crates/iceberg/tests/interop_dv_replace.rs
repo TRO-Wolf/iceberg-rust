@@ -216,8 +216,7 @@ async fn write_data_file(table: &Table, rows: &[(i64, &str)]) -> DataFile {
     ])
     .expect("build data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "rust-data".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

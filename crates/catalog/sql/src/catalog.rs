@@ -980,7 +980,7 @@ impl Catalog for SqlCatalog {
             return view_with_same_name_err(&tbl_ident);
         }
 
-        let (tbl_creation, location) = match creation.location.clone() {
+        let (tbl_creation, _location) = match creation.location.clone() {
             Some(location) => (creation, location),
             None => {
                 // Fall back to the namespace location, then to the warehouse location.
@@ -1011,8 +1011,7 @@ impl Catalog for SqlCatalog {
         let tbl_metadata = TableMetadataBuilder::from_table_creation(tbl_creation)?
             .build()?
             .metadata;
-        let tbl_metadata_location =
-            MetadataLocation::new_with_table_location(location.clone()).to_string();
+        let tbl_metadata_location = MetadataLocation::for_metadata(&tbl_metadata)?.to_string();
 
         tbl_metadata
             .write_to(&self.fileio, &tbl_metadata_location)

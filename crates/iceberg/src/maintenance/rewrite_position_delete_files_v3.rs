@@ -241,7 +241,7 @@ impl RewritePositionDeleteFiles {
     ) -> Result<Vec<DataFile>> {
         let metadata = self.table.metadata();
         let schema = metadata.current_schema().clone();
-        let location_generator = DefaultLocationGenerator::new(metadata.clone())?;
+        let location_generator = TableLocationGenerator::new(metadata)?;
         let file_name_generator = DefaultFileNameGenerator::new(
             "rewritten-dv".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),

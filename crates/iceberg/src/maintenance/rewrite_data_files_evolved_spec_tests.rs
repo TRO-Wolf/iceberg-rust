@@ -233,8 +233,7 @@ pub(crate) async fn write_current_spec_file(
     ])
     .expect("batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location gen");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location gen");
     let file_name_gen = DefaultFileNameGenerator::new(
         file_name.to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
