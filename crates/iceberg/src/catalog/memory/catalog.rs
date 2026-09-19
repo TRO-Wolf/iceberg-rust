@@ -25,7 +25,9 @@ use futures::lock::Mutex;
 use itertools::Itertools;
 
 use super::namespace_state::NamespaceState;
-use crate::catalog::table_metadata_cache::{TableMetadataCache, load_or_fetch_table_metadata};
+use crate::catalog::table_metadata_cache::{
+    CacheScope, TableMetadataCache, load_or_fetch_table_metadata,
+};
 use crate::io::object_cache::ObjectCache;
 use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
 use crate::spec::{TableMetadataBuilder, ViewMetadata, ViewMetadataBuilder};
@@ -47,8 +49,8 @@ const LOCATION: &str = "location";
 pub struct MemoryCatalogBuilder {
     config: MemoryCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
-    /// Opt-in session metadata-pointer cache (FK4.1). Default `None` = OFF.
     table_metadata_cache: Option<Arc<TableMetadataCache>>,
+    pub(crate) cache_credential_context: Option<String>,
     pub(crate) shared_object_cache_bytes: Option<u64>,
 }
 
@@ -62,6 +64,7 @@ impl Default for MemoryCatalogBuilder {
             },
             storage_factory: None,
             table_metadata_cache: None,
+            cache_credential_context: None,
             shared_object_cache_bytes: None,
         }
     }
@@ -122,6 +125,7 @@ impl CatalogBuilder for MemoryCatalogBuilder {
                     self.config,
                     self.storage_factory,
                     self.table_metadata_cache,
+                    self.cache_credential_context,
                     self.shared_object_cache_bytes,
                 )
             }
@@ -146,8 +150,8 @@ pub struct MemoryCatalog {
     pub(crate) file_io: FileIO,
     warehouse_location: String,
     properties: HashMap<String, String>,
-    /// Opt-in metadata-pointer cache (FK4.1). `None` = default OFF.
     pub(crate) table_metadata_cache: Option<Arc<TableMetadataCache>>,
+    pub(crate) cache_scope: CacheScope,
     pub(crate) shared_object_cache: Option<Arc<ObjectCache>>,
 }
 
@@ -157,15 +161,18 @@ impl MemoryCatalog {
         config: MemoryCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
         table_metadata_cache: Option<Arc<TableMetadataCache>>,
+        cache_credential_context: Option<String>,
         shared_object_cache_bytes: Option<u64>,
     ) -> Result<Self> {
-        // Use provided factory or default to MemoryStorageFactory
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
 
-        // The builder validates `config.name` is `Some` before constructing the catalog;
-        // fall back to the empty name defensively rather than panicking.
         let name = config.name.unwrap_or_default();
         let properties = config.props.clone();
+        let cache_scope = CacheScope::for_catalog(
+            format!("memory:{}", config.warehouse),
+            cache_credential_context,
+            &config.props,
+        );
 
         let file_io = FileIOBuilder::new(factory).with_props(config.props).build();
         let shared_object_cache = Self::shared_cache(&file_io, shared_object_cache_bytes);
@@ -177,6 +184,7 @@ impl MemoryCatalog {
             warehouse_location: config.warehouse,
             properties,
             table_metadata_cache,
+            cache_scope,
             shared_object_cache,
         })
     }
@@ -197,16 +205,14 @@ impl MemoryCatalog {
             .cloned()
     }
 
-    /// Load table metadata from FileIO (or the opt-in pointer cache) and assemble a [`Table`].
-    /// No catalog lock held.
     async fn load_table_from_location(
         &self,
         table_ident: &TableIdent,
         metadata_location: &str,
     ) -> Result<Table> {
-        // v1: location string equality only; MemoryCatalog has no service version token.
         let metadata = load_or_fetch_table_metadata(
             &self.file_io,
+            &self.cache_scope,
             metadata_location,
             self.table_metadata_cache.as_deref(),
             None,
@@ -414,16 +420,13 @@ impl Catalog for MemoryCatalog {
             .metadata;
         let metadata_location = MetadataLocation::new_with_table_location(location).to_string();
 
-        // Write outside the lock so concurrent catalog ops are not serialized on FileIO.
         metadata.write_to(&self.file_io, &metadata_location).await?;
 
         {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
             root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
         }
-        // Seed only after the pointer is claimed — a failed insert must not leave a cache entry
-        // for a location the catalog does not own.
-        self.cache_put(&metadata_location, &metadata);
+        self.cache_put(&metadata_location, &metadata).await;
 
         self.table_builder()
             .metadata_location(metadata_location)
@@ -452,7 +455,9 @@ impl Catalog for MemoryCatalog {
             root_namespace_state.remove_existing_table(table_ident)?
         };
         if let Some(cache) = self.table_metadata_cache.as_ref() {
-            cache.invalidate(&metadata_location);
+            cache
+                .invalidate(&self.cache_scope, &metadata_location)
+                .await;
         }
         self.file_io.delete(&metadata_location).await
     }
@@ -492,29 +497,26 @@ impl Catalog for MemoryCatalog {
         table_ident: &TableIdent,
         metadata_location: String,
     ) -> Result<Table> {
-        // Read (and validate reachability of) the metadata BEFORE claiming the pointer, so a reload
-        // failure cannot leave a half-created table. See the atomicity guarantee above.
-        // Goes through the opt-in pointer cache (miss path still fail-closed on unreadable files).
         let metadata = load_or_fetch_table_metadata(
             &self.file_io,
+            &self.cache_scope,
             &metadata_location,
             self.table_metadata_cache.as_deref(),
             None,
         )
         .await?;
 
-        {
+        let insert_result = {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
-            if let Err(e) =
-                root_namespace_state.insert_new_table(table_ident, metadata_location.clone())
-            {
-                // load_or_fetch may have installed a cache entry; do not keep it if the pointer
-                // was never claimed (e.g. table already exists).
-                if let Some(cache) = self.table_metadata_cache.as_ref() {
-                    cache.invalidate(&metadata_location);
-                }
-                return Err(e);
+            root_namespace_state.insert_new_table(table_ident, metadata_location.clone())
+        };
+        if let Err(e) = insert_result {
+            if let Some(cache) = self.table_metadata_cache.as_ref() {
+                cache
+                    .invalidate(&self.cache_scope, &metadata_location)
+                    .await;
             }
+            return Err(e);
         }
 
         self.table_builder()
@@ -558,18 +560,14 @@ impl Catalog for MemoryCatalog {
         let table_ident = commit.identifier().clone();
         let base_metadata_location = commit.base_metadata_location().map(str::to_string);
 
-        // 1. Snapshot pointer under a short lock.
         let stored_at_start = self.table_metadata_location(&table_ident).await?;
 
-        // 2. Load + apply + write outside the lock.
         let current_table = self
             .load_table_from_location(&table_ident, &stored_at_start)
             .await?;
         let staged_table = commit.apply(current_table)?;
         let new_metadata_location = staged_table.metadata_location_result()?.to_string();
 
-        // Early CAS against the load snapshot — cheap reject when the commit was already stale
-        // at start (no FileIO).
         check_no_concurrent_modification(
             "table",
             staged_table.identifier(),
@@ -578,10 +576,6 @@ impl Catalog for MemoryCatalog {
             &new_metadata_location,
         )?;
 
-        // Recheck the pointer under a short lock before the write. A concurrent winner that
-        // advanced it during load and apply makes this refuse, and no orphan file is written. A
-        // loser that races between this recheck and the step 3 CAS may still leave one orphan
-        // file. The pointer never half-flips.
         {
             let root_namespace_state = self.root_namespace_state.lock().await;
             let stored_mid = root_namespace_state
@@ -601,7 +595,6 @@ impl Catalog for MemoryCatalog {
             .write_commit_metadata(staged_table.file_io(), &new_metadata_location)
             .await?;
 
-        // 3. Authoritative pointer CAS under a short lock (I/O already complete).
         let mut root_namespace_state = self.root_namespace_state.lock().await;
         let stored_now = root_namespace_state
             .get_existing_table_location(&table_ident)?
@@ -614,34 +607,29 @@ impl Catalog for MemoryCatalog {
             &new_metadata_location,
         )?;
         let updated_table = root_namespace_state.commit_table_update(staged_table)?;
-        // Evict the prior pointer (limit session retention) and seed the new one so the next
-        // load_table is a hit without re-GET.
+        drop(root_namespace_state);
         if let Some(cache) = self.table_metadata_cache.as_ref()
             && stored_at_start != new_metadata_location
         {
-            cache.invalidate(&stored_at_start);
+            cache.invalidate(&self.cache_scope, &stored_at_start).await;
         }
         self.cache_put(
             updated_table
                 .metadata_location()
                 .unwrap_or(new_metadata_location.as_str()),
             updated_table.metadata(),
-        );
+        )
+        .await;
 
         Ok(updated_table)
     }
 
-    /// Evict the cached entry for this table's metadata location. A no-op with no cache, or with
-    /// no such table.
-    ///
-    /// Mirrors Java `Catalog.invalidateTable`. An unknown table leaves other keys alone. A
-    /// `clear()` of the whole cache would thrash unrelated entries.
     async fn invalidate_table(&self, table: &TableIdent) -> Result<()> {
         let Some(cache) = self.table_metadata_cache.as_ref() else {
             return Ok(());
         };
         if let Ok(location) = self.table_metadata_location(table).await {
-            cache.invalidate(&location);
+            cache.invalidate(&self.cache_scope, &location).await;
         }
         Ok(())
     }
@@ -3162,8 +3150,6 @@ pub(crate) mod tests {
         );
     }
 
-    // FK4.1 / scout #7 — metadata-pointer cache (opt-in, default OFF).
-
     async fn new_memory_catalog_with_cache(cache: Arc<TableMetadataCache>) -> MemoryCatalog {
         let warehouse_location = temp_path();
         MemoryCatalogBuilder::default()
@@ -3204,7 +3190,6 @@ pub(crate) mod tests {
             "load must surface the same catalog pointer"
         );
         assert_eq!(second.metadata_location().unwrap(), pointer.as_str());
-        // Shared Arc from the cache (create seeded a distinct Arc; loads share the cached one).
         assert!(
             std::sync::Arc::ptr_eq(&first.metadata_ref(), &second.metadata_ref()),
             "two loads must share the cached TableMetadata Arc"
@@ -3265,13 +3250,11 @@ pub(crate) mod tests {
                 .map(String::as_str),
             Some("1")
         );
-        // update_table seeded the new pointer; load is a hit (zero body fetch).
         assert_eq!(cache.stats().hits, 1);
         assert_eq!(cache.stats().body_fetches, 0);
         assert_eq!(cache.stats().misses, 0);
     }
 
-    /// `invalidate_table` drops the location entry so the next load body-fetches again.
     #[tokio::test]
     async fn test_fk4_1_invalidate_table_evicts_pointer_entry() {
         let cache = Arc::new(TableMetadataCache::new());
@@ -3280,14 +3263,16 @@ pub(crate) mod tests {
         let ident = table.identifier().clone();
         let pointer = table.metadata_location().unwrap().to_string();
 
-        // Confirm a hit first.
         cache.reset_stats();
         let _ = catalog.load_table(&ident).await.expect("warm");
         assert_eq!(cache.stats().hits, 1);
 
         catalog.invalidate_table(&ident).await.expect("invalidate");
         assert!(
-            cache.lookup(&pointer, None).is_none(),
+            cache
+                .lookup(&catalog.cache_scope, &pointer, None)
+                .await
+                .is_none(),
             "invalidate_table must drop the location entry"
         );
 
@@ -3316,7 +3301,6 @@ pub(crate) mod tests {
         let ident = table.identifier().clone();
 
         cache.reset_stats();
-        // Simulate commit-retry refresh: load, load again, same pointer.
         let a = catalog.load_table(&ident).await.expect("retry load 1");
         let b = catalog.load_table(&ident).await.expect("retry load 2");
         assert_eq!(a.metadata_location(), b.metadata_location());
@@ -3328,7 +3312,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// `drop_table` must evict the pointer-cache entry so a recycled location cannot soft-reuse.
     #[tokio::test]
     async fn test_fk4_1_drop_table_evicts_cache_entry() {
         let cache = Arc::new(TableMetadataCache::new());
@@ -3336,17 +3319,23 @@ pub(crate) mod tests {
         let table = create_table_with_namespace(&catalog).await;
         let ident = table.identifier().clone();
         let pointer = table.metadata_location().unwrap().to_string();
-        assert!(cache.lookup(&pointer, None).is_some());
+        assert!(
+            cache
+                .lookup(&catalog.cache_scope, &pointer, None)
+                .await
+                .is_some()
+        );
 
         catalog.drop_table(&ident).await.expect("drop");
         assert!(
-            cache.lookup(&pointer, None).is_none(),
+            cache
+                .lookup(&catalog.cache_scope, &pointer, None)
+                .await
+                .is_none(),
             "drop_table must invalidate the metadata-location cache entry"
         );
     }
 
-    /// Invalidating an unknown table must not thrash other tables' pointer entries
-    /// (Java `invalidateTable` is a no-op for absent idents — not a session-wide clear).
     #[tokio::test]
     async fn test_fk4_1_invalidate_missing_table_does_not_clear_session() {
         let cache = Arc::new(TableMetadataCache::new());
@@ -3354,7 +3343,10 @@ pub(crate) mod tests {
         let table = create_table_with_namespace(&catalog).await;
         let pointer = table.metadata_location().unwrap().to_string();
         assert!(
-            cache.lookup(&pointer, None).is_some(),
+            cache
+                .lookup(&catalog.cache_scope, &pointer, None)
+                .await
+                .is_some(),
             "create must seed the cache"
         );
 
@@ -3364,12 +3356,14 @@ pub(crate) mod tests {
             .await
             .expect("missing invalidate is Ok");
         assert!(
-            cache.lookup(&pointer, None).is_some(),
+            cache
+                .lookup(&catalog.cache_scope, &pointer, None)
+                .await
+                .is_some(),
             "invalidate of missing table must not clear sibling pointer entries"
         );
     }
 
-    /// Successful update must drop the prior pointer key from the session cache.
     #[tokio::test]
     async fn test_fk4_1_update_evicts_prior_pointer() {
         let cache = Arc::new(TableMetadataCache::new());
@@ -3390,11 +3384,17 @@ pub(crate) mod tests {
         let new_loc = updated.metadata_location().unwrap().to_string();
         assert_ne!(base, new_loc);
         assert!(
-            cache.lookup(&base, None).is_none(),
+            cache
+                .lookup(&catalog.cache_scope, &base, None)
+                .await
+                .is_none(),
             "prior pointer must be evicted after successful update"
         );
         assert!(
-            cache.lookup(&new_loc, None).is_some(),
+            cache
+                .lookup(&catalog.cache_scope, &new_loc, None)
+                .await
+                .is_some(),
             "new pointer must be seeded"
         );
     }

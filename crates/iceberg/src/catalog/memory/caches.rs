@@ -29,6 +29,12 @@ impl MemoryCatalogBuilder {
         self.shared_object_cache_bytes = Some(bytes);
         self
     }
+
+    #[allow(missing_docs)]
+    pub fn with_cache_credential_context(mut self, context: String) -> Self {
+        self.cache_credential_context = Some(context);
+        self
+    }
 }
 
 impl MemoryCatalog {
@@ -47,13 +53,16 @@ impl MemoryCatalog {
     }
 
     /// Publish parsed metadata into the optional session cache (no-op when cache is OFF).
-    pub(crate) fn cache_put(&self, metadata_location: &str, metadata: &TableMetadata) {
+    pub(crate) async fn cache_put(&self, metadata_location: &str, metadata: &TableMetadata) {
         if let Some(cache) = self.table_metadata_cache.as_ref() {
-            cache.put(
-                metadata_location.to_string(),
-                Arc::new(metadata.clone()),
-                None,
-            );
+            cache
+                .put(
+                    &self.cache_scope,
+                    metadata_location.to_string(),
+                    Arc::new(metadata.clone()),
+                    None,
+                )
+                .await;
         }
     }
 }
