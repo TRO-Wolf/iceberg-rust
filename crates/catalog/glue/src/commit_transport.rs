@@ -15,25 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 #[cfg(test)]
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::sync::Arc;
 #[cfg(test)]
+use std::sync::Mutex;
+#[cfg(any(test, feature = "commit-fault-injection"))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use aws_sdk_glue::error::ProvideErrorMetadata;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
+use iceberg::spec::TableMetadata;
 #[cfg(test)]
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind, Result, TableIdent};
 
 use crate::error::{CommitSendDisposition, classify_commit_send_disposition};
+
+#[allow(missing_docs)]
+pub const GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE: &str =
+    "glue.fault.drop-update-table-response";
+#[allow(missing_docs)]
+pub const GLUE_COMMIT_OPERATION_ID_PROP: &str = "engine.operation-id";
 
 pub(crate) struct GlueUpdateTableCall {
     pub database_name: String,
@@ -56,6 +65,10 @@ pub(crate) trait GlueCommitTransport: Send + Sync + Debug {
     async fn send_update_table(&self, call: GlueUpdateTableCall) -> GlueCommitSend;
     #[cfg(test)]
     fn catalog_commit_attempts(&self) -> u64;
+    #[cfg(all(test, feature = "commit-fault-injection"))]
+    fn is_response_dropping_transport(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct LiveGlueCommitTransport {
@@ -112,55 +125,144 @@ impl GlueCommitTransport for LiveGlueCommitTransport {
     }
 }
 
-#[cfg(test)]
+fn fault_drop_count(props: &HashMap<String, String>) -> Result<Option<u64>> {
+    let Some(raw) = props.get(GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE) else {
+        return Ok(None);
+    };
+    #[cfg(feature = "commit-fault-injection")]
+    return raw.parse::<u64>().map(Some).map_err(|error| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Catalog property {GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE} must hold a \
+                 non-negative integer, got {raw:?}: {error}"
+            ),
+        )
+    });
+    #[cfg(not(feature = "commit-fault-injection"))]
+    Err(Error::new(
+        ErrorKind::FeatureUnsupported,
+        format!(
+            "Catalog property {GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE} requires the \
+             `commit-fault-injection` cargo feature on iceberg-catalog-glue, got {raw:?}"
+        ),
+    ))
+}
+
+#[cfg(any(test, feature = "commit-fault-injection"))]
+type CommitTransportParts = (
+    Arc<dyn GlueCommitTransport>,
+    Option<Arc<DiscardingGlueCommitTransport>>,
+);
+
+#[cfg(any(test, feature = "commit-fault-injection"))]
+pub(crate) fn build_commit_transport_parts(
+    props: &HashMap<String, String>,
+    inner: Arc<dyn GlueCommitTransport>,
+) -> Result<CommitTransportParts> {
+    let drop_count = fault_drop_count(props)?;
+    let fault = drop_count.map(|count| {
+        Arc::new(DiscardingGlueCommitTransport::new(
+            Arc::clone(&inner),
+            count,
+        ))
+    });
+    let transport: Arc<dyn GlueCommitTransport> = match &fault {
+        Some(wrapper) => Arc::clone(wrapper) as Arc<dyn GlueCommitTransport>,
+        None => inner,
+    };
+    Ok((transport, fault))
+}
+
+#[cfg(feature = "commit-fault-injection")]
+pub(crate) fn build_commit_transport(
+    props: &HashMap<String, String>,
+    inner: Arc<dyn GlueCommitTransport>,
+) -> Result<Arc<dyn GlueCommitTransport>> {
+    Ok(build_commit_transport_parts(props, inner)?.0)
+}
+
+#[cfg(not(feature = "commit-fault-injection"))]
+pub(crate) fn build_commit_transport(
+    props: &HashMap<String, String>,
+    inner: Arc<dyn GlueCommitTransport>,
+) -> Result<Arc<dyn GlueCommitTransport>> {
+    fault_drop_count(props)?;
+    Ok(inner)
+}
+
+#[cfg(any(test, feature = "commit-fault-injection"))]
 pub(crate) struct DiscardingGlueCommitTransport {
     inner: Arc<dyn GlueCommitTransport>,
     attempts: AtomicU64,
+    drop_remaining: AtomicU64,
     observed_accepted_response_lost: AtomicBool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "commit-fault-injection"))]
 impl Debug for DiscardingGlueCommitTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscardingGlueCommitTransport")
             .field("inner", &self.inner)
             .field("attempts", &self.attempts.load(Ordering::SeqCst))
+            .field(
+                "drop_remaining",
+                &self.drop_remaining.load(Ordering::SeqCst),
+            )
             .finish()
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "commit-fault-injection"))]
 impl DiscardingGlueCommitTransport {
-    pub(crate) fn new(inner: Arc<dyn GlueCommitTransport>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn GlueCommitTransport>, drop_count: u64) -> Self {
         Self {
             inner,
             attempts: AtomicU64::new(0),
+            drop_remaining: AtomicU64::new(drop_count),
             observed_accepted_response_lost: AtomicBool::new(false),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn observed_accepted_response_lost(&self) -> bool {
         self.observed_accepted_response_lost.load(Ordering::SeqCst)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "commit-fault-injection"))]
 #[async_trait]
 impl GlueCommitTransport for DiscardingGlueCommitTransport {
     async fn send_update_table(&self, call: GlueUpdateTableCall) -> GlueCommitSend {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         match self.inner.send_update_table(call).await {
             GlueCommitSend::Success => {
-                self.observed_accepted_response_lost
-                    .store(true, Ordering::SeqCst);
-                GlueCommitSend::AcceptedResponseLost
+                let claimed = self
+                    .drop_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok();
+                if claimed {
+                    self.observed_accepted_response_lost
+                        .store(true, Ordering::SeqCst);
+                    GlueCommitSend::AcceptedResponseLost
+                } else {
+                    GlueCommitSend::Success
+                }
             }
             other => other,
         }
     }
 
+    #[cfg(test)]
     fn catalog_commit_attempts(&self) -> u64 {
         self.attempts.load(Ordering::SeqCst)
+    }
+
+    #[cfg(all(test, feature = "commit-fault-injection"))]
+    fn is_response_dropping_transport(&self) -> bool {
+        true
     }
 }
 
@@ -301,6 +403,54 @@ pub(crate) fn map_glue_commit_send(send: GlueCommitSend, table_ident: &TableIden
             Err(map_update_table_service_error(error, table_ident))
         }
     }
+}
+
+pub(crate) fn map_glue_commit_send_identified(
+    send: GlueCommitSend,
+    table_ident: &TableIdent,
+    operation_ids: impl FnOnce() -> Vec<String>,
+) -> Result<()> {
+    map_glue_commit_send(send, table_ident)
+        .map_err(|error| with_operation_id_context(error, operation_ids))
+}
+
+pub(crate) fn with_operation_id_context(
+    error: Error,
+    operation_ids: impl FnOnce() -> Vec<String>,
+) -> Error {
+    if error.kind() != ErrorKind::CommitStateUnknown {
+        return error;
+    }
+    operation_ids().into_iter().fold(error, |error, id| {
+        error.with_context(GLUE_COMMIT_OPERATION_ID_PROP, id)
+    })
+}
+
+pub(crate) fn commit_send_operation_ids(
+    base: &TableMetadata,
+    staged: &TableMetadata,
+) -> Vec<String> {
+    let mut ids: Vec<String> = staged
+        .snapshots()
+        .filter(|snapshot| base.snapshot_by_id(snapshot.snapshot_id()).is_none())
+        .filter_map(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get(GLUE_COMMIT_OPERATION_ID_PROP)
+                .cloned()
+        })
+        .collect();
+    if let (Some(next), previous) = (
+        staged.properties().get(GLUE_COMMIT_OPERATION_ID_PROP),
+        base.properties().get(GLUE_COMMIT_OPERATION_ID_PROP),
+    ) && Some(next) != previous
+    {
+        ids.push(next.clone());
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 #[cfg(test)]

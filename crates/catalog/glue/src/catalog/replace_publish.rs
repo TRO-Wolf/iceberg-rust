@@ -22,7 +22,9 @@ use iceberg::{Error, ErrorKind, Result};
 use super::GlueCatalog;
 #[cfg(test)]
 use crate::commit_transport::glue_commit_send_landed;
-use crate::commit_transport::{GlueUpdateTableCall, map_glue_commit_send};
+use crate::commit_transport::{
+    GlueUpdateTableCall, commit_send_operation_ids, map_glue_commit_send, with_operation_id_context,
+};
 use crate::utils::{convert_to_glue_table, validate_namespace};
 
 pub(super) async fn publish(
@@ -78,7 +80,7 @@ pub(super) async fn publish(
         new_metadata_location,
         table.metadata(),
         table.metadata().properties(),
-        Some(stored),
+        Some(stored.clone()),
     )?;
     let send = catalog
         .commit_transport
@@ -95,7 +97,15 @@ pub(super) async fn publish(
     {
         harness.publish(table.clone());
     }
-    map_glue_commit_send(send, &table_ident)?;
-
-    Ok(table)
+    match map_glue_commit_send(send, &table_ident) {
+        Ok(()) => Ok(table),
+        Err(error) if error.kind() == ErrorKind::CommitStateUnknown => {
+            let ids = match TableMetadata::read_from(&catalog.file_io, &stored).await {
+                Ok(base) => commit_send_operation_ids(&base, table.metadata()),
+                Err(_) => Vec::new(),
+            };
+            Err(with_operation_id_context(error, move || ids))
+        }
+        Err(error) => Err(error),
+    }
 }

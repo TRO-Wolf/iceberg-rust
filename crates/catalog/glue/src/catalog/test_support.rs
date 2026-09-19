@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::commit_transport::{DiscardingGlueCommitTransport, build_commit_transport_parts};
 
 #[cfg(test)]
 impl GlueCatalog {
@@ -33,6 +34,11 @@ impl GlueCatalog {
 
     pub(crate) fn live_commit_transport(&self) -> Arc<dyn GlueCommitTransport> {
         Arc::clone(&self.commit_transport)
+    }
+
+    #[cfg(feature = "commit-fault-injection")]
+    pub(crate) fn commit_transport_drops_responses(&self) -> bool {
+        self.commit_transport.is_response_dropping_transport()
     }
 
     pub(crate) fn for_commit_outcome_tests_at_version(
@@ -56,5 +62,34 @@ impl GlueCatalog {
             commit_transport,
             outcome_harness: Some(harness),
         }
+    }
+
+    pub(crate) fn for_commit_fault_tests_at_version(
+        file_io: FileIO,
+        props: HashMap<String, String>,
+        commit_transport_inner: Arc<dyn GlueCommitTransport>,
+        table: Table,
+        client: aws_sdk_glue::Client,
+        version_id: Option<String>,
+    ) -> Result<(Self, Option<Arc<DiscardingGlueCommitTransport>>)> {
+        let (commit_transport, fault) =
+            build_commit_transport_parts(&props, commit_transport_inner)?;
+        let harness = GlueCommitHarness::new(table, version_id);
+        Ok((
+            GlueCatalog {
+                config: GlueCatalogConfig {
+                    name: Some("pr5a-glue".to_string()),
+                    uri: None,
+                    catalog_id: None,
+                    warehouse: "memory://pr5a".to_string(),
+                    props,
+                },
+                client: GlueClient(client),
+                file_io,
+                commit_transport,
+                outcome_harness: Some(harness),
+            },
+            fault,
+        ))
     }
 }

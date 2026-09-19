@@ -20,6 +20,9 @@ use std::collections::HashMap;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_glue::config::Credentials;
 use aws_sdk_glue::types::{Database, DatabaseInput, StorageDescriptor, TableInput};
+use iceberg::io::{
+    S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
+};
 use iceberg::spec::TableMetadata;
 use iceberg::{Error, ErrorKind, Namespace, NamespaceIdent, Result};
 
@@ -88,6 +91,42 @@ pub(crate) async fn create_sdk_config(
     }
 
     config.load().await
+}
+
+pub(crate) fn resolve_file_io_props(
+    props: &HashMap<String, String>,
+    endpoint_uri: Option<&String>,
+) -> HashMap<String, String> {
+    let mut file_io_props = props.clone();
+    if !file_io_props.contains_key(S3_ACCESS_KEY_ID)
+        && let Some(access_key_id) = props.get(AWS_ACCESS_KEY_ID)
+    {
+        file_io_props.insert(S3_ACCESS_KEY_ID.to_string(), access_key_id.to_string());
+    }
+    if !file_io_props.contains_key(S3_SECRET_ACCESS_KEY)
+        && let Some(secret_access_key) = props.get(AWS_SECRET_ACCESS_KEY)
+    {
+        file_io_props.insert(
+            S3_SECRET_ACCESS_KEY.to_string(),
+            secret_access_key.to_string(),
+        );
+    }
+    if !file_io_props.contains_key(S3_REGION)
+        && let Some(region) = props.get(AWS_REGION_NAME)
+    {
+        file_io_props.insert(S3_REGION.to_string(), region.to_string());
+    }
+    if !file_io_props.contains_key(S3_SESSION_TOKEN)
+        && let Some(session_token) = props.get(AWS_SESSION_TOKEN)
+    {
+        file_io_props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
+    }
+    if !file_io_props.contains_key(S3_ENDPOINT)
+        && let Some(aws_endpoint) = endpoint_uri
+    {
+        file_io_props.insert(S3_ENDPOINT.to_string(), aws_endpoint.to_string());
+    }
+    file_io_props
 }
 
 /// Create `DatabaseInput` from `NamespaceIdent` and properties

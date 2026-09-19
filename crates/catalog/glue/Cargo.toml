@@ -28,6 +28,9 @@ keywords = ["iceberg", "glue", "catalog"]
 license = { workspace = true }
 repository = { workspace = true }
 
+[features]
+commit-fault-injection = []
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
