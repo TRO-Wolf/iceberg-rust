@@ -36,12 +36,7 @@ async fn p7_scan_plan_fetches_each_manifest_once_through_object_cache() {
         .metadata(fixture.table.metadata_ref())
         .identifier(fixture.table.identifier().clone())
         .file_io(fixture.table.file_io().clone())
-        .metadata_location(
-            fixture
-                .table
-                .metadata_location()
-                .expect("fixture location"),
-        )
+        .metadata_location(fixture.table.metadata_location().expect("fixture location"))
         .object_cache(Arc::clone(&object_cache))
         .build()
         .expect("table with object cache");

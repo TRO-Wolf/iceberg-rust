@@ -439,7 +439,9 @@ async fn dummy_client() -> aws_sdk_s3tables::Client {
     aws_sdk_s3tables::Client::new(&cfg)
 }
 
-fn failable_pointer() -> (Arc<Mutex<Option<(String, String)>>>, PointerFn) {
+type PointerState = Arc<Mutex<Option<(String, String)>>>;
+
+fn failable_pointer() -> (PointerState, PointerFn) {
     let state = Arc::new(Mutex::new(None));
     let held = Arc::clone(&state);
     (

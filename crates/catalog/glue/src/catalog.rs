@@ -681,16 +681,6 @@ impl Catalog for GlueCatalog {
         Ok(table)
     }
 
-    /// Asynchronously drops a table from the database.
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - The namespace provided in `table` cannot be validated
-    /// or does not exist.
-    /// - The underlying database client encounters an error while
-    /// attempting to drop the table. This includes scenarios where
-    /// the table does not exist.
-    /// - Any network or communication error occurs with the database backend.
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
         let db_name = validate_namespace(table.namespace())?;
         let table_name = table.name();
