@@ -342,10 +342,10 @@ impl MergeManifestProcess {
         &self,
         snapshot_producer: &mut SnapshotProducer<'_>,
         data_manifests: Vec<ManifestFile>,
-    ) -> Result<Vec<ManifestFile>> {
+    ) -> Result<(Vec<ManifestFile>, usize)> {
         // Disabled / empty short-circuit (Java `mergeManifests` L80-83).
         if !self.settings.merge_enabled || data_manifests.is_empty() {
-            return Ok(data_manifests);
+            return Ok((data_manifests, 0));
         }
 
         // Java's `first` is the unconditional STREAM HEAD (`ManifestFile first = manifestIter.next()`,
@@ -376,9 +376,10 @@ impl MergeManifestProcess {
         spec_order.sort_unstable_by(|a, b| b.cmp(a)); // reverse order
 
         let mut merged: Vec<ManifestFile> = Vec::new();
+        let mut replaced_count = 0usize;
         for spec_id in spec_order {
             let group = groups.remove(&spec_id).expect("spec id came from the keys");
-            let group_result = self
+            let (group_result, group_replaced) = self
                 .merge_group(
                     snapshot_producer,
                     spec_id,
@@ -387,9 +388,10 @@ impl MergeManifestProcess {
                 )
                 .await?;
             merged.extend(group_result);
+            replaced_count += group_replaced;
         }
 
-        Ok(merged)
+        Ok((merged, replaced_count))
     }
 
     /// Bin-pack and merge one spec-id group (Java `mergeGroup` L140-185).
@@ -399,7 +401,7 @@ impl MergeManifestProcess {
         spec_id: i32,
         group: Vec<ManifestFile>,
         first_manifest_path: Option<&str>,
-    ) -> Result<Vec<ManifestFile>> {
+    ) -> Result<(Vec<ManifestFile>, usize)> {
         // ListPacker(targetSizeBytes, lookback=1, largestBinFirst=false).packEnd(group,
         // ManifestFile::length) (Java L146-148). The weight is the manifest's on-disk length.
         let bins = bin_packing::pack_end(group, self.settings.target_size_bytes, |manifest| {
@@ -407,6 +409,7 @@ impl MergeManifestProcess {
         });
 
         let mut output: Vec<ManifestFile> = Vec::new();
+        let mut replaced_count = 0usize;
         for bin in bins {
             let bin_contains_first = first_manifest_path.is_some_and(|first_path| {
                 bin.iter()
@@ -419,6 +422,10 @@ impl MergeManifestProcess {
             ) {
                 BinDisposition::Keep => output.extend(bin),
                 BinDisposition::Merge => {
+                    replaced_count += bin
+                        .iter()
+                        .filter(|manifest| manifest.added_snapshot_id != self.snapshot_id)
+                        .count();
                     let merged = self
                         .create_manifest(snapshot_producer, spec_id, &bin)
                         .await?;
@@ -427,7 +434,7 @@ impl MergeManifestProcess {
             }
         }
 
-        Ok(output)
+        Ok((output, replaced_count))
     }
 
     /// Merge `bin` into a single manifest (Java `createManifest` L187-239). Per entry of each source
@@ -483,12 +490,12 @@ impl ManifestProcess for MergeManifestProcess {
         &self,
         snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Result<Vec<ManifestFile>> {
+    ) -> Result<(Vec<ManifestFile>, usize)> {
         // Split DATA from DELETE manifests and reorder DATA so the new added manifest is first.
         let (data_manifests, delete_manifests) = self.split_and_reorder(manifests);
 
         // Merge the data manifests (Java `mergeManager.mergeManifests(unmergedManifests)`).
-        let merged_data = self
+        let (merged_data, replaced_count) = self
             .merge_data_manifests(snapshot_produce, data_manifests)
             .await?;
 
@@ -497,7 +504,7 @@ impl ManifestProcess for MergeManifestProcess {
         // manifests; this port leaves the delete manifests un-merged — see the module doc).
         let mut result = merged_data;
         result.extend(delete_manifests);
-        Ok(result)
+        Ok((result, replaced_count))
     }
 }
 

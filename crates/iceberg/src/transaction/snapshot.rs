@@ -100,8 +100,8 @@ impl ManifestProcess for DefaultManifestProcess {
         &self,
         _snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Result<Vec<ManifestFile>> {
-        Ok(manifests)
+    ) -> Result<(Vec<ManifestFile>, usize)> {
+        Ok((manifests, 0))
     }
 }
 
@@ -120,7 +120,7 @@ pub(crate) trait ManifestProcess: Send + Sync {
         &self,
         snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
+    ) -> impl Future<Output = Result<(Vec<ManifestFile>, usize)>> + Send;
 }
 
 #[path = "snapshot/first_row_id_policy.rs"]
@@ -1113,10 +1113,10 @@ impl<'a> SnapshotProducer<'a> {
         // deletes and the split is a no-op there.
         manifest_files.extend(existing_delete_manifests);
 
-        let manifest_files = manifest_process
+        let (manifest_files, merged_manifests) = manifest_process
             .process_manifests(self, manifest_files)
             .await?;
-        Ok((manifest_files, replaced_manifests))
+        Ok((manifest_files, replaced_manifests + merged_manifests))
     }
 
     /// Build a manifest writer for a rewritten (filtered) manifest, using the partition spec of the
@@ -1391,26 +1391,24 @@ impl<'a> SnapshotProducer<'a> {
                 .map_err(summary_error)?
         };
 
-        if snapshot_produce_operation.operation() == Operation::Replace {
-            let mut manifests_created = 0u64;
-            let mut manifests_kept = 0u64;
-            for manifest in &new_manifests {
-                if manifest.added_snapshot_id == self.snapshot_id {
-                    manifests_created += 1;
-                } else {
-                    manifests_kept += 1;
-                }
+        let mut manifests_created = 0u64;
+        let mut manifests_kept = 0u64;
+        for manifest in &new_manifests {
+            if manifest.added_snapshot_id == self.snapshot_id {
+                manifests_created += 1;
+            } else {
+                manifests_kept += 1;
             }
-            let properties = &mut summary.additional_properties;
-            properties.insert(
-                "manifests-created".to_string(),
-                manifests_created.to_string(),
-            );
-            properties.insert("manifests-kept".to_string(), manifests_kept.to_string());
-            properties
-                .entry("manifests-replaced".to_string())
-                .or_insert_with(|| manifests_replaced.to_string());
         }
+        let properties = &mut summary.additional_properties;
+        properties.insert(
+            "manifests-created".to_string(),
+            manifests_created.to_string(),
+        );
+        properties.insert("manifests-kept".to_string(), manifests_kept.to_string());
+        properties
+            .entry("manifests-replaced".to_string())
+            .or_insert_with(|| manifests_replaced.to_string());
 
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;
         let writer_next_row_id = manifest_list_writer.next_row_id();
