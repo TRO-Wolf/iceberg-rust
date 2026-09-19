@@ -20,18 +20,21 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Int32Array, UInt64Array};
 use datafusion::prelude::SessionContext;
-use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+use futures::TryStreamExt;
+use iceberg::expr::{Bind, Predicate, Reference};
+use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::spec::{
-    FormatVersion, ListType, MapType, NestedField, PrimitiveType, Schema as IcebergSchema,
+    Datum, FormatVersion, ListType, MapType, NestedField, PrimitiveType, Schema as IcebergSchema,
     StructType, Type,
 };
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use tempfile::TempDir;
 
 use crate::IcebergCatalogProvider;
 
 struct NullFixture {
     ctx: SessionContext,
+    catalog: Arc<MemoryCatalog>,
     _warehouse: TempDir,
 }
 
@@ -86,6 +89,30 @@ impl NullShape {
         }
     }
 
+    fn rows(self) -> [&'static str; 4] {
+        match self {
+            NullShape::ListInt => ["(1, [1, 2])", "(2, NULL)", "(3, [])", "(4, [NULL])"],
+            NullShape::ListStruct => [
+                "(1, [named_struct('a', CAST(1 AS INT))])",
+                "(2, NULL)",
+                "(3, [])",
+                "(4, [CAST(NULL AS STRUCT<a INT>)])",
+            ],
+            NullShape::MapStrInt => [
+                "(1, map('k', CAST(1 AS INT)))",
+                "(2, NULL)",
+                "(3, MAP {})",
+                "(4, map('k', CAST(NULL AS INT)))",
+            ],
+            NullShape::StructInt => [
+                "(1, named_struct('a', CAST(1 AS INT)))",
+                "(2, NULL)",
+                "(3, named_struct('a', CAST(NULL AS INT)))",
+                "(4, named_struct('a', CAST(4 AS INT)))",
+            ],
+        }
+    }
+
     fn seed(self) -> &'static str {
         match self {
             NullShape::ListInt => "(1, [1, 2]), (2, NULL), (3, []), (4, [NULL])",
@@ -106,10 +133,19 @@ impl NullShape {
     }
 }
 
-async fn null_fixture(
+#[derive(Clone, Copy, Default)]
+struct FixtureOpts {
+    seeded_per_row: bool,
+    partition_on_id: bool,
+    target_partitions: Option<usize>,
+    metrics_default: Option<&'static str>,
+}
+
+async fn null_fixture_opts(
     merge_on_read: bool,
     format_version: FormatVersion,
     shape: NullShape,
+    opts: FixtureOpts,
 ) -> NullFixture {
     let warehouse = TempDir::new().expect("warehouse");
     let catalog = Arc::new(
@@ -142,39 +178,84 @@ async fn null_fixture(
     } else {
         "copy-on-write"
     };
-    catalog
-        .create_table(
-            &namespace,
-            TableCreation::builder()
-                .name("t".to_string())
-                .location(format!("{}/t", warehouse.path().to_str().expect("utf8")))
-                .schema(schema)
-                .format_version(format_version)
-                .properties(HashMap::from([
-                    ("write.delete.mode".to_string(), mode.to_string()),
-                    ("write.update.mode".to_string(), mode.to_string()),
-                ]))
-                .build(),
-        )
-        .await
-        .expect("table");
+    let mut properties = HashMap::from([
+        ("write.delete.mode".to_string(), mode.to_string()),
+        ("write.update.mode".to_string(), mode.to_string()),
+    ]);
+    if let Some(metrics) = opts.metrics_default {
+        properties.insert(
+            "write.metadata.metrics.default".to_string(),
+            metrics.to_string(),
+        );
+    }
+    let creation = TableCreation::builder()
+        .name("t".to_string())
+        .location(format!("{}/t", warehouse.path().to_str().expect("utf8")))
+        .schema(schema)
+        .format_version(format_version)
+        .properties(properties);
+    if opts.partition_on_id {
+        let creation = creation
+            .partition_spec(
+                iceberg::spec::UnboundPartitionSpec::builder()
+                    .with_spec_id(0)
+                    .add_partition_field(1, "id", iceberg::spec::Transform::Identity)
+                    .expect("identity(id)")
+                    .build(),
+            )
+            .build();
+        catalog
+            .create_table(&namespace, creation)
+            .await
+            .expect("table");
+    } else {
+        catalog
+            .create_table(&namespace, creation.build())
+            .await
+            .expect("table");
+    }
 
     let catalog_provider = IcebergCatalogProvider::try_new(catalog.clone())
         .await
         .expect("catalog provider");
-    let ctx = SessionContext::new();
+    let ctx = match opts.target_partitions {
+        Some(n) => SessionContext::new_with_config(
+            datafusion::execution::config::SessionConfig::new().with_target_partitions(n),
+        ),
+        None => SessionContext::new(),
+    };
     ctx.register_catalog("catalog", Arc::new(catalog_provider));
-    ctx.sql(&format!("INSERT INTO catalog.ns.t VALUES {}", shape.seed()))
-        .await
-        .expect("plan seed insert")
-        .collect()
-        .await
-        .expect("seed insert");
+    if opts.seeded_per_row {
+        for row in shape.rows() {
+            ctx.sql(&format!("INSERT INTO catalog.ns.t VALUES {row}"))
+                .await
+                .expect("plan seed insert")
+                .collect()
+                .await
+                .expect("seed insert");
+        }
+    } else {
+        ctx.sql(&format!("INSERT INTO catalog.ns.t VALUES {}", shape.seed()))
+            .await
+            .expect("plan seed insert")
+            .collect()
+            .await
+            .expect("seed insert");
+    }
 
     NullFixture {
         ctx,
+        catalog,
         _warehouse: warehouse,
     }
+}
+
+async fn null_fixture(
+    merge_on_read: bool,
+    format_version: FormatVersion,
+    shape: NullShape,
+) -> NullFixture {
+    null_fixture_opts(merge_on_read, format_version, shape, FixtureOpts::default()).await
 }
 
 async fn ids(ctx: &SessionContext) -> Vec<i64> {
@@ -497,6 +578,106 @@ async fn select_where_xs_is_null_returns_the_null_row() {
                     select_ids(&fixture.ctx, "SELECT id FROM catalog.ns.t WHERE xs IS NULL").await,
                     vec![2],
                     "{} {format_version:?} merge_on_read={merge_on_read}",
+                    shape.name()
+                );
+            }
+        }
+    }
+}
+
+async fn plan_task_count(table: &iceberg::table::Table, predicate: Predicate) -> usize {
+    let tasks: Vec<iceberg::scan::FileScanTask> = table
+        .scan()
+        .with_file_prune_only(predicate)
+        .build()
+        .expect("a prune-only scan must never bind an unbindable term")
+        .plan_files()
+        .await
+        .expect("plan files")
+        .try_collect()
+        .await
+        .expect("collect tasks");
+    tasks.len()
+}
+
+#[tokio::test]
+async fn cow_prune_scan_drops_the_unbindable_null_term() {
+    for shape in NullShape::ALL {
+        for format_version in [FormatVersion::V2, FormatVersion::V3] {
+            let fixture = null_fixture_opts(false, format_version, shape, FixtureOpts {
+                seeded_per_row: true,
+                ..FixtureOpts::default()
+            })
+            .await;
+            let table = fixture
+                .catalog
+                .load_table(&TableIdent::from_strs(["ns", "t"]).expect("ident"))
+                .await
+                .expect("load table");
+
+            let and_prune = Reference::new("id")
+                .greater_than(Datum::int(1))
+                .and(Reference::new("xs").is_null());
+            let planned = plan_task_count(&table, and_prune).await;
+            assert_eq!(
+                planned, 3,
+                "{} {format_version:?}: the sound conjunct prunes the id=1 file only",
+                shape.name()
+            );
+
+            let or_prune = Reference::new("xs")
+                .is_null()
+                .or(Reference::new("id").equal_to(Datum::int(1)));
+            let planned = plan_task_count(&table, or_prune).await;
+            assert_eq!(
+                planned,
+                4,
+                "{} {format_version:?}: an unbindable disjunct widens the prune to every file",
+                shape.name()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn filtered_scan_residual_drops_the_unbindable_null_term() {
+    for shape in NullShape::ALL {
+        for format_version in [FormatVersion::V2, FormatVersion::V3] {
+            let fixture = null_fixture_opts(false, format_version, shape, FixtureOpts {
+                seeded_per_row: true,
+                ..FixtureOpts::default()
+            })
+            .await;
+            let table = fixture
+                .catalog
+                .load_table(&TableIdent::from_strs(["ns", "t"]).expect("ident"))
+                .await
+                .expect("load table");
+
+            let filter = Reference::new("id")
+                .greater_than(Datum::int(1))
+                .and(Reference::new("xs").is_null());
+            let tasks: Vec<iceberg::scan::FileScanTask> = table
+                .scan()
+                .with_filter(filter)
+                .build()
+                .expect("a filtered scan must never bind an unbindable term")
+                .plan_files()
+                .await
+                .expect("plan files")
+                .try_collect()
+                .await
+                .expect("collect tasks");
+            assert!(!tasks.is_empty());
+            let expected_residual = Reference::new("id")
+                .greater_than(Datum::int(1))
+                .bind(tasks[0].schema.clone(), true)
+                .expect("bind expected residual");
+            for task in &tasks {
+                assert_eq!(
+                    task.predicate.as_deref(),
+                    Some(&expected_residual),
+                    "{} {format_version:?}: the residual keeps only the sound conjunct",
                     shape.name()
                 );
             }

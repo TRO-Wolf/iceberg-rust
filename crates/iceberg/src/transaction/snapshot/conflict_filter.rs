@@ -95,11 +95,18 @@ fn partition_might_match(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use super::first_conflicting_file;
     use crate::expr::Reference;
     use crate::memory::tests::new_memory_catalog;
-    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Datum, Literal, Struct};
+    use crate::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, NestedField,
+        PrimitiveType, Schema, Struct, Type,
+    };
     use crate::transaction::tests::make_v2_minimal_table_in_catalog;
+    use crate::{Catalog, NamespaceIdent, TableCreation};
 
     #[tokio::test]
     async fn unknown_spec_id_stays_conflicting() {
@@ -120,5 +127,88 @@ mod tests {
             .expect("an unknown spec must not error")
             .expect("an unknown spec must stay conflicting");
         assert_eq!(conflicting.file_path(), "test/unknown-spec.parquet");
+    }
+
+    async fn table_with_list_column(catalog: &impl Catalog) -> crate::table::Table {
+        let namespace = NamespaceIdent::new("ns1".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("namespace");
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "xs",
+                    Type::List(ListType::new(
+                        NestedField::list_element(3, Type::Primitive(PrimitiveType::Int), false)
+                            .into(),
+                    )),
+                )),
+            ])
+            .build()
+            .expect("schema");
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .build(),
+            )
+            .await
+            .expect("create table")
+    }
+
+    fn data_file(path: &str, upper_id: i32) -> crate::spec::DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .value_counts(HashMap::from([(1, 1u64)]))
+            .upper_bounds(HashMap::from([(1, Datum::int(upper_id))]))
+            .build()
+            .expect("build data file")
+    }
+
+    #[tokio::test]
+    async fn unbindable_conflict_filter_widens_instead_of_failing_to_bind() {
+        let catalog = new_memory_catalog().await;
+        let table = table_with_list_column(&catalog).await;
+        let filter = Reference::new("id")
+            .greater_than(Datum::int(1))
+            .and(Reference::new("xs").is_null());
+
+        let conflicting = first_conflicting_file(
+            &[data_file("test/maybe.parquet", 4)],
+            &table,
+            Some(&filter),
+            true,
+        )
+        .expect("an unbindable term must widen, not error")
+        .expect("a file the sound conjunct might match stays conflicting");
+        assert_eq!(conflicting.file_path(), "test/maybe.parquet");
+
+        let none = first_conflicting_file(
+            &[data_file("test/cannot.parquet", 1)],
+            &table,
+            Some(&filter),
+            true,
+        )
+        .expect("an unbindable term must widen, not error");
+        assert!(
+            none.is_none(),
+            "a file whose id upper bound is 1 cannot match id > 1"
+        );
     }
 }
