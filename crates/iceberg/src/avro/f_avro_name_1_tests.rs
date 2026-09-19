@@ -29,7 +29,7 @@ use tempfile::TempDir;
 use super::schema_to_avro_schema;
 use crate::arrow::avro_reader::read_avro_data_bytes;
 use crate::arrow::schema_to_arrow_schema;
-use crate::avro::name::{ocf_json_parse_count, repair_avro_container};
+use crate::avro::ocf::{ocf_json_parse_count, repair_avro_container};
 use crate::expr::Reference;
 use crate::io::{FileIO, LocalFsStorageFactory};
 use crate::memory::MemoryCatalogBuilder;
@@ -564,7 +564,9 @@ fn test_bytes<'a>(bs: &'a [u8], i: &mut usize) -> &'a [u8] {
     s
 }
 
-fn ocf_parts(bs: &[u8]) -> (Vec<(Vec<u8>, Vec<u8>)>, [u8; 16], usize) {
+type OcfMeta = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn ocf_parts(bs: &[u8]) -> (OcfMeta, [u8; 16], usize) {
     let mut i = 4usize;
     let mut entries = Vec::new();
     loop {
@@ -586,7 +588,7 @@ fn ocf_parts(bs: &[u8]) -> (Vec<(Vec<u8>, Vec<u8>)>, [u8; 16], usize) {
     (entries, sync, i + 16)
 }
 
-fn ocf_container(entries: &[(Vec<u8>, Vec<u8>)], sync: [u8; 16], body: &[u8]) -> Vec<u8> {
+fn ocf_container(entries: &OcfMeta, sync: [u8; 16], body: &[u8]) -> Vec<u8> {
     let mut out = b"Obj\x01".to_vec();
     avro_long_out(&mut out, entries.len() as i64);
     for (k, v) in entries {

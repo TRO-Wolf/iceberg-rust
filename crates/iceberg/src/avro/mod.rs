@@ -19,5 +19,6 @@
 #[cfg(test)]
 mod f_avro_name_1_tests;
 pub(crate) mod name;
+pub(crate) mod ocf;
 mod schema;
 pub(crate) use schema::*;

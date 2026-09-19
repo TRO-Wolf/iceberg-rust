@@ -94,7 +94,7 @@
 // flagged at the item with a targeted allow and a one-line reason.
 
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::Read;
 use std::sync::Arc;
 
 use apache_avro::schema::{RecordSchema, UnionSchema};
@@ -167,8 +167,8 @@ pub(crate) fn read_avro_data_bytes(
         "Avro data-file batch_size must be greater than zero",
     );
 
-    let repaired = crate::avro::name::repair_avro_container(bytes)?;
-    let reader = AvroReader::new(Cursor::new(&repaired[..])).map_err(|e| {
+    let (head, body) = crate::avro::ocf::repaired_ocf_parts(bytes)?;
+    let reader = AvroReader::new(head.as_ref().chain(body)).map_err(|e| {
         Error::new(
             ErrorKind::DataInvalid,
             "Failed to open Avro data file (could not read the OCF header)",

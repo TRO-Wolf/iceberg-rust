@@ -388,12 +388,6 @@ pub fn read_data_files_from_avro<R: Read>(
     partition_type: &StructType,
     version: FormatVersion,
 ) -> Result<Vec<DataFile>> {
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf).map_err(|e| {
-        Error::new(ErrorKind::Unexpected, "Failed to read Avro data file bytes").with_source(e)
-    })?;
-    let buf = crate::avro::name::repair_avro_container(&buf)?;
-
     let mut avro_schema = match version {
         FormatVersion::V1 => data_file_schema_v1(partition_type).unwrap(),
         FormatVersion::V2 => data_file_schema_v2(partition_type).unwrap(),
@@ -401,7 +395,8 @@ pub fn read_data_files_from_avro<R: Read>(
     };
     crate::avro::name::strictify_avro_field_names(&mut avro_schema);
 
-    let reader = AvroReader::with_schema(&avro_schema, &buf[..])?;
+    let stream = crate::avro::ocf::ocf_repaired_stream(reader)?;
+    let reader = AvroReader::with_schema(&avro_schema, stream)?;
     reader
         .into_iter()
         .map(|value| {

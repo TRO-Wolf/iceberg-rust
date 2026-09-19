@@ -23,6 +23,7 @@ pub use entry::*;
 mod metadata;
 pub use metadata::*;
 mod writer;
+use std::io::Read;
 use std::sync::Arc;
 
 use apache_avro::Reader as AvroReader;
@@ -55,17 +56,16 @@ impl Manifest {
         bs: &[u8],
         schema_fallback: Option<crate::spec::SchemaRef>,
     ) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
-        let repaired = crate::avro::name::repair_avro_container(bs)?;
-        let bs: &[u8] = &repaired;
+        let (head, body) = crate::avro::ocf::repaired_ocf_parts(bs)?;
 
-        let reader = AvroReader::new(bs)?;
+        let reader = AvroReader::new(head.as_ref().chain(body))?;
 
         // Parse manifest metadata
         let meta = reader.user_metadata();
         let metadata = ManifestMetadata::parse_with_schema_fallback(meta, schema_fallback)?;
 
         // Parse manifest entries
-        let entries = entry::manifest_entries_from_avro(bs, &metadata)?;
+        let entries = entry::manifest_entries_from_avro(head.as_ref().chain(body), &metadata)?;
 
         Ok((metadata, entries))
     }

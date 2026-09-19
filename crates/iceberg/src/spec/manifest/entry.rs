@@ -704,8 +704,8 @@ pub(super) fn manifest_schema_v1(partition_type: &StructType) -> Result<AvroSche
     schema_to_avro_schema("manifest_entry", &schema)
 }
 
-pub(crate) fn manifest_entries_from_avro(
-    bs: &[u8],
+pub(crate) fn manifest_entries_from_avro<R: std::io::Read>(
+    reader: R,
     metadata: &ManifestMetadata,
 ) -> Result<Vec<ManifestEntry>> {
     let partition_type = metadata.partition_spec.partition_type(&metadata.schema)?;
@@ -715,7 +715,7 @@ pub(crate) fn manifest_entries_from_avro(
     };
     strictify_avro_field_names(&mut avro_schema);
     let spec_id = metadata.partition_spec.spec_id();
-    AvroReader::with_schema(&avro_schema, bs)?
+    AvroReader::with_schema(&avro_schema, reader)?
         .map(|value| {
             let value = value?;
             match metadata.format_version {

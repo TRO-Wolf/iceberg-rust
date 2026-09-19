@@ -24,17 +24,7 @@ use apache_avro::schema::{Name, RecordField as AvroRecordField, UnionSchema};
 use apache_avro::types::Value as AvroValue;
 use serde_json::Value as JsonValue;
 
-use crate::{Error, ErrorKind, Result};
-
 pub(crate) const ICEBERG_FIELD_NAME_PROP: &str = "iceberg-field-name";
-
-#[cfg(test)]
-static OCF_JSON_PARSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) fn ocf_json_parse_count() -> usize {
-    OCF_JSON_PARSES.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 static JAVA_LETTER_RANGES: &[(u16, u16)] = &[
     (0x0041, 0x005A),
@@ -628,172 +618,15 @@ pub(crate) fn strictify_avro_field_names(schema: &mut AvroSchema) {
     }
 }
 
-fn read_avro_long(cursor: &mut &[u8]) -> Option<i64> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    loop {
-        let (&byte, rest) = cursor.split_first()?;
-        *cursor = rest;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(((value >> 1) as i64) ^ -((value & 1) as i64));
-        }
-        shift += 7;
-        if shift > 63 {
-            return None;
-        }
-    }
-}
-
-fn read_avro_bytes<'a>(cursor: &mut &'a [u8]) -> Option<&'a [u8]> {
-    let len = usize::try_from(read_avro_long(cursor)?).ok()?;
-    if cursor.len() < len {
-        return None;
-    }
-    let (bytes, rest) = cursor.split_at(len);
-    *cursor = rest;
-    Some(bytes)
-}
-
-fn read_avro_metadata(cursor: &mut &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
-    let mut entries = Vec::new();
-    loop {
-        let mut count = read_avro_long(cursor)?;
-        if count == 0 {
-            return Some(entries);
-        }
-        if count < 0 {
-            count = count.checked_neg()?;
-            read_avro_long(cursor)?;
-        }
-        if count > i64::try_from(cursor.len()).unwrap_or(i64::MAX) {
-            return None;
-        }
-        for _ in 0..count {
-            let key = String::from_utf8(read_avro_bytes(cursor)?.to_vec()).ok()?;
-            let value = read_avro_bytes(cursor)?.to_vec();
-            entries.push((key, value));
-        }
-    }
-}
-
-fn write_avro_long(out: &mut Vec<u8>, value: i64) {
-    let mut n = ((value << 1) ^ (value >> 63)) as u64;
-    loop {
-        if n & !0x7f == 0 {
-            out.push(n as u8);
-            return;
-        }
-        out.push((n as u8 & 0x7f) | 0x80);
-        n >>= 7;
-    }
-}
-
-fn patch_record_field(field: &mut serde_json::Map<String, JsonValue>) -> bool {
-    let Some(name) = field
-        .get("name")
-        .and_then(JsonValue::as_str)
-        .map(str::to_owned)
-    else {
-        return false;
-    };
-    let original = field
-        .get(ICEBERG_FIELD_NAME_PROP)
-        .and_then(JsonValue::as_str)
-        .unwrap_or(name.as_str())
-        .to_owned();
-    let canonical = java_avro_name(&original);
-    let target = if is_apache_avro_name(&canonical) {
+pub(crate) fn repair_target_name(original: &str) -> Cow<'_, str> {
+    let canonical = java_avro_name(original);
+    if is_apache_avro_name(&canonical) {
         canonical
     } else {
-        strict_avro_name(&original)
-    };
-    if name == target.as_ref() {
-        return false;
-    }
-    field.insert("name".to_string(), JsonValue::String(target.into_owned()));
-    field
-        .entry(ICEBERG_FIELD_NAME_PROP.to_string())
-        .or_insert(JsonValue::String(original));
-    true
-}
-
-fn patch_schema_node(node: &mut JsonValue) -> bool {
-    match node {
-        JsonValue::Object(map) => {
-            let mut changed = false;
-            if let Some(JsonValue::Array(fields)) = map.get_mut("fields") {
-                for field in fields.iter_mut() {
-                    if let JsonValue::Object(field) = field {
-                        changed |= patch_record_field(field);
-                    }
-                }
-            }
-            for value in map.values_mut() {
-                changed |= patch_schema_node(value);
-            }
-            changed
-        }
-        JsonValue::Array(items) => items
-            .iter_mut()
-            .fold(false, |c, v| c | patch_schema_node(v)),
-        _ => false,
+        strict_avro_name(original)
     }
 }
 
-pub(crate) fn repair_avro_container(bs: &[u8]) -> Result<Cow<'_, [u8]>> {
-    const MAGIC: &[u8; 4] = b"Obj\x01";
-    if !bs.starts_with(MAGIC) {
-        return Ok(Cow::Borrowed(bs));
-    }
-    let mut cursor = &bs[4..];
-    let Some(entries) = read_avro_metadata(&mut cursor) else {
-        return Ok(Cow::Borrowed(bs));
-    };
-    let Some(schema_bytes) = entries
-        .iter()
-        .find(|(key, _)| key == "avro.schema")
-        .map(|(_, value)| value.clone())
-    else {
-        return Ok(Cow::Borrowed(bs));
-    };
-    #[cfg(test)]
-    OCF_JSON_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let Ok(mut json) = serde_json::from_slice::<JsonValue>(&schema_bytes) else {
-        return Ok(Cow::Borrowed(bs));
-    };
-    if !patch_schema_node(&mut json) {
-        return Ok(Cow::Borrowed(bs));
-    }
-    let patched_schema = serde_json::to_vec(&json).map_err(|e| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            "Failed to encode patched Avro schema",
-        )
-        .with_source(e)
-    })?;
-
-    let mut out = Vec::with_capacity(bs.len() + patched_schema.len());
-    out.extend_from_slice(MAGIC);
-    write_avro_long(&mut out, i64::try_from(entries.len()).unwrap_or(i64::MAX));
-    for (key, value) in entries {
-        write_avro_long(&mut out, i64::try_from(key.len()).unwrap_or(i64::MAX));
-        out.extend_from_slice(key.as_bytes());
-        if key == "avro.schema" {
-            write_avro_long(
-                &mut out,
-                i64::try_from(patched_schema.len()).unwrap_or(i64::MAX),
-            );
-            out.extend_from_slice(&patched_schema);
-        } else {
-            write_avro_long(&mut out, i64::try_from(value.len()).unwrap_or(i64::MAX));
-            out.extend_from_slice(&value);
-        }
-    }
-    write_avro_long(&mut out, 0);
-    out.extend_from_slice(cursor);
-    Ok(Cow::Owned(out))
-}
 pub(crate) fn avro_field_name(
     field_name: &str,
     custom_attributes: &mut BTreeMap<String, JsonValue>,
