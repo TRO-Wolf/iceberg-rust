@@ -233,7 +233,6 @@ mod test {
     use arrow_array::{ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StructArray};
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType, Field, Fields};
-    use arrow_select::concat::concat_batches;
     use itertools::Itertools;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -275,8 +274,7 @@ mod test {
         // check data
         let reader = reader_builder.build().unwrap();
         let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
-        let res = concat_batches(&batch.schema(), &batches).unwrap();
-        assert_eq!(*batch, res);
+        crate::writer::tests::assert_batches_read_back(batch, &batches);
 
         // check metadata
         let expect_column_num = batch.num_columns();

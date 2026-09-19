@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 
 use crate::arrow::schema_to_arrow_schema;
@@ -30,7 +31,9 @@ use crate::spec::{DataContentType, DataFile, PartitionKey, PartitionSpec, Schema
 use crate::writer::base_writer::data_file_writer::resolve_partition_spec_id;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileWriterBuilder};
-use crate::writer::file_writer::{FileWriterBuilder, parquet_compression_from_properties};
+use crate::writer::file_writer::{
+    DELETE_TYPE_META_KEY, FileWriterBuilder, parquet_compression_from_properties,
+};
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
@@ -54,6 +57,10 @@ pub fn pos_delete_schema() -> Result<Schema> {
 pub fn position_delete_writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_statistics_truncate_length(None)
+        .set_key_value_metadata(Some(vec![KeyValue::new(
+            DELETE_TYPE_META_KEY.to_string(),
+            "position".to_string(),
+        )]))
         .build()
 }
 
@@ -64,6 +71,10 @@ pub fn position_delete_writer_properties_for(
     Ok(WriterProperties::builder()
         .set_statistics_truncate_length(None)
         .set_compression(parquet_compression_from_properties(properties)?)
+        .set_key_value_metadata(Some(vec![KeyValue::new(
+            DELETE_TYPE_META_KEY.to_string(),
+            "position".to_string(),
+        )]))
         .build())
 }
 

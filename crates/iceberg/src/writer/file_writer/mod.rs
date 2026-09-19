@@ -29,7 +29,15 @@ pub use avro_writer::{AvroWriter, AvroWriterBuilder};
 mod parquet_writer;
 pub use parquet_writer::{ParquetWriter, ParquetWriterBuilder};
 mod parquet_compression;
+mod parquet_footer;
 pub use parquet_compression::parquet_compression_from_properties;
+pub(crate) use parquet_footer::DELETE_TYPE_META_KEY;
+pub use parquet_footer::{
+    equality_delete_writer_properties, equality_delete_writer_properties_for,
+};
+
+#[cfg(test)]
+mod parquet_footer_tests;
 
 use crate::io::OutputFile;
 
