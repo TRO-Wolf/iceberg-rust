@@ -172,6 +172,42 @@ cargo test -p iceberg-datafusion --lib dangling_dv → FAILED: 1 failed / 0 pass
 controls stayed green under the mutation. `git checkout HEAD -- manifest_filter.rs` restored
 the fix; both filters re-ran green (10/10 and 1/1).
 
+## Round 2 — perf remediations (Grok P2s, no behaviour change)
+
+| Item | Commit | Subject |
+|---|---|---|
+| perf | `4f2902d0` | `perf: F-DANGLING-DV-COMMIT-1 — borrowed path matching, bounded-concurrency manifest loads` |
+| docs | this commit | `docs: F-DANGLING-DV-COMMIT-1 — round 2` |
+
+- **R-01** (`manifest_filter.rs::is_dangling_dv`, `delete_file_index.rs` ~228): the common leg now
+  compares `referenced_data_file_ref()` — a `&str` — directly against the removed-path set, so a
+  live DV hashes a borrowed path with no `String` allocation; `referenced_data_file_location`
+  (the bounds leg, which allocates) runs only when `referenced_data_file` is `None`. The
+  equality-delete leg of the helper is preserved ahead of both legs.
+- **R-03**: `dangling_dv_paths` is now `Option<&HashSet<&str>>` borrowing
+  `RemovalTargets::data_paths` (new `data_paths()` accessor on `removal_targets.rs`) — the set
+  `RemovalTargets::new` already builds from `removed_data_files`; the second owned
+  `HashSet<String>` is gone.
+- **R-04**: the three post-load entry scans (`has_removal` / `has_expired` / `has_dangling`)
+  folded into one pass over live entries in `scan_manifest`; the `expiry` second-stage filter
+  (`every_manifest || has_removal`) applies after the pass and gates `has_expired`, matching
+  the round-1 predicate order exactly.
+- **R-02** (`process_deletes` ~110-121, ~151-156): delete-manifest load+scan is split into a
+  pure `scan_manifest` (free fn, `&FileIO` only) run over
+  `stream::iter(...).buffer_unordered(DELETE_MANIFEST_SCAN_CONCURRENCY = 8)` — the
+  `rewrite_data_files_dv.rs` pattern — while the rewrite stays sequential because it needs
+  `&mut self` (`new_filtering_manifest_writer` → `manifest_counter`) and `&mut hits`. Results
+  carry their source index into a pre-sized `Vec<Option<ManifestScan>>`, so the rewrite and the
+  output manifest list stay in manifest-list order — deterministic output, matching Java's
+  worker-pool-open/serial-apply shape. `filter_manifest` (data-manifest path) now delegates to
+  the same `scan_manifest` + rewrite pair.
+- **Mutation rerun** (round-1 mutation, full fix-file revert to `2c8bb888`): `dangling_dv`
+  5 failed / 5 passed of 10 iceberg + 1 failed / 1 datafusion — **6 red of 11**, all controls
+  green, identical signatures; restore → 10/10 + 1/1 green.
+- **Gates**: `dangling_dv` 10 + 1, `transaction` 691 (1 ignored), `seq_gc` 12,
+  `rewrite_data_files` 110, `remove_dangling` 24, `cow_bytes` 8, datafusion `delete` 43
+  (1 ignored); `fmt --check`, clippy `-D warnings`, size checker, comment-ban `hits=0`.
+
 ## Residue / scope decisions
 
 - `RemoveDanglingDeleteFiles` stays necessary for tables whose metadata ALREADY carries a

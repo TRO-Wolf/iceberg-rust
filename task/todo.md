@@ -46,7 +46,13 @@ commit drops its DVs; the fork only dropped them inside `RewriteDataFiles`.
 - [x] MUTATION: full fix-file revert → 6 red (5 cells + e2e), all controls green;
       restore → green; revert uncommitted
 - [x] Ledger + this entry + map.md updates (transaction / maintenance / physical_plan)
-- [ ] Gates: fmt, clippy `-D warnings`, size checker, comment-ban `hits=0`
+- [x] Gates: fmt, clippy `-D warnings`, size checker, comment-ban `hits=0`
+- [x] Round 2 perf (`4f2902d0`): R-01 borrowed `&str` path match (bounds helper only when
+      `referenced_data_file` is None), R-03 `RemovalTargets::data_paths` reused (no second
+      owned set), R-04 three entry scans folded to one pass, R-02 delete-manifest load+scan
+      on `buffer_unordered(8)` with indexed reassembly — rewrites stay sequential for
+      `manifest_counter`; round-1 mutation rerun → 6 red / controls green, identical
+      signatures
 
 ## ACTIVE (2026-09-19): F-RPD-COMMITS-1 — `rewrite_position_delete_files` commits once and keeps file scope, as Java does
 
