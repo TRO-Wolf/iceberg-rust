@@ -18,9 +18,9 @@
 use std::sync::Arc;
 
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 
-use crate::arrow::reader::{ArrowFileReader, ArrowReader, ParquetReadOptions};
+use crate::arrow::reader::{ArrowFileReader, ArrowReader, ParquetReadOptions, page_index_policy};
 use crate::error::Result;
 use crate::io::{FileIO, FileMetadata};
 use crate::{Error, ErrorKind};
@@ -48,13 +48,13 @@ impl ArrowReader {
                 let mut metadata_reader = ParquetMetaDataReader::new_with_metadata(
                     ParquetMetaData::clone(metadata.as_ref()),
                 )
-                .with_page_index_policy(PageIndexPolicy::from(
+                .with_page_index_policy(page_index_policy(
                     parquet_read_options.preload_page_index(),
                 ))
-                .with_column_index_policy(PageIndexPolicy::from(
+                .with_column_index_policy(page_index_policy(
                     parquet_read_options.preload_column_index(),
                 ))
-                .with_offset_index_policy(PageIndexPolicy::from(
+                .with_offset_index_policy(page_index_policy(
                     parquet_read_options.preload_offset_index(),
                 ));
                 metadata_reader

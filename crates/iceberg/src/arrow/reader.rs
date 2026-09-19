@@ -121,6 +121,14 @@ pub(crate) struct ParquetReadOptions {
     pub(crate) preload_page_index: bool,
 }
 
+pub(crate) fn page_index_policy(needed: bool) -> PageIndexPolicy {
+    if needed {
+        PageIndexPolicy::Optional
+    } else {
+        PageIndexPolicy::Skip
+    }
+}
+
 impl ParquetReadOptions {
     pub(crate) fn metadata_size_hint(&self) -> Option<usize> {
         self.metadata_size_hint
@@ -433,6 +441,8 @@ impl ArrowReader {
             (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
         let mut parquet_read_options = parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
+        parquet_read_options.preload_column_index = should_load_page_index;
+        parquet_read_options.preload_offset_index = should_load_page_index;
 
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
@@ -711,13 +721,13 @@ impl ArrowReader {
             }
 
             if row_selection_enabled {
-                row_selection = Some(Self::get_row_selection_for_filter_predicate(
+                row_selection = Self::get_row_selection_for_filter_predicate(
                     &predicate,
                     record_batch_stream_builder.metadata(),
                     &selected_row_group_indices,
                     &field_id_map,
                     &task.schema,
-                )?);
+                )?;
             }
         }
 
@@ -1563,31 +1573,24 @@ impl ArrowReader {
         Ok(results)
     }
 
-    fn get_row_selection_for_filter_predicate(
+    pub(crate) fn get_row_selection_for_filter_predicate(
         predicate: &BoundPredicate,
         parquet_metadata: &Arc<ParquetMetaData>,
         selected_row_groups: &Option<Vec<usize>>,
         field_id_map: &HashMap<i32, usize>,
         snapshot_schema: &Schema,
-    ) -> Result<RowSelection> {
-        let Some(column_index) = parquet_metadata.column_index() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Parquet file metadata does not contain a column index",
-            ));
-        };
-
-        let Some(offset_index) = parquet_metadata.offset_index() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Parquet file metadata does not contain an offset index",
-            ));
+    ) -> Result<Option<RowSelection>> {
+        let (Some(column_index), Some(offset_index)) = (
+            parquet_metadata.column_index(),
+            parquet_metadata.offset_index(),
+        ) else {
+            return Ok(None);
         };
 
         if let Some(selected_row_groups) = selected_row_groups
             && selected_row_groups.is_empty()
         {
-            return Ok(RowSelection::from(Vec::new()));
+            return Ok(Some(RowSelection::from(Vec::new())));
         }
 
         let mut selected_row_groups_idx = 0;
@@ -1626,7 +1629,9 @@ impl ArrowReader {
             }
         }
 
-        Ok(results.into_iter().flatten().collect::<Vec<_>>().into())
+        Ok(Some(
+            results.into_iter().flatten().collect::<Vec<_>>().into(),
+        ))
     }
 
     /// Java's `ParquetMetadataConverter.getOffset(ColumnChunk)`: the byte offset at which a column
@@ -1743,7 +1748,7 @@ impl ArrowReader {
 
 /// Build the map of parquet field id to Parquet column index in the schema.
 /// Returns None if the Parquet file doesn't have field IDs embedded (e.g., migrated tables).
-fn build_field_id_map(parquet_schema: &SchemaDescriptor) -> Result<Option<HashMap<i32, usize>>> {
+pub(crate) fn build_field_id_map(parquet_schema: &SchemaDescriptor) -> Result<Option<HashMap<i32, usize>>> {
     let mut column_map = HashMap::new();
 
     for (idx, field) in parquet_schema.columns().iter().enumerate() {
@@ -1783,7 +1788,7 @@ fn leaf_count(ty: &parquet::schema::types::Type) -> usize {
 /// Maps fallback field ids to leaf column indices, for primitive top-level fields only. Java
 /// `ParquetSchemaUtil.addFallbackIds()`. # Notes Use top-level field positions, not leaf positions,
 /// to match `add_fallback_field_ids_to_arrow_schema`.
-fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32, usize> {
+pub(crate) fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32, usize> {
     let mut column_map = HashMap::new();
     let mut leaf_idx = 0;
 
@@ -2590,13 +2595,13 @@ impl AsyncFileReader for ArrowFileReader {
             let reader = ParquetMetaDataReader::new()
                 .with_prefetch_hint(self.parquet_read_options.metadata_size_hint())
                 // Set the page policy first because it updates both column and offset policies.
-                .with_page_index_policy(PageIndexPolicy::from(
+                .with_page_index_policy(page_index_policy(
                     self.parquet_read_options.preload_page_index(),
                 ))
-                .with_column_index_policy(PageIndexPolicy::from(
+                .with_column_index_policy(page_index_policy(
                     self.parquet_read_options.preload_column_index(),
                 ))
-                .with_offset_index_policy(PageIndexPolicy::from(
+                .with_offset_index_policy(page_index_policy(
                     self.parquet_read_options.preload_offset_index(),
                 ));
             let size = self.meta.size;

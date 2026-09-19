@@ -247,137 +247,117 @@ impl<'a> PageIndexEvaluator<'a> {
         F: Fn(Option<Datum>, Option<Datum>, PageNullCount) -> Result<bool>,
     {
         let result: Result<Vec<bool>> = match column_index {
-            ColumnIndexMetaData::NONE => {
+            ColumnIndexMetaData::NONE | ColumnIndexMetaData::INT96(_) => {
                 return Ok(None);
             }
-            ColumnIndexMetaData::BOOLEAN(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| {
-                            Datum::new(field_type.clone(), PrimitiveLiteral::Boolean(val))
-                        }),
-                        max.map(|&val| {
-                            Datum::new(field_type.clone(), PrimitiveLiteral::Boolean(val))
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::INT32(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| Datum::physical(field_type, PrimitiveLiteral::Int(val))),
-                        max.map(|&val| Datum::physical(field_type, PrimitiveLiteral::Int(val))),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::INT64(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| Datum::new(field_type.clone(), PrimitiveLiteral::Long(val))),
-                        max.map(|&val| Datum::new(field_type.clone(), PrimitiveLiteral::Long(val))),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::FLOAT(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| {
-                            Datum::physical(
-                                field_type,
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
-                        max.map(|&val| {
-                            Datum::physical(
-                                field_type,
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::DOUBLE(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Double(OrderedFloat::from(val)),
-                            )
-                        }),
-                        max.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Double(OrderedFloat::from(val)),
-                            )
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::BYTE_ARRAY(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::String(String::from_utf8(val.to_vec()).unwrap()),
-                            )
-                        }),
-                        max.map(|val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::String(String::from_utf8(val.to_vec()).unwrap()),
-                            )
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
-            ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_) => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "unsupported 'FIXED_LEN_BYTE_ARRAY' index type in column_index",
-                ));
-            }
-            ColumnIndexMetaData::INT96(_) => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "unsupported 'INT96' index type in column_index",
-                ));
-            }
+            ColumnIndexMetaData::BOOLEAN(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |&val| Self::bound_datum(field_type, PrimitiveLiteral::Boolean(val)),
+            ),
+            ColumnIndexMetaData::INT32(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |&val| Self::bound_datum(field_type, PrimitiveLiteral::Int(val)),
+            ),
+            ColumnIndexMetaData::INT64(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |&val| Self::bound_datum(field_type, PrimitiveLiteral::Long(val)),
+            ),
+            ColumnIndexMetaData::FLOAT(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |&val| Self::bound_datum(field_type, PrimitiveLiteral::Float(OrderedFloat::from(val))),
+            ),
+            ColumnIndexMetaData::DOUBLE(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |&val| {
+                    Self::bound_datum(field_type, PrimitiveLiteral::Double(OrderedFloat::from(val)))
+                },
+            ),
+            ColumnIndexMetaData::BYTE_ARRAY(idx)
+            | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(idx) => Self::apply_to_pages(
+                &predicate,
+                idx.min_values_iter(),
+                idx.max_values_iter(),
+                |i| idx.null_count(i),
+                row_counts,
+                |val| Self::bound_datum_bytes(field_type, val),
+            ),
         };
 
         Ok(Some(result?))
     }
+
+    fn apply_to_pages<'v, F, V>(
+        predicate: &F,
+        min_values: impl Iterator<Item = Option<&'v V>>,
+        max_values: impl Iterator<Item = Option<&'v V>>,
+        null_count: impl Fn(usize) -> Option<i64>,
+        row_counts: &[usize],
+        bound: impl Fn(&'v V) -> Option<Datum>,
+    ) -> Result<Vec<bool>>
+    where
+        F: Fn(Option<Datum>, Option<Datum>, PageNullCount) -> Result<bool>,
+        V: ?Sized + 'v,
+    {
+        min_values
+            .zip(max_values)
+            .enumerate()
+            .zip(row_counts.iter())
+            .map(|((i, (min, max)), &row_count)| {
+                predicate(
+                    min.and_then(|val| bound(val)),
+                    max.and_then(|val| bound(val)),
+                    PageNullCount::from_row_and_null_counts(row_count, null_count(i)),
+                )
+            })
+            .collect()
+    }
+
+    fn bound_datum(field_type: &PrimitiveType, literal: PrimitiveLiteral) -> Option<Datum> {
+        match (field_type, &literal) {
+            (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Int(value)) => Some(Datum::new(
+                field_type.clone(),
+                PrimitiveLiteral::Int128(i128::from(*value)),
+            )),
+            (PrimitiveType::Decimal { .. }, PrimitiveLiteral::Long(value)) => Some(Datum::new(
+                field_type.clone(),
+                PrimitiveLiteral::Int128(i128::from(*value)),
+            )),
+            _ if field_type.compatible(&literal) => {
+                Some(Datum::new(field_type.clone(), literal))
+            }
+            _ => {
+                let promoted = literal.promote_to(field_type);
+                field_type
+                    .compatible(&promoted)
+                    .then(|| Datum::new(field_type.clone(), promoted))
+            }
+        }
+    }
+
+    fn bound_datum_bytes(field_type: &PrimitiveType, bytes: &[u8]) -> Option<Datum> {
+        Datum::try_from_bytes(bytes, field_type.clone()).ok()
+    }
+
 
     fn visit_inequality(
         &mut self,
@@ -403,7 +383,7 @@ impl<'a> PageIndexEvaluator<'a> {
                 let bound = if use_lower_bound { min } else { max };
 
                 if let Some(bound) = bound {
-                    if cmp_fn(&bound, datum) {
+                    if bound.partial_cmp(datum).is_none() || cmp_fn(&bound, datum) {
                         return Ok(true);
                     }
 

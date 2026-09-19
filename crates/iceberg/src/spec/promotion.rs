@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::Result;
 use crate::expr::BoundReference;
 use crate::spec::{
-    DataFile, Datum, Literal, ManifestEntry, PartitionSpec, PrimitiveLiteral, PrimitiveType,
+    DataFile, Datum, Literal, ManifestEntry, PartitionSpec, PrimitiveLiteral,
     Schema, Struct, StructType, TableMetadata, Type, is_promotion_allowed,
 };
 
@@ -44,9 +44,6 @@ impl Datum {
         }
     }
 
-    pub(crate) fn physical(field_type: &PrimitiveType, literal: PrimitiveLiteral) -> Datum {
-        Datum::new(field_type.clone(), literal.promote_to(field_type))
-    }
 }
 
 impl DataFile {
