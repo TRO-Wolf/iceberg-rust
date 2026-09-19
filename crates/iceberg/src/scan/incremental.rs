@@ -1005,14 +1005,12 @@ impl IncrementalChangelogScan {
                 .get_manifest(manifest_file, Some(plan_context.snapshot_schema.clone()))
                 .await?;
             for entry in manifest.entries() {
-                if entry.status() == ManifestStatus::Deleted {
-                    continue;
-                }
-                // `ManifestEntry::inherit_data` populates `snapshot_id()`; the fallback is
-                // defensive.
                 let entry_snapshot_id = entry
                     .snapshot_id()
                     .unwrap_or(manifest_file.added_snapshot_id);
+                if entry.status() == ManifestStatus::Deleted && entry_snapshot_id != snapshot_id {
+                    continue;
+                }
                 let context = DeleteFileContext {
                     manifest_entry: entry.clone(),
                     partition_spec_id: manifest_file.partition_spec_id,
