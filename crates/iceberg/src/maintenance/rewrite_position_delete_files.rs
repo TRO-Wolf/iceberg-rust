@@ -16,7 +16,6 @@
 // under the License.
 
 //! Compacts live PARQUET position-delete files of the current snapshot.
-//! Java `RewritePositionDeleteFiles`. One `Replace` snapshot per admitted bin.
 //!
 //! Each added file carries that bin's max rewritten data sequence number.
 //! An over-high stamp deletes rows the bin never masked. An under-low stamp
@@ -45,7 +44,7 @@ use super::rewrite_data_files::{
     MAX_FILE_GROUP_SIZE_BYTES_DEFAULT, MAX_FILE_SIZE_DEFAULT_RATIO, MIN_FILE_SIZE_DEFAULT_RATIO,
     MIN_INPUT_FILES_DEFAULT, pack_bins,
 };
-use super::rewrite_data_files_plan::PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT;
+use super::rewrite_data_files_plan::{PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT, plan_commit_batches};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::delete_file_index::referenced_data_file_location;
 use crate::delete_vector::load_delete_vector;
@@ -74,8 +73,12 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Catalog, Error, ErrorKind, Result};
 
+#[path = "rewrite_position_delete_files_commit.rs"]
+mod commit_path;
 #[path = "rewrite_position_delete_files_v3.rs"]
 mod v3;
+
+use commit_path::{RewrittenBin, delete_uncommitted_files};
 
 /// The `(spec_id, partition)` group a position-delete file belongs to (Java's
 /// `BinPackRewritePositionDeletePlanner` groups by partition + spec).
@@ -192,6 +195,28 @@ struct ResolvedConfig {
     write_max_file_size: u64,
     /// Per-chunk measured-byte cap, derived from candidate-filter headroom.
     chunk_budget: u64,
+    delete_granularity: DeleteGranularity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteGranularity {
+    File,
+    Partition,
+}
+
+fn parse_delete_granularity(properties: &HashMap<String, String>) -> Result<DeleteGranularity> {
+    match properties.get(TableProperties::PROPERTY_DELETE_GRANULARITY) {
+        None => Ok(DeleteGranularity::File),
+        Some(value) if value.eq_ignore_ascii_case("file") => Ok(DeleteGranularity::File),
+        Some(value) if value.eq_ignore_ascii_case("partition") => Ok(DeleteGranularity::Partition),
+        Some(value) => Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Invalid value '{value}' for table property '{}'",
+                TableProperties::PROPERTY_DELETE_GRANULARITY
+            ),
+        )),
+    }
 }
 
 /// Compacts live parquet position deletes. Java `RewritePositionDeleteFiles`.
@@ -199,7 +224,6 @@ struct ResolvedConfig {
 /// | Deferred option | Why it is not emulable here |
 /// |---|---|
 /// | `rewrite-job-order` | Bins commit in plan order. |
-/// | `partial-progress.*` / `max-concurrent-file-group-rewrites` | Sequential, one commit per bin. Failure is not atomic. |
 /// | `output-spec-id` | Each bin writes under its group spec. Java never consults this option. |
 /// | Per-group `Result` list | [`RewritePositionDeleteFilesResult`] carries four aggregates only. |
 pub struct RewritePositionDeleteFiles {
@@ -290,8 +314,7 @@ impl RewritePositionDeleteFiles {
         self
     }
 
-    /// Compact admitted bins, one `Replace` snapshot each. Sequential, so a mid-loop failure
-    /// leaves earlier bins committed. Re-run to continue. Java's non-partial path is one commit.
+    #[allow(missing_docs)]
     pub async fn execute(self, catalog: &dyn Catalog) -> Result<RewritePositionDeleteFilesResult> {
         // Validate thresholds before any IO, as Java's `sizeThresholds` does at planner `init`.
         let config = self.resolve_config()?;
@@ -318,27 +341,56 @@ impl RewritePositionDeleteFiles {
                 .await;
         }
 
-        let groups = self
+        let (groups, live_paths) = self
             .collect_position_delete_groups(&snapshot, &mut partition_filter)
             .await?;
 
         let (bins, _) = plan_bins(groups, &config);
+        let per_commit = plan_commit_batches(
+            bins.len(),
+            self.partial_progress,
+            self.partial_progress_max_commits,
+        )
+        .first()
+        .copied()
+        .unwrap_or(usize::MAX);
 
-        // Advance the base after each commit so later bins skip a full stale-base re-apply.
         let mut table = self.table.clone();
         let mut result = RewritePositionDeleteFilesResult::default();
+        let mut pending: Vec<RewrittenBin> = Vec::new();
         for bin in bins {
-            table = self
-                .compact_group(
+            match self
+                .rewrite_bin(&table, &bin, live_paths.get(&bin.0), &config)
+                .await
+            {
+                Ok(rewritten) => pending.push(rewritten),
+                Err(error) => {
+                    if self.partial_progress {
+                        continue;
+                    }
+                    delete_uncommitted_files(&table, &pending).await;
+                    return Err(error);
+                }
+            }
+            if pending.len() >= per_commit {
+                self.commit_bins(
                     catalog,
-                    &table,
-                    &bin,
-                    &config,
+                    &mut table,
+                    &mut pending,
                     starting_snapshot_id,
                     &mut result,
                 )
                 .await?;
+            }
         }
+        self.commit_bins(
+            catalog,
+            &mut table,
+            &mut pending,
+            starting_snapshot_id,
+            &mut result,
+        )
+        .await?;
 
         Ok(result)
     }
@@ -474,6 +526,7 @@ impl RewritePositionDeleteFiles {
             rewrite_all: self.rewrite_all,
             write_max_file_size,
             chunk_budget,
+            delete_granularity: parse_delete_granularity(self.table.metadata().properties())?,
         })
     }
 
@@ -483,13 +536,17 @@ impl RewritePositionDeleteFiles {
         &self,
         snapshot: &Snapshot,
         partition_filter: &mut PartitionFilter,
-    ) -> Result<HashMap<GroupKey, Vec<LiveDeleteEntry>>> {
+    ) -> Result<(
+        HashMap<GroupKey, Vec<LiveDeleteEntry>>,
+        HashMap<GroupKey, HashSet<String>>,
+    )> {
         let metadata = self.table.metadata();
         let manifest_list = snapshot
             .load_manifest_list(self.table.file_io(), metadata)
             .await?;
 
         let mut groups: HashMap<GroupKey, Vec<LiveDeleteEntry>> = HashMap::new();
+        let mut live_paths: HashMap<GroupKey, HashSet<String>> = HashMap::new();
         for manifest_file in manifest_list.entries() {
             let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
             for entry in manifest.entries() {
@@ -497,25 +554,32 @@ impl RewritePositionDeleteFiles {
                     continue;
                 }
                 let data_file = entry.data_file();
-                if data_file.content_type() != DataContentType::PositionDeletes {
-                    continue;
+                match data_file.content_type() {
+                    DataContentType::Data => {
+                        live_paths
+                            .entry((data_file.partition_spec_id, data_file.partition().clone()))
+                            .or_default()
+                            .insert(data_file.file_path().to_string());
+                    }
+                    DataContentType::PositionDeletes => {
+                        if data_file.file_format() != DataFileFormat::Parquet {
+                            continue;
+                        }
+                        if !partition_filter.matches(metadata, data_file)? {
+                            continue;
+                        }
+                        let key = (data_file.partition_spec_id, data_file.partition().clone());
+                        groups.entry(key).or_default().push(LiveDeleteEntry {
+                            data_file: data_file.clone(),
+                            sequence_number: entry.sequence_number().unwrap_or(0),
+                        });
+                    }
+                    _ => {}
                 }
-                // Fork divergence: skip Puffin DVs and V2 ORC/Avro. Java's planner is format-blind.
-                if data_file.file_format() != DataFileFormat::Parquet {
-                    continue;
-                }
-                if !partition_filter.matches(metadata, data_file)? {
-                    continue;
-                }
-                let key = (data_file.partition_spec_id, data_file.partition().clone());
-                groups.entry(key).or_default().push(LiveDeleteEntry {
-                    data_file: data_file.clone(),
-                    sequence_number: entry.sequence_number().unwrap_or(0),
-                });
             }
         }
 
-        Ok(groups)
+        Ok((groups, live_paths))
     }
 
     /// Bind [`Self::filter`] once before the walk. `AlwaysTrue` never binds.
@@ -532,86 +596,6 @@ impl RewritePositionDeleteFiles {
             .with_source(e)
         })?;
         Ok(PartitionFilter::bound(bound_row_filter))
-    }
-
-    /// Compact one admitted bin. Stamp every output with THIS bin's max rewritten data-seq.
-    /// Ranging over the partition or reusing another bin's max is a stamping error.
-    async fn compact_group(
-        &self,
-        catalog: &dyn Catalog,
-        table: &Table,
-        bin: &AdmittedBin,
-        config: &ResolvedConfig,
-        starting_snapshot_id: i64,
-        result: &mut RewritePositionDeleteFilesResult,
-    ) -> Result<Table> {
-        let (key, entries) = bin;
-
-        let mut pairs: Vec<(String, i64)> = Vec::new();
-        for entry in entries {
-            self.read_position_pairs(table, &entry.data_file, &mut pairs)
-                .await?;
-        }
-
-        // Per-bin skip. An early return in `execute` would drop every later bin.
-        if pairs.is_empty() {
-            return Ok(table.clone());
-        }
-
-        // Sort once, before any split. Per-chunk sort still writes every pair but breaks range pruning.
-        pairs.sort();
-
-        let new_files = self
-            .write_compacted_file(table, key, &pairs, config)
-            .await?;
-
-        // THIS bin's max. Over-high over-applies; under-low resurrects.
-        let max_seq = entries
-            .iter()
-            .map(|e| e.sequence_number)
-            .max()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "compact_group called with an empty group (no sequence numbers)",
-                )
-            })?;
-
-        let rewritten_bytes: u64 = entries.iter().map(|e| e.data_file.file_size_in_bytes).sum();
-        let rewritten_count = entries.len();
-        let added_count = new_files.len();
-        let mut added_bytes: u64 = 0;
-        for file in &new_files {
-            added_bytes = added_bytes
-                .checked_add(file.file_size_in_bytes)
-                .ok_or_else(|| Error::new(ErrorKind::Unexpected, "added bytes count overflow"))?;
-        }
-        let rewritten_files: Vec<DataFile> = entries.iter().map(|e| e.data_file.clone()).collect();
-
-        // Stamp through the explicit-seq add, not the inherit add.
-        let transaction = Transaction::new(table);
-        let mut action = transaction
-            .rewrite_files(Vec::new(), Vec::new())
-            .delete_delete_files(rewritten_files);
-        for file in new_files {
-            action = action.add_delete_file_with_sequence_number(file, max_seq);
-        }
-        let action = action.validate_from_snapshot(starting_snapshot_id);
-        let transaction = action.apply(transaction)?;
-        let committed = transaction.commit(catalog).await?;
-
-        result.rewritten_delete_files_count += rewritten_count;
-        result.added_delete_files_count += added_count;
-        result.rewritten_bytes_count = result
-            .rewritten_bytes_count
-            .checked_add(rewritten_bytes)
-            .ok_or_else(|| Error::new(ErrorKind::Unexpected, "rewritten bytes count overflow"))?;
-        result.added_bytes_count = result
-            .added_bytes_count
-            .checked_add(added_bytes)
-            .ok_or_else(|| Error::new(ErrorKind::Unexpected, "added bytes count overflow"))?;
-
-        Ok(committed)
     }
 
     /// Read reserved `file_path` and `pos` by field id, so a renamed column still reads.

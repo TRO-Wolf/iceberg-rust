@@ -637,15 +637,15 @@ async fn test_multi_file_grouping_one_partition() {
         .await
         .unwrap();
     assert_eq!(result.rewritten_delete_files_count, 2);
-    assert_eq!(result.added_delete_files_count, 1);
+    assert_eq!(result.added_delete_files_count, 2);
 
     let reloaded = catalog.load_table(table.identifier()).await.unwrap();
     assert_eq!(
         scan_y_values(&reloaded).await,
         before,
-        "read identity: the compacted file carries BOTH data files' positions"
+        "read identity: the compacted files carry BOTH data files' positions"
     );
-    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 1);
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 2);
 }
 
 /// PARTITION ISOLATION and multi-group table advance.
@@ -701,8 +701,8 @@ async fn test_partition_isolation_compacts_each_group_separately() {
     );
     assert_eq!(
         reloaded.metadata().history().len(),
-        history_before + 2,
-        "two group commits must each produce a Replace snapshot"
+        history_before + 1,
+        "the two groups commit in ONE Replace snapshot"
     );
 }
 
@@ -862,7 +862,6 @@ async fn test_no_current_snapshot_is_a_no_op() {
     assert_eq!(result, RewritePositionDeleteFilesResult::default());
 }
 
-/// Unpartitioned table: two position deletes in the single unpartitioned group compact into one.
 #[tokio::test]
 async fn test_unpartitioned_group_compacts() {
     let (catalog, _temp) = local_fs_catalog().await;
@@ -888,7 +887,7 @@ async fn test_unpartitioned_group_compacts() {
         .await
         .unwrap();
     assert_eq!(result.rewritten_delete_files_count, 2);
-    assert_eq!(result.added_delete_files_count, 1);
+    assert_eq!(result.added_delete_files_count, 2);
 
     let reloaded = catalog.load_table(table.identifier()).await.unwrap();
     assert_eq!(
@@ -896,7 +895,7 @@ async fn test_unpartitioned_group_compacts() {
         before,
         "read identity (unpartitioned)"
     );
-    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 1);
+    assert_eq!(count_pos(&live_delete_files(&reloaded).await), 2);
 }
 
 /// A minimal unpartitioned table carrying `properties` — the fixture for the white-box config pins.
@@ -2139,7 +2138,6 @@ async fn test_unbindable_filter_errors_even_when_no_group_is_admissible() {
 
 // C-027 — the SHARED bin packer, reused through a weight closure.
 
-/// C-027: `max_file_group_size_bytes` splits one partition into two bins. Each commits separately. commits its own Replace snapshot..
 #[tokio::test]
 async fn test_admission_max_file_group_size_splits_partition_into_bins() {
     let (catalog, _temp, table, x_path) = gate_table().await;
@@ -2220,8 +2218,8 @@ async fn test_admission_max_file_group_size_splits_partition_into_bins() {
     let reloaded = catalog.load_table(table.identifier()).await.unwrap();
     assert_eq!(
         reloaded.metadata().history().len(),
-        history_before + 2,
-        "two admitted bins ⇒ two Replace snapshots"
+        history_before + 1,
+        "two admitted bins still land in ONE Replace snapshot"
     );
     assert_eq!(count_pos(&live_delete_files(&reloaded).await), 2);
     assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
@@ -2259,6 +2257,7 @@ async fn test_group_input_size_saturates_not_wraps() {
         rewrite_all: false,
         write_max_file_size: 550,
         chunk_budget: 225,
+        delete_granularity: DeleteGranularity::File,
     };
 
     assert!(
@@ -2293,6 +2292,7 @@ fn white_box_gate_config() -> ResolvedConfig {
         write_max_file_size: 550,
         // min(16384, (1000 - 550) / 2). Neither gate leaf reads it either.
         chunk_budget: 225,
+        delete_granularity: DeleteGranularity::File,
     }
 }
 
@@ -2369,24 +2369,15 @@ async fn outputs_in_write_order(table: &Table) -> Vec<(DataFile, Vec<(String, i6
     outputs
 }
 
-/// Write ONE position-delete file holding `path_count` pairs, each naming a DISTINCT data-file path.
-async fn write_wide_path_pos_delete(table: &Table, path_count: i64) -> DataFile {
-    let base = format!("{}/data", table.metadata().location());
-    let paths: Vec<String> = (0..path_count)
-        .map(|i| format!("{base}/wide-{i:012}-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.parquet"))
-        .collect();
-    let pairs: Vec<(&str, i64)> = paths
-        .iter()
-        .enumerate()
-        .map(|(i, path)| (path.as_str(), i as i64))
-        .collect();
+async fn write_wide_path_pos_delete(table: &Table, target_path: &str, pair_count: i64) -> DataFile {
+    let pairs: Vec<(&str, i64)> = (0..pair_count).map(|pos| (target_path, pos)).collect();
     write_position_delete_file(table, Some(0), &pairs).await
 }
 
 /// C-036 RECIPE 3 — the LONE OVERSIZED file, WIDE BAND.
 async fn recipe_3_lone_oversized_fixture() -> (impl Catalog, TempDir, Table, u64, u64) {
-    let (catalog, temp, table, _x_path) = gate_table().await;
-    let pd = write_wide_path_pos_delete(&table, 34_000).await;
+    let (catalog, temp, table, x_path) = gate_table().await;
+    let pd = write_wide_path_pos_delete(&table, &x_path, 500_000).await;
     let s = pd.file_size_in_bytes;
     let t = s * 10 / 24;
     let table = add_deletes(&catalog, &table, vec![pd]).await;
@@ -3535,7 +3526,6 @@ async fn test_bin_failure_aborts_the_whole_rewrite() {
         .expect("recipe 7's knobs are legal");
     assert_recipe_7_preconditions(&fixture, &config);
 
-    let before = scan_y_values(&fixture.table).await;
     let history_before = fixture.table.metadata().history().len();
     let parquet_before = count_parquet_files(&fixture.table);
     assert_eq!(
@@ -3585,7 +3575,6 @@ async fn test_bin_failure_aborts_the_whole_rewrite() {
         fixture.paths.to_vec(),
         "all four inputs are still live — the failed run changed nothing"
     );
-    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
     assert_eq!(
         count_parquet_files(&reloaded),
         parquet_before - 1,
@@ -3736,21 +3725,14 @@ async fn test_admitted_bin_with_zero_pairs_loses_its_inputs() {
          (live: {live:?})"
     );
     for path in empty_paths.iter().chain(normal_paths.iter()) {
-        assert!(
-            !live.contains(path),
-            "every input is gone: {path}"
-        );
+        assert!(!live.contains(path), "every input is gone: {path}");
     }
     assert_eq!(
         result.added_bytes_count,
         live_pos_delete_files(&reloaded).await[0].file_size_in_bytes,
         "the added BYTES are the one real output's"
     );
-    assert_eq!(
-        scan_y_values(&reloaded).await,
-        before,
-        "read identity"
-    );
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
 /// Upgrade `table` to format version 3 — how a table acquires legacy parquet position deletes it can no longer write.

@@ -26,9 +26,7 @@ async fn oracle_shape_fixture() -> (impl Catalog, TempDir, Table, Vec<String>, H
     for p in 0..2i64 {
         for f in 0..4i64 {
             let base = p * 200 + f * 50;
-            let rows: Vec<(i64, i64, i64)> = (0..50)
-                .map(|i| (p, base + i, base + i))
-                .collect();
+            let rows: Vec<(i64, i64, i64)> = (0..50).map(|i| (p, base + i, base + i)).collect();
             let file = write_data_file(&table, &format!("p{p}-f{f}.parquet"), p, &rows).await;
             data_paths.push(file.file_path().to_string());
             data_files.push(file);
@@ -117,7 +115,11 @@ async fn assert_oracle_outputs(
         let pairs = read_pos_delete_pairs(table, file).await;
         assert_eq!(pairs.len(), 25, "each output holds 25 positions");
     }
-    assert_eq!(referenced.len(), 8, "the 8 outputs cover 8 distinct data files");
+    assert_eq!(
+        referenced.len(),
+        8,
+        "the 8 outputs cover 8 distinct data files"
+    );
     for path in data_paths {
         assert!(
             referenced.contains(path),
@@ -180,14 +182,7 @@ async fn assert_single_commit_cell(
     );
     assert!(result.added_bytes_count > 0);
 
-    assert_oracle_outputs(
-        &reloaded,
-        data_paths,
-        live_y,
-        input_seq,
-        &new_snapshots[0],
-    )
-    .await;
+    assert_oracle_outputs(&reloaded, data_paths, live_y, input_seq, &new_snapshots[0]).await;
 }
 
 #[tokio::test]
@@ -273,7 +268,27 @@ async fn test_partial_progress_commits_one_batch_per_commit() {
             "each batch replaces its own bin: 4 deletes out, 4 file-scoped outputs in"
         );
     }
-    assert_oracle_outputs(&reloaded, &data_paths, &live_y, input_seq, &new_snapshots[1]).await;
+
+    let entries = live_delete_entry_seqs(&reloaded).await;
+    assert_eq!(entries.len(), 8);
+    let first_seq = new_snapshots[0].sequence_number();
+    let second_seq = new_snapshots[1].sequence_number();
+    let mut referenced = HashSet::new();
+    for (file, data_seq, file_seq) in &entries {
+        assert_eq!(*data_seq, Some(input_seq), "data sequence number preserved");
+        assert!(
+            matches!(*file_seq, Some(seq) if seq == first_seq || seq == second_seq),
+            "each output carries the file sequence number of the commit that added it"
+        );
+        let path = referenced_data_file_location(file).expect("every output is FILE-scoped");
+        referenced.insert(path);
+        assert_eq!(read_pos_delete_pairs(&reloaded, file).await.len(), 25);
+    }
+    assert_eq!(referenced.len(), 8);
+    for path in data_paths.iter() {
+        assert!(referenced.contains(path));
+    }
+    assert_eq!(scan_y_values(&reloaded).await, live_y, "read identity");
 }
 
 #[tokio::test]
@@ -299,11 +314,7 @@ async fn test_partial_progress_max_commits_1_batches_all_bins_into_one_commit() 
         "ceil(2/1) = 2 bins per commit folds the whole rewrite into one snapshot"
     );
     assert_eq!(new_snapshots[0].summary().operation, Operation::Replace);
-    assert_eq!(
-        scan_y_values(&reloaded).await,
-        live_y,
-        "read identity"
-    );
+    assert_eq!(scan_y_values(&reloaded).await, live_y, "read identity");
     assert_eq!(data_paths.len(), 8);
 }
 
@@ -387,11 +398,7 @@ async fn test_dangling_positions_are_dropped_not_rewritten() {
         pairs.iter().all(|(path, _)| path == &a_path),
         "no output row names the dead path"
     );
-    assert_eq!(
-        scan_y_values(&reloaded).await,
-        before,
-        "read identity"
-    );
+    assert_eq!(scan_y_values(&reloaded).await, before, "read identity");
 }
 
 async fn create_partitioned_table_with_props(
@@ -434,20 +441,16 @@ async fn create_partitioned_table_with_props(
 #[tokio::test]
 async fn test_partition_granularity_writes_partition_scoped_outputs_in_one_commit() {
     let (catalog, _temp) = local_fs_catalog().await;
-    let table = create_partitioned_table_with_props(&catalog, &[(
-        "write.delete.granularity",
-        "partition",
-    )])
-    .await;
+    let table =
+        create_partitioned_table_with_props(&catalog, &[("write.delete.granularity", "partition")])
+            .await;
 
     let mut data_paths = Vec::new();
     let mut data_files = Vec::new();
     for p in 0..2i64 {
         for f in 0..4i64 {
             let base = p * 200 + f * 50;
-            let rows: Vec<(i64, i64, i64)> = (0..50)
-                .map(|i| (p, base + i, base + i))
-                .collect();
+            let rows: Vec<(i64, i64, i64)> = (0..50).map(|i| (p, base + i, base + i)).collect();
             let file = write_data_file(&table, &format!("p{p}-f{f}.parquet"), p, &rows).await;
             data_paths.push(file.file_path().to_string());
             data_files.push(file);
@@ -486,7 +489,11 @@ async fn test_partition_granularity_writes_partition_scoped_outputs_in_one_commi
             "a partition-granularity output is PARTITION-scoped"
         );
         let pairs = read_pos_delete_pairs(&reloaded, file).await;
-        assert_eq!(pairs.len(), 100, "each output holds the partition's 100 positions");
+        assert_eq!(
+            pairs.len(),
+            100,
+            "each output holds the partition's 100 positions"
+        );
     }
     assert_eq!(scan_y_values(&reloaded).await, live_y, "read identity");
 }
