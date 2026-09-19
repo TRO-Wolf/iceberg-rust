@@ -394,3 +394,88 @@ split into `metadata_delete_tests/`, ceilings lowered 1918→1912 and 6845→684
 | `strict_metrics_evaluator` | 26/26 — PROVEN |
 | `delete_files` | 213/213 — PROVEN |
 | `scan` | 292/292 — PROVEN |
+
+## 10. Round 3 — V-01 (S0): decimal scale-blind strict comparisons (HEAD `30ba7d6d`)
+
+Commits: `8dc5d033` red-first pins, `30ba7d6d` fix.
+
+### The hole
+
+`StrictMetricsEvaluator.eq`/`not_eq` compared raw `PrimitiveLiteral` values — for
+decimals the unscaled `Int128` mantissa — where Java 1.11.0 uses
+`lit.comparator()` (BigDecimal `compareTo`, scale-aware). Binding does not
+rescale decimal literals (`DecimalLiteral.to` returns `this` — fork mirrors this
+at `datum.rs`), so `d <> 10` (mantissa 10, scale 0) against file bounds
+`[10.00,10.00]` (mantissa 1000, scale 2) evaluated `1000 > 10` → MUST_MATCH →
+`delete_from_row_filter`/`resolve_filter_deletes` dropped a file whose rows
+cannot match — silent data loss. `eq` had the mirror false negative.
+`visit_inequality` was already scale-aware (`Datum::PartialOrd` uses
+`decimal_from_i128_with_scale` per side); `in`/`not_in` already matched Java
+(`Set.contains` scale-sensitive equals on both sides, `Datum` ordering for the
+bound filters). Verified from 1.11.0 bytecode: strict `eq`/`notEq` use
+`Literal.comparator()`; `in` uses `Set.contains` + `BoundReference.comparator()`;
+`notIn` filters via `lit.comparator()`.
+
+### Adjacent gap found and closed during pinning
+
+Java 1.11.0's *inclusive* `notEq`/`notIn` contain a `uniqueValue` fast-path
+(bytecode verified): when a column has a single distinct non-null, non-NaN
+value, `notEq` proves cannot-match iff `lit.comparator().compare(value, lit) ==
+0`, and `notIn` proves cannot-match iff `literals.contains(value)` (scale-
+sensitive `equals`). The fork's inclusive `not_eq`/`not_in` were unconditional
+`ROWS_MIGHT_MATCH` stubs. This matters twice over: (a) `canDeleteUsingMetadata`
+— the delete predicate `d <> 10` prunes the `[10.00,10.00]` file in Java, so the
+decision is vacuous-TRUE (nothing to drop); without the port the fork answers
+FALSE — a conservative-direction parity gap; (b) `resolve_filter_deletes` — Java
+`continue`s past the cannot-match file and commits keeping it; without the port
+the fork would hit the PARTIAL error where Java commits cleanly. Ported as
+`unique_value` + the two arms.
+
+### Pin group (8 pins, `metadata_delete_boundary_tests.rs`)
+
+Each pin asserts `StrictMetricsEvaluator::eval` directly AND
+`can_delete_using_metadata`, on a real `decimal(9,2)` file `[10.00,10.00]`
+(synthetic bounds):
+
+| predicate | strict eval | decision |
+|---|---|---|
+| `d <> 10` | false | true (vacuous — inclusive prunes) |
+| `d = 10` | true | true |
+| `d <> 10.000` | false | true (vacuous) |
+| `d IN (10,11)` | false | false |
+| `d NOT IN (10)` — binds to `NotEq` in both impls | false | true (vacuous) |
+| `d < 10.001` | true | true |
+| `d >= 10` | true | true |
+
+Plus `delete_from_row_filter(d <> 10)` over `[10.00,10.00]` + `[20.00,20.00]`:
+commit succeeds, live set is `{"test/kept.parquet"}` — the equal-scale file is
+kept, the non-matching file dropped. 5 of 8 red on HEAD (all three `d <> X`
+shapes, `d = 10`, the commit pin); `IN`, `NOT IN`'s decision arm, `lt`, `ge`
+were already correct.
+
+### Mutations (each reverted, suite re-verified)
+
+- `not_eq` lower restored to `lower.literal() > datum.literal()`: 2 pins red
+  (`d <> 10`, `d NOT IN (10)`) — scale-aware `>` is load-bearing — **PROVEN**.
+- `eq` restored to `lower.literal() == datum.literal()`: `d = 10` red —
+  comparator equality is load-bearing — **PROVEN**.
+- inclusive `not_eq` `unique_value` check removed: 4 pins red (all three `d <>`
+  decision pins + the commit pin) — `uniqueValue` is load-bearing — **PROVEN**.
+
+### Gates at HEAD `30ba7d6d`
+
+| gate | result |
+|---|---|
+| `cargo fmt --all -- --check` | clean — PROVEN |
+| `cargo clippy -p iceberg --all-targets -- -D warnings` | clean — PROVEN |
+| `check_rust_file_size.sh` | 532 files clean (inclusive ceiling 2191→2187) — PROVEN |
+| `comment_ban.py` | hits=0 — PROVEN |
+| `check_agent_artifacts.sh` / `check_comment_blocks.sh` / `check_matrix_anchors.sh` | OK — PROVEN |
+| `taplo check` / `cargo machete` / `typos` | clean — PROVEN |
+| `metadata_delete_boundary_tests` | 18/18 — PROVEN |
+| `strict_metrics_evaluator` | 26/26 — PROVEN |
+| `inclusive_metrics_evaluator` | 23/23 — PROVEN |
+| `can_delete_using_metadata` | 40/40 — PROVEN |
+| `delete_files` | 221/221 — PROVEN |
+| `expr::` | 404/404 — PROVEN |
+| `scan` | 293/293 — PROVEN |
