@@ -66,7 +66,7 @@ impl MetadataLocation {
         }
     }
 
-    /// Creates a new metadata location for `metadata`, honoring its `write.metadata.path`.
+    #[allow(missing_docs)]
     pub fn for_metadata(metadata: &TableMetadata) -> Result<Self> {
         Ok(Self {
             metadata_dir: write_metadata_dir(metadata.location(), metadata.properties())?,
@@ -109,8 +109,6 @@ impl MetadataLocation {
         ])
     }
 
-    /// Parses a metadata JSON location in ANY directory (a table configured with
-    /// `write.metadata.path` keeps no `/metadata` parent).
     pub(crate) fn from_file_path(s: &str) -> Result<Self> {
         let (dir, file_name) = s.rsplit_once('/').ok_or(Error::new(
             ErrorKind::Unexpected,
