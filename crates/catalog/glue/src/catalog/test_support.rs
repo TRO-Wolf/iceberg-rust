@@ -54,7 +54,11 @@ impl GlueCatalog {
             client: GlueClient(client),
             file_io,
             commit_transport,
+            table_metadata_cache: None,
+            cache_scope: CacheScope::isolated("glue:test"),
+            shared_object_cache: None,
             outcome_harness: Some(harness),
+            pointer_source: None,
         }
     }
 }
