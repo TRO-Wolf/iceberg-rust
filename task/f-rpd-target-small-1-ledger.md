@@ -49,7 +49,7 @@ source + bytecode verified; the RPD action drives
 | Ratios | `MIN_FILE_SIZE_DEFAULT_RATIO = 0.75`, `MAX_FILE_SIZE_DEFAULT_RATIO = 1.80` |
 | Thresholds (`sizeThresholds`) | `defaultMin = (long)(target * 0.75)`; `defaultMax = (long)(target * 1.80)` → at target 2000: min 1500, max 3600 |
 | Candidate filter (`filterFiles`) | `outsideDesiredFileSizeRange(file)`: `file.fileSizeInBytes() < minFileSize || > maxFileSize` — files inside `[1500, 3600]` are not candidates |
-| Group filter (`filterFileGroups`) | `enoughInputFiles(group) || enoughContent(group) || tooMuchContent(group)` — `enoughInputFiles`: `group.numFiles() > 1 && >= minInputFiles` (default 5); `enoughContent`: `group.numFiles() > 1 && totalSize > targetSize`; `tooMuchContent`: `totalSize > maxFileGroupSize` (default 100 GiB) |
+| Group filter (`filterFileGroups`) | `enoughInputFiles(group) || enoughContent(group) || tooMuchContent(group)` — `enoughInputFiles`: `group.numFiles() > 1 && >= minInputFiles` (default 5); `enoughContent`: `group.numFiles() > 1 && totalSize > targetSize`; `tooMuchContent`: `totalSize > maxFileSize` (bytecode-verified: `inputSize(list) > maxFileSize`; this table earlier read `maxFileGroupSize`, which was wrong) |
 | RPD defaults | `write.delete.target-file-size-bytes`, default 67108864 |
 
 Fork (`crates/iceberg/src/maintenance/rewrite_position_delete_files.rs`,
@@ -60,7 +60,7 @@ Fork (`crates/iceberg/src/maintenance/rewrite_position_delete_files.rs`,
 | Ratios | `MIN_FILE_SIZE_DEFAULT_RATIO = 0.75`, `MAX_FILE_SIZE_DEFAULT_RATIO = 1.80` (`rewrite_data_files_plan.rs`) |
 | Thresholds | `d2l(target as f64 * 0.75)` = 1500, `d2l(target as f64 * 1.80)` = 3600 at target 2000 |
 | Candidate filter (`is_candidate`) | `length < min_file_size_bytes || length > max_file_size_bytes` |
-| Group filter (`group_qualifies`) | `size > 1 && size >= min_input_files` (default 5) OR `size > 1 && input_size > target` OR `input_size > max_file_group_size` |
+| Group filter (`group_qualifies`) | `size > 1 && size >= min_input_files` (default 5) OR `size > 1 && input_size > target` OR `input_size > max_file_size_bytes` |
 | RPD defaults | `write.delete.target-file-size-bytes`, default 67108864 |
 
 **Conclusion: the rule is identical.** `is_candidate` is `outsideDesiredFileSizeRange`;
