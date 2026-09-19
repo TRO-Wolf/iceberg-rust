@@ -25,7 +25,7 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
-## ACTIVE (2026-09-22): F-RDF-COW-BYTES-1 — a data rewrite keeps a position delete that still applies, as Java does
+## ACTIVE (2026-09-18): F-RDF-COW-BYTES-1 — a data rewrite keeps a position delete that still applies, as Java does
 
 Ledger: [`f-rdf-cow-bytes-1-ledger.md`](f-rdf-cow-bytes-1-ledger.md). Branch
 `fix/f-rdf-cow-bytes-1` off fork `main`. Consumer: RePark rows ICE-RDF-COW-BYTES-1 +
