@@ -116,6 +116,7 @@ files `a`/`b`, one Puffin path, one blob per file):
 | `test_dangling_dv_merge_append_keeps_dvs` | merge append adds only, keeps both blobs |
 | `test_dangling_dv_row_delta_adding_deletes_only_keeps_dvs` | row delta adding a DV only keeps all entries |
 | `test_dangling_dv_parquet_position_delete_not_dropped_by_this_rule` | V2 file-scoped parquet delete on `a` survives `a`'s overwrite (sequence GC decides it) |
+| `test_dangling_dv_delete_manifest_order_survives_concurrent_loads` | Round 3 (V-01): three live delete manifests (a 128-blob one first, two single-blob ones) all rewritten by one `delete_files` commit — the committed list's delete-manifest order equals the sequential order |
 
 Every drop cell asserts the SURVIVING entry is exactly `b`'s blob — same Puffin path, same
 `content_offset`/`content_size_in_bytes` — the sibling-blob control is structural, not a
@@ -207,6 +208,31 @@ the fix; both filters re-ran green (10/10 and 1/1).
 - **Gates**: `dangling_dv` 10 + 1, `transaction` 691 (1 ignored), `seq_gc` 12,
   `rewrite_data_files` 110, `remove_dangling` 24, `cow_bytes` 8, datafusion `delete` 43
   (1 ignored); `fmt --check`, clippy `-D warnings`, size checker, comment-ban `hits=0`.
+
+## Round 3 — order pin (verification P3 V-01)
+
+| Item | Commit | Subject |
+|---|---|---|
+| test | this commit | `test: F-DANGLING-DV-COMMIT-1 — pin the delete-manifest order after concurrent loads` |
+
+V-01: pushing scan results in completion order (or reversing them) reddened no cell — every
+fixture had one delete manifest and none asserted the new manifest list's order.
+
+- New cell `test_dangling_dv_delete_manifest_order_survives_concurrent_loads`: v3 table, three
+  live delete manifests from three row-delta commits — a 128-blob manifest that lands FIRST in
+  list order (added delete manifests precede carried ones) plus two single-blob manifests — then
+  one `delete_files` commit removing all 130 referenced data files rewrites all three. The cell
+  asserts the post-commit delete-manifest order (keyed by each manifest's `referenced_data_file`
+  set, which survives tombstoning) equals the pre-commit order, all DVs dropped, rows intact.
+- Mutation: `scans.push(scan)` in completion order instead of indexed reassembly did NOT redden
+  the cell — on local fs every `load_manifest` resolves in issue order, so completion order is
+  already the list order and the arm is unobservable through this surface. The `scans.reverse()`
+  arm is deterministic: **red** with `left` the reversed list (`[[s1],[s2],[big…]]` vs expected
+  `[[big…],[s1],[s2]]`). Restore → green. The re-index is therefore pinned on every reordering a
+  reader can observe; the in-issue-order arrival case cannot distinguish index-placement from
+  FIFO push, which is inherent to a same-task `buffer_unordered` over synchronous-resolving IO.
+- Gates: `cargo test -p iceberg --lib dangling_dv` 11/11, `fmt --check`, clippy `-D warnings`,
+  size checker, comment-ban `hits=0`.
 
 ## Residue / scope decisions
 

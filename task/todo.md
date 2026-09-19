@@ -53,6 +53,10 @@ commit drops its DVs; the fork only dropped them inside `RewriteDataFiles`.
       on `buffer_unordered(8)` with indexed reassembly — rewrites stay sequential for
       `manifest_counter`; round-1 mutation rerun → 6 red / controls green, identical
       signatures
+- [x] Round 3 (V-01 order pin): `test_dangling_dv_delete_manifest_order_survives_concurrent_loads`
+      — 3 delete manifests (128-blob first, 2 single) all rewritten; committed order pinned
+      to sequential. Mutation: completion-order push unobservable on local fs (in-issue-order
+      arrival); `reverse()` arm red, restore green
 
 ## ACTIVE (2026-09-19): F-RPD-COMMITS-1 — `rewrite_position_delete_files` commits once and keeps file scope, as Java does
 

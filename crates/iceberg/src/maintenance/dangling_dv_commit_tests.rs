@@ -24,7 +24,7 @@ use crate::maintenance::rewrite_data_files_cow_bytes_tests::{
     file_scoped_metrics, write_position_delete,
 };
 use crate::maintenance::rewrite_data_files_router_bound_tests::write_dv;
-use crate::spec::{DataContentType, DataFile, FormatVersion};
+use crate::spec::{DataContentType, DataFile, FormatVersion, ManifestContentType};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 
@@ -300,6 +300,100 @@ async fn test_dangling_dv_row_delta_adding_deletes_only_keeps_dvs() {
         (1, 12, 12),
         (1, 31, 31)
     ]);
+}
+
+async fn delete_manifest_referenced_paths(table: &Table) -> Vec<Vec<String>> {
+    let snapshot = table.metadata().current_snapshot().expect("snapshot");
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("manifest list");
+    let mut manifests = Vec::new();
+    for manifest_file in manifest_list.entries() {
+        if manifest_file.content != ManifestContentType::Deletes {
+            continue;
+        }
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .expect("manifest");
+        let mut referenced: Vec<String> = manifest
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.data_file().referenced_data_file())
+            .collect();
+        referenced.sort_unstable();
+        manifests.push(referenced);
+    }
+    manifests
+}
+
+#[tokio::test]
+async fn test_dangling_dv_delete_manifest_order_survives_concurrent_loads() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V3).await;
+    let s1 = write_data_file(&table, "s1.parquet", 0, &rows(0, 400, 1)).await;
+    let s2 = write_data_file(&table, "s2.parquet", 0, &rows(0, 401, 1)).await;
+    let keep = write_data_file(&table, "keep.parquet", 1, &rows(1, 500, 1)).await;
+    let mut big = Vec::new();
+    for index in 0..128i64 {
+        big.push(
+            write_data_file(
+                &table,
+                &format!("big{index}.parquet"),
+                0,
+                &rows(0, 10_000 + index, 1),
+            )
+            .await,
+        );
+    }
+    let mut all = vec![s1.clone(), s2.clone(), keep.clone()];
+    all.extend(big.iter().cloned());
+    let table = append_files(&catalog, &table, all).await;
+
+    let s1_path = s1.file_path().to_string();
+    let s2_path = s2.file_path().to_string();
+    let s1_dvs = write_dv(&table, 0, &[(s1_path.as_str(), &[0])]).await;
+    let table = add_deletes(&catalog, &table, s1_dvs).await;
+    let s2_dvs = write_dv(&table, 0, &[(s2_path.as_str(), &[0])]).await;
+    let table = add_deletes(&catalog, &table, s2_dvs).await;
+    let big_pairs: Vec<(&str, &[u64])> = big
+        .iter()
+        .map(|file| (file.file_path(), &[0][..]))
+        .collect();
+    let big_dvs = write_dv(&table, 0, &big_pairs).await;
+    assert_eq!(big_dvs.len(), 128);
+    let table = add_deletes(&catalog, &table, big_dvs).await;
+
+    let pre = delete_manifest_referenced_paths(&table).await;
+    assert_eq!(
+        pre.len(),
+        3,
+        "three row-delta commits leave three delete manifests"
+    );
+    assert_eq!(
+        pre[0].len(),
+        128,
+        "the fat manifest sits first so its slower load would invert completion order"
+    );
+
+    let tx = Transaction::new(&table);
+    let mut removed = vec![s1, s2];
+    removed.extend(big.iter().cloned());
+    let tx = tx
+        .delete_files()
+        .delete_data_files(removed)
+        .apply(tx)
+        .expect("delete files");
+    let table = commit(&catalog, tx).await;
+
+    let post = delete_manifest_referenced_paths(&table).await;
+    assert_eq!(
+        post, pre,
+        "concurrent loads must not reorder the delete manifests in the committed list"
+    );
+    assert_eq!(live_delete_files(&table).await.len(), 0);
+    assert_eq!(scan_rows(&table).await, vec![(1, 500, 500)]);
 }
 
 #[tokio::test]
