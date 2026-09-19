@@ -171,12 +171,38 @@ to 1901). Shared helpers were widened to `pub(crate)` in place.
 
 | pin | risk pinned | status |
 |---|---|---|
-| `test_rewrite_delete_manifests_clusters_deletes_v2` | unpart_mor_v2: 2 delete manifests → 1, entries Existing, seqs/fseqs/snapshot ids preserved on disk (raw avro, non-inherited), scan still applies deletes; summary 2/0/5, op `replace` | GREEN post-implementation |
-| `test_rewrite_delete_manifests_clusters_dvs_v3` | unpart_mor_v3: DVs re-cluster into a delete manifest, seqs preserved, scan applies; summary 2/5 | GREEN post-implementation |
-| `test_rewrite_delete_manifests_drops_empty_delete_manifest` | part_mor_real: an emptied delete manifest is replaced by nothing (replaced 4, created 2) | GREEN post-implementation |
-| `test_rewrite_delete_manifests_explicit_false_keeps_java_default` | flag off ⇒ byte-identical carry-forward (core default); explicit `false` identical | GREEN before and after |
-| `test_rewrite_delete_manifests_respects_rewrite_if` | predicate-false delete manifest kept | GREEN post-implementation |
+| `test_rewrite_delete_manifests_clusters_deletes_v2` | unpart_mor_v2: 2 delete manifests → 1, entries Existing, seqs/fseqs/snapshot ids preserved on disk (raw avro, non-inherited), scan still applies deletes; summary 2/0/5, op `replace` | PROVEN (green; red under mutants A and B) |
+| `test_rewrite_delete_manifests_clusters_dvs_v3` | unpart_mor_v3: DVs re-cluster into a delete manifest, seqs preserved, scan applies; summary 2/5 | PROVEN (green; red under mutants A and B) |
+| `test_rewrite_delete_manifests_drops_empty_delete_manifest` | part_mor_real: an emptied delete manifest is replaced by nothing (replaced 4, created 2) | PROVEN (green; red under mutants A and B) |
+| `test_rewrite_delete_manifests_explicit_false_keeps_java_default` | flag off ⇒ byte-identical carry-forward (core default); explicit `false` identical | PROVEN (green under A; red under B via the resurrected row — the seq pins carry the corruption class) |
+| `test_rewrite_delete_manifests_respects_rewrite_if` | predicate-false delete manifest kept | PROVEN (green; red under mutant A) |
 | evolved_spec no-commit | Spark `numManifests==1 && size==1` skip — no core analogue | OPEN residue (§4) |
+
+## 6. Mutation evidence
+
+**Mutant A — delete manifests immune again** (`content_matches` reduced to
+`content == Data`): `clusters_deletes_v2` and `clusters_dvs_v3` fail at the delete-manifest
+count (`left: 1, right: 2`), `drops_empty_delete_manifest` fails the same way, and
+`respects_rewrite_if` fails on the surviving rewritten path. `explicit_false` stays green
+(it pins the default). Restored.
+
+**Mutant B — sequence numbers re-assigned** (`add_existing_entry(entry)` →
+`add_entry` after `entry.sequence_number = None`): `clusters_deletes_v2` and
+`clusters_dvs_v3` fail at `existing_files_count` (`Some(3)` expected, `Some(0)` actual —
+entries re-stamped `Added`), `drops_empty_delete_manifest` fails `Some(2)`/`Some(0)`, and
+`explicit_false_keeps_java_default` fails at the ROW SCAN (`{2}` expected, `{2, 1}`
+actual — the re-stamped delete stopped applying and row `y=1` resurrected, the exact
+silent-corruption class the provenance pins guard). Restored; suite re-verified green
+(25 tests in the `rewrite_manifests` filter).
+
+## 7. Gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p iceberg --all-targets -- -D warnings` — clean.
+- `scripts/check_rust_file_size.sh` — 553 files clean; `rewrite_manifests.rs` ceiling
+  lowered 1915 → 1901 (the file shrunk by the comment-block deletions this unit made).
+- `typos .` — clean.
+- `comment_ban.py` — `comment-ban hits=0`.
 
 Implementation notes:
 
