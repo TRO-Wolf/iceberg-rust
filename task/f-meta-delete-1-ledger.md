@@ -302,3 +302,95 @@ red-first pins, `f82a4e46` implementation, `c5af541a` gate fixes — rustfmt lay
   routed to run 24c's routing decision.
 - Independent Critic pass — not run in this lane; deferred to the PR-level review step of the
   owner's shipping workflow — **OPEN**.
+
+## 9. Round 2 — two-critic findings and resolutions (HEAD `1ce033c9`)
+
+Commits on top of round 1: `bf0621a2` red-first pins, `9bf43d76` implementation,
+`1ce033c9` size-ceiling refactor (evaluator compaction, boundary test module
+split into `metadata_delete_tests/`, ceilings lowered 1918→1912 and 6845→6842).
+
+### L-001 (UTF-16 string order) — REFUTED by measurement and bytecode
+
+- Oracle measurement (`/tmp/oc-worker/pd-oracle/utf16_delete_truth.json`, Spark 4.1.2 +
+  Iceberg 1.11.0): `￿ < 𐀀` is true and a U+FFFF-only file is a metadata-only
+  delete under `s < '𐀀'` — Java orders strings by code point, not UTF-16 unit.
+- Bytecode: `types.Comparators$CharSeqComparator` compares UTF-16 units but bumps any
+  high surrogate above every BMP unit. On well-formed strings that is exactly
+  code-point order (a lone surrogate can never tie against a different low surrogate
+  without `min` cutting the other string mid-pair). `str` ordering in Rust is the same
+  order — inequalities were already correct; the round-1 `Vec<u16>` port was rewritten
+  to code points.
+- Resolution: `strict_prefix_eval.rs` rewritten — `starts_with` is `str::starts_with`;
+  `not_starts_with` streams `char` values with `len_utf16()` accounting so a
+  supplementary-plane prefix compares against the first code point that fits its UTF-16
+  width; no `Vec<u16>`/`Vec<char>` collects (also closes R-04). All-nulls
+  `not_starts_with` is MUST_MATCH per Java.
+- Pins (real parquet bounds via the fork's writer): the five measured cells —
+  `string_lt_bmp_upper_below_supplementary`, `string_lt_mixed_bounds_below_supplementary`,
+  `string_gt_bmp_upper_above_pua`, `string_gt_supplementary_above_bmp_max`,
+  `string_not_eq_pua_below_range` — plus `not_starts_with_supplementary_prefix`,
+  `not_starts_with_order_boundary`, and `starts_with_supplementary_prefix_is_vacuous`
+  (Java answer derived from the verified comparator: a supplementary prefix can never
+  be a strict prefix of a BMP bound, and `STARTS WITH` is non-deterministic anyway →
+  vacuous-true). 8 pins, all red on the UTF-16-unit code, all green at HEAD.
+- Mutation: `cmp_utf16_prefix` flipped to compare first UTF-16 code units →
+  `not_starts_with_order_boundary` and `string_gt_supplementary_above_bmp_max` red —
+  code-point order is load-bearing — **PROVEN**, reverted.
+
+### L-002 (nested-field metrics provable) — CLOSED
+
+- Bytecode: every `StrictMetricsEvaluator` arm checks `isNestedColumn` (field id absent
+  from the top-level struct) except `isNaN`/`notNaN`. Fork added `accessor().is_nested()`
+  guards to `is_null`, `not_null`, `visit_inequality` (covers lt/ltEq/gt/gtEq), `eq`,
+  `not_eq`, `in`, `not_in`; `is_nan`/`not_nan` left unguarded per Java.
+- Pin: `nested_field_metrics_are_not_provable` — struct column `s.x` with real metrics
+  bounds, `s.x = 7` → false (Java keeps the file — its inclusive evaluator has no
+  nested guard — then strict MIGHT_NOT). Red before the guards, green after.
+- Mutation: `is_nested` check dropped from `eq` → pin red — **PROVEN**, reverted.
+
+### L-003 (stale evaluator unit tests) — CLOSED
+
+- `test_all_nulls` `not_starts_with` corrected to Java's answer (containsNullsOnly →
+  MUST_MATCH → true); stale "always false" prefix-test messages rewritten to describe
+  actual strict-metrics semantics. `cargo test -p iceberg --lib strict_metrics_evaluator`:
+  26/26 green.
+
+### R-01/R-02/R-03 (streaming decision walk) — CLOSED
+
+- `PlanContext::try_for_each_data_file` iterates manifest-list entries in order, skips
+  non-data manifests, applies manifest pruning before opening, opens one manifest at a
+  time, evaluates each live entry by reference via the extracted `survives_plan_filter`
+  free function (shared with `process_data_manifest_entry` — ordinary scan path
+  unchanged), and returns `Ok(false)` on the first callback `false`. No `Vec<DataFile>`
+  collect, no per-manifest `Vec<ManifestEntryContext>`, no `DeleteFileIndex`, no
+  channels/populate task. `TableScan` exposes `plan_context()`; the delegate wrapper
+  was dropped for size.
+- Pin: `short_circuits_before_unreadable_manifest` — append file2 then file1, delete
+  file2's manifest (list order newest-first → file1's manifest walked first); `id >= 2`
+  is unproven on file1 `[1,3]` → `Ok(false)` without opening the deleted manifest.
+  Red under collect-then-decide (error opening the deleted manifest), green after.
+- Mutation: early `return Ok(false)` removed → pin red — **PROVEN**, reverted.
+
+### R-05 (SchemaRef bind) — CLOSED
+
+- `selects_partitions(&SchemaRef, …)` binds projections/equivalence against the table's
+  existing `current_schema` `Arc` — no `Arc::new(schema.clone())` deep copy.
+
+### Round-2 gates at HEAD `1ce033c9`
+
+| gate | result |
+|---|---|
+| `cargo fmt --all -- --check` | clean — PROVEN |
+| `cargo clippy -p iceberg --all-targets -- -D warnings` | clean — PROVEN |
+| `./scripts/check_rust_file_size.sh` | 526 files clean — PROVEN |
+| `comment_ban.py <clone> origin/main HEAD` | hits=0 — PROVEN |
+| `check_agent_artifacts.sh` | OK — PROVEN |
+| `check_comment_blocks.sh` | OK — PROVEN |
+| `check_matrix_anchors.sh` | OK — PROVEN |
+| `taplo check` | clean — PROVEN |
+| `cargo machete` | none — PROVEN |
+| `typos` | clean — PROVEN |
+| `can_delete_using_metadata` | 33/33 — PROVEN |
+| `strict_metrics_evaluator` | 26/26 — PROVEN |
+| `delete_files` | 213/213 — PROVEN |
+| `scan` | 292/292 — PROVEN |
