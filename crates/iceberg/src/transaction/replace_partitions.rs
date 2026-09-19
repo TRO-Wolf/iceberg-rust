@@ -349,7 +349,7 @@ impl TransactionAction for ReplacePartitionsAction {
             snapshot_properties,
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
-        )
+        )?
         .with_target_branch(self.target_branch.clone())?;
 
         // Validate the added files like fast append: data content type, partition-spec match, and

@@ -568,7 +568,7 @@ impl TransactionAction for RowDeltaAction {
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
-        )
+        )?
         .with_removed_delete_files(self.removed_delete_files.clone())
         .with_target_branch(self.target_branch.clone())?;
         let snapshot_producer = if self
@@ -4083,6 +4083,7 @@ mod tests {
                 vec![],
                 FirstRowIdPolicy::Suppress,
             )
+            .unwrap()
             .with_added_delete_files(vec![delete_file]);
             let err = producer
                 .validate_added_delete_files()
@@ -4404,7 +4405,7 @@ mod tests {
                 HashMap::new(),
                 vec![],
                 FirstRowIdPolicy::Suppress,
-            )
+            )?
             .with_added_delete_files(vec![self.dv.clone()])
             .commit(ReplaceOpAddDvOperation, DefaultManifestProcess)
             .await

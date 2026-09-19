@@ -400,7 +400,7 @@ impl TransactionAction for RewriteFilesAction {
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
-        )
+        )?
         .with_target_branch(self.target_branch.clone())?;
 
         // Keep the replaced files' data seq on the added files when the caller asks for it. `None` leaves
