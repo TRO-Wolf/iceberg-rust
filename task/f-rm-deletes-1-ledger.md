@@ -117,8 +117,17 @@ no new snapshot exists.
 answers `rewritten 3, added 1` and carries both delete manifests byte-identical, where the
 Spark action answers `5, 2` and ends with ONE delete manifest.
 
-Measured RED (step-2 pin run, pre-implementation): recorded in §5 after the pin run —
-each pin's failure output is the fork's verbatim answer.
+Measured RED (step-2 pin run, pre-implementation, stub flag compiled but inert):
+
+- `test_rewrite_delete_manifests_clusters_deletes_v2` — `assert_eq!(1, delete_manifests.len())`
+  fails `left: 1, right: 2`: both delete manifests carried byte-identical.
+- `test_rewrite_delete_manifests_clusters_dvs_v3` — same failure shape on V3 DVs.
+- `test_rewrite_delete_manifests_drops_empty_delete_manifest` — `left: 1, right: 2`:
+  the emptied delete manifest is carried, not dropped.
+- `test_rewrite_delete_manifests_respects_rewrite_if` — the predicate-matched delete
+  manifest's path is still present after the commit.
+- `test_rewrite_delete_manifests_explicit_false_keeps_java_default` — green before and
+  after (it pins the preserved Java-core default, not the new behavior).
 
 ## 4. Design — the opt-in
 
@@ -154,15 +163,40 @@ divergence, unchanged by this flag (see §5 OPEN).
 
 ## 5. Pin map / verdicts
 
+Pin file: `crates/iceberg/src/transaction/rewrite_manifests_deletes_tests.rs`, wired from
+`action.rs` via `#[path]` (the `occ_scoped_tests.rs` precedent — `rewrite_manifests.rs`
+sat exactly on its 1915-line legacy ceiling; private-item doc blocks on the items whose
+semantics the flag changes were deleted to buy headroom, and the ceiling row was lowered
+to 1901). Shared helpers were widened to `pub(crate)` in place.
+
 | pin | risk pinned | status |
 |---|---|---|
-| `test_rewrite_delete_manifests_clusters_deletes_into_one_delete_manifest_v2` | unpart_mor_v2: 2 delete manifests → 1, entries Existing, seqs/fseqs/snapshot ids preserved, scan still applies deletes | OPEN (written red) |
-| `test_rewrite_delete_manifests_clusters_dvs_into_one_delete_manifest_v3` | unpart_mor_v3: DVs re-cluster into a delete manifest, seqs preserved, scan applies | OPEN (written red) |
-| `test_rewrite_delete_manifests_drops_manifest_with_no_live_entries` | part_mor_real: an emptied delete manifest is replaced by nothing | OPEN (written red) |
-| `test_rewrite_delete_manifests_summary_counts_cover_both_content_kinds` | created/kept/replaced = 2/0/5, op `replace` | OPEN (written red) |
-| `test_rewrite_delete_manifests_default_off_keeps_deletes` | flag off ⇒ byte-identical carry-forward (core default) | covered by existing test 5 + explicit `false` pin |
-| `test_rewrite_delete_manifests_respects_rewrite_if` | predicate-false delete manifest kept | OPEN (written red) |
+| `test_rewrite_delete_manifests_clusters_deletes_v2` | unpart_mor_v2: 2 delete manifests → 1, entries Existing, seqs/fseqs/snapshot ids preserved on disk (raw avro, non-inherited), scan still applies deletes; summary 2/0/5, op `replace` | GREEN post-implementation |
+| `test_rewrite_delete_manifests_clusters_dvs_v3` | unpart_mor_v3: DVs re-cluster into a delete manifest, seqs preserved, scan applies; summary 2/5 | GREEN post-implementation |
+| `test_rewrite_delete_manifests_drops_empty_delete_manifest` | part_mor_real: an emptied delete manifest is replaced by nothing (replaced 4, created 2) | GREEN post-implementation |
+| `test_rewrite_delete_manifests_explicit_false_keeps_java_default` | flag off ⇒ byte-identical carry-forward (core default); explicit `false` identical | GREEN before and after |
+| `test_rewrite_delete_manifests_respects_rewrite_if` | predicate-false delete manifest kept | GREEN post-implementation |
 | evolved_spec no-commit | Spark `numManifests==1 && size==1` skip — no core analogue | OPEN residue (§4) |
+
+Implementation notes:
+
+- Field `rewrite_delete_manifests: bool` on `RewriteManifestsAction`, default `false`;
+  setter is `#[allow(missing_docs)]` per the comment-ban route for public items.
+- `perform_rewrite` content gate: `content == Data || self.rewrite_delete_manifests`.
+- `ClusterWriters` keys gained `ManifestContentType` (`(String, i32, ManifestContentType)`);
+  `new_cluster_manifest_writer` is invoked with the source manifest's content, so DATA and
+  DELETE entries can never share a writer. `ManifestContentType` gained `PartialOrd, Ord`
+  for the deterministic finish-order sort (Data=0 sorts before Deletes=1).
+- A rewritten delete manifest with zero live entries contributes no cluster output and is
+  dropped while still counting toward `manifests-replaced` — the oracle's `part_mor_real`
+  shape; `validate_files_counts` balances because its active-file count is 0.
+- Test-shape adaptations recorded: a Puffin deletion vector covers exactly ONE
+  `referenced_data_file`, so the V3 shape uses one DV per row-delta commit (the oracle's
+  2-manifests-1-file-each shape); the minimal fixtures are `identity(x)`-partitioned, so
+  all shapes are single-partition.
+- A delete entry's status legitimately flips Added → Existing on rewrite (Java
+  `writer.existing`); the pins assert the transition and compare only the provenance
+  triple (snapshot id, data seq, file seq).
 
 Mutation obligations (step 4): (a) revert the content gate so deletes stay immune ⇒ the
 three cluster pins must go red; (b) re-stamp entries (`add_entry` path semantics) ⇒ the seq

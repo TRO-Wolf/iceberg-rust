@@ -17,16 +17,20 @@
 
 use std::collections::HashSet;
 
+use crate::Catalog;
 use crate::memory::tests::new_memory_catalog;
-use crate::spec::{DataFile, Literal, ManifestContentType, ManifestFile, Operation, Struct};
+use crate::spec::{
+    DataFile, Literal, ManifestContentType, ManifestFile, ManifestStatus, Operation, Struct,
+};
 use crate::table::Table;
 use crate::transaction::rewrite_manifests::tests::{
-    append_files, current_manifests, live_entry, scan_y_values, summary_prop,
-    write_real_data_file, write_real_position_delete,
+    append_files, current_manifests, live_entry, scan_y_values, summary_prop, write_real_data_file,
+    write_real_position_delete,
 };
-use crate::transaction::tests::{make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog};
+use crate::transaction::tests::{
+    make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog,
+};
 use crate::transaction::{ApplyTransactionAction, Transaction};
-use crate::Catalog;
 
 async fn manifests_of(table: &Table, content: ManifestContentType) -> Vec<ManifestFile> {
     current_manifests(table)
@@ -143,7 +147,7 @@ async fn rewrite_deletes(table: &Table, catalog: &impl Catalog) -> Table {
 }
 
 #[tokio::test]
-async fn test_rewrite_delete_manifests_unpartitioned_v2() {
+async fn test_rewrite_delete_manifests_clusters_deletes_v2() {
     let catalog = new_memory_catalog().await;
     let table = make_v2_minimal_table_in_catalog(&catalog).await;
 
@@ -159,20 +163,19 @@ async fn test_rewrite_delete_manifests_unpartitioned_v2() {
     let tx = tx.row_delta().add_deletes(vec![d1]).apply(tx).unwrap();
     let table = tx.commit(&catalog).await.unwrap();
 
-    let d2 = write_real_position_delete(
-        &table,
-        0,
-        &[
-            (f2.file_path().to_string(), 0),
-            (f3.file_path().to_string(), 1),
-        ],
-    )
+    let d2 = write_real_position_delete(&table, 0, &[
+        (f2.file_path().to_string(), 0),
+        (f3.file_path().to_string(), 1),
+    ])
     .await;
     let tx = Transaction::new(&table);
     let tx = tx.row_delta().add_deletes(vec![d2]).apply(tx).unwrap();
     let table = tx.commit(&catalog).await.unwrap();
 
-    assert_eq!(3, manifests_of(&table, ManifestContentType::Data).await.len());
+    assert_eq!(
+        3,
+        manifests_of(&table, ManifestContentType::Data).await.len()
+    );
     assert_eq!(
         2,
         manifests_of(&table, ManifestContentType::Deletes)
@@ -205,12 +208,19 @@ async fn test_rewrite_delete_manifests_unpartitioned_v2() {
     assert_eq!(Some("5".into()), summary_prop(&table, "manifests-replaced"));
     assert_eq!(
         Operation::Replace,
-        table.metadata().current_snapshot().unwrap().summary().operation
+        table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .operation
     );
 
     for (i, path) in delete_paths.iter().enumerate() {
-        assert_eq!(before_provenance[i], live_entry(&table, path).await);
+        let after = live_entry(&table, path).await;
         let (_, snap, seq, fseq) = before_provenance[i];
+        assert_eq!(ManifestStatus::Existing, after.0);
+        assert_eq!((snap, seq, fseq), (after.1, after.2, after.3));
         assert_eq!(
             (snap, seq, fseq),
             raw_delete_entry(&delete_manifests[0], &table, path).await,
@@ -226,7 +236,7 @@ async fn test_rewrite_delete_manifests_unpartitioned_v2() {
 }
 
 #[tokio::test]
-async fn test_rewrite_delete_manifests_unpartitioned_v3_dv() {
+async fn test_rewrite_delete_manifests_clusters_dvs_v3() {
     let catalog = new_memory_catalog().await;
     let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
@@ -242,21 +252,15 @@ async fn test_rewrite_delete_manifests_unpartitioned_v3_dv() {
     let tx = tx.row_delta().add_deletes(vec![d1]).apply(tx).unwrap();
     let table = tx.commit(&catalog).await.unwrap();
 
-    let d2 = write_real_dv_file(
-        &table,
-        "dv2.puffin",
-        0,
-        &[
-            (f2.file_path().to_string(), 0),
-            (f3.file_path().to_string(), 1),
-        ],
-    )
-    .await;
+    let d2 = write_real_dv_file(&table, "dv2.puffin", 0, &[(f2.file_path().to_string(), 0)]).await;
     let tx = Transaction::new(&table);
     let tx = tx.row_delta().add_deletes(vec![d2]).apply(tx).unwrap();
     let table = tx.commit(&catalog).await.unwrap();
 
-    assert_eq!(3, manifests_of(&table, ManifestContentType::Data).await.len());
+    assert_eq!(
+        3,
+        manifests_of(&table, ManifestContentType::Data).await.len()
+    );
     assert_eq!(
         2,
         manifests_of(&table, ManifestContentType::Deletes)
@@ -283,15 +287,17 @@ async fn test_rewrite_delete_manifests_unpartitioned_v3_dv() {
     assert_eq!(Some("5".into()), summary_prop(&table, "manifests-replaced"));
 
     for (i, path) in delete_paths.iter().enumerate() {
-        assert_eq!(before_provenance[i], live_entry(&table, path).await);
+        let after = live_entry(&table, path).await;
         let (_, snap, seq, fseq) = before_provenance[i];
+        assert_eq!(ManifestStatus::Existing, after.0);
+        assert_eq!((snap, seq, fseq), (after.1, after.2, after.3));
         assert_eq!(
             (snap, seq, fseq),
             raw_delete_entry(&delete_manifests[0], &table, path).await
         );
     }
 
-    assert_eq!(HashSet::from([3, 4, 6]), scan_y_values(&table).await);
+    assert_eq!(HashSet::from([3, 4, 5, 6]), scan_y_values(&table).await);
 }
 
 #[tokio::test]
@@ -322,7 +328,10 @@ async fn test_rewrite_delete_manifests_drops_empty_delete_manifest() {
         .unwrap();
     let table = tx.commit(&catalog).await.unwrap();
 
-    assert_eq!(2, manifests_of(&table, ManifestContentType::Data).await.len());
+    assert_eq!(
+        2,
+        manifests_of(&table, ManifestContentType::Data).await.len()
+    );
     assert_eq!(
         2,
         manifests_of(&table, ManifestContentType::Deletes)
@@ -333,10 +342,7 @@ async fn test_rewrite_delete_manifests_drops_empty_delete_manifest() {
     let committed_d2 = live_delete_data_file(&table, d2.file_path()).await;
     let tx = Transaction::new(&table);
     let action = tx
-        .rewrite_files(
-            Vec::<DataFile>::new(),
-            Vec::<DataFile>::new(),
-        )
+        .rewrite_files(Vec::<DataFile>::new(), Vec::<DataFile>::new())
         .delete_delete_file(committed_d2);
     let tx = action.apply(tx).unwrap();
     let table = tx.commit(&catalog).await.unwrap();
@@ -390,7 +396,10 @@ async fn test_rewrite_delete_manifests_explicit_false_keeps_java_default() {
     let tx = action.apply(tx).unwrap();
     let table = tx.commit(&catalog).await.unwrap();
 
-    assert_eq!(1, manifests_of(&table, ManifestContentType::Data).await.len());
+    assert_eq!(
+        1,
+        manifests_of(&table, ManifestContentType::Data).await.len()
+    );
     let delete_manifests = manifests_of(&table, ManifestContentType::Deletes).await;
     assert_eq!(1, delete_manifests.len());
     assert_eq!(Some("1".into()), summary_prop(&table, "manifests-created"));

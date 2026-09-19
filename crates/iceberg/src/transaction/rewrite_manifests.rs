@@ -89,6 +89,7 @@ pub struct RewriteManifestsAction {
     /// Manifests to add explicitly (Java `addedManifests`); each must carry only existing entries with an
     /// unassigned snapshot id + sequence number (validated in [`Self::add_manifest`]).
     added_manifests: Vec<ManifestFile>,
+    rewrite_delete_manifests: bool,
     /// User-supplied snapshot summary properties (Java `RewriteManifests.set`).
     snapshot_properties: HashMap<String, String>,
     commit_uuid: Option<Uuid>,
@@ -100,6 +101,7 @@ impl RewriteManifestsAction {
         Self {
             cluster_by: None,
             rewrite_if: None,
+            rewrite_delete_manifests: false,
             deleted_manifests: vec![],
             added_manifests: vec![],
             snapshot_properties: HashMap::default(),
@@ -201,7 +203,8 @@ impl RewriteManifestsAction {
     }
 
     #[allow(missing_docs)]
-    pub fn rewrite_delete_manifests(self, _rewrite: bool) -> Self {
+    pub fn rewrite_delete_manifests(mut self, rewrite: bool) -> Self {
+        self.rewrite_delete_manifests = rewrite;
         self
     }
 
@@ -415,8 +418,10 @@ impl RewriteManifestsAction {
                 continue;
             }
 
+            let content_matches =
+                manifest_file.content == ManifestContentType::Data || self.rewrite_delete_manifests;
             let should_rewrite = self.cluster_by.is_some()
-                && manifest_file.content == ManifestContentType::Data
+                && content_matches
                 && self
                     .rewrite_if
                     .as_ref()
@@ -450,6 +455,7 @@ impl RewriteManifestsAction {
                         snapshot_producer,
                         cluster_key,
                         manifest_file.partition_spec_id,
+                        manifest_file.content,
                         entry,
                         per_entry_size_estimate,
                     )
@@ -478,9 +484,9 @@ impl RewriteManifestsAction {
 struct ClusterWriters {
     target_size_bytes: u64,
     /// Per key: the open writer's accumulated size estimate.
-    open_estimates: HashMap<(String, i32), u64>,
+    open_estimates: HashMap<(String, i32, ManifestContentType), u64>,
     /// Per key: the open writer (taken out + replaced on a roll).
-    open_writers: HashMap<(String, i32), crate::spec::ManifestWriter>,
+    open_writers: HashMap<(String, i32, ManifestContentType), crate::spec::ManifestWriter>,
     /// Sealed manifests, in append order.
     finished: Vec<ManifestFile>,
 }
@@ -500,10 +506,11 @@ impl ClusterWriters {
         snapshot_producer: &mut SnapshotProducer<'_>,
         cluster_key: String,
         partition_spec_id: i32,
+        content: ManifestContentType,
         entry: ManifestEntry,
         per_entry_size_estimate: u64,
     ) -> Result<()> {
-        let key = (cluster_key, partition_spec_id);
+        let key = (cluster_key, partition_spec_id, content);
 
         // Roll BEFORE appending if the current open writer has reached the target (Java rolls on the
         // entry that would tip it over; here the estimate is checked against the same threshold).
@@ -518,8 +525,8 @@ impl ClusterWriters {
 
         // Ensure an open writer exists for this key.
         if !self.open_writers.contains_key(&key) {
-            let writer = snapshot_producer
-                .new_cluster_manifest_writer(partition_spec_id, ManifestContentType::Data)?;
+            let writer =
+                snapshot_producer.new_cluster_manifest_writer(partition_spec_id, content)?;
             self.open_writers.insert(key.clone(), writer);
             self.open_estimates.insert(key.clone(), 0);
         }
@@ -544,7 +551,8 @@ impl ClusterWriters {
     async fn finish(mut self) -> Result<Vec<ManifestFile>> {
         // Sort the still-open keys for a deterministic manifest ordering across runs (the per-attempt
         // HashMap iteration order is otherwise nondeterministic; the live set is identical regardless).
-        let mut open_keys: Vec<(String, i32)> = self.open_writers.keys().cloned().collect();
+        let mut open_keys: Vec<(String, i32, ManifestContentType)> =
+            self.open_writers.keys().cloned().collect();
         open_keys.sort();
 
         let mut result = std::mem::take(&mut self.finished);
