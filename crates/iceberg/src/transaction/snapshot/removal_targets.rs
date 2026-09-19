@@ -65,6 +65,10 @@ impl<'a> RemovalTargets<'a> {
         !self.data_paths.is_empty()
     }
 
+    pub(super) fn data_paths(&self) -> &HashSet<&'a str> {
+        &self.data_paths
+    }
+
     pub(super) fn has_delete_targets(&self) -> bool {
         !self.delete_keys.is_empty()
     }

@@ -17,25 +17,47 @@
 
 use std::collections::HashSet;
 
+use futures::{StreamExt, stream};
+
 use super::SnapshotProducer;
 use super::removal_targets::{RemovalHits, RemovalTargets};
 use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};
 use crate::error::Result;
+use crate::io::FileIO;
 use crate::spec::{
-    DataFile, Manifest, ManifestContentType, ManifestEntry, ManifestFile,
+    DataContentType, DataFile, Manifest, ManifestContentType, ManifestEntry, ManifestFile,
     UNASSIGNED_SEQUENCE_NUMBER,
 };
 use crate::{Error, ErrorKind};
 
+const DELETE_MANIFEST_SCAN_CONCURRENCY: usize = 8;
+
+#[derive(Clone, Copy)]
 struct DeleteFileExpiry {
     min_data_sequence_number: i64,
     every_manifest: bool,
 }
 
-fn is_dangling_dv(data_file: &DataFile, removed_data_paths: &HashSet<String>) -> bool {
-    is_deletion_vector(data_file)
-        && referenced_data_file_location(data_file)
-            .is_some_and(|referenced| removed_data_paths.contains(&referenced))
+enum ManifestScan {
+    Carry(ManifestFile),
+    Rewrite {
+        manifest_file: ManifestFile,
+        manifest: Manifest,
+        expiry: Option<DeleteFileExpiry>,
+    },
+}
+
+fn is_dangling_dv(data_file: &DataFile, removed_data_paths: &HashSet<&str>) -> bool {
+    if !is_deletion_vector(data_file)
+        || data_file.content_type() == DataContentType::EqualityDeletes
+    {
+        return false;
+    }
+    match data_file.referenced_data_file_ref() {
+        Some(referenced) => removed_data_paths.contains(referenced),
+        None => referenced_data_file_location(data_file)
+            .is_some_and(|referenced| removed_data_paths.contains(referenced.as_str())),
+    }
 }
 
 impl DeleteFileExpiry {
@@ -66,6 +88,43 @@ impl DeleteFileExpiry {
                 sequence_number > 0 && sequence_number < self.min_data_sequence_number
             })
     }
+}
+
+async fn scan_manifest(
+    file_io: &FileIO,
+    manifest_file: ManifestFile,
+    targets: &RemovalTargets<'_>,
+    expiry: Option<&DeleteFileExpiry>,
+    dangling_dv_paths: Option<&HashSet<&str>>,
+) -> Result<ManifestScan> {
+    let content = manifest_file.content;
+    let expiry = expiry.filter(|expiry| expiry.may_expire_in(&manifest_file));
+    let may_hold_dangling = dangling_dv_paths.is_some()
+        && (manifest_file.has_added_files() || manifest_file.has_existing_files());
+    if !targets.wants(content) && expiry.is_none() && !may_hold_dangling {
+        return Ok(ManifestScan::Carry(manifest_file));
+    }
+    let manifest = manifest_file.load_manifest(file_io).await?;
+    let mut has_removal = false;
+    let mut has_expired = false;
+    let mut has_dangling = false;
+    for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+        has_removal = has_removal || targets.matches(content, entry.data_file());
+        has_expired = has_expired || expiry.is_some_and(|expiry| expiry.expires(entry));
+        has_dangling = has_dangling
+            || dangling_dv_paths.is_some_and(|paths| is_dangling_dv(entry.data_file(), paths));
+    }
+    let expiry = expiry
+        .filter(|expiry| expiry.every_manifest || has_removal)
+        .copied();
+    if !(has_removal || has_dangling || has_expired && expiry.is_some()) {
+        return Ok(ManifestScan::Carry(manifest_file));
+    }
+    Ok(ManifestScan::Rewrite {
+        manifest_file,
+        manifest,
+        expiry,
+    })
 }
 
 impl SnapshotProducer<'_> {
@@ -101,23 +160,48 @@ impl SnapshotProducer<'_> {
             )
         });
         let dangling_dv_paths =
-            (drops_old_delete_files && !removed_data_files.is_empty()).then(|| {
-                removed_data_files
-                    .iter()
-                    .map(|data_file| data_file.file_path().to_string())
-                    .collect::<HashSet<String>>()
-            });
-        for manifest_file in delete_manifests {
-            filtered.push(
-                self.filter_manifest(
+            (drops_old_delete_files && targets.has_data_targets()).then(|| targets.data_paths());
+        let delete_manifest_count = delete_manifests.len();
+        let file_io = self.table.file_io().clone();
+        let mut delete_scans = stream::iter(delete_manifests.into_iter().enumerate().map(
+            |(index, manifest_file)| {
+                let file_io = file_io.clone();
+                let targets = &targets;
+                let expiry = expiry.as_ref();
+                async move {
+                    scan_manifest(&file_io, manifest_file, targets, expiry, dangling_dv_paths)
+                        .await
+                        .map(|scan| (index, scan))
+                }
+            },
+        ))
+        .buffer_unordered(DELETE_MANIFEST_SCAN_CONCURRENCY);
+        let mut scans: Vec<Option<ManifestScan>> =
+            (0..delete_manifest_count).map(|_| None).collect();
+        while let Some(result) = delete_scans.next().await {
+            let (index, scan) = result?;
+            scans[index] = Some(scan);
+        }
+        for scan in scans.into_iter().flatten() {
+            match scan {
+                ManifestScan::Carry(manifest_file) => filtered.push((manifest_file, false)),
+                ManifestScan::Rewrite {
                     manifest_file,
-                    &targets,
-                    expiry.as_ref(),
-                    dangling_dv_paths.as_ref(),
-                    &mut hits,
-                )
-                .await?,
-            );
+                    manifest,
+                    expiry,
+                } => filtered.push((
+                    self.rewrite_manifest_with_deletes(
+                        &manifest_file,
+                        &manifest,
+                        &targets,
+                        expiry.as_ref(),
+                        dangling_dv_paths,
+                        &mut hits,
+                    )
+                    .await?,
+                    true,
+                )),
+            }
         }
 
         let missing = targets.missing_data_paths(&hits);
@@ -143,45 +227,37 @@ impl SnapshotProducer<'_> {
         manifest_file: ManifestFile,
         targets: &RemovalTargets<'_>,
         expiry: Option<&DeleteFileExpiry>,
-        dangling_dv_paths: Option<&HashSet<String>>,
+        dangling_dv_paths: Option<&HashSet<&str>>,
         hits: &mut RemovalHits,
     ) -> Result<(ManifestFile, bool)> {
-        let content = manifest_file.content;
-        let expiry = expiry.filter(|expiry| expiry.may_expire_in(&manifest_file));
-        let may_hold_dangling = dangling_dv_paths.is_some()
-            && (manifest_file.has_added_files() || manifest_file.has_existing_files());
-        if !targets.wants(content) && expiry.is_none() && !may_hold_dangling {
-            return Ok((manifest_file, false));
-        }
-        let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
-
-        let has_removal = manifest
-            .entries()
-            .iter()
-            .any(|entry| entry.is_alive() && targets.matches(content, entry.data_file()));
-        let expiry = expiry.filter(|expiry| expiry.every_manifest || has_removal);
-        let has_expired = expiry
-            .is_some_and(|expiry| manifest.entries().iter().any(|entry| expiry.expires(entry)));
-        let has_dangling = dangling_dv_paths.is_some_and(|removed_data_paths| {
-            manifest.entries().iter().any(|entry| {
-                entry.is_alive() && is_dangling_dv(entry.data_file(), removed_data_paths)
-            })
-        });
-        if !has_removal && !has_expired && !has_dangling {
-            return Ok((manifest_file, false));
-        }
-
-        let rewritten = self
-            .rewrite_manifest_with_deletes(
-                &manifest_file,
-                &manifest,
-                targets,
+        match scan_manifest(
+            self.table.file_io(),
+            manifest_file,
+            targets,
+            expiry,
+            dangling_dv_paths,
+        )
+        .await?
+        {
+            ManifestScan::Carry(manifest_file) => Ok((manifest_file, false)),
+            ManifestScan::Rewrite {
+                manifest_file,
+                manifest,
                 expiry,
-                dangling_dv_paths,
-                hits,
-            )
-            .await?;
-        Ok((rewritten, true))
+            } => {
+                let rewritten = self
+                    .rewrite_manifest_with_deletes(
+                        &manifest_file,
+                        &manifest,
+                        targets,
+                        expiry.as_ref(),
+                        dangling_dv_paths,
+                        hits,
+                    )
+                    .await?;
+                Ok((rewritten, true))
+            }
+        }
     }
 
     async fn rewrite_manifest_with_deletes(
@@ -190,7 +266,7 @@ impl SnapshotProducer<'_> {
         manifest: &Manifest,
         targets: &RemovalTargets<'_>,
         expiry: Option<&DeleteFileExpiry>,
-        dangling_dv_paths: Option<&HashSet<String>>,
+        dangling_dv_paths: Option<&HashSet<&str>>,
         hits: &mut RemovalHits,
     ) -> Result<ManifestFile> {
         let content = manifest_file.content;
