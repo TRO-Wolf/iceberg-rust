@@ -29,7 +29,7 @@ use crate::spec::{PrimitiveType, Schema as IcebergSchema, Type};
 
 pub(super) const PRIMITIVE_BUFFER_SIZE: usize = 8;
 
-enum ZColumnKind {
+pub(super) enum ZColumnKind {
     WholeNumber,
     FloatingPoint,
     TimestampSeconds,
@@ -67,44 +67,8 @@ impl ZOrderEncoder {
                     format!("Cannot find column '{name}' in table schema"),
                 )
             })?;
-            let (kind, width) = match field.field_type.as_ref() {
-                Type::Primitive(primitive) => match primitive {
-                    PrimitiveType::Int | PrimitiveType::Long | PrimitiveType::Date => {
-                        (ZColumnKind::WholeNumber, PRIMITIVE_BUFFER_SIZE)
-                    }
-                    PrimitiveType::Time | PrimitiveType::Timestamp => {
-                        (ZColumnKind::WholeNumber, PRIMITIVE_BUFFER_SIZE)
-                    }
-                    PrimitiveType::Timestamptz => {
-                        (ZColumnKind::TimestampSeconds, PRIMITIVE_BUFFER_SIZE)
-                    }
-                    PrimitiveType::Float | PrimitiveType::Double => {
-                        (ZColumnKind::FloatingPoint, PRIMITIVE_BUFFER_SIZE)
-                    }
-                    PrimitiveType::Boolean => (ZColumnKind::Boolean, PRIMITIVE_BUFFER_SIZE),
-                    PrimitiveType::String => (ZColumnKind::Text, var_length_contribution),
-                    PrimitiveType::Uuid => (ZColumnKind::Uuid, var_length_contribution),
-                    PrimitiveType::Binary | PrimitiveType::Fixed(_) => {
-                        (ZColumnKind::Bytes, var_length_contribution)
-                    }
-                    unsupported => {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Cannot use column {name} of type {unsupported} in ZOrdering, the type is unsupported"
-                            ),
-                        ));
-                    }
-                },
-                unsupported => {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Cannot use column {name} of type {unsupported} in ZOrdering, the type is unsupported"
-                        ),
-                    ));
-                }
-            };
+            let (kind, width) =
+                column_kind(name, field.field_type.as_ref(), var_length_contribution)?;
             let column = arrow_schema.index_of(name).map_err(|error| {
                 Error::new(
                     ErrorKind::Unexpected,
@@ -148,6 +112,43 @@ impl ZOrderEncoder {
         }
         Ok(())
     }
+}
+
+pub(super) fn column_kind(
+    name: &str,
+    field_type: &Type,
+    var_length_contribution: usize,
+) -> Result<(ZColumnKind, usize)> {
+    let unsupported = || {
+        Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot use column {name} of type {field_type} in ZOrdering, the type is unsupported"
+            ),
+        ))
+    };
+    let Type::Primitive(primitive) = field_type else {
+        return unsupported();
+    };
+    Ok(match primitive {
+        PrimitiveType::Int | PrimitiveType::Long | PrimitiveType::Date => {
+            (ZColumnKind::WholeNumber, PRIMITIVE_BUFFER_SIZE)
+        }
+        PrimitiveType::Time | PrimitiveType::Timestamp => {
+            (ZColumnKind::WholeNumber, PRIMITIVE_BUFFER_SIZE)
+        }
+        PrimitiveType::Timestamptz => (ZColumnKind::TimestampSeconds, PRIMITIVE_BUFFER_SIZE),
+        PrimitiveType::Float | PrimitiveType::Double => {
+            (ZColumnKind::FloatingPoint, PRIMITIVE_BUFFER_SIZE)
+        }
+        PrimitiveType::Boolean => (ZColumnKind::Boolean, PRIMITIVE_BUFFER_SIZE),
+        PrimitiveType::String => (ZColumnKind::Text, var_length_contribution),
+        PrimitiveType::Uuid => (ZColumnKind::Uuid, var_length_contribution),
+        PrimitiveType::Binary | PrimitiveType::Fixed(_) => {
+            (ZColumnKind::Bytes, var_length_contribution)
+        }
+        _ => return unsupported(),
+    })
 }
 
 fn encode_column(

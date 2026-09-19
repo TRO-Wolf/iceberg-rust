@@ -20,7 +20,8 @@ use std::collections::BTreeSet;
 use crate::error::{Error, ErrorKind, Result};
 use crate::maintenance::rewrite_data_files::RewriteDataFiles;
 use crate::maintenance::rewrite_data_files_plan::format_java_double;
-use crate::spec::{Schema, SortOrder, Transform, Type};
+use crate::maintenance::rewrite_data_files_zorder::column_kind;
+use crate::spec::{Schema, SortOrder, Transform};
 use crate::table::Table;
 
 pub(super) const SHUFFLE_PARTITIONS_PER_FILE_DEFAULT: usize = 1;
@@ -339,18 +340,11 @@ fn valid_z_order_columns(table: &Table, spec: &ZOrderSpec) -> Result<Vec<String>
                 ),
             )
         })?;
-        if matches!(
+        column_kind(
+            name,
             field.field_type.as_ref(),
-            Type::Struct(_) | Type::List(_) | Type::Map(_)
-        ) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Cannot use column {name} of type {} in ZOrdering, the type is unsupported",
-                    field.field_type
-                ),
-            ));
-        }
+            spec.var_length_contribution.max(1) as usize,
+        )?;
         if identity_sources.contains(&field.id) {
             continue;
         }
