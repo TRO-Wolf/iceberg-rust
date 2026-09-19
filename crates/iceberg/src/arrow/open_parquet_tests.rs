@@ -306,6 +306,41 @@ async fn position_deletes_hand_selection_to_parquet() {
 }
 
 #[tokio::test]
+async fn all_keep_predicate_with_position_deletes_keeps_index() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let del_path = path(&tmp, "pos-deletes.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    write_id_pages(&data_path, &ids);
+    let schema = id_schema();
+    let delete = write_pos_delete_file(&del_path, &data_path, &[10, 70]);
+    let predicate = bound(
+        &schema,
+        Reference::new("id").greater_than_or_equal_to(Datum::int(0)),
+    );
+    let before = ROW_SELECTIONS_APPLIED.with(|count| count.get());
+    let strips_before = PAGE_INDEX_STRIPS.with(|count| count.get());
+    let rows = collect(
+        with_deletes(task(&data_path, schema, &[1], Some(predicate)), vec![
+            delete,
+        ]),
+        true,
+    )
+    .await;
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS - 2);
+    assert_eq!(
+        ROW_SELECTIONS_APPLIED.with(|count| count.get()) - before,
+        1,
+        "the delete-derived selection must still reach parquet"
+    );
+    assert_eq!(
+        PAGE_INDEX_STRIPS.with(|count| count.get()) - strips_before,
+        0,
+        "position deletes must keep the page index even under an all-keep predicate"
+    );
+}
+
+#[tokio::test]
 async fn retry_failure_reports_first_error_as_source() {
     let tmp = tmpdir();
     let data_path = path(&tmp, "garbage.parquet");
