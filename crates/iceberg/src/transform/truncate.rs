@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::ArrayRef;
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 
 use super::TransformFunction;
@@ -87,6 +87,104 @@ impl Truncate {
     fn truncate_decimal_i128(v: i128, width: i128) -> i128 {
         v - (((v % width) + width) % width)
     }
+
+    fn truncate_string_generic<O: arrow_array::OffsetSizeTrait>(
+        &self,
+        input: &ArrayRef,
+    ) -> crate::Result<ArrayRef> {
+        let len = self.width as usize;
+        let mut builder = arrow_array::builder::GenericByteBuilder::<
+            arrow_array::types::GenericStringType<O>,
+        >::with_capacity(input.len(), input.len().saturating_mul(len));
+        match input.data_type() {
+            DataType::Utf8 => {
+                let array = downcast_input::<arrow_array::StringArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_str(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            DataType::LargeUtf8 => {
+                let array = downcast_input::<arrow_array::LargeStringArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_str(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            DataType::Utf8View => {
+                let array = downcast_input::<arrow_array::StringViewArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_str(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            other => {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::FeatureUnsupported,
+                    format!("Unsupported data type for truncate transform: {other:?}"),
+                ));
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+
+    fn truncate_binary_generic<O: arrow_array::OffsetSizeTrait>(
+        &self,
+        input: &ArrayRef,
+    ) -> crate::Result<ArrayRef> {
+        let len = self.width as usize;
+        let mut builder = arrow_array::builder::GenericByteBuilder::<
+            arrow_array::types::GenericBinaryType<O>,
+        >::with_capacity(input.len(), input.len().saturating_mul(len));
+        match input.data_type() {
+            DataType::Binary => {
+                let array = downcast_input::<arrow_array::BinaryArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_binary(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            DataType::LargeBinary => {
+                let array = downcast_input::<arrow_array::LargeBinaryArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_binary(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            DataType::BinaryView => {
+                let array = downcast_input::<arrow_array::BinaryViewArray>(input)?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_binary(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            other => {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::FeatureUnsupported,
+                    format!("Unsupported data type for truncate transform: {other:?}"),
+                ));
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }
 }
 
 /// Downcast a transform input to the concrete Arrow array its [`DataType`] implies, or return a
@@ -143,59 +241,39 @@ impl TransformFunction for Truncate {
                     .map_err(|err| Error::new(crate::ErrorKind::Unexpected, format!("{err}")))?;
                 Ok(Arc::new(res))
             }
-            DataType::Utf8 => {
-                let len = self.width as usize;
-                let res: arrow_array::StringArray = arrow_array::StringArray::from_iter(
-                    downcast_input::<arrow_array::StringArray>(&input)?
-                        .iter()
-                        .map(|v| v.map(|v| Self::truncate_str(v, len))),
-                );
-                Ok(Arc::new(res))
-            }
-            DataType::LargeUtf8 => {
-                let len = self.width as usize;
-                let res: arrow_array::LargeStringArray = arrow_array::LargeStringArray::from_iter(
-                    downcast_input::<arrow_array::LargeStringArray>(&input)?
-                        .iter()
-                        .map(|v| v.map(|v| Self::truncate_str(v, len))),
-                );
-                Ok(Arc::new(res))
-            }
-            DataType::Binary => {
-                let len = self.width as usize;
-                let res: arrow_array::BinaryArray = arrow_array::BinaryArray::from_iter(
-                    downcast_input::<arrow_array::BinaryArray>(&input)?
-                        .iter()
-                        .map(|v| v.map(|v| Self::truncate_binary(v, len))),
-                );
-                Ok(Arc::new(res))
-            }
-            DataType::LargeBinary => {
-                let len = self.width as usize;
-                let res: arrow_array::LargeBinaryArray = arrow_array::LargeBinaryArray::from_iter(
-                    downcast_input::<arrow_array::LargeBinaryArray>(&input)?
-                        .iter()
-                        .map(|v| v.map(|v| Self::truncate_binary(v, len))),
-                );
-                Ok(Arc::new(res))
-            }
+            DataType::Utf8 => self.truncate_string_generic::<i32>(&input),
+            DataType::LargeUtf8 => self.truncate_string_generic::<i64>(&input),
+            DataType::Binary => self.truncate_binary_generic::<i32>(&input),
+            DataType::LargeBinary => self.truncate_binary_generic::<i64>(&input),
             DataType::BinaryView => {
                 let len = self.width as usize;
-                let res: arrow_array::BinaryViewArray = arrow_array::BinaryViewArray::from_iter(
-                    downcast_input::<arrow_array::BinaryViewArray>(&input)?
-                        .iter()
-                        .map(|v| v.map(|v| Self::truncate_binary(v, len))),
-                );
-                Ok(Arc::new(res))
+                let array = downcast_input::<arrow_array::BinaryViewArray>(&input)?;
+                let mut builder = arrow_array::builder::GenericByteViewBuilder::<
+                    arrow_array::types::BinaryViewType,
+                >::with_capacity(array.len());
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_binary(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
             }
             DataType::Utf8View => {
                 let len = self.width as usize;
-                let res: arrow_array::StringViewArray = arrow_array::StringViewArray::from_iter(
-                    downcast_input::<arrow_array::StringViewArray>(&input)?
-                        .iter()
-                        .map(|v| v.map(|v| Self::truncate_str(v, len))),
-                );
-                Ok(Arc::new(res))
+                let array = downcast_input::<arrow_array::StringViewArray>(&input)?;
+                let mut builder = arrow_array::builder::GenericByteViewBuilder::<
+                    arrow_array::types::StringViewType,
+                >::with_capacity(array.len());
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        builder.append_value(Self::truncate_str(array.value(i), len));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
             }
             _ => Err(crate::Error::new(
                 crate::ErrorKind::FeatureUnsupported,
@@ -204,6 +282,20 @@ impl TransformFunction for Truncate {
                     input.data_type()
                 ),
             )),
+        }
+    }
+
+    fn transform_to_type(
+        &self,
+        input: &ArrayRef,
+        expected: &DataType,
+    ) -> Option<crate::Result<ArrayRef>> {
+        match expected {
+            DataType::Utf8 => Some(self.truncate_string_generic::<i32>(input)),
+            DataType::LargeUtf8 => Some(self.truncate_string_generic::<i64>(input)),
+            DataType::Binary => Some(self.truncate_binary_generic::<i32>(input)),
+            DataType::LargeBinary => Some(self.truncate_binary_generic::<i64>(input)),
+            _ => None,
         }
     }
 

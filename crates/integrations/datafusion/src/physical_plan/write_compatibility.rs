@@ -15,7 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::arrow::datatypes::{DataType, Field};
+use std::sync::Arc;
+
+use datafusion::arrow::datatypes::{DataType, Field, Fields, SchemaRef};
+use datafusion::common::Result as DFResult;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{CastExpr, Column};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::projection::ProjectionExec;
 
 pub(super) const MAX_WRITE_COMPATIBILITY_DEPTH: usize = 64;
 
@@ -60,7 +67,7 @@ fn data_type_is_write_compatible(input: &DataType, expected: &DataType, depth: u
     }
 }
 
-fn leaf_layout_compatible(input: &DataType, expected: &DataType) -> bool {
+pub(super) fn leaf_layout_compatible(input: &DataType, expected: &DataType) -> bool {
     matches!(
         (input, expected),
         (
@@ -71,4 +78,44 @@ fn leaf_layout_compatible(input: &DataType, expected: &DataType) -> bool {
             DataType::Binary | DataType::LargeBinary | DataType::BinaryView
         )
     )
+}
+
+pub(super) fn canonical_layout_input(
+    input: Arc<dyn ExecutionPlan>,
+    expected_fields: &Fields,
+) -> DFResult<(Arc<dyn ExecutionPlan>, SchemaRef)> {
+    let input_schema = input.schema();
+    let needs_cast = |input_field: &Arc<Field>, expected_field: &Arc<Field>| {
+        input_field.data_type() != expected_field.data_type()
+            && leaf_layout_compatible(input_field.data_type(), expected_field.data_type())
+    };
+    if !input_schema
+        .fields()
+        .iter()
+        .zip(expected_fields.iter())
+        .any(|(input, expected)| needs_cast(input, expected))
+    {
+        return Ok((input, input_schema));
+    }
+    let canonical_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = input_schema
+        .fields()
+        .iter()
+        .zip(expected_fields.iter())
+        .enumerate()
+        .map(|(index, (input_field, expected_field))| {
+            let expr: Arc<dyn PhysicalExpr> = if needs_cast(input_field, expected_field) {
+                Arc::new(CastExpr::new(
+                    Arc::new(Column::new(input_field.name(), index)),
+                    expected_field.data_type().clone(),
+                    None,
+                ))
+            } else {
+                Arc::new(Column::new(input_field.name(), index))
+            };
+            (expr, input_field.name().clone())
+        })
+        .collect();
+    let input = Arc::new(ProjectionExec::try_new(canonical_exprs, input)?);
+    let input_schema = input.schema();
+    Ok((input, input_schema))
 }
