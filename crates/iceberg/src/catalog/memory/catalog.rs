@@ -46,7 +46,7 @@ pub const MEMORY_CATALOG_WAREHOUSE: &str = "warehouse";
 const LOCATION: &str = "location";
 
 /// Builder for [`MemoryCatalog`].
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MemoryCatalogBuilder {
     config: MemoryCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
@@ -54,23 +54,6 @@ pub struct MemoryCatalogBuilder {
     pub(crate) cache_credential_context: Option<String>,
     pub(crate) shared_object_cache_bytes: Option<u64>,
     pub(crate) shared_footer_cache: Option<Arc<ParquetFooterCache>>,
-}
-
-impl Default for MemoryCatalogBuilder {
-    fn default() -> Self {
-        Self {
-            config: MemoryCatalogConfig {
-                name: None,
-                warehouse: "".to_string(),
-                props: HashMap::new(),
-            },
-            storage_factory: None,
-            table_metadata_cache: None,
-            cache_credential_context: None,
-            shared_object_cache_bytes: None,
-            shared_footer_cache: None,
-        }
-    }
 }
 
 impl MemoryCatalogBuilder {
@@ -112,34 +95,30 @@ impl CatalogBuilder for MemoryCatalogBuilder {
             .filter(|(k, _)| k != MEMORY_CATALOG_WAREHOUSE)
             .collect();
 
-        let result = {
-            if self.config.name.is_none() {
-                Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Catalog name is required",
-                ))
-            } else if self.config.warehouse.is_empty() {
-                Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Catalog warehouse is required",
-                ))
-            } else {
-                MemoryCatalog::new(
-                    self.config,
-                    self.storage_factory,
-                    self.table_metadata_cache,
-                    self.cache_credential_context,
-                    self.shared_object_cache_bytes,
-                    self.shared_footer_cache,
-                )
-            }
-        };
-
-        std::future::ready(result)
+        std::future::ready(if self.config.name.is_none() {
+            Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Catalog name is required",
+            ))
+        } else if self.config.warehouse.is_empty() {
+            Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Catalog warehouse is required",
+            ))
+        } else {
+            MemoryCatalog::new(
+                self.config,
+                self.storage_factory,
+                self.table_metadata_cache,
+                self.cache_credential_context,
+                self.shared_object_cache_bytes,
+                self.shared_footer_cache,
+            )
+        })
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct MemoryCatalogConfig {
     name: Option<String>,
     warehouse: String,

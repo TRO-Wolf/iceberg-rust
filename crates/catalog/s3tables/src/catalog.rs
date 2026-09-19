@@ -46,7 +46,7 @@ use crate::commit_transport::{
     LiveS3TablesCommitTransport, S3TablesCommitSend, S3TablesCommitTransport, S3TablesUpdateCall,
     map_s3tables_commit_send,
 };
-use crate::utils::create_sdk_config;
+use crate::utils::{create_sdk_config, from_aws_sdk_error};
 
 /// S3Tables table bucket ARN property
 pub const S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN: &str = "table_bucket_arn";
@@ -979,15 +979,6 @@ impl S3TablesCatalog {
             harness.publish(table.clone());
         }
     }
-}
-
-/// Format AWS SDK error into iceberg error
-pub(crate) fn from_aws_sdk_error<T>(error: aws_sdk_s3tables::error::SdkError<T>) -> Error
-where T: std::fmt::Debug {
-    Error::new(
-        ErrorKind::Unexpected,
-        format!("Operation failed for hitting aws sdk error: {error:?}"),
-    )
 }
 
 #[cfg(test)]

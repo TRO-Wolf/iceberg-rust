@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_s3tables::config::Credentials;
+use iceberg::{Error, ErrorKind};
 
 /// Property aws profile name
 pub const AWS_PROFILE_NAME: &str = "profile_name";
@@ -68,4 +69,12 @@ pub(crate) async fn create_sdk_config(
     }
 
     config.load().await
+}
+
+pub(crate) fn from_aws_sdk_error<T>(error: aws_sdk_s3tables::error::SdkError<T>) -> Error
+where T: std::fmt::Debug {
+    Error::new(
+        ErrorKind::Unexpected,
+        format!("Operation failed for hitting aws sdk error: {error:?}"),
+    )
 }
