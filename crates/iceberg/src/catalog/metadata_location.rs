@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
 
 use uuid::Uuid;
 
+use crate::spec::{TableMetadata, TableProperties};
+use crate::utils::strip_trailing_slash;
 use crate::{Error, ErrorKind, Result};
 
 /// Helper for parsing a metadata JSON location under `<table>/metadata/`.
@@ -28,10 +31,28 @@ use crate::{Error, ErrorKind, Result};
 /// `v<version>.metadata.json` (Java `HadoopTableOperations`, row R167).
 #[derive(Clone, Debug, PartialEq)]
 pub struct MetadataLocation {
-    table_location: String,
+    metadata_dir: String,
     version: i32,
     /// `None` is the Hadoop convention. A uuid is the Hive/REST convention.
     id: Option<Uuid>,
+}
+
+pub(crate) fn write_metadata_dir(
+    table_location: &str,
+    properties: &HashMap<String, String>,
+) -> Result<String> {
+    match properties.get(TableProperties::PROPERTY_WRITE_METADATA_LOCATION) {
+        Some(dir) => strip_trailing_slash(dir).map(str::to_string),
+        None => Ok(format!("{table_location}/metadata")),
+    }
+}
+
+pub(crate) fn metadata_file_location(metadata: &TableMetadata, file_name: &str) -> Result<String> {
+    Ok(format!(
+        "{}/{}",
+        write_metadata_dir(metadata.location(), metadata.properties())?,
+        file_name
+    ))
 }
 
 impl MetadataLocation {
@@ -39,10 +60,19 @@ impl MetadataLocation {
     /// Only used for creating a new table. For updates, see `with_next_version`.
     pub fn new_with_table_location(table_location: impl ToString) -> Self {
         Self {
-            table_location: table_location.to_string(),
+            metadata_dir: format!("{}/metadata", table_location.to_string()),
             version: 0,
             id: Some(Uuid::new_v4()),
         }
+    }
+
+    /// Creates a new metadata location for `metadata`, honoring its `write.metadata.path`.
+    pub fn for_metadata(metadata: &TableMetadata) -> Result<Self> {
+        Ok(Self {
+            metadata_dir: write_metadata_dir(metadata.location(), metadata.properties())?,
+            version: 0,
+            id: Some(Uuid::new_v4()),
+        })
     }
 
     /// Creates a new metadata location for an updated metadata file.
@@ -51,7 +81,7 @@ impl MetadataLocation {
     /// The next Hadoop file is uncompressed `.metadata.json` even if the current file was gzip.
     pub fn with_next_version(&self) -> Self {
         Self {
-            table_location: self.table_location.clone(),
+            metadata_dir: self.metadata_dir.clone(),
             version: self.version.wrapping_add(1),
             id: self.id.map(|_| Uuid::new_v4()),
         }
@@ -62,15 +92,36 @@ impl MetadataLocation {
         self.id.is_none()
     }
 
+    pub(crate) fn rebased(&self, metadata: &TableMetadata) -> Result<Self> {
+        Ok(Self {
+            metadata_dir: write_metadata_dir(metadata.location(), metadata.properties())?,
+            ..self.clone()
+        })
+    }
+
     pub(crate) fn hadoop_version_siblings(&self) -> Option<[String; 2]> {
         if !self.is_hadoop_convention() {
             return None;
         }
-        let dir = format!("{}/metadata", self.table_location);
         Some([
-            format!("{}/v{}.gz.metadata.json", dir, self.version),
-            format!("{}/v{}.metadata.json.gz", dir, self.version),
+            format!("{}/v{}.gz.metadata.json", self.metadata_dir, self.version),
+            format!("{}/v{}.metadata.json.gz", self.metadata_dir, self.version),
         ])
+    }
+
+    /// Parses a metadata JSON location in ANY directory (a table configured with
+    /// `write.metadata.path` keeps no `/metadata` parent).
+    pub(crate) fn from_file_path(s: &str) -> Result<Self> {
+        let (dir, file_name) = s.rsplit_once('/').ok_or(Error::new(
+            ErrorKind::Unexpected,
+            format!("Invalid metadata location: {s}"),
+        ))?;
+        let (version, id) = Self::parse_file_name(file_name)?;
+        Ok(MetadataLocation {
+            metadata_dir: dir.to_string(),
+            version,
+            id,
+        })
     }
 
     fn parse_metadata_path_prefix(path: &str) -> Result<String> {
@@ -117,14 +168,10 @@ impl Display for MetadataLocation {
         match self.id {
             Some(id) => write!(
                 f,
-                "{}/metadata/{:0>5}-{}.metadata.json",
-                self.table_location, self.version, id
+                "{}/{:0>5}-{}.metadata.json",
+                self.metadata_dir, self.version, id
             ),
-            None => write!(
-                f,
-                "{}/metadata/v{}.metadata.json",
-                self.table_location, self.version
-            ),
+            None => write!(f, "{}/v{}.metadata.json", self.metadata_dir, self.version),
         }
     }
 }
@@ -138,11 +185,11 @@ impl FromStr for MetadataLocation {
             format!("Invalid metadata location: {s}"),
         ))?;
 
-        let prefix = Self::parse_metadata_path_prefix(path)?;
+        Self::parse_metadata_path_prefix(path)?;
         let (version, id) = Self::parse_file_name(file_name)?;
 
         Ok(MetadataLocation {
-            table_location: prefix,
+            metadata_dir: path.to_string(),
             version,
             id,
         })
@@ -164,7 +211,7 @@ mod test {
             (
                 "/metadata/1234567-2cd22b57-5127-4198-92ba-e4e67c79821b.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "".to_string(),
+                    metadata_dir: "/metadata".to_string(),
                     version: 1234567,
                     id: Some(Uuid::from_str("2cd22b57-5127-4198-92ba-e4e67c79821b").unwrap()),
                 }),
@@ -173,7 +220,7 @@ mod test {
             (
                 "/abc/metadata/1234567-2cd22b57-5127-4198-92ba-e4e67c79821b.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 1234567,
                     id: Some(Uuid::from_str("2cd22b57-5127-4198-92ba-e4e67c79821b").unwrap()),
                 }),
@@ -182,7 +229,7 @@ mod test {
             (
                 "/abc/def/metadata/1234567-2cd22b57-5127-4198-92ba-e4e67c79821b.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "/abc/def".to_string(),
+                    metadata_dir: "/abc/def/metadata".to_string(),
                     version: 1234567,
                     id: Some(Uuid::from_str("2cd22b57-5127-4198-92ba-e4e67c79821b").unwrap()),
                 }),
@@ -191,7 +238,7 @@ mod test {
             (
                 "https://127.0.0.1/metadata/1234567-2cd22b57-5127-4198-92ba-e4e67c79821b.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "https://127.0.0.1".to_string(),
+                    metadata_dir: "https://127.0.0.1/metadata".to_string(),
                     version: 1234567,
                     id: Some(Uuid::from_str("2cd22b57-5127-4198-92ba-e4e67c79821b").unwrap()),
                 }),
@@ -200,7 +247,7 @@ mod test {
             (
                 "/abc/metadata/1234567-81056704-ce5b-41c4-bb83-eb6408081af6.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 1234567,
                     id: Some(Uuid::from_str("81056704-ce5b-41c4-bb83-eb6408081af6").unwrap()),
                 }),
@@ -209,7 +256,7 @@ mod test {
             (
                 "/abc/metadata/00000-2cd22b57-5127-4198-92ba-e4e67c79821b.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 0,
                     id: Some(Uuid::from_str("2cd22b57-5127-4198-92ba-e4e67c79821b").unwrap()),
                 }),
@@ -246,7 +293,7 @@ mod test {
             (
                 "/abc/metadata/v3.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 3,
                     id: None,
                 }),
@@ -254,7 +301,7 @@ mod test {
             (
                 "/abc/metadata/v0.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 0,
                     id: None,
                 }),
@@ -262,7 +309,7 @@ mod test {
             (
                 "/abc/metadata/v12.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 12,
                     id: None,
                 }),
@@ -270,7 +317,7 @@ mod test {
             (
                 "/abc/metadata/v00003.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 3,
                     id: None,
                 }),
@@ -278,7 +325,7 @@ mod test {
             (
                 "/abc/metadata/00003-2cd22b57-5127-4198-92ba-e4e67c79821b.gz.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 3,
                     id: Some(Uuid::from_str("2cd22b57-5127-4198-92ba-e4e67c79821b").unwrap()),
                 }),
@@ -286,7 +333,7 @@ mod test {
             (
                 "/abc/metadata/00003-2cd22b57-5127-4198-92ba-e4e67c79821b.metadata.json.gz",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 3,
                     id: Some(Uuid::from_str("2cd22b57-5127-4198-92ba-e4e67c79821b").unwrap()),
                 }),
@@ -294,7 +341,7 @@ mod test {
             (
                 "/abc/metadata/v3.gz.metadata.json",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 3,
                     id: None,
                 }),
@@ -302,7 +349,7 @@ mod test {
             (
                 "/abc/metadata/v3.metadata.json.gz",
                 Ok(MetadataLocation {
-                    table_location: "/abc".to_string(),
+                    metadata_dir: "/abc/metadata".to_string(),
                     version: 3,
                     id: None,
                 }),
@@ -347,7 +394,7 @@ mod test {
             let next = MetadataLocation::from_str(&input.to_string())
                 .unwrap()
                 .with_next_version();
-            assert_eq!(next.table_location, input.table_location);
+            assert_eq!(next.metadata_dir, input.metadata_dir);
             assert_eq!(next.version, input.version + 1);
             assert_ne!(next.id, input.id);
             assert!(next.id.is_some());
@@ -359,7 +406,7 @@ mod test {
         let current =
             MetadataLocation::from_str("/wh/t/metadata/v3.metadata.json").expect("parse hadoop v3");
         let next = current.with_next_version();
-        assert_eq!(next.table_location, "/wh/t");
+        assert_eq!(next.metadata_dir, "/wh/t/metadata");
         assert_eq!(next.version, 4);
         assert_eq!(next.id, None);
         assert_eq!(next.to_string(), "/wh/t/metadata/v4.metadata.json");
@@ -537,16 +584,44 @@ mod test {
     }
 
     #[test]
-    fn new_with_table_location_and_properties_honors_write_metadata_path() {
+    fn for_metadata_honors_write_metadata_path() {
         use std::collections::HashMap;
 
-        let relocated = MetadataLocation::new_with_table_location_and_properties(
-            "/wh/ns/t",
-            &HashMap::from([(
-                "write.metadata.path".to_string(),
-                "/alt-meta/".to_string(),
-            )]),
-        )
+        use crate::spec::{FormatVersion, PartitionSpec, StructType, TableMetadata};
+
+        fn metadata(properties: HashMap<String, String>) -> TableMetadata {
+            TableMetadata {
+                format_version: FormatVersion::V2,
+                table_uuid: Uuid::new_v4(),
+                location: "/wh/ns/t".to_string(),
+                last_updated_ms: 0,
+                last_column_id: 1,
+                schemas: HashMap::new(),
+                current_schema_id: 1,
+                partition_specs: HashMap::new(),
+                default_spec: PartitionSpec::unpartition_spec().into(),
+                default_partition_type: StructType::new(vec![]),
+                last_partition_id: 1000,
+                default_sort_order_id: 0,
+                sort_orders: HashMap::new(),
+                snapshots: HashMap::new(),
+                current_snapshot_id: None,
+                last_sequence_number: 1,
+                properties,
+                snapshot_log: Vec::new(),
+                metadata_log: vec![],
+                refs: HashMap::new(),
+                statistics: HashMap::new(),
+                partition_statistics: HashMap::new(),
+                encryption_keys: HashMap::new(),
+                next_row_id: 0,
+            }
+        }
+
+        let relocated = MetadataLocation::for_metadata(&metadata(HashMap::from([(
+            "write.metadata.path".to_string(),
+            "/alt-meta/".to_string(),
+        )])))
         .expect("relocated create location");
         let rendered = relocated.to_string();
         assert!(
@@ -554,11 +629,8 @@ mod test {
             "write.metadata.path is the complete directory with trailing slash stripped, got {rendered}"
         );
 
-        let plain = MetadataLocation::new_with_table_location_and_properties(
-            "/wh/ns/t",
-            &HashMap::new(),
-        )
-        .expect("default create location");
+        let plain = MetadataLocation::for_metadata(&metadata(HashMap::new()))
+            .expect("default create location");
         let rendered = plain.to_string();
         assert!(
             rendered.starts_with("/wh/ns/t/metadata/00000-"),
@@ -605,7 +677,10 @@ mod test {
             encryption_keys: HashMap::new(),
             next_row_id: 0,
         };
-        let moved = base.with_next_version().rebased(&metadata).expect("rebased");
+        let moved = base
+            .with_next_version()
+            .rebased(&metadata)
+            .expect("rebased");
         let rendered = moved.to_string();
         assert!(
             rendered.starts_with("/alt-meta/00001-") && rendered.ends_with(".metadata.json"),
@@ -643,10 +718,7 @@ mod test {
         let catalog = MemoryCatalogBuilder::default()
             .load(
                 "mem",
-                HashMap::from([(
-                    MEMORY_CATALOG_WAREHOUSE.to_string(),
-                    "/wh".to_string(),
-                )]),
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), "/wh".to_string())]),
             )
             .await
             .expect("load catalog");
@@ -664,7 +736,7 @@ mod test {
             ])
             .build()
             .expect("schema");
-        let spec = PartitionSpec::builder(schema.clone().into())
+        let spec = PartitionSpec::builder(schema.clone())
             .add_partition_field("cat", "cat", Transform::Identity)
             .expect("spec field")
             .build()

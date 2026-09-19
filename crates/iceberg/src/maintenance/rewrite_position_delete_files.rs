@@ -69,7 +69,7 @@ use crate::writer::base_writer::position_delete_writer::{
 };
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
+    DefaultFileNameGenerator, FileNameGenerator, LocationGenerator, TableLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
@@ -664,7 +664,7 @@ impl RewritePositionDeleteFiles {
             writer_config: PositionDeleteWriterConfig::new()?,
             metrics_config: Arc::new(MetricsConfig::for_position_delete_table(metadata)?),
             parquet_properties: position_delete_writer_properties_for(metadata.properties())?,
-            location_gen: DefaultLocationGenerator::new(metadata.clone())?,
+            location_gen: TableLocationGenerator::new(metadata)?,
             file_name_gen: DefaultFileNameGenerator::new(
                 "compacted-pos-del".to_string(),
                 Some(uuid::Uuid::now_v7().to_string()),
@@ -979,7 +979,7 @@ struct GroupWriteFactory {
     writer_config: PositionDeleteWriterConfig,
     metrics_config: Arc<MetricsConfig>,
     parquet_properties: WriterProperties,
-    location_gen: DefaultLocationGenerator,
+    location_gen: TableLocationGenerator,
     file_name_gen: DefaultFileNameGenerator,
     file_io: FileIO,
     write_max_file_size: u64,

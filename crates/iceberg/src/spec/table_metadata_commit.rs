@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::str::FromStr;
-
 use bytes::Bytes;
 
 use super::table_metadata::TableMetadata;
@@ -56,7 +54,7 @@ impl ViewMetadata {
 }
 
 fn is_hadoop_location(location: &str) -> bool {
-    MetadataLocation::from_str(location).is_ok_and(|parsed| parsed.is_hadoop_convention())
+    MetadataLocation::from_file_path(location).is_ok_and(|parsed| parsed.is_hadoop_convention())
 }
 
 fn version_exists_conflict(location: &str, existing: &str) -> Error {
@@ -74,7 +72,7 @@ async fn write_hadoop_version_bytes(
     location: &str,
     payload: Bytes,
 ) -> Result<()> {
-    if let Ok(parsed) = MetadataLocation::from_str(location)
+    if let Ok(parsed) = MetadataLocation::from_file_path(location)
         && let Some(siblings) = parsed.hadoop_version_siblings()
     {
         for sibling in &siblings {

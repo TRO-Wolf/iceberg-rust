@@ -114,7 +114,7 @@ use crate::writer::base_writer::position_delete_writer::{
 };
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, TableLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
@@ -497,7 +497,7 @@ impl ConvertEqualityDeleteFiles {
             .clone();
 
         let config = PositionDeleteWriterConfig::new()?;
-        let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
+        let location_gen = TableLocationGenerator::new(metadata)?;
         let file_name_gen = DefaultFileNameGenerator::new(
             "converted-pos-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),

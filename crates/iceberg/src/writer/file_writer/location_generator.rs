@@ -17,11 +17,13 @@
 
 //! This module contains the location generator and file name generator for generating path of data file.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use crate::Result;
-use crate::spec::{DataFileFormat, PartitionKey, TableMetadata};
+use crate::spec::{DataFileFormat, PartitionKey, TableMetadata, TableProperties};
+use crate::utils::strip_trailing_slash;
+use crate::{Error, ErrorKind, Result};
 
 /// `LocationGenerator` used to generate the location of data file.
 pub trait LocationGenerator: Clone + Send + Sync + 'static {
@@ -41,8 +43,6 @@ pub trait LocationGenerator: Clone + Send + Sync + 'static {
     fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String;
 }
 
-const WRITE_DATA_LOCATION: &str = "write.data.path";
-const WRITE_FOLDER_STORAGE_LOCATION: &str = "write.folder-storage.path";
 const DEFAULT_DATA_DIR: &str = "/data";
 
 #[derive(Clone, Debug)]
@@ -58,8 +58,8 @@ impl DefaultLocationGenerator {
         let table_location = table_metadata.location();
         let prop = table_metadata.properties();
         let configured_data_location = prop
-            .get(WRITE_DATA_LOCATION)
-            .or(prop.get(WRITE_FOLDER_STORAGE_LOCATION));
+            .get(TableProperties::PROPERTY_WRITE_DATA_LOCATION)
+            .or(prop.get(TableProperties::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION));
         let data_location = if let Some(data_location) = configured_data_location {
             data_location.clone()
         } else {
@@ -89,6 +89,211 @@ impl LocationGenerator for DefaultLocationGenerator {
                 partition_key.unwrap().to_path(),
                 file_name
             )
+        }
+    }
+}
+
+fn property_as_boolean(properties: &HashMap<String, String>, key: &str, default: bool) -> bool {
+    properties
+        .get(key)
+        .map_or(default, |value| value.eq_ignore_ascii_case("true"))
+}
+
+fn deprecated_property_error(name: &str) -> Error {
+    Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "Property '{name}' has been deprecated and will be removed in 2.0.0, use 'write.data.path' instead."
+        ),
+    )
+}
+
+fn default_data_location(
+    properties: &HashMap<String, String>,
+    table_location: &str,
+) -> Result<String> {
+    let raw = if let Some(value) = properties.get(TableProperties::PROPERTY_WRITE_DATA_LOCATION) {
+        value.clone()
+    } else {
+        if properties.contains_key(TableProperties::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION) {
+            return Err(deprecated_property_error(
+                TableProperties::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION,
+            ));
+        }
+        format!("{table_location}{DEFAULT_DATA_DIR}")
+    };
+    strip_trailing_slash(&raw).map(str::to_string)
+}
+
+fn object_store_data_location(
+    properties: &HashMap<String, String>,
+    table_location: &str,
+) -> Result<String> {
+    let raw = if let Some(value) = properties.get(TableProperties::PROPERTY_WRITE_DATA_LOCATION) {
+        value.clone()
+    } else {
+        if properties.contains_key(TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PATH) {
+            return Err(deprecated_property_error(
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PATH,
+            ));
+        }
+        if properties.contains_key(TableProperties::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION) {
+            return Err(deprecated_property_error(
+                TableProperties::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION,
+            ));
+        }
+        format!("{table_location}{DEFAULT_DATA_DIR}")
+    };
+    strip_trailing_slash(&raw).map(str::to_string)
+}
+
+fn path_context(table_location: &str) -> String {
+    let path = match table_location.split_once("://") {
+        Some((_, rest)) => rest.split_once('/').map(|(_, path)| path).unwrap_or(""),
+        None => match table_location.split_once(':') {
+            Some((_, rest)) => rest,
+            None => table_location,
+        },
+    };
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    match segments.len() {
+        0 => String::new(),
+        1 if path.starts_with('/') => format!("/{}", segments[0]),
+        1 => segments[0].to_string(),
+        _ => format!(
+            "{}/{}",
+            segments[segments.len() - 2],
+            segments[segments.len() - 1]
+        ),
+    }
+}
+
+fn dirs_from_hash(binary: &str) -> String {
+    let mut dirs = String::new();
+    for i in (0..12).step_by(4) {
+        if i > 0 {
+            dirs.push('/');
+        }
+        dirs.push_str(&binary[i..(i + 4).min(binary.len())]);
+    }
+    if binary.len() > 12 {
+        dirs.push('/');
+        dirs.push_str(&binary[12..]);
+    }
+    dirs
+}
+
+fn compute_hash(file_name: &str) -> String {
+    let hash = murmur3::murmur3_32(&mut file_name.as_bytes(), 0)
+        .expect("murmur3_32 over a byte slice cannot fail");
+    let binary = format!("{:032b}", hash | 0x8000_0000);
+    dirs_from_hash(&binary[binary.len() - 20..])
+}
+
+#[allow(missing_docs)]
+#[derive(Clone, Debug)]
+pub struct ObjectStoreLocationGenerator {
+    storage_location: String,
+    context: Option<String>,
+    include_partition_paths: bool,
+}
+
+impl ObjectStoreLocationGenerator {
+    #[allow(missing_docs)]
+    pub fn new(table_location: &str, properties: &HashMap<String, String>) -> Result<Self> {
+        let storage_location = object_store_data_location(properties, table_location)?;
+        let context = if storage_location.starts_with(table_location) {
+            None
+        } else {
+            Some(path_context(table_location))
+        };
+        let include_partition_paths = property_as_boolean(
+            properties,
+            TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS,
+            true,
+        );
+        Ok(Self {
+            storage_location,
+            context,
+            include_partition_paths,
+        })
+    }
+}
+
+impl LocationGenerator for ObjectStoreLocationGenerator {
+    fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
+        let file_name = match partition_key {
+            Some(key)
+                if self.include_partition_paths
+                    && !PartitionKey::is_effectively_none(Some(key)) =>
+            {
+                format!("{}/{}", key.to_path(), file_name)
+            }
+            _ => file_name.to_string(),
+        };
+        let hash = compute_hash(&file_name);
+        match &self.context {
+            Some(context) => format!(
+                "{}/{}/{}/{}",
+                self.storage_location, hash, context, file_name
+            ),
+            None if self.include_partition_paths => {
+                format!("{}/{}/{}", self.storage_location, hash, file_name)
+            }
+            None => format!("{}/{}-{}", self.storage_location, hash, file_name),
+        }
+    }
+}
+
+#[allow(missing_docs)]
+#[derive(Clone, Debug)]
+pub enum TableLocationGenerator {
+    #[allow(missing_docs)]
+    Default(DefaultLocationGenerator),
+    #[allow(missing_docs)]
+    ObjectStore(ObjectStoreLocationGenerator),
+}
+
+impl TableLocationGenerator {
+    #[allow(missing_docs)]
+    pub fn new(table_metadata: &TableMetadata) -> Result<Self> {
+        let table_location = strip_trailing_slash(table_metadata.location())?;
+        let properties = table_metadata.properties();
+        if let Some(implementation) =
+            properties.get(TableProperties::PROPERTY_WRITE_LOCATION_PROVIDER_IMPL)
+        {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "write.location-provider.impl names the Java class '{implementation}', which cannot be instantiated here; remove the property to use the default or object-storage location provider"
+                ),
+            ));
+        }
+        if property_as_boolean(
+            properties,
+            TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+            false,
+        ) {
+            Ok(Self::ObjectStore(ObjectStoreLocationGenerator::new(
+                table_location,
+                properties,
+            )?))
+        } else {
+            Ok(Self::Default(DefaultLocationGenerator::with_data_location(
+                default_data_location(properties, table_location)?,
+            )))
+        }
+    }
+}
+
+impl LocationGenerator for TableLocationGenerator {
+    fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
+        match self {
+            Self::Default(generator) => generator.generate_location(partition_key, file_name),
+            Self::ObjectStore(generator) => generator.generate_location(partition_key, file_name),
         }
     }
 }
@@ -151,11 +356,10 @@ pub(crate) mod test {
     use crate::ErrorKind;
     use crate::spec::{
         FormatVersion, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
-        Struct, StructType, TableMetadata, Transform, Type,
+        Struct, StructType, TableMetadata, TableProperties, Transform, Type,
     };
     use crate::writer::file_writer::location_generator::{
         DefaultLocationGenerator, FileNameGenerator, TableLocationGenerator,
-        WRITE_DATA_LOCATION, WRITE_FOLDER_STORAGE_LOCATION,
     };
 
     #[test]
@@ -202,7 +406,7 @@ pub(crate) mod test {
 
         // test custom data location
         table_metadata.properties.insert(
-            WRITE_FOLDER_STORAGE_LOCATION.to_string(),
+            TableProperties::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION.to_string(),
             "s3://data.db/table/data_1".to_string(),
         );
         let location_generator =
@@ -215,7 +419,7 @@ pub(crate) mod test {
         );
 
         table_metadata.properties.insert(
-            WRITE_DATA_LOCATION.to_string(),
+            TableProperties::PROPERTY_WRITE_DATA_LOCATION.to_string(),
             "s3://data.db/table/data_2".to_string(),
         );
         let location_generator =
@@ -228,7 +432,7 @@ pub(crate) mod test {
         );
 
         table_metadata.properties.insert(
-            WRITE_DATA_LOCATION.to_string(),
+            TableProperties::PROPERTY_WRITE_DATA_LOCATION.to_string(),
             // invalid table location
             "s3://data.db/data_3".to_string(),
         );

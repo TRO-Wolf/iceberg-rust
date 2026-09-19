@@ -21,6 +21,7 @@ use std::ops::RangeFrom;
 
 use uuid::Uuid;
 
+use crate::catalog::metadata_file_location;
 use crate::error::Result;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::visitors::residual_evaluator::ResidualEvaluator;
@@ -37,7 +38,6 @@ use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
-const META_ROOT_PATH: &str = "metadata";
 #[path = "replace_record_count.rs"]
 mod replace_record_count;
 
@@ -374,19 +374,16 @@ impl<'a> SnapshotProducer<'a> {
         partition_spec: PartitionSpecRef,
         content: ManifestContentType,
     ) -> Result<ManifestWriter> {
-        let new_manifest_path = format!(
-            "{}/{}/{}-m{}.{}",
-            self.table.metadata().location(),
-            META_ROOT_PATH,
-            self.commit_uuid,
-            self.manifest_counter.next().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Exhausted manifest file name counter",
-                )
-            })?,
-            DataFileFormat::Avro
-        );
+        let counter = self.manifest_counter.next().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Exhausted manifest file name counter",
+            )
+        })?;
+        let new_manifest_path = metadata_file_location(
+            self.table.metadata(),
+            &format!("{}-m{}.{}", self.commit_uuid, counter, DataFileFormat::Avro),
+        )?;
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
         let builder = ManifestWriterBuilder::new(
             output_file,
@@ -1155,19 +1152,16 @@ impl<'a> SnapshotProducer<'a> {
             .as_ref()
             .clone();
 
-        let new_manifest_path = format!(
-            "{}/{}/{}-m{}.{}",
-            self.table.metadata().location(),
-            META_ROOT_PATH,
-            self.commit_uuid,
-            self.manifest_counter.next().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Exhausted manifest file name counter",
-                )
-            })?,
-            DataFileFormat::Avro
-        );
+        let counter = self.manifest_counter.next().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Exhausted manifest file name counter",
+            )
+        })?;
+        let new_manifest_path = metadata_file_location(
+            self.table.metadata(),
+            &format!("{}-m{}.{}", self.commit_uuid, counter, DataFileFormat::Avro),
+        )?;
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
         let builder = ManifestWriterBuilder::new(
             output_file,
@@ -1313,15 +1307,16 @@ impl<'a> SnapshotProducer<'a> {
         update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)
     }
 
-    fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
-        format!(
-            "{}/{}/snap-{}-{}-{}.{}",
-            self.table.metadata().location(),
-            META_ROOT_PATH,
-            self.snapshot_id,
-            attempt,
-            self.commit_uuid,
-            DataFileFormat::Avro
+    fn generate_manifest_list_file_path(&self, attempt: i64) -> Result<String> {
+        metadata_file_location(
+            self.table.metadata(),
+            &format!(
+                "snap-{}-{}-{}.{}",
+                self.snapshot_id,
+                attempt,
+                self.commit_uuid,
+                DataFileFormat::Avro
+            ),
         )
     }
 
@@ -1347,7 +1342,7 @@ impl<'a> SnapshotProducer<'a> {
             self.removed_delete_files = self.resolve_removed_delete_files(&requested).await?;
         }
 
-        let manifest_list_path = self.generate_manifest_list_file_path(0);
+        let manifest_list_path = self.generate_manifest_list_file_path(0)?;
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
         let parent_snapshot_id = self.parent_snapshot_id();

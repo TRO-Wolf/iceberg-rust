@@ -237,20 +237,46 @@ preserved default-shaped generator).
    object-store; deprecated-property checks per provider, Java short-circuit order).
 3. `catalog/metadata_location.rs`: `MetadataLocation` field becomes `metadata_dir`;
   `from_file_path` (lenient parent) alongside strict `from_str`;
-   `new_with_table_location_and_properties`; `rebased(table_location, properties)`;
-   `write_metadata_dir`/`metadata_file_location` helpers (Java `metadataFileLocation`).
+   `for_metadata(&TableMetadata)` (Java `metadataFileLocation(newMetadata, …)` —
+   the built metadata already carries location + properties, keeping every
+   catalog call site line-neutral under the file-size ceilings);
+   `rebased(&metadata)`; `write_metadata_dir`/`metadata_file_location` helpers.
 4. `catalog/mod.rs` `TableCommit::apply`: parse with `from_file_path`, `with_next_version`,
    `rebased` against the NEW metadata's location+properties.
 5. `transaction/staged_table.rs`: same treatment at create/replace/apply_locally;
-   `hadoop_staged_location` parses with `from_file_path`.
+   `hadoop_staged_location` parses with `from_file_path`. `keeps_location` retained:
+   a relocated staged replace restarts at v0 under the new location (pre-existing
+   fork rule, pinned by `replace_restarts_versioning_under_a_different_caller_location`).
 6. `spec/table_metadata_commit.rs`: hadoop-convention detection via `from_file_path`.
 7. `snapshot.rs`: `metadata_file_location(metadata, name)` at the three manifest sites.
-8. Every catalog `create_table`: `new_with_table_location_and_properties(location,
-   metadata.properties())` — memory, hms, glue, s3tables, sql (view sites unchanged).
+8. Every catalog `create_table`: `MetadataLocation::for_metadata(&metadata)` —
+   memory, hms, glue, s3tables, sql (view sites unchanged).
 9. Wire `TableLocationGenerator::new` into the fork's own writers + maintenance
    (`rewrite_data_files_write`, `rewrite_position_delete_files{,_v3}`,
    `partition_key_audit`, `convert_equality_delete_files`, `delete_vector_container`,
    datafusion `write.rs`/`row_lineage.rs`/`delete_position_deletes.rs`).
+
+## Implementation landed (step 3)
+
+`TableLocationGenerator::new(&TableMetadata) -> Result<Self>` resolves the Java
+provider: `write.location-provider.impl` present → `ErrorKind::FeatureUnsupported`
+loud refusal; `write.object-storage.enabled=true` → `ObjectStoreLocationGenerator`;
+otherwise `DefaultLocationGenerator` (kept public for existing callers and test
+fixtures). Object-store paths are `storage/hash-dirs[/context][/partition]/file`
+with `context` = last two table-location components when data storage is outside
+the table location and suppressed under it; `partitioned-paths=false` yields
+`storage/hash-file`. Deprecated `write.folder-storage.path` and (object-store arm)
+`write.object-storage.path` are rejected unless `write.data.path` short-circuits
+(Java constructor order). `MetadataLocation` now carries `metadata_dir` (the
+`/metadata` suffix moved into the dir), `from_file_path` accepts ANY parent dir,
+and every metadata-writing surface routes through `write_metadata_dir`:
+`TableCommit::apply`, staged create/replace/`apply_locally`, the three
+`SnapshotProducer` manifest/manifest-list sites, and all five catalog
+`create_table` paths. Production call sites switched to the resolver: the five
+maintenance writers, `delete_vector_container`, and the three DataFusion write
+paths; test-only fixtures keep `DefaultLocationGenerator`. `memory/catalog.rs`
+table create unchanged for views. Size ceilings ratcheted down in
+`scripts/check_rust_file_size.py` for the five files that shrank.
 
 ## Proof status
 
@@ -259,8 +285,9 @@ preserved default-shaped generator).
 | Java rules extracted from 1.11.0 bytecode | PROVEN (bytecode above) |
 | Hash algorithm reproduces every oracle dir | PROVEN (independent check, 9/9 names) |
 | Fork currently ignores the three properties | PROVEN (no readers exist) |
-| Resolved provider answers every oracle data cell | OPEN — step 2/3 |
-| `write.metadata.path` honored for JSON/manifests/manifest lists on the memory catalog | OPEN — step 2/3 |
-| Relocated metadata pointer round-trips through `MetadataLocation` parsing | OPEN — step 2/3 |
-| `write.location-provider.impl` refused with a typed error | OPEN — step 2/3 |
+| Resolved provider answers every oracle data cell | PROVEN — `cargo test -p iceberg --lib location`, 14 `table_location_generator_*` pins green |
+| `write.metadata.path` honored for JSON/manifests/manifest lists on the memory catalog | PROVEN — `write_metadata_path_relocates_metadata_files_on_memory_catalog` green |
+| Relocated metadata pointer round-trips through `MetadataLocation` parsing | PROVEN — `from_file_path_accepts_relocated_metadata_dir`, `rebased_moves_dir_with_write_metadata_path` green |
+| `write.location-provider.impl` refused with a typed error | PROVEN — `table_location_generator_refuses_java_provider_impl` green (`FeatureUnsupported`) |
 | Mutation pass (hash, flag, context, metadata path) drives pins red then green | OPEN — step 4 |
+| No GAP_MATRIX row exists for location providers | PROVEN — grep of `docs/parity/GAP_MATRIX.md`; the ledger is this unit's home per the brief |

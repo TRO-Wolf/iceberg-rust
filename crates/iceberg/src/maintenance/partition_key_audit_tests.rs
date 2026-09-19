@@ -201,7 +201,7 @@ async fn write_computed_files(table: &Table, batch: &RecordBatch) -> Vec<DataFil
     let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(schema.clone(), spec)
         .expect("build splitter");
     let location_generator =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+        TableLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_generator = DefaultFileNameGenerator::new(
         "clean".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -242,7 +242,7 @@ async fn write_position_delete_file(
 ) -> DataFile {
     let config = PositionDeleteWriterConfig::new().expect("position delete config");
     let location_generator =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+        TableLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_generator = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

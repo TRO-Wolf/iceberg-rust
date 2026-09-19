@@ -589,8 +589,7 @@ impl Catalog for HmsCatalog {
             .build()?
             .metadata;
 
-        let metadata_location =
-            MetadataLocation::new_with_table_location(location.clone()).to_string();
+        let metadata_location = MetadataLocation::for_metadata(&metadata)?.to_string();
 
         metadata.write_to(&self.file_io, &metadata_location).await?;
 
