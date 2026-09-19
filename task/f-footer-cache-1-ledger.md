@@ -290,4 +290,15 @@ All mutations applied, tested red, and reverted via `git checkout`; the footer-c
 
 ## Round-2 gates
 
-(Filled after the gate run — see hand-back for the authoritative list.)
+| Command | Result |
+|---|---|
+| `cargo test -p iceberg --lib footer_cache` | PASS — 20/20 |
+| `cargo test -p iceberg --lib arrow` | PASS — 498/498 (1 ignored) |
+| `cargo test -p iceberg --lib footer` | PASS — 46/46 |
+| `cargo test -p iceberg-datafusion --lib` | PASS — 301/301 (1 ignored) |
+| `cargo test -p iceberg-catalog-s3tables --lib footer` | PASS — 1/1 (`l001_footer_cache_default_off`) |
+| `cargo test -p iceberg-catalog-glue --lib footer` | PASS — 1/1 (`l001_footer_cache_default_off`) |
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy -p iceberg -p iceberg-datafusion -p iceberg-catalog-s3tables -p iceberg-catalog-glue --all-targets -- -D warnings` | clean |
+| `make check` (workspace clippy, taplo, machete, agent-artifacts, matrix-anchors, comment-blocks, rust-file-size) | clean — 554 files |
+| `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/pb-fork2 3962b0e8 HEAD` | `comment-ban hits=0` |
