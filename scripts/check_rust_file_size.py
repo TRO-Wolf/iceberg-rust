@@ -105,7 +105,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/transaction/rewrite_files.rs": 2458,
     "crates/iceberg/src/transaction/rewrite_manifests.rs": 1898,
     "crates/iceberg/src/transaction/row_delta.rs": 6366,
-    "crates/iceberg/src/transaction/snapshot.rs": 3350,
+    "crates/iceberg/src/transaction/snapshot.rs": 3349,
     "crates/iceberg/src/transaction/update_partition_spec.rs": 1263,
     "crates/iceberg/src/transaction/update_schema.rs": 3595,
     "crates/iceberg/src/transform/temporal.rs": 2792,
