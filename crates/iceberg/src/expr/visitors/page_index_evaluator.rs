@@ -170,31 +170,28 @@ impl<'a> PageIndexEvaluator<'a> {
         let row_counts = {
             // Caches row count calculations for columns that appear multiple times in
             // the predicate
-            match self.row_count_cache.get(&parquet_column_index) {
-                Some(count) => count.clone(),
-                None => {
-                    let Some(offset_index) = self.offset_index.get(parquet_column_index) else {
-                        // if we have a column index, we should always have an offset index.
-                        return Err(Error::new(
-                            ErrorKind::Unexpected,
-                            format!("Missing offset index for field id {field_id}"),
-                        ));
-                    };
+            if !self.row_count_cache.contains_key(&parquet_column_index) {
+                let Some(offset_index) = self.offset_index.get(parquet_column_index) else {
+                    // if we have a column index, we should always have an offset index.
+                    return Err(Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Missing offset index for field id {field_id}"),
+                    ));
+                };
 
-                    let count = self.calc_row_counts(offset_index);
-                    self.row_count_cache
-                        .insert(parquet_column_index, count.clone());
-
-                    count
-                }
+                let count = self.calc_row_counts(offset_index);
+                self.row_count_cache.insert(parquet_column_index, count);
             }
+            self.row_count_cache
+                .get(&parquet_column_index)
+                .expect("row counts just cached")
         };
 
         let Some(page_filter) = Self::apply_predicate_to_column_index(
             predicate,
             field_type,
             column_index,
-            &row_counts,
+            row_counts,
         )?
         else {
             return self.select_all_rows();
@@ -218,7 +215,7 @@ impl<'a> PageIndexEvaluator<'a> {
     /// Returns a list of row counts per page
     fn calc_row_counts(&self, offset_index: &OffsetIndexMetaData) -> Vec<usize> {
         let mut remaining_rows = self.row_group_metadata.num_rows() as usize;
-        let mut row_counts = Vec::with_capacity(self.offset_index.len());
+        let mut row_counts = Vec::with_capacity(offset_index.page_locations().len());
 
         let page_locations = offset_index.page_locations();
         for (idx, page_location) in page_locations.iter().enumerate() {
