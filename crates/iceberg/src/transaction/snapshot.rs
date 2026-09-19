@@ -29,9 +29,9 @@ use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
     ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter, ManifestWriterBuilder,
-    Operation, Schema, Snapshot, SnapshotRef, SnapshotReference, SnapshotRetention,
-    SnapshotSummaryCollector, Struct, StructType, Summary, TableMetadata, TableProperties,
-    update_snapshot_summaries,
+    Operation, PartitionSpecRef, Schema, Snapshot, SnapshotRef, SnapshotReference,
+    SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary, TableMetadata,
+    TableProperties, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -101,8 +101,6 @@ impl ManifestProcess for DefaultManifestProcess {
         _snapshot_produce: &mut SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
     ) -> Result<Vec<ManifestFile>> {
-        // Pass the manifest list through unchanged — the fast-append / single-manifest path. This MUST
-        // stay a no-op so `FastAppend` behavior is byte-identical to the pre-seam-change producer.
         Ok(manifests)
     }
 }
@@ -130,11 +128,6 @@ mod first_row_id_policy;
 
 pub(crate) use first_row_id_policy::FirstRowIdPolicy;
 
-/// An ADDED delete file paired with its OPTIONAL explicit DATA sequence number — the Rust analogue of
-/// Java's `Delegates.PendingDeleteFile` (a delete file wrapped with a nullable `dataSequenceNumber()`).
-/// `None` ⇒ the entry inherits the new snapshot's sequence number at read time (Java
-/// `addFile(DeleteFile)`); `Some(seq)` ⇒ the entry is written with that explicit data seq (Java
-/// `addFile(DeleteFile, long)` → `writeDeleteFileGroup`'s `writer.add(file, dataSeq)`).
 pub(crate) type PendingDeleteFile = (DataFile, Option<i64>);
 
 mod conflict_filter;
@@ -349,21 +342,14 @@ impl<'a> SnapshotProducer<'a> {
         self.snapshot_properties.extend(properties);
     }
 
-    /// Build a manifest writer for a brand-new manifest of `content` under `partition_spec_id`.
-    /// Java `BaseRewriteManifests.getWriter`.
-    ///
-    /// It keys on the partition-spec id directly, which is the difference from
-    /// [`SnapshotProducer::new_filtering_manifest_writer`], which keys off a source manifest. The
-    /// `content` axis mirrors Java's `writeDataManifests` against `writeDeleteManifests`.
-    pub(crate) fn new_cluster_manifest_writer(
-        &mut self,
+    pub(crate) fn cluster_partition_spec(
+        &self,
         partition_spec_id: i32,
-        content: ManifestContentType,
-    ) -> Result<ManifestWriter> {
-        let partition_spec = self
-            .table
+    ) -> Result<PartitionSpecRef> {
+        self.table
             .metadata()
             .partition_spec_by_id(partition_spec_id)
+            .cloned()
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
@@ -371,10 +357,23 @@ impl<'a> SnapshotProducer<'a> {
                         "Cannot rewrite manifests: unknown partition spec id {partition_spec_id}"
                     ),
                 )
-            })?
-            .as_ref()
-            .clone();
+            })
+    }
 
+    pub(crate) fn new_cluster_manifest_writer(
+        &mut self,
+        partition_spec_id: i32,
+        content: ManifestContentType,
+    ) -> Result<ManifestWriter> {
+        let partition_spec = self.cluster_partition_spec(partition_spec_id)?;
+        self.new_cluster_manifest_writer_for_spec(partition_spec, content)
+    }
+
+    pub(crate) fn new_cluster_manifest_writer_for_spec(
+        &mut self,
+        partition_spec: PartitionSpecRef,
+        content: ManifestContentType,
+    ) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",
             self.table.metadata().location(),
@@ -394,7 +393,7 @@ impl<'a> SnapshotProducer<'a> {
             Some(self.snapshot_id),
             self.key_metadata.clone(),
             self.table.metadata().current_schema().clone(),
-            partition_spec,
+            partition_spec.as_ref().clone(),
         );
         match self.table.metadata().format_version() {
             FormatVersion::V1 => Ok(builder.build_v1()),

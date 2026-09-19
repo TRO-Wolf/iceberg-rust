@@ -227,3 +227,36 @@ Implementation notes:
 Mutation obligations (step 4): (a) revert the content gate so deletes stay immune ⇒ the
 three cluster pins must go red; (b) re-stamp entries (`add_entry` path semantics) ⇒ the seq
 pins must go red.
+
+## 8. Round 2 — perf remediation (rv-rmd-perf findings)
+
+- **R-01 (deep clone per entry) — FIXED.** `perform_rewrite` no longer does
+  `entry.as_ref().clone()`. It calls `load_manifest_parts_with_schema_fallback` +
+  `apply_manifest_list_context` — the exact two halves of `ManifestFile::load_manifest` —
+  so live `ManifestEntry`s move by value straight into `add_existing_entry` with zero
+  clones. The data leg uses the identical loop, so both legs get it.
+- **R-02 (extra `Arc` wrap) — FIXED** by the same change: `Manifest::new` (which wraps
+  every entry in `Arc`) is never constructed; the decode still happens once via the same
+  `try_from_avro_bytes_with_schema_fallback` path `load_manifest` uses.
+- **R-04 (writer-per-key cost) — FIXED as scoped.** Cluster keys are interned:
+  `key_ids: HashMap<String, u32>` assigns each distinct `cluster_by` output a dense id, so
+  the per-entry maps (`open_estimates`, `open_writers`) hash `(u32, i32, ManifestContentType)`
+  instead of a `String` twice per append. `finish` sorts through the `keys: Vec<String>`
+  index, so output ordering is byte-identical to the previous `sort()`. A
+  `specs: HashMap<i32, PartitionSpecRef>` cache resolves each spec id once per rewrite via
+  the new `SnapshotProducer::cluster_partition_spec` and shares the `Arc`; writers are
+  built through `new_cluster_manifest_writer_for_spec(PartitionSpecRef, content)`.
+  `ManifestWriterBuilder::new` takes an owned `PartitionSpec`, so one deep spec clone per
+  writer creation remains — that is structurally required unless the builder/metadata
+  takes `PartitionSpecRef`, a spec-level change not in scope. The other three
+  `new_cluster_manifest_writer` call sites (merge_append, snapshot ×2) are unchanged: the
+  id-keyed method now delegates through the lookup.
+- **R-03 (streaming the manifest writer) — OPEN.** `ManifestWriter` buffers every entry in
+  `manifest_entries` and computes summary counts at `write_manifest_file`; streaming the
+  Avro body with incremental summaries is a spec-level writer refactor (manifest
+  serialization format path), not a small local change. Recorded OPEN.
+- **Module doc** — the "Delete manifests are immune" line now states the immunity is the
+  default and names the opt-in (edited in place, no new comment lines).
+- **Ceilings** — `snapshot.rs` lowered 3355 → 3354 (comment deletions in the same regions
+  the changes touched). `rewrite_manifests.rs` stays at 1901.
+- All 25 filtered `rewrite_manifests` tests re-run green; behavior unchanged, no new pins.
