@@ -131,5 +131,54 @@ NO `.with_jitter()`. Yields (`backoff/exponential.rs:204-253`):
 
 ## Status
 
-PROVEN so far: the bytecode facts above and the backon schedule. OPEN: the pins,
-the implementation, the mutation evidence — recorded after steps 2-4.
+PROVEN:
+
+- Java bytecode facts above (`javap -c -p` on `Tasks$Builder` +
+  `SnapshotProducer.commit`, jar `iceberg-spark-runtime-4.1_2.13-1.11.0.jar`).
+- `CommitRetryBackoff` (`crates/iceberg/src/transaction/commit_backoff.rs`)
+  implements the decoded loop as an `Iterator<Duration>` (backon `Backoff`
+  blanket impl covers it): `sleep = min(minWait * 2^(attempt-1), maxWait)` —
+  computed in `f64` and clamped to `[0, i32::MAX]` before `as u64`, the `d2i`
+  equivalent — `+ jitter` where jitter is `rand::rng().random_range(0..bound)`,
+  `bound = max(1, delay_ms / 10)` (`(int)(delayMs * 0.1)` == `delayMs / 10` for
+  all `delayMs < ~1e17`; the double `0.1` is `> 1/10` by 5.5e-18 so the product
+  never rounds down across an integer boundary). `rand` was already a normal
+  `[dependencies]` entry of the `iceberg` crate (Cargo.toml untouched).
+  `ThreadRng` is `!Send`/`!Sync` (`Rc` inside), so the closure calls
+  `rand::rng()` per sleep — also Java's exact `ThreadLocalRandom.current()`
+  per-call access. The backoff is `Send + Sync + Unpin` as `Backoff` requires.
+- Stop conditions: `attempt >= num_retries + 1` (Java `retry(n)` →
+  `maxAttempts = n+1`, javap offsets 209-217) or `elapsed() > max_duration`
+  when `attempt > 1` (first failure exempt, strict `>`). `elapsed()` is an
+  `Instant`-backed `FnMut` captured at backoff construction — called inside
+  `next()`, which backon invokes after each failure, the same point Java
+  measures `currentTimeMillis() - startTimeMs`.
+- 11 pins in `commit_backoff_tests.rs`, all green: deterministic schedule for
+  default + small configs with injected jitter, the `nextInt` bound capture,
+  `bound - 1` ceiling, the unit bound below 10ms, the max-wait cap, the
+  wall-clock timeout stop (attempt-1 exempt, `elapsed == max` still retries),
+  and the attempt-count bound incl. `num-retries=0`.
+- Mutation evidence (each applied, test run red, reverted):
+  - jitter removed (`jitter_ms = 0`): 5 pins red —
+    `default_schedule_*`, `small_config_schedule_*`,
+    `jitter_bound_is_java_next_int_bound`,
+    `jittered_sleep_stays_inside_java_bound`,
+    `sub_ten_ms_delay_has_unit_jitter_bound`.
+  - jitter bound at 100% (`(self.jitter)(delay_ms)`): 3 pins red —
+    `jitter_bound_is_java_next_int_bound`,
+    `jittered_sleep_stays_inside_java_bound`,
+    `sub_ten_ms_delay_has_unit_jitter_bound`.
+  - attempt off by one (`attempt > max_attempts`): 9 pins red — every
+    schedule/bound/count pin including `zero_retries_never_sleeps`.
+- `cargo test -p iceberg --lib transaction`: 743 passed, 0 failed (covers the
+  OCC retry battery through the rewired `commit()`).
+- Gates: `cargo fmt --all -- --check`, `python3 scripts/check_rust_file_size.py`
+  (mod.rs ceiling lowered 1945 → 1937), `typos`, `comment-ban hits=0`.
+
+OPEN:
+
+- Storm re-measurement against Spark (16 concurrent appends) is run 24c's —
+  not in this unit's scope.
+- `commit.status-check.*` retries in `commit_status.rs` use their own manual
+  loop, untouched — Java's `Tasks` jitter applies there too, but that path is
+  reconciliation, not the OCC collision the RePark fixture measures.
