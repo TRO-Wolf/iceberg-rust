@@ -67,7 +67,7 @@ impl ArrowReader {
         prefetched_metadata: Option<Arc<ParquetMetaData>>,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         Self::open_parquet_file_cached(
-            data_file_path,
+            &Arc::from(data_file_path),
             file_io,
             file_size_in_bytes,
             parquet_read_options,
@@ -78,7 +78,7 @@ impl ArrowReader {
     }
 
     pub(crate) async fn open_parquet_file_cached(
-        data_file_path: &str,
+        data_file_path: &Arc<str>,
         file_io: &FileIO,
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
@@ -176,7 +176,7 @@ impl ArrowReader {
     }
 
     async fn open_parquet_file_sized(
-        data_file_path: &str,
+        data_file_path: &Arc<str>,
         file_io: &FileIO,
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
@@ -204,20 +204,16 @@ impl ArrowReader {
                     .seed(data_file_path, file_size_in_bytes, prefetched)
                     .await;
             }
-            let metadata = footer_cache
+            footer_cache
                 .footer_or_fetch(
                     data_file_path,
                     file_size_in_bytes,
                     parquet_read_options,
                     &mut reader,
                 )
-                .await?;
-            ArrowReaderMetadata::try_new(metadata, Default::default()).map_err(|e| {
-                OpenParquetError::Other(
-                    Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata")
-                        .with_source(e),
-                )
-            })?
+                .await?
+                .as_ref()
+                .clone()
         } else {
             match prefetched_metadata {
                 Some(metadata) => {

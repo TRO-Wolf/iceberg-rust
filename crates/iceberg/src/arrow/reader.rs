@@ -159,7 +159,7 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     prefetched_parquet_metadata: HashMap<Arc<str>, Arc<ParquetMetaData>>,
-    footer_cache: Option<TableFooterCache>,
+    pub(crate) footer_cache: Option<TableFooterCache>,
 }
 
 impl ArrowReaderBuilder {

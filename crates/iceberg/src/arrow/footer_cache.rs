@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use moka::ops::compute;
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 
@@ -27,7 +28,7 @@ use crate::arrow::reader::{ArrowFileReader, ParquetReadOptions};
 use crate::catalog::CacheScope;
 use crate::{Error, ErrorKind};
 
-const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FooterKey {
@@ -38,12 +39,29 @@ struct FooterKey {
 
 #[derive(Debug, Clone)]
 struct CachedFooter {
-    metadata: Arc<ParquetMetaData>,
+    arrow_metadata: Arc<ArrowReaderMetadata>,
     index_checked: bool,
+    index_attempted: bool,
+}
+
+fn has_index(metadata: &ParquetMetaData) -> bool {
+    metadata.column_index().is_some() && metadata.offset_index().is_some()
+}
+
+fn base_arrow_metadata(
+    metadata: Arc<ParquetMetaData>,
+) -> std::result::Result<Arc<ArrowReaderMetadata>, OpenParquetError> {
+    ArrowReaderMetadata::try_new(metadata, Default::default())
+        .map(Arc::new)
+        .map_err(|e| {
+            OpenParquetError::Other(
+                Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata").with_source(e),
+            )
+        })
 }
 
 fn footer_weight(_key: &FooterKey, entry: &CachedFooter) -> u32 {
-    u32::try_from(entry.metadata.memory_size()).unwrap_or(u32::MAX)
+    u32::try_from(entry.arrow_metadata.metadata().memory_size()).unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -124,6 +142,23 @@ impl ParquetFooterCache {
     pub(crate) fn weighted_size(&self) -> u64 {
         self.entries.weighted_size()
     }
+
+    #[cfg(test)]
+    pub(crate) async fn probe_index_state(
+        &self,
+        scope: &CacheScope,
+        path: &Arc<str>,
+        file_size_in_bytes: u64,
+    ) -> Option<(bool, bool)> {
+        self.entries
+            .get(&FooterKey {
+                scope: scope.clone(),
+                path: Arc::clone(path),
+                file_size_in_bytes,
+            })
+            .await
+            .map(|entry| (entry.index_checked, entry.index_attempted))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,86 +180,68 @@ impl TableFooterCache {
 
     pub(crate) async fn seed(
         &self,
-        path: &str,
+        path: &Arc<str>,
         file_size_in_bytes: u64,
         metadata: Arc<ParquetMetaData>,
     ) {
-        let key = self.key(path, file_size_in_bytes);
-        let index_checked = metadata.column_index().is_some() && metadata.offset_index().is_some();
+        let index_checked = has_index(&metadata);
+        let Ok(arrow_metadata) = base_arrow_metadata(metadata) else {
+            return;
+        };
         self.cache
             .entries
-            .entry_by_ref(&key)
+            .entry_by_ref(&self.key(path, file_size_in_bytes))
             .or_insert(CachedFooter {
-                metadata,
+                arrow_metadata,
                 index_checked,
+                index_attempted: false,
             })
             .await;
     }
 
-    fn key(&self, path: &str, file_size_in_bytes: u64) -> FooterKey {
+    fn key(&self, path: &Arc<str>, file_size_in_bytes: u64) -> FooterKey {
         FooterKey {
             scope: self.scope.clone(),
-            path: Arc::from(path),
+            path: Arc::clone(path),
             file_size_in_bytes,
         }
     }
 
     pub(crate) async fn footer_or_fetch(
         &self,
-        path: &str,
+        path: &Arc<str>,
         file_size_in_bytes: u64,
         options: ParquetReadOptions,
         reader: &mut ArrowFileReader,
-    ) -> std::result::Result<Arc<ParquetMetaData>, OpenParquetError> {
+    ) -> std::result::Result<Arc<ArrowReaderMetadata>, OpenParquetError> {
         let need_index = options.preload_page_index();
         let key = self.key(path, file_size_in_bytes);
-        let entry = match self.cache.entries.get(&key).await {
-            Some(entry) => {
-                self.cache.hits.fetch_add(1, Ordering::Relaxed);
-                entry
+        if let Some(entry) = self.cache.entries.get(&key).await {
+            self.cache.hits.fetch_add(1, Ordering::Relaxed);
+            if !need_index || entry.index_checked || entry.index_attempted {
+                return Ok(Arc::clone(&entry.arrow_metadata));
             }
-            None => {
-                self.cache.misses.fetch_add(1, Ordering::Relaxed);
-                self.cache
-                    .entries
-                    .try_get_with(key.clone(), async {
-                        self.cache.fetches.fetch_add(1, Ordering::Relaxed);
-                        let metadata = reader.get_metadata(None).await.map_err(|e| {
-                            OpenParquetError::Footer(
-                                Error::new(
-                                    ErrorKind::Unexpected,
-                                    "Failed to load Parquet metadata",
-                                )
-                                .with_source(e),
-                            )
-                        })?;
-                        Ok::<CachedFooter, OpenParquetError>(CachedFooter {
-                            metadata,
-                            index_checked: need_index,
-                        })
-                    })
-                    .await
-                    .map_err(|e| match e.as_ref() {
-                        OpenParquetError::Footer(e) => OpenParquetError::Footer(shared_error(e)),
-                        OpenParquetError::Other(e) => OpenParquetError::Other(shared_error(e)),
-                    })?
-            }
-        };
-        if !need_index || entry.index_checked {
-            return Ok(entry.metadata);
+        } else {
+            self.cache.misses.fetch_add(1, Ordering::Relaxed);
         }
-        let upgraded = self
+        let computed = self
             .cache
             .entries
             .entry_by_ref(&key)
             .and_try_compute_with(|existing| async move {
-                if existing.as_ref().is_some_and(|e| e.value().index_checked) {
-                    return Ok::<compute::Op<CachedFooter>, OpenParquetError>(compute::Op::Nop);
-                }
-                let metadata = match existing {
-                    Some(e) => {
+                match existing {
+                    Some(entry)
+                        if !need_index
+                            || entry.value().index_checked
+                            || entry.value().index_attempted =>
+                    {
+                        Ok::<compute::Op<CachedFooter>, OpenParquetError>(compute::Op::Nop)
+                    }
+                    Some(entry) => {
                         let mut indexed = ParquetMetaDataReader::new_with_metadata(
-                            ParquetMetaData::clone(e.value().metadata.as_ref()),
+                            ParquetMetaData::clone(
+                                entry.value().arrow_metadata.metadata().as_ref(),
+                            ),
                         )
                         .with_page_index_policy(page_index_policy(options.preload_page_index()))
                         .with_column_index_policy(page_index_policy(options.preload_column_index()))
@@ -249,12 +266,20 @@ impl TableFooterCache {
                                 .with_source(e),
                             )
                         })?;
-                        self.cache.upgrades.fetch_add(1, Ordering::Relaxed);
-                        Arc::new(metadata)
+                        let index_checked = has_index(&metadata);
+                        let arrow_metadata = base_arrow_metadata(Arc::new(metadata))?;
+                        if index_checked {
+                            self.cache.upgrades.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(compute::Op::Put(CachedFooter {
+                            arrow_metadata,
+                            index_checked,
+                            index_attempted: true,
+                        }))
                     }
                     None => {
                         self.cache.fetches.fetch_add(1, Ordering::Relaxed);
-                        reader.get_metadata(None).await.map_err(|e| {
+                        let metadata = reader.get_metadata(None).await.map_err(|e| {
                             OpenParquetError::Footer(
                                 Error::new(
                                     ErrorKind::Unexpected,
@@ -262,25 +287,24 @@ impl TableFooterCache {
                                 )
                                 .with_source(e),
                             )
-                        })?
+                        })?;
+                        let index_checked = has_index(&metadata);
+                        let arrow_metadata = base_arrow_metadata(metadata)?;
+                        Ok(compute::Op::Put(CachedFooter {
+                            arrow_metadata,
+                            index_checked,
+                            index_attempted: need_index,
+                        }))
                     }
-                };
-                Ok(compute::Op::Put(CachedFooter {
-                    metadata,
-                    index_checked: true,
-                }))
+                }
             })
             .await?;
-        match upgraded.into_entry() {
-            Some(entry) => Ok(entry.into_value().metadata),
+        match computed.into_entry() {
+            Some(entry) => Ok(Arc::clone(&entry.into_value().arrow_metadata)),
             None => Err(OpenParquetError::Other(Error::new(
                 ErrorKind::Unexpected,
-                "Footer cache upgrade produced no entry",
+                "Footer cache compute produced no entry",
             ))),
         }
     }
-}
-
-fn shared_error(error: &Error) -> Error {
-    Error::new(error.kind(), error.message()).with_retryable(error.retryable())
 }

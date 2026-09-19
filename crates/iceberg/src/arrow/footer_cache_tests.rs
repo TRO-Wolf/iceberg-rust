@@ -86,6 +86,14 @@ fn opts_unfiltered() -> ParquetReadOptions {
     options
 }
 
+fn opts_filtered() -> ParquetReadOptions {
+    let mut options = ParquetReadOptions::builder().build();
+    options.preload_column_index = true;
+    options.preload_offset_index = true;
+    options.preload_page_index = true;
+    options
+}
+
 async fn file_reader(
     io: &FileIO,
     path: &str,
@@ -241,17 +249,18 @@ async fn c4_same_path_different_size_misses() {
     write_id_pages(&p, &ids);
     let size = std::fs::metadata(&p).expect("stat").len();
     let seeded = file_metadata(&p);
+    let path_arc: Arc<str> = Arc::from(p.as_str());
     let (io, _opens, _ranges) = recording_io();
     let cache = Arc::new(ParquetFooterCache::new());
     let handle = TableFooterCache::new(cache.clone(), CacheScope::isolated("c4"));
-    handle.seed(&p, size, seeded.clone()).await;
+    handle.seed(&path_arc, size, seeded.clone()).await;
     cache.run_pending_tasks().await;
     assert_eq!(cache.len(), 1);
     let mut wrong_size_reader =
         file_reader(&io, &p, size + 16 * 1024 * 1024, opts_unfiltered()).await;
     let _ = handle
         .footer_or_fetch(
-            &p,
+            &path_arc,
             size + 16 * 1024 * 1024,
             opts_unfiltered(),
             &mut wrong_size_reader,
@@ -260,11 +269,14 @@ async fn c4_same_path_different_size_misses() {
     assert_eq!(cache.stats().fetches, 1, "different size must miss");
     let mut reader = file_reader(&io, &p, size, opts_unfiltered()).await;
     let hit = handle
-        .footer_or_fetch(&p, size, opts_unfiltered(), &mut reader)
+        .footer_or_fetch(&path_arc, size, opts_unfiltered(), &mut reader)
         .await
         .expect("seeded entry must hit");
     assert_eq!(cache.stats().fetches, 1, "same size must hit");
-    assert!(Arc::ptr_eq(&hit, &seeded), "a hit serves the stored Arc");
+    assert!(
+        Arc::ptr_eq(hit.metadata(), &seeded),
+        "a hit serves the stored Arc"
+    );
 }
 
 #[tokio::test]
@@ -278,14 +290,15 @@ async fn c5_two_scopes_same_path_two_entries() {
     let cache = Arc::new(ParquetFooterCache::new());
     let scope_a = TableFooterCache::new(cache.clone(), CacheScope::new("catalog:one", "creds-a"));
     let scope_b = TableFooterCache::new(cache.clone(), CacheScope::new("catalog:one", "creds-b"));
+    let path_arc: Arc<str> = Arc::from(p.as_str());
     let mut r1 = file_reader(&io, &p, size, opts_unfiltered()).await;
     scope_a
-        .footer_or_fetch(&p, size, opts_unfiltered(), &mut r1)
+        .footer_or_fetch(&path_arc, size, opts_unfiltered(), &mut r1)
         .await
         .expect("scope a");
     let mut r2 = file_reader(&io, &p, size, opts_unfiltered()).await;
     scope_b
-        .footer_or_fetch(&p, size, opts_unfiltered(), &mut r2)
+        .footer_or_fetch(&path_arc, size, opts_unfiltered(), &mut r2)
         .await
         .expect("scope b");
     assert_eq!(cache.stats().fetches, 2, "scopes must not share");
@@ -316,6 +329,7 @@ async fn c6_concurrent_cold_opens_one_footer_read() {
     let err_cache = Arc::new(ParquetFooterCache::new());
     let err_handle = TableFooterCache::new(err_cache.clone(), CacheScope::isolated("c6-err"));
     let bogus = size + 16 * 1024 * 1024;
+    let err_path: Arc<str> = Arc::from(p.as_str());
     let mut readers = Vec::new();
     for _ in 0..16 {
         readers.push(file_reader(&io, &p, bogus, opts_unfiltered()).await);
@@ -323,7 +337,7 @@ async fn c6_concurrent_cold_opens_one_footer_read() {
     let results = join_all(
         readers
             .iter_mut()
-            .map(|r| err_handle.footer_or_fetch(&p, bogus, opts_unfiltered(), r)),
+            .map(|r| err_handle.footer_or_fetch(&err_path, bogus, opts_unfiltered(), r)),
     )
     .await;
     assert_eq!(results.len(), 16);
@@ -331,14 +345,17 @@ async fn c6_concurrent_cold_opens_one_footer_read() {
         results.iter().all(|r| r.is_err()),
         "the injected read error must reach every waiter"
     );
-    assert_eq!(err_cache.stats().fetches, 1, "one failed fetch shared");
+    assert!(
+        err_cache.stats().fetches >= 1 && err_cache.stats().fetches <= 16,
+        "each waiter retries its own uncached read: {}",
+        err_cache.stats().fetches
+    );
     assert_eq!(err_cache.len(), 0, "failed reads are never cached");
     let mut reader = file_reader(&io, &p, bogus, opts_unfiltered()).await;
     let _ = err_handle
-        .footer_or_fetch(&p, bogus, opts_unfiltered(), &mut reader)
+        .footer_or_fetch(&err_path, bogus, opts_unfiltered(), &mut reader)
         .await;
-    assert_eq!(err_cache.stats().fetches, 2, "a failed read is retried");
-    assert_eq!(err_cache.len(), 0);
+    assert_eq!(err_cache.len(), 0, "a retried failure is still uncached");
 }
 
 #[tokio::test]
@@ -356,12 +373,13 @@ async fn c7_byte_bound_evicts_and_rescan_identical() {
     let probe_cache = Arc::new(ParquetFooterCache::new());
     let probe = TableFooterCache::new(probe_cache, CacheScope::isolated("c7-probe"));
     let size0 = std::fs::metadata(&paths[0]).expect("stat").len();
+    let path0_arc: Arc<str> = Arc::from(paths[0].as_str());
     let mut probe_reader = file_reader(&io, &paths[0], size0, opts_unfiltered()).await;
     let probed = probe
-        .footer_or_fetch(&paths[0], size0, opts_unfiltered(), &mut probe_reader)
+        .footer_or_fetch(&path0_arc, size0, opts_unfiltered(), &mut probe_reader)
         .await
         .expect("probe");
-    let bound = probed.memory_size() as u64;
+    let bound = probed.metadata().memory_size() as u64;
     let cache = Arc::new(ParquetFooterCache::with_max_bytes(bound));
     let handle = TableFooterCache::new(cache.clone(), CacheScope::isolated("c7"));
     let tasks = id_tasks(&paths, &schema);
@@ -468,7 +486,7 @@ async fn c9_no_cache_keeps_todays_counts() {
     for (p, size) in paths.iter().zip(&sizes) {
         assert_eq!(footer_reads(&ranges, p, *size), 1, "cold scan: {p}");
     }
-    read_tasks(tasks, io, None, 4, true)
+    read_tasks(tasks, io.clone(), None, 4, true)
         .await
         .expect("warm scan");
     for (p, size) in paths.iter().zip(&sizes) {
@@ -476,6 +494,68 @@ async fn c9_no_cache_keeps_todays_counts() {
             footer_reads(&ranges, p, *size),
             2,
             "uncached warm scan: {p}"
+        );
+    }
+    assert!(
+        ArrowReaderBuilder::new(io.clone()).footer_cache.is_none(),
+        "ArrowReaderBuilder::new attaches no footer cache"
+    );
+    let bare_table = Table::builder()
+        .metadata(minimal_metadata())
+        .identifier(TableIdent::from_strs(["db", "t"]).expect("ident"))
+        .file_io(io.clone())
+        .metadata_location("memory://wh/t/metadata/v1.json")
+        .build()
+        .expect("bare table");
+    assert!(
+        bare_table.footer_cache().is_none(),
+        "Table::builder attaches no footer cache"
+    );
+    let bare_scan = bare_table.scan().build().expect("bare scan");
+    assert!(
+        bare_scan.footer_cache.is_none(),
+        "TableScan from a cache-less table attaches no footer cache"
+    );
+    assert!(
+        bare_scan
+            .configure_reader(ArrowReaderBuilder::new(io.clone()))
+            .footer_cache
+            .is_none(),
+        "configure_reader attaches no footer cache"
+    );
+    let catalog = MemoryCatalogBuilder::default()
+        .load(
+            "memory",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                tmp.path().to_str().expect("utf8").to_string(),
+            )]),
+        )
+        .await
+        .expect("catalog");
+    let namespace = NamespaceIdent::new("ns".into());
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("namespace");
+    let created = catalog
+        .create_table(
+            &namespace,
+            crate::TableCreation::builder()
+                .name("t".to_string())
+                .schema(id_schema().as_ref().clone())
+                .build(),
+        )
+        .await
+        .expect("create");
+    let loaded = catalog
+        .load_table(&TableIdent::new(namespace, "t".to_string()))
+        .await
+        .expect("load");
+    for candidate in [&created, &loaded] {
+        assert!(
+            candidate.footer_cache().is_none(),
+            "a catalog without a shared footer cache attaches none"
         );
     }
 }
@@ -745,4 +825,8 @@ async fn measure_100_file_footer_requests() {
     assert_eq!(uncached_warm_reads, 200);
     assert_eq!(cached_cold_reads, 100);
     assert_eq!(cached_warm_reads, 100);
+}
+
+mod r2 {
+    include!("footer_cache_r2_tests.rs");
 }

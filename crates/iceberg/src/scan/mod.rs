@@ -623,7 +623,7 @@ pub struct TableScan {
     /// [`Self::plan_tasks`]. Captured at [`build`](TableScanBuilder::build) time; never consulted by
     /// [`Self::plan_files`] (whose path is byte-unchanged).
     split_config: SplitConfig,
-    footer_cache: Option<TableFooterCache>,
+    pub(crate) footer_cache: Option<TableFooterCache>,
 }
 
 /// The reporter, the shared counter collector, and the immutable inputs needed to build a
