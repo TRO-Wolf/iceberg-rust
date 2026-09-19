@@ -544,7 +544,6 @@ impl ParquetWriter {
                             *per_col_null_val_num.entry(field_id).or_insert(0) += null_count;
                         }
 
-                        // Bounds are only collected for Truncate/Full; produce() truncates them.
                         if mode.collects_bounds() {
                             min_max_agg.update(field_id, statistics.clone())?;
                         }
