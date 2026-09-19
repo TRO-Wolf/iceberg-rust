@@ -540,3 +540,86 @@ kept the parsed pointer dir for every convention.
 - `./scripts/check_agent_artifacts.sh`, `check_matrix_anchors.sh`,
   `check_comment_blocks.sh`, `typos .` — all clean.
 - `comment_ban.py` over `origin/main..HEAD` — `comment-ban hits=0`.
+
+## Round 5 — V-002: Hadoop-convention tables refuse `write.metadata.path`
+
+### Root cause
+
+Round 4's `MetadataLocation::rebased` routed a Hadoop-convention (`vN`) pointer
+carrying `write.metadata.path` through `write_metadata_dir`, relocating the next
+version into the property's directory (`/alt-meta/vN.metadata.json`). Java
+`HadoopTableOperations.commit` refuses that table outright — the property is
+never honored on the path-based catalog.
+
+### Java 1.11.0 bytecode (spark-runtime 4.1_2.13-1.11.0.jar, `javap -c -p`, re-verified this round)
+
+- `HadoopTableOperations.commit` offsets 71–92:
+  `checkArgument(!metadata.properties().containsKey("write.metadata.path"),
+  "Hadoop path-based tables cannot relocate metadata")` — `containsKey`, so even
+  an empty value refuses; the check runs on the NEW (updated) metadata before
+  the temp file is written. Offsets 48–68 additionally refuse a
+  `metadata.location()` change ("Hadoop path-based tables cannot be relocated").
+- `metadataFilePath(version, codec)` → `metadataPath(fileName)` →
+  `new Path(metadataRoot(), fileName)`; `metadataRoot()` =
+  `new Path(this.location, "metadata")` — `this.location` is the constructor's
+  loaded-from table path. `write.metadata.path` is never read here.
+- `BaseMetastoreTableOperations.metadataFileLocation` still honors the property
+  (metastore-convention tables keep it — unchanged from rounds 1–4).
+
+### Fork rule after the fix (`MetadataLocation::rebased`)
+
+- Hadoop convention (`id == None`) + `write.metadata.path` present in the NEW
+  metadata → typed `ErrorKind::DataInvalid` carrying Java's verbatim message
+  `"Hadoop path-based tables cannot relocate metadata"`. The refusal fires
+  inside `rebased`, which every commit path funnels through, so it lands before
+  any file is written:
+  - `TableCommit::apply` (catalog/mod.rs) — memory/glue/sql/hms/rest/s3tables
+    `update_table` all error at `commit.apply`, before `write_commit_metadata`.
+  - `StagedTableTransaction::begin_replace` keeps-location arm — errors before
+    `ensure_staged_version_absent` / `write_commit_metadata`.
+  - `Transaction::apply_locally` — errors before `write_commit_metadata`.
+- Hadoop convention, property absent → keeps the pointer's own `metadata_dir`
+  (round-4 rule, unchanged).
+- Uuid convention → `write_metadata_dir` (metastore rule, unchanged); staged
+  create and non-keeps replace go through `for_metadata` (uuid convention) so
+  they keep honoring the property.
+
+### Pins
+
+- `rebased_keeps_pointer_dir_for_hadoop_convention` — property arm removed;
+  now pins only the no-property keep-dir arm.
+- `rebased_refuses_write_metadata_path_for_hadoop_convention` — unit pin:
+  hadoop `v2` + property → `DataInvalid` + Java's exact message.
+- `hadoop_pointer_commit_refuses_write_metadata_path` — end-to-end: register a
+  `v3` Hadoop pointer in the memory catalog, `update_table_properties` sets
+  `write.metadata.path`, `commit` → `DataInvalid` + Java's message; catalog
+  pointer still `v3`; `list("/alt-meta")` empty; no `v4` under the pointer dir.
+- `replace_from_a_hadoop_pointer_refuses_write_metadata_path` —
+  `begin_replace` on a `v7` pointer with the property in creation properties →
+  `DataInvalid`; no `v8` staged; `list(alt-meta)` empty.
+- `apply_locally_on_a_hadoop_pointer_refuses_write_metadata_path` —
+  `update_table_properties` + `apply_locally` on a `v7` pointer →
+  `DataInvalid`; no `v8`; `list(alt-meta)` empty.
+
+### Mutation evidence
+
+| Mutation | Pins driven red |
+|---|---|
+| `rebased` → unconditional `write_metadata_dir` (bug shape) | 7 red — `rebased_keeps_pointer_dir_for_hadoop_convention`, `rebased_refuses_write_metadata_path_for_hadoop_convention`, `hadoop_pointer_commit_refuses_write_metadata_path`, `replace_from_a_hadoop_pointer_refuses_write_metadata_path`, `apply_locally_on_a_hadoop_pointer_refuses_write_metadata_path`, `hadoop_replace_with_files_publishes_only_next_version`, `hadoop_replace_without_files_publishes_only_next_version` |
+| refusal applied to ALL conventions (guard loses `is_hadoop_convention`) | 6 red — `rebased_moves_dir_with_write_metadata_path`, `rebased_keeps_pointer_dir_for_hadoop_convention`, `write_metadata_path_relocates_metadata_files_on_memory_catalog`, `execute_fails_loud_when_write_metadata_path_is_outside_the_source_prefix`, both `hadoop_replace_*` |
+
+All reverted; filtered suite green again.
+
+### Round-5 gates
+
+- `cargo test -p iceberg --lib -- staged_table metadata_location
+  rewrite_table_path catalog::memory` — 166/166.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p iceberg --all-targets --all-features -- -D warnings` —
+  clean (only `crates/iceberg` touched).
+- `./scripts/check_rust_file_size.sh` — 563 files clean
+  (`metadata_location.rs` 969, `staged_table_version_tests.rs` 413 — both
+  under the 1,000 default; `staged_table_tests.rs` left at 964 untouched).
+- `./scripts/check_agent_artifacts.sh`, `check_matrix_anchors.sh`,
+  `check_comment_blocks.sh`, `typos .` — all clean.
+- `comment_ban.py` over `origin/main..HEAD` — `comment-ban hits=0`.
