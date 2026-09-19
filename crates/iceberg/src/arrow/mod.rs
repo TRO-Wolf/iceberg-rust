@@ -62,3 +62,6 @@ pub mod record_batch_partition_splitter;
 #[cfg(test)]
 mod spark_fixture_tests;
 pub use record_batch_partition_splitter::*;
+
+#[cfg(test)]
+mod f_transform_arrow_types_1_tests;

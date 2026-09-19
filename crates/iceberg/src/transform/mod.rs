@@ -25,6 +25,8 @@ use crate::spec::{Datum, Transform};
 use crate::{Error, ErrorKind, Result};
 
 mod bucket;
+#[cfg(test)]
+mod f_transform_arrow_types_1_tests;
 mod identity;
 mod temporal;
 mod truncate;

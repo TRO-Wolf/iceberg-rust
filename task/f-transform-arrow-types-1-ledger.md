@@ -159,9 +159,27 @@ UTF-8 bytes; truncate widths in code points):
 
 ## RED-FIRST evidence (step 2)
 
-PENDING — pins added in `transform/f_transform_arrow_types_1_tests.rs` and
-`arrow/f_transform_arrow_types_1_tests.rs`; baseline failure counts recorded below after the
-first run.
+Pins landed in `crates/iceberg/src/transform/f_transform_arrow_types_1_tests.rs` (14 tests:
+oracle cells per layout for truncate/bucket/identity/void over Binary, LargeBinary, BinaryView,
+Utf8, LargeUtf8, Utf8View; `FixedSizeBinary` truncate rejection + bucket acceptance;
+transform_literal binary/fixed; `project`/`strict_project` binary-literal partition predicates)
+and `crates/iceberg/src/arrow/f_transform_arrow_types_1_tests.rs` (11 tests: calculator
+canonicalization per layout for truncate/identity/void/bucket over both families, splitter
+partition keys per layout, `arrow_struct_to_literal` view-leaf reads, memory-catalog
+fast-append write -> plan_files -> `to_arrow` for `b = X'0102'` on a `LargeBinary` batch, v2 + v3).
+
+Baseline run on the UNFIXED tree (`cargo test -p iceberg --lib f_transform_arrow_types_1`):
+**20 failed, 5 passed** (25 new tests, 3896 filtered out).
+
+- GREEN (already-correct behavior, pinned): `identity_and_void_*_every_layout` x2,
+  `truncate_fixed_size_binary_rejected_java_parity`, `bucket_fixed_size_binary_oracle`,
+  `bucket_literal_binary_and_fixed`.
+- RED (defects): every `LargeBinary`/`BinaryView`/`Utf8View` truncate arm; `BinaryView`/`Utf8View`
+  bucket arms; `transform_literal` on a binary datum; `project`/`strict_project` on binary
+  literals (propagates `FeatureUnsupported`, failing the whole predicate); every non-canonical
+  calculator output (identity/void/truncate on `Binary`, `BinaryView`, `LargeUtf8`, `Utf8View`);
+  `arrow_struct_to_literal` on view leaves; both end-to-end write-scan pins
+  (`split batch: FeatureUnsupported ... LargeBinary` — the reported RePark error verbatim).
 
 ## Mutation validation (step 4)
 
