@@ -18,8 +18,10 @@
 use std::error::Error as _;
 use std::sync::Arc;
 
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 
+use super::open_parquet::{ROW_SELECTIONS_APPLIED, effective_row_selection};
 use super::page_prune_fixture::*;
 use super::reader::{ArrowReader, ParquetReadOptions};
 use crate::expr::Reference;
@@ -198,6 +200,86 @@ async fn deletes_force_index_load_under_not_eq() {
     assert!(
         any_read_intersects(&read_ranges, &data_path, &index_ranges),
         "deletes must force the page-index load even for a non-prunable predicate"
+    );
+}
+
+#[test]
+fn all_keep_row_selection_is_dropped() {
+    let all_keep = RowSelection::from(vec![RowSelector::select(128)]);
+    assert!(effective_row_selection(Some(all_keep)).is_none());
+}
+
+#[test]
+fn skipping_row_selection_is_kept() {
+    let skipping = RowSelection::from(vec![RowSelector::skip(8), RowSelector::select(120)]);
+    assert!(effective_row_selection(Some(skipping)).is_some());
+}
+
+#[test]
+fn empty_row_selection_is_kept() {
+    let empty = RowSelection::from(Vec::new());
+    assert!(effective_row_selection(Some(empty)).is_some());
+}
+
+#[tokio::test]
+async fn all_keep_predicate_hands_no_selection_to_parquet() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    write_id_pages(&data_path, &ids);
+    let schema = id_schema();
+    let predicate = bound(
+        &schema,
+        Reference::new("id").greater_than_or_equal_to(Datum::int(0)),
+    );
+    let before = ROW_SELECTIONS_APPLIED.with(|count| count.get());
+    let rows = collect(task(&data_path, schema, &[1], Some(predicate)), true).await;
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS);
+    assert_eq!(
+        ROW_SELECTIONS_APPLIED.with(|count| count.get()) - before,
+        0,
+        "a predicate that keeps every page must not hand parquet a RowSelection"
+    );
+}
+
+#[tokio::test]
+async fn pruning_predicate_hands_selection_to_parquet() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    write_id_pages(&data_path, &ids);
+    let schema = id_schema();
+    let predicate = bound(&schema, Reference::new("id").equal_to(Datum::int(64)));
+    let before = ROW_SELECTIONS_APPLIED.with(|count| count.get());
+    let rows = collect(task(&data_path, schema, &[1], Some(predicate)), true).await;
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(
+        ROW_SELECTIONS_APPLIED.with(|count| count.get()) - before,
+        1,
+        "a predicate that skips pages must hand parquet a RowSelection"
+    );
+}
+
+#[tokio::test]
+async fn position_deletes_hand_selection_to_parquet() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let del_path = path(&tmp, "pos-deletes.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    write_id_pages(&data_path, &ids);
+    let schema = id_schema();
+    let delete = write_pos_delete_file(&del_path, &data_path, &[10, 70]);
+    let before = ROW_SELECTIONS_APPLIED.with(|count| count.get());
+    let rows = collect(
+        with_deletes(task(&data_path, schema, &[1], None), vec![delete]),
+        true,
+    )
+    .await;
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS - 2);
+    assert_eq!(
+        ROW_SELECTIONS_APPLIED.with(|count| count.get()) - before,
+        1,
+        "a delete selection must never be dropped"
     );
 }
 

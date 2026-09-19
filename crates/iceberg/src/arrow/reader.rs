@@ -51,7 +51,7 @@ use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::delete_filter::positional_delete_keep_mask;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::int96::coerce_int96_timestamps;
-use crate::arrow::open_parquet::page_index_policy;
+use crate::arrow::open_parquet::{effective_row_selection, page_index_policy};
 use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::record_batch_predicate::{
     evaluate_predicate_to_mask, is_nan_row_mask, not_nan_row_mask, null_filled,
@@ -755,7 +755,7 @@ impl ArrowReader {
             };
         }
 
-        if let Some(row_selection) = row_selection {
+        if let Some(row_selection) = effective_row_selection(row_selection) {
             record_batch_stream_builder =
                 record_batch_stream_builder.with_row_selection(row_selection);
         }

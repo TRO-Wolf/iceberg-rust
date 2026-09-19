@@ -43,6 +43,27 @@ pub(crate) fn page_index_policy(needed: bool) -> PageIndexPolicy {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ROW_SELECTIONS_APPLIED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_applied_selection(selection: &Option<RowSelection>) {
+    if selection.is_some() {
+        ROW_SELECTIONS_APPLIED.with(|count| count.set(count.get() + 1));
+    }
+}
+
+#[cfg(not(test))]
+fn record_applied_selection(_: &Option<RowSelection>) {}
+
+pub(crate) fn effective_row_selection(selection: Option<RowSelection>) -> Option<RowSelection> {
+    record_applied_selection(&selection);
+    selection
+}
+
 pub(crate) enum OpenParquetError {
     Footer(Error),
     Other(Error),
