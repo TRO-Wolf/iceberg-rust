@@ -54,10 +54,7 @@ fn ident(name: &str) -> TableIdent {
     TableIdent::new(NamespaceIdent::new("ns".to_string()), name.to_string())
 }
 
-async fn catalog_with_cache(
-    warehouse: &str,
-    cache: Arc<TableMetadataCache>,
-) -> MemoryCatalog {
+async fn catalog_with_cache(warehouse: &str, cache: Arc<TableMetadataCache>) -> MemoryCatalog {
     MemoryCatalogBuilder::default()
         .with_table_metadata_cache(cache)
         .load(
@@ -101,7 +98,10 @@ async fn l2_register_reads_body_directly_and_republishes_entry() {
         "register must read the live body, not a cached parse"
     );
 
-    let loaded = catalog.load_table(&ident("t")).await.expect("load after register");
+    let loaded = catalog
+        .load_table(&ident("t"))
+        .await
+        .expect("load after register");
     assert_eq!(
         loaded.metadata().location(),
         "memory://wh/t-registered",
@@ -146,5 +146,9 @@ async fn l2_register_insert_failure_evicts_stale_entry() {
     let err = catalog.register_table(&ident("t"), loc).await;
     assert!(err.is_err(), "missing namespace must fail the insert");
     cache.run_pending_tasks().await;
-    assert_eq!(cache.len(), 0, "a failed register must evict the stale entry");
+    assert_eq!(
+        cache.len(),
+        0,
+        "a failed register must evict the stale entry"
+    );
 }

@@ -244,9 +244,7 @@ impl S3TablesCommitTransport for ScriptedS3TablesCommitTransport {
                 S3TablesCommitSend::AcceptedResponseLost
             }
             S3TablesCommitScript::Success => S3TablesCommitSend::Success(None),
-            S3TablesCommitScript::SuccessToken(token) => {
-                S3TablesCommitSend::Success(Some(token))
-            }
+            S3TablesCommitScript::SuccessToken(token) => S3TablesCommitSend::Success(Some(token)),
             S3TablesCommitScript::Conflict => S3TablesCommitSend::ModeledService(
                 UpdateTableMetadataLocationError::ConflictException(
                     aws_sdk_s3tables::types::error::ConflictException::builder().build(),

@@ -18,13 +18,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use iceberg::CatalogBuilder;
 use iceberg::io::{FileIO, MemoryStorageFactory};
 use iceberg::spec::{
     NestedField, PrimitiveType, Schema, TableMetadata, TableMetadataBuilder, Type,
 };
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{TableCreation, TableMetadataCache};
+use iceberg::{CatalogBuilder, TableCreation, TableMetadataCache};
 
 use super::*;
 use crate::commit_transport::{GlueCommitScript, ScriptedGlueCommitTransport};
@@ -473,15 +472,18 @@ fn builder_props(
     props
 }
 
-fn failable_pointer() -> (Arc<Mutex<Option<(String, Option<String>)>>>, PointerFn) {
+type FailablePointerState = Arc<Mutex<Option<(String, Option<String>)>>>;
+
+fn failable_pointer() -> (FailablePointerState, PointerFn) {
     let state = Arc::new(Mutex::new(None));
     let held = Arc::clone(&state);
     (
         state,
         Arc::new(move |_| {
-            held.lock().expect("pointer state").clone().ok_or_else(|| {
-                Error::new(ErrorKind::Unexpected, "pointer fetch failed")
-            })
+            held.lock()
+                .expect("pointer state")
+                .clone()
+                .ok_or_else(|| Error::new(ErrorKind::Unexpected, "pointer fetch failed"))
         }),
     )
 }
@@ -498,11 +500,10 @@ async fn l1_region_only_injected_factory_isolates_shared_cache() {
         .with_storage_factory(Arc::new(MemoryStorageFactory))
         .load(
             "glue-a",
-            builder_props(
-                Some("shared-cat"),
-                "memory://wh",
-                &[("region_name", "us-east-1")],
-            ),
+            builder_props(Some("shared-cat"), "memory://wh", &[(
+                "region_name",
+                "us-east-1",
+            )]),
         )
         .await
         .expect("load catalog a")
@@ -512,11 +513,10 @@ async fn l1_region_only_injected_factory_isolates_shared_cache() {
         .with_storage_factory(Arc::new(MemoryStorageFactory))
         .load(
             "glue-b",
-            builder_props(
-                Some("shared-cat"),
-                "memory://wh",
-                &[("region_name", "us-east-1")],
-            ),
+            builder_props(Some("shared-cat"), "memory://wh", &[(
+                "region_name",
+                "us-east-1",
+            )]),
         )
         .await
         .expect("load catalog b")
@@ -590,7 +590,10 @@ async fn l2_register_table_reads_body_directly() {
     );
 
     let missing = cat
-        .register_table(&ident("t3"), "memory://wh/t/absent.metadata.json".to_string())
+        .register_table(
+            &ident("t3"),
+            "memory://wh/t/absent.metadata.json".to_string(),
+        )
         .await;
     assert!(missing.is_err(), "register of a missing body must fail");
 }
@@ -636,7 +639,11 @@ async fn l3_invalidate_table_evicts_current_pointer_location() {
     );
     assert_eq!(stats.body_fetches, 3);
     cache.run_pending_tasks().await;
-    assert_eq!(cache.len(), 2, "loc1 entry stays; only the current location evicts");
+    assert_eq!(
+        cache.len(),
+        2,
+        "loc1 entry stays; only the current location evicts"
+    );
 }
 
 #[tokio::test]
@@ -733,7 +740,9 @@ async fn l3_drop_failure_keeps_cache_entry() {
     cat.load_table(&t).await.expect("seed entry");
     let err = cat.drop_table(&t).await;
     assert!(err.is_err(), "failed drop must surface");
-    cat.load_table(&t).await.expect("warm load after failed drop");
+    cat.load_table(&t)
+        .await
+        .expect("warm load after failed drop");
     assert_eq!(cache.stats().hits, 1, "a failed drop must not evict");
 }
 
@@ -780,7 +789,10 @@ async fn l005_publish_arms_version_id_on_first_load() {
     *state.lock().expect("pointer state") = (loc2.clone(), Some("vid-2".to_string()));
     cat.load_table(&t).await.expect("published entry hits");
     let stats = cache.stats();
-    assert_eq!(stats.body_fetches, 1, "the published entry must serve the load");
+    assert_eq!(
+        stats.body_fetches, 1,
+        "the published entry must serve the load"
+    );
     assert_eq!(stats.hits, 2, "commit base refresh + published load");
 
     *state.lock().expect("pointer state") = (loc2.clone(), Some("vid-3".to_string()));

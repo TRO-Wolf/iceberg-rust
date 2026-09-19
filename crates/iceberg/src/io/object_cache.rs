@@ -411,8 +411,8 @@ impl ObjectCache {
         }
     }
 
-    /// Counts the remote body fetches this cache has performed.
-    pub fn body_fetches(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn body_fetches(&self) -> u64 {
         self.body_fetches.load(Ordering::SeqCst)
     }
 
