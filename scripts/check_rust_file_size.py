@@ -124,7 +124,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/integrations/datafusion/src/catalog.rs": 1589,
     "crates/integrations/datafusion/src/physical_plan/delete.rs": 1145,
     "crates/integrations/datafusion/src/physical_plan/project.rs": 1471,
-    "crates/integrations/datafusion/src/physical_plan/scan.rs": 1592,
+    "crates/integrations/datafusion/src/physical_plan/scan.rs": 1506,
     "crates/integrations/datafusion/tests/integration_datafusion_test.rs": 6872,
     "crates/sketches/src/theta.rs": 1024,
     "crates/storage/opendal/src/lib.rs": 1939,

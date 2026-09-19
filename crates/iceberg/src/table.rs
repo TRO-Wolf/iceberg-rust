@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
-use crate::arrow::ArrowReaderBuilder;
+use crate::arrow::{ArrowReaderBuilder, TableFooterCache};
 use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
 use crate::expr::visitors::inclusive_projection::InclusiveProjection;
 use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
@@ -46,6 +46,7 @@ pub struct TableBuilder {
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
     object_cache: Option<Arc<ObjectCache>>,
+    footer_cache: Option<TableFooterCache>,
 }
 
 impl TableBuilder {
@@ -59,12 +60,19 @@ impl TableBuilder {
             disable_cache: false,
             cache_size_bytes: None,
             object_cache: None,
+            footer_cache: None,
         }
     }
 
     /// Share one [`ObjectCache`] with every other table built from it; the cache must have been built on the same `FileIO` this builder is given.
     pub fn object_cache(mut self, object_cache: Arc<ObjectCache>) -> Self {
         self.object_cache = Some(object_cache);
+        self
+    }
+
+    #[allow(missing_docs)]
+    pub fn footer_cache(mut self, footer_cache: TableFooterCache) -> Self {
+        self.footer_cache = Some(footer_cache);
         self
     }
 
@@ -123,6 +131,7 @@ impl TableBuilder {
             disable_cache,
             cache_size_bytes,
             object_cache: shared_object_cache,
+            footer_cache,
         } = self;
 
         let Some(file_io) = file_io else {
@@ -166,6 +175,7 @@ impl TableBuilder {
             identifier,
             readonly,
             object_cache,
+            footer_cache,
         })
     }
 }
@@ -197,6 +207,7 @@ pub struct Table {
     identifier: TableIdent,
     readonly: bool,
     object_cache: Arc<ObjectCache>,
+    footer_cache: Option<TableFooterCache>,
 }
 
 impl Table {
@@ -255,6 +266,11 @@ impl Table {
     /// Returns this table's object cache
     pub fn object_cache(&self) -> Arc<ObjectCache> {
         self.object_cache.clone()
+    }
+
+    /// Returns this table's shared Parquet footer cache handle, if one was injected.
+    pub fn footer_cache(&self) -> Option<TableFooterCache> {
+        self.footer_cache.clone()
     }
 
     /// Creates a table scan.
@@ -382,7 +398,11 @@ impl Table {
 
     /// Create a reader for the table.
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
-        ArrowReaderBuilder::new(self.file_io.clone())
+        let mut builder = ArrowReaderBuilder::new(self.file_io.clone());
+        if let Some(cache) = self.footer_cache.clone() {
+            builder = builder.with_footer_cache(cache);
+        }
+        builder
     }
 }
 

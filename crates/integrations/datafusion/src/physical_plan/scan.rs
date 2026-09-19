@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
@@ -32,17 +31,17 @@ use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProp
 use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
-use iceberg::metadata_columns::is_metadata_column_name;
 use iceberg::scan::{PartitionWork, stream_partition_work};
 use iceberg::table::Table;
 
 use super::conform::{
-    ColumnSource, advertised_field_id, conform_batch, strip_nested_metadata_from_record_batch,
+    ColumnSource, conform_batch, strip_nested_metadata_from_record_batch,
     strip_nested_metadata_from_schema,
 };
 #[cfg(test)]
 use super::conform::{conform_column, is_arrow_promotion_allowed};
 use super::expr_to_predicate::scan_predicates;
+use super::scan_helpers::{exact_table_row_count, project_bindings, resolve_bindings};
 pub use super::scan_knobs::{IcebergScanOptions, ensure_iceberg_scan_options};
 pub(crate) use super::scan_knobs::{
     ScanKnobs, build_table_scan, clamp_scan_knob, scan_knobs_from_context,
@@ -317,16 +316,24 @@ impl ExecutionPlan for IcebergTableScan {
             let concurrency = self.per_partition_concurrency;
             let batch_size = self.batch_size;
             let row_selection = self.row_selection_enabled;
-            let stream =
-                stream_partition_work(file_io, &work, concurrency, batch_size, true, row_selection)
-                    .map_err(to_datafusion_error)?
-                    .map_err(to_datafusion_error)
-                    .and_then(move |batch| {
-                        futures::future::ready(
-                            conform_batch(batch, &conform_schema, &sources)
-                                .and_then(strip_nested_metadata_from_record_batch),
-                        )
-                    });
+            let footer_cache = self.table.footer_cache();
+            let stream = stream_partition_work(
+                file_io,
+                &work,
+                concurrency,
+                batch_size,
+                true,
+                row_selection,
+                footer_cache,
+            )
+            .map_err(to_datafusion_error)?
+            .map_err(to_datafusion_error)
+            .and_then(move |batch| {
+                futures::future::ready(
+                    conform_batch(batch, &conform_schema, &sources)
+                        .and_then(strip_nested_metadata_from_record_batch),
+                )
+            });
 
             // GlobalLimitExec owns the limit when N > 1.
             let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
@@ -448,100 +455,6 @@ pub(crate) async fn get_batch_stream(
         .map_err(to_datafusion_error)?
         .map_err(to_datafusion_error);
     Ok(Box::pin(stream))
-}
-
-fn exact_table_row_count(
-    table: &Table,
-    snapshot_id: i64,
-    partitions: &[PartitionWork],
-) -> Option<usize> {
-    let mut planned_any_task = false;
-    for work in partitions {
-        for task in work.tasks() {
-            planned_any_task = true;
-            if task.predicate.is_some() || !task.deletes.is_empty() {
-                return None;
-            }
-        }
-    }
-    if !planned_any_task {
-        return Some(0);
-    }
-    let summary = table.metadata().snapshot_by_id(snapshot_id)?.summary();
-    let total: u64 = summary
-        .additional_properties
-        .get("total-records")?
-        .parse()
-        .ok()?;
-    usize::try_from(total).ok()
-}
-
-/// Binds every advertised column to the scanned snapshot's schema BY FIELD ID, mapping an
-/// advertised name to that schema's name for the same id, or to `None` when it lacks the id.
-///
-/// A name is not an identity in Iceberg, so the two schemas disagree on names after a rename. The
-/// advertised Arrow fields carry `PARQUET:field_id`; a field without it is a loud error rather than
-/// a name-based guess. With no snapshot to resolve against, the binding is the identity.
-fn resolve_bindings(
-    table: &Table,
-    snapshot_id: Option<i64>,
-    schema: &ArrowSchemaRef,
-) -> DFResult<HashMap<String, Option<String>>> {
-    let metadata = table.metadata();
-    let snapshot = match snapshot_id {
-        Some(snapshot_id) => metadata.snapshot_by_id(snapshot_id),
-        None => metadata.current_snapshot(),
-    };
-    let Some(snapshot) = snapshot else {
-        return Ok(schema
-            .fields()
-            .iter()
-            .map(|field| (field.name().clone(), Some(field.name().clone())))
-            .collect());
-    };
-    let snapshot_schema = snapshot.schema(metadata).map_err(to_datafusion_error)?;
-
-    let mut bindings = HashMap::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        // A reserved metadata column is not a table field; the core scan resolves it by name.
-        if is_metadata_column_name(field.name()) {
-            bindings.insert(field.name().clone(), Some(field.name().clone()));
-            continue;
-        }
-        let field_id = advertised_field_id(field)?;
-        bindings.insert(
-            field.name().clone(),
-            snapshot_schema
-                .name_by_field_id(field_id)
-                .map(str::to_string),
-        );
-    }
-    Ok(bindings)
-}
-
-/// Turns the output columns' bindings into `select` names and [`ColumnSource`]s, in order.
-fn project_bindings(
-    output_schema: &ArrowSchemaRef,
-    bindings: &HashMap<String, Option<String>>,
-) -> DFResult<(Vec<String>, Vec<ColumnSource>)> {
-    let mut scan_columns = Vec::with_capacity(output_schema.fields().len());
-    let mut sources = Vec::with_capacity(output_schema.fields().len());
-    for field in output_schema.fields() {
-        match bindings.get(field.name()) {
-            Some(Some(name)) => {
-                scan_columns.push(name.clone());
-                sources.push(ColumnSource::Scanned(name.clone()));
-            }
-            Some(None) => sources.push(ColumnSource::Absent),
-            None => {
-                return Err(datafusion::error::DataFusionError::Internal(format!(
-                    "projected column '{}' is not part of the schema the scan was built from",
-                    field.name()
-                )));
-            }
-        }
-    }
-    Ok((scan_columns, sources))
 }
 
 #[cfg(test)]

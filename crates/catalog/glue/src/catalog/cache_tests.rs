@@ -109,7 +109,7 @@ async fn catalog(
         .await
         .expect("build catalog")
         .with_file_io_for_tests(file_io.clone())
-        .with_cache_options(cache, object_cache_bytes, cred_ctx)
+        .with_cache_options(cache, object_cache_bytes, cred_ctx, None)
         .with_pointer_source(pointer)
 }
 
