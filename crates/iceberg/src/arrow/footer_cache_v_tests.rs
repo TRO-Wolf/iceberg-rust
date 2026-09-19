@@ -21,6 +21,7 @@ use parquet::file::properties::WriterProperties;
 
 use super::*;
 use crate::arrow::footer_cache::{ParquetFooterCache, TableFooterCache};
+use crate::arrow::open_parquet::{PAGE_INDEX_STRIPS, ROW_SELECTIONS_APPLIED};
 use crate::arrow::reader::ArrowReader;
 use crate::catalog::CacheScope;
 use crate::expr::Reference;
@@ -145,6 +146,73 @@ async fn v_cached_indexless_then_filtered_pos_deletes_match_uncached() {
     assert_eq!(cache.stats().upgrades, 1, "deletes must upgrade the index");
     assert_eq!(cache.stats().fetches, 1);
     let _ = ranges;
+}
+
+#[tokio::test]
+async fn v_all_keep_strip_leaves_cached_index_for_later_prune() {
+    let tmp = tmpdir();
+    let p = path(&tmp, "data.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    write_id_pages(&p, &ids);
+    let size = std::fs::metadata(&p).expect("stat").len();
+    let path_arc: Arc<str> = Arc::from(p.as_str());
+    let schema = id_schema();
+    let all_keep = bound(
+        &schema,
+        Reference::new("id").greater_than_or_equal_to(Datum::int(0)),
+    );
+    let pruning = bound(&schema, Reference::new("id").equal_to(Datum::int(64)));
+    let uncached = collect(
+        task(&p, schema.clone(), &[1], Some(pruning.clone())),
+        true,
+    )
+    .await;
+    let (io, _opens, _ranges) = recording_io();
+    let cache = Arc::new(ParquetFooterCache::new());
+    let handle = TableFooterCache::new(cache.clone(), CacheScope::isolated("v-strip"));
+    let strips_before = PAGE_INDEX_STRIPS.with(|count| count.get());
+    let first = read_tasks(
+        vec![task(&p, schema.clone(), &[1], Some(all_keep))],
+        io.clone(),
+        Some(handle.clone()),
+        1,
+        true,
+    )
+    .await
+    .expect("cached all-keep scan");
+    assert_eq!(first.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS);
+    assert_eq!(
+        PAGE_INDEX_STRIPS.with(|count| count.get()) - strips_before,
+        1,
+        "the all-keep cached scan must take the strip path"
+    );
+    cache.run_pending_tasks().await;
+    let mut probe_reader = file_reader(&io, &p, size, opts_filtered()).await;
+    let served = handle
+        .footer_or_fetch(&path_arc, size, opts_filtered(), &mut probe_reader)
+        .await
+        .expect("warm hit");
+    assert!(
+        served.metadata().column_index().is_some() && served.metadata().offset_index().is_some(),
+        "the strip must not remove the page index from the shared cache entry"
+    );
+    let applied_before = ROW_SELECTIONS_APPLIED.with(|count| count.get());
+    let second = read_tasks(
+        vec![task(&p, schema, &[1], Some(pruning))],
+        io,
+        Some(handle),
+        1,
+        true,
+    )
+    .await
+    .expect("cached pruning scan");
+    assert_eq!(second.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(dump(&second), dump(&uncached));
+    assert_eq!(
+        ROW_SELECTIONS_APPLIED.with(|count| count.get()) - applied_before,
+        1,
+        "a pruning scan of the cached file must still hand parquet a RowSelection"
+    );
 }
 
 #[tokio::test]
