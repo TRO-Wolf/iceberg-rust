@@ -145,6 +145,8 @@ mod metrics_config_tests;
 mod partition_key_audit;
 pub mod partition_stats;
 mod remove_dangling_delete_files;
+#[cfg(test)]
+mod replace_commit_summary_tests;
 mod rewrite_data_files;
 #[cfg(test)]
 mod rewrite_data_files_cow_bytes_tests;
