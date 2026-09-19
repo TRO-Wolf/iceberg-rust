@@ -68,16 +68,16 @@ Points pinned by this reading:
   sanitizes to `c_xD83D_xDE00` — exactly the oracle. Rust port iterates `str::encode_utf16()`.
   **PROVEN** (oracle `emoji_*` rows + Java source).
 - A leading digit is NOT a letter → `sanitize('1')` = `_1` → `1st` → `_1st` (oracle-confirmed).
-  Non-ASCII Nd digits likewise get `_<digit>` with the original digit char appended. **PROVEN**
+  Non-ASCII decimal digits (category N-d) likewise get `_<digit>` with the original digit char appended. **PROVEN**
 - `Integer.toHexString(c).toUpperCase(ROOT)` = minimal-width UPPERCASE hex of the UTF-16 unit:
   `' '`→`_x20`, `'-'`→`_x2D`, `'.'`→`_x2E`. **PROVEN**
 - `Character.isLetter` = Unicode general categories **Lu, Ll, Lt, Lm, Lo**;
-  `Character.isLetterOrDigit` adds **Nd** only. Rust `char::is_alphabetic` is the *Alphabetic*
+  `Character.isLetterOrDigit` adds decimal digits (category N-d) only. Rust `char::is_alphabetic` is the *Alphabetic*
   derived property (L\* + Nl + Other_Alphabetic) and `char::is_alphanumeric` adds Nl + No — both
   are SUPERSETS of Java's sets, so they are not drop-in equivalents. **PROVEN** (JDK semantics vs
   Rust std docs).
 - Choice made for classification (allowed by the brief): a generated range table over the BMP of
-  categories {Lu,Ll,Lt,Lm,Lo} for letters and {Nd} for digits — 380 + 37 ranges — produced by
+  categories {Lu,Ll,Lt,Lm,Lo} for letters and {N-d} for digits — 380 + 37 ranges — produced by
   Python `unicodedata` (Unicode **15.0.0**). Skew note, pinned: JDK 17 = Unicode 13.0, JDK 21 =
   Unicode 15.0; a BMP codepoint that gained a letter category between 13 and 15 would classify
   differently. Supplementary code points never matter: we iterate UTF-16 units and every surrogate
@@ -182,7 +182,7 @@ Measured: apache-avro 0.21 default validator rejects `é`/`列` embedded field n
 - `crates/iceberg/src/avro/name.rs` (new): `java_avro_name` ports `makeCompatibleName`/`sanitize`
   over `str::encode_utf16()` — digit → `_<digit>`, other invalid char → `_x` + uppercase hex of the
   UTF-16 code unit; letter/digit classification via generated BMP range tables {Lu,Ll,Lt,Lm,Lo} and
-  {Nd}. `avro_field_name` stamps `iceberg-field-name` beside `field-id` only when the name changes.
+  {N-d}. `avro_field_name` stamps `iceberg-field-name` beside `field-id` only when the name changes.
   `iceberg_field_name` reads it back. `strict_avro_name`/`strictify_avro_field_names` map any
   apache-avro-invalid name to a deterministic ASCII-valid one (used on reader schemas and on OCF
   header repair). `repair_avro_container` rewrites the `avro.schema` JSON inside an OCF header —
@@ -237,7 +237,7 @@ Measured: apache-avro 0.21 default validator rejects `é`/`列` embedded field n
 - [x] RED-FIRST pins: exact write schema, fixture reads, write→read, table-level scan — `fed67a75` PROVEN
 - [x] Java-exact sanitizer + `iceberg-field-name` on every `schema_to_avro_schema` record — §7 PROVEN
 - [x] Reader restores Iceberg names (attr / computed avro-name inverse) — §7 PROVEN
-- [x] OCF header patch for unparseable embedded schemas — §7 PROVEN
+- [x] OCF header patch for unparsable embedded schemas — §7 PROVEN
 - [x] Broken RePark manifest readable — §8 PROVEN (readable, not loud)
 - [x] `é`/`列` readable without global validator / Cargo change — §8 PROVEN
 - [x] Mutation arithmetic recorded — §8 PROVEN

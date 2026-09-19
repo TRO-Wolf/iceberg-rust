@@ -367,7 +367,7 @@ fn repaired_colliding_names_bind_distinctly() {
         );
         assert!(
             AvroReader::new(Cursor::new(&broken)).is_err(),
-            "container must be unparseable before repair"
+            "container must be unparsable before repair"
         );
 
         let repaired = repair_avro_container(&broken).unwrap();
