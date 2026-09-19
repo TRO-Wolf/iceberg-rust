@@ -688,3 +688,7 @@ mod tests;
 #[cfg(test)]
 #[path = "expr_to_predicate_nan_tests.rs"]
 mod nan_tests;
+
+#[cfg(test)]
+#[path = "expr_to_predicate_ts_tz_tests.rs"]
+mod ts_tz_tests;
