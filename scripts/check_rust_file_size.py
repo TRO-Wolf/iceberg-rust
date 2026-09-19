@@ -36,13 +36,13 @@ DEFAULT_CEILING = 1000
 # without permitting more legacy file-size debt. Delete a row once its file is
 # at or below DEFAULT_CEILING. Keep keys sorted.
 LEGACY_CEILINGS: dict[str, int] = {
-    "crates/catalog/glue/src/catalog.rs": 1048,
-    "crates/catalog/hms/src/catalog.rs": 1063,
+    "crates/catalog/glue/src/catalog.rs": 1046,
+    "crates/catalog/hms/src/catalog.rs": 1062,
     "crates/catalog/rest/src/catalog.rs": 4970,
     "crates/catalog/rest/src/client.rs": 1483,
     "crates/catalog/rest/src/types.rs": 1128,
-    "crates/catalog/s3tables/src/catalog.rs": 1403,
-    "crates/catalog/sql/src/catalog.rs": 3947,
+    "crates/catalog/s3tables/src/catalog.rs": 1402,
+    "crates/catalog/sql/src/catalog.rs": 3946,
     "crates/iceberg/src/arrow/avro_reader.rs": 1255,
     "crates/iceberg/src/arrow/avro_reader_tests.rs": 1097,
     "crates/iceberg/src/arrow/caching_delete_file_loader.rs": 3270,
@@ -107,7 +107,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/transaction/rewrite_files.rs": 2458,
     "crates/iceberg/src/transaction/rewrite_manifests.rs": 1915,
     "crates/iceberg/src/transaction/row_delta.rs": 6366,
-    "crates/iceberg/src/transaction/snapshot.rs": 3355,
+    "crates/iceberg/src/transaction/snapshot.rs": 3350,
     "crates/iceberg/src/transaction/update_partition_spec.rs": 1263,
     "crates/iceberg/src/transaction/update_schema.rs": 3595,
     "crates/iceberg/src/transform/bucket.rs": 1214,

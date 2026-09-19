@@ -17,10 +17,26 @@
 
 use std::num::NonZeroUsize;
 
+use crate::{Error, ErrorKind, Result};
+
 // Use a default value of 1 as the safest option.
 // See https://doc.rust-lang.org/std/thread/fn.available_parallelism.html#limitations
 // for more details.
 const DEFAULT_PARALLELISM: usize = 1;
+
+pub(crate) fn strip_trailing_slash(path: &str) -> Result<&str> {
+    if path.is_empty() {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "path must not be null or empty",
+        ));
+    }
+    let mut stripped = path;
+    while stripped.ends_with('/') && !stripped.ends_with("://") {
+        stripped = &stripped[..stripped.len() - 1];
+    }
+    Ok(stripped)
+}
 
 /// Uses [`std::thread::available_parallelism`] in order to
 /// retrieve an estimate of the default amount of parallelism

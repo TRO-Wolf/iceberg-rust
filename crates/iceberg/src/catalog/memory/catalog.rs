@@ -391,7 +391,7 @@ impl Catalog for MemoryCatalog {
         let table_ident = TableIdent::new(namespace_ident.clone(), table_name);
 
         // Resolve the table location under a short lock (may need namespace properties).
-        let (table_creation, location) = match table_creation.location.clone() {
+        let (table_creation, _location) = match table_creation.location.clone() {
             Some(location) => (table_creation, location),
             None => {
                 let root_namespace_state = self.root_namespace_state.lock().await;
@@ -412,7 +412,7 @@ impl Catalog for MemoryCatalog {
         let metadata = TableMetadataBuilder::from_table_creation(table_creation)?
             .build()?
             .metadata;
-        let metadata_location = MetadataLocation::new_with_table_location(location).to_string();
+        let metadata_location = MetadataLocation::for_metadata(&metadata)?.to_string();
 
         // Write outside the lock so concurrent catalog ops are not serialized on FileIO.
         metadata.write_to(&self.file_io, &metadata_location).await?;

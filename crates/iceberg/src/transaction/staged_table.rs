@@ -44,7 +44,6 @@
 //!
 //! Java interop battery is a disclosed non-goal of the first unit (GAP_MATRIX 🟡).
 
-use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind, Result};
@@ -97,7 +96,7 @@ impl StagedTableTransaction {
                 ),
             ));
         }
-        let location = creation.location.clone().ok_or_else(|| {
+        creation.location.clone().ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
                 "StagedTableTransaction::begin_create requires TableCreation.location",
@@ -106,7 +105,7 @@ impl StagedTableTransaction {
         let metadata = TableMetadataBuilder::from_table_creation(creation)?
             .build()?
             .metadata;
-        let metadata_location = MetadataLocation::new_with_table_location(&location).to_string();
+        let metadata_location = MetadataLocation::for_metadata(&metadata)?.to_string();
         metadata.write_to(&file_io, &metadata_location).await?;
 
         let table = Table::builder()
@@ -169,6 +168,7 @@ impl StagedTableTransaction {
             .location
             .clone()
             .unwrap_or_else(|| existing_location.to_string());
+
         let keeps_location = creation
             .location
             .as_deref()
@@ -227,9 +227,9 @@ impl StagedTableTransaction {
                 .build()?
                 .metadata;
 
-        let metadata_location = match MetadataLocation::from_str(&base_metadata_location) {
-            Ok(base) if keeps_location => base.with_next_version().to_string(),
-            _ => MetadataLocation::new_with_table_location(&table_location).to_string(),
+        let metadata_location = match MetadataLocation::from_file_path(&base_metadata_location) {
+            Ok(base) if keeps_location => base.with_next_version().rebased(&metadata)?.to_string(),
+            _ => MetadataLocation::for_metadata(&metadata)?.to_string(),
         };
         if hadoop_staged_location(&metadata_location) {
             ensure_staged_version_absent(existing.file_io(), &metadata_location).await?;
@@ -336,9 +336,11 @@ impl Transaction {
     /// the pointer in one catalog step.
     pub async fn apply_locally(self) -> Result<Table> {
         let current_table = self.run_actions_locally().await?;
-        let next_location = MetadataLocation::from_str(current_table.metadata_location_result()?)?
-            .with_next_version()
-            .to_string();
+        let next_location =
+            MetadataLocation::from_file_path(current_table.metadata_location_result()?)?
+                .with_next_version()
+                .rebased(current_table.metadata())?
+                .to_string();
         current_table
             .metadata()
             .write_commit_metadata(current_table.file_io(), &next_location)
@@ -402,7 +404,8 @@ fn parse_format_version_property(raw: &str) -> Result<FormatVersion> {
 }
 
 fn hadoop_staged_location(metadata_location: &str) -> bool {
-    MetadataLocation::from_str(metadata_location).is_ok_and(|parsed| parsed.is_hadoop_convention())
+    MetadataLocation::from_file_path(metadata_location)
+        .is_ok_and(|parsed| parsed.is_hadoop_convention())
 }
 
 async fn ensure_staged_version_absent(file_io: &FileIO, metadata_location: &str) -> Result<()> {
@@ -412,7 +415,7 @@ async fn ensure_staged_version_absent(file_io: &FileIO, metadata_location: &str)
         None
     };
     if occupied.is_none()
-        && let Ok(parsed) = MetadataLocation::from_str(metadata_location)
+        && let Ok(parsed) = MetadataLocation::from_file_path(metadata_location)
         && let Some(siblings) = parsed.hadoop_version_siblings()
     {
         for sibling in siblings {

@@ -37,7 +37,7 @@ use iceberg::spec::{
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, TableLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
@@ -207,11 +207,11 @@ fn lineage_arrow_field(name: &'static str, field_id: i32) -> Field {
 }
 
 type DmlDataFileWriterBuilder =
-    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+    DataFileWriterBuilder<ParquetWriterBuilder, TableLocationGenerator, DefaultFileNameGenerator>;
 
 type DmlRollingBuilder = RollingFileWriterBuilder<
     ParquetWriterBuilder,
-    DefaultLocationGenerator,
+    TableLocationGenerator,
     DefaultFileNameGenerator,
 >;
 
@@ -247,7 +247,7 @@ impl StreamingDataFileWriter {
             FieldMatchMode::Name,
         );
         let location_gen =
-            DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
+            TableLocationGenerator::new(table.metadata()).map_err(to_datafusion_error)?;
         let file_name_gen = DefaultFileNameGenerator::new(
             uuid::Uuid::now_v7().to_string(),
             None,
