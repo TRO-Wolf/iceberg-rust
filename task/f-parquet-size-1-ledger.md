@@ -281,3 +281,39 @@ other footer cells stay green. `parquet_writer.rs` came in one line under its ce
 (3 390) by inlining three once-used locals (`inner_writer`, `written_size`,
 `parquet_metadata`); the checker ceiling was lowered to match. The whole diff was
 grepped for `unwrap()`/`expect(` outside `*_tests.rs`/`#[cfg(test)]` — none.
+
+## Round 4 — raw-parquet test readers accept non-blob inference
+
+Fork CI "Tests (default)" failed on
+`iceberg-datafusion::sorted_insert_types insert_into_binary_order_sorts_unsigned_bytes`:
+`sorted_insert_shared::read_binary_column` reads a fork-written data file with a raw
+`ParquetRecordBatchReaderBuilder` and downcast to `LargeBinaryArray`. Without the
+`ARROW:schema` blob, raw inference yields `Binary` for BYTE_ARRAY — exactly what
+Spark-written files have always produced. The fix is test-side: the helper casts the
+column to `LargeBinary` before the downcast, so either representation is accepted
+(`crates/integrations/datafusion/tests/sorted_insert_shared/mod.rs` — the only file
+touched).
+
+**Sweep.** Every raw-parquet read in the workspace's tests was checked for unstable
+downcasts (`grep LargeBinaryArray|LargeStringArray|ParquetRecordBatchReaderBuilder`
+plus `SerializedFileReader`): Iceberg `binary` is the only primitive whose write-side
+Arrow shape (`LargeBinary`, `schema.rs:926`) differs from blob-less inference
+(`Binary`); `string` writes `Utf8`, `uuid`/`fixed` write `FixedSizeBinary`, and Arrow
+`downcast_ref` ignores timezone strings, so `Timestamp*Array` downcasts are stable.
+`write_defaults_tests.rs` already carried a `Binary`-or-`LargeBinary` fallback from
+round 1; `equality_delete_set.rs`/`value.rs` match both via `if let` chains;
+`nested_projection_evo_pin_tests.rs` and `arrow/schema.rs` downcasts are in-memory,
+not parquet reads. The Iceberg scan path is unaffected — it projects the table's
+Iceberg schema, so `binary` stays `LargeBinary` there.
+
+**Downstream effect.** Raw readers of fork-written files (pyarrow, arrow-rs without
+the Iceberg schema) now infer `binary` instead of `large_binary` for Iceberg binary
+columns — the same inference Spark-written files produce.
+
+**Runs.** `cargo test -p iceberg-datafusion --test sorted_insert_types` 10/10,
+`--test sorted_insert` 17/17, `--test sorted_insert_writer` 5/5,
+`--test insert_compression` 4/4, `--test rewrite_compression` 3/3,
+`--test rewrite_size_pin` 4/4, `--test rewrite_size_probe` 0 (1 ignored),
+`cargo test -p iceberg --lib writer::` 165/165, `--lib -- arrow:: scan::` 655/655.
+fmt clean, `clippy -p iceberg-datafusion --all-targets -- -D warnings` clean,
+comment-ban `hits=0`.
