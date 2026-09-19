@@ -17,23 +17,32 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use async_trait::async_trait;
+use bytes::Bytes;
 use futures::TryStreamExt;
 use parquet::arrow::arrow_reader::RowSelection;
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::basic::Compression;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use super::reader::{
     ArrowReader, ArrowReaderBuilder, build_fallback_field_id_map, build_field_id_map,
 };
+use crate::Result;
 use crate::expr::{Bind, BoundPredicate, Predicate};
-use crate::io::FileIO;
+use crate::io::{
+    FileIO, FileIOBuilder, FileInfo, FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorage,
+    OutputFile, Storage, StorageConfig, StorageFactory,
+};
 use crate::puffin::PuffinReader;
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
 use crate::spec::{
@@ -405,4 +414,136 @@ pub(crate) fn tmpdir() -> TempDir {
 
 pub(crate) fn path(tmp: &TempDir, name: &str) -> String {
     tmp.path().join(name).to_string_lossy().to_string()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RecordingStorage {
+    #[serde(skip)]
+    new_input_calls: Arc<AtomicUsize>,
+    #[serde(skip)]
+    read_ranges: Arc<Mutex<Vec<Range<u64>>>>,
+}
+
+struct RecordingFileRead {
+    inner: Box<dyn FileRead>,
+    read_ranges: Arc<Mutex<Vec<Range<u64>>>>,
+}
+
+#[async_trait]
+impl FileRead for RecordingFileRead {
+    async fn read(&self, range: Range<u64>) -> Result<Bytes> {
+        self.read_ranges
+            .lock()
+            .expect("read ranges")
+            .push(range.clone());
+        self.inner.read(range).await
+    }
+}
+
+#[async_trait]
+#[typetag::serde]
+impl Storage for RecordingStorage {
+    async fn exists(&self, path: &str) -> Result<bool> {
+        LocalFsStorage::new().exists(path).await
+    }
+    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
+        LocalFsStorage::new().metadata(path).await
+    }
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        LocalFsStorage::new().read(path).await
+    }
+    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        let inner = LocalFsStorage::new().reader(path).await?;
+        Ok(Box::new(RecordingFileRead {
+            inner,
+            read_ranges: self.read_ranges.clone(),
+        }))
+    }
+    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        LocalFsStorage::new().write(path, bs).await
+    }
+    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        LocalFsStorage::new().writer(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<()> {
+        LocalFsStorage::new().delete(path).await
+    }
+    async fn delete_prefix(&self, path: &str) -> Result<()> {
+        LocalFsStorage::new().delete_prefix(path).await
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
+        LocalFsStorage::new().list(prefix).await
+    }
+    fn new_input(&self, path: &str) -> Result<InputFile> {
+        self.new_input_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+    fn new_output(&self, path: &str) -> Result<OutputFile> {
+        Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RecordingStorageFactory {
+    #[serde(skip)]
+    new_input_calls: Arc<AtomicUsize>,
+    #[serde(skip)]
+    read_ranges: Arc<Mutex<Vec<Range<u64>>>>,
+}
+
+#[typetag::serde]
+impl StorageFactory for RecordingStorageFactory {
+    fn build(&self, _config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        Ok(Arc::new(RecordingStorage {
+            new_input_calls: self.new_input_calls.clone(),
+            read_ranges: self.read_ranges.clone(),
+        }))
+    }
+}
+
+pub(crate) fn recording_io() -> (FileIO, Arc<AtomicUsize>, Arc<Mutex<Vec<Range<u64>>>>) {
+    let new_input_calls = Arc::new(AtomicUsize::new(0));
+    let read_ranges = Arc::new(Mutex::new(Vec::new()));
+    let io = FileIOBuilder::new(Arc::new(RecordingStorageFactory {
+        new_input_calls: new_input_calls.clone(),
+        read_ranges: read_ranges.clone(),
+    }))
+    .build();
+    (io, new_input_calls, read_ranges)
+}
+
+fn byte_range(offset: Option<i64>, length: Option<i32>) -> Option<Range<u64>> {
+    let start = u64::try_from(offset?).ok()?;
+    let length = u64::try_from(length?).ok()?;
+    Some(start..(start + length))
+}
+
+pub(crate) fn index_byte_ranges(metadata: &ParquetMetaData) -> Vec<Range<u64>> {
+    let mut ranges = Vec::new();
+    for group in 0..metadata.num_row_groups() {
+        for column in metadata.row_group(group).columns() {
+            if let Some(range) =
+                byte_range(column.column_index_offset(), column.column_index_length())
+            {
+                ranges.push(range);
+            }
+            if let Some(range) =
+                byte_range(column.offset_index_offset(), column.offset_index_length())
+            {
+                ranges.push(range);
+            }
+        }
+    }
+    ranges
+}
+
+pub(crate) fn any_read_intersects(
+    read_ranges: &Mutex<Vec<Range<u64>>>,
+    ranges: &[Range<u64>],
+) -> bool {
+    read_ranges.lock().expect("read ranges").iter().any(|read| {
+        ranges
+            .iter()
+            .any(|r| read.start < r.end && r.start < read.end)
+    })
 }

@@ -50,6 +50,8 @@ pub mod partition_value_calculator;
 pub use partition_value_calculator::*;
 
 #[cfg(test)]
+mod open_parquet_tests;
+#[cfg(test)]
 mod page_prune_fixture;
 #[cfg(test)]
 mod page_prune_tests;

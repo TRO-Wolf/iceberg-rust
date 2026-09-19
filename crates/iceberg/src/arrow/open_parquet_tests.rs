@@ -1,0 +1,153 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::error::Error as _;
+use std::sync::Arc;
+
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+
+use super::page_prune_fixture::*;
+use super::reader::{ArrowReader, ParquetReadOptions};
+
+#[tokio::test]
+async fn footer_short_read_retries_with_real_size() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    write_id_pages(&data_path, &ids);
+    let actual = std::fs::metadata(&data_path).expect("stat").len();
+    let (io, new_input_calls, _ranges) = recording_io();
+    let (_reader, metadata) = ArrowReader::open_parquet_file(
+        &data_path,
+        &io,
+        actual + 512,
+        ParquetReadOptions::builder().build(),
+        None,
+    )
+    .await
+    .expect("stale manifest size retries with real size");
+    assert!(metadata.metadata().file_metadata().num_rows() > 0);
+    assert_eq!(
+        new_input_calls.load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
+}
+
+#[tokio::test]
+async fn footer_error_at_real_size_does_not_retry() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "garbage.parquet");
+    std::fs::write(&data_path, vec![0xABu8; 300]).expect("write");
+    let actual = std::fs::metadata(&data_path).expect("stat").len();
+    let (io, new_input_calls, _ranges) = recording_io();
+    let err = ArrowReader::open_parquet_file(
+        &data_path,
+        &io,
+        actual,
+        ParquetReadOptions::builder().build(),
+        None,
+    )
+    .await
+    .err()
+    .expect("garbage file fails");
+    assert!(
+        err.to_string().contains("Failed to load Parquet metadata"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        new_input_calls.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
+#[tokio::test]
+async fn page_index_error_does_not_retry() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let corrupt_path = path(&tmp, "corrupt.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    write_id_pages(&data_path, &ids);
+    let prefetched = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Skip)
+        .parse_and_finish(&std::fs::File::open(&data_path).expect("open"))
+        .expect("prefetched metadata");
+    let column_index_offset = prefetched
+        .row_group(0)
+        .column(0)
+        .column_index_offset()
+        .expect("column index present") as u64;
+    let column_index_length = prefetched
+        .row_group(0)
+        .column(0)
+        .column_index_length()
+        .expect("column index present") as usize;
+    let mut bytes = std::fs::read(&data_path).expect("read");
+    for byte in
+        &mut bytes[column_index_offset as usize..column_index_offset as usize + column_index_length]
+    {
+        *byte = 0xAB;
+    }
+    std::fs::write(&corrupt_path, &bytes).expect("write corrupt");
+    let actual = bytes.len() as u64;
+    let (io, new_input_calls, _ranges) = recording_io();
+    let mut options = ParquetReadOptions::builder().build();
+    options.preload_page_index = true;
+    let err = ArrowReader::open_parquet_file(
+        &corrupt_path,
+        &io,
+        actual + 512,
+        options,
+        Some(Arc::new(prefetched)),
+    )
+    .await
+    .err()
+    .expect("corrupt index fails");
+    assert!(
+        err.to_string().contains("page index"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        new_input_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn retry_failure_reports_first_error_as_source() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "garbage.parquet");
+    std::fs::write(&data_path, vec![0xABu8; 300]).expect("write");
+    let actual = std::fs::metadata(&data_path).expect("stat").len();
+    let (io, _calls, _ranges) = recording_io();
+    let err = ArrowReader::open_parquet_file(
+        &data_path,
+        &io,
+        actual + 512,
+        ParquetReadOptions::builder().build(),
+        None,
+    )
+    .await
+    .err()
+    .expect("garbage file fails");
+    let source = err.source().expect("first error kept as source");
+    assert!(
+        source
+            .to_string()
+            .contains("Failed to load Parquet metadata"),
+        "first error not preserved as source: {source}"
+    );
+}
