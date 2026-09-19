@@ -141,7 +141,26 @@ absent, so most cells are structurally inexpressible.
 
 ## Findings
 
-(to be filled by steps 4–5)
+- **Write path (step 4, measured by filtered test `binpack_transform_default_order_sorts_by_bucket_key_and_stamps`):**
+  `rewrite_data_files_write.rs::rewrite_sort_plan` already evaluates transforms — each non-identity
+  field builds a `BoxedTransformFunction` (`create_transform_function`) applied to the key array in
+  `sort_group_batch`, and `write_sorted_run` stamps every output file `with_sort_order_id(stamp)`.
+  Pin: a v2 table whose DEFAULT order is `bucket[4](y) asc nulls-first` is bin-pack-compacted so each
+  output file's rows are non-decreasing in `bucket[4](y)` (verified by re-applying the same transform
+  function to the written `y` column), the file order provably differs from identity order
+  (`differs_from_identity_sort`), and `file.sort_order_id() == Some(order_id)`. `Transform::Void`
+  fields are skipped, an unresolvable field/order falls back to unsorted with a 0 stamp.
+- **DataFusion INSERT path (verified by code reading, NOT fixed or extended here):**
+  `integrations/datafusion/src/physical_plan/sort.rs::write_sort_plan` already maps a transform-bearing
+  default order into `PhysicalSortExpr`s — non-identity fields are wrapped in `SortTransformExpr`
+  (evaluates `create_transform_function` inside the plan), nested sources in `NestedFieldExpr`, and
+  `sort_for_write` returns `sort_order_id` which `IcebergWriteExec` stamps via
+  `DataFileWriterBuilder::with_sort_order_id`. INSERT therefore already honors a transformed default
+  order; no finding to record, no change made.
+- **Nested source:** `person.name` binds through `field_by_name` and is pinned by
+  `test_sort_by_binds_nested_column_source` (`truncate[3]` on src 3). A transform on the struct itself
+  (`bucket(4, person)`) is rejected by the cannot-bind rule
+  (`test_sort_by_rejects_transform_on_struct_source`).
 
 ## Mutation table
 
