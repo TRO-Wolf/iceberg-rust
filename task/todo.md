@@ -25,6 +25,28 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-19): F-RPD-COMMITS-1 — `rewrite_position_delete_files` commits once and keeps file scope, as Java does
+
+Ledger: [`f-rpd-commits-1-ledger.md`](f-rpd-commits-1-ledger.md). Branch `fix/f-rpd-commits-1`
+off fork `main` (`50350e33`). Consumer: RePark registry row ICE-RDF-RPD-COMMITS-1 — the
+run-23a RPD oracle (Spark 4.1.2 + Iceberg 1.11.0) answers 8 rewritten / 8 added file-scoped
+outputs in ONE `replace` snapshot; the fork compacted to 2 partition-scoped files over 2
+commits.
+
+- [x] MEASURE + RED: `rewrite_position_delete_files_commits_tests.rs` — oracle-shape cells
+      for `rewrite_all` / `min_input_files(1)` / baseline / partial-progress controls /
+      dangling positions / partition granularity; stale per-bin-commit tests moved to the
+      Java contract. 9 red / 91 green. `ac9a53a1`
+- [x] FIX: staged `rewrite_bin` + batched `commit_bins` in new `commit_path` submodule —
+      one `replace` for all bins by default, `plan_commit_batches` drives partial-progress
+      batches; `write.delete.granularity` (default file) splits outputs per referenced
+      path; live-path filtering drops dangling positions; failed bins abort the whole
+      non-partial run with output cleanup. `8e7fde35`
+- [x] Mutation: `per_commit = 1` → 9 cells red; dangling-retain + per-path split removed
+      → 7 cells red; restore → 100/100 green; reverts not committed.
+- [x] Ledger + this entry; `cargo fmt --all`, clippy `-D warnings`, size checker green
+      (tests-file legacy ceiling lowered 4716 → 4608).
+
 ## ACTIVE (2026-09-18): F-RDF-GRANULARITY-1 — rewrite output is planned per read split
 
 Ledger: [`f-rdf-granularity-1-ledger.md`](f-rdf-granularity-1-ledger.md). Branch

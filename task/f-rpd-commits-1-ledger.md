@@ -27,9 +27,9 @@
 
 | Step | Commit | Subject |
 |---|---|---|
-| 1 | TBD | `test: F-RPD-COMMITS-1 — red single-commit, file-scoped cells` |
-| 2 | TBD | `fix: F-RPD-COMMITS-1 — position-delete rewrite commits once and keeps file scope, as Java does` |
-| 3 | TBD | `docs: F-RPD-COMMITS-1 — ledger, mutation proof` |
+| 1 | `ac9a53a1` | `test: F-RPD-COMMITS-1 — red single-commit, file-scoped cells` |
+| 2 | `8e7fde35` | `fix: F-RPD-COMMITS-1 — position-delete rewrite commits once and keeps file scope, as Java does` |
+| 3 | this commit | `docs: F-RPD-COMMITS-1 — ledger, mutation proof` |
 
 ## The oracle shape (run-23a)
 
@@ -112,12 +112,96 @@ Controls green before and after: `test_baseline_declines_every_bin_and_commits_n
 
 ## The fix
 
-TBD — written after the fix lands.
+`crates/iceberg/src/maintenance/rewrite_position_delete_files.rs` +
+new sibling module `rewrite_position_delete_files_commit.rs` (the file crossed the
+1000-line default ceiling, so the commit-path code moved there, the same pattern
+`rewrite_position_delete_files_v3.rs` already uses; the tests-file legacy ceiling was
+lowered 4716 → 4608 to match the shrink — ceilings only move down).
+
+1. **Staged rewrite, batched commits.** `compact_group` (read → write → commit per bin) is
+   replaced by `rewrite_bin` (read → drop dangling → sort → write, no commit) returning a
+   `RewrittenBin { deleted, added: [(file, data_seq)] }`, and `commit_bins`, which folds a
+   batch of staged bins into ONE `RewriteFiles`/`replace` transaction. `execute` drives
+   `per_commit = plan_commit_batches(bins, partial_progress, max_commits).first()` — the same
+   shared helper `RewriteDataFiles` uses, which returns one batch covering every bin when
+   partial progress is off and `ceil(total/max_commits)`-sized batches when it is on.
+2. **Atomicity.** A non-partial bin failure cleans up every already-written output file
+   (`delete_uncommitted_files`) and propagates — Java's `Tasks.stopOnFailure()` +
+   `commitOrClean` abort semantics. An `apply`/`commit` failure deletes that batch's output
+   files and propagates — Java's `CleanableFailure`, whole rewrite fails, no retry.
+   Partial progress suppresses a bin's write failure exactly as Java's
+   `suppressFailureWhenFinished` does (the bin is skipped; only *successful* rewrites count
+   toward a batch, as `BaseCommitService` offers only completed groups).
+3. **File scope.** `ResolvedConfig` gains `delete_granularity`, parsed from the new
+   `TableProperties::PROPERTY_DELETE_GRANULARITY` (`write.delete.granularity`) with default
+   **file** — `SparkWriteConf.deleteGranularity`'s answer on this path (Java's
+   `TableProperties.DELETE_GRANULARITY_DEFAULT` is `"partition"`, but the RPD write path
+   overrides it; this fork has no other reader of the property). Under `file`,
+   `write_group_outputs` splits the sorted pairs into runs of equal `file_path` and opens a
+   fresh `write_compacted_file` chain per run — Java's `FileScopedPositionDeleteWriter`
+   behaviour (one rolling chain per referenced path, rolling at write-max). Equal
+   `file_path` bounds then mark each output file-scoped via
+   `referenced_data_file_location` leg 3 — the same leg Java's `PositionDeleteWriter` relies
+   on; `referenced_data_file` (field 134) is not stamped, matching Java. Under `partition`
+   the whole bin goes through one writer as before.
+4. **Dangling positions.** `collect_position_delete_groups` now also returns the live
+   data-file paths per `(spec_id, partition)` group key (Java's `leftsemi` join on
+   `file_path` against the group's live `files` scan). `rewrite_bin` retains only pairs
+   whose path is live in that group; a bin whose pairs all drop contributes its inputs to
+   the remove set and nothing to the add set — Java removes the empty group's input files
+   in the commit, it does not skip the group.
+5. **Counts.** `rewritten_*` counts come from the `deleted` sets (all admitted inputs,
+   empty-output bins included); `added_*` from the `added` sets — the same quantities
+   `RewritePositionDeletesGroup.asResult()` reports.
+6. **v3 unchanged.** `rewrite_to_deletion_vectors` was not touched; it already commits once
+   and already drops positions for dead data files (`test_v3_position_naming_a_non_live_data_file_is_dropped`
+   stays green). `partial_progress` has no effect on the v3 arm, matching the Java arm where
+   the DV rewrite is a separate code path inside the same single-commit manager.
 
 ## Red / green / mutation output
 
-TBD — pasted from the runs.
+Command for every row: `cargo test -p iceberg --lib rewrite_position_delete_files`
+(100 tests in the filter).
+
+**RED** (baseline, commit `ac9a53a1`): 91 passed / 9 failed — the nine cells listed above.
+
+**GREEN** (commit `8e7fde35`): 100 passed / 0 failed.
+
+**MUTATION A — single-commit half reverted** (`per_commit = 1`, i.e. one commit per bin):
+91 passed / **9 failed**, all for the commit-shape reason:
+
+- `commits_tests::test_rewrite_all_commits_once_and_keeps_file_scope` FAILED
+- `commits_tests::test_min_input_files_1_commits_once_and_keeps_file_scope` FAILED
+- `commits_tests::test_partial_progress_max_commits_1_batches_all_bins_into_one_commit` FAILED
+- `commits_tests::test_partition_granularity_writes_partition_scoped_outputs_in_one_commit` FAILED
+- `test_one_replace_commit_for_all_bins` FAILED
+- `test_bin_failure_aborts_the_whole_rewrite` FAILED
+- `test_admitted_bin_with_zero_pairs_loses_its_inputs` FAILED
+- `test_partition_isolation_compacts_each_group_separately` FAILED
+- `test_admission_max_file_group_size_splits_partition_into_bins` FAILED
+
+**MUTATION B — file-scope half reverted** (dangling `retain` removed + the per-path run
+split in `write_group_outputs` removed, so every bin writes one partition-scoped output):
+93 passed / **7 failed**:
+
+- `commits_tests::test_dangling_positions_are_dropped_not_rewritten` FAILED
+- `commits_tests::test_rewrite_all_commits_once_and_keeps_file_scope` FAILED
+- `commits_tests::test_min_input_files_1_commits_once_and_keeps_file_scope` FAILED
+- `commits_tests::test_partial_progress_commits_one_batch_per_commit` FAILED
+- `commits_tests::test_partial_progress_max_commits_1_batches_all_bins_into_one_commit` FAILED
+- `test_multi_file_grouping_one_partition` FAILED
+- `test_unpartitioned_group_compacts` FAILED
+
+**RESTORED**: 100 passed / 0 failed.
 
 ## RePark strict-xfail forecast
 
-TBD — written at the end.
+| RePark cell | Fork answer now | Oracle | Forecast |
+|---|---|---|---|
+| `rpd_rewrite_all` value cell | `rewritten 8 / added 8`, outputs file-scoped 25-pos each, data seq 9, file seq = rewrite snapshot | identical | **xpass** — the strict xfail will fire and can flip to pass |
+| `rpd_rewrite_all` snapshot cell | ops end `append, delete, replace` — one `replace`, so 10 snapshots not 11 | identical | **xpass** |
+| `rpd_min_input_files_1` value cell | identical to `rpd_rewrite_all` | identical | **xpass** |
+| `rpd_min_input_files_1` snapshot cell | identical | identical | **xpass** |
+
+All four strict xfails should now fire XPASS against the bumped fork and retire.
+The `rpd_baseline` cell already passed (declined bins commit nothing) and is untouched.
