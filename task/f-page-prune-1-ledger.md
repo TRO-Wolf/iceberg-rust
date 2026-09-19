@@ -264,3 +264,60 @@ off (`crates/integrations/datafusion/src/physical_plan/spark_fixture_tests.rs`).
   tests)
 - `cargo test -p iceberg-datafusion --lib` — 289 passed, 1 ignored (5 DF clause tests + 3
   Spark-fixture SQL-door tests)
+
+## Round 3 — review remediation
+
+Reviewer reports `rv-pp-logic-out.json` (logic) and `rv-pp-perf-out.json` / `rv-pp-perf-report.md`
+(perf), remediated per orchestrator rulings.
+
+### Findings table
+
+| ID | Ruling | Pin | Commits |
+|---|---|---|---|
+| L-001 | Not a defect — declared divergence (Q-24b-1); evaluator unchanged | `n_all_null_pages_skipped_for_lt_declared_divergence` (core door), `sql_door_nulls_under_lt_le_not_gt_three_valued` (DF door) | `a6a7bdd5` |
+| L-002 (P2) | `eq`/`IN` must keep pages whose column-index min or max is NaN | `f_eq_in_nan_bound_keeps_page` | `39a1bc3f` (test, RED), `a74abafb` (fix) |
+| L-003 (P3) | Stale-size retry only after a footer-read failure at the manifest size; first error stays the source | `footer_error_at_real_size_does_not_retry`, `retry_failure_reports_first_error_as_source`, `footer_short_read_retries_with_real_size`, `page_index_error_does_not_retry` | `869b7182` (test, RED), `27f0654d` (fix) |
+| R-01/R-05 (P2) | Load the page index only when the bound predicate has ≥1 page-prunable leaf; deletes still force it | `not_eq_only_scan_reads_no_index_bytes`, `eq_scan_reads_index_bytes`, `deletes_force_index_load` (counting storage) | `e2166af5` (test), `956e34d2` (fix) |
+| R-02 (P3, optional if cheap) | Borrow `&[usize]` from the row-count cache; `calc_row_counts` capacity = page count | covered by existing evaluator/page-prune suite | `f6b6873a` |
+| R-02 (Datum-free compare) | Deferred — threading raw typed bounds into every leaf predicate's `Datum`-ordering semantics is not the cheap part of the finding | — | — |
+| R-03 (perf report, reader decode widening) | Kept — correctness fix proven by M6/M7; optional memory-only array drop not taken | — | — |
+| R-04 | 1,347-line source ceiling preserved — evaluator tests split into `page_index_evaluator_tests.rs` | — | `a74abafb` |
+
+### Declared: nulls under `<` at the core door
+
+`PageIndexEvaluator::visit_inequality` skips all-null pages for `<` / `<=` (and, via
+`rewrite_not`, for `NOT (s > _)` / `NOT (s >= _)`). Ruling Q-24b-1 declares this correct:
+
+- The fork's own row-group evaluator on main does the same at the row-group level —
+  `row_group_metrics_evaluator.rs` `visit_inequality` returns `ROWS_CANNOT_MATCH` when
+  `contains_nulls_only(field_id)` (readable in this tree).
+- Java `ParquetMetricsRowGroupFilter.lt`/`ltEq` return `ROWS_CANNOT_MATCH` when a column chunk
+  contains only nulls, and parquet-mr's column-index filter treats NULL as not satisfying `<`
+  (UNMEASURED — the Iceberg Java 1.11 source and parquet-mr are not in this tree; cited from
+  the reviewer report and the orchestrator ruling).
+- SQL three-valued logic and Spark's answer agree: `s < 'v999'`, `s <= 'z'`, and
+  `NOT (s > 'a')` exclude NULL rows — pinned at the DataFusion door ON and OFF by
+  `sql_door_nulls_under_lt_le_not_gt_three_valued` (the provider marks pushdown `Inexact`, so
+  DataFusion re-filters with SQL semantics; `NOT (s > 'a')` reaches the page index as
+  `s <= 'a'` through `rewrite_not`).
+
+The genuinely inconsistent piece is the core `RecordBatch` residual's nulls-first `<`, which
+keeps NULL rows (`record_batch_predicate.rs` module doc — readable; it carries the iceberg-api
+1.10.0 bytecode citations for Java's `Comparators.nullsFirst` total order and the per-op
+`null_verdict` table where `<`/`<=` resolve NULL to `true`). That is pre-existing BUG-002
+semantics this unit does not change. Pinned at the core door by
+`n_all_null_pages_skipped_for_lt_declared_divergence`: ON returns 384 rows — the page index
+skips the two all-null pages (128 rows) and the residual then keeps the 64 NULLs on mixed
+pages; OFF returns all 512. The core-door scan result therefore differs from SQL by exactly
+the NULL rows on kept pages — matching what the row-group evaluator already produces for
+all-null groups (skipped) vs NULLs inside kept groups (kept by the residual).
+
+### Round-3 mutation evidence
+
+| Mutation | Result |
+|---|---|
+| L-002 pin vs pre-fix evaluator (`eq`/`IN` skip on NaN bound) | `f_eq_in_nan_bound_keeps_page` red (NaN min bound wrongly skipped) |
+| L-003 pins vs pre-fix retry (retried after index error; retry error lost first source) | `page_index_error_does_not_retry` red (3 opens, not 1), `retry_failure_reports_first_error_as_source` red |
+| R-01/R-05 pin vs pre-fix gate (index loaded for any predicate) | `not_eq_only_scan_reads_no_index_bytes` red |
+| M9 `AllNull` skip removed from `visit_inequality` | `n_all_null_pages_skipped_for_lt_declared_divergence` red |
+| M10 DF pushdown `Inexact` → `Exact` | `sql_door_nulls_under_lt_le_not_gt_three_valued` red (512 rows incl. NULLs through the door) |
