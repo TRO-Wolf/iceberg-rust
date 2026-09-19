@@ -121,6 +121,39 @@ impl StorageFactory for CountingStorageFactory {
     }
 }
 
+#[derive(Debug)]
+struct ReadGate {
+    entered: AtomicU64,
+    permits: tokio::sync::Semaphore,
+}
+
+impl ReadGate {
+    fn new() -> Self {
+        Self {
+            entered: AtomicU64::new(0),
+            permits: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn wait(&self) -> Result<()> {
+        self.entered.fetch_add(1, Ordering::Relaxed);
+        self.permits
+            .acquire()
+            .await
+            .map_err(|_| Error::new(ErrorKind::Unexpected, "read gate closed"))?
+            .forget();
+        Ok(())
+    }
+
+    fn entered(&self) -> u64 {
+        self.entered.load(Ordering::Relaxed)
+    }
+
+    fn release(&self) {
+        self.permits.add_permits(1);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GatedStorage {
     #[serde(skip)]
@@ -131,6 +164,8 @@ struct GatedStorage {
     fail_reads: Arc<AtomicBool>,
     #[serde(skip)]
     read_yields: u32,
+    #[serde(skip)]
+    read_gate: Option<Arc<ReadGate>>,
 }
 
 #[async_trait]
@@ -147,6 +182,9 @@ impl Storage for GatedStorage {
     async fn read(&self, path: &str) -> Result<Bytes> {
         for _ in 0..self.read_yields {
             tokio::task::yield_now().await;
+        }
+        if let Some(gate) = &self.read_gate {
+            gate.wait().await?;
         }
         self.body_reads.fetch_add(1, Ordering::Relaxed);
         if self.fail_reads.load(Ordering::Relaxed) {
@@ -198,6 +236,8 @@ struct GatedStorageFactory {
     fail_reads: Arc<AtomicBool>,
     #[serde(skip)]
     read_yields: u32,
+    #[serde(skip)]
+    read_gate: Option<Arc<ReadGate>>,
 }
 
 impl GatedStorageFactory {
@@ -210,9 +250,26 @@ impl GatedStorageFactory {
                 body_reads: body_reads.clone(),
                 fail_reads: fail_reads.clone(),
                 read_yields,
+                read_gate: None,
             },
             body_reads,
             fail_reads,
+        )
+    }
+
+    fn blocking() -> (Self, Arc<AtomicU64>, Arc<ReadGate>) {
+        let body_reads = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(ReadGate::new());
+        (
+            Self {
+                storage: MemoryStorage::new(),
+                body_reads: body_reads.clone(),
+                fail_reads: Arc::new(AtomicBool::new(false)),
+                read_yields: 0,
+                read_gate: Some(gate.clone()),
+            },
+            body_reads,
+            gate,
         )
     }
 }
@@ -225,6 +282,7 @@ impl StorageFactory for GatedStorageFactory {
             body_reads: self.body_reads.clone(),
             fail_reads: self.fail_reads.clone(),
             read_yields: self.read_yields,
+            read_gate: self.read_gate.clone(),
         }))
     }
 }
@@ -472,9 +530,10 @@ async fn version_never_sole_check_location_required() {
     cache
         .put(
             &scope,
-            "memory://a".to_string(),
+            "memory://a",
             meta.clone(),
             Some("etag-1".to_string()),
+            None,
         )
         .await;
     assert!(
@@ -497,7 +556,7 @@ async fn learn_version_guard_then_mismatch_fail_closed() {
     let cache = TableMetadataCache::new();
     let scope = test_scope();
     let meta = Arc::new(sample_metadata("memory://warehouse/t"));
-    cache.put(&scope, "memory://a".to_string(), meta, None).await;
+    cache.put(&scope, "memory://a", meta, None, None).await;
 
     assert!(
         cache.lookup(&scope, "memory://a", Some("v1")).await.is_some(),
@@ -521,7 +580,9 @@ async fn eviction_under_pressure_bounds_and_counts_and_never_stale() {
     let (factory, _body_reads) = CountingStorageFactory::new();
     let file_io = crate::io::FileIOBuilder::new(Arc::new(factory)).build();
     let scope = test_scope();
-    let cache = TableMetadataCache::with_max_entries(2);
+    let doc_bytes = u64::from(measured_body_len(&sample_metadata("memory://warehouse/t")));
+    let bound = doc_bytes * 2 + 1;
+    let cache = TableMetadataCache::with_max_bytes(bound);
 
     for i in 0..5 {
         let location = format!("memory://warehouse/t/metadata/v{i}.metadata.json");
@@ -547,8 +608,13 @@ async fn eviction_under_pressure_bounds_and_counts_and_never_stale() {
     cache.run_pending_tasks().await;
 
     assert!(
+        cache.weighted_size() <= bound,
+        "cache must hold at most the configured byte bound: {} > {bound}",
+        cache.weighted_size()
+    );
+    assert!(
         cache.len() <= 2,
-        "cache must hold at most the configured bound: {}",
+        "byte bound of two documents must retain at most two entries: {}",
         cache.len()
     );
     assert!(
@@ -679,4 +745,169 @@ async fn concurrent_cold_loads_dedup_single_fetch_and_errors_reach_all() {
 fn _counting_storage_is_dyn_storage() {
     let _f: Arc<dyn StorageFactory> = Arc::new(CountingStorageFactory::new().0);
     let _ = Error::new(ErrorKind::Unexpected, "compile-only");
+}
+
+async fn wait_gate_entered(gate: &ReadGate, n: u64) {
+    for _ in 0..10_000 {
+        if gate.entered() >= n {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("read gate never reached {n} entered reads");
+}
+
+#[tokio::test]
+async fn default_byte_bound_evicts_under_pressure() {
+    let cache = TableMetadataCache::new();
+    let scope = test_scope();
+    let meta = Arc::new(sample_metadata("memory://warehouse/t"));
+
+    for i in 0..3 {
+        cache
+            .put(
+                &scope,
+                &format!("memory://l{i}"),
+                meta.clone(),
+                None,
+                Some(32 * 1024 * 1024),
+            )
+            .await;
+    }
+    cache.run_pending_tasks().await;
+
+    assert!(
+        cache.weighted_size() <= 64 * 1024 * 1024,
+        "default bound is 64 MiB: {}",
+        cache.weighted_size()
+    );
+    assert!(
+        cache.len() <= 2,
+        "three 32 MiB entries cannot all fit the 64 MiB default: {}",
+        cache.len()
+    );
+    assert!(
+        cache.stats().evictions >= 1,
+        "crossing the default bound must evict: {}",
+        cache.stats().evictions
+    );
+}
+
+#[tokio::test]
+async fn cancelled_initiator_does_not_poison_or_install() {
+    let (factory, body_reads, gate) = GatedStorageFactory::blocking();
+    let file_io = crate::io::FileIOBuilder::new(Arc::new(factory)).build();
+    let location = "memory://warehouse/t/metadata/v1.metadata.json";
+    sample_metadata("memory://warehouse/t")
+        .write_to(&file_io, location)
+        .await
+        .expect("write");
+
+    let cache = Arc::new(TableMetadataCache::new());
+    let scope = test_scope();
+
+    let spawned_file_io = file_io.clone();
+    let spawned_scope = scope.clone();
+    let spawned_cache = Arc::clone(&cache);
+    let initiator = tokio::spawn(async move {
+        load_or_fetch_table_metadata(
+            &spawned_file_io,
+            &spawned_scope,
+            location,
+            Some(&spawned_cache),
+            Some("v1"),
+        )
+        .await
+    });
+    wait_gate_entered(&gate, 1).await;
+    initiator.abort();
+    assert!(
+        initiator.await.is_err(),
+        "the blocked initiator must be cancelled"
+    );
+    gate.release();
+
+    let loaded = load_or_fetch_table_metadata(&file_io, &scope, location, Some(&cache), Some("v1"))
+        .await
+        .expect("load after cancelled initiator");
+    assert_eq!(loaded.location(), "memory://warehouse/t");
+    assert_eq!(
+        body_reads.load(Ordering::Relaxed),
+        1,
+        "the aborted read must not reach storage; exactly one real fetch follows"
+    );
+    assert_eq!(cache.stats().body_fetches, 1);
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.len(), 1, "cancelled init must not install an entry");
+
+    let again = load_or_fetch_table_metadata(&file_io, &scope, location, Some(&cache), Some("v1"))
+        .await
+        .expect("warm load");
+    assert_eq!(again.location(), "memory://warehouse/t");
+    assert_eq!(cache.stats().hits, 1);
+}
+
+#[tokio::test]
+async fn version_mismatch_during_inflight_load_fail_closed_refetches() {
+    let (factory, _body_reads, gate) = GatedStorageFactory::blocking();
+    let file_io = crate::io::FileIOBuilder::new(Arc::new(factory)).build();
+    let location = "memory://warehouse/t/metadata/v1.metadata.json";
+    sample_metadata("memory://warehouse/t-v1")
+        .write_to(&file_io, location)
+        .await
+        .expect("write v1 body");
+
+    let cache = Arc::new(TableMetadataCache::new());
+    let scope = test_scope();
+
+    let first_file_io = file_io.clone();
+    let first_scope = scope.clone();
+    let first_cache = Arc::clone(&cache);
+    let first = tokio::spawn(async move {
+        load_or_fetch_table_metadata(
+            &first_file_io,
+            &first_scope,
+            location,
+            Some(&first_cache),
+            Some("v1"),
+        )
+        .await
+    });
+    wait_gate_entered(&gate, 1).await;
+
+    let second_file_io = file_io.clone();
+    let second_scope = scope.clone();
+    let second_cache = Arc::clone(&cache);
+    let second = tokio::spawn(async move {
+        load_or_fetch_table_metadata(
+            &second_file_io,
+            &second_scope,
+            location,
+            Some(&second_cache),
+            Some("v2"),
+        )
+        .await
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    gate.release();
+    wait_gate_entered(&gate, 2).await;
+
+    sample_metadata("memory://warehouse/t-v2")
+        .write_to(&file_io, location)
+        .await
+        .expect("swap body");
+    gate.release();
+
+    let v1 = first.await.expect("join").expect("first load");
+    let v2 = second.await.expect("join").expect("second load");
+    assert_eq!(v1.location(), "memory://warehouse/t-v1");
+    assert_eq!(
+        v2.location(),
+        "memory://warehouse/t-v2",
+        "a version-mismatched load must fail closed and fetch its own body"
+    );
+    assert_eq!(cache.stats().body_fetches, 2);
+    assert_eq!(cache.stats().hits, 0);
 }

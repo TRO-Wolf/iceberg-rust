@@ -37,7 +37,6 @@ use super::{
     SnapshotRef, SnapshotRetention, SortOrder, SortOrderBuilder, SortOrderRef, StatisticsFile,
     StructType, TableProperties,
 };
-use crate::compression::CompressionCodec;
 use crate::error::{Result, timestamp_ms_to_utc};
 use crate::io::{FileIO, RedactedProps};
 use crate::spec::EncryptedKey;
@@ -465,31 +464,9 @@ impl TableMetadata {
         file_io: &FileIO,
         metadata_location: impl AsRef<str>,
     ) -> Result<TableMetadata> {
-        let metadata_location = metadata_location.as_ref();
-        let input_file = file_io.new_input(metadata_location)?;
-        let metadata_content = input_file.read().await?;
-
-        // Check if the file is compressed by looking for the gzip "magic number".
-        let metadata = if metadata_content.len() > 2
-            && metadata_content[0] == 0x1F
-            && metadata_content[1] == 0x8B
-        {
-            let decompressed_data = CompressionCodec::Gzip
-                .decompress(metadata_content.to_vec())
-                .map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "Trying to read compressed metadata file",
-                    )
-                    .with_context("file_path", metadata_location)
-                    .with_source(e)
-                })?;
-            serde_json::from_slice(&decompressed_data)?
-        } else {
-            serde_json::from_slice(&metadata_content)?
-        };
-
-        Ok(metadata)
+        Self::read_from_measured(file_io, metadata_location)
+            .await
+            .map(|(metadata, _)| metadata)
     }
 
     /// Write table metadata to the given location.
