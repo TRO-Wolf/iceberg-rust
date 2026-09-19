@@ -18,11 +18,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use iceberg::io::FileIO;
+use iceberg::io::{FileIO, MemoryStorageFactory};
 use iceberg::spec::{NestedField, PrimitiveType, Schema, TableMetadata, TableMetadataBuilder, Type};
-use iceberg::{TableCreation, TableMetadataCache};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{CatalogBuilder, TableCreation, TableMetadataCache};
 
 use super::*;
+use crate::commit_transport::{S3TablesCommitScript, ScriptedS3TablesCommitTransport};
+use crate::{S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN, S3TablesCatalogBuilder};
 
 type PointerFn = Arc<dyn Fn(&TableIdent) -> Result<(String, String)> + Send + Sync>;
 
@@ -124,7 +127,9 @@ async fn p1_second_handle_commit_visible_on_first_handle_next_load() {
     assert_eq!(before.metadata().location(), "memory://wh/t");
 
     *state.lock().expect("pointer state") = (loc2.to_string(), "tok-2".to_string());
-    second_handle.cache_put(loc2, &meta2).await;
+    second_handle
+        .cache_put(loc2, Arc::new(meta2), Some("tok-2".to_string()))
+        .await;
 
     let after = first_handle.load_table(&t).await.expect("load after commit");
     assert_eq!(
@@ -409,5 +414,523 @@ async fn p9_no_cache_handles_every_load_body_gets() {
         warm2.metadata().location(),
         "memory://wh/t-rewritten",
         "with a cache handle the second load serves the cached Arc"
+    );
+}
+
+fn builder_props(arn: &str, extra: &[(&str, &str)]) -> HashMap<String, String> {
+    let mut props = HashMap::from([(
+        S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+        arn.to_string(),
+    )]);
+    for (key, value) in extra {
+        props.insert(key.to_string(), value.to_string());
+    }
+    props
+}
+
+async fn dummy_client() -> aws_sdk_s3tables::Client {
+    let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .credentials_provider(aws_sdk_s3tables::config::Credentials::new(
+            "test", "test", None, None, "test",
+        ))
+        .region(aws_config::Region::new("us-east-1"))
+        .load()
+        .await;
+    aws_sdk_s3tables::Client::new(&cfg)
+}
+
+fn failable_pointer() -> (Arc<Mutex<Option<(String, String)>>>, PointerFn) {
+    let state = Arc::new(Mutex::new(None));
+    let held = Arc::clone(&state);
+    (
+        state,
+        Arc::new(move |_| {
+            held.lock().expect("pointer state").clone().ok_or_else(|| {
+                Error::new(ErrorKind::Unexpected, "pointer fetch failed")
+            })
+        }),
+    )
+}
+
+#[tokio::test]
+async fn l1_region_only_injected_io_isolates_shared_cache() {
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    let (_state, source) = mutable_pointer(loc, "tok");
+    let shared = Arc::new(TableMetadataCache::new());
+    let t = ident("t");
+
+    let cat_factory = S3TablesCatalogBuilder::default()
+        .with_table_metadata_cache(Arc::clone(&shared))
+        .with_storage_factory(Arc::new(MemoryStorageFactory))
+        .load(
+            "cat-factory",
+            builder_props(
+                "arn:aws:s3tables:us-east-1:1:bucket/shared",
+                &[("region_name", "us-east-1")],
+            ),
+        )
+        .await
+        .expect("load factory catalog")
+        .with_pointer_source(Arc::clone(&source));
+
+    let client_io = FileIO::new_with_memory();
+    let cat_client = S3TablesCatalogBuilder::default()
+        .with_table_metadata_cache(Arc::clone(&shared))
+        .with_client(dummy_client().await)
+        .load(
+            "cat-client",
+            builder_props(
+                "arn:aws:s3tables:us-east-1:1:bucket/shared",
+                &[("region_name", "us-east-1")],
+            ),
+        )
+        .await
+        .expect("load client catalog")
+        .with_file_io_for_tests(client_io.clone())
+        .with_pointer_source(source);
+
+    sample_metadata("memory://wh/t-factory")
+        .write_to(&cat_factory.file_io, loc)
+        .await
+        .expect("write factory body");
+    sample_metadata("memory://wh/t-client")
+        .write_to(&client_io, loc)
+        .await
+        .expect("write client body");
+
+    let factory_table = cat_factory.load_table(&t).await.expect("factory load");
+    let client_table = cat_client.load_table(&t).await.expect("client load");
+
+    assert_eq!(factory_table.metadata().location(), "memory://wh/t-factory");
+    assert_eq!(client_table.metadata().location(), "memory://wh/t-client");
+    let stats = shared.stats();
+    assert_eq!(stats.body_fetches, 2, "injected-io scopes must isolate");
+    assert_eq!(stats.misses, 2);
+
+    cat_factory.load_table(&t).await.expect("warm factory");
+    assert_eq!(
+        shared.stats().hits,
+        1,
+        "each isolated scope still caches its own entry"
+    );
+}
+
+#[tokio::test]
+async fn p1_commit_through_update_table_visible_on_shared_handle() {
+    let file_io = FileIO::new_with_memory();
+    let loc1 = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc1)
+        .await
+        .expect("write v1");
+
+    let (state, source) = mutable_pointer(loc1, "tok-1");
+    let cache = Arc::new(TableMetadataCache::new());
+    let arn = "arn:aws:s3tables:us-east-1:1:bucket/commit";
+    let creds = Some("ctx-shared".to_string());
+    let cat_a = catalog(
+        arn,
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        creds.clone(),
+        Arc::clone(&source),
+    )
+    .await;
+    let cat_b = catalog(
+        arn,
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        creds,
+        source,
+    )
+    .await
+    .with_commit_transport(ScriptedS3TablesCommitTransport::new([
+        S3TablesCommitScript::Success,
+    ]));
+    let t = ident("t");
+
+    cat_a.load_table(&t).await.expect("cold load on a");
+    let table_b = cat_b.load_table(&t).await.expect("warm load on b");
+    assert_eq!(cache.stats().body_fetches, 1);
+
+    let tx = Transaction::new(&table_b);
+    let committed = tx
+        .update_table_properties()
+        .set("commit.marker".to_string(), "yes".to_string())
+        .apply(tx)
+        .expect("apply")
+        .commit(&cat_b)
+        .await
+        .expect("commit through update_table");
+    let loc2 = committed
+        .metadata_location()
+        .expect("committed location")
+        .to_string();
+    assert_ne!(loc2, loc1);
+
+    *state.lock().expect("pointer state") = (loc2.clone(), "tok-2".to_string());
+
+    let after = cat_a.load_table(&t).await.expect("load after commit");
+    assert_eq!(after.metadata_location(), Some(loc2.as_str()));
+    assert_eq!(
+        after.metadata().properties().get("commit.marker"),
+        Some(&"yes".to_string()),
+        "handle a must observe the committed metadata"
+    );
+    let stats = cache.stats();
+    assert_eq!(
+        stats.body_fetches, 1,
+        "commit must publish the staged metadata so handle a loads warm"
+    );
+    assert_eq!(
+        stats.hits, 3,
+        "warm b load + commit base refresh + warm a post-commit load"
+    );
+}
+
+#[tokio::test]
+async fn l005_publish_carries_service_version_token() {
+    let file_io = FileIO::new_with_memory();
+    let loc1 = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc1)
+        .await
+        .expect("write v1");
+
+    let (state, source) = mutable_pointer(loc1, "tok-1");
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        "arn:aws:s3tables:us-east-1:1:bucket/tok",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        Some("ctx".to_string()),
+        source,
+    )
+    .await
+    .with_commit_transport(ScriptedS3TablesCommitTransport::new([
+        S3TablesCommitScript::SuccessToken("tok-2".to_string()),
+    ]));
+    let t = ident("t");
+
+    let table = cat.load_table(&t).await.expect("seed load");
+    let tx = Transaction::new(&table);
+    let committed = tx
+        .update_table_properties()
+        .set("v".to_string(), "2".to_string())
+        .apply(tx)
+        .expect("apply")
+        .commit(&cat)
+        .await
+        .expect("commit");
+    let loc2 = committed
+        .metadata_location()
+        .expect("committed location")
+        .to_string();
+
+    *state.lock().expect("pointer state") = (loc2.clone(), "tok-9".to_string());
+    cat.load_table(&t)
+        .await
+        .expect("load under a different service version");
+    let stats = cache.stats();
+    assert_eq!(
+        stats.misses, 2,
+        "the published tok-2 entry must fail closed against service tok-9"
+    );
+    assert_eq!(stats.body_fetches, 2);
+
+    cat.load_table(&t).await.expect("warm re-armed load");
+    assert_eq!(
+        cache.stats().hits,
+        2,
+        "commit base refresh + re-armed warm load"
+    );
+}
+
+#[tokio::test]
+async fn l002_register_table_is_unsupported_on_s3tables() {
+    let file_io = FileIO::new_with_memory();
+    let (_state, source) = mutable_pointer("memory://wh/t/metadata/v1.metadata.json", "tok");
+    let cat = catalog(
+        "arn:aws:s3tables:us-east-1:1:bucket/reg",
+        &file_io,
+        None,
+        None,
+        None,
+        source,
+    )
+    .await;
+    let err = cat
+        .register_table(&ident("t"), "memory://wh/t/metadata/v1.metadata.json".to_string())
+        .await
+        .expect_err("register must fail");
+    assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+}
+
+#[tokio::test]
+async fn l3_invalidate_table_evicts_current_pointer_location() {
+    let file_io = FileIO::new_with_memory();
+    let loc1 = "memory://wh/t/metadata/v1.metadata.json";
+    let loc2 = "memory://wh/t/metadata/v2.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc1)
+        .await
+        .expect("write v1");
+    sample_metadata("memory://wh/t-moved")
+        .write_to(&file_io, loc2)
+        .await
+        .expect("write v2");
+
+    let (state, source) = mutable_pointer(loc1, "tok-1");
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        "arn:aws:s3tables:us-east-1:1:bucket/inv",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        Some("ctx".to_string()),
+        source,
+    )
+    .await;
+    let t = ident("t");
+
+    cat.load_table(&t).await.expect("seed loc1 entry");
+    *state.lock().expect("pointer state") = (loc2.to_string(), "tok-2".to_string());
+    cat.load_table(&t).await.expect("seed loc2 entry");
+
+    cat.invalidate_table(&t).await.expect("invalidate");
+    cache.run_pending_tasks().await;
+
+    let reloaded = cat.load_table(&t).await.expect("load after invalidate");
+    assert_eq!(reloaded.metadata().location(), "memory://wh/t-moved");
+    let stats = cache.stats();
+    assert_eq!(
+        stats.misses, 3,
+        "the evicted current location must miss again"
+    );
+    assert_eq!(stats.body_fetches, 3);
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.len(), 2, "loc1 entry stays; only the current location evicts");
+}
+
+#[tokio::test]
+async fn l3_invalidate_pointer_failure_evicts_nothing() {
+    let file_io = FileIO::new_with_memory();
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write");
+
+    let (state, source) = failable_pointer();
+    *state.lock().expect("pointer state") = Some((loc.to_string(), "tok".to_string()));
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        "arn:aws:s3tables:us-east-1:1:bucket/invfail",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        Some("ctx".to_string()),
+        source,
+    )
+    .await;
+    let t = ident("t");
+
+    cat.load_table(&t).await.expect("seed load");
+    *state.lock().expect("pointer state") = None;
+
+    let err = cat
+        .invalidate_table(&t)
+        .await
+        .expect_err("pointer failure must surface");
+    assert_eq!(err.kind(), ErrorKind::Unexpected);
+
+    *state.lock().expect("pointer state") = Some((loc.to_string(), "tok".to_string()));
+    cat.load_table(&t).await.expect("load after failed invalidate");
+    assert_eq!(
+        cache.stats().hits, 1,
+        "a failed pointer fetch must not evict the known entry"
+    );
+    assert_eq!(cache.stats().body_fetches, 1);
+}
+
+#[tokio::test]
+async fn l3_drop_table_evicts_last_known_location() {
+    let file_io = FileIO::new_with_memory();
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write");
+
+    let (_state, source) = mutable_pointer(loc, "tok");
+    let dropped = Arc::new(Mutex::new(Vec::<String>::new()));
+    let dropped_seen = Arc::clone(&dropped);
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        "arn:aws:s3tables:us-east-1:1:bucket/drop",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        Some("ctx".to_string()),
+        source,
+    )
+    .await
+    .with_drop_source(Arc::new(move |ident| {
+        dropped_seen
+            .lock()
+            .expect("drop log")
+            .push(ident.name().to_string());
+        Ok(())
+    }));
+    let t = ident("t");
+
+    cat.load_table(&t).await.expect("seed load");
+    cat.drop_table(&t).await.expect("drop");
+    cache.run_pending_tasks().await;
+    assert_eq!(dropped.lock().expect("drop log").as_slice(), ["t"]);
+    assert_eq!(
+        cache.len(),
+        0,
+        "a successful drop must evict the last known location"
+    );
+}
+
+#[tokio::test]
+async fn l3_drop_failure_keeps_cache_entry() {
+    let file_io = FileIO::new_with_memory();
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write");
+
+    let (_state, source) = mutable_pointer(loc, "tok");
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        "arn:aws:s3tables:us-east-1:1:bucket/dropfail",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        Some("ctx".to_string()),
+        source,
+    )
+    .await
+    .with_drop_source(Arc::new(|_| {
+        Err(Error::new(ErrorKind::Unexpected, "delete failed"))
+    }));
+    let t = ident("t");
+
+    cat.load_table(&t).await.expect("seed load");
+    cat.drop_table(&t).await.expect_err("drop must fail");
+    cat.load_table(&t).await.expect("load after failed drop");
+    assert_eq!(
+        cache.stats().hits, 1,
+        "a failed drop must not evict the entry"
+    );
+}
+
+async fn builder_catalog(
+    arn: &str,
+    props_extra: &[(&str, &str)],
+    shared: &Arc<TableMetadataCache>,
+    file_io: &FileIO,
+    source: PointerFn,
+) -> S3TablesCatalog {
+    S3TablesCatalogBuilder::default()
+        .with_table_metadata_cache(Arc::clone(shared))
+        .load("cat", builder_props(arn, props_extra))
+        .await
+        .expect("builder load")
+        .with_file_io_for_tests(file_io.clone())
+        .with_pointer_source(source)
+}
+
+#[tokio::test]
+async fn p4_identical_credential_props_separate_by_identity_alone() {
+    let file_io = FileIO::new_with_memory();
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write");
+    let (_state, source) = mutable_pointer(loc, "tok");
+    let shared = Arc::new(TableMetadataCache::new());
+    let creds = [("aws_access_key_id", "SHARED-AKID")];
+    let t = ident("t");
+
+    let cat_a = builder_catalog(
+        "arn:aws:s3tables:us-east-1:1:bucket/a",
+        &creds,
+        &shared,
+        &file_io,
+        Arc::clone(&source),
+    )
+    .await;
+    let cat_b = builder_catalog(
+        "arn:aws:s3tables:us-east-1:1:bucket/b",
+        &creds,
+        &shared,
+        &file_io,
+        Arc::clone(&source),
+    )
+    .await;
+    let cat_a2 = builder_catalog(
+        "arn:aws:s3tables:us-east-1:1:bucket/a",
+        &creds,
+        &shared,
+        &file_io,
+        source,
+    )
+    .await;
+
+    cat_a.load_table(&t).await.expect("load a");
+    cat_b.load_table(&t).await.expect("load b");
+    cat_a2.load_table(&t).await.expect("load a2");
+
+    let stats = shared.stats();
+    assert_eq!(
+        stats.misses, 2,
+        "identical credentials must still isolate by catalog identity"
+    );
+    assert_eq!(stats.body_fetches, 2);
+    assert_eq!(stats.hits, 1, "same identity + same context shares");
+}
+
+#[tokio::test]
+async fn p9_builder_load_without_cache_rereads_every_load() {
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    let file_io = FileIO::new_with_memory();
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write v1");
+    let (_state, source) = mutable_pointer(loc, "tok");
+
+    let cat = S3TablesCatalogBuilder::default()
+        .load(
+            "cat",
+            builder_props("arn:aws:s3tables:us-east-1:1:bucket/raw", &[]),
+        )
+        .await
+        .expect("builder load")
+        .with_file_io_for_tests(file_io.clone())
+        .with_pointer_source(source);
+    let t = ident("t");
+
+    cat.load_table(&t).await.expect("load 1");
+    assert!(cat.table_metadata_cache.is_none());
+
+    sample_metadata("memory://wh/t-rewritten")
+        .write_to(&file_io, loc)
+        .await
+        .expect("rewrite");
+    let second = cat.load_table(&t).await.expect("load 2");
+    assert_eq!(
+        second.metadata().location(),
+        "memory://wh/t-rewritten",
+        "a builder-loaded catalog without cache handles re-reads the body"
     );
 }

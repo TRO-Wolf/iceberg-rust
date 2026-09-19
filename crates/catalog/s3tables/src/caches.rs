@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use iceberg::io::FileIO;
 use iceberg::io::object_cache::ObjectCache;
-use iceberg::spec::TableMetadata;
+use iceberg::spec::TableMetadataRef;
 use iceberg::table::{Table, TableBuilder};
 use iceberg::{CacheScope, TableMetadataCache};
 
@@ -67,13 +67,19 @@ impl S3TablesCatalog {
         }
     }
 
-    pub(crate) async fn cache_put(&self, metadata_location: &str, metadata: &TableMetadata) {
+    pub(crate) async fn cache_put(
+        &self,
+        metadata_location: &str,
+        metadata: TableMetadataRef,
+        object_version: Option<String>,
+    ) {
         if let Some(cache) = self.table_metadata_cache.as_ref() {
             cache
                 .put(
                     &self.cache_scope,
-                    metadata_location.to_string(),
-                    Arc::new(metadata.clone()),
+                    metadata_location,
+                    metadata,
+                    object_version,
                     None,
                 )
                 .await;

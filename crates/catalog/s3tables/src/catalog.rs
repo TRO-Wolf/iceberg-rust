@@ -42,7 +42,7 @@ use crate::commit_transport::S3TablesCommitHarness;
 #[cfg(test)]
 use crate::commit_transport::s3tables_commit_send_landed;
 use crate::commit_transport::{
-    LiveS3TablesCommitTransport, S3TablesCommitTransport, S3TablesUpdateCall,
+    LiveS3TablesCommitTransport, S3TablesCommitSend, S3TablesCommitTransport, S3TablesUpdateCall,
     map_s3tables_commit_send,
 };
 use crate::utils::create_sdk_config;
@@ -228,11 +228,15 @@ pub struct S3TablesCatalog {
     #[cfg(test)]
     pub(crate) pointer_source: Option<PointerSource>,
     #[cfg(test)]
+    drop_source: Option<DropSource>,
+    #[cfg(test)]
     outcome_harness: Option<Arc<S3TablesCommitHarness>>,
 }
 
 #[cfg(test)]
 pub(crate) type PointerSource = Arc<dyn Fn(&TableIdent) -> Result<(String, String)> + Send + Sync>;
+#[cfg(test)]
+pub(crate) type DropSource = Arc<dyn Fn(&TableIdent) -> Result<()> + Send + Sync>;
 
 impl std::fmt::Debug for S3TablesCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -255,6 +259,8 @@ impl S3TablesCatalog {
             aws_sdk_s3tables::Client::new(&aws_config)
         };
 
+        let injected_io = config.client.is_some() || storage_factory.is_some();
+
         let factory = storage_factory.unwrap_or_else(|| {
             Arc::new(OpenDalStorageFactory::S3 {
                 configured_scheme: "s3".to_string(),
@@ -267,11 +273,15 @@ impl S3TablesCatalog {
 
         let commit_transport = Arc::new(LiveS3TablesCommitTransport::new(s3tables_client.clone()));
 
-        let cache_scope = CacheScope::for_catalog(
-            format!("s3tables:{}", config.table_bucket_arn),
-            None,
-            &config.props,
-        );
+        let cache_scope = if injected_io {
+            CacheScope::isolated(format!("s3tables:{}", config.table_bucket_arn))
+        } else {
+            CacheScope::for_catalog(
+                format!("s3tables:{}", config.table_bucket_arn),
+                None,
+                &config.props,
+            )
+        };
 
         Ok(Self {
             config,
@@ -284,6 +294,8 @@ impl S3TablesCatalog {
             #[cfg(test)]
             pointer_source: None,
             #[cfg(test)]
+            drop_source: None,
+            #[cfg(test)]
             outcome_harness: None,
         })
     }
@@ -291,6 +303,12 @@ impl S3TablesCatalog {
     #[cfg(test)]
     pub(crate) fn with_pointer_source(mut self, source: PointerSource) -> Self {
         self.pointer_source = Some(source);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_drop_source(mut self, source: DropSource) -> Self {
+        self.drop_source = Some(source);
         self
     }
 
@@ -342,6 +360,7 @@ impl S3TablesCatalog {
             cache_scope: CacheScope::isolated("s3tables:test"),
             shared_object_cache: None,
             pointer_source: None,
+            drop_source: None,
             outcome_harness: Some(harness),
         }
     }
@@ -698,7 +717,8 @@ impl Catalog for S3TablesCatalog {
             MetadataLocation::new_with_table_location(table_location).to_string();
         metadata.write_to(&self.file_io, &metadata_location).await?;
 
-        self.s3tables_client
+        let update_resp = self
+            .s3tables_client
             .update_table_metadata_location()
             .table_bucket_arn(self.config.table_bucket_arn.clone())
             .namespace(namespace.to_url_string())
@@ -709,14 +729,20 @@ impl Catalog for S3TablesCatalog {
             .await
             .map_err(from_aws_sdk_error)?;
 
-        self.cache_put(&metadata_location, &metadata).await;
-
         let table = self
             .table_builder()
             .identifier(table_ident)
-            .metadata_location(metadata_location)
+            .metadata_location(metadata_location.clone())
             .metadata(metadata)
             .build()?;
+
+        self.cache_put(
+            &metadata_location,
+            table.metadata_ref(),
+            Some(update_resp.version_token),
+        )
+        .await;
+
         Ok(table)
     }
 
@@ -729,13 +755,52 @@ impl Catalog for S3TablesCatalog {
 
     /// Drops an existing table from the s3tables catalog.
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
-        let req = self
-            .s3tables_client
-            .delete_table()
-            .table_bucket_arn(self.config.table_bucket_arn.clone())
-            .namespace(table.namespace().to_url_string())
-            .name(table.name());
-        req.send().await.map_err(from_aws_sdk_error)?;
+        let dropped_location = self
+            .get_table_pointer(table)
+            .await
+            .ok()
+            .map(|(location, _)| location);
+
+        #[cfg(test)]
+        if let Some(source) = &self.drop_source {
+            source(table)?;
+        }
+        #[cfg(test)]
+        if self.drop_source.is_none() {
+            let req = self
+                .s3tables_client
+                .delete_table()
+                .table_bucket_arn(self.config.table_bucket_arn.clone())
+                .namespace(table.namespace().to_url_string())
+                .name(table.name());
+            req.send().await.map_err(from_aws_sdk_error)?;
+        }
+        #[cfg(not(test))]
+        {
+            let req = self
+                .s3tables_client
+                .delete_table()
+                .table_bucket_arn(self.config.table_bucket_arn.clone())
+                .namespace(table.namespace().to_url_string())
+                .name(table.name());
+            req.send().await.map_err(from_aws_sdk_error)?;
+        }
+
+        if let (Some(cache), Some(location)) = (
+            self.table_metadata_cache.as_ref(),
+            dropped_location.as_deref(),
+        ) {
+            cache.invalidate(&self.cache_scope, location).await;
+        }
+        Ok(())
+    }
+
+    async fn invalidate_table(&self, table: &TableIdent) -> Result<()> {
+        let Some(cache) = self.table_metadata_cache.as_ref() else {
+            return Ok(());
+        };
+        let (location, _) = self.get_table_pointer(table).await?;
+        cache.invalidate(&self.cache_scope, &location).await;
         Ok(())
     }
 
@@ -803,17 +868,22 @@ impl Catalog for S3TablesCatalog {
             .write_commit_metadata(staged_table.file_io(), staged_metadata_location)
             .await?;
 
-        self.cas_update_metadata_location(
-            &table_ident,
-            table_namespace,
-            version_token,
-            staged_metadata_location,
-            Some(&staged_table),
-        )
-        .await?;
+        let new_version = self
+            .cas_update_metadata_location(
+                &table_ident,
+                table_namespace,
+                version_token,
+                staged_metadata_location,
+                Some(&staged_table),
+            )
+            .await?;
 
-        self.cache_put(staged_metadata_location, staged_table.metadata())
-            .await;
+        self.cache_put(
+            staged_metadata_location,
+            staged_table.metadata_ref(),
+            new_version,
+        )
+        .await;
 
         Ok(staged_table)
     }
@@ -848,16 +918,17 @@ impl Catalog for S3TablesCatalog {
 
         let new_metadata_location = table.metadata_location_result()?.to_string();
         // The staged replace already wrote the new metadata file. Only the pointer CAS remains.
-        self.cas_update_metadata_location(
-            &table_ident,
-            table_namespace,
-            version_token,
-            &new_metadata_location,
-            Some(&table),
-        )
-        .await?;
+        let new_version = self
+            .cas_update_metadata_location(
+                &table_ident,
+                table_namespace,
+                version_token,
+                &new_metadata_location,
+                Some(&table),
+            )
+            .await?;
 
-        self.cache_put(&new_metadata_location, table.metadata())
+        self.cache_put(&new_metadata_location, table.metadata_ref(), new_version)
             .await;
 
         Ok(table)
@@ -873,7 +944,7 @@ impl S3TablesCatalog {
         version_token: String,
         metadata_location: &str,
         #[cfg_attr(not(test), allow(unused_variables))] published: Option<&Table>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let send = self
             .commit_transport
             .send_update_metadata_location(S3TablesUpdateCall {
@@ -890,8 +961,12 @@ impl S3TablesCatalog {
         {
             self.publish_outcome_harness(table);
         }
+        let new_version = match &send {
+            S3TablesCommitSend::Success(token) => token.clone(),
+            _ => None,
+        };
         map_s3tables_commit_send(send, table_ident)?;
-        Ok(())
+        Ok(new_version)
     }
 
     #[cfg(test)]
