@@ -146,6 +146,8 @@ mod rewrite_data_files;
 mod rewrite_data_files_cow_bytes_tests;
 #[cfg(test)]
 mod rewrite_data_files_dangling_tests;
+#[cfg(test)]
+mod rewrite_data_files_delete_loader_tests;
 mod rewrite_data_files_dv;
 #[cfg(test)]
 mod rewrite_data_files_evolved_schema_tests;

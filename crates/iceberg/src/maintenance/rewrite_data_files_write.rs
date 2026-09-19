@@ -147,15 +147,16 @@ pub(crate) async fn write_compacted_files(
         .transpose()?;
     let run_target = usize::try_from(write_max).unwrap_or(usize::MAX);
 
+    let reader = ArrowReaderBuilder::new(table.file_io().clone())
+        .with_prefetched_parquet_metadata(input_footers)
+        .build();
+
     let mut files = Vec::new();
     let mut peak = 0usize;
     for read_task in read_tasks {
         let task_stream = Box::pin(futures::stream::iter(read_task.into_iter().map(Ok)))
             as crate::scan::FileScanTaskStream;
-        let mut batch_stream = ArrowReaderBuilder::new(table.file_io().clone())
-            .with_prefetched_parquet_metadata(input_footers.clone())
-            .build()
-            .read(task_stream)?;
+        let mut batch_stream = reader.clone().read(task_stream)?;
 
         if let Some(keys) = &sort.keys {
             let mut run: Vec<RecordBatch> = Vec::new();

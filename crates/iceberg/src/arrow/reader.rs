@@ -246,7 +246,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
-            prefetched_parquet_metadata: self.prefetched_parquet_metadata,
+            prefetched_parquet_metadata: Arc::new(self.prefetched_parquet_metadata),
         }
     }
 }
@@ -264,7 +264,7 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
-    prefetched_parquet_metadata: HashMap<Arc<str>, Arc<ParquetMetaData>>,
+    prefetched_parquet_metadata: Arc<HashMap<Arc<str>, Arc<ParquetMetaData>>>,
 }
 
 impl ArrowReader {
