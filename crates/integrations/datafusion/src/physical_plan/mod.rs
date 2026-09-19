@@ -38,6 +38,8 @@ pub(crate) mod scan;
 pub(crate) mod scan_knobs;
 pub(crate) mod snapshot_target;
 pub(crate) mod sort;
+#[cfg(test)]
+mod spark_fixture_tests;
 pub(crate) mod update;
 pub(crate) mod write;
 
