@@ -140,6 +140,8 @@ mod dangling_dv_commit_tests;
 mod delete_file_seq_gc_tests;
 mod delete_orphan_files;
 mod delete_reachable_files;
+#[cfg(test)]
+mod metrics_config_tests;
 mod partition_key_audit;
 pub mod partition_stats;
 mod remove_dangling_delete_files;

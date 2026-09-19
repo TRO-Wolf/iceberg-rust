@@ -48,7 +48,7 @@
 
 use std::collections::HashMap;
 
-use super::{Datum, PrimitiveLiteral, PrimitiveType};
+use super::{Datum, PrimitiveLiteral, PrimitiveType, TableMetadata};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_DELETE_FILE_PATH, RESERVED_COL_NAME_DELETE_FILE_POS,
 };
@@ -360,6 +360,11 @@ impl MetricsConfig {
         }
     }
 
+    #[allow(missing_docs)]
+    pub fn for_table(metadata: &TableMetadata) -> Self {
+        Self::from_properties(metadata.properties())
+    }
+
     /// The metrics config for a position-delete file, mirroring `MetricsConfig.forPositionDelete`.
     ///
     /// Starts from the built-in default (`truncate(16)`) but forces the reserved position-delete
@@ -378,6 +383,12 @@ impl MetricsConfig {
             MetricsMode::Full,
         );
         config
+    }
+
+    #[allow(missing_docs)]
+    pub fn for_position_delete_table(metadata: &TableMetadata) -> Self {
+        let _ = metadata;
+        Self::for_position_delete()
     }
 
     /// The resolved metrics mode for a column: its explicit override if present, else the

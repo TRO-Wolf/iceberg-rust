@@ -222,6 +222,51 @@ Fixture replayed through `ParquetWriterBuilder` + `DataFileWriterBuilder`
 - **RePark's own writers** are run 24c's half — this unit adds the helpers and wires
   the fork's production sites only.
 
+## Step 2 — RED-FIRST pins (second commit)
+
+`maintenance/metrics_config_tests.rs`, declared `#[cfg(test)]` in
+`maintenance/mod.rs`. Fourteen pins:
+
+- 12 oracle cells — fixture schema + rows replayed through
+  `ParquetWriterBuilder::with_metrics_config(MetricsConfig::for_table(metadata))`
+  + `DataFileWriterBuilder`; `column_sizes` asserts key sets (compressed sizes are
+  engine-dependent), counts assert keys + values, bounds assert keys + exact bytes.
+- `rewrite_data_files_honors_metrics_default_none` — a `default=none` table's input
+  file is written with a bare builder (bounds present), `rewrite_all` runs, and the
+  live output file must carry all-six-maps-empty metrics.
+- `position_delete_keeps_full_bounds_under_none_default` — `ConvertEqualityDeleteFiles`
+  on a `default=none` table; the produced pos-delete file must carry
+  `column_sizes`/`value_counts`/bounds keyed ONLY by the reserved
+  `file_path`/`pos` ids and the `file_path` bound must equal the full data-file path
+  bytes (Full, not `truncate(16)`).
+
+Compile seam for the red commit: `for_table` / `for_position_delete_table` exist as
+stubs (`from_properties` / `for_position_delete` bodies — the pre-unit behaviors).
+
+**Red-first run** (`cargo test -p iceberg --lib metrics_config_tests`): **11 red,
+3 green**, every red for the intended reason —
+
+| pin | status | reason |
+|---|---|---|
+| oracle_cell_default | red | fork emits element (8) value/null counts + bounds |
+| oracle_cell_none | GREEN guard | `from_properties` already resolves `none` |
+| oracle_cell_counts | red | element (8) counts |
+| oracle_cell_truncate4 | red | element (8) counts + bounds |
+| oracle_cell_full | red | element (8) counts + bounds |
+| oracle_cell_column_s_none | red | element (8) metrics |
+| oracle_cell_nested_override | GREEN guard | `none`+`st.a=full` already resolves |
+| oracle_cell_max_inferred_2 | red | limit ignored — all columns keep the default |
+| oracle_cell_max_inferred_2_default_set | red | element (8) counts |
+| oracle_cell_sorted_none | red | no sorted promotion — `{}` vs `{2}` |
+| oracle_cell_sorted_counts | red | no sorted promotion — no bounds for 3 |
+| oracle_cell_bad_mode | red | element (8) metrics |
+| rewrite_data_files_honors_metrics_default_none | red | writer unconfigured — bounds written |
+| position_delete_keeps_full_bounds_under_none_default | GREEN guard | `for_position_delete()` overlay already Full |
+
+The three green guards pin behavior that was already correct and must not regress
+when the real `for_table` / `for_position_delete_table` land (the pos-delete pin
+turns red if a delete writer is wired to `for_table` instead — bounds vanish).
+
 ## Propositions
 
 - [ ] P1 `for_table` resolves default/column/max-inferred/sorted rules exactly per

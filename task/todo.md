@@ -37,8 +37,9 @@ table properties are ignored by the fork's own Parquet writers (compaction rewri
       `ParquetMetrics$MetricsVisitor`), production `ParquetWriterBuilder` inventory
       (8 live sites + 1 dead helper; three brief-named files are test-only), oracle
       cells extracted, fork replay measured (field-8 list/map divergence)
-- [ ] RED-FIRST pins: 12 oracle cells (six maps vs Spark, keys + bound bytes) +
-      `rewrite_data_files` none-cell e2e + position-delete overlay pin
+- [x] RED-FIRST pins: 12 oracle cells (six maps vs Spark, keys + bound bytes) +
+      `rewrite_data_files` none-cell e2e + position-delete overlay pin — 11 red /
+      3 green guards on `from_properties`/`for_position_delete` stubs
 - [ ] IMPLEMENT: `MetricsConfig::for_table` / `for_position_delete_table` +
       list/map-descendant drop; wire all production sites
 - [ ] MUTATION (drop promotion / drop limit / drop rewrite wiring) + gates + ledger
