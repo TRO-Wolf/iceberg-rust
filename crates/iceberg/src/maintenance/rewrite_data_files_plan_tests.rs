@@ -22,7 +22,7 @@ use crate::maintenance::rewrite_data_files::tests::{
     config_for, synthetic_spec_and_schema, synthetic_task,
 };
 use crate::maintenance::rewrite_data_files_plan::{
-    input_split_size, plan_file_groups, plan_read_tasks,
+    expected_output_files, input_split_size, plan_file_groups, plan_read_tasks, write_max_file_size,
 };
 use crate::spec::{Literal, PartitionSpec, Struct, Transform};
 
@@ -137,4 +137,44 @@ fn test_plan_read_tasks_default_target_is_one_task_per_group() {
         1,
         "one read task per group ⇒ one output file, the pre-F-RDF-GRANULARITY-1 answer"
     );
+}
+
+#[test]
+fn test_expected_output_files_remainder_rule_cells() {
+    let config = config_for(2_000, 1_500, 3_600, 1);
+    let cases: Vec<(u64, u64)> = vec![
+        (6_776, 4),
+        (4_612, 3),
+        (1_999, 1),
+        (2_000, 1),
+        (4_000, 2),
+        (18_000, 9),
+        (3_500, 2),
+        (4_398, 2),
+        (4_400, 3),
+        (17_500, 8),
+    ];
+    for (input_size, expected) in cases {
+        assert_eq!(
+            expected_output_files(input_size, &config),
+            expected,
+            "expected_output_files({input_size})"
+        );
+    }
+}
+
+#[test]
+fn test_input_split_size_between_target_and_write_max() {
+    let config = config_for(1_000_000, 750_000, 1_800_000, 1);
+    let write_max = write_max_file_size(1_000_000, 1_800_000);
+    assert_eq!(write_max, 1_400_000);
+    let cases: Vec<(u64, u64)> = vec![(10_500_000, 1_055_120), (2_994_000, 1_003_120)];
+    for (input_size, expected) in cases {
+        let split = input_split_size(input_size, &config);
+        assert_eq!(split, expected, "input_split_size({input_size})");
+        assert!(
+            split > 1_000_000 && split < write_max,
+            "split {split} must sit strictly between target and writeMaxFileSize (unclamped)"
+        );
+    }
 }
