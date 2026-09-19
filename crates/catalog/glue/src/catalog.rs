@@ -23,6 +23,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use aws_sdk_glue::operation::create_table::CreateTableError;
 use aws_sdk_glue::types::TableInput;
+use iceberg::arrow::ParquetFooterCache;
 use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{
     FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
@@ -77,6 +78,7 @@ pub struct GlueCatalogBuilder {
     table_metadata_cache: Option<Arc<TableMetadataCache>>,
     shared_object_cache_bytes: Option<u64>,
     cache_credential_context: Option<String>,
+    shared_footer_cache: Option<Arc<ParquetFooterCache>>,
 }
 
 impl Default for GlueCatalogBuilder {
@@ -93,6 +95,7 @@ impl Default for GlueCatalogBuilder {
             table_metadata_cache: None,
             shared_object_cache_bytes: None,
             cache_credential_context: None,
+            shared_footer_cache: None,
         }
     }
 }
@@ -158,6 +161,7 @@ impl CatalogBuilder for GlueCatalogBuilder {
                         self.table_metadata_cache,
                         self.shared_object_cache_bytes,
                         self.cache_credential_context,
+                        self.shared_footer_cache,
                     )
                 })
         }
@@ -214,6 +218,7 @@ pub struct GlueCatalog {
     table_metadata_cache: Option<Arc<TableMetadataCache>>,
     cache_scope: CacheScope,
     shared_object_cache: Option<Arc<ObjectCache>>,
+    shared_footer_cache: Option<Arc<ParquetFooterCache>>,
     #[cfg(test)]
     outcome_harness: Option<Arc<GlueCommitHarness>>,
     #[cfg(test)]
@@ -331,6 +336,7 @@ impl GlueCatalog {
             table_metadata_cache: None,
             cache_scope,
             shared_object_cache: None,
+            shared_footer_cache: None,
             #[cfg(test)]
             outcome_harness: None,
             #[cfg(test)]

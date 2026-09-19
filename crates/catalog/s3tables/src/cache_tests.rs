@@ -99,7 +99,7 @@ async fn catalog(
     S3TablesCatalog::new(config(arn), None)
         .await
         .expect("build catalog")
-        .with_cache_options(cache, object_cache_bytes, cred_ctx)
+        .with_cache_options(cache, object_cache_bytes, cred_ctx, None)
         .with_file_io_for_tests(file_io.clone())
         .with_pointer_source(pointer)
 }

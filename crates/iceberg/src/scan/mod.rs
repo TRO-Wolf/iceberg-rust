@@ -47,7 +47,7 @@ pub use partition_work::*;
 pub use task::*;
 pub use task_group::*;
 
-use crate::arrow::ArrowReaderBuilder;
+use crate::arrow::{ArrowReaderBuilder, TableFooterCache};
 use crate::delete_file_index::DeleteFileIndex;
 use crate::events::{self, ScanEvent};
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
@@ -379,7 +379,7 @@ impl<'a> TableScanBuilder<'a> {
     }
 
     /// Build the table scan.
-    pub fn build(self) -> Result<TableScan> {
+    pub fn build(mut self) -> Result<TableScan> {
         let split_config = self.resolve_split_config();
 
         // Capture the table name once, for the `ScanEvent` fired at plan time (Java
@@ -432,23 +432,7 @@ impl<'a> TableScanBuilder<'a> {
                     // No snapshot means an empty scan. Java returns early, before its timer and
                     // report block, so a snapshotless table emits no `ScanReport`. `metrics:
                     // None` matches that.
-                    return Ok(TableScan {
-                        batch_size: self.batch_size,
-                        column_names: self.column_names,
-                        file_io: self.table.file_io().clone(),
-                        plan_context: None,
-                        table_name,
-                        concurrency_limit_data_files: self.concurrency_limit_data_files,
-                        concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
-                        concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
-                        row_group_filtering_enabled: self.row_group_filtering_enabled,
-                        row_selection_enabled: self.row_selection_enabled,
-                        within_file_read_parallelism: self.within_file_read_parallelism,
-                        range_fetch_concurrency: self.range_fetch_concurrency,
-                        range_coalesce_bytes: self.range_coalesce_bytes,
-                        metrics: None,
-                        split_config,
-                    });
+                    return Ok(self.assemble_scan(None, None, split_config, table_name));
                 };
                 current_snapshot_id.clone()
             }
@@ -545,7 +529,7 @@ impl<'a> TableScanBuilder<'a> {
             table_metadata: self.table.metadata_ref(),
             snapshot_schema: schema,
             case_sensitive: self.case_sensitive,
-            predicate: self.filter.map(Arc::new),
+            predicate: self.filter.take().map(Arc::new),
             snapshot_bound_predicate: snapshot_bound_predicate.map(Arc::new),
             // File-prune-only scans keep plan-time pruning but skip residual attachment so
             // co-located survivors remain (COW MERGE). Default `with_filter` applies residuals.
@@ -559,11 +543,21 @@ impl<'a> TableScanBuilder<'a> {
             metrics_collector: metrics.as_ref().map(|context| context.collector.clone()),
         };
 
-        Ok(TableScan {
+        Ok(self.assemble_scan(Some(plan_context), metrics, split_config, table_name))
+    }
+
+    fn assemble_scan(
+        &self,
+        plan_context: Option<PlanContext>,
+        metrics: Option<ScanMetricsContext>,
+        split_config: SplitConfig,
+        table_name: String,
+    ) -> TableScan {
+        TableScan {
             batch_size: self.batch_size,
-            column_names: self.column_names,
+            column_names: self.column_names.clone(),
             file_io: self.table.file_io().clone(),
-            plan_context: Some(plan_context),
+            plan_context,
             table_name,
             concurrency_limit_data_files: self.concurrency_limit_data_files,
             concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
@@ -575,7 +569,8 @@ impl<'a> TableScanBuilder<'a> {
             range_coalesce_bytes: self.range_coalesce_bytes,
             metrics,
             split_config,
-        })
+            footer_cache: self.table.footer_cache(),
+        }
     }
 }
 
@@ -629,6 +624,7 @@ pub struct TableScan {
     /// [`Self::plan_tasks`]. Captured at [`build`](TableScanBuilder::build) time; never consulted by
     /// [`Self::plan_files`] (whose path is byte-unchanged).
     split_config: SplitConfig,
+    footer_cache: Option<TableFooterCache>,
 }
 
 /// The reporter, the shared counter collector, and the immutable inputs needed to build a

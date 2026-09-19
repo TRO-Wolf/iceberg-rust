@@ -25,6 +25,7 @@ use futures::lock::Mutex;
 use itertools::Itertools;
 
 use super::namespace_state::NamespaceState;
+use crate::arrow::ParquetFooterCache;
 use crate::catalog::table_metadata_cache::{
     CacheScope, TableMetadataCache, load_or_fetch_table_metadata,
 };
@@ -52,6 +53,7 @@ pub struct MemoryCatalogBuilder {
     table_metadata_cache: Option<Arc<TableMetadataCache>>,
     pub(crate) cache_credential_context: Option<String>,
     pub(crate) shared_object_cache_bytes: Option<u64>,
+    pub(crate) shared_footer_cache: Option<Arc<ParquetFooterCache>>,
 }
 
 impl Default for MemoryCatalogBuilder {
@@ -66,6 +68,7 @@ impl Default for MemoryCatalogBuilder {
             table_metadata_cache: None,
             cache_credential_context: None,
             shared_object_cache_bytes: None,
+            shared_footer_cache: None,
         }
     }
 }
@@ -127,6 +130,7 @@ impl CatalogBuilder for MemoryCatalogBuilder {
                     self.table_metadata_cache,
                     self.cache_credential_context,
                     self.shared_object_cache_bytes,
+                    self.shared_footer_cache,
                 )
             }
         };
@@ -153,6 +157,7 @@ pub struct MemoryCatalog {
     pub(crate) table_metadata_cache: Option<Arc<TableMetadataCache>>,
     pub(crate) cache_scope: CacheScope,
     pub(crate) shared_object_cache: Option<Arc<ObjectCache>>,
+    pub(crate) shared_footer_cache: Option<Arc<ParquetFooterCache>>,
 }
 
 impl MemoryCatalog {
@@ -163,6 +168,7 @@ impl MemoryCatalog {
         table_metadata_cache: Option<Arc<TableMetadataCache>>,
         cache_credential_context: Option<String>,
         shared_object_cache_bytes: Option<u64>,
+        shared_footer_cache: Option<Arc<ParquetFooterCache>>,
     ) -> Result<Self> {
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
 
@@ -186,6 +192,7 @@ impl MemoryCatalog {
             table_metadata_cache,
             cache_scope,
             shared_object_cache,
+            shared_footer_cache,
         })
     }
 
