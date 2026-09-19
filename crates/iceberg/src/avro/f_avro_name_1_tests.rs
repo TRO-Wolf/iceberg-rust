@@ -170,10 +170,7 @@ fn ocf_meta(bs: &[u8]) -> HashMap<String, Vec<u8>> {
     meta
 }
 
-fn find_record<'v>(
-    v: &'v serde_json::Value,
-    record_name: &str,
-) -> Option<&'v serde_json::Value> {
+fn find_record<'v>(v: &'v serde_json::Value, record_name: &str) -> Option<&'v serde_json::Value> {
     if let serde_json::Value::Object(map) = v {
         if map.get("type").and_then(|t| t.as_str()) == Some("record")
             && map.get("name").and_then(|n| n.as_str()) == Some(record_name)
@@ -214,8 +211,7 @@ async fn writes_java_avro_field_names() {
     for (iceberg_name, avro_name, attr) in CASES {
         let bs = write_manifest_bytes(iceberg_name).await;
         let meta = ocf_meta(&bs);
-        let schema_json: serde_json::Value =
-            serde_json::from_slice(&meta["avro.schema"]).unwrap();
+        let schema_json: serde_json::Value = serde_json::from_slice(&meta["avro.schema"]).unwrap();
         let r102 = find_record(&schema_json, "r102")
             .unwrap_or_else(|| panic!("no r102 record for {iceberg_name}"));
         let fields = r102["fields"].as_array().unwrap();
@@ -265,10 +261,7 @@ async fn sanitizes_every_record_from_schema_to_avro_schema() {
     let json = serde_json::to_value(&avro).unwrap();
     let top = &json["fields"];
     assert_eq!(top[0]["name"].as_str().unwrap(), "my_x20col");
-    assert_eq!(
-        top[0]["iceberg-field-name"].as_str().unwrap(),
-        "my col"
-    );
+    assert_eq!(top[0]["iceberg-field-name"].as_str().unwrap(), "my col");
     let inner = find_record(&json, "r2").expect("nested record r2");
     assert_eq!(inner["fields"][0]["name"].as_str().unwrap(), "a_x2Db");
     assert_eq!(
@@ -282,12 +275,9 @@ fn reads_spark_manifest_partition_values() {
     let dir = format!("{}/testdata/avro_names", env!("CARGO_MANIFEST_DIR"));
     for (file, iceberg_name, expected) in FIXTURES {
         let bs = std::fs::read(format!("{dir}/{file}")).unwrap();
-        let manifest = Manifest::parse_avro(&bs)
-            .unwrap_or_else(|e| panic!("{file} must parse: {e:?}"));
-        assert!(
-            !manifest.entries().is_empty(),
-            "{file} must hold entries"
-        );
+        let manifest =
+            Manifest::parse_avro(&bs).unwrap_or_else(|e| panic!("{file} must parse: {e:?}"));
+        assert!(!manifest.entries().is_empty(), "{file} must hold entries");
         assert_eq!(
             manifest.metadata().partition_spec.fields()[0].name.as_str(),
             *iceberg_name,
@@ -340,13 +330,10 @@ async fn write_partitioned_file(
 ) -> crate::spec::DataFile {
     let schema = table.metadata().current_schema().clone();
     let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).expect("arrow schema"));
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![id])) as ArrayRef,
-            Arc::new(StringArray::from(vec![col_value])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![id])) as ArrayRef,
+        Arc::new(StringArray::from(vec![col_value])) as ArrayRef,
+    ])
     .expect("batch");
     let location = format!("{}/data/{name}", table.metadata().location());
     let output = table.file_io().new_output(location).expect("output");

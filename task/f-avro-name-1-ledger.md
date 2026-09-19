@@ -177,14 +177,68 @@ Measured: apache-avro 0.21 default validator rejects `é`/`列` embedded field n
 `set_*_validator` — the global validator is therefore unnecessary and remains uninstalled.
 **PROVEN** (measured; pin tests follow).
 
-## 7. Clauses checklist (updated as work lands)
+## 7. Implementation (what landed)
+
+- `crates/iceberg/src/avro/name.rs` (new): `java_avro_name` ports `makeCompatibleName`/`sanitize`
+  over `str::encode_utf16()` — digit → `_<digit>`, other invalid char → `_x` + uppercase hex of the
+  UTF-16 code unit; letter/digit classification via generated BMP range tables {Lu,Ll,Lt,Lm,Lo} and
+  {Nd}. `avro_field_name` stamps `iceberg-field-name` beside `field-id` only when the name changes.
+  `iceberg_field_name` reads it back. `strict_avro_name`/`strictify_avro_field_names` map any
+  apache-avro-invalid name to a deterministic ASCII-valid one (used on reader schemas and on OCF
+  header repair). `repair_avro_container` rewrites the `avro.schema` JSON inside an OCF header —
+  sanitizing every invalid record/field name recursively and stamping `iceberg-field-name` with the
+  original — with a hand-rolled varint metadata codec, bytes after the sync marker untouched.
+- `avro/schema.rs`: `field` and map key/value visitors call `avro_field_name`;
+  `AvroSchemaToSchema::record` restores `NestedField.name` via `iceberg_field_name`; record naming
+  (`r<field-id>`) goes through `set_record_name` in `name.rs`.
+- `spec/values/serde.rs`: `RawLiteral` record serialization emits sanitized Avro keys (matching
+  what `to_value().resolve()` and `encode` look up by name); read side accepts either the Iceberg
+  name or its `java_avro_name` image when building the partition `Struct`.
+- `spec/manifest/mod.rs`: `try_from_avro_bytes_with_schema_fallback` runs
+  `repair_avro_container` before OCF open; entry decode delegated to
+  `entry::manifest_entries_from_avro`, which builds the versioned reader schema, runs
+  `strictify_avro_field_names` on it, then `AvroReader::with_schema` + serde `try_into` as before.
+- `spec/manifest/writer.rs`, `spec/manifest/data_file.rs`: record values written through the
+  Avro pipeline carry sanitized keys; `data_file` reads buffer + repair the container.
+- `arrow/avro_reader.rs`: data-file reads repair the container before `AvroReader::new` —
+  Spark-written data files with raw `é`/`列` names become readable, no global validator.
+
+## 8. Verification (measured on this tree, HEAD = fix slice)
+
+- Pin suite `avro::f_avro_name_1_tests` — 5/5 green:
+  `sanitizes_every_record_from_schema_to_avro_schema` (every table row incl. map/nested records),
+  `writes_java_avro_field_names` (exact `my_x20col`/`_1st`/`a_x2Db`/`a_x2Eb`/`c_xD83D_xDE00` +
+  `iceberg-field-name` presence/absence per oracle), `write_then_read_round_trip` (all names),
+  `reads_spark_manifest_partition_values` (all 20 Spark v2/v3 fixtures + RePark broken file →
+  partition value `x` under the Iceberg name), `table_scan_filters_on_spaced_partition_column`
+  (memory catalog, append, scan with `my col` filter → row `1,"x"`). **PROVEN**
+- Broken RePark manifest (`repark_broken_space_m0.avro`, raw `my col` in embedded schema):
+  **readable** — OCF header repair sanitizes the embedded schema; partition value returns `x`.
+  The preferred outcome per the brief; loud refusal unnecessary. **PROVEN**
+- `é`/`列`: Spark files with raw non-ASCII names read via container repair; fork-written files
+  keep `é`/`列` raw (Java-letters → valid under `java_avro_name`) and carry no attr, as the
+  oracle. No global validator installed; no Cargo change. **PROVEN**
+- Regression: `avro::` 32/32, `manifest` 200/200, `spec::values` 145/145 lib tests green.
+  **PROVEN**
+- Mutation: `git stash` of the whole fix slice (tests stay committed at `fed67a75`) → all 5 pins
+  red with the pre-fix signatures (raw names written, v2 Spark fixtures silently `[None]`, v3
+  fixtures `field my_x20col is not exist`, round trip + scan `Invalid field name my col`).
+  Restored via `git stash pop`; pins re-verified green after the subsequent code-motion refactor.
+  **PROVEN**
+- Gates: `cargo fmt --all -- --check` clean; `cargo clippy -p iceberg --all-targets --
+  -D warnings` clean; `scripts/check_rust_file_size.sh` 524 files clean (ceilings lowered to new
+  sizes: `avro_reader.rs` 1255, `schema.rs` 2092, `manifest/mod.rs` 1237, `writer.rs` 1056);
+  `comment_ban.py /tmp/pd-fork origin/main HEAD` → `comment-ban hits=0`;
+  `check_comment_blocks.sh` OK. **PROVEN**
+
+## 9. Clauses checklist
 
 - [x] MEASURE write names, fixture reads, broken-file behavior, reader mapping — §3 PROVEN
-- [ ] RED-FIRST pins: exact write schema, fixture reads, write→read, table-level scan — OPEN
-- [ ] Java-exact sanitizer + `iceberg-field-name` on every `schema_to_avro_schema` record — OPEN
-- [ ] Reader restores Iceberg names (attr / computed avro-name inverse) — OPEN
-- [ ] OCF header patch for unparseable embedded schemas — OPEN
-- [ ] Broken RePark manifest readable, loud-refusal fallback pinned — OPEN (target: readable)
-- [ ] `é`/`列` readable without global validator / Cargo change — OPEN (target: patch)
-- [ ] Mutation arithmetic recorded — OPEN
-- [ ] Gates: fmt, clippy, size checker, comment-ban, filtered tests — OPEN
+- [x] RED-FIRST pins: exact write schema, fixture reads, write→read, table-level scan — `fed67a75` PROVEN
+- [x] Java-exact sanitizer + `iceberg-field-name` on every `schema_to_avro_schema` record — §7 PROVEN
+- [x] Reader restores Iceberg names (attr / computed avro-name inverse) — §7 PROVEN
+- [x] OCF header patch for unparseable embedded schemas — §7 PROVEN
+- [x] Broken RePark manifest readable — §8 PROVEN (readable, not loud)
+- [x] `é`/`列` readable without global validator / Cargo change — §8 PROVEN
+- [x] Mutation arithmetic recorded — §8 PROVEN
+- [x] Gates: fmt, clippy, size checker, comment-ban, filtered tests — §8 PROVEN

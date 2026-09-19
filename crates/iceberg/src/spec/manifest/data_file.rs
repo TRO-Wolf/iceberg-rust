@@ -368,13 +368,13 @@ pub fn write_data_files_to_avro<W: Write>(
     let mut writer = AvroWriter::new(&avro_schema, writer);
 
     for data_file in data_files {
-        let value = to_value(DataFileSerde::try_from(
+        let mut value = to_value(DataFileSerde::try_from(
             data_file,
             partition_type,
             FormatVersion::V1,
-        )?)?
-        .resolve(&avro_schema)?;
-        writer.append(value)?;
+        )?)?;
+        crate::avro::name::sanitize_avro_value_names(&mut value);
+        writer.append(value.resolve(&avro_schema)?)?;
     }
 
     Ok(writer.flush()?)
@@ -388,13 +388,20 @@ pub fn read_data_files_from_avro<R: Read>(
     partition_type: &StructType,
     version: FormatVersion,
 ) -> Result<Vec<DataFile>> {
-    let avro_schema = match version {
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).map_err(|e| {
+        Error::new(ErrorKind::Unexpected, "Failed to read Avro data file bytes").with_source(e)
+    })?;
+    let buf = crate::avro::name::repair_avro_container(&buf)?;
+
+    let mut avro_schema = match version {
         FormatVersion::V1 => data_file_schema_v1(partition_type).unwrap(),
         FormatVersion::V2 => data_file_schema_v2(partition_type).unwrap(),
         FormatVersion::V3 => data_file_schema_v3(partition_type).unwrap(),
     };
+    crate::avro::name::strictify_avro_field_names(&mut avro_schema);
 
-    let reader = AvroReader::with_schema(&avro_schema, reader)?;
+    let reader = AvroReader::with_schema(&avro_schema, &buf[..])?;
     reader
         .into_iter()
         .map(|value| {

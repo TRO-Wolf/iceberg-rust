@@ -25,7 +25,7 @@ pub use metadata::*;
 mod writer;
 use std::sync::Arc;
 
-use apache_avro::{Reader as AvroReader, from_value};
+use apache_avro::Reader as AvroReader;
 pub use writer::*;
 
 use super::{
@@ -55,6 +55,9 @@ impl Manifest {
         bs: &[u8],
         schema_fallback: Option<crate::spec::SchemaRef>,
     ) -> Result<(ManifestMetadata, Vec<ManifestEntry>)> {
+        let repaired = crate::avro::name::repair_avro_container(bs)?;
+        let bs: &[u8] = &repaired;
+
         let reader = AvroReader::new(bs)?;
 
         // Parse manifest metadata
@@ -62,39 +65,7 @@ impl Manifest {
         let metadata = ManifestMetadata::parse_with_schema_fallback(meta, schema_fallback)?;
 
         // Parse manifest entries
-        let partition_type = metadata.partition_spec.partition_type(&metadata.schema)?;
-
-        let entries = match metadata.format_version {
-            FormatVersion::V1 => {
-                let schema = manifest_schema_v1(&partition_type)?;
-                let reader = AvroReader::with_schema(&schema, bs)?;
-                reader
-                    .into_iter()
-                    .map(|value| {
-                        from_value::<_serde::ManifestEntryV1>(&value?)?.try_into(
-                            metadata.partition_spec.spec_id(),
-                            &partition_type,
-                            &metadata.schema,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            }
-            // Manifest Schema & Manifest Entry did not change between V2 and V3
-            FormatVersion::V2 | FormatVersion::V3 => {
-                let schema = manifest_schema_v2(&partition_type)?;
-                let reader = AvroReader::with_schema(&schema, bs)?;
-                reader
-                    .into_iter()
-                    .map(|value| {
-                        from_value::<_serde::ManifestEntryV2>(&value?)?.try_into(
-                            metadata.partition_spec.spec_id(),
-                            &partition_type,
-                            &metadata.schema,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            }
-        };
+        let entries = entry::manifest_entries_from_avro(bs, &metadata)?;
 
         Ok((metadata, entries))
     }

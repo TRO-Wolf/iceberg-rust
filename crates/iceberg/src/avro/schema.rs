@@ -26,6 +26,7 @@ use apache_avro::schema::{
 use itertools::{Either, Itertools};
 use serde_json::{Number, Value};
 
+use crate::avro::name::{avro_field_name, iceberg_field_name, set_record_name};
 use crate::spec::{
     ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, SchemaVisitor,
     StructType, Type, visit_schema,
@@ -76,9 +77,7 @@ impl SchemaVisitor for SchemaToAvroSchema {
         avro_schema: AvroSchemaOrField,
     ) -> Result<AvroSchemaOrField> {
         let mut field_schema = avro_schema.unwrap_left();
-        if let AvroSchema::Record(record) = &mut field_schema {
-            record.name = Name::from(format!("r{}", field.id).as_str());
-        }
+        set_record_name(&mut field_schema, format!("r{}", field.id));
 
         if !field.required {
             field_schema = avro_optional(field_schema)?;
@@ -92,21 +91,22 @@ impl SchemaVisitor for SchemaToAvroSchema {
             None
         };
 
-        let mut avro_record_field = AvroRecordField {
-            name: field.name.clone(),
+        let mut custom_attributes = BTreeMap::new();
+        custom_attributes.insert(
+            FIELD_ID_PROP.to_string(),
+            Value::Number(Number::from(field.id)),
+        );
+
+        let avro_record_field = AvroRecordField {
+            name: avro_field_name(&field.name, &mut custom_attributes),
             schema: field_schema,
             order: RecordFieldOrder::Ignore,
             position: 0,
             doc: field.doc.clone(),
             aliases: None,
             default,
-            custom_attributes: Default::default(),
+            custom_attributes,
         };
-
-        avro_record_field.custom_attributes.insert(
-            FIELD_ID_PROP.to_string(),
-            Value::Number(Number::from(field.id)),
-        );
 
         Ok(Either::Right(avro_record_field))
     }
@@ -128,9 +128,7 @@ impl SchemaVisitor for SchemaToAvroSchema {
     fn list(&mut self, list: &ListType, value: AvroSchemaOrField) -> Result<AvroSchemaOrField> {
         let mut field_schema = value.unwrap_left();
 
-        if let AvroSchema::Record(record) = &mut field_schema {
-            record.name = Name::from(format!("r{}", list.element_field.id).as_str());
-        }
+        set_record_name(&mut field_schema, format!("r{}", list.element_field.id));
 
         if !list.element_field.required {
             field_schema = avro_optional(field_schema)?;
@@ -184,39 +182,39 @@ impl SchemaVisitor for SchemaToAvroSchema {
             // Avro map requires that key must be string type. Here we convert it to array if key is
             // not string type.
             let key_field = {
-                let mut field = AvroRecordField {
-                    name: map.key_field.name.clone(),
+                let mut custom_attributes = BTreeMap::new();
+                custom_attributes.insert(
+                    FIELD_ID_PROP.to_string(),
+                    Value::Number(Number::from(map.key_field.id)),
+                );
+                AvroRecordField {
+                    name: avro_field_name(&map.key_field.name, &mut custom_attributes),
                     doc: None,
                     aliases: None,
                     default: None,
                     schema: key_field_schema,
                     order: RecordFieldOrder::Ascending,
                     position: 0,
-                    custom_attributes: Default::default(),
-                };
-                field.custom_attributes.insert(
-                    FIELD_ID_PROP.to_string(),
-                    Value::Number(Number::from(map.key_field.id)),
-                );
-                field
+                    custom_attributes,
+                }
             };
 
             let value_field = {
-                let mut field = AvroRecordField {
-                    name: map.value_field.name.clone(),
+                let mut custom_attributes = BTreeMap::new();
+                custom_attributes.insert(
+                    FIELD_ID_PROP.to_string(),
+                    Value::Number(Number::from(map.value_field.id)),
+                );
+                AvroRecordField {
+                    name: avro_field_name(&map.value_field.name, &mut custom_attributes),
                     doc: None,
                     aliases: None,
                     default: None,
                     schema: value_field_schema,
                     order: RecordFieldOrder::Ignore,
                     position: 0,
-                    custom_attributes: Default::default(),
-                };
-                field.custom_attributes.insert(
-                    FIELD_ID_PROP.to_string(),
-                    Value::Number(Number::from(map.value_field.id)),
-                );
-                field
+                    custom_attributes,
+                }
             };
 
             let fields = vec![key_field, value_field];
@@ -361,9 +359,7 @@ fn avro_variant_schema() -> Result<AvroSchema> {
 /// variant value-id 8). The `field_id` is the enclosing map field's id (key-id or value-id), which
 /// is what Java peeks off the deque.
 fn rename_map_record(schema: &mut AvroSchema, field_id: i32) {
-    if let AvroSchema::Record(record) = schema {
-        record.name = Name::from(format!("r{field_id}").as_str());
-    }
+    set_record_name(schema, format!("r{field_id}"));
 }
 
 /// Whether an Avro record has the variant SHAPE: exactly two fields, `metadata` and `value`,
@@ -639,7 +635,8 @@ impl AvroSchemaVisitor for AvroSchemaToSchema {
                     "null is not a valid Iceberg field type",
                 )
             })?;
-            let mut field = NestedField::new(field_id, &avro_field.name, field_type, !optional);
+            let iceberg_name = iceberg_field_name(avro_field);
+            let mut field = NestedField::new(field_id, iceberg_name, field_type, !optional);
 
             if let Some(doc) = &avro_field.doc {
                 field = field.with_doc(doc);

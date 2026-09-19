@@ -18,5 +18,6 @@
 //! Avro related codes.
 #[cfg(test)]
 mod f_avro_name_1_tests;
+pub(crate) mod name;
 mod schema;
 pub(crate) use schema::*;

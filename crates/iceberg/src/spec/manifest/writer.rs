@@ -467,16 +467,14 @@ impl ManifestWriter {
 
         let partition_summary = self.construct_partition_summaries(&partition_type)?;
         for entry in std::mem::take(&mut self.manifest_entries) {
-            let value = match self.metadata.format_version {
-                FormatVersion::V1 => to_value(ManifestEntryV1::try_from(entry, &partition_type)?)?
-                    .resolve(&avro_schema)?,
+            let mut value = match self.metadata.format_version {
+                FormatVersion::V1 => to_value(ManifestEntryV1::try_from(entry, &partition_type)?)?,
                 FormatVersion::V2 | FormatVersion::V3 => {
                     to_value(ManifestEntryV2::try_from(entry, &partition_type)?)?
-                        .resolve(&avro_schema)?
                 }
             };
-
-            avro_writer.append(value)?;
+            crate::avro::name::sanitize_avro_value_names(&mut value);
+            avro_writer.append(value.resolve(&avro_schema)?)?;
         }
 
         let content = avro_writer.into_inner()?;
