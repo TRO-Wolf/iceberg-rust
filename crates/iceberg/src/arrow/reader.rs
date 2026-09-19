@@ -41,7 +41,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::{
-    ColumnChunkMetaData, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+    ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 use typed_builder::TypedBuilder;
@@ -51,6 +51,7 @@ use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::delete_filter::positional_delete_keep_mask;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::int96::coerce_int96_timestamps;
+use crate::arrow::open_parquet::page_index_policy;
 use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::record_batch_predicate::{
     evaluate_predicate_to_mask, is_nan_row_mask, not_nan_row_mask, null_filled,
@@ -62,7 +63,6 @@ use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
-use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
@@ -119,14 +119,6 @@ pub(crate) struct ParquetReadOptions {
     /// Whether to preload the page index when reading Parquet metadata.
     #[builder(default = false)]
     pub(crate) preload_page_index: bool,
-}
-
-pub(crate) fn page_index_policy(needed: bool) -> PageIndexPolicy {
-    if needed {
-        PageIndexPolicy::Optional
-    } else {
-        PageIndexPolicy::Skip
-    }
 }
 
 impl ParquetReadOptions {
@@ -1573,67 +1565,6 @@ impl ArrowReader {
         Ok(results)
     }
 
-    pub(crate) fn get_row_selection_for_filter_predicate(
-        predicate: &BoundPredicate,
-        parquet_metadata: &Arc<ParquetMetaData>,
-        selected_row_groups: &Option<Vec<usize>>,
-        field_id_map: &HashMap<i32, usize>,
-        snapshot_schema: &Schema,
-    ) -> Result<Option<RowSelection>> {
-        let (Some(column_index), Some(offset_index)) = (
-            parquet_metadata.column_index(),
-            parquet_metadata.offset_index(),
-        ) else {
-            return Ok(None);
-        };
-
-        if let Some(selected_row_groups) = selected_row_groups
-            && selected_row_groups.is_empty()
-        {
-            return Ok(Some(RowSelection::from(Vec::new())));
-        }
-
-        let mut selected_row_groups_idx = 0;
-
-        let page_index = column_index
-            .iter()
-            .enumerate()
-            .zip(offset_index)
-            .zip(parquet_metadata.row_groups());
-
-        let mut results = Vec::new();
-        for (((idx, column_index), offset_index), row_group_metadata) in page_index {
-            if let Some(selected_row_groups) = selected_row_groups {
-                if idx == selected_row_groups[selected_row_groups_idx] {
-                    selected_row_groups_idx += 1;
-                } else {
-                    continue;
-                }
-            }
-
-            let selections_for_page = PageIndexEvaluator::eval(
-                predicate,
-                column_index,
-                offset_index,
-                row_group_metadata,
-                field_id_map,
-                snapshot_schema,
-            )?;
-
-            results.push(selections_for_page);
-
-            if let Some(selected_row_groups) = selected_row_groups
-                && selected_row_groups_idx == selected_row_groups.len()
-            {
-                break;
-            }
-        }
-
-        Ok(Some(
-            results.into_iter().flatten().collect::<Vec<_>>().into(),
-        ))
-    }
-
     /// Java's `ParquetMetadataConverter.getOffset(ColumnChunk)`: the byte offset at which a column
     /// chunk's data begins, which for the first column of a row group is that row group's real
     /// start position in the file. The rule is `MIN(data_page_offset, dictionary_page_offset)`. The
@@ -1748,7 +1679,9 @@ impl ArrowReader {
 
 /// Build the map of parquet field id to Parquet column index in the schema.
 /// Returns None if the Parquet file doesn't have field IDs embedded (e.g., migrated tables).
-pub(crate) fn build_field_id_map(parquet_schema: &SchemaDescriptor) -> Result<Option<HashMap<i32, usize>>> {
+pub(crate) fn build_field_id_map(
+    parquet_schema: &SchemaDescriptor,
+) -> Result<Option<HashMap<i32, usize>>> {
     let mut column_map = HashMap::new();
 
     for (idx, field) in parquet_schema.columns().iter().enumerate() {
@@ -1788,7 +1721,9 @@ fn leaf_count(ty: &parquet::schema::types::Type) -> usize {
 /// Maps fallback field ids to leaf column indices, for primitive top-level fields only. Java
 /// `ParquetSchemaUtil.addFallbackIds()`. # Notes Use top-level field positions, not leaf positions,
 /// to match `add_fallback_field_ids_to_arrow_schema`.
-pub(crate) fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32, usize> {
+pub(crate) fn build_fallback_field_id_map(
+    parquet_schema: &SchemaDescriptor,
+) -> HashMap<i32, usize> {
     let mut column_map = HashMap::new();
     let mut leaf_idx = 0;
 

@@ -18,6 +18,11 @@
 use datafusion::common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
+use iceberg::expr::Predicate;
+use iceberg::scan::TableScan;
+use iceberg::table::Table;
+
+use crate::to_datafusion_error;
 
 /// Iceberg-specific scan knobs registered on DataFusion [`ConfigOptions`], prefix `iceberg.`.
 ///
@@ -194,4 +199,31 @@ pub fn ensure_iceberg_scan_options(config: &mut datafusion::prelude::SessionConf
             .extensions
             .insert(IcebergScanOptions::default());
     }
+}
+
+pub(crate) fn build_table_scan(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    column_names: Vec<String>,
+    predicates: Option<Predicate>,
+    knobs: ScanKnobs,
+) -> datafusion::error::Result<TableScan> {
+    let scan_builder = match snapshot_id {
+        Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
+        None => table.scan(),
+    };
+    let mut scan_builder = scan_builder.select(column_names);
+    if let Some(pred) = predicates {
+        scan_builder = scan_builder.with_filter(pred);
+    }
+    if let Some(batch_size) = knobs.batch_size {
+        scan_builder = scan_builder.with_batch_size(Some(clamp_scan_knob(batch_size)));
+    }
+    if let Some(concurrency) = knobs.data_file_concurrency {
+        scan_builder = scan_builder.with_data_file_concurrency_limit(clamp_scan_knob(concurrency));
+    }
+    scan_builder
+        .with_row_selection_enabled(knobs.row_selection_enabled)
+        .build()
+        .map_err(to_datafusion_error)
 }

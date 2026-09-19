@@ -281,6 +281,11 @@ pub async fn plan_partition_work_from_scan(
 }
 
 impl TableScan {
+    #[allow(missing_docs)]
+    pub fn row_selection_enabled(&self) -> bool {
+        self.row_selection_enabled
+    }
+
     /// Snapshot id + filter mode used for multi-partition assignment, when a snapshot exists.
     pub(crate) fn plan_context_snapshot_and_mode(&self) -> Option<(i64, ScanFilterMode)> {
         let ctx = self.plan_context.as_ref()?;

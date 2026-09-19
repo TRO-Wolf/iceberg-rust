@@ -33,7 +33,7 @@ use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::metadata_columns::is_metadata_column_name;
-use iceberg::scan::{PartitionWork, TableScan, stream_partition_work};
+use iceberg::scan::{PartitionWork, stream_partition_work};
 use iceberg::table::Table;
 
 use super::conform::{
@@ -44,7 +44,9 @@ use super::conform::{
 use super::conform::{conform_column, is_arrow_promotion_allowed};
 use super::expr_to_predicate::scan_predicates;
 pub use super::scan_knobs::{IcebergScanOptions, ensure_iceberg_scan_options};
-pub(crate) use super::scan_knobs::{ScanKnobs, clamp_scan_knob, scan_knobs_from_context};
+pub(crate) use super::scan_knobs::{
+    ScanKnobs, build_table_scan, clamp_scan_knob, scan_knobs_from_context,
+};
 use crate::to_datafusion_error;
 
 /// Manages the scanning process of an Iceberg [`Table`]. [`IcebergTableScan::plan`] assigns the
@@ -72,7 +74,7 @@ pub struct IcebergTableScan {
     /// Per-partition data-file concurrency `P = max(1, ceil(L/N))`.
     per_partition_concurrency: usize,
     batch_size: Option<usize>,
-    row_selection_enabled: bool,
+    pub(crate) row_selection_enabled: bool,
 }
 
 impl IcebergTableScan {
@@ -314,15 +316,10 @@ impl ExecutionPlan for IcebergTableScan {
             let file_io = self.table.file_io().clone();
             let concurrency = self.per_partition_concurrency;
             let batch_size = self.batch_size;
-            let stream = stream_partition_work(
-                file_io,
-                &work,
-                concurrency,
-                batch_size,
-                true,
-                self.row_selection_enabled,
-            )
-            .map_err(to_datafusion_error)?
+            let row_selection = self.row_selection_enabled;
+            let stream =
+                stream_partition_work(file_io, &work, concurrency, batch_size, true, row_selection)
+                    .map_err(to_datafusion_error)?
                     .map_err(to_datafusion_error)
                     .and_then(move |batch| {
                         futures::future::ready(
@@ -434,36 +431,6 @@ impl DisplayAs for IcebergTableScan {
         }
         write!(f, " N={n}")
     }
-}
-
-pub(crate) fn build_table_scan(
-    table: &Table,
-    snapshot_id: Option<i64>,
-    column_names: Vec<String>,
-    predicates: Option<Predicate>,
-    knobs: ScanKnobs,
-) -> DFResult<TableScan> {
-    let scan_builder = match snapshot_id {
-        Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
-        None => table.scan(),
-    };
-
-    // Never `select_all()`: it reads the column set the table has now, not the advertised one.
-    let mut scan_builder = scan_builder.select(column_names);
-    if let Some(pred) = predicates {
-        scan_builder = scan_builder.with_filter(pred);
-    }
-    // Clamped here too, so a hand-built `ScanKnobs` holding `Some(0)` cannot reach Parquet.
-    if let Some(batch_size) = knobs.batch_size {
-        scan_builder = scan_builder.with_batch_size(Some(clamp_scan_knob(batch_size)));
-    }
-    if let Some(concurrency) = knobs.data_file_concurrency {
-        scan_builder = scan_builder.with_data_file_concurrency_limit(clamp_scan_knob(concurrency));
-    }
-    scan_builder
-        .with_row_selection_enabled(knobs.row_selection_enabled)
-        .build()
-        .map_err(to_datafusion_error)
 }
 
 pub(crate) async fn get_batch_stream(
@@ -1276,67 +1243,6 @@ mod tests {
         let knobs = scan_knobs_from_context(&context);
         assert_eq!(knobs.batch_size, Some(17));
         assert_eq!(knobs.data_file_concurrency, Some(5));
-    }
-
-    #[test]
-    fn test_scan_knobs_from_context_wires_row_selection_enabled() {
-        use datafusion::execution::SessionStateBuilder;
-        use datafusion::prelude::SessionConfig;
-
-        let mut config = SessionConfig::new();
-        ensure_iceberg_scan_options(&mut config);
-        let state = SessionStateBuilder::new()
-            .with_config(config.clone())
-            .build();
-        assert!(
-            scan_knobs_from_context(&state.task_ctx()).row_selection_enabled,
-            "row selection must default on"
-        );
-
-        config
-            .options_mut()
-            .set("iceberg.row_selection_enabled", "false")
-            .expect("set extension key");
-        let state = SessionStateBuilder::new().with_config(config).build();
-        assert!(
-            !scan_knobs_from_context(&state.task_ctx()).row_selection_enabled,
-            "iceberg.row_selection_enabled=false must reach the knobs"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_plan_carries_row_selection_enabled_to_multi_partition_path() {
-        let table = create_test_table();
-        let scan_on = IcebergTableScan::plan(
-            table.clone(),
-            None,
-            test_arrow_schema(),
-            None,
-            &[],
-            None,
-            ScanKnobs {
-                row_selection_enabled: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("plan");
-        assert!(scan_on.row_selection_enabled);
-        let scan_off = IcebergTableScan::plan(
-            table,
-            None,
-            test_arrow_schema(),
-            None,
-            &[],
-            None,
-            ScanKnobs {
-                row_selection_enabled: false,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("plan");
-        assert!(!scan_off.row_selection_enabled);
     }
 
     /// The clamp floor is 1: a raw 0 empties the Parquet stream, or hangs the buffer.

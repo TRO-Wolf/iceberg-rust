@@ -30,8 +30,8 @@ use super::reader::ArrowReaderBuilder;
 use crate::expr::Reference;
 use crate::io::FileIO;
 use crate::metadata_columns::{
-    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-    RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
+    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_POS,
+    RESERVED_FIELD_ID_ROW_ID,
 };
 use crate::scan::FileScanTaskStream;
 use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Type};
@@ -106,10 +106,11 @@ async fn m_filtered_scan_succeeds_without_any_page_index() {
         false,
         1,
     )]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
-    ])
-    .expect("batch");
+    let batch =
+        RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+        ])
+        .expect("batch");
     let props = WriterProperties::builder()
         .set_data_page_row_count_limit(PAGE_ROWS)
         .set_write_batch_size(PAGE_ROWS)
@@ -139,10 +140,11 @@ async fn m_filtered_scan_succeeds_without_offset_index() {
         false,
         1,
     )]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
-    ])
-    .expect("batch");
+    let batch =
+        RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+        ])
+        .expect("batch");
     let props = WriterProperties::builder()
         .set_data_page_row_count_limit(PAGE_ROWS)
         .set_write_batch_size(PAGE_ROWS)
@@ -171,10 +173,11 @@ async fn m_filtered_scan_succeeds_with_chunk_only_statistics() {
         false,
         1,
     )]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
-    ])
-    .expect("batch");
+    let batch =
+        RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+        ])
+        .expect("batch");
     let props = WriterProperties::builder()
         .set_data_page_row_count_limit(PAGE_ROWS)
         .set_write_batch_size(PAGE_ROWS)
@@ -399,10 +402,9 @@ async fn d_position_deletes_inside_kept_and_skipped_pages() {
     let selection = page_selection(&metadata, &schema, &predicate, &None).expect("selection");
     assert_prunes(&selection);
     let delete = write_pos_delete_file(&del_path, &data_path, &[10, 70, 300, 500]);
-    let t = with_deletes(
-        task(&data_path, schema, &[1], Some(predicate)),
-        vec![delete],
-    );
+    let t = with_deletes(task(&data_path, schema, &[1], Some(predicate)), vec![
+        delete,
+    ]);
     let rows = on_off(t).await;
     assert_eq!(rows.len(), ROWS - 256 - 2);
 }
@@ -424,10 +426,9 @@ async fn d_equality_deletes_null_key_and_nonkeyset() {
         Reference::new("id").greater_than_or_equal_to(Datum::int(256)),
     );
     let delete = write_eq_delete_file(&del_path, &[Some(300), None], vec![1]);
-    let t = with_deletes(
-        task(&data_path, schema, &[2], Some(predicate)),
-        vec![delete],
-    );
+    let t = with_deletes(task(&data_path, schema, &[2], Some(predicate)), vec![
+        delete,
+    ]);
     let rows = on_off(t).await;
     assert_eq!(rows.len(), ROWS - 256 - 1);
 }
@@ -445,10 +446,9 @@ async fn d_equality_deletes_keyset_path() {
         Reference::new("id").greater_than_or_equal_to(Datum::int(256)),
     );
     let delete = write_eq_delete_file(&del_path, &[Some(300), Some(500)], vec![1]);
-    let t = with_deletes(
-        task(&data_path, schema, &[1], Some(predicate)),
-        vec![delete],
-    );
+    let t = with_deletes(task(&data_path, schema, &[1], Some(predicate)), vec![
+        delete,
+    ]);
     let rows = on_off(t).await;
     assert_eq!(rows.len(), ROWS - 256 - 2);
 }
@@ -467,11 +467,9 @@ async fn d_deletion_vector_inside_kept_and_skipped_pages() {
     );
     let file_io = FileIO::new_with_fs();
     let delete = write_dv_delete_file(&file_io, &dv_path, &data_path, &[5, 100, 300, 500]).await;
-    let t = with_deletes(
-        task(&data_path, schema, &[1], Some(predicate)),
-        vec![delete],
-    );
+    let t = with_deletes(task(&data_path, schema, &[1], Some(predicate)), vec![
+        delete,
+    ]);
     let rows = on_off(t).await;
     assert_eq!(rows.len(), ROWS - 256 - 2);
 }
-

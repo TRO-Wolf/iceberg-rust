@@ -19,19 +19,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::Int32Array;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use tempfile::TempDir;
 
 use crate::IcebergCatalogProvider;
 use crate::physical_plan::scan::{IcebergTableScan, ScanKnobs, build_table_scan};
-use crate::physical_plan::scan_knobs::ensure_iceberg_scan_options;
+use crate::physical_plan::scan_knobs::{ensure_iceberg_scan_options, scan_knobs_from_context};
 
 const ROWS: i32 = 512;
 
@@ -175,15 +179,14 @@ async fn single_stream_filtered_scan_row_selection_on_matches_off() {
         ))
         .await
         .expect("load table");
-    let arrow_schema = Arc::new(
-        schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"),
-    );
+    let arrow_schema =
+        Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
     let filters = [col("id").gt_eq(lit(400i32))];
 
     async fn single_stream_rows(
-        table: &iceberg::table::Table,
-        arrow_schema: &datafusion::arrow::datatypes::SchemaRef,
-        filters: &[datafusion::prelude::Expr],
+        table: &Table,
+        arrow_schema: &SchemaRef,
+        filters: &[Expr],
         row_selection: bool,
     ) -> usize {
         let scan = IcebergTableScan::new(
@@ -209,8 +212,7 @@ async fn single_stream_filtered_scan_row_selection_on_matches_off() {
             .build()
             .task_ctx();
         let stream = scan.execute(0, task_ctx).expect("execute");
-        let batches: Vec<datafusion::arrow::array::RecordBatch> =
-            stream.try_collect().await.expect("collect");
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect");
         batches.iter().map(|b| b.num_rows()).sum()
     }
 
@@ -262,4 +264,66 @@ async fn single_stream_scan_builder_receives_row_selection_knob() {
     )
     .expect("scan off");
     assert!(!scan_off.row_selection_enabled());
+}
+
+#[test]
+fn scan_knobs_from_context_wires_row_selection_enabled() {
+    let mut config = SessionConfig::new();
+    ensure_iceberg_scan_options(&mut config);
+    let state = SessionStateBuilder::new()
+        .with_config(config.clone())
+        .build();
+    assert!(
+        scan_knobs_from_context(&state.task_ctx()).row_selection_enabled,
+        "row selection must default on"
+    );
+
+    config
+        .options_mut()
+        .set("iceberg.row_selection_enabled", "false")
+        .expect("set extension key");
+    let state = SessionStateBuilder::new().with_config(config).build();
+    assert!(
+        !scan_knobs_from_context(&state.task_ctx()).row_selection_enabled,
+        "iceberg.row_selection_enabled=false must reach the knobs"
+    );
+}
+
+#[tokio::test]
+async fn plan_carries_row_selection_enabled_to_multi_partition_path() {
+    let fixture = fixture().await;
+    let table = fixture
+        .catalog
+        .load_table(&TableIdent::new(
+            NamespaceIdent::new("ns".to_string()),
+            "t".to_string(),
+        ))
+        .await
+        .expect("load table");
+    let arrow_schema =
+        Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
+
+    let scan_on = IcebergTableScan::plan(
+        table.clone(),
+        None,
+        arrow_schema.clone(),
+        None,
+        &[],
+        None,
+        ScanKnobs {
+            row_selection_enabled: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("plan on");
+    assert!(scan_on.row_selection_enabled);
+
+    let scan_off = IcebergTableScan::plan(table, None, arrow_schema, None, &[], None, ScanKnobs {
+        row_selection_enabled: false,
+        ..Default::default()
+    })
+    .await
+    .expect("plan off");
+    assert!(!scan_off.row_selection_enabled);
 }

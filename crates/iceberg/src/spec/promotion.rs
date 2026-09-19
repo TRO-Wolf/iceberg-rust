@@ -21,8 +21,8 @@ use std::sync::Arc;
 use crate::Result;
 use crate::expr::BoundReference;
 use crate::spec::{
-    DataFile, Datum, Literal, ManifestEntry, PartitionSpec, PrimitiveLiteral,
-    Schema, Struct, StructType, TableMetadata, Type, is_promotion_allowed,
+    DataFile, Datum, Literal, ManifestEntry, PartitionSpec, PrimitiveLiteral, Schema, Struct,
+    StructType, TableMetadata, Type, is_promotion_allowed,
 };
 
 impl Datum {
@@ -43,7 +43,6 @@ impl Datum {
             _ => Cow::Borrowed(self),
         }
     }
-
 }
 
 impl DataFile {

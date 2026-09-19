@@ -280,7 +280,9 @@ impl<'a> PageIndexEvaluator<'a> {
                 idx.max_values_iter(),
                 |i| idx.null_count(i),
                 row_counts,
-                |&val| Self::bound_datum(field_type, PrimitiveLiteral::Float(OrderedFloat::from(val))),
+                |&val| {
+                    Self::bound_datum(field_type, PrimitiveLiteral::Float(OrderedFloat::from(val)))
+                },
             ),
             ColumnIndexMetaData::DOUBLE(idx) => Self::apply_to_pages(
                 &predicate,
@@ -289,7 +291,10 @@ impl<'a> PageIndexEvaluator<'a> {
                 |i| idx.null_count(i),
                 row_counts,
                 |&val| {
-                    Self::bound_datum(field_type, PrimitiveLiteral::Double(OrderedFloat::from(val)))
+                    Self::bound_datum(
+                        field_type,
+                        PrimitiveLiteral::Double(OrderedFloat::from(val)),
+                    )
                 },
             ),
             ColumnIndexMetaData::BYTE_ARRAY(idx)
@@ -324,8 +329,8 @@ impl<'a> PageIndexEvaluator<'a> {
             .zip(row_counts.iter())
             .map(|((i, (min, max)), &row_count)| {
                 predicate(
-                    min.and_then(|val| bound(val)),
-                    max.and_then(|val| bound(val)),
+                    min.and_then(&bound),
+                    max.and_then(&bound),
                     PageNullCount::from_row_and_null_counts(row_count, null_count(i)),
                 )
             })
@@ -342,9 +347,7 @@ impl<'a> PageIndexEvaluator<'a> {
                 field_type.clone(),
                 PrimitiveLiteral::Int128(i128::from(*value)),
             )),
-            _ if field_type.compatible(&literal) => {
-                Some(Datum::new(field_type.clone(), literal))
-            }
+            _ if field_type.compatible(&literal) => Some(Datum::new(field_type.clone(), literal)),
             _ => {
                 let promoted = literal.promote_to(field_type);
                 field_type
@@ -357,7 +360,6 @@ impl<'a> PageIndexEvaluator<'a> {
     fn bound_datum_bytes(field_type: &PrimitiveType, bytes: &[u8]) -> Option<Datum> {
         Datum::try_from_bytes(bytes, field_type.clone()).ok()
     }
-
 
     fn visit_inequality(
         &mut self,

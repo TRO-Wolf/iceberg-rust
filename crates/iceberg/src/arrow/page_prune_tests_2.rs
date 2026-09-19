@@ -119,11 +119,9 @@ async fn s_float_to_double_promotion_matches_unfiltered() {
         false,
         1,
     )]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(Float32Array::from(
-            (0..ROWS).map(|i| i as f32).collect::<Vec<f32>>(),
-        )) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Float32Array::from(
+        (0..ROWS).map(|i| i as f32).collect::<Vec<f32>>(),
+    )) as ArrayRef])
     .expect("batch");
     write_parquet(&data_path, arrow_schema, &[batch], page_props());
     let schema = iceberg_schema(vec![NestedField::required(
@@ -149,13 +147,11 @@ async fn s_decimal_on_fixed_matches_unfiltered() {
         false,
         1,
     )]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(
-            Decimal128Array::from((0..ROWS as i128).collect::<Vec<i128>>())
-                .with_precision_and_scale(38, 2)
-                .expect("decimal"),
-        ) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+        Decimal128Array::from((0..ROWS as i128).collect::<Vec<i128>>())
+            .with_precision_and_scale(38, 2)
+            .expect("decimal"),
+    ) as ArrayRef])
     .expect("batch");
     write_parquet(&data_path, arrow_schema, &[batch], page_props());
     let schema = iceberg_schema(vec![NestedField::required(
@@ -176,8 +172,8 @@ async fn s_decimal_on_fixed_matches_unfiltered() {
             PrimitiveLiteral::Int128(256),
         )),
     );
-    let selection = page_selection(&file_metadata(&data_path), &schema, &predicate, &None)
-        .expect("selection");
+    let selection =
+        page_selection(&file_metadata(&data_path), &schema, &predicate, &None).expect("selection");
     assert_prunes(&selection);
     let rows = on_off(task(&data_path, schema, &[1], Some(predicate))).await;
     assert_eq!(rows.len(), ROWS - 256);
@@ -193,13 +189,11 @@ async fn s_decimal_widening_matches_unfiltered() {
         false,
         1,
     )]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(
-            Decimal128Array::from((0..ROWS as i128).collect::<Vec<i128>>())
-                .with_precision_and_scale(10, 2)
-                .expect("decimal"),
-        ) as ArrayRef,
-    ])
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+        Decimal128Array::from((0..ROWS as i128).collect::<Vec<i128>>())
+            .with_precision_and_scale(10, 2)
+            .expect("decimal"),
+    ) as ArrayRef])
     .expect("batch");
     write_parquet(&data_path, arrow_schema, &[batch], page_props());
     let schema = iceberg_schema(vec![NestedField::required(
@@ -220,8 +214,8 @@ async fn s_decimal_widening_matches_unfiltered() {
             PrimitiveLiteral::Int128(256),
         )),
     );
-    let selection = page_selection(&file_metadata(&data_path), &schema, &predicate, &None)
-        .expect("selection");
+    let selection =
+        page_selection(&file_metadata(&data_path), &schema, &predicate, &None).expect("selection");
     assert_prunes(&selection);
     let rows = on_off(task(&data_path, schema, &[1], Some(predicate))).await;
     assert_eq!(rows.len(), ROWS - 256);
@@ -277,10 +271,7 @@ async fn n_eq_not_eq_not_in_match_unfiltered() {
     let data_path = path(&tmp, "data.parquet");
     write_null_pages(&data_path);
     let schema = id_s_schema();
-    let eq = bound(
-        &schema,
-        Reference::new("s").equal_to(Datum::string("v300")),
-    );
+    let eq = bound(&schema, Reference::new("s").equal_to(Datum::string("v300")));
     let rows = on_off(task(&data_path, schema.clone(), &[1, 2], Some(eq))).await;
     assert_eq!(rows.len(), 1);
     let not_eq = bound(
@@ -340,13 +331,31 @@ async fn f_is_nan_and_not_nan_match_unfiltered() {
     write_nan_pages(&data_path);
     let schema = nan_schema();
     let predicate = bound(&schema, Reference::new("f").is_nan());
-    let rows = on_off(task(&data_path, schema.clone(), &[1, 2, 3], Some(predicate))).await;
+    let rows = on_off(task(
+        &data_path,
+        schema.clone(),
+        &[1, 2, 3],
+        Some(predicate),
+    ))
+    .await;
     assert_eq!(rows.len(), 64);
     let predicate = bound(&schema, Reference::new("f").is_not_nan());
-    let rows = on_off(task(&data_path, schema.clone(), &[1, 2, 3], Some(predicate))).await;
+    let rows = on_off(task(
+        &data_path,
+        schema.clone(),
+        &[1, 2, 3],
+        Some(predicate),
+    ))
+    .await;
     assert_eq!(rows.len(), ROWS - 64);
     let predicate = bound(&schema, Reference::new("d").is_nan());
-    let rows = on_off(task(&data_path, schema.clone(), &[1, 2, 3], Some(predicate))).await;
+    let rows = on_off(task(
+        &data_path,
+        schema.clone(),
+        &[1, 2, 3],
+        Some(predicate),
+    ))
+    .await;
     assert_eq!(rows.len(), 64);
     let predicate = bound(&schema, Reference::new("d").is_not_nan());
     let rows = on_off(task(&data_path, schema, &[1, 2, 3], Some(predicate))).await;
@@ -364,12 +373,15 @@ async fn f_lt_gt_not_match_unfiltered() {
         &schema,
         Reference::new("id").greater_than_or_equal_to(Datum::int(256)),
     );
-    let selection = page_selection(&file_metadata(&data_path), &schema, &id_pred, &None)
-        .expect("selection");
+    let selection =
+        page_selection(&file_metadata(&data_path), &schema, &id_pred, &None).expect("selection");
     assert_prunes(&selection);
     let rows = on_off(task(&data_path, schema.clone(), &[1, 2, 3], Some(lt))).await;
     assert_eq!(rows.len(), 200);
-    let gt = bound(&schema, Reference::new("f").greater_than(Datum::float(400.0)));
+    let gt = bound(
+        &schema,
+        Reference::new("f").greater_than(Datum::float(400.0)),
+    );
     let rows = on_off(task(&data_path, schema.clone(), &[1, 2, 3], Some(gt))).await;
     assert_eq!(rows.len(), 0);
     let not_lt = bound(
@@ -409,10 +421,16 @@ async fn t_truncated_string_bounds_match_unfiltered() {
     write_id_s_pages(&data_path, &ids, &values);
     let schema = id_s_schema();
     let target = format!("{prefix}00300suffix");
-    let eq = bound(&schema, Reference::new("s").equal_to(Datum::string(&target)));
+    let eq = bound(
+        &schema,
+        Reference::new("s").equal_to(Datum::string(&target)),
+    );
     let rows = on_off(task(&data_path, schema.clone(), &[1, 2], Some(eq))).await;
     assert_eq!(rows.len(), 1);
-    let lt = bound(&schema, Reference::new("s").less_than(Datum::string(&target)));
+    let lt = bound(
+        &schema,
+        Reference::new("s").less_than(Datum::string(&target)),
+    );
     let rows = on_off(task(&data_path, schema.clone(), &[1, 2], Some(lt))).await;
     assert_eq!(rows.len(), 300);
     let ge = bound(
@@ -462,8 +480,8 @@ async fn t_binary_column_matches_unfiltered() {
         &schema,
         Reference::new("b").equal_to(Datum::binary(values[300].clone())),
     );
-    let selection = page_selection(&file_metadata(&data_path), &schema, &eq, &None)
-        .expect("selection");
+    let selection =
+        page_selection(&file_metadata(&data_path), &schema, &eq, &None).expect("selection");
     assert_prunes(&selection);
     let rows = on_off(task(&data_path, schema, &[1, 2], Some(eq))).await;
     assert_eq!(rows.len(), 1);
@@ -480,10 +498,11 @@ async fn r_ranged_task_intersects_row_group_and_page_selection() {
         false,
         1,
     )]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
-    ])
-    .expect("batch");
+    let batch =
+        RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+        ])
+        .expect("batch");
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .set_data_page_row_count_limit(32)
@@ -508,8 +527,8 @@ async fn r_ranged_task_intersects_row_group_and_page_selection() {
         &schema,
         Reference::new("id").greater_than_or_equal_to(Datum::int(384)),
     );
-    let selection = page_selection(&metadata, &schema, &predicate, &Some(vec![2, 3]))
-        .expect("selection");
+    let selection =
+        page_selection(&metadata, &schema, &predicate, &Some(vec![2, 3])).expect("selection");
     assert_eq!(selected_rows(&selection), 128);
     let mut t = task(&data_path, schema, &[1], Some(predicate));
     t.start = rg2_start;

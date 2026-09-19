@@ -22,8 +22,8 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
-use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::arrow::arrow_reader::RowSelection;
+use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::basic::Compression;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
@@ -106,10 +106,11 @@ pub(crate) fn write_id_pages(path: &str, ids: &[i32]) {
         false,
         1,
     )]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(Int32Array::from(ids.to_vec())) as ArrayRef,
-    ])
-    .expect("batch");
+    let batch =
+        RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(ids.to_vec())) as ArrayRef,
+        ])
+        .expect("batch");
     write_parquet(path, arrow_schema, &[batch], page_props());
 }
 
@@ -202,11 +203,8 @@ pub(crate) fn dump(batches: &[RecordBatch]) -> Vec<Vec<String>> {
             rows.push(
                 (0..batch.num_columns())
                     .map(|col| {
-                        arrow_cast::display::array_value_to_string(
-                            batch.column(col).as_ref(),
-                            row,
-                        )
-                        .expect("value")
+                        arrow_cast::display::array_value_to_string(batch.column(col).as_ref(), row)
+                            .expect("value")
                     })
                     .collect(),
             );
@@ -321,10 +319,11 @@ pub(crate) fn write_eq_delete_file(
         true,
         *equality_ids.first().expect("equality id"),
     )]));
-    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-        Arc::new(Int32Array::from(keys.to_vec())) as ArrayRef,
-    ])
-    .expect("batch");
+    let batch =
+        RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(keys.to_vec())) as ArrayRef,
+        ])
+        .expect("batch");
     write_parquet(
         path,
         arrow_schema,
@@ -354,7 +353,9 @@ pub(crate) async fn write_dv_delete_file(
     let output = file_io.new_output(path).expect("dv output");
     let mut writer = DVFileWriter::new(output).unpartitioned();
     for position in positions {
-        writer.delete(data_path, *position, None).expect("dv delete");
+        writer
+            .delete(data_path, *position, None)
+            .expect("dv delete");
     }
     writer.close().await.expect("dv close");
     let input = file_io.new_input(path).expect("dv input");
