@@ -41,7 +41,7 @@ pub trait TransformFunction: Send + Sync + Debug {
     fn transform(&self, input: ArrayRef) -> Result<ArrayRef>;
     /// transform_literal will take an input literal and transform it into a new literal.
     fn transform_literal(&self, input: &Datum) -> Result<Option<Datum>>;
-    /// Builds the transform output directly in `expected` layout when possible, else `None`.
+    #[allow(missing_docs)]
     fn transform_to_type(
         &self,
         _input: &ArrayRef,

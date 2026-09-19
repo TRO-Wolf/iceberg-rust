@@ -573,15 +573,17 @@ mod tests {
             create_expression_evaluator(partition_spec, &schema, &predicate, case_sensitive)?;
 
         let mut matching = create_data_file_string();
-        matching.partition = Struct::from_iter([Some(Literal::Primitive(
-            PrimitiveLiteral::Binary(vec![0x01, 0x02]),
-        ))]);
+        matching.partition =
+            Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Binary(vec![
+                0x01, 0x02,
+            ])))]);
         assert!(expression_evaluator.eval(&matching)?);
 
         let mut non_matching = create_data_file_string();
-        non_matching.partition = Struct::from_iter([Some(Literal::Primitive(
-            PrimitiveLiteral::Binary(vec![0x02]),
-        ))]);
+        non_matching.partition =
+            Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Binary(vec![
+                0x02,
+            ])))]);
         assert!(!expression_evaluator.eval(&non_matching)?);
 
         Ok(())
