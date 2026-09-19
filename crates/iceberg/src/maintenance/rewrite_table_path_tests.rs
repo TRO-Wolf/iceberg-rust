@@ -605,9 +605,6 @@ async fn execute_is_deterministic_and_rejects_double_rewrite() {
     );
 }
 
-/// `write.metadata.path` relocates every metadata file outside the table location. A FULL rewrite
-/// whose source prefix is the table location then hits `new_path`/`staging_path` on those files and
-/// must fail LOUD (Java `newPath` parity) instead of silently rewriting or proceeding.
 #[tokio::test]
 async fn execute_fails_loud_when_write_metadata_path_is_outside_the_source_prefix() {
     let (catalog, file_io, tmp) = local_fs_catalog().await;
@@ -645,7 +642,7 @@ async fn execute_fails_loud_when_write_metadata_path_is_outside_the_source_prefi
 
     let err = super::RewriteTablePath::new(table)
         .rewrite_location_prefix(&location, "s3://bucket/relocated")
-        .staging_location(&format!("{location}-staging"))
+        .staging_location(format!("{location}-staging"))
         .execute(&file_io)
         .await
         .expect_err("metadata outside the source prefix must fail loudly");
