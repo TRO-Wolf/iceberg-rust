@@ -25,8 +25,8 @@ use arrow_schema::DataType;
 
 use crate::expr::{BoundPredicate, Predicate, PredicateOperator};
 use crate::spec::{Datum, NestedField, PrimitiveLiteral, PrimitiveType, Transform, Type};
-use crate::transform::test::TestProjectionFixture;
 use crate::transform::create_transform_function;
+use crate::transform::test::TestProjectionFixture;
 use crate::{ErrorKind, Result};
 
 const BINARY_ROWS: [Option<&[u8]>; 7] = [
@@ -163,51 +163,40 @@ fn assert_int_rows(out: &ArrayRef, expected: &[Option<i32>]) {
 #[test]
 fn test_truncate_binary_oracle_every_layout() {
     let cases: [(u32, [Option<Vec<u8>>; 7]); 3] = [
-        (
-            1,
-            [
-                Some(vec![]),
-                Some(vec![0x01]),
-                Some(vec![0x01]),
-                Some(vec![0x01]),
-                Some(vec![0xff]),
-                None,
-                Some(vec![0xe4]),
-            ],
-        ),
-        (
-            2,
-            [
-                Some(vec![]),
-                Some(vec![0x01]),
-                Some(vec![0x01, 0x02]),
-                Some(vec![0x01, 0x02]),
-                Some(vec![0xff, 0x00]),
-                None,
-                Some(vec![0xe4, 0xb8]),
-            ],
-        ),
-        (
-            3,
-            [
-                Some(vec![]),
-                Some(vec![0x01]),
-                Some(vec![0x01, 0x02]),
-                Some(vec![0x01, 0x02, 0x03]),
-                Some(vec![0xff, 0x00, 0xff]),
-                None,
-                Some(vec![0xe4, 0xb8, 0xad]),
-            ],
-        ),
+        (1, [
+            Some(vec![]),
+            Some(vec![0x01]),
+            Some(vec![0x01]),
+            Some(vec![0x01]),
+            Some(vec![0xff]),
+            None,
+            Some(vec![0xe4]),
+        ]),
+        (2, [
+            Some(vec![]),
+            Some(vec![0x01]),
+            Some(vec![0x01, 0x02]),
+            Some(vec![0x01, 0x02]),
+            Some(vec![0xff, 0x00]),
+            None,
+            Some(vec![0xe4, 0xb8]),
+        ]),
+        (3, [
+            Some(vec![]),
+            Some(vec![0x01]),
+            Some(vec![0x01, 0x02]),
+            Some(vec![0x01, 0x02, 0x03]),
+            Some(vec![0xff, 0x00, 0xff]),
+            None,
+            Some(vec![0xe4, 0xb8, 0xad]),
+        ]),
     ];
     for input in binary_arrays() {
         let layout = input.data_type().clone();
         for (width, expected) in &cases {
             let out = transform_of(&Transform::Truncate(*width))
                 .transform(input.clone())
-                .unwrap_or_else(|e| {
-                    panic!("truncate[{width}] must accept {layout:?}: {e}")
-                });
+                .unwrap_or_else(|e| panic!("truncate[{width}] must accept {layout:?}: {e}"));
             assert_eq!(
                 out.data_type(),
                 &layout,
@@ -245,9 +234,7 @@ fn test_bucket_binary_oracle_every_layout() {
         for (num_buckets, expected) in &cases {
             let out = transform_of(&Transform::Bucket(*num_buckets))
                 .transform(input.clone())
-                .unwrap_or_else(|e| {
-                    panic!("bucket[{num_buckets}] must accept {layout:?}: {e}")
-                });
+                .unwrap_or_else(|e| panic!("bucket[{num_buckets}] must accept {layout:?}: {e}"));
             assert_eq!(out.data_type(), &DataType::Int32);
             assert_int_rows(&out, expected);
         }
@@ -299,9 +286,7 @@ fn test_truncate_string_oracle_every_layout() {
         for (width, expected) in &cases {
             let out = transform_of(&Transform::Truncate(*width))
                 .transform(input.clone())
-                .unwrap_or_else(|e| {
-                    panic!("truncate[{width}] must accept {layout:?}: {e}")
-                });
+                .unwrap_or_else(|e| panic!("truncate[{width}] must accept {layout:?}: {e}"));
             assert_eq!(out.data_type(), &layout);
             assert_string_rows(&out, expected);
         }
@@ -335,9 +320,7 @@ fn test_bucket_string_oracle_every_layout() {
         for (num_buckets, expected) in &cases {
             let out = transform_of(&Transform::Bucket(*num_buckets))
                 .transform(input.clone())
-                .unwrap_or_else(|e| {
-                    panic!("bucket[{num_buckets}] must accept {layout:?}: {e}")
-                });
+                .unwrap_or_else(|e| panic!("bucket[{num_buckets}] must accept {layout:?}: {e}"));
             assert_eq!(out.data_type(), &DataType::Int32);
             assert_int_rows(&out, expected);
         }
@@ -441,7 +424,7 @@ fn projected_binary(predicate: BoundPredicate) -> Option<(PredicateOperator, Dat
         .project("b_trunc", &predicate)
         .expect("project must not error on a binary literal")
     {
-        Some(Predicate::Binary(expr)) => Some((expr.op().clone(), expr.literal().clone())),
+        Some(Predicate::Binary(expr)) => Some((expr.op(), expr.literal().clone())),
         other => panic!("expected a binary partition predicate, got {other:?}"),
     }
 }
@@ -460,13 +443,10 @@ fn test_project_truncate_binary_eq() {
 #[test]
 fn test_project_truncate_binary_in_set() -> Result<()> {
     let fixture = binary_fixture(Transform::Truncate(1));
-    let predicate = fixture.set_predicate(
-        PredicateOperator::In,
-        vec![
-            Datum::binary(vec![0x01, 0x02]),
-            Datum::binary(vec![0xe4, 0xb8, 0xad]),
-        ],
-    );
+    let predicate = fixture.set_predicate(PredicateOperator::In, vec![
+        Datum::binary(vec![0x01, 0x02]),
+        Datum::binary(vec![0xe4, 0xb8, 0xad]),
+    ]);
     let projected = Transform::Truncate(1)
         .project("b_trunc", &predicate)?
         .expect("truncate(1) on an IN list must project to a partition predicate");

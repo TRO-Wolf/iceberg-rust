@@ -255,12 +255,19 @@ fn test_calculator_identity_binary_every_layout_canonicalizes() {
 #[test]
 fn test_calculator_void_binary_every_layout_canonicalizes() {
     let schema = id_binary_schema();
-    let spec = binary_spec(Transform::Void);
+    let spec = PartitionSpec::builder(Arc::new(id_binary_schema()))
+        .with_spec_id(0)
+        .add_partition_field("b", "b_part", Transform::Truncate(1))
+        .expect("add partition field")
+        .add_partition_field("b", "b_void", Transform::Void)
+        .expect("add void field")
+        .build()
+        .expect("build spec");
     for column in binary_columns() {
         let layout = column.data_type().clone();
         let struct_array = partition_struct(&spec, &schema, &batch_for("b", column));
         assert_eq!(
-            partition_field_bytes(&struct_array, "b_part"),
+            partition_field_bytes(&struct_array, "b_void"),
             vec![None; 7],
             "void partition values for {layout:?} input"
         );
@@ -387,35 +394,34 @@ fn test_splitter_truncate_binary_every_layout() {
 
 #[test]
 fn test_arrow_struct_to_literal_view_layouts() {
-    let schema = id_binary_schema();
-    let spec = binary_spec(Transform::Identity);
-    let partition_type = spec.partition_type(&schema).expect("partition type");
-    let field_id = partition_type.fields()[0].id;
-    for leaf in [
-        Arc::new(BinaryViewArray::from(BINARY_ROWS.to_vec())) as ArrayRef,
-        Arc::new(StringViewArray::from(STRING_ROWS.to_vec())) as ArrayRef,
+    for (schema, spec, leaf, field_name) in [
+        (
+            id_binary_schema(),
+            binary_spec(Transform::Identity),
+            Arc::new(BinaryViewArray::from(BINARY_ROWS.to_vec())) as ArrayRef,
+            "b_part",
+        ),
+        (
+            id_string_schema(),
+            string_spec(Transform::Identity),
+            Arc::new(StringViewArray::from(STRING_ROWS.to_vec())) as ArrayRef,
+            "s_part",
+        ),
     ] {
+        let partition_type = spec.partition_type(&schema).expect("partition type");
+        let field_id = partition_type.fields()[0].id;
         let field = Arc::new(
-            Field::new("b_part", leaf.data_type().clone(), true).with_metadata(HashMap::from([
+            Field::new(field_name, leaf.data_type().clone(), true).with_metadata(HashMap::from([
                 (PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string()),
             ])),
         );
+        let layout = leaf.data_type().clone();
         let struct_array: ArrayRef = Arc::new(
             StructArray::try_new(vec![field].into(), vec![leaf], None).expect("struct array"),
         );
-        let literals =
-            arrow_struct_to_literal(&struct_array, &partition_type).unwrap_or_else(|e| {
-                panic!(
-                    "arrow_struct_to_literal must read a {:?} leaf: {e}",
-                    struct_array
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .expect("struct")
-                        .column(0)
-                        .data_type()
-                )
-            });
-        assert_eq!(literals.len(), 7);
+        let literals = arrow_struct_to_literal(&struct_array, &partition_type)
+            .unwrap_or_else(|e| panic!("arrow_struct_to_literal must read a {layout:?} leaf: {e}"));
+        assert_eq!(literals.len(), 7, "literal count for {layout:?}");
     }
 }
 
@@ -489,7 +495,11 @@ async fn write_computed_files(table: &Table, batch: &RecordBatch) -> Vec<crate::
     writer.close().await.expect("close fanout writer")
 }
 
-async fn append_files(catalog: &impl Catalog, table: &Table, files: Vec<crate::spec::DataFile>) -> Table {
+async fn append_files(
+    catalog: &impl Catalog,
+    table: &Table,
+    files: Vec<crate::spec::DataFile>,
+) -> Table {
     let tx = Transaction::new(table);
     let action = tx.fast_append().add_data_files(files);
     let tx = action.apply(tx).expect("apply fast append");
@@ -500,10 +510,7 @@ async fn large_binary_partitioned_write_scan(format_version: FormatVersion) -> R
     let (catalog, _tmp) = local_fs_catalog().await;
     let table = create_table(&catalog, format_version).await;
 
-    let batch = batch_for(
-        "b",
-        Arc::new(LargeBinaryArray::from(BINARY_ROWS.to_vec())),
-    );
+    let batch = batch_for("b", Arc::new(LargeBinaryArray::from(BINARY_ROWS.to_vec())));
     let files = write_computed_files(&table, &batch).await;
     assert_eq!(
         files.len(),

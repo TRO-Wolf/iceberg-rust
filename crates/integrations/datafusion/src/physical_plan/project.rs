@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, RecordBatch};
-use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::datatypes::{DataType, Schema as ArrowSchema};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::Column;
@@ -35,97 +35,11 @@ use iceberg::table::Table;
 
 use crate::to_datafusion_error;
 
-/// Nesting depth beyond which [`data_type_is_write_compatible`] stops walking and
-/// falls back to plain structural equality (the pre-widening rule).
-///
-/// The input schema comes from a query plan, so the walk is user-influenced: a
-/// pathologically nested type must not be able to overflow the thread stack
-/// (AGENTS.md, "Recursion Safety"). The fallback is the STRICT comparison, so
-/// exceeding the limit can only ever reject a write the widened rule would have
-/// accepted — never accept one it would have rejected.
-const MAX_WRITE_COMPATIBILITY_DEPTH: usize = 64;
-
-/// Whether an input field may be written into the table field `expected`.
-///
-/// Identical to structural equality except for **one-directional nullability
-/// widening**: a NON-nullable input value can always be stored in a nullable
-/// (Iceberg OPTIONAL) target, so `required -> optional` is accepted. The reverse
-/// is not: a nullable input into a required target may carry a NULL the table
-/// forbids, and stays rejected. Names, types, field order and arity are
-/// unchanged — strict.
-///
-/// This is the direction Java Iceberg gates writes on. Decoded from the
-/// `iceberg-api` 1.10.0 bytecode (`org.apache.iceberg.types.CheckCompatibility`):
-/// `writeCompatibilityErrors(readSchema, writeSchema)` visits the TABLE schema
-/// with `checkNullability = true`, and `field()` records the nullability error
-/// `"<name> should be required, but is optional"` on exactly one condition —
-/// `readField.isRequired() && writeField.isOptional()`, i.e. optional incoming
-/// data into a required table column. A required incoming field landing in an
-/// optional table column produces no error at all. Java never gates a write on
-/// whole-schema equality.
-///
-/// The fork's check stays STRICTER than Java's on every other axis (Java matches
-/// by field id, tolerates missing optionals and extra fields, and permits type
-/// promotion); this function relaxes the nullability axis only.
-///
-/// Comparing name + nullability + data type is EXHAUSTIVE here, not a subset of
-/// `Field`'s own equality: both sides arrive from `strip_metadata_from_schema`,
-/// which rebuilds every field at every level with `Field::new`, so the remaining
-/// `Field` components (`metadata`, `dict_is_ordered`) are equal by construction.
-/// Nullability is therefore the only axis this relaxes.
-fn field_is_write_compatible(input: &Field, expected: &Field, depth: usize) -> bool {
-    input.name() == expected.name()
-        // The ONLY relaxation: reject exactly `nullable input -> required target`.
-        && (!input.is_nullable() || expected.is_nullable())
-        && data_type_is_write_compatible(input.data_type(), expected.data_type(), depth)
-}
-
-/// [`field_is_write_compatible`] for data types: recurses through the nested
-/// kinds an Iceberg schema can produce (struct fields, list elements, map
-/// key/value) so the widening applies at every level, and compares everything
-/// else exactly.
-fn data_type_is_write_compatible(input: &DataType, expected: &DataType, depth: usize) -> bool {
-    if depth >= MAX_WRITE_COMPATIBILITY_DEPTH {
-        // Depth guard: degrade to the strict pre-widening rule rather than
-        // recursing further (see MAX_WRITE_COMPATIBILITY_DEPTH).
-        return input == expected;
-    }
-    let depth = depth + 1;
-    match (input, expected) {
-        (DataType::Struct(input_fields), DataType::Struct(expected_fields)) => {
-            input_fields.len() == expected_fields.len()
-                && input_fields
-                    .iter()
-                    .zip(expected_fields.iter())
-                    .all(|(input, expected)| field_is_write_compatible(input, expected, depth))
-        }
-        (DataType::List(input_element), DataType::List(expected_element))
-        | (DataType::LargeList(input_element), DataType::LargeList(expected_element)) => {
-            field_is_write_compatible(input_element, expected_element, depth)
-        }
-        (
-            DataType::FixedSizeList(input_element, input_len),
-            DataType::FixedSizeList(expected_element, expected_len),
-        ) => {
-            input_len == expected_len
-                && field_is_write_compatible(input_element, expected_element, depth)
-        }
-        // The map's `key_value` entries field is a struct of {key, value}; the
-        // recursion widens the VALUE field. The `sorted` flag is part of the
-        // type and must match.
-        (
-            DataType::Map(input_entries, input_sorted),
-            DataType::Map(expected_entries, expected_sorted),
-        ) => {
-            input_sorted == expected_sorted
-                && field_is_write_compatible(input_entries, expected_entries, depth)
-        }
-        // Every primitive — and any nested kind not modelled above — must match
-        // EXACTLY. Unknown shapes fall back to the strict rule rather than being
-        // waved through.
-        (input, expected) => input == expected,
-    }
-}
+#[path = "write_compatibility.rs"]
+mod write_compatibility;
+#[cfg(test)]
+use write_compatibility::MAX_WRITE_COMPATIBILITY_DEPTH;
+use write_compatibility::field_is_write_compatible;
 
 /// Extends an ExecutionPlan with partition value calculations for Iceberg tables.
 ///
@@ -1281,6 +1195,58 @@ mod tests {
         assert!(!field_is_write_compatible(
             &Field::new("a", DataType::Int32, false),
             &Field::new("a", DataType::Int64, true),
+            0
+        ));
+    }
+
+    #[test]
+    fn test_field_write_compatibility_string_binary_layout_families() {
+        for input in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            assert!(field_is_write_compatible(
+                &Field::new("a", input.clone(), false),
+                &utf8("a", true),
+                0
+            ));
+            assert!(!field_is_write_compatible(
+                &Field::new("a", input.clone(), false),
+                &Field::new("a", DataType::LargeBinary, true),
+                0
+            ));
+        }
+        for input in [
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+        ] {
+            assert!(field_is_write_compatible(
+                &Field::new("a", input.clone(), false),
+                &Field::new("a", DataType::LargeBinary, true),
+                0
+            ));
+            assert!(!field_is_write_compatible(
+                &Field::new("a", input.clone(), false),
+                &utf8("a", true),
+                0
+            ));
+        }
+        assert!(field_is_write_compatible(
+            &Field::new("a", DataType::FixedSizeBinary(4), false),
+            &Field::new("a", DataType::FixedSizeBinary(4), true),
+            0
+        ));
+        assert!(!field_is_write_compatible(
+            &Field::new("a", DataType::FixedSizeBinary(4), false),
+            &Field::new("a", DataType::FixedSizeBinary(8), true),
+            0
+        ));
+        assert!(!field_is_write_compatible(
+            &Field::new("a", DataType::FixedSizeBinary(4), false),
+            &Field::new("a", DataType::LargeBinary, true),
+            0
+        ));
+        assert!(!field_is_write_compatible(
+            &Field::new("a", DataType::Utf8View, true),
+            &utf8("a", false),
             0
         ));
     }
