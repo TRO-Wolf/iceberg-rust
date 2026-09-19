@@ -234,6 +234,50 @@ fixture had one delete manifest and none asserted the new manifest list's order.
 - Gates: `cargo test -p iceberg --lib dangling_dv` 11/11, `fmt --check`, clippy `-D warnings`,
   size checker, comment-ban `hits=0`.
 
+## Round 4 — fork CI red on a changelog-scan cell
+
+| Item | Commit | Subject |
+|---|---|---|
+| fix | `8d1a5299` | `fix: F-DANGLING-DV-COMMIT-1 — changelog plans a removed file's deletes from the pre-commit delete set` |
+| docs | this commit | `docs: F-DANGLING-DV-COMMIT-1 — round 4` |
+
+Fork CI "Tests (default)" reddened
+`scan::incremental::tests::test_changelog_row_level_merge_on_read_chain_emits_java_taxonomy_tasks`:
+the `DELETED_DATA_FILE` task for `a.parquet` at S3 carried empty `existing_deletes` and empty
+embedded task deletes where the pin expects `a-dv.puffin` in both. The same-commit DV drop
+tombstones `a-dv.puffin` in S3's delete manifest, and `build_snapshot_delete_indexes` skipped
+every `Deleted` entry, so S3's `existing` index lost it.
+
+**Java answer.** 1.11.0 api `DeletedDataFileScanTask` javadoc: `existingDeletes` is "a list of
+previously added delete files to apply when reading the data file" — "all historical delete
+files added earlier must be applied while reading the data file … to output only those data
+records that were live when the data file was removed". Its worked example is this fixture:
+S1 appends F2, S2 adds D1 deleting from F2, S3 removes F2 →
+`DeletedDataFileScanTask(file=F2, existing-deletes=[D1], snapshot=S3)`. The index consulted is
+the delete set valid BEFORE the deleting commit — the parent snapshot's, not the current
+snapshot's post-commit set. Core `BaseIncrementalChangelogScan` 1.11.0 still rejects
+delete-manifest ranges and attaches `NO_DELETES`; the row-level taxonomy is the fork's
+ENGINE-FIRST extension over the api contract (GAP_MATRIX R123), and apache/iceberg#14264's
+planning description confirms the same semantic ("existing deletes that were present before
+file deletion"). Exactly-once forces it too: with an empty list the consumer would emit every
+`a.parquet` row as deleted at S3, double-reporting the rows the S2 `DeletedRows` task already
+reported. A DV dropped by the deleting commit itself was live at removal, so it belongs.
+
+**Fix.** `build_snapshot_delete_indexes`: a `Deleted` entry whose `entry.snapshot_id()` is the
+snapshot being planned was live in the parent → routed to `existing`; a tombstone attributed
+to an earlier snapshot stays skipped. The doc line "A `Deleted` tombstone belongs to neither."
+is now stale for own-snapshot tombstones but stays untouched — the comment ban forbids
+rewording, and the corrected semantic lives here. The pin itself was already Java's answer and
+needed no change. The CI red is the mutation proof that this gate is load-bearing: the
+skip-all-tombstones arm is exactly what failed.
+
+- Gates: `scan::incremental` 32/32, `scan::` 250/250, `inspect::` 135/135,
+  `iceberg-datafusion metadata` 6/6 (the `changelog` filter matches no datafusion tests).
+- Round-1 mutation rerun (full `manifest_filter.rs` revert to `2c8bb888`): **7 red of 12** —
+  the 5 drop cells + `test_dangling_dv_delete_manifest_order_survives_concurrent_loads` (the
+  round-3 pin also asserts the drop; `left: 130, right: 0` live DVs) + 1 datafusion e2e; all 5
+  controls green; restore → 11/11 + e2e green; revert uncommitted.
+
 ## Residue / scope decisions
 
 - `RemoveDanglingDeleteFiles` stays necessary for tables whose metadata ALREADY carries a

@@ -57,6 +57,13 @@ commit drops its DVs; the fork only dropped them inside `RewriteDataFiles`.
       — 3 delete manifests (128-blob first, 2 single) all rewritten; committed order pinned
       to sequential. Mutation: completion-order push unobservable on local fs (in-issue-order
       arrival); `reverse()` arm red, restore green
+- [x] Round 4 (fork CI red): `build_snapshot_delete_indexes` in `scan/incremental.rs` — a
+      `Deleted` delete-manifest entry attributed to the snapshot being planned routes to
+      `existing` (Java `DeletedDataFileScanTask.existingDeletes` = deletes live when the file
+      was removed = parent delete set); earlier tombstones still skipped. Pin unchanged —
+      it was already Java's answer. `8d1a5299`. Mutation rerun → 7 red / 12 (5 drop cells +
+      order pin + e2e), controls green; `scan::incremental` 32, `scan::` 250, `inspect::` 135,
+      datafusion `metadata` 6 all green
 
 ## ACTIVE (2026-09-19): F-RPD-COMMITS-1 — `rewrite_position_delete_files` commits once and keeps file scope, as Java does
 
