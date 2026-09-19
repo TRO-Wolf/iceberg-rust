@@ -18,6 +18,8 @@
 pub(crate) mod commit;
 pub(crate) mod conform;
 pub(crate) mod cow_affected;
+#[cfg(test)]
+mod dangling_dv_delete_tests;
 pub(crate) mod delete;
 pub(crate) mod delete_legacy_merge;
 pub(crate) mod expr_to_predicate;

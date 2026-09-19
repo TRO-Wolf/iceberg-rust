@@ -135,6 +135,8 @@ mod compute_partition_stats;
 mod compute_table_stats;
 mod convert_equality_delete_files;
 #[cfg(test)]
+mod dangling_dv_commit_tests;
+#[cfg(test)]
 mod delete_file_seq_gc_tests;
 mod delete_orphan_files;
 mod delete_reachable_files;
