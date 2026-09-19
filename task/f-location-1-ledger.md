@@ -289,5 +289,33 @@ table create unchanged for views. Size ceilings ratcheted down in
 | `write.metadata.path` honored for JSON/manifests/manifest lists on the memory catalog | PROVEN — `write_metadata_path_relocates_metadata_files_on_memory_catalog` green |
 | Relocated metadata pointer round-trips through `MetadataLocation` parsing | PROVEN — `from_file_path_accepts_relocated_metadata_dir`, `rebased_moves_dir_with_write_metadata_path` green |
 | `write.location-provider.impl` refused with a typed error | PROVEN — `table_location_generator_refuses_java_provider_impl` green (`FeatureUnsupported`) |
-| Mutation pass (hash, flag, context, metadata path) drives pins red then green | OPEN — step 4 |
+| Mutation pass (hash, flag, context, metadata path) drives pins red then green | PROVEN — see below |
 | No GAP_MATRIX row exists for location providers | PROVEN — grep of `docs/parity/GAP_MATRIX.md`; the ledger is this unit's home per the brief |
+
+## Mutation evidence (step 4)
+
+Each mutation applied alone, `cargo test -p iceberg --lib location_generator`
+(or `write_metadata_path`) run, then reverted and confirmed green:
+
+| Mutation | Pins driven red |
+|---|---|
+| murmur3 seed 0→1 in `compute_hash` | 8 red — every oracle-hash pin (`object_storage_unpartitioned`, `_partitioned`, `_unpartitioned_paths{,_partitioned}`, `_data_path_{unpartitioned,partitioned}`, `context_suppressed`, `rejects_deprecated_object_storage_path` short-circuit pin) |
+| `partitioned-paths` default true→false | 4 red — `object_storage_partitioned`, `object_storage_data_path_partitioned`, `object_storage_unpartitioned` (its file name lost the partition segment so its pinned hash dirs moved), `context_suppressed` |
+| `context` forced to `None` | 3 red — `object_storage_data_path_{unpartitioned,partitioned}` (no `ns/<table>` segment), `rejects_deprecated_object_storage_path` (context pin) |
+| `generate_manifest_list_file_path` reverted to `{loc}/metadata/…` | 1 red — `write_metadata_path_relocates_metadata_files_on_memory_catalog` (manifest list escaped the relocated dir) |
+
+All reverted; `cargo test -p iceberg --lib location` = 55/55 green.
+
+## Gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p <crate> --all-targets -- -D warnings` — clean for iceberg,
+  iceberg-datafusion, iceberg-catalog-{glue,hms,s3tables,sql}.
+- `./scripts/check_rust_file_size.sh` — 522 files clean after ratcheting the
+  five shrunk ceilings; `check_rust_file_size_test.py` 11/11.
+- `./scripts/check_agent_artifacts.sh`, `check_matrix_anchors.sh`,
+  `check_comment_blocks.sh` — all OK.
+- `comment_ban.py` (the run-24d lane script) over `origin/main..HEAD` —
+  `comment-ban hits=0`.
+- `cargo test -p iceberg --lib location` — 55/55.
+- `cargo test -p iceberg --test hadoop_version_commit` — 15/15.
