@@ -36,6 +36,7 @@ impl GlueCatalog {
         Arc::clone(&self.commit_transport)
     }
 
+    #[cfg(feature = "commit-fault-injection")]
     pub(crate) fn commit_transport_drops_responses(&self) -> bool {
         self.commit_transport.is_response_dropping_transport()
     }

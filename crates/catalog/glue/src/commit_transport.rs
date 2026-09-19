@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 #[cfg(test)]
@@ -65,7 +65,7 @@ pub(crate) trait GlueCommitTransport: Send + Sync + Debug {
     async fn send_update_table(&self, call: GlueUpdateTableCall) -> GlueCommitSend;
     #[cfg(test)]
     fn catalog_commit_attempts(&self) -> u64;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "commit-fault-injection"))]
     fn is_response_dropping_transport(&self) -> bool {
         false
     }
@@ -260,7 +260,7 @@ impl GlueCommitTransport for DiscardingGlueCommitTransport {
         self.attempts.load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "commit-fault-injection"))]
     fn is_response_dropping_transport(&self) -> bool {
         true
     }
@@ -408,16 +408,21 @@ pub(crate) fn map_glue_commit_send(send: GlueCommitSend, table_ident: &TableIden
 pub(crate) fn map_glue_commit_send_identified(
     send: GlueCommitSend,
     table_ident: &TableIdent,
-    operation_ids: Vec<String>,
+    operation_ids: impl FnOnce() -> Vec<String>,
 ) -> Result<()> {
-    map_glue_commit_send(send, table_ident).map_err(|error| {
-        if error.kind() == ErrorKind::CommitStateUnknown {
-            operation_ids.into_iter().fold(error, |error, id| {
-                error.with_context(GLUE_COMMIT_OPERATION_ID_PROP, id)
-            })
-        } else {
-            error
-        }
+    map_glue_commit_send(send, table_ident)
+        .map_err(|error| with_operation_id_context(error, operation_ids))
+}
+
+pub(crate) fn with_operation_id_context(
+    error: Error,
+    operation_ids: impl FnOnce() -> Vec<String>,
+) -> Error {
+    if error.kind() != ErrorKind::CommitStateUnknown {
+        return error;
+    }
+    operation_ids().into_iter().fold(error, |error, id| {
+        error.with_context(GLUE_COMMIT_OPERATION_ID_PROP, id)
     })
 }
 
@@ -425,13 +430,9 @@ pub(crate) fn commit_send_operation_ids(
     base: &TableMetadata,
     staged: &TableMetadata,
 ) -> Vec<String> {
-    let base_snapshot_ids: HashSet<i64> = base
-        .snapshots()
-        .map(|snapshot| snapshot.snapshot_id())
-        .collect();
     let mut ids: Vec<String> = staged
         .snapshots()
-        .filter(|snapshot| !base_snapshot_ids.contains(&snapshot.snapshot_id()))
+        .filter(|snapshot| base.snapshot_by_id(snapshot.snapshot_id()).is_none())
         .filter_map(|snapshot| {
             snapshot
                 .summary()
@@ -446,25 +447,6 @@ pub(crate) fn commit_send_operation_ids(
     ) && Some(next) != previous
     {
         ids.push(next.clone());
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    ids
-}
-
-pub(crate) fn published_metadata_operation_ids(metadata: &TableMetadata) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    if let Some(id) = metadata.current_snapshot().and_then(|snapshot| {
-        snapshot
-            .summary()
-            .additional_properties
-            .get(GLUE_COMMIT_OPERATION_ID_PROP)
-            .cloned()
-    }) {
-        ids.push(id);
-    }
-    if let Some(id) = metadata.properties().get(GLUE_COMMIT_OPERATION_ID_PROP) {
-        ids.push(id.clone());
     }
     ids.sort_unstable();
     ids.dedup();

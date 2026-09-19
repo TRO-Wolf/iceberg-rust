@@ -990,11 +990,9 @@ impl Catalog for GlueCatalog {
         {
             harness.publish(staged_table.clone());
         }
-        map_glue_commit_send_identified(
-            send,
-            &table_ident,
-            commit_send_operation_ids(base_metadata.as_ref(), staged_table.metadata()),
-        )?;
+        map_glue_commit_send_identified(send, &table_ident, || {
+            commit_send_operation_ids(base_metadata.as_ref(), staged_table.metadata())
+        })?;
 
         Ok(staged_table)
     }
