@@ -26,10 +26,12 @@ use crate::error::ErrorKind;
 use crate::maintenance::RewriteJobOrder;
 use crate::maintenance::rewrite_data_files::RewriteDataFiles;
 use crate::maintenance::rewrite_data_files::tests::{
-    append_files, create_partitioned_table, live_data_file_paths, local_fs_catalog, scan_rows,
-    write_data_file,
+    append_files, config_for, create_partitioned_table, live_data_file_paths, local_fs_catalog,
+    scan_rows, synthetic_spec_and_schema, synthetic_task, write_data_file,
 };
-use crate::maintenance::rewrite_data_files_plan::{format_java_double, plan_commit_batches};
+use crate::maintenance::rewrite_data_files_plan::{
+    format_java_double, input_split_size, plan_commit_batches, plan_read_tasks,
+};
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec,
     PrimitiveType, Schema, Struct, Transform, Type,
@@ -816,4 +818,55 @@ async fn test_default_spec_partial_progress_matches_java_single_file() {
     );
     assert_eq!(live_data_spec_ids(&table).await, HashSet::from([1]));
     assert_eq!(scan_l001_rows(&table).await, rows_before);
+}
+
+#[tokio::test]
+async fn test_target_small_output_count_follows_java_read_splits() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_l001_table(&catalog, "granularity-target").await;
+    let mut sizes: Vec<(i32, u64)> = Vec::new();
+    for index in 0..8i64 {
+        let p = (index % 2) as i32;
+        let file = write_l001_file(&table, &format!("g-{index}"), p, index * 50).await;
+        sizes.push((p, file.file_size_in_bytes()));
+        append_files(&catalog, &table, vec![file]).await;
+    }
+    let table = catalog.load_table(table.identifier()).await.unwrap();
+    println!("fork-written file sizes: {sizes:?}");
+
+    let (spec, schema) = synthetic_spec_and_schema();
+    let config = config_for(2_000, 1_500, 3_600, 1);
+    let mut expected_outputs = 0usize;
+    for p in [0i32, 1] {
+        let tasks: Vec<crate::scan::FileScanTask> = sizes
+            .iter()
+            .filter(|(pp, _)| *pp == p)
+            .enumerate()
+            .map(|(i, (_, size))| {
+                synthetic_task(&format!("s{p}-{i}"), *size, i64::from(p), 0, &spec, &schema)
+            })
+            .collect();
+        let input_size: u64 = tasks.iter().map(|task| task.length).sum();
+        let split_size = input_split_size(input_size, &config);
+        println!("p={p}: input={input_size} inputSplitSize={split_size}");
+        expected_outputs += plan_read_tasks(tasks, split_size).unwrap().len();
+    }
+    println!("java-formula expected output files: {expected_outputs}");
+    assert!(
+        expected_outputs > 2,
+        "the fixture must force more than one read task per group, got {expected_outputs}"
+    );
+
+    let result = RewriteDataFiles::new(table.clone())
+        .rewrite_all(true)
+        .target_file_size_bytes(2_000)
+        .execute(&catalog)
+        .await
+        .expect("target_small rewrite must succeed");
+    assert_eq!(result.rewritten_data_files_count, 8);
+    assert_eq!(result.file_groups.len(), 2, "one group per partition");
+    assert_eq!(
+        result.added_data_files_count, expected_outputs,
+        "the output count must follow Java's read-split planning, not one file per group"
+    );
 }

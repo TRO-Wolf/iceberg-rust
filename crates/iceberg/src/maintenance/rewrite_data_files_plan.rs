@@ -320,3 +320,60 @@ pub(super) fn pack_bins<T>(
     }
     bins
 }
+
+pub(super) const SPLIT_OVERHEAD: u64 = 5 * 1024;
+
+pub(super) fn write_max_file_size(target: u64, max: u64) -> u64 {
+    (target as f64 + (max as f64 - target as f64) * 0.5) as u64
+}
+
+pub(super) fn expected_output_files(input_size: u64, config: &ResolvedConfig) -> u64 {
+    let target = config.target_file_size_bytes;
+    if input_size < target {
+        return 1;
+    }
+    let with_remainder = input_size.div_ceil(target);
+    let without_remainder = input_size / target;
+    let avg_without_remainder = input_size / without_remainder;
+    if input_size % target > config.min_file_size_bytes {
+        with_remainder
+    } else if (avg_without_remainder as f64)
+        < (1.1 * target as f64).min(write_max_file_size(target, config.max_file_size_bytes) as f64)
+    {
+        without_remainder
+    } else {
+        with_remainder
+    }
+}
+
+pub(super) fn input_split_size(input_size: u64, config: &ResolvedConfig) -> u64 {
+    let estimated =
+        (input_size / expected_output_files(input_size, config)).saturating_add(SPLIT_OVERHEAD);
+    if estimated < config.target_file_size_bytes {
+        config.target_file_size_bytes
+    } else {
+        estimated.min(write_max_file_size(
+            config.target_file_size_bytes,
+            config.max_file_size_bytes,
+        ))
+    }
+}
+
+pub(super) fn plan_read_tasks(
+    tasks: Vec<FileScanTask>,
+    split_size: u64,
+) -> Result<Vec<Vec<FileScanTask>>> {
+    let mut splits = Vec::new();
+    for task in tasks {
+        splits.extend(task.split(split_size)?);
+    }
+    Ok(crate::scan::bin_pack::PackingIterator::new(
+        splits.into_iter(),
+        split_size,
+        crate::scan::PROPERTY_SPLIT_LOOKBACK_DEFAULT,
+        true,
+        |task: &FileScanTask| task.weight(0),
+    )
+    .map(crate::scan::merge_tasks)
+    .collect())
+}

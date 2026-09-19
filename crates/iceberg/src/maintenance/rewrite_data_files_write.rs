@@ -39,6 +39,9 @@ use crate::arrow::{
 };
 use crate::error::{Error, ErrorKind, Result};
 use crate::io::{FileIO, FileMetadata};
+use crate::maintenance::rewrite_data_files_plan::{
+    ResolvedConfig, input_split_size, plan_read_tasks, write_max_file_size,
+};
 use crate::maintenance::rewrite_data_files_router::BoundedPartitionRouter;
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
@@ -68,11 +71,10 @@ pub(crate) struct CompactedWrite {
 pub(crate) async fn write_compacted_files(
     table: &Table,
     group: &[FileScanTask],
-    target_file_size_bytes: u64,
-    max_open_partition_writers: usize,
+    config: &ResolvedConfig,
     output_spec: &PartitionSpecRef,
 ) -> Result<CompactedWrite> {
-    if max_open_partition_writers == 0 {
+    if config.max_open_partition_writers == 0 {
         return Err(Error::new(
             ErrorKind::DataInvalid,
             "'max-open-partition-writers' is set to 0 but must be > 0",
@@ -98,9 +100,10 @@ pub(crate) async fn write_compacted_files(
         writer_properties = writer_properties.set_column_dictionary_enabled(path, false);
     }
     let parquet_builder = ParquetWriterBuilder::new(writer_properties.build(), schema.clone());
+    let write_max = write_max_file_size(config.target_file_size_bytes, config.max_file_size_bytes);
     let rolling_builder = RollingFileWriterBuilder::new(
         parquet_builder,
-        usize::try_from(target_file_size_bytes).unwrap_or(usize::MAX),
+        usize::try_from(write_max).unwrap_or(usize::MAX),
         table.file_io().clone(),
         location_generator,
         file_name_generator,
@@ -114,7 +117,7 @@ pub(crate) async fn write_compacted_files(
         .iter()
         .map(|field| field.id)
         .collect();
-    let tasks: Vec<Result<FileScanTask>> = group
+    let tasks: Vec<FileScanTask> = group
         .iter()
         .cloned()
         .map(|mut task| {
@@ -124,99 +127,101 @@ pub(crate) async fn write_compacted_files(
             if carry_lineage {
                 project_row_lineage(&mut task);
             }
-            Ok(task)
+            task
         })
         .collect();
-    let task_stream = Box::pin(futures::stream::iter(tasks)) as crate::scan::FileScanTaskStream;
-    let mut batch_stream = ArrowReaderBuilder::new(table.file_io().clone())
+
+    let input_size: u64 = tasks
+        .iter()
+        .fold(0u64, |sum, task| sum.saturating_add(task.length));
+    let split_size = input_split_size(input_size, config);
+    let read_tasks = plan_read_tasks(tasks, split_size)?;
+
+    let splitter = (!spec.fields().is_empty())
+        .then(|| {
+            RecordBatchPartitionSplitter::try_new_with_computed_values(
+                schema.clone(),
+                output_spec.clone(),
+            )
+        })
+        .transpose()?;
+    let run_target = usize::try_from(write_max).unwrap_or(usize::MAX);
+
+    let reader = ArrowReaderBuilder::new(table.file_io().clone())
         .with_prefetched_parquet_metadata(input_footers)
-        .build()
-        .read(task_stream)?;
+        .build();
 
-    if let Some(keys) = &sort.keys {
-        let splitter = (!spec.fields().is_empty())
-            .then(|| {
-                RecordBatchPartitionSplitter::try_new_with_computed_values(
-                    schema.clone(),
-                    output_spec.clone(),
-                )
-            })
-            .transpose()?;
-        let run_target = usize::try_from(target_file_size_bytes).unwrap_or(usize::MAX);
-        let mut files = Vec::new();
-        let mut peak = 0usize;
-        let mut run: Vec<RecordBatch> = Vec::new();
-        let mut run_bytes = 0usize;
-        while let Some(batch) = batch_stream.try_next().await? {
-            run_bytes += batch.get_array_memory_size();
-            run.push(batch);
-            if run_bytes >= run_target {
-                write_sorted_run(
-                    &arrow_schema,
-                    std::mem::take(&mut run),
-                    keys,
-                    splitter.as_ref(),
-                    &rolling_builder,
-                    &spec,
-                    sort.stamp,
-                    max_open_partition_writers,
-                    &mut files,
-                    &mut peak,
-                )
-                .await?;
-                run_bytes = 0;
+    let mut files = Vec::new();
+    let mut peak = 0usize;
+    for read_task in read_tasks {
+        let task_stream = Box::pin(futures::stream::iter(read_task.into_iter().map(Ok)))
+            as crate::scan::FileScanTaskStream;
+        let mut batch_stream = reader.clone().read(task_stream)?;
+
+        if let Some(keys) = &sort.keys {
+            let mut run: Vec<RecordBatch> = Vec::new();
+            let mut run_bytes = 0usize;
+            while let Some(batch) = batch_stream.try_next().await? {
+                run_bytes += batch.get_array_memory_size();
+                run.push(batch);
+                if run_bytes >= run_target {
+                    write_sorted_run(
+                        &arrow_schema,
+                        std::mem::take(&mut run),
+                        keys,
+                        splitter.as_ref(),
+                        &rolling_builder,
+                        &spec,
+                        sort.stamp,
+                        config.max_open_partition_writers,
+                        &mut files,
+                        &mut peak,
+                    )
+                    .await?;
+                    run_bytes = 0;
+                }
             }
+            write_sorted_run(
+                &arrow_schema,
+                run,
+                keys,
+                splitter.as_ref(),
+                &rolling_builder,
+                &spec,
+                sort.stamp,
+                config.max_open_partition_writers,
+                &mut files,
+                &mut peak,
+            )
+            .await?;
+            continue;
         }
-        write_sorted_run(
-            &arrow_schema,
-            run,
-            keys,
-            splitter.as_ref(),
-            &rolling_builder,
-            &spec,
-            sort.stamp,
-            max_open_partition_writers,
-            &mut files,
-            &mut peak,
-        )
-        .await?;
-        return Ok(CompactedWrite {
-            files,
-            peak_open_partition_writers: peak,
-        });
-    }
 
-    let writer_builder = DataFileWriterBuilder::new(rolling_builder)
-        .with_partition_spec(spec.clone())
-        .with_sort_order_id(sort.stamp);
-
-    if spec.fields().is_empty() {
-        let mut writer = writer_builder.build(None).await?;
-        while let Some(batch) = batch_stream.try_next().await? {
-            writer.write(batch).await?;
-        }
-        let files = writer.close().await?;
-        return Ok(CompactedWrite {
-            files,
-            peak_open_partition_writers: 1,
-        });
-    }
-
-    let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
-        schema.clone(),
-        output_spec.clone(),
-    )?;
-    let mut router = BoundedPartitionRouter::new(writer_builder, max_open_partition_writers)?;
-    while let Some(batch) = batch_stream.try_next().await? {
-        for (partition_key, partition_batch) in splitter.split(&batch)? {
-            router.write(partition_key, partition_batch).await?;
+        let writer_builder = DataFileWriterBuilder::new(rolling_builder.clone())
+            .with_partition_spec(spec.clone())
+            .with_sort_order_id(sort.stamp);
+        if let Some(splitter) = &splitter {
+            let mut router =
+                BoundedPartitionRouter::new(writer_builder, config.max_open_partition_writers)?;
+            while let Some(batch) = batch_stream.try_next().await? {
+                for (partition_key, partition_batch) in splitter.split(&batch)? {
+                    router.write(partition_key, partition_batch).await?;
+                }
+            }
+            peak = peak.max(router.peak_open_partition_writers());
+            files.extend(router.close().await?);
+        } else {
+            let mut writer = writer_builder.build(None).await?;
+            while let Some(batch) = batch_stream.try_next().await? {
+                writer.write(batch).await?;
+            }
+            files.extend(writer.close().await?);
+            peak = peak.max(1);
         }
     }
-    let peak_open_partition_writers = router.peak_open_partition_writers();
-    let files = router.close().await?;
     Ok(CompactedWrite {
         files,
-        peak_open_partition_writers,
+        peak_open_partition_writers: peak,
     })
 }
 
