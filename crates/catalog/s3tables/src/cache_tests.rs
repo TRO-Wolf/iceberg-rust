@@ -518,6 +518,61 @@ async fn l1_region_only_injected_io_isolates_shared_cache() {
 }
 
 #[tokio::test]
+async fn l1_shared_credential_injected_io_still_isolates() {
+    for (selector, marker_a, marker_b) in [
+        ("aws_access_key_id", "memory://wh/t-akid-factory", "memory://wh/t-akid-client"),
+        ("profile_name", "memory://wh/t-prof-factory", "memory://wh/t-prof-client"),
+    ] {
+        let loc = "memory://wh/t/metadata/v1.metadata.json";
+        let (_state, source) = mutable_pointer(loc, "tok");
+        let shared = Arc::new(TableMetadataCache::new());
+        let t = ident("t");
+        let props = builder_props(
+            "arn:aws:s3tables:us-east-1:1:bucket/shared",
+            &[(selector, "SHARED-CRED")],
+        );
+
+        let cat_factory = S3TablesCatalogBuilder::default()
+            .with_table_metadata_cache(Arc::clone(&shared))
+            .with_storage_factory(Arc::new(MemoryStorageFactory))
+            .load("cat-factory", props.clone())
+            .await
+            .expect("load factory catalog")
+            .with_pointer_source(Arc::clone(&source));
+
+        let cat_client = S3TablesCatalogBuilder::default()
+            .with_table_metadata_cache(Arc::clone(&shared))
+            .with_client(dummy_client().await)
+            .with_storage_factory(Arc::new(MemoryStorageFactory))
+            .load("cat-client", props)
+            .await
+            .expect("load client catalog")
+            .with_pointer_source(source);
+
+        sample_metadata(marker_a)
+            .write_to(&cat_factory.file_io, loc)
+            .await
+            .expect("write factory body");
+        sample_metadata(marker_b)
+            .write_to(&cat_client.file_io, loc)
+            .await
+            .expect("write client body");
+
+        let factory_table = cat_factory.load_table(&t).await.expect("factory load");
+        let client_table = cat_client.load_table(&t).await.expect("client load");
+
+        assert_eq!(factory_table.metadata().location(), marker_a, "{selector}");
+        assert_eq!(client_table.metadata().location(), marker_b, "{selector}");
+        let stats = shared.stats();
+        assert_eq!(
+            stats.body_fetches, 2,
+            "identical credential props must not collapse injected-io isolation: {selector}"
+        );
+        assert_eq!(stats.misses, 2, "{selector}");
+    }
+}
+
+#[tokio::test]
 async fn p1_commit_through_update_table_visible_on_shared_handle() {
     let file_io = FileIO::new_with_memory();
     let loc1 = "memory://wh/t/metadata/v1.metadata.json";
