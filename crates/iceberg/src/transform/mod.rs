@@ -20,6 +20,7 @@
 use std::fmt::Debug;
 
 use arrow_array::ArrayRef;
+use arrow_schema::DataType;
 
 use crate::spec::{Datum, Transform};
 use crate::{Error, ErrorKind, Result};
@@ -40,6 +41,14 @@ pub trait TransformFunction: Send + Sync + Debug {
     fn transform(&self, input: ArrayRef) -> Result<ArrayRef>;
     /// transform_literal will take an input literal and transform it into a new literal.
     fn transform_literal(&self, input: &Datum) -> Result<Option<Datum>>;
+    /// Builds the transform output directly in `expected` layout when possible, else `None`.
+    fn transform_to_type(
+        &self,
+        _input: &ArrayRef,
+        _expected: &DataType,
+    ) -> Option<Result<ArrayRef>> {
+        None
+    }
     /// A thin wrapper around `transform_literal`
     /// to return an error even when it's `None`.
     fn transform_literal_result(&self, input: &Datum) -> Result<Datum> {

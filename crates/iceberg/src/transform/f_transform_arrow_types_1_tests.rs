@@ -556,3 +556,44 @@ fn test_project_truncate_binary_starts_with_width_boundaries() {
     assert_eq!(op, PredicateOperator::StartsWith);
     assert_eq!(datum, Datum::binary(vec![0x01]));
 }
+
+#[test]
+fn test_truncate_transform_to_type_writes_expected_layout() {
+    let truncate = transform_of(&Transform::Truncate(1));
+    let binary_view: ArrayRef = Arc::new(BinaryViewArray::from(BINARY_ROWS.to_vec()));
+    let out = truncate
+        .transform_to_type(&binary_view, &DataType::LargeBinary)
+        .expect("binary truncate into LargeBinary must be supported")
+        .expect("truncate into LargeBinary must succeed");
+    assert_eq!(out.data_type(), &DataType::LargeBinary);
+    assert_binary_rows(&out, &[
+        Some(vec![]),
+        Some(vec![0x01]),
+        Some(vec![0x01]),
+        Some(vec![0x01]),
+        Some(vec![0xff]),
+        None,
+        Some(vec![0xe4]),
+    ]);
+    let utf8_view: ArrayRef = Arc::new(StringViewArray::from(STRING_ROWS.to_vec()));
+    let out = truncate
+        .transform_to_type(&utf8_view, &DataType::Utf8)
+        .expect("string truncate into Utf8 must be supported")
+        .expect("truncate into Utf8 must succeed");
+    assert_eq!(out.data_type(), &DataType::Utf8);
+    assert_string_rows(&out, &[
+        Some(""),
+        Some("i"),
+        Some("中"),
+        Some("a"),
+        Some("🚀"),
+        None,
+        Some("a"),
+    ]);
+    assert!(
+        truncate
+            .transform_to_type(&binary_view, &DataType::Int32)
+            .is_none(),
+        "unrelated expected layouts must decline the fast path"
+    );
+}

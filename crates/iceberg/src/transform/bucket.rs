@@ -185,6 +185,23 @@ impl Bucket {
     fn bucket_bytes(&self, v: &[u8]) -> i32 {
         self.bucket_n(Self::hash_bytes(v))
     }
+
+    fn bucket_with<'a, V: ?Sized + 'a, A: arrow_array::Array>(
+        &self,
+        array: &'a A,
+        value: impl Fn(usize) -> &'a V,
+        bucket: impl Fn(&V) -> i32,
+    ) -> arrow_array::Int32Array {
+        let mut values = Vec::with_capacity(array.len());
+        for i in 0..array.len() {
+            values.push(if array.is_valid(i) {
+                bucket(value(i))
+            } else {
+                0
+            });
+        }
+        arrow_array::Int32Array::new(values.into(), array.nulls().cloned())
+    }
 }
 
 /// Downcast a transform input to the concrete Arrow array its [`DataType`] implies, or return a
@@ -240,41 +257,34 @@ impl TransformFunction for Bucket {
                 downcast_input::<arrow_array::TimestampNanosecondArray>(&input)?
                     .unary(|v| self.bucket_timestamp(v / 1000))
             }
-            DataType::Utf8 => arrow_array::Int32Array::from_iter(
-                downcast_input::<arrow_array::StringArray>(&input)?
-                    .iter()
-                    .map(|v| v.map(|v| self.bucket_str(v))),
-            ),
-            DataType::LargeUtf8 => arrow_array::Int32Array::from_iter(
-                downcast_input::<arrow_array::LargeStringArray>(&input)?
-                    .iter()
-                    .map(|v| v.map(|v| self.bucket_str(v))),
-            ),
-            DataType::Binary => arrow_array::Int32Array::from_iter(
-                downcast_input::<arrow_array::BinaryArray>(&input)?
-                    .iter()
-                    .map(|v| v.map(|v| self.bucket_bytes(v))),
-            ),
-            DataType::LargeBinary => arrow_array::Int32Array::from_iter(
-                downcast_input::<arrow_array::LargeBinaryArray>(&input)?
-                    .iter()
-                    .map(|v| v.map(|v| self.bucket_bytes(v))),
-            ),
-            DataType::FixedSizeBinary(_) => arrow_array::Int32Array::from_iter(
-                downcast_input::<arrow_array::FixedSizeBinaryArray>(&input)?
-                    .iter()
-                    .map(|v| v.map(|v| self.bucket_bytes(v))),
-            ),
-            DataType::BinaryView => arrow_array::Int32Array::from_iter(
-                downcast_input::<arrow_array::BinaryViewArray>(&input)?
-                    .iter()
-                    .map(|v| v.map(|v| self.bucket_bytes(v))),
-            ),
-            DataType::Utf8View => arrow_array::Int32Array::from_iter(
-                downcast_input::<arrow_array::StringViewArray>(&input)?
-                    .iter()
-                    .map(|v| v.map(|v| self.bucket_str(v))),
-            ),
+            DataType::Utf8 => {
+                let array = downcast_input::<arrow_array::StringArray>(&input)?;
+                self.bucket_with(array, |i| array.value(i), |v| self.bucket_str(v))
+            }
+            DataType::LargeUtf8 => {
+                let array = downcast_input::<arrow_array::LargeStringArray>(&input)?;
+                self.bucket_with(array, |i| array.value(i), |v| self.bucket_str(v))
+            }
+            DataType::Binary => {
+                let array = downcast_input::<arrow_array::BinaryArray>(&input)?;
+                self.bucket_with(array, |i| array.value(i), |v| self.bucket_bytes(v))
+            }
+            DataType::LargeBinary => {
+                let array = downcast_input::<arrow_array::LargeBinaryArray>(&input)?;
+                self.bucket_with(array, |i| array.value(i), |v| self.bucket_bytes(v))
+            }
+            DataType::FixedSizeBinary(_) => {
+                let array = downcast_input::<arrow_array::FixedSizeBinaryArray>(&input)?;
+                self.bucket_with(array, |i| array.value(i), |v| self.bucket_bytes(v))
+            }
+            DataType::BinaryView => {
+                let array = downcast_input::<arrow_array::BinaryViewArray>(&input)?;
+                self.bucket_with(array, |i| array.value(i), |v| self.bucket_bytes(v))
+            }
+            DataType::Utf8View => {
+                let array = downcast_input::<arrow_array::StringViewArray>(&input)?;
+                self.bucket_with(array, |i| array.value(i), |v| self.bucket_str(v))
+            }
             _ => {
                 return Err(crate::Error::new(
                     crate::ErrorKind::FeatureUnsupported,

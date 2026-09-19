@@ -39,7 +39,7 @@ use crate::to_datafusion_error;
 mod write_compatibility;
 #[cfg(test)]
 use write_compatibility::MAX_WRITE_COMPATIBILITY_DEPTH;
-use write_compatibility::field_is_write_compatible;
+use write_compatibility::{canonical_layout_input, field_is_write_compatible};
 
 /// Extends an ExecutionPlan with partition value calculations for Iceberg tables.
 ///
@@ -66,16 +66,15 @@ pub fn project_with_partition(
         return Ok(input);
     }
 
-    let input_schema = input.schema();
-
     // Validate that input_schema matches the Iceberg table schema
     // Strip metadata from both schemas before comparison to ignore metadata differences
     let expected_arrow_schema =
         schema_to_arrow_schema(table_schema.as_ref()).map_err(to_datafusion_error)?;
-    let input_schema_cleaned =
-        strip_metadata_from_schema(&input_schema).map_err(to_datafusion_error)?;
     let expected_schema_cleaned =
         strip_metadata_from_schema(&expected_arrow_schema).map_err(to_datafusion_error)?;
+    let (input, input_schema) = canonical_layout_input(input, expected_schema_cleaned.fields())?;
+    let input_schema_cleaned =
+        strip_metadata_from_schema(&input_schema).map_err(to_datafusion_error)?;
 
     // Field-by-field rather than `!=` on the whole schema: the ONE tolerated
     // difference is safe-direction nullability widening (a non-nullable input
