@@ -1887,3 +1887,27 @@ root (empty key).
       planted orphan, spares reachable files; nested control table exact set.
 - [x] Gates (units + compile of the MinIO suite; Docker excused), ledger, commit
       with TRO-Wolf identity + trailer, `handback.json`.
+
+## F-TRANSFORM-ARROW-TYPES-1 — every transform over every Arrow string/binary layout (2026-10-XX)
+
+Branch `fix/f-transform-arrow-types-1`, ledger `task/f-transform-arrow-types-1-ledger.md`.
+RePark `truncate(1, b)` INSERT fails: `FeatureUnsupported => Unsupported data type for truncate
+transform: LargeBinary`. RePark/DataFusion hand LargeBinary/LargeUtf8 and may hand
+BinaryView/Utf8View; transform code handles only Binary/Utf8 in places.
+
+- [ ] Step 1 ledger: per-transform x per-layout acceptance matrix (array path, literal path,
+      partition-value/writer path, projection/pruning path) + run-24d binary-transform oracle
+      cells + per-row Java murmur3 buckets. Commit.
+- [ ] Step 2 red-first pins: `transform/f_transform_arrow_types_1_tests.rs` (oracle cells for
+      Binary/LargeBinary/BinaryView + Utf8/LargeUtf8/Utf8View, literal + projection pins,
+      FixedSizeBinary-truncate rejection) and `arrow/f_transform_arrow_types_1_tests.rs`
+      (calculator canonicalization, splitter partitions, memory-catalog partitioned fast-append
+      write -> scan `b = X'0102'` -> id 3, v2+v3). Record RED. Commit.
+- [ ] Step 3 fix: truncate arms LargeBinary/BinaryView/Utf8View + literal Binary arm; bucket arms
+      BinaryView/Utf8View; calculator canonicalizes transform output to partition arrow type
+      (cast only on mismatch); value.rs accessor view arms; extract bucket/truncate test mods
+      to `*_tests.rs` (file-size ceilings, comments deleted in the move); widen DF
+      `data_type_is_write_compatible` for same-family string/binary layouts. Commit.
+- [ ] Step 4 mutation (one knob at a time, arithmetic recorded) + gates (comment-ban, fmt,
+      clippy -p iceberg and -p iceberg-datafusion, size checker, typos, filtered tests only);
+      ledger PROVEN/OPEN; handback.json; echo.
