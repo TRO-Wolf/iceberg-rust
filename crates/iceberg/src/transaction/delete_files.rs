@@ -224,7 +224,7 @@ impl TransactionAction for DeleteFilesAction {
             // A delete-only commit adds no data files.
             vec![],
             FirstRowIdPolicy::Suppress,
-        )
+        )?
         .with_stage_only(self.stage_only)
         .with_target_branch(self.target_branch.clone())?;
 

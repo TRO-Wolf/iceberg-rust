@@ -427,7 +427,7 @@ impl TransactionAction for CherryPickAction {
                     snapshot_properties,
                     added_data_files.clone(),
                     FirstRowIdPolicy::Suppress,
-                );
+                )?;
                 // Validate the replayed adds like fast append (data content type, partition-spec match,
                 // partition-value compatibility). The replayed removes are resolved by-path inside the
                 // producer via the operation's `delete_files` seam (`failMissingDeletePaths`).

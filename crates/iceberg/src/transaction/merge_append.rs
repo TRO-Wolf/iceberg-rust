@@ -150,7 +150,7 @@ impl TransactionAction for MergeAppendAction {
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
-        )
+        )?
         .with_target_branch(self.target_branch.clone())?;
 
         // Validate added files (identical to fast append — only DATA content, matching spec, valid

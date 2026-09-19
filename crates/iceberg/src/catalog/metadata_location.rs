@@ -47,14 +47,6 @@ pub(crate) fn write_metadata_dir(
     }
 }
 
-pub(crate) fn metadata_file_location(metadata: &TableMetadata, file_name: &str) -> Result<String> {
-    Ok(format!(
-        "{}/{}",
-        write_metadata_dir(metadata.location(), metadata.properties())?,
-        file_name
-    ))
-}
-
 impl MetadataLocation {
     /// Creates a completely new metadata location starting at version 0.
     /// Only used for creating a new table. For updates, see `with_next_version`.
