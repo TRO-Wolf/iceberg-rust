@@ -579,7 +579,10 @@ async fn position_delete_footer_matches_java_layout() -> Result<()> {
         "the parquet schema root carries Java's message name"
     );
 
-    let key_values = file_metadata.key_value_metadata().cloned().unwrap_or_default();
+    let key_values = file_metadata
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default();
     let iceberg_schema = key_values
         .iter()
         .find(|kv| kv.key == super::parquet_footer::ICEBERG_SCHEMA_META_KEY)

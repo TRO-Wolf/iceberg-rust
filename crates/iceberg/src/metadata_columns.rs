@@ -162,7 +162,7 @@ static DELETE_FILE_PATH_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
             RESERVED_COL_NAME_DELETE_FILE_PATH,
             Type::Primitive(PrimitiveType::String),
         )
-        .with_doc("Path of a file, used in position-based delete files"),
+        .with_doc("Path of a file in which a deleted row is stored"),
     )
 });
 
@@ -175,7 +175,7 @@ static DELETE_FILE_POS_FIELD: Lazy<NestedFieldRef> = Lazy::new(|| {
             RESERVED_COL_NAME_DELETE_FILE_POS,
             Type::Primitive(PrimitiveType::Long),
         )
-        .with_doc("Ordinal position of a row, used in position-based delete files"),
+        .with_doc("Ordinal position of a deleted row in the data file"),
     )
 });
 
