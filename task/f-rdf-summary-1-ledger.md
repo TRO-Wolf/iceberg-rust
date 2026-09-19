@@ -103,6 +103,16 @@ Two commits, both in `crates/iceberg/src/transaction/snapshot.rs` (the shared pr
   count via `entry().or_insert` so `RewriteManifests` (which computes its own
   created/kept/replaced/entries-processed via `extend_snapshot_properties`) keeps its authoritative
   values.
+- `b03bdab2` — round 2: the Spark oracle (`appends_rm_rdf`, `merges_rdf_only`) shows Java stamps
+  the three counters on EVERY operation — plain `INSERT` (append) commits carry
+  `manifests-created=1, manifests-kept=0..3, manifests-replaced=0` and MoR merges (overwrite) carry
+  `manifests-created=3, manifests-kept=2, manifests-replaced=1`. The `Operation::Replace` guard is
+  removed so every snapshot-producing commit is stamped. `manifests-replaced` is now the Java sum
+  `filterManager.manifestsReplaced() + mergeManager.manifestsReplaced()`: `ManifestProcess` /
+  `DefaultManifestProcess` / `MergeManifestProcess::process_manifests` return
+  `(Vec<ManifestFile>, usize)` where the usize is the merge-side count — manifests consumed by a
+  merged bin whose `added_snapshot_id` differs from the current snapshot (carried sources only,
+  matching `ManifestMergeManager.replacedManifests`); `manifest_file` sums filter + merge counts.
 
 Java comparison (`MergingSnapshotProducer.apply`): `addedDataSummary + addedDeleteSummary +
 appendedManifestSummary + filteredDataManifestSummary + filteredDeleteManifestSummary`, then
@@ -144,6 +154,23 @@ set (required + forbidden) AND the count invariants against a live manifest walk
 - `rm_delete_manifests_replace_summary_matches_java_keys` — `rewrite_delete_manifests(true)`:
   `manifests-created=2`, `manifests-replaced=3`, totals carried
 
+Round-2 operation-level pins (counts derived from each commit's own manifest list, compared against
+the oracle programs `appends_rm_rdf` / `merges_rdf_only` — key set and count shape, not Spark's
+byte sizes):
+
+- `append_commits_stamp_manifest_counts` — first append `created=1, kept=0, replaced=0`; second
+  append `created=1, kept=1, replaced=0` (oracle 1st/2nd inserts)
+- `row_delta_merge_commit_stamps_manifest_counts` — MoR merge adds one data + one delete manifest,
+  keeps one data manifest: `created=2, kept=1, replaced=0`
+- `cow_overwrite_commit_stamps_manifest_counts` — copy-on-write rewrite of one file: `created=2,
+  kept=0, replaced=1` (filter rewrites the carried manifest)
+- `delete_only_commit_stamps_manifest_counts` — a position-delete-only commit writes one delete
+  manifest and keeps the data manifest untouched: `created=1, kept=1, replaced=0`
+- `merge_append_stamps_merge_side_replaced_count` — `commit.manifest.min-count-to-merge=2`, two
+  carried manifests bin-merged: `created=1, kept=0, replaced=2` (merge-side count, oracle
+  `merges_rdf_only` shape); the plain `fast_append` under the same property merges nothing and
+  keeps `manifests-replaced=0`
+
 ## Mutation evidence (step 4)
 
 - Reverted the `b8acea60` clone lines to `std::mem::take` (`cargo test -p iceberg --lib
@@ -161,23 +188,45 @@ set (required + forbidden) AND the count invariants against a live manifest walk
   pins stay green because `RewriteManifests` stamps its own counts. Both mutations restored after
   the run; the suite re-verified 11/11 green.
 
+Round-2 mutations (run on `b03bdab2`):
+
+- Counted kept manifests as created (`added_snapshot_id == id || != id` ⇒ `created += 1`):
+  `append_commits_stamp_manifest_counts` red — `second append: manifests-created
+  left: 2 right: 1`.
+- Re-applied the round-1 `Operation::Replace` guard around the whole stamping block:
+  `append_commits_stamp_manifest_counts` red — `missing summary key 'manifests-created'` on the
+  append summary. Both restored after the run; the suite re-verified 16/16 green.
+
 ## Gates
 
 - `cargo fmt --all` — clean
 - `cargo clippy -p iceberg --all-targets -- -D warnings` — clean
-- `cargo test -p iceberg --lib replace_commit_summary` — 11 passed
+- `cargo test -p iceberg --lib replace_commit_summary` — 16 passed
 - `cargo test -p iceberg --lib snapshot_summary` — 16 passed
 - `cargo test -p iceberg --lib rewrite_` — 319 passed
 - `cargo test -p iceberg --lib replace_record_count` — 5 passed
+- `cargo test -p iceberg --lib append` — 116 passed
+- `cargo test -p iceberg --lib row_delta` — 123 passed
+- `cargo test -p iceberg --lib overwrite` — 76 passed
+- `cargo test -p iceberg --lib delete_files` — 222 passed
 - the lane's comment-ban gate against `origin/main` — `comment-ban hits=0` after every commit
+
+Key-set tests updated for the universal stamping (round-2 brief step 4):
+
+- `transaction::merge_append::tests::test_merge_append_at_threshold_merges_and_preserves_provenance`
+  pinned `manifests-created/-kept/-replaced` absent on an append-operation commit (the pre-parity
+  shape). Updated to the Java-correct counts for its fixture (one merged manifest; two carried
+  sources consumed): `manifests-created=1, manifests-kept=0, manifests-replaced=2` — the same
+  values the `merge_append_stamps_merge_side_replaced_count` pin asserts.
 
 ## Residue
 
-- `manifests-*` keys are emitted only on `Operation::Replace` (the scoped operations). `append`,
-  `overwrite`, and `delete` commits still do not write them; Java writes them only on
-  merge/filter operations too, so this matches — flagging as observed scope, not a gap.
+- `manifests-*` keys are now stamped on EVERY snapshot-producing commit (`append`, `overwrite`,
+  `delete`, `replace`) matching the Spark oracle — the round-1 claim that Java only writes them on
+  merge/filter operations was refuted by `rdf_summary_truth.json` (`appends_rm_rdf`,
+  `merges_rdf_only`).
 - `entries-processed` remains a `RewriteManifests`-only key, matching Java.
 - `manifests-replaced` for `RewriteManifests` counts action-level rewritten+deleted manifests
-  (its own `extend_snapshot_properties` values win via `or_insert`); for `RewriteFiles`-family
-  commits it counts manifests rewritten by the delete-side filter — the fork has no
-  manifest-merge manager, so there is no merge-side component to add.
+  (its own `extend_snapshot_properties` values win via `or_insert`); for all other commits it is
+  the Java `filter + merge` sum — filter-rewritten manifests from `process_deletes` plus
+  carried-source manifests consumed by `MergeManifestProcess` bins.
