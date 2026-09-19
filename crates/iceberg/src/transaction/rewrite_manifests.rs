@@ -661,7 +661,6 @@ struct RewriteManifestsOperation {
 
 impl SnapshotProduceOperation for RewriteManifestsOperation {
     fn operation(&self) -> Operation {
-        // Java `BaseRewriteManifests.operation()` returns `DataOperations.REPLACE` (L87-89).
         Operation::Replace
     }
 
@@ -676,8 +675,6 @@ impl SnapshotProduceOperation for RewriteManifestsOperation {
         &self,
         _snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<DataFile>> {
-        // A manifest rewrite removes no data files (the live set is unchanged), so there is nothing for
-        // the producer's by-path `process_deletes` to do.
         Ok(vec![])
     }
 
@@ -685,8 +682,11 @@ impl SnapshotProduceOperation for RewriteManifestsOperation {
         &self,
         _snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // The precomputed final list (new manifests first, then added, then kept — Java L189-194).
         Ok(self.existing_manifests.clone())
+    }
+
+    fn drops_old_delete_files(&self) -> bool {
+        false
     }
 }
 

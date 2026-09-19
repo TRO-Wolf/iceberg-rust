@@ -348,10 +348,6 @@ impl SnapshotProduceOperation for DeleteFilesOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // Expose EVERY current manifest, DATA and DELETE. `process_deletes` decides per DATA manifest
-        // whether to rewrite, carry forward, or drop it. Every DELETE manifest carries forward unchanged,
-        // so a delete on a merge-on-read table keeps all outstanding position and equality deletes
-        // instead of dropping them and resurrecting deleted rows.
         snapshot_produce.current_manifests().await
     }
 }

@@ -37,12 +37,6 @@ async fn remove_data_files(catalog: &impl Catalog, table: &Table, removed: Vec<D
     tx.commit(catalog).await.unwrap()
 }
 
-/// A fixture whose lone position delete genuinely dangles after compaction.
-///
-/// Everything sits in partition `x = 0`, so the table is one bin-pack group. Sequence 1 appends
-/// five files, sequence 2 adds a position delete, and sequence 3 appends a sixth. The rewrite
-/// starts from sequence 3, so the restamped data lifts the partition minimum to 3 and the
-/// delete at 2 falls under Java's strict `<` dangling clause.
 async fn dangling_after_compaction_fixture(catalog: &impl Catalog) -> (Table, String) {
     let table = create_partitioned_table(catalog, crate::spec::FormatVersion::V2).await;
 
@@ -61,6 +55,7 @@ async fn dangling_after_compaction_fixture(catalog: &impl Catalog) -> (Table, St
             .await,
         );
     }
+    files.push(write_data_file(&table, "other-partition.parquet", 1, &[(1, 77, 770)]).await);
     let table = append_files(catalog, &table, files).await;
 
     let pos_delete = write_position_delete_file(&table, 0, &[(two_row_path, 0)]).await;

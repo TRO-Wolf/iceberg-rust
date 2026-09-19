@@ -27,11 +27,11 @@ use crate::expr::visitors::residual_evaluator::ResidualEvaluator;
 use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::spec::{
-    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, Manifest, ManifestContentType,
-    ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter,
-    ManifestWriterBuilder, Operation, Schema, Snapshot, SnapshotRef, SnapshotReference,
-    SnapshotRetention, SnapshotSummaryCollector, Struct, StructType, Summary, TableMetadata,
-    TableProperties, update_snapshot_summaries,
+    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
+    ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriter, ManifestWriterBuilder,
+    Operation, Schema, Snapshot, SnapshotRef, SnapshotReference, SnapshotRetention,
+    SnapshotSummaryCollector, Struct, StructType, Summary, TableMetadata, TableProperties,
+    update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -87,6 +87,10 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     fn allows_empty_commit(&self) -> bool {
         false
     }
+
+    fn drops_old_delete_files(&self) -> bool {
+        true
+    }
 }
 
 pub(crate) struct DefaultManifestProcess;
@@ -134,10 +138,11 @@ pub(crate) use first_row_id_policy::FirstRowIdPolicy;
 pub(crate) type PendingDeleteFile = (DataFile, Option<i64>);
 
 mod conflict_filter;
+mod manifest_filter;
 mod removal_targets;
 
 use conflict_filter::first_conflicting_file;
-use removal_targets::{DeleteFileMatcher, RemovalHits, RemovalTargets};
+use removal_targets::DeleteFileMatcher;
 
 pub(crate) fn latest_snapshot<'a>(
     metadata: &'a TableMetadata,
@@ -535,22 +540,11 @@ impl<'a> SnapshotProducer<'a> {
     /// Return EVERY current manifest — DATA **and** DELETE — from the current snapshot's manifest list,
     /// the complete candidate set a delete-bearing operation's `existing_manifest` hands to the producer.
     ///
-    /// Shared by every delete-bearing operation. Each exposes the FULL manifest list so
-    /// `process_deletes` can rewrite, carry forward, or drop each DATA manifest. Every DELETE
-    /// manifest carries forward UNCHANGED, because its entries are delete-file paths, which never
-    /// appear in a DATA `delete_paths` set.
-    ///
     /// Carrying delete manifests forward is REQUIRED FOR CORRECTNESS, not an optimization. Java
     /// `MergingSnapshotProducer.apply` composes both filtered lists into the new manifest list. An
     /// action returning DATA manifests only would omit every delete manifest the current snapshot
     /// carried, which silently drops all outstanding deletes table-wide and resurrects every
     /// deleted row. This helper makes that bug class unrepresentable.
-    ///
-    /// **Conservative dangling-delete posture, a documented divergence.** Java's `apply` also drops
-    /// delete files older than the surviving data's minimum sequence number, and removes DVs
-    /// orphaned by the data files it deleted. This port carries every delete manifest forward
-    /// UNCHANGED. Keeping a delete that no longer applies is harmless, while dropping one that still
-    /// applies resurrects rows. Cleanup belongs to `RemoveDanglingDeleteFiles`.
     pub(crate) async fn current_manifests(&self) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = self.parent_snapshot() else {
             return Ok(vec![]);
@@ -1082,16 +1076,17 @@ impl<'a> SnapshotProducer<'a> {
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
 
-        // Rewrite existing manifests to remove the requested deletes (Java
-        // `ManifestFilterManager.filterManifests`). Manifests that contain none of the target files are
-        // carried forward unchanged.
-        let processed = self
+        let (processed, expired_delete_files) = self
             .process_deletes(
                 existing_manifests,
                 &removed_data_files,
                 &removed_delete_files,
+                snapshot_produce_operation.drops_old_delete_files(),
             )
             .await?;
+        self.removed_data_files = removed_data_files;
+        self.removed_delete_files = removed_delete_files;
+        self.removed_delete_files.extend(expired_delete_files);
         let (existing_data_manifests, existing_delete_manifests): (Vec<_>, Vec<_>) = processed
             .into_iter()
             .partition(|manifest| manifest.content == ManifestContentType::Data);
@@ -1131,106 +1126,6 @@ impl<'a> SnapshotProducer<'a> {
             .process_manifests(self, manifest_files)
             .await?;
         Ok(manifest_files)
-    }
-
-    /// Rewrite the existing manifests to remove `delete_files`, mirroring Java
-    /// `ManifestFilterManager.filterManifests` + `MergingSnapshotProducer.apply`'s keep rule.
-    ///
-    /// A DATA manifest entry matches by path; a DELETE manifest entry matches by the Java
-    /// `DeleteFileSet` triple, so two deletion vectors sharing one Puffin path are removed
-    /// independently. Matching live entries become `Deleted`, keeping their data file and both
-    /// sequence numbers. Every other live entry is copied forward as `Existing`, keeping its snapshot
-    /// id and both sequence numbers. Every other manifest carries forward unchanged.
-    ///
-    /// A rewritten manifest is kept even when every live entry became `Deleted`. An unrewritten
-    /// manifest with no live files is dropped.
-    ///
-    /// # Errors
-    ///
-    /// A requested removal matched no live entry. Java `failMissingDeletePaths`.
-    async fn process_deletes(
-        &mut self,
-        existing_manifests: Vec<ManifestFile>,
-        removed_data_files: &[DataFile],
-        removed_delete_files: &[DataFile],
-    ) -> Result<Vec<ManifestFile>> {
-        if removed_data_files.is_empty() && removed_delete_files.is_empty() {
-            return Ok(existing_manifests);
-        }
-
-        let targets = RemovalTargets::new(removed_data_files, removed_delete_files);
-        let mut hits = RemovalHits::default();
-        let mut result_manifests = Vec::with_capacity(existing_manifests.len());
-
-        for manifest_file in existing_manifests {
-            let content = manifest_file.content;
-            if !targets.wants(content) {
-                if manifest_file.has_added_files() || manifest_file.has_existing_files() {
-                    result_manifests.push(manifest_file);
-                }
-                continue;
-            }
-            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
-
-            let has_matching_delete = manifest
-                .entries()
-                .iter()
-                .any(|entry| entry.is_alive() && targets.matches(content, entry.data_file()));
-
-            if !has_matching_delete {
-                if manifest_file.has_added_files() || manifest_file.has_existing_files() {
-                    result_manifests.push(manifest_file);
-                }
-                continue;
-            }
-
-            let rewritten = self
-                .rewrite_manifest_with_deletes(&manifest_file, &manifest, &targets, &mut hits)
-                .await?;
-            result_manifests.push(rewritten);
-        }
-
-        let missing = targets.missing_data_paths(&hits);
-        if !missing.is_empty() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Missing required files to delete: {}", missing.join(", ")),
-            ));
-        }
-
-        Ok(result_manifests)
-    }
-
-    /// Write a rewritten copy of `manifest` with the entries `targets` matches marked `Deleted` and
-    /// the rest copied forward as `Existing`. Records each removal in `hits`.
-    async fn rewrite_manifest_with_deletes(
-        &mut self,
-        manifest_file: &ManifestFile,
-        manifest: &Manifest,
-        targets: &RemovalTargets<'_>,
-        hits: &mut RemovalHits,
-    ) -> Result<ManifestFile> {
-        // Rewrite with the source manifest's own partition spec so the spec id / partition type of the
-        // copied-forward entries is preserved (Java writes with `reader.spec()`).
-        let content = manifest_file.content;
-        let mut writer = self.new_filtering_manifest_writer(manifest_file)?;
-
-        for entry in manifest.entries() {
-            // Already-deleted entries are informational only and are not carried forward.
-            if !entry.is_alive() {
-                continue;
-            }
-
-            let entry = entry.as_ref().clone();
-            if targets.matches(content, entry.data_file()) {
-                hits.record(content, entry.data_file());
-                writer.add_delete_entry(entry)?;
-            } else {
-                writer.add_existing_entry(entry)?;
-            }
-        }
-
-        writer.write_manifest_file().await
     }
 
     /// Build a manifest writer for a rewritten (filtered) manifest, using the partition spec of the
@@ -1457,9 +1352,12 @@ impl<'a> SnapshotProducer<'a> {
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
         let parent_snapshot_id = self.parent_snapshot_id();
-        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
+        let summary_error = |err: Error| {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
-        })?;
+        };
+        let summary = self
+            .summary(&snapshot_produce_operation)
+            .map_err(summary_error)?;
         replace_record_count::validate_replace_record_counts(&summary)?;
 
         let mut manifest_list_writer = match self.table.metadata().format_version() {
@@ -1489,9 +1387,16 @@ impl<'a> SnapshotProducer<'a> {
             ),
         };
 
+        let removed_delete_file_count = self.removed_delete_files.len();
         let new_manifests = self
             .manifest_file(&snapshot_produce_operation, &process)
             .await?;
+        let summary = if self.removed_delete_files.len() == removed_delete_file_count {
+            summary
+        } else {
+            self.summary(&snapshot_produce_operation)
+                .map_err(summary_error)?
+        };
 
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;
         let writer_next_row_id = manifest_list_writer.next_row_id();

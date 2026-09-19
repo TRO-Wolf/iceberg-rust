@@ -268,22 +268,16 @@ fn find_dangling_deletes(live: &LiveEntries) -> Vec<DataFile> {
     for entry in &live.live_delete_entries {
         let data_file = &entry.data_file;
 
-        // A file-scoped delete dangles when its referenced path is not a live data-file path. The read
-        // path routes such a delete BY PATH in `crate::delete_file_index`, and that lookup consults
-        // neither the spec id nor the partition tuple. The per-partition min-seq rule therefore says
-        // nothing about whether it still applies. This check must come first. Judging a file-scoped
-        // delete by the min-seq rule removes a delete the reader still honors, and the masked rows
-        // resurrect permanently, because the removal is a committed metadata change.
-        if let Some(referenced) = referenced_data_file_location(data_file) {
-            if !live.live_data_file_paths.contains(&referenced) {
+        if is_deletion_vector(data_file) {
+            let live_referenced = referenced_data_file_location(data_file)
+                .is_some_and(|referenced| live.live_data_file_paths.contains(&referenced));
+            if !live_referenced {
                 dangling.push(data_file.clone());
             }
             continue;
-        }
-        // A deletion vector with no `referenced_data_file` is malformed. Its reference can never match a
-        // live path, so it dangles by absence. This matches the left-outer-join-then-null semantics.
-        if is_deletion_vector(data_file) {
-            dangling.push(data_file.clone());
+        } else if referenced_data_file_location(data_file)
+            .is_some_and(|referenced| live.live_data_file_paths.contains(&referenced))
+        {
             continue;
         }
 

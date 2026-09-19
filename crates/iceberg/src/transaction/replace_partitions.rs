@@ -629,23 +629,6 @@ impl SnapshotProduceOperation for ReplacePartitionsOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // Expose EVERY current manifest — DATA and DELETE — via the shared
-        // [`SnapshotProducer::current_manifests`]. The producer's `process_deletes` decides per DATA manifest
-        // whether to rewrite (to drop replaced-partition files), carry forward unchanged, or drop it; every
-        // DELETE manifest carries forward UNCHANGED (its entries are delete-file paths, never in the
-        // data-file `delete_paths`), so replacing a partition on a merge-on-read table preserves all
-        // outstanding position / equality deletes in the UNREPLACED partitions instead of silently dropping
-        // them table-wide and resurrecting deleted rows. The conservative dangling-delete posture (no
-        // pruning) is documented on the helper.
-        //
-        // NAMED DIVERGENCE on the FULL-TABLE-REPLACE branch (`is_full_table_replace`): there ARE no
-        // unreplaced partitions there, so the rationale above does not apply and this carry-forward is
-        // where the port diverges from Java most. Java's `deleteByRowFilter` drives BOTH filter managers
-        // (`MergingSnapshotProducer.deleteByRowFilter` offsets 5-18) and `apply` additionally runs
-        // `deleteFilterManager.removeDanglingDeletesFor(...)` (offsets 103-114), so under `alwaysTrue`
-        // Java removes every live DELETE file as well. This port keeps them. It cannot resurrect rows
-        // (every referenced data file is removed and the replacements carry a higher sequence number), but
-        // it leaves a manifest-list difference byte-level interop would show. See row R104's residue.
         snapshot_produce.current_manifests().await
     }
 }

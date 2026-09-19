@@ -134,12 +134,16 @@ mod actions_provider;
 mod compute_partition_stats;
 mod compute_table_stats;
 mod convert_equality_delete_files;
+#[cfg(test)]
+mod delete_file_seq_gc_tests;
 mod delete_orphan_files;
 mod delete_reachable_files;
 mod partition_key_audit;
 pub mod partition_stats;
 mod remove_dangling_delete_files;
 mod rewrite_data_files;
+#[cfg(test)]
+mod rewrite_data_files_cow_bytes_tests;
 #[cfg(test)]
 mod rewrite_data_files_dangling_tests;
 mod rewrite_data_files_dv;

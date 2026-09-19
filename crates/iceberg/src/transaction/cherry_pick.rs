@@ -485,9 +485,6 @@ impl SnapshotProduceOperation for CherryPickReplayOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // Expose EVERY current manifest — DATA and DELETE — so the producer's `process_deletes` can rewrite
-        // the DATA manifests that hold replayed-removed files and carry every DELETE manifest forward unchanged
-        // (the established merge-on-read-preserving posture; see `SnapshotProducer::current_manifests`).
         snapshot_produce.current_manifests().await
     }
 }

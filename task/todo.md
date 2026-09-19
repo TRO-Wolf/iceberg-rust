@@ -25,6 +25,36 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-18): F-RDF-COW-BYTES-1 — a data rewrite keeps a position delete that still applies, as Java does
+
+Ledger: [`f-rdf-cow-bytes-1-ledger.md`](f-rdf-cow-bytes-1-ledger.md). Branch
+`fix/f-rdf-cow-bytes-1` off fork `main`. Consumer: RePark rows ICE-RDF-COW-BYTES-1 +
+ICE-RDF-DANGLE-2 (one defect — the dropped file-scoped parquet delete inflates the
+vanished-byte sum). Fix: both referenced-path removal arms restricted to
+`is_deletion_vector` (Puffin) per Java `ManifestFilterManager.isDanglingDV`/`ContentFileUtil.isDV`; non-DV
+file-scoped deletes with a live reference are kept, dead ones fall to the partition
+min-seq rule.
+
+- [x] Step 0 measurement incl. MERGE-based Spark probe (4 file-scoped parquet deletes
+      over rewritten files KEPT, `removed 0` — refutes the f16 reclaim inference);
+      ledger committed `66299118`
+- [x] Step 1 red: `rewrite_data_files_cow_bytes_tests.rs` (8 cells, 5 red pre-fix)
+      `194503d4`
+- [x] Step 2 fix + 6 f16-inference pins re-pinned to the Spark keep (none deleted);
+      `remove_dangling_delete_files.rs` 1804→1798 ceiling lowered; `5e7455f2`
+- [x] Step 3 mutation: fix reverted → exactly the 5 file-scoped cells red (1 vs 0),
+      3 controls green; restored 8/8; revert not committed
+- [x] Step 4 ledger + todo + map.md; gates: `cow_bytes` 8/8, `rewrite_data_files`
+      104/104, `remove_dangling` 23/23, `rewrite_position_delete` 93/93, fmt, clippy
+      `-D warnings`, file-size, comment-blocks, artifacts, anchors
+- [x] Round 4 (claude-opus-5): port of Java `dropDeleteFilesOlderThan` on the merging
+      commit path (`transaction/snapshot/manifest_filter.rs`; `FastAppend` +
+      `RewriteManifests` opt out). Red `c7c45299` (`delete_file_seq_gc_tests.rs`, 6 red /
+      5 green), fix `b273d097` (3 pins re-examined: 1 re-pinned to Java, 2 fixtures kept
+      their assertions), R-02/R-04/nits `47d767d8`, mutation ×3 in the ledger
+- [ ] Next unit: `removeDanglingDeletesFor` on every merging commit (DV drop outside
+      `RewriteDataFiles`); R-03 (RPD packing dead file-scoped deletes)
+
 ## ACTIVE (2026-09-18): F-ROWID-ORDER-1 — INSERT commits data files in ascending partition order
 
 Ledger: [`f-rowid-order-1-ledger.md`](f-rowid-order-1-ledger.md). Branch `fix/f-rowid-order-1`

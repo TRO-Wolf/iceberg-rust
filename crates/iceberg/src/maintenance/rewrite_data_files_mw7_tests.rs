@@ -218,10 +218,15 @@ async fn test_mw7_unpartitioned_single_file_partition_scoped_full_bounds_is_recl
         .expect("compaction must succeed");
     assert_eq!(result.rewritten_data_files_count, 1);
     assert_eq!(result.added_data_files_count, 0);
-    assert_eq!(result.removed_delete_files_count, 1);
+    assert_eq!(result.removed_delete_files_count, 0);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
-    assert!(live_delete_file_paths(&table).await.is_empty());
+    assert!(
+        live_delete_file_paths(&table)
+            .await
+            .contains(delete.file_path()),
+        "the file-scoped parquet delete stays live: Java's reclaim is Puffin-only"
+    );
     assert!(live_data_file_paths(&table).await.is_empty());
     assert!(scan_rows(&table).await.is_empty());
 }

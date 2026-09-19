@@ -96,10 +96,6 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // Expose every current manifest, DATA and DELETE. `process_deletes` rewrites, carries, or drops
-        // each DATA manifest. Every DELETE manifest carries forward unchanged, because its entries are
-        // delete-file paths and never appear in `delete_paths`. Dropping one would resurrect deleted rows on
-        // a merge-on-read table. The helper documents the conservative dangling-delete posture.
         snapshot_produce.current_manifests().await
     }
 }

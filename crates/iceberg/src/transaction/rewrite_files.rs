@@ -519,9 +519,6 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        // Expose EVERY current manifest, DATA and DELETE. DELETE manifests carry forward unchanged. A
-        // rewrite that dropped them would lose every outstanding merge-on-read delete and resurrect
-        // deleted rows.
         snapshot_produce.current_manifests().await
     }
 }

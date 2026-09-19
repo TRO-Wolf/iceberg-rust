@@ -32,7 +32,6 @@ use crate::transaction::{ActionCommit, TransactionAction};
 /// FastAppendAction is a transaction action for fast append data files to the table.
 pub struct FastAppendAction {
     check_duplicate: bool,
-    // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
@@ -173,10 +172,11 @@ impl SnapshotProduceOperation for FastAppendOperation {
         // manifest list with no predicate. The non-merging fast append keeps the manifest-list
         // STRUCTURE intact, including a manifest a prior delete left ALL-DELETED. Filtering those
         // out drops a manifest Java keeps referenced, which could then be collected.
-        //
-        // The MERGING append does NOT carry all-tombstone manifests, because Java's
-        // `MergingSnapshotProducer.apply` filters them out. That filter stays in `merge_append.rs`.
         Ok(manifest_list.entries().to_vec())
+    }
+
+    fn drops_old_delete_files(&self) -> bool {
+        false
     }
 }
 
