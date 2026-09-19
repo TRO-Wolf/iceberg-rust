@@ -905,3 +905,12 @@ async fn p9_builder_load_without_cache_rereads_every_load() {
         "without a cache handle every load re-reads the body"
     );
 }
+
+#[tokio::test]
+async fn l001_footer_cache_default_off() {
+    assert!(GlueCatalogBuilder::default().shared_footer_cache.is_none());
+    let file_io = FileIO::new_with_memory();
+    let (_state, source) = mutable_pointer("memory://wh/t/metadata/v1.metadata.json", None);
+    let cat = catalog(None, "memory://wh", &file_io, None, None, None, source).await;
+    assert!(cat.shared_footer_cache.is_none());
+}
