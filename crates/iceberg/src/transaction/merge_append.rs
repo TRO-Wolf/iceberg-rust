@@ -1112,12 +1112,16 @@ mod tests {
             "merge_append records Operation::Append"
         );
         assert_eq!(
-            summary_prop(&table, "manifests-created"),
-            None,
-            "merge_append emits NO manifests-created key (fast_append summary shape)"
+            summary_prop(&table, "manifests-created").as_deref(),
+            Some("1"),
+            "merge_append emits manifests-created for the merged manifest"
         );
-        assert_eq!(summary_prop(&table, "manifests-kept"), None);
-        assert_eq!(summary_prop(&table, "manifests-replaced"), None);
+        assert_eq!(summary_prop(&table, "manifests-kept").as_deref(), Some("0"));
+        assert_eq!(
+            summary_prop(&table, "manifests-replaced").as_deref(),
+            Some("2"),
+            "the two carried source manifests consumed by the merge count as replaced"
+        );
         assert_eq!(
             summary_prop(&table, "total-data-files").as_deref(),
             Some("3"),
