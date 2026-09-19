@@ -15,11 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Metrics-config coverage pin for `RewriteTablePath::write_position_delete_content`: the staged
-//! position-delete file keeps ONLY the reserved `file_path`/`pos` metrics, with FULL bounds, under
-//! `write.metadata.metrics.default=none`. Mutation-proven: dropping `with_metrics_config` truncates
-//! the `file_path` bound and fails the pin.
-
 use std::collections::HashSet;
 
 use super::*;
