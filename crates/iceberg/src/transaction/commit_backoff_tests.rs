@@ -166,9 +166,7 @@ fn first_failure_is_exempt_from_total_timeout() {
 
 #[test]
 fn total_timeout_stops_retries_after_first_attempt() {
-    let mut backoff = backoff_with(props(100, 60_000, 1_000, 4), vec![0, 0, 1_001], vec![
-        0, 0, 0,
-    ]);
+    let mut backoff = backoff_with(props(100, 60_000, 1_000, 4), vec![0, 1_001], vec![0, 0, 0]);
     let sleeps: Vec<Duration> = backoff.by_ref().collect();
     assert_eq!(
         vec![Duration::from_millis(100), Duration::from_millis(200)],

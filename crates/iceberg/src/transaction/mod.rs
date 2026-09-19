@@ -109,15 +109,15 @@ mod upgrade_format_version;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
+use backon::RetryableWithContext;
 
 use crate::error::{Error, Result};
 use crate::events::{self, CreateSnapshotEvent};
 use crate::spec::{Snapshot, TableProperties};
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
+use crate::transaction::commit_backoff::CommitRetryBackoff;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_partition_spec::UpdatePartitionSpecAction;
@@ -385,7 +385,7 @@ impl Transaction {
 
         let table_props = self.table.metadata().table_properties()?;
 
-        let backoff = Self::build_backoff(table_props)?;
+        let backoff = Self::build_backoff(table_props);
         let tx = self;
 
         let (tx, result) = (|mut tx: Transaction| async {
@@ -495,16 +495,8 @@ impl Transaction {
         }
     }
 
-    fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
-        Ok(ExponentialBuilder::new()
-            .with_min_delay(Duration::from_millis(props.commit_min_retry_wait_ms))
-            .with_max_delay(Duration::from_millis(props.commit_max_retry_wait_ms))
-            .with_total_delay(Some(Duration::from_millis(
-                props.commit_total_retry_timeout_ms,
-            )))
-            .with_max_times(props.commit_num_retries)
-            .with_factor(2.0)
-            .build())
+    fn build_backoff(props: TableProperties) -> CommitRetryBackoff {
+        CommitRetryBackoff::new(props)
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
