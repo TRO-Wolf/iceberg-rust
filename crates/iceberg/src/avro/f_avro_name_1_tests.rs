@@ -18,11 +18,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use tempfile::TempDir;
 
 use super::schema_to_avro_schema;
+use crate::arrow::avro_reader::read_avro_data_bytes;
 use crate::arrow::schema_to_arrow_schema;
 use crate::expr::Reference;
 use crate::io::{FileIO, LocalFsStorageFactory};
@@ -34,7 +35,9 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
-use crate::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
+use crate::writer::file_writer::{
+    AvroWriterBuilder, FileWriter, FileWriterBuilder, ParquetWriterBuilder,
+};
 use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 
 const CASES: &[(&str, &str, Option<&str>)] = &[
@@ -429,4 +432,84 @@ async fn table_scan_filters_on_spaced_partition_column() {
         .unwrap();
     assert_eq!(id_col.value(0), 1);
     assert_eq!(col.value(0), "x");
+}
+
+async fn write_avro_data_file(schema: Arc<Schema>, batch: &RecordBatch) -> Vec<u8> {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("d.avro");
+    let io = FileIO::new_with_fs();
+    let out = io.new_output(path.to_str().unwrap()).unwrap();
+    let mut writer = AvroWriterBuilder::new(schema)
+        .build(out)
+        .await
+        .expect("avro writer");
+    writer.write(batch).await.expect("write batch");
+    writer.close().await.expect("close");
+    std::fs::read(&path).unwrap()
+}
+
+fn string_col<'b>(batch: &'b RecordBatch, name: &str) -> &'b StringArray {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("column {name}"))
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+}
+
+fn int_col<'b>(batch: &'b RecordBatch, name: &str) -> &'b Int32Array {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("column {name}"))
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn avro_data_file_round_trip_sanitizes_value_keys() {
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "my col", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "a-b", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(4, "1st", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(5, "c\u{1F600}", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("x"), None])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![Some(7), None])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("e"), None])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let bs = write_avro_data_file(schema.clone(), &batch).await;
+    let batches = read_avro_data_bytes(&bs, &schema, 1024).expect("read avro data file");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2);
+    let batch = &batches[0];
+    assert_eq!(int_col(batch, "id").value(0), 1);
+    let my_col = string_col(batch, "my col");
+    assert_eq!(my_col.value(0), "x");
+    assert!(my_col.is_null(1));
+    let dash = int_col(batch, "a-b");
+    assert_eq!(dash.value(0), 7);
+    assert!(dash.is_null(1));
+    let leading = string_col(batch, "1st");
+    assert_eq!(leading.value(0), "a");
+    assert_eq!(leading.value(1), "b");
+    let emoji = string_col(batch, "c\u{1F600}");
+    assert_eq!(emoji.value(0), "e");
+    assert!(emoji.is_null(1));
 }
