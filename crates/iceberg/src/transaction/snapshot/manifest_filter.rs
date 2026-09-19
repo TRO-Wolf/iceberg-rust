@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashSet;
+
 use super::SnapshotProducer;
 use super::removal_targets::{RemovalHits, RemovalTargets};
+use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};
 use crate::error::Result;
 use crate::spec::{
     DataFile, Manifest, ManifestContentType, ManifestEntry, ManifestFile,
@@ -27,6 +30,12 @@ use crate::{Error, ErrorKind};
 struct DeleteFileExpiry {
     min_data_sequence_number: i64,
     every_manifest: bool,
+}
+
+fn is_dangling_dv(data_file: &DataFile, removed_data_paths: &HashSet<String>) -> bool {
+    is_deletion_vector(data_file)
+        && referenced_data_file_location(data_file)
+            .is_some_and(|referenced| removed_data_paths.contains(&referenced))
 }
 
 impl DeleteFileExpiry {
@@ -80,7 +89,7 @@ impl SnapshotProducer<'_> {
         let mut filtered = Vec::with_capacity(data_manifests.len() + delete_manifests.len());
         for manifest_file in data_manifests {
             filtered.push(
-                self.filter_manifest(manifest_file, &targets, None, &mut hits)
+                self.filter_manifest(manifest_file, &targets, None, None, &mut hits)
                     .await?,
             );
         }
@@ -91,10 +100,23 @@ impl SnapshotProducer<'_> {
                 !removed_data_files.is_empty(),
             )
         });
+        let dangling_dv_paths =
+            (drops_old_delete_files && !removed_data_files.is_empty()).then(|| {
+                removed_data_files
+                    .iter()
+                    .map(|data_file| data_file.file_path().to_string())
+                    .collect::<HashSet<String>>()
+            });
         for manifest_file in delete_manifests {
             filtered.push(
-                self.filter_manifest(manifest_file, &targets, expiry.as_ref(), &mut hits)
-                    .await?,
+                self.filter_manifest(
+                    manifest_file,
+                    &targets,
+                    expiry.as_ref(),
+                    dangling_dv_paths.as_ref(),
+                    &mut hits,
+                )
+                .await?,
             );
         }
 
@@ -121,11 +143,14 @@ impl SnapshotProducer<'_> {
         manifest_file: ManifestFile,
         targets: &RemovalTargets<'_>,
         expiry: Option<&DeleteFileExpiry>,
+        dangling_dv_paths: Option<&HashSet<String>>,
         hits: &mut RemovalHits,
     ) -> Result<(ManifestFile, bool)> {
         let content = manifest_file.content;
         let expiry = expiry.filter(|expiry| expiry.may_expire_in(&manifest_file));
-        if !targets.wants(content) && expiry.is_none() {
+        let may_hold_dangling = dangling_dv_paths.is_some()
+            && (manifest_file.has_added_files() || manifest_file.has_existing_files());
+        if !targets.wants(content) && expiry.is_none() && !may_hold_dangling {
             return Ok((manifest_file, false));
         }
         let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
@@ -137,12 +162,24 @@ impl SnapshotProducer<'_> {
         let expiry = expiry.filter(|expiry| expiry.every_manifest || has_removal);
         let has_expired = expiry
             .is_some_and(|expiry| manifest.entries().iter().any(|entry| expiry.expires(entry)));
-        if !has_removal && !has_expired {
+        let has_dangling = dangling_dv_paths.is_some_and(|removed_data_paths| {
+            manifest.entries().iter().any(|entry| {
+                entry.is_alive() && is_dangling_dv(entry.data_file(), removed_data_paths)
+            })
+        });
+        if !has_removal && !has_expired && !has_dangling {
             return Ok((manifest_file, false));
         }
 
         let rewritten = self
-            .rewrite_manifest_with_deletes(&manifest_file, &manifest, targets, expiry, hits)
+            .rewrite_manifest_with_deletes(
+                &manifest_file,
+                &manifest,
+                targets,
+                expiry,
+                dangling_dv_paths,
+                hits,
+            )
             .await?;
         Ok((rewritten, true))
     }
@@ -153,6 +190,7 @@ impl SnapshotProducer<'_> {
         manifest: &Manifest,
         targets: &RemovalTargets<'_>,
         expiry: Option<&DeleteFileExpiry>,
+        dangling_dv_paths: Option<&HashSet<String>>,
         hits: &mut RemovalHits,
     ) -> Result<ManifestFile> {
         let content = manifest_file.content;
@@ -167,7 +205,10 @@ impl SnapshotProducer<'_> {
             if targets.matches(content, entry.data_file()) {
                 hits.record(content, entry.data_file());
                 writer.add_delete_entry(entry)?;
-            } else if expiry.is_some_and(|expiry| expiry.expires(&entry)) {
+            } else if dangling_dv_paths.is_some_and(|removed_data_paths| {
+                is_dangling_dv(entry.data_file(), removed_data_paths)
+            }) || expiry.is_some_and(|expiry| expiry.expires(&entry))
+            {
                 hits.expire(entry.data_file());
                 writer.add_delete_entry(entry)?;
             } else {

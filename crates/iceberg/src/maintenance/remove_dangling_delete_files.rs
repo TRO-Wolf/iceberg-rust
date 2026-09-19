@@ -1679,9 +1679,6 @@ mod tests {
         );
     }
 
-    /// Deletion vectors, end to end. A plain RewriteFiles of data file A carries a real Puffin
-    /// deletion vector forward. The vector now references a gone file, so it dangles, and this
-    /// action removes it.
     #[tokio::test]
     async fn test_dangling_deletion_vector_removed_after_referenced_data_rewritten_away() {
         use crate::spec::ManifestContentType;
@@ -1714,7 +1711,6 @@ mod tests {
         );
 
         // A plain RewriteFiles gives A' a new path, so the vector no longer applies and y=20 comes back.
-        // The carry posture keeps the now-dangling vector.
         let a_prime = write_data_file(&table, "a-prime.parquet", 0, &[
             (0, 10, 100),
             (0, 20, 200),
@@ -1726,8 +1722,17 @@ mod tests {
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
         assert!(
-            live_delete_paths(&table).await.contains(&dv_path),
-            "plain RewriteFiles carries the now-dangling DV forward (Rust carry-posture)"
+            !live_delete_paths(&table).await.contains(&dv_path),
+            "the merging commit drops the now-dangling DV (Java removeDanglingDeletesFor)"
+        );
+        assert_eq!(
+            summary_prop(&table, "removed-dvs").as_deref(),
+            Some("1"),
+            "the rewrite snapshot reports one removed DV"
+        );
+        assert_eq!(
+            summary_prop(&table, "removed-delete-files").as_deref(),
+            Some("1")
         );
         assert_eq!(
             scan_y_values(&table).await,
@@ -1735,27 +1740,21 @@ mod tests {
             "after A->A' the DV references a gone file, so y=20 is already back"
         );
 
-        // The action removes the dangling DV (referenced file A is gone).
         let result = RemoveDanglingDeleteFiles::new(table.clone())
             .execute(&catalog)
             .await
             .unwrap();
-        assert_eq!(
-            result.removed_delete_files.len(),
-            1,
-            "the dangling DV must be removed"
+        assert!(
+            result.removed_delete_files.is_empty(),
+            "the commit already dropped the DV, so the action finds nothing to remove"
         );
-        assert_eq!(result.removed_dvs_count(), 1, "it is counted as a DV");
-        assert_eq!(
-            result.removed_position_delete_files_count(),
-            0,
-            "a DV is not a parquet position delete"
-        );
+        assert_eq!(result.removed_dvs_count(), 0);
+        assert_eq!(result.removed_position_delete_files_count(), 0);
 
         let reloaded = catalog.load_table(table.identifier()).await.unwrap();
         assert!(
             !live_delete_paths(&reloaded).await.contains(&dv_path),
-            "the dangling DV must be tombstoned"
+            "the DV stays tombstoned"
         );
         assert_eq!(
             summary_prop(&reloaded, "removed-dvs").as_deref(),
@@ -1788,11 +1787,10 @@ mod tests {
             "the removed DV must be a Deleted tombstone"
         );
 
-        // The read result is UNCHANGED by the GC (the DV was already not applying).
         assert_eq!(
             scan_y_values(&reloaded).await,
             HashSet::from([10, 20, 30]),
-            "removing the dangling DV does not change the read result"
+            "the live row set is unchanged by the drop"
         );
     }
 }
