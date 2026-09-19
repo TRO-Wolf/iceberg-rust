@@ -41,7 +41,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::{
-    ColumnChunkMetaData, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+    ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 use typed_builder::TypedBuilder;
@@ -51,6 +51,7 @@ use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::delete_filter::positional_delete_keep_mask;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::int96::coerce_int96_timestamps;
+use crate::arrow::open_parquet::page_index_policy;
 use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::record_batch_predicate::{
     evaluate_predicate_to_mask, is_nan_row_mask, not_nan_row_mask, null_filled,
@@ -62,7 +63,7 @@ use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
-use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
+use crate::expr::visitors::page_index_evaluator::predicate_can_prune_pages;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
@@ -429,10 +430,16 @@ impl ArrowReader {
         parquet_read_options: ParquetReadOptions,
         prefetched_metadata: Option<Arc<ParquetMetaData>>,
     ) -> Result<ArrowRecordBatchStream> {
+        let predicate_can_prune = task
+            .predicate
+            .as_deref()
+            .is_some_and(predicate_can_prune_pages);
         let should_load_page_index =
-            (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
+            (row_selection_enabled && predicate_can_prune) || !task.deletes.is_empty();
         let mut parquet_read_options = parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
+        parquet_read_options.preload_column_index = should_load_page_index;
+        parquet_read_options.preload_offset_index = should_load_page_index;
 
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
@@ -519,14 +526,31 @@ impl ArrowReader {
         let mut record_batch_stream_builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
+        let needs_physical_ordinals = task.project_field_ids().contains(&RESERVED_FIELD_ID_POS)
+            || task.project_field_ids().contains(&RESERVED_FIELD_ID_ROW_ID);
+
         // Metadata fields are not in the file. The V3 row-lineage pair is the exception: it can be
         // stored, and Java prefers the stored value.
-        let project_field_ids_without_metadata: Vec<i32> = task
+        let mut project_field_ids_without_metadata: Vec<i32> = task
             .project_field_ids
             .iter()
             .filter(|&&id| !is_metadata_field(id) || is_row_lineage_field(id))
             .copied()
             .collect();
+        if needs_physical_ordinals {
+            if let Some(predicate) = task.predicate.as_deref() {
+                let mut collector = CollectFieldIdVisitor::default();
+                visit(&mut collector, predicate)?;
+                project_field_ids_without_metadata.extend(collector.field_ids());
+            }
+            for delete in task.deletes.iter() {
+                if let Some(equality_ids) = &delete.equality_ids {
+                    project_field_ids_without_metadata.extend(equality_ids.iter().copied());
+                }
+            }
+            project_field_ids_without_metadata.sort_unstable();
+            project_field_ids_without_metadata.dedup();
+        }
 
         // Only fallback ids project by position. Both other branches project by field id.
         let projection_mask = Self::get_arrow_projection_mask(
@@ -539,14 +563,6 @@ impl ArrowReader {
 
         record_batch_stream_builder =
             record_batch_stream_builder.with_projection(projection_mask.clone());
-
-        // A `_pos` projection needs each row's true physical ordinal, to write position deletes.
-        // `RowSelection` skips rows at the decode layer and loses those ordinals, so this path
-        // decodes in order with no RowFilter, RowSelection, or row-group prune. Batches still
-        // stream, so memory stays O(batch). `_row_id` needs the same, because its fallback is
-        // `first_row_id + pos`. A scan that does not project either keeps full pushdown.
-        let needs_physical_ordinals = task.project_field_ids().contains(&RESERVED_FIELD_ID_POS)
-            || task.project_field_ids().contains(&RESERVED_FIELD_ID_ROW_ID);
         if needs_physical_ordinals {
             // This path decodes the whole file with ordinals from 0. A ranged split task would
             // re-emit every row per split, with wrong `_pos`, which corrupts written position
@@ -711,13 +727,13 @@ impl ArrowReader {
             }
 
             if row_selection_enabled {
-                row_selection = Some(Self::get_row_selection_for_filter_predicate(
+                row_selection = Self::get_row_selection_for_filter_predicate(
                     &predicate,
                     record_batch_stream_builder.metadata(),
                     &selected_row_group_indices,
                     &field_id_map,
                     &task.schema,
-                )?);
+                )?;
             }
         }
 
@@ -1009,7 +1025,7 @@ impl ArrowReader {
     ) -> Result<RecordBatch> {
         let row_count = batch.num_rows();
         let batch_base = *absolute_pos;
-        let transformed = transformer.process_record_batch(batch)?;
+        let transformed = transformer.process_record_batch(batch.clone())?;
         // `absolute_pos` and the transformer's `next_row_position` must stay aligned. Under a
         // `_pos` projection the first ordinal in the batch equals `batch_base`. A desync corrupts
         // written position deletes.
@@ -1029,7 +1045,7 @@ impl ArrowReader {
             "absolute_pos desynced from transformer _pos (batch_base={batch_base}, rows={row_count})"
         );
         let mask = Self::survival_mask(
-            &transformed,
+            &batch,
             row_count,
             batch_base,
             positional_deletes,
@@ -1049,41 +1065,6 @@ impl ArrowReader {
                 .with_source(e)
             }),
         }
-    }
-
-    /// The projected Iceberg [`Schema`] a whole-file reader resolves against: the projected field
-    /// ids present in the file, plus the V3 row-lineage pair, whose stored value wins. Every other
-    /// reserved column is synthesized. Field order follows the projection.
-    fn build_expected_schema(task: &FileScanTask) -> Result<Arc<Schema>> {
-        let mut fields = Vec::new();
-        for &field_id in task.project_field_ids() {
-            // The row-lineage pair is the one stored metadata pair, and the stored value wins.
-            let field = if is_row_lineage_field(field_id) {
-                get_metadata_field(field_id)?.clone()
-            } else if is_metadata_field(field_id) {
-                continue;
-            } else {
-                task.schema
-                    .field_by_id(field_id)
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Projected field id {field_id} is not present in the scan schema \
-                                 for data file '{}'",
-                                task.data_file_path
-                            ),
-                        )
-                    })?
-                    .clone()
-            };
-            fields.push(field);
-        }
-        let schema = Schema::builder()
-            .with_schema_id(task.schema.schema_id())
-            .with_fields(fields)
-            .build()?;
-        Ok(Arc::new(schema))
     }
 
     /// Builds the per-row survival mask for a transformed batch, from the positional deletes over
@@ -1308,9 +1289,7 @@ impl ArrowReader {
         parquet_schema: &SchemaDescriptor,
         predicate: &BoundPredicate,
     ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
-        let mut collector = CollectFieldIdVisitor {
-            field_ids: HashSet::default(),
-        };
+        let mut collector = CollectFieldIdVisitor::default();
         visit(&mut collector, predicate)?;
 
         let iceberg_field_ids = collector.field_ids();
@@ -1563,72 +1542,6 @@ impl ArrowReader {
         Ok(results)
     }
 
-    fn get_row_selection_for_filter_predicate(
-        predicate: &BoundPredicate,
-        parquet_metadata: &Arc<ParquetMetaData>,
-        selected_row_groups: &Option<Vec<usize>>,
-        field_id_map: &HashMap<i32, usize>,
-        snapshot_schema: &Schema,
-    ) -> Result<RowSelection> {
-        let Some(column_index) = parquet_metadata.column_index() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Parquet file metadata does not contain a column index",
-            ));
-        };
-
-        let Some(offset_index) = parquet_metadata.offset_index() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Parquet file metadata does not contain an offset index",
-            ));
-        };
-
-        if let Some(selected_row_groups) = selected_row_groups
-            && selected_row_groups.is_empty()
-        {
-            return Ok(RowSelection::from(Vec::new()));
-        }
-
-        let mut selected_row_groups_idx = 0;
-
-        let page_index = column_index
-            .iter()
-            .enumerate()
-            .zip(offset_index)
-            .zip(parquet_metadata.row_groups());
-
-        let mut results = Vec::new();
-        for (((idx, column_index), offset_index), row_group_metadata) in page_index {
-            if let Some(selected_row_groups) = selected_row_groups {
-                if idx == selected_row_groups[selected_row_groups_idx] {
-                    selected_row_groups_idx += 1;
-                } else {
-                    continue;
-                }
-            }
-
-            let selections_for_page = PageIndexEvaluator::eval(
-                predicate,
-                column_index,
-                offset_index,
-                row_group_metadata,
-                field_id_map,
-                snapshot_schema,
-            )?;
-
-            results.push(selections_for_page);
-
-            if let Some(selected_row_groups) = selected_row_groups
-                && selected_row_groups_idx == selected_row_groups.len()
-            {
-                break;
-            }
-        }
-
-        Ok(results.into_iter().flatten().collect::<Vec<_>>().into())
-    }
-
     /// Java's `ParquetMetadataConverter.getOffset(ColumnChunk)`: the byte offset at which a column
     /// chunk's data begins, which for the first column of a row group is that row group's real
     /// start position in the file. The rule is `MIN(data_page_offset, dictionary_page_offset)`. The
@@ -1743,7 +1656,9 @@ impl ArrowReader {
 
 /// Build the map of parquet field id to Parquet column index in the schema.
 /// Returns None if the Parquet file doesn't have field IDs embedded (e.g., migrated tables).
-fn build_field_id_map(parquet_schema: &SchemaDescriptor) -> Result<Option<HashMap<i32, usize>>> {
+pub(crate) fn build_field_id_map(
+    parquet_schema: &SchemaDescriptor,
+) -> Result<Option<HashMap<i32, usize>>> {
     let mut column_map = HashMap::new();
 
     for (idx, field) in parquet_schema.columns().iter().enumerate() {
@@ -1783,7 +1698,9 @@ fn leaf_count(ty: &parquet::schema::types::Type) -> usize {
 /// Maps fallback field ids to leaf column indices, for primitive top-level fields only. Java
 /// `ParquetSchemaUtil.addFallbackIds()`. # Notes Use top-level field positions, not leaf positions,
 /// to match `add_fallback_field_ids_to_arrow_schema`.
-fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32, usize> {
+pub(crate) fn build_fallback_field_id_map(
+    parquet_schema: &SchemaDescriptor,
+) -> HashMap<i32, usize> {
     let mut column_map = HashMap::new();
     let mut leaf_idx = 0;
 
@@ -1891,12 +1808,13 @@ fn add_fallback_field_ids_to_arrow_schema(arrow_schema: &ArrowSchemaRef) -> Arc<
 }
 
 /// A visitor to collect field ids from bound predicates.
-struct CollectFieldIdVisitor {
+#[derive(Default)]
+pub(crate) struct CollectFieldIdVisitor {
     field_ids: HashSet<i32>,
 }
 
 impl CollectFieldIdVisitor {
-    fn field_ids(self) -> HashSet<i32> {
+    pub(crate) fn field_ids(self) -> HashSet<i32> {
         self.field_ids
     }
 }
@@ -2590,13 +2508,13 @@ impl AsyncFileReader for ArrowFileReader {
             let reader = ParquetMetaDataReader::new()
                 .with_prefetch_hint(self.parquet_read_options.metadata_size_hint())
                 // Set the page policy first because it updates both column and offset policies.
-                .with_page_index_policy(PageIndexPolicy::from(
+                .with_page_index_policy(page_index_policy(
                     self.parquet_read_options.preload_page_index(),
                 ))
-                .with_column_index_policy(PageIndexPolicy::from(
+                .with_column_index_policy(page_index_policy(
                     self.parquet_read_options.preload_column_index(),
                 ))
-                .with_offset_index_policy(PageIndexPolicy::from(
+                .with_offset_index_policy(page_index_policy(
                     self.parquet_read_options.preload_offset_index(),
                 ));
             let size = self.meta.size;
@@ -2730,9 +2648,7 @@ mod tests {
         let expr = Reference::new("qux").is_null();
         let bound_expr = expr.bind(schema, true).unwrap();
 
-        let mut visitor = CollectFieldIdVisitor {
-            field_ids: HashSet::default(),
-        };
+        let mut visitor = CollectFieldIdVisitor::default();
         visit(&mut visitor, &bound_expr).unwrap();
 
         let mut expected = HashSet::default();
@@ -2817,9 +2733,7 @@ message schema {
             .and(Reference::new("baz").is_null());
         let bound_expr = expr.bind(schema, true).unwrap();
 
-        let mut visitor = CollectFieldIdVisitor {
-            field_ids: HashSet::default(),
-        };
+        let mut visitor = CollectFieldIdVisitor::default();
         visit(&mut visitor, &bound_expr).unwrap();
 
         let mut expected = HashSet::default();
@@ -2837,9 +2751,7 @@ message schema {
             .or(Reference::new("baz").is_null());
         let bound_expr = expr.bind(schema, true).unwrap();
 
-        let mut visitor = CollectFieldIdVisitor {
-            field_ids: HashSet::default(),
-        };
+        let mut visitor = CollectFieldIdVisitor::default();
         visit(&mut visitor, &bound_expr).unwrap();
 
         let mut expected = HashSet::default();

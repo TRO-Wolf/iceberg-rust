@@ -28,6 +28,8 @@ mod list_null_tests;
 pub(crate) mod metadata_scan;
 #[cfg(test)]
 mod occ_exec_tests;
+#[cfg(test)]
+mod page_prune_tests;
 pub(crate) mod project;
 pub(crate) mod promotion;
 pub(crate) mod repartition;
@@ -36,6 +38,8 @@ pub(crate) mod scan;
 pub(crate) mod scan_knobs;
 pub(crate) mod snapshot_target;
 pub(crate) mod sort;
+#[cfg(test)]
+mod spark_fixture_tests;
 pub(crate) mod update;
 pub(crate) mod write;
 

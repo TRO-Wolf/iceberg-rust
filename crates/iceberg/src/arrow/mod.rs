@@ -48,6 +48,17 @@ pub use value::*;
 /// Partition value calculator for computing partition values
 pub mod partition_value_calculator;
 pub use partition_value_calculator::*;
+
+#[cfg(test)]
+mod open_parquet_tests;
+#[cfg(test)]
+mod page_prune_fixture;
+#[cfg(test)]
+mod page_prune_tests;
+#[cfg(test)]
+mod page_prune_tests_2;
 /// Record batch partition splitter for partitioned tables
 pub mod record_batch_partition_splitter;
+#[cfg(test)]
+mod spark_fixture_tests;
 pub use record_batch_partition_splitter::*;

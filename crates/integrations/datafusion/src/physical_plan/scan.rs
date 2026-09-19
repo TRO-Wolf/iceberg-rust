@@ -44,7 +44,9 @@ use super::conform::{
 use super::conform::{conform_column, is_arrow_promotion_allowed};
 use super::expr_to_predicate::scan_predicates;
 pub use super::scan_knobs::{IcebergScanOptions, ensure_iceberg_scan_options};
-pub(crate) use super::scan_knobs::{ScanKnobs, clamp_scan_knob, scan_knobs_from_context};
+pub(crate) use super::scan_knobs::{
+    ScanKnobs, build_table_scan, clamp_scan_knob, scan_knobs_from_context,
+};
 use crate::to_datafusion_error;
 
 /// Manages the scanning process of an Iceberg [`Table`]. [`IcebergTableScan::plan`] assigns the
@@ -72,6 +74,7 @@ pub struct IcebergTableScan {
     /// Per-partition data-file concurrency `P = max(1, ceil(L/N))`.
     per_partition_concurrency: usize,
     batch_size: Option<usize>,
+    pub(crate) row_selection_enabled: bool,
 }
 
 impl IcebergTableScan {
@@ -129,6 +132,7 @@ impl IcebergTableScan {
             partition_work: Vec::new(),
             per_partition_concurrency: 1,
             batch_size: None,
+            row_selection_enabled: true,
         })
     }
 
@@ -196,6 +200,7 @@ impl IcebergTableScan {
         scan.partition_work = work;
         scan.per_partition_concurrency = p;
         scan.batch_size = knobs.batch_size.map(clamp_scan_knob);
+        scan.row_selection_enabled = knobs.row_selection_enabled;
         scan.plan_properties = Self::compute_properties(scan.schema(), n);
         Ok(scan)
     }
@@ -311,8 +316,9 @@ impl ExecutionPlan for IcebergTableScan {
             let file_io = self.table.file_io().clone();
             let concurrency = self.per_partition_concurrency;
             let batch_size = self.batch_size;
+            let row_selection = self.row_selection_enabled;
             let stream =
-                stream_partition_work(file_io, &work, concurrency, batch_size, true, false)
+                stream_partition_work(file_io, &work, concurrency, batch_size, true, row_selection)
                     .map_err(to_datafusion_error)?
                     .map_err(to_datafusion_error)
                     .and_then(move |batch| {
@@ -427,7 +433,6 @@ impl DisplayAs for IcebergTableScan {
     }
 }
 
-/// Builds a [`TableScan`] and converts it into a stream of Arrow [`RecordBatch`]es.
 pub(crate) async fn get_batch_stream(
     table: Table,
     snapshot_id: Option<i64>,
@@ -435,25 +440,7 @@ pub(crate) async fn get_batch_stream(
     predicates: Option<Predicate>,
     knobs: ScanKnobs,
 ) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
-    let scan_builder = match snapshot_id {
-        Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
-        None => table.scan(),
-    };
-
-    // Never `select_all()`: it reads the column set the table has now, not the advertised one.
-    let mut scan_builder = scan_builder.select(column_names);
-    if let Some(pred) = predicates {
-        scan_builder = scan_builder.with_filter(pred);
-    }
-    // Clamped here too, so a hand-built `ScanKnobs` holding `Some(0)` cannot reach Parquet.
-    if let Some(batch_size) = knobs.batch_size {
-        scan_builder = scan_builder.with_batch_size(Some(clamp_scan_knob(batch_size)));
-    }
-    if let Some(concurrency) = knobs.data_file_concurrency {
-        scan_builder = scan_builder.with_data_file_concurrency_limit(clamp_scan_knob(concurrency));
-    }
-    // Row selection stays at the core default, off: the page-index parse cost can dominate.
-    let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
+    let table_scan = build_table_scan(&table, snapshot_id, column_names, predicates, knobs)?;
 
     let stream = table_scan
         .to_arrow()
@@ -1274,6 +1261,7 @@ mod tests {
             data_file_concurrency: Some(0),
             target_partitions: 1,
             multi_partition_scan: true,
+            row_selection_enabled: true,
         };
         let effective_batch = knobs.batch_size.map(clamp_scan_knob);
         let effective_conc = knobs.data_file_concurrency.map(clamp_scan_knob);
@@ -1328,6 +1316,7 @@ mod tests {
         config.options_mut().extensions.insert(IcebergScanOptions {
             multi_partition_scan: false,
             data_file_concurrency: 0,
+            row_selection_enabled: true,
         });
         let state = SessionStateBuilder::new().with_config(config).build();
         let knobs = scan_knobs_from_context(&state.task_ctx());
@@ -1353,6 +1342,7 @@ mod tests {
         config.options_mut().extensions.insert(IcebergScanOptions {
             multi_partition_scan: true,
             data_file_concurrency: 16,
+            row_selection_enabled: true,
         });
         let state = SessionStateBuilder::new().with_config(config).build();
         let knobs = scan_knobs_from_context(&state.task_ctx());
@@ -1364,6 +1354,7 @@ mod tests {
         config2.options_mut().extensions.insert(IcebergScanOptions {
             multi_partition_scan: true,
             data_file_concurrency: 2,
+            row_selection_enabled: true,
         });
         let state2 = SessionStateBuilder::new().with_config(config2).build();
         let knobs2 = scan_knobs_from_context(&state2.task_ctx());
@@ -1411,6 +1402,7 @@ mod tests {
             data_file_concurrency: Some(4),
             target_partitions: 4,
             multi_partition_scan: true,
+            row_selection_enabled: true,
         };
         let scan = IcebergTableScan::plan(
             table,
@@ -1490,6 +1482,7 @@ mod tests {
             data_file_concurrency: Some(8),
             target_partitions: 8,
             multi_partition_scan: false,
+            row_selection_enabled: true,
         };
         let t = if knobs.multi_partition_scan {
             knobs.target_partitions.max(1)
@@ -1533,6 +1526,7 @@ mod tests {
             data_file_concurrency: Some(1),
             target_partitions: 1,
             multi_partition_scan: true,
+            row_selection_enabled: true,
         };
         let scan = IcebergTableScan::plan(
             table,
