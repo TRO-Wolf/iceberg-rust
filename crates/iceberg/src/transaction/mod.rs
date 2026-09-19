@@ -56,7 +56,6 @@
 /// The `ApplyTransactionAction` trait provides an `apply` method
 /// that allows users to apply a transaction action to a `Transaction`.
 mod action;
-
 pub use action::*;
 // The write / snapshot-management action builders are re-exported next to their (private) modules so
 // each type is NAMEABLE by an external engine — stored in a field, returned from a helper, or used as
@@ -66,6 +65,7 @@ mod append;
 pub use append::FastAppendAction;
 mod cherry_pick;
 pub use cherry_pick::CherryPickAction;
+mod commit_backoff;
 mod commit_status;
 mod delete_files;
 pub use delete_files::DeleteFilesAction;
