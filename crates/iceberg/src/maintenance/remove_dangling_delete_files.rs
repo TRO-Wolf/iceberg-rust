@@ -879,7 +879,7 @@ mod tests {
         let delete_schema =
             Arc::new(arrow_schema_to_schema(config.projected_arrow_schema_ref()).unwrap());
 
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let file_name_gen = DefaultFileNameGenerator::new(
             "eq-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),
@@ -927,7 +927,7 @@ mod tests {
         deletes: &[(String, i64)],
     ) -> DataFile {
         let config = PositionDeleteWriterConfig::new().unwrap();
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let file_name_gen = DefaultFileNameGenerator::new(
             "pos-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),
@@ -977,7 +977,7 @@ mod tests {
         use crate::spec::MetricsConfig;
 
         let config = PositionDeleteWriterConfig::new().unwrap();
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let file_name_gen = DefaultFileNameGenerator::new(
             "file-scoped-pos-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),

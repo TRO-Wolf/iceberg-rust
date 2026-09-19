@@ -123,7 +123,7 @@ async fn write_xyz(table: &Table, part_x: i64, rows: &[(i64, i64, i64)]) -> Data
         Arc::new(Int64Array::from(zs)) as ArrayRef,
     ])
     .expect("batch");
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).expect("loc");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("loc");
     let file_name_gen = DefaultFileNameGenerator::new(
         format!("x{part_x}"),
         Some(uuid::Uuid::now_v7().to_string()),

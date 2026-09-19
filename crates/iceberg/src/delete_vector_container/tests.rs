@@ -168,8 +168,7 @@ async fn write_pos_delete(table: &Table, deletes: &[(String, i64)]) -> DataFile 
     use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
     let config = PositionDeleteWriterConfig::new().expect("pos-delete config");
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location gen");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location gen");
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

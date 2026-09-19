@@ -185,8 +185,7 @@ mod tests {
             .expect("create table");
 
         let schema = table.metadata().current_schema().clone();
-        let location_gen =
-            DefaultLocationGenerator::new(table.metadata().clone()).expect("location");
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location");
         let file_name_gen = DefaultFileNameGenerator::new(
             "data".to_string(),
             None,

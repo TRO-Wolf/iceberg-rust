@@ -246,8 +246,7 @@ async fn write_category_file(
     ])
     .expect("build the {id, category} data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "cpdata".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

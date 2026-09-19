@@ -84,7 +84,7 @@ async fn write_pos_delete(table: &Table, deletes: &[(String, i64)]) -> DataFile 
     };
     use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
     let config = PositionDeleteWriterConfig::new().unwrap();
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -489,7 +489,7 @@ async fn test_f21_partition_scoped_merge_keeps_parquet() {
         };
         use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
         let config = PositionDeleteWriterConfig::new().unwrap();
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let file_name_gen = DefaultFileNameGenerator::new(
             "pos-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),

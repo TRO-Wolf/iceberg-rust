@@ -733,8 +733,7 @@ async fn discover_row_identities(table: &Table, target_ids: &[i64]) -> Vec<(Stri
 /// The spec requires the pairs to arrive sorted by `(file_path, pos)`.
 async fn write_pos_delete_from_pairs(table: &Table, pairs: &[(String, i64)]) -> DataFile {
     let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -1034,8 +1033,7 @@ async fn write_partitioned_gen_data_file(
     ])
     .expect("build the per-partition data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "rust-data".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -1081,8 +1079,7 @@ async fn write_partitioned_gen_position_delete_file(
 ) -> DataFile {
     let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -1278,8 +1275,7 @@ async fn write_equality_delete_for_ids(table: &Table, ids: &[i64]) -> DataFile {
     let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
         .expect("equality-delete writer config (equality_ids = [1])");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "eq-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -1698,8 +1694,7 @@ async fn write_partitioned_equality_delete_for_ids(
     let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
         .expect("equality-delete writer config (equality_ids = [1])");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "eq-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -2267,8 +2262,7 @@ async fn write_truncate_gen_data_file(
     ])
     .expect("build the per-partition data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "rust-data".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -2463,8 +2457,7 @@ async fn write_truncate_partitioned_equality_delete_for_ids(
     let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
         .expect("equality-delete writer config (equality_ids = [1])");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "eq-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

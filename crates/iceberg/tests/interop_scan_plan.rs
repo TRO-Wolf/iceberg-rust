@@ -697,8 +697,7 @@ async fn write_data_file(table: &Table, basename: &str, shape: FixtureShape) -> 
 /// Write a REAL parquet position-delete deleting position 0 of `data_file_path` (unpartitioned).
 async fn write_position_delete(table: &Table, data_file_path: &str) -> DataFile {
     let config = PositionDeleteWriterConfig::new().expect("position-delete writer config");
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "big-deletes".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

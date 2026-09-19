@@ -135,8 +135,7 @@ fn rolling_builder(
     DefaultLocationGenerator,
     DefaultFileNameGenerator,
 > {
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen =
         DefaultFileNameGenerator::new(prefix.to_string(), None, DataFileFormat::Parquet);
     RollingFileWriterBuilder::new_with_default_file_size(

@@ -821,7 +821,7 @@ async fn write_real_pos_delete(
 ) -> DataFile {
     let metadata = table.metadata();
     let config = PositionDeleteWriterConfig::new().expect("pos delete config");
-    let location_gen = DefaultLocationGenerator::new(metadata.clone()).expect("location gen");
+    let location_gen = DefaultLocationGenerator::new(metadata).expect("location gen");
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -954,7 +954,7 @@ async fn rewritten_pos_delete_keeps_source_spec_and_partition() {
     )
     .expect("partition key");
     let config = PositionDeleteWriterConfig::new().expect("config");
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).expect("loc");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("loc");
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

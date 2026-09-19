@@ -125,8 +125,7 @@ async fn write_l001_file(table: &Table, tag: &str, p: i32, start: i64) -> DataFi
         Arc::new(StringArray::from(vec!["x".repeat(20); 50])) as ArrayRef,
     ])
     .expect("build (id, p, v) batch");
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         format!("data-{tag}"),
         Some(uuid::Uuid::now_v7().to_string()),

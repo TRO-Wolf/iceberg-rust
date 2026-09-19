@@ -105,8 +105,7 @@ async fn write_rows(table: &Table, n: usize) -> DataFile {
     ])
     .expect("build data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "rinvar".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
