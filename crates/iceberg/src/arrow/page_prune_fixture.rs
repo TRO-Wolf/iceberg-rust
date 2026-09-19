@@ -205,6 +205,26 @@ pub(crate) async fn collect(task: FileScanTask, row_selection: bool) -> Vec<Reco
         .expect("collect")
 }
 
+pub(crate) async fn collect_with_io(
+    task: FileScanTask,
+    row_selection: bool,
+    file_io: FileIO,
+    metadata_size_hint: usize,
+) -> Vec<RecordBatch> {
+    let reader = ArrowReaderBuilder::new(file_io)
+        .with_batch_size(37)
+        .with_row_group_filtering_enabled(true)
+        .with_row_selection_enabled(row_selection)
+        .with_metadata_size_hint(metadata_size_hint)
+        .build();
+    reader
+        .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+        .expect("read")
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .expect("collect")
+}
+
 pub(crate) fn dump(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     for batch in batches {
@@ -421,12 +441,13 @@ struct RecordingStorage {
     #[serde(skip)]
     new_input_calls: Arc<AtomicUsize>,
     #[serde(skip)]
-    read_ranges: Arc<Mutex<Vec<Range<u64>>>>,
+    read_ranges: Arc<Mutex<Vec<(String, Range<u64>)>>>,
 }
 
 struct RecordingFileRead {
     inner: Box<dyn FileRead>,
-    read_ranges: Arc<Mutex<Vec<Range<u64>>>>,
+    path: String,
+    read_ranges: Arc<Mutex<Vec<(String, Range<u64>)>>>,
 }
 
 #[async_trait]
@@ -435,7 +456,7 @@ impl FileRead for RecordingFileRead {
         self.read_ranges
             .lock()
             .expect("read ranges")
-            .push(range.clone());
+            .push((self.path.clone(), range.clone()));
         self.inner.read(range).await
     }
 }
@@ -456,6 +477,7 @@ impl Storage for RecordingStorage {
         let inner = LocalFsStorage::new().reader(path).await?;
         Ok(Box::new(RecordingFileRead {
             inner,
+            path: path.to_string(),
             read_ranges: self.read_ranges.clone(),
         }))
     }
@@ -488,7 +510,7 @@ struct RecordingStorageFactory {
     #[serde(skip)]
     new_input_calls: Arc<AtomicUsize>,
     #[serde(skip)]
-    read_ranges: Arc<Mutex<Vec<Range<u64>>>>,
+    read_ranges: Arc<Mutex<Vec<(String, Range<u64>)>>>,
 }
 
 #[typetag::serde]
@@ -501,7 +523,11 @@ impl StorageFactory for RecordingStorageFactory {
     }
 }
 
-pub(crate) fn recording_io() -> (FileIO, Arc<AtomicUsize>, Arc<Mutex<Vec<Range<u64>>>>) {
+pub(crate) fn recording_io() -> (
+    FileIO,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<(String, Range<u64>)>>>,
+) {
     let new_input_calls = Arc::new(AtomicUsize::new(0));
     let read_ranges = Arc::new(Mutex::new(Vec::new()));
     let io = FileIOBuilder::new(Arc::new(RecordingStorageFactory {
@@ -538,12 +564,18 @@ pub(crate) fn index_byte_ranges(metadata: &ParquetMetaData) -> Vec<Range<u64>> {
 }
 
 pub(crate) fn any_read_intersects(
-    read_ranges: &Mutex<Vec<Range<u64>>>,
+    read_ranges: &Mutex<Vec<(String, Range<u64>)>>,
+    path: &str,
     ranges: &[Range<u64>],
 ) -> bool {
-    read_ranges.lock().expect("read ranges").iter().any(|read| {
-        ranges
-            .iter()
-            .any(|r| read.start < r.end && r.start < read.end)
-    })
+    read_ranges
+        .lock()
+        .expect("read ranges")
+        .iter()
+        .any(|(p, read)| {
+            p == path
+                && ranges
+                    .iter()
+                    .any(|r| read.start < r.end && r.start < read.end)
+        })
 }

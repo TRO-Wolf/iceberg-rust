@@ -22,6 +22,8 @@ use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 
 use super::page_prune_fixture::*;
 use super::reader::{ArrowReader, ParquetReadOptions};
+use crate::expr::Reference;
+use crate::spec::Datum;
 
 #[tokio::test]
 async fn footer_short_read_retries_with_real_size() {
@@ -123,6 +125,79 @@ async fn page_index_error_does_not_retry() {
     assert_eq!(
         new_input_calls.load(std::sync::atomic::Ordering::Relaxed),
         1
+    );
+}
+
+#[tokio::test]
+async fn not_eq_only_scan_reads_no_index_bytes() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    write_id_pages(&data_path, &ids);
+    let schema = id_schema();
+    let metadata = file_metadata(&data_path);
+    let index_ranges = index_byte_ranges(&metadata);
+    assert!(!index_ranges.is_empty(), "fixture must carry a page index");
+    let predicate = bound(&schema, Reference::new("id").not_equal_to(Datum::int(64)));
+    let (io, _calls, read_ranges) = recording_io();
+    let rows = collect_with_io(task(&data_path, schema, &[1], Some(predicate)), true, io, 8).await;
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS - 1);
+    assert!(
+        !any_read_intersects(&read_ranges, &data_path, &index_ranges),
+        "a !=-only filtered scan must not read page-index bytes"
+    );
+}
+
+#[tokio::test]
+async fn eq_scan_reads_index_bytes() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    write_id_pages(&data_path, &ids);
+    let schema = id_schema();
+    let metadata = file_metadata(&data_path);
+    let index_ranges = index_byte_ranges(&metadata);
+    assert!(!index_ranges.is_empty(), "fixture must carry a page index");
+    let predicate = bound(&schema, Reference::new("id").equal_to(Datum::int(64)));
+    let (io, _calls, read_ranges) = recording_io();
+    let rows = collect_with_io(task(&data_path, schema, &[1], Some(predicate)), true, io, 8).await;
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert!(
+        any_read_intersects(&read_ranges, &data_path, &index_ranges),
+        "an = filtered scan must read page-index bytes"
+    );
+}
+
+#[tokio::test]
+async fn deletes_force_index_load_under_not_eq() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let del_path = path(&tmp, "pos-deletes.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    write_id_pages(&data_path, &ids);
+    let schema = id_schema();
+    let metadata = file_metadata(&data_path);
+    let index_ranges = index_byte_ranges(&metadata);
+    assert!(!index_ranges.is_empty(), "fixture must carry a page index");
+    let predicate = bound(&schema, Reference::new("id").not_equal_to(Datum::int(64)));
+    let delete = write_pos_delete_file(&del_path, &data_path, &[10, 70]);
+    let (io, _calls, read_ranges) = recording_io();
+    let rows = collect_with_io(
+        with_deletes(task(&data_path, schema, &[1], Some(predicate)), vec![
+            delete,
+        ]),
+        true,
+        io,
+        8,
+    )
+    .await;
+    assert_eq!(
+        rows.iter().map(|b| b.num_rows()).sum::<usize>(),
+        ROWS - 1 - 2
+    );
+    assert!(
+        any_read_intersects(&read_ranges, &data_path, &index_ranges),
+        "deletes must force the page-index load even for a non-prunable predicate"
     );
 }
 
