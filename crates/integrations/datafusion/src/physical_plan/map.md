@@ -44,6 +44,7 @@ exec (row R169).
 | `expr_to_predicate.rs` | filter pushdown (F-ICE-NAN-PUSHDOWN-1: NaN equality and IN rewrite to `is_nan`, never a NaN literal; ranges and NOT IN with NaN stay unpushed; F-LIST-NULL-ACCESSOR-1: `term_binds_soundly` mirrors `Reference::bind` — field plus accessor — so null tests and every other operator on list/map/struct or accessorless leaf names drop to residual evaluation instead of raising `Accessor for Field … not found`) |
 | `expr_to_predicate_nan_tests.rs` | conversion unit pins for the NaN arms, wired via `#[path]` from `expr_to_predicate.rs` |
 | `list_null_tests.rs` | F-LIST-NULL-ACCESSOR-1 e2e cells: `IS NULL` / `IS NOT NULL` DELETE/UPDATE/SELECT over `list<int>`, `list<struct<a:int>>`, `map<string,int>` and `struct<a:int>` on v2/v3 × CoW/MoR, exact surviving ids vs the run-23a list-null oracle |
+| `dangling_dv_delete_tests.rs` | F-DANGLING-DV-COMMIT-1 e2e cell: a v3 CoW DELETE that removes a whole DV-bearing data file drops the DV in the commit (`removed-dvs`/`removed-delete-files` summary counters), live ids unchanged |
 | `row_lineage.rs` / `snapshot_target.rs` / `cow_affected.rs` | DML helpers. `row_lineage.rs` is the single lineage attach path for COW DELETE/UPDATE and MoR UPDATE (`attach_update_lineage`, `cow_scan_stream`); `cow_scan_stream` projects the current schema over the pinned snapshot's files (F-EVO-SCAN-1). Its `StreamingDataFileWriter` takes compression from `parquet_compression_from_properties` (F-WRITE-COMPRESS-2) |
 | `mod.rs` | module root |
 
