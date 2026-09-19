@@ -907,7 +907,7 @@ impl<'a> SnapshotProducer<'a> {
     // Each group's entries are written by a writer built under THAT group's spec, so a file added under an
     // older spec keeps its own spec id / partition type instead of being stamped under the default.
     async fn write_added_manifests(&mut self) -> Result<Vec<ManifestFile>> {
-        let added_data_files = std::mem::take(&mut self.added_data_files);
+        let added_data_files = self.added_data_files.clone();
         if added_data_files.is_empty() {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
@@ -968,7 +968,7 @@ impl<'a> SnapshotProducer<'a> {
     /// A V1 table has no delete manifests, so the explicit seq is ignored there. Each group's writer
     /// is built under THAT group's spec, so a delete file under an older spec keeps its own spec.
     async fn write_added_delete_manifests(&mut self) -> Result<Vec<ManifestFile>> {
-        let added_delete_files = std::mem::take(&mut self.added_delete_files);
+        let added_delete_files = self.added_delete_files.clone();
         if added_delete_files.is_empty() {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,

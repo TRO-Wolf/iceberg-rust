@@ -17,18 +17,18 @@
 
 use std::collections::HashMap;
 
+use super::RewriteDataFiles;
 use super::rewrite_data_files::tests::{
     append_files, create_partitioned_table, local_fs_catalog, write_data_file,
     write_position_delete_file,
 };
-use super::RewriteDataFiles;
+use crate::Catalog;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestStatus,
     Operation,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
-use crate::Catalog;
 
 const PARTITION: i64 = 0;
 
@@ -75,12 +75,8 @@ async fn seed_mor_table(catalog: &impl Catalog, format_version: FormatVersion) -
             &rows(PARTITION, 1000 + merge * 200, 200),
         )
         .await;
-        let delete_file = write_position_delete_file(
-            &table,
-            PARTITION,
-            &[(deleted_path.clone(), merge)],
-        )
-        .await;
+        let delete_file =
+            write_position_delete_file(&table, PARTITION, &[(deleted_path.clone(), merge)]).await;
         table = merge_commit(catalog, &table, vec![merge_file], vec![delete_file]).await;
     }
     table
@@ -117,7 +113,10 @@ fn summary_content_size(data_file: &DataFile) -> u64 {
 }
 
 async fn live_files(table: &Table, content: ManifestContentType) -> Vec<DataFile> {
-    let snapshot = table.metadata().current_snapshot().expect("current snapshot");
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("current snapshot");
     let manifest_list = snapshot
         .load_manifest_list(table.file_io(), table.metadata())
         .await
@@ -141,7 +140,10 @@ async fn live_files(table: &Table, content: ManifestContentType) -> Vec<DataFile
 }
 
 async fn snapshot_added_files(table: &Table, content: ManifestContentType) -> Vec<DataFile> {
-    let snapshot = table.metadata().current_snapshot().expect("current snapshot");
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("current snapshot");
     let manifest_list = snapshot
         .load_manifest_list(table.file_io(), table.metadata())
         .await
