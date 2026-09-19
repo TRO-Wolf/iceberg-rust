@@ -327,12 +327,20 @@ impl ArrowReader {
             return Ok((arrow_metadata, selected_row_group_indices, row_selection));
         }
         record_index_strip();
-        let stripped = ParquetMetaData::clone(arrow_metadata.metadata().as_ref())
-            .into_builder()
-            .set_column_index(None)
-            .set_offset_index(None)
-            .build();
-        let options = ArrowReaderOptions::new().with_schema(Arc::clone(arrow_metadata.schema()));
+        let schema = Arc::clone(arrow_metadata.schema());
+        let metadata = Arc::clone(arrow_metadata.metadata());
+        drop(arrow_metadata);
+        let stripped = match Arc::try_unwrap(metadata) {
+            Ok(owned) => owned
+                .into_builder()
+                .set_column_index(None)
+                .set_offset_index(None)
+                .build(),
+            Err(shared) => {
+                ParquetMetaData::new(shared.file_metadata().clone(), shared.row_groups().to_vec())
+            }
+        };
+        let options = ArrowReaderOptions::new().with_schema(schema);
         let arrow_metadata =
             ArrowReaderMetadata::try_new(Arc::new(stripped), options).map_err(|e| {
                 Error::new(
