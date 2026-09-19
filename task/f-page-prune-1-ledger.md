@@ -61,25 +61,33 @@ The session door is `IcebergTableProvider::scan` → `scan_knobs_from_context(&s
   *incremented* upper bound (`truncate_min_value` / `truncate_max_value` in
   `parquet::column::writer`), so stored bounds stay valid under the 64-byte truncate.
 
-## Clause matrix
+## Clause matrix — all green (29 core + 5 DataFusion tests)
 
-| Clause | Test (planned name) | File |
+Core tests live in `crates/iceberg/src/arrow/page_prune_tests.rs` (W/M/L/D) and
+`page_prune_tests_2.rs` (S/N/F/T/R); shared builders in `page_prune_fixture.rs`. Each fixture
+writes 512 rows at `data_page_row_count_limit(64)` → 8 pages per column in one row group;
+`assert_prunes` proves the evaluator's `RowSelection` skips at least one page, and every
+correctness clause compares knob-ON rows against knob-OFF on the same task.
+
+| Clause | Result | Tests |
 |---|---|---|
-| W writer emits page index | `w_writer_emits_column_and_offset_index` | `src/arrow/page_prune_tests.rs` |
-| M missing page index | `m_scan_succeeds_without_column_index`, `m_scan_succeeds_without_offset_index`, `m_prefetched_footer_without_index` | same |
-| L row lineage | `l_row_lineage_columns_match_unfiltered` | same |
-| D deletes | `d_position_deletes_inside_skipped_pages`, `d_equality_deletes_null_key_and_nonkeyset`, `d_deletion_vector_v3` | same |
-| S schema evolution | `s_added_column_predicates`, `s_renamed_column`, `s_drop_readd_new_id`, `s_int_to_long`, `s_float_to_double`, `s_decimal_widening` | same |
-| N nulls | `n_is_null`, `n_is_not_null`, `n_eq`, `n_not_eq`, `n_not_in` | same |
-| F NaN | `f_is_nan`, `f_not_nan`, `f_lt`, `f_gt`, `f_not_lt`, `f_eq_nan` | same |
-| T truncated bounds | `t_eq`, `t_lt`, `t_ge`, `t_starts_with`, `t_not_starts_with`, `t_binary_column` | same |
-| R split tasks | `r_ranged_task_multi_row_group` | same |
-| DF DataFusion door | `df_row_selection_knob_both_paths`, `df_set_knob_reaches_plan` | `physical_plan` tests |
+| W writer emits page index | green | `w_data_file_writer_emits_column_and_offset_index` |
+| M missing page index | green | `m_filtered_scan_succeeds_without_any_page_index`, `m_filtered_scan_succeeds_without_offset_index`, `m_filtered_scan_succeeds_with_chunk_only_statistics`, `m_prefetched_footer_without_index_scans_filtered_rows` |
+| L row lineage (v3) | green | `l_row_lineage_columns_match_unfiltered`, `l_stored_row_lineage_columns_match_unfiltered`, `l_last_updated_sequence_number_alone_matches_unfiltered`, `l_pos_and_file_columns_match_unfiltered` |
+| D deletes | green | `d_position_deletes_inside_kept_and_skipped_pages`, `d_equality_deletes_keyset_path`, `d_equality_deletes_null_key_and_nonkeyset`, `d_deletion_vector_inside_kept_and_skipped_pages` |
+| S schema evolution | green | `s_added_column_predicates_match_unfiltered`, `s_renamed_column_predicate_matches_unfiltered`, `s_readded_name_with_new_field_id_matches_unfiltered`, `s_int_to_long_promotion_matches_unfiltered`, `s_float_to_double_promotion_matches_unfiltered`, `s_decimal_widening_matches_unfiltered`, `s_decimal_on_fixed_matches_unfiltered` |
+| N nulls | green | `n_is_null_matches_unfiltered`, `n_is_not_null_matches_unfiltered`, `n_eq_not_eq_not_in_match_unfiltered` |
+| F NaN | green | `f_is_nan_and_not_nan_match_unfiltered`, `f_lt_gt_not_match_unfiltered`, `f_eq_nan_matches_unfiltered` |
+| T truncated bounds | green | `t_truncated_string_bounds_match_unfiltered`, `t_binary_column_matches_unfiltered` |
+| R split tasks | green | `r_ranged_task_intersects_row_group_and_page_selection` |
+| DF DataFusion door | green | `multi_partition_filtered_scan_row_selection_on_matches_off`, `single_stream_filtered_scan_row_selection_on_matches_off`, `single_stream_scan_builder_receives_row_selection_knob`, `scan_knobs_from_context_wires_row_selection_enabled`, `plan_carries_row_selection_enabled_to_multi_partition_path` (`crates/integrations/datafusion/src/physical_plan/page_prune_tests.rs`) |
 
-Each clause asserts: the fixture file has >= 4 pages in the filtered column,
-`PageIndexEvaluator::eval` yields a `RowSelection` with at least one skip and one select
-selector, and knob-ON rows/values equal knob-OFF (and the in-memory filter of the unfiltered
-scan).
+The DataFusion door is proven through `IcebergTableProvider` end-to-end (row equality ON vs
+OFF on each path), through the `ScanKnobs` seam (`scan_knobs_from_context` reflects `SET
+iceberg.row_selection_enabled=false`, `build_table_scan` stores the flag on the `TableScan`),
+and through `IcebergTableScan::plan` carrying the flag into the multi-partition exec. A
+footer-prefetch byte count cannot serve as the seam: the 512 KiB `metadata_size_hint` default
+always covers the index bytes of a test file.
 
 ## Findings (pre-change audit)
 
@@ -115,6 +123,65 @@ scan).
   `is_nan` (F-ICE-NAN-PUSHDOWN-1). Core-level `eq(NaN)` is consistent ON==OFF because the Arrow
   `eq` residual matches nothing either.
 
-## Mutation evidence
+## Fixes (commit 16bf797f)
 
-(to be filled — one leg per fix, `N red out of M` recorded per leg)
+1. `get_row_selection_for_filter_predicate` returns `Ok(None)` when column or offset index
+   metadata is absent; the caller treats `None` as "scan all pages" (parquet-mr
+   `ColumnIndexFilter` semantics — a missing index never errors, never excludes a page).
+   Moved to `open_parquet.rs` in the size-gate refactor.
+2. `page_index_policy(needed)` maps preload flags to `PageIndexPolicy::Optional` when page
+   selection or deletes need them and `Skip` otherwise, in both the prefetched-footer and the
+   footer-load paths (`open_parquet.rs`). `Required` (the `From<bool>` mapping) fails on
+   index-less files before the evaluator can fall back.
+3. `apply_predicate_to_column_index` decodes every supported index variant through
+   `Datum::try_from_bytes`; unsupported variants (INT96) and undecodable bounds return `None`
+   per page, which the visitors translate to "keep the page". BOOLEAN/INT32/INT64/FLOAT/
+   DOUBLE use the generic `PrimitiveColumnIndex`; BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY share
+   `ByteArrayColumnIndex`.
+4. `bound_datum` normalizes decimal INT32/INT64 index bounds to `Int128` so they compare
+   against Iceberg decimal literals; `Datum::physical` (the old, narrower converter) was
+   removed as dead.
+5. `visit_inequality` keeps a page when `partial_cmp` returns `None` (incomparable bound
+   types, e.g. truncated or foreign-writer bounds) — the old code treated it as no-match and
+   silently skipped the page.
+
+## Mutation evidence — every fix is load-bearing
+
+| Mutation | Result |
+|---|---|
+| M1 revert fix 1 (`Err` on missing index) | `m_filtered_scan_succeeds_without_any_page_index`, `m_filtered_scan_succeeds_without_offset_index` red |
+| M2 revert bound decode (pre-fix `unwrap`/`FeatureUnsupported` arms) | `s_decimal_on_fixed_matches_unfiltered`, `t_binary_column_matches_unfiltered` red |
+| M3 revert decimal Int64→Int128 normalization | `s_decimal_widening_matches_unfiltered` red |
+| M4 `Optional` → `Required` index policy | `m_filtered_scan_succeeds_without_offset_index` red |
+| M5 DataFusion default `true` → `false` | `scan_knobs_from_context_wires_row_selection_enabled` red |
+
+## Findings recorded during implementation
+
+- parquet-rs emits `ColumnIndexMetaData::NONE` for FLOAT and DOUBLE columns in this build —
+  float predicates cannot prune and conservatively keep every page (correct, and the F/N
+  clauses prove row equality; pruning coverage for floats depends on parquet-rs emitting
+  those indexes or on foreign fixtures).
+- parquet writers round truncated max bounds UP (`truncate_max_value`), so a shared >64-byte
+  prefix legitimately keeps every page on `=`; the T clause uses distinct short-prefix
+  binaries for a load-bearing prune and a long-prefix string for the keep-correctness case.
+- NaN orders above all ordinary values in `Datum::partial_cmp` (Java `Double.compare`
+  parity), so `!(f < 100)` and `f >= 100` correctly include the all-NaN page.
+- Writer defaults: `WriterProperties::builder().build()` carries no page row limit (page
+  size 1 MiB, `column_index_truncate_length` 64); `write.parquet.page-row-limit` and
+  `write.parquet.page-size-bytes` are not honoured (Java honours both) — recorded, not fixed.
+- The file-size gate (`check_rust_file_size.sh`) forced three extractions, all
+  behavior-preserving: `get_row_selection_for_filter_predicate` and `page_index_policy` →
+  `arrow/open_parquet.rs`; `TableScan::row_selection_enabled` getter →
+  `scan/partition_work.rs`; `build_table_scan` → `physical_plan/scan_knobs.rs`. Ceilings were
+  lowered to the new sizes (reader 10185, evaluator 1347, DF scan 1592), never raised.
+
+## Gates
+
+- `cargo fmt --all -- --check` — clean
+- `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings` — clean
+- `make check` — clean (fmt, workspace clippy, taplo, cargo-machete, agent-artifacts,
+  matrix-anchors, comment-blocks, rust-file-size)
+- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/pb-fork origin/main HEAD` — `comment-ban hits=0`
+- `cargo test -p iceberg --lib arrow` — 460 passed, 1 ignored (includes all 29 clause tests)
+- `cargo test -p iceberg-datafusion --lib` — 286 passed, 1 ignored (includes all 5 DF clause
+  tests)
