@@ -368,12 +368,12 @@ pub fn write_data_files_to_avro<W: Write>(
     let mut writer = AvroWriter::new(&avro_schema, writer);
 
     for data_file in data_files {
-        let mut value = to_value(DataFileSerde::try_from(
+        let value = to_value(DataFileSerde::try_from(
             data_file,
             partition_type,
             FormatVersion::V1,
         )?)?;
-        crate::avro::name::sanitize_avro_value_names(&mut value);
+        let value = crate::avro::name::sanitize_avro_value_names(value);
         writer.append(value.resolve(&avro_schema)?)?;
     }
 

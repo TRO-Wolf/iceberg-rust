@@ -559,19 +559,28 @@ fn is_apache_avro_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-pub(crate) fn sanitize_avro_value_names(value: &mut AvroValue) {
+pub(crate) fn sanitize_avro_value_names(mut value: AvroValue) -> AvroValue {
+    sanitize_avro_value_names_in_place(&mut value);
+    value
+}
+
+fn sanitize_avro_value_names_in_place(value: &mut AvroValue) {
     match value {
         AvroValue::Record(fields) => {
             for (name, field) in fields.iter_mut() {
                 if let Cow::Owned(renamed) = java_avro_name(name) {
                     *name = renamed;
                 }
-                sanitize_avro_value_names(field);
+                sanitize_avro_value_names_in_place(field);
             }
         }
-        AvroValue::Array(items) => items.iter_mut().for_each(sanitize_avro_value_names),
-        AvroValue::Map(map) => map.values_mut().for_each(sanitize_avro_value_names),
-        AvroValue::Union(_, inner) => sanitize_avro_value_names(inner),
+        AvroValue::Array(items) => items
+            .iter_mut()
+            .for_each(sanitize_avro_value_names_in_place),
+        AvroValue::Map(map) => map
+            .values_mut()
+            .for_each(sanitize_avro_value_names_in_place),
+        AvroValue::Union(_, inner) => sanitize_avro_value_names_in_place(inner),
         _ => {}
     }
 }

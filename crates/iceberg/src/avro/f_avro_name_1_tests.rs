@@ -482,16 +482,13 @@ async fn avro_data_file_round_trip_sanitizes_value_keys() {
             .unwrap(),
     );
     let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
-    let batch = RecordBatch::try_new(
-        arrow_schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
-            Arc::new(StringArray::from(vec![Some("x"), None])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![Some(7), None])) as ArrayRef,
-            Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
-            Arc::new(StringArray::from(vec![Some("e"), None])) as ArrayRef,
-        ],
-    )
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(StringArray::from(vec![Some("x"), None])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![Some(7), None])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+        Arc::new(StringArray::from(vec![Some("e"), None])) as ArrayRef,
+    ])
     .unwrap();
 
     let bs = write_avro_data_file(schema.clone(), &batch).await;
