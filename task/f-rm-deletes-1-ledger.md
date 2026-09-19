@@ -255,8 +255,10 @@ pins must go red.
   `manifest_entries` and computes summary counts at `write_manifest_file`; streaming the
   Avro body with incremental summaries is a spec-level writer refactor (manifest
   serialization format path), not a small local change. Recorded OPEN.
-- **Module doc** — the "Delete manifests are immune" line now states the immunity is the
-  default and names the opt-in (edited in place, no new comment lines).
-- **Ceilings** — `snapshot.rs` lowered 3355 → 3354 (comment deletions in the same regions
-  the changes touched). `rewrite_manifests.rs` stays at 1901.
+- **Module doc** — the unconditional "Delete manifests are immune" line was DELETED: the
+  comment-ban checker counts an edited comment line as an added one (`hits`), so the only
+  hits=0 route to removing the now-untrue claim is deletion. The opt-in is documented in
+  `crates/iceberg/src/transaction/map.md` and §4/§8 here.
+- **Ceilings** — `snapshot.rs` lowered 3355 → 3354, `rewrite_manifests.rs` lowered
+  1901 → 1898 (comment deletions in the regions the changes touched).
 - All 25 filtered `rewrite_manifests` tests re-run green; behavior unchanged, no new pins.

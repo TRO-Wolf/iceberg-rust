@@ -31,9 +31,6 @@
 //!
 //! Re-stamping provenance here is silent corruption.
 //!
-//! **Delete manifests are immune by default.** A `Deletes`-content manifest carries forward
-//! byte-identical unless `rewrite_delete_manifests` opts in to the Spark-action delete leg.
-//!
 //! ## Named deviations from Java
 //!
 //! | not ported | consequence |
