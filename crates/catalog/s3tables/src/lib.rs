@@ -48,6 +48,7 @@
 
 #![deny(missing_docs)]
 
+mod caches;
 mod catalog;
 #[cfg(test)]
 mod commit_outcome_tests;
