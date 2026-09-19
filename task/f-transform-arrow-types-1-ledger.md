@@ -183,8 +183,61 @@ Baseline run on the UNFIXED tree (`cargo test -p iceberg --lib f_transform_arrow
 
 ## Mutation validation (step 4)
 
-PENDING.
+Twelve surgical mutations across the changed code; each was compiled fresh against the pin suite
+(`cargo test -p iceberg --lib f_transform_arrow_types_1`, or
+`cargo test -p iceberg-datafusion --lib string_binary_layout_families` for M9) and every one was
+KILLED — zero survivors. Post-restore re-run: 25/25 pins green, comparator pin green.
+
+| mutation | killed by |
+|---|---|
+| M1 truncate.rs — drop `BinaryView` arm | binary oracle + calculator + splitter + e2e (4 failed) |
+| M2 truncate.rs — drop `Utf8View` arm | string oracle + calculator (2 failed) |
+| M3 truncate.rs — drop `LargeBinary` arm (the reported defect) | oracle, literal-projection, calculator, splitter, e2e (6 failed) |
+| M4 truncate.rs — drop literal `Binary` arm | literal pin, `project`/`strict_project` pins, e2e pruning (7 failed) |
+| M5 bucket.rs — drop `BinaryView` arm | binary bucket oracle + calculator (2 failed) |
+| M6 bucket.rs — drop `Utf8View` arm | string bucket oracle + calculator (2 failed) |
+| M7 calculator — skip canonical cast | every non-canonical calculator pin + splitter + e2e (6 failed) |
+| M8 value.rs — drop `BinaryViewArray` accessor | `arrow_struct_to_literal` view pin (1 failed) |
+| M9 write gate — strict leaf equality | `field_write_compatibility_string_binary_layout_families` (1 failed) |
+| M10 `truncate_binary` returns input untruncated | binary oracle, literal, calculator, splitter, e2e (10 failed) |
+| M11 `truncate_str` truncates bytes not code points | string oracle `"中文字"`/`"a中b"` code-point rows (2 failed) |
+| M12 truncate `BinaryView` arm emits `Binary` layout | layout-preservation assert in the binary oracle pin (1 failed) |
 
 ## PROVEN / OPEN summary
 
-PENDING.
+PROVEN:
+
+- `truncate[W]` accepts `Binary`, `LargeBinary`, `BinaryView`, `Utf8`, `LargeUtf8`, `Utf8View` in
+  the array path and binary datums in the literal path; output layout = input layout; binary =
+  bytes, string = Unicode code points (M11 pins the discriminator rows).
+- `bucket[N]` adds `BinaryView`/`Utf8View`; Java murmur3 oracle cells hold on every layout;
+  `FixedSizeBinary` stays accepted for bucket and rejected for truncate (Java `canTransform`).
+- `identity`/`void` keep array passthrough / same-type nulls on every layout.
+- `PartitionValueCalculator` canonicalizes any source-layout output to the partition field's
+  Arrow type via `arrow_cast::cast`; splitter partition keys and `arrow_struct_to_literal` round
+  trip on view leaves.
+- `Transform::project`/`strict_project` on binary literals no longer error — eq, in-set, range
+  and `NotStartsWith` projections produce partition predicates.
+- iceberg-datafusion `field_is_write_compatible` accepts the string/binary layout families
+  (same leaf equivalence as `parquet_leaf_equivalent`); FixedSizeBinary still exact-width only.
+- End-to-end: memory-catalog fast append of a `LargeBinary` batch into a `truncate(1,b)`
+  partitioned table writes 5 partitioned data files, and `b = X'0102'` prunes to exactly the
+  file holding row 3 and returns it — on format v2 and v3.
+- Gates: `cargo fmt --all -- --check`, `cargo clippy -p iceberg --all-targets -D warnings`,
+  `cargo clippy -p iceberg-datafusion --all-targets -D warnings`, `check_rust_file_size`,
+  `check_comment_blocks`, `check_agent_artifacts`, `check_matrix_anchors`,
+  `comment_ban.py hits=0`, `typos .` — all green; targeted suites 25/25 + 112 transform + 416
+  arrow + 214 physical_plan green.
+
+OPEN / noted:
+
+- `truncate` on non-canonical layouts returns the INPUT layout (not canonical `LargeBinary`/
+  `Utf8`); canonicalization is the calculator's single cast of the partition column. Deliberate:
+  the transform contract is layout-preserving; the partition schema is canonical. Pinned by the
+  calculator tests.
+- The cast copies the partition column only when the input layout differs from canonical — a
+  `LargeBinary` table batch is a no-op check; `Binary`/`BinaryView`/`Utf8View` inputs pay one
+  cast, unavoidable because `StructArray` requires the canonical field type the rest of the
+  write path is built against.
+- RePark/Spark end-to-end was not re-run (no engine, no docker in this lane); the DataFusion
+  write path is proven at the comparator + memory-catalog level.
