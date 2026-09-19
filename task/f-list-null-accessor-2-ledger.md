@@ -193,3 +193,72 @@ Restore = `git checkout HEAD --` the same files:
 - `Not` subtrees are deliberately widened whole rather than De Morgan-rewritten:
   `Predicate::rewrite_not` exists if a future caller needs the tighter form, but
   every current prune site accepts the conservative result.
+
+## 9. Round 2 — widen only where widening is sound
+
+The Grok logic critic found an S1 in round 1: `TableScanBuilder::with_filter` is a
+**row filter**, not a prune hint. The bound predicate becomes each
+`FileScanTask`'s residual — the Arrow `RowFilter`, row-group skipping and page
+selection all consume it. Executed probe, reproduced here as a permanent cell:
+a four-row `list<int>` table under `table.scan().with_filter(xs IS NULL)`
+returned ids `[1, 2, 3, 4]` under the widened residual, where Java returns `[2]`
+— a silent wrong answer, strictly worse than the loud `DataInvalid` it replaced.
+
+Java parity finding (iceberg-api 1.10.0 sources):
+`Accessors.BuildPositionAccessors.struct` builds a `PositionAccessor` for **every**
+struct field including list/map/struct containers, so
+`table.newScan().filter(isNull("xs"))` binds **exactly** in Java. Widening a
+residual is therefore never Java parity; the real fix for row-filter users is
+container `PositionAccessor`s — recorded as the explicit follow-up below.
+
+### Per-site ruling (orchestrator, adopting the critic's recommendation)
+
+| Site | Ruling | Rationale |
+|---|---|---|
+| `scan/mod.rs` `TableScanBuilder::build` | widen iff `file_prune_only` | a prune-only predicate is safe to over-approximate; a residual is the row contract |
+| `scan/incremental.rs` `IncrementalAppendScanBuilder::build` | STAY LOUD | incremental residuals are always applied |
+| `conflict_filter.rs` `first_conflicting_file` | WIDEN | a wider bound can only *add* conflicts — conservative |
+| `row_delta.rs` added-DV + removed-data-files binds | WIDEN | same: widening only adds conflicts |
+| `overwrite_files.rs` `row_filter` | STAY STRICT (unchanged) | exact-match validation, §6 |
+
+Implementation: `Predicate::bind_for_scan(schema, case_sensitive, file_prune_only)`
+delegates to `bind_pruning` when the scan is prune-only and to strict `bind`
+otherwise — a one-line swap in `scan/mod.rs` under its frozen ceiling;
+`incremental.rs` reverts to plain `bind` (`Bind` back in scope). Commits
+`80eb325f` (re-pinned cells, red under round-1 code) and `e4a46eb0` (the ruling).
+
+### Cells
+
+- `filtered_row_filter_stays_loud_on_an_unbindable_term` — replaces the round-1
+  residual cell (which encoded the wrong contract): `with_filter(id > 1 AND
+  xs IS NULL)` and `with_filter(xs IS NULL)` both raise `DataInvalid`, all four
+  shapes × v2/v3.
+- `a_row_filter_never_returns_the_widened_row_set` — the critic's probe as a
+  permanent cell: `with_filter(xs IS NULL)` must either fail `DataInvalid`
+  (today's contract) or, once container accessors land, return exactly `[2]`
+  (Java's answer). It can never return `[1, 2, 3, 4]` again.
+- `incremental_scan_stays_loud_on_an_unbindable_term` — incremental build fails
+  `DataInvalid` on the compound filter.
+- `cow_prune_scan_drops_the_unbindable_null_term` — unchanged, still green:
+  the prune-only direction of the ruling.
+- `bind_for_scan_widens_only_when_prune_only` — unit pin on the flag.
+
+### Round-2 mutation
+
+- `bind_for_scan(..., file_prune_only)` call site flipped to `true` (with_filter
+  widens again): both row-filter cells RED — `[1, 2, 3, 4]` reproduced. Restore
+  → GREEN.
+- `conflict_filter.rs` `.bind_pruning` → `.bind` (validation strict again):
+  `unbindable_conflict_filter_widens_instead_of_failing_to_bind` RED with
+  `DataInvalid => Accessor for Field xs not found`. Restore → GREEN.
+
+### Explicit follow-up
+
+**Container `PositionAccessor`s for exact `IS NULL`/`IS NOT NULL` on
+list/map/struct columns (Java parity).** Java's
+`Accessors.BuildPositionAccessors` assigns a position accessor to every field —
+container roots included — so `filter(isNull("xs"))` binds and evaluates
+exactly. Once the fork's `build_accessors` covers containers, `with_filter`
+stops raising `DataInvalid` here and `a_row_filter_never_returns_the_widened_row_set`
+flips from the `Err` arm to asserting `[2]`, and `bind_pruning`'s widening sites
+become unreachable for these terms (they stay for missing accessors elsewhere).

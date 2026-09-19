@@ -1783,3 +1783,13 @@ every SQL fixture variant stayed green because `delete_from` always converts fir
       `conflict_filter` 9, `row_delta` 120, `incremental` 39, `predicate` 187,
       `wrong_case_fails_to_bind` 9), clippy `-D warnings` clean, size checker
       516 files clean, comment-ban hits=0. Ledger + this entry.
+- [x] Round 2 (critic S1): `with_filter` is a row filter — a widened residual
+      silently returned `[1,2,3,4]` for `xs IS NULL` where Java returns `[2]`.
+      Ruling: widen iff `file_prune_only` (`bind_for_scan`), incremental stays
+      loud, conflict/row_delta validation widens (can only add conflicts),
+      overwrite `row_filter` stays strict. Re-pinned cells: loud row-filter,
+      row-set probe (`[1,2,3,4]` can never return), incremental loud, prune-only
+      kept (`80eb325f` red → `e4a46eb0` fix). Mutation both directions red →
+      restored green. Java parity follow-up recorded: container
+      `PositionAccessor`s so `isNull("xs")` binds exactly — the real row-filter
+      fix. Ledger §9.
