@@ -22,7 +22,9 @@ use iceberg::{Error, ErrorKind, Result};
 use super::GlueCatalog;
 #[cfg(test)]
 use crate::commit_transport::glue_commit_send_landed;
-use crate::commit_transport::{GlueUpdateTableCall, map_glue_commit_send};
+use crate::commit_transport::{
+    GlueUpdateTableCall, map_glue_commit_send_identified, published_metadata_operation_ids,
+};
 use crate::utils::{convert_to_glue_table, validate_namespace};
 
 pub(super) async fn publish(
@@ -95,7 +97,11 @@ pub(super) async fn publish(
     {
         harness.publish(table.clone());
     }
-    map_glue_commit_send(send, &table_ident)?;
+    map_glue_commit_send_identified(
+        send,
+        &table_ident,
+        published_metadata_operation_ids(table.metadata()),
+    )?;
 
     Ok(table)
 }

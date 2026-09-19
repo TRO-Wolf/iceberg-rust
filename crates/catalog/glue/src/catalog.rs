@@ -39,7 +39,7 @@ use crate::commit_transport::GlueCommitHarness;
 use crate::commit_transport::glue_commit_send_landed;
 use crate::commit_transport::{
     GlueCommitTransport, GlueUpdateTableCall, LiveGlueCommitTransport, build_commit_transport,
-    map_glue_commit_send,
+    commit_send_operation_ids, map_glue_commit_send_identified,
 };
 use crate::error::{from_aws_build_error, from_aws_sdk_error};
 use crate::utils::{
@@ -958,6 +958,7 @@ impl Catalog for GlueCatalog {
         let (current_table, current_version_id, current_metadata_location) =
             self.resolve_commit_base(&table_ident, &mut commit).await?;
 
+        let base_metadata = current_table.metadata_ref();
         let staged_table = commit.apply(current_table)?;
         let staged_metadata_location = staged_table.metadata_location_result()?;
 
@@ -989,7 +990,11 @@ impl Catalog for GlueCatalog {
         {
             harness.publish(staged_table.clone());
         }
-        map_glue_commit_send(send, &table_ident)?;
+        map_glue_commit_send_identified(
+            send,
+            &table_ident,
+            commit_send_operation_ids(base_metadata.as_ref(), staged_table.metadata()),
+        )?;
 
         Ok(staged_table)
     }

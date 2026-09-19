@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 #[cfg(test)]
@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use aws_sdk_glue::error::ProvideErrorMetadata;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
+use iceberg::spec::TableMetadata;
 #[cfg(test)]
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind, Result, TableIdent};
@@ -120,18 +121,41 @@ impl GlueCommitTransport for LiveGlueCommitTransport {
     }
 }
 
-fn fault_drop_count(_props: &HashMap<String, String>) -> Result<Option<u64>> {
-    Ok(None)
+fn fault_drop_count(props: &HashMap<String, String>) -> Result<Option<u64>> {
+    let Some(raw) = props.get(GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE) else {
+        return Ok(None);
+    };
+    #[cfg(feature = "commit-fault-injection")]
+    return raw.parse::<u64>().map(Some).map_err(|error| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Catalog property {GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE} must hold a \
+                 non-negative integer, got {raw:?}: {error}"
+            ),
+        )
+    });
+    #[cfg(not(feature = "commit-fault-injection"))]
+    Err(Error::new(
+        ErrorKind::FeatureUnsupported,
+        format!(
+            "Catalog property {GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE} requires the \
+             `commit-fault-injection` cargo feature on iceberg-catalog-glue, got {raw:?}"
+        ),
+    ))
 }
+
+#[cfg(any(test, feature = "commit-fault-injection"))]
+type CommitTransportParts = (
+    Arc<dyn GlueCommitTransport>,
+    Option<Arc<DiscardingGlueCommitTransport>>,
+);
 
 #[cfg(any(test, feature = "commit-fault-injection"))]
 pub(crate) fn build_commit_transport_parts(
     props: &HashMap<String, String>,
     inner: Arc<dyn GlueCommitTransport>,
-) -> Result<(
-    Arc<dyn GlueCommitTransport>,
-    Option<Arc<DiscardingGlueCommitTransport>>,
-)> {
+) -> Result<CommitTransportParts> {
     let drop_count = fault_drop_count(props)?;
     let fault = drop_count.map(|count| {
         Arc::new(DiscardingGlueCommitTransport::new(
@@ -370,6 +394,72 @@ pub(crate) fn map_glue_commit_send(send: GlueCommitSend, table_ident: &TableIden
             Err(map_update_table_service_error(error, table_ident))
         }
     }
+}
+
+pub(crate) fn map_glue_commit_send_identified(
+    send: GlueCommitSend,
+    table_ident: &TableIdent,
+    operation_ids: Vec<String>,
+) -> Result<()> {
+    map_glue_commit_send(send, table_ident).map_err(|error| {
+        if error.kind() == ErrorKind::CommitStateUnknown {
+            operation_ids.into_iter().fold(error, |error, id| {
+                error.with_context(GLUE_COMMIT_OPERATION_ID_PROP, id)
+            })
+        } else {
+            error
+        }
+    })
+}
+
+pub(crate) fn commit_send_operation_ids(
+    base: &TableMetadata,
+    staged: &TableMetadata,
+) -> Vec<String> {
+    let base_snapshot_ids: HashSet<i64> = base
+        .snapshots()
+        .map(|snapshot| snapshot.snapshot_id())
+        .collect();
+    let mut ids: Vec<String> = staged
+        .snapshots()
+        .filter(|snapshot| !base_snapshot_ids.contains(&snapshot.snapshot_id()))
+        .filter_map(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get(GLUE_COMMIT_OPERATION_ID_PROP)
+                .cloned()
+        })
+        .collect();
+    if let (Some(next), previous) = (
+        staged.properties().get(GLUE_COMMIT_OPERATION_ID_PROP),
+        base.properties().get(GLUE_COMMIT_OPERATION_ID_PROP),
+    ) && Some(next) != previous
+    {
+        ids.push(next.clone());
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+pub(crate) fn published_metadata_operation_ids(metadata: &TableMetadata) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(id) = metadata.current_snapshot().and_then(|snapshot| {
+        snapshot
+            .summary()
+            .additional_properties
+            .get(GLUE_COMMIT_OPERATION_ID_PROP)
+            .cloned()
+    }) {
+        ids.push(id);
+    }
+    if let Some(id) = metadata.properties().get(GLUE_COMMIT_OPERATION_ID_PROP) {
+        ids.push(id.clone());
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 #[cfg(test)]
