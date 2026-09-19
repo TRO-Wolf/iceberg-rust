@@ -41,12 +41,17 @@ table properties are ignored by the fork's own Parquet writers (compaction rewri
       `rewrite_data_files` none-cell e2e + position-delete overlay pin — 11 red /
       3 green guards on `from_properties`/`for_position_delete` stubs
 - [x] IMPLEMENT: `MetricsConfig::for_table` / `for_position_delete_table` +
-      list/map-descendant drop; wire all 6 production sites (DataFusion sites are
-      run 24c's half — the helpers are what they call). 14/14 pins green
+      list/map-descendant drop; wire all 6 iceberg-crate production sites.
+      14/14 pins green
 - [x] MUTATION (drop promotion / drop limit / drop rewrite wiring → 2+1+1 pins red,
       all reverted) + gates: fmt, workspace clippy `-D warnings`, `make check` green,
       `parquet_writer.rs` ceiling 3390 → 3346, comment-ban `hits=0`, typos;
       `metrics` 172, `parquet_writer` 28, `maintenance::` 402 all green
+- [x] ROUND 2: comment-gate hit fixed (moved comment deleted, `e9db23c4`); scope
+      correction — DataFusion writers ARE fork code: `write.rs`/`row_lineage.rs` →
+      `for_table`, `delete_position_deletes.rs` → `for_position_delete_table`
+      (`7b562926`); INSERT none-metrics pin red-first `fd71d001`, mutation → red,
+      reverted; `physical_plan` 203/203, comment-ban `hits=0`
 - [ ] handback.json
 
 

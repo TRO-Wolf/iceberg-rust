@@ -334,6 +334,40 @@ order's bound schema; the fork's `SortOrder` carries no schema, so `for_table`
 resolves `source_id` names through the CURRENT schema — promotion survives a column
 rename where Java's stored key would silently go stale. Deliberate, recorded here.
 
+## Round 2 — comment-gate rejection + DataFusion wiring correction
+
+Round-1 head `47665d8b` was rejected by the comment gate: the bounds-collection
+comment line traveled inside the new `stats_eligible` guard in
+`parquet_to_data_file_builder`, and a moved comment counts as added. The line is
+deleted (the fact lives here); ceiling tracked the shrink (3346 → 3345). Commit
+`e9db23c4` → `comment-ban hits=0`.
+
+**Scope correction (owner ruling):** the DataFusion writers under
+`crates/integrations/datafusion/` are fork code, not RePark — round 1's
+"unwired by design (run 24c)" was wrong. RePark's own writers live in the RePark
+repository and remain run 24c's half. Wired:
+
+- `physical_plan/write.rs` (`IcebergWriteExec` INSERT) → `for_table`
+- `physical_plan/row_lineage.rs` (`StreamingDataFileWriter`, the DML data writer
+  also used by the CoW DELETE path) → `for_table`
+- `physical_plan/delete_position_deletes.rs` → `for_position_delete_table`
+
+`task_writer.rs` and `delete.rs` need nothing — the first is test-only, the
+second reuses `StreamingDataFileWriter`.
+
+**Pin (red-first, `fd71d001`):** `write.rs` `mod tests` —
+`test_insert_honors_metrics_default_none` drives `IcebergWriteExec` on a
+`write.metadata.metrics.default=none` table through the existing
+`MockExecutionPlan` harness and asserts all six maps empty. Red pre-wiring
+(`column_sizes {1: 38, 2: 53}`); green post-wiring (`7b562926`). Mutation —
+dropping the `with_metrics_config` call in `write.rs` — re-reds the pin with the
+identical signature; reverted.
+
+Gates (round 2): `cargo fmt --all -- --check` clean; `cargo clippy -p iceberg
+-p iceberg-datafusion --all-targets -- -D warnings` clean; `cargo test -p
+iceberg-datafusion --lib physical_plan` 203/203; `metrics_config_tests` 14/14;
+comment-ban `hits=0`; rust-file-size clean; typos clean.
+
 ## Propositions
 
 - [x] P1 `for_table` resolves default/column/max-inferred/sorted rules exactly per
