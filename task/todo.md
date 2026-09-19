@@ -46,6 +46,19 @@ commits.
       → 7 cells red; restore → 100/100 green; reverts not committed.
 - [x] Ledger + this entry; `cargo fmt --all`, clippy `-D warnings`, size checker green
       (tests-file legacy ceiling lowered 4716 → 4608).
+- [x] ROUND 3 (rebased onto fork `main` `e3eef24f`, #301/#302 merged): L-001 re-pin of
+      the #301 residue cell `test_seq_gc_residue_rpd_then_rdf_reaches_zero_delete_files`
+      — four stale `2`s to Spark's `16` (16 file-scoped deletes → 16 file-scoped outputs
+      in one commit, seq GC retires all 16 after RDF). `0408b0f7`
+- [x] Perf `ee97abd8`: R-01 `rewrite_bin` takes the bin by value and moves `DataFile`s
+      into `pending` (no clones); R-02 live paths collected flat then keyed only for
+      delete-bearing partitions (`Arc<str>`); R-03 `GroupWriteFactory` built once per
+      bin — no per-path `TableMetadata` clone, shared file-name counter; R-04 known
+      bound recorded (in-memory sort vs Java spill), `sort_unstable` applied.
+- [x] Mutations rerun on the rebased head: A (`per_commit = 1`) 91/9 failed; B (retain
+      + split removed) 93/7 failed; restored 100/100. Suites added to the gate:
+      `seq_gc` 12, `cow_bytes` 8, `rewrite_data_files` 110 — all green; fmt, clippy,
+      size checker, comment-ban `hits=0`.
 
 ## ACTIVE (2026-09-18): F-RDF-GRANULARITY-1 — rewrite output is planned per read split
 

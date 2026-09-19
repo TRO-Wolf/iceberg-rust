@@ -240,3 +240,100 @@ position-delete file per partition group — partition-scoped — and never cons
 Whether the fork's DELETE write should follow the property (and which default applies on
 that path — `TableProperties.DELETE_GRANULARITY_DEFAULT` = `"partition"` vs the
 `SparkWriteConf` `FILE` override) is a separate lane.
+
+## Round 3 — rebase onto #301/#302: one logic re-pin, three perf fixes
+
+Fork main `e3eef24f` (F-RDF-GRANULARITY-1, #302) and #301 (F-RDF-COW-BYTES-1, the
+delete-file sequence GC) are now underneath this lane. The #301 test
+`delete_file_seq_gc_tests.rs::test_seq_gc_residue_rpd_then_rdf_reaches_zero_delete_files`
+was authored against the OLD partition-scoped RPD output and went red on this branch
+(`left: 16, right: 2`).
+
+**L-001 — the seq-GC residue re-pin (test-only).** Spark's recorded
+`residue_rpd_then_rdf` sequence rewrites 16 file-scoped position deletes to 16
+file-scoped outputs in ONE commit, then the data rewrite reaches zero delete files.
+The four stale `2`s in that cell are re-pinned to `16`: `added_delete_files_count`,
+live delete-file count after the RPD commit, and the snapshot summaries
+`removed-position-delete-files` / `removed-delete-files` after the data rewrite
+retires all 16 (the reviewer's throwaway re-pin confirmed the rest of the cell green:
+RDF 16 → 2 data files, `removed_delete_files_count` 0, rows conserved). Production
+RPD is not changed for this.
+
+**R-01 — move admitted bins by value** (`rewrite_position_delete_files_commit.rs`).
+`rewrite_bin` took `&AdmittedBin` and cloned every input `DataFile` into
+`RewrittenBin.deleted` while the `bins` vector still held the originals. It now takes
+the bin by value; `deleted` is built with `entries.into_iter().map(|e| e.data_file)` —
+no `DataFile` clones on the commit path. The `execute` loop binds
+`live_paths.get(&bin.0)` before the move.
+
+**R-02 — live paths only for delete-bearing partitions**
+(`collect_position_delete_groups`). The old map held a `HashSet<String>` of every live
+data-file path in the table keyed by `(spec_id, partition)` — the whole table, not the
+partitions Java's per-partition join ever visits. The walk now collects data paths
+into a flat `Vec<(GroupKey, Arc<str>)>` and inserts them into the keyed sets only for
+keys present in `groups` — partitions that actually admitted a position-delete group.
+The set retained for the rewrite shrinks from all-table to delete-bearing partitions;
+the transient flat vec is dropped at return. Paths are `Arc<str>`; `pairs.retain`
+looks up `live.contains(path.as_str())` (`Arc<str>: Borrow<str>`).
+
+**R-03 — one writer factory per bin** (`GroupWriteFactory`). `write_compacted_file`
+rebuilt `DefaultLocationGenerator::new(metadata.clone())` — a full `TableMetadata`
+clone — plus `PositionDeleteWriterConfig`, `PartitionKey`, `DefaultFileNameGenerator`
+and the parquet `WriterProperties` for every referenced-path run. `write_group_outputs`
+now builds `GroupWriteFactory` once per bin; `write_compacted_file(&factory, chunk)`
+clones only `String`/`Arc` handles per output file. The shared
+`DefaultFileNameGenerator` keeps names unique through its atomic counter (one uuid
+suffix per bin + counter — the same shape as Java's writeId + counter file names).
+An empty `pairs` short-circuits before the factory build, preserving the old
+no-lookup-for-an-all-dangling-bin path.
+
+**R-04 — in-memory pair sort, known bound (recorded).** A bin's `(path, pos)` pairs
+are sorted fully in memory; Java spills through `sortWithinPartitions`. This is a
+pre-existing peak, not a new hold. The one-line safe part is taken:
+`pairs.sort()` → `pairs.sort_unstable()` — equal elements are identical
+`(String, i64)` values, so stability is unobservable. Spill/k-way merge stays a
+recorded bound for a later lane.
+
+**R-05 (P3, observed, not in this round's scope):** `added_paths` collects
+`to_string` per output for abort cleanup, and abort deletes run serially — noted
+here so it is not lost.
+
+## Round 3 — mutation reruns on the rebased head
+
+Same two mutations as round 1, applied to `ee97abd8`, run, and reverted uncommitted.
+
+**MUTATION A — single-commit half reverted** (`per_commit = 1`): 91 passed /
+**9 failed** — the same nine single-commit cells as round 1
+(`commits_tests::test_min_input_files_1_commits_once_and_keeps_file_scope`,
+`test_partial_progress_max_commits_1_batches_all_bins_into_one_commit`,
+`test_partition_granularity_writes_partition_scoped_outputs_in_one_commit`,
+`test_rewrite_all_commits_once_and_keeps_file_scope`,
+`test_admission_max_file_group_size_splits_partition_into_bins`,
+`test_bin_failure_aborts_the_whole_rewrite`,
+`test_admitted_bin_with_zero_pairs_loses_its_inputs`,
+`test_one_replace_commit_for_all_bins`,
+`test_partition_isolation_compacts_each_group_separately`).
+
+**MUTATION B — file-scope half reverted** (dangling `retain` removed + per-path run
+split removed): 93 passed / **7 failed** — the same seven cells as round 1
+(`commits_tests::test_dangling_positions_are_dropped_not_rewritten`,
+`test_rewrite_all_commits_once_and_keeps_file_scope`,
+`test_min_input_files_1_commits_once_and_keeps_file_scope`,
+`test_partial_progress_commits_one_batch_per_commit`,
+`test_partial_progress_max_commits_1_batches_all_bins_into_one_commit`,
+`test_multi_file_grouping_one_partition`,
+`test_unpartitioned_group_compacts`).
+
+**RESTORED**: 100 passed / 0 failed.
+
+## Round 3 — gates
+
+- `cargo test -p iceberg --lib seq_gc` — 12 passed (the re-pinned residue cell green).
+- `cargo test -p iceberg --lib cow_bytes` — 8 passed.
+- `cargo test -p iceberg --lib rewrite_data_files` — 110 passed.
+- `cargo test -p iceberg --lib rewrite_position_delete_files` — 100 passed.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p iceberg --all-targets -- -D warnings` — clean.
+- `python3 scripts/check_rust_file_size.py` — clean, no ceiling moved.
+- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/na-fork2 origin/main HEAD` —
+  `comment-ban hits=0`.
