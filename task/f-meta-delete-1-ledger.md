@@ -255,4 +255,50 @@ exactly, e.g. all-null `v`, or `id IN (2,3)` on bounds `[1,3]`).
 
 ## 8. Gate + mutation record
 
-(to be filled at step 4 — every clause ends `PROVEN` or `OPEN`.)
+Recorded at HEAD `c5af541a` (four commits over `origin/main`: `c63772d5` ledger, `1ed5048d`
+red-first pins, `f82a4e46` implementation, `c5af541a` gate fixes — rustfmt layout + two
+`#[allow]` attributes, zero behavioral change).
+
+### Mutations (each reverted after measurement; suite re-verified 23/23 green at HEAD)
+
+- **Partition arm dropped** (`if evaluator.eval(file)` kept, metrics OR removed): 22/23 pass,
+  `partition_arm_only_proof` red — the file provable only by strict partition evaluation is
+  the named red. Partition arm is load-bearing — **PROVEN**.
+- **Metrics arm dropped** (`StrictMetricsEvaluator::eval` OR removed): 11/23 pass, 12 red —
+  `whole_one_file`, `whole_two_files`, `string_eq_whole`, `is_null_whole`, `or_whole`,
+  `not_in_whole`'s sibling `partition_select_bucket`, `partition_plus_metrics`,
+  `nondeterministic_like`, `case_sensitivity_binds_the_filter`, `prior_deletes_then_whole_v2`,
+  `prior_deletes_then_whole_v3`, `uses_the_named_ref`. Metrics arm is load-bearing — **PROVEN**.
+  (`partition_select_bucket` red is expected and Java-consistent: bucket `strict_project`
+  yields no projection for `eq` — same as Java's `projectStrict`, which only projects
+  NotEq/NotIn through collision-prone transforms — so `selectsPartitions` does not fire and
+  the file is proven by the metrics arm in both implementations.)
+- **`use_ref` dropped** (branch argument ignored): 22/23 pass, `uses_the_named_ref` red —
+  named-reference handling is load-bearing — **PROVEN**.
+
+### Gates at HEAD
+
+| gate | command | result |
+|---|---|---|
+| fmt | `cargo fmt --all -- --check` | clean — PROVEN |
+| clippy | `cargo clippy -p iceberg --all-targets -- -D warnings` | clean — PROVEN |
+| size | `./scripts/check_rust_file_size.sh` | 524 files clean (96 legacy ceilings) — PROVEN |
+| comment ban | `comment_ban.py <clone> origin/main HEAD` | hits=0 — PROVEN |
+| artifacts | `./scripts/check_agent_artifacts.sh` | OK — PROVEN |
+| comment blocks | `./scripts/check_comment_blocks.sh` | OK — PROVEN |
+| matrix anchors | `./scripts/check_matrix_anchors.sh` | 88 rows anchored — PROVEN |
+| toml | `taplo check` | clean — PROVEN |
+| unused deps | `cargo machete` | none — PROVEN |
+| spelling | `typos` | clean — PROVEN |
+| pins | `cargo test -p iceberg --lib can_delete_using_metadata` | 23/23 green at HEAD — PROVEN |
+| delete regressions | `cargo test -p iceberg --lib delete_files` | 203/203 green at HEAD — PROVEN |
+| scan regressions | `cargo test -p iceberg --lib scan` | 292/292 green at HEAD — PROVEN |
+
+### Residues
+
+- D3 (bind-schema source on renamed-column + evolved-spec edge) — **OPEN**, recorded in §5.
+- D2 (`no_match` commit path returns `Err` where Spark commits an empty `delete` snapshot) —
+  pinned as fork-today behavior; the decision itself is correct vacuous-true — **OPEN**,
+  routed to run 24c's routing decision.
+- Independent Critic pass — not run in this lane; deferred to the PR-level review step of the
+  owner's shipping workflow — **OPEN**.
