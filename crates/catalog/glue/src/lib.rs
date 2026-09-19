@@ -45,6 +45,8 @@
 
 mod catalog;
 #[cfg(test)]
+mod commit_fault_tests;
+#[cfg(test)]
 mod commit_outcome_tests;
 mod commit_transport;
 mod error;
@@ -53,6 +55,9 @@ mod replace_publish_tests;
 mod schema;
 mod utils;
 pub use catalog::*;
+pub use commit_transport::{
+    GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE, GLUE_COMMIT_OPERATION_ID_PROP,
+};
 pub use utils::{
     AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
 };

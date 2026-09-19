@@ -23,10 +23,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use aws_sdk_glue::operation::create_table::CreateTableError;
 use aws_sdk_glue::types::TableInput;
-use iceberg::io::{
-    FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
-    S3_SESSION_TOKEN, StorageFactory,
-};
+use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
@@ -41,16 +38,15 @@ use crate::commit_transport::GlueCommitHarness;
 #[cfg(test)]
 use crate::commit_transport::glue_commit_send_landed;
 use crate::commit_transport::{
-    GlueCommitTransport, GlueUpdateTableCall, LiveGlueCommitTransport, map_glue_commit_send,
+    GlueCommitTransport, GlueUpdateTableCall, LiveGlueCommitTransport, build_commit_transport,
+    map_glue_commit_send,
 };
 use crate::error::{from_aws_build_error, from_aws_sdk_error};
 use crate::utils::{
     convert_to_database, convert_to_glue_table, convert_to_namespace, create_sdk_config,
-    get_default_table_location, get_metadata_location, validate_namespace,
+    get_default_table_location, get_metadata_location, resolve_file_io_props, validate_namespace,
 };
-use crate::{
-    AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, with_catalog_id,
-};
+use crate::with_catalog_id;
 
 mod replace_publish;
 #[cfg(test)]
@@ -212,41 +208,16 @@ impl GlueCatalog {
         storage_factory: Option<Arc<dyn StorageFactory>>,
     ) -> Result<Self> {
         let sdk_config = create_sdk_config(&config.props, config.uri.as_ref()).await;
-        let mut file_io_props = config.props.clone();
-        if !file_io_props.contains_key(S3_ACCESS_KEY_ID)
-            && let Some(access_key_id) = file_io_props.get(AWS_ACCESS_KEY_ID)
-        {
-            file_io_props.insert(S3_ACCESS_KEY_ID.to_string(), access_key_id.to_string());
-        }
-        if !file_io_props.contains_key(S3_SECRET_ACCESS_KEY)
-            && let Some(secret_access_key) = file_io_props.get(AWS_SECRET_ACCESS_KEY)
-        {
-            file_io_props.insert(
-                S3_SECRET_ACCESS_KEY.to_string(),
-                secret_access_key.to_string(),
-            );
-        }
-        if !file_io_props.contains_key(S3_REGION)
-            && let Some(region) = file_io_props.get(AWS_REGION_NAME)
-        {
-            file_io_props.insert(S3_REGION.to_string(), region.to_string());
-        }
-        if !file_io_props.contains_key(S3_SESSION_TOKEN)
-            && let Some(session_token) = file_io_props.get(AWS_SESSION_TOKEN)
-        {
-            file_io_props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
-        }
-        if !file_io_props.contains_key(S3_ENDPOINT)
-            && let Some(aws_endpoint) = config.uri.as_ref()
-        {
-            file_io_props.insert(S3_ENDPOINT.to_string(), aws_endpoint.to_string());
-        }
+        let file_io_props = resolve_file_io_props(&config.props, config.uri.as_ref());
 
         let client = aws_sdk_glue::Client::new(&sdk_config);
-        let commit_transport = Arc::new(LiveGlueCommitTransport::new(
-            client.clone(),
-            config.catalog_id.clone(),
-        ));
+        let commit_transport = build_commit_transport(
+            &config.props,
+            Arc::new(LiveGlueCommitTransport::new(
+                client.clone(),
+                config.catalog_id.clone(),
+            )),
+        )?;
 
         // Use provided factory or default to OpenDalStorageFactory::S3
         let factory = storage_factory.unwrap_or_else(|| {

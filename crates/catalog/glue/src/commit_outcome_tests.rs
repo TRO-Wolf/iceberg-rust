@@ -127,12 +127,12 @@ fn dv_file(path: &str, referenced: &str) -> DataFile {
         .expect("dv file")
 }
 
-fn unique_ident() -> TableIdent {
+pub(crate) fn unique_ident() -> TableIdent {
     let n = TABLE_SEQ.fetch_add(1, Ordering::SeqCst);
     TableIdent::new(NamespaceIdent::new("pr5a".to_string()), format!("t{n}"))
 }
 
-async fn dummy_glue_client() -> aws_sdk_glue::Client {
+pub(crate) async fn dummy_glue_client() -> aws_sdk_glue::Client {
     let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .credentials_provider(aws_sdk_glue::config::Credentials::new(
             "pr5a", "pr5a", None, None, "pr5a",
@@ -143,7 +143,11 @@ async fn dummy_glue_client() -> aws_sdk_glue::Client {
     aws_sdk_glue::Client::new(&cfg)
 }
 
-async fn seed_table(file_io: &FileIO, ident: &TableIdent, format: FormatVersion) -> Table {
+pub(crate) async fn seed_table(
+    file_io: &FileIO,
+    ident: &TableIdent,
+    format: FormatVersion,
+) -> Table {
     let location = format!(
         "memory://pr5a/{}/{}",
         ident.namespace().to_url_string(),
@@ -572,6 +576,7 @@ async fn credentialed_glue_commit_class_smokes_and_one_accepted_then_lost_append
     }
     let discarding = Arc::new(DiscardingGlueCommitTransport::new(
         catalog.live_commit_transport(),
+        u64::MAX,
     ));
     let discarded =
         catalog.with_commit_transport(Arc::clone(&discarding) as Arc<dyn GlueCommitTransport>);
@@ -601,13 +606,16 @@ async fn discarding_transport_marks_accepted_response_lost() {
     let (catalog, _, _, _, _) = catalog_with([GlueCommitScript::Success], FormatVersion::V2).await;
     let discarding = Arc::new(DiscardingGlueCommitTransport::new(
         catalog.live_commit_transport(),
+        u64::MAX,
     ));
     let catalog =
         catalog.with_commit_transport(Arc::clone(&discarding) as Arc<dyn GlueCommitTransport>);
     assert_eq!(catalog.catalog_commit_attempts(), 0);
-    let discarding = DiscardingGlueCommitTransport::new(ScriptedGlueCommitTransport::new([
-        GlueCommitScript::Success,
-    ]) as Arc<dyn GlueCommitTransport>);
+    let discarding = DiscardingGlueCommitTransport::new(
+        ScriptedGlueCommitTransport::new([GlueCommitScript::Success])
+            as Arc<dyn GlueCommitTransport>,
+        u64::MAX,
+    );
     let send = discarding
         .send_update_table(crate::commit_transport::GlueUpdateTableCall {
             database_name: "pr5a".to_string(),
