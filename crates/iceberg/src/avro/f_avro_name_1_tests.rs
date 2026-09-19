@@ -604,21 +604,82 @@ fn ocf_container(entries: &OcfMeta, sync: [u8; 16], body: &[u8]) -> Vec<u8> {
 }
 
 fn unfix_schema_name(node: &mut JsonValue, good: &str, broken: &str) {
+    unfix_schema_names(node, &[(good.to_string(), broken.to_string())]);
+}
+
+fn unfix_schema_names(node: &mut JsonValue, renames: &[(String, String)]) {
     match node {
         JsonValue::Object(map) => {
-            if map.get("name").and_then(JsonValue::as_str) == Some(good) {
-                map.insert("name".to_string(), JsonValue::String(broken.to_string()));
-                map.remove("iceberg-field-name");
+            if let Some(name) = map.get("name").and_then(JsonValue::as_str) {
+                if let Some((_, broken)) = renames.iter().find(|(good, _)| good == name) {
+                    map.insert("name".to_string(), JsonValue::String(broken.clone()));
+                    map.remove("iceberg-field-name");
+                }
             }
             for value in map.values_mut() {
-                unfix_schema_name(value, good, broken);
+                unfix_schema_names(value, renames);
             }
         }
         JsonValue::Array(items) => items
             .iter_mut()
-            .for_each(|v| unfix_schema_name(v, good, broken)),
+            .for_each(|v| unfix_schema_names(v, renames)),
         _ => {}
     }
+}
+
+fn struct_of(names: &[&str]) -> StructType {
+    StructType::new(
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                NestedField::optional(
+                    1000 + i as i32,
+                    *name,
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into()
+            })
+            .collect(),
+    )
+}
+
+fn broken_container(
+    write_names: &[&str],
+    iceberg_names: &[&str],
+    partition: Struct,
+) -> (Vec<u8>, StructType) {
+    let write_type = struct_of(write_names);
+    let mut good = Vec::new();
+    write_data_files_to_avro(
+        &mut good,
+        vec![one_data_file(partition)],
+        &write_type,
+        FormatVersion::V2,
+    )
+    .unwrap();
+    let (mut entries, sync, body_off) = ocf_parts(&good);
+    let schema_entry = entries
+        .iter_mut()
+        .find(|(k, _)| k == b"avro.schema")
+        .unwrap();
+    let mut json: JsonValue = serde_json::from_slice(&schema_entry.1).unwrap();
+    let renames: Vec<(String, String)> = write_names
+        .iter()
+        .zip(iceberg_names.iter())
+        .map(|(w, r)| {
+            (
+                crate::avro::name::java_avro_name(w).into_owned(),
+                (*r).to_string(),
+            )
+        })
+        .collect();
+    unfix_schema_names(&mut json, &renames);
+    schema_entry.1 = serde_json::to_vec(&json).unwrap();
+    (
+        ocf_container(&entries, sync, &good[body_off..]),
+        struct_of(iceberg_names),
+    )
 }
 
 fn one_data_file(partition: Struct) -> DataFile {
@@ -727,4 +788,126 @@ fn data_files_avro_reader_repairs_schema_names_while_streaming() {
             .unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].partition[0], Some(Literal::string("x")));
+}
+
+fn record_fields(node: &JsonValue, record_name: &str) -> Option<Vec<(String, Option<String>)>> {
+    match node {
+        JsonValue::Object(map) => {
+            if map.get("name").and_then(JsonValue::as_str) == Some(record_name)
+                && let Some(JsonValue::Array(fields)) = map.get("fields")
+            {
+                return Some(
+                    fields
+                        .iter()
+                        .map(|f| {
+                            (
+                                f.get("name")
+                                    .and_then(JsonValue::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                f.get("iceberg-field-name")
+                                    .and_then(JsonValue::as_str)
+                                    .map(str::to_string),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            map.values().find_map(|v| record_fields(v, record_name))
+        }
+        JsonValue::Array(items) => items.iter().find_map(|v| record_fields(v, record_name)),
+        _ => None,
+    }
+}
+
+#[test]
+fn colliding_avro_field_names_fail_at_schema_build() {
+    for (a, b, avro_name) in [("a b", "a_x20b", "a_x20b"), ("1a", "_1a", "_1a")] {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, a, Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(2, b, Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        let err = schema_to_avro_schema("data", &schema).unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(a) && msg.contains(b) && msg.contains(avro_name),
+            "error must name both Iceberg fields and the Avro name: {msg}"
+        );
+    }
+}
+
+#[test]
+fn repaired_colliding_names_bind_distinctly() {
+    for (ice_a, ice_b, avro_a, avro_b) in [
+        ("a b", "a_x20b", "a_x20b", "a_x20b_1"),
+        ("1a", "_1a", "_1a", "_1a_1"),
+        ("é", "_xE9", "_xE9", "_xE9_1"),
+        ("列", "_x5217", "_x5217", "_x5217_1"),
+    ] {
+        let (broken, read_type) = broken_container(
+            &["f1", "f2"],
+            &[ice_a, ice_b],
+            Struct::from_iter([Some(Literal::string("v1")), Some(Literal::string("v2"))]),
+        );
+        assert!(
+            AvroReader::new(Cursor::new(&broken)).is_err(),
+            "container must be unparseable before repair"
+        );
+
+        let repaired = repair_avro_container(&broken).unwrap();
+        assert!(matches!(repaired, Cow::Owned(_)));
+        let (entries, _, _) = ocf_parts(&repaired);
+        let schema_json = &entries.iter().find(|(k, _)| k == b"avro.schema").unwrap().1;
+        let json: JsonValue = serde_json::from_slice(schema_json).unwrap();
+        let fields = record_fields(&json, "r102").expect("partition record r102");
+        assert_eq!(
+            fields,
+            vec![
+                (avro_a.to_string(), Some(ice_a.to_string())),
+                (avro_b.to_string(), Some(ice_b.to_string())),
+            ],
+            "repaired names for {ice_a}/{ice_b}"
+        );
+
+        let mut reader = Cursor::new(repaired.into_owned());
+        let files = read_data_files_from_avro(
+            &mut reader,
+            &tiny_schema(),
+            0,
+            &read_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].partition[0], Some(Literal::string("v1")));
+        assert_eq!(files[0].partition[1], Some(Literal::string("v2")));
+    }
+}
+
+#[test]
+fn unique_avro_names_bind_before_literal_names() {
+    let ty = Type::Struct(struct_of(&["a b", "a_x20b"]));
+    let value = apache_avro::types::Value::Record(vec![
+        (
+            "a_x20b".to_string(),
+            apache_avro::types::Value::String("v_ab".to_string()),
+        ),
+        (
+            "a_x20b_1".to_string(),
+            apache_avro::types::Value::String("v_lit".to_string()),
+        ),
+    ]);
+    let raw: crate::spec::RawLiteral = apache_avro::from_value(&value).unwrap();
+    let lit = raw.try_into(&ty).unwrap();
+    assert_eq!(
+        lit,
+        Some(Literal::Struct(Struct::from_iter([
+            Some(Literal::string("v_ab")),
+            Some(Literal::string("v_lit")),
+        ])))
+    );
 }
