@@ -292,8 +292,8 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         }
 
         if let (Some(lower), Some(upper)) = (self.lower(reference), self.upper(reference))
-            && lower.literal() == datum.literal()
-            && upper.literal() == datum.literal()
+            && lower.as_ref().partial_cmp(datum) == Some(std::cmp::Ordering::Equal)
+            && upper.as_ref().partial_cmp(datum) == Some(std::cmp::Ordering::Equal)
         {
             return ROWS_MUST_MATCH;
         }
@@ -318,7 +318,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
             if lower.is_nan() {
                 return ROWS_MIGHT_NOT_MATCH;
             }
-            if lower.literal() > datum.literal() {
+            if lower.as_ref() > datum {
                 return ROWS_MUST_MATCH;
             }
         }
@@ -327,7 +327,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
             if upper.is_nan() {
                 return ROWS_MIGHT_NOT_MATCH;
             }
-            if upper.literal() < datum.literal() {
+            if upper.as_ref() < datum {
                 return ROWS_MUST_MATCH;
             }
         }

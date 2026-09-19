@@ -58,7 +58,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/expr/expression_parser.rs": 1267,
     "crates/iceberg/src/expr/predicate.rs": 2676,
     "crates/iceberg/src/expr/visitors/aggregate_evaluator.rs": 1117,
-    "crates/iceberg/src/expr/visitors/inclusive_metrics_evaluator.rs": 2191,
+    "crates/iceberg/src/expr/visitors/inclusive_metrics_evaluator.rs": 2187,
     "crates/iceberg/src/expr/visitors/manifest_evaluator.rs": 1753,
     "crates/iceberg/src/expr/visitors/residual_evaluator.rs": 1641,
     "crates/iceberg/src/expr/visitors/row_group_metrics_evaluator.rs": 1941,
