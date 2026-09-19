@@ -231,3 +231,24 @@ revisits), and the pin catches it three ways (`upgrades`, `entry_count`, index r
 | `./scripts/check_matrix_anchors.sh` | OK (88 rows anchored) |
 | `./scripts/check_comment_blocks.sh` | OK |
 | `python3 -B -m unittest scripts/check_rust_file_size_test.py` | 11 tests OK |
+
+# Round 2 — review remediation
+
+Review inputs: logic report `rv-fc-logic-report.md` (PASS, findings L-001/L-002),
+perf report `rv-fc-perf-out.json` (LOOKS-GOOD, findings R-01..R-08; R-04..R-07
+require no fix per the reviewer).
+
+## Findings table
+
+| Id | Severity | Ruling | Pin |
+|---|---|---|---|
+| R-01 | P2 | Fix — cache the base `ArrowReaderMetadata` (default-options build) beside the footer in the entry; rebuild only on insert/upgrade. Per-task rebuilds (name mapping / fallback ids / INT96) stay per task — they depend on `task.name_mapping` and `task.schema`. | `r01_hit_reuses_base_arrow_metadata`, `r01_per_task_rebuilds_still_apply` |
+| R-02 | P2 | Fix — key path holds the task's `Arc<str>` (`Arc::clone`, refcount bump, no `Arc::from(&str)` copy) threaded from `FileScanTask.data_file_path` through `open_parquet_file_cached`/`sized`/`seed`/`footer_or_fetch`. | `r02_key_reuses_task_path_arc` |
+| R-03 | P2 | Fix — default budget 256 MiB. Reviewer cost model: an unindexed footer is ~2–8 KiB but an indexed wide footer is 1–10 MiB, so at 64 MiB a filtered-scan upgrade wave collapses occupancy from ~8k files to tens–hundreds and evicts the working set. 256 MiB keeps ~25–250 indexed wide files plus the unindexed tail; still bounded and opt-in. | `r03_upgrade_grows_weight_at_stable_count` |
+| R-08 | P3 | Fix — all inserts/upgrades now run inside `entry_by_ref().and_try_compute_with` (the per-key compute slot). `try_init_or_read`'s post-init `insert_with_hash` is unconditional (moka 0.12.16 `future/value_initializer.rs:243`), so a `try_get_with` init racing an upgrade `Op::Put` could insert index-less over indexed. Under compute, every mutation re-reads fresh per-key state: `need_index=false` only `Put`s on absence, and the only `Put` on an existing entry is the strict index upgrade. Trade-off: coalesced *error* delivery is lost — each waiter serially retries the read on failure (transient errors get an independent attempt; failures still never cache). Success dedup is unchanged (second compute sees `Some` → `Op::Nop`). | `r08_indexless_never_replaces_indexed` |
+| L-001 | P3 | Fix — C-9 now builds through every production constructor (`ArrowReaderBuilder::new`, `Table::builder`, `TableScan::build` + `configure_reader`, `MemoryCatalogBuilder`, plus `S3TablesCatalogBuilder`/`GlueCatalogBuilder` defaults in their own crates) and asserts no cache is attached. | `c9_no_cache_keeps_todays_counts` extended; `l001_*` asserts in catalog `cache_tests.rs` |
+| L-002 | P3 | Fix — `index_checked` = actual presence (`column_index().is_some() && offset_index().is_some()`), matching `seed` and `get_row_selection_for_filter_predicate`. New `index_attempted` bounds retries: after a load attempt that finds no index (index-less file), later filtered tasks hit instead of re-entering compute. | `l002_index_checked_reflects_presence` |
+| R-04 | P3 | No fix — compute waiter held across index I/O is intended same-key serialization; unrelated keys and `get()` are not blocked. | — |
+| R-05 | P3 | No fix — the upgrade's `ParquetMetaData::clone` is required because `load_page_index` mutates; once per file, off the hit path. | — |
+| R-06 | P3 | No fix — leading `get()` for hits stays; it skips the compute slot entirely. | — |
+| R-07 | P3 | No fix — `memory_size()` overcounts shared `SchemaDescPtr`; do not under-weigh. The cached `ArrowReaderMetadata`'s Arrow `SchemaRef`/`fields` heap is not weighed (O(columns), bounded by the footer it was parsed from). | — |
