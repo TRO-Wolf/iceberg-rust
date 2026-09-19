@@ -16,5 +16,7 @@
 // under the License.
 
 //! Avro related codes.
+#[cfg(test)]
+mod f_avro_name_1_tests;
 mod schema;
 pub(crate) use schema::*;
