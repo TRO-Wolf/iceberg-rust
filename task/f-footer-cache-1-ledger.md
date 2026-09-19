@@ -252,3 +252,42 @@ require no fix per the reviewer).
 | R-05 | P3 | No fix — the upgrade's `ParquetMetaData::clone` is required because `load_page_index` mutates; once per file, off the hit path. | — |
 | R-06 | P3 | No fix — leading `get()` for hits stays; it skips the compute slot entirely. | — |
 | R-07 | P3 | No fix — `memory_size()` overcounts shared `SchemaDescPtr`; do not under-weigh. The cached `ArrowReaderMetadata`'s Arrow `SchemaRef`/`fields` heap is not weighed (O(columns), bounded by the footer it was parsed from). | — |
+
+## Round-2 commits
+
+- `a78754bc` docs: findings table (R-01..R-08, L-001/L-002)
+- `fa2d46e3` fix: remediation implementation + all iceberg pins (findings R-01, R-02, R-03, R-08, L-002, L-001 core constructors)
+- `284c48ec` test: L-001 default-off pins for the S3 Tables and Glue catalog builders
+
+## Round-2 mutations
+
+| Mutation | Pin expected red | Observed |
+|---|---|---|
+| Hit path rebuilds base via `base_arrow_metadata` instead of `Arc::clone` | `r01_hit_reuses_base_arrow_metadata` | FAILED — `Arc::ptr_eq` on the schema false: fresh `ArrowReaderMetadata::try_new` per hit |
+| `FooterKey` reduced to scope-only (`path`/`file_size_in_bytes` stubbed) | `r01_per_task_rebuilds_still_apply` | FAILED — name-mapped and INT96 files collided on one entry; wrong footer served |
+| `key()` allocates `Arc::from(path.as_ref())` instead of `Arc::clone(path)` | `r02_key_reuses_task_path_arc` | FAILED — task path `Arc` strong count stayed 1, expected 2 |
+| Upgrade arm short-circuits to `Op::Nop` | `r03_upgrade_grows_weight_at_stable_count` | FAILED — `weighted_size` 1518 → 1518 (no growth) |
+| `seed` uses unconditional `entries.insert` instead of `or_insert` | `r08_indexless_never_replaces_indexed` | FAILED — index-less seed overwrote the indexed entry (`Some((true,true))` expected) |
+| Cold-insert `index_checked` set to `need_index` instead of `has_index` | `l002_index_checked_reflects_presence` | FAILED — index-less file recorded `Some((true,true))`, expected `Some((false,true))` |
+| `ArrowReaderBuilder::new` attaches a default `TableFooterCache` | `c9_no_cache_keeps_todays_counts` | FAILED — "`ArrowReaderBuilder::new` attaches no footer cache" assert fired |
+| `S3TablesCatalogBuilder::default` sets `shared_footer_cache: Some(..)` | `catalog::tests::l001_footer_cache_default_off` (s3tables) | FAILED — builder-default assert fired |
+| `GlueCatalogBuilder::default` sets `shared_footer_cache: Some(..)` | `catalog::cache_tests::l001_footer_cache_default_off` (glue) | FAILED — builder-default assert fired |
+
+All mutations applied, tested red, and reverted via `git checkout`; the footer-cache suite re-ran 20/20 green on the restored tree.
+
+## Round-2 notes
+
+- `footer_cache_tests.rs` crossed the 1000-line default ceiling; the round-2 pins and their
+  r2-only fixtures (`write_id_pages_noindex`/`noids`, `write_int96_pages`,
+  `file_metadata_noindex`) moved to `footer_cache_r2_tests.rs` via the repo's
+  `mod r2 { include!(..) }` convention — same as `catalog.rs`'s test split.
+- `index_attempted` (new entry field) bounds the retry after a successful load that finds no
+  index: without it every filtered task on an index-less file would re-enter the serialized
+  compute and re-issue index range reads forever.
+- R-02 lookup is `get`-then-compute keyed on `Arc::clone(&task.data_file_path)` — the refcount
+  bump is the pin (`before + 1`), not a borrowed-key `Equivalent` path; moka `future::Cache`
+  lookups require an owned key.
+
+## Round-2 gates
+
+(Filled after the gate run — see hand-back for the authoritative list.)
