@@ -484,21 +484,79 @@ fn test_project_truncate_binary_range() {
 #[test]
 fn test_strict_project_truncate_binary_not_starts_with() -> Result<()> {
     let fixture = binary_fixture(Transform::Truncate(1));
+    let projected = Transform::Truncate(1).strict_project(
+        "b_trunc",
+        &fixture.binary_predicate(
+            PredicateOperator::NotStartsWith,
+            Datum::binary(vec![0x01, 0x02]),
+        ),
+    )?;
+    assert!(
+        projected.is_none(),
+        "Java strict projection returns null for a NotStartsWith literal longer than the width, got {projected:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_project_truncate_binary_not_starts_with_longer_than_width_is_none() {
+    let fixture = binary_fixture(Transform::Truncate(1));
     let projected = Transform::Truncate(1)
-        .strict_project(
+        .project(
             "b_trunc",
             &fixture.binary_predicate(
                 PredicateOperator::NotStartsWith,
                 Datum::binary(vec![0x01, 0x02]),
             ),
-        )?
-        .expect("len > width NotStartsWith must project through transform_literal");
-    match projected {
-        Predicate::Binary(expr) => {
-            assert_eq!(expr.op(), PredicateOperator::NotStartsWith);
-            assert_eq!(expr.literal(), &Datum::binary(vec![0x01]));
-        }
-        other => panic!("expected a binary partition predicate, got {other:?}"),
-    }
-    Ok(())
+        )
+        .expect("project must not error on a binary literal");
+    assert!(
+        projected.is_none(),
+        "a binary NOT STARTS WITH literal longer than the width cannot inclusive-project, got {projected:?}"
+    );
+}
+
+#[test]
+fn test_project_truncate_binary_not_starts_with_width_boundaries() {
+    let fixture = binary_fixture(Transform::Truncate(1));
+    let (op, datum) = projected_binary(fixture.binary_predicate(
+        PredicateOperator::NotStartsWith,
+        Datum::binary(vec![0x01]),
+    ))
+    .expect("len == width must project to NotEq");
+    assert_eq!(op, PredicateOperator::NotEq);
+    assert_eq!(datum, Datum::binary(vec![0x01]));
+    let (op, datum) = projected_binary(fixture.binary_predicate(
+        PredicateOperator::NotStartsWith,
+        Datum::binary(vec![]),
+    ))
+    .expect("len < width must project to NotStartsWith on the literal");
+    assert_eq!(op, PredicateOperator::NotStartsWith);
+    assert_eq!(datum, Datum::binary(vec![]));
+}
+
+#[test]
+fn test_project_truncate_binary_starts_with_width_boundaries() {
+    let fixture = binary_fixture(Transform::Truncate(1));
+    let (op, datum) = projected_binary(fixture.binary_predicate(
+        PredicateOperator::StartsWith,
+        Datum::binary(vec![0x01]),
+    ))
+    .expect("len == width must project to Eq");
+    assert_eq!(op, PredicateOperator::Eq);
+    assert_eq!(datum, Datum::binary(vec![0x01]));
+    let (op, datum) = projected_binary(fixture.binary_predicate(
+        PredicateOperator::StartsWith,
+        Datum::binary(vec![]),
+    ))
+    .expect("len < width must project to StartsWith on the literal");
+    assert_eq!(op, PredicateOperator::StartsWith);
+    assert_eq!(datum, Datum::binary(vec![]));
+    let (op, datum) = projected_binary(fixture.binary_predicate(
+        PredicateOperator::StartsWith,
+        Datum::binary(vec![0x01, 0x02]),
+    ))
+    .expect("len > width must project to StartsWith on the truncated literal");
+    assert_eq!(op, PredicateOperator::StartsWith);
+    assert_eq!(datum, Datum::binary(vec![0x01]));
 }
