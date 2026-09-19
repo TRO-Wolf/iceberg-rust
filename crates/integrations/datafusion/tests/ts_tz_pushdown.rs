@@ -496,6 +496,9 @@ async fn filtered_rows_match_the_in_memory_reference() {
             ("ts >= CAST(1703000000 AS TIMESTAMP)", vec![2, 3]),
             ("ts < CAST(1703000000 AS TIMESTAMP)", vec![1, 4]),
             ("ts = CAST(1703000000 AS TIMESTAMP)", vec![2]),
+            ("ts >= CAST(1703000000000000 AS TIMESTAMP(6))", vec![2, 3]),
+            ("ts = CAST(1703000000000000 AS TIMESTAMP(6))", vec![2]),
+            ("ts < CAST(1703000000000000 AS TIMESTAMP(6))", vec![1, 4]),
             (
                 "ts BETWEEN CAST(1703000000 AS TIMESTAMP) AND CAST(1706000000 AS TIMESTAMP)",
                 vec![2, 3],
