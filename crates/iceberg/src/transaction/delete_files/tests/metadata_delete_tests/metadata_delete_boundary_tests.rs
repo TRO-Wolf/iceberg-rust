@@ -15,18 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::super::append_files;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use super::super::{append_files, live_file_paths};
 use super::{
     assert_decision, counted_file, make_oracle_table_in_catalog, make_table_in_catalog,
     oracle_file1, oracle_file2,
 };
-use crate::expr::Reference;
+use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
+use crate::expr::{Bind, Predicate, Reference};
 use crate::memory::tests::new_memory_catalog;
 use crate::spec::{
-    DataContentType, DataFile, Datum, FormatVersion, NestedField, PrimitiveType, Schema, Struct,
-    StructType, Type,
+    DataContentType, DataFile, Datum, FormatVersion, NestedField, PrimitiveLiteral, PrimitiveType,
+    Schema, Struct, StructType, Type,
 };
 use crate::table::Table;
+use crate::transaction::{ApplyTransactionAction, Transaction};
 
 fn nested_oracle_schema() -> Schema {
     Schema::builder()
@@ -305,5 +310,175 @@ async fn can_delete_using_metadata_short_circuits_before_unreadable_manifest() {
     assert!(
         matches!(decision, Ok(false)),
         "id >= 2 on file1 [1,3] is an unproven candidate in the FIRST manifest of the list (newest first): the walk must answer Ok(false) without opening the deleted second manifest — a collect-then-decide walk errors instead, got {decision:?}"
+    );
+}
+
+fn decimal_oracle_schema() -> Schema {
+    Schema::builder()
+        .with_fields(vec![
+            NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(
+                2,
+                "d",
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                }),
+            )
+            .into(),
+        ])
+        .build()
+        .expect("the decimal oracle schema builds")
+}
+
+fn decimal_bound(mantissa: i128) -> Datum {
+    Datum::new(
+        PrimitiveType::Decimal {
+            precision: 9,
+            scale: 2,
+        },
+        PrimitiveLiteral::Int128(mantissa),
+    )
+}
+
+fn dec(literal: &str) -> Datum {
+    Datum::decimal_from_str(literal).expect("decimal literal parses")
+}
+
+async fn assert_decimal_decision(
+    predicate: &Predicate,
+    strict_expected: bool,
+    decision_expected: bool,
+    why: &str,
+) {
+    let catalog = new_memory_catalog().await;
+    let table =
+        make_table_in_catalog(&catalog, FormatVersion::V2, None, decimal_oracle_schema()).await;
+    let file = counted_file("test/dec.parquet", 0, Struct::empty(), 1, &[(2, 0)], &[(
+        2,
+        decimal_bound(1000),
+        decimal_bound(1000),
+    )]);
+    let bound = predicate
+        .clone()
+        .rewrite_not()
+        .bind(Arc::new(decimal_oracle_schema()), true)
+        .expect("the predicate binds");
+    assert_eq!(
+        StrictMetricsEvaluator::eval(&bound, &file).expect("strict metrics resolves"),
+        strict_expected,
+        "strict metrics on [10.00, 10.00]: {why}"
+    );
+    let table = append_files(&catalog, &table, vec![file]).await;
+    assert_decision(&table, predicate, None, decision_expected, why).await;
+}
+
+#[tokio::test]
+async fn can_delete_using_metadata_decimal_neq_scale_zero_is_not_provable() {
+    assert_decimal_decision(
+        &Reference::new("d").not_equal_to(dec("10")),
+        false,
+        true,
+        "d <> 10 vs [10.00,10.00]: strict MIGHT_NOT (comparator-equal); the decision is vacuous-true — Java inclusive notEq proves cannot-match via uniqueValue and prunes the file",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn can_delete_using_metadata_decimal_eq_scale_zero_is_provable() {
+    assert_decimal_decision(
+        &Reference::new("d").equal_to(dec("10")),
+        true,
+        true,
+        "d = 10 vs [10.00,10.00]: Java comparator equality is scale-aware, MUST_MATCH",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn can_delete_using_metadata_decimal_neq_scale_three_is_not_provable() {
+    assert_decimal_decision(
+        &Reference::new("d").not_equal_to(dec("10.000")),
+        false,
+        true,
+        "d <> 10.000 vs [10.00,10.00]: strict MIGHT_NOT; decision vacuous-true via inclusive uniqueValue prune",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn can_delete_using_metadata_decimal_in_is_not_provable() {
+    assert_decimal_decision(
+        &Reference::new("d").is_in([dec("10"), dec("11")]),
+        false,
+        false,
+        "d IN (10,11) vs [10.00,10.00]: Java Set.contains uses scale-sensitive equals — candidate but unproven, decision false",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn can_delete_using_metadata_decimal_not_in_is_not_provable() {
+    assert_decimal_decision(
+        &Reference::new("d").is_not_in([dec("10")]),
+        false,
+        true,
+        "d NOT IN (10) binds to NotEq (both Java and fork collapse singletons): strict MIGHT_NOT, decision vacuous-true",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn can_delete_using_metadata_decimal_lt_is_provable() {
+    assert_decimal_decision(
+        &Reference::new("d").less_than(dec("10.001")),
+        true,
+        true,
+        "d < 10.001 vs [10.00,10.00]: upper 10.00 < 10.001 under scale-aware order, MUST_MATCH",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn can_delete_using_metadata_decimal_gte_is_provable() {
+    assert_decimal_decision(
+        &Reference::new("d").greater_than_or_equal_to(dec("10")),
+        true,
+        true,
+        "d >= 10 vs [10.00,10.00]: lower 10.00 >= 10 under scale-aware order, MUST_MATCH",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn delete_from_row_filter_decimal_neq_keeps_scale_equivalent_file() {
+    let catalog = new_memory_catalog().await;
+    let table =
+        make_table_in_catalog(&catalog, FormatVersion::V2, None, decimal_oracle_schema()).await;
+    let table = append_files(&catalog, &table, vec![
+        counted_file("test/kept.parquet", 0, Struct::empty(), 1, &[(2, 0)], &[(
+            2,
+            decimal_bound(1000),
+            decimal_bound(1000),
+        )]),
+        counted_file("test/gone.parquet", 0, Struct::empty(), 1, &[(2, 0)], &[(
+            2,
+            decimal_bound(2000),
+            decimal_bound(2000),
+        )]),
+    ])
+    .await;
+
+    let tx = Transaction::new(&table);
+    let action = tx
+        .delete_files()
+        .delete_from_row_filter(Reference::new("d").not_equal_to(dec("10")));
+    let tx = action.apply(tx).expect("delete_from_row_filter applies");
+    let table = tx.commit(&catalog).await.expect("delete commits");
+
+    assert_eq!(
+        live_file_paths(&table).await,
+        HashSet::from(["test/kept.parquet".to_string()]),
+        "the [10.00,10.00] file is kept: no row satisfies d <> 10 under scale-aware comparison"
     );
 }
