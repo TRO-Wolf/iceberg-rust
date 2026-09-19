@@ -263,3 +263,28 @@ Glue — `crates/catalog/glue/`:
 - `cargo test -p iceberg --lib catalog::memory` — 95/95.
 - `cargo test -p iceberg-catalog-s3tables --lib` — 46/46.
 - `cargo test -p iceberg-catalog-glue --lib` — 57/57.
+
+# Round 2 — review remediation (head 6911441c, draft #311)
+
+Independent review verdicts: logic `NEEDS_REMEDIATION`
+(`rv-cc-logic-report.md`, findings L-001..L-005), performance `LOOKS-GOOD
+(no P1)` (`rv-cc-perf-out.json`, findings R-01..R-04). Every finding is
+fixed red-first: a pin that fails on 6911441c, then the fix.
+
+## Findings table
+
+| ID | Sev | Finding | Ruling | Pin | Commit |
+|----|-----|---------|--------|-----|--------|
+| L-001 | P1 | `region_name`/`s3.region` in `CREDENTIAL_CONTEXT_PROP_KEYS` make two catalogs sharing only a region collide on one scope; injected SDK clients / storage factories never enter the derivation | Credential context derives ONLY from credential selectors: `aws_access_key_id`, `profile_name`, `s3.access-key-id`, `client.assume-role.arn`, `client.assume-role.session-name`, `client.assume-role.external-id`. Region is not a selector. Catalogs built with `with_client` or `with_storage_factory` get a per-instance uuid unless `with_cache_credential_context` is explicit. Secrets/session tokens never appear in the context or Debug output | derivation unit tests (every selector distinguishes; region alone isolates; secrets absent from context+Debug); reviewer scenario: two s3tables catalogs `{region_name}` + injected client+factory each, one shared cache, same ARN → 2 body fetches, each sees its own bytes; glue same shape with `{region_name, warehouse}` + two injected factories | pending |
+| L-002 | P1 | `register_table` loads through the cache: a cached entry lets register succeed after the body was deleted, and serves stale bytes after a same-location rewrite | `register_table` always reads the body through the catalog FileIO (no cache lookup), then puts the freshly parsed metadata | register → delete body → register Err → rewrite same location → register returns the new parse (glue + memory; s3tables has no register — FeatureUnsupported) | pending |
+| L-003 | P2 | Glue and S3 Tables inherit the no-op `invalidate_table`/`drop_table` | Both override `invalidate_table` (fetch pointer; success → evict that location in this scope; pointer failure → evict nothing and return the error) and `drop_table` (evict the dropped table's pre-delete location, best-effort) | seeded entry gone after invalidate/drop; pointer-fetch failure propagates with no eviction; `test_invalidate_defaults_are_noops` updated | pending |
+| L-004 | P2 | Hollow pins: P-1 moved the pointer by hand + manual put; P-4 used different cred props; P-3 only tested a custom bound; P-7 compared ObjectCache identity; P-9 bypassed `CatalogBuilder::load`; P-5 lacked cancelled-initiator and in-flight-version legs | P-1 goes through `Transaction.commit`→`update_table`; P-4 uses IDENTICAL non-empty credential props on two catalog identities plus derivation-level tests; P-3 asserts the DEFAULT bound; P-7 reads manifests through a real `plan_files()`; P-9 builds catalogs via `CatalogBuilder::load`; P-5 adds a dropped initiator and a version mismatch arriving mid-init | each pin observed red when its rule is removed (mutation results below) | pending |
+| L-005 | P2 | Write publish stores `object_version=None`, so a same-location version bump between publish and first versioned load soft-arms instead of fail-closing | Publish carries the service version token when the service returns one: S3 Tables `UpdateTableMetadataLocationOutput.version_token` (transport `Success` now carries `Option<String>`; `cas_update_metadata_location` returns it). Glue `UpdateTable` returns no version → publish stores unarmed; the first versioned load arms (learn path) and a later mismatch still fail-closes | after a commit, a load under a different version refetches (s3tables armed case); glue pinned via the arm-on-learn + mismatch legs | pending |
+| R-01 | P2 | Bound is entry-count only | Cache is byte-bounded: `CachedEntry.body_len` (raw body byte length captured at read; `put` callers pass the known length or it is derived by serializing once) with a moka `weigher`; `with_max_bytes`; default `64 MiB` (≈1024 typical ~64KiB metadata documents — preserves the round-1 capacity intuition while bounding memory by bytes). `with_max_entries(n)` maps to `n × 64KiB` — RePark's entry setting keeps a meaning as a byte budget under a documented per-document assumption | `with_max_bytes` eviction test + default-bound pin (declared weights cross 64MiB → eviction) | pending |
+| R-02 | P2 | Production `eviction_listener` makes every `get` at capacity run the moka housekeeper | Listener removed from the production path entirely. Evictions are counted by delta accounting: `installed` (incremented once per single-flight init and per `put` into an absent key) − `entry_count` − explicit `invalidate` removals − `clear` removals. Advisory under races, exact after `run_pending_tasks`; chosen over a `#[cfg(test)]` listener so `stats().evictions` stays truthful for production callers | eviction count still asserted in the bound pins | pending |
+| R-03 | P3 | `String` keys clone per lookup | `CacheScope` fields and `CacheKey.location` are `Arc<str>`; scope clone per lookup is refcount-only | compile + existing pins | pending |
+| R-04 | P3 | `cache_put` deep-clones `TableMetadata` | `put`/`cache_put` take `TableMetadataRef`; write paths publish `staged_table.metadata_ref()` | compile + existing pins | pending |
+
+## Round-2 execution log
+
+pending
