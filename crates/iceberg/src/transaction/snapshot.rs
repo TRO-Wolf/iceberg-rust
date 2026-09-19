@@ -1033,7 +1033,7 @@ impl<'a> SnapshotProducer<'a> {
         &mut self,
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
-    ) -> Result<Vec<ManifestFile>> {
+    ) -> Result<(Vec<ManifestFile>, usize)> {
         // The files to remove were resolved in `commit()` (before `summary()`, so the summary can reflect
         // the deletes) and stored in `self.removed_data_files` / `self.removed_delete_files`. They stay
         // SEPARATE here because the two manifest kinds match on different keys: a DATA entry by path, a
@@ -1067,7 +1067,7 @@ impl<'a> SnapshotProducer<'a> {
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
 
-        let (processed, expired_delete_files) = self
+        let (processed, expired_delete_files, replaced_manifests) = self
             .process_deletes(
                 existing_manifests,
                 &removed_data_files,
@@ -1116,7 +1116,7 @@ impl<'a> SnapshotProducer<'a> {
         let manifest_files = manifest_process
             .process_manifests(self, manifest_files)
             .await?;
-        Ok(manifest_files)
+        Ok((manifest_files, replaced_manifests))
     }
 
     /// Build a manifest writer for a rewritten (filtered) manifest, using the partition spec of the
@@ -1381,15 +1381,36 @@ impl<'a> SnapshotProducer<'a> {
         };
 
         let removed_delete_file_count = self.removed_delete_files.len();
-        let new_manifests = self
+        let (new_manifests, manifests_replaced) = self
             .manifest_file(&snapshot_produce_operation, &process)
             .await?;
-        let summary = if self.removed_delete_files.len() == removed_delete_file_count {
+        let mut summary = if self.removed_delete_files.len() == removed_delete_file_count {
             summary
         } else {
             self.summary(&snapshot_produce_operation)
                 .map_err(summary_error)?
         };
+
+        if snapshot_produce_operation.operation() == Operation::Replace {
+            let mut manifests_created = 0u64;
+            let mut manifests_kept = 0u64;
+            for manifest in &new_manifests {
+                if manifest.added_snapshot_id == self.snapshot_id {
+                    manifests_created += 1;
+                } else {
+                    manifests_kept += 1;
+                }
+            }
+            let properties = &mut summary.additional_properties;
+            properties.insert(
+                "manifests-created".to_string(),
+                manifests_created.to_string(),
+            );
+            properties.insert("manifests-kept".to_string(), manifests_kept.to_string());
+            properties
+                .entry("manifests-replaced".to_string())
+                .or_insert_with(|| manifests_replaced.to_string());
+        }
 
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;
         let writer_next_row_id = manifest_list_writer.next_row_id();
