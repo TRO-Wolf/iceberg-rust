@@ -227,20 +227,74 @@ V3=1_706_000_000_000_000us, NEG=-86_400_000_000us):
 
 ## Mutation evidence
 
-Populated at the mutation step; arithmetic is `N red of M` against the
-populations above.
+Arithmetic is `N red of M` against the populations above. Mutations were
+applied one at a time and the tree was restored and re-run green between
+and after them.
 
-- M-1 revert the fix (`git revert` of the fix commit, tests kept):
-  expectation — the C-1/C-4/C-5 pins re-fail; recorded below.
-- M-2 `timestamp`-flavor confusion: in `scalar_value_to_datum`, convert a
-  zone-bearing microsecond literal as `Datum::timestamp_micros`
-  (a `timestamptz` value pushed through a `timestamp` datum — the
-  `timestamp` <-> `timestamptz` cast this unit forbids). Because the datum
-  type no longer matches the field it stays unpushed, so to make the
-  boundary pin go red the mutation instead keeps the `Timestamptz` datum
-  type and shifts the instant — the concrete one-line mutation is recorded
-  with its result below.
+- **M-1 revert the fix**
+  (`git checkout <red-commit> -- crates/integrations/datafusion/src/physical_plan/expr_to_predicate.rs`,
+  all pins kept at HEAD):
+  - `cargo test -p iceberg-datafusion --lib expr_to_predicate`:
+    **8 red of 82** — the seven ts_tz pins
+    (`zoned_timestamp_literals_map_to_timestamptz_datums`,
+    `milli_and_second_literals_widen_exactly`,
+    `zoned_literals_push_onto_timestamptz_columns`,
+    `cross_zone_timestamp_comparisons_stay_unpushed`,
+    `zone_string_only_timestamp_cast_on_a_column_strips`,
+    `cast_wrapped_timestamp_literal_converts_then_pushes`,
+    `single_stream_scan_reads_rows_behind_a_zoned_literal`) plus
+    `tests::test_scalar_value_to_datum_timestamp` (pins the s/ms widening).
+  - `cargo test -p iceberg-datafusion --test ts_tz_pushdown`:
+    **3 red of 7** — `zoned_literals_push_a_predicate_and_prune_files`
+    (predicate `None`, all 4 files planned),
+    `cross_zone_and_cross_unit_comparisons_stay_unpushed`
+    (`tsn >= lit(us, "UTC")` pushed a `Timestamp` datum),
+    `boundary_row_survives_a_zoned_literal` (scan emitted all 4 rows).
+- **M-2 `timestamp`/`timestamptz` value mutation** — one line in
+  `timestamp_micros_datum`: the zoned arm pushed
+  `Datum::timestamptz_micros(micros + 18_000_000_000)`, i.e. the literal
+  went through a zone "conversion" that shifted the instant five hours.
+  The datum still binds `timestamptz`, so the wrong predicate prunes.
+  - `cargo test -p iceberg-datafusion --lib ts_tz`: **6 red of 11**.
+  - `cargo test -p iceberg-datafusion --test ts_tz_pushdown`:
+    **4 red of 7**, including the boundary pin:
+    `boundary_row_survives_a_zoned_literal` returned `[3]` for
+    `ts >= V2@UTC` (expected `[2,3]` — the boundary row was silently
+    pruned by the shifted literal, a wrong answer DataFusion's Inexact
+    re-filter cannot repair) and
+    `filtered_rows_match_the_in_memory_reference` returned `[3]` for
+    `WHERE ts >= CAST(1703000000 AS TIMESTAMP)`.
+  - This is the load-bearing check for C-1: the zone string must be a
+    display label only — any mutation that routes the literal through a
+    `timestamp` <-> `timestamptz` value conversion moves the pushed
+    boundary and is caught end to end.
+- **Restore:** `git checkout HEAD -- expr_to_predicate.rs`; re-ran
+  `--lib ts_tz` (11/11 ok) and `--test ts_tz_pushdown` (7/7 ok).
+  `git status` clean afterwards.
 
 ## Gates
 
-Recorded after the final gate run.
+Final state, branch `fix/f-ts-pushdown-1`:
+
+| command | result |
+|---|---|
+| `cargo fmt --all -- --check` | clean (exit 0) |
+| `cargo clippy -p iceberg-datafusion -p iceberg --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test -p iceberg-datafusion --lib ts_tz` | 11 passed, 0 failed |
+| `cargo test -p iceberg-datafusion --lib expr_to_predicate` | 82 passed, 0 failed |
+| `cargo test -p iceberg-datafusion --lib predicate` | 86 passed, 0 failed |
+| `cargo test -p iceberg-datafusion --lib scan` | 42 passed, 0 failed |
+| `cargo test -p iceberg-datafusion --lib table` | 57 passed, 0 failed |
+| `cargo test -p iceberg-datafusion --test ts_tz_pushdown` | 7 passed, 0 failed |
+| `make check` | exit 0 — fmt --check, workspace clippy `-D warnings`, taplo, cargo-machete, agent-artifacts, matrix-anchors, comment-blocks, rust-file-size all OK |
+| `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/pb-fork2 origin/main HEAD` | `comment-ban hits=0` |
+
+Environment for every test run: `CARGO_BUILD_JOBS=6 RUST_TEST_THREADS=6`.
+
+One pre-existing pin updated as part of the fix:
+`tests::test_scalar_value_to_datum_timestamp` asserted `TimestampSecond`
+and `TimestampMillisecond` scalars convert to `None`; with the C-3
+exact-widening arms they now convert to scaled `timestamp_micros` datums,
+and the pin asserts the exact scaled value (and `i64::MAX`/`MIN` still
+return `None` via `checked_mul`, covered in
+`milli_and_second_literals_past_the_micros_range_are_not_pushed`).
