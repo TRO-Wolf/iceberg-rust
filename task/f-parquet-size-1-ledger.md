@@ -20,8 +20,8 @@
 # F-PARQUET-SIZE-1 — why a fork-written 50-row parquet file is larger than Spark's, measured first
 
 **Date:** 2026-09-18. **Base:** `origin/main` `587d3592` (fork tip at branch
-`fix/f-parquet-size-1`). **Model:** swe-2-high. **Path:** steps 1–2 MEASURE + CLASSIFY —
-this commit carries no product code.
+`fix/f-parquet-size-1`). **Model:** swe-2-high. **Path:** steps 1–2 MEASURE + CLASSIFY
+(first commit), steps 3–4 FIX + MUTATION (later commits).
 
 This ledger retires when the unit's fix lands or the owner removes the unit.
 
@@ -168,3 +168,55 @@ data-file writer (`Avro$WriteBuilder` stamps it too).
   `uuid`, `fixed`, `decimal`, nested list/map/struct — write → read → values + field ids.
 - Size cell: the 50-row RePark shape measured before (1 430) and after.
 - Mutation: revert the options → footer cell red.
+
+## Step 3–4 results — landed
+
+**Implementation.** New `file_writer/parquet_footer.rs::writer_options` builds the
+`ArrowWriterOptions` for every `ParquetWriter` (lazy init at
+`parquet_writer.rs:664-668`): `props.into_builder().set_key_value_metadata` injects
+`iceberg.schema` (replacing any same-key entry a caller supplied), and
+`with_skip_arrow_metadata(true)` suppresses the arrow-rs blob. `parquet_writer.rs` was
+at its legacy 3 391-line ceiling, so the helper lives in its own module; the test cell
+is `file_writer/parquet_footer_tests.rs`.
+
+**After-measurement (same probe, same rows).**
+
+| variant | before | after | Spark |
+|---|---|---|---|
+| RePark path (dict default-on), ids 200–249 | 1 430 | **1 098** | 1 146 |
+| RePark path, ids 250–299 | 1 467 | **1 135** | 1 178 |
+| INSERT path (dict off), ids 200–249 | 1 294 | **962** | 1 146 |
+
+Footer: 965 → 633 B (Spark 707 B); kv is now `{iceberg.schema: 194 B}` exactly. The fork
+file is now *smaller* than Spark's — residual −48 B is `created_by` (24 vs 71 B) plus
+thrift/encoding detail (class b). No fork-side change to encodings, compression, page
+version, statistics, or indexes.
+
+**Cells.** `parquet_footer_tests.rs` holds four cells:
+`footer_key_values_match_java` (full `DataFileWriter` path, kv == `{iceberg.schema}` and
+the JSON re-parses to the written schema), `footer_iceberg_schema_round_trips_all_types`
+(same pin over a 21-field schema covering every primitive + list/map/struct),
+`all_types_values_round_trip_without_arrow_schema` (write → `ParquetRecordBatchReader`
+read → value equality), and `repark_shape_file_size_matches_java_scale` (the 50-row
+shape must land < 1 300 B; measured 1 098).
+
+**Reader-safety evidence.** `test_all_type_for_write`,
+`test_parquet_writer_with_complex_schema`, the `write_defaults_tests` matrix, the
+equality/position-delete write-read cells, and `data_file_writer_tests` all read
+fork-written files back through `ParquetRecordBatchReader` inference — the same path
+that already reads Spark files (which never carried the key). One physical-type note:
+Iceberg `binary` writes as `LargeBinary`; without the blob, BYTE_ARRAY infers to
+`Binary` (parquet-rs `arrow/schema/primitive.rs:289`) — identical to what a Spark file
+of the same column already yields. The two shared check helpers
+(`writer::tests::check_parquet_data_file`, the equality-delete twin) now cast read
+columns to the expected Arrow type before value comparison; byte content is unchanged
+by the cast. `field_id`s still reach the reader via parquet `field_id` →
+`PARQUET:field_id` field metadata.
+
+**Mutation.** Reverting `try_new_with_options` → `try_new` turned all three footer/size
+cells red (`["ARROW:schema"]` vs `["iceberg.schema"]`; file back to 1 430 B) while the
+value round-trip stayed green — the cells fail on exactly the fixed mechanism. Fix
+restored; `cargo test -p iceberg --lib writer::` 162/162 green.
+
+**Test-run coverage.** `writer::` 162/162, `arrow:: + scan:: + maintenance:: +
+inspect::` 1 181/1 181, `iceberg-datafusion` write-filtered 15/15.
