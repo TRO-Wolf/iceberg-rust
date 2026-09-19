@@ -19,6 +19,8 @@ use std::collections::HashMap;
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_s3tables::config::Credentials;
+use iceberg::spec::{TableMetadata, TableProperties};
+use iceberg::{Error, ErrorKind, Result};
 
 /// Property aws profile name
 pub const AWS_PROFILE_NAME: &str = "profile_name";
@@ -68,4 +70,56 @@ pub(crate) async fn create_sdk_config(
     }
 
     config.load().await
+}
+
+fn under_warehouse(path: &str, warehouse: &str) -> bool {
+    let warehouse = warehouse.trim_end_matches('/');
+    let path = path.trim_end_matches('/');
+    path == warehouse || path.starts_with(&format!("{warehouse}/"))
+}
+
+pub(crate) fn ensure_write_paths_under_warehouse(
+    metadata: &TableMetadata,
+    metadata_location: &str,
+) -> Result<()> {
+    let warehouse = metadata.location();
+    if !under_warehouse(metadata_location, warehouse) {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "S3 Tables owns the table warehouse: metadata location {metadata_location} is outside {warehouse}"
+            ),
+        ));
+    }
+    for key in [
+        TableProperties::PROPERTY_WRITE_METADATA_LOCATION,
+        TableProperties::PROPERTY_WRITE_DATA_LOCATION,
+    ] {
+        if let Some(value) = metadata.properties().get(key)
+            && !under_warehouse(value, warehouse)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("S3 Tables owns the table warehouse: {key}={value} is outside {warehouse}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_no_write_path_override(properties: &HashMap<String, String>) -> Result<()> {
+    for key in [
+        TableProperties::PROPERTY_WRITE_METADATA_LOCATION,
+        TableProperties::PROPERTY_WRITE_DATA_LOCATION,
+    ] {
+        if let Some(value) = properties.get(key) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "S3 Tables generates the table warehouse: {key}={value} cannot be under it and cannot be honored"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
