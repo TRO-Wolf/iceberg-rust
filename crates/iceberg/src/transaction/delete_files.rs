@@ -2252,6 +2252,6 @@ mod tests {
         // `test_delete_from_row_filter_case_insensitive_wrong_case_deletes`.
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
-
     mod delete_files_extracted;
+    mod metadata_delete_tests;
 }

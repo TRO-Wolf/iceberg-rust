@@ -73,25 +73,27 @@ impl<'a> InclusiveMetricsEvaluator<'a> {
     }
 
     fn contains_nans_only(&self, field_id: i32) -> bool {
-        let nan_count = self.nan_count(field_id);
-        let value_count = self.value_count(field_id);
-
-        nan_count.is_some() && nan_count == value_count
+        let count = self.nan_count(field_id);
+        count.is_some() && count == self.value_count(field_id)
     }
 
     fn contains_nulls_only(&self, field_id: i32) -> bool {
-        let null_count = self.null_count(field_id);
-        let value_count = self.value_count(field_id);
-
-        null_count.is_some() && null_count == value_count
+        let count = self.null_count(field_id);
+        count.is_some() && count == self.value_count(field_id)
     }
 
     fn may_contain_null(&self, field_id: i32) -> bool {
-        if let Some(&null_count) = self.null_count(field_id) {
-            null_count > 0
-        } else {
-            true
+        self.null_count(field_id).copied().is_none_or(|c| c > 0)
+    }
+
+    fn unique_value(&self, reference: &BoundReference) -> Option<std::borrow::Cow<'_, Datum>> {
+        let field_id = reference.field().id;
+        if self.may_contain_null(field_id) || self.nan_count(field_id).is_some_and(|&n| n > 0) {
+            return None;
         }
+        let lower = self.lower_bound(reference)?;
+        let upper = self.upper_bound(reference)?;
+        (!lower.is_nan() && !upper.is_nan() && lower == upper).then_some(lower)
     }
 
     fn visit_inequality(
@@ -120,11 +122,7 @@ impl<'a> InclusiveMetricsEvaluator<'a> {
         };
 
         if let Some(bound) = bound.as_deref() {
-            if cmp_fn(bound, datum) {
-                return ROWS_MIGHT_MATCH;
-            }
-
-            return ROWS_CANNOT_MATCH;
+            return Ok(cmp_fn(bound, datum));
         }
 
         ROWS_MIGHT_MATCH
@@ -173,13 +171,7 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
-        if self.contains_nulls_only(field_id) {
-            return ROWS_CANNOT_MATCH;
-        }
-
-        ROWS_MIGHT_MATCH
+        Ok(!self.contains_nulls_only(reference.field().id))
     }
 
     fn is_nan(
@@ -283,13 +275,15 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
 
     fn not_eq(
         &mut self,
-        _reference: &BoundReference,
-        _datum: &Datum,
+        reference: &BoundReference,
+        datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        // Because the bounds are not necessarily a min or max value,
-        // this cannot be answered using them. notEq(col, X) with (X, Y)
-        // doesn't guarantee that X is a value in col.
+        if let Some(value) = self.unique_value(reference)
+            && value.as_ref().partial_cmp(datum) == Some(std::cmp::Ordering::Equal)
+        {
+            return ROWS_CANNOT_MATCH;
+        }
         ROWS_MIGHT_MATCH
     }
 
@@ -466,13 +460,15 @@ impl BoundPredicateVisitor for InclusiveMetricsEvaluator<'_> {
 
     fn not_in(
         &mut self,
-        _reference: &BoundReference,
-        _literals: &FnvHashSet<Datum>,
+        reference: &BoundReference,
+        literals: &FnvHashSet<Datum>,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        // Because the bounds are not necessarily a min or max value,
-        // this cannot be answered using them. notIn(col, {X, ...})
-        // with (X, Y) doesn't guarantee that X is a value in col.
+        if let Some(value) = self.unique_value(reference)
+            && literals.contains(&*value)
+        {
+            return ROWS_CANNOT_MATCH;
+        }
         ROWS_MIGHT_MATCH
     }
 }

@@ -21,6 +21,7 @@ use futures::channel::mpsc::Sender;
 use futures::{SinkExt, TryFutureExt};
 
 use crate::delete_file_index::DeleteFileIndex;
+use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::visitors::residual_evaluator::ResidualEvaluator;
 use crate::expr::{BoundPredicate, Predicate};
 use crate::io::object_cache::ObjectCache;
@@ -30,8 +31,9 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntry, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
-    PartitionSpecRef, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef, TableProperties,
+    DataContentType, DataFile, ManifestContentType, ManifestEntry, ManifestEntryRef, ManifestFile,
+    ManifestList, NameMapping, PartitionSpecRef, SchemaRef, SnapshotRef, TableMetadata,
+    TableMetadataRef, TableProperties,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -309,6 +311,56 @@ impl ManifestEntryContext {
         )?;
         Ok(Some(bound))
     }
+
+    pub(crate) fn survives_plan_filter(&self) -> Result<bool> {
+        survives_plan_filter(
+            &self.manifest_entry,
+            self.partition_spec_id,
+            self.bound_predicates.as_deref(),
+            &self.expression_evaluator_cache,
+        )
+    }
+}
+
+fn survives_plan_filter(
+    manifest_entry: &ManifestEntry,
+    partition_spec_id: i32,
+    bound_predicates: Option<&BoundPredicates>,
+    expression_evaluator_cache: &ExpressionEvaluatorCache,
+) -> Result<bool> {
+    if !manifest_entry.is_alive() {
+        return Ok(false);
+    }
+
+    if manifest_entry.content_type() != DataContentType::Data {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Encountered an entry for a delete file in a data file manifest",
+        ));
+    }
+
+    if let Some(BoundPredicates {
+        snapshot_bound_predicate,
+        partition_bound_predicate,
+    }) = bound_predicates
+    {
+        let expression_evaluator =
+            expression_evaluator_cache.get(partition_spec_id, partition_bound_predicate);
+
+        if !expression_evaluator.eval(manifest_entry.data_file())? {
+            return Ok(false);
+        }
+
+        if !InclusiveMetricsEvaluator::eval(
+            snapshot_bound_predicate,
+            manifest_entry.data_file(),
+            false,
+        )? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 /// PlanContext wraps a [`SnapshotRef`] alongside all the other
@@ -572,5 +624,64 @@ impl PlanContext {
             partition_spec,
             name_mapping: self.name_mapping.clone(),
         })
+    }
+
+    pub(crate) async fn try_for_each_data_file<F>(&self, mut f: F) -> Result<bool>
+    where F: FnMut(&DataFile) -> Result<bool> {
+        let manifest_list = self.get_manifest_list().await?;
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != ManifestContentType::Data {
+                continue;
+            }
+
+            let bound_predicates = if self.predicate.is_some() {
+                let partition_bound_predicate = self.get_partition_filter(manifest_file)?;
+                if !self
+                    .manifest_evaluator_cache
+                    .get(
+                        manifest_file.partition_spec_id,
+                        partition_bound_predicate.clone(),
+                    )
+                    .eval(manifest_file)?
+                {
+                    continue;
+                }
+                Some(BoundPredicates {
+                    partition_bound_predicate,
+                    snapshot_bound_predicate: self.snapshot_bound_predicate.clone().ok_or(
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "Expected a snapshot-bound predicate but none present",
+                        ),
+                    )?,
+                })
+            } else {
+                None
+            };
+
+            let manifest = self
+                .object_cache
+                .get_manifest(manifest_file, Some(self.snapshot_schema.clone()))
+                .await?;
+            let partition_type = self
+                .table_metadata
+                .partition_spec_by_id(manifest_file.partition_spec_id)
+                .and_then(|spec| spec.partition_type(&self.snapshot_schema).ok());
+
+            for manifest_entry in manifest.entries() {
+                let manifest_entry =
+                    ManifestEntry::with_promoted_partition(manifest_entry, partition_type.as_ref());
+                if survives_plan_filter(
+                    &manifest_entry,
+                    manifest_file.partition_spec_id,
+                    bound_predicates.as_ref(),
+                    &self.expression_evaluator_cache,
+                )? && !f(manifest_entry.data_file())?
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 }

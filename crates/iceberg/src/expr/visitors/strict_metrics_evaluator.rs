@@ -18,16 +18,14 @@
 use fnv::FnvHashSet;
 
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
+use crate::expr::visitors::strict_prefix_eval;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::spec::{DataFile, Datum};
 use crate::{Error, ErrorKind, Result};
 
-#[allow(dead_code)]
 const ROWS_MUST_MATCH: Result<bool> = Ok(true);
-#[allow(dead_code)]
 const ROWS_MIGHT_NOT_MATCH: Result<bool> = Ok(false);
 
-#[allow(dead_code)]
 /// Evaluates an `Expression` on a `DataFile` to test whether all rows in the file match.
 ///  
 /// This evaluation is strict: it returns true if all rows in a file must match the expression.
@@ -41,7 +39,6 @@ pub(crate) struct StrictMetricsEvaluator<'a> {
 }
 
 impl<'a> StrictMetricsEvaluator<'a> {
-    #[allow(dead_code)]
     fn new(data_file: &'a DataFile) -> Self {
         StrictMetricsEvaluator { data_file }
     }
@@ -50,7 +47,6 @@ impl<'a> StrictMetricsEvaluator<'a> {
     /// provided [`DataFile`]'s metrics. Used by [`TableScan`] to
     /// see if this `DataFile` contains data that could match
     /// the scan's filter.
-    #[allow(dead_code)]
     pub(crate) fn eval(filter: &'a BoundPredicate, data_file: &'a DataFile) -> crate::Result<bool> {
         if data_file.record_count == 0 {
             return ROWS_MUST_MATCH;
@@ -120,6 +116,13 @@ impl<'a> StrictMetricsEvaluator<'a> {
             .is_some_and(|&nan_count| nan_count > 0)
     }
 
+    fn cannot_prove_match(&self, reference: &BoundReference) -> bool {
+        let field_id = reference.field().id;
+        reference.accessor().is_nested()
+            || self.may_contain_null(field_id)
+            || self.may_contain_nan(field_id)
+    }
+
     fn visit_inequality(
         &mut self,
         reference: &BoundReference,
@@ -127,9 +130,7 @@ impl<'a> StrictMetricsEvaluator<'a> {
         cmp_fn: fn(&Datum, &Datum) -> bool,
         use_lower_bound: bool,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
-        if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
+        if self.cannot_prove_match(reference) {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
@@ -180,9 +181,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
-        if self.contains_nulls_only(field_id) {
+        if !reference.accessor().is_nested() && self.contains_nulls_only(reference.field().id) {
             return ROWS_MUST_MATCH;
         }
 
@@ -194,15 +193,12 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
-        if let Some(&count) = self.null_count(field_id) {
-            if count == 0 {
-                return ROWS_MUST_MATCH;
-            } else {
-                return ROWS_MIGHT_NOT_MATCH;
-            }
+        if !reference.accessor().is_nested()
+            && self.null_count(reference.field().id).copied() == Some(0)
+        {
+            return ROWS_MUST_MATCH;
         }
+
         ROWS_MIGHT_NOT_MATCH
     }
 
@@ -211,11 +207,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
-        let contains_only = self.contains_nans_only(field_id);
-
-        if contains_only {
+        if self.contains_nans_only(reference.field().id) {
             return ROWS_MUST_MATCH;
         }
 
@@ -229,13 +221,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
     ) -> crate::Result<bool> {
         let field_id = reference.field().id;
 
-        if let Some(&nan_count) = self.nan_count(field_id)
-            && nan_count == 0
-        {
-            return ROWS_MUST_MATCH;
-        }
-
-        if self.contains_nulls_only(field_id) {
+        if self.nan_count(field_id).copied() == Some(0) || self.contains_nulls_only(field_id) {
             return ROWS_MUST_MATCH;
         }
 
@@ -301,20 +287,15 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
-        if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
+        if self.cannot_prove_match(reference) {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
-        if let (Some(lower), Some(upper)) = (self.lower(reference), self.upper(reference)) {
-            // For an equality predicate to hold strictly, we must have:
-            //     lower == literal.value == upper.
-            if lower.literal() == datum.literal() && upper.literal() == datum.literal() {
-                return ROWS_MUST_MATCH;
-            } else {
-                return ROWS_MIGHT_NOT_MATCH;
-            }
+        if let (Some(lower), Some(upper)) = (self.lower(reference), self.upper(reference))
+            && lower.as_ref().partial_cmp(datum) == Some(std::cmp::Ordering::Equal)
+            && upper.as_ref().partial_cmp(datum) == Some(std::cmp::Ordering::Equal)
+        {
+            return ROWS_MUST_MATCH;
         }
 
         ROWS_MIGHT_NOT_MATCH
@@ -326,9 +307,10 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
-        if self.contains_nulls_only(field_id) || self.contains_nans_only(field_id) {
+        if !reference.accessor().is_nested()
+            && (self.contains_nulls_only(reference.field().id)
+                || self.contains_nans_only(reference.field().id))
+        {
             return ROWS_MUST_MATCH;
         }
 
@@ -336,7 +318,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
             if lower.is_nan() {
                 return ROWS_MIGHT_NOT_MATCH;
             }
-            if lower.literal() > datum.literal() {
+            if lower.as_ref() > datum {
                 return ROWS_MUST_MATCH;
             }
         }
@@ -345,7 +327,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
             if upper.is_nan() {
                 return ROWS_MIGHT_NOT_MATCH;
             }
-            if upper.literal() < datum.literal() {
+            if upper.as_ref() < datum {
                 return ROWS_MUST_MATCH;
             }
         }
@@ -355,20 +337,20 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
 
     fn starts_with(
         &mut self,
-        _reference: &BoundReference,
-        _datum: &Datum,
+        reference: &BoundReference,
+        datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        ROWS_MIGHT_NOT_MATCH
+        strict_prefix_eval::eval_starts_with(self.data_file, reference, datum)
     }
 
     fn not_starts_with(
         &mut self,
-        _reference: &BoundReference,
-        _datum: &Datum,
+        reference: &BoundReference,
+        datum: &Datum,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        ROWS_MIGHT_NOT_MATCH
+        strict_prefix_eval::eval_not_starts_with(self.data_file, reference, datum)
     }
 
     fn r#in(
@@ -377,9 +359,7 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         literals: &FnvHashSet<Datum>,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
-        if self.may_contain_null(field_id) || self.may_contain_nan(field_id) {
+        if self.cannot_prove_match(reference) {
             return ROWS_MIGHT_NOT_MATCH;
         }
 
@@ -400,9 +380,10 @@ impl BoundPredicateVisitor for StrictMetricsEvaluator<'_> {
         literals: &FnvHashSet<Datum>,
         _predicate: &BoundPredicate,
     ) -> crate::Result<bool> {
-        let field_id = reference.field().id;
-
-        if self.contains_nulls_only(field_id) || self.contains_nans_only(field_id) {
+        if !reference.accessor().is_nested()
+            && (self.contains_nulls_only(reference.field().id)
+                || self.contains_nans_only(reference.field().id))
+        {
             return ROWS_MUST_MATCH;
         }
 
@@ -982,11 +963,11 @@ mod test {
         assert!(!result, "Should skip: equal on all-null column");
 
         let result = StrictMetricsEvaluator::eval(&starts_with("all_nulls", "a"), &file).unwrap();
-        assert!(!result, "Strict eval: startsWith always returns false");
+        assert!(!result, "Should skip: startsWith on a nullable column");
 
         let result =
             StrictMetricsEvaluator::eval(&not_starts_with("all_nulls", "a"), &file).unwrap();
-        assert!(!result, "Strict eval: notStartsWith always returns false");
+        assert!(result, "Should read: notStartsWith on an all-null column");
 
         // "some_nulls" (field 5) has some nulls.
         let result = StrictMetricsEvaluator::eval(&not_null("some_nulls"), &file).unwrap();
@@ -1472,10 +1453,13 @@ mod test {
         let result = StrictMetricsEvaluator::eval(&starts_with("required", "a"), &file1).unwrap();
         assert!(
             !result,
-            "strict eval: startsWith always false (no metrics support)"
+            "strict eval: startsWith unproven without both bounds"
         );
         let result = StrictMetricsEvaluator::eval(&starts_with("required", "a"), &file2).unwrap();
-        assert!(!result, "strict eval: startsWith always false");
+        assert!(
+            !result,
+            "strict eval: startsWith unproven when the column is nullable"
+        );
     }
 
     #[test]
@@ -1485,10 +1469,16 @@ mod test {
 
         let result =
             StrictMetricsEvaluator::eval(&not_starts_with("required", "a"), &file1).unwrap();
-        assert!(!result, "Strict eval: notStartsWith always false");
+        assert!(
+            !result,
+            "Strict eval: notStartsWith unproven without both bounds"
+        );
         let result =
             StrictMetricsEvaluator::eval(&not_starts_with("required", "a"), &file2).unwrap();
-        assert!(!result, "Strict eval: notStartsWith always false");
+        assert!(
+            !result,
+            "Strict eval: notStartsWith unproven when bounds overlap the prefix"
+        );
     }
 
     #[test]

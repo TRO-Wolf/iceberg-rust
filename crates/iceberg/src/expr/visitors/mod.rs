@@ -40,4 +40,5 @@ pub(crate) mod residual_evaluator;
 pub(crate) mod rewrite_not;
 pub(crate) mod row_group_metrics_evaluator;
 pub(crate) mod strict_metrics_evaluator;
+pub(crate) mod strict_prefix_eval;
 pub(crate) mod strict_projection;
