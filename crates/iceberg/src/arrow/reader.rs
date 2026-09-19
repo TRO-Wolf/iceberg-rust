@@ -50,9 +50,11 @@ use crate::arrow::avro_reader::read_avro_data_file;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::delete_filter::positional_delete_keep_mask;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
+use crate::arrow::footer_cache::TableFooterCache;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::open_parquet::page_index_policy;
 use crate::arrow::orc_reader::read_orc_data_file;
+use crate::arrow::ranges::merge_ranges;
 use crate::arrow::record_batch_predicate::{
     evaluate_predicate_to_mask, is_nan_row_mask, not_nan_row_mask, null_filled,
 };
@@ -157,6 +159,7 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     prefetched_parquet_metadata: HashMap<Arc<str>, Arc<ParquetMetaData>>,
+    footer_cache: Option<TableFooterCache>,
 }
 
 impl ArrowReaderBuilder {
@@ -172,6 +175,7 @@ impl ArrowReaderBuilder {
             row_selection_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
             prefetched_parquet_metadata: HashMap::new(),
+            footer_cache: None,
         }
     }
 
@@ -234,6 +238,12 @@ impl ArrowReaderBuilder {
         self
     }
 
+    #[allow(missing_docs)]
+    pub fn with_footer_cache(mut self, footer_cache: TableFooterCache) -> Self {
+        self.footer_cache = Some(footer_cache);
+        self
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
@@ -248,6 +258,7 @@ impl ArrowReaderBuilder {
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
             prefetched_parquet_metadata: Arc::new(self.prefetched_parquet_metadata),
+            footer_cache: self.footer_cache,
         }
     }
 }
@@ -266,6 +277,7 @@ pub struct ArrowReader {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     prefetched_parquet_metadata: Arc<HashMap<Arc<str>, Arc<ParquetMetaData>>>,
+    footer_cache: Option<TableFooterCache>,
 }
 
 impl ArrowReader {
@@ -279,6 +291,7 @@ impl ArrowReader {
         let row_selection_enabled = self.row_selection_enabled;
         let parquet_read_options = self.parquet_read_options;
         let prefetched_parquet_metadata = self.prefetched_parquet_metadata;
+        let footer_cache = self.footer_cache;
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
         let stream: ArrowRecordBatchStream = if concurrency_limit_data_files == 1 {
@@ -299,6 +312,7 @@ impl ArrowReader {
                             row_selection_enabled,
                             parquet_read_options,
                             prefetched_metadata,
+                            footer_cache.clone(),
                         )
                     })
                     .map_err(|err| {
@@ -325,6 +339,7 @@ impl ArrowReader {
                             row_selection_enabled,
                             parquet_read_options,
                             prefetched_metadata,
+                            footer_cache.clone(),
                         )
                     })
                     .map_err(|err| {
@@ -357,6 +372,7 @@ impl ArrowReader {
         row_selection_enabled: bool,
         parquet_read_options: ParquetReadOptions,
         prefetched_metadata: Option<Arc<ParquetMetaData>>,
+        footer_cache: Option<TableFooterCache>,
     ) -> Result<ArrowRecordBatchStream> {
         Self::reject_variant_projection(&task)?;
         match task.data_file_format {
@@ -370,6 +386,7 @@ impl ArrowReader {
                     row_selection_enabled,
                     parquet_read_options,
                     prefetched_metadata,
+                    footer_cache,
                 )
                 .await
             }
@@ -429,6 +446,7 @@ impl ArrowReader {
         row_selection_enabled: bool,
         parquet_read_options: ParquetReadOptions,
         prefetched_metadata: Option<Arc<ParquetMetaData>>,
+        footer_cache: Option<TableFooterCache>,
     ) -> Result<ArrowRecordBatchStream> {
         let predicate_can_prune = task
             .predicate
@@ -444,12 +462,13 @@ impl ArrowReader {
         let delete_filter_rx =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
 
-        let (parquet_file_reader, arrow_metadata) = Self::open_parquet_file(
+        let (parquet_file_reader, arrow_metadata) = Self::open_parquet_file_cached(
             &task.data_file_path,
             &file_io,
             task.file_size_in_bytes,
             parquet_read_options,
             prefetched_metadata,
+            footer_cache,
         )
         .await?;
 
@@ -2524,42 +2543,6 @@ impl AsyncFileReader for ArrowFileReader {
         }
         .boxed()
     }
-}
-
-/// Merge overlapping or nearby byte ranges, combining ranges with gaps <= `coalesce` bytes.
-/// Adapted from object_store's `merge_ranges` in `util.rs`.
-fn merge_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
-    if ranges.is_empty() {
-        return vec![];
-    }
-
-    let mut ranges = ranges.to_vec();
-    ranges.sort_unstable_by_key(|r| r.start);
-
-    let mut merged = Vec::with_capacity(ranges.len());
-    let mut start_idx = 0;
-    let mut end_idx = 1;
-
-    while start_idx != ranges.len() {
-        let mut range_end = ranges[start_idx].end;
-
-        while end_idx != ranges.len()
-            && ranges[end_idx]
-                .start
-                .checked_sub(range_end)
-                .map(|delta| delta <= coalesce)
-                .unwrap_or(true)
-        {
-            range_end = range_end.max(ranges[end_idx].end);
-            end_idx += 1;
-        }
-
-        merged.push(ranges[start_idx].start..range_end);
-        start_idx = end_idx;
-        end_idx += 1;
-    }
-
-    merged
 }
 
 /// Casts a literal to the column's Arrow type. The reader may return `LargeUtf8` or `Utf8View`

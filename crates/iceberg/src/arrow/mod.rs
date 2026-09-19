@@ -32,10 +32,13 @@ pub(crate) mod delete_filter;
 pub use delete_filter::DeleteFilter;
 pub(crate) mod equality_delete_set;
 
+mod footer_cache;
+pub use footer_cache::{ParquetFooterCache, ParquetFooterCacheStats, TableFooterCache};
 mod int96;
 pub(crate) mod null_propagation;
 mod open_parquet;
 pub(crate) mod orc_reader;
+mod ranges;
 mod reader;
 pub(crate) mod record_batch_predicate;
 /// RecordBatch projection utilities
