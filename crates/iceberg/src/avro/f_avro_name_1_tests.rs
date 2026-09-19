@@ -15,23 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 
+use apache_avro::Reader as AvroReader;
 use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
+use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 
 use super::schema_to_avro_schema;
 use crate::arrow::avro_reader::read_avro_data_bytes;
 use crate::arrow::schema_to_arrow_schema;
+use crate::avro::name::{ocf_json_parse_count, repair_avro_container};
 use crate::expr::Reference;
 use crate::io::{FileIO, LocalFsStorageFactory};
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
-    DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal, Manifest,
-    ManifestEntry, ManifestStatus, ManifestWriterBuilder, NestedField, PartitionSpec,
-    PrimitiveType, Schema, Struct, Transform, Type,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
+    Manifest, ManifestEntry, ManifestStatus, ManifestWriterBuilder, NestedField, PartitionSpec,
+    PrimitiveType, Schema, Struct, StructType, Transform, Type, read_data_files_from_avro,
+    write_data_files_to_avro,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -509,4 +515,214 @@ async fn avro_data_file_round_trip_sanitizes_value_keys() {
     let emoji = string_col(batch, "c\u{1F600}");
     assert_eq!(emoji.value(0), "e");
     assert!(emoji.is_null(1));
+}
+
+struct NoReadToEnd<R>(R);
+
+impl<R: Read> Read for NoReadToEnd<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+
+    fn read_to_end(&mut self, _buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        Err(std::io::Error::other(
+            "read_to_end is forbidden: the container must be streamed",
+        ))
+    }
+}
+
+fn avro_long_out(out: &mut Vec<u8>, value: i64) {
+    let mut n = ((value << 1) ^ (value >> 63)) as u64;
+    loop {
+        if n & !0x7f == 0 {
+            out.push(n as u8);
+            return;
+        }
+        out.push((n as u8 & 0x7f) | 0x80);
+        n >>= 7;
+    }
+}
+
+fn test_long(bs: &[u8], i: &mut usize) -> i64 {
+    let mut v: u64 = 0;
+    let mut s = 0u32;
+    loop {
+        let c = bs[*i];
+        *i += 1;
+        v |= u64::from(c & 0x7f) << s;
+        if c & 0x80 == 0 {
+            return ((v >> 1) as i64) ^ -((v & 1) as i64);
+        }
+        s += 7;
+    }
+}
+
+fn test_bytes<'a>(bs: &'a [u8], i: &mut usize) -> &'a [u8] {
+    let n = test_long(bs, i) as usize;
+    let s = &bs[*i..*i + n];
+    *i += n;
+    s
+}
+
+fn ocf_parts(bs: &[u8]) -> (Vec<(Vec<u8>, Vec<u8>)>, [u8; 16], usize) {
+    let mut i = 4usize;
+    let mut entries = Vec::new();
+    loop {
+        let mut count = test_long(bs, &mut i);
+        if count == 0 {
+            break;
+        }
+        if count < 0 {
+            count = -count;
+            test_long(bs, &mut i);
+        }
+        for _ in 0..count {
+            let k = test_bytes(bs, &mut i).to_vec();
+            let v = test_bytes(bs, &mut i).to_vec();
+            entries.push((k, v));
+        }
+    }
+    let sync: [u8; 16] = bs[i..i + 16].try_into().unwrap();
+    (entries, sync, i + 16)
+}
+
+fn ocf_container(entries: &[(Vec<u8>, Vec<u8>)], sync: [u8; 16], body: &[u8]) -> Vec<u8> {
+    let mut out = b"Obj\x01".to_vec();
+    avro_long_out(&mut out, entries.len() as i64);
+    for (k, v) in entries {
+        avro_long_out(&mut out, k.len() as i64);
+        out.extend_from_slice(k);
+        avro_long_out(&mut out, v.len() as i64);
+        out.extend_from_slice(v);
+    }
+    avro_long_out(&mut out, 0);
+    out.extend_from_slice(&sync);
+    out.extend_from_slice(body);
+    out
+}
+
+fn unfix_schema_name(node: &mut JsonValue, good: &str, broken: &str) {
+    match node {
+        JsonValue::Object(map) => {
+            if map.get("name").and_then(JsonValue::as_str) == Some(good) {
+                map.insert("name".to_string(), JsonValue::String(broken.to_string()));
+                map.remove("iceberg-field-name");
+            }
+            for value in map.values_mut() {
+                unfix_schema_name(value, good, broken);
+            }
+        }
+        JsonValue::Array(items) => items
+            .iter_mut()
+            .for_each(|v| unfix_schema_name(v, good, broken)),
+        _ => {}
+    }
+}
+
+fn one_data_file(partition: Struct) -> DataFile {
+    DataFile {
+        content: DataContentType::Data,
+        file_path: "s3://b/f.parquet".to_string(),
+        file_format: DataFileFormat::Parquet,
+        partition,
+        record_count: 1,
+        file_size_in_bytes: 10,
+        column_sizes: HashMap::new(),
+        value_counts: HashMap::new(),
+        null_value_counts: HashMap::new(),
+        nan_value_counts: HashMap::new(),
+        lower_bounds: HashMap::new(),
+        upper_bounds: HashMap::new(),
+        key_metadata: None,
+        split_offsets: None,
+        equality_ids: None,
+        sort_order_id: None,
+        partition_spec_id: 0,
+        first_row_id: None,
+        referenced_data_file: None,
+        content_offset: None,
+        content_size_in_bytes: None,
+    }
+}
+
+fn tiny_schema() -> Schema {
+    Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn ocf_repair_json_parses_only_when_schema_names_need_it() {
+    let dir = format!("{}/testdata/avro_names", env!("CARGO_MANIFEST_DIR"));
+    let valid = std::fs::read(format!("{dir}/valid_v2-m0.avro")).unwrap();
+    let renamed = std::fs::read(format!("{dir}/space_v2-m0.avro")).unwrap();
+    let before = ocf_json_parse_count();
+    for bs in [&valid, &renamed] {
+        let repaired = repair_avro_container(bs).unwrap();
+        assert!(matches!(repaired, Cow::Borrowed(_)));
+        assert_eq!(repaired.as_ref(), bs.as_slice());
+    }
+    assert_eq!(ocf_json_parse_count(), before);
+
+    let broken = std::fs::read(format!("{dir}/repark_broken_space_m0.avro")).unwrap();
+    let repaired = repair_avro_container(&broken).unwrap();
+    assert!(matches!(repaired, Cow::Owned(_)));
+    assert_eq!(ocf_json_parse_count(), before + 1);
+}
+
+#[test]
+fn data_files_avro_reader_streams_without_read_to_end() {
+    let schema = tiny_schema();
+    let partition_type = StructType::new(vec![]);
+    let mut bytes = Vec::new();
+    write_data_files_to_avro(
+        &mut bytes,
+        vec![one_data_file(Struct::empty())],
+        &partition_type,
+        FormatVersion::V2,
+    )
+    .unwrap();
+    let mut reader = NoReadToEnd(Cursor::new(bytes));
+    let files =
+        read_data_files_from_avro(&mut reader, &schema, 0, &partition_type, FormatVersion::V2)
+            .unwrap();
+    assert_eq!(files.len(), 1);
+}
+
+#[test]
+fn data_files_avro_reader_repairs_schema_names_while_streaming() {
+    let schema = tiny_schema();
+    let partition_type = StructType::new(vec![
+        NestedField::optional(1000, "my col", Type::Primitive(PrimitiveType::String)).into(),
+    ]);
+    let mut good = Vec::new();
+    write_data_files_to_avro(
+        &mut good,
+        vec![one_data_file(Struct::from_iter([Some(Literal::string(
+            "x",
+        ))]))],
+        &partition_type,
+        FormatVersion::V2,
+    )
+    .unwrap();
+    let (mut entries, sync, body_off) = ocf_parts(&good);
+    let schema_entry = entries
+        .iter_mut()
+        .find(|(k, _)| k == b"avro.schema")
+        .unwrap();
+    let mut json: JsonValue = serde_json::from_slice(&schema_entry.1).unwrap();
+    unfix_schema_name(&mut json, "my_x20col", "my col");
+    schema_entry.1 = serde_json::to_vec(&json).unwrap();
+    let broken = ocf_container(&entries, sync, &good[body_off..]);
+    assert!(AvroReader::new(Cursor::new(&broken)).is_err());
+
+    let mut reader = NoReadToEnd(Cursor::new(broken));
+    let files =
+        read_data_files_from_avro(&mut reader, &schema, 0, &partition_type, FormatVersion::V2)
+            .unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].partition[0], Some(Literal::string("x")));
 }

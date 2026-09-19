@@ -28,6 +28,14 @@ use crate::{Error, ErrorKind, Result};
 
 pub(crate) const ICEBERG_FIELD_NAME_PROP: &str = "iceberg-field-name";
 
+#[cfg(test)]
+static OCF_JSON_PARSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn ocf_json_parse_count() -> usize {
+    OCF_JSON_PARSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static JAVA_LETTER_RANGES: &[(u16, u16)] = &[
     (0x0041, 0x005A),
     (0x0061, 0x007A),
@@ -749,6 +757,8 @@ pub(crate) fn repair_avro_container(bs: &[u8]) -> Result<Cow<'_, [u8]>> {
     else {
         return Ok(Cow::Borrowed(bs));
     };
+    #[cfg(test)]
+    OCF_JSON_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Ok(mut json) = serde_json::from_slice::<JsonValue>(&schema_bytes) else {
         return Ok(Cow::Borrowed(bs));
     };
