@@ -31,6 +31,20 @@ impl Predicate {
             .bind(schema, case_sensitive)
     }
 
+    #[allow(missing_docs)]
+    pub fn bind_for_scan(
+        &self,
+        schema: &SchemaRef,
+        case_sensitive: bool,
+        file_prune_only: bool,
+    ) -> Result<BoundPredicate> {
+        if file_prune_only {
+            self.bind_pruning(schema.clone(), case_sensitive)
+        } else {
+            self.bind(schema.clone(), case_sensitive)
+        }
+    }
+
     fn drop_unbindable_terms_at(
         &self,
         schema: &SchemaRef,
@@ -240,5 +254,12 @@ mod tests {
                 .bind_pruning(schema(), true)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn bind_for_scan_widens_only_when_prune_only() {
+        let predicate = Reference::new("xs").is_null();
+        assert!(predicate.bind_for_scan(&schema(), true, true).is_ok());
+        assert!(predicate.bind_for_scan(&schema(), true, false).is_err());
     }
 }

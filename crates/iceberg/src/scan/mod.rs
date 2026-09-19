@@ -504,7 +504,7 @@ impl<'a> TableScanBuilder<'a> {
             // Bind with the builder's case sensitivity. `PlanContext` already rebinds the
             // partition filter that way, so a hardcoded `true` here made
             // `InclusiveMetricsEvaluator` disagree with the partition prune.
-            Some(predicates.bind_pruning(schema.clone(), self.case_sensitive)?)
+            Some(predicates.bind_for_scan(&schema, self.case_sensitive, self.file_prune_only)?)
         } else {
             None
         };

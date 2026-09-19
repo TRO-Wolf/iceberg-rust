@@ -21,7 +21,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Int32Array, UInt64Array};
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
-use iceberg::expr::{Bind, Predicate, Reference};
+use iceberg::expr::{Predicate, Reference};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::spec::{
     Datum, FormatVersion, ListType, MapType, NestedField, PrimitiveType, Schema as IcebergSchema,
