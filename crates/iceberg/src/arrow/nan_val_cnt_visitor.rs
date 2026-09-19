@@ -301,7 +301,8 @@ mod tests {
         let metrics = MetricsConfig::from_properties(&std::collections::HashMap::from([(
             "write.metadata.metrics.default".to_string(),
             "none".to_string(),
-        )]));
+        )]))
+        .unwrap();
         assert_eq!(metrics.default_mode_of(), MetricsMode::None);
         assert!(
             !schema_needs_nan_value_counts(&schema, &metrics),
@@ -389,7 +390,8 @@ mod tests {
         let metrics = MetricsConfig::from_properties(&std::collections::HashMap::from([(
             "write.metadata.metrics.default".to_string(),
             "counts".to_string(),
-        )]));
+        )]))
+        .unwrap();
         assert_eq!(metrics.default_mode_of(), MetricsMode::Counts);
         assert!(
             schema_needs_nan_value_counts(&schema, &metrics),
@@ -407,7 +409,8 @@ mod tests {
         let metrics = MetricsConfig::from_properties(&std::collections::HashMap::from([(
             "write.metadata.metrics.default".to_string(),
             "truncate(1)".to_string(),
-        )]));
+        )]))
+        .unwrap();
         assert!(
             matches!(metrics.default_mode_of(), MetricsMode::Truncate(1)),
             "parsed truncate(1)"
@@ -433,7 +436,8 @@ mod tests {
                 "write.metadata.metrics.column.b".to_string(),
                 "full".to_string(),
             ),
-        ]));
+        ]))
+        .unwrap();
         assert!(
             schema_needs_nan_value_counts(&schema, &metrics),
             "gate true when any float leaf collects counts"
@@ -456,7 +460,8 @@ mod tests {
                 "write.metadata.metrics.column.score".to_string(),
                 "full".to_string(),
             ),
-        ]));
+        ]))
+        .unwrap();
         assert!(
             schema_needs_nan_value_counts(&schema, &metrics),
             "per-column full override must enable the NaN visitor when default is none"
@@ -473,7 +478,8 @@ mod tests {
         let metrics = MetricsConfig::from_properties(&std::collections::HashMap::from([(
             "write.metadata.metrics.column.score".to_string(),
             "none".to_string(),
-        )]));
+        )]))
+        .unwrap();
         assert!(
             !schema_needs_nan_value_counts(&schema, &metrics),
             "per-column none on the only float must skip the NaN visitor"

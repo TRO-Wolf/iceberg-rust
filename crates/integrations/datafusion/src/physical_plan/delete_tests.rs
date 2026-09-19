@@ -51,6 +51,9 @@ use super::{
     position_delete_unpartitioned_fast_path, sort_position_delete_pairs, *,
 };
 
+#[path = "delete_metrics_tests.rs"]
+mod metrics_tests;
+
 // An assignment must never smuggle a NULL into a REQUIRED column. A dictionary or REE array
 // whose VALUES hold a NULL reports `null_count() == 0`, and `RecordBatch::try_new`'s own check
 // is physical too, so the NULL passes both gates and is written.

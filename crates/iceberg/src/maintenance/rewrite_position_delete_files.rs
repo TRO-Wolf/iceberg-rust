@@ -662,6 +662,7 @@ impl RewritePositionDeleteFiles {
                 partition.clone(),
             )?,
             writer_config: PositionDeleteWriterConfig::new()?,
+            metrics_config: Arc::new(MetricsConfig::for_position_delete_table(metadata)?),
             parquet_properties: position_delete_writer_properties_for(metadata.properties())?,
             location_gen: DefaultLocationGenerator::new(metadata.clone())?,
             file_name_gen: DefaultFileNameGenerator::new(
@@ -685,7 +686,7 @@ impl RewritePositionDeleteFiles {
             factory.parquet_properties.clone(),
             factory.writer_config.schema().clone(),
         )
-        .with_metrics_config(MetricsConfig::for_position_delete());
+        .with_metrics_config(factory.metrics_config.clone());
         // writeMax, not the resolved target. On 32-bit a larger bound saturates to "never roll".
         let rolling = RollingFileWriterBuilder::new(
             parquet_builder,
@@ -976,6 +977,7 @@ struct LiveDeleteEntry {
 struct GroupWriteFactory {
     partition_key: PartitionKey,
     writer_config: PositionDeleteWriterConfig,
+    metrics_config: Arc<MetricsConfig>,
     parquet_properties: WriterProperties,
     location_gen: DefaultLocationGenerator,
     file_name_gen: DefaultFileNameGenerator,
