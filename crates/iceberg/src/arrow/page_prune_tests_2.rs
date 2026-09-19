@@ -277,8 +277,7 @@ async fn n_all_null_pages_skipped_for_lt_declared_divergence() {
     );
     let metadata = file_metadata(&data_path);
     let ci = metadata.column_index().expect("column index");
-    if let parquet::file::page_index::column_index::ColumnIndexMetaData::BYTE_ARRAY(idx) =
-        &ci[0][1]
+    if let parquet::file::page_index::column_index::ColumnIndexMetaData::BYTE_ARRAY(idx) = &ci[0][1]
     {
         for p in 0..2 {
             assert!(
@@ -303,11 +302,7 @@ async fn n_all_null_pages_skipped_for_lt_declared_divergence() {
         true,
     )
     .await;
-    let off = collect(
-        task(&data_path, schema, &[1, 2], Some(predicate)),
-        false,
-    )
-    .await;
+    let off = collect(task(&data_path, schema, &[1, 2], Some(predicate)), false).await;
     assert_eq!(dump(&on).len(), ROWS - 128);
     assert_eq!(dump(&off).len(), ROWS);
 }

@@ -187,12 +187,8 @@ impl<'a> PageIndexEvaluator<'a> {
                 .expect("row counts just cached")
         };
 
-        let Some(page_filter) = Self::apply_predicate_to_column_index(
-            predicate,
-            field_type,
-            column_index,
-            row_counts,
-        )?
+        let Some(page_filter) =
+            Self::apply_predicate_to_column_index(predicate, field_type, column_index, row_counts)?
         else {
             return self.select_all_rows();
         };

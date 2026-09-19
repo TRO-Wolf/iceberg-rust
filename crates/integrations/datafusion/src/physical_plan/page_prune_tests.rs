@@ -487,10 +487,7 @@ async fn sql_door_nulls_under_lt_le_not_gt_three_valued() {
             "SELECT id FROM catalog.ns.t WHERE s < 'v999'",
             expected_lt.clone(),
         ),
-        (
-            "SELECT id FROM catalog.ns.t WHERE s <= 'z'",
-            expected_lt,
-        ),
+        ("SELECT id FROM catalog.ns.t WHERE s <= 'z'", expected_lt),
         (
             "SELECT id FROM catalog.ns.t WHERE NOT (s > 'a')",
             Vec::new(),
