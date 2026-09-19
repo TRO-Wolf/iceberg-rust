@@ -29,7 +29,9 @@ mod tests {
     use rand::Rng;
     use tempfile::NamedTempFile;
 
-    use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
+    use crate::expr::visitors::page_index_evaluator::{
+        PageIndexEvaluator, PageNullCount,
+    };
     use crate::expr::{Bind, Reference};
     use crate::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
     use crate::{ErrorKind, Result};
@@ -550,6 +552,49 @@ mod tests {
         assert_eq!(result, expected);
 
         Ok(())
+    }
+
+    #[test]
+    fn inequality_incomparable_bound_keeps_page() {
+        let bound = Datum::int(7);
+        let literal = Datum::string("b");
+        assert!(bound.partial_cmp(&literal).is_none());
+
+        for (cmp_fn, use_lower_bound) in [
+            (PartialOrd::lt as fn(&Datum, &Datum) -> bool, true),
+            (PartialOrd::le, true),
+            (PartialOrd::gt, false),
+            (PartialOrd::ge, false),
+        ] {
+            let (min, max) = if use_lower_bound {
+                (Some(bound.clone()), None)
+            } else {
+                (None, Some(bound.clone()))
+            };
+            assert!(
+                PageIndexEvaluator::inequality_keeps_page(
+                    min,
+                    max,
+                    PageNullCount::NoneNull,
+                    &literal,
+                    cmp_fn,
+                    use_lower_bound,
+                ),
+                "incomparable bound must keep the page"
+            );
+        }
+
+        assert!(
+            !PageIndexEvaluator::inequality_keeps_page(
+                Some(Datum::int(7)),
+                None,
+                PageNullCount::NoneNull,
+                &Datum::int(5),
+                PartialOrd::lt,
+                true,
+            ),
+            "comparable bound outside range must skip the page"
+        );
     }
 
     fn build_iceberg_schema_and_field_map() -> Result<(Arc<Schema>, HashMap<i32, usize>)> {

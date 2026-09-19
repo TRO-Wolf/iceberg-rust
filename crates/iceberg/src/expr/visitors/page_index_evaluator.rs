@@ -435,29 +435,46 @@ impl<'a> PageIndexEvaluator<'a> {
         self.calc_row_selection(
             field_id,
             |min, max, null_count| {
-                if matches!(null_count, PageNullCount::AllNull) {
-                    return Ok(false);
-                }
-
-                if datum.is_nan() {
-                    // NaN indicates unreliable bounds.
-                    return Ok(true);
-                }
-
-                let bound = if use_lower_bound { min } else { max };
-
-                if let Some(bound) = bound {
-                    if bound.partial_cmp(datum).is_none() || cmp_fn(&bound, datum) {
-                        return Ok(true);
-                    }
-
-                    return Ok(false);
-                }
-
-                Ok(true)
+                Ok(Self::inequality_keeps_page(
+                    min,
+                    max,
+                    null_count,
+                    datum,
+                    cmp_fn,
+                    use_lower_bound,
+                ))
             },
             MissingColBehavior::MightMatch,
         )
+    }
+
+    pub(crate) fn inequality_keeps_page(
+        min: Option<Datum>,
+        max: Option<Datum>,
+        nulls: PageNullCount,
+        datum: &Datum,
+        cmp_fn: fn(&Datum, &Datum) -> bool,
+        use_lower_bound: bool,
+    ) -> bool {
+        if matches!(nulls, PageNullCount::AllNull) {
+            return false;
+        }
+
+        if datum.is_nan() {
+            return true;
+        }
+
+        let bound = if use_lower_bound { min } else { max };
+
+        if let Some(bound) = bound {
+            if bound.partial_cmp(datum).is_none() || cmp_fn(&bound, datum) {
+                return true;
+            }
+
+            return false;
+        }
+
+        true
     }
 }
 
