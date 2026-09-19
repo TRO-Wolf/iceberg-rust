@@ -245,3 +245,92 @@ matches Java's own default, so behavior diverges only when a table overrides the
 - Gates after round 2: `cargo fmt --all`, `cargo clippy -p iceberg -p iceberg-datafusion
   --all-targets -- -D warnings`, `python3 scripts/check_rust_file_size.py`, and
   `cargo test -p iceberg --lib rewrite_data_files` → **102 passed, 0 failed**.
+
+## 9. Round 3 — the `cow_bytes` cross-PR failure after the rebase onto #301
+
+### 9.1 Reproduction
+
+Rebased onto fork #301 (`29ea7f6d`, F-RDF-COW-BYTES-1 merge; round-1/2 commits replayed,
+HEAD `e9ce779f`), `cargo test -p iceberg --lib cow_bytes` reports **7 of 8 cells red**
+— not only the `…_dangling_cleanup_removes_delete` cell named in the brief. The brief's
+premise that the twin `…_keeps_delete_without_cleanup` "still passes with 2 added files"
+does not hold on this tree: every cell whose `added_data_files_count` expectation was
+authored under the old one-output-per-group model fails. Signatures:
+
+| cell | asserted | measured |
+|---|---|---|
+| `partition_delete_threshold_keeps_applicable_delete` | 1 | 4 |
+| `rewrite_all_keeps_applicable_delete` | 2 | 8 |
+| `remove_dangling_keeps_applicable_delete` | 2 | 8 |
+| `remove_dangling_single_row_keeps_applicable_delete` | 2 | 8 |
+| `partition_delete_survives_dangling_cleanup` | 2 | 8 |
+| `new_sequence_keeps_delete_without_cleanup` | 2 | 8 |
+| `new_sequence_dangling_cleanup_removes_delete` | 2 | 8 |
+| `file_scoped_delete_threshold_keeps_applicable_delete` | 1 | 1 (green) |
+
+### 9.2 Step-0 measurement (temporary instrumentation, reverted)
+
+`cow_bytes_shape` writes 2 partitions × 4 files × 50 rows — the same RePark shape. Printed:
+
+```text
+sizes [2104×8] target 2104
+delete_file 1777 bytes
+options target=2104 min=1578 max=3787 write_max=2945 del_bytes=1777
+group part=0 input=8416 expected=4 split=2945 read_tasks=4 task_weights=[3881, 2104, 2104, 2104]
+group part=1 input=8416 expected=4 split=2945 read_tasks=4 task_weights=[2104, 2104, 2104, 2104]
+```
+
+- **Resolved options** (every cell resolves the same: `.target_file_size_bytes(target)`,
+  min/max defaulted): target 2,104, min 1,578 (`0.75·target`), max 3,787 (`1.8·target`),
+  `writeMaxFileSize` = 2,104 + (3,787 − 2,104)·0.5 = **2,945**.
+- **Group input size**: `inputSize(group) = Σ ContentScanTask::length` — data lengths only
+  (`SizeBasedFileRewritePlanner.java:200-202`, 1.11.0). 4 × 2,104 = **8,416 B** per
+  partition group; the 1,777 B delete file does NOT enter group input.
+- **`expectedOutputFiles(8416)`**: `8416 % 2104 = 0 ≤ min 1578`; `avg = 2104 < min(1.1·2104
+  = 2314.4, writeMax 2945)` ⇒ withoutRemainder = **4** (`…Planner.java:234-257`).
+- **`inputSplitSize(8416)`**: `8416/4 + 5120 = 7224 ≥ target` ⇒ `min(7224, 2945)` =
+  **2,945** (`…Planner.java:211-217`; `SPLIT_OVERHEAD = 5,120` at java:119).
+- **Task weight does include delete bytes** — Java `TableScanUtil` weight =
+  `max(task.sizeBytes(), task.filesCount()·openFileCost)` (TableScanUtil.java:138) with
+  `sizeBytes() = length() + deletesSizeBytes()` (`BaseFileScanTask.java:65`); the fork's
+  `FileScanTask::weight` (`scan/task.rs:547`) mirrors it. The file-scoped delete
+  (1,777 B) rides only on file-0's task → part-0 weights [3,881, 2,104, 2,104, 2,104].
+- **Read tasks**: split 2,945; every 2-file pair ≥ 2×2,104 = 4,208 > 2,945 ⇒ **4 tasks per
+  group** ⇒ 8 outputs for the two-partition cells, 4 for the single-group cell
+  (`partition_delete_threshold`), 1 for the single-file group (`file_scoped_delete_…`,
+  already green — its `input < target ⇒ expected = 1`).
+
+### 9.3 The `remove_dangling_deletes` option does not change the plan
+
+The two `new_sequence` cells are planning-identical: the option only arms the post-commit
+dangling-delete GC (fork #301), which runs on the merge path after outputs are written. It
+touches neither scan-task weights, grouping, split size, nor the writer roll. Both cells
+measure **8** — the twin's failure signature is the same `left: 8, right: 2`, confirming
+the divergence is the stale output-count model, not delete cleanup.
+
+### 9.4 Java's answer on this shape
+
+On the measured fork sizes, Java plans **8 outputs for each two-partition cell, 4 for the
+single-partition-group cell, 1 for the single-file group** — identically the fork's
+measured values. So the #301 `added_data_files_count` expectations (and their
+`assert_output_sequences` counts) were written under the pre-granularity
+one-output-per-group model and are stale: **re-pin, not planner fix**.
+
+### 9.5 Re-pin
+
+`rewrite_data_files_cow_bytes_tests.rs`: seven `added_data_files_count` pins moved to
+Java's counts (4 or 8; `file_scoped_delete_…` stays 1) and the matching
+`assert_output_sequences` output counts to 4 or 8. No cell deleted; every
+`removed_delete_files_count`, delete-liveness, sequence-stamp, and `scan_rows`
+conservation assertion kept byte-for-byte. All 8 cells green, rows conserved in each.
+
+### 9.6 Gates after round 3
+
+- `cargo test -p iceberg --lib cow_bytes` → **8 passed, 0 failed**
+- `cargo test -p iceberg --lib rewrite_data_files` → **110 passed, 0 failed**
+- `cargo test -p iceberg --lib seq_gc` → **12 passed, 0 failed**
+- `cargo test -p iceberg --lib remove_dangling` → **24 passed, 0 failed**
+- `cargo fmt --all`, `cargo clippy -p iceberg -p iceberg-datafusion --all-targets --
+  -D warnings`, `python3 scripts/check_rust_file_size.py` → all green
+
+Commits: `044ca7ee` (re-pin), `docs:` (this section + todo).

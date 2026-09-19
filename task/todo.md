@@ -68,6 +68,18 @@ streamed one writer chain per group at the plain target.
 - prognosis: all three RePark xfails stay — on RePark-written ≈1,694 B files the fork
       now answers Java's 8/8/8+3, still ≠ Spark's 4/4/4+2 measured on Spark-written
       ≈1,153 B files; residual is writer file size, not planning
+- [x] Round 3 — cross-PR failure after rebase onto #301 (`29ea7f6d`, HEAD `e9ce779f`):
+      7 of 8 `cow_bytes` cells red on `added_data_files_count` (the named dangling cell
+      AND its twin — the brief's "twin still passes" premise did not hold on the tree).
+      Step-0 instrumentation (reverted): 8 × 2,104 B files, delete 1,777 B, resolved
+      target 2,104 / min 1,578 / max 3,787 / writeMax 2,945; group input 8,416 ⇒
+      `expectedOutputFiles` 4 ⇒ `inputSplitSize` 2,945; task weight = length + delete
+      bytes (Java `sizeBytes()`, BaseFileScanTask.java:65) ⇒ 4 read tasks per group.
+      Java answers 8/8, 4, 1 on this shape ⇒ #301 pins were stale one-output-per-group
+      expectations ⇒ re-pin (`044ca7ee`), no planner change; `remove_dangling_deletes`
+      does not touch planning (post-commit GC only). Ledger §9; gates: cow_bytes 8/8,
+      rewrite_data_files 110/110, seq_gc 12/12, remove_dangling 24/24, fmt, clippy,
+      file-size
 
 ## ACTIVE (2026-09-18): F-RDF-COW-BYTES-1 — a data rewrite keeps a position delete that still applies, as Java does
 
