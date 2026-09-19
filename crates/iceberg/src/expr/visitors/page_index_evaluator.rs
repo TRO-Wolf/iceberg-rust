@@ -172,7 +172,6 @@ impl<'a> PageIndexEvaluator<'a> {
             // the predicate
             if !self.row_count_cache.contains_key(&parquet_column_index) {
                 let Some(offset_index) = self.offset_index.get(parquet_column_index) else {
-                    // if we have a column index, we should always have an offset index.
                     return Err(Error::new(
                         ErrorKind::Unexpected,
                         format!("Missing offset index for field id {field_id}"),

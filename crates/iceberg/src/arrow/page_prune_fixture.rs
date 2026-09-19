@@ -436,18 +436,20 @@ pub(crate) fn path(tmp: &TempDir, name: &str) -> String {
     tmp.path().join(name).to_string_lossy().to_string()
 }
 
+type ReadRanges = Arc<Mutex<Vec<(String, Range<u64>)>>>;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RecordingStorage {
     #[serde(skip)]
     new_input_calls: Arc<AtomicUsize>,
     #[serde(skip)]
-    read_ranges: Arc<Mutex<Vec<(String, Range<u64>)>>>,
+    read_ranges: ReadRanges,
 }
 
 struct RecordingFileRead {
     inner: Box<dyn FileRead>,
     path: String,
-    read_ranges: Arc<Mutex<Vec<(String, Range<u64>)>>>,
+    read_ranges: ReadRanges,
 }
 
 #[async_trait]
@@ -510,7 +512,7 @@ struct RecordingStorageFactory {
     #[serde(skip)]
     new_input_calls: Arc<AtomicUsize>,
     #[serde(skip)]
-    read_ranges: Arc<Mutex<Vec<(String, Range<u64>)>>>,
+    read_ranges: ReadRanges,
 }
 
 #[typetag::serde]
@@ -523,11 +525,7 @@ impl StorageFactory for RecordingStorageFactory {
     }
 }
 
-pub(crate) fn recording_io() -> (
-    FileIO,
-    Arc<AtomicUsize>,
-    Arc<Mutex<Vec<(String, Range<u64>)>>>,
-) {
+pub(crate) fn recording_io() -> (FileIO, Arc<AtomicUsize>, ReadRanges) {
     let new_input_calls = Arc::new(AtomicUsize::new(0));
     let read_ranges = Arc::new(Mutex::new(Vec::new()));
     let io = FileIOBuilder::new(Arc::new(RecordingStorageFactory {

@@ -47,7 +47,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/arrow/avro_reader_tests.rs": 1097,
     "crates/iceberg/src/arrow/caching_delete_file_loader.rs": 3270,
     "crates/iceberg/src/arrow/delete_filter.rs": 2938,
-    "crates/iceberg/src/arrow/reader.rs": 10162,
+    "crates/iceberg/src/arrow/reader.rs": 10157,
     "crates/iceberg/src/arrow/schema.rs": 3711,
     "crates/iceberg/src/arrow/value.rs": 1961,
     "crates/iceberg/src/avro/schema.rs": 2055,

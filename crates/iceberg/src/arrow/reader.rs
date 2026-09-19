@@ -539,9 +539,7 @@ impl ArrowReader {
             .collect();
         if needs_physical_ordinals {
             if let Some(predicate) = task.predicate.as_deref() {
-                let mut collector = CollectFieldIdVisitor {
-                    field_ids: HashSet::default(),
-                };
+                let mut collector = CollectFieldIdVisitor::default();
                 visit(&mut collector, predicate)?;
                 project_field_ids_without_metadata.extend(collector.field_ids());
             }
@@ -1291,9 +1289,7 @@ impl ArrowReader {
         parquet_schema: &SchemaDescriptor,
         predicate: &BoundPredicate,
     ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
-        let mut collector = CollectFieldIdVisitor {
-            field_ids: HashSet::default(),
-        };
+        let mut collector = CollectFieldIdVisitor::default();
         visit(&mut collector, predicate)?;
 
         let iceberg_field_ids = collector.field_ids();
@@ -2652,9 +2648,7 @@ mod tests {
         let expr = Reference::new("qux").is_null();
         let bound_expr = expr.bind(schema, true).unwrap();
 
-        let mut visitor = CollectFieldIdVisitor {
-            field_ids: HashSet::default(),
-        };
+        let mut visitor = CollectFieldIdVisitor::default();
         visit(&mut visitor, &bound_expr).unwrap();
 
         let mut expected = HashSet::default();
@@ -2739,9 +2733,7 @@ message schema {
             .and(Reference::new("baz").is_null());
         let bound_expr = expr.bind(schema, true).unwrap();
 
-        let mut visitor = CollectFieldIdVisitor {
-            field_ids: HashSet::default(),
-        };
+        let mut visitor = CollectFieldIdVisitor::default();
         visit(&mut visitor, &bound_expr).unwrap();
 
         let mut expected = HashSet::default();
@@ -2759,9 +2751,7 @@ message schema {
             .or(Reference::new("baz").is_null());
         let bound_expr = expr.bind(schema, true).unwrap();
 
-        let mut visitor = CollectFieldIdVisitor {
-            field_ids: HashSet::default(),
-        };
+        let mut visitor = CollectFieldIdVisitor::default();
         visit(&mut visitor, &bound_expr).unwrap();
 
         let mut expected = HashSet::default();
