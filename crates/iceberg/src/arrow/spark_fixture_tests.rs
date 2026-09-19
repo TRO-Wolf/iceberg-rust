@@ -466,6 +466,50 @@ async fn spark_base_v3_selective_predicates_skip_pages() {
 }
 
 #[tokio::test]
+async fn spark_s_eq_keeps_all_pages_under_degenerate_truncated_bounds() {
+    let truth = truth();
+    let table = load_table(&truth, "base_v2");
+    let predicate = base_queries()
+        .into_iter()
+        .find(|(name, _)| *name == "s_eq")
+        .and_then(|(_, pred)| pred)
+        .expect("predicate");
+    let schema = table.metadata().current_schema().clone();
+    let bound = predicate.bind(schema.clone(), false).expect("bind");
+
+    let tasks: Vec<_> = table
+        .scan()
+        .build()
+        .expect("scan")
+        .plan_files()
+        .await
+        .expect("plan")
+        .try_collect()
+        .await
+        .expect("tasks");
+    for task in &tasks {
+        let local = task
+            .data_file_path
+            .strip_prefix(FIXTURE_PREFIX)
+            .map(|rest| fixture_root().join(rest.trim_start_matches('/')))
+            .expect("fixture path");
+        let metadata = file_metadata(local.to_str().expect("utf8"));
+        let map = field_id_map(&metadata);
+        let selection = ArrowReader::get_row_selection_for_filter_predicate(
+            &bound, &metadata, &None, &map, &schema,
+        )
+        .expect("selection")
+        .expect("s carries a column index on every file");
+        let total: usize = selection.iter().map(|s| s.row_count).sum();
+        assert_eq!(
+            selected_rows(&selection),
+            total,
+            "all s bounds collapse to the same truncated prefix — every page must stay"
+        );
+    }
+}
+
+#[tokio::test]
 async fn spark_base_v2_per_file_selection_prunes() {
     let truth = truth();
     let table = load_table(&truth, "base_v2");
