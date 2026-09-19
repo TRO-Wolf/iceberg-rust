@@ -390,6 +390,227 @@ fn assert_rdf_key_set(props: &HashMap<String, String>, delete_drop: bool, contex
     );
 }
 
+async fn manifest_list_counts(table: &Table, snapshot: &Snapshot) -> (u64, u64) {
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("manifest list");
+    let mut created = 0u64;
+    let mut kept = 0u64;
+    for manifest in manifest_list.entries() {
+        if manifest.added_snapshot_id == snapshot.snapshot_id() {
+            created += 1;
+        } else {
+            kept += 1;
+        }
+    }
+    (created, kept)
+}
+
+fn assert_manifest_counts(
+    table_props: &HashMap<String, String>,
+    expected: (u64, u64, u64),
+    context: &str,
+) {
+    let (created, kept, replaced) = expected;
+    assert_eq!(
+        prop_u64(table_props, "manifests-created"),
+        created,
+        "{context}: manifests-created"
+    );
+    assert_eq!(
+        prop_u64(table_props, "manifests-kept"),
+        kept,
+        "{context}: manifests-kept"
+    );
+    assert_eq!(
+        prop_u64(table_props, "manifests-replaced"),
+        replaced,
+        "{context}: manifests-replaced"
+    );
+}
+
+async fn set_table_property(
+    catalog: &impl Catalog,
+    table: &Table,
+    key: &str,
+    value: &str,
+) -> Table {
+    let tx = Transaction::new(table);
+    let action = tx
+        .update_table_properties()
+        .set(key.to_string(), value.to_string());
+    let tx = action.apply(tx).expect("apply property update");
+    tx.commit(catalog).await.expect("commit property update")
+}
+
+#[tokio::test]
+async fn append_commits_stamp_manifest_counts() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let file_a = write_data_file(&table, "app-a.parquet", PARTITION, &rows(PARTITION, 0, 250)).await;
+    let table = append_files(&catalog, &table, vec![file_a]).await;
+    let first = table
+        .metadata()
+        .current_snapshot()
+        .expect("first append snapshot")
+        .as_ref()
+        .clone();
+    assert_eq!(first.summary().operation, Operation::Append);
+    let (created, kept) = manifest_list_counts(&table, &first).await;
+    assert_eq!((created, kept), (1, 0), "first append writes one manifest");
+    assert_manifest_counts(&props_of(&first), (1, 0, 0), "first append");
+
+    let file_b = write_data_file(&table, "app-b.parquet", PARTITION, &rows(PARTITION, 250, 250)).await;
+    let table = append_files(&catalog, &table, vec![file_b]).await;
+    let second = table
+        .metadata()
+        .current_snapshot()
+        .expect("second append snapshot")
+        .as_ref()
+        .clone();
+    assert_eq!(second.summary().operation, Operation::Append);
+    let (created, kept) = manifest_list_counts(&table, &second).await;
+    assert_eq!(
+        (created, kept),
+        (1, 1),
+        "second append adds one manifest and keeps the first"
+    );
+    assert_manifest_counts(&props_of(&second), (1, 1, 0), "second append");
+    assert_eq!(
+        prop_u64(&props_of(&second), "manifests-replaced"),
+        0,
+        "a fast_append that merges nothing replaces no manifests"
+    );
+}
+
+#[tokio::test]
+async fn row_delta_merge_commit_stamps_manifest_counts() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let seed = write_data_file(&table, "mseed.parquet", PARTITION, &rows(PARTITION, 0, 250)).await;
+    let deleted_path = seed.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![seed]).await;
+    let merge_file = write_data_file(&table, "mmerge.parquet", PARTITION, &rows(PARTITION, 250, 200)).await;
+    let delete_file =
+        write_position_delete_file(&table, PARTITION, &[(deleted_path, 0)]).await;
+    let table = merge_commit(&catalog, &table, vec![merge_file], vec![delete_file]).await;
+
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("merge snapshot")
+        .as_ref()
+        .clone();
+    assert_eq!(snapshot.summary().operation, Operation::Overwrite);
+    let (created, kept) = manifest_list_counts(&table, &snapshot).await;
+    assert_eq!(
+        (created, kept),
+        (2, 1),
+        "merge writes one data manifest and one delete manifest, keeps the append manifest"
+    );
+    assert_manifest_counts(&props_of(&snapshot), (2, 1, 0), "row-delta merge");
+}
+
+#[tokio::test]
+async fn cow_overwrite_commit_stamps_manifest_counts() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let file_a = write_data_file(&table, "ow-a.parquet", PARTITION, &rows(PARTITION, 0, 250)).await;
+    let file_b = write_data_file(&table, "ow-b.parquet", PARTITION, &rows(PARTITION, 250, 250)).await;
+    let removed = file_a.clone();
+    let table = append_files(&catalog, &table, vec![file_a, file_b]).await;
+
+    let replacement =
+        write_data_file(&table, "ow-new.parquet", PARTITION, &rows(PARTITION, 500, 250)).await;
+    let tx = Transaction::new(&table);
+    let action = tx
+        .overwrite_files()
+        .add_file(replacement)
+        .delete_data_files(vec![removed]);
+    let tx = action.apply(tx).expect("apply overwrite");
+    let table = tx.commit(&catalog).await.expect("commit overwrite");
+
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("overwrite snapshot")
+        .as_ref()
+        .clone();
+    assert_eq!(snapshot.summary().operation, Operation::Overwrite);
+    let (created, kept) = manifest_list_counts(&table, &snapshot).await;
+    assert_eq!(
+        (created, kept),
+        (2, 0),
+        "overwrite writes the added manifest plus the tombstoning rewrite of the source manifest"
+    );
+    assert_manifest_counts(&props_of(&snapshot), (2, 0, 1), "CoW overwrite");
+}
+
+#[tokio::test]
+async fn delete_only_commit_stamps_manifest_counts() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let seed = write_data_file(&table, "dseed.parquet", PARTITION, &rows(PARTITION, 0, 250)).await;
+    let deleted_path = seed.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![seed]).await;
+    let delete_file = write_position_delete_file(&table, PARTITION, &[(deleted_path, 0)]).await;
+    let table = add_deletes(&catalog, &table, vec![delete_file]).await;
+
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("delete snapshot")
+        .as_ref()
+        .clone();
+    assert_eq!(snapshot.summary().operation, Operation::Delete);
+    let (created, kept) = manifest_list_counts(&table, &snapshot).await;
+    assert_eq!(
+        (created, kept),
+        (1, 1),
+        "delete commit writes one delete manifest and keeps the data manifest"
+    );
+    assert_manifest_counts(&props_of(&snapshot), (1, 1, 0), "delete-only commit");
+}
+
+#[tokio::test]
+async fn merge_append_stamps_merge_side_replaced_count() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let file_a = write_data_file(&table, "ma-a.parquet", PARTITION, &rows(PARTITION, 0, 250)).await;
+    let table = append_files(&catalog, &table, vec![file_a]).await;
+    let file_b = write_data_file(&table, "ma-b.parquet", PARTITION, &rows(PARTITION, 250, 250)).await;
+    let table = append_files(&catalog, &table, vec![file_b]).await;
+    let table =
+        set_table_property(&catalog, &table, "commit.manifest.min-count-to-merge", "2").await;
+
+    let file_c = write_data_file(&table, "ma-c.parquet", PARTITION, &rows(PARTITION, 500, 250)).await;
+    let tx = Transaction::new(&table);
+    let action = tx.merge_append().add_data_files(vec![file_c]);
+    let tx = action.apply(tx).expect("apply merge append");
+    let table = tx.commit(&catalog).await.expect("commit merge append");
+
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("merge append snapshot")
+        .as_ref()
+        .clone();
+    assert_eq!(snapshot.summary().operation, Operation::Append);
+    let (created, kept) = manifest_list_counts(&table, &snapshot).await;
+    assert_eq!(
+        (created, kept),
+        (1, 0),
+        "the merge bin-packs all three manifests into one"
+    );
+    assert_manifest_counts(&props_of(&snapshot), (1, 0, 2), "merge append");
+}
+
 async fn rewrite_and_reload(
     catalog: &impl Catalog,
     action: RewriteDataFiles,
