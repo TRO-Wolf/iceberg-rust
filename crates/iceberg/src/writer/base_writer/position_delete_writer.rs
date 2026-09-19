@@ -24,6 +24,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 
 use crate::arrow::schema_to_arrow_schema;
 use crate::metadata_columns::{delete_file_path_field, delete_file_pos_field};
@@ -57,6 +58,7 @@ pub fn pos_delete_schema() -> Result<Schema> {
 pub fn position_delete_writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_statistics_truncate_length(None)
+        .set_column_dictionary_enabled(ColumnPath::from("pos"), false)
         .set_key_value_metadata(Some(vec![KeyValue::new(
             DELETE_TYPE_META_KEY.to_string(),
             "position".to_string(),
@@ -70,6 +72,7 @@ pub fn position_delete_writer_properties_for(
 ) -> Result<WriterProperties> {
     Ok(WriterProperties::builder()
         .set_statistics_truncate_length(None)
+        .set_column_dictionary_enabled(ColumnPath::from("pos"), false)
         .set_compression(parquet_compression_from_properties(properties)?)
         .set_key_value_metadata(Some(vec![KeyValue::new(
             DELETE_TYPE_META_KEY.to_string(),

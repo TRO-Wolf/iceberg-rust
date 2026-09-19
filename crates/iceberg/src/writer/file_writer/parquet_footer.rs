@@ -20,20 +20,36 @@ use std::collections::HashMap;
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
+use serde::Serialize;
 
 use super::parquet_compression_from_properties;
-use crate::spec::Schema;
+use crate::spec::{NestedFieldRef, Schema};
 use crate::{Error, ErrorKind, Result};
 
 pub(crate) const ICEBERG_SCHEMA_META_KEY: &str = "iceberg.schema";
 
 pub(crate) const DELETE_TYPE_META_KEY: &str = "delete-type";
 
-pub(super) fn writer_options(
-    props: &WriterProperties,
-    schema: &Schema,
-) -> Result<ArrowWriterOptions> {
-    let schema_json = serde_json::to_string(schema).map_err(|err| {
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct JavaOrderedSchema<'a> {
+    r#type: &'static str,
+    schema_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identifier_field_ids: Option<Vec<i32>>,
+    fields: &'a [NestedFieldRef],
+}
+
+fn java_ordered_schema_json(schema: &Schema) -> Result<String> {
+    let mut identifier_field_ids: Vec<i32> = schema.identifier_field_ids().collect();
+    identifier_field_ids.sort_unstable();
+    serde_json::to_string(&JavaOrderedSchema {
+        r#type: "struct",
+        schema_id: schema.schema_id(),
+        identifier_field_ids: (!identifier_field_ids.is_empty()).then_some(identifier_field_ids),
+        fields: schema.as_struct().fields(),
+    })
+    .map_err(|err| {
         Error::new(
             ErrorKind::DataInvalid,
             format!(
@@ -41,7 +57,14 @@ pub(super) fn writer_options(
                 schema.schema_id()
             ),
         )
-    })?;
+    })
+}
+
+pub(super) fn writer_options(
+    props: &WriterProperties,
+    schema: &Schema,
+) -> Result<ArrowWriterOptions> {
+    let schema_json = java_ordered_schema_json(schema)?;
     let mut key_values = props.key_value_metadata().cloned().unwrap_or_default();
     key_values.retain(|entry| entry.key != ICEBERG_SCHEMA_META_KEY);
     key_values.push(KeyValue::new(
@@ -55,6 +78,7 @@ pub(super) fn writer_options(
         .build();
     Ok(ArrowWriterOptions::new()
         .with_properties(props)
+        .with_schema_root("table".to_string())
         .with_skip_arrow_metadata(true))
 }
 
