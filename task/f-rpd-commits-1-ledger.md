@@ -29,7 +29,8 @@
 |---|---|---|
 | 1 | `ac9a53a1` | `test: F-RPD-COMMITS-1 — red single-commit, file-scoped cells` |
 | 2 | `8e7fde35` | `fix: F-RPD-COMMITS-1 — position-delete rewrite commits once and keeps file scope, as Java does` |
-| 3 | this commit | `docs: F-RPD-COMMITS-1 — ledger, mutation proof` |
+| 3 | `5cef0008` | `docs: F-RPD-COMMITS-1 — ledger, mutation proof` |
+| 4 | this commit | `fix: F-RPD-COMMITS-1 — doc lines replaced by allow(missing_docs); granularity property cited` |
 
 ## The oracle shape (run-23a)
 
@@ -205,3 +206,37 @@ split in `write_group_outputs` removed, so every bin writes one partition-scoped
 
 All four strict xfails should now fire XPASS against the bumped fork and retire.
 The `rpd_baseline` cell already passed (declined bins commit nothing) and is untouched.
+
+## Round 2 — comment-gate remediation
+
+The mechanical comment gate rejected round 1 on three `///` lines. All three are deleted
+and the items take `#[allow(missing_docs)]` instead. Their facts live here:
+
+- `partial_progress(bool)` — commits rewritten bins in batches instead of one atomic
+  commit (Java `PARTIAL_PROGRESS_ENABLED`, default false).
+- `partial_progress_max_commits(usize)` — caps the commit count under partial progress;
+  bins per commit round up (Java `PARTIAL_PROGRESS_MAX_COMMITS`, default 10; must be
+  positive when enabled).
+- `PROPERTY_DELETE_GRANULARITY` — the `write.delete.granularity` key; `file` or
+  `partition`.
+
+**Granularity property citation (read-only check, bytecode-verified on the 1.11.0
+spark-runtime jar):** the key is exactly Java's —
+`TableProperties.DELETE_GRANULARITY = "write.delete.granularity"` (javap `-constants`
+prints it verbatim). The fork's `file` default is NOT Java's
+`TableProperties.DELETE_GRANULARITY_DEFAULT`: `<clinit>` assigns that field from
+`DeleteGranularity.PARTITION.toString()` — i.e. `"partition"`. The `file` default is the
+RPD write path's own override: `SparkWriteConf.deleteGranularity()` parses option
+`delete-granularity`, then table property `write.delete.granularity`, then
+`defaultValue(DeleteGranularity.FILE)` — all three steps visible in the method's bytecode.
+Since this action is the property's only reader in the fork, `parse_delete_granularity`
+returns `file` on absence — the same value Java's RPD path resolves.
+
+**Follow-up (recorded, not changed):** the DataFusion DELETE path
+(`physical_plan/delete_position_deletes.rs`, `group_pairs_by_partition`) writes one
+position-delete file per partition group — partition-scoped — and never consults
+`write.delete.granularity`. Under Java, position deletes written for merge-on-read
+`DELETE` go through a writer that honours the delete-granularity resolution above.
+Whether the fork's DELETE write should follow the property (and which default applies on
+that path — `TableProperties.DELETE_GRANULARITY_DEFAULT` = `"partition"` vs the
+`SparkWriteConf` `FILE` override) is a separate lane.

@@ -296,13 +296,13 @@ impl RewritePositionDeleteFiles {
         self
     }
 
-    /// Commits rewritten bins in batches instead of one atomic commit (Java `PARTIAL_PROGRESS_ENABLED`).
+    #[allow(missing_docs)]
     pub fn partial_progress(mut self, partial_progress: bool) -> Self {
         self.partial_progress = partial_progress;
         self
     }
 
-    /// Caps the commit count under partial progress; bins per commit round up (Java `PARTIAL_PROGRESS_MAX_COMMITS`).
+    #[allow(missing_docs)]
     pub fn partial_progress_max_commits(mut self, partial_progress_max_commits: usize) -> Self {
         self.partial_progress_max_commits = partial_progress_max_commits;
         self
