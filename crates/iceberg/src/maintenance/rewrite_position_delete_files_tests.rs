@@ -4666,14 +4666,13 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
     assert_eq!(without_gc.rewritten_data_files_count, 1);
     assert_eq!(
         without_gc.removed_delete_files_count, 1,
-        "the rewrite drops the DV; the shadowed parquet delete stays until GC"
+        "the rewrite drops the DV; the shadowed parquet delete is retired by the commit's sequence GC"
     );
     let after_rewrite = catalog.load_table(table.identifier()).await.unwrap();
     assert_eq!(scan_y_values(&after_rewrite).await, before);
-    assert_eq!(
-        live_delete_files(&after_rewrite).await.len(),
-        1,
-        "the parquet position delete is still live without remove_dangling_deletes"
+    assert!(
+        live_delete_files(&after_rewrite).await.is_empty(),
+        "the parquet position delete (seq 2) is below the rewrite's minimum live data seq (4), as Java's dropDeleteFilesOlderThan"
     );
 
     let (table, before) = build_non_superset_vector_table(&catalog).await;
@@ -4685,8 +4684,8 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
     assert_eq!(rewrite.rewritten_data_files_count, 1);
     assert_eq!(rewrite.added_data_files_count, 1);
     assert_eq!(
-        rewrite.removed_delete_files_count, 2,
-        "the DV drops with the rewritten file; the shadowed parquet delete is GC'd"
+        rewrite.removed_delete_files_count, 1,
+        "the DV drops with the rewritten file; the commit's sequence GC already retired the parquet delete, so the dangling pass finds nothing"
     );
 
     let cleared = catalog.load_table(table.identifier()).await.unwrap();

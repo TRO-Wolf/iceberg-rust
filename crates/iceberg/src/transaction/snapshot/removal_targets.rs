@@ -37,6 +37,7 @@ pub(super) struct RemovalTargets<'a> {
 #[derive(Default)]
 pub(super) struct RemovalHits {
     data_paths: HashSet<String>,
+    expired_delete_files: Vec<DataFile>,
 }
 
 impl<'a> RemovalTargets<'a> {
@@ -89,6 +90,14 @@ impl RemovalHits {
         if content == ManifestContentType::Data {
             self.data_paths.insert(file.file_path().to_string());
         }
+    }
+
+    pub(super) fn expire(&mut self, file: &DataFile) {
+        self.expired_delete_files.push(file.clone());
+    }
+
+    pub(super) fn into_expired_delete_files(self) -> Vec<DataFile> {
+        self.expired_delete_files
     }
 }
 
