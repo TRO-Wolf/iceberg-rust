@@ -153,3 +153,77 @@ Pins:
   `file_size_in_bytes = 1585` selects 0 under both option sets and adds no snapshot.
 - **Footer cells** (red first): `iceberg.schema` kv equals Java's 287-B JSON byte-for-byte;
   `pos` column carries no dictionary page (data page PLAIN); parquet schema root is `table`.
+
+## Fix — landed (commit `ac1bcf21`)
+
+All three Java-divergent writer defaults fixed, no Cargo change:
+
+1. `metadata_columns.rs` — `file_path` / `pos` field docs now Java's bytecode-verified strings
+   (`Path of a file in which a deleted row is stored`, `Ordinal position of a deleted row in
+   the data file`).
+2. `parquet_footer.rs` — `java_ordered_schema_json` serializes `iceberg.schema` in Java's key
+   order (`type`, `schema-id`, `identifier-field-ids`, `fields`); `with_schema_root("table")`
+   replaces `arrow_schema` on every file rolled through `ParquetWriterBuilder` (data and delete
+   alike — parquet-mr names the root `table` for both).
+3. `position_delete_writer.rs` — both property builders set
+   `set_column_dictionary_enabled(ColumnPath::from("pos"), false)`; `file_path` stays
+   dictionary-encoded, matching the oracle's observed layout. Covers every production path:
+   the DataFusion MoR DELETE physical plan, `rewrite_position_delete_files` output,
+   `remove_dangling_delete_files`, `rewrite_table_path`, `convert_equality_delete_files`.
+
+## Post-fix measurements — PROVEN
+
+| Variant | Before | After |
+|---|---|---|
+| 25-pos delete file via `position_delete_writer_properties_for` (equal path length) | 1375 B | **1297 B** |
+| RePark-equivalent props | 1348 B | 1325 B |
+| `iceberg.schema` kv | 303 B | 287 B — byte-identical to Java's |
+| `pos` encoding | RLE_DICTIONARY + dict page | PLAIN, no dict page |
+| parquet root | `arrow_schema` | `table` |
+
+Residual vs Spark (1585 B): −288 B = deprecated unsigned-order `min`/`max` stats on `file_path`
+(−218 B; parquet-rs writes them only when `sort_order().is_signed()` — hard-coded, no knob),
+`created_by` (−44 B; parquet-rs honestly reports itself), thrift/encoding-id/page layout
+(~−26 B). **Nothing Java-visible remains.**
+
+## Test results — PROVEN
+
+- `floor_tests::test_spark_sized_delete_files_inside_the_band_are_not_candidates` — the oracle
+  shape with Spark-sized metadata selects 0 under both option sets, no snapshot (green).
+- `floor_tests::test_sub_min_delete_files_in_the_same_shape_are_rewritten` — the eligibility
+  control: real fork-written files are sub-min and rewrite 8→8 (green).
+- `parquet_footer_tests::position_delete_footer_matches_java_layout` — all Java-layout cells
+  (green post-fix; red pre-fix on the `table` root cell).
+- Maintenance suite: 102/102 green. Writer surface: 166 green.
+- The dict→PLAIN change shrank output bytes; three fixture tests that calibrate roll/tail
+  boundaries off measured file sizes needed recalibration: the shared fixture writer now uses
+  `position_delete_writer_properties()` (production-shaped inputs — previously raw
+  `WriterProperties` produced dict-encoded `pos`, an asymmetry nothing writes in production),
+  and `test_roll_bound_is_write_max_not_target` raised positions 12000→13000 to keep the
+  measured total over its 30×16 KiB precondition floor.
+
+## Mutation — PROVEN
+
+- Footer pin killed the `pos` mutant: flipping `set_column_dictionary_enabled("pos", …)` back
+  to `true` fails the pin on the dictionary-page cell (observed).
+- The same pin was red on the `arrow_schema` cell before the fix (commit `988da6e0`), green
+  after — the `table`-root and Java-ordered-JSON cells are load-bearing.
+- Planner pin is non-vacuous: the eligibility control rewrites the same table with real
+  sub-min files 8→8, so the zero-result test cannot pass by a dead planner.
+
+## Gates — PROVEN
+
+`cargo fmt --check` clean; `cargo clippy -p iceberg --all-targets -- -D warnings` clean;
+`check_rust_file_size.sh` 522 files clean (the tests file's legacy ceiling ratcheted 4607→4604
+after the pin moved to the floor-tests sibling); `check_comment_blocks.sh`,
+`check_matrix_anchors.sh`, `check_agent_artifacts.sh` OK; comment-ban hits=0.
+
+## Final answer to the brief
+
+The selection rule needed no fix — it is already Java's, and the pin proves it. The residual
+8→8 at the oracle shape is produced by parquet-rs-vs-parquet-mr byte internals, not by any
+Iceberg-level writer default. What the fork writes now matches Java on every observable axis
+that exists at the Iceberg layer: schema kv bytes, root name, field docs, `delete-type` kv,
+column encodings (`file_path` dict / `pos` PLAIN), untruncated stats, ZSTD, indexes, page
+layout reach. The remaining −288 B is engine internals a reader can only see by diffing thrift
+footers against a parquet-mr file.
