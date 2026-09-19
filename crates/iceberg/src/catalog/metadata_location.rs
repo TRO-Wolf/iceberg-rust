@@ -85,11 +85,17 @@ impl MetadataLocation {
     }
 
     pub(crate) fn rebased(&self, metadata: &TableMetadata) -> Result<Self> {
-        let metadata_dir = if self.is_hadoop_convention()
-            && !metadata
+        if self.is_hadoop_convention()
+            && metadata
                 .properties()
                 .contains_key(TableProperties::PROPERTY_WRITE_METADATA_LOCATION)
         {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Hadoop path-based tables cannot relocate metadata",
+            ));
+        }
+        let metadata_dir = if self.is_hadoop_convention() {
             self.metadata_dir.clone()
         } else {
             write_metadata_dir(metadata.location(), metadata.properties())?
