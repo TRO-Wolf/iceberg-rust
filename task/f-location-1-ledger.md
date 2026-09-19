@@ -319,3 +319,18 @@ All reverted; `cargo test -p iceberg --lib location` = 55/55 green.
   `comment-ban hits=0`.
 - `cargo test -p iceberg --lib location` — 55/55.
 - `cargo test -p iceberg --test hadoop_version_commit` — 15/15.
+
+## Round 2 — comment gate + rebase
+
+- Three added doc-comment lines removed from `metadata_location.rs`
+  (`for_metadata` gained `#[allow(missing_docs)]`; `from_file_path` is
+  `pub(crate)` and needs no allowance). Gate now `comment-ban hits=0` over
+  `origin/main..HEAD`.
+- Rebased onto origin/main (`466bdbc7`, carries fork #308 F-AVRO-NAME-1 and
+  F-TS-PUSHDOWN-1). One conflict: `scripts/check_rust_file_size.py`
+  LEGACY_CEILINGS — kept the LOWER value per path (s3tables 1402, sql 3946,
+  arrow/avro_reader 1255). Size checker clean post-merge (531 files).
+- Post-rebase: `cargo test -p iceberg --lib location` 55/55;
+  `hadoop_version_commit` 15/15; catalog lib suites glue 50, hms 48,
+  s3tables 39, sql 81, datafusion 292 — all green. fmt, per-crate clippy,
+  `typos .`, artifact/matrix/comment scripts all clean.
