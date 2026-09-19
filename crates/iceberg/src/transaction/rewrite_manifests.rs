@@ -270,7 +270,7 @@ impl TransactionAction for RewriteManifestsAction {
             vec![],
             // Java `BaseRewriteManifests` extends `SnapshotProducer` and adds no data file.
             FirstRowIdPolicy::Preserve,
-        );
+        )?;
 
         // Load the FULL manifest list — DATA and DELETE (Java `allManifests`, L171); `current_data_manifests`
         // would drop the delete manifests, which must be carried forward so deletes still apply.
@@ -1830,7 +1830,7 @@ pub(crate) mod tests {
         use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
         let config = PositionDeleteWriterConfig::new().unwrap();
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let file_name_gen = DefaultFileNameGenerator::new(
             "pos-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),

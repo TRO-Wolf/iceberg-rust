@@ -285,8 +285,7 @@ async fn write_yid_file(table: &Table, ids: Vec<i64>, ys: Vec<i64>) -> DataFile 
     ])
     .expect("build the {id, y} data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "cdata".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -330,8 +329,7 @@ async fn write_y_eq_delete_file(table: &Table, lo: i64, hi: i64) -> DataFile {
     let config = EqualityDeleteWriterConfig::new(vec![2], schema.clone())
         .expect("equality-delete writer config (equality_ids=[2], the y field)");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "yeqdel".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

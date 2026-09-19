@@ -334,8 +334,7 @@ async fn write_partition_file(
     ])
     .expect("build the per-partition {id, Category, y} data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "fdata".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

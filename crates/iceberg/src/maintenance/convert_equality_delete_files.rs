@@ -114,7 +114,7 @@ use crate::writer::base_writer::position_delete_writer::{
 };
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, TableLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
@@ -186,6 +186,7 @@ impl ConvertEqualityDeleteFiles {
             return Ok(ConvertEqualityDeleteFilesResult::default());
         }
 
+        let location_gen = TableLocationGenerator::new(metadata)?;
         // Materialize each (filter-matching) equality-delete file into a position-delete file, pairing
         // the new pos-delete with the seq to stamp it and the eq-delete to replace.
         let mut converted: Vec<DataFile> = Vec::new();
@@ -194,7 +195,7 @@ impl ConvertEqualityDeleteFiles {
             if !self.eq_delete_matches_filter(eq)? {
                 continue;
             }
-            match self.materialize_one(eq, &live).await? {
+            match self.materialize_one(eq, &live, &location_gen).await? {
                 Some(pos_delete) => {
                     converted.push(eq.data_file.clone());
                     added.push((pos_delete, eq.sequence_number));
@@ -335,6 +336,7 @@ impl ConvertEqualityDeleteFiles {
         &self,
         eq: &LiveDeleteEntry,
         live: &LiveEntries,
+        location_gen: &TableLocationGenerator,
     ) -> Result<Option<DataFile>> {
         let metadata = self.table.metadata();
         let schema = metadata.current_schema().clone();
@@ -391,7 +393,9 @@ impl ConvertEqualityDeleteFiles {
         // Spec-recommended position-delete ordering: sort by (file_path, pos) before writing.
         pairs.sort();
 
-        let pos_delete = self.write_position_delete_file(eq, &pairs).await?;
+        let pos_delete = self
+            .write_position_delete_file(eq, &pairs, location_gen)
+            .await?;
         Ok(Some(pos_delete))
     }
 
@@ -478,6 +482,7 @@ impl ConvertEqualityDeleteFiles {
         &self,
         eq: &LiveDeleteEntry,
         pairs: &[(String, i64)],
+        location_gen: &TableLocationGenerator,
     ) -> Result<DataFile> {
         let metadata = self.table.metadata();
         let schema = metadata.current_schema().clone();
@@ -497,7 +502,6 @@ impl ConvertEqualityDeleteFiles {
             .clone();
 
         let config = PositionDeleteWriterConfig::new()?;
-        let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
         let file_name_gen = DefaultFileNameGenerator::new(
             "converted-pos-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),
@@ -514,7 +518,7 @@ impl ConvertEqualityDeleteFiles {
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.table.file_io().clone(),
-            location_gen,
+            location_gen.clone(),
             file_name_gen,
         );
 

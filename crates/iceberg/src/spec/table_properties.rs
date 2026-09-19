@@ -141,6 +141,22 @@ impl TableProperties {
 
     /// Default file format for data files
     pub const PROPERTY_DEFAULT_FILE_FORMAT: &str = "write.format.default";
+
+    #[allow(missing_docs)]
+    pub const PROPERTY_WRITE_DATA_LOCATION: &str = "write.data.path";
+    #[allow(missing_docs)]
+    pub const PROPERTY_WRITE_OBJECT_STORAGE_ENABLED: &str = "write.object-storage.enabled";
+    #[allow(missing_docs)]
+    pub const PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS: &str =
+        "write.object-storage.partitioned-paths";
+    #[allow(missing_docs)]
+    pub const PROPERTY_WRITE_OBJECT_STORAGE_PATH: &str = "write.object-storage.path";
+    #[allow(missing_docs)]
+    pub const PROPERTY_WRITE_FOLDER_STORAGE_LOCATION: &str = "write.folder-storage.path";
+    #[allow(missing_docs)]
+    pub const PROPERTY_WRITE_METADATA_LOCATION: &str = "write.metadata.path";
+    #[allow(missing_docs)]
+    pub const PROPERTY_WRITE_LOCATION_PROVIDER_IMPL: &str = "write.location-provider.impl";
     /// Default file format for delete files
     pub const PROPERTY_DELETE_DEFAULT_FILE_FORMAT: &str = "write.delete.format.default";
     /// Default value for data file format

@@ -165,8 +165,7 @@ async fn write_real(table: &Table, ids: &[i64], data: &[&str]) -> DataFile {
     ])
     .expect("build the {id,data} data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "staged".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

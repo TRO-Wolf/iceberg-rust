@@ -137,7 +137,7 @@ async fn write_position_deletes_for_partition(
     configured_spec: Option<iceberg::spec::PartitionSpec>,
 ) -> DFResult<Vec<DataFile>> {
     let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
+        TableLocationGenerator::new(table.metadata()).map_err(to_datafusion_error)?;
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

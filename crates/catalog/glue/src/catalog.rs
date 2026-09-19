@@ -621,21 +621,19 @@ impl Catalog for GlueCatalog {
         let db_name = validate_namespace(namespace)?;
         let table_name = creation.name.clone();
 
-        let location = match &creation.location {
-            Some(location) => location.clone(),
-            None => {
-                let ns = self.get_namespace(namespace).await?;
-                let location =
-                    get_default_table_location(&ns, &db_name, &table_name, &self.config.warehouse);
-                creation.location = Some(location.clone());
-                location
-            }
-        };
+        if creation.location.is_none() {
+            let ns = self.get_namespace(namespace).await?;
+            creation.location = Some(get_default_table_location(
+                &ns,
+                &db_name,
+                &table_name,
+                &self.config.warehouse,
+            ));
+        }
         let metadata = TableMetadataBuilder::from_table_creation(creation)?
             .build()?
             .metadata;
-        let metadata_location =
-            MetadataLocation::new_with_table_location(location.clone()).to_string();
+        let metadata_location = MetadataLocation::for_metadata(&metadata)?.to_string();
 
         metadata.write_to(&self.file_io, &metadata_location).await?;
 

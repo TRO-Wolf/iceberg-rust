@@ -57,7 +57,7 @@ use crate::table::Table;
 use crate::transform::{BoxedTransformFunction, create_transform_function};
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, TableLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
@@ -87,7 +87,7 @@ pub(crate) async fn write_compacted_files(
     let sort = rewrite_sort_plan(table, &arrow_schema);
     let spec = output_spec.as_ref().clone();
 
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = TableLocationGenerator::new(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(
         "compacted".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -235,7 +235,7 @@ async fn write_sorted_run(
     splitter: Option<&RecordBatchPartitionSplitter>,
     rolling_builder: &RollingFileWriterBuilder<
         ParquetWriterBuilder,
-        DefaultLocationGenerator,
+        TableLocationGenerator,
         DefaultFileNameGenerator,
     >,
     spec: &PartitionSpec,

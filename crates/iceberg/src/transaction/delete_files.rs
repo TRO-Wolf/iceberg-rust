@@ -224,7 +224,7 @@ impl TransactionAction for DeleteFilesAction {
             // A delete-only commit adds no data files.
             vec![],
             FirstRowIdPolicy::Suppress,
-        )
+        )?
         .with_stage_only(self.stage_only)
         .with_target_branch(self.target_branch.clone())?;
 
@@ -1394,7 +1394,7 @@ mod tests {
         use arrow_array::StringArray;
 
         let config = PositionDeleteWriterConfig::new().unwrap();
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let file_name_gen = DefaultFileNameGenerator::new(
             "pos-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),

@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::io::FileIO;
 use crate::spec::{NestedField, PrimitiveType, Schema, TableMetadataBuilder, Type};
 use crate::table::Table;
-use crate::transaction::StagedTableTransaction;
+use crate::transaction::{ApplyTransactionAction, StagedTableTransaction, Transaction};
 use crate::{ErrorKind, NamespaceIdent, TableCreation, TableIdent};
 
 fn schema() -> Schema {
@@ -245,6 +246,103 @@ async fn replace_restarts_versioning_when_base_pointer_does_not_parse() {
     assert!(
         staged_location.starts_with(&format!("{table_location}/metadata/00000-")),
         "an unparsable base pointer keeps the v0 restart, got {staged_location}"
+    );
+}
+
+#[tokio::test]
+async fn replace_from_a_hadoop_pointer_refuses_write_metadata_path() {
+    let file_io = FileIO::new_with_memory();
+    let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "t".into());
+    let table_location = "memory://wh/ns/t";
+    let table = table_at(
+        &file_io,
+        &ident,
+        table_location,
+        &format!("{table_location}/metadata/v7.metadata.json"),
+    )
+    .await;
+
+    let creation = TableCreation::builder()
+        .name(ident.name().to_string())
+        .schema(schema())
+        .properties(HashMap::from([(
+            "write.metadata.path".to_string(),
+            "memory://alt-meta".to_string(),
+        )]))
+        .build();
+    let err = match StagedTableTransaction::begin_replace(&table, creation).await {
+        Ok(_) => panic!("a hadoop-pointer replace carrying write.metadata.path must fail"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(
+        err.message()
+            .contains("Hadoop path-based tables cannot relocate metadata"),
+        "the refusal must carry Java's message, got: {err}"
+    );
+    assert!(
+        !file_io
+            .exists(format!("{table_location}/metadata/v8.metadata.json"))
+            .await
+            .expect("v8 exists check"),
+        "no staged metadata file may be written"
+    );
+    assert!(
+        file_io
+            .list("memory://alt-meta")
+            .await
+            .expect("list alt-meta")
+            .is_empty(),
+        "nothing may be written under write.metadata.path"
+    );
+}
+
+#[tokio::test]
+async fn apply_locally_on_a_hadoop_pointer_refuses_write_metadata_path() {
+    let file_io = FileIO::new_with_memory();
+    let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "t".into());
+    let table_location = "memory://wh/ns/t";
+    let table = table_at(
+        &file_io,
+        &ident,
+        table_location,
+        &format!("{table_location}/metadata/v7.metadata.json"),
+    )
+    .await;
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_table_properties()
+        .set(
+            "write.metadata.path".to_string(),
+            "memory://alt-meta".to_string(),
+        )
+        .apply(tx)
+        .expect("apply");
+    let err = match tx.apply_locally().await {
+        Ok(_) => panic!("a hadoop-pointer local apply carrying write.metadata.path must fail"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(
+        err.message()
+            .contains("Hadoop path-based tables cannot relocate metadata"),
+        "the refusal must carry Java's message, got: {err}"
+    );
+    assert!(
+        !file_io
+            .exists(format!("{table_location}/metadata/v8.metadata.json"))
+            .await
+            .expect("v8 exists check"),
+        "no metadata file may be written"
+    );
+    assert!(
+        file_io
+            .list("memory://alt-meta")
+            .await
+            .expect("list alt-meta")
+            .is_empty(),
+        "nothing may be written under write.metadata.path"
     );
 }
 

@@ -27,7 +27,6 @@ use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::mem::take;
 use std::ops::Deref;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use _serde::{deserialize_snapshot, serialize_snapshot};
@@ -662,12 +661,13 @@ impl TableCommit {
         }
 
         // Bump the version of metadata
-        let new_metadata_location = MetadataLocation::from_str(current_metadata_location)?
+        let new_metadata = metadata_builder.build()?.metadata;
+        let new_metadata_location = MetadataLocation::from_file_path(current_metadata_location)?
             .with_next_version()
+            .rebased(&new_metadata)?
             .to_string();
-
         Ok(table
-            .with_metadata(Arc::new(metadata_builder.build()?.metadata))
+            .with_metadata(Arc::new(new_metadata))
             .with_metadata_location(new_metadata_location))
     }
 }
@@ -2851,7 +2851,7 @@ mod tests {
             updated_table
                 .metadata_location()
                 .unwrap()
-                .starts_with("s3://bucket/test/location/metadata/00001-")
+                .starts_with("s3://bucket/test/new_location/data/metadata/00001-")
         );
 
         assert_eq!(

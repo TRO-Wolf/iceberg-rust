@@ -400,7 +400,7 @@ impl TransactionAction for RewriteFilesAction {
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
-        )
+        )?
         .with_target_branch(self.target_branch.clone())?;
 
         // Keep the replaced files' data seq on the added files when the caller asks for it. `None` leaves
@@ -1081,7 +1081,7 @@ mod tests {
         let delete_schema =
             Arc::new(arrow_schema_to_schema(config.projected_arrow_schema_ref()).unwrap());
 
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let file_name_gen = DefaultFileNameGenerator::new(
             "eq-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),
@@ -1135,7 +1135,7 @@ mod tests {
         use arrow_array::StringArray;
 
         let config = PositionDeleteWriterConfig::new().unwrap();
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let file_name_gen = DefaultFileNameGenerator::new(
             "pos-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),

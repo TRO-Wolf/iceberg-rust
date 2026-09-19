@@ -21,6 +21,7 @@ use std::ops::RangeFrom;
 
 use uuid::Uuid;
 
+use crate::catalog::write_metadata_dir;
 use crate::error::Result;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::visitors::residual_evaluator::ResidualEvaluator;
@@ -37,7 +38,6 @@ use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
-const META_ROOT_PATH: &str = "metadata";
 #[path = "replace_record_count.rs"]
 mod replace_record_count;
 
@@ -152,6 +152,7 @@ pub(crate) fn latest_snapshot<'a>(
 
 pub(crate) struct SnapshotProducer<'a> {
     pub(crate) table: &'a Table,
+    metadata_dir: String,
     snapshot_id: i64,
     commit_uuid: Uuid,
     key_metadata: Option<Vec<u8>>,
@@ -187,7 +188,7 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
         first_row_id_policy: FirstRowIdPolicy,
-    ) -> Self {
+    ) -> Result<Self> {
         let added_data_files = match first_row_id_policy {
             FirstRowIdPolicy::Preserve => added_data_files,
             FirstRowIdPolicy::Suppress => added_data_files
@@ -198,8 +199,11 @@ impl<'a> SnapshotProducer<'a> {
                 })
                 .collect(),
         };
-        Self {
+        let metadata = table.metadata();
+        let metadata_dir = write_metadata_dir(metadata.location(), metadata.properties())?;
+        Ok(Self {
             table,
+            metadata_dir,
             snapshot_id: Self::generate_unique_snapshot_id(table),
             commit_uuid,
             key_metadata,
@@ -212,7 +216,7 @@ impl<'a> SnapshotProducer<'a> {
             stage_only: false,
             target_branch: MAIN_BRANCH.to_string(),
             manifest_counter: (0..),
-        }
+        })
     }
 
     /// Commit onto `branch` instead of `main`. Java `SnapshotProducer.targetBranch(String)`.
@@ -374,19 +378,7 @@ impl<'a> SnapshotProducer<'a> {
         partition_spec: PartitionSpecRef,
         content: ManifestContentType,
     ) -> Result<ManifestWriter> {
-        let new_manifest_path = format!(
-            "{}/{}/{}-m{}.{}",
-            self.table.metadata().location(),
-            META_ROOT_PATH,
-            self.commit_uuid,
-            self.manifest_counter.next().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Exhausted manifest file name counter",
-                )
-            })?,
-            DataFileFormat::Avro
-        );
+        let new_manifest_path = self.new_manifest_path()?;
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
         let builder = ManifestWriterBuilder::new(
             output_file,
@@ -1155,19 +1147,7 @@ impl<'a> SnapshotProducer<'a> {
             .as_ref()
             .clone();
 
-        let new_manifest_path = format!(
-            "{}/{}/{}-m{}.{}",
-            self.table.metadata().location(),
-            META_ROOT_PATH,
-            self.commit_uuid,
-            self.manifest_counter.next().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Exhausted manifest file name counter",
-                )
-            })?,
-            DataFileFormat::Avro
-        );
+        let new_manifest_path = self.new_manifest_path()?;
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
         let builder = ManifestWriterBuilder::new(
             output_file,
@@ -1313,16 +1293,30 @@ impl<'a> SnapshotProducer<'a> {
         update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)
     }
 
-    fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
-        format!(
-            "{}/{}/snap-{}-{}-{}.{}",
-            self.table.metadata().location(),
-            META_ROOT_PATH,
+    fn new_manifest_path(&mut self) -> Result<String> {
+        let counter = self.manifest_counter.next().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Exhausted manifest file name counter",
+            )
+        })?;
+        Ok(format!(
+            "{}/{}-m{}.{}",
+            self.metadata_dir,
+            self.commit_uuid,
+            counter,
+            DataFileFormat::Avro
+        ))
+    }
+
+    fn generate_manifest_list_file_path(&self, attempt: i64) -> Result<String> {
+        Ok(format!(
+            "{}/snap-{}-{attempt}-{}.{}",
+            self.metadata_dir,
             self.snapshot_id,
-            attempt,
             self.commit_uuid,
             DataFileFormat::Avro
-        )
+        ))
     }
 
     /// Finished building the action and return the [`ActionCommit`] to the transaction.
@@ -1347,7 +1341,7 @@ impl<'a> SnapshotProducer<'a> {
             self.removed_delete_files = self.resolve_removed_delete_files(&requested).await?;
         }
 
-        let manifest_list_path = self.generate_manifest_list_file_path(0);
+        let manifest_list_path = self.generate_manifest_list_file_path(0)?;
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
         let parent_snapshot_id = self.parent_snapshot_id();
@@ -2949,7 +2943,8 @@ mod multispec_tests {
             HashMap::new(),
             vec![],
             FirstRowIdPolicy::Suppress,
-        );
+        )
+        .unwrap();
         producer.removed_data_files = vec![removed];
 
         let summary = producer

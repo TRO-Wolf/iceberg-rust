@@ -425,8 +425,7 @@ async fn commit_equality_delete(catalog: &MemoryCatalog, table: &Table, id: i32)
     let schema = table.metadata().current_schema().clone();
     let config =
         EqualityDeleteWriterConfig::new(vec![1], schema.clone()).expect("eq-delete config");
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         format!("eqdel-{id}"),
         Some(uuid::Uuid::now_v7().to_string()),

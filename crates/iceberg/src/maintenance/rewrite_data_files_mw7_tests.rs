@@ -86,8 +86,7 @@ async fn write_unpartitioned_position_delete(
     full_path_bounds: bool,
 ) -> DataFile {
     let config = PositionDeleteWriterConfig::new().expect("pos-delete config");
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
