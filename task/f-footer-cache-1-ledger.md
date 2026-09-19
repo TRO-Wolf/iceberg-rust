@@ -198,11 +198,36 @@ revisits), and the pin catches it three ways (`upgrades`, `entry_count`, index r
 - `merge_ranges` moved `reader.rs` → `arrow/ranges.rs` (pure function extraction) to
   keep `reader.rs` under its file-size ceiling after the cache plumbing; the DataFusion
   `scan.rs` likewise shed `exact_table_row_count`/`resolve_bindings`/`project_bindings`
-  to the new `physical_plan/scan_helpers.rs`. Moved code's comments were deleted per
-  the comment ban.
-- File-size ceilings lowered (shrunk files) in `scripts/check_rust_file_size.py`:
-  `arrow/reader.rs` 10157→10140, `scan/mod.rs` 6878→6874.
+  to the new `physical_plan/scan_helpers.rs`, and `from_aws_sdk_error` moved
+  `catalog.rs` → `utils.rs` in s3tables. Moved code's comments were deleted per the
+  comment ban.
+- `MemoryCatalogBuilder`'s hand-written `Default` impl (all `None`/empty) became
+  `#[derive(Default)]` with `MemoryCatalogConfig` gaining the derive — identical
+  semantics, −15 lines to hold `catalog.rs` under its ceiling.
+- File-size ceilings adjusted in `scripts/check_rust_file_size.py` for shrunk files:
+  `arrow/reader.rs` 10157→10140, `scan/mod.rs` 6878→6874,
+  `datafusion physical_plan/scan.rs` 1592→1505, `catalog/memory/catalog.rs` 3398→3384.
+- `s3tables/catalog.rs` also dropped below its 1000 ceiling via the
+  `from_aws_sdk_error` move plus a `format!` identity hoist in `new()`.
 
 ## Gate results
 
-PENDING — filled at final gate run.
+| Gate | Result |
+|---|---|
+| `cargo fmt --all` + `cargo fmt --all -- --check` | clean |
+| `cargo clippy -p iceberg -p iceberg-datafusion -p iceberg-catalog-s3tables -p iceberg-catalog-glue --all-targets -- -D warnings` | Finished, 0 warnings |
+| `cargo test -p iceberg --lib arrow::` | 466 passed, 0 failed (incl. all F-PAGE-PRUNE-1 + open_parquet + spark_fixture tests) |
+| `cargo test -p iceberg --lib scan::` | 250 passed, 0 failed |
+| `cargo test -p iceberg --lib catalog::memory` | 98 passed, 0 failed |
+| `cargo test -p iceberg-catalog-s3tables --lib` | 57 passed, 0 failed |
+| `cargo test -p iceberg-catalog-glue --lib` | 68 passed, 0 failed |
+| `cargo test -p iceberg-datafusion --lib physical_plan` | 222 passed, 0 failed (1 ignored measurement) |
+| `python3 scripts/check_rust_file_size.py` | 553 files clean (93 legacy ceilings) |
+| `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/pb-fork2 3962b0e8 HEAD` | `comment-ban hits=0` after every commit |
+| `typos` | clean |
+| `taplo check` | clean |
+| `cargo machete` | no unused dependencies |
+| `./scripts/check_agent_artifacts.sh` | OK |
+| `./scripts/check_matrix_anchors.sh` | OK (88 rows anchored) |
+| `./scripts/check_comment_blocks.sh` | OK |
+| `python3 -B -m unittest scripts/check_rust_file_size_test.py` | 11 tests OK |
