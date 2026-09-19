@@ -97,5 +97,9 @@ pub(super) async fn publish(
     }
     map_glue_commit_send(send, &table_ident)?;
 
+    catalog
+        .cache_put(table.metadata_location_result()?, table.metadata())
+        .await;
+
     Ok(table)
 }
