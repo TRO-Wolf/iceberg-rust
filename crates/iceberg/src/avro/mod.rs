@@ -17,6 +17,8 @@
 
 //! Avro related codes.
 #[cfg(test)]
+mod f_avro_name_1_ocf_tests;
+#[cfg(test)]
 mod f_avro_name_1_tests;
 pub(crate) mod name;
 pub(crate) mod ocf;
