@@ -118,9 +118,12 @@ Facts this establishes:
 - **C-7** Rows returned equal the in-memory reference for `>=`, `<`, `=`,
   `BETWEEN`, `IN`, a boundary microsecond, and a negative (pre-1970)
   literal, on both the multi-partition and single-stream scan paths.
-- **C-8** `BETWEEN`/`IN` arrive as `>=`/`<=` conjuncts and `OR`ed `=`
-  conjuncts; each conjunct pushes independently, so mixed-zone IN lists push
-  the sound part.
+- **C-8** `BETWEEN` arrives as `>=`/`<=` top-level conjuncts, and each pushes
+  independently. `IN` arrives as `OR`ed `=` terms inside one expression: an
+  `OR` pushes only when every term converts, so a mixed-zone `IN` list is
+  dropped whole (DataFusion re-filters above the scan). That is the safe
+  direction; no part of such a list is pushed. Corrected after the Grok logic
+  review of #312.
 
 ## RED evidence (pre-fix, base 43fcd243)
 
