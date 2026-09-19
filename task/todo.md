@@ -45,6 +45,16 @@ seam reachable from a normal build, with the typed unknown carrying `engine.oper
 - [x] Ledger + this entry; fmt, clippy both modes, size checker (ceiling ratcheted 1048→1024),
       glue `--lib` tests green both modes. No AWS creds/network; `credentialed_requested()`
       stays false.
+- [x] Round 2 RED (`dd8093aa`): L-001 cell `leftover_table_property_is_not_named_by_replace_publish`
+      red pre-fix; L-002 public-builder cells (`GlueCatalogBuilder::load`) both modes; residual
+      pins `n=0` no-op and failed-call-keeps-budget; `seed_table_with_properties` helper.
+- [x] Round 2 FIX (`575f2c48`): publish diffs staged vs base (read at `stored`) only in the
+      `CommitStateUnknown` arm — `published_metadata_operation_ids` deleted;
+      `map_glue_commit_send_identified`/`with_operation_id_context` take `FnOnce` so
+      `commit_send_operation_ids` runs only on the unknown path; `snapshot_by_id` replaces the
+      base `HashSet`; `catalog.rs` ceiling 1024→1022.
+- [x] Round 2 mutation: un-wired `GlueCatalog::new` → public-builder cells red in BOTH modes
+      (test-constructor cells stayed green — the pinned gap); restored green.
 
 ## ACTIVE (2026-09-18): F-RDF-GRANULARITY-1 — rewrite output is planned per read split
 

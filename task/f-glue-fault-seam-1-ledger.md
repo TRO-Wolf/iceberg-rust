@@ -137,3 +137,91 @@ With the property path present but `fault_drop_count` stubbed to `Ok(None)`:
   `UpdateTable` lands while the response is dropped → metadata-only commits surface typed
   `CommitStateUnknown` (non-retryable) carrying the operation id; snapshot commits reconcile to
   success after reload with exactly one catalog commit attempt.
+
+## 7. Round 2 — review findings L-001 / L-002 / R-01 (commits `dd8093aa` test, `575f2c48` fix)
+
+Reviews: `rv-glue-logic-out.json` (L-001, L-002) and `rv-glue-perf-out.json` (R-01..R-04).
+R-04 (document the two public consts) is overruled by the comment ban — `#[allow(missing_docs)]`
+stays; this note is its record.
+
+### L-001 — replace publish named leftover operation ids (fixed)
+
+`published_metadata_operation_ids` read `engine.operation-id` from the published metadata's
+current snapshot and table properties — both inherited from the base when the replace carries
+empty `TableCreation.properties` (`set_properties` empty-map early-return keeps the base map,
+`table_metadata_builder.rs:250`). A dropped publish response then surfaced `CommitStateUnknown`
+naming an id an earlier commit stamped, which RePark residual reconciliation could match
+against a previous snapshot.
+
+Fix: `publish` maps the send through `map_glue_commit_send` first; only when the mapped kind is
+`CommitStateUnknown` does it read the base metadata file at `stored` (the live pointer — equal
+to `expected_base_metadata_location` whenever the CAS check passed, so it is exactly the file
+the staged metadata was built on) and diff via `commit_send_operation_ids` — the same rule
+`update_table` uses. A base read that fails attaches no ids; the unknown error still returns.
+`published_metadata_operation_ids` is deleted.
+
+Cells (`replace_publish_tests.rs`, run in both feature modes — they drive the scripted
+`AcceptThenLose`, not the fault property):
+
+- `leftover_table_property_is_not_named_by_replace_publish` — red pre-fix
+  (`context: { engine.operation-id: op-old }`), green post-fix.
+- `introduced_table_property_is_named_by_replace_publish` — the positive pin: a replace whose
+  `TableCreation.properties` sets `engine.operation-id=op-new` over a base carrying `op-old`
+  names `op-new` and not `op-old`.
+
+### L-002 — production constructor unpinned (fixed)
+
+Every fault cell built through `for_commit_fault_tests_at_version`; un-wiring
+`GlueCatalog::new` left the suite green. New cells go through the PUBLIC path
+`GlueCatalogBuilder::load` → `GlueCatalog::new` (offline: static creds + region props make
+`create_sdk_config`/`FileIOBuilder` network-free):
+
+- `enabled::public_builder_installs_the_dropping_wrapper_when_the_property_is_set` — observes
+  the installed transport through a `cfg(all(test, feature))` trait seam
+  `is_response_dropping_transport` (default false; `DiscardingGlueCommitTransport` overrides
+  true) surfaced as `GlueCatalog::commit_transport_drops_responses`. The trait seam is the
+  smallest honest proof: it names the installed transport kind without exposing the
+  `pub(crate)` wrapper type.
+- `disabled::public_builder_refuses_the_fault_property_without_the_feature` — `load` fails
+  with `FeatureUnsupported` naming the property.
+
+Mutation proof (un-wired `new()` → `Arc::new(LiveGlueCommitTransport::new(..))` directly,
+not committed):
+
+- `cargo test -p iceberg-catalog-glue --lib` → `FAILED. 53 passed; 1 failed`:
+  `public_builder_refuses_the_fault_property_without_the_feature` (load succeeded instead of
+  refusing). The test-constructor refusal cell stayed green — the original gap, now pinned.
+- `cargo test -p iceberg-catalog-glue --lib --features commit-fault-injection` →
+  `FAILED. 59 passed; 1 failed`:
+  `public_builder_installs_the_dropping_wrapper_when_the_property_is_set` (no wrapper
+  installed); all other enabled cells stayed green.
+- Restore → `ok. 54 passed` / `ok. 60 passed`, tree clean.
+
+### R-01 / R-02 / R-03 — ids computed on the unknown path only (fixed)
+
+`map_glue_commit_send_identified` now takes `impl FnOnce() -> Vec<String>`; the
+`commit_send_operation_ids` walk runs only when the mapped kind is `CommitStateUnknown`
+(`with_operation_id_context` holds the kind gate and the context fold). Publish is lazy the
+same way through the match arm above (R-03). `commit_send_operation_ids` filters staged
+snapshots by `base.snapshot_by_id` instead of building a full-base `HashSet` (R-02).
+
+Residual pins added (`commit_fault_tests.rs::enabled`):
+
+- `drop_count_zero_installs_the_wrapper_but_drops_nothing` — `n=0` installs the wrapper with
+  an empty budget; a commit succeeds, no `AcceptedResponseLost` observed.
+- `a_failed_call_does_not_consume_the_drop_budget` — `ConcurrentModification` then `Success`
+  under `n=1`: the conflict attempt consumes nothing, the retried send's success is the one
+  dropped, and a third commit passes.
+
+### Round-2 gates
+
+- `cargo test -p iceberg-catalog-glue --lib` → `ok. 54 passed`
+- `cargo test -p iceberg-catalog-glue --lib --features commit-fault-injection` →
+  `ok. 60 passed`
+- `cargo clippy -p iceberg-catalog-glue --all-targets -- -D warnings` → clean
+- `cargo clippy -p iceberg-catalog-glue --all-targets --features commit-fault-injection -- -D
+  warnings` → clean
+- `cargo fmt --all -- --check` → clean
+- `python3 scripts/check_rust_file_size.py` → `rust-file-size: 516 files clean (96 legacy
+  ceilings)`; `catalog.rs` ceiling ratcheted 1024 → 1022
+- No AWS creds/network/`aws` CLI at any point; `credentialed_requested()` stays false.
