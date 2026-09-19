@@ -1755,3 +1755,31 @@ root (empty key).
       planted orphan, spares reachable files; nested control table exact set.
 - [x] Gates (units + compile of the MinIO suite; Docker excused), ledger, commit
       with TRO-Wolf identity + trailer, `handback.json`.
+
+## F-LIST-NULL-ACCESSOR-2 — compound predicates over a nested column reach `bind` unguarded (2026-09-18)
+
+Branch `fix/f-list-null-accessor-2`, base `29ea7f6d`. Ledger
+`task/f-list-null-accessor-2-ledger.md`. #299 gated only the DataFusion converter;
+Iceberg's raw-`Predicate` surfaces (`with_filter`, `with_file_prune_only`,
+incremental scan filter, `conflict_detection_filter`) bound caller predicates with
+no soundness check, so `id > 1 AND xs IS NULL` / `xs IS NULL OR id = 1` over a
+list/map/struct column raised `Accessor for Field xs not found`. Entry-point defect:
+every SQL fixture variant stayed green because `delete_from` always converts first.
+
+- [x] Red cells: prune-only and filtered scans over `NullShape::ALL` × v2/v3
+      (seeded-per-row fixtures so file pruning is observable) plus a
+      `first_conflicting_file` cell — all red `DataInvalid => Accessor for Field
+      xs not found` (`b32b218c`).
+- [x] Fix: `Predicate::drop_unbindable_terms` + `bind_pruning` in new
+      `expr/sanitize.rs` — a leaf drops only when its field resolves but has no
+      accessor; `AND` keeps the sound conjunct, `OR` widens, `NOT` widens whole;
+      missing/wrong-cased fields still fail bind loudly (9 wrong-case contract
+      tests preserved). Applied at the five raw binds: `scan/mod.rs`,
+      `incremental.rs`, `conflict_filter.rs`, `row_delta.rs` ×2 — all line-neutral
+      under frozen legacy ceilings (`c9e24310`).
+- [x] Mutation: revert fix files to `b32b218c` → all three cells red with the
+      defect signature; restore → green.
+- [x] Gates: fmt clean, filtered tests green (`list_null` 12, `expr::sanitize` 9,
+      `conflict_filter` 9, `row_delta` 120, `incremental` 39, `predicate` 187,
+      `wrong_case_fails_to_bind` 9), clippy `-D warnings` clean, size checker
+      516 files clean, comment-ban hits=0. Ledger + this entry.
