@@ -19,17 +19,22 @@ use std::fs::File;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use futures::TryStreamExt;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection,
+};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use super::page_prune_fixture::{
-    bound, field, field_id_map, file_metadata, iceberg_schema, selected_rows, task, tmpdir,
+    bound, collect_with_io, field, field_id_map, file_metadata, iceberg_schema, index_byte_ranges,
+    recording_io, selected_rows, task, tmpdir,
 };
 use super::reader::{ArrowFileReader, ArrowReader, ArrowReaderBuilder};
 use crate::expr::Reference;
@@ -147,7 +152,12 @@ async fn collect_timed(tasks: &[FileScanTask], row_selection: bool) -> (Duration
     (start.elapsed(), batches.iter().map(|b| b.num_rows()).sum())
 }
 
-async fn decode_one(path: &str, selection: Option<RowSelection>, load_index: bool) -> Duration {
+async fn decode_one(
+    path: &str,
+    selection: Option<RowSelection>,
+    load_index: bool,
+    with_filter: bool,
+) -> Duration {
     let file_io = FileIO::new_with_fs();
     let input = file_io.new_input(path).expect("input");
     let file_read = input.reader().await.expect("reader");
@@ -175,6 +185,24 @@ async fn decode_one(path: &str, selection: Option<RowSelection>, load_index: boo
     if let Some(selection) = selection {
         builder = builder.with_row_selection(selection);
     }
+    if with_filter {
+        let parquet_schema = builder.parquet_schema().clone();
+        let projection = ProjectionMask::leaves(&parquet_schema, [1]);
+        let predicate = ArrowPredicateFn::new(projection, |batch: RecordBatch| {
+            let category = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("category");
+            Ok(BooleanArray::from(
+                category
+                    .iter()
+                    .map(|v| v == Some("cat_7"))
+                    .collect::<Vec<bool>>(),
+            ))
+        });
+        builder = builder.with_row_filter(RowFilter::new(vec![Box::new(predicate)]));
+    }
     let start = Instant::now();
     let batches = builder
         .build()
@@ -182,7 +210,11 @@ async fn decode_one(path: &str, selection: Option<RowSelection>, load_index: boo
         .try_collect::<Vec<RecordBatch>>()
         .await
         .expect("decode");
-    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS);
+    let expected = if with_filter { ROWS / 8 } else { ROWS };
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        expected
+    );
     start.elapsed()
 }
 
@@ -264,18 +296,24 @@ async fn perf_page_prune_cost_breakdown() {
     let mut decode_sel = Vec::new();
     let mut decode_none = Vec::new();
     let mut decode_no_index = Vec::new();
+    let mut decode_filter_index = Vec::new();
+    let mut decode_filter_no_index = Vec::new();
     for _ in 0..REPS {
         for (i, p) in paths.iter().take(DECODE_FILES).enumerate() {
-            decode_sel.push(decode_one(p, Some(selections[i].clone()), true).await);
-            decode_none.push(decode_one(p, None, true).await);
-            decode_no_index.push(decode_one(p, None, false).await);
+            decode_sel.push(decode_one(p, Some(selections[i].clone()), true, false).await);
+            decode_none.push(decode_one(p, None, true, false).await);
+            decode_no_index.push(decode_one(p, None, false, false).await);
+            decode_filter_index.push(decode_one(p, None, true, true).await);
+            decode_filter_no_index.push(decode_one(p, None, false, true).await);
         }
     }
     let decode_sel = median(&mut decode_sel);
     let decode_none = median(&mut decode_none);
     let decode_no_index = median(&mut decode_no_index);
+    let decode_filter_index = median(&mut decode_filter_index);
+    let decode_filter_no_index = median(&mut decode_filter_no_index);
     println!(
-        "(c) decode/file: all-select RowSelection {decode_sel:?}, no selection {decode_none:?}, no index {decode_no_index:?}"
+        "(c) decode/file: all-select RowSelection {decode_sel:?}, no selection {decode_none:?}, no index {decode_no_index:?}, filter+index {decode_filter_index:?}, filter+no index {decode_filter_no_index:?}"
     );
 
     let p0 = &paths[0];
@@ -314,6 +352,21 @@ async fn perf_page_prune_cost_breakdown() {
         collect_timed(&tasks_np, false).await.1,
     );
     assert_eq!(on_rows, off_rows, "ON and OFF must return the same rows");
+
+    for on in [true, false] {
+        let (io, _calls, ranges) = recording_io();
+        let _ = collect_with_io(tasks_np[0].clone(), on, io, 512 * 1024).await;
+        let recorded = ranges.lock().expect("ranges");
+        let total_bytes: u64 = recorded.iter().map(|(_, r)| r.end - r.start).sum();
+        println!(
+            "single-file reads on={on}: {} calls, {total_bytes} B, ranges {:?}",
+            recorded.len(),
+            recorded
+        );
+        drop(recorded);
+        let metadata = file_metadata(&paths[0]);
+        let _ = index_byte_ranges(&metadata);
+    }
 
     let on = median_scan(&tasks_np, true, false).await;
     let off = median_scan(&tasks_np, false, false).await;

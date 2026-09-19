@@ -21,7 +21,7 @@ use std::sync::Arc;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 
-use super::open_parquet::{ROW_SELECTIONS_APPLIED, effective_row_selection};
+use super::open_parquet::{PAGE_INDEX_STRIPS, ROW_SELECTIONS_APPLIED, effective_row_selection};
 use super::page_prune_fixture::*;
 use super::reader::{ArrowReader, ParquetReadOptions};
 use crate::expr::Reference;
@@ -233,12 +233,18 @@ async fn all_keep_predicate_hands_no_selection_to_parquet() {
         Reference::new("id").greater_than_or_equal_to(Datum::int(0)),
     );
     let before = ROW_SELECTIONS_APPLIED.with(|count| count.get());
+    let strips_before = PAGE_INDEX_STRIPS.with(|count| count.get());
     let rows = collect(task(&data_path, schema, &[1], Some(predicate)), true).await;
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), ROWS);
     assert_eq!(
         ROW_SELECTIONS_APPLIED.with(|count| count.get()) - before,
         0,
         "a predicate that keeps every page must not hand parquet a RowSelection"
+    );
+    assert_eq!(
+        PAGE_INDEX_STRIPS.with(|count| count.get()) - strips_before,
+        1,
+        "a predicate that keeps every page must not let decode see the page index"
     );
 }
 
@@ -251,12 +257,18 @@ async fn pruning_predicate_hands_selection_to_parquet() {
     let schema = id_schema();
     let predicate = bound(&schema, Reference::new("id").equal_to(Datum::int(64)));
     let before = ROW_SELECTIONS_APPLIED.with(|count| count.get());
+    let strips_before = PAGE_INDEX_STRIPS.with(|count| count.get());
     let rows = collect(task(&data_path, schema, &[1], Some(predicate)), true).await;
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     assert_eq!(
         ROW_SELECTIONS_APPLIED.with(|count| count.get()) - before,
         1,
         "a predicate that skips pages must hand parquet a RowSelection"
+    );
+    assert_eq!(
+        PAGE_INDEX_STRIPS.with(|count| count.get()) - strips_before,
+        0,
+        "a predicate that skips pages must keep the page index"
     );
 }
 
@@ -270,6 +282,7 @@ async fn position_deletes_hand_selection_to_parquet() {
     let schema = id_schema();
     let delete = write_pos_delete_file(&del_path, &data_path, &[10, 70]);
     let before = ROW_SELECTIONS_APPLIED.with(|count| count.get());
+    let strips_before = PAGE_INDEX_STRIPS.with(|count| count.get());
     let rows = collect(
         with_deletes(task(&data_path, schema, &[1], None), vec![delete]),
         true,
@@ -280,6 +293,11 @@ async fn position_deletes_hand_selection_to_parquet() {
         ROW_SELECTIONS_APPLIED.with(|count| count.get()) - before,
         1,
         "a delete selection must never be dropped"
+    );
+    assert_eq!(
+        PAGE_INDEX_STRIPS.with(|count| count.get()) - strips_before,
+        0,
+        "deletes must keep the page index"
     );
 }
 

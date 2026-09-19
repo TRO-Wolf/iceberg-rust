@@ -30,7 +30,10 @@ use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::io::{FileIO, FileMetadata};
-use crate::metadata_columns::{get_metadata_field, is_metadata_field, is_row_lineage_field};
+use crate::metadata_columns::{
+    RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, get_metadata_field, is_metadata_field,
+    is_row_lineage_field,
+};
 use crate::scan::FileScanTask;
 use crate::spec::Schema;
 use crate::{Error, ErrorKind};
@@ -47,6 +50,8 @@ pub(crate) fn page_index_policy(needed: bool) -> PageIndexPolicy {
 thread_local! {
     pub(crate) static ROW_SELECTIONS_APPLIED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    pub(crate) static PAGE_INDEX_STRIPS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -59,9 +64,18 @@ fn record_applied_selection(selection: &Option<RowSelection>) {
 #[cfg(not(test))]
 fn record_applied_selection(_: &Option<RowSelection>) {}
 
+#[cfg(test)]
+fn record_index_strip() {
+    PAGE_INDEX_STRIPS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_index_strip() {}
+
 pub(crate) fn effective_row_selection(selection: Option<RowSelection>) -> Option<RowSelection> {
-    record_applied_selection(&selection);
-    selection
+    let effective = selection.filter(|s| s.skipped_row_count() > 0 || !s.selects_any());
+    record_applied_selection(&effective);
+    effective
 }
 
 pub(crate) enum OpenParquetError {
@@ -251,6 +265,83 @@ impl ArrowReader {
         };
 
         Ok((reader, arrow_metadata))
+    }
+
+    pub(crate) fn prune_indexed_metadata_for_scan(
+        task: &FileScanTask,
+        arrow_metadata: ArrowReaderMetadata,
+        row_group_filtering_enabled: bool,
+        row_selection_enabled: bool,
+        predicate_can_prune: bool,
+    ) -> Result<(
+        ArrowReaderMetadata,
+        Option<Vec<usize>>,
+        Option<RowSelection>,
+    )> {
+        let needs_physical_ordinals = task.project_field_ids().contains(&RESERVED_FIELD_ID_POS)
+            || task.project_field_ids().contains(&RESERVED_FIELD_ID_ROW_ID);
+        let decide_early = task.deletes.is_empty()
+            && row_selection_enabled
+            && predicate_can_prune
+            && !needs_physical_ordinals;
+        let Some(predicate) = task.predicate.as_deref().filter(|_| decide_early) else {
+            return Ok((arrow_metadata, None, None));
+        };
+        let (_, field_id_map) =
+            Self::build_field_id_set_and_map(arrow_metadata.parquet_schema(), predicate)?;
+        let mut selected_row_group_indices = (task.start != 0 || task.length != 0)
+            .then(|| {
+                Self::filter_row_groups_by_byte_range(
+                    arrow_metadata.metadata(),
+                    task.start,
+                    task.length,
+                )
+            })
+            .transpose()?;
+        if row_group_filtering_enabled {
+            let pruned = Self::get_selected_row_group_indices(
+                predicate,
+                arrow_metadata.metadata(),
+                &field_id_map,
+                &task.schema,
+            )?;
+            selected_row_group_indices = Some(match selected_row_group_indices {
+                Some(byte_range) => byte_range
+                    .into_iter()
+                    .filter(|idx| pruned.contains(idx))
+                    .collect(),
+                None => pruned,
+            });
+        }
+        let row_selection = Self::get_row_selection_for_filter_predicate(
+            predicate,
+            arrow_metadata.metadata(),
+            &selected_row_group_indices,
+            &field_id_map,
+            &task.schema,
+        )?;
+        let redundant = row_selection
+            .as_ref()
+            .is_some_and(|s| s.selects_any() && s.skipped_row_count() == 0);
+        if !redundant {
+            return Ok((arrow_metadata, selected_row_group_indices, row_selection));
+        }
+        record_index_strip();
+        let stripped = ParquetMetaData::clone(arrow_metadata.metadata().as_ref())
+            .into_builder()
+            .set_column_index(None)
+            .set_offset_index(None)
+            .build();
+        let options = ArrowReaderOptions::new().with_schema(Arc::clone(arrow_metadata.schema()));
+        let arrow_metadata =
+            ArrowReaderMetadata::try_new(Arc::new(stripped), options).map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to create ArrowReaderMetadata without page index",
+                )
+                .with_source(e)
+            })?;
+        Ok((arrow_metadata, selected_row_group_indices, row_selection))
     }
 }
 

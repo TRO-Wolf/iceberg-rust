@@ -523,6 +523,15 @@ impl ArrowReader {
             arrow_metadata
         };
 
+        let (arrow_metadata, mut selected_row_group_indices, mut row_selection) =
+            Self::prune_indexed_metadata_for_scan(
+                &task,
+                arrow_metadata,
+                row_group_filtering_enabled,
+                row_selection_enabled,
+                predicate_can_prune,
+            )?;
+
         let mut record_batch_stream_builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
@@ -673,17 +682,7 @@ impl ArrowReader {
             (final_predicate, None, None)
         };
 
-        // Row-group selection has three sources: a byte range from a split task, applicable
-        // equality deletes, and a scan predicate when row-group filtering is on. `RowSelection`
-        // has two: applicable positional deletes, and a scan predicate when row selection is on.
-        // Positional deletes only apply through a `RowSelection`, so that path runs whenever
-        // deletes exist, even with predicate filtering off.
-        let mut selected_row_group_indices = None;
-        let mut row_selection = None;
-
-        // Filter row groups based on byte range from task.start and task.length.
-        // If both start and length are 0, read the entire file (backwards compatibility).
-        if task.start != 0 || task.length != 0 {
+        if (task.start != 0 || task.length != 0) && selected_row_group_indices.is_none() {
             let byte_range_filtered_row_groups = Self::filter_row_groups_by_byte_range(
                 record_batch_stream_builder.metadata(),
                 task.start,
@@ -706,7 +705,7 @@ impl ArrowReader {
             )?;
             record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
 
-            if row_group_filtering_enabled {
+            if row_group_filtering_enabled && row_selection.is_none() {
                 let predicate_filtered_row_groups = Self::get_selected_row_group_indices(
                     &predicate,
                     record_batch_stream_builder.metadata(),
@@ -726,7 +725,7 @@ impl ArrowReader {
                 };
             }
 
-            if row_selection_enabled {
+            if row_selection_enabled && row_selection.is_none() {
                 row_selection = Self::get_row_selection_for_filter_predicate(
                     &predicate,
                     record_batch_stream_builder.metadata(),
@@ -1285,7 +1284,7 @@ impl ArrowReader {
         Ok(results.into())
     }
 
-    fn build_field_id_set_and_map(
+    pub(crate) fn build_field_id_set_and_map(
         parquet_schema: &SchemaDescriptor,
         predicate: &BoundPredicate,
     ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
@@ -1519,7 +1518,7 @@ impl ArrowReader {
         Ok(RowFilter::new(vec![Box::new(arrow_predicate)]))
     }
 
-    fn get_selected_row_group_indices(
+    pub(crate) fn get_selected_row_group_indices(
         predicate: &BoundPredicate,
         parquet_metadata: &Arc<ParquetMetaData>,
         field_id_map: &HashMap<i32, usize>,
@@ -1580,7 +1579,7 @@ impl ArrowReader {
     ///
     /// Midpoint selection means a window that misses a row group's midpoint reads none of its
     /// rows. Callers must TILE `[0, file_size)`. Java behaves the same way.
-    fn filter_row_groups_by_byte_range(
+    pub(crate) fn filter_row_groups_by_byte_range(
         parquet_metadata: &Arc<ParquetMetaData>,
         start: u64,
         length: u64,

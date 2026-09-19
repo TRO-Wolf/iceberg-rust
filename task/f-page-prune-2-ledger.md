@@ -56,16 +56,90 @@ Columns: `id` i64 ascending, `category` string cycling `cat_0..=cat_7` (every pa
 every value — `category = 'cat_7'` can prune no page), plus `v1` f64 / `v2` i32. Scan
 collects all columns, batch size 8,192, median of 5 after a warmup pass.
 
-(numbers to be recorded here)
+Recorded runs (each printed scan number is already a median of 5):
+
+Before the fix (selection handed to parquet unconditionally):
+
+```
+(a) evaluator total 168-255µs over 50 files (~5µs/file)
+(b) nonprunable selection keeps every row: true
+(c) decode/file: all-select RowSelection ~2.0ms, no selection ~1.89ms, no index ~1.84ms
+(d) footer+index parse: Optional ~20µs, Skip ~13µs
+scan nonprunable: ON 241.4ms OFF 189.4ms ratio 1.274
+scan prunable: ON ~28ms OFF ~44ms ratio ~0.63
+```
+
+The evaluator (~5µs/file) and the index parse (~7µs/file) are noise; the all-keep
+`RowSelection` costs ~150µs/file in the sparse-fetch path. After landing the
+`effective_row_selection` drop alone the ratio improved to ~1.17 but a residual ~33ms
+(≈660µs/file) remained.
+
+Residual isolation: forcing `should_load_page_index` off produced ON/OFF = 1.011 —
+the residual is the *presence* of the loaded index, not the selection. Byte-level read
+recording shows identical fetch plans ON vs OFF (3 calls, same ranges; the coalesced
+data read covers the index bytes anyway). The mechanism is inside parquet-rs:
+`InMemoryRowGroup::column_chunks` hands `page_locations` to `SerializedPageReader`
+whenever `offset_index` is present, flipping it from `Values` (incremental header
+parse) to `Pages` (per-page `get_bytes`) mode. Measured directly in `decode_one`:
+
+```
+decode/file, no selection: filter + index loaded 3.42-3.64ms vs filter + no index 2.82-2.94ms
+```
+
+i.e. ~0.7ms/file — with a `RowFilter` present, `Pages` mode is slower than header
+parsing. That is a parquet-rs 58.4.0 internal; the fix must keep the index out of the
+decode metadata for the all-keep case.
 
 ## Fix
 
-(to be recorded)
+Two changes, both keyed off the *evaluated* selection, never the static leaf class:
+
+1. `effective_row_selection` (`crates/iceberg/src/arrow/open_parquet.rs`) drops a
+   `RowSelection` that selects rows but skips none (`selects_any() &&
+   skipped_row_count() == 0`), applied to the final intersected selection before
+   `with_row_selection`. Empty selections (`!selects_any()`) and any selection with a
+   skipped row — including every delete-derived selection — are preserved.
+2. `ArrowReader::prune_indexed_metadata_for_scan` (same file) runs before the stream
+   builder exists: only when there are no deletes, row selection is on, the predicate
+   is statically prunable, and no `_pos`/`_row_id` ordinals are projected, it evaluates
+   row-group filtering and the filter's `RowSelection` on `arrow_metadata` and, when
+   the result is all-keep, rebuilds the `ArrowReaderMetadata` over a
+   `ParquetMetaData` whose column and offset indexes are stripped
+   (`into_builder().set_column_index(None).set_offset_index(None)`), preserving the
+   stamped/coerced arrow schema. The decode then runs `Values` mode exactly as the
+   pre-F-PAGE-PRUNE-1 path did. Prunable selections keep the index (sparse fetch is
+   the win); deletes never take this path and always keep the index.
+
+After the fix (medians of 5, two runs):
+
+```
+scan nonprunable: ON 184.2/184.3ms OFF 183.7/190.3ms ratio 1.003 / 0.969   (target ≤1.03)
+scan prunable:    ON 28.0/26.5ms  OFF 43.4/41.9ms  ratio 0.645 / 0.632    (win retained)
+```
+
+Behavior pins in `open_parquet_tests.rs` use a thread-local seam that counts only
+selections actually handed to parquet (`ROW_SELECTIONS_APPLIED`) and one that counts
+index-stripped metadata (`PAGE_INDEX_STRIPS`):
+
+- all-keep predicate → 0 selections applied, 1 strip, all rows returned
+- pruning predicate → 1 selection applied, 0 strips, pruned rows
+- position deletes → 1 selection applied, 0 strips, deleted rows removed
+- `effective_row_selection` unit pins: all-keep dropped, partial kept, empty kept
 
 ## Mutation evidence
 
-(to be recorded)
+- `effective_row_selection` mutated to a passthrough: `all_keep_row_selection_is_dropped`
+  and `all_keep_predicate_hands_no_selection_to_parquet` both go red (selection applied
+  count 1, expected 0).
+- `prune_indexed_metadata_for_scan` mutated to return before stripping:
+  `all_keep_predicate_hands_no_selection_to_parquet` goes red on the strip assert
+  (0 strips, expected 1).
+
+Both restored; all pins green again.
 
 ## Gates
 
-(to be recorded)
+- `cargo fmt --all` clean
+- filtered suites: `open_parquet` 16, `page_prune` 31+1 ignored, `page_index` 17,
+  `spark_fixture` 9, `arrow::` lib 458+2 ignored — all green
+- `crates/iceberg/src/arrow/reader.rs` 10,156 lines (ceiling 10,157)
