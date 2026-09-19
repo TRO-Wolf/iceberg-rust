@@ -267,14 +267,86 @@ The three green guards pin behavior that was already correct and must not regres
 when the real `for_table` / `for_position_delete_table` land (the pos-delete pin
 turns red if a delete writer is wired to `for_table` instead — bounds vanish).
 
+## Step 3 — IMPLEMENT (third commit)
+
+`spec/metrics_config.rs`:
+
+- `MetricsConfig::for_table(&TableMetadata)` — `from(props, Some(current_schema),
+  Some(default_sort_order))`. The shared `from` runs Java's exact sequence: read the
+  `max-inferred-column-defaults` limit (default 100; negative or non-numeric warns and
+  falls back to 100 — Java's `propertyAsInt` throws on non-numeric, the infallible API
+  warns instead, recorded in Scope decisions); if the default property is absent and
+  `projected_field_ids` (fields whose type is primitive/variant/struct, Java
+  `TypeUtil.getProjectedIds`) exceeds the limit, the first `limit` metrics-eligible
+  fields in `limit_field_ids` order (Java `MetricsConfig$1`: struct scans direct
+  fields, then descends; list visits element; map visits key then value) get explicit
+  `truncate(16)` entries and the default flips to `none`. Then order-preserving sort
+  fields (`transform.preserves_order()` — the fork's enum already matches Java's
+  Identity/Truncate/Year/Month/Day/Hour set) are promoted to at least `truncate(16)`
+  via the current schema's `name_by_field_id`. Column overrides apply last.
+- `MetricsConfig::for_position_delete_table(&TableMetadata)` — `for_table` +
+  `file_path`/`pos` Full + every table column-mode re-keyed under `row.<name>`,
+  keeping the table default mode.
+- `pub(crate) struct_descended_field_ids(schema)` — field ids reachable through
+  struct nesting only; the parquet metrics pass uses it for Java's
+  `MetricsVisitor.list()/.map()` empty-return.
+
+`writer/file_writer/parquet_writer.rs` (`parquet_to_data_file_builder`): value/null
+counts and bounds (and the retained `nan_value_counts` keys) are written only for
+`stats_eligible` field ids — list/map descendants keep `column_sizes` only, matching
+Java 1.11.0's `ParquetMetrics` visitor. `parquet_files_to_data_files` now calls
+`for_table(table_metadata)` (was `from_properties`).
+
+Writer wiring: `rewrite_data_files_write.rs` → `for_table`;
+`partition_key_audit.rs` → `for_table`; `convert_equality_delete_files.rs` →
+`for_position_delete_table`; `rewrite_table_path.rs` → `for_position_delete_table`;
+`rewrite_position_delete_files.rs` → `for_position_delete_table` (resolved once in
+`group_writer_factory`, carried on `GroupWriteFactory`). DataFusion INSERT/DML/DELETE
+sites stay unwired — run 24c's half calls the same helpers.
+
+Test corrections to Java semantics (pre-existing tests pinned the fork's old,
+non-Java list/map-descendant metrics): `test_parquet_writer_with_complex_schema`
+drops ids 7/11/13 from counts and bounds; `test_nan_val_cnts_list_type` /
+`test_nan_val_cnts_map_type` assert all five stats maps empty with `column_sizes`
+retained.
+
+## Step 4 — MUTATION + gates
+
+| mutation | pin(s) driven red | result |
+|---|---|---|
+| sorted promotion removed | `oracle_cell_sorted_none`, `oracle_cell_sorted_counts` | both FAILED (`{}` vs `{2}`; missing bound for 3) |
+| max-inferred removed | `oracle_cell_max_inferred_2` | FAILED (`{1..8}` vs `{1,2}`); sibling `default=counts` cell stayed green |
+| rewrite table config skipped | `rewrite_data_files_honors_metrics_default_none` | FAILED (bounds written) |
+
+All mutations reverted; `metrics_config_tests` 14/14 green after revert.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy -p iceberg --all-targets --
+-D warnings` clean; `make check` green (workspace clippy, taplo, cargo-machete,
+agent-artifacts, matrix-anchors, comment-blocks, file-size);
+`check_rust_file_size.py` ceiling for `parquet_writer.rs` lowered 3390 → 3346 (the
+file shrank — the checker demands the ceiling track the file); `comment_ban.py
+origin/main HEAD` prints `comment-ban hits=0`; `typos` clean. Filtered test runs:
+`metrics` 172/172, `writer::file_writer::parquet_writer` 28/28,
+`maintenance::` (minus pins) 402/402.
+
+Residual parity note: Java resolves promoted sort-column names through the sort
+order's bound schema; the fork's `SortOrder` carries no schema, so `for_table`
+resolves `source_id` names through the CURRENT schema — promotion survives a column
+rename where Java's stored key would silently go stale. Deliberate, recorded here.
+
 ## Propositions
 
-- [ ] P1 `for_table` resolves default/column/max-inferred/sorted rules exactly per
-      bytecode; pinned red-first by the 12 oracle cells.
-- [ ] P2 `for_position_delete_table` = `for_table` + `file_path`/`pos` Full + `row.*`
-      re-key; pinned by the delete-overlay pin.
-- [ ] P3 every production writer above applies the resolved config; pinned by the
-      `rewrite_data_files` e2e none-cell.
-- [ ] P4 list/map descendants drop counts/bounds but keep `column_sizes`; pinned by
-      every oracle cell's key sets.
-- [ ] P5 mutations (drop promotion / drop limit / drop wiring) turn named pins red.
+- [x] P1 `for_table` resolves default/column/max-inferred/sorted rules exactly per
+      bytecode; pinned red-first by the 12 oracle cells — all green post-impl, and
+      the sort/max-inferred mutations drive the right cells red.
+- [x] P2 `for_position_delete_table` = `for_table` + `file_path`/`pos` Full + `row.*`
+      re-key; pinned by the delete-overlay pin (green; Full `file_path` bound exact).
+- [x] P3 every production writer above applies the resolved config; pinned by the
+      `rewrite_data_files` e2e none-cell and the mutation that skips it (red).
+- [x] P4 list/map descendants drop counts/bounds but keep `column_sizes`; pinned by
+      every oracle cell's key sets and the three corrected writer tests.
+- [x] P5 mutations (drop promotion / drop limit / drop wiring) turn named pins red —
+      verified above, all three reverted.
+- [~] P6 OPEN residue: Java drops a column's counts/bounds when a chunk lacks
+      statistics entirely; the fork still gates only bounds on stats presence. No
+      oracle cell exercises it — recorded, not fixed this unit.

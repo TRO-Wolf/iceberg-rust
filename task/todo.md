@@ -40,9 +40,13 @@ table properties are ignored by the fork's own Parquet writers (compaction rewri
 - [x] RED-FIRST pins: 12 oracle cells (six maps vs Spark, keys + bound bytes) +
       `rewrite_data_files` none-cell e2e + position-delete overlay pin — 11 red /
       3 green guards on `from_properties`/`for_position_delete` stubs
-- [ ] IMPLEMENT: `MetricsConfig::for_table` / `for_position_delete_table` +
-      list/map-descendant drop; wire all production sites
-- [ ] MUTATION (drop promotion / drop limit / drop rewrite wiring) + gates + ledger
+- [x] IMPLEMENT: `MetricsConfig::for_table` / `for_position_delete_table` +
+      list/map-descendant drop; wire all 6 production sites (DataFusion sites are
+      run 24c's half — the helpers are what they call). 14/14 pins green
+- [x] MUTATION (drop promotion / drop limit / drop rewrite wiring → 2+1+1 pins red,
+      all reverted) + gates: fmt, workspace clippy `-D warnings`, `make check` green,
+      `parquet_writer.rs` ceiling 3390 → 3346, comment-ban `hits=0`, typos;
+      `metrics` 172, `parquet_writer` 28, `maintenance::` 402 all green
 - [ ] handback.json
 
 

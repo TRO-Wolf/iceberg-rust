@@ -46,7 +46,8 @@ use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
     MetricsConfig, MetricsMode, NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef,
-    SchemaVisitor, Struct, StructType, TableMetadata, Type, visit_schema,
+    SchemaVisitor, Struct, StructType, TableMetadata, Type, struct_descended_field_ids,
+    visit_schema,
 };
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
@@ -486,7 +487,7 @@ impl ParquetWriter {
                 file_path,
                 // TODO: Implement nan_value_counts here
                 HashMap::new(),
-                &MetricsConfig::from_properties(table_metadata.properties()),
+                &MetricsConfig::for_table(table_metadata),
             )?;
             builder.partition_spec_id(table_metadata.default_partition_spec_id());
             let data_file = builder.build().unwrap();
@@ -509,11 +510,9 @@ impl ParquetWriter {
         nan_value_counts: HashMap<i32, u64>,
         metrics_config: &MetricsConfig,
     ) -> Result<DataFileBuilder> {
-        let index_by_parquet_path = {
-            let mut visitor = IndexByParquetPathName::new();
-            visit_schema(&schema, &mut visitor)?;
-            visitor
-        };
+        let mut index_by_parquet_path = IndexByParquetPathName::new();
+        visit_schema(&schema, &mut index_by_parquet_path)?;
+        let stats_eligible = struct_descended_field_ids(&schema);
 
         let mut per_col_size: HashMap<i32, u64> = HashMap::new();
         let mut per_col_val_num: HashMap<i32, u64> = HashMap::new();
@@ -536,17 +535,19 @@ impl ParquetWriter {
 
                 *per_col_size.entry(field_id).or_insert(0) +=
                     column_chunk_metadata.compressed_size() as u64;
-                *per_col_val_num.entry(field_id).or_insert(0) +=
-                    column_chunk_metadata.num_values() as u64;
+                if stats_eligible.contains(&field_id) {
+                    *per_col_val_num.entry(field_id).or_insert(0) +=
+                        column_chunk_metadata.num_values() as u64;
 
-                if let Some(statistics) = column_chunk_metadata.statistics() {
-                    if let Some(null_count) = statistics.null_count_opt() {
-                        *per_col_null_val_num.entry(field_id).or_insert(0) += null_count;
-                    }
+                    if let Some(statistics) = column_chunk_metadata.statistics() {
+                        if let Some(null_count) = statistics.null_count_opt() {
+                            *per_col_null_val_num.entry(field_id).or_insert(0) += null_count;
+                        }
 
-                    // Bounds are only collected for Truncate/Full; produce() truncates them.
-                    if mode.collects_bounds() {
-                        min_max_agg.update(field_id, statistics.clone())?;
+                        // Bounds are only collected for Truncate/Full; produce() truncates them.
+                        if mode.collects_bounds() {
+                            min_max_agg.update(field_id, statistics.clone())?;
+                        }
                     }
                 }
             }
@@ -555,11 +556,9 @@ impl ParquetWriter {
         // Drop nan counts for columns whose mode persists nothing (`None`), mirroring the
         // skip-the-column behavior above.
         let mut nan_value_counts = nan_value_counts;
-        nan_value_counts.retain(|field_id, _| min_max_agg.mode_for(*field_id).collects_counts());
-
-        let column_sizes = per_col_size;
-        let value_counts = per_col_val_num;
-        let null_value_counts = per_col_null_val_num;
+        nan_value_counts.retain(|field_id, _| {
+            stats_eligible.contains(field_id) && min_max_agg.mode_for(*field_id).collects_counts()
+        });
         let (lower_bounds, upper_bounds) = min_max_agg.produce();
 
         let mut builder = DataFileBuilder::default();
@@ -570,9 +569,9 @@ impl ParquetWriter {
             .partition(Struct::empty())
             .record_count(metadata.file_metadata().num_rows() as u64)
             .file_size_in_bytes(written_size as u64)
-            .column_sizes(column_sizes)
-            .value_counts(value_counts)
-            .null_value_counts(null_value_counts)
+            .column_sizes(per_col_size)
+            .value_counts(per_col_val_num)
+            .null_value_counts(per_col_null_val_num)
             .nan_value_counts(nan_value_counts)
             // # NOTE:
             // - We can ignore implementing distinct_counts due to this: https://lists.apache.org/thread/j52tsojv0x4bopxyzsp7m7bqt23n5fnd
@@ -1744,18 +1743,12 @@ mod tests {
 
         // check data file
         assert_eq!(data_file.record_count(), 1024);
+        let mut size_keys = data_file.column_sizes().keys().copied().collect::<Vec<_>>();
+        size_keys.sort_unstable();
+        assert_eq!(size_keys, vec![0, 2, 5, 6, 7, 9, 11, 13]);
         assert_eq!(
             *data_file.value_counts(),
-            HashMap::from([
-                (0, 1024),
-                (5, 1024),
-                (6, 1024),
-                (2, 1024),
-                (7, 1024),
-                (9, 1024),
-                (11, 1024),
-                (13, (1..1025).sum()),
-            ])
+            HashMap::from([(0, 1024), (5, 1024), (6, 1024), (2, 1024), (9, 1024)])
         );
         assert_eq!(
             *data_file.lower_bounds(),
@@ -1764,10 +1757,7 @@ mod tests {
                 (5, Datum::long(0)),
                 (6, Datum::long(0)),
                 (2, Datum::string("0")),
-                (7, Datum::long(0)),
-                (9, Datum::long(0)),
-                (11, Datum::string("0")),
-                (13, Datum::long(0))
+                (9, Datum::long(0))
             ])
         );
         assert_eq!(
@@ -1777,10 +1767,7 @@ mod tests {
                 (5, Datum::long(1023)),
                 (6, Datum::long(1023)),
                 (2, Datum::string("999")),
-                (7, Datum::long(1023)),
-                (9, Datum::long(1023)),
-                (11, Datum::string("999")),
-                (13, Datum::long(1023))
+                (9, Datum::long(1023))
             ])
         );
 
@@ -2627,23 +2614,14 @@ mod tests {
 
         // check data file
         assert_eq!(data_file.record_count(), 1);
-        assert_eq!(*data_file.value_counts(), HashMap::from([(1, 4), (4, 4)]));
-        assert_eq!(
-            *data_file.lower_bounds(),
-            HashMap::from([(1, Datum::float(1.0)), (4, Datum::float(1.0))])
-        );
-        assert_eq!(
-            *data_file.upper_bounds(),
-            HashMap::from([(1, Datum::float(2.0)), (4, Datum::float(2.0))])
-        );
-        assert_eq!(
-            *data_file.null_value_counts(),
-            HashMap::from([(1, 0), (4, 0)])
-        );
-        assert_eq!(
-            *data_file.nan_value_counts(),
-            HashMap::from([(1, 1), (4, 1)])
-        );
+        let mut size_keys = data_file.column_sizes().keys().copied().collect::<Vec<_>>();
+        size_keys.sort_unstable();
+        assert_eq!(size_keys, vec![1, 4]);
+        assert_eq!(*data_file.value_counts(), HashMap::new());
+        assert_eq!(*data_file.lower_bounds(), HashMap::new());
+        assert_eq!(*data_file.upper_bounds(), HashMap::new());
+        assert_eq!(*data_file.null_value_counts(), HashMap::new());
+        assert_eq!(*data_file.nan_value_counts(), HashMap::new());
 
         // check the written file
         let expect_batch = concat_batches(&arrow_schema, vec![&to_write]).unwrap();
@@ -2808,36 +2786,14 @@ mod tests {
 
         // check data file
         assert_eq!(data_file.record_count(), 4);
-        assert_eq!(
-            *data_file.value_counts(),
-            HashMap::from([(1, 4), (2, 4), (6, 4), (7, 4)])
-        );
-        assert_eq!(
-            *data_file.lower_bounds(),
-            HashMap::from([
-                (1, Datum::int(1)),
-                (2, Datum::float(1.0)),
-                (6, Datum::int(1)),
-                (7, Datum::float(1.0))
-            ])
-        );
-        assert_eq!(
-            *data_file.upper_bounds(),
-            HashMap::from([
-                (1, Datum::int(4)),
-                (2, Datum::float(2.0)),
-                (6, Datum::int(4)),
-                (7, Datum::float(2.0))
-            ])
-        );
-        assert_eq!(
-            *data_file.null_value_counts(),
-            HashMap::from([(1, 0), (2, 0), (6, 0), (7, 0)])
-        );
-        assert_eq!(
-            *data_file.nan_value_counts(),
-            HashMap::from([(2, 1), (7, 1)])
-        );
+        let mut size_keys = data_file.column_sizes().keys().copied().collect::<Vec<_>>();
+        size_keys.sort_unstable();
+        assert_eq!(size_keys, vec![1, 2, 6, 7]);
+        assert_eq!(*data_file.value_counts(), HashMap::new());
+        assert_eq!(*data_file.lower_bounds(), HashMap::new());
+        assert_eq!(*data_file.upper_bounds(), HashMap::new());
+        assert_eq!(*data_file.null_value_counts(), HashMap::new());
+        assert_eq!(*data_file.nan_value_counts(), HashMap::new());
 
         // check the written file
         let expect_batch = concat_batches(&arrow_schema, vec![&to_write]).unwrap();

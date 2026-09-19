@@ -501,7 +501,9 @@ impl RewriteTablePath {
             position_delete_writer_properties_for(self.table.metadata().properties())?,
             config.schema().clone(),
         )
-        .with_metrics_config(MetricsConfig::for_position_delete());
+        .with_metrics_config(MetricsConfig::for_position_delete_table(
+            self.table.metadata(),
+        ));
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.table.file_io().clone(),

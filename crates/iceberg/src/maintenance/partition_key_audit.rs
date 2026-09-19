@@ -122,7 +122,8 @@ use super::rewrite_data_files::parse_target_file_size;
 use crate::arrow::{ArrowReaderBuilder, RecordBatchPartitionSplitter};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, PartitionSpecRef, SchemaRef, Struct, TableMetadata,
+    DataContentType, DataFile, DataFileFormat, MetricsConfig, PartitionSpecRef, SchemaRef, Struct,
+    TableMetadata,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -520,7 +521,8 @@ async fn rewrite_under_computed_keys(
             .set_compression(compression)
             .build(),
         schema.clone(),
-    );
+    )
+    .with_metrics_config(MetricsConfig::for_table(table.metadata()));
     let rolling_builder = RollingFileWriterBuilder::new(
         parquet_builder,
         usize::try_from(target_file_size_bytes).unwrap_or(usize::MAX),

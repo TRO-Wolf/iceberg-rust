@@ -37,18 +37,13 @@
 //! [`MetricsMode::truncate_upper_bound`]) port Java `ParquetMetrics.truncateLowerBound` /
 //! `truncateUpperBound` together with `UnicodeUtil`/`BinaryUtil`'s string/binary truncation;
 //! the Parquet writer applies them per column (see `writer::file_writer::parquet_writer`).
-//!
-//! NAMED residue (deferred — both need a schema / sort-order the config alone does not
-//! carry): the wide-schema `write.metadata.metrics.max-inferred-column-defaults` inference
-//! (Java caps how many columns receive the default, the rest becoming [`MetricsMode::None`])
-//! and the sorted-column auto-promotion (a `none`/`counts` default is upgraded to
-//! `truncate(16)` for sort-key columns). Threading a table's *resolved* config through the
-//! data-file writer construction (so non-default `write.metadata.metrics.*` is honored on
-//! data files, not just the built-in `truncate(16)` default) is a further plumbing pass.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::{Datum, PrimitiveLiteral, PrimitiveType, TableMetadata};
+use super::{
+    Datum, NestedFieldRef, PrimitiveLiteral, PrimitiveType, Schema, SortOrder, StructType,
+    TableMetadata, Type,
+};
 use crate::metadata_columns::{
     RESERVED_COL_NAME_DELETE_FILE_PATH, RESERVED_COL_NAME_DELETE_FILE_POS,
 };
@@ -321,48 +316,65 @@ impl MetricsConfig {
     /// `tracing::warn!` and falls back — to the resolved default for a column, or to
     /// `truncate(16)` for the default itself — rather than erroring, matching Java.
     pub fn from_properties(properties: &HashMap<String, String>) -> Self {
+        Self::from(properties, None, None)
+    }
+
+    #[allow(missing_docs)]
+    pub fn for_table(metadata: &TableMetadata) -> Self {
+        Self::from(
+            metadata.properties(),
+            Some(metadata.current_schema()),
+            Some(metadata.default_sort_order().as_ref()),
+        )
+    }
+
+    fn from(
+        properties: &HashMap<String, String>,
+        schema: Option<&Schema>,
+        sort_order: Option<&SortOrder>,
+    ) -> Self {
+        let max_inferred = max_inferred_column_defaults(properties);
+        let mut column_modes = HashMap::new();
         let default_mode = match properties.get(METRICS_MODE_DEFAULT_KEY) {
-            Some(raw) => MetricsMode::parse(raw).unwrap_or_else(|error| {
-                tracing::warn!(
-                    ?error,
-                    key = METRICS_MODE_DEFAULT_KEY,
-                    value = raw,
-                    "invalid default metrics mode; falling back to {DEFAULT_WRITE_METRICS_MODE_DEFAULT}"
-                );
-                Self::default_mode()
-            }),
-            None => Self::default_mode(),
+            Some(raw) => parse_mode_or(raw, Self::default_mode(), METRICS_MODE_DEFAULT_KEY),
+            None => match schema {
+                Some(schema) if projected_field_ids(schema).len() > max_inferred => {
+                    for field_id in limit_field_ids(schema, max_inferred) {
+                        if let Some(name) = schema.name_by_field_id(field_id) {
+                            column_modes.insert(name.to_string(), Self::default_mode());
+                        }
+                    }
+                    MetricsMode::None
+                }
+                _ => Self::default_mode(),
+            },
         };
 
-        let mut column_modes = HashMap::new();
+        let sorted_default = match default_mode {
+            MetricsMode::None | MetricsMode::Counts => MetricsMode::Truncate(16),
+            mode => mode,
+        };
+        if let (Some(schema), Some(sort_order)) = (schema, sort_order) {
+            for field in &sort_order.fields {
+                if field.transform.preserves_order()
+                    && let Some(name) = schema.name_by_field_id(field.source_id)
+                {
+                    column_modes.insert(name.to_string(), sorted_default);
+                }
+            }
+        }
+
         for (key, raw) in properties {
             let Some(column) = key.strip_prefix(METRICS_MODE_COLUMN_CONF_PREFIX) else {
                 continue;
             };
-            // Java does not special-case the bare prefix: `key.replaceFirst(PREFIX, "")` yields
-            // an empty alias and it is stored verbatim. We mirror that (it is harmless — an
-            // empty column name cannot match any real schema field).
-            let mode = MetricsMode::parse(raw).unwrap_or_else(|error| {
-                tracing::warn!(
-                    ?error,
-                    key,
-                    value = raw,
-                    "invalid column metrics mode; falling back to the table default"
-                );
-                default_mode
-            });
-            column_modes.insert(column.to_string(), mode);
+            column_modes.insert(column.to_string(), parse_mode_or(raw, default_mode, key));
         }
 
         MetricsConfig {
             default_mode,
             column_modes,
         }
-    }
-
-    #[allow(missing_docs)]
-    pub fn for_table(metadata: &TableMetadata) -> Self {
-        Self::from_properties(metadata.properties())
     }
 
     /// The metrics config for a position-delete file, mirroring `MetricsConfig.forPositionDelete`.
@@ -387,8 +399,24 @@ impl MetricsConfig {
 
     #[allow(missing_docs)]
     pub fn for_position_delete_table(metadata: &TableMetadata) -> Self {
-        let _ = metadata;
-        Self::for_position_delete()
+        let table_config = Self::for_table(metadata);
+        let mut column_modes = HashMap::from([
+            (
+                RESERVED_COL_NAME_DELETE_FILE_PATH.to_string(),
+                MetricsMode::Full,
+            ),
+            (
+                RESERVED_COL_NAME_DELETE_FILE_POS.to_string(),
+                MetricsMode::Full,
+            ),
+        ]);
+        for (name, mode) in &table_config.column_modes {
+            column_modes.insert(format!("row.{name}"), *mode);
+        }
+        MetricsConfig {
+            default_mode: table_config.default_mode,
+            column_modes,
+        }
     }
 
     /// The resolved metrics mode for a column: its explicit override if present, else the
@@ -411,6 +439,128 @@ impl MetricsConfig {
         MetricsMode::parse(DEFAULT_WRITE_METRICS_MODE_DEFAULT)
             .expect("DEFAULT_WRITE_METRICS_MODE_DEFAULT must be a valid metrics mode")
     }
+}
+
+const METRICS_MAX_INFERRED_KEY: &str = "write.metadata.metrics.max-inferred-column-defaults";
+const METRICS_MAX_INFERRED_DEFAULT: usize = 100;
+
+fn parse_mode_or(raw: &str, fallback: MetricsMode, key: &str) -> MetricsMode {
+    MetricsMode::parse(raw).unwrap_or_else(|error| {
+        tracing::warn!(
+            ?error,
+            key,
+            value = raw,
+            "invalid metrics mode; falling back"
+        );
+        fallback
+    })
+}
+
+fn max_inferred_column_defaults(properties: &HashMap<String, String>) -> usize {
+    let Some(raw) = properties.get(METRICS_MAX_INFERRED_KEY) else {
+        return METRICS_MAX_INFERRED_DEFAULT;
+    };
+    match raw.parse::<i32>() {
+        Ok(value) if value < 0 => {
+            tracing::warn!(
+                key = METRICS_MAX_INFERRED_KEY,
+                value,
+                "invalid max-inferred-column-defaults (negative); falling back to {METRICS_MAX_INFERRED_DEFAULT}"
+            );
+            METRICS_MAX_INFERRED_DEFAULT
+        }
+        Ok(value) => value as usize,
+        Err(_) => {
+            tracing::warn!(
+                key = METRICS_MAX_INFERRED_KEY,
+                value = raw,
+                "invalid max-inferred-column-defaults; falling back to {METRICS_MAX_INFERRED_DEFAULT}"
+            );
+            METRICS_MAX_INFERRED_DEFAULT
+        }
+    }
+}
+
+fn projected_field_ids(schema: &Schema) -> HashSet<i32> {
+    let mut out = HashSet::new();
+    let mut stack: Vec<&NestedFieldRef> = schema.as_struct().fields().iter().collect();
+    while let Some(field) = stack.pop() {
+        let ty = field.field_type.as_ref();
+        if ty.is_primitive() || ty.is_variant() || ty.is_struct() {
+            out.insert(field.id);
+        }
+        match ty {
+            Type::Struct(inner) => stack.extend(inner.fields().iter()),
+            Type::List(list) => stack.push(&list.element_field),
+            Type::Map(map) => {
+                stack.push(&map.key_field);
+                stack.push(&map.value_field);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn limit_field_ids(schema: &Schema, limit: usize) -> HashSet<i32> {
+    fn eligible(ty: &Type) -> bool {
+        ty.is_primitive() || ty.is_variant()
+    }
+    fn visit_struct(struct_type: &StructType, limit: usize, ids: &mut HashSet<i32>) {
+        for field in struct_type.fields() {
+            if ids.len() >= limit {
+                return;
+            }
+            if eligible(&field.field_type) {
+                ids.insert(field.id);
+            }
+        }
+        for field in struct_type.fields() {
+            if ids.len() >= limit {
+                return;
+            }
+            visit_type(&field.field_type, limit, ids);
+        }
+    }
+    fn visit_type(ty: &Type, limit: usize, ids: &mut HashSet<i32>) {
+        match ty {
+            Type::Struct(inner) => visit_struct(inner, limit, ids),
+            Type::List(list) => {
+                if ids.len() < limit && eligible(&list.element_field.field_type) {
+                    ids.insert(list.element_field.id);
+                }
+                visit_type(&list.element_field.field_type, limit, ids);
+            }
+            Type::Map(map) => {
+                if ids.len() < limit && eligible(&map.key_field.field_type) {
+                    ids.insert(map.key_field.id);
+                }
+                if ids.len() < limit && eligible(&map.value_field.field_type) {
+                    ids.insert(map.value_field.id);
+                }
+                visit_type(&map.key_field.field_type, limit, ids);
+                visit_type(&map.value_field.field_type, limit, ids);
+            }
+            _ => {}
+        }
+    }
+    let mut ids = HashSet::new();
+    visit_struct(schema.as_struct(), limit, &mut ids);
+    ids
+}
+
+pub(crate) fn struct_descended_field_ids(schema: &Schema) -> HashSet<i32> {
+    let mut out = HashSet::new();
+    let mut stack: Vec<&StructType> = vec![schema.as_struct()];
+    while let Some(struct_type) = stack.pop() {
+        for field in struct_type.fields() {
+            out.insert(field.id);
+            if let Type::Struct(inner) = field.field_type.as_ref() {
+                stack.push(inner);
+            }
+        }
+    }
+    out
 }
 
 impl Default for MetricsConfig {

@@ -40,11 +40,11 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Catalog, NamespaceIdent, TableCreation};
 
@@ -142,10 +142,7 @@ async fn create_oracle_table(
         Some(order) => builder.sort_order(order).build(),
         None => builder.build(),
     };
-    catalog
-        .create_table(&namespace, creation)
-        .await
-        .unwrap()
+    catalog.create_table(&namespace, creation).await.unwrap()
 }
 
 fn sort_by(source_id: i32) -> SortOrder {
@@ -190,13 +187,7 @@ async fn write_oracle_file(table: &Table, config: Option<MetricsConfig>) -> Data
         .await
         .unwrap();
     writer.write(batch).await.unwrap();
-    writer
-        .close()
-        .await
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap()
+    writer.close().await.unwrap().into_iter().next().unwrap()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -230,13 +221,21 @@ fn assert_maps(file: &DataFile, expected: &CellExpect) {
         .iter()
         .map(|(id, h)| (*id, (*h).to_string()))
         .collect();
-    assert_eq!(bound_hex(file.lower_bounds()), expected_lower, "lower_bounds");
+    assert_eq!(
+        bound_hex(file.lower_bounds()),
+        expected_lower,
+        "lower_bounds"
+    );
     let expected_upper: Vec<(i32, String)> = expected
         .upper_bounds
         .iter()
         .map(|(id, h)| (*id, (*h).to_string()))
         .collect();
-    assert_eq!(bound_hex(file.upper_bounds()), expected_upper, "upper_bounds");
+    assert_eq!(
+        bound_hex(file.upper_bounds()),
+        expected_upper,
+        "upper_bounds"
+    );
 }
 
 struct CellExpect {
@@ -355,7 +354,10 @@ async fn oracle_cell_full() {
         nan_value_counts: NAN_D,
         lower_bounds: &[
             (1, "0100000000000000"),
-            (2, "616c7068612d6c6f6e672d737472696e672d76616c75652d30303031"),
+            (
+                2,
+                "616c7068612d6c6f6e672d737472696e672d76616c75652d30303031",
+            ),
             (3, "000000000000f83f"),
             (6, "6161"),
             (7, "01000000"),
@@ -528,8 +530,7 @@ async fn live_files(table: &Table, content: DataContentType) -> Vec<DataFile> {
 #[tokio::test]
 async fn rewrite_data_files_honors_metrics_default_none() {
     let (catalog, _tmp) = local_fs_catalog().await;
-    let table =
-        create_oracle_table(&catalog, &[(METRICS_DEFAULT_KEY, "none")], None).await;
+    let table = create_oracle_table(&catalog, &[(METRICS_DEFAULT_KEY, "none")], None).await;
     let input = write_oracle_file(&table, None).await;
     assert!(
         !input.lower_bounds().is_empty(),
@@ -587,10 +588,7 @@ async fn position_delete_keeps_full_bounds_under_none_default() {
         .properties([(METRICS_DEFAULT_KEY.to_string(), "none".to_string())])
         .format_version(FormatVersion::V2)
         .build();
-    let table = catalog
-        .create_table(&namespace, creation)
-        .await
-        .unwrap();
+    let table = catalog.create_table(&namespace, creation).await.unwrap();
 
     let data = write_data_file(&table, "d.parquet", 0, &[(0, 10, 100), (0, 20, 200)]).await;
     let data_path = data.file_path().to_string();
@@ -627,7 +625,13 @@ async fn position_delete_keeps_full_bounds_under_none_default() {
         file.upper_bounds().keys().copied().collect::<HashSet<_>>(),
         reserved
     );
-    assert_eq!(*file.value_counts().get(&RESERVED_FIELD_ID_DELETE_FILE_PATH).unwrap(), 1);
+    assert_eq!(
+        *file
+            .value_counts()
+            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
+            .unwrap(),
+        1
+    );
     let path_bound = file
         .lower_bounds()
         .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
