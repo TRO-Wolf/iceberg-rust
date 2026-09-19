@@ -94,7 +94,7 @@
 // flagged at the item with a targeted allow and a one-line reason.
 
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::Read;
 use std::sync::Arc;
 
 use apache_avro::schema::{RecordSchema, UnionSchema};
@@ -114,7 +114,7 @@ use crate::metadata_columns::{RESERVED_FIELD_ID_DELETED, RESERVED_FIELD_ID_POS};
 use crate::spec::{
     Literal, NestedField, PrimitiveLiteral, PrimitiveType, Schema, StructType, Type,
 };
-use crate::{Error, ErrorKind, Result};
+use crate::{Error, ErrorKind, Result, ensure_data_valid};
 
 /// The Avro record-field property holding an Iceberg field id (matches the `FIELD_ID_PROP`
 /// stamped by [`crate::avro`]'s schema conversion).
@@ -162,14 +162,13 @@ pub(crate) fn read_avro_data_bytes(
     expected: &Schema,
     batch_size: usize,
 ) -> Result<Vec<RecordBatch>> {
-    if batch_size == 0 {
-        return Err(Error::new(
-            ErrorKind::DataInvalid,
-            "Avro data-file batch_size must be greater than zero",
-        ));
-    }
+    ensure_data_valid!(
+        batch_size > 0,
+        "Avro data-file batch_size must be greater than zero",
+    );
 
-    let reader = AvroReader::new(Cursor::new(bytes)).map_err(|e| {
+    let (head, body) = crate::avro::ocf::repaired_ocf_parts(bytes)?;
+    let reader = AvroReader::new(head.as_ref().chain(body)).map_err(|e| {
         Error::new(
             ErrorKind::DataInvalid,
             "Failed to open Avro data file (could not read the OCF header)",

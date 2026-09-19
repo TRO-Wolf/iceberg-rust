@@ -427,8 +427,8 @@ impl ManifestWriter {
             .partition_type(&self.metadata.schema)?;
         let table_schema = &self.metadata.schema;
         let avro_schema = match self.metadata.format_version {
-            FormatVersion::V1 => manifest_schema_v1(&partition_type)?,
-            FormatVersion::V2 | FormatVersion::V3 => manifest_schema_v2(&partition_type)?,
+            FormatVersion::V1 => manifest_schema_v1(&partition_type, false)?,
+            FormatVersion::V2 | FormatVersion::V3 => manifest_schema_v2(&partition_type, false)?,
         };
         let mut avro_writer = AvroWriter::new(&avro_schema, Vec::new());
         avro_writer.add_user_metadata(
@@ -468,15 +468,13 @@ impl ManifestWriter {
         let partition_summary = self.construct_partition_summaries(&partition_type)?;
         for entry in std::mem::take(&mut self.manifest_entries) {
             let value = match self.metadata.format_version {
-                FormatVersion::V1 => to_value(ManifestEntryV1::try_from(entry, &partition_type)?)?
-                    .resolve(&avro_schema)?,
+                FormatVersion::V1 => to_value(ManifestEntryV1::try_from(entry, &partition_type)?)?,
                 FormatVersion::V2 | FormatVersion::V3 => {
                     to_value(ManifestEntryV2::try_from(entry, &partition_type)?)?
-                        .resolve(&avro_schema)?
                 }
             };
-
-            avro_writer.append(value)?;
+            let value = crate::avro::name::sanitize_avro_value_names(value);
+            avro_writer.append(value.resolve(&avro_schema)?)?;
         }
 
         let content = avro_writer.into_inner()?;

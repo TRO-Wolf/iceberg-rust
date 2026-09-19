@@ -752,7 +752,7 @@ pub(crate) mod _serde {
                             .into_iter()
                             .map(|(field_name, value)| {
                                 let field = struct_ty
-                                    .field_by_name(field_name.as_str())
+                                    .field_by_avro_name(field_name.as_str())
                                     .ok_or_else(|| {
                                         invalid_err_with_reason(
                                             "record",

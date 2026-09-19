@@ -48,13 +48,14 @@ use apache_avro::{Codec, Schema as AvroSchema, Writer as OcfWriter};
 use arrow_array::{RecordBatch, StructArray};
 use bytes::Bytes;
 
+use super::avro_reject::reject_unsupported_types;
 use super::{FileWriter, FileWriterBuilder};
 use crate::arrow::arrow_struct_to_literal;
 use crate::avro::schema_to_avro_schema;
 use crate::io::OutputFile;
 use crate::spec::{
-    DataContentType, DataFileBuilder, DataFileFormat, Literal, NestedField, PrimitiveType,
-    RawLiteral, SchemaRef, Struct, StructType, Type,
+    DataContentType, DataFileBuilder, DataFileFormat, Literal, RawLiteral, SchemaRef, Struct,
+    StructType, Type,
 };
 use crate::writer::CurrentFileStatus;
 use crate::{Error, ErrorKind, Result};
@@ -280,6 +281,7 @@ fn encode_batch_to_values(
 
         let raw_literal = RawLiteral::try_from(literal, &struct_ty)?;
         let value = apache_avro::to_value(raw_literal)
+            .map(crate::avro::name::sanitize_avro_value_names)
             .and_then(|v| v.resolve(avro_schema))
             .map_err(|err| {
                 Error::new(
@@ -298,45 +300,6 @@ fn encode_batch_to_values(
     }
 
     Ok((values, size))
-}
-
-/// Reject Iceberg types the Avro data path cannot round-trip.
-///
-/// `variant` is rejected with [`ErrorKind::FeatureUnsupported`] to match the reader, which rejects
-/// `variant` on read (`arrow/value.rs`). `unknown` is the always-null no-physical-column type; the
-/// reader's literal converter also defers it (`FeatureUnsupported`), so for symmetric round-trip
-/// behavior in this engine-only cycle we reject it here rather than silently emit `null` rows that
-/// the matching reader would then refuse. (Java emits Avro `null`; closing that asymmetry is tracked
-/// for the interop cycle — see the actor summary.)
-fn reject_unsupported_types(struct_type: &StructType) -> Result<()> {
-    for field in struct_type.fields() {
-        reject_unsupported_field(field)?;
-    }
-    Ok(())
-}
-
-fn reject_unsupported_field(field: &NestedField) -> Result<()> {
-    match field.field_type.as_ref() {
-        Type::Variant => Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Avro data writer does not support the variant type (the reader rejects it on read)",
-        )
-        .with_context("field_id", field.id.to_string())
-        .with_context("field_name", field.name.clone())),
-        Type::Primitive(PrimitiveType::Unknown) => Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Avro data writer does not support the unknown type yet (the always-null read path is deferred)",
-        )
-        .with_context("field_id", field.id.to_string())
-        .with_context("field_name", field.name.clone())),
-        Type::Struct(s) => reject_unsupported_types(s),
-        Type::List(l) => reject_unsupported_field(&l.element_field),
-        Type::Map(m) => {
-            reject_unsupported_field(&m.key_field)?;
-            reject_unsupported_field(&m.value_field)
-        }
-        Type::Primitive(_) => Ok(()),
-    }
 }
 
 #[cfg(test)]

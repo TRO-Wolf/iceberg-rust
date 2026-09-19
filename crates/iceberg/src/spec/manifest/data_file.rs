@@ -361,9 +361,9 @@ pub fn write_data_files_to_avro<W: Write>(
     version: FormatVersion,
 ) -> Result<usize> {
     let avro_schema = match version {
-        FormatVersion::V1 => data_file_schema_v1(partition_type).unwrap(),
-        FormatVersion::V2 => data_file_schema_v2(partition_type).unwrap(),
-        FormatVersion::V3 => data_file_schema_v3(partition_type).unwrap(),
+        FormatVersion::V1 => data_file_schema_v1(partition_type, false).unwrap(),
+        FormatVersion::V2 => data_file_schema_v2(partition_type, false).unwrap(),
+        FormatVersion::V3 => data_file_schema_v3(partition_type, false).unwrap(),
     };
     let mut writer = AvroWriter::new(&avro_schema, writer);
 
@@ -372,9 +372,9 @@ pub fn write_data_files_to_avro<W: Write>(
             data_file,
             partition_type,
             FormatVersion::V1,
-        )?)?
-        .resolve(&avro_schema)?;
-        writer.append(value)?;
+        )?)?;
+        let value = crate::avro::name::sanitize_avro_value_names(value);
+        writer.append(value.resolve(&avro_schema)?)?;
     }
 
     Ok(writer.flush()?)
@@ -388,13 +388,15 @@ pub fn read_data_files_from_avro<R: Read>(
     partition_type: &StructType,
     version: FormatVersion,
 ) -> Result<Vec<DataFile>> {
-    let avro_schema = match version {
-        FormatVersion::V1 => data_file_schema_v1(partition_type).unwrap(),
-        FormatVersion::V2 => data_file_schema_v2(partition_type).unwrap(),
-        FormatVersion::V3 => data_file_schema_v3(partition_type).unwrap(),
+    let mut avro_schema = match version {
+        FormatVersion::V1 => data_file_schema_v1(partition_type, true).unwrap(),
+        FormatVersion::V2 => data_file_schema_v2(partition_type, true).unwrap(),
+        FormatVersion::V3 => data_file_schema_v3(partition_type, true).unwrap(),
     };
+    crate::avro::name::strictify_avro_field_names(&mut avro_schema);
 
-    let reader = AvroReader::with_schema(&avro_schema, reader)?;
+    let stream = crate::avro::ocf::ocf_repaired_stream(reader)?;
+    let reader = AvroReader::with_schema(&avro_schema, stream)?;
     reader
         .into_iter()
         .map(|value| {
