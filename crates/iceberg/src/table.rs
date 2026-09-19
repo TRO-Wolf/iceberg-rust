@@ -261,7 +261,7 @@ impl Table {
         self.object_cache.clone()
     }
 
-    /// Returns this table's shared Parquet footer cache handle, if one was injected.
+    #[allow(missing_docs)]
     pub fn footer_cache(&self) -> Option<TableFooterCache> {
         self.footer_cache.clone()
     }
