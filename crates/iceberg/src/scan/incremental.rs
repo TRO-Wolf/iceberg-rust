@@ -39,7 +39,7 @@ use futures::{SinkExt, StreamExt, TryStreamExt};
 use super::context::{ManifestEntryContext, PlanContext, parse_name_mapping};
 use crate::delete_file_index::DeleteFileIndex;
 use crate::events::{self, IncrementalScanEvent};
-use crate::expr::{Bind, Predicate};
+use crate::expr::Predicate;
 use crate::io::FileIO;
 use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::runtime::spawn;
@@ -295,7 +295,7 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
         }
 
         let snapshot_bound_predicate = if let Some(ref predicate) = self.filter {
-            Some(predicate.bind(schema.clone(), self.case_sensitive)?)
+            Some(predicate.bind_pruning(schema.clone(), self.case_sensitive)?)
         } else {
             None
         };

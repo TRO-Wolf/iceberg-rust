@@ -70,8 +70,8 @@ use uuid::Uuid;
 
 use crate::delete_file_index::is_deletion_vector;
 use crate::error::Result;
+use crate::expr::Predicate;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
-use crate::expr::{Bind, Predicate};
 use crate::spec::{DataContentType, DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
@@ -422,7 +422,7 @@ impl RowDeltaAction {
             Some(filter) => Some(
                 filter
                     .clone()
-                    .bind(current.metadata().current_schema().clone(), case_sensitive)?,
+                    .bind_pruning(current.metadata().current_schema().clone(), case_sensitive)?,
             ),
             None => None,
         };
@@ -672,7 +672,7 @@ impl TransactionAction for RowDeltaAction {
                 // Bind here and pass the bound predicate, which keeps the shared helper's signature
                 // stable across actions. `RewriteFiles` passes `None`, which narrows nothing.
                 let bound_conflict_filter = match conflict_filter {
-                    Some(filter) => Some(filter.clone().bind(
+                    Some(filter) => Some(filter.clone().bind_pruning(
                         current.metadata().current_schema().clone(),
                         self.case_sensitive,
                     )?),

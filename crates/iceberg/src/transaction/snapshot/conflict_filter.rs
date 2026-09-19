@@ -46,7 +46,7 @@ pub(crate) fn first_conflicting_file(
         .cloned()
         .unwrap_or(Predicate::AlwaysTrue)
         .rewrite_not()
-        .bind(schema, case_sensitive)?;
+        .bind_pruning(schema, case_sensitive)?;
 
     let mut partition_evaluators: HashMap<i32, ExpressionEvaluator> = HashMap::new();
     for file in files {

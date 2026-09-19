@@ -51,7 +51,7 @@ use crate::arrow::ArrowReaderBuilder;
 use crate::delete_file_index::DeleteFileIndex;
 use crate::events::{self, ScanEvent};
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
-use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::expr::{BoundPredicate, Predicate};
 use crate::io::FileIO;
 use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::metrics::{MetricsReport, MetricsReporter, ScanReport, TimeUnit, TimerResult};
@@ -504,7 +504,7 @@ impl<'a> TableScanBuilder<'a> {
             // Bind with the builder's case sensitivity. `PlanContext` already rebinds the
             // partition filter that way, so a hardcoded `true` here made
             // `InclusiveMetricsEvaluator` disagree with the partition prune.
-            Some(predicates.bind(schema.clone(), self.case_sensitive)?)
+            Some(predicates.bind_pruning(schema.clone(), self.case_sensitive)?)
         } else {
             None
         };

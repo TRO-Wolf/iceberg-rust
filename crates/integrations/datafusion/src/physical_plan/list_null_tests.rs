@@ -620,7 +620,8 @@ async fn cow_prune_scan_drops_the_unbindable_null_term() {
                 .and(Reference::new("xs").is_null());
             let planned = plan_task_count(&table, and_prune).await;
             assert_eq!(
-                planned, 3,
+                planned,
+                3,
                 "{} {format_version:?}: the sound conjunct prunes the id=1 file only",
                 shape.name()
             );
