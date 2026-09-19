@@ -52,6 +52,20 @@ table properties are ignored by the fork's own Parquet writers (compaction rewri
       `for_table`, `delete_position_deletes.rs` → `for_position_delete_table`
       (`7b562926`); INSERT none-metrics pin red-first `fd71d001`, mutation → red,
       reverted; `physical_plan` 203/203, comment-ban `hits=0`
+- [x] ROUND 3: L-002 — `for_table`/`for_position_delete_table`/`from_properties`
+      return `Result`, typed `DataInvalid` on unparsable max-inferred (Java
+      `propertyAsInt` → `Integer.parseInt`, bytecode-verified), negatives →
+      limit 0; error threaded through all nine sites. Perf R-01..R-05:
+      `MetricsByFieldId` per build (name lookups gone), `stats_eligible`
+      precomputed, `Arc<MetricsConfig>` (no per-file clones), `for_table`
+      hoisted, count-only `projected_field_count`; `parquet_writer.rs` 3343,
+      ceiling lowered. L-001 five wiring pins (row_lineage,
+      delete_position_deletes, partition_key_audit, rewrite_table_path —
+      `write_position_delete_content` now returns `DataFile`,
+      rewrite_position_delete_files); L-005 `row.*` overlay kill. Six mutations
+      → named pins red, all reverted. Gates: `metrics` 177, `maintenance::`
+      421, `parquet_writer` 28, `physical_plan` 205, `make check` green,
+      comment-ban `hits=0`, size 532 clean
 - [ ] handback.json
 
 

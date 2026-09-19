@@ -368,6 +368,77 @@ Gates (round 2): `cargo fmt --all -- --check` clean; `cargo clippy -p iceberg
 iceberg-datafusion --lib physical_plan` 203/203; `metrics_config_tests` 14/14;
 comment-ban `hits=0`; rust-file-size clean; typos clean.
 
+## Round 3 — logic PASS: perf P2s, wiring coverage, malformed-property parity
+
+Critic reports `rv-mc-logic-out.json` (PASS) + `rv-mc-perf-out.json`. Five items.
+
+**L-002 (typed error, Java-verified):** `javap -c -p` on
+`PropertyUtil.propertyAsInt` shows `Integer.parseInt` with no catch — Java
+`MetricsConfig.forTable` throws on an unparsable
+`write.metadata.metrics.max-inferred-column-defaults`. The fork warned and fell
+back to 100. `max_inferred_column_defaults` now returns
+`ErrorKind::DataInvalid` on parse failure; negative values parse fine in Java
+and map to effective limit 0 (`usize::try_from(v).unwrap_or(0)`), pinned by
+`oracle_cell_max_inferred_negative`. `from_properties` / `for_table` /
+`for_position_delete_table` now return `Result`; `?` (or
+`map_err(to_datafusion_error)`) threaded through all nine wired sites and every
+test caller. `malformed_max_inferred_fails_writer_construction` pins the typed
+error at writer construction.
+
+**Perf R-01..R-05:** `MetricsByFieldId` (in `spec/metrics_config.rs`) precomputes
+`field_id -> MetricsMode` plus the `stats_eligible` set once per writer build;
+`MinMaxColAggregator` borrows it (`&'a`) instead of resolving modes by column
+name per column per row group and instead of owning a cloned `MetricsConfig`.
+`ParquetWriterBuilder` holds `Arc<MetricsConfig>` (`with_metrics_config(impl
+Into<Arc<..>>)` keeps both owned and shared callers); `GroupWriteFactory` stores
+the `Arc` so `write_compacted_file` clones a pointer, not the mode map.
+`parquet_files_to_data_files` resolves `for_table` once outside the loop.
+`projected_field_ids` became count-only `projected_field_count` for the
+max-inferred first pass. `parquet_writer.rs` shrank to 3343; ceiling lowered
+3345 -> 3343.
+
+**L-001 (five wiring pins, all `metrics.default=none`):**
+`test_streaming_data_file_writer_honors_metrics_default_none` and
+`test_write_position_deletes_honors_metrics_default_none` in the new
+`physical_plan/delete_metrics_tests.rs` (a `#[path]` child of `delete::tests`,
+needed for the `pub(super)`/`pub(crate)` items) prove the row_lineage and
+delete_position_deletes sites; `test_repair_rewritten_files_honor_metrics_default_none`
+in `partition_key_audit_tests.rs` proves the repair site;
+`staged_pos_delete_keeps_full_bounds_under_none_default` in the new
+`rewrite_table_path_metrics_tests.rs` proves the staging site
+(`write_position_delete_content` now returns the `DataFile` so metrics are
+observable); `compacted_pos_delete_keeps_full_bounds_under_none_default` in
+`metrics_config_tests.rs` proves the compaction site. Data-writer pins assert
+all six maps empty; delete-writer pins assert only `file_path`/`pos` keys with
+FULL bounds — the `row.*` overlay is unobservable on the fork's two-column
+delete schema, so full bounds are the kill signal (the no-config default
+`truncate(16)` truncates them).
+
+**L-005 (row.* overlay kill):** `position_delete_keeps_full_bounds_under_none_default`
+now also asserts `for_position_delete_table` exposes `row.x -> Counts` (the
+table's per-column override) and `row.y -> None` (inherits default); removing
+the `row.{name}` re-key loop drives it red (`None` vs `Counts`).
+
+**Mutations (all reverted):** drop `with_metrics_config` in `row_lineage.rs` ->
+streaming pin red (all six maps non-empty); in `delete_position_deletes.rs` ->
+pin red (`file_path` bound truncated to 16 bytes); in `partition_key_audit.rs`
+-> repair pin red; in `rewrite_table_path.rs` -> staged pin red (bound
+truncated); in `rewrite_position_delete_files.rs` -> compacted pin red
+(truncated); remove the `row.*` loop in `metrics_config.rs` -> overlay pin red.
+
+**File-size fallout:** `rewrite_position_delete_files_tests.rs` is at its 4607
+legacy ceiling, so the compaction pin lives in `metrics_config_tests.rs` (809 <
+1000) with its own pos-delete writer helper instead of a new module there.
+`delete_tests.rs` and `rewrite_table_path_tests.rs` exceeded the default 1000,
+so each pin moved to a dedicated `#[path]` child module file.
+
+Gates (round 3): `cargo fmt --all -- --check` clean; `cargo clippy -p iceberg
+-p iceberg-datafusion --all-targets -- -D warnings` clean; `metrics` 177/177;
+`maintenance::` 421/421; `writer::file_writer::parquet_writer` 28/28;
+`iceberg-datafusion physical_plan` 205/205 (+1 ignored measurement);
+`make check` green; `comment_ban.py` hits=0; `check_rust_file_size.sh` 532 files
+clean.
+
 ## Propositions
 
 - [x] P1 `for_table` resolves default/column/max-inferred/sorted rules exactly per
