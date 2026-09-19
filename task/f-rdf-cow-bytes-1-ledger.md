@@ -22,7 +22,7 @@
 **Ledger id:** `F-RDF-COW-BYTES-1-2026-09-22`
 **Branch:** `fix/f-rdf-cow-bytes-1` (cut off fork `main`)
 **Scope:** one defect, one commit per brief step; one ledger for the lane
-**Model:** swe-2-high
+**Model:** swe-2-high (rounds 1–3); claude-opus-5 (round 4)
 
 | Item | Commits | Subject |
 |---|---|---|
@@ -31,7 +31,12 @@
 | 2 | `5e7455f2` | `fix: F-RDF-COW-BYTES-1 — the rewrite keeps a position delete that still applies, as Java does` |
 | 3 | — | (mutation proof — no commit) |
 | 4 | `292c4f71` | `docs: F-RDF-COW-BYTES-1 — ledger, mutation proof` |
-| 5 | this commit | `docs: F-RDF-COW-BYTES-1 — delete the stale module sentence; seq-GC audit` |
+| 5 | `b8002010` | `docs: F-RDF-COW-BYTES-1 — delete the stale module sentence; seq-GC audit` |
+| R4-1 | `c7c45299` | `test: F-RDF-COW-BYTES-1 — red delete-file sequence GC cells` |
+| R4-2 | `b273d097` | `fix: F-RDF-COW-BYTES-1 — merging commits retire delete files older than every live data file, as Java's dropDeleteFilesOlderThan` |
+| R4-3 | `47d767d8` | `fix: F-RDF-COW-BYTES-1 — review items R-02, R-04; stale module line deleted` |
+| R4-4 | — | (mutation proof — no commit) |
+| R4-5 | this commit | `docs: F-RDF-COW-BYTES-1 — round 4` |
 
 ## Defect
 
@@ -345,3 +350,259 @@ a partition-scoped attach, which nothing then removes. Both shapes' measurements
 recorded above; the xfail's rewritten count could not be reproduced for a file-scoped
 delete and is believed to reflect Spark's own partition-scoped delete files (or a
 stale measurement). The removed-count divergence (the actual defect) reproduces exactly.
+
+## Round 4 — port of Java's delete-file sequence GC (`dropDeleteFilesOlderThan`)
+
+Perf review R-01 (P1): after round 1 the fork correctly keeps a file-scoped parquet
+delete, but it had no port of the commit-path sequence GC. Deletes that apply to no live
+row then stayed in every later snapshot, while Java retires them. Round 4 ports the GC.
+It also closes R-02 and R-04 and the two logic nits, and records R-03.
+
+### Java 1.11.0 lines relied on
+
+Source: tag `apache-iceberg-1.11.0`, fetched from GitHub raw this round and diffed
+against the logic reviewer's copies (identical).
+
+| Fact | File:line |
+|---|---|
+| The minimum is over the FILTERED existing data manifests (`filterManager.filterManifests(snapshot.dataManifests())`), `ManifestFile::minSequenceNumber`, `UNASSIGNED_SEQ` skipped, reduced from `base.lastSequenceNumber()` | `core/.../MergingSnapshotProducer.java:977-989` |
+| `deleteFilterManager.dropDeleteFilesOlderThan(minDataSequenceNumber)` | `MergingSnapshotProducer.java:990` |
+| `removeDanglingDeletesFor(filterManager.filesToBeDeleted())` (the DV half) | `MergingSnapshotProducer.java:994-995` |
+| The delete summary merges `deleteFilterManager.buildSummary(filteredDeletes)` | `MergingSnapshotProducer.java:1019` |
+| `dropDeleteFilesOlderThan` stores the minimum (`>= 0` precondition) | `core/.../ManifestFilterManager.java:160-164` |
+| A live delete entry is marked when `dataSequenceNumber() > 0 && dataSequenceNumber() < minSequenceNumber` (strict `<`, every delete content alike) | `ManifestFilterManager.java:462-467` (scan), `:516-522` (rewrite) |
+| A marked entry is written with `writer.delete(entry)` and added to the per-manifest deleted set | `ManifestFilterManager.java:534-549` |
+| `buildSummary` calls `summaryBuilder.deletedFile(spec, file)` for every file in that set | `ManifestFilterManager.java:254-269` |
+| `deletedFile(spec, DeleteFile)` increments `removed-delete-files`, `removed-position-delete-files` / `removed-equality-delete-files` / `removed-dvs` and the record/size counters | `core/.../SnapshotSummary.java:144-146`, `:325-337` |
+| The manifest-open gate: `filterManifest` → `canContainDeletedFiles` returns `false` for a manifest with no live files; with trusted manifest references only a referenced manifest is opened; else `canContainDroppedFiles` (true when `deletePaths` is non-empty, when `deleteFiles` overlap the manifest's partitions, or when `removedDataFilePaths` is non-empty), `canContainExpressionDeletes`, `canContainDroppedPartitions` | `ManifestFilterManager.java:368-376`, `:400-447`; trust rule `:241-246` |
+| A manifest's `minSequenceNumber` counts LIVE entries only; none → `UNASSIGNED_SEQ` | `core/.../ManifestWriter.java:111-115`, `:222-223` |
+| Merging operation set: `MergeAppend`, `BaseOverwriteFiles`, `BaseReplacePartitions`, `BaseRowDelta`, `StreamingDelete`, `BaseRewriteFiles`, `CherryPickOperation` extend `MergingSnapshotProducer`; `FastAppend` and `BaseRewriteManifests` extend `SnapshotProducer` | `MergeAppend.java:24`, `BaseOverwriteFiles.java:31`, `BaseReplacePartitions.java:26`, `BaseRowDelta.java:31`, `StreamingDelete.java:24`, `BaseRewriteFiles.java:26`, `CherryPickOperation.java:46`, `FastAppend.java:36`, `BaseRewriteManifests.java:49` |
+| `isDanglingDV` = `ContentFileUtil.isDV(file) && removedDataFilePaths.contains(file.referencedDataFile())` | `ManifestFilterManager.java:493-495` |
+| `RemoveDanglingDeletesSparkAction.findDanglingDeletes` filters `data_file.content != 0` with no format test, so DVs are judged by the partition minimum too | `spark/v4.1/.../RemoveDanglingDeletesSparkAction.java:125-176` |
+| A DV whose data seq is below its data file's fails the scan: `DV data sequence number (%s) must be greater than or equal to data file sequence number (%s)` | `core/.../DeleteFileIndex.java:207-213` |
+
+### What the port does
+
+`crates/iceberg/src/transaction/snapshot/manifest_filter.rs` (new) now holds
+`process_deletes` (moved out of `snapshot.rs`, comments dropped in the move) and the
+GC. `snapshot.rs` 3450 → 3355 lines, ceiling lowered.
+
+- **Operation set.** `SnapshotProduceOperation::drops_old_delete_files` defaults to
+  `true`. `FastAppendOperation` and `RewriteManifestsOperation` return `false`: they are
+  the two Java `SnapshotProducer` subclasses. Every other operation is a Java
+  `MergingSnapshotProducer`: merge append, overwrite, replace partitions, row delta,
+  delete files, rewrite files, and cherry-pick replay.
+- **Minimum.** Data manifests are filtered first. The minimum is the fold of
+  `min_sequence_number` over the filtered existing DATA manifests (rewritten or carried,
+  dead ones included, before the keep rule), skipping `UNASSIGNED_SEQUENCE_NUMBER`, with
+  identity `last_sequence_number()`. It is global, not per partition, as Java's. Added
+  data files of this commit are not in it, as in Java (they are in
+  `prepareNewDataManifests`, not `filtered`). The fork's `ManifestWriter` also counts
+  only live entries (`spec/manifest/writer.rs`), so a fully-tombstoned rewritten
+  manifest is skipped exactly as Java skips it.
+- **Retirement.** A live entry with `0 < data seq < minimum` in an examined DELETE
+  manifest becomes a `Deleted` entry (`add_delete_entry`, snapshot id and both
+  sequence numbers kept) in the rewritten delete manifest. Delete manifests added by
+  this commit are never examined.
+- **Summary.** `process_deletes` returns the retired `DataFile`s. `manifest_file`
+  appends them to `removed_delete_files`, and `commit` rebuilds the summary when that
+  list grew. The snapshot therefore reports `removed-delete-files`,
+  `removed-position-delete-files` / `removed-equality-delete-files` / `removed-dvs`,
+  the removed record and size counters, and lower `total-*` values, like Java's
+  `buildSummary`. The REPLACE record-count guard still runs on the first summary,
+  before manifest IO. Retirement does not change `added-records` / `deleted-records`.
+- **Scope (Java's manifest-open gate).** The fork has no `manifestLocation`, so it
+  cannot model Java's trusted-reference test exactly. Rule: when the commit removes a
+  data file, every live delete manifest is examined (Java: `removedDataFilePaths`
+  non-empty and references not trusted). When it removes only delete files, only the
+  delete manifests holding one of them are examined (Java: trusted references, the
+  scan-derived callers — RPD, `RowDelta.removeDeletes`). When it removes nothing, no
+  manifest is examined (merge append, add-only row delta). A delete manifest whose own
+  `min_sequence_number` is not below the minimum is not read: none of its live entries
+  can expire, so Java's rewrite of it would be a no-op too.
+- **Soundness.** A position delete applies to data seq ≤ its own, an equality delete to
+  data seq < its own. Below the minimum it applies to no live data file. Added files
+  carry the new snapshot's seq, or with `use-starting-sequence-number` the starting
+  snapshot's seq, which is ≥ every retired delete's seq only when the delete is older
+  than the minimum. That case is exactly the one where the rewrite already read the
+  delete when it produced the new file.
+
+Named scope differences (all keep row safety; the fork examines fewer manifests, except
+the first case):
+
+1. `RowDelta` that removes data files AND delete files. Java trusts the references and
+   opens only the manifests holding the removed deletes. The fork examines every
+   delete manifest, so it retires more.
+2. `RemoveDanglingDeleteFiles` commit (removes delete files only). Java's
+   `SparkDeleteFile` has no manifest location, so Java opens every delete manifest whose
+   partitions overlap a removed file. The fork examines only the manifests that hold a
+   removed file.
+3. `DeleteFiles.delete_from_row_filter` / `ReplacePartitions` that match no data file.
+   Java still opens delete manifests through `deleteExpression` / `dropPartitions`. The
+   fork examines none.
+4. `removeDanglingDeletesFor` (Java drops a DV whose referenced data file ANY merging
+   commit removes) is still ported only on the `RewriteDataFiles` path
+   (`plan_dv_removal`). `DeleteFiles` / `OverwriteFiles` / `RowDelta` removing a data
+   file keep its DV until the sequence GC or `RemoveDanglingDeleteFiles` retires it. This
+   is the next unit, not this one.
+
+No cell pins cherry-pick replay. It takes the default `true`, as Java's
+`CherryPickOperation`.
+
+### Red cells (R4-1, `c7c45299`)
+
+New file `crates/iceberg/src/maintenance/delete_file_seq_gc_tests.rs` (maintenance/,
+because cell (a) drives RPD and RDF; the other cells drive transaction actions
+directly). The helpers `write_position_delete`, `file_scoped_metrics` and
+`partition_scoped_metrics` in `rewrite_data_files_cow_bytes_tests.rs` became
+`pub(super)`.
+
+`cargo test -p iceberg --lib seq_gc` at `c7c45299`: 5 passed, 6 failed.
+
+| test | brief item | pre-fix |
+|---|---|---|
+| `test_seq_gc_residue_rpd_then_rdf_reaches_zero_delete_files` | (a) v2, 2 partitions × 8 files, file-scoped parquet delete of every even `y` per file, RPD default (16 → 2), RDF default (16 → 2): 2 data + 0 delete files, rows unchanged, `removed_delete_files_count` 0, summary `removed-position-delete-files=2`, `total-delete-files=0` | RED at the zero-delete assert (every count before it matched) |
+| `test_seq_gc_keeps_position_delete_at_the_minimum_live_sequence` | (b) a position delete at the minimum live seq still masks rows after a `DeleteFiles` commit | green |
+| `test_seq_gc_keeps_equality_delete_applying_to_older_live_data` | (b) equality delete at seq 3 over live data at seq 1 survives a `DeleteFiles` commit | green |
+| `test_seq_gc_fast_append_keeps_stale_delete` | (b)/(c) fast append | green |
+| `test_seq_gc_merge_append_keeps_stale_delete` | (c) merge append (Java opens no delete manifest) | green |
+| `test_seq_gc_row_delta_adding_deletes_only_keeps_stale_delete` | (c) add-only row delta | green |
+| `test_seq_gc_delete_files_retires_stale_delete` | (c) `DeleteFiles` | RED |
+| `test_seq_gc_overwrite_files_retires_stale_delete` | (c) `OverwriteFiles` | RED |
+| `test_seq_gc_replace_partitions_retires_stale_delete` | (c) `ReplacePartitions` | RED |
+| `test_seq_gc_row_delta_removing_data_retires_stale_delete` | (c) `RowDelta.remove_rows` | RED |
+| `test_seq_gc_rewrite_files_retires_stale_delete` | (c) `RewriteFiles` | RED |
+
+The (c) cells use a delete at seq 1 that names a data path the table never held, then
+append the live data at seq 2. Each retiring cell asserts: no live delete file,
+`removed-position-delete-files=1`, `removed-delete-files=1`, `total-delete-files=0`, and
+the scan rows. The fast-append cell passes without the flag too: `FastAppend` has no
+removal surface. It pins behaviour, not the flag.
+
+### Fix (R4-2, `b273d097`) — existing pins re-examined
+
+Three existing pins failed on the fix. Each asserted the pre-port carry-forward:
+
+- `rewrite_position_delete_files_tests.rs::test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files`.
+  The shadowed parquet delete (seq 2) sits below the rewrite's minimum (4). Java's
+  rewrite commit retires it. Re-pinned: after the default rewrite no delete file is
+  live. With `remove_dangling_deletes(true)`, `removed_delete_files_count` is 1 (the DV
+  only), because the dangling pass finds nothing. Rows are unchanged in both halves.
+- `rewrite_data_files_dangling_tests.rs::test_remove_dangling_deletes_defaults_off` and
+  `…_on_removes_the_dangling_delete`. The single-partition fixture put every data file
+  in the rewrite, so the minimum rose to 3 and Java's commit GC would retire the delete
+  (then the sub-action finds nothing). These tests exist to prove the opt-in sub-action
+  composes. The fixture now appends one extra data file in partition `x = 1` at seq 1.
+  The rewrite does not touch it (one file, under `min-input-files`), so the global
+  minimum stays 1 and no sequence GC fires, in Java or here. The partition-`x = 0`
+  minimum still rises to 3, so only `RemoveDanglingDeleteFiles` removes the delete.
+  Both tests keep every assertion unchanged. The fixture's doc block (it said
+  "Everything sits in partition `x = 0`") was deleted, not reworded.
+
+Comment lines deleted because they became false: the `current_manifests` doc
+paragraphs "Every DELETE manifest carries forward UNCHANGED" and "Conservative
+dangling-delete posture", the `manifest_file` note "Manifests that contain none of the
+target files are carried forward unchanged", and the `existing_manifest` blocks in
+`rewrite_files.rs`, `delete_files.rs`, `overwrite_files_operation.rs`,
+`replace_partitions.rs` (including its full-table-replace note, whose "this port keeps
+them" is no longer true for deletes older than the last sequence) and `cherry_pick.rs`.
+To fit the two opt-outs under the frozen ceilings, duplicated comment lines were
+deleted in `append.rs` (the merge-append aside, which `merge_append.rs` already records,
+and the "properties used to create SnapshotProducer" note) and `rewrite_manifests.rs`
+(three lines restating the struct doc or line 308). Ceilings lowered: `snapshot.rs`
+3355, `rewrite_files.rs` 2458, `delete_files.rs` 2257, `replace_partitions.rs` 2784,
+`cherry_pick.rs` 2103, `rewrite_position_delete_files_tests.rs` 4715. `map.md`
+(transaction, maintenance) rows updated.
+
+### Review items (R4-3, `47d767d8`)
+
+- **R-02 (P2).** `live_file_scoped_position_deletes` now returns
+  `LiveFileScopedDeletes { paths, deletion_vectors }` from one walk. `paths` (every
+  file-scoped position delete) feeds the planner's ratio. `deletion_vectors` clones only
+  Puffin DVs, the only files `plan_dv_removal` can drop. Before, every file-scoped
+  parquet `DataFile` was cloned as well. `plan_dv_removal` no longer re-tests
+  `is_deletion_vector`: its input is DV-only. `file_scoped_delete_paths_from` is gone,
+  and the test-only `file_scoped_delete_paths` reuses the walk.
+- **R-04 (P3) — ruling: the reviewer is right under the fork's row-safety posture, not
+  under Java parity.** Java's `findDanglingDeletes` judges DVs by the partition minimum
+  too (no format filter). On a valid table, a DV with a live referenced file can never
+  fall below its partition minimum: `DeleteFileIndex.java:207-213` rejects a DV whose
+  seq is below its data file's. A red cell that tried to build that state failed with
+  exactly that `DataInvalid` from the fork's planner. The fall-through therefore fires
+  only for a DV stamped in a FOREIGN partition with no live data. In that case Java's
+  left join gives `min IS NULL` and drops a DV that the reader still honors by path.
+  The fork already keeps the parquet analogue
+  (`test_file_scoped_position_delete_in_a_foreign_partition_applies_and_survives`).
+  The `continue` makes DVs consistent with that. Cell
+  `test_remove_dangling_keeps_a_foreign_partition_dv_whose_data_file_is_live`: a v3 DV
+  for a file in `x = 1`, stamped `x = 2`, masks `y = 11`. `RemoveDanglingDeleteFiles`
+  removes 0 DVs, the DV stays live, and the rows are unchanged. This is a named
+  divergence from Java in the row-safe direction.
+- **Logic nit (citation).** `RewriteDataFilesSparkAction.danglingDVs` does not exist in
+  1.11.0. Every mention in this ledger and in `task/todo.md` now names
+  `ManifestFilterManager.isDanglingDV` (reached through `removeDanglingDeletesFor`,
+  `MergingSnapshotProducer.java:994-995`).
+- **Logic nit (module doc).** The `rewrite_data_files_dv.rs` line `//! Drop file-scoped
+  deletes that reference data files this rewrite removes.` and the `//!` line after it
+  were deleted, not reworded.
+- **R-03 (P2, recorded, not fixed).** RPD can pack small dead file-scoped parquet
+  deletes into one partition-scoped output that then attaches to every data file of the
+  partition, and every scan opens it (`rewrite_position_delete_files.rs` ~453-657). The
+  sequence GC now retires such an output at the next merging commit that removes a data
+  file, but only once the output's seq (the max rewritten seq) is below every live data
+  file's. A different unit.
+- The ledger's Spark-probe line named a machine-local wrapper path. It now describes
+  the wrapper without the path.
+
+### Mutation proof (R4-4, not committed)
+
+1. **Revert the step-2 fix.** `git checkout c7c45299 --` `snapshot.rs`,
+   `snapshot/removal_targets.rs`, `append.rs`, `rewrite_manifests.rs`, and
+   `snapshot/manifest_filter.rs` moved aside. `cargo test -p iceberg --lib seq_gc`:
+   6 passed, 6 FAILED — exactly the six retirement cells (the residue cell at "Spark
+   4.1.2 + Iceberg 1.11.0 ends the residue sequence at zero delete files", the five (c)
+   cells at "a delete older than every live data file is retired by a merging commit").
+   Green: both (b) row-safety controls, the three keep controls, and the R-04 cell.
+   `test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files` FAILED at "the parquet
+   position delete (seq 2) is below the rewrite's minimum live data seq (4)". Restored →
+   12/12.
+2. **`<` → `<=` in `DeleteFileExpiry::expires` alone.** 12/12 green. The manifest-level
+   test `min_sequence_number < minimum` still prunes the delete manifest, so the entry
+   test never runs. The mutation was incomplete, not the cell. **Both comparisons →
+   `<=`:** 11 passed, 1 FAILED,
+   `test_seq_gc_keeps_position_delete_at_the_minimum_live_sequence` ("a delete whose
+   sequence equals the minimum live data sequence still applies"). Restored → 12/12.
+3. **Revert R-04** (`git checkout b273d097 -- remove_dangling_delete_files.rs`).
+   `test_remove_dangling_keeps_a_foreign_partition_dv_whose_data_file_is_live` FAILED,
+   `left: 1` (the DV was collected). The other 11 green. Restored → 12/12,
+   `remove_dangling` 24/24.
+
+### Gates (round 4, `CARGO_BUILD_JOBS=6 RUST_TEST_THREADS=6`)
+
+- `cargo test -p iceberg --lib seq_gc` 12/12; `--lib transaction` 685 passed, 1 ignored;
+  `--lib rewrite_data_files` 104/104; `--lib rewrite_position_delete` 93/93;
+  `--lib remove_dangling` 24/24; `--lib cow_bytes` 8/8; `--lib maintenance` 376/376.
+- `cargo test -p iceberg-datafusion --lib delete` 38 passed, 1 ignored; `--lib update`
+  11/11; `--lib merge` 2/2.
+- `cargo fmt --all`; `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D
+  warnings` clean; `python3 scripts/check_rust_file_size.py` clean (96 legacy
+  ceilings); comment gate `comment-ban hits=0`.
+
+### RePark forecast
+
+- `test_residue_matches_spark_zero_delete_files`: expected to flip to pass. Cell (a)
+  reproduces the sequence in-tree and reaches 2 data + 0 delete files. The fork's RPD
+  stamps the max rewritten data seq (`rewrite_position_delete_files.rs` `compact_group`),
+  so its outputs sit at the DELETE's seq. The default RDF starts from the RPD snapshot,
+  and the commit's minimum is that snapshot's seq, so both outputs are retired.
+  `removed_delete_files_count` stays 0, as Spark's. Caveat: if RePark's residue runs RDF
+  with `use-starting-sequence-number=false` or a filter that leaves an older data file
+  live, the minimum stays low and Java keeps the deletes too. Parity still holds.
+- ICE-RDF-DANGLE-2 removed-count cells: unchanged from the round-1 forecast
+  (`removed_delete_files_count` 0). In those cells the delete's seq equals the rewrite's
+  starting seq and the commit minimum, so the strict `<` keeps it, as Java does. The
+  eight `cow_bytes` cells are green without change.
+- New observable: a merging commit that retires deletes now reports them in its snapshot
+  summary (`removed-delete-files`, `removed-position-delete-files`, lower
+  `total-delete-files`). RePark cells that compare summaries of such commits should now
+  match Spark. Before, they differed by exactly the retired files.
