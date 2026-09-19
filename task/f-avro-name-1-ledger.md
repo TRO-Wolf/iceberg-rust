@@ -242,3 +242,114 @@ Measured: apache-avro 0.21 default validator rejects `é`/`列` embedded field n
 - [x] `é`/`列` readable without global validator / Cargo change — §8 PROVEN
 - [x] Mutation arithmetic recorded — §8 PROVEN
 - [x] Gates: fmt, clippy, size checker, comment-ban, filtered tests — §8 PROVEN
+
+# Round 2 — critic follow-up (fork #308)
+
+Base: round-1 head `4d18cc8a`. Critics: `/tmp/oc-worker/pd-fork/rv-avro-logic-out.json`,
+`/tmp/oc-worker/pd-fork/rv-avro-perf-out.json`. Nine findings, all addressed red-first.
+
+## R2-1. Findings → fix → pin
+
+- **L-001 (P1) CLOSED** — Avro data-file writer renamed schema fields but not record VALUE keys;
+  `Value::resolve` silently dropped optional values to null and failed required ones. Fix:
+  `RawLiteralEnum::try_from` in `spec/values/serde.rs` sanitizes record keys at construction via
+  `sanitize_avro_value_names` (recursive: records, maps, arrays, unions) — every writer path
+  (manifest writer, data-file writer, `write_data_files_to_avro`) emits aligned keys. Pin:
+  `avro_data_file_round_trip_sanitizes_value_keys` — write→read for `my col`, `a-b`, `1st`,
+  `c😀` over optional+required fields; red pre-fix with `Missing field in record: "_1st"`.
+  Commits: test+fix in the L-001 slice (see commit list).
+- **L-002 (P1) CLOSED** — collisions. (1) Write path: `avro_record_schema` under
+  `AvroNameCollision::Fail` scans for duplicate Avro names and returns typed `DataInvalid`
+  naming both Iceberg fields and the colliding name — mirrors Java `setFields` `Duplicate field`.
+  (2) Read/binding: `StructType::field_by_avro_name` consults a `OnceLock`-cached map built by
+  `uniquified_avro_names` — a field keeps its name when it already owns the canonical Avro name;
+  otherwise it is assigned `repair_target_name` + numeric suffix. A literal-name hit can never
+  shadow the field whose sanitized name/`iceberg-field-name` owns the slot (repaired names bind
+  before literal names — stated choice: binding is by repaired-name precedence, not field-id,
+  because `apache-avro` `resolve` matches by name and the decoded `Value::Record` carries no ids).
+  Pins: `colliding_avro_field_names_fail_at_schema_build` (`a b`/`a_x20b`, `1a`/`_1a` →
+  `DataInvalid`), `unique_avro_names_bind_before_literal_names` (serde binding),
+  `repaired_colliding_names_bind_distinctly` (all four pairs through repair+read).
+- **L-003 (P2) CLOSED** — repair collapsed Java-legal pairs (`é`/`_xE9`, `列`/`_x5217`) into
+  duplicates. Fix: OCF repair and reader-schema strictify share `uniquified_avro_names`, which
+  keeps each name's canonical owner and suffixes the repair (`_xE9_1`, `a_x20b_1`, …);
+  `iceberg-field-name` always preserves the original. Pin:
+  `repaired_colliding_names_bind_distinctly` — all four pairs read back distinctly.
+- **L-004 (P2) CLOSED** — coverage pins added; implementation already correct. Pin:
+  `ocf_metadata_multi_block_and_negative_blocks_decode` (two-positive, all-negative, and mixed
+  block counts decode identically through slice parse, streaming header, repair, and full
+  read; a broken-schema multi-block header repairs and reads), plus
+  `ocf_repair_passes_through_valid_containers_byte_identical` (Null/Deflate/Zstandard →
+  `Cow::Borrowed`, byte-equal) and
+  `ocf_repair_fixes_schema_names_inside_snappy_and_zstd_containers` (Zstandard container
+  round-trips repaired; a snappy-flagged container — snappy codec feature is OFF in this
+  workspace, so its body cannot be decoded — repairs its header and preserves `avro.codec`).
+- **R-01 (P1) CLOSED** — `repair_avro_container` parsed schema JSON unconditionally. Fix:
+  `schema_names_need_repair` scans `"name"` values in the schema bytes with the apache-avro
+  name rule; only when a name needs repair does the header parse JSON (`patch_record_field`
+  allocates only on rename). Pin: `ocf_repair_json_parses_only_when_schema_names_need_it` —
+  thread-local `ocf_json_parse_count` probe: 0 parses for valid containers, 1 for broken.
+- **R-02 (P1) CLOSED** — repair copied whole files; `read_data_files_from_avro` lost `R: Read`.
+  Fix: `ocf_repaired_stream` repairs only the header (`read_ocf_header` streams OCF metadata
+  incl. negative block counts) and returns `Chain<Cursor<header>, BufReader<&mut R>>` — body
+  never copied; signature stays streaming. Pin:
+  `data_files_avro_reader_streams_without_read_to_end` (a reader whose `read_to_end` errors).
+- **R-03 (P2) CLOSED** — per-record re-sanitization in serde binding. Fix:
+  `StructType.avro_lookup: OnceLock<Arc<HashMap<String, usize>>>` built once via
+  `uniquified_avro_names`; `RawLiteral` record conversion calls `field_by_avro_name`. No
+  sanitizer call per record. Pin: `unique_avro_names_bind_before_literal_names`.
+- **R-04 (P3) CLOSED** — `java_avro_name` now returns `Cow::Borrowed` immediately when
+  `is_apache_avro_name(name)` (covers ASCII fast path and all already-valid names).
+- **R-05 (P2) CLOSED** — `strictify_avro_field_names` returns a change flag through recursion;
+  unions are rebuilt only when a nested variant renamed.
+
+## R2-2. Structural notes
+
+- `avro/ocf.rs` (new) holds all OCF machinery (header parse, repair, streaming reader);
+  `avro/name.rs` keeps name logic only. `avro/schema_build.rs` and `spec/datatypes_de.rs` were
+  split out for file-size ceilings (moved code's comments deleted per RULE 0).
+- The `OCF_JSON_PARSES` probe is `thread_local!` — parallel test threads must not race the
+  counter (caught when the L-004 suite first ran the counter test concurrently).
+- `apache-avro`'s `snappy` feature is not enabled in this workspace (`apache-avro = "0.21"`,
+  features `["zstandard"]`; Cargo edits banned). Snappy coverage is a hand-flagged
+  `avro.codec: snappy` container through repair — codec metadata preserved, schema repaired.
+  Record-level snappy decode cannot run without the feature.
+- `StructType` grew past `clippy::large_enum_variant` via `SchemaOp`; the three lookup caches
+  sit behind `Arc<HashMap>` (8 bytes, keeps laziness, `box_collection`-clean).
+
+## R2-3. Mutation (revert → red)
+
+Single-batch surgical reverts (value-key sanitize no-op, dup check skipped,
+`uniquified_avro_names` verbatim, fast-path scan removed, `read_to_end` restore, negative
+block count rejected, literal-name binding): **12 of 15 pins red** —
+`avro_data_file_round_trip_sanitizes_value_keys`, `write_then_read_round_trip`,
+`table_scan_filters_on_spaced_partition_column` (L-001),
+`colliding_avro_field_names_fail_at_schema_build` (L-002 write),
+`unique_avro_names_bind_before_literal_names` + `repaired_colliding_names_bind_distinctly`
+(L-002 bind / L-003), `ocf_repair_json_parses_only_when_schema_names_need_it` (R-01),
+`data_files_avro_reader_streams_without_read_to_end` (R-02),
+`ocf_metadata_multi_block_and_negative_blocks_decode` +
+`data_files_avro_reader_repairs_schema_names_while_streaming` +
+`ocf_repair_fixes_schema_names_inside_snappy_and_zstd_containers` (L-004),
+`reads_spark_manifest_partition_values` (regression). `git checkout` restored; all 15 green.
+**PROVEN**
+
+## R2-4. Gates (HEAD = `12170c8f`)
+
+- `cargo test -p iceberg --lib f_avro_name_1` — 15/15 green. **PROVEN**
+- `cargo test -p iceberg --lib avro` 129, `manifest` 200 (3 ignored), `values` 173,
+  `writer` 179 (1 ignored). **PROVEN**
+- `cargo fmt --all -- --check` clean; `cargo clippy -p iceberg --all-targets -- -D warnings`
+  clean; `scripts/check_rust_file_size.py` 529 files clean (test module split:
+  `f_avro_name_1_ocf_tests.rs`); `scripts/check_comment_blocks.sh` OK. **PROVEN**
+- No push, no PR, no `gh`, no Cargo.toml/Cargo.lock change. **PROVEN**
+
+## R2-5. Commits (round 2, oldest → newest)
+
+- `1502c47e` test: pin OCF fast path and streaming repair (R-01, R-02)
+- `35fb3014` fix: OCF fast path and header-only streaming repair (R-01, R-02)
+- `1d3da9e6` test: pin collision loud-fail and distinct repair (L-002, L-003)
+- `bd4e1ef3` fix: collision-safe names, unique repair, cached binding
+  (L-002, L-003, R-03, R-04, R-05)
+- `077ab446` test: pin OCF container shapes (L-004)
+- `12170c8f` test: split OCF pins into sibling test module (size ceiling)
