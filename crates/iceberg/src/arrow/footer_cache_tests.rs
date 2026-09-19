@@ -50,11 +50,7 @@ fn footer_reads(ranges: &Mutex<Vec<(String, Range<u64>)>>, path: &str, file_size
         .count()
 }
 
-fn footer_bytes(
-    ranges: &Mutex<Vec<(String, Range<u64>)>>,
-    path: &str,
-    file_size: u64,
-) -> u64 {
+fn footer_bytes(ranges: &Mutex<Vec<(String, Range<u64>)>>, path: &str, file_size: u64) -> u64 {
     ranges
         .lock()
         .expect("read ranges")
@@ -446,7 +442,8 @@ async fn c8_cache_on_matches_off_and_still_prunes() {
     assert_eq!(dump(&unfiltered_cached), dump(&unfiltered_uncached));
     assert_eq!(cache.stats().fetches, 1);
     assert_eq!(
-        cache.stats().upgrades, 0,
+        cache.stats().upgrades,
+        0,
         "a filtered cold open loads the index inline"
     );
 }
