@@ -55,6 +55,8 @@ mod page_prune_fixture;
 mod page_prune_tests;
 #[cfg(test)]
 mod page_prune_tests_2;
+#[cfg(test)]
+mod spark_fixture_tests;
 /// Record batch partition splitter for partitioned tables
 pub mod record_batch_partition_splitter;
 pub use record_batch_partition_splitter::*;
