@@ -29,9 +29,7 @@ mod tests {
     use rand::Rng;
     use tempfile::NamedTempFile;
 
-    use crate::expr::visitors::page_index_evaluator::{
-        PageIndexEvaluator, PageNullCount,
-    };
+    use crate::expr::visitors::page_index_evaluator::{PageIndexEvaluator, PageNullCount};
     use crate::expr::{Bind, Reference};
     use crate::spec::{Datum, NestedField, PrimitiveType, Schema, Type};
     use crate::{ErrorKind, Result};

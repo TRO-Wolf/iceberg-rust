@@ -332,3 +332,24 @@ all-null groups (skipped) vs NULLs inside kept groups (kept by the residual).
 - `cargo test -p iceberg --lib arrow` — 478 passed, 1 ignored
 - `cargo test -p iceberg --lib page_index` — 16 passed
 - `cargo test -p iceberg-datafusion --lib` — 290 passed, 1 ignored
+
+## Round 4 — verification pin
+
+The Grok verification critic (`rv-pp-verify-out.json`) passed the unit with one finding:
+
+- **V-001 (S3):** mutating `visit_inequality` to *skip* a page when `bound.partial_cmp(datum)`
+  returns `None` left every pin green — the "incomparable bounds keep the page" rule was
+  unpinned. `Datum::to` normalizes the literal to the column type at bind time, so the `None`
+  arm is unreachable through a bound predicate; the per-page decision is extracted into
+  `PageIndexEvaluator::inequality_keeps_page` (same pattern as `eq_keeps_page`/`in_keeps_page`)
+  and pinned directly by `inequality_incomparable_bound_keeps_page` — an `Int` bound vs a
+  `String` literal (`partial_cmp` → `None`) must keep the page for `<`, `<=`, `>`, `>=`, plus a
+  comparable-out-of-range bound must skip. Mutation applied → the pin red; reverted → green.
+- **V-002 (noted):** the Spark fixtures are one row group per file, so the only two-row-group
+  ranged cell is the synthetic `r_ranged_task_intersects_row_group_and_page_selection` pin.
+
+### Round-4 mutation evidence
+
+| Mutation | Result |
+|---|---|
+| V-001 `partial_cmp → None` skips the page instead of keeping it | `inequality_incomparable_bound_keeps_page` red |
