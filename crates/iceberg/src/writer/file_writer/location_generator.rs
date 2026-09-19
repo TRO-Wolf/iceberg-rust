@@ -161,8 +161,7 @@ fn path_context(table_location: &str) -> String {
         .collect();
     match segments.len() {
         0 => String::new(),
-        1 if path.starts_with('/') => format!("/{}", segments[0]),
-        1 => segments[0].to_string(),
+        1 => format!("/{}", segments[0]),
         _ => format!(
             "{}/{}",
             segments[segments.len() - 2],
@@ -836,6 +835,59 @@ pub(crate) mod test {
             generator.generate_location(None, "f.parquet"),
             "s3://wh/new/0111/1111/1110/11001100/ns/t/f.parquet",
             "write.data.path short-circuits the deprecated check, as Java does"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_object_storage_context_bucket_root_parent() {
+        for location in ["s3://bucket/mytable", "s3://bucket/mytable/"] {
+            let metadata = table_metadata(
+                location,
+                props(&[
+                    ("write.object-storage.enabled", "true"),
+                    ("write.data.path", "s3://alt-data"),
+                ]),
+            );
+            let generator = TableLocationGenerator::new(&metadata).unwrap();
+            assert_eq!(
+                generator.generate_location(None, "f.parquet"),
+                "s3://alt-data/0111/1111/1110/11001100//mytable/f.parquet",
+                "Hadoop Path({location}) has an empty-named parent, so the context keeps a leading slash"
+            );
+        }
+    }
+
+    #[test]
+    fn table_location_generator_object_storage_context_single_segment_relative() {
+        let metadata = table_metadata(
+            "mytable",
+            props(&[
+                ("write.object-storage.enabled", "true"),
+                ("write.data.path", "s3://alt-data"),
+            ]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(None, "f.parquet"),
+            "s3://alt-data/0111/1111/1110/11001100//mytable/f.parquet",
+            "Hadoop Path(mytable) has the empty path as parent, so the context keeps a leading slash"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_object_storage_context_bucket_only() {
+        let metadata = table_metadata(
+            "s3://bucket",
+            props(&[
+                ("write.object-storage.enabled", "true"),
+                ("write.data.path", "s3://alt-data"),
+            ]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(None, "f.parquet"),
+            "s3://alt-data/0111/1111/1110/11001100//f.parquet",
+            "Hadoop Path(s3://bucket) has a null parent and an empty name, so the context is empty"
         );
     }
 
