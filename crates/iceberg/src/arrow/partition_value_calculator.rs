@@ -252,8 +252,32 @@ impl PartitionValueCalculator {
 
         // Apply transforms to each source column
         let mut partition_values = Vec::with_capacity(self.transform_functions.len());
-        for (source_column, transform_fn) in source_columns.iter().zip(&self.transform_functions) {
-            let partition_value = transform_fn.transform(source_column.clone())?;
+        for ((source_column, transform_fn), expected_field) in source_columns
+            .iter()
+            .zip(&self.transform_functions)
+            .zip(expected_struct_fields.iter())
+        {
+            let partition_value = match transform_fn
+                .transform_to_type(source_column, expected_field.data_type())
+            {
+                Some(result) => result?,
+                None => {
+                    let partition_value = transform_fn.transform(source_column.clone())?;
+                    if partition_value.data_type() == expected_field.data_type() {
+                        partition_value
+                    } else {
+                        arrow_cast::cast(partition_value.as_ref(), expected_field.data_type())
+                            .map_err(|e| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    format!(
+                                        "Failed to cast partition value to the partition field type: {e}"
+                                    ),
+                                )
+                            })?
+                    }
+                }
+            };
             partition_values.push(partition_value);
         }
 

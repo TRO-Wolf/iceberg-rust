@@ -29,6 +29,14 @@ use crate::expr::{BoundPredicate, BoundReference};
 use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType, Schema};
 use crate::{Error, ErrorKind, Result};
 
+fn literal_prefix_bytes<'a>(literal: &'a PrimitiveLiteral, err_msg: &str) -> Result<&'a [u8]> {
+    match literal {
+        PrimitiveLiteral::String(s) => Ok(s.as_bytes()),
+        PrimitiveLiteral::Binary(b) => Ok(b.as_slice()),
+        _ => Err(Error::new(ErrorKind::Unexpected, err_msg)),
+    }
+}
+
 pub(crate) struct RowGroupMetricsEvaluator<'a> {
     row_group_metadata: &'a RowGroupMetaData,
     iceberg_field_id_to_parquet_column_index: &'a HashMap<i32, usize>,
@@ -344,45 +352,27 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             return ROW_GROUP_CANT_MATCH;
         }
 
-        let PrimitiveLiteral::String(datum) = datum.literal() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Cannot use StartsWith operator on non-string values",
-            ));
-        };
+        let prefix = literal_prefix_bytes(
+            datum.literal(),
+            "Cannot use StartsWith operator on non-string values",
+        )?;
 
         if let Some(lower_bound) = self.min_value(field_id)? {
-            let PrimitiveLiteral::String(lower_bound) = lower_bound.literal() else {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "Cannot use StartsWith operator on non-string lower_bound value",
-                ));
-            };
-
-            let prefix_length = lower_bound.chars().count().min(datum.chars().count());
-
-            // truncate lower bound so that its length
-            // is not greater than the length of prefix
-            let truncated_lower_bound = lower_bound.chars().take(prefix_length).collect::<String>();
-            if datum < &truncated_lower_bound {
+            let lower_bound = literal_prefix_bytes(
+                lower_bound.literal(),
+                "Cannot use StartsWith operator on non-string lower_bound value",
+            )?;
+            if prefix < &lower_bound[..lower_bound.len().min(prefix.len())] {
                 return ROW_GROUP_CANT_MATCH;
             }
         }
 
         if let Some(upper_bound) = self.max_value(field_id)? {
-            let PrimitiveLiteral::String(upper_bound) = upper_bound.literal() else {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "Cannot use StartsWith operator on non-string upper_bound value",
-                ));
-            };
-
-            let prefix_length = upper_bound.chars().count().min(datum.chars().count());
-
-            // truncate upper bound so that its length
-            // is not greater than the length of prefix
-            let truncated_upper_bound = upper_bound.chars().take(prefix_length).collect::<String>();
-            if datum > &truncated_upper_bound {
+            let upper_bound = literal_prefix_bytes(
+                upper_bound.literal(),
+                "Cannot use StartsWith operator on non-string upper_bound value",
+            )?;
+            if prefix > &upper_bound[..upper_bound.len().min(prefix.len())] {
                 return ROW_GROUP_CANT_MATCH;
             }
         }
@@ -405,53 +395,39 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
         // notStartsWith will match unless all values must start with the prefix.
         // This happens when the lower and upper bounds both start with the prefix.
 
-        let PrimitiveLiteral::String(prefix) = datum.literal() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Cannot use StartsWith operator on non-string values",
-            ));
-        };
+        let prefix = literal_prefix_bytes(
+            datum.literal(),
+            "Cannot use StartsWith operator on non-string values",
+        )?;
 
         let Some(lower_bound) = self.min_value(field_id)? else {
             return ROW_GROUP_MIGHT_MATCH;
         };
 
-        let PrimitiveLiteral::String(lower_bound_str) = lower_bound.literal() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Cannot use NotStartsWith operator on non-string lower_bound value",
-            ));
-        };
+        let lower_bound = literal_prefix_bytes(
+            lower_bound.literal(),
+            "Cannot use NotStartsWith operator on non-string lower_bound value",
+        )?;
 
-        if lower_bound_str < prefix {
-            // if lower is shorter than the prefix then lower doesn't start with the prefix
+        if lower_bound < prefix {
             return ROW_GROUP_MIGHT_MATCH;
         }
 
-        let prefix_len = prefix.chars().count();
-
-        if lower_bound_str.chars().take(prefix_len).collect::<String>() == *prefix {
-            // lower bound matches the prefix
-
+        if lower_bound.starts_with(prefix) {
             let Some(upper_bound) = self.max_value(field_id)? else {
                 return ROW_GROUP_MIGHT_MATCH;
             };
 
-            let PrimitiveLiteral::String(upper_bound) = upper_bound.literal() else {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "Cannot use NotStartsWith operator on non-string upper_bound value",
-                ));
-            };
+            let upper_bound = literal_prefix_bytes(
+                upper_bound.literal(),
+                "Cannot use NotStartsWith operator on non-string upper_bound value",
+            )?;
 
-            // if upper is shorter than the prefix then upper can't start with the prefix
-            if upper_bound.chars().count() < prefix_len {
+            if upper_bound.len() < prefix.len() {
                 return ROW_GROUP_MIGHT_MATCH;
             }
 
-            if upper_bound.chars().take(prefix_len).collect::<String>() == *prefix {
-                // both bounds match the prefix, so all rows must match the
-                // prefix and therefore do not satisfy the predicate
+            if upper_bound.starts_with(prefix) {
                 return ROW_GROUP_CANT_MATCH;
             }
         }
