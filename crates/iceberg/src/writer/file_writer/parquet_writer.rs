@@ -55,7 +55,7 @@ use crate::{Error, ErrorKind, Result};
 /// ParquetWriterBuilder is used to builder a [`ParquetWriter`]
 #[derive(Clone, Debug)]
 pub struct ParquetWriterBuilder {
-    writer_options: ArrowWriterOptions,
+    writer_options: std::result::Result<ArrowWriterOptions, Arc<Error>>,
     schema: SchemaRef,
     match_mode: FieldMatchMode,
     metrics_config: MetricsConfig,
@@ -79,7 +79,8 @@ impl ParquetWriterBuilder {
         match_mode: FieldMatchMode,
     ) -> Self {
         Self {
-            writer_options: super::parquet_footer::writer_options(&props, &schema),
+            writer_options: super::parquet_footer::writer_options(&props, &schema)
+                .map_err(Arc::new),
             schema,
             match_mode,
             metrics_config: MetricsConfig::default(),
@@ -111,7 +112,10 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             schema: self.schema.clone(),
             writer_arrow_schema: Arc::new(self.schema.as_ref().try_into()?),
             inner_writer: None,
-            writer_options: self.writer_options.clone(),
+            writer_options: self
+                .writer_options
+                .clone()
+                .map_err(|err| Error::new(err.kind(), err.message().to_string()))?,
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
@@ -660,9 +664,8 @@ impl FileWriter for ParquetWriter {
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let inner_writer = self.output_file.writer().await?;
             let writer = AsyncArrowWriter::try_new_with_options(
-                AsyncFileWriter::new(inner_writer),
+                AsyncFileWriter::new(self.output_file.writer().await?),
                 self.writer_arrow_schema.clone(),
                 self.writer_options.clone(),
             )
@@ -695,8 +698,6 @@ impl FileWriter for ParquetWriter {
             Error::new(ErrorKind::Unexpected, "Failed to finish parquet writer.").with_source(err)
         })?;
 
-        let written_size = writer.bytes_written();
-
         if self.current_row_num == 0 {
             self.output_file.delete().await.map_err(|err| {
                 Error::new(
@@ -707,12 +708,10 @@ impl FileWriter for ParquetWriter {
             })?;
             Ok(vec![])
         } else {
-            let parquet_metadata = Arc::new(metadata);
-
             Ok(vec![Self::parquet_to_data_file_builder(
                 self.schema,
-                parquet_metadata,
-                written_size,
+                Arc::new(metadata),
+                writer.bytes_written(),
                 self.output_file.location().to_string(),
                 self.nan_value_count_visitor.nan_value_counts,
                 &self.metrics_config,

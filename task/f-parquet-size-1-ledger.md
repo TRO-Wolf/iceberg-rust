@@ -266,3 +266,18 @@ and values read back either way. Fix restored; 8/8 green.
 write-filtered 15/15, fmt clean, `clippy -p iceberg --all-targets -- -D warnings`
 clean, size checker clean (`parquet_writer.rs` back at the 3 391 ceiling),
 comment-ban `hits=0`.
+
+## Round 3 — typed serialisation error, no production expect
+
+Round 2's `expect` in `parquet_footer::writer_options` violated the no-`unwrap`/`expect`
+rule outside tests. `writer_options` again returns `Result<ArrowWriterOptions>`; the
+serde failure is `DataInvalid` naming the schema id with the serde detail in the
+message. `ParquetWriterBuilder` still prepares the options once, but stores
+`Result<ArrowWriterOptions, Arc<Error>>` (`Arc` keeps the builder `Clone + Debug`);
+`FileWriterBuilder::build` — the first already-`Result` point — rehydrates the stored
+error as `Error::new(kind, message)` and fails the writer build with `DataInvalid`
+instead of ever panicking. Footer bytes unchanged: the byte-identity and all seven
+other footer cells stay green. `parquet_writer.rs` came in one line under its ceiling
+(3 390) by inlining three once-used locals (`inner_writer`, `written_size`,
+`parquet_metadata`); the checker ceiling was lowered to match. The whole diff was
+grepped for `unwrap()`/`expect(` outside `*_tests.rs`/`#[cfg(test)]` — none.
