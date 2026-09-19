@@ -25,7 +25,51 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
-## ACTIVE (2026-09-19): F-DANGLING-DV-COMMIT-1 — every merging commit drops the DVs of the data files it removes
+## ACTIVE (2026-09-19): F-METRICS-CONFIG-1 — Java's table metrics config, everywhere the fork writes
+
+Ledger: [`f-metrics-config-1-ledger.md`](f-metrics-config-1-ledger.md). Branch
+`fix/f-metrics-config-1` off fork `main` (`43fcd243`). Defect: `write.metadata.metrics.*`
+table properties are ignored by the fork's own Parquet writers (compaction rewrites
+`metrics.default=none` files WITH full bounds).
+
+- [x] MEASURE: Java 1.11.0 bytecode (`from`/`forTable`/`forPositionDelete`/
+      `limitFieldIds`/`getProjectedIds`/`orderPreservingSortedColumns`/
+      `ParquetMetrics$MetricsVisitor`), production `ParquetWriterBuilder` inventory
+      (8 live sites + 1 dead helper; three brief-named files are test-only), oracle
+      cells extracted, fork replay measured (field-8 list/map divergence)
+- [x] RED-FIRST pins: 12 oracle cells (six maps vs Spark, keys + bound bytes) +
+      `rewrite_data_files` none-cell e2e + position-delete overlay pin — 11 red /
+      3 green guards on `from_properties`/`for_position_delete` stubs
+- [x] IMPLEMENT: `MetricsConfig::for_table` / `for_position_delete_table` +
+      list/map-descendant drop; wire all 6 iceberg-crate production sites.
+      14/14 pins green
+- [x] MUTATION (drop promotion / drop limit / drop rewrite wiring → 2+1+1 pins red,
+      all reverted) + gates: fmt, workspace clippy `-D warnings`, `make check` green,
+      `parquet_writer.rs` ceiling 3390 → 3346, comment-ban `hits=0`, typos;
+      `metrics` 172, `parquet_writer` 28, `maintenance::` 402 all green
+- [x] ROUND 2: comment-gate hit fixed (moved comment deleted, `e9db23c4`); scope
+      correction — DataFusion writers ARE fork code: `write.rs`/`row_lineage.rs` →
+      `for_table`, `delete_position_deletes.rs` → `for_position_delete_table`
+      (`7b562926`); INSERT none-metrics pin red-first `fd71d001`, mutation → red,
+      reverted; `physical_plan` 203/203, comment-ban `hits=0`
+- [x] ROUND 3: L-002 — `for_table`/`for_position_delete_table`/`from_properties`
+      return `Result`, typed `DataInvalid` on unparsable max-inferred (Java
+      `propertyAsInt` → `Integer.parseInt`, bytecode-verified), negatives →
+      limit 0; error threaded through all nine sites. Perf R-01..R-05:
+      `MetricsByFieldId` per build (name lookups gone), `stats_eligible`
+      precomputed, `Arc<MetricsConfig>` (no per-file clones), `for_table`
+      hoisted, count-only `projected_field_count`; `parquet_writer.rs` 3343,
+      ceiling lowered. L-001 five wiring pins (row_lineage,
+      delete_position_deletes, partition_key_audit, rewrite_table_path —
+      `write_position_delete_content` now returns `DataFile`,
+      rewrite_position_delete_files); L-005 `row.*` overlay kill. Six mutations
+      → named pins red, all reverted. Gates: `metrics` 177, `maintenance::`
+      421, `parquet_writer` 28, `physical_plan` 205, `make check` green,
+      comment-ban `hits=0`, size 532 clean
+- [ ] handback.json
+
+
+## DONE (2026-09-19): F-DANGLING-DV-COMMIT-1 — every merging commit drops the DVs of the data files it removes
 
 Ledger: [`f-dangling-dv-commit-1-ledger.md`](f-dangling-dv-commit-1-ledger.md). Branch
 `fix/f-dangling-dv-commit-1` off fork `main` (`587d3592`). Consumer: the #301

@@ -467,8 +467,11 @@ impl RewriteTablePath {
             }
         }
 
-        self.write_position_delete_content(delete_file, &rewritten_pairs, source, staging)
-            .await
+        Ok(self
+            .write_position_delete_content(delete_file, &rewritten_pairs, source, staging)
+            .await?
+            .file_path()
+            .to_string())
     }
 
     /// Writes the rewritten pairs into a parquet position-delete file under the staging location,
@@ -480,7 +483,7 @@ impl RewriteTablePath {
         pairs: &[(String, i64)],
         source: &str,
         staging: &str,
-    ) -> Result<String> {
+    ) -> Result<DataFile> {
         let config = PositionDeleteWriterConfig::new()?;
 
         // The content must land at exactly stagingPath(origLoc), the layout Java uses, so the copy
@@ -501,7 +504,9 @@ impl RewriteTablePath {
             position_delete_writer_properties_for(self.table.metadata().properties())?,
             config.schema().clone(),
         )
-        .with_metrics_config(MetricsConfig::for_position_delete());
+        .with_metrics_config(MetricsConfig::for_position_delete_table(
+            self.table.metadata(),
+        )?);
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.table.file_io().clone(),
@@ -573,7 +578,7 @@ impl RewriteTablePath {
                 ),
             ));
         }
-        Ok(staged_file.file_path().to_string())
+        Ok(staged_file)
     }
 }
 

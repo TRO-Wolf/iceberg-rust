@@ -1,0 +1,457 @@
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one
+  ~ or more contributor license agreements.  See the NOTICE file
+  ~ distributed with this work for additional information
+  ~ regarding copyright ownership.  The ASF licenses this file
+  ~ to you under the Apache License, Version 2.0 (the
+  ~ "License"); you may not use this file except in compliance
+  ~ with the License.  You may obtain a copy of the License at
+  ~
+  ~   http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing,
+  ~ software distributed under the License is distributed on an
+  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  ~ KIND, either express or implied.  See the License for the
+  ~ specific language governing permissions and limitations
+  ~ under the License.
+-->
+
+# F-METRICS-CONFIG-1 — Java's table metrics config, everywhere the fork writes
+
+**Date:** 2026-09-19. **Base:** `origin/main` `43fcd243` (fork tip at branch
+`fix/f-metrics-config-1`). **Model:** swe-2-high. **Path:** step 1 MEASURE (first
+commit), step 2 RED-FIRST pins, step 3 IMPLEMENT, step 4 MUTATION + gates (later
+commits).
+
+This ledger retires when the unit lands or the owner removes it.
+
+## Defect
+
+`write.metadata.metrics.default` / `write.metadata.metrics.column.<col>` are table
+properties users set to keep sensitive values out of manifest bounds. RePark measured
+them IGNORED: the fork's own writers build `ParquetWriterBuilder` without the table's
+resolved config, so `metrics.default=none` data files are rewritten by compaction WITH
+full bounds — a privacy regression Java does not have.
+
+## Java 1.11.0, verified against bytecode
+
+Jar: `iceberg-spark-runtime-4.1_2.13-1.11.0.jar`, read with `javap -c -p`.
+
+### `MetricsConfig.forTable(Table)` / `forPositionDelete(Table)` / `from(props, schema, sortOrder)`
+
+- `forTable(table)` = `from(table.properties(), table.schema(), table.sortOrder())`.
+- `forPositionDelete(table)`: puts `file_path -> Full`, `pos -> Full` (the
+  `MetadataColumns.DELETE_FILE_PATH` / `DELETE_FILE_POS` names), then re-keys every
+  entry of `forTable(table).columnModes` as `row.<name>` and keeps the table's
+  `defaultMode`. The `row.` entries serve position-delete schemas carrying a `row`
+  struct; the fork's delete schema has only `file_path`/`pos`, so they are inert today
+  but ported verbatim.
+- `forPositionDelete()` (no-arg) is a static `POSITION_DELETE_MODE` = columnModes
+  `{file_path: Full, pos: Full}` over `DEFAULT_MODE` — this is what the fork's current
+  `MetricsConfig::for_position_delete()` ports.
+- `from(props, schema, sortOrder)`:
+  1. `limit = maxInferredColumnDefaults(props)` —
+     `PropertyUtil.propertyAsInt(props, "write.metadata.metrics.max-inferred-column-defaults", 100)`;
+     `propertyAsInt` is a bare `Integer.parseInt` with NO catch — a non-numeric value
+     throws `NumberFormatException` out of `forTable` (hard failure at write time, not
+     a warn-fallback). A negative parsed value warns and falls back to 100.
+  2. `defaultMode`: if `write.metadata.metrics.default` is set, `parseMode` it (bad
+     value warns, falls back to `DEFAULT_MODE` = `truncate(16)`); else if `schema ==
+     null` or `getProjectedIds(schema).size() <= limit`, `DEFAULT_MODE`; else the
+     wide-schema branch: `defaultMode = None` AND the first `limit` field ids (Java
+     traversal order) each get an explicit `columnModes[findColumnName(id)] =
+     DEFAULT_MODE` entry. (Mechanism matters: the surviving columns carry explicit
+     entries, the default itself flips to `none`.)
+  3. Sorted promotion: `sortedDefault = sortedColumnDefaultMode(defaultMode)` —
+     `None` or `Counts` -> `Truncate(16)`, else the mode unchanged. Then every column
+     of `SortOrderUtil.orderPreservingSortedColumns(sortOrder)` is put into
+     `columnModes` with `sortedDefault` (unconditional put — overwrites inferred
+     entries, is overwritten by explicit `column.*` overrides which run next).
+  4. Column overrides: every `write.metadata.metrics.column.<name>` key; the name is
+     `key.replaceFirst(PREFIX, "")` (dotted nested names kept verbatim); bad value
+     warns and falls back to the resolved `defaultMode`.
+- `orderPreservingSortedColumns(order)`: null order -> empty set; otherwise fields
+  filtered by `transform.preservesOrder()`, mapped `sourceId ->
+  order.schema().findColumnName(sourceId)`, nulls dropped. The Rust `SortOrder` is
+  unbound, so the fork resolves names through `TableMetadata.current_schema()` — Java
+  binds the order to the same schema at build (`SortOrderParser`/`checkCompatibility`).
+- `preservesOrder()` per transform, verified: `Identity`, `Truncate`, and
+  `TimeTransform` (Years/Months/Days/Hours) return true; `Void`, `Bucket`, `Unknown`
+  false. The fork's `Transform::preserves_order()` already matches exactly.
+
+### `limitFieldIds(schema, limit)` (`MetricsConfig$1`, a `CustomOrderSchemaVisitor`)
+
+- `metricsEligible(type)` = `isPrimitiveType() || isVariantType()` — struct/list/map
+  fields are NOT eligible themselves.
+- `struct()`: FIRST scans its direct fields in order, adding each eligible field id
+  while `idSet.size() < limit`; THEN iterates the children in field order, descending
+  lazily (each child's subtree fully consumed before the next, each level re-checking
+  the limit).
+- `list()`: if under limit and `elementType` is eligible, adds `elementId`; then
+  descends into the element type (so `list<struct>` element fields CAN consume slots).
+- `map()`: adds `keyId` then `valueId` under the same guards; then descends into key
+  and value types.
+- Oracle confirmation: `(id,s,d,st,xs)` with limit 2 -> `{1,2}` — the direct-field
+  scan stops at the limit before descending.
+
+### `TypeUtil.getProjectedIds(schema)` (`GetProjectedIds`, includeStructIds = true)
+
+Adds a field's id when its type is primitive, variant, or struct. List/map field ids
+are NOT added; their element/key/value field ids are added by their own `field()`
+visits (primitive/variant/struct-typed children). For the oracle schema:
+`{1,2,3,4,6,7,8}` (7 ids — `st` included, `xs` excluded, `xs.element` included).
+The `list()/map()` null-result fallbacks are unreachable in the post-order walk
+(every child `field()` returns the set).
+
+### `ParquetMetrics$MetricsVisitor` (1.11.0, field-id-keyed)
+
+- `message()`: first pass puts `columnSizes[fieldId] = totalCompressedSize` for every
+  projected field whose `effectiveMode != None` — INCLUDING list/map descendants;
+  then `footerMetrics` descends the schema.
+- `primitive()`: mode `None` -> no metrics; otherwise `metricsFromFooter`/`counts`.
+  `metricsFromFooter` returns `null` for INT96, returns counts-only when
+  `truncateLength <= 0`, and returns `null` (dropping the column ENTIRELY — value
+  counts, null counts and bounds) when any row-group chunk's `getStatistics()` is
+  absent or `isEmpty()`. `bounds()` applies the same stat-less-drop.
+- `list()` and `map()` return EMPTY lists — every metric under a list or map is
+  dropped except `column_sizes` (collected in the `message()` pass).
+- `struct()` descends; `variant()` has its own handling.
+- `MetricsUtil.metricsMode(config, fieldId, schema)` resolves modes by
+  `schema.findColumnName(fieldId)` — the fork's `name_by_field_id` + `column_mode`
+  is the same lookup.
+
+### Mode parsing
+
+`MetricsModes.fromString`: case-insensitive `none`/`counts`/`full`, `truncate(N)`
+with `N > 0` parsed as `int` (overflow rejects). `parseMode` catches
+`IllegalArgumentException`, warns, returns the fallback. The fork's
+`MetricsMode::parse` already matches.
+
+### `validateReferencedColumns(schema)`
+
+Lives on `MetricsConfig` but is called from `PropertiesUpdate`/`TableMetadata`
+(property-set time), NOT from `from` or the write path — so `for_table` performs no
+validation and unknown `column.*` names are inert, matching Java's writer behavior.
+
+## Oracle (the run-24d metrics oracle), extracted
+
+Table `(id BIGINT, s STRING, d DOUBLE, st STRUCT<a: STRING, b: INT>, xs ARRAY<INT>)`
+— field ids 1,2,3,4(st),6(st.a),7(st.b),5(xs),8(xs.element); two rows:
+`id` 1/3, `s` "alpha-long-string-value-0001"/"zulu-long-string-value-0003", `d`
+1.5/2.5, `st` ("aa",1)/("zz",3), `xs` [1,2]/[3]. The Spark file's
+`xs.list.element` column DOES carry footer stats (min 1, max 3, nulls 0); Java drops
+its metrics anyway (list/map rule above).
+
+Per-cell expected map KEYS (`column_sizes` values are engine-dependent — pins assert
+key sets only; `value_counts`/`null_value_counts`/`nan_value_counts` pins assert
+keys + values; bounds pins assert keys + exact bytes):
+
+| cell | props | expected |
+|---|---|---|
+| default | — | counts {1,2,3,6,7}, sizes {1,2,3,6,7,8}, nan {3:0}, bounds {1,2,3,6,7}, `s` 16 B truncated |
+| none | default=none | every map empty |
+| counts | default=counts | counts+nan+sizes as default; bounds empty |
+| truncate4 | default=truncate(4) | as default; `s` bounds `616c7068`/`7a756c76` |
+| full | default=full | as default; `s` bounds untruncated |
+| col_none | column.s=none | field 2 absent from EVERY map (sizes too) |
+| col_nested | default=none + column.st.a=full | only field 6, all six maps |
+| max_inferred_2 | max-inferred=2 | only fields {1,2} in every map |
+| max_inferred_2_default_set | max-inferred=2 + default=counts | limit inert; counts everywhere, no bounds |
+| sorted_none | default=none + WRITE ORDERED BY s | only field 2, `s` bounds 16 B |
+| sorted_counts | default=counts + WRITE ORDERED BY d | counts everywhere; bounds only field 3 |
+| bad_mode | default=bogus | identical to default cell |
+
+## Fork writer inventory — every production `ParquetWriterBuilder` site
+
+Config reaches metrics only via `ParquetWriterBuilder::with_metrics_config` →
+`ParquetWriter::parquet_to_data_file_builder` (the writer's own close path is the
+only `parquet_to_data_file_builder` caller).
+
+| site | file:line | writes | today | fix |
+|---|---|---|---|---|
+| compaction rewrite | `maintenance/rewrite_data_files_write.rs:102` | data files | builder default | `for_table` |
+| partition-key repair | `maintenance/partition_key_audit.rs:518` | data files | builder default | `for_table` |
+| eq-delete conversion | `maintenance/convert_equality_delete_files.rs:509` | pos-delete | `for_position_delete()` | `for_position_delete_table` |
+| pos-delete compaction | `maintenance/rewrite_position_delete_files.rs:684` | pos-delete | `for_position_delete()` | `for_position_delete_table` |
+| table-path rewrite | `maintenance/rewrite_table_path.rs:500` | pos-delete | `for_position_delete()` | `for_position_delete_table` |
+| DataFusion INSERT | `integrations/.../physical_plan/write.rs:304` | data files | builder default | `for_table` |
+| DataFusion DML | `integrations/.../physical_plan/row_lineage.rs:242` | data files | builder default | `for_table` |
+| DataFusion DELETE | `integrations/.../physical_plan/delete_position_deletes.rs:148` | pos-delete | `for_position_delete()` | `for_position_delete_table` |
+| dead helper | `writer/file_writer/parquet_writer.rs:489` | data files | `from_properties` | `for_table` |
+
+The brief's defect list also names `remove_dangling_delete_files.rs`,
+`delete_vector_lookup.rs`, `compute_table_stats.rs` — measured WRONG: every
+`ParquetWriterBuilder`/`PositionDeleteFileWriterBuilder` hit in those files is inside
+`#[cfg(test)]` (boundaries at lines 327, 85, 363). Nothing to wire there. All
+`transaction/*.rs`, `writer/base_writer/*`, `task_writer.rs`, `fanout_writer.rs`,
+`unpartitioned_writer.rs`, `clustered_writer.rs` hits are likewise test-only — those
+layers take a caller-built rolling builder, so config flows in from the sites above.
+
+## Measured fork output vs the oracle (default config)
+
+Fixture replayed through `ParquetWriterBuilder` + `DataFileWriterBuilder`
+(scratch probe, not committed):
+
+| map | fork keys | oracle keys | verdict |
+|---|---|---|---|
+| column_sizes | {1,2,3,6,7,8} | {1,2,3,6,7,8} | match (values differ — engine-dependent compressed sizes) |
+| value_counts | {1,2,3,6,7,**8**} | {1,2,3,6,7} | fork emits element count |
+| null_value_counts | {1,2,3,6,7,**8**} | {1,2,3,6,7} | fork emits element count |
+| nan_value_counts | {3} | {3} | match |
+| lower_bounds | {1,2,3,6,7,**8**} | {1,2,3,6,7} | fork emits element bound `01000000` |
+| upper_bounds | {1,2,3,6,7,**8**} | {1,2,3,6,7} | fork emits element bound `03000000` |
+
+## Scope decisions (measured, not guessed)
+
+- **List/map-descendant metrics drop is IN SCOPE.** The pins compare the
+  fork-written `DataFile`'s six maps with Spark's recorded ones; every cell fails on
+  the extra field-8 entries until `parquet_to_data_file_builder` drops counts/bounds
+  for fields not reachable through structs — Java's `MetricsVisitor.list()/.map()`
+  empty-return, measured above. `column_sizes` keeps list/map fields (Java's
+  `message()` pass).
+- **Stat-less-chunk drop: deferred.** Java drops a column's value/null counts and
+  bounds when ANY chunk's statistics is absent/empty; the fork gates only bounds.
+  No oracle cell exercises a stat-less column (Spark always writes stats); recorded
+  here as a known residue, not fixed this unit.
+- **`max-inferred-column-defaults` non-numeric**: Java throws; the fork warns and
+  falls back to 100 (the `for_table` API is infallible; warn-and-continue is this
+  module's established fallback idiom). Negative: warn + 100 (matches Java).
+- **`row.<name>` overlays are inert** in the fork's two-column delete schema but are
+  ported verbatim (a future `row` field resolves them exactly as Java does).
+- **RePark's own writers** are run 24c's half — this unit adds the helpers and wires
+  the fork's production sites only.
+
+## Step 2 — RED-FIRST pins (second commit)
+
+`maintenance/metrics_config_tests.rs`, declared `#[cfg(test)]` in
+`maintenance/mod.rs`. Fourteen pins:
+
+- 12 oracle cells — fixture schema + rows replayed through
+  `ParquetWriterBuilder::with_metrics_config(MetricsConfig::for_table(metadata))`
+  + `DataFileWriterBuilder`; `column_sizes` asserts key sets (compressed sizes are
+  engine-dependent), counts assert keys + values, bounds assert keys + exact bytes.
+- `rewrite_data_files_honors_metrics_default_none` — a `default=none` table's input
+  file is written with a bare builder (bounds present), `rewrite_all` runs, and the
+  live output file must carry all-six-maps-empty metrics.
+- `position_delete_keeps_full_bounds_under_none_default` — `ConvertEqualityDeleteFiles`
+  on a `default=none` table; the produced pos-delete file must carry
+  `column_sizes`/`value_counts`/bounds keyed ONLY by the reserved
+  `file_path`/`pos` ids and the `file_path` bound must equal the full data-file path
+  bytes (Full, not `truncate(16)`).
+
+Compile seam for the red commit: `for_table` / `for_position_delete_table` exist as
+stubs (`from_properties` / `for_position_delete` bodies — the pre-unit behaviors).
+
+**Red-first run** (`cargo test -p iceberg --lib metrics_config_tests`): **11 red,
+3 green**, every red for the intended reason —
+
+| pin | status | reason |
+|---|---|---|
+| oracle_cell_default | red | fork emits element (8) value/null counts + bounds |
+| oracle_cell_none | GREEN guard | `from_properties` already resolves `none` |
+| oracle_cell_counts | red | element (8) counts |
+| oracle_cell_truncate4 | red | element (8) counts + bounds |
+| oracle_cell_full | red | element (8) counts + bounds |
+| oracle_cell_column_s_none | red | element (8) metrics |
+| oracle_cell_nested_override | GREEN guard | `none`+`st.a=full` already resolves |
+| oracle_cell_max_inferred_2 | red | limit ignored — all columns keep the default |
+| oracle_cell_max_inferred_2_default_set | red | element (8) counts |
+| oracle_cell_sorted_none | red | no sorted promotion — `{}` vs `{2}` |
+| oracle_cell_sorted_counts | red | no sorted promotion — no bounds for 3 |
+| oracle_cell_bad_mode | red | element (8) metrics |
+| rewrite_data_files_honors_metrics_default_none | red | writer unconfigured — bounds written |
+| position_delete_keeps_full_bounds_under_none_default | GREEN guard | `for_position_delete()` overlay already Full |
+
+The three green guards pin behavior that was already correct and must not regress
+when the real `for_table` / `for_position_delete_table` land (the pos-delete pin
+turns red if a delete writer is wired to `for_table` instead — bounds vanish).
+
+## Step 3 — IMPLEMENT (third commit)
+
+`spec/metrics_config.rs`:
+
+- `MetricsConfig::for_table(&TableMetadata)` — `from(props, Some(current_schema),
+  Some(default_sort_order))`. The shared `from` runs Java's exact sequence: read the
+  `max-inferred-column-defaults` limit (default 100; negative or non-numeric warns and
+  falls back to 100 — Java's `propertyAsInt` throws on non-numeric, the infallible API
+  warns instead, recorded in Scope decisions); if the default property is absent and
+  `projected_field_ids` (fields whose type is primitive/variant/struct, Java
+  `TypeUtil.getProjectedIds`) exceeds the limit, the first `limit` metrics-eligible
+  fields in `limit_field_ids` order (Java `MetricsConfig$1`: struct scans direct
+  fields, then descends; list visits element; map visits key then value) get explicit
+  `truncate(16)` entries and the default flips to `none`. Then order-preserving sort
+  fields (`transform.preserves_order()` — the fork's enum already matches Java's
+  Identity/Truncate/Year/Month/Day/Hour set) are promoted to at least `truncate(16)`
+  via the current schema's `name_by_field_id`. Column overrides apply last.
+- `MetricsConfig::for_position_delete_table(&TableMetadata)` — `for_table` +
+  `file_path`/`pos` Full + every table column-mode re-keyed under `row.<name>`,
+  keeping the table default mode.
+- `pub(crate) struct_descended_field_ids(schema)` — field ids reachable through
+  struct nesting only; the parquet metrics pass uses it for Java's
+  `MetricsVisitor.list()/.map()` empty-return.
+
+`writer/file_writer/parquet_writer.rs` (`parquet_to_data_file_builder`): value/null
+counts and bounds (and the retained `nan_value_counts` keys) are written only for
+`stats_eligible` field ids — list/map descendants keep `column_sizes` only, matching
+Java 1.11.0's `ParquetMetrics` visitor. `parquet_files_to_data_files` now calls
+`for_table(table_metadata)` (was `from_properties`).
+
+Writer wiring: `rewrite_data_files_write.rs` → `for_table`;
+`partition_key_audit.rs` → `for_table`; `convert_equality_delete_files.rs` →
+`for_position_delete_table`; `rewrite_table_path.rs` → `for_position_delete_table`;
+`rewrite_position_delete_files.rs` → `for_position_delete_table` (resolved once in
+`group_writer_factory`, carried on `GroupWriteFactory`). DataFusion INSERT/DML/DELETE
+sites stay unwired — run 24c's half calls the same helpers.
+
+Test corrections to Java semantics (pre-existing tests pinned the fork's old,
+non-Java list/map-descendant metrics): `test_parquet_writer_with_complex_schema`
+drops ids 7/11/13 from counts and bounds; `test_nan_val_cnts_list_type` /
+`test_nan_val_cnts_map_type` assert all five stats maps empty with `column_sizes`
+retained.
+
+## Step 4 — MUTATION + gates
+
+| mutation | pin(s) driven red | result |
+|---|---|---|
+| sorted promotion removed | `oracle_cell_sorted_none`, `oracle_cell_sorted_counts` | both FAILED (`{}` vs `{2}`; missing bound for 3) |
+| max-inferred removed | `oracle_cell_max_inferred_2` | FAILED (`{1..8}` vs `{1,2}`); sibling `default=counts` cell stayed green |
+| rewrite table config skipped | `rewrite_data_files_honors_metrics_default_none` | FAILED (bounds written) |
+
+All mutations reverted; `metrics_config_tests` 14/14 green after revert.
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy -p iceberg --all-targets --
+-D warnings` clean; `make check` green (workspace clippy, taplo, cargo-machete,
+agent-artifacts, matrix-anchors, comment-blocks, file-size);
+`check_rust_file_size.py` ceiling for `parquet_writer.rs` lowered 3390 → 3346 (the
+file shrank — the checker demands the ceiling track the file); `comment_ban.py
+origin/main HEAD` prints `comment-ban hits=0`; `typos` clean. Filtered test runs:
+`metrics` 172/172, `writer::file_writer::parquet_writer` 28/28,
+`maintenance::` (minus pins) 402/402.
+
+Residual parity note: Java resolves promoted sort-column names through the sort
+order's bound schema; the fork's `SortOrder` carries no schema, so `for_table`
+resolves `source_id` names through the CURRENT schema — promotion survives a column
+rename where Java's stored key would silently go stale. Deliberate, recorded here.
+
+## Round 2 — comment-gate rejection + DataFusion wiring correction
+
+Round-1 head `47665d8b` was rejected by the comment gate: the bounds-collection
+comment line traveled inside the new `stats_eligible` guard in
+`parquet_to_data_file_builder`, and a moved comment counts as added. The line is
+deleted (the fact lives here); ceiling tracked the shrink (3346 → 3345). Commit
+`e9db23c4` → `comment-ban hits=0`.
+
+**Scope correction (owner ruling):** the DataFusion writers under
+`crates/integrations/datafusion/` are fork code, not RePark — round 1's
+"unwired by design (run 24c)" was wrong. RePark's own writers live in the RePark
+repository and remain run 24c's half. Wired:
+
+- `physical_plan/write.rs` (`IcebergWriteExec` INSERT) → `for_table`
+- `physical_plan/row_lineage.rs` (`StreamingDataFileWriter`, the DML data writer
+  also used by the CoW DELETE path) → `for_table`
+- `physical_plan/delete_position_deletes.rs` → `for_position_delete_table`
+
+`task_writer.rs` and `delete.rs` need nothing — the first is test-only, the
+second reuses `StreamingDataFileWriter`.
+
+**Pin (red-first, `fd71d001`):** `write.rs` `mod tests` —
+`test_insert_honors_metrics_default_none` drives `IcebergWriteExec` on a
+`write.metadata.metrics.default=none` table through the existing
+`MockExecutionPlan` harness and asserts all six maps empty. Red pre-wiring
+(`column_sizes {1: 38, 2: 53}`); green post-wiring (`7b562926`). Mutation —
+dropping the `with_metrics_config` call in `write.rs` — re-reds the pin with the
+identical signature; reverted.
+
+Gates (round 2): `cargo fmt --all -- --check` clean; `cargo clippy -p iceberg
+-p iceberg-datafusion --all-targets -- -D warnings` clean; `cargo test -p
+iceberg-datafusion --lib physical_plan` 203/203; `metrics_config_tests` 14/14;
+comment-ban `hits=0`; rust-file-size clean; typos clean.
+
+## Round 3 — logic PASS: perf P2s, wiring coverage, malformed-property parity
+
+Critic reports `rv-mc-logic-out.json` (PASS) + `rv-mc-perf-out.json`. Five items.
+
+**L-002 (typed error, Java-verified):** `javap -c -p` on
+`PropertyUtil.propertyAsInt` shows `Integer.parseInt` with no catch — Java
+`MetricsConfig.forTable` throws on an unparsable
+`write.metadata.metrics.max-inferred-column-defaults`. The fork warned and fell
+back to 100. `max_inferred_column_defaults` now returns
+`ErrorKind::DataInvalid` on parse failure; negative values parse fine in Java
+and map to effective limit 0 (`usize::try_from(v).unwrap_or(0)`), pinned by
+`oracle_cell_max_inferred_negative`. `from_properties` / `for_table` /
+`for_position_delete_table` now return `Result`; `?` (or
+`map_err(to_datafusion_error)`) threaded through all nine wired sites and every
+test caller. `malformed_max_inferred_fails_writer_construction` pins the typed
+error at writer construction.
+
+**Perf R-01..R-05:** `MetricsByFieldId` (in `spec/metrics_config.rs`) precomputes
+`field_id -> MetricsMode` plus the `stats_eligible` set once per writer build;
+`MinMaxColAggregator` borrows it (`&'a`) instead of resolving modes by column
+name per column per row group and instead of owning a cloned `MetricsConfig`.
+`ParquetWriterBuilder` holds `Arc<MetricsConfig>` (`with_metrics_config(impl
+Into<Arc<..>>)` keeps both owned and shared callers); `GroupWriteFactory` stores
+the `Arc` so `write_compacted_file` clones a pointer, not the mode map.
+`parquet_files_to_data_files` resolves `for_table` once outside the loop.
+`projected_field_ids` became count-only `projected_field_count` for the
+max-inferred first pass. `parquet_writer.rs` shrank to 3343; ceiling lowered
+3345 -> 3343.
+
+**L-001 (five wiring pins, all `metrics.default=none`):**
+`test_streaming_data_file_writer_honors_metrics_default_none` and
+`test_write_position_deletes_honors_metrics_default_none` in the new
+`physical_plan/delete_metrics_tests.rs` (a `#[path]` child of `delete::tests`,
+needed for the `pub(super)`/`pub(crate)` items) prove the row_lineage and
+delete_position_deletes sites; `test_repair_rewritten_files_honor_metrics_default_none`
+in `partition_key_audit_tests.rs` proves the repair site;
+`staged_pos_delete_keeps_full_bounds_under_none_default` in the new
+`rewrite_table_path_metrics_tests.rs` proves the staging site
+(`write_position_delete_content` now returns the `DataFile` so metrics are
+observable); `compacted_pos_delete_keeps_full_bounds_under_none_default` in
+`metrics_config_tests.rs` proves the compaction site. Data-writer pins assert
+all six maps empty; delete-writer pins assert only `file_path`/`pos` keys with
+FULL bounds — the `row.*` overlay is unobservable on the fork's two-column
+delete schema, so full bounds are the kill signal (the no-config default
+`truncate(16)` truncates them).
+
+**L-005 (row.* overlay kill):** `position_delete_keeps_full_bounds_under_none_default`
+now also asserts `for_position_delete_table` exposes `row.x -> Counts` (the
+table's per-column override) and `row.y -> None` (inherits default); removing
+the `row.{name}` re-key loop drives it red (`None` vs `Counts`).
+
+**Mutations (all reverted):** drop `with_metrics_config` in `row_lineage.rs` ->
+streaming pin red (all six maps non-empty); in `delete_position_deletes.rs` ->
+pin red (`file_path` bound truncated to 16 bytes); in `partition_key_audit.rs`
+-> repair pin red; in `rewrite_table_path.rs` -> staged pin red (bound
+truncated); in `rewrite_position_delete_files.rs` -> compacted pin red
+(truncated); remove the `row.*` loop in `metrics_config.rs` -> overlay pin red.
+
+**File-size fallout:** `rewrite_position_delete_files_tests.rs` is at its 4607
+legacy ceiling, so the compaction pin lives in `metrics_config_tests.rs` (809 <
+1000) with its own pos-delete writer helper instead of a new module there.
+`delete_tests.rs` and `rewrite_table_path_tests.rs` exceeded the default 1000,
+so each pin moved to a dedicated `#[path]` child module file.
+
+Gates (round 3): `cargo fmt --all -- --check` clean; `cargo clippy -p iceberg
+-p iceberg-datafusion --all-targets -- -D warnings` clean; `metrics` 177/177;
+`maintenance::` 421/421; `writer::file_writer::parquet_writer` 28/28;
+`iceberg-datafusion physical_plan` 205/205 (+1 ignored measurement);
+`make check` green; `comment_ban.py` hits=0; `check_rust_file_size.sh` 532 files
+clean.
+
+## Propositions
+
+- [x] P1 `for_table` resolves default/column/max-inferred/sorted rules exactly per
+      bytecode; pinned red-first by the 12 oracle cells — all green post-impl, and
+      the sort/max-inferred mutations drive the right cells red.
+- [x] P2 `for_position_delete_table` = `for_table` + `file_path`/`pos` Full + `row.*`
+      re-key; pinned by the delete-overlay pin (green; Full `file_path` bound exact).
+- [x] P3 every production writer above applies the resolved config; pinned by the
+      `rewrite_data_files` e2e none-cell and the mutation that skips it (red).
+- [x] P4 list/map descendants drop counts/bounds but keep `column_sizes`; pinned by
+      every oracle cell's key sets and the three corrected writer tests.
+- [x] P5 mutations (drop promotion / drop limit / drop wiring) turn named pins red —
+      verified above, all three reverted.
+- [~] P6 OPEN residue: Java drops a column's counts/bounds when a chunk lacks
+      statistics entirely; the fork still gates only bounds on stats presence. No
+      oracle cell exercises it — recorded, not fixed this unit.

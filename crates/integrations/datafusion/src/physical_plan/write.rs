@@ -39,7 +39,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN};
-use iceberg::spec::{DataFileFormat, TableProperties, serialize_data_file_to_json};
+use iceberg::spec::{DataFileFormat, MetricsConfig, TableProperties, serialize_data_file_to_json};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -308,6 +308,9 @@ impl ExecutionPlan for IcebergWriteExec {
                 .build(),
             self.table.metadata().current_schema().clone(),
             FieldMatchMode::Name,
+        )
+        .with_metrics_config(
+            MetricsConfig::for_table(self.table.metadata()).map_err(to_datafusion_error)?,
         );
         let target_file_size = table_props.write_target_file_size_bytes;
 
@@ -699,6 +702,110 @@ mod tests {
         // 7. Verify the file exists
         let file_io = table.file_io();
         assert!(file_io.exists(file_path).await?, "Data file should exist");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_insert_honors_metrics_default_none() -> Result<()> {
+        let iceberg_catalog = get_iceberg_catalog().await;
+        let namespace = NamespaceIdent::new("test_namespace".to_string());
+        iceberg_catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await?;
+
+        let schema = get_test_schema()?;
+        let creation = TableCreation::builder()
+            .location(temp_path())
+            .name("metrics_none_table".to_string())
+            .properties(HashMap::from([(
+                "write.metadata.metrics.default".to_string(),
+                "none".to_string(),
+            )]))
+            .schema(schema)
+            .build();
+        let table = iceberg_catalog.create_table(&namespace, creation).await?;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef,
+        ])
+        .map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to create record batch: {e}"),
+            )
+        })?;
+
+        let input_plan = Arc::new(MockExecutionPlan::new(arrow_schema, vec![batch]));
+        let write_exec = IcebergWriteExec::new(table.clone(), input_plan, None);
+        let mut stream = write_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to execute plan: {e}"),
+                )
+            })?;
+
+        let mut results = vec![];
+        while let Some(batch) = stream.next().await {
+            results.push(batch.map_err(|e| {
+                Error::new(ErrorKind::Unexpected, format!("Failed to get batch: {e}"))
+            })?);
+        }
+        assert_eq!(results.len(), 1, "Expected one result batch");
+
+        let data_file_json = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray")
+            .value(0);
+        let data_file = deserialize_data_file_from_json(
+            data_file_json,
+            table.metadata().default_partition_spec_id(),
+            table.metadata().default_partition_type(),
+            table.metadata().current_schema(),
+        )
+        .expect("Failed to deserialize data file JSON");
+
+        assert_eq!(data_file.record_count(), 3);
+        assert!(
+            data_file.column_sizes().is_empty(),
+            "metrics.default=none must write no column_sizes: {:?}",
+            data_file.column_sizes()
+        );
+        assert!(
+            data_file.value_counts().is_empty(),
+            "metrics.default=none must write no value_counts"
+        );
+        assert!(
+            data_file.null_value_counts().is_empty(),
+            "metrics.default=none must write no null_value_counts"
+        );
+        assert!(
+            data_file.nan_value_counts().is_empty(),
+            "metrics.default=none must write no nan_value_counts"
+        );
+        assert!(
+            data_file.lower_bounds().is_empty(),
+            "metrics.default=none must write no lower_bounds"
+        );
+        assert!(
+            data_file.upper_bounds().is_empty(),
+            "metrics.default=none must write no upper_bounds"
+        );
 
         Ok(())
     }
