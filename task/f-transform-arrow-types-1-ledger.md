@@ -241,3 +241,86 @@ OPEN / noted:
   write path is built against.
 - RePark/Spark end-to-end was not re-run (no engine, no docker in this lane); the DataFusion
   write path is proven at the comparator + memory-catalog level.
+
+# Round 3 — silent wrong read (L-01) + perf (R-01..R-04)
+
+## Findings and Java evidence
+
+L-01 (P1, silent wrong read): `adjust_operator` special-cased only `PrimitiveLiteral::String`, so a
+binary `NOT STARTS WITH` literal longer than the truncate width inclusive-projected to
+`NotStartsWith` on the truncated literal — `b NOT STARTS WITH X'0102'` through `truncate(1,b)`
+became `b_trunc NOT STARTS WITH X'01'` and pruned the `X'01'` partition holding row `X'01'`, a
+matching row silently dropped. Java 1.11.0 bytecode (`Truncate$TruncateString.project`,
+`ProjectionUtil.truncateArray`): `STARTS_WITH` len<w keeps op+literal, len==w -> `equal`,
+len>w -> `STARTS_WITH truncate(lit)`; `NOT_STARTS_WITH` len<w keeps op, len==w -> `notEqual`,
+len>w -> `null`; `projectStrict` mirrors it. `TruncateByteBuffer.project` uses plain
+`truncateArray`, under which binary `NOT_STARTS_WITH` projects to null always — so the string rule
+applied to binary is strictly stronger than Java yet still correctness-preserving; the Rust port
+adopts the string rule for both literal kinds.
+
+Strict side found a second unsound cell: the `NotStartsWith` `Ordering::Greater` arm returned a
+projected predicate where Java returns `None`; corrected and the round-2 pin's expectation fixed.
+
+Evaluator sweep: `InclusiveMetricsEvaluator` threw `Cannot use StartsWith operator on non-string
+values` during `plan_files` on any binary starts-with literal; `ExpressionEvaluator`'s
+`(Binary,Binary)` starts_with returned `false` (and `not_starts_with` `true` — a silent
+wrong-keep); `ManifestEvaluator`, `RowGroupMetricsEvaluator` and `PageIndexEvaluator` rejected
+non-string literals the same way. All five now compare string and binary bounds byte-wise, which
+is order-equivalent to the prior char logic on UTF-8 and shrinks each evaluator.
+
+L-02 (P3): `test_arrow_struct_to_literal_view_layouts` asserted a count; it now asserts the seven
+decoded `Literal::Struct` rows including the empty-vs-NULL distinction.
+
+## Perf
+
+- R-01: `project_with_partition` runs `canonical_layout_input` (write_compatibility.rs) before the
+  compatibility check: one `CastExpr` inner projection for top-level string/binary columns whose
+  layout differs from the canonical Iceberg Arrow type, making identity partitions pass-through
+  and the later calculator/write-defaults casts no-ops.
+- R-02: `TransformFunction::transform_to_type` (truncate only) lets the partition-value
+  calculator truncate straight into a pre-sized builder of the expected field layout — no
+  intermediate view array plus cast.
+- R-03/R-04: all truncate and bucket byte-family arms use `with_capacity` builders and `is_valid`
+  loops instead of `from_iter` over `Option`; `bucket_with` writes a `Vec<i32>` and reuses the
+  input null buffer.
+
+`spec/transform.rs` test module extracted to `spec/transform_tests.rs` (comments dropped per
+RULE 0) to keep the file under its size ceiling; `manifest_evaluator.rs`,
+`page_index_evaluator.rs` and `row_group_metrics_evaluator.rs` ceilings lowered to post-format
+sizes; `project.rs` ceiling 1472 -> 1471. `transform_to_type` is a method on the public
+`TransformFunction` trait, so `missing_docs` demands a doc comment the comment gate would count;
+`#[allow(missing_docs)]` (the rewrite_position_delete_files precedent) satisfies both.
+
+## Round-3 mutation validation
+
+Eleven surgical mutations against `cargo test -p iceberg --lib f_transform_arrow_types_1` (and
+`expression_evaluator` for M4). First pass: 8 killed, 3 survivors — M4 (expression-evaluator
+binary arm) and M6 (manifest `datum_as_bytes` binary arm) had no pin reaching them, so two pins
+landed (`test_expr_starts_with_binary`, `test_starts_with_binary_partitioned_write_scan_v2/v3`)
+and both mutations now die. M8 (page-index `literal_prefix_bytes` binary arm) survives: no e2e in
+this lane reaches `PageIndexEvaluator`, its test file sits at its size ceiling, and the arm is
+the same helper shape as the row-group arm the e2e did kill — noted, not silent.
+
+| mutation | verdict | killed by |
+|---|---|---|
+| M1 inclusive `NotStartsWith` — drop Binary arm | KILLED | boundary + None pins + e2e v2/v3 |
+| M2 inclusive `StartsWith` — drop Binary arm | KILLED | `starts_with` width-boundaries pin |
+| M3 strict `NotStartsWith` Greater -> Some | KILLED | strict pin + e2e v2/v3 |
+| M4 expr-eval binary starts_with -> `true` | KILLED (pin added) | `test_expr_starts_with_binary` |
+| M5 inclusive-metrics — drop Binary arm | KILLED | e2e v2/v3 |
+| M6 manifest `datum_as_bytes` — drop Binary arm | KILLED (pin added) | `STARTS WITH X''` e2e v2/v3 |
+| M7 row-group — drop Binary arm | KILLED | e2e v2/v3 |
+| M8 page-index — drop Binary arm | SURVIVED | unreachable in this lane's e2e (see above) |
+| M9 `transform_to_type` Utf8 -> `None` | KILLED | `transform_to_type` pin |
+| M10 `bucket_with` validity -> `false` | KILLED | bucket oracle + calculator pins |
+| M11 truncate view arm drops null handling | KILLED | binary oracle pin NULL row |
+
+Behavior-neutral perf paths (bypassing `transform_to_type` or `canonical_layout_input`) are
+unkillable by construction — outputs are identical, only the intermediate casts differ.
+
+## Round-3 gates
+
+`cargo fmt --all -- --check`, `cargo clippy -p iceberg -p iceberg-datafusion --all-targets --
+-D warnings`, `check_rust_file_size` (ceilings only down), `typos .`, comment-ban hits=0 — all
+green; pin suite 33/33 + transform 116 + arrow 418 + expression_evaluator 21 + physical_plan 214
+green.
