@@ -232,8 +232,7 @@ pub struct S3TablesCatalog {
 }
 
 #[cfg(test)]
-pub(crate) type PointerSource =
-    Arc<dyn Fn(&TableIdent) -> Result<(String, String)> + Send + Sync>;
+pub(crate) type PointerSource = Arc<dyn Fn(&TableIdent) -> Result<(String, String)> + Send + Sync>;
 
 impl std::fmt::Debug for S3TablesCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
