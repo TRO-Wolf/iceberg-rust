@@ -85,8 +85,17 @@ impl MetadataLocation {
     }
 
     pub(crate) fn rebased(&self, metadata: &TableMetadata) -> Result<Self> {
+        let metadata_dir = if self.is_hadoop_convention()
+            && !metadata
+                .properties()
+                .contains_key(TableProperties::PROPERTY_WRITE_METADATA_LOCATION)
+        {
+            self.metadata_dir.clone()
+        } else {
+            write_metadata_dir(metadata.location(), metadata.properties())?
+        };
         Ok(Self {
-            metadata_dir: write_metadata_dir(metadata.location(), metadata.properties())?,
+            metadata_dir,
             version: self.version,
             id: self.id,
         })
@@ -189,11 +198,42 @@ impl FromStr for MetadataLocation {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::str::FromStr;
 
     use uuid::Uuid;
 
     use crate::MetadataLocation;
+    use crate::spec::{FormatVersion, PartitionSpec, StructType, TableMetadata};
+
+    fn table_metadata(location: &str, properties: HashMap<String, String>) -> TableMetadata {
+        TableMetadata {
+            format_version: FormatVersion::V2,
+            table_uuid: Uuid::new_v4(),
+            location: location.to_string(),
+            last_updated_ms: 0,
+            last_column_id: 1,
+            schemas: HashMap::new(),
+            current_schema_id: 1,
+            partition_specs: HashMap::new(),
+            default_spec: PartitionSpec::unpartition_spec().into(),
+            default_partition_type: StructType::new(vec![]),
+            last_partition_id: 1000,
+            default_sort_order_id: 0,
+            sort_orders: HashMap::new(),
+            snapshots: HashMap::new(),
+            current_snapshot_id: None,
+            last_sequence_number: 1,
+            properties,
+            snapshot_log: Vec::new(),
+            metadata_log: vec![],
+            refs: HashMap::new(),
+            statistics: HashMap::new(),
+            partition_statistics: HashMap::new(),
+            encryption_keys: HashMap::new(),
+            next_row_id: 0,
+        }
+    }
 
     #[test]
     fn test_metadata_location_from_string() {
@@ -576,43 +616,10 @@ mod test {
 
     #[test]
     fn for_metadata_honors_write_metadata_path() {
-        use std::collections::HashMap;
-
-        use crate::spec::{FormatVersion, PartitionSpec, StructType, TableMetadata};
-
-        fn metadata(properties: HashMap<String, String>) -> TableMetadata {
-            TableMetadata {
-                format_version: FormatVersion::V2,
-                table_uuid: Uuid::new_v4(),
-                location: "/wh/ns/t".to_string(),
-                last_updated_ms: 0,
-                last_column_id: 1,
-                schemas: HashMap::new(),
-                current_schema_id: 1,
-                partition_specs: HashMap::new(),
-                default_spec: PartitionSpec::unpartition_spec().into(),
-                default_partition_type: StructType::new(vec![]),
-                last_partition_id: 1000,
-                default_sort_order_id: 0,
-                sort_orders: HashMap::new(),
-                snapshots: HashMap::new(),
-                current_snapshot_id: None,
-                last_sequence_number: 1,
-                properties,
-                snapshot_log: Vec::new(),
-                metadata_log: vec![],
-                refs: HashMap::new(),
-                statistics: HashMap::new(),
-                partition_statistics: HashMap::new(),
-                encryption_keys: HashMap::new(),
-                next_row_id: 0,
-            }
-        }
-
-        let relocated = MetadataLocation::for_metadata(&metadata(HashMap::from([(
-            "write.metadata.path".to_string(),
-            "/alt-meta/".to_string(),
-        )])))
+        let relocated = MetadataLocation::for_metadata(&table_metadata(
+            "/wh/ns/t",
+            HashMap::from([("write.metadata.path".to_string(), "/alt-meta/".to_string())]),
+        ))
         .expect("relocated create location");
         let rendered = relocated.to_string();
         assert!(
@@ -620,7 +627,7 @@ mod test {
             "write.metadata.path is the complete directory with trailing slash stripped, got {rendered}"
         );
 
-        let plain = MetadataLocation::for_metadata(&metadata(HashMap::new()))
+        let plain = MetadataLocation::for_metadata(&table_metadata("/wh/ns/t", HashMap::new()))
             .expect("default create location");
         let rendered = plain.to_string();
         assert!(
@@ -631,43 +638,14 @@ mod test {
 
     #[test]
     fn rebased_moves_dir_with_write_metadata_path() {
-        use std::collections::HashMap;
-
-        use crate::spec::{FormatVersion, PartitionSpec, StructType, TableMetadata};
-
         let base = MetadataLocation::from_str(
             "/wh/ns/t/metadata/00000-a0c2e704-85a1-4368-8ed6-0b0b2a337ec9.metadata.json",
         )
         .expect("parse base");
-        let metadata = TableMetadata {
-            format_version: FormatVersion::V2,
-            table_uuid: Uuid::new_v4(),
-            location: "/wh/ns/t".to_string(),
-            last_updated_ms: 0,
-            last_column_id: 1,
-            schemas: HashMap::new(),
-            current_schema_id: 1,
-            partition_specs: HashMap::new(),
-            default_spec: PartitionSpec::unpartition_spec().into(),
-            default_partition_type: StructType::new(vec![]),
-            last_partition_id: 1000,
-            default_sort_order_id: 0,
-            sort_orders: HashMap::new(),
-            snapshots: HashMap::new(),
-            current_snapshot_id: None,
-            last_sequence_number: 1,
-            properties: HashMap::from([(
-                "write.metadata.path".to_string(),
-                "/alt-meta".to_string(),
-            )]),
-            snapshot_log: Vec::new(),
-            metadata_log: vec![],
-            refs: HashMap::new(),
-            statistics: HashMap::new(),
-            partition_statistics: HashMap::new(),
-            encryption_keys: HashMap::new(),
-            next_row_id: 0,
-        };
+        let metadata = table_metadata(
+            "/wh/ns/t",
+            HashMap::from([("write.metadata.path".to_string(), "/alt-meta".to_string())]),
+        );
         let moved = base
             .with_next_version()
             .rebased(&metadata)
@@ -689,6 +667,37 @@ mod test {
         assert!(
             rendered.starts_with("/wh/moved/metadata/00001-"),
             "absent the property the dir follows the new metadata location, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn rebased_keeps_pointer_dir_for_hadoop_convention() {
+        let base = MetadataLocation::from_file_path("/wh/sales/orders/metadata/v2.metadata.json")
+            .expect("parse hadoop base");
+
+        let plain = table_metadata("/wh/sales/seed", HashMap::new());
+        let next = base
+            .with_next_version()
+            .rebased(&plain)
+            .expect("rebased hadoop");
+        assert_eq!(
+            next.to_string(),
+            "/wh/sales/orders/metadata/v3.metadata.json",
+            "a hadoop-convention pointer keeps its own directory, not the metadata location"
+        );
+
+        let relocated = table_metadata(
+            "/wh/sales/seed",
+            HashMap::from([("write.metadata.path".to_string(), "/alt-meta/".to_string())]),
+        );
+        let moved = base
+            .with_next_version()
+            .rebased(&relocated)
+            .expect("rebased hadoop with property");
+        assert_eq!(
+            moved.to_string(),
+            "/alt-meta/v3.metadata.json",
+            "write.metadata.path wins over the pointer dir even for the hadoop convention"
         );
     }
 
