@@ -18,6 +18,7 @@
 //! This module contains the location generator and file name generator for generating path of data file.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -170,26 +171,10 @@ fn path_context(table_location: &str) -> String {
     }
 }
 
-fn dirs_from_hash(binary: &str) -> String {
-    let mut dirs = String::new();
-    for i in (0..12).step_by(4) {
-        if i > 0 {
-            dirs.push('/');
-        }
-        dirs.push_str(&binary[i..(i + 4).min(binary.len())]);
-    }
-    if binary.len() > 12 {
-        dirs.push('/');
-        dirs.push_str(&binary[12..]);
-    }
-    dirs
-}
-
-fn compute_hash(file_name: &str) -> String {
-    let hash = murmur3::murmur3_32(&mut file_name.as_bytes(), 0)
-        .expect("murmur3_32 over a byte slice cannot fail");
-    let binary = format!("{:032b}", hash | 0x8000_0000);
-    dirs_from_hash(&binary[binary.len() - 20..])
+fn hash_dirs(file_name: &str) -> u32 {
+    murmur3::murmur3_32(&mut file_name.as_bytes(), 0)
+        .expect("murmur3_32 over a byte slice cannot fail")
+        | 0x8000_0000
 }
 
 #[allow(missing_docs)]
@@ -224,26 +209,47 @@ impl ObjectStoreLocationGenerator {
 
 impl LocationGenerator for ObjectStoreLocationGenerator {
     fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
+        let partitioned_name;
         let file_name = match partition_key {
             Some(key)
                 if self.include_partition_paths
                     && !PartitionKey::is_effectively_none(Some(key)) =>
             {
-                format!("{}/{}", key.to_path(), file_name)
+                partitioned_name = format!("{}/{}", key.to_path(), file_name);
+                partitioned_name.as_str()
             }
-            _ => file_name.to_string(),
+            _ => file_name,
         };
-        let hash = compute_hash(&file_name);
+        let hash = hash_dirs(file_name);
+        let mut location =
+            String::with_capacity(self.storage_location.len() + file_name.len() + 24);
+        location.push_str(&self.storage_location);
+        write!(
+            location,
+            "/{:04b}/{:04b}/{:04b}/{:08b}",
+            (hash >> 16) & 0xF,
+            (hash >> 12) & 0xF,
+            (hash >> 8) & 0xF,
+            hash & 0xFF
+        )
+        .expect("writing to a String cannot fail");
         match &self.context {
-            Some(context) => format!(
-                "{}/{}/{}/{}",
-                self.storage_location, hash, context, file_name
-            ),
-            None if self.include_partition_paths => {
-                format!("{}/{}/{}", self.storage_location, hash, file_name)
+            Some(context) => {
+                location.push('/');
+                location.push_str(context);
+                location.push('/');
+                location.push_str(file_name);
             }
-            None => format!("{}/{}-{}", self.storage_location, hash, file_name),
+            None if self.include_partition_paths => {
+                location.push('/');
+                location.push_str(file_name);
+            }
+            None => {
+                location.push('-');
+                location.push_str(file_name);
+            }
         }
+        location
     }
 }
 
