@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use crate::arrow::ArrowReaderBuilder;
+use crate::expr::Predicate;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
@@ -304,6 +305,19 @@ impl Table {
     /// Returns the flag indicating whether the `Table` is readonly or not
     pub fn readonly(&self) -> bool {
         self.readonly
+    }
+
+    /// Whether every data file matching `predicate` is provably wholly covered by it, using table metadata alone.
+    pub async fn can_delete_using_metadata(
+        &self,
+        _predicate: &Predicate,
+        _branch: Option<&str>,
+        _case_sensitive: bool,
+    ) -> Result<bool> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "can_delete_using_metadata is not implemented",
+        ))
     }
 
     /// Returns the current schema as a shared reference.
