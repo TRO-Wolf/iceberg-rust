@@ -276,8 +276,6 @@ pub(crate) fn schema_to_avro_schema(name: impl ToString, schema: &Schema) -> Res
     schema_to_avro_schema_with(name, schema, AvroNameCollision::Fail)
 }
 
-/// Converting iceberg schema to a reader-side avro schema; colliding Avro field
-/// names are made unique with `_N` suffixes instead of failing.
 pub(crate) fn schema_to_avro_schema_for_read(
     name: impl ToString,
     schema: &Schema,
