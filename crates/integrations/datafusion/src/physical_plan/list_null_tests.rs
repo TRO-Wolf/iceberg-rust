@@ -641,7 +641,109 @@ async fn cow_prune_scan_drops_the_unbindable_null_term() {
 }
 
 #[tokio::test]
-async fn filtered_scan_residual_drops_the_unbindable_null_term() {
+async fn filtered_row_filter_stays_loud_on_an_unbindable_term() {
+    for shape in NullShape::ALL {
+        for format_version in [FormatVersion::V2, FormatVersion::V3] {
+            let fixture = null_fixture_opts(false, format_version, shape, FixtureOpts {
+                seeded_per_row: true,
+                ..FixtureOpts::default()
+            })
+            .await;
+            let table = fixture
+                .catalog
+                .load_table(&TableIdent::from_strs(["ns", "t"]).expect("ident"))
+                .await
+                .expect("load table");
+
+            let compound = Reference::new("id")
+                .greater_than(Datum::int(1))
+                .and(Reference::new("xs").is_null());
+            let err = table
+                .scan()
+                .with_filter(compound)
+                .build()
+                .expect_err("a row filter binds exactly or fails loudly");
+            assert_eq!(
+                err.kind(),
+                iceberg::ErrorKind::DataInvalid,
+                "{} {format_version:?}: the unbindable term must fail the row-filter bind",
+                shape.name()
+            );
+
+            let err = table
+                .scan()
+                .with_filter(Reference::new("xs").is_null())
+                .build()
+                .expect_err("a row filter binds exactly or fails loudly");
+            assert_eq!(
+                err.kind(),
+                iceberg::ErrorKind::DataInvalid,
+                "{} {format_version:?}: the unbindable null test must fail the row-filter bind",
+                shape.name()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_row_filter_never_returns_the_widened_row_set() {
+    for shape in NullShape::ALL {
+        for format_version in [FormatVersion::V2, FormatVersion::V3] {
+            let fixture = null_fixture_opts(false, format_version, shape, FixtureOpts {
+                seeded_per_row: true,
+                ..FixtureOpts::default()
+            })
+            .await;
+            let table = fixture
+                .catalog
+                .load_table(&TableIdent::from_strs(["ns", "t"]).expect("ident"))
+                .await
+                .expect("load table");
+
+            match table
+                .scan()
+                .with_filter(Reference::new("xs").is_null())
+                .build()
+            {
+                Err(err) => assert_eq!(
+                    err.kind(),
+                    iceberg::ErrorKind::DataInvalid,
+                    "{} {format_version:?}: loud is the current row-filter contract",
+                    shape.name()
+                ),
+                Ok(scan) => {
+                    let batches: Vec<datafusion::arrow::record_batch::RecordBatch> = scan
+                        .to_arrow()
+                        .await
+                        .expect("arrow stream")
+                        .try_collect()
+                        .await
+                        .expect("collect batches");
+                    let mut ids = vec![];
+                    for batch in &batches {
+                        let column = batch
+                            .column_by_name("id")
+                            .expect("id column")
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .expect("int32 id column");
+                        ids.extend_from_slice(column.values());
+                    }
+                    ids.sort_unstable();
+                    assert_eq!(
+                        ids,
+                        vec![2],
+                        "{} {format_version:?}: Java returns only the NULL row; a widened residual returns every row",
+                        shape.name()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn incremental_scan_stays_loud_on_an_unbindable_term() {
     for shape in NullShape::ALL {
         for format_version in [FormatVersion::V2, FormatVersion::V3] {
             let fixture = null_fixture_opts(false, format_version, shape, FixtureOpts {
@@ -658,30 +760,17 @@ async fn filtered_scan_residual_drops_the_unbindable_null_term() {
             let filter = Reference::new("id")
                 .greater_than(Datum::int(1))
                 .and(Reference::new("xs").is_null());
-            let tasks: Vec<iceberg::scan::FileScanTask> = table
-                .scan()
+            let err = table
+                .incremental_append_scan()
                 .with_filter(filter)
                 .build()
-                .expect("a filtered scan must never bind an unbindable term")
-                .plan_files()
-                .await
-                .expect("plan files")
-                .try_collect()
-                .await
-                .expect("collect tasks");
-            assert!(!tasks.is_empty());
-            let expected_residual = Reference::new("id")
-                .greater_than(Datum::int(1))
-                .bind(tasks[0].schema.clone(), true)
-                .expect("bind expected residual");
-            for task in &tasks {
-                assert_eq!(
-                    task.predicate.as_deref(),
-                    Some(&expected_residual),
-                    "{} {format_version:?}: the residual keeps only the sound conjunct",
-                    shape.name()
-                );
-            }
+                .expect_err("incremental residuals always apply; the filter stays loud");
+            assert_eq!(
+                err.kind(),
+                iceberg::ErrorKind::DataInvalid,
+                "{} {format_version:?}: the unbindable term must fail the incremental bind",
+                shape.name()
+            );
         }
     }
 }
