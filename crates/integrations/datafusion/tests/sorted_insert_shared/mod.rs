@@ -449,8 +449,9 @@ pub fn read_binary_column(path: &str, index: usize) -> Vec<Option<Vec<u8>>> {
     let mut values = Vec::new();
     for batch in reader {
         let batch = batch.expect("read batch");
-        let column = batch
-            .column(index)
+        let column = datafusion::arrow::compute::cast(batch.column(index), &DataType::LargeBinary)
+            .expect("binary column");
+        let column = column
             .as_any()
             .downcast_ref::<LargeBinaryArray>()
             .expect("binary column");
