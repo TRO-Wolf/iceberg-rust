@@ -408,3 +408,39 @@ async fn repark_shape_file_size_matches_java_scale() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn rolled_files_from_one_builder_have_identical_bytes() -> Result<()> {
+    let dir = TempDir::new().unwrap();
+    let file_io = FileIO::new_with_fs();
+    let location_gen =
+        DefaultLocationGenerator::with_data_location(dir.path().to_str().unwrap().to_string());
+    let file_name_gen =
+        DefaultFileNameGenerator::new("rolled".to_string(), None, DataFileFormat::Parquet);
+    let schema = Arc::new(repark_schema());
+    let builder = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone());
+    let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int64Array::from_iter_values(200..250)) as ArrayRef,
+        Arc::new(Int32Array::from_value(1, 50)) as ArrayRef,
+        Arc::new(StringArray::from(vec!["xxxxxxxxxxxxxxxxxxxx"; 50])) as ArrayRef,
+    ])
+    .unwrap();
+    let mut paths = vec![];
+    for _ in 0..2 {
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let path = output_file.location().to_string();
+        let mut writer = builder.build(output_file).await?;
+        writer.write(&batch).await?;
+        writer.close().await?;
+        paths.push(path);
+    }
+    assert_eq!(
+        std::fs::read(&paths[0]).unwrap(),
+        std::fs::read(&paths[1]).unwrap(),
+        "files rolled from one writer builder must be byte-identical"
+    );
+    Ok(())
+}

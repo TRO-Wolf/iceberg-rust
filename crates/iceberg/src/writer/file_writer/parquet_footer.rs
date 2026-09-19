@@ -20,21 +20,11 @@ use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 
 use crate::spec::Schema;
-use crate::{Error, ErrorKind, Result};
 
 pub(crate) const ICEBERG_SCHEMA_META_KEY: &str = "iceberg.schema";
 
-pub(super) fn writer_options(
-    props: &WriterProperties,
-    schema: &Schema,
-) -> Result<ArrowWriterOptions> {
-    let schema_json = serde_json::to_string(schema).map_err(|err| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            "Failed to serialize the Iceberg schema for the parquet footer",
-        )
-        .with_source(err)
-    })?;
+pub(super) fn writer_options(props: &WriterProperties, schema: &Schema) -> ArrowWriterOptions {
+    let schema_json = serde_json::to_string(schema).expect("the Iceberg schema serializes to JSON");
     let mut key_values = props.key_value_metadata().cloned().unwrap_or_default();
     key_values.retain(|entry| entry.key != ICEBERG_SCHEMA_META_KEY);
     key_values.push(KeyValue::new(
@@ -46,7 +36,7 @@ pub(super) fn writer_options(
         .into_builder()
         .set_key_value_metadata(Some(key_values))
         .build();
-    Ok(ArrowWriterOptions::new()
+    ArrowWriterOptions::new()
         .with_properties(props)
-        .with_skip_arrow_metadata(true))
+        .with_skip_arrow_metadata(true)
 }
