@@ -334,3 +334,114 @@ All reverted; `cargo test -p iceberg --lib location` = 55/55 green.
   `hadoop_version_commit` 15/15; catalog lib suites glue 50, hms 48,
   s3tables 39, sql 81, datafusion 292 — all green. fmt, per-crate clippy,
   `typos .`, artifact/matrix/comment scripts all clean.
+
+## Round 3 — logic P2s + perf (fork #314)
+
+### L-001 — Hadoop `Path` context parity
+
+`javap -c` on `LocationProviders$ObjectStoreLocationProvider.pathContext`
+returns `parent.getName() + "/" + getName()` when a parent exists, else
+`getName()`. Hadoop `Path` semantics (verified against hadoop-common
+3.3.6): `s3://bucket/mytable` → name=`mytable`, parent=`s3://bucket/`
+whose name is the empty string, so Java's context is `/mytable` and the
+data path carries `//` before the table segment; `s3://bucket` (and
+`s3://bucket/`) → name empty, parent null, context empty; `mytable` →
+parent is the EMPTY path (not null), so the context is again `/mytable`;
+multi-segment locations take the last two segments. `path_context` now
+splits on `/`, drops empties, and yields `""` / `/{seg}` /
+`{parent}/{name}` for 0 / 1 / 2+ segments. Pins:
+`object_storage_context_{bucket_root_parent,single_segment_relative,bucket_only}`
+plus the trailing-slash cases in `object_storage_unpartitioned` (the
+`s3://bucket/mytable` and `mytable` cases pin the exact oracle string
+`s3://alt-data/0111/1111/1110/11001100//mytable/f.parquet`).
+
+### L-002 — S3 Tables owns the warehouse
+
+Java S3 Tables catalog behavior: **UNMEASURED** — no S3 Tables catalog
+jar exists under the run-24d ivy cache, so no bytecode evidence. The
+offline Rust contract is pinned instead: the service generates the table
+warehouse location, so (a) `create_table` refuses ANY
+`write.metadata.path` / `write.data.path` creation property (nothing can
+be verified under a warehouse that does not exist yet), and (b)
+`update_table` / `publish_replace_table` refuse the staged metadata
+location and any configured `write.metadata.path` / `write.data.path`
+that is not `{warehouse}/`-prefixed — all typed `ErrorKind::DataInvalid`,
+all before any metadata write or metadata-pointer CAS. Glue keeps
+honoring external paths. Helpers `under_warehouse` /
+`ensure_write_paths_under_warehouse` / `ensure_no_write_path_override`
+live in `s3tables/src/utils.rs`; the four pins (create refusal, update
+refusal, replace refusal, under-warehouse acceptance asserting no CAS on
+refusal) live in `commit_outcome_tests.rs`.
+
+### L-003 — `rewrite_table_path` loud failure pin
+
+`relativize` already fails `DataInvalid` ("does not start with") when a
+path escapes the source prefix; the new end-to-end pin
+`execute_fails_loud_when_write_metadata_path_is_outside_the_source_prefix`
+drives a full rewrite where `write.metadata.path` placed manifests and
+the manifest list outside the table location and asserts the loud error
+(never a silent rewrite).
+
+### R-01 — object-store path generation allocs
+
+`generate_location` no longer builds `file_name.to_string()` in the
+unpartitioned arm nor a 32-char binary `String` for the hash: the 20
+hash bits are written straight into the final path buffer via
+`std::fmt::Write`. Hash dirs remain byte-identical to the oracle pins.
+
+### R-02 — cached metadata dir on `SnapshotProducer`
+
+`SnapshotProducer::new` resolves `write_metadata_dir` once (now returns
+`Result<Self>`); both manifest writers and the manifest-list path use
+the cached `metadata_dir` via `new_manifest_path` /
+`generate_manifest_list_file_path`. The dead `metadata_file_location`
+free fn was removed. `snapshot.rs` held at exactly its 3350 ceiling.
+
+### R-03 — `DefaultLocationGenerator::new` borrows metadata
+
+Signature is `impl Borrow<TableMetadata>`: every caller passes
+`&TableMetadata` with no clone, AND the three `//!` doc-test lines in
+`writer/mod.rs` that pass an owned `table.metadata().clone()` still
+compile verbatim — required because any touched `//!` line is a
+comment-ban hit (`&TableMetadata`-only would have forced edits onto
+comment lines). ~50 call sites updated.
+
+### R-04 — one generator per `execute`
+
+`convert_equality_delete_files` builds its `TableLocationGenerator` once
+in `execute` and threads `&TableLocationGenerator` through
+`materialize_one` → `write_position_delete_file` (cloned only at the
+rolling-writer builder) instead of one construction per equality delete.
+
+### R-05 — `rebased` without struct clone
+
+`MetadataLocation::rebased` now copies `version` and `id` explicitly and
+recomputes only `metadata_dir` — no `..self.clone()`.
+
+### Round-3 mutations
+
+| Mutation | Pins driven red |
+|---|---|
+| `path_context` 1-segment arm → no leading slash | 2 red — `context_bucket_root_parent`, `context_single_segment_relative` |
+| `under_warehouse` → always true | 2 red — `update_table_refuses_…`, `publish_replace_table_refuses_…` |
+| `ensure_no_write_path_override` → no-op | 1 red — `create_table_refuses_…` |
+| `relativize` prefix check → passthrough | 2 red — `execute_fails_loud_…_outside_the_source_prefix`, `relativize_errors_when_path_not_under_prefix` |
+
+All reverted; filtered suites green again.
+
+### Round-3 gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p iceberg -p iceberg-datafusion -p iceberg-catalog-s3tables
+  -p iceberg-integration-tests --all-targets -- -D warnings` — clean.
+- `./scripts/check_rust_file_size.sh` — 531 files clean; four shrunk test
+  ceilings ratcheted down (interop_remove_dangling 1021→1018,
+  interop_scan_exec 2592→2585, interop_scan_plan 1028→1027,
+  interop_write_data 2115→2111); `snapshot.rs` held at 3350,
+  `s3tables/catalog.rs` at 1402, `rewrite_table_path_tests.rs` at 1000.
+- `comment_ban.py` over `origin/main..HEAD` — `comment-ban hits=0`.
+- `./scripts/check_agent_artifacts.sh`, `check_matrix_anchors.sh`,
+  `check_comment_blocks.sh`, `typos .` — all clean.
+- `cargo test -p iceberg --lib -- location convert_equality
+  rewrite_table_path` — 84/84; `cargo test -p iceberg-catalog-s3tables`
+  — 43/43 + register_table + doctest.
