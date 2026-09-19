@@ -40,7 +40,7 @@ enum MissingColBehavior {
     MightMatch,
 }
 
-enum PageNullCount {
+pub(crate) enum PageNullCount {
     AllNull,
     NoneNull,
     SomeNull,
@@ -361,6 +361,62 @@ impl<'a> PageIndexEvaluator<'a> {
         Datum::try_from_bytes(bytes, field_type.clone()).ok()
     }
 
+    pub(crate) fn eq_keeps_page(
+        min: Option<Datum>,
+        max: Option<Datum>,
+        nulls: PageNullCount,
+        datum: &Datum,
+    ) -> bool {
+        if matches!(nulls, PageNullCount::AllNull) {
+            return false;
+        }
+
+        if let Some(min) = min
+            && min.gt(datum)
+        {
+            return false;
+        }
+
+        if let Some(max) = max
+            && max.lt(datum)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    pub(crate) fn in_keeps_page(
+        min: Option<Datum>,
+        max: Option<Datum>,
+        nulls: PageNullCount,
+        literals: &FnvHashSet<Datum>,
+    ) -> bool {
+        if matches!(nulls, PageNullCount::AllNull) {
+            return false;
+        }
+
+        match (min, max) {
+            (Some(min), Some(max))
+                if literals
+                    .iter()
+                    .all(|datum| datum.lt(&min) || datum.gt(&max)) =>
+            {
+                return false;
+            }
+            (Some(min), _) if !literals.iter().any(|datum| datum.ge(&min)) => {
+                return false;
+            }
+            (_, Some(max)) if !literals.iter().any(|datum| datum.le(&max)) => {
+                return false;
+            }
+
+            _ => {}
+        }
+
+        true
+    }
+
     fn visit_inequality(
         &mut self,
         reference: &BoundReference,
@@ -522,25 +578,7 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
 
         self.calc_row_selection(
             field_id,
-            |min, max, nulls| {
-                if matches!(nulls, PageNullCount::AllNull) {
-                    return Ok(false);
-                }
-
-                if let Some(min) = min
-                    && min.gt(datum)
-                {
-                    return Ok(false);
-                }
-
-                if let Some(max) = max
-                    && max.lt(datum)
-                {
-                    return Ok(false);
-                }
-
-                Ok(true)
-            },
+            |min, max, nulls| Ok(Self::eq_keeps_page(min, max, nulls, datum)),
             MissingColBehavior::CantMatch,
         )
     }
@@ -712,34 +750,7 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
         }
         self.calc_row_selection(
             field_id,
-            |min, max, nulls| {
-                if matches!(nulls, PageNullCount::AllNull) {
-                    return Ok(false);
-                }
-
-                match (min, max) {
-                    (Some(min), Some(max))
-                        if literals
-                            .iter()
-                            .all(|datum| datum.lt(&min) || datum.gt(&max)) =>
-                    {
-                        // if all values are outside the bounds, rows cannot match.
-                        return Ok(false);
-                    }
-                    (Some(min), _) if !literals.iter().any(|datum| datum.ge(&min)) => {
-                        // if none of the values are greater than the min bound, rows cant match
-                        return Ok(false);
-                    }
-                    (_, Some(max)) if !literals.iter().any(|datum| datum.le(&max)) => {
-                        // if all values are greater than upper bound, rows cannot match.
-                        return Ok(false);
-                    }
-
-                    _ => {}
-                }
-
-                Ok(true)
-            },
+            |min, max, nulls| Ok(Self::in_keeps_page(min, max, nulls, literals)),
             MissingColBehavior::CantMatch,
         )
     }

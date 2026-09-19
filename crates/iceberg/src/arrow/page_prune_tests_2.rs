@@ -409,6 +409,90 @@ async fn f_eq_nan_matches_unfiltered() {
     assert_eq!(rows.len(), 0);
 }
 
+#[test]
+fn f_eq_in_nan_bound_keeps_page() {
+    use fnv::FnvHashSet;
+
+    use crate::expr::visitors::page_index_evaluator::{PageIndexEvaluator, PageNullCount};
+
+    let datum = Datum::float(100.0);
+    assert!(
+        PageIndexEvaluator::eq_keeps_page(
+            Some(Datum::float(f32::NAN)),
+            Some(Datum::float(5.0)),
+            PageNullCount::NoneNull,
+            &datum,
+        ),
+        "a NaN min bound is unreliable and must keep the page"
+    );
+    assert!(
+        PageIndexEvaluator::eq_keeps_page(
+            Some(Datum::float(0.0)),
+            Some(Datum::float(f32::NAN)),
+            PageNullCount::NoneNull,
+            &datum,
+        ),
+        "a NaN max bound is unreliable and must keep the page"
+    );
+    assert!(
+        PageIndexEvaluator::eq_keeps_page(
+            Some(Datum::float(0.0)),
+            Some(Datum::float(5.0)),
+            PageNullCount::NoneNull,
+            &Datum::float(f32::NAN),
+        ),
+        "a NaN literal is unreliable and must keep the page"
+    );
+    assert!(
+        !PageIndexEvaluator::eq_keeps_page(
+            Some(Datum::float(0.0)),
+            Some(Datum::float(5.0)),
+            PageNullCount::NoneNull,
+            &datum,
+        ),
+        "finite bounds that exclude the literal still skip the page"
+    );
+
+    let literals: FnvHashSet<Datum> = [Datum::float(100.0)].into_iter().collect();
+    assert!(
+        PageIndexEvaluator::in_keeps_page(
+            Some(Datum::float(f32::NAN)),
+            Some(Datum::float(5.0)),
+            PageNullCount::NoneNull,
+            &literals,
+        ),
+        "a NaN min bound is unreliable and must keep the page for IN"
+    );
+    assert!(
+        PageIndexEvaluator::in_keeps_page(
+            Some(Datum::float(0.0)),
+            Some(Datum::float(f32::NAN)),
+            PageNullCount::NoneNull,
+            &literals,
+        ),
+        "a NaN max bound is unreliable and must keep the page for IN"
+    );
+    let nan_literals: FnvHashSet<Datum> = [Datum::float(f32::NAN)].into_iter().collect();
+    assert!(
+        PageIndexEvaluator::in_keeps_page(
+            Some(Datum::float(0.0)),
+            Some(Datum::float(5.0)),
+            PageNullCount::NoneNull,
+            &nan_literals,
+        ),
+        "a NaN literal is unreliable and must keep the page for IN"
+    );
+    assert!(
+        !PageIndexEvaluator::in_keeps_page(
+            Some(Datum::float(0.0)),
+            Some(Datum::float(5.0)),
+            PageNullCount::NoneNull,
+            &literals,
+        ),
+        "finite bounds that exclude every literal still skip the page"
+    );
+}
+
 #[tokio::test]
 async fn t_truncated_string_bounds_match_unfiltered() {
     let tmp = tmpdir();
