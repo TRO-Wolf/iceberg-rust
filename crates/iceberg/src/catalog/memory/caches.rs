@@ -20,7 +20,7 @@ use std::sync::Arc;
 use super::catalog::{MemoryCatalog, MemoryCatalogBuilder};
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
-use crate::spec::TableMetadata;
+use crate::spec::TableMetadataRef;
 use crate::table::{Table, TableBuilder};
 
 impl MemoryCatalogBuilder {
@@ -53,14 +53,20 @@ impl MemoryCatalog {
     }
 
     /// Publish parsed metadata into the optional session cache (no-op when cache is OFF).
-    pub(crate) async fn cache_put(&self, metadata_location: &str, metadata: &TableMetadata) {
+    pub(crate) async fn cache_put(
+        &self,
+        metadata_location: &str,
+        metadata: TableMetadataRef,
+        body_len: Option<u64>,
+    ) {
         if let Some(cache) = self.table_metadata_cache.as_ref() {
             cache
                 .put(
                     &self.cache_scope,
-                    metadata_location.to_string(),
-                    Arc::new(metadata.clone()),
+                    metadata_location,
+                    metadata,
                     None,
+                    body_len.and_then(|len| u32::try_from(len).ok()),
                 )
                 .await;
         }

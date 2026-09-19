@@ -30,7 +30,7 @@ use crate::catalog::table_metadata_cache::{
 };
 use crate::io::object_cache::ObjectCache;
 use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
-use crate::spec::{TableMetadataBuilder, ViewMetadata, ViewMetadataBuilder};
+use crate::spec::{TableMetadata, TableMetadataBuilder, ViewMetadata, ViewMetadataBuilder};
 use crate::table::Table;
 use crate::view::{View, ViewCommit};
 use crate::{
@@ -426,7 +426,9 @@ impl Catalog for MemoryCatalog {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
             root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
         }
-        self.cache_put(&metadata_location, &metadata).await;
+        let metadata = Arc::new(metadata);
+        self.cache_put(&metadata_location, metadata.clone(), None)
+            .await;
 
         self.table_builder()
             .metadata_location(metadata_location)
@@ -488,23 +490,14 @@ impl Catalog for MemoryCatalog {
         Ok(())
     }
 
-    /// Register an existing table (also the default publish path for a staged **create** via
-    /// [`Catalog::publish_create_table`]). # Notes Registration is all-or-nothing. The read of
-    /// `metadata_location` proves this catalog's [`FileIO`] reaches the metadata, and it happens
-    /// before the pointer insert.
     async fn register_table(
         &self,
         table_ident: &TableIdent,
         metadata_location: String,
     ) -> Result<Table> {
-        let metadata = load_or_fetch_table_metadata(
-            &self.file_io,
-            &self.cache_scope,
-            &metadata_location,
-            self.table_metadata_cache.as_deref(),
-            None,
-        )
-        .await?;
+        let (metadata, body_len) =
+            TableMetadata::read_from_measured(&self.file_io, &metadata_location).await?;
+        let metadata = Arc::new(metadata);
 
         let insert_result = {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
@@ -518,6 +511,9 @@ impl Catalog for MemoryCatalog {
             }
             return Err(e);
         }
+
+        self.cache_put(&metadata_location, metadata.clone(), Some(body_len))
+            .await;
 
         self.table_builder()
             .metadata_location(metadata_location)
@@ -617,7 +613,8 @@ impl Catalog for MemoryCatalog {
             updated_table
                 .metadata_location()
                 .unwrap_or(new_metadata_location.as_str()),
-            updated_table.metadata(),
+            updated_table.metadata_ref(),
+            None,
         )
         .await;
 
