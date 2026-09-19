@@ -79,7 +79,7 @@ pub(crate) struct CompactedWrite {
 const SORTED_OUTPUT_ROWS: usize = 8192;
 
 type RewriteWriterBuilder =
-    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+    DataFileWriterBuilder<ParquetWriterBuilder, TableLocationGenerator, DefaultFileNameGenerator>;
 
 struct RewriteOutput {
     chunk_rows: usize,
