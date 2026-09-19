@@ -31,9 +31,9 @@ use crate::io::LocalFsStorageFactory;
 use crate::maintenance::RewriteDataFiles;
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, Literal, ManifestContentType,
-    NestedField, Operation, PartitionKey, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
-    SnapshotRef, Struct, Transform, Type,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
+    ManifestContentType, NestedField, Operation, PartitionKey, PartitionSpec, PrimitiveType,
+    Schema as IcebergSchema, SnapshotRef, Struct, Transform, Type,
 };
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::position_delete_writer::{
@@ -233,10 +233,8 @@ async fn write_position_delete_file(
         Some(uuid::Uuid::now_v7().to_string()),
         DataFileFormat::Parquet,
     );
-    let parquet_builder = ParquetWriterBuilder::new(
-        parquet::file::properties::WriterProperties::builder().build(),
-        config.schema().clone(),
-    );
+    let parquet_builder =
+        ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone());
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_builder,
         table.file_io().clone(),
@@ -2458,10 +2456,9 @@ async fn test_config_write_max_file_size_clamps_to_java_long_max() {
 async fn test_roll_bound_is_write_max_not_target() {
     let (catalog, _temp, table, x_path) = gate_table().await;
 
-    // Five files, each ~118 KB, over DISJOINT position ranges of the same data file.
     let mut deletes = Vec::new();
     for k in 0..5i64 {
-        deletes.push(write_sized_pos_delete(&table, &x_path, 1 + k * 20_000, 12_000).await);
+        deletes.push(write_sized_pos_delete(&table, &x_path, 1 + k * 20_000, 13_000).await);
     }
     let sizes: Vec<u64> = deletes.iter().map(|f| f.file_size_in_bytes).collect();
     let b: u64 = sizes.iter().sum();
