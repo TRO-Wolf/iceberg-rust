@@ -17,17 +17,23 @@
 
 //! Table API for Apache Iceberg
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use crate::arrow::ArrowReaderBuilder;
-use crate::expr::Predicate;
+use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
+use crate::expr::visitors::inclusive_projection::InclusiveProjection;
+use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
+use crate::expr::visitors::strict_projection::StrictProjection;
+use crate::expr::{Bind, Predicate};
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::{
     BatchScan, IncrementalAppendScanBuilder, IncrementalChangelogScanBuilder, TableScanBuilder,
 };
-use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
+use crate::spec::{Schema, SchemaRef, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -310,14 +316,63 @@ impl Table {
     /// Whether every data file matching `predicate` is provably wholly covered by it, using table metadata alone.
     pub async fn can_delete_using_metadata(
         &self,
-        _predicate: &Predicate,
-        _branch: Option<&str>,
-        _case_sensitive: bool,
+        predicate: &Predicate,
+        branch: Option<&str>,
+        case_sensitive: bool,
     ) -> Result<bool> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "can_delete_using_metadata is not implemented",
-        ))
+        let metadata = self.metadata();
+        let schema = metadata.current_schema().clone();
+
+        if selects_partitions(predicate, metadata, schema.as_ref(), case_sensitive)? {
+            return Ok(true);
+        }
+
+        let mut builder = self
+            .scan()
+            .with_case_sensitive(case_sensitive)
+            .with_file_prune_only(predicate.clone());
+        if let Some(branch) = branch {
+            builder = builder.use_ref(branch);
+        }
+        let data_files = builder.build()?.matching_data_files().await?;
+
+        let strict_bound = predicate.clone().rewrite_not().bind(schema.clone(), true)?;
+
+        let mut evaluators: HashMap<i32, ExpressionEvaluator> = HashMap::new();
+        for data_file in &data_files {
+            let spec_id = data_file.partition_spec_id;
+            let evaluator = match evaluators.entry(spec_id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Cannot resolve partition spec id {spec_id}"),
+                        )
+                    })?;
+                    let partition_schema = Arc::new(
+                        Schema::builder()
+                            .with_schema_id(spec.spec_id())
+                            .with_fields(
+                                spec.partition_type(schema.as_ref())?.fields().to_owned(),
+                            )
+                            .build()?,
+                    );
+                    let projected = StrictProjection::new(spec.clone())
+                        .strict_project(&strict_bound)?
+                        .rewrite_not()
+                        .bind(partition_schema, true)?;
+                    entry.insert(ExpressionEvaluator::new(projected))
+                }
+            };
+            if evaluator.eval(data_file)?
+                || StrictMetricsEvaluator::eval(&strict_bound, data_file)?
+            {
+                continue;
+            }
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Returns the current schema as a shared reference.
@@ -329,6 +384,41 @@ impl Table {
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
         ArrowReaderBuilder::new(self.file_io.clone())
     }
+}
+
+fn selects_partitions(
+    predicate: &Predicate,
+    metadata: &TableMetadata,
+    schema: &Schema,
+    case_sensitive: bool,
+) -> Result<bool> {
+    let bound = predicate
+        .clone()
+        .rewrite_not()
+        .bind(Arc::new(schema.clone()), case_sensitive)?;
+    for spec in metadata.partition_specs_iter() {
+        if spec.is_unpartitioned() {
+            return Ok(false);
+        }
+        let partition_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(spec.spec_id())
+                .with_fields(spec.partition_type(schema)?.fields().to_owned())
+                .build()?,
+        );
+        let inclusive = InclusiveProjection::new(spec.clone())
+            .project(&bound)?
+            .rewrite_not()
+            .bind(partition_schema.clone(), case_sensitive)?;
+        let strict = StrictProjection::new(spec.clone())
+            .strict_project(&bound)?
+            .rewrite_not()
+            .bind(partition_schema, case_sensitive)?;
+        if inclusive != strict {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// `StaticTable` is a read-only table struct that can be created from a metadata file or from `TableMetaData` without a catalog.

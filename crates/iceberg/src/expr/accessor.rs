@@ -56,6 +56,10 @@ impl StructAccessor {
         &self.r#type
     }
 
+    pub(crate) fn is_nested(&self) -> bool {
+        self.inner.is_some()
+    }
+
     pub(crate) fn get<'a>(&'a self, container: &'a Struct) -> Result<Option<Datum>> {
         let value = container.fields().get(self.position).ok_or_else(|| {
             Error::new(

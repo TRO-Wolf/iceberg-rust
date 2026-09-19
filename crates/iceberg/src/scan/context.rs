@@ -17,10 +17,11 @@
 
 use std::sync::Arc;
 
-use futures::channel::mpsc::Sender;
+use futures::channel::mpsc::{Sender, channel};
 use futures::{SinkExt, TryFutureExt};
 
 use crate::delete_file_index::DeleteFileIndex;
+use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::visitors::residual_evaluator::ResidualEvaluator;
 use crate::expr::{BoundPredicate, Predicate};
 use crate::io::object_cache::ObjectCache;
@@ -30,8 +31,9 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntry, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
-    PartitionSpecRef, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef, TableProperties,
+    DataContentType, DataFile, ManifestContentType, ManifestEntry, ManifestEntryRef, ManifestFile,
+    ManifestList, NameMapping, PartitionSpecRef, SchemaRef, SnapshotRef, TableMetadata,
+    TableMetadataRef, TableProperties,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -202,6 +204,40 @@ impl ManifestFileContext {
 
         Ok(())
     }
+
+    pub(crate) async fn fetch_manifest_entries(&self) -> Result<Vec<ManifestEntryContext>> {
+        let manifest = self
+            .object_cache
+            .get_manifest(&self.manifest_file, Some(self.snapshot_schema.clone()))
+            .await?;
+        let partition_type = self
+            .partition_spec
+            .as_ref()
+            .and_then(|spec| spec.partition_type(&self.snapshot_schema).ok());
+
+        manifest
+            .entries()
+            .iter()
+            .map(|manifest_entry| {
+                Ok(ManifestEntryContext {
+                    manifest_entry: ManifestEntry::with_promoted_partition(
+                        manifest_entry,
+                        partition_type.as_ref(),
+                    ),
+                    expression_evaluator_cache: self.expression_evaluator_cache.clone(),
+                    field_ids: self.field_ids.clone(),
+                    partition_spec_id: self.manifest_file.partition_spec_id,
+                    bound_predicates: self.bound_predicates.clone(),
+                    snapshot_schema: self.snapshot_schema.clone(),
+                    delete_file_index: self.delete_file_index.clone(),
+                    case_sensitive: self.case_sensitive,
+                    residual_evaluator: self.residual_evaluator.clone(),
+                    partition_spec: self.partition_spec.clone(),
+                    name_mapping: self.name_mapping.clone(),
+                })
+            })
+            .collect()
+    }
 }
 
 impl ManifestEntryContext {
@@ -308,6 +344,44 @@ impl ManifestEntryContext {
             self.case_sensitive,
         )?;
         Ok(Some(bound))
+    }
+
+    pub(crate) fn survives_plan_filter(&self) -> Result<bool> {
+        if !self.manifest_entry.is_alive() {
+            return Ok(false);
+        }
+
+        if self.manifest_entry.content_type() != DataContentType::Data {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Encountered an entry for a delete file in a data file manifest",
+            ));
+        }
+
+        if let Some(ref bound_predicates) = self.bound_predicates {
+            let BoundPredicates {
+                snapshot_bound_predicate,
+                partition_bound_predicate,
+            } = bound_predicates.as_ref();
+
+            let expression_evaluator = self
+                .expression_evaluator_cache
+                .get(self.partition_spec_id, partition_bound_predicate);
+
+            if !expression_evaluator.eval(self.manifest_entry.data_file())? {
+                return Ok(false);
+            }
+
+            if !InclusiveMetricsEvaluator::eval(
+                snapshot_bound_predicate,
+                self.manifest_entry.data_file(),
+                false,
+            )? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 }
 
@@ -572,5 +646,32 @@ impl PlanContext {
             partition_spec,
             name_mapping: self.name_mapping.clone(),
         })
+    }
+
+    pub(crate) async fn matching_data_files(&self) -> Result<Vec<DataFile>> {
+        let manifest_list = self.get_manifest_list().await?;
+        let (tx_data, _rx_data) = channel(1);
+        let (delete_file_idx, _delete_index_tx) = DeleteFileIndex::new();
+        let (tx_delete, _rx_delete) = channel(1);
+        let manifest_file_contexts = self.build_manifest_file_contexts(
+            manifest_list,
+            tx_data,
+            delete_file_idx,
+            tx_delete,
+        )?;
+
+        let mut data_files = Vec::new();
+        for manifest_file_context in manifest_file_contexts {
+            let manifest_file_context = manifest_file_context?;
+            if manifest_file_context.manifest_file.content != ManifestContentType::Data {
+                continue;
+            }
+            for entry_context in manifest_file_context.fetch_manifest_entries().await? {
+                if entry_context.survives_plan_filter()? {
+                    data_files.push(entry_context.manifest_entry.data_file().clone());
+                }
+            }
+        }
+        Ok(data_files)
     }
 }

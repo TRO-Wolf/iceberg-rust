@@ -219,6 +219,8 @@ fn synthetic_deletion_vector(
         .partition_spec_id(spec_id)
         .partition(partition)
         .referenced_data_file(Some(referenced_data_file.to_string()))
+        .content_offset(Some(4))
+        .content_size_in_bytes(Some(40))
         .build()
         .expect("deletion vector builds")
 }
@@ -897,7 +899,7 @@ async fn can_delete_using_metadata_case_sensitivity_binds_the_filter() {
 }
 
 #[tokio::test]
-async fn can_delete_using_metadata_checks_every_partition_spec() {
+async fn can_delete_using_metadata_selects_partitions_requires_every_spec() {
     let catalog = new_memory_catalog().await;
     let spec = UnboundPartitionSpec::builder()
         .with_spec_id(0)
@@ -910,11 +912,11 @@ async fn can_delete_using_metadata_checks_every_partition_spec() {
             "test/file1.parquet",
             0,
             vec![Some(Literal::string("x"))],
-            1,
+            2,
             &[
-                (1, Datum::int(3), Datum::int(3)),
+                (1, Datum::int(3), Datum::int(5)),
                 (2, Datum::string("x"), Datum::string("x")),
-                (3, Datum::string("a"), Datum::string("a")),
+                (3, Datum::string("a"), Datum::string("b")),
             ],
         ),
     ])
@@ -944,10 +946,10 @@ async fn can_delete_using_metadata_checks_every_partition_spec() {
 
     assert_decision(
         &table,
-        &Reference::new("id").equal_to(Datum::int(7)),
+        &Reference::new("id").equal_to(Datum::int(3)),
         None,
         false,
-        "id=7: spec 0 (identity cat) does not project it, so selectsPartitions is false; file1 [3,3] then fails the strict check — Java checks ALL specs",
+        "id=3 selects whole partitions under the DEFAULT spec ({cat,id}) but not under spec 0 ({cat}); checking every spec forces the scan path, where file1 [3,5] is an unproven candidate — a default-spec-only check wrongly answers true",
     )
     .await;
 }

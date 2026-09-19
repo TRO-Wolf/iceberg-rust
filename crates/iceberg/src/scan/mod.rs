@@ -50,14 +50,13 @@ pub use task_group::*;
 use crate::arrow::ArrowReaderBuilder;
 use crate::delete_file_index::DeleteFileIndex;
 use crate::events::{self, ScanEvent};
-use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
 use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::metrics::{MetricsReport, MetricsReporter, ScanReport, TimeUnit, TimerResult};
 use crate::runtime::spawn;
 use crate::scan::metrics_collector::ScanMetricsCollector;
-use crate::spec::{DataContentType, DataFileFormat, ManifestContentType, SnapshotRef};
+use crate::spec::{DataContentType, DataFile, DataFileFormat, ManifestContentType, SnapshotRef};
 
 /// True when `offsets` is strictly ascending (each value > previous). Used to gate within-file
 /// expand so we only take the offsets-aware split branch, never fixed-size windows.
@@ -963,51 +962,19 @@ impl TableScan {
         self.plan_context.as_ref().map(|x| &x.snapshot)
     }
 
+    pub(crate) async fn matching_data_files(&self) -> Result<Vec<DataFile>> {
+        match self.plan_context.as_ref() {
+            Some(plan_context) => plan_context.matching_data_files().await,
+            None => Ok(vec![]),
+        }
+    }
+
     async fn process_data_manifest_entry(
         manifest_entry_context: ManifestEntryContext,
         mut file_scan_task_tx: Sender<Result<FileScanTask>>,
     ) -> Result<()> {
-        // skip processing this manifest entry if it has been marked as deleted
-        if !manifest_entry_context.manifest_entry.is_alive() {
+        if !manifest_entry_context.survives_plan_filter()? {
             return Ok(());
-        }
-
-        // abort the plan if we encounter a manifest entry for a delete file
-        if manifest_entry_context.manifest_entry.content_type() != DataContentType::Data {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "Encountered an entry for a delete file in a data file manifest",
-            ));
-        }
-
-        if let Some(ref bound_predicates) = manifest_entry_context.bound_predicates {
-            let BoundPredicates {
-                snapshot_bound_predicate,
-                partition_bound_predicate,
-            } = bound_predicates.as_ref();
-
-            let expression_evaluator_cache =
-                manifest_entry_context.expression_evaluator_cache.as_ref();
-
-            let expression_evaluator = expression_evaluator_cache.get(
-                manifest_entry_context.partition_spec_id,
-                partition_bound_predicate,
-            );
-
-            // skip any data file whose partition data indicates that it can't contain
-            // any data that matches this scan's filter
-            if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
-                return Ok(());
-            }
-
-            // skip any data file whose metrics don't match this scan's filter
-            if !InclusiveMetricsEvaluator::eval(
-                snapshot_bound_predicate,
-                manifest_entry_context.manifest_entry.data_file(),
-                false,
-            )? {
-                return Ok(());
-            }
         }
 
         // congratulations! the manifest entry has made its way through the
