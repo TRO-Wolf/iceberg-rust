@@ -270,7 +270,17 @@ for every strategy, i.e. the pre-unit behaviour), 11 of the 17 pins fail and 6 p
 pass are the ones that must not depend on ordering: the four option preconditions, the
 unsorted-table refusal, and the bin-pack control. Restoring the dispatch turns all 17 green.
 
-The per-clause mutation table is recorded at step 5.
+**The mutation table (step 5).** Each clause was broken in turn, the filtered suites re-run, and
+the mutation reverted. Every clause has at least one pin that fails when it breaks.
+
+| mutation | what it breaks | pins that go RED |
+|---|---|---|
+| M1 `sort_order_stamp` never matches a table order (always 0) | the stamp rule | `sort_by_table_order_uses_the_default_order_and_stamps_its_id`, `sort_explicit_order_equal_to_the_table_order_stamps_the_table_order_id`, `sort_explicit_order_equal_to_a_historical_table_order_stamps_that_order_id`, `sort_partitioned_orders_every_partition_group` (4 of 17 sort pins; the z pins stay green, correctly — a z rewrite stamps 0 either way) |
+| M2 the in-run sort reverses its key order | the order itself | 10 of 17 sort pins and 6 of 13 z pins, including all three bounded-memory pins |
+| M3 the budget never spills (one unbounded run) | the bounded-memory clause | `a_small_sort_budget_spills_runs_and_still_writes_one_global_order`, `a_small_sort_budget_spills_a_zorder_rewrite_too`, `more_runs_than_the_merge_fan_in_merge_in_passes` (3; every ordering pin stays green, which is the point: an unbounded collect produces the RIGHT order and still violates the clause) |
+| M6 the k-way merge ignores the keys (emits run after run) | the global order ACROSS spilled runs | `a_small_sort_budget_spills_runs_and_still_writes_one_global_order`, `more_runs_than_the_merge_fan_in_merge_in_passes` (2; the non-spilling pins stay green, so the merge has its own pins) |
+| M4 z-order encodes `timestamptz` in micros, not seconds | the z type mapping | `zorder_over_a_string_a_timestamp_and_a_long_matches_the_spark_row_order` |
+| M5 the float mask uses a LOGICAL shift (`>>>`) instead of Java's arithmetic `>>` | the float encoding quirk | `floating_point_matches_javas_ordered_bytes_including_its_shift_quirk` |
 
 ## 6. Gates
 
