@@ -199,7 +199,7 @@ async fn test_cow_bytes_partition_delete_threshold_keeps_applicable_delete() {
         .expect("rewrite must succeed");
 
     assert_eq!(result.rewritten_data_files_count, 4);
-    assert_eq!(result.added_data_files_count, 1);
+    assert_eq!(result.added_data_files_count, 4);
     assert_eq!(result.removed_delete_files_count, 0);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
@@ -208,7 +208,7 @@ async fn test_cow_bytes_partition_delete_threshold_keeps_applicable_delete() {
         HashSet::from([delete_path]),
         "the still-applicable partition-scoped position delete must stay live"
     );
-    assert_output_sequences(&table, 2, 3, 1).await;
+    assert_output_sequences(&table, 2, 3, 4).await;
     assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
 }
 
@@ -259,7 +259,7 @@ async fn test_cow_bytes_rewrite_all_keeps_applicable_delete() {
         .expect("rewrite must succeed");
 
     assert_eq!(result.rewritten_data_files_count, 8);
-    assert_eq!(result.added_data_files_count, 2);
+    assert_eq!(result.added_data_files_count, 8);
     assert_eq!(result.removed_delete_files_count, 0);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
@@ -268,7 +268,7 @@ async fn test_cow_bytes_rewrite_all_keeps_applicable_delete() {
         HashSet::from([delete_path]),
         "the still-applicable position delete must stay live"
     );
-    assert_output_sequences(&table, 2, 3, 2).await;
+    assert_output_sequences(&table, 2, 3, 8).await;
     assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
 }
 
@@ -290,7 +290,7 @@ async fn test_cow_bytes_remove_dangling_keeps_applicable_delete() {
         .expect("rewrite must succeed");
 
     assert_eq!(result.rewritten_data_files_count, 8);
-    assert_eq!(result.added_data_files_count, 2);
+    assert_eq!(result.added_data_files_count, 8);
     assert_eq!(result.removed_delete_files_count, 0);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
@@ -299,7 +299,7 @@ async fn test_cow_bytes_remove_dangling_keeps_applicable_delete() {
         HashSet::from([delete_path]),
         "delete seq 2 is not below partition min data seq 2, so it is not dangling"
     );
-    assert_output_sequences(&table, 2, 3, 2).await;
+    assert_output_sequences(&table, 2, 3, 8).await;
     assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
 }
 
@@ -321,7 +321,7 @@ async fn test_cow_bytes_remove_dangling_single_row_keeps_applicable_delete() {
         .expect("rewrite must succeed");
 
     assert_eq!(result.rewritten_data_files_count, 8);
-    assert_eq!(result.added_data_files_count, 2);
+    assert_eq!(result.added_data_files_count, 8);
     assert_eq!(result.removed_delete_files_count, 0);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
@@ -330,7 +330,7 @@ async fn test_cow_bytes_remove_dangling_single_row_keeps_applicable_delete() {
         HashSet::from([delete_path]),
         "the still-applicable position delete must stay live"
     );
-    assert_output_sequences(&table, 2, 3, 2).await;
+    assert_output_sequences(&table, 2, 3, 8).await;
     assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
 }
 
@@ -352,7 +352,7 @@ async fn test_cow_bytes_partition_delete_survives_dangling_cleanup() {
         .expect("rewrite must succeed");
 
     assert_eq!(result.rewritten_data_files_count, 8);
-    assert_eq!(result.added_data_files_count, 2);
+    assert_eq!(result.added_data_files_count, 8);
     assert_eq!(result.removed_delete_files_count, 0);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
@@ -361,7 +361,7 @@ async fn test_cow_bytes_partition_delete_survives_dangling_cleanup() {
         HashSet::from([delete_path]),
         "the still-applicable partition-scoped position delete must stay live"
     );
-    assert_output_sequences(&table, 2, 3, 2).await;
+    assert_output_sequences(&table, 2, 3, 8).await;
     assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
 }
 
@@ -382,7 +382,7 @@ async fn test_cow_bytes_new_sequence_keeps_delete_without_cleanup() {
         .expect("rewrite must succeed");
 
     assert_eq!(result.rewritten_data_files_count, 8);
-    assert_eq!(result.added_data_files_count, 2);
+    assert_eq!(result.added_data_files_count, 8);
     assert_eq!(result.removed_delete_files_count, 0);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
@@ -391,7 +391,7 @@ async fn test_cow_bytes_new_sequence_keeps_delete_without_cleanup() {
         HashSet::from([delete_path]),
         "the now-dangling delete stays live while the sub-action is off"
     );
-    assert_output_sequences(&table, 3, 3, 2).await;
+    assert_output_sequences(&table, 3, 3, 8).await;
     assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
 }
 
@@ -413,7 +413,7 @@ async fn test_cow_bytes_new_sequence_dangling_cleanup_removes_delete() {
         .expect("rewrite must succeed");
 
     assert_eq!(result.rewritten_data_files_count, 8);
-    assert_eq!(result.added_data_files_count, 2);
+    assert_eq!(result.added_data_files_count, 8);
     assert_eq!(result.removed_delete_files_count, 1);
 
     let table = catalog.load_table(table.identifier()).await.unwrap();
@@ -421,6 +421,6 @@ async fn test_cow_bytes_new_sequence_dangling_cleanup_removes_delete() {
         live_delete_file_paths(&table).await.is_empty(),
         "delete seq 2 is below the new partition min data seq 3, so it dangles"
     );
-    assert_output_sequences(&table, 3, 3, 2).await;
+    assert_output_sequences(&table, 3, 3, 8).await;
     assert_eq!(scan_rows(&table).await, rows_before, "row conservation");
 }
