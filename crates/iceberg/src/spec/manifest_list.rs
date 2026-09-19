@@ -790,7 +790,7 @@ impl ManifestFile {
 }
 
 /// The type of files tracked by the manifest, either data or delete files; Data(0) for all v1 manifests
-#[derive(Debug, PartialEq, Clone, Copy, Eq, Hash, Default)]
+#[derive(Debug, PartialEq, Clone, Copy, Eq, Hash, Default, PartialOrd, Ord)]
 pub enum ManifestContentType {
     /// The manifest content is data.
     #[default]

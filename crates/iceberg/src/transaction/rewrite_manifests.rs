@@ -31,9 +31,6 @@
 //!
 //! Re-stamping provenance here is silent corruption.
 //!
-//! **Delete manifests are immune.** A `Deletes`-content manifest is never re-clustered. It carries
-//! forward byte-identical, so outstanding merge-on-read deletes still apply after the rewrite.
-//!
 //! ## Named deviations from Java
 //!
 //! | not ported | consequence |
@@ -53,7 +50,8 @@ use uuid::Uuid;
 use crate::error::{Error, ErrorKind, Result};
 use crate::spec::{
     DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile, Operation,
-    TableProperties, UNASSIGNED_SEQUENCE_NUMBER, UNASSIGNED_SNAPSHOT_ID,
+    PartitionSpecRef, TableProperties, UNASSIGNED_SEQUENCE_NUMBER, UNASSIGNED_SNAPSHOT_ID,
+    apply_manifest_list_context,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::{
@@ -89,6 +87,7 @@ pub struct RewriteManifestsAction {
     /// Manifests to add explicitly (Java `addedManifests`); each must carry only existing entries with an
     /// unassigned snapshot id + sequence number (validated in [`Self::add_manifest`]).
     added_manifests: Vec<ManifestFile>,
+    rewrite_delete_manifests: bool,
     /// User-supplied snapshot summary properties (Java `RewriteManifests.set`).
     snapshot_properties: HashMap<String, String>,
     commit_uuid: Option<Uuid>,
@@ -100,6 +99,7 @@ impl RewriteManifestsAction {
         Self {
             cluster_by: None,
             rewrite_if: None,
+            rewrite_delete_manifests: false,
             deleted_manifests: vec![],
             added_manifests: vec![],
             snapshot_properties: HashMap::default(),
@@ -198,6 +198,12 @@ impl RewriteManifestsAction {
         }
         self.added_manifests.push(manifest);
         Ok(self)
+    }
+
+    #[allow(missing_docs)]
+    pub fn rewrite_delete_manifests(mut self, rewrite: bool) -> Self {
+        self.rewrite_delete_manifests = rewrite;
+        self
     }
 
     /// Merge a property into the snapshot summary (Java `RewriteManifests.set`).
@@ -340,28 +346,16 @@ impl TransactionAction for RewriteManifestsAction {
     }
 }
 
-/// The result of partitioning + re-clustering the current manifests.
 struct RewriteOutcome {
-    /// The newly-written cluster manifests (already carry the new snapshot id from the writer).
     new_manifests: Vec<ManifestFile>,
-    /// The number of new cluster manifests (== `new_manifests.len()`, kept explicit for the summary so a
-    /// later refactor cannot desync it from the byte vec).
     new_manifest_count: usize,
-    /// The current manifests that were rewritten (their entries went into `new_manifests`) — the
-    /// "replaced" side of the conservation check, alongside the explicitly-deleted manifests.
     rewritten_manifests: Vec<ManifestFile>,
-    /// The current manifests carried forward unchanged (predicate-false, delete-content, or no cluster fn).
     kept_manifests: Vec<ManifestFile>,
-    /// The number of kept manifests (== `kept_manifests.len()`, for the summary).
     kept_count: usize,
-    /// Total live entries re-clustered (Java `entryCount` / `entries-processed`).
     entries_processed: u64,
 }
 
 impl RewriteManifestsAction {
-    /// validateDeletedManifests (Java `BaseRewriteManifests.validateDeletedManifests`, L286-298): every
-    /// `delete_manifest` argument must be present in the current snapshot's manifest list, matched by path
-    /// (Java ManifestFile equality is path-based). The first missing one errors with Java's message shape.
     fn validate_deleted_manifests(
         &self,
         current_manifests: &[ManifestFile],
@@ -387,18 +381,6 @@ impl RewriteManifestsAction {
         Ok(())
     }
 
-    /// Partition the current manifests and (when a cluster function is set) re-cluster the matching data
-    /// manifests' live entries into new manifests.
-    ///
-    /// Mirrors Java `performRewrite` (L239-276) + `keepActiveManifests` (L221-229). The deleted set is
-    /// excluded up front (Java `remainingManifests`, L242-245). For each remaining manifest:
-    /// - **no cluster function** ⇒ every non-deleted manifest is KEPT as-is (Java `requiresRewrite` returns
-    ///   `false` when `clusterByFunc == null`, so `keepActiveManifests` runs);
-    /// - **delete-content manifest** OR **`rewrite_if` predicate false** ⇒ KEPT as-is (Java
-    ///   `containsDeletes(manifest) || !matchesPredicate(manifest)`, L252);
-    /// - otherwise ⇒ REWRITTEN: each LIVE entry (`is_alive`; Java `liveEntries()` skips DELETED) is appended
-    ///   to the cluster writer for `(cluster_by(file), manifest.partition_spec_id)` via `add_existing_entry`
-    ///   (provenance preserved).
     async fn perform_rewrite(
         &self,
         snapshot_producer: &mut SnapshotProducer<'_>,
@@ -418,12 +400,13 @@ impl RewriteManifestsAction {
 
         for manifest_file in current_manifests {
             if deleted_paths.contains(manifest_file.manifest_path.as_str()) {
-                // Explicitly deleted — replaced by an added_manifest; never kept, never rewritten here.
                 continue;
             }
 
+            let content_matches =
+                manifest_file.content == ManifestContentType::Data || self.rewrite_delete_manifests;
             let should_rewrite = self.cluster_by.is_some()
-                && manifest_file.content == ManifestContentType::Data
+                && content_matches
                 && self
                     .rewrite_if
                     .as_ref()
@@ -431,32 +414,31 @@ impl RewriteManifestsAction {
                     .unwrap_or(true);
 
             if !should_rewrite {
-                // KEPT as-is: no cluster fn, a delete-content manifest, or the predicate said keep.
                 kept_manifests.push(manifest_file.clone());
                 continue;
             }
 
-            // REWRITTEN: re-cluster its live entries (provenance preserved).
             let cluster_by = self
                 .cluster_by
                 .as_ref()
                 .expect("should_rewrite implies cluster_by is set");
-            let manifest = manifest_file
-                .load_manifest(snapshot_producer.table.file_io())
+            let (_, mut entries) = manifest_file
+                .load_manifest_parts_with_schema_fallback(snapshot_producer.table.file_io(), None)
                 .await?;
+            apply_manifest_list_context(&mut entries, manifest_file)?;
             let per_entry_size_estimate = estimate_per_entry_size(manifest_file);
 
-            for entry in manifest.entries() {
+            for entry in entries {
                 if !entry.is_alive() {
                     continue;
                 }
-                let entry = entry.as_ref().clone();
                 let cluster_key = cluster_by(entry.data_file());
                 cluster_writers
                     .append(
                         snapshot_producer,
                         cluster_key,
                         manifest_file.partition_spec_id,
+                        manifest_file.content,
                         entry,
                         per_entry_size_estimate,
                     )
@@ -482,26 +464,13 @@ impl RewriteManifestsAction {
     }
 }
 
-/// The per-`(cluster_key, partition_spec_id)` manifest writers, with the estimated-length size-rolling
-/// proxy for Java's `writer.length() >= manifestTargetSizeBytes` (L368).
-///
-/// Each key owns ONE open writer plus a running byte-size ESTIMATE. When appending an entry would not yet
-/// be reached, it accumulates onto the open writer; once the estimate reaches `target_size_bytes` the open
-/// writer is sealed into a finished [`ManifestFile`] and a fresh writer takes over (the roll). All finished
-/// manifests are returned by [`ClusterWriters::finish`].
-///
-/// **Why an estimate (documented divergence):** [`crate::spec::ManifestWriter`] buffers entries and
-/// exposes no incremental on-disk length, so the exact `writer.length()` Java rolls on is unavailable until
-/// the writer is closed. The per-entry estimate (the source manifest's average entry size) only shifts the
-/// roll POINTS — every live entry is still written exactly once with preserved provenance — so it cannot
-/// affect correctness, only the manifest-count distribution. With the default 8 MB target rolling is rare.
 struct ClusterWriters {
     target_size_bytes: u64,
-    /// Per key: the open writer's accumulated size estimate.
-    open_estimates: HashMap<(String, i32), u64>,
-    /// Per key: the open writer (taken out + replaced on a roll).
-    open_writers: HashMap<(String, i32), crate::spec::ManifestWriter>,
-    /// Sealed manifests, in append order.
+    key_ids: HashMap<String, u32>,
+    keys: Vec<String>,
+    specs: HashMap<i32, PartitionSpecRef>,
+    open_estimates: HashMap<(u32, i32, ManifestContentType), u64>,
+    open_writers: HashMap<(u32, i32, ManifestContentType), crate::spec::ManifestWriter>,
     finished: Vec<ManifestFile>,
 }
 
@@ -509,27 +478,35 @@ impl ClusterWriters {
     fn new(target_size_bytes: u64) -> Self {
         Self {
             target_size_bytes,
+            key_ids: HashMap::new(),
+            keys: Vec::new(),
+            specs: HashMap::new(),
             open_estimates: HashMap::new(),
             open_writers: HashMap::new(),
             finished: Vec::new(),
         }
     }
 
-    /// Append one live entry to the writer for `(cluster_key, partition_spec_id)`, rolling to a new
-    /// manifest first if the open writer's estimated size has reached the target (Java `WriterWrapper.addEntry`
-    /// L365-373: roll on `writer.length() >= target`, then `writer.existing(entry)`).
     async fn append(
         &mut self,
         snapshot_producer: &mut SnapshotProducer<'_>,
         cluster_key: String,
         partition_spec_id: i32,
+        content: ManifestContentType,
         entry: ManifestEntry,
         per_entry_size_estimate: u64,
     ) -> Result<()> {
-        let key = (cluster_key, partition_spec_id);
+        let key_id = match self.key_ids.get(&cluster_key) {
+            Some(id) => *id,
+            None => {
+                let key_id = self.keys.len() as u32;
+                self.keys.push(cluster_key.clone());
+                self.key_ids.insert(cluster_key, key_id);
+                key_id
+            }
+        };
+        let key = (key_id, partition_spec_id, content);
 
-        // Roll BEFORE appending if the current open writer has reached the target (Java rolls on the
-        // entry that would tip it over; here the estimate is checked against the same threshold).
         if let Some(estimate) = self.open_estimates.get(&key).copied()
             && estimate >= self.target_size_bytes
             && let Some(writer) = self.open_writers.remove(&key)
@@ -539,39 +516,41 @@ impl ClusterWriters {
             self.open_estimates.remove(&key);
         }
 
-        // Ensure an open writer exists for this key.
         if !self.open_writers.contains_key(&key) {
-            let writer = snapshot_producer
-                .new_cluster_manifest_writer(partition_spec_id, ManifestContentType::Data)?;
-            self.open_writers.insert(key.clone(), writer);
-            self.open_estimates.insert(key.clone(), 0);
+            let spec = match self.specs.get(&partition_spec_id) {
+                Some(spec) => spec.clone(),
+                None => {
+                    let spec = snapshot_producer.cluster_partition_spec(partition_spec_id)?;
+                    self.specs.insert(partition_spec_id, spec.clone());
+                    spec
+                }
+            };
+            let writer = snapshot_producer.new_cluster_manifest_writer_for_spec(spec, content)?;
+            self.open_writers.insert(key, writer);
+            self.open_estimates.insert(key, 0);
         }
 
-        // Append the entry as an EXISTING entry — preserves snapshot id + both sequence numbers, status
-        // becomes Existing (Java `writer.existing(entry)`). THE load-bearing provenance invariant.
         let writer = self
             .open_writers
             .get_mut(&key)
             .expect("writer was just inserted for this key");
         writer.add_existing_entry(entry)?;
-        // Saturating add: the per-entry estimate derives from the UNTRUSTED `manifest_length` of a
-        // manifest list read from storage; a hostile value must not panic (debug) or wrap the
-        // estimate back to small (release). Saturation just pins the estimate at the ceiling, which
-        // rolls the writer — harmless (audit hardening 2026-06-10).
         let estimate = self.open_estimates.entry(key).or_insert(0);
         *estimate = estimate.saturating_add(per_entry_size_estimate);
 
         Ok(())
     }
 
-    /// Seal every still-open writer and return all finished manifests in deterministic order (sorted by
-    /// `(cluster_key, partition_spec_id)`), then the rolled ones already in append order. Java closes all
-    /// writers in `performRewrite`'s `finally` (L273-275).
     async fn finish(mut self) -> Result<Vec<ManifestFile>> {
-        // Sort the still-open keys for a deterministic manifest ordering across runs (the per-attempt
-        // HashMap iteration order is otherwise nondeterministic; the live set is identical regardless).
-        let mut open_keys: Vec<(String, i32)> = self.open_writers.keys().cloned().collect();
-        open_keys.sort();
+        let mut open_keys: Vec<(u32, i32, ManifestContentType)> =
+            self.open_writers.keys().copied().collect();
+        open_keys.sort_by(|a, b| {
+            (self.keys[a.0 as usize].as_str(), a.1, a.2).cmp(&(
+                self.keys[b.0 as usize].as_str(),
+                b.1,
+                b.2,
+            ))
+        });
 
         let mut result = std::mem::take(&mut self.finished);
         for key in open_keys {
@@ -691,7 +670,7 @@ impl SnapshotProduceOperation for RewriteManifestsOperation {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashSet;
 
     use super::RewriteManifestsAction;
@@ -723,7 +702,11 @@ mod tests {
     }
 
     /// Fast-append `files` in one commit and return the updated table.
-    async fn append_files(catalog: &impl Catalog, table: &Table, files: Vec<DataFile>) -> Table {
+    pub(crate) async fn append_files(
+        catalog: &impl Catalog,
+        table: &Table,
+        files: Vec<DataFile>,
+    ) -> Table {
         let tx = Transaction::new(table);
         let action = tx.fast_append().add_data_files(files);
         let tx = action.apply(tx).unwrap();
@@ -756,7 +739,7 @@ mod tests {
     }
 
     /// Return (status, snapshot_id, data_seq, file_seq) of the live entry for `path` (panics if absent).
-    async fn live_entry(
+    pub(crate) async fn live_entry(
         table: &Table,
         path: &str,
     ) -> (ManifestStatus, Option<i64>, Option<i64>, Option<i64>) {
@@ -782,7 +765,7 @@ mod tests {
     }
 
     /// The current snapshot's full manifest list (data + deletes).
-    async fn current_manifests(table: &Table) -> Vec<ManifestFile> {
+    pub(crate) async fn current_manifests(table: &Table) -> Vec<ManifestFile> {
         let snapshot = table.metadata().current_snapshot().unwrap();
         snapshot
             .load_manifest_list(table.file_io(), table.metadata())
@@ -793,7 +776,7 @@ mod tests {
     }
 
     /// Read a snapshot summary property, defaulting to `None` when absent.
-    fn summary_prop(table: &Table, prop: &str) -> Option<String> {
+    pub(crate) fn summary_prop(table: &Table, prop: &str) -> Option<String> {
         table
             .metadata()
             .current_snapshot()
@@ -1783,7 +1766,7 @@ mod tests {
 
     /// Write a real parquet data file (rows are `(x, y)` with a constant z) under the table location and
     /// return its [`DataFile`] routed to partition `x = part_value`.
-    async fn write_real_data_file(
+    pub(crate) async fn write_real_data_file(
         table: &Table,
         file_name: &str,
         part_value: i64,
@@ -1826,7 +1809,7 @@ mod tests {
     }
 
     /// Write a real position-delete parquet file dropping the given `(data_path, pos)` pairs.
-    async fn write_real_position_delete(
+    pub(crate) async fn write_real_position_delete(
         table: &Table,
         part_value: i64,
         deletes: &[(String, i64)],
@@ -1886,7 +1869,7 @@ mod tests {
     }
 
     /// Scan the table and collect the `y` column values.
-    async fn scan_y_values(table: &Table) -> HashSet<i64> {
+    pub(crate) async fn scan_y_values(table: &Table) -> HashSet<i64> {
         use arrow_array::{Int64Array, RecordBatch};
         use futures::TryStreamExt;
 

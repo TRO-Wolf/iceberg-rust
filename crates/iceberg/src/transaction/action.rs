@@ -31,6 +31,9 @@ mod occ_scoped_projection_tests;
 #[cfg(test)]
 #[path = "occ_scoped_tests.rs"]
 pub(crate) mod occ_scoped_tests;
+#[cfg(test)]
+#[path = "rewrite_manifests_deletes_tests.rs"]
+mod rewrite_manifests_deletes_tests;
 
 /// A boxed, thread-safe reference to a `TransactionAction`.
 pub(crate) type BoxedTransactionAction = Arc<dyn TransactionAction>;
