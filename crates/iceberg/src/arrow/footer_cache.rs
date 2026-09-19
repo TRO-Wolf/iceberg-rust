@@ -46,7 +46,6 @@ fn footer_weight(_key: &FooterKey, entry: &CachedFooter) -> u32 {
     u32::try_from(entry.metadata.memory_size()).unwrap_or(u32::MAX)
 }
 
-/// Snapshot of footer-cache traffic counters (for tests / op-count pins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[allow(missing_docs)]
 pub struct ParquetFooterCacheStats {
@@ -57,8 +56,8 @@ pub struct ParquetFooterCacheStats {
     pub evictions: u64,
 }
 
-/// A shared, scope-aware, byte-bounded cache of Parquet file footers.
 #[derive(Debug)]
+#[allow(missing_docs)]
 pub struct ParquetFooterCache {
     entries: moka::future::Cache<FooterKey, CachedFooter>,
     hits: AtomicU64,
@@ -127,8 +126,8 @@ impl ParquetFooterCache {
     }
 }
 
-/// A [`ParquetFooterCache`] bound to one catalog [`CacheScope`], carried by each `Table`.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
 pub struct TableFooterCache {
     cache: Arc<ParquetFooterCache>,
     scope: CacheScope,
