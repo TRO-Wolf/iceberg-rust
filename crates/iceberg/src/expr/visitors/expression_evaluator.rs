@@ -225,6 +225,7 @@ impl BoundPredicateVisitor for ExpressionEvaluatorVisitor<'_> {
 
         match (datum.literal(), literal.literal()) {
             (PrimitiveLiteral::String(d), PrimitiveLiteral::String(l)) => Ok(d.starts_with(l)),
+            (PrimitiveLiteral::Binary(d), PrimitiveLiteral::Binary(l)) => Ok(d.starts_with(l)),
             _ => Ok(false),
         }
     }

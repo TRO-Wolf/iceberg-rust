@@ -322,7 +322,7 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
             return ROWS_CANNOT_MATCH;
         }
 
-        let prefix = ManifestFilterVisitor::datum_as_str(
+        let prefix = ManifestFilterVisitor::datum_as_bytes(
             datum,
             "Cannot perform starts_with on non-string value",
         )?;
@@ -330,14 +330,14 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
 
         if let Some(lower_bound) = &field.lower_bound {
             let min_len = lower_bound.len().min(prefix_len);
-            if prefix.as_bytes().lt(&lower_bound[..min_len]) {
+            if prefix.lt(&lower_bound[..min_len]) {
                 return ROWS_CANNOT_MATCH;
             }
         }
 
         if let Some(upper_bound) = &field.upper_bound {
             let min_len = upper_bound.len().min(prefix_len);
-            if prefix.as_bytes().gt(&upper_bound[..min_len]) {
+            if prefix.gt(&upper_bound[..min_len]) {
                 return ROWS_CANNOT_MATCH;
             }
         }
@@ -357,29 +357,25 @@ impl BoundPredicateVisitor for ManifestFilterVisitor<'_> {
             return ROWS_MIGHT_MATCH;
         }
 
-        let prefix = ManifestFilterVisitor::datum_as_str(
+        let prefix = ManifestFilterVisitor::datum_as_bytes(
             datum,
             "Cannot perform not_starts_with on non-string value",
         )?;
         let prefix_len = prefix.len();
 
-        // not_starts_with will match unless all values must start with the prefix. This happens when
-        // the lower and upper bounds both start with the prefix.
         if let Some(lower_bound) = &field.lower_bound {
-            // if lower is shorter than the prefix then lower doesn't start with the prefix
             if prefix_len > lower_bound.len() {
                 return ROWS_MIGHT_MATCH;
             }
 
-            if prefix.as_bytes().eq(&lower_bound[..prefix_len])
+            if prefix.eq(&lower_bound[..prefix_len])
                 && let Some(upper_bound) = &field.upper_bound
             {
-                // if upper is shorter than the prefix then upper can't start with the prefix
                 if prefix_len > upper_bound.len() {
                     return ROWS_MIGHT_MATCH;
                 }
 
-                if prefix.as_bytes().eq(&upper_bound[..prefix_len]) {
+                if prefix.eq(&upper_bound[..prefix_len]) {
                     return ROWS_CANNOT_MATCH;
                 }
             }
@@ -467,11 +463,12 @@ impl ManifestFilterVisitor<'_> {
         all_null
     }
 
-    fn datum_as_str<'a>(bound: &'a Datum, err_msg: &str) -> crate::Result<&'a String> {
-        let PrimitiveLiteral::String(bound) = bound.literal() else {
-            return Err(Error::new(ErrorKind::Unexpected, err_msg));
-        };
-        Ok(bound)
+    fn datum_as_bytes<'a>(bound: &'a Datum, err_msg: &str) -> crate::Result<&'a [u8]> {
+        match bound.literal() {
+            PrimitiveLiteral::String(bound) => Ok(bound.as_bytes()),
+            PrimitiveLiteral::Binary(bound) => Ok(bound.as_slice()),
+            _ => Err(Error::new(ErrorKind::Unexpected, err_msg)),
+        }
     }
 
     fn bytes_to_datum(
