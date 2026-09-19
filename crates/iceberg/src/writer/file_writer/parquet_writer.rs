@@ -661,10 +661,10 @@ impl FileWriter for ParquetWriter {
         } else {
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
-            let writer = AsyncArrowWriter::try_new(
+            let writer = AsyncArrowWriter::try_new_with_options(
                 async_writer,
                 self.writer_arrow_schema.clone(),
-                Some(self.writer_properties.clone()),
+                super::parquet_footer::writer_options(&self.writer_properties, &self.schema)?,
             )
             .map_err(|err| {
                 Error::new(ErrorKind::Unexpected, "Failed to build parquet writer.")

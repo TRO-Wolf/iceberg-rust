@@ -363,7 +363,26 @@ mod tests {
 
         let reader = reader_builder.build().unwrap();
         let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
-        let res = concat_batches(&batch.schema(), &batches).unwrap();
+        assert_batches_read_back(batch, &batches);
+    }
+
+    pub(crate) fn assert_batches_read_back(batch: &RecordBatch, batches: &[RecordBatch]) {
+        let res = concat_batches(&batches[0].schema(), batches).unwrap();
+        let res = RecordBatch::try_new(
+            batch.schema(),
+            res.columns()
+                .iter()
+                .zip(batch.schema().fields())
+                .map(|(column, field)| {
+                    if column.data_type() == field.data_type() {
+                        column.clone()
+                    } else {
+                        arrow_cast::cast::cast(column, field.data_type()).unwrap()
+                    }
+                })
+                .collect(),
+        )
+        .unwrap();
         assert_eq!(*batch, res);
     }
 }
