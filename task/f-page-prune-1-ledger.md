@@ -173,7 +173,85 @@ always covers the index bytes of a test file.
   behavior-preserving: `get_row_selection_for_filter_predicate` and `page_index_policy` →
   `arrow/open_parquet.rs`; `TableScan::row_selection_enabled` getter →
   `scan/partition_work.rs`; `build_table_scan` → `physical_plan/scan_knobs.rs`. Ceilings were
-  lowered to the new sizes (reader 10185, evaluator 1347, DF scan 1592), never raised.
+  lowered to the new sizes (reader 10162 after the round-2 `build_expected_schema` move,
+  evaluator 1347, DF scan 1592), never raised.
+
+## Round 2 — Spark-written fixtures
+
+Provenance: five tables written by Spark 4.1.2 + iceberg-spark-runtime 1.11.0 (parquet-mr
+writers), `write.parquet.page-row-limit=100`, `write.parquet.row-group-size-bytes=16384`,
+2,000 rows over 4 data files per seed table, merge-on-read delete/update settings. Paths were
+rewritten to the neutral prefix `/iceberg-fixtures/page-prune` and checked in under
+`crates/iceberg/testdata/interop/page_prune/` (data + metadata + `page_prune_truth.json`,
+Spark's recorded answer per query). Tests map the prefix onto the checked-in tree through a
+`Storage` wrapper over `LocalFsStorage` (`PrefixStorage` in
+`crates/iceberg/src/arrow/spark_fixture_tests.rs`), build each `Table` from its latest
+metadata file, translate every truth predicate into an Iceberg `Predicate`, and assert row
+equality with row selection ON and OFF.
+
+| Table | Metadata | Contents |
+|---|---|---|
+| `base_v2` | v2 | 4 data files, 2,000 rows |
+| `base_v3` | v2 | + `_row_id`, `_last_updated_sequence_number` assertions |
+| `del_v2` | v3 | + 3 position-delete parquet files |
+| `del_v3` | v6 | + deletion vectors (puffin), MoR update `i += 1_000_000` on ids 1000–1020 (`_last_updated_sequence_number` 5) |
+| `evo_v2` | v10 | `i` INT→BIGINT, `f` FLOAT→DOUBLE, `dec` (9,2)→(18,2), `s`→`s2` rename, `n` drop/re-add (new id), `addc` added, +300 rows |
+
+Coverage: 21 predicates × 4 tables + 11 × evo_v2 = **95 query assertions** at the core door,
+each compared ON and OFF against Spark's recorded rows (ids; ids + lineage on the v3 tables).
+Selective-page assertions: `id_eq`, `id_range`, `ts_range`, `i_gt`, `f_gt` skip pages on
+`base_v2`; `id_eq`, `id_range`, `ts_range` on `base_v3`; `spark_base_v2_per_file_selection_prunes`
+proves `id_eq` skips pages on ≥1 file and keeps on ≥1. DataFusion SQL door: 15 cases across
+`base_v2`, `del_v3`, `evo_v2` — `count/sum/min/max(id)` equal Spark truth with the knob on and
+off (`crates/integrations/datafusion/src/physical_plan/spark_fixture_tests.rs`).
+
+### Findings fixed in round 2
+
+- **Whole-file/lineage path dropped predicate columns (found via `base_v3.i_gt`/`del_v3.i_gt`
+  → 0 rows).** The `_pos`/`_row_id` whole-file path decoded only the projected columns, so a
+  residual on a non-projected column reached `survival_mask` on a batch missing the column and
+  evaluated all-false (`i > 1800` → 0 rows under a `_row_id` projection). Fix
+  (`crates/iceberg/src/arrow/reader.rs`): the decode projection is widened with the
+  predicate's referenced field ids and the equality-delete `equality_ids`, and `survival_mask`
+  evaluates the residual/eq masks on the decoded (pre-transform) batch — the same batch shape
+  the normal path's `RowFilter` residual sees. `build_expected_schema` (the Avro/ORC decode
+  schema) carries the same widening and moved to `open_parquet.rs` for the file-size ceiling.
+- **Stale `file_size_in_bytes` broke the footer read (found via `del_v2`).** The fixture's
+  path rewrite changed delete-file contents, so the manifest records sizes ~17–36 bytes larger
+  than the files on disk; `open_parquet_file` passed the manifest size to
+  `ParquetMetaDataReader::load_and_finish`, which then read past EOF ("failed to fill whole
+  buffer"). Java reads the actual object length (`SeekableInputStream.getLength`) and never
+  uses the manifest size for the footer. Fix (`crates/iceberg/src/arrow/open_parquet.rs`): on
+  a failed open, stat the file and retry once with the real size; the fast path keeps the
+  manifest size so the no-stat optimization stands.
+
+### Documented semantics (not defects)
+
+- **Spark SQL vs Java `Evaluator` on NULLs.** `n != 900` and `n NOT IN (900, 901)`: Spark's
+  three-valued filter drops NULL rows; the residual evaluator is Java-faithful
+  (`Evaluator.notEq`/`notIn` are `!eq`/`!in` under the nulls-first comparator, so NULLs pass —
+  the audit BUG-002 semantics already encoded in `record_batch_predicate.rs`). The expected
+  sets are Spark ∪ `n IS NULL` (base_v2/base_v3 1999/1998, del_v2/del_v3 1902/1901), and the
+  tests assert exactly that. Through the DataFusion door the provider marks pushdown
+  `Inexact`, DataFusion re-filters with SQL three-valued logic, and the SQL answer matches
+  Spark verbatim (asserted: 1499/1474).
+- **`s_eq` cannot prune on this fixture.** Every `s` value shares an 80-char prefix and
+  parquet-mr truncates column-index bounds at 64 bytes, so every page's `s` bounds are the
+  same truncated prefix — the literal can never be disproved and the evaluator keeps all
+  2,000 rows (asserted by `spark_s_eq_keeps_all_pages_under_degenerate_truncated_bounds`; a
+  foreign-writer case of the T clause's truncated-bound finding). Row results are still
+  asserted Spark-exact in the query tests.
+- **parquet-mr clause-M case confirmed.** The truth file records that the `d` DOUBLE column
+  has no column index in the file holding NaNs — the missing-index tolerance from round 1
+  carries it (those queries pass).
+
+### Round-2 mutation evidence
+
+| Mutation | Result |
+|---|---|
+| M6 `needs_physical_ordinals` decode widening off (`if false`) | `spark_base_v3_queries_match_with_lineage` red (`i_gt` → 0) |
+| M7 `survival_mask(&transformed)` instead of decoded `&batch` | `spark_base_v3_queries_match_with_lineage` red (`i_gt` → 0) |
+| M8 stale-size retry disabled (`if true`) | `spark_del_v2_queries_match_position_deletes` red (short read) |
 
 ## Gates
 
@@ -182,6 +260,7 @@ always covers the index bytes of a test file.
 - `make check` — clean (fmt, workspace clippy, taplo, cargo-machete, agent-artifacts,
   matrix-anchors, comment-blocks, rust-file-size)
 - `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/pb-fork origin/main HEAD` — `comment-ban hits=0`
-- `cargo test -p iceberg --lib arrow` — 460 passed, 1 ignored (includes all 29 clause tests)
-- `cargo test -p iceberg-datafusion --lib` — 286 passed, 1 ignored (includes all 5 DF clause
+- `cargo test -p iceberg --lib arrow` — 469 passed, 1 ignored (29 clause tests + 9 Spark-fixture
   tests)
+- `cargo test -p iceberg-datafusion --lib` — 289 passed, 1 ignored (5 DF clause tests + 3
+  Spark-fixture SQL-door tests)
