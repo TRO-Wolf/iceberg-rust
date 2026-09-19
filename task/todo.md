@@ -25,7 +25,27 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
-## ACTIVE (2026-09-19): F-DANGLING-DV-COMMIT-1 — every merging commit drops the DVs of the data files it removes
+## ACTIVE (2026-09-19): F-METRICS-CONFIG-1 — Java's table metrics config, everywhere the fork writes
+
+Ledger: [`f-metrics-config-1-ledger.md`](f-metrics-config-1-ledger.md). Branch
+`fix/f-metrics-config-1` off fork `main` (`43fcd243`). Defect: `write.metadata.metrics.*`
+table properties are ignored by the fork's own Parquet writers (compaction rewrites
+`metrics.default=none` files WITH full bounds).
+
+- [x] MEASURE: Java 1.11.0 bytecode (`from`/`forTable`/`forPositionDelete`/
+      `limitFieldIds`/`getProjectedIds`/`orderPreservingSortedColumns`/
+      `ParquetMetrics$MetricsVisitor`), production `ParquetWriterBuilder` inventory
+      (8 live sites + 1 dead helper; three brief-named files are test-only), oracle
+      cells extracted, fork replay measured (field-8 list/map divergence)
+- [ ] RED-FIRST pins: 12 oracle cells (six maps vs Spark, keys + bound bytes) +
+      `rewrite_data_files` none-cell e2e + position-delete overlay pin
+- [ ] IMPLEMENT: `MetricsConfig::for_table` / `for_position_delete_table` +
+      list/map-descendant drop; wire all production sites
+- [ ] MUTATION (drop promotion / drop limit / drop rewrite wiring) + gates + ledger
+- [ ] handback.json
+
+
+## DONE (2026-09-19): F-DANGLING-DV-COMMIT-1 — every merging commit drops the DVs of the data files it removes
 
 Ledger: [`f-dangling-dv-commit-1-ledger.md`](f-dangling-dv-commit-1-ledger.md). Branch
 `fix/f-dangling-dv-commit-1` off fork `main` (`587d3592`). Consumer: the #301
