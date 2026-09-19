@@ -4075,7 +4075,7 @@ mod tests {
             synthetic_delete_file("test/a-pos-del.parquet", 0),
             synthetic_equality_delete_file("test/a-eq-del.parquet", 0),
         ] {
-            let producer = SnapshotProducer::new(
+            let err = SnapshotProducer::new(
                 &table,
                 uuid::Uuid::now_v7(),
                 None,
@@ -4084,10 +4084,9 @@ mod tests {
                 FirstRowIdPolicy::Suppress,
             )
             .unwrap()
-            .with_added_delete_files(vec![delete_file]);
-            let err = producer
-                .validate_added_delete_files()
-                .expect_err("a V1 table must reject every added delete file");
+            .with_added_delete_files(vec![delete_file])
+            .validate_added_delete_files()
+            .expect_err("a V1 table must reject every added delete file");
             assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(
                 err.message(),

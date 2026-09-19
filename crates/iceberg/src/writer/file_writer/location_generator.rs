@@ -17,6 +17,7 @@
 
 //! This module contains the location generator and file name generator for generating path of data file.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -55,7 +56,8 @@ pub struct DefaultLocationGenerator {
 
 impl DefaultLocationGenerator {
     /// Create a new `DefaultLocationGenerator`.
-    pub fn new(table_metadata: &TableMetadata) -> Result<Self> {
+    pub fn new(table_metadata: impl Borrow<TableMetadata>) -> Result<Self> {
+        let table_metadata = table_metadata.borrow();
         let table_location = table_metadata.location();
         let prop = table_metadata.properties();
         let configured_data_location = prop
