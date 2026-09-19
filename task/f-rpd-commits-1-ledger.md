@@ -300,7 +300,7 @@ here so it is not lost.
 
 ## Round 3 — mutation reruns on the rebased head
 
-Same two mutations as round 1, applied to `ee97abd8`, run, and reverted uncommitted.
+Same two mutations as round 1, applied to the round-3 perf commit, run, and reverted uncommitted.
 
 **MUTATION A — single-commit half reverted** (`per_commit = 1`): 91 passed /
 **9 failed** — the same nine single-commit cells as round 1

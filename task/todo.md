@@ -50,7 +50,7 @@ commits.
       the #301 residue cell `test_seq_gc_residue_rpd_then_rdf_reaches_zero_delete_files`
       — four stale `2`s to Spark's `16` (16 file-scoped deletes → 16 file-scoped outputs
       in one commit, seq GC retires all 16 after RDF). `0408b0f7`
-- [x] Perf `ee97abd8`: R-01 `rewrite_bin` takes the bin by value and moves `DataFile`s
+- [x] Perf (round 3): R-01 `rewrite_bin` takes the bin by value and moves `DataFile`s
       into `pending` (no clones); R-02 live paths collected flat then keyed only for
       delete-bearing partitions (`Arc<str>`); R-03 `GroupWriteFactory` built once per
       bin — no per-path `TableMetadata` clone, shared file-name counter; R-04 known
