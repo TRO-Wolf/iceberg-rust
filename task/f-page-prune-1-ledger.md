@@ -321,3 +321,14 @@ all-null groups (skipped) vs NULLs inside kept groups (kept by the residual).
 | R-01/R-05 pin vs pre-fix gate (index loaded for any predicate) | `not_eq_only_scan_reads_no_index_bytes` red |
 | M9 `AllNull` skip removed from `visit_inequality` | `n_all_null_pages_skipped_for_lt_declared_divergence` red |
 | M10 DF pushdown `Inexact` → `Exact` | `sql_door_nulls_under_lt_le_not_gt_three_valued` red (512 rows incl. NULLs through the door) |
+
+### Round-3 gates
+
+- `cargo fmt --all -- --check` — clean
+- `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings` — clean
+- `make check` — clean (fmt, workspace clippy, taplo, cargo-machete, agent-artifacts,
+  matrix-anchors, comment-blocks, rust-file-size; `reader.rs` ceiling lowered 10162 → 10157)
+- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/pb-fork origin/main HEAD` — `comment-ban hits=0`
+- `cargo test -p iceberg --lib arrow` — 478 passed, 1 ignored
+- `cargo test -p iceberg --lib page_index` — 16 passed
+- `cargo test -p iceberg-datafusion --lib` — 290 passed, 1 ignored
