@@ -559,7 +559,7 @@ async fn test_name_defaults_to_sentinel_when_unset() {
 }
 
 #[tokio::test]
-async fn test_invalidate_defaults_are_noops() {
+async fn test_invalidate_table_without_cache_is_noop_and_view_is_noop() {
     let config = S3TablesCatalogConfig {
         name: Some("s3t_cat".to_string()),
         table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string(),
