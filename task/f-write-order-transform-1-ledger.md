@@ -175,6 +175,68 @@ restored byte-identically (`git status` clean before the step-5 commit).
 | width/unsupported validation removed | `to_sort_field` no longer called `check_supported_transform` | `cargo test -p iceberg --lib sort_order` | `test_sort_by_rejects_bad_transform_widths`, `test_sort_by_rejects_unsupported_transforms` (commits succeeded where Java refuses) |
 | cannot-bind validation removed | `to_sort_field` dropped the `result_type` check | `cargo test -p iceberg --lib sort_order` | `test_sort_by_rejects_transform_type_mismatch`, `test_sort_by_rejects_transform_on_struct_source` — the commit still erred, but via `check_compatibility` as `ErrorKind::Unexpected`, not `DataInvalid` with Java's `Cannot bind: …` shape; the pin proves the action-level check is what produces the Java surface |
 
+## Round 2 — verification-critic residues (V-01, V-02, V-03)
+
+### V-01 — YEARS-MONTHS cell now pinned
+
+`test_sort_by_commits_year_and_month_transforms`: `WRITE ORDERED BY years(ts), months(ts)` analogue
+— `sort_by("ts", Year, Asc, First)` + `sort_by("ts", Month, Asc, First)` commits one order (id 1)
+with two fields `{year, src 2, asc, nulls-first}` and `{month, src 2, asc, nulls-first}` — the
+oracle's exact field strings (its `ts` is source-id 3; the test schema's `ts` is source-id 2).
+
+### V-02 — width boundary: decompiled evidence, action's boundary IS Java's
+
+The critic's premise was checked against the actual bytecode, not recollection. Decompiled with
+`javap -c` from `iceberg-spark-runtime-4.1_2.13:1.11.0` (the oracle's own GAV):
+
+`Spark3Util.findWidth(Transform)` has TWO literal-type arms:
+
+- **IntegerType arm** (bytecode 53–99): `checkArgument(literal.intValue() > 0,
+  "Unsupported width for transform: %s", transform.describe())`, then `return intValue`.
+  NO upper bound — any positive `int` is accepted, including `Integer.MAX_VALUE`.
+- **LongType arm** (bytecode 116–219): `checkArgument(value > 0 && value < 2147483647L, same
+  message)`, then `Math.toIntExact`-style `> MAX → IllegalArgumentException`, `return intValue`.
+  Strictly `< i32::MAX` — but reachable ONLY for `L`-suffixed or over-int literals.
+
+`Bucket.get(int)` and `Truncate.get(int)` each check only `width > 0`
+(`"Invalid number of buckets/truncate width: %s (must be > 0)"`) — no upper bound. Java core
+accepts `Expressions.bucket("id", 2147483647)`; `int` itself is the ceiling.
+
+Effective Spark-SQL surface: `bucket(2147483647, id)` parses the literal as `IntegerType`
+(fits `int`) → int arm → ACCEPTED, commits `bucket[2147483647]`; `bucket(2147483648, id)` is a
+`LongType` literal → long arm → refused with `Unsupported width for transform:
+bucket(2147483648, id)`; `bucket(2147483647L, id)` (`L` suffix → LongType) → also refused —
+a typing distinction the fork's `Transform::Bucket(u32)` API cannot and should not see.
+
+Action boundary stays `1..=i32::MAX` (`width == 0 || i32::try_from(width).is_err()` refused):
+exactly what Java's core layer can express and what the Spark surface accepts for ordinary
+integer literals. The `2147483647L` divergence is a parser-layer concern — RePark holds the
+literal's type and can refuse it there, matching Spark's layering where `findWidth` sees the
+`Literal`'s `DataType`. Recorded as a named residue, NOT a bug.
+
+Pins added: `test_sort_by_accepts_width_at_java_int_max` — `bucket[2147483647]` and
+`truncate[2147483647]` both COMMIT (the boundary value Java accepts, contrary to the critic's
+premise); `truncate(y, 2147483648)` refusal added beside the existing `bucket(x, 2147483648)`
+pin — `> i32::MAX` is the boundary Java refuses (long arm + unrepresentable in a Java `int`
+and in `Transforms.fromString`'s `Integer.parseInt` round-trip).
+
+### V-03 — nested pin asserts the transform
+
+`test_sort_by_binds_nested_column_source` now asserts the committed `SortField` directly:
+`field.source_id == 3` AND `field.transform == Transform::Truncate(3)`, in addition to the
+serialized `truncate[3]` JSON assertion that was already there.
+
+### Round-2 gates
+
+| gate | result |
+|---|---|
+| `cargo test -p iceberg --lib sort_order` | 34 passed, 0 failed |
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy -p iceberg --all-targets -- -D warnings` | clean |
+| `./scripts/check_rust_file_size.sh` | clean |
+| `typos` on touched files | clean |
+| `python3 comment_ban.py` vs `origin/main` | `comment-ban hits=0` |
+
 ## Gates (step 6)
 
 | gate | result |

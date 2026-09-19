@@ -421,6 +421,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sort_by_commits_year_and_month_transforms() {
+        let catalog = new_memory_catalog().await;
+        let table = make_timestamp_table_in_catalog(&catalog).await;
+
+        let table = commit_sort_order(
+            &catalog,
+            &table,
+            Transaction::new(&table)
+                .replace_sort_order()
+                .sort_by(
+                    "ts",
+                    Transform::Year,
+                    SortDirection::Ascending,
+                    NullOrder::First,
+                )
+                .sort_by(
+                    "ts",
+                    Transform::Month,
+                    SortDirection::Ascending,
+                    NullOrder::First,
+                ),
+        )
+        .await;
+
+        assert_eq!(table.metadata().default_sort_order_id(), 1);
+        let fields = serde_json::to_value(&table.metadata().default_sort_order().fields)
+            .expect("serialize sort fields");
+        assert_eq!(
+            fields,
+            serde_json::json!([
+                {
+                    "transform": "year",
+                    "source-id": 2,
+                    "direction": "asc",
+                    "null-order": "nulls-first"
+                },
+                {
+                    "transform": "month",
+                    "source-id": 2,
+                    "direction": "asc",
+                    "null-order": "nulls-first"
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sort_by_accepts_width_at_java_int_max() {
+        let catalog = new_memory_catalog().await;
+        let table = make_xyz_table_in_catalog(&catalog).await;
+
+        let table = commit_sort_order(
+            &catalog,
+            &table,
+            Transaction::new(&table)
+                .replace_sort_order()
+                .sort_by(
+                    "x",
+                    Transform::Bucket(i32::MAX as u32),
+                    SortDirection::Ascending,
+                    NullOrder::First,
+                )
+                .sort_by(
+                    "y",
+                    Transform::Truncate(i32::MAX as u32),
+                    SortDirection::Ascending,
+                    NullOrder::First,
+                ),
+        )
+        .await;
+
+        let fields = serde_json::to_value(&table.metadata().default_sort_order().fields)
+            .expect("serialize sort fields");
+        assert_eq!(
+            fields,
+            serde_json::json!([
+                {
+                    "transform": "bucket[2147483647]",
+                    "source-id": 1,
+                    "direction": "asc",
+                    "null-order": "nulls-first"
+                },
+                {
+                    "transform": "truncate[2147483647]",
+                    "source-id": 2,
+                    "direction": "asc",
+                    "null-order": "nulls-first"
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn test_reapplied_equal_sort_order_reuses_its_order_id() {
         let catalog = new_memory_catalog().await;
         let table = make_xyz_table_in_catalog(&catalog).await;
@@ -554,6 +647,22 @@ mod tests {
             error.message(),
             "Unsupported width for transform: bucket(2147483648, x)"
         );
+
+        let error = Arc::new(Transaction::new(&table).replace_sort_order().sort_by(
+            "y",
+            Transform::Truncate(2147483648),
+            SortDirection::Ascending,
+            NullOrder::First,
+        ))
+        .commit(&table)
+        .await
+        .err()
+        .expect("truncate width above the Java int maximum must be rejected");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            error.message(),
+            "Unsupported width for transform: truncate(y, 2147483648)"
+        );
     }
 
     #[tokio::test]
@@ -655,6 +764,9 @@ mod tests {
         )
         .await;
 
+        let field = &table.metadata().default_sort_order().fields[0];
+        assert_eq!(field.source_id, 3);
+        assert_eq!(field.transform, Transform::Truncate(3));
         let fields = serde_json::to_value(&table.metadata().default_sort_order().fields)
             .expect("serialize sort fields");
         assert_eq!(
