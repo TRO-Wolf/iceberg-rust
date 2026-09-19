@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Drop file-scoped deletes that reference data files this rewrite removes.
-//!
 //! Delete-file removal is keyed by the Java `DeleteFileSet` triple, so a drop leaves
 //! a sibling blob at the same Puffin path in place.
 
@@ -37,14 +35,19 @@ pub(super) struct DvRewritePlan {
     pub(super) removed_count: usize,
 }
 
+pub(super) struct LiveFileScopedDeletes {
+    pub(super) paths: HashSet<String>,
+    pub(super) deletion_vectors: Vec<(DataFile, String)>,
+}
+
 pub(super) fn plan_dv_removal(
-    live: &[(DataFile, String)],
+    deletion_vectors: &[(DataFile, String)],
     rewritten_data_paths: &HashSet<String>,
 ) -> DvRewritePlan {
     let mut removed = Vec::new();
     let mut removed_count: usize = 0;
-    for (delete_file, referenced) in live {
-        if is_deletion_vector(delete_file) && rewritten_data_paths.contains(referenced) {
+    for (delete_file, referenced) in deletion_vectors {
+        if rewritten_data_paths.contains(referenced) {
             removed_count = removed_count.saturating_add(1);
             removed.push(delete_file.clone());
         }
@@ -55,41 +58,20 @@ pub(super) fn plan_dv_removal(
     }
 }
 
-pub(super) fn file_scoped_delete_paths_from(live: &[(DataFile, String)]) -> HashSet<String> {
-    live.iter()
-        .map(|(delete_file, _)| delete_file.file_path().to_string())
-        .collect()
-}
-
 #[cfg(test)]
 pub(super) async fn file_scoped_delete_paths(table: &Table) -> Result<HashSet<String>> {
-    let mut paths = HashSet::new();
-    let Some(manifests) = load_delete_manifests(table).await? else {
-        return Ok(paths);
-    };
-    for manifest in manifests {
-        for entry in manifest.entries() {
-            if !entry.is_alive() {
-                continue;
-            }
-            let data_file = entry.data_file();
-            if data_file.content_type() != DataContentType::PositionDeletes {
-                continue;
-            }
-            if referenced_data_file_location(data_file).is_some() {
-                paths.insert(data_file.file_path().to_string());
-            }
-        }
-    }
-    Ok(paths)
+    Ok(live_file_scoped_position_deletes(table).await?.paths)
 }
 
 pub(super) async fn live_file_scoped_position_deletes(
     table: &Table,
-) -> Result<Vec<(DataFile, String)>> {
-    let mut out = Vec::new();
+) -> Result<LiveFileScopedDeletes> {
+    let mut live = LiveFileScopedDeletes {
+        paths: HashSet::new(),
+        deletion_vectors: Vec::new(),
+    };
     let Some(manifests) = load_delete_manifests(table).await? else {
-        return Ok(out);
+        return Ok(live);
     };
     for manifest in manifests {
         for entry in manifest.entries() {
@@ -101,11 +83,14 @@ pub(super) async fn live_file_scoped_position_deletes(
                 continue;
             }
             if let Some(referenced) = referenced_data_file_location(data_file) {
-                out.push((data_file.clone(), referenced));
+                live.paths.insert(data_file.file_path().to_string());
+                if is_deletion_vector(data_file) {
+                    live.deletion_vectors.push((data_file.clone(), referenced));
+                }
             }
         }
     }
-    Ok(out)
+    Ok(live)
 }
 
 async fn load_delete_manifests(table: &Table) -> Result<Option<Vec<Manifest>>> {

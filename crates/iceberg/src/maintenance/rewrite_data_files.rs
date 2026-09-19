@@ -296,7 +296,7 @@ impl RewriteDataFiles {
         let tasks = self.plan_scan_tasks().await?;
         let data_files_by_path = self.collect_live_data_files().await?;
         let live_deletes = rewrite_dv::live_file_scoped_position_deletes(&self.table).await?;
-        config.file_scoped_delete_paths = rewrite_dv::file_scoped_delete_paths_from(&live_deletes);
+        config.file_scoped_delete_paths = live_deletes.paths;
         let mut groups = plan_file_groups_for_table(&self.table, tasks, &config);
 
         if groups.is_empty() {
@@ -323,7 +323,7 @@ impl RewriteDataFiles {
                         &table,
                         &groups[cursor],
                         &data_files_by_path,
-                        &live_deletes,
+                        &live_deletes.deletion_vectors,
                         &config,
                         &output_spec,
                     )
@@ -550,7 +550,7 @@ impl RewriteDataFiles {
         table: &Table,
         group: &[FileScanTask],
         data_files_by_path: &HashMap<String, DataFile>,
-        live_file_scoped_deletes: &[(DataFile, String)],
+        live_deletion_vectors: &[(DataFile, String)],
         config: &ResolvedConfig,
         output_spec: &PartitionSpecRef,
     ) -> Result<WrittenGroup> {
@@ -595,7 +595,7 @@ impl RewriteDataFiles {
             .iter()
             .map(|file| file.file_path().to_string())
             .collect();
-        let dv_plan = rewrite_dv::plan_dv_removal(live_file_scoped_deletes, &rewritten_paths);
+        let dv_plan = rewrite_dv::plan_dv_removal(live_deletion_vectors, &rewritten_paths);
 
         Ok(WrittenGroup {
             result,

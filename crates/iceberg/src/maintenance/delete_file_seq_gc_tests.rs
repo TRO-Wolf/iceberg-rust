@@ -18,6 +18,7 @@
 use std::collections::HashSet;
 
 use crate::Catalog;
+use crate::maintenance::RemoveDanglingDeleteFiles;
 use crate::maintenance::rewrite_data_files::RewriteDataFiles;
 use crate::maintenance::rewrite_data_files::tests::{
     add_deletes, append_files, create_partitioned_table, live_delete_file_paths, local_fs_catalog,
@@ -26,6 +27,7 @@ use crate::maintenance::rewrite_data_files::tests::{
 use crate::maintenance::rewrite_data_files_cow_bytes_tests::{
     file_scoped_metrics, partition_scoped_metrics, write_position_delete,
 };
+use crate::maintenance::rewrite_data_files_router_bound_tests::write_dv;
 use crate::maintenance::rewrite_position_delete_files::RewritePositionDeleteFiles;
 use crate::spec::{DataContentType, DataFile, FormatVersion};
 use crate::table::Table;
@@ -398,4 +400,42 @@ async fn test_seq_gc_row_delta_adding_deletes_only_keeps_stale_delete() {
     let table = add_deletes(&catalog, &stale.table, vec![extra]).await;
     assert_kept(&table, &stale.delete_path).await;
     assert_eq!(live_delete_file_paths(&table).await.len(), 2);
+}
+
+#[tokio::test]
+async fn test_remove_dangling_keeps_a_foreign_partition_dv_whose_data_file_is_live() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V3).await;
+    let a = write_data_file(&table, "a.parquet", 1, &rows(1, 10, 3)).await;
+    let a_path = a.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![a]).await;
+    let dv = write_dv(&table, 2, &[(a_path.as_str(), &[1])]).await;
+    assert_eq!(dv.len(), 1);
+    assert_eq!(
+        dv[0].referenced_data_file().as_deref(),
+        Some(a_path.as_str())
+    );
+    let dv_path = dv[0].file_path().to_string();
+    let table = add_deletes(&catalog, &table, dv).await;
+    let expected = vec![(1, 10, 10), (1, 12, 12)];
+    assert_eq!(scan_rows(&table).await, expected);
+
+    let result = RemoveDanglingDeleteFiles::new(table.clone())
+        .execute(&catalog)
+        .await
+        .expect("remove dangling deletes");
+    assert_eq!(
+        result.removed_dvs_count(),
+        0,
+        "a DV whose referenced data file is live still masks a row and must not be collected"
+    );
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload after remove dangling");
+    assert_eq!(
+        live_delete_file_paths(&table).await,
+        HashSet::from([dv_path])
+    );
+    assert_eq!(scan_rows(&table).await, expected);
 }

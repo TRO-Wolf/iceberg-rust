@@ -273,8 +273,8 @@ fn find_dangling_deletes(live: &LiveEntries) -> Vec<DataFile> {
                 .is_some_and(|referenced| live.live_data_file_paths.contains(&referenced));
             if !live_referenced {
                 dangling.push(data_file.clone());
-                continue;
             }
+            continue;
         } else if referenced_data_file_location(data_file)
             .is_some_and(|referenced| live.live_data_file_paths.contains(&referenced))
         {

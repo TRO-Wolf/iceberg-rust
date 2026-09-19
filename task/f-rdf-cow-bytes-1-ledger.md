@@ -45,7 +45,7 @@ merge-on-read DELETE writes a parquet position-delete file with FULL `file_path`
 (`crates/iceberg/src/maintenance/rewrite_data_files_dv.rs`) then drops that delete in the
 `RewriteFiles` commit when the referenced data file is rewritten — because it treats every
 file-scoped position delete as a deletion vector. Java's DV-removal path
-(`RewriteDataFilesSparkAction.danglingDVs` via `ContentFileUtil.isDV`) is Puffin-only, so
+(`ManifestFilterManager.isDanglingDV` inside `MergingSnapshotProducer.apply`, via `ContentFileUtil.isDV`) is Puffin-only, so
 Spark keeps the parquet delete.
 
 ## Step 0 — measurement
@@ -117,7 +117,7 @@ below the partition minimum data seq 9 → kept.
 
 The earlier whole-file DELETE probe was invalid (Spark removed the data file entirely).
 The corrected probe ran Spark 4.1.2 + Iceberg 1.11.0 under
-`/tmp/oc-worker/_lib/jvm-lock.sh /tmp/sparkenv/bin/python` (driver 2g, UI off):
+the shared JVM lock wrapper with the Spark virtualenv's python (driver 2g, UI off):
 
 ```python
 # shape: unpartitioned (id BIGINT, v STRING), v2, write.delete.mode=merge-on-read,
@@ -149,7 +149,7 @@ file-scoped parquet deletes through a DV-shaped path — Java's reclaim is Puffi
   are deletion vectors; parquet position deletes never are.
 - `ContentFileUtil.referencedDataFile` — legs: `referenced_data_file` field, else equal
   `file_path` lower/upper bounds. Format-agnostic; decides INDEX ROUTING only.
-- `RewriteDataFilesSparkAction.danglingDVs` / `isDanglingDV` — drops only `isDV` deletes
+- `ManifestFilterManager.isDanglingDV` (1.11.0 L493-495, reached through `MergingSnapshotProducer.apply` → `removeDanglingDeletesFor`, L994-995; round 4 corrected the round-1 name `RewriteDataFilesSparkAction.danglingDVs`, which does not exist in 1.11.0) — drops only `isDV` deletes
   whose referenced data file was rewritten. Puffin-only.
 - `BaseRewriteFiles` / `MergingSnapshotProducer.apply` —
   `dropDeleteFilesOlderThan(minDataSequenceNumber)`: sequence-based GC of delete entries
@@ -204,7 +204,7 @@ under `use-starting-sequence-number=false`.
 ## Step 2 — the fix
 
 Two removal paths restricted to `is_deletion_vector` (Puffin), matching Java's
-`danglingDVs` / `ContentFileUtil.isDV`:
+`ManifestFilterManager.isDanglingDV` / `ContentFileUtil.isDV`:
 
 - `rewrite_data_files_dv.rs::plan_dv_removal` — the drop predicate gains
   `is_deletion_vector(delete_file) &&`: a file-scoped PARQUET position delete whose
@@ -309,7 +309,7 @@ comment line counts as an added one. Round 3 deletes the whole three-line senten
 (`//! Java 1.10.0 ManifestFilterManager.isDanglingDV is …`, `//!
 removedDataFilePaths.contains(…). The apply path drops DVs`, `//! only. …`) — pure
 deletion, no comment line added or changed. The fact the sentence carried is already
-recorded in "Java rules confirmed from source" above (`danglingDVs`/`isDanglingDV`
+recorded in "Java rules confirmed from source" above (`ManifestFilterManager.isDanglingDV`
 drops only `isDV` deletes whose referenced data file was rewritten; Puffin-only).
 
 ### Seq-GC audit — does the fork port `MergingSnapshotProducer.dropDeleteFilesOlderThan`?
