@@ -18,13 +18,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use iceberg::io::FileIO;
+use iceberg::CatalogBuilder;
+use iceberg::io::{FileIO, MemoryStorageFactory};
 use iceberg::spec::{
     NestedField, PrimitiveType, Schema, TableMetadata, TableMetadataBuilder, Type,
 };
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{TableCreation, TableMetadataCache};
 
 use super::*;
+use crate::commit_transport::{GlueCommitScript, ScriptedGlueCommitTransport};
 
 type PointerFn = Arc<dyn Fn(&TableIdent) -> Result<(String, Option<String>)> + Send + Sync>;
 type PointerState = Arc<Mutex<(String, Option<String>)>>;
@@ -151,7 +154,9 @@ async fn p1_second_handle_commit_visible_on_first_handle_next_load() {
     assert_eq!(before.metadata().location(), "memory://wh/t");
 
     *state.lock().expect("pointer state") = (loc2.to_string(), Some("vid-2".to_string()));
-    second_handle.cache_put(loc2, &meta2).await;
+    second_handle
+        .cache_put(loc2, Arc::new(meta2), Some("vid-2".to_string()))
+        .await;
 
     let after = first_handle
         .load_table(&t)
@@ -446,5 +451,498 @@ async fn p9_no_cache_handles_every_load_body_gets() {
         warm2.metadata().location(),
         "memory://wh/t-rewritten",
         "with a cache handle the second load serves the cached Arc"
+    );
+}
+
+fn builder_props(
+    catalog_id: Option<&str>,
+    warehouse: &str,
+    extra: &[(&str, &str)],
+) -> HashMap<String, String> {
+    let mut props = HashMap::new();
+    if let Some(id) = catalog_id {
+        props.insert(GLUE_CATALOG_PROP_CATALOG_ID.to_string(), id.to_string());
+    }
+    props.insert(
+        GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse.to_string(),
+    );
+    for (key, value) in extra {
+        props.insert(key.to_string(), value.to_string());
+    }
+    props
+}
+
+fn failable_pointer() -> (Arc<Mutex<Option<(String, Option<String>)>>>, PointerFn) {
+    let state = Arc::new(Mutex::new(None));
+    let held = Arc::clone(&state);
+    (
+        state,
+        Arc::new(move |_| {
+            held.lock().expect("pointer state").clone().ok_or_else(|| {
+                Error::new(ErrorKind::Unexpected, "pointer fetch failed")
+            })
+        }),
+    )
+}
+
+#[tokio::test]
+async fn l1_region_only_injected_factory_isolates_shared_cache() {
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    let (_state, source) = mutable_pointer(loc, Some("vid"));
+    let shared = Arc::new(TableMetadataCache::new());
+    let t = ident("t");
+
+    let cat_a = GlueCatalogBuilder::default()
+        .with_table_metadata_cache(Arc::clone(&shared))
+        .with_storage_factory(Arc::new(MemoryStorageFactory))
+        .load(
+            "glue-a",
+            builder_props(
+                Some("shared-cat"),
+                "memory://wh",
+                &[("region_name", "us-east-1")],
+            ),
+        )
+        .await
+        .expect("load catalog a")
+        .with_pointer_source(Arc::clone(&source));
+    let cat_b = GlueCatalogBuilder::default()
+        .with_table_metadata_cache(Arc::clone(&shared))
+        .with_storage_factory(Arc::new(MemoryStorageFactory))
+        .load(
+            "glue-b",
+            builder_props(
+                Some("shared-cat"),
+                "memory://wh",
+                &[("region_name", "us-east-1")],
+            ),
+        )
+        .await
+        .expect("load catalog b")
+        .with_pointer_source(source);
+
+    sample_metadata("memory://wh/t-a")
+        .write_to(&cat_a.file_io(), loc)
+        .await
+        .expect("write a body");
+    sample_metadata("memory://wh/t-b")
+        .write_to(&cat_b.file_io(), loc)
+        .await
+        .expect("write b body");
+
+    let table_a = cat_a.load_table(&t).await.expect("load a");
+    let table_b = cat_b.load_table(&t).await.expect("load b");
+    assert_eq!(table_a.metadata().location(), "memory://wh/t-a");
+    assert_eq!(table_b.metadata().location(), "memory://wh/t-b");
+    let stats = shared.stats();
+    assert_eq!(stats.body_fetches, 2, "injected-io scopes must isolate");
+    assert_eq!(stats.misses, 2);
+
+    cat_a.load_table(&t).await.expect("warm a load");
+    assert_eq!(shared.stats().hits, 1, "each isolated scope still caches");
+}
+
+#[tokio::test]
+async fn l2_register_table_reads_body_directly() {
+    let file_io = FileIO::new_with_memory();
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    let (_state, source) = mutable_pointer(loc, Some("vid"));
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        Some("cat-1"),
+        "s3://wh",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        None,
+        source,
+    )
+    .await
+    .with_create_source(Arc::new(|_| Ok(())));
+    let t = ident("t");
+
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write v1");
+    cat.load_table(&t).await.expect("seed cached entry");
+
+    sample_metadata("memory://wh/t-registered")
+        .write_to(&file_io, loc)
+        .await
+        .expect("rewrite body");
+    let registered = cat
+        .register_table(&ident("t2"), loc.to_string())
+        .await
+        .expect("register reads the live body");
+    assert_eq!(
+        registered.metadata().location(),
+        "memory://wh/t-registered",
+        "register must bypass the cached parse"
+    );
+
+    let loaded = cat.load_table(&t).await.expect("load after register");
+    assert_eq!(
+        loaded.metadata().location(),
+        "memory://wh/t-registered",
+        "register must republish the entry it replaced"
+    );
+
+    let missing = cat
+        .register_table(&ident("t3"), "memory://wh/t/absent.metadata.json".to_string())
+        .await;
+    assert!(missing.is_err(), "register of a missing body must fail");
+}
+
+#[tokio::test]
+async fn l3_invalidate_table_evicts_current_pointer_location() {
+    let file_io = FileIO::new_with_memory();
+    let loc1 = "memory://wh/t/metadata/v1.metadata.json";
+    let loc2 = "memory://wh/t/metadata/v2.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc1)
+        .await
+        .expect("write v1");
+    sample_metadata("memory://wh/t-moved")
+        .write_to(&file_io, loc2)
+        .await
+        .expect("write v2");
+    let (state, source) = mutable_pointer(loc1, Some("vid-1"));
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        Some("cat-1"),
+        "s3://wh",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        None,
+        source,
+    )
+    .await;
+    let t = ident("t");
+
+    cat.load_table(&t).await.expect("seed loc1 entry");
+    *state.lock().expect("pointer state") = (loc2.to_string(), Some("vid-2".to_string()));
+    cat.load_table(&t).await.expect("seed loc2 entry");
+
+    cat.invalidate_table(&t).await.expect("invalidate");
+    cat.load_table(&t).await.expect("load after invalidate");
+
+    let stats = cache.stats();
+    assert_eq!(
+        stats.misses, 3,
+        "the evicted current location must miss again"
+    );
+    assert_eq!(stats.body_fetches, 3);
+    cache.run_pending_tasks().await;
+    assert_eq!(cache.len(), 2, "loc1 entry stays; only the current location evicts");
+}
+
+#[tokio::test]
+async fn l3_invalidate_pointer_failure_evicts_nothing() {
+    let file_io = FileIO::new_with_memory();
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write");
+    let (state, source) = failable_pointer();
+    *state.lock().expect("pointer state") = Some((loc.to_string(), Some("vid".to_string())));
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        Some("cat-1"),
+        "s3://wh",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        None,
+        source,
+    )
+    .await;
+    let t = ident("t");
+
+    cat.load_table(&t).await.expect("seed entry");
+    *state.lock().expect("pointer state") = None;
+
+    let err = cat.invalidate_table(&t).await;
+    assert!(err.is_err(), "a failed pointer fetch must surface");
+
+    *state.lock().expect("pointer state") = Some((loc.to_string(), Some("vid".to_string())));
+    cat.load_table(&t).await.expect("warm load still cached");
+    assert_eq!(cache.stats().hits, 1, "nothing must be evicted on failure");
+}
+
+#[tokio::test]
+async fn l3_drop_table_evicts_last_known_location() {
+    let file_io = FileIO::new_with_memory();
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write");
+    let (_state, source) = mutable_pointer(loc, Some("vid"));
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        Some("cat-1"),
+        "s3://wh",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        None,
+        source,
+    )
+    .await
+    .with_drop_source(Arc::new(|_| Ok(())));
+    let t = ident("t");
+
+    cat.load_table(&t).await.expect("seed entry");
+    cat.drop_table(&t).await.expect("drop");
+    cat.load_table(&t).await.expect("load after drop");
+
+    let stats = cache.stats();
+    assert_eq!(stats.misses, 2, "dropped location must refetch");
+    assert_eq!(stats.body_fetches, 2);
+}
+
+#[tokio::test]
+async fn l3_drop_failure_keeps_cache_entry() {
+    let file_io = FileIO::new_with_memory();
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write");
+    let (_state, source) = mutable_pointer(loc, Some("vid"));
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        Some("cat-1"),
+        "s3://wh",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        None,
+        source,
+    )
+    .await
+    .with_drop_source(Arc::new(|_| {
+        Err(Error::new(ErrorKind::Unexpected, "delete refused"))
+    }));
+    let t = ident("t");
+
+    cat.load_table(&t).await.expect("seed entry");
+    let err = cat.drop_table(&t).await;
+    assert!(err.is_err(), "failed drop must surface");
+    cat.load_table(&t).await.expect("warm load after failed drop");
+    assert_eq!(cache.stats().hits, 1, "a failed drop must not evict");
+}
+
+#[tokio::test]
+async fn l005_publish_arms_version_id_on_first_load() {
+    let file_io = FileIO::new_with_memory();
+    let loc1 = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc1)
+        .await
+        .expect("write v1");
+    let (state, source) = mutable_pointer(loc1, Some("vid-1"));
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat = catalog(
+        Some("cat-1"),
+        "s3://wh",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        None,
+        source,
+    )
+    .await
+    .with_commit_transport(ScriptedGlueCommitTransport::new([
+        GlueCommitScript::Success,
+    ]));
+    let t = ident("t");
+
+    let table = cat.load_table(&t).await.expect("seed load");
+    let tx = Transaction::new(&table);
+    let committed = tx
+        .update_table_properties()
+        .set("v".to_string(), "2".to_string())
+        .apply(tx)
+        .expect("apply")
+        .commit(&cat)
+        .await
+        .expect("commit");
+    let loc2 = committed
+        .metadata_location()
+        .expect("committed location")
+        .to_string();
+
+    *state.lock().expect("pointer state") = (loc2.clone(), Some("vid-2".to_string()));
+    cat.load_table(&t).await.expect("published entry hits");
+    let stats = cache.stats();
+    assert_eq!(stats.body_fetches, 1, "the published entry must serve the load");
+    assert_eq!(stats.hits, 2, "commit base refresh + published load");
+
+    *state.lock().expect("pointer state") = (loc2.clone(), Some("vid-3".to_string()));
+    cat.load_table(&t)
+        .await
+        .expect("a different version id must fail closed");
+    let stats = cache.stats();
+    assert_eq!(stats.misses, 2);
+    assert_eq!(stats.body_fetches, 2);
+
+    cat.load_table(&t).await.expect("re-armed warm load");
+    assert_eq!(cache.stats().hits, 3);
+}
+
+#[tokio::test]
+async fn p1_commit_through_update_table_visible_on_shared_handle() {
+    let file_io = FileIO::new_with_memory();
+    let loc1 = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc1)
+        .await
+        .expect("write v1");
+    let (state, source) = mutable_pointer(loc1, Some("vid-1"));
+    let cache = Arc::new(TableMetadataCache::new());
+    let cat_a = catalog(
+        Some("cat-1"),
+        "s3://wh",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        Some("ctx-shared".to_string()),
+        Arc::clone(&source),
+    )
+    .await;
+    let cat_b = catalog(
+        Some("cat-1"),
+        "s3://wh",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        Some("ctx-shared".to_string()),
+        source,
+    )
+    .await
+    .with_commit_transport(ScriptedGlueCommitTransport::new([
+        GlueCommitScript::Success,
+    ]));
+    let t = ident("t");
+
+    cat_a.load_table(&t).await.expect("cold load on a");
+    let table_b = cat_b.load_table(&t).await.expect("warm load on b");
+    assert_eq!(cache.stats().body_fetches, 1);
+
+    let tx = Transaction::new(&table_b);
+    let committed = tx
+        .update_table_properties()
+        .set("commit.marker".to_string(), "yes".to_string())
+        .apply(tx)
+        .expect("apply")
+        .commit(&cat_b)
+        .await
+        .expect("commit through update_table");
+    let loc2 = committed
+        .metadata_location()
+        .expect("committed location")
+        .to_string();
+    assert_ne!(loc2, loc1);
+
+    *state.lock().expect("pointer state") = (loc2.clone(), Some("vid-2".to_string()));
+
+    let after = cat_a.load_table(&t).await.expect("load after commit");
+    assert_eq!(after.metadata_location(), Some(loc2.as_str()));
+    assert_eq!(
+        after.metadata().properties().get("commit.marker"),
+        Some(&"yes".to_string()),
+        "handle a must observe the committed metadata"
+    );
+    let stats = cache.stats();
+    assert_eq!(
+        stats.body_fetches, 1,
+        "commit must publish the staged metadata so handle a loads warm"
+    );
+    assert_eq!(
+        stats.hits, 3,
+        "warm b load + commit base refresh + warm a post-commit load"
+    );
+}
+
+#[tokio::test]
+async fn p4_identical_credential_props_separate_by_identity_alone() {
+    let file_io = FileIO::new_with_memory();
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write");
+    let (_state, source) = mutable_pointer(loc, Some("vid"));
+    let cache = Arc::new(TableMetadataCache::new());
+    let t = ident("t");
+
+    let cat_a = catalog(
+        Some("cat-a"),
+        "s3://wh",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        Some("identical-ctx".to_string()),
+        Arc::clone(&source),
+    )
+    .await;
+    let cat_b = catalog(
+        Some("cat-b"),
+        "s3://wh",
+        &file_io,
+        Some(Arc::clone(&cache)),
+        None,
+        Some("identical-ctx".to_string()),
+        source,
+    )
+    .await;
+
+    cat_a.load_table(&t).await.expect("load a");
+    cat_b.load_table(&t).await.expect("load b");
+
+    let stats = cache.stats();
+    assert_eq!(
+        stats.misses, 2,
+        "identical credentials must still separate by catalog identity"
+    );
+    assert_eq!(stats.body_fetches, 2);
+}
+
+#[tokio::test]
+async fn p9_builder_load_without_cache_rereads_every_load() {
+    let file_io = FileIO::new_with_memory();
+    let loc = "memory://wh/t/metadata/v1.metadata.json";
+    sample_metadata("memory://wh/t")
+        .write_to(&file_io, loc)
+        .await
+        .expect("write v1");
+    let (_state, source) = mutable_pointer(loc, Some("vid"));
+
+    let cat = GlueCatalogBuilder::default()
+        .load("glue-plain", builder_props(Some("cat-1"), "s3://wh", &[]))
+        .await
+        .expect("builder load")
+        .with_file_io_for_tests(file_io.clone())
+        .with_pointer_source(source);
+    let t = ident("t");
+
+    let first = cat.load_table(&t).await.expect("first load");
+    assert_eq!(first.metadata().location(), "memory://wh/t");
+    assert!(cat.table_metadata_cache.is_none());
+
+    sample_metadata("memory://wh/t-rewritten")
+        .write_to(&file_io, loc)
+        .await
+        .expect("rewrite body");
+    let second = cat.load_table(&t).await.expect("second load");
+    assert_eq!(
+        second.metadata().location(),
+        "memory://wh/t-rewritten",
+        "without a cache handle every load re-reads the body"
     );
 }

@@ -59,6 +59,8 @@ impl GlueCatalog {
             shared_object_cache: None,
             outcome_harness: Some(harness),
             pointer_source: None,
+            drop_source: None,
+            create_source: None,
         }
     }
 }

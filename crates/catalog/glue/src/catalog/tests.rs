@@ -50,7 +50,7 @@ async fn test_name_defaults_to_sentinel_when_unset() {
 }
 
 #[tokio::test]
-async fn test_invalidate_defaults_are_noops() {
+async fn test_invalidate_table_without_cache_is_noop_and_view_is_noop() {
     let catalog = build_glue_catalog(Some("glue_cat"), HashMap::new()).await;
     let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
     catalog.invalidate_table(&ident).await.unwrap();
