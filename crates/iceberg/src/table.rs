@@ -339,34 +339,40 @@ impl Table {
         let strict_bound = predicate.clone().rewrite_not().bind(schema.clone(), true)?;
 
         let mut evaluators: HashMap<i32, ExpressionEvaluator> = HashMap::new();
-        scan.try_for_each_data_file(|data_file| {
-            let spec_id = data_file.partition_spec_id;
-            let evaluator = match evaluators.entry(spec_id) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Cannot resolve partition spec id {spec_id}"),
-                        )
-                    })?;
-                    let partition_schema = Arc::new(
-                        Schema::builder()
-                            .with_schema_id(spec.spec_id())
-                            .with_fields(spec.partition_type(schema.as_ref())?.fields().to_owned())
-                            .build()?,
-                    );
-                    let projected = StrictProjection::new(spec.clone())
-                        .strict_project(&strict_bound)?
-                        .rewrite_not()
-                        .bind(partition_schema, true)?;
-                    entry.insert(ExpressionEvaluator::new(projected))
-                }
-            };
-            Ok(evaluator.eval(data_file)?
-                || StrictMetricsEvaluator::eval(&strict_bound, data_file)?)
-        })
-        .await
+        let Some(plan_context) = scan.plan_context() else {
+            return Ok(true);
+        };
+        plan_context
+            .try_for_each_data_file(|data_file| {
+                let spec_id = data_file.partition_spec_id;
+                let evaluator = match evaluators.entry(spec_id) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                format!("Cannot resolve partition spec id {spec_id}"),
+                            )
+                        })?;
+                        let partition_schema = Arc::new(
+                            Schema::builder()
+                                .with_schema_id(spec.spec_id())
+                                .with_fields(
+                                    spec.partition_type(schema.as_ref())?.fields().to_owned(),
+                                )
+                                .build()?,
+                        );
+                        let projected = StrictProjection::new(spec.clone())
+                            .strict_project(&strict_bound)?
+                            .rewrite_not()
+                            .bind(partition_schema, true)?;
+                        entry.insert(ExpressionEvaluator::new(projected))
+                    }
+                };
+                Ok(evaluator.eval(data_file)?
+                    || StrictMetricsEvaluator::eval(&strict_bound, data_file)?)
+            })
+            .await
     }
 
     /// Returns the current schema as a shared reference.

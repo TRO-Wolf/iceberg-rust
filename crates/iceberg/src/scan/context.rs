@@ -627,9 +627,7 @@ impl PlanContext {
     }
 
     pub(crate) async fn try_for_each_data_file<F>(&self, mut f: F) -> Result<bool>
-    where
-        F: FnMut(&DataFile) -> Result<bool>,
-    {
+    where F: FnMut(&DataFile) -> Result<bool> {
         let manifest_list = self.get_manifest_list().await?;
         for manifest_file in manifest_list.entries() {
             if manifest_file.content != ManifestContentType::Data {
@@ -671,10 +669,8 @@ impl PlanContext {
                 .and_then(|spec| spec.partition_type(&self.snapshot_schema).ok());
 
             for manifest_entry in manifest.entries() {
-                let manifest_entry = ManifestEntry::with_promoted_partition(
-                    manifest_entry,
-                    partition_type.as_ref(),
-                );
+                let manifest_entry =
+                    ManifestEntry::with_promoted_partition(manifest_entry, partition_type.as_ref());
                 if survives_plan_filter(
                     &manifest_entry,
                     manifest_file.partition_spec_id,

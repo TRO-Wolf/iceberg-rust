@@ -56,7 +56,7 @@ use crate::metadata_columns::{get_metadata_field_id, is_metadata_column_name};
 use crate::metrics::{MetricsReport, MetricsReporter, ScanReport, TimeUnit, TimerResult};
 use crate::runtime::spawn;
 use crate::scan::metrics_collector::ScanMetricsCollector;
-use crate::spec::{DataContentType, DataFile, DataFileFormat, ManifestContentType, SnapshotRef};
+use crate::spec::{DataContentType, DataFileFormat, ManifestContentType, SnapshotRef};
 
 /// True when `offsets` is strictly ascending (each value > previous). Used to gate within-file
 /// expand so we only take the offsets-aware split branch, never fixed-size windows.
@@ -962,14 +962,8 @@ impl TableScan {
         self.plan_context.as_ref().map(|x| &x.snapshot)
     }
 
-    pub(crate) async fn try_for_each_data_file<F>(&self, f: F) -> Result<bool>
-    where
-        F: FnMut(&DataFile) -> Result<bool>,
-    {
-        match self.plan_context.as_ref() {
-            Some(plan_context) => plan_context.try_for_each_data_file(f).await,
-            None => Ok(true),
-        }
+    pub(crate) fn plan_context(&self) -> Option<&PlanContext> {
+        self.plan_context.as_ref()
     }
 
     async fn process_data_manifest_entry(
