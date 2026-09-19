@@ -27,9 +27,9 @@ use iceberg::{
     plan_commit_base_load,
 };
 
-use super::{GlueCatalog, GlueCatalogBuilder};
 #[cfg(test)]
 use super::PointerSource;
+use super::{GlueCatalog, GlueCatalogBuilder};
 use crate::error::from_aws_sdk_error;
 use crate::utils::{get_metadata_location, validate_namespace};
 use crate::with_catalog_id;
