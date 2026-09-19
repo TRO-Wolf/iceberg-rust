@@ -449,7 +449,8 @@ async fn append_commits_stamp_manifest_counts() {
     let (catalog, _temp) = local_fs_catalog().await;
     let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
 
-    let file_a = write_data_file(&table, "app-a.parquet", PARTITION, &rows(PARTITION, 0, 250)).await;
+    let file_a =
+        write_data_file(&table, "app-a.parquet", PARTITION, &rows(PARTITION, 0, 250)).await;
     let table = append_files(&catalog, &table, vec![file_a]).await;
     let first = table
         .metadata()
@@ -462,7 +463,13 @@ async fn append_commits_stamp_manifest_counts() {
     assert_eq!((created, kept), (1, 0), "first append writes one manifest");
     assert_manifest_counts(&props_of(&first), (1, 0, 0), "first append");
 
-    let file_b = write_data_file(&table, "app-b.parquet", PARTITION, &rows(PARTITION, 250, 250)).await;
+    let file_b = write_data_file(
+        &table,
+        "app-b.parquet",
+        PARTITION,
+        &rows(PARTITION, 250, 250),
+    )
+    .await;
     let table = append_files(&catalog, &table, vec![file_b]).await;
     let second = table
         .metadata()
@@ -493,9 +500,14 @@ async fn row_delta_merge_commit_stamps_manifest_counts() {
     let seed = write_data_file(&table, "mseed.parquet", PARTITION, &rows(PARTITION, 0, 250)).await;
     let deleted_path = seed.file_path().to_string();
     let table = append_files(&catalog, &table, vec![seed]).await;
-    let merge_file = write_data_file(&table, "mmerge.parquet", PARTITION, &rows(PARTITION, 250, 200)).await;
-    let delete_file =
-        write_position_delete_file(&table, PARTITION, &[(deleted_path, 0)]).await;
+    let merge_file = write_data_file(
+        &table,
+        "mmerge.parquet",
+        PARTITION,
+        &rows(PARTITION, 250, 200),
+    )
+    .await;
+    let delete_file = write_position_delete_file(&table, PARTITION, &[(deleted_path, 0)]).await;
     let table = merge_commit(&catalog, &table, vec![merge_file], vec![delete_file]).await;
 
     let snapshot = table
@@ -520,12 +532,23 @@ async fn cow_overwrite_commit_stamps_manifest_counts() {
     let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
 
     let file_a = write_data_file(&table, "ow-a.parquet", PARTITION, &rows(PARTITION, 0, 250)).await;
-    let file_b = write_data_file(&table, "ow-b.parquet", PARTITION, &rows(PARTITION, 250, 250)).await;
+    let file_b = write_data_file(
+        &table,
+        "ow-b.parquet",
+        PARTITION,
+        &rows(PARTITION, 250, 250),
+    )
+    .await;
     let removed = file_a.clone();
     let table = append_files(&catalog, &table, vec![file_a, file_b]).await;
 
-    let replacement =
-        write_data_file(&table, "ow-new.parquet", PARTITION, &rows(PARTITION, 500, 250)).await;
+    let replacement = write_data_file(
+        &table,
+        "ow-new.parquet",
+        PARTITION,
+        &rows(PARTITION, 500, 250),
+    )
+    .await;
     let tx = Transaction::new(&table);
     let action = tx
         .overwrite_files()
@@ -584,12 +607,24 @@ async fn merge_append_stamps_merge_side_replaced_count() {
 
     let file_a = write_data_file(&table, "ma-a.parquet", PARTITION, &rows(PARTITION, 0, 250)).await;
     let table = append_files(&catalog, &table, vec![file_a]).await;
-    let file_b = write_data_file(&table, "ma-b.parquet", PARTITION, &rows(PARTITION, 250, 250)).await;
+    let file_b = write_data_file(
+        &table,
+        "ma-b.parquet",
+        PARTITION,
+        &rows(PARTITION, 250, 250),
+    )
+    .await;
     let table = append_files(&catalog, &table, vec![file_b]).await;
     let table =
         set_table_property(&catalog, &table, "commit.manifest.min-count-to-merge", "2").await;
 
-    let file_c = write_data_file(&table, "ma-c.parquet", PARTITION, &rows(PARTITION, 500, 250)).await;
+    let file_c = write_data_file(
+        &table,
+        "ma-c.parquet",
+        PARTITION,
+        &rows(PARTITION, 500, 250),
+    )
+    .await;
     let tx = Transaction::new(&table);
     let action = tx.merge_append().add_data_files(vec![file_c]);
     let tx = action.apply(tx).expect("apply merge append");
