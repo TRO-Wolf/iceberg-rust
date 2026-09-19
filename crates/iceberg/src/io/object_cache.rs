@@ -17,6 +17,7 @@
 
 use std::mem::size_of;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::expr::accessor::StructAccessor;
 use crate::io::FileIO;
@@ -372,6 +373,7 @@ pub struct ObjectCache {
     cache: moka::future::Cache<CachedObjectKey, CachedItem>,
     file_io: FileIO,
     cache_disabled: bool,
+    body_fetches: Arc<AtomicU64>,
 }
 
 impl ObjectCache {
@@ -393,6 +395,7 @@ impl ObjectCache {
                     .build(),
                 file_io,
                 cache_disabled: false,
+                body_fetches: Arc::new(AtomicU64::new(0)),
             }
         }
     }
@@ -404,7 +407,13 @@ impl ObjectCache {
             cache: moka::future::Cache::new(0),
             file_io,
             cache_disabled: true,
+            body_fetches: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn body_fetches(&self) -> u64 {
+        self.body_fetches.load(Ordering::SeqCst)
     }
 
     /// Retrieves an Arc [`Manifest`] from the cache
@@ -418,6 +427,7 @@ impl ObjectCache {
         schema_fallback: Option<SchemaRef>,
     ) -> Result<Arc<Manifest>> {
         if self.cache_disabled {
+            self.body_fetches.fetch_add(1, Ordering::SeqCst);
             return manifest_file
                 .load_manifest_with_schema_fallback(&self.file_io, schema_fallback)
                 .await
@@ -473,6 +483,7 @@ impl ObjectCache {
         table_metadata: &TableMetadataRef,
     ) -> Result<Arc<ManifestList>> {
         if self.cache_disabled {
+            self.body_fetches.fetch_add(1, Ordering::SeqCst);
             return snapshot
                 .load_manifest_list(&self.file_io, table_metadata)
                 .await
@@ -517,6 +528,7 @@ impl ObjectCache {
         manifest_file: &ManifestFile,
         schema_fallback: Option<SchemaRef>,
     ) -> Result<CachedItem> {
+        self.body_fetches.fetch_add(1, Ordering::SeqCst);
         let (metadata, entries) = manifest_file
             .load_manifest_parts_with_schema_fallback(&self.file_io, schema_fallback)
             .await?;
@@ -531,6 +543,7 @@ impl ObjectCache {
         snapshot: &SnapshotRef,
         table_metadata: &TableMetadataRef,
     ) -> Result<CachedItem> {
+        self.body_fetches.fetch_add(1, Ordering::SeqCst);
         let manifest_list = snapshot
             .load_manifest_list(&self.file_io, table_metadata)
             .await?;
@@ -542,6 +555,10 @@ impl ObjectCache {
 #[cfg(test)]
 #[path = "object_cache_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "object_cache_scan_tests.rs"]
+mod scan_tests;
 
 #[cfg(test)]
 #[path = "object_cache_charge_tests.rs"]

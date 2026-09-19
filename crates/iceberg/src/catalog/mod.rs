@@ -39,7 +39,7 @@ pub use metadata_location::*;
 use mockall::automock;
 use serde_derive::{Deserialize, Serialize};
 pub use table_metadata_cache::{
-    TableMetadataCache, TableMetadataCacheStats, load_or_fetch_table_metadata,
+    CacheScope, TableMetadataCache, TableMetadataCacheStats, load_or_fetch_table_metadata,
 };
 use typed_builder::TypedBuilder;
 use uuid::Uuid;

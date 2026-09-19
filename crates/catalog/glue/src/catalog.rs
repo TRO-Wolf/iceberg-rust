@@ -23,6 +23,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use aws_sdk_glue::operation::create_table::CreateTableError;
 use aws_sdk_glue::types::TableInput;
+use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{
     FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
     S3_SESSION_TOKEN, StorageFactory,
@@ -30,9 +31,9 @@ use iceberg::io::{
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, CatalogBuilder, CommitBaseLoadPlan, Error, ErrorKind, MetadataLocation, Namespace,
-    NamespaceIdent, Result, TableCommit, TableCreation, TableIdent, UNNAMED_CATALOG,
-    commit_base_conflict_error, plan_commit_base_load,
+    CacheScope, Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace,
+    NamespaceIdent, Result, TableCommit, TableCreation, TableIdent, TableMetadataCache,
+    UNNAMED_CATALOG,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
@@ -46,12 +47,15 @@ use crate::commit_transport::{
 use crate::error::{from_aws_build_error, from_aws_sdk_error};
 use crate::utils::{
     convert_to_database, convert_to_glue_table, convert_to_namespace, create_sdk_config,
-    get_default_table_location, get_metadata_location, validate_namespace,
+    get_default_table_location, validate_namespace,
 };
 use crate::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, with_catalog_id,
 };
 
+#[cfg(test)]
+mod cache_tests;
+mod caches;
 mod replace_publish;
 #[cfg(test)]
 mod test_support;
@@ -70,6 +74,9 @@ pub const GLUE_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 pub struct GlueCatalogBuilder {
     config: GlueCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    table_metadata_cache: Option<Arc<TableMetadataCache>>,
+    shared_object_cache_bytes: Option<u64>,
+    cache_credential_context: Option<String>,
 }
 
 impl Default for GlueCatalogBuilder {
@@ -83,6 +90,9 @@ impl Default for GlueCatalogBuilder {
                 props: HashMap::new(),
             },
             storage_factory: None,
+            table_metadata_cache: None,
+            shared_object_cache_bytes: None,
+            cache_credential_context: None,
         }
     }
 }
@@ -141,7 +151,15 @@ impl CatalogBuilder for GlueCatalogBuilder {
                 ));
             }
 
-            GlueCatalog::new(self.config, self.storage_factory).await
+            GlueCatalog::new(self.config, self.storage_factory)
+                .await
+                .map(|catalog| {
+                    catalog.with_cache_options(
+                        self.table_metadata_cache,
+                        self.shared_object_cache_bytes,
+                        self.cache_credential_context,
+                    )
+                })
         }
     }
 }
@@ -193,9 +211,26 @@ pub struct GlueCatalog {
     client: GlueClient,
     file_io: FileIO,
     commit_transport: Arc<dyn GlueCommitTransport>,
+    table_metadata_cache: Option<Arc<TableMetadataCache>>,
+    cache_scope: CacheScope,
+    shared_object_cache: Option<Arc<ObjectCache>>,
     #[cfg(test)]
     outcome_harness: Option<Arc<GlueCommitHarness>>,
+    #[cfg(test)]
+    pointer_source: Option<PointerSource>,
+    #[cfg(test)]
+    drop_source: Option<DropSource>,
+    #[cfg(test)]
+    create_source: Option<CreateSource>,
 }
+
+#[cfg(test)]
+pub(super) type PointerSource =
+    Arc<dyn Fn(&TableIdent) -> Result<(String, Option<String>)> + Send + Sync>;
+#[cfg(test)]
+pub(super) type DropSource = Arc<dyn Fn(&TableIdent) -> Result<()> + Send + Sync>;
+#[cfg(test)]
+pub(super) type CreateSource = Arc<dyn Fn(&TableIdent) -> Result<()> + Send + Sync>;
 
 impl Debug for GlueCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -249,6 +284,7 @@ impl GlueCatalog {
         ));
 
         // Use provided factory or default to OpenDalStorageFactory::S3
+        let injected_io = storage_factory.is_some();
         let factory = storage_factory.unwrap_or_else(|| {
             Arc::new(OpenDalStorageFactory::S3 {
                 configured_scheme: "s3a".to_string(),
@@ -259,188 +295,56 @@ impl GlueCatalog {
             .with_props(file_io_props)
             .build();
 
+        let cache_scope = if injected_io {
+            CacheScope::isolated(format!(
+                "glue:{}:{}:{}",
+                config.catalog_id.as_deref().unwrap_or("default"),
+                config
+                    .props
+                    .get(AWS_REGION_NAME)
+                    .map(String::as_str)
+                    .unwrap_or("default"),
+                config.warehouse
+            ))
+        } else {
+            CacheScope::for_catalog(
+                format!(
+                    "glue:{}:{}:{}",
+                    config.catalog_id.as_deref().unwrap_or("default"),
+                    config
+                        .props
+                        .get(AWS_REGION_NAME)
+                        .map(String::as_str)
+                        .unwrap_or("default"),
+                    config.warehouse
+                ),
+                None,
+                &config.props,
+            )
+        };
+
         Ok(GlueCatalog {
             config,
             client: GlueClient(client),
             file_io,
             commit_transport,
+            table_metadata_cache: None,
+            cache_scope,
+            shared_object_cache: None,
             #[cfg(test)]
             outcome_harness: None,
+            #[cfg(test)]
+            pointer_source: None,
+            #[cfg(test)]
+            drop_source: None,
+            #[cfg(test)]
+            create_source: None,
         })
     }
 
     /// Get the catalogs `FileIO`
     pub fn file_io(&self) -> FileIO {
         self.file_io.clone()
-    }
-
-    /// Glue GetTable for the service metadata pointer + version_id, without reading TableMetadata
-    /// from object storage. Used by the commit path to skip a second full metadata load when the
-    /// pointer still matches the commit base.
-    async fn get_table_pointer(
-        &self,
-        table: &TableIdent,
-    ) -> Result<(
-        String,         /* metadata_location */
-        Option<String>, /* version_id */
-    )> {
-        let db_name = validate_namespace(table.namespace())?;
-        let table_name = table.name();
-
-        #[cfg(test)]
-        if let Some(harness) = &self.outcome_harness {
-            return Ok(harness.pointer());
-        }
-
-        let builder = self
-            .client
-            .0
-            .get_table()
-            .database_name(&db_name)
-            .name(table_name);
-        let builder = with_catalog_id!(builder, self.config);
-
-        let glue_table_output = builder.send().await.map_err(from_aws_sdk_error)?;
-
-        let glue_table = glue_table_output.table().ok_or_else(|| {
-            Error::new(
-                ErrorKind::TableNotFound,
-                format!(
-                    "Table object for database: {db_name} and table: {table_name} does not exist"
-                ),
-            )
-        })?;
-
-        let version_id = glue_table.version_id.clone();
-        let metadata_location = get_metadata_location(&glue_table.parameters)?;
-        Ok((metadata_location, version_id))
-    }
-
-    /// Loads a table from the Glue Catalog along with its version_id for optimistic locking.
-    ///
-    /// # Returns
-    /// A `Result` wrapping a tuple of (`Table`, `Option<String>`) where the String is the version_id
-    /// from Glue that should be used for optimistic concurrency control when updating the table.
-    ///
-    /// # Errors
-    /// This function may return an error in several scenarios, including:
-    /// - Failure to validate the namespace.
-    /// - Failure to retrieve the table from the Glue Catalog.
-    /// - Absence of metadata location information in the table's properties.
-    /// - Issues reading or deserializing the table's metadata file.
-    async fn load_table_with_version_id(
-        &self,
-        table: &TableIdent,
-    ) -> Result<(Table, Option<String>)> {
-        let db_name = validate_namespace(table.namespace())?;
-        let table_name = table.name();
-        #[cfg(test)]
-        if let Some(harness) = &self.outcome_harness {
-            let loaded = harness.table();
-            let version_id = harness.pointer().1;
-            let rebound = Table::builder()
-                .file_io(self.file_io())
-                .metadata_location(
-                    loaded
-                        .metadata_location()
-                        .ok_or_else(|| {
-                            Error::new(
-                                ErrorKind::Unexpected,
-                                format!(
-                                    "Table object for database: {db_name} and table: {table_name} is missing a metadata location"
-                                ),
-                            )
-                        })?
-                        .to_string(),
-                )
-                .metadata(loaded.metadata_ref())
-                .identifier(TableIdent::new(
-                    NamespaceIdent::new(db_name),
-                    table_name.to_owned(),
-                ))
-                .build()?;
-            return Ok((rebound, version_id));
-        }
-        let (metadata_location, version_id) = self.get_table_pointer(table).await?;
-
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
-
-        let table = Table::builder()
-            .file_io(self.file_io())
-            .metadata_location(metadata_location)
-            .metadata(metadata)
-            .identifier(TableIdent::new(
-                NamespaceIdent::new(db_name),
-                table_name.to_owned(),
-            ))
-            .build()?;
-
-        Ok((table, version_id))
-    }
-
-    /// Resolve the base table for a commit: GetTable for the pointer + version_id, then either
-    /// reuse a pre-loaded base (skip S3 metadata parse), conflict early, or full-load metadata.
-    async fn resolve_commit_base(
-        &self,
-        table_ident: &TableIdent,
-        commit: &mut TableCommit,
-    ) -> Result<(
-        Table,
-        Option<String>, /* version_id */
-        String,         /* current_metadata_location */
-    )> {
-        let (service_location, version_id) = self.get_table_pointer(table_ident).await?;
-        let base_loc = commit.base_metadata_location().map(str::to_string);
-        let provided = commit.take_base_table();
-        let provided_loc = provided
-            .as_ref()
-            .and_then(|t| t.metadata_location().map(str::to_string));
-
-        match plan_commit_base_load(
-            &service_location,
-            base_loc.as_deref(),
-            provided_loc.as_deref(),
-        ) {
-            CommitBaseLoadPlan::ReuseProvided => {
-                let provided = provided.ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "commit base-load plan is ReuseProvided but no base table was supplied",
-                    )
-                })?;
-                // Rebind catalog FileIO + commit identifier (defense in depth vs forged base).
-                let db_name = validate_namespace(table_ident.namespace())?;
-                let table = Table::builder()
-                    .file_io(self.file_io())
-                    .metadata_location(service_location.clone())
-                    .metadata(provided.metadata_ref())
-                    .identifier(TableIdent::new(
-                        NamespaceIdent::new(db_name),
-                        table_ident.name().to_owned(),
-                    ))
-                    .build()?;
-                Ok((table, version_id, service_location))
-            }
-            CommitBaseLoadPlan::Conflict => Err(commit_base_conflict_error(
-                table_ident,
-                base_loc.as_deref(),
-                &service_location,
-            )),
-            CommitBaseLoadPlan::FullLoad => {
-                let metadata = TableMetadata::read_from(&self.file_io, &service_location).await?;
-                let db_name = validate_namespace(table_ident.namespace())?;
-                let table = Table::builder()
-                    .file_io(self.file_io())
-                    .metadata_location(service_location.clone())
-                    .metadata(metadata)
-                    .identifier(TableIdent::new(
-                        NamespaceIdent::new(db_name),
-                        table_ident.name().to_owned(),
-                    ))
-                    .build()?;
-                Ok((table, version_id, service_location))
-            }
-        }
     }
 }
 
@@ -747,12 +651,17 @@ impl Catalog for GlueCatalog {
 
         builder.send().await.map_err(from_aws_sdk_error)?;
 
-        Table::builder()
-            .file_io(self.file_io())
-            .metadata_location(metadata_location)
+        let table = self
+            .table_builder()
+            .metadata_location(metadata_location.clone())
             .metadata(metadata)
             .identifier(TableIdent::new(NamespaceIdent::new(db_name), table_name))
-            .build()
+            .build()?;
+
+        self.cache_put(&metadata_location, table.metadata_ref(), None)
+            .await;
+
+        Ok(table)
     }
 
     /// Loads a table from the Glue Catalog and constructs a `Table` object
@@ -772,19 +681,14 @@ impl Catalog for GlueCatalog {
         Ok(table)
     }
 
-    /// Asynchronously drops a table from the database.
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - The namespace provided in `table` cannot be validated
-    /// or does not exist.
-    /// - The underlying database client encounters an error while
-    /// attempting to drop the table. This includes scenarios where
-    /// the table does not exist.
-    /// - Any network or communication error occurs with the database backend.
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
         let db_name = validate_namespace(table.namespace())?;
         let table_name = table.name();
+        let dropped_location = self
+            .get_table_pointer(table)
+            .await
+            .ok()
+            .map(|(location, _)| location);
 
         let builder = self
             .client
@@ -794,8 +698,32 @@ impl Catalog for GlueCatalog {
             .name(table_name);
         let builder = with_catalog_id!(builder, self.config);
 
+        #[cfg(test)]
+        if let Some(source) = &self.drop_source {
+            source(table)?;
+        }
+        #[cfg(test)]
+        if self.drop_source.is_none() {
+            builder.send().await.map_err(from_aws_sdk_error)?;
+        }
+        #[cfg(not(test))]
         builder.send().await.map_err(from_aws_sdk_error)?;
 
+        if let (Some(cache), Some(location)) = (
+            self.table_metadata_cache.as_ref(),
+            dropped_location.as_deref(),
+        ) {
+            cache.invalidate(&self.cache_scope, location).await;
+        }
+        Ok(())
+    }
+
+    async fn invalidate_table(&self, table: &TableIdent) -> Result<()> {
+        let Some(cache) = self.table_metadata_cache.as_ref() else {
+            return Ok(());
+        };
+        let (location, _) = self.get_table_pointer(table).await?;
+        cache.invalidate(&self.cache_scope, &location).await;
         Ok(())
     }
 
@@ -951,31 +879,46 @@ impl Catalog for GlueCatalog {
             .table_input(table_input);
         let builder = with_catalog_id!(builder, self.config);
 
-        builder.send().await.map_err(|e| {
-            let error = e.into_service_error();
-            match error {
-                CreateTableError::EntityNotFoundException(_) => Error::new(
-                    ErrorKind::NamespaceNotFound,
-                    format!("Database {db_name} does not exist"),
-                ),
-                CreateTableError::AlreadyExistsException(_) => Error::new(
-                    ErrorKind::TableAlreadyExists,
-                    format!("Table {table_ident} already exists"),
-                ),
-                _ => Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Failed to register table {table_ident} due to AWS SDK error"),
-                ),
-            }
-            .with_source(anyhow!("aws sdk error: {error:?}"))
-        })?;
+        let send_result = async {
+            builder.send().await.map_err(|e| {
+                let error = e.into_service_error();
+                match error {
+                    CreateTableError::EntityNotFoundException(_) => Error::new(
+                        ErrorKind::NamespaceNotFound,
+                        format!("Database {db_name} does not exist"),
+                    ),
+                    CreateTableError::AlreadyExistsException(_) => Error::new(
+                        ErrorKind::TableAlreadyExists,
+                        format!("Table {table_ident} already exists"),
+                    ),
+                    _ => Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to register table {table_ident} due to AWS SDK error"),
+                    ),
+                }
+                .with_source(anyhow!("aws sdk error: {error:?}"))
+            })
+        };
+        #[cfg(test)]
+        if let Some(source) = &self.create_source {
+            source(table_ident)?;
+        } else {
+            send_result.await?;
+        }
+        #[cfg(not(test))]
+        send_result.await?;
 
-        Ok(Table::builder()
+        let table = self
+            .table_builder()
             .identifier(table_ident.clone())
-            .metadata_location(metadata_location)
+            .metadata_location(metadata_location.clone())
             .metadata(metadata)
-            .file_io(self.file_io())
-            .build()?)
+            .build()?;
+
+        self.cache_put(&metadata_location, table.metadata_ref(), None)
+            .await;
+
+        Ok(table)
     }
 
     async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
@@ -1019,6 +962,9 @@ impl Catalog for GlueCatalog {
             harness.publish(staged_table.clone());
         }
         map_glue_commit_send(send, &table_ident)?;
+
+        self.cache_put(staged_metadata_location, staged_table.metadata_ref(), None)
+            .await;
 
         Ok(staged_table)
     }

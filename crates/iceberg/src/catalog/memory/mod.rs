@@ -20,5 +20,7 @@
 mod caches;
 mod catalog;
 mod namespace_state;
+#[cfg(test)]
+mod register_cache_tests;
 
 pub use catalog::*;

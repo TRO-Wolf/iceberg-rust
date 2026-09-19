@@ -25,13 +25,15 @@ use aws_sdk_s3tables::operation::get_namespace::GetNamespaceOutput;
 use aws_sdk_s3tables::operation::get_table::GetTableOutput;
 use aws_sdk_s3tables::operation::list_tables::ListTablesOutput;
 use aws_sdk_s3tables::types::OpenTableFormat;
+use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
-use iceberg::spec::{TableMetadata, TableMetadataBuilder};
+use iceberg::spec::TableMetadataBuilder;
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, CatalogBuilder, CommitBaseLoadPlan, Error, ErrorKind, MetadataLocation, Namespace,
-    NamespaceIdent, Result, TableCommit, TableCreation, TableIdent, UNNAMED_CATALOG,
-    commit_base_conflict_error, plan_commit_base_load,
+    CacheScope, Catalog, CatalogBuilder, CommitBaseLoadPlan, Error, ErrorKind, MetadataLocation,
+    Namespace, NamespaceIdent, Result, TableCommit, TableCreation, TableIdent, TableMetadataCache,
+    UNNAMED_CATALOG, commit_base_conflict_error, load_or_fetch_table_metadata,
+    plan_commit_base_load,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
@@ -40,7 +42,7 @@ use crate::commit_transport::S3TablesCommitHarness;
 #[cfg(test)]
 use crate::commit_transport::s3tables_commit_send_landed;
 use crate::commit_transport::{
-    LiveS3TablesCommitTransport, S3TablesCommitTransport, S3TablesUpdateCall,
+    LiveS3TablesCommitTransport, S3TablesCommitSend, S3TablesCommitTransport, S3TablesUpdateCall,
     map_s3tables_commit_send,
 };
 use crate::utils::create_sdk_config;
@@ -104,6 +106,9 @@ impl std::fmt::Debug for S3TablesCatalogConfig {
 pub struct S3TablesCatalogBuilder {
     config: S3TablesCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    pub(crate) table_metadata_cache: Option<Arc<TableMetadataCache>>,
+    pub(crate) shared_object_cache_bytes: Option<u64>,
+    pub(crate) cache_credential_context: Option<String>,
 }
 
 /// Default builder for [`S3TablesCatalog`].
@@ -118,6 +123,9 @@ impl Default for S3TablesCatalogBuilder {
                 props: HashMap::new(),
             },
             storage_factory: None,
+            table_metadata_cache: None,
+            shared_object_cache_bytes: None,
+            cache_credential_context: None,
         }
     }
 }
@@ -194,7 +202,15 @@ impl CatalogBuilder for S3TablesCatalogBuilder {
                     "Table bucket ARN is required",
                 ))
             } else {
-                S3TablesCatalog::new(self.config, self.storage_factory).await
+                S3TablesCatalog::new(self.config, self.storage_factory)
+                    .await
+                    .map(|catalog| {
+                        catalog.with_cache_options(
+                            self.table_metadata_cache,
+                            self.shared_object_cache_bytes,
+                            self.cache_credential_context,
+                        )
+                    })
             }
         }
     }
@@ -204,11 +220,23 @@ impl CatalogBuilder for S3TablesCatalogBuilder {
 pub struct S3TablesCatalog {
     config: S3TablesCatalogConfig,
     s3tables_client: aws_sdk_s3tables::Client,
-    file_io: FileIO,
+    pub(crate) file_io: FileIO,
     commit_transport: Arc<dyn S3TablesCommitTransport>,
+    pub(crate) table_metadata_cache: Option<Arc<TableMetadataCache>>,
+    pub(crate) cache_scope: CacheScope,
+    pub(crate) shared_object_cache: Option<Arc<ObjectCache>>,
+    #[cfg(test)]
+    pub(crate) pointer_source: Option<PointerSource>,
+    #[cfg(test)]
+    drop_source: Option<DropSource>,
     #[cfg(test)]
     outcome_harness: Option<Arc<S3TablesCommitHarness>>,
 }
+
+#[cfg(test)]
+pub(crate) type PointerSource = Arc<dyn Fn(&TableIdent) -> Result<(String, String)> + Send + Sync>;
+#[cfg(test)]
+pub(crate) type DropSource = Arc<dyn Fn(&TableIdent) -> Result<()> + Send + Sync>;
 
 impl std::fmt::Debug for S3TablesCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -231,6 +259,8 @@ impl S3TablesCatalog {
             aws_sdk_s3tables::Client::new(&aws_config)
         };
 
+        let injected_io = config.client.is_some() || storage_factory.is_some();
+
         let factory = storage_factory.unwrap_or_else(|| {
             Arc::new(OpenDalStorageFactory::S3 {
                 configured_scheme: "s3".to_string(),
@@ -243,14 +273,49 @@ impl S3TablesCatalog {
 
         let commit_transport = Arc::new(LiveS3TablesCommitTransport::new(s3tables_client.clone()));
 
+        let cache_scope = if injected_io {
+            CacheScope::isolated(format!("s3tables:{}", config.table_bucket_arn))
+        } else {
+            CacheScope::for_catalog(
+                format!("s3tables:{}", config.table_bucket_arn),
+                None,
+                &config.props,
+            )
+        };
+
         Ok(Self {
             config,
             s3tables_client,
             file_io,
             commit_transport,
+            table_metadata_cache: None,
+            cache_scope,
+            shared_object_cache: None,
+            #[cfg(test)]
+            pointer_source: None,
+            #[cfg(test)]
+            drop_source: None,
             #[cfg(test)]
             outcome_harness: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pointer_source(mut self, source: PointerSource) -> Self {
+        self.pointer_source = Some(source);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_drop_source(mut self, source: DropSource) -> Self {
+        self.drop_source = Some(source);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_file_io_for_tests(mut self, file_io: FileIO) -> Self {
+        self.file_io = file_io;
+        self
     }
 
     #[cfg(test)]
@@ -291,6 +356,11 @@ impl S3TablesCatalog {
             s3tables_client: client,
             file_io,
             commit_transport,
+            table_metadata_cache: None,
+            cache_scope: CacheScope::isolated("s3tables:test"),
+            shared_object_cache: None,
+            pointer_source: None,
+            drop_source: None,
             outcome_harness: Some(harness),
         }
     }
@@ -303,6 +373,10 @@ impl S3TablesCatalog {
         String, /* metadata_location */
         String, /* version_token */
     )> {
+        #[cfg(test)]
+        if let Some(source) = &self.pointer_source {
+            return source(table_ident);
+        }
         #[cfg(test)]
         if let Some(harness) = &self.outcome_harness {
             return Ok(harness.pointer());
@@ -336,7 +410,8 @@ impl S3TablesCatalog {
         if let Some(harness) = &self.outcome_harness {
             let loaded = harness.table();
             let version_token = harness.pointer().1;
-            let rebound = Table::builder()
+            let rebound = self
+                .table_builder()
                 .identifier(table_ident.clone())
                 .metadata(loaded.metadata_ref())
                 .metadata_location(
@@ -353,18 +428,24 @@ impl S3TablesCatalog {
                         })?
                         .to_string(),
                 )
-                .file_io(self.file_io.clone())
                 .build()?;
             return Ok((rebound, version_token));
         }
         let (metadata_location, version_token) = self.get_table_pointer(table_ident).await?;
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await?;
+        let metadata = load_or_fetch_table_metadata(
+            &self.file_io,
+            &self.cache_scope,
+            &metadata_location,
+            self.table_metadata_cache.as_deref(),
+            Some(&version_token),
+        )
+        .await?;
 
-        let table = Table::builder()
+        let table = self
+            .table_builder()
             .identifier(table_ident.clone())
             .metadata(metadata)
             .metadata_location(metadata_location)
-            .file_io(self.file_io.clone())
             .build()?;
         Ok((table, version_token))
     }
@@ -396,11 +477,11 @@ impl S3TablesCatalog {
                     )
                 })?;
                 // Rebind catalog FileIO + commit identifier (defense in depth vs forged base).
-                let table = Table::builder()
+                let table = self
+                    .table_builder()
                     .identifier(table_ident.clone())
                     .metadata(provided.metadata_ref())
                     .metadata_location(service_location)
-                    .file_io(self.file_io.clone())
                     .build()?;
                 Ok((table, version_token))
             }
@@ -410,12 +491,19 @@ impl S3TablesCatalog {
                 &service_location,
             )),
             CommitBaseLoadPlan::FullLoad => {
-                let metadata = TableMetadata::read_from(&self.file_io, &service_location).await?;
-                let table = Table::builder()
+                let metadata = load_or_fetch_table_metadata(
+                    &self.file_io,
+                    &self.cache_scope,
+                    &service_location,
+                    self.table_metadata_cache.as_deref(),
+                    Some(&version_token),
+                )
+                .await?;
+                let table = self
+                    .table_builder()
                     .identifier(table_ident.clone())
                     .metadata(metadata)
                     .metadata_location(service_location)
-                    .file_io(self.file_io.clone())
                     .build()?;
                 Ok((table, version_token))
             }
@@ -629,7 +717,8 @@ impl Catalog for S3TablesCatalog {
             MetadataLocation::new_with_table_location(table_location).to_string();
         metadata.write_to(&self.file_io, &metadata_location).await?;
 
-        self.s3tables_client
+        let update_resp = self
+            .s3tables_client
             .update_table_metadata_location()
             .table_bucket_arn(self.config.table_bucket_arn.clone())
             .namespace(namespace.to_url_string())
@@ -640,12 +729,20 @@ impl Catalog for S3TablesCatalog {
             .await
             .map_err(from_aws_sdk_error)?;
 
-        let table = Table::builder()
+        let table = self
+            .table_builder()
             .identifier(table_ident)
-            .metadata_location(metadata_location)
+            .metadata_location(metadata_location.clone())
             .metadata(metadata)
-            .file_io(self.file_io.clone())
             .build()?;
+
+        self.cache_put(
+            &metadata_location,
+            table.metadata_ref(),
+            Some(update_resp.version_token),
+        )
+        .await;
+
         Ok(table)
     }
 
@@ -658,13 +755,52 @@ impl Catalog for S3TablesCatalog {
 
     /// Drops an existing table from the s3tables catalog.
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
-        let req = self
-            .s3tables_client
-            .delete_table()
-            .table_bucket_arn(self.config.table_bucket_arn.clone())
-            .namespace(table.namespace().to_url_string())
-            .name(table.name());
-        req.send().await.map_err(from_aws_sdk_error)?;
+        let dropped_location = self
+            .get_table_pointer(table)
+            .await
+            .ok()
+            .map(|(location, _)| location);
+
+        #[cfg(test)]
+        if let Some(source) = &self.drop_source {
+            source(table)?;
+        }
+        #[cfg(test)]
+        if self.drop_source.is_none() {
+            let req = self
+                .s3tables_client
+                .delete_table()
+                .table_bucket_arn(self.config.table_bucket_arn.clone())
+                .namespace(table.namespace().to_url_string())
+                .name(table.name());
+            req.send().await.map_err(from_aws_sdk_error)?;
+        }
+        #[cfg(not(test))]
+        {
+            let req = self
+                .s3tables_client
+                .delete_table()
+                .table_bucket_arn(self.config.table_bucket_arn.clone())
+                .namespace(table.namespace().to_url_string())
+                .name(table.name());
+            req.send().await.map_err(from_aws_sdk_error)?;
+        }
+
+        if let (Some(cache), Some(location)) = (
+            self.table_metadata_cache.as_ref(),
+            dropped_location.as_deref(),
+        ) {
+            cache.invalidate(&self.cache_scope, location).await;
+        }
+        Ok(())
+    }
+
+    async fn invalidate_table(&self, table: &TableIdent) -> Result<()> {
+        let Some(cache) = self.table_metadata_cache.as_ref() else {
+            return Ok(());
+        };
+        let (location, _) = self.get_table_pointer(table).await?;
+        cache.invalidate(&self.cache_scope, &location).await;
         Ok(())
     }
 
@@ -732,14 +868,22 @@ impl Catalog for S3TablesCatalog {
             .write_commit_metadata(staged_table.file_io(), staged_metadata_location)
             .await?;
 
-        self.cas_update_metadata_location(
-            &table_ident,
-            table_namespace,
-            version_token,
+        let new_version = self
+            .cas_update_metadata_location(
+                &table_ident,
+                table_namespace,
+                version_token,
+                staged_metadata_location,
+                Some(&staged_table),
+            )
+            .await?;
+
+        self.cache_put(
             staged_metadata_location,
-            Some(&staged_table),
+            staged_table.metadata_ref(),
+            new_version,
         )
-        .await?;
+        .await;
 
         Ok(staged_table)
     }
@@ -774,14 +918,18 @@ impl Catalog for S3TablesCatalog {
 
         let new_metadata_location = table.metadata_location_result()?.to_string();
         // The staged replace already wrote the new metadata file. Only the pointer CAS remains.
-        self.cas_update_metadata_location(
-            &table_ident,
-            table_namespace,
-            version_token,
-            &new_metadata_location,
-            Some(&table),
-        )
-        .await?;
+        let new_version = self
+            .cas_update_metadata_location(
+                &table_ident,
+                table_namespace,
+                version_token,
+                &new_metadata_location,
+                Some(&table),
+            )
+            .await?;
+
+        self.cache_put(&new_metadata_location, table.metadata_ref(), new_version)
+            .await;
 
         Ok(table)
     }
@@ -796,7 +944,7 @@ impl S3TablesCatalog {
         version_token: String,
         metadata_location: &str,
         #[cfg_attr(not(test), allow(unused_variables))] published: Option<&Table>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let send = self
             .commit_transport
             .send_update_metadata_location(S3TablesUpdateCall {
@@ -813,8 +961,12 @@ impl S3TablesCatalog {
         {
             self.publish_outcome_harness(table);
         }
+        let new_version = match &send {
+            S3TablesCommitSend::Success(token) => token.clone(),
+            _ => None,
+        };
         map_s3tables_commit_send(send, table_ident)?;
-        Ok(())
+        Ok(new_version)
     }
 
     #[cfg(test)]
@@ -836,568 +988,10 @@ where T: std::fmt::Debug {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-    use iceberg::transaction::{ApplyTransactionAction, Transaction};
-
-    use super::*;
-
-    const SECRET: &str = "SECRET_DO_NOT_LEAK";
-
-    fn config_with_secret_props() -> S3TablesCatalogConfig {
-        S3TablesCatalogConfig {
-            name: Some("s3t_cat".to_string()),
-            table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string(),
-            endpoint_url: None,
-            client: None,
-            props: HashMap::from([
-                ("aws_secret_access_key".to_string(), SECRET.to_string()),
-                ("aws_session_token".to_string(), SECRET.to_string()),
-                ("region_name".to_string(), "us-east-1".to_string()),
-            ]),
-        }
-    }
-
-    /// Risk: the raw prop map holds live AWS credentials, so a derived `Debug` prints them.
-    /// Pins that secret values redact to `"***"` and that keys stay visible.
-    /// Mutation: revert the manual `Debug` to `#[derive(Debug)]` gives RED.
-    #[test]
-    fn test_config_debug_redacts_secret_prop_values() {
-        let config = config_with_secret_props();
-
-        let debug = format!("{config:?}");
-
-        assert!(
-            !debug.contains(SECRET),
-            "S3TablesCatalogConfig Debug leaked a secret value: {debug}"
-        );
-        assert!(debug.contains("***"), "expected redaction marker: {debug}");
-        for key in ["aws_secret_access_key", "aws_session_token"] {
-            assert!(debug.contains(key), "secret key `{key}` dropped: {debug}");
-        }
-        assert!(
-            debug.contains("us-east-1") && debug.contains("s3t_cat"),
-            "non-secret fields must stay visible: {debug}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_catalog_debug_redacts_secret_prop_values() {
-        let catalog = S3TablesCatalog::new(config_with_secret_props(), None)
-            .await
-            .expect("build S3TablesCatalog offline");
-
-        let debug = format!("{catalog:?}");
-
-        assert!(
-            !debug.contains(SECRET),
-            "S3TablesCatalog Debug leaked a secret value: {debug}"
-        );
-        assert!(
-            debug.contains("aws_secret_access_key"),
-            "key dropped: {debug}"
-        );
-        assert!(debug.contains("***"), "expected redaction marker: {debug}");
-    }
-
-    async fn load_s3tables_catalog_from_env() -> Result<Option<S3TablesCatalog>> {
-        let table_bucket_arn = match std::env::var("TABLE_BUCKET_ARN").ok() {
-            Some(table_bucket_arn) => table_bucket_arn,
-            None => return Ok(None),
-        };
-
-        let config = S3TablesCatalogConfig {
-            name: None,
-            table_bucket_arn,
-            endpoint_url: None,
-            client: None,
-            props: HashMap::new(),
-        };
-
-        Ok(Some(S3TablesCatalog::new(config, None).await?))
-    }
-
-    #[tokio::test]
-    async fn test_s3tables_list_namespace() {
-        let catalog = match load_s3tables_catalog_from_env().await {
-            Ok(Some(catalog)) => catalog,
-            Ok(None) => return,
-            Err(e) => panic!("Error loading catalog: {e}"),
-        };
-
-        let namespaces = catalog.list_namespaces(None).await.unwrap();
-        assert!(!namespaces.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_s3tables_list_tables() {
-        let catalog = match load_s3tables_catalog_from_env().await {
-            Ok(Some(catalog)) => catalog,
-            Ok(None) => return,
-            Err(e) => panic!("Error loading catalog: {e}"),
-        };
-
-        let tables = catalog
-            .list_tables(&NamespaceIdent::new("aws_s3_metadata".to_string()))
-            .await
-            .unwrap();
-        assert!(!tables.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_s3tables_load_table() {
-        let catalog = match load_s3tables_catalog_from_env().await {
-            Ok(Some(catalog)) => catalog,
-            Ok(None) => return,
-            Err(e) => panic!("Error loading catalog: {e}"),
-        };
-
-        let table = catalog
-            .load_table(&TableIdent::new(
-                NamespaceIdent::new("aws_s3_metadata".to_string()),
-                "query_storage_metadata".to_string(),
-            ))
-            .await
-            .unwrap();
-        println!("{table:?}");
-    }
-
-    #[tokio::test]
-    async fn test_s3tables_create_delete_namespace() {
-        let catalog = match load_s3tables_catalog_from_env().await {
-            Ok(Some(catalog)) => catalog,
-            Ok(None) => return,
-            Err(e) => panic!("Error loading catalog: {e}"),
-        };
-
-        let namespace = NamespaceIdent::new("test_s3tables_create_delete_namespace".to_string());
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .unwrap();
-        assert!(catalog.namespace_exists(&namespace).await.unwrap());
-        catalog.drop_namespace(&namespace).await.unwrap();
-        assert!(!catalog.namespace_exists(&namespace).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_s3tables_create_delete_table() {
-        let catalog = match load_s3tables_catalog_from_env().await {
-            Ok(Some(catalog)) => catalog,
-            Ok(None) => return,
-            Err(e) => panic!("Error loading catalog: {e}"),
-        };
-
-        let creation = {
-            let schema = Schema::builder()
-                .with_schema_id(0)
-                .with_fields(vec![
-                    NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::required(2, "bar", Type::Primitive(PrimitiveType::String)).into(),
-                ])
-                .build()
-                .unwrap();
-            TableCreation::builder()
-                .name("test_s3tables_create_delete_table".to_string())
-                .properties(HashMap::new())
-                .schema(schema)
-                .build()
-        };
-
-        let namespace = NamespaceIdent::new("test_s3tables_create_delete_table".to_string());
-        let table_ident = TableIdent::new(
-            namespace.clone(),
-            "test_s3tables_create_delete_table".to_string(),
-        );
-        catalog.drop_namespace(&namespace).await.ok();
-        catalog.drop_table(&table_ident).await.ok();
-
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .unwrap();
-        catalog.create_table(&namespace, creation).await.unwrap();
-        assert!(catalog.table_exists(&table_ident).await.unwrap());
-        catalog.drop_table(&table_ident).await.unwrap();
-        assert!(!catalog.table_exists(&table_ident).await.unwrap());
-        catalog.drop_namespace(&namespace).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_s3tables_update_table() {
-        let catalog = match load_s3tables_catalog_from_env().await {
-            Ok(Some(catalog)) => catalog,
-            Ok(None) => return,
-            Err(e) => panic!("Error loading catalog: {e}"),
-        };
-
-        let namespace = NamespaceIdent::new("test_s3tables_update_table".to_string());
-        let table_ident =
-            TableIdent::new(namespace.clone(), "test_s3tables_update_table".to_string());
-
-        catalog.drop_table(&table_ident).await.ok();
-        catalog.drop_namespace(&namespace).await.ok();
-
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .unwrap();
-
-        let creation = {
-            let schema = Schema::builder()
-                .with_schema_id(0)
-                .with_fields(vec![
-                    NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::required(2, "bar", Type::Primitive(PrimitiveType::String)).into(),
-                ])
-                .build()
-                .unwrap();
-            TableCreation::builder()
-                .name(table_ident.name().to_string())
-                .properties(HashMap::new())
-                .schema(schema)
-                .build()
-        };
-
-        let table = catalog.create_table(&namespace, creation).await.unwrap();
-
-        let tx = Transaction::new(&table);
-
-        let original_metadata_location = table.metadata_location();
-
-        let tx = tx
-            .update_table_properties()
-            .set("test_property".to_string(), "test_value".to_string())
-            .apply(tx)
-            .unwrap();
-
-        let updated_table = tx.commit(&catalog).await.unwrap();
-
-        assert_eq!(
-            updated_table.metadata().properties().get("test_property"),
-            Some(&"test_value".to_string())
-        );
-
-        assert_ne!(
-            updated_table.metadata_location(),
-            original_metadata_location,
-            "Metadata location should be updated after commit"
-        );
-
-        let reloaded_table = catalog.load_table(&table_ident).await.unwrap();
-
-        assert_eq!(
-            reloaded_table.metadata().properties().get("test_property"),
-            Some(&"test_value".to_string())
-        );
-        assert_eq!(
-            reloaded_table.metadata_location(),
-            updated_table.metadata_location(),
-            "Reloaded table should have the same metadata location as the updated table"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_builder_load_missing_bucket_arn() {
-        let builder = S3TablesCatalogBuilder::default();
-        let result = builder.load("s3tables", HashMap::new()).await;
-
-        assert!(result.is_err());
-        if let Err(err) = result {
-            assert_eq!(err.kind(), ErrorKind::DataInvalid);
-            assert_eq!(err.message(), "Table bucket ARN is required");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_builder_with_endpoint_url_ok() {
-        let builder = S3TablesCatalogBuilder::default().with_endpoint_url("http://localhost:4566");
-
-        let result = builder
-            .load(
-                "s3tables",
-                HashMap::from([
-                    (
-                        S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
-                        "arn:aws:s3tables:us-east-1:123456789012:bucket/test".to_string(),
-                    ),
-                    ("some_prop".to_string(), "some_value".to_string()),
-                ]),
-            )
-            .await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_builder_with_client_ok() {
-        use aws_config::BehaviorVersion;
-
-        let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
-        let client = aws_sdk_s3tables::Client::new(&sdk_config);
-
-        let builder = S3TablesCatalogBuilder::default().with_client(client);
-        let result = builder
-            .load(
-                "s3tables",
-                HashMap::from([(
-                    S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
-                    "arn:aws:s3tables:us-east-1:123456789012:bucket/test".to_string(),
-                )]),
-            )
-            .await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_builder_with_table_bucket_arn() {
-        let test_arn = "arn:aws:s3tables:us-west-2:123456789012:bucket/test-bucket";
-        let builder = S3TablesCatalogBuilder::default().with_table_bucket_arn(test_arn);
-
-        let result = builder.load("s3tables", HashMap::new()).await;
-
-        assert!(result.is_ok());
-        let catalog = result.unwrap();
-        assert_eq!(catalog.config.table_bucket_arn, test_arn);
-    }
-
-    #[tokio::test]
-    async fn test_builder_empty_table_bucket_arn_edge_cases() {
-        let mut props = HashMap::new();
-        props.insert(
-            S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
-            "".to_string(),
-        );
-
-        let builder = S3TablesCatalogBuilder::default();
-        let result = builder.load("s3tables", props).await;
-
-        assert!(result.is_err());
-        if let Err(err) = result {
-            assert_eq!(err.kind(), ErrorKind::DataInvalid);
-            assert_eq!(err.message(), "Table bucket ARN is required");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_endpoint_url_property_overrides_builder_method() {
-        let test_arn = "arn:aws:s3tables:us-west-2:123456789012:bucket/test-bucket";
-        let builder_endpoint = "http://localhost:4566";
-        let property_endpoint = "http://localhost:8080";
-
-        let builder = S3TablesCatalogBuilder::default()
-            .with_table_bucket_arn(test_arn)
-            .with_endpoint_url(builder_endpoint);
-
-        let mut props = HashMap::new();
-        props.insert(
-            S3TABLES_CATALOG_PROP_ENDPOINT_URL.to_string(),
-            property_endpoint.to_string(),
-        );
-
-        let result = builder.load("s3tables", props).await;
-
-        assert!(result.is_ok());
-        let catalog = result.unwrap();
-
-        assert_eq!(
-            catalog.config.endpoint_url,
-            Some(property_endpoint.to_string())
-        );
-        assert_ne!(
-            catalog.config.endpoint_url,
-            Some(builder_endpoint.to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_endpoint_url_builder_method_only() {
-        let test_arn = "arn:aws:s3tables:us-west-2:123456789012:bucket/test-bucket";
-        let builder_endpoint = "http://localhost:4566";
-
-        let builder = S3TablesCatalogBuilder::default()
-            .with_table_bucket_arn(test_arn)
-            .with_endpoint_url(builder_endpoint);
-
-        let result = builder.load("s3tables", HashMap::new()).await;
-
-        assert!(result.is_ok());
-        let catalog = result.unwrap();
-
-        assert_eq!(
-            catalog.config.endpoint_url,
-            Some(builder_endpoint.to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_endpoint_url_property_only() {
-        let test_arn = "arn:aws:s3tables:us-west-2:123456789012:bucket/test-bucket";
-        let property_endpoint = "http://localhost:8080";
-
-        let builder = S3TablesCatalogBuilder::default().with_table_bucket_arn(test_arn);
-
-        let mut props = HashMap::new();
-        props.insert(
-            S3TABLES_CATALOG_PROP_ENDPOINT_URL.to_string(),
-            property_endpoint.to_string(),
-        );
-
-        let result = builder.load("s3tables", props).await;
-
-        assert!(result.is_ok());
-        let catalog = result.unwrap();
-
-        assert_eq!(
-            catalog.config.endpoint_url,
-            Some(property_endpoint.to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_table_bucket_arn_property_overrides_builder_method() {
-        let builder_arn = "arn:aws:s3tables:us-west-2:123456789012:bucket/builder-bucket";
-        let property_arn = "arn:aws:s3tables:us-east-1:987654321098:bucket/property-bucket";
-
-        let builder = S3TablesCatalogBuilder::default().with_table_bucket_arn(builder_arn);
-
-        let mut props = HashMap::new();
-        props.insert(
-            S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
-            property_arn.to_string(),
-        );
-
-        let result = builder.load("s3tables", props).await;
-
-        assert!(result.is_ok());
-        let catalog = result.unwrap();
-
-        assert_eq!(catalog.config.table_bucket_arn, property_arn);
-        assert_ne!(catalog.config.table_bucket_arn, builder_arn);
-    }
-
-    #[tokio::test]
-    async fn test_table_bucket_arn_builder_method_only() {
-        let builder_arn = "arn:aws:s3tables:us-west-2:123456789012:bucket/builder-bucket";
-
-        let builder = S3TablesCatalogBuilder::default().with_table_bucket_arn(builder_arn);
-
-        let result = builder.load("s3tables", HashMap::new()).await;
-
-        assert!(result.is_ok());
-        let catalog = result.unwrap();
-
-        assert_eq!(catalog.config.table_bucket_arn, builder_arn);
-    }
-
-    #[tokio::test]
-    async fn test_table_bucket_arn_property_only() {
-        let property_arn = "arn:aws:s3tables:us-east-1:987654321098:bucket/property-bucket";
-
-        let builder = S3TablesCatalogBuilder::default();
-
-        let mut props = HashMap::new();
-        props.insert(
-            S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
-            property_arn.to_string(),
-        );
-
-        let result = builder.load("s3tables", props).await;
-
-        assert!(result.is_ok());
-        let catalog = result.unwrap();
-
-        assert_eq!(catalog.config.table_bucket_arn, property_arn);
-    }
-
-    #[tokio::test]
-    async fn test_builder_empty_name_validation() {
-        let test_arn = "arn:aws:s3tables:us-west-2:123456789012:bucket/test-bucket";
-        let builder = S3TablesCatalogBuilder::default().with_table_bucket_arn(test_arn);
-
-        let result = builder.load("", HashMap::new()).await;
-
-        assert!(result.is_err());
-        if let Err(err) = result {
-            assert_eq!(err.kind(), ErrorKind::DataInvalid);
-            assert_eq!(err.message(), "Catalog name cannot be empty");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_builder_whitespace_only_name_validation() {
-        let test_arn = "arn:aws:s3tables:us-west-2:123456789012:bucket/test-bucket";
-        let builder = S3TablesCatalogBuilder::default().with_table_bucket_arn(test_arn);
-
-        let result = builder.load("   \t\n  ", HashMap::new()).await;
-
-        assert!(result.is_err());
-        if let Err(err) = result {
-            assert_eq!(err.kind(), ErrorKind::DataInvalid);
-            assert_eq!(err.message(), "Catalog name cannot be empty");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_builder_name_validation_with_missing_arn() {
-        let builder = S3TablesCatalogBuilder::default();
-
-        let result = builder.load("", HashMap::new()).await;
-
-        assert!(result.is_err());
-        if let Err(err) = result {
-            assert_eq!(err.kind(), ErrorKind::DataInvalid);
-            assert_eq!(err.message(), "Catalog name cannot be empty");
-        }
-    }
-
-    /// Construction builds the SDK client but makes no network call, so these accessors need
-    /// no credentials and no live bucket.
-    #[tokio::test]
-    async fn test_name_and_properties_return_config() {
-        let config = S3TablesCatalogConfig {
-            name: Some("s3t_cat".to_string()),
-            table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string(),
-            endpoint_url: None,
-            client: None,
-            props: HashMap::from([("region_name".to_string(), "us-east-1".to_string())]),
-        };
-        let catalog = S3TablesCatalog::new(config, None).await.unwrap();
-
-        assert_eq!(catalog.name(), "s3t_cat");
-        // Mutation guard: the empty-map default fails this.
-        assert_eq!(
-            catalog.properties().get("region_name").map(String::as_str),
-            Some("us-east-1")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_name_defaults_to_sentinel_when_unset() {
-        let config = S3TablesCatalogConfig {
-            name: None,
-            table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string(),
-            endpoint_url: None,
-            client: None,
-            props: HashMap::new(),
-        };
-        let catalog = S3TablesCatalog::new(config, None).await.unwrap();
-        assert_eq!(catalog.name(), UNNAMED_CATALOG);
-    }
-
-    #[tokio::test]
-    async fn test_invalidate_defaults_are_noops() {
-        let config = S3TablesCatalogConfig {
-            name: Some("s3t_cat".to_string()),
-            table_bucket_arn: "arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string(),
-            endpoint_url: None,
-            client: None,
-            props: HashMap::new(),
-        };
-        let catalog = S3TablesCatalog::new(config, None).await.unwrap();
-        let ident = TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string());
-        // No network: the inherited no-op defaults return Ok.
-        catalog.invalidate_table(&ident).await.unwrap();
-        catalog.invalidate_view(&ident).await.unwrap();
-    }
+    include!("catalog_tests.rs");
+}
+
+#[cfg(test)]
+mod cache_tests {
+    include!("cache_tests.rs");
 }

@@ -39,7 +39,7 @@ pub(crate) struct S3TablesUpdateCall {
 }
 
 pub(crate) enum S3TablesCommitSend {
-    Success,
+    Success(Option<String>),
     #[allow(dead_code)]
     AcceptedResponseLost,
     Transport(Box<aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError>>),
@@ -109,7 +109,7 @@ impl S3TablesCommitTransport for LiveS3TablesCommitTransport {
             .version_token(call.version_token)
             .metadata_location(call.metadata_location);
         match builder.send().await {
-            Ok(_) => S3TablesCommitSend::Success,
+            Ok(output) => S3TablesCommitSend::Success(Some(output.version_token)),
             Err(error) => S3TablesCommitSend::Transport(Box::new(error)),
         }
     }
@@ -158,7 +158,7 @@ impl S3TablesCommitTransport for DiscardingS3TablesCommitTransport {
     async fn send_update_metadata_location(&self, call: S3TablesUpdateCall) -> S3TablesCommitSend {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         match self.inner.send_update_metadata_location(call).await {
-            S3TablesCommitSend::Success => {
+            S3TablesCommitSend::Success(_) => {
                 self.observed_accepted_response_lost
                     .store(true, Ordering::SeqCst);
                 S3TablesCommitSend::AcceptedResponseLost
@@ -179,6 +179,7 @@ pub(crate) enum S3TablesCommitScript {
     MaybeSentLost,
     AcceptThenLose,
     Success,
+    SuccessToken(String),
     Conflict,
     Forbidden,
 }
@@ -242,7 +243,8 @@ impl S3TablesCommitTransport for ScriptedS3TablesCommitTransport {
                     .store(true, Ordering::SeqCst);
                 S3TablesCommitSend::AcceptedResponseLost
             }
-            S3TablesCommitScript::Success => S3TablesCommitSend::Success,
+            S3TablesCommitScript::Success => S3TablesCommitSend::Success(None),
+            S3TablesCommitScript::SuccessToken(token) => S3TablesCommitSend::Success(Some(token)),
             S3TablesCommitScript::Conflict => S3TablesCommitSend::ModeledService(
                 UpdateTableMetadataLocationError::ConflictException(
                     aws_sdk_s3tables::types::error::ConflictException::builder().build(),
@@ -269,7 +271,7 @@ fn boxed_err(message: &str) -> Box<dyn std::error::Error + Send + Sync> {
 pub(crate) fn s3tables_commit_send_landed(send: &S3TablesCommitSend) -> bool {
     matches!(
         send,
-        S3TablesCommitSend::Success | S3TablesCommitSend::AcceptedResponseLost
+        S3TablesCommitSend::Success(_) | S3TablesCommitSend::AcceptedResponseLost
     )
 }
 
@@ -278,7 +280,7 @@ pub(crate) fn map_s3tables_commit_send(
     table_ident: &TableIdent,
 ) -> Result<()> {
     match send {
-        S3TablesCommitSend::Success => Ok(()),
+        S3TablesCommitSend::Success(_) => Ok(()),
         S3TablesCommitSend::AcceptedResponseLost => {
             let timeout = aws_sdk_s3tables::error::SdkError::timeout_error(boxed_err(
                 "S3 Tables accepted the update; the response was lost",

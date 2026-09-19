@@ -17,31 +17,46 @@
 
 use std::sync::Arc;
 
-use super::catalog::{MemoryCatalog, MemoryCatalogBuilder};
-use crate::io::FileIO;
-use crate::io::object_cache::ObjectCache;
-use crate::spec::TableMetadataRef;
-use crate::table::{Table, TableBuilder};
+use iceberg::io::FileIO;
+use iceberg::io::object_cache::ObjectCache;
+use iceberg::spec::TableMetadataRef;
+use iceberg::table::{Table, TableBuilder};
+use iceberg::{CacheScope, TableMetadataCache};
 
-impl MemoryCatalogBuilder {
-    /// Share ONE manifest [`ObjectCache`] of `bytes` across every table this catalog loads.
+use crate::catalog::{S3TablesCatalog, S3TablesCatalogBuilder};
+
+#[allow(missing_docs)]
+impl S3TablesCatalogBuilder {
+    pub fn with_table_metadata_cache(mut self, cache: Arc<TableMetadataCache>) -> Self {
+        self.table_metadata_cache = Some(cache);
+        self
+    }
+
     pub fn with_shared_object_cache_bytes(mut self, bytes: u64) -> Self {
         self.shared_object_cache_bytes = Some(bytes);
         self
     }
 
-    #[allow(missing_docs)]
     pub fn with_cache_credential_context(mut self, context: String) -> Self {
         self.cache_credential_context = Some(context);
         self
     }
 }
 
-impl MemoryCatalog {
-    pub(crate) fn shared_cache(file_io: &FileIO, bytes: Option<u64>) -> Option<Arc<ObjectCache>> {
-        bytes
-            .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(ObjectCache::new_with_capacity(file_io.clone(), bytes)))
+impl S3TablesCatalog {
+    pub(crate) fn with_cache_options(
+        mut self,
+        table_metadata_cache: Option<Arc<TableMetadataCache>>,
+        shared_object_cache_bytes: Option<u64>,
+        cache_credential_context: Option<String>,
+    ) -> Self {
+        self.table_metadata_cache = table_metadata_cache;
+        self.shared_object_cache = build_object_cache(&self.file_io, shared_object_cache_bytes);
+        if let Some(context) = cache_credential_context {
+            self.cache_scope =
+                CacheScope::new(self.cache_scope.catalog_identity().to_string(), context);
+        }
+        self
     }
 
     pub(crate) fn table_builder(&self) -> TableBuilder {
@@ -52,12 +67,11 @@ impl MemoryCatalog {
         }
     }
 
-    /// Publish parsed metadata into the optional session cache (no-op when cache is OFF).
     pub(crate) async fn cache_put(
         &self,
         metadata_location: &str,
         metadata: TableMetadataRef,
-        body_len: Option<u64>,
+        object_version: Option<String>,
     ) {
         if let Some(cache) = self.table_metadata_cache.as_ref() {
             cache
@@ -65,10 +79,16 @@ impl MemoryCatalog {
                     &self.cache_scope,
                     metadata_location,
                     metadata,
+                    object_version,
                     None,
-                    body_len.and_then(|len| u32::try_from(len).ok()),
                 )
                 .await;
         }
     }
+}
+
+pub(crate) fn build_object_cache(file_io: &FileIO, bytes: Option<u64>) -> Option<Arc<ObjectCache>> {
+    bytes
+        .filter(|bytes| *bytes > 0)
+        .map(|bytes| Arc::new(ObjectCache::new_with_capacity(file_io.clone(), bytes)))
 }
