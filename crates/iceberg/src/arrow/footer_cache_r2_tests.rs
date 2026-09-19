@@ -103,7 +103,7 @@ fn write_int96_pages(path: &str) {
             .expect("column")
             .expect("column writer");
         col.typed::<Int96Type>()
-            .write_batch(&values, Some(&vec![1; 3]), None)
+            .write_batch(&values, Some(&[1; 3]), None)
             .expect("write ts");
         col.close().expect("close ts");
     }
