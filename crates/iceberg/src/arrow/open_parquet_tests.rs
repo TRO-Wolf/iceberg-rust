@@ -18,8 +18,12 @@
 use std::error::Error as _;
 use std::sync::Arc;
 
+use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+use parquet::basic::Compression;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+use parquet::file::properties::WriterProperties;
 
 use super::open_parquet::{PAGE_INDEX_STRIPS, ROW_SELECTIONS_APPLIED, effective_row_selection};
 use super::page_prune_fixture::*;
@@ -324,5 +328,104 @@ async fn retry_failure_reports_first_error_as_source() {
             .to_string()
             .contains("Failed to load Parquet metadata"),
         "first error not preserved as source: {source}"
+    );
+}
+
+#[tokio::test]
+async fn ranged_all_keep_scan_returns_only_split_row_groups() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![field(
+        "id",
+        DataType::Int32,
+        false,
+        1,
+    )]));
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+        Arc::new(Int32Array::from(ids)) as ArrayRef
+    ])
+    .expect("batch");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_data_page_row_count_limit(32)
+        .set_write_batch_size(32)
+        .set_max_row_group_row_count(Some(128))
+        .build();
+    write_parquet(&data_path, arrow_schema, &[batch], props);
+    let metadata = file_metadata(&data_path);
+    assert_eq!(metadata.num_row_groups(), 4);
+    assert_page_count(&metadata, 3, 0, 3);
+    let rg2_start = {
+        let first_column = metadata.row_group(2).columns().first().expect("column");
+        let data_offset = first_column.data_page_offset();
+        match first_column.dictionary_page_offset() {
+            Some(dict) if data_offset > dict => dict,
+            _ => data_offset,
+        }
+    } as u64;
+    let file_size = std::fs::metadata(&data_path).expect("stat").len();
+    let schema = id_schema();
+    let predicate = bound(
+        &schema,
+        Reference::new("id").greater_than_or_equal_to(Datum::int(0)),
+    );
+    let mut t = task(&data_path, schema, &[1], Some(predicate));
+    t.start = rg2_start;
+    t.length = file_size - rg2_start;
+    let strips_before = PAGE_INDEX_STRIPS.with(|count| count.get());
+    let rows = collect(t, true).await;
+    assert_eq!(
+        rows.iter().map(|b| b.num_rows()).sum::<usize>(),
+        256,
+        "the ranged split must return only row groups 2 and 3"
+    );
+    assert_eq!(
+        PAGE_INDEX_STRIPS.with(|count| count.get()) - strips_before,
+        1,
+        "an all-keep ranged scan must take the strip path"
+    );
+}
+
+#[tokio::test]
+async fn all_keep_pages_return_only_selected_row_groups() {
+    let tmp = tmpdir();
+    let data_path = path(&tmp, "data.parquet");
+    let ids: Vec<i32> = (0..ROWS as i32).collect();
+    let strings: Vec<Option<String>> = (0..ROWS)
+        .map(|i| (i >= 256).then(|| "a".to_string()))
+        .collect();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        field("id", DataType::Int32, false, 1),
+        field("s", DataType::Utf8, true, 2),
+    ]));
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+        Arc::new(Int32Array::from(ids)) as ArrayRef,
+        Arc::new(StringArray::from(strings)) as ArrayRef,
+    ])
+    .expect("batch");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_data_page_row_count_limit(32)
+        .set_write_batch_size(32)
+        .set_max_row_group_row_count(Some(128))
+        .build();
+    write_parquet(&data_path, arrow_schema, &[batch], props);
+    let metadata = file_metadata(&data_path);
+    assert_eq!(metadata.num_row_groups(), 4);
+    assert_page_count(&metadata, 3, 1, 3);
+    let schema = id_s_schema();
+    let predicate = bound(&schema, Reference::new("s").less_than(Datum::string("x")));
+    let strips_before = PAGE_INDEX_STRIPS.with(|count| count.get());
+    let rows = collect(task(&data_path, schema, &[1, 2], Some(predicate)), true).await;
+    assert_eq!(
+        rows.iter().map(|b| b.num_rows()).sum::<usize>(),
+        256,
+        "row-group stats must drop the all-null row groups the nulls-first residual keeps"
+    );
+    assert_eq!(
+        PAGE_INDEX_STRIPS.with(|count| count.get()) - strips_before,
+        1,
+        "all-keep pages over the surviving row groups must take the strip path"
     );
 }
