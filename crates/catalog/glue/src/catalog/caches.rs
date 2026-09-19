@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use iceberg::io::FileIO;
 use iceberg::io::object_cache::ObjectCache;
-use iceberg::spec::TableMetadata;
+use iceberg::spec::TableMetadataRef;
 use iceberg::table::{Table, TableBuilder};
 use iceberg::{
     CacheScope, CommitBaseLoadPlan, Error, ErrorKind, NamespaceIdent, Result, TableCommit,
@@ -76,13 +76,19 @@ impl GlueCatalog {
         }
     }
 
-    pub(super) async fn cache_put(&self, metadata_location: &str, metadata: &TableMetadata) {
+    pub(super) async fn cache_put(
+        &self,
+        metadata_location: &str,
+        metadata: TableMetadataRef,
+        object_version: Option<String>,
+    ) {
         if let Some(cache) = self.table_metadata_cache.as_ref() {
             cache
                 .put(
                     &self.cache_scope,
-                    metadata_location.to_string(),
-                    Arc::new(metadata.clone()),
+                    metadata_location,
+                    metadata,
+                    object_version,
                     None,
                 )
                 .await;
@@ -92,6 +98,18 @@ impl GlueCatalog {
     #[cfg(test)]
     pub(super) fn with_pointer_source(mut self, pointer_source: PointerSource) -> Self {
         self.pointer_source = Some(pointer_source);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_drop_source(mut self, source: super::DropSource) -> Self {
+        self.drop_source = Some(source);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_create_source(mut self, source: super::CreateSource) -> Self {
+        self.create_source = Some(source);
         self
     }
 
