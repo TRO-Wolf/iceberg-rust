@@ -137,6 +137,40 @@ index-stripped metadata (`PAGE_INDEX_STRIPS`):
 
 Both restored; all pins green again.
 
+## Round 2 — review remediation
+
+Review reports: logic PASS (`rv-pp2-logic-report.md`), perf APPROVE
+(`rv-pp2-perf-out.json`).
+
+| Finding | Severity | Remediation | Evidence |
+|---|---|---|---|
+| L-001 — the strip arm's `selected_row_group_indices` return and the caller's `with_row_groups` had no oracle | S2 | Two pins added in `open_parquet_tests.rs` | `ranged_all_keep_scan_returns_only_split_row_groups`, `all_keep_pages_return_only_selected_row_groups`; mutation below turns the second pin red |
+| R-01 — deep `ParquetMetaData` clone on the strip path | P3 | `Arc::try_unwrap` + `into_builder().set_column_index(None).set_offset_index(None)` when the metadata `Arc` is unique; otherwise `ParquetMetaData::new(file_metadata.clone(), row_groups.to_vec())`, which carries no indexes | all strip pins stay green |
+
+Pin shapes:
+
+- `ranged_all_keep_scan_returns_only_split_row_groups`: 4 row groups of 128,
+  split task starting at RG2's data offset through EOF, predicate `id >= 0`
+  (all-keep at page level). Asserts exactly 256 rows and 1 strip. This pin guards
+  the caller's `with_row_groups` application: the strip arm's indices are
+  byte-range derived, so the caller re-derives them when the arm returns `None`
+  (`reader.rs` byte-range gate) and this pin alone cannot see that mutation.
+- `all_keep_pages_return_only_selected_row_groups`: 4 row groups of 128, `s`
+  all-null in RG0–RG1 and `"a"` in RG2–RG3, predicate `s < 'x'`. Row-group
+  metrics drop the all-null groups (`contains_nulls_only` → `null_count ==
+  num_rows`); the surviving groups are all-keep at page level, so the strip path
+  runs with `Some([2, 3])`. Asserts exactly 256 rows and 1 strip. Losing the
+  indices re-reads the excluded groups, and the nulls-first `lt` residual keeps
+  their NULL rows: 512 rows.
+
+Round-2 mutation evidence:
+
+- Strip arm mutated to `Ok((arrow_metadata, None, row_selection))`:
+  `all_keep_pages_return_only_selected_row_groups` fails (512 rows returned,
+  256 expected) — red as designed; `ranged_all_keep_scan_returns_only_split_row_groups`
+  stays green because the caller re-derives the byte-range restriction, which is
+  itself the contract that pin documents. Restored; both pins green.
+
 ## Gates
 
 - `cargo fmt --all` clean
