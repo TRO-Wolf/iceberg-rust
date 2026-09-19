@@ -136,7 +136,7 @@ fn perf_tasks(
 
 async fn collect_timed(tasks: &[FileScanTask], row_selection: bool) -> (Duration, usize) {
     let stream =
-        Box::pin(futures::stream::iter(tasks.to_vec().into_iter().map(Ok))) as FileScanTaskStream;
+        Box::pin(futures::stream::iter(Vec::from(tasks).into_iter().map(Ok))) as FileScanTaskStream;
     let reader = ArrowReaderBuilder::new(FileIO::new_with_fs())
         .with_batch_size(BATCH_SIZE)
         .with_row_group_filtering_enabled(true)
