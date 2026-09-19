@@ -539,3 +539,75 @@ async fn equality_delete_footer_carries_delete_type() -> Result<()> {
     );
     Ok(())
 }
+
+const JAVA_POS_DELETE_SCHEMA_JSON: &str = "{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":2147483546,\"name\":\"file_path\",\"required\":true,\"type\":\"string\",\"doc\":\"Path of a file in which a deleted row is stored\"},{\"id\":2147483545,\"name\":\"pos\",\"required\":true,\"type\":\"long\",\"doc\":\"Ordinal position of a deleted row in the data file\"}]}";
+
+#[tokio::test]
+async fn position_delete_footer_matches_java_layout() -> Result<()> {
+    let dir = TempDir::new().unwrap();
+    let file_io = FileIO::new_with_fs();
+    let location_gen =
+        DefaultLocationGenerator::with_data_location(dir.path().to_str().unwrap().to_string());
+    let file_name_gen =
+        DefaultFileNameGenerator::new("pos-del".to_string(), None, DataFileFormat::Parquet);
+    let config = PositionDeleteWriterConfig::new()?;
+    let parquet_builder =
+        ParquetWriterBuilder::new(position_delete_writer_properties(), config.schema().clone());
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        file_io,
+        location_gen,
+        file_name_gen,
+    );
+    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .unpartitioned()
+        .build(None)
+        .await?;
+    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+        Arc::new(StringArray::from(vec!["data-file.parquet"; 25])) as ArrayRef,
+        Arc::new(Int64Array::from_iter_values((0..25).map(|pos| pos * 2))) as ArrayRef,
+    ])?;
+    writer.write(batch).await?;
+    let files = writer.close().await?;
+    assert_eq!(files.len(), 1);
+
+    let reader = SerializedFileReader::new(std::fs::File::open(files[0].file_path())?).unwrap();
+    let file_metadata = reader.metadata().file_metadata();
+    assert_eq!(
+        file_metadata.schema_descr().root_schema().name(),
+        "table",
+        "the parquet schema root carries Java's message name"
+    );
+
+    let key_values = file_metadata.key_value_metadata().cloned().unwrap_or_default();
+    let iceberg_schema = key_values
+        .iter()
+        .find(|kv| kv.key == super::parquet_footer::ICEBERG_SCHEMA_META_KEY)
+        .and_then(|kv| kv.value.as_deref())
+        .expect("iceberg.schema must be present");
+    assert_eq!(
+        iceberg_schema, JAVA_POS_DELETE_SCHEMA_JSON,
+        "the schema key-value matches Java's MetadataColumns byte-for-byte"
+    );
+    assert_eq!(iceberg_schema.len(), 287);
+
+    let row_group = reader.metadata().row_group(0);
+    let path_column = row_group.column(0);
+    assert!(
+        path_column.dictionary_page_offset().is_some(),
+        "file_path stays dictionary-encoded, as parquet-mr writes it"
+    );
+    let pos_column = row_group.column(1);
+    assert!(
+        pos_column.dictionary_page_offset().is_none(),
+        "pos carries no dictionary page, as parquet-mr writes INT64 columns"
+    );
+    let pos_encodings: Vec<parquet::basic::Encoding> = pos_column.encodings().collect();
+    assert!(
+        !pos_encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
+            && !pos_encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
+        "pos is not dictionary-encoded: {pos_encodings:?}"
+    );
+    assert!(pos_encodings.contains(&parquet::basic::Encoding::PLAIN));
+    Ok(())
+}
