@@ -623,3 +623,22 @@ All reverted; filtered suite green again.
 - `./scripts/check_agent_artifacts.sh`, `check_matrix_anchors.sh`,
   `check_comment_blocks.sh`, `typos .` — all clean.
 - `comment_ban.py` over `origin/main..HEAD` — `comment-ban hits=0`.
+
+## Round 6 — `SetLocation` commit re-pinned to Java (orchestrator, run 25d)
+
+CI's last red was `catalog::tests::test_table_commit`: a commit carrying
+`SetLocation` now writes its next metadata file under the new location's
+`metadata/`, and the pin expected the old location. Measured on Spark 4.1.2 +
+Iceberg 1.11.0 with `InMemoryCatalog` (a `BaseMetastoreTableOperations`
+catalog), recorder `record_set_location.py`, truth `set_location_truth.json`:
+
+| Cell | Java |
+|---|---|
+| `ALTER TABLE … SET LOCATION '<new>'`, no `write.metadata.path` | `00001-*.metadata.json` written under `<new>/metadata/`; the next commit and the manifest list follow it |
+| the same with `write.metadata.path` set | `00001-*` stays under `write.metadata.path` |
+
+`newMetadataFilePath` derives the path from the metadata being written, so the
+fork's new behaviour is Java's and the pin encoded the pre-F-LOCATION-1 fork.
+The pin now expects `s3://bucket/test/new_location/data/metadata/00001-`.
+
+- `cargo test -p iceberg --lib catalog::` — 208/208.
