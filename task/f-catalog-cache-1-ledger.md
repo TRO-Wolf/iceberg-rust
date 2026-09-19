@@ -400,3 +400,45 @@ Honest non-mutation rows (no discriminating mutation exists):
 - fmt / clippy `-p iceberg -p iceberg-catalog-s3tables -p iceberg-catalog-glue
   --all-targets -D warnings` / file-size / comment-ban / taplo / machete /
   typos / agent-artifacts / matrix-anchors — green (see Gates section).
+
+# Round 3 — verification remediation (head 380b181f, rebased)
+
+Independent verification (`rv-cc-verify-out.json`, Grok critic) re-proved
+every round-2 rule by mutation except one: **V-001 (P2)** — the catalog
+l1 pins stayed green under "always `CacheScope::for_catalog`" because
+region-only props isolate through the derivation fallback anyway; the
+injected-IO `isolated()` special case was unpinned for the case where
+credential selectors would otherwise collide.
+
+## V-001 fix
+
+New pins assert isolation under IDENTICAL non-empty credential selectors —
+the only scenario where `for_catalog` alone would produce one shared scope:
+
+- s3tables `l1_shared_credential_injected_io_still_isolates`: two catalogs,
+  same bucket ARN, same selector value (`aws_access_key_id=SHARED-CRED`,
+  then `profile_name=SHARED-CRED`), one with its own `MemoryStorageFactory`,
+  the other with its own injected SDK client AND its own
+  `MemoryStorageFactory`, one shared cache → 2 body fetches, each sees its
+  own bytes.
+- glue `l1_shared_credential_injected_factories_still_isolate`: two
+  catalogs, same catalog id + warehouse, same selector value (akid and
+  profile variants), each with its own `MemoryStorageFactory`, one shared
+  cache → 2 body fetches, each sees its own bytes.
+
+Mutation proof (applied, observed red, reverted): replace the
+`if injected_io { isolated() } else { for_catalog() }` branch with plain
+`for_catalog` in each catalog — the new pins RED (catalog B served catalog
+A's cached bytes under the identical-selector scope; body_fetches path
+collapsed to one shared entry). The region-only l1 pins remain as the
+derivation-fallback leg.
+
+## Verifier attack results (recorded, no code change owed)
+
+| Attack | Result | Disposition |
+|---|---|---|
+| Same ARN + same `aws_access_key_id` + two different `with_storage_factory` instances | not shared at HEAD (2 body fetches) | now pinned by the V-001 tests |
+| AcceptThenLose → `CommitStateUnknown` | publish skipped; cache still holds the old location; next load unchanged | correct — publish only after a landed write |
+| `invalidate` racing an in-flight `try_get_with` load of the same key | entry re-inserted after the invalidate (moka completes the init insert) | **declared P3 — safe**: the key is an immutable metadata location reached through the fresh pointer on every load (D-1), so a resurrected entry is never a stale answer; the only stale case is an in-place rewrite of that URI, which `register_table` now reads directly (L-002) |
+| `with_max_bytes(1)` vs a ~64 KiB document | load still returns correct metadata; bound holds | correct — weigher admits oversized entries singly, never stale |
+| Secrets in scope/Debug paths | `CREDENTIAL_CONTEXT_PROP_KEYS` has no secret keys; config Debug redacts via `is_secret_prop_key`; `secret_props_never_reach_context_or_debug` green | no change |
