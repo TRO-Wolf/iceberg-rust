@@ -257,6 +257,7 @@ async fn test_pin13_off_switch_forces_n1_with_target_partitions_gt1() {
     config.options_mut().extensions.insert(IcebergScanOptions {
         multi_partition_scan: false,
         data_file_concurrency: 8,
+        row_selection_enabled: true,
     });
     let ctx = SessionContext::new_with_config(config);
     ctx.register_table("test_table", Arc::new(provider))
@@ -367,6 +368,7 @@ async fn test_pin1_pin5_multi_file_partitioning_and_limit() {
     config.options_mut().extensions.insert(IcebergScanOptions {
         multi_partition_scan: true,
         data_file_concurrency: 4,
+        row_selection_enabled: true,
     });
     let ctx = SessionContext::new_with_config(config);
     ctx.register_table("test_table", Arc::new(provider))

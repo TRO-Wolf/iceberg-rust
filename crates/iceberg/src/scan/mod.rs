@@ -664,6 +664,11 @@ impl std::fmt::Debug for ScanMetricsContext {
 }
 
 impl TableScan {
+    #[allow(missing_docs)]
+    pub fn row_selection_enabled(&self) -> bool {
+        self.row_selection_enabled
+    }
+
     /// Returns a stream of [`FileScanTask`]s.
     pub async fn plan_files(&self) -> Result<FileScanTaskStream> {
         let Some(plan_context) = self.plan_context.as_ref() else {

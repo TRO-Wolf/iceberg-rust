@@ -32,6 +32,7 @@ pub struct IcebergScanOptions {
     pub multi_partition_scan: bool,
     /// Total data-file concurrency budget `L`. Zero → use `target_partitions`.
     pub data_file_concurrency: usize,
+    pub row_selection_enabled: bool,
 }
 
 impl Default for IcebergScanOptions {
@@ -39,6 +40,7 @@ impl Default for IcebergScanOptions {
         Self {
             multi_partition_scan: true,
             data_file_concurrency: 0,
+            row_selection_enabled: true,
         }
     }
 }
@@ -72,6 +74,13 @@ impl ExtensionOptions for IcebergScanOptions {
                     ))
                 })?;
             }
+            "row_selection_enabled" => {
+                self.row_selection_enabled = value.parse().map_err(|e| {
+                    DataFusionError::Configuration(format!(
+                        "invalid iceberg.row_selection_enabled={value}: {e}"
+                    ))
+                })?;
+            }
             _ => {
                 return Err(DataFusionError::Configuration(format!(
                     "unknown iceberg config key: {key}"
@@ -93,6 +102,11 @@ impl ExtensionOptions for IcebergScanOptions {
                 value: Some(self.data_file_concurrency.to_string()),
                 description: "Total data-file concurrency budget L (0 = derive from target_partitions)",
             },
+            ConfigEntry {
+                key: "row_selection_enabled".to_string(),
+                value: Some(self.row_selection_enabled.to_string()),
+                description: "Parquet page-index row selection on filtered scans",
+            },
         ]
     }
 }
@@ -102,8 +116,6 @@ impl ConfigExtension for IcebergScanOptions {
 }
 
 /// Session-derived knobs for building an Iceberg core `TableScan` and its partition assignment.
-/// DataFusion's `TaskContext` supplies them. Row selection stays at the core default, off, because
-/// parsing the Parquet page index can outweigh the gain.
 ///
 /// | Symbol | Value |
 /// |---|---|
@@ -119,6 +131,7 @@ pub(crate) struct ScanKnobs {
     pub target_partitions: usize,
     /// Dedicated multi-partition off-switch (pin 13). Default true.
     pub multi_partition_scan: bool,
+    pub row_selection_enabled: bool,
 }
 
 impl Default for ScanKnobs {
@@ -128,6 +141,7 @@ impl Default for ScanKnobs {
             data_file_concurrency: None,
             target_partitions: 1,
             multi_partition_scan: true,
+            row_selection_enabled: true,
         }
     }
 }
@@ -163,6 +177,7 @@ pub(crate) fn scan_knobs_from_context(context: &TaskContext) -> ScanKnobs {
         data_file_concurrency: Some(data_file_concurrency),
         target_partitions,
         multi_partition_scan,
+        row_selection_enabled: iceberg_opts.row_selection_enabled,
     }
 }
 
