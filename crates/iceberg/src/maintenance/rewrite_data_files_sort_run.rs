@@ -46,10 +46,10 @@ pub(super) trait SortedBatchSink {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SortRunStats {
-    pub(super) spilled_runs: usize,
-    pub(super) merge_passes: usize,
-    pub(super) peak_sort_bytes: u64,
+pub(crate) struct SortRunStats {
+    pub(crate) spilled_runs: usize,
+    pub(crate) merge_passes: usize,
+    pub(crate) peak_sort_bytes: u64,
 }
 
 pub(super) struct ExternalSorter {

@@ -20,16 +20,16 @@ use std::cmp::Ordering;
 use crate::Catalog;
 use crate::maintenance::RewriteStrategy;
 use crate::maintenance::rewrite_data_files::RewriteDataFiles;
-use crate::maintenance::rewrite_data_files::tests::local_fs_catalog;
+use crate::maintenance::rewrite_data_files::tests::{live_delete_file_paths, local_fs_catalog};
 use crate::maintenance::rewrite_data_files_sort_harness::{
-    OracleRow, OutputFile, concatenated_rows, indexes, oracle_batches, oracle_row, oracle_table,
-    output_files,
+    OracleRow, OutputFile, concatenated_rows, delete_oracle_rows, indexes, oracle_batches,
+    oracle_row, oracle_table, output_files, scan_lineage,
 };
 use crate::maintenance::rewrite_data_files_sort_vectors::{
     SPARK_SORT_EXPLICIT, SPARK_SORT_EXPLICIT_MULTI, SPARK_SORT_EXPLICIT_OVER_TABLE_ORDER,
     SPARK_SORT_PARTITIONED, SPARK_SORT_TABLE_ORDER, SPARK_SORT_TABLE_ORDER_PARTITIONED,
     SPARK_SORT_TARGET_SMALL_FILES, SPARK_SORT_TRANSFORM_BUCKET, SPARK_SORT_TRANSFORM_DAYS,
-    SPARK_SORT_TRANSFORM_TRUNC,
+    SPARK_SORT_TRANSFORM_TRUNC, SPARK_SORT_V3_LINEAGE, SPARK_SORT_WITH_DELETES,
 };
 use crate::spec::{FormatVersion, NullOrder, SortDirection, SortField, SortOrder, Transform};
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -519,4 +519,65 @@ async fn bin_pack_stays_the_default_strategy() {
         .collect();
     inputs.sort_unstable();
     assert_eq!(rewritten, inputs);
+}
+
+#[tokio::test]
+async fn sort_on_v3_keeps_every_rows_lineage_and_matches_the_spark_row_order() {
+    let (catalog, _guard) = local_fs_catalog().await;
+    let table = oracle_table(&catalog, FormatVersion::V3, false, None).await;
+    let before = scan_lineage(&table).await;
+
+    RewriteDataFiles::new(table.clone())
+        .strategy(RewriteStrategy::Sort(id_desc_nulls_last()))
+        .rewrite_all(true)
+        .execute(&catalog)
+        .await
+        .expect("sort rewrite");
+
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload");
+    let after = scan_lineage(&table).await;
+    assert_eq!(
+        before, after,
+        "SORT-V3-LINEAGE: the rewrite changed a row's _row_id or _last_updated_sequence_number"
+    );
+    assert_same_key_order(
+        "SORT-V3-LINEAGE",
+        SPARK_SORT_V3_LINEAGE,
+        &concatenated_rows(&output_files(&table).await),
+        compare_id_desc_nulls_last,
+    );
+}
+
+#[tokio::test]
+async fn sort_applies_merge_on_read_deletes_and_keeps_the_delete_files() {
+    let (catalog, _guard) = local_fs_catalog().await;
+    let table = oracle_table(&catalog, FormatVersion::V2, false, None).await;
+    let deleted: Vec<i64> = (0..100).filter(|index| index % 5 == 0).collect();
+    let table = delete_oracle_rows(&catalog, &table, &deleted).await;
+    let delete_paths_before = live_delete_file_paths(&table).await;
+    assert!(!delete_paths_before.is_empty());
+
+    let order = order_of(vec![field(1, Transform::Identity, true, true)]);
+    let result = RewriteDataFiles::new(table.clone())
+        .strategy(RewriteStrategy::Sort(order))
+        .rewrite_all(true)
+        .execute(&catalog)
+        .await
+        .expect("sort rewrite");
+    assert_eq!(result.removed_delete_files_count, 0);
+
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload");
+    assert_eq!(live_delete_file_paths(&table).await, delete_paths_before);
+    assert_same_key_order(
+        "SORT-WITH-DELETES",
+        SPARK_SORT_WITH_DELETES,
+        &concatenated_rows(&output_files(&table).await),
+        compare_id_asc_nulls_first,
+    );
 }

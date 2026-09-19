@@ -284,4 +284,35 @@ the mutation reverted. Every clause has at least one pin that fails when it brea
 
 ## 6. Gates
 
-Recorded at step 6.
+| gate | command | result |
+|---|---|---|
+| unit pins (every `rewrite_data_files` module) | `cargo test -p iceberg --lib rewrite_data_files` | `ok. 143 passed; 0 failed; 0 ignored; 0 measured; 3981 filtered out` |
+| the neighbouring delete-rewrite suites | `cargo test -p iceberg --lib rewrite_position_delete` | `ok. 101 passed; 0 failed; 0 ignored; 0 measured; 4023 filtered out` |
+| format | `cargo fmt --all -- --check` | clean |
+| lints | `cargo clippy -p iceberg --all-targets -- -D warnings` | `Finished dev profile` — no warning |
+| file size | `python3 scripts/check_rust_file_size.py` | `581 files clean (92 legacy ceilings)`; the `rewrite_data_files.rs` ceiling moved DOWN 2440 → 2418 |
+| prose | `typos crates/iceberg/src/maintenance/ task/rdf-sort-1-ledger.md` | clean |
+| comment ban | `comment_ban.py <clone> origin/main` | `comment-ban hits=0` |
+
+## 7. What the RePark side owes
+
+The `CALL rewrite_data_files` router consumes this API:
+
+| procedure argument | fork API |
+|---|---|
+| `strategy => 'binpack'` (or absent, with no `sort_order`) | leave the default, `RewriteStrategy::BinPack` |
+| `strategy => 'sort'`, no `sort_order` | `RewriteStrategy::SortByTableOrder` |
+| `strategy => 'sort'`, `sort_order => '<cols>'` | parse the string into a `SortOrder` (direction and null order per column, transforms allowed) → `RewriteStrategy::Sort(order)` |
+| `sort_order => 'zorder(a, b)'` with or without `strategy => 'sort'` | `RewriteStrategy::ZOrder(ZOrderSpec::new([...]))` |
+| `options => map('var-length-contribution', n)` | `ZOrderSpec::var_length_contribution(n)` |
+| `options => map('max-output-size', n)` | `ZOrderSpec::max_output_size(n)` |
+| `options => map('shuffle-partitions-per-file', n)` / `('compression-factor', f)` | `RewriteDataFiles::shuffle_partitions_per_file` / `compression_factor` |
+
+The router still owns four refusals, because each is a property of the procedure's argument shape,
+not of the action: `unsupported strategy: <x>. Only binpack or sort is supported`; `Cannot set
+rewrite mode, it has already been set to BIN-PACK` (a `sort_order` with `strategy => 'binpack'`);
+`Cannot mix identity sort columns and a Zorder sort expression: <text>`; and `Unable to parse
+sortOrder: <text>` (a transform inside `zorder(...)`). For an unknown option it builds Java's
+`Cannot use options [<names>], they are not supported by the action or the rewriter <NAME>` from
+`RewriteStrategy::valid_option_names()` and `RewriteStrategy::description()`, which exist for it.
+Every other refusal in §1 comes out of `execute` as a typed `Error` with Java's message text.

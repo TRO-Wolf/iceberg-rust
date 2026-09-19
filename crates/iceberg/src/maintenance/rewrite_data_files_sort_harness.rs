@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type, TimestampMicrosecondType};
 use arrow_array::{
-    ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use futures::TryStreamExt;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -226,7 +226,7 @@ pub(super) async fn write_oracle_file(
         Some(cat) => {
             builder
                 .partition_spec_id(0)
-                .partition(Struct::from_iter([cat.map(|value| Literal::string(value))]));
+                .partition(Struct::from_iter([cat.map(Literal::string)]));
         }
         None => {
             builder.partition_spec_id(0).partition(Struct::empty());
@@ -255,10 +255,7 @@ fn oracle_batch(rows: &[OracleRow], arrow_schema: &Arc<arrow_schema::Schema>) ->
 
 pub(super) struct OutputFile {
     pub(super) name: String,
-    pub(super) path: String,
     pub(super) sort_order_id: Option<i32>,
-    pub(super) record_count: u64,
-    pub(super) partition: Struct,
     pub(super) rows: Vec<OracleRow>,
 }
 
@@ -287,9 +284,6 @@ pub(super) async fn output_files(table: &Table) -> Vec<OutputFile> {
                 name,
                 rows: read_rows_in_file_order(table, &path).await,
                 sort_order_id: data_file.sort_order_id(),
-                record_count: data_file.record_count(),
-                partition: data_file.partition().clone(),
-                path,
             });
         }
     }
@@ -349,10 +343,11 @@ pub(super) async fn read_rows_in_file_order(table: &Table, path: &str) -> Vec<Or
         let values = batch.column_by_name("v").expect("v column").clone();
         let strings = batch.column_by_name("s").expect("s column").clone();
         for row in 0..batch.num_rows() {
-            let id = ids
-                .is_null(row)
-                .then_some(None)
-                .unwrap_or_else(|| Some(ids.as_primitive::<Int64Type>().value(row)));
+            let id = if ids.is_null(row) {
+                None
+            } else {
+                Some(ids.as_primitive::<Int64Type>().value(row))
+            };
             let index = id.unwrap_or(77);
             rows.push(OracleRow {
                 index,
@@ -402,4 +397,98 @@ pub(super) fn spill_files(table: &Table) -> Vec<String> {
     found
 }
 
-pub(super) const OUTPUT_FORMAT: DataFileFormat = DataFileFormat::Parquet;
+pub(super) async fn scan_lineage(table: &Table) -> Vec<(Option<i64>, i64, i64)> {
+    use crate::metadata_columns::{
+        RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
+    };
+
+    let stream = table
+        .scan()
+        .select([
+            "id",
+            RESERVED_COL_NAME_ROW_ID,
+            RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+        ])
+        .build()
+        .expect("lineage scan")
+        .to_arrow()
+        .await
+        .expect("lineage batches");
+    let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect lineage");
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch.column_by_name("id").expect("id").clone();
+        let row_ids = batch
+            .column_by_name(RESERVED_COL_NAME_ROW_ID)
+            .expect("_row_id")
+            .as_primitive::<Int64Type>();
+        let sequences = batch
+            .column_by_name(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER)
+            .expect("_last_updated_sequence_number")
+            .as_primitive::<Int64Type>();
+        for row in 0..batch.num_rows() {
+            assert!(row_ids.is_valid(row), "a v3 row must carry a _row_id");
+            assert!(sequences.is_valid(row), "a v3 row must carry a sequence");
+            rows.push((
+                (!ids.is_null(row)).then(|| ids.as_primitive::<Int64Type>().value(row)),
+                row_ids.value(row),
+                sequences.value(row),
+            ));
+        }
+    }
+    rows.sort_unstable();
+    rows
+}
+
+pub(super) async fn delete_oracle_rows(
+    catalog: &impl Catalog,
+    table: &Table,
+    ids: &[i64],
+) -> Table {
+    use crate::arrow::arrow_schema_to_schema;
+    use crate::maintenance::rewrite_data_files::tests::add_deletes;
+    use crate::writer::base_writer::equality_delete_writer::{
+        EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+    };
+    use crate::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator,
+    };
+    use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+
+    let schema = table.metadata().current_schema().clone();
+    let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone()).expect("delete config");
+    let delete_schema = Arc::new(
+        arrow_schema_to_schema(config.projected_arrow_schema_ref()).expect("delete schema"),
+    );
+    let location_generator =
+        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let file_name_generator = DefaultFileNameGenerator::new(
+        "eq-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        delete_schema.clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+        .unpartitioned()
+        .build(None)
+        .await
+        .expect("delete writer");
+    let arrow_schema = Arc::new(schema_to_arrow_schema(&delete_schema).expect("delete arrow"));
+    let batch = RecordBatch::try_new(arrow_schema, vec![
+        Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef
+    ])
+    .expect("delete batch");
+    writer.write(batch).await.expect("write deletes");
+    let deletes = writer.close().await.expect("close delete writer");
+    add_deletes(catalog, table, deletes).await
+}
