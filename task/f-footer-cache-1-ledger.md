@@ -162,12 +162,21 @@ Source: `measure_100_file_footer_requests` eprintln, run 1 (this round).
 
 ## Mutation evidence
 
-| Mutation | Expected red pin | Result |
+Each mutation was applied to `footer_cache.rs`, the named pin was run, the failure
+observed, then the file was reverted (`git checkout`). After all four reverts the
+suite re-ran: 14/14 green.
+
+| Mutation | Pin | Observed failure |
 |---|---|---|
-| drop `file_size_in_bytes` from `FooterKey` | C-4 red | PENDING |
-| drop `scope` from `FooterKey` | C-5 red | PENDING |
-| `Op::Put` second entry instead of replace on upgrade (insert-only) | C-3 red | PENDING |
-| remove dedup (`try_get_with` → plain `get`+insert) | C-6 red | PENDING |
+| dropped `file_size_in_bytes` from `FooterKey` + `key()` | C-4 | `c4_same_path_different_size_misses` FAILED — `different size must miss: left 0, right 1` (wrong-size lookup hit the seeded entry, no fetch) |
+| dropped `scope` from `FooterKey` + `key()` | C-5 | `c5_two_scopes_same_path_two_entries` FAILED — `scopes must not share: left 1, right 2` (second scope hit scope A's entry) |
+| upgrade compute ran under a different key (`wrapping_add(1)` on size) — the "second entry instead of replace" bug | C-3 | `c3_filtered_scan_upgrades_entry_once` FAILED — `upgrades: left 0, right 1` (the compute's `None` arm cold-fetched and stored under the foreign key; the real entry stayed index-less) |
+| replaced `try_get_with` with `get` + `insert` (no coalescing) | C-6 | `c6_concurrent_cold_opens_one_footer_read` FAILED — `fetches: left 16, right 1` (every waiter read the footer) |
+
+Note on the C-3 mutation shape: moka `insert` itself replaces under the same key, so
+"insert instead of replace" is only observable as a *different-key* insert — the
+mutation models exactly that bug class (upgrade stored under a key the lookup never
+revisits), and the pin catches it three ways (`upgrades`, `entry_count`, index reads).
 
 ## Implementation decisions
 
