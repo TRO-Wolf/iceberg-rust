@@ -2648,7 +2648,7 @@ mod tests {
         use arrow_array::StringArray;
 
         let config = PositionDeleteWriterConfig::new().unwrap();
-        let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+        let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
         let file_name_gen = DefaultFileNameGenerator::new(
             "pos-del".to_string(),
             Some(uuid::Uuid::now_v7().to_string()),

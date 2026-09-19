@@ -203,8 +203,7 @@ async fn write_wap_data_file(
     ])
     .expect("build per-partition data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "wapdata".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

@@ -397,8 +397,7 @@ async fn write_category_file(
     ])
     .expect("build the {id, category} data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "s5data".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -444,8 +443,7 @@ async fn write_category_eq_delete(
     let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
         .expect("equality-delete writer config (equality_ids = [1])");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "s5eqdel".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -504,8 +502,7 @@ async fn write_yid_file(table: &Table, ids: Vec<i64>, ys: Vec<i64>) -> DataFile 
     ])
     .expect("build the {id, y} data batch");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "s5ydata".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
@@ -547,8 +544,7 @@ async fn write_y_eq_delete_file(table: &Table, lo: i64, hi: i64) -> DataFile {
     let config = EqualityDeleteWriterConfig::new(vec![2], schema.clone())
         .expect("equality-delete writer config (equality_ids=[2], the y field)");
 
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         "s5yeqdel".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

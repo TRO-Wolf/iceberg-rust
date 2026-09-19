@@ -219,7 +219,7 @@ async fn write_eq_delete_inner(
     let delete_schema =
         Arc::new(arrow_schema_to_schema(config.projected_arrow_schema_ref()).unwrap());
 
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).unwrap();
     let file_name_gen = DefaultFileNameGenerator::new(
         "eq-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),

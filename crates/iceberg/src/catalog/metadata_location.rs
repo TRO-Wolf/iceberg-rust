@@ -87,7 +87,8 @@ impl MetadataLocation {
     pub(crate) fn rebased(&self, metadata: &TableMetadata) -> Result<Self> {
         Ok(Self {
             metadata_dir: write_metadata_dir(metadata.location(), metadata.properties())?,
-            ..self.clone()
+            version: self.version,
+            id: self.id,
         })
     }
 

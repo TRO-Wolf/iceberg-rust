@@ -55,7 +55,7 @@ pub struct DefaultLocationGenerator {
 
 impl DefaultLocationGenerator {
     /// Create a new `DefaultLocationGenerator`.
-    pub fn new(table_metadata: TableMetadata) -> Result<Self> {
+    pub fn new(table_metadata: &TableMetadata) -> Result<Self> {
         let table_location = table_metadata.location();
         let prop = table_metadata.properties();
         let configured_data_location = prop
@@ -403,8 +403,7 @@ pub(crate) mod test {
         );
 
         // test default data location
-        let location_generator =
-            super::DefaultLocationGenerator::new(table_metadata.clone()).unwrap();
+        let location_generator = super::DefaultLocationGenerator::new(&table_metadata).unwrap();
         let location =
             location_generator.generate_location(None, &file_name_generator.generate_file_name());
         assert_eq!(location, "s3://data.db/table/data/part-00000-test.parquet");
@@ -414,8 +413,7 @@ pub(crate) mod test {
             TableProperties::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION.to_string(),
             "s3://data.db/table/data_1".to_string(),
         );
-        let location_generator =
-            super::DefaultLocationGenerator::new(table_metadata.clone()).unwrap();
+        let location_generator = super::DefaultLocationGenerator::new(&table_metadata).unwrap();
         let location =
             location_generator.generate_location(None, &file_name_generator.generate_file_name());
         assert_eq!(
@@ -427,8 +425,7 @@ pub(crate) mod test {
             TableProperties::PROPERTY_WRITE_DATA_LOCATION.to_string(),
             "s3://data.db/table/data_2".to_string(),
         );
-        let location_generator =
-            super::DefaultLocationGenerator::new(table_metadata.clone()).unwrap();
+        let location_generator = super::DefaultLocationGenerator::new(&table_metadata).unwrap();
         let location =
             location_generator.generate_location(None, &file_name_generator.generate_file_name());
         assert_eq!(
@@ -441,8 +438,7 @@ pub(crate) mod test {
             // invalid table location
             "s3://data.db/data_3".to_string(),
         );
-        let location_generator =
-            super::DefaultLocationGenerator::new(table_metadata.clone()).unwrap();
+        let location_generator = super::DefaultLocationGenerator::new(&table_metadata).unwrap();
         let location =
             location_generator.generate_location(None, &file_name_generator.generate_file_name());
         assert_eq!(location, "s3://data.db/data_3/part-00003-test.parquet");
@@ -513,7 +509,7 @@ pub(crate) mod test {
         };
 
         // Test with DefaultLocationGenerator
-        let default_location_gen = super::DefaultLocationGenerator::new(table_metadata).unwrap();
+        let default_location_gen = super::DefaultLocationGenerator::new(&table_metadata).unwrap();
         let location = default_location_gen.generate_location(Some(&partition_key), file_name);
         assert_eq!(
             location,

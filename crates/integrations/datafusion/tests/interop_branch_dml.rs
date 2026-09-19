@@ -313,8 +313,7 @@ async fn write_id_file(table: &Table, id: i32, data: &str) -> DataFile {
         Arc::new(StringArray::from(vec![data])),
     ])
     .expect("batch");
-    let location_gen =
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("location generator");
+    let location_gen = DefaultLocationGenerator::new(table.metadata()).expect("location generator");
     let file_name_gen = DefaultFileNameGenerator::new(
         format!("retry-{id}"),
         Some(uuid::Uuid::now_v7().to_string()),

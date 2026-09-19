@@ -471,7 +471,7 @@ async fn equality_delete_written_after_promotion_applies_to_a_pre_promotion_part
             delete_schema,
         ),
         table.file_io().clone(),
-        DefaultLocationGenerator::new(table.metadata().clone()).expect("locations"),
+        DefaultLocationGenerator::new(table.metadata()).expect("locations"),
         DefaultFileNameGenerator::new("eq-del".to_string(), None, DataFileFormat::Parquet),
     );
     let key = PartitionKey::new(
