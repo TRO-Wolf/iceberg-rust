@@ -39,9 +39,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN};
-use iceberg::spec::{
-    DataFileFormat, MetricsConfig, TableProperties, serialize_data_file_to_json,
-};
+use iceberg::spec::{DataFileFormat, MetricsConfig, TableProperties, serialize_data_file_to_json};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
