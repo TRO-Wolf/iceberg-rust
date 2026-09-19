@@ -346,6 +346,8 @@ block count rejected, literal-name binding): **12 of 15 pins red** —
 
 ## R2-5. Commits (round 2, oldest → newest)
 
+- `4e4c92c9` test: pin Avro data-file value-key sanitization (L-001)
+- `7a393e00` fix: sanitize Avro data-file record value keys (L-001)
 - `1502c47e` test: pin OCF fast path and streaming repair (R-01, R-02)
 - `35fb3014` fix: OCF fast path and header-only streaming repair (R-01, R-02)
 - `1d3da9e6` test: pin collision loud-fail and distinct repair (L-002, L-003)
