@@ -54,6 +54,8 @@ mod open_parquet_tests;
 #[cfg(test)]
 mod page_prune_fixture;
 #[cfg(test)]
+mod page_prune_perf_tests;
+#[cfg(test)]
 mod page_prune_tests;
 #[cfg(test)]
 mod page_prune_tests_2;
