@@ -31,9 +31,9 @@ use crate::io::LocalFsStorageFactory;
 use crate::maintenance::RewriteDataFiles;
 use crate::memory::MemoryCatalogBuilder;
 use crate::spec::{
-    DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, Literal, ManifestContentType,
-    NestedField, Operation, PartitionKey, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
-    SnapshotRef, Struct, Transform, Type,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
+    ManifestContentType, NestedField, Operation, PartitionKey, PartitionSpec, PrimitiveType,
+    Schema as IcebergSchema, SnapshotRef, Struct, Transform, Type,
 };
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::writer::base_writer::position_delete_writer::{
@@ -4604,4 +4604,126 @@ async fn test_v3_non_superset_refusal_is_cleared_by_rewrite_data_files() {
             "the refusal names '{knob}', the escape this test actually runs: {refusal}"
         );
     }
+}
+
+async fn repark_shape_data_files(table: &Table) -> (Vec<DataFile>, Vec<String>) {
+    let table_loc = table.metadata().location().to_string();
+    let mut files = Vec::new();
+    let mut paths = Vec::new();
+    for part in 0..2i64 {
+        for index in 0..8 {
+            let path = format!("{table_loc}/data/x={part}/d{index}.parquet");
+            paths.push(path.clone());
+            files.push(
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(path)
+                    .file_format(DataFileFormat::Parquet)
+                    .file_size_in_bytes(500)
+                    .record_count(50)
+                    .partition_spec_id(0)
+                    .partition(Struct::from_iter([Some(Literal::long(part))]))
+                    .build()
+                    .unwrap(),
+            );
+        }
+    }
+    (files, paths)
+}
+
+#[tokio::test]
+async fn test_spark_sized_delete_files_inside_the_band_are_not_candidates() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+    let table_loc = table.metadata().location().to_string();
+    let (data_files, data_paths) = repark_shape_data_files(&table).await;
+    let table = append_files(&catalog, &table, data_files).await;
+
+    let spark_sized: Vec<DataFile> = data_paths
+        .iter()
+        .enumerate()
+        .step_by(2)
+        .map(|(index, _)| {
+            let part = (index / 8) as i64;
+            DataFileBuilder::default()
+                .content(DataContentType::PositionDeletes)
+                .file_path(format!("{table_loc}/data/x={part}/del{index}-deletes.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(1585)
+                .record_count(25)
+                .partition_spec_id(0)
+                .partition(Struct::from_iter([Some(Literal::long(part))]))
+                .build()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(spark_sized.len(), 8);
+    let table = add_deletes(&catalog, &table, spark_sized).await;
+
+    let action = || RewritePositionDeleteFiles::new(table.clone()).target_file_size_bytes(2000);
+    let config = action().resolve_config().expect("the knobs are legal");
+    assert_eq!(config.min_file_size_bytes, 1500);
+    assert_eq!(config.max_file_size_bytes, 3600);
+
+    let snapshots_before = table.metadata().snapshots().count();
+    let result = action().execute(&catalog).await.unwrap();
+    assert_eq!(
+        result,
+        RewritePositionDeleteFilesResult::default(),
+        "files inside [min, max] are not candidates — Java's zero for the oracle shape"
+    );
+
+    let second = action()
+        .min_input_files(1)
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        second,
+        RewritePositionDeleteFilesResult::default(),
+        "min-input-files=1 cannot select files that were never candidates"
+    );
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    assert_eq!(
+        reloaded.metadata().snapshots().count(),
+        snapshots_before,
+        "nothing selected means no commit, as Spark reports no new snapshot"
+    );
+}
+
+#[tokio::test]
+async fn test_sub_min_delete_files_in_the_same_shape_are_rewritten() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+    let (data_files, data_paths) = repark_shape_data_files(&table).await;
+    let table = append_files(&catalog, &table, data_files).await;
+
+    let positions: Vec<i64> = (0..25).collect();
+    let mut deletes = Vec::new();
+    for (index, path) in data_paths.iter().enumerate().step_by(2) {
+        deletes.push(
+            write_file_scoped_position_delete_file(&table, (index / 8) as i64, path, &positions)
+                .await,
+        );
+    }
+    assert_eq!(deletes.len(), 8);
+    let action = || RewritePositionDeleteFiles::new(table.clone()).target_file_size_bytes(2000);
+    let config = action().resolve_config().expect("the knobs are legal");
+    assert!(
+        deletes
+            .iter()
+            .all(|f| f.file_size_in_bytes < config.min_file_size_bytes),
+        "fixture: every real delete file is SUB-MIN against the resolved floor {}",
+        config.min_file_size_bytes
+    );
+    let table = add_deletes(&catalog, &table, deletes).await;
+
+    let result = RewritePositionDeleteFiles::new(table.clone())
+        .target_file_size_bytes(2000)
+        .execute(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(result.rewritten_delete_files_count, 8);
+    assert_eq!(result.added_delete_files_count, 8);
 }
