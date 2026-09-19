@@ -830,3 +830,7 @@ async fn measure_100_file_footer_requests() {
 mod r2 {
     include!("footer_cache_r2_tests.rs");
 }
+
+mod v {
+    include!("footer_cache_v_tests.rs");
+}
