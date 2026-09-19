@@ -309,7 +309,9 @@ impl ExecutionPlan for IcebergWriteExec {
             self.table.metadata().current_schema().clone(),
             FieldMatchMode::Name,
         )
-        .with_metrics_config(MetricsConfig::for_table(self.table.metadata()));
+        .with_metrics_config(
+            MetricsConfig::for_table(self.table.metadata()).map_err(to_datafusion_error)?,
+        );
         let target_file_size = table_props.write_target_file_size_bytes;
 
         let file_io = self.table.file_io().clone();

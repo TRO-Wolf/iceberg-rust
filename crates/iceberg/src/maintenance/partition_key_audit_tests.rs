@@ -940,3 +940,51 @@ async fn test_repair_rewritten_files_carry_the_table_codec() {
         assert!(chunks > 0, "parquet file {local} has no column chunks");
     }
 }
+
+#[tokio::test]
+async fn test_repair_rewritten_files_honor_metrics_default_none() {
+    let (catalog, _tmp) = local_fs_catalog().await;
+    let (table, path_a, path_b, path_c) = miskeyed_fixture(&catalog).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_table_properties()
+        .set(
+            "write.metadata.metrics.default".to_string(),
+            "none".to_string(),
+        )
+        .apply(tx)
+        .expect("apply metrics property");
+    let table = tx.commit(&catalog).await.expect("commit metrics property");
+
+    let result = RepairPartitionKeys::new(table.clone())
+        .execute(&catalog)
+        .await
+        .expect("repair the miskeyed fixture");
+    assert_eq!(result.added_data_files_count, 2);
+
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload the repaired table");
+    let rewritten: Vec<DataFile> = live_data_files_by_path(&table)
+        .await
+        .expect("live data files after repair")
+        .into_values()
+        .filter(|file| {
+            ![path_a.as_str(), path_b.as_str(), path_c.as_str()].contains(&file.file_path())
+        })
+        .collect();
+    assert_eq!(rewritten.len(), 2, "repair must add two rewritten files");
+    for file in &rewritten {
+        assert!(
+            file.column_sizes().is_empty()
+                && file.value_counts().is_empty()
+                && file.null_value_counts().is_empty()
+                && file.nan_value_counts().is_empty()
+                && file.lower_bounds().is_empty()
+                && file.upper_bounds().is_empty(),
+            "metrics.default=none must strip all six metrics maps on {}",
+            file.file_path()
+        );
+    }
+}

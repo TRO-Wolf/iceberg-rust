@@ -101,7 +101,7 @@ pub(crate) async fn write_compacted_files(
         writer_properties = writer_properties.set_column_dictionary_enabled(path, false);
     }
     let parquet_builder = ParquetWriterBuilder::new(writer_properties.build(), schema.clone())
-        .with_metrics_config(MetricsConfig::for_table(table.metadata()));
+        .with_metrics_config(MetricsConfig::for_table(table.metadata())?);
     let write_max = write_max_file_size(config.target_file_size_bytes, config.max_file_size_bytes);
     let rolling_builder = RollingFileWriterBuilder::new(
         parquet_builder,

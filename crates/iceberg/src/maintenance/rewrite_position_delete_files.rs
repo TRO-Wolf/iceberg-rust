@@ -662,7 +662,7 @@ impl RewritePositionDeleteFiles {
                 partition.clone(),
             )?,
             writer_config: PositionDeleteWriterConfig::new()?,
-            metrics_config: MetricsConfig::for_position_delete_table(metadata),
+            metrics_config: Arc::new(MetricsConfig::for_position_delete_table(metadata)?),
             parquet_properties: position_delete_writer_properties_for(metadata.properties())?,
             location_gen: DefaultLocationGenerator::new(metadata.clone())?,
             file_name_gen: DefaultFileNameGenerator::new(
@@ -977,7 +977,7 @@ struct LiveDeleteEntry {
 struct GroupWriteFactory {
     partition_key: PartitionKey,
     writer_config: PositionDeleteWriterConfig,
-    metrics_config: MetricsConfig,
+    metrics_config: Arc<MetricsConfig>,
     parquet_properties: WriterProperties,
     location_gen: DefaultLocationGenerator,
     file_name_gen: DefaultFileNameGenerator,

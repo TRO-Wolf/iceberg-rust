@@ -522,7 +522,7 @@ async fn rewrite_under_computed_keys(
             .build(),
         schema.clone(),
     )
-    .with_metrics_config(MetricsConfig::for_table(table.metadata()));
+    .with_metrics_config(MetricsConfig::for_table(table.metadata())?);
     let rolling_builder = RollingFileWriterBuilder::new(
         parquet_builder,
         usize::try_from(target_file_size_bytes).unwrap_or(usize::MAX),

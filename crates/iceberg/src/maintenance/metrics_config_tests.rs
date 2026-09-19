@@ -30,23 +30,27 @@ use crate::maintenance::rewrite_data_files::RewriteDataFiles;
 use crate::maintenance::rewrite_data_files::tests::{
     add_deletes, append_files, local_fs_catalog, write_data_file, write_equality_delete_file,
 };
+use crate::maintenance::rewrite_position_delete_files::RewritePositionDeleteFiles;
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, ListType, MetricsConfig,
-    NestedField, NullOrder, PartitionSpec, PrimitiveType, Schema, SortDirection, SortField,
-    SortOrder, StructType, Transform, Type,
+    MetricsMode, NestedField, NullOrder, PartitionSpec, PrimitiveType, Schema, SortDirection,
+    SortField, SortOrder, StructType, Transform, Type,
 };
 use crate::table::Table;
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use crate::writer::base_writer::position_delete_writer::{
+    PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
+};
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
-use crate::{Catalog, NamespaceIdent, TableCreation};
+use crate::{Catalog, ErrorKind, NamespaceIdent, TableCreation};
 
 const METRICS_DEFAULT_KEY: &str = "write.metadata.metrics.default";
 const METRICS_MAX_INFERRED_KEY: &str = "write.metadata.metrics.max-inferred-column-defaults";
@@ -276,7 +280,11 @@ async fn run_oracle_cell(
 ) {
     let (catalog, _tmp) = local_fs_catalog().await;
     let table = create_oracle_table(&catalog, properties, sort_order).await;
-    let file = write_oracle_file(&table, Some(MetricsConfig::for_table(table.metadata()))).await;
+    let file = write_oracle_file(
+        &table,
+        Some(MetricsConfig::for_table(table.metadata()).unwrap()),
+    )
+    .await;
     assert_eq!(file.record_count(), 2);
     assert_maps(&file, expected);
 }
@@ -506,6 +514,44 @@ async fn oracle_cell_bad_mode() {
     .await;
 }
 
+#[tokio::test]
+async fn oracle_cell_max_inferred_negative() {
+    run_oracle_cell(&[(METRICS_MAX_INFERRED_KEY, "-1")], None, &CellExpect {
+        column_size_keys: NO_SIZES,
+        value_counts: EMPTY,
+        null_value_counts: EMPTY,
+        nan_value_counts: EMPTY,
+        lower_bounds: NO_BOUNDS,
+        upper_bounds: NO_BOUNDS,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn malformed_max_inferred_fails_writer_construction() {
+    let (catalog, _tmp) = local_fs_catalog().await;
+    let table = create_oracle_table(
+        &catalog,
+        &[(METRICS_MAX_INFERRED_KEY, "not-a-number")],
+        None,
+    )
+    .await;
+
+    let err = MetricsConfig::for_table(table.metadata()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    let err = MetricsConfig::for_position_delete_table(table.metadata()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+
+    let input = write_oracle_file(&table, None).await;
+    let table = append_files(&catalog, &table, vec![input]).await;
+    let err = RewriteDataFiles::new(table)
+        .rewrite_all(true)
+        .execute(&catalog)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+}
+
 async fn live_files(table: &Table, content: DataContentType) -> Vec<DataFile> {
     let snapshot = table.metadata().current_snapshot().expect("snapshot");
     let manifest_list = snapshot
@@ -585,7 +631,13 @@ async fn position_delete_keeps_full_bounds_under_none_default() {
         .name("t".to_string())
         .schema(schema)
         .partition_spec(spec)
-        .properties([(METRICS_DEFAULT_KEY.to_string(), "none".to_string())])
+        .properties([
+            (METRICS_DEFAULT_KEY.to_string(), "none".to_string()),
+            (
+                "write.metadata.metrics.column.x".to_string(),
+                "counts".to_string(),
+            ),
+        ])
         .format_version(FormatVersion::V2)
         .build();
     let table = catalog.create_table(&namespace, creation).await.unwrap();
@@ -644,4 +696,124 @@ async fn position_delete_keeps_full_bounds_under_none_default() {
         "file_path bound must be the FULL untruncated path"
     );
     assert!(file.nan_value_counts().is_empty());
+
+    let delete_config = MetricsConfig::for_position_delete_table(table.metadata()).unwrap();
+    assert_eq!(
+        delete_config.column_mode("row.x"),
+        MetricsMode::Counts,
+        "the row.<name> overlay must carry the table's per-column mode"
+    );
+    assert_eq!(
+        delete_config.column_mode("row.y"),
+        MetricsMode::None,
+        "a row field with no override inherits the table default"
+    );
+    assert_eq!(delete_config.column_mode("file_path"), MetricsMode::Full);
+    assert_eq!(delete_config.column_mode("pos"), MetricsMode::Full);
+}
+
+async fn write_oracle_pos_delete(table: &Table, pairs: &[(&str, i64)]) -> DataFile {
+    let config = PositionDeleteWriterConfig::new().expect("pos delete config");
+    let location_gen = DefaultLocationGenerator::new(table.metadata().clone()).expect("loc gen");
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "pos-del".to_string(),
+        Some(uuid::Uuid::now_v7().to_string()),
+        DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        config.schema().clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    let mut writer = PositionDeleteFileWriterBuilder::new(rolling, config.clone())
+        .unpartitioned()
+        .build(None)
+        .await
+        .expect("build pos delete writer");
+    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+        Arc::new(StringArray::from(
+            pairs.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        )) as ArrayRef,
+        Arc::new(Int64Array::from(
+            pairs.iter().map(|(_, pos)| *pos).collect::<Vec<_>>(),
+        )) as ArrayRef,
+    ])
+    .expect("pos delete batch");
+    writer.write(batch).await.expect("write pos delete");
+    writer
+        .close()
+        .await
+        .expect("close pos delete writer")
+        .into_iter()
+        .next()
+        .expect("a pos delete file")
+}
+
+#[tokio::test]
+async fn compacted_pos_delete_keeps_full_bounds_under_none_default() {
+    let (catalog, _tmp) = local_fs_catalog().await;
+    let table = create_oracle_table(&catalog, &[(METRICS_DEFAULT_KEY, "none")], None).await;
+    let x = write_oracle_file(&table, None).await;
+    let x_path = x.file_path().to_string();
+    let table = append_files(&catalog, &table, vec![x]).await;
+    let pd1 = write_oracle_pos_delete(&table, &[(&x_path, 0)]).await;
+    let table = add_deletes(&catalog, &table, vec![pd1]).await;
+    let pd2 = write_oracle_pos_delete(&table, &[(&x_path, 1)]).await;
+    let table = add_deletes(&catalog, &table, vec![pd2]).await;
+
+    RewritePositionDeleteFiles::new(table.clone())
+        .min_input_files(2)
+        .execute(&catalog)
+        .await
+        .unwrap();
+
+    let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+    let pos_files = live_files(&reloaded, DataContentType::PositionDeletes).await;
+    assert_eq!(pos_files.len(), 1, "exactly one compacted pos-delete");
+    let file = &pos_files[0];
+
+    let reserved: HashSet<i32> = HashSet::from([
+        RESERVED_FIELD_ID_DELETE_FILE_PATH,
+        RESERVED_FIELD_ID_DELETE_FILE_POS,
+    ]);
+    for keys in [
+        file.column_sizes()
+            .keys()
+            .copied()
+            .collect::<HashSet<i32>>(),
+        file.value_counts()
+            .keys()
+            .copied()
+            .collect::<HashSet<i32>>(),
+        file.null_value_counts()
+            .keys()
+            .copied()
+            .collect::<HashSet<i32>>(),
+        file.lower_bounds()
+            .keys()
+            .copied()
+            .collect::<HashSet<i32>>(),
+        file.upper_bounds()
+            .keys()
+            .copied()
+            .collect::<HashSet<i32>>(),
+    ] {
+        assert_eq!(keys, reserved);
+    }
+    assert!(file.nan_value_counts().is_empty());
+    assert_eq!(
+        file.lower_bounds()
+            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
+            .expect("file_path lower bound")
+            .to_bytes()
+            .unwrap()
+            .as_ref(),
+        x_path.as_bytes(),
+        "file_path bound must be the FULL untruncated path"
+    );
 }

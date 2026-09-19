@@ -45,9 +45,8 @@ use crate::arrow::{
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
-    MetricsConfig, MetricsMode, NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef,
-    SchemaVisitor, Struct, StructType, TableMetadata, Type, struct_descended_field_ids,
-    visit_schema,
+    MetricsByFieldId, MetricsConfig, NestedFieldRef, PartitionSpec, PrimitiveType, Schema,
+    SchemaRef, SchemaVisitor, Struct, StructType, TableMetadata, Type, visit_schema,
 };
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
@@ -59,7 +58,7 @@ pub struct ParquetWriterBuilder {
     writer_options: std::result::Result<ArrowWriterOptions, Arc<Error>>,
     schema: SchemaRef,
     match_mode: FieldMatchMode,
-    metrics_config: MetricsConfig,
+    metrics_config: Arc<MetricsConfig>,
 }
 
 impl ParquetWriterBuilder {
@@ -84,15 +83,15 @@ impl ParquetWriterBuilder {
                 .map_err(Arc::new),
             schema,
             match_mode,
-            metrics_config: MetricsConfig::default(),
+            metrics_config: Arc::new(MetricsConfig::default()),
         }
     }
 
     /// Set the [`MetricsConfig`] that decides which column statistics the data file keeps. It
     /// overrides the default `truncate(16)`. A position-delete writer needs
     /// [`MetricsConfig::for_position_delete`], which keeps `file_path` bounds full.
-    pub fn with_metrics_config(mut self, metrics_config: MetricsConfig) -> Self {
-        self.metrics_config = metrics_config;
+    pub fn with_metrics_config(mut self, metrics_config: impl Into<Arc<MetricsConfig>>) -> Self {
+        self.metrics_config = metrics_config.into();
         self
     }
 }
@@ -121,7 +120,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
             collect_nan_value_counts,
-            metrics_config: self.metrics_config.clone(),
+            metrics: MetricsByFieldId::new(self.schema.as_ref(), &self.metrics_config),
         })
     }
 }
@@ -340,37 +339,18 @@ pub struct ParquetWriter {
     /// When false the write path skips the NaN visitor entirely (no float/double leaves under a
     /// counts-collecting metrics mode). Computed once in [`ParquetWriterBuilder::build`].
     collect_nan_value_counts: bool,
-    metrics_config: MetricsConfig,
+    metrics: MetricsByFieldId,
 }
 
 /// Used to aggregate min and max value of each column.
-struct MinMaxColAggregator {
+struct MinMaxColAggregator<'a> {
     lower_bounds: HashMap<i32, Datum>,
     upper_bounds: HashMap<i32, Datum>,
     schema: SchemaRef,
-    metrics_config: MetricsConfig,
+    metrics: &'a MetricsByFieldId,
 }
 
-impl MinMaxColAggregator {
-    /// Creates new and empty `MinMaxColAggregator`
-    fn new(schema: SchemaRef, metrics_config: MetricsConfig) -> Self {
-        Self {
-            lower_bounds: HashMap::new(),
-            upper_bounds: HashMap::new(),
-            schema,
-            metrics_config,
-        }
-    }
-
-    /// The resolved [`MetricsMode`] for a column, by its (dotted) schema name; columns absent from
-    /// the schema fall back to the table default.
-    fn mode_for(&self, field_id: i32) -> MetricsMode {
-        match self.schema.name_by_field_id(field_id) {
-            Some(name) => self.metrics_config.column_mode(name),
-            None => self.metrics_config.default_mode_of(),
-        }
-    }
-
+impl MinMaxColAggregator<'_> {
     fn update_state_min(&mut self, field_id: i32, datum: Datum) {
         self.lower_bounds
             .entry(field_id)
@@ -442,13 +422,13 @@ impl MinMaxColAggregator {
     fn produce(self) -> (HashMap<i32, Datum>, HashMap<i32, Datum>) {
         let mut lower_bounds = HashMap::with_capacity(self.lower_bounds.len());
         for (field_id, datum) in &self.lower_bounds {
-            if let Some(bound) = self.mode_for(*field_id).truncate_lower_bound(datum) {
+            if let Some(bound) = self.metrics.mode_for(*field_id).truncate_lower_bound(datum) {
                 lower_bounds.insert(*field_id, bound);
             }
         }
         let mut upper_bounds = HashMap::with_capacity(self.upper_bounds.len());
         for (field_id, datum) in &self.upper_bounds {
-            if let Some(bound) = self.mode_for(*field_id).truncate_upper_bound(datum) {
+            if let Some(bound) = self.metrics.mode_for(*field_id).truncate_upper_bound(datum) {
                 upper_bounds.insert(*field_id, bound);
             }
         }
@@ -466,6 +446,10 @@ impl ParquetWriter {
     ) -> Result<Vec<DataFile>> {
         // TODO: support adding to partitioned table
         let mut data_files: Vec<DataFile> = Vec::new();
+        let metrics = MetricsByFieldId::new(
+            table_metadata.current_schema(),
+            &MetricsConfig::for_table(table_metadata)?,
+        );
 
         for file_path in file_paths {
             let input_file = file_io.new_input(&file_path)?;
@@ -487,7 +471,7 @@ impl ParquetWriter {
                 file_path,
                 // TODO: Implement nan_value_counts here
                 HashMap::new(),
-                &MetricsConfig::for_table(table_metadata),
+                &metrics,
             )?;
             builder.partition_spec_id(table_metadata.default_partition_spec_id());
             let data_file = builder.build().unwrap();
@@ -508,16 +492,20 @@ impl ParquetWriter {
         written_size: usize,
         file_path: String,
         nan_value_counts: HashMap<i32, u64>,
-        metrics_config: &MetricsConfig,
+        metrics: &MetricsByFieldId,
     ) -> Result<DataFileBuilder> {
         let mut index_by_parquet_path = IndexByParquetPathName::new();
         visit_schema(&schema, &mut index_by_parquet_path)?;
-        let stats_eligible = struct_descended_field_ids(&schema);
 
         let mut per_col_size: HashMap<i32, u64> = HashMap::new();
         let mut per_col_val_num: HashMap<i32, u64> = HashMap::new();
         let mut per_col_null_val_num: HashMap<i32, u64> = HashMap::new();
-        let mut min_max_agg = MinMaxColAggregator::new(schema, metrics_config.clone());
+        let mut min_max_agg = MinMaxColAggregator {
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            schema,
+            metrics,
+        };
 
         for row_group in metadata.row_groups() {
             for column_chunk_metadata in row_group.columns() {
@@ -527,7 +515,7 @@ impl ParquetWriter {
                     continue;
                 };
 
-                let mode = min_max_agg.mode_for(field_id);
+                let mode = metrics.mode_for(field_id);
                 // MetricsMode::None — persist nothing for this column (Java skips it entirely).
                 if !mode.collects_counts() {
                     continue;
@@ -535,7 +523,7 @@ impl ParquetWriter {
 
                 *per_col_size.entry(field_id).or_insert(0) +=
                     column_chunk_metadata.compressed_size() as u64;
-                if stats_eligible.contains(&field_id) {
+                if metrics.stats_eligible.contains(&field_id) {
                     *per_col_val_num.entry(field_id).or_insert(0) +=
                         column_chunk_metadata.num_values() as u64;
 
@@ -556,7 +544,8 @@ impl ParquetWriter {
         // skip-the-column behavior above.
         let mut nan_value_counts = nan_value_counts;
         nan_value_counts.retain(|field_id, _| {
-            stats_eligible.contains(field_id) && min_max_agg.mode_for(*field_id).collects_counts()
+            metrics.stats_eligible.contains(field_id)
+                && metrics.mode_for(*field_id).collects_counts()
         });
         let (lower_bounds, upper_bounds) = min_max_agg.produce();
 
@@ -712,7 +701,7 @@ impl FileWriter for ParquetWriter {
                 writer.bytes_written(),
                 self.output_file.location().to_string(),
                 self.nan_value_count_visitor.nan_value_counts,
-                &self.metrics_config,
+                &self.metrics,
             )?])
         }
     }
@@ -1273,7 +1262,8 @@ mod tests {
                 "write.metadata.metrics.column.b".to_string(),
                 "full".to_string(),
             ),
-        ]));
+        ]))
+        .unwrap();
         assert!(schema_needs_nan_value_counts(
             iceberg_schema.as_ref(),
             &metrics
@@ -1530,7 +1520,8 @@ mod tests {
         let metrics = crate::spec::MetricsConfig::from_properties(&HashMap::from([(
             "write.metadata.metrics.default".to_string(),
             "none".to_string(),
-        )]));
+        )]))
+        .unwrap();
         assert!(
             !schema_needs_nan_value_counts(iceberg_schema.as_ref(), &metrics),
             "gate must be false under MetricsMode::None"
@@ -2915,6 +2906,7 @@ mod tests {
                 "write.metadata.metrics.default".to_string(),
                 mode.to_string(),
             )]))
+            .unwrap()
         };
 
         // Full → untruncated bounds, counts present.
@@ -2962,7 +2954,13 @@ mod tests {
         );
         // Int columns are never truncated (Java truncates only string/binary), so the default
         // config does not affect this aggregator's bounds.
-        let mut min_max_agg = MinMaxColAggregator::new(schema, MetricsConfig::default());
+        let metrics = MetricsByFieldId::new(&schema, &MetricsConfig::default());
+        let mut min_max_agg = MinMaxColAggregator {
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            schema,
+            metrics: &metrics,
+        };
         let create_statistics =
             |min, max| Statistics::Int32(ValueStatistics::new(min, max, None, None, false));
         min_max_agg

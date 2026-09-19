@@ -45,6 +45,9 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 
+#[path = "rewrite_table_path_metrics_tests.rs"]
+mod metrics_tests;
+
 // ---- pure path helpers (Java RewriteTablePathUtil parity) -------------------------------------
 
 #[test]

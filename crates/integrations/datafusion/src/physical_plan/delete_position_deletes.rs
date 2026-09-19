@@ -150,7 +150,9 @@ async fn write_position_deletes_for_partition(
             .map_err(to_datafusion_error)?,
         config.schema().clone(),
     )
-    .with_metrics_config(MetricsConfig::for_position_delete_table(table.metadata()));
+    .with_metrics_config(
+        MetricsConfig::for_position_delete_table(table.metadata()).map_err(to_datafusion_error)?,
+    );
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_builder,
         table.file_io().clone(),

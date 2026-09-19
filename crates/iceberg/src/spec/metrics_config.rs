@@ -315,12 +315,12 @@ impl MetricsConfig {
     /// `write.metadata.metrics.column.<name>` key. An unparsable mode is logged via
     /// `tracing::warn!` and falls back — to the resolved default for a column, or to
     /// `truncate(16)` for the default itself — rather than erroring, matching Java.
-    pub fn from_properties(properties: &HashMap<String, String>) -> Self {
+    pub fn from_properties(properties: &HashMap<String, String>) -> Result<Self> {
         Self::from(properties, None, None)
     }
 
     #[allow(missing_docs)]
-    pub fn for_table(metadata: &TableMetadata) -> Self {
+    pub fn for_table(metadata: &TableMetadata) -> Result<Self> {
         Self::from(
             metadata.properties(),
             Some(metadata.current_schema()),
@@ -332,13 +332,13 @@ impl MetricsConfig {
         properties: &HashMap<String, String>,
         schema: Option<&Schema>,
         sort_order: Option<&SortOrder>,
-    ) -> Self {
-        let max_inferred = max_inferred_column_defaults(properties);
+    ) -> Result<Self> {
+        let max_inferred = max_inferred_column_defaults(properties)?;
         let mut column_modes = HashMap::new();
         let default_mode = match properties.get(METRICS_MODE_DEFAULT_KEY) {
             Some(raw) => parse_mode_or(raw, Self::default_mode(), METRICS_MODE_DEFAULT_KEY),
             None => match schema {
-                Some(schema) if projected_field_ids(schema).len() > max_inferred => {
+                Some(schema) if projected_field_count(schema) > max_inferred => {
                     for field_id in limit_field_ids(schema, max_inferred) {
                         if let Some(name) = schema.name_by_field_id(field_id) {
                             column_modes.insert(name.to_string(), Self::default_mode());
@@ -371,10 +371,10 @@ impl MetricsConfig {
             column_modes.insert(column.to_string(), parse_mode_or(raw, default_mode, key));
         }
 
-        MetricsConfig {
+        Ok(MetricsConfig {
             default_mode,
             column_modes,
-        }
+        })
     }
 
     /// The metrics config for a position-delete file, mirroring `MetricsConfig.forPositionDelete`.
@@ -398,8 +398,8 @@ impl MetricsConfig {
     }
 
     #[allow(missing_docs)]
-    pub fn for_position_delete_table(metadata: &TableMetadata) -> Self {
-        let table_config = Self::for_table(metadata);
+    pub fn for_position_delete_table(metadata: &TableMetadata) -> Result<Self> {
+        let table_config = Self::for_table(metadata)?;
         let mut column_modes = HashMap::from([
             (
                 RESERVED_COL_NAME_DELETE_FILE_PATH.to_string(),
@@ -413,10 +413,10 @@ impl MetricsConfig {
         for (name, mode) in &table_config.column_modes {
             column_modes.insert(format!("row.{name}"), *mode);
         }
-        MetricsConfig {
+        Ok(MetricsConfig {
             default_mode: table_config.default_mode,
             column_modes,
-        }
+        })
     }
 
     /// The resolved metrics mode for a column: its explicit override if present, else the
@@ -456,38 +456,27 @@ fn parse_mode_or(raw: &str, fallback: MetricsMode, key: &str) -> MetricsMode {
     })
 }
 
-fn max_inferred_column_defaults(properties: &HashMap<String, String>) -> usize {
+fn max_inferred_column_defaults(properties: &HashMap<String, String>) -> Result<usize> {
     let Some(raw) = properties.get(METRICS_MAX_INFERRED_KEY) else {
-        return METRICS_MAX_INFERRED_DEFAULT;
+        return Ok(METRICS_MAX_INFERRED_DEFAULT);
     };
-    match raw.parse::<i32>() {
-        Ok(value) if value < 0 => {
-            tracing::warn!(
-                key = METRICS_MAX_INFERRED_KEY,
-                value,
-                "invalid max-inferred-column-defaults (negative); falling back to {METRICS_MAX_INFERRED_DEFAULT}"
-            );
-            METRICS_MAX_INFERRED_DEFAULT
-        }
-        Ok(value) => value as usize,
-        Err(_) => {
-            tracing::warn!(
-                key = METRICS_MAX_INFERRED_KEY,
-                value = raw,
-                "invalid max-inferred-column-defaults; falling back to {METRICS_MAX_INFERRED_DEFAULT}"
-            );
-            METRICS_MAX_INFERRED_DEFAULT
-        }
-    }
+    let value: i32 = raw.parse().map_err(|error| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("invalid value {raw:?} for {METRICS_MAX_INFERRED_KEY}"),
+        )
+        .with_source(error)
+    })?;
+    Ok(usize::try_from(value).unwrap_or(0))
 }
 
-fn projected_field_ids(schema: &Schema) -> HashSet<i32> {
-    let mut out = HashSet::new();
+fn projected_field_count(schema: &Schema) -> usize {
+    let mut count = 0;
     let mut stack: Vec<&NestedFieldRef> = schema.as_struct().fields().iter().collect();
     while let Some(field) = stack.pop() {
         let ty = field.field_type.as_ref();
         if ty.is_primitive() || ty.is_variant() || ty.is_struct() {
-            out.insert(field.id);
+            count += 1;
         }
         match ty {
             Type::Struct(inner) => stack.extend(inner.fields().iter()),
@@ -499,7 +488,7 @@ fn projected_field_ids(schema: &Schema) -> HashSet<i32> {
             _ => {}
         }
     }
-    out
+    count
 }
 
 fn limit_field_ids(schema: &Schema, limit: usize) -> HashSet<i32> {
@@ -561,6 +550,33 @@ pub(crate) fn struct_descended_field_ids(schema: &Schema) -> HashSet<i32> {
         }
     }
     out
+}
+
+pub(crate) struct MetricsByFieldId {
+    pub(crate) stats_eligible: HashSet<i32>,
+    modes: HashMap<i32, MetricsMode>,
+    default_mode: MetricsMode,
+}
+
+impl MetricsByFieldId {
+    pub(crate) fn new(schema: &Schema, metrics_config: &MetricsConfig) -> Self {
+        Self {
+            stats_eligible: struct_descended_field_ids(schema),
+            modes: schema
+                .field_id_to_name_map()
+                .iter()
+                .map(|(field_id, name)| (*field_id, metrics_config.column_mode(name)))
+                .collect(),
+            default_mode: metrics_config.default_mode_of(),
+        }
+    }
+
+    pub(crate) fn mode_for(&self, field_id: i32) -> MetricsMode {
+        self.modes
+            .get(&field_id)
+            .copied()
+            .unwrap_or(self.default_mode)
+    }
 }
 
 impl Default for MetricsConfig {
@@ -687,7 +703,7 @@ mod tests {
 
     #[test]
     fn config_default_is_truncate_16() {
-        let config = MetricsConfig::from_properties(&HashMap::new());
+        let config = MetricsConfig::from_properties(&HashMap::new()).unwrap();
         assert_eq!(config.default_mode_of(), MetricsMode::Truncate(16));
         assert_eq!(config.column_mode("any"), MetricsMode::Truncate(16));
         assert_eq!(MetricsConfig::default(), config);
@@ -696,7 +712,8 @@ mod tests {
     #[test]
     fn config_reads_explicit_default() {
         let config =
-            MetricsConfig::from_properties(&props(&[("write.metadata.metrics.default", "full")]));
+            MetricsConfig::from_properties(&props(&[("write.metadata.metrics.default", "full")]))
+                .unwrap();
         assert_eq!(config.default_mode_of(), MetricsMode::Full);
         assert_eq!(config.column_mode("unspecified"), MetricsMode::Full);
     }
@@ -707,7 +724,8 @@ mod tests {
             ("write.metadata.metrics.default", "counts"),
             ("write.metadata.metrics.column.id", "full"),
             ("write.metadata.metrics.column.name", "none"),
-        ]));
+        ]))
+        .unwrap();
         assert_eq!(config.column_mode("id"), MetricsMode::Full);
         assert_eq!(config.column_mode("name"), MetricsMode::None);
         // A column without an override falls back to the default.
@@ -720,7 +738,8 @@ mod tests {
         let config = MetricsConfig::from_properties(&props(&[(
             "write.metadata.metrics.default",
             "truncate(0)",
-        )]));
+        )]))
+        .unwrap();
         assert_eq!(config.default_mode_of(), MetricsMode::Truncate(16));
     }
 
@@ -729,7 +748,8 @@ mod tests {
         let config = MetricsConfig::from_properties(&props(&[
             ("write.metadata.metrics.default", "counts"),
             ("write.metadata.metrics.column.id", "bogus"),
-        ]));
+        ]))
+        .unwrap();
         // The bad column mode falls back to the resolved default, not to truncate(16).
         assert_eq!(config.column_mode("id"), MetricsMode::Counts);
     }
@@ -741,7 +761,8 @@ mod tests {
         let config = MetricsConfig::from_properties(&props(&[
             ("write.metadata.metrics.column.", "full"),
             ("write.metadata.metrics.default", "counts"),
-        ]));
+        ]))
+        .unwrap();
         assert_eq!(config.column_mode(""), MetricsMode::Full);
         // A real column name still falls back to the table default.
         assert_eq!(config.column_mode("id"), MetricsMode::Counts);

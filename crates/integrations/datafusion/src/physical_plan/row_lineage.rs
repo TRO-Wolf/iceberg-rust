@@ -247,7 +247,9 @@ impl StreamingDataFileWriter {
             schema.clone(),
             FieldMatchMode::Name,
         )
-        .with_metrics_config(MetricsConfig::for_table(table.metadata()));
+        .with_metrics_config(
+            MetricsConfig::for_table(table.metadata()).map_err(to_datafusion_error)?,
+        );
         let location_gen =
             DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_datafusion_error)?;
         let file_name_gen = DefaultFileNameGenerator::new(

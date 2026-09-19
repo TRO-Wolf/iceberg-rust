@@ -141,6 +141,7 @@ pub(super) fn partition_scoped_metrics() -> MetricsConfig {
         "write.metadata.metrics.column.file_path".to_string(),
         "none".to_string(),
     )]))
+    .unwrap()
 }
 
 async fn live_data_sequences(table: &Table) -> Vec<(String, i64, i64)> {
