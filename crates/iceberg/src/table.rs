@@ -313,7 +313,7 @@ impl Table {
         self.readonly
     }
 
-    /// Whether every data file matching `predicate` is provably wholly covered by it, using table metadata alone.
+    #[allow(missing_docs)]
     pub async fn can_delete_using_metadata(
         &self,
         predicate: &Predicate,
@@ -353,9 +353,7 @@ impl Table {
                     let partition_schema = Arc::new(
                         Schema::builder()
                             .with_schema_id(spec.spec_id())
-                            .with_fields(
-                                spec.partition_type(schema.as_ref())?.fields().to_owned(),
-                            )
+                            .with_fields(spec.partition_type(schema.as_ref())?.fields().to_owned())
                             .build()?,
                     );
                     let projected = StrictProjection::new(spec.clone())
@@ -365,8 +363,7 @@ impl Table {
                     entry.insert(ExpressionEvaluator::new(projected))
                 }
             };
-            if evaluator.eval(data_file)?
-                || StrictMetricsEvaluator::eval(&strict_bound, data_file)?
+            if evaluator.eval(data_file)? || StrictMetricsEvaluator::eval(&strict_bound, data_file)?
             {
                 continue;
             }

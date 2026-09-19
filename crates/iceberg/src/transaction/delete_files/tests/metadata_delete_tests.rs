@@ -25,8 +25,8 @@ use crate::spec::{
     NestedField, Operation, PrimitiveType, Schema, Struct, Transform, Type, UnboundPartitionSpec,
 };
 use crate::table::Table;
-use crate::transform::create_transform_function;
 use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::transform::create_transform_function;
 use crate::{Catalog, TableCreation, TableIdent};
 
 fn oracle_schema() -> Schema {
@@ -67,6 +67,7 @@ async fn make_oracle_table_in_catalog(
         .expect("table creates")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn oracle_data_file(
     path: &str,
     spec_id: i32,
@@ -473,8 +474,8 @@ async fn can_delete_using_metadata_partition_select_bucket() {
     let table = make_oracle_table_in_catalog(&catalog, FormatVersion::V2, Some(spec)).await;
 
     let bucket = |id: i32| {
-        let transform = create_transform_function(&Transform::Bucket(4))
-            .expect("bucket transform resolves");
+        let transform =
+            create_transform_function(&Transform::Bucket(4)).expect("bucket transform resolves");
         let datum = transform
             .transform_literal_result(&Datum::int(id))
             .expect("bucket of a literal resolves");
@@ -482,28 +483,16 @@ async fn can_delete_using_metadata_partition_select_bucket() {
     };
 
     let table = append_files(&catalog, &table, vec![
-        partitioned_oracle_file(
-            "test/file1.parquet",
-            0,
-            vec![Some(bucket(3))],
-            1,
-            &[
-                (1, Datum::int(3), Datum::int(3)),
-                (2, Datum::string("x"), Datum::string("x")),
-                (3, Datum::string("a"), Datum::string("a")),
-            ],
-        ),
-        partitioned_oracle_file(
-            "test/file2.parquet",
-            0,
-            vec![Some(bucket(7))],
-            1,
-            &[
-                (1, Datum::int(7), Datum::int(7)),
-                (2, Datum::string("g"), Datum::string("g")),
-                (3, Datum::string("x"), Datum::string("x")),
-            ],
-        ),
+        partitioned_oracle_file("test/file1.parquet", 0, vec![Some(bucket(3))], 1, &[
+            (1, Datum::int(3), Datum::int(3)),
+            (2, Datum::string("x"), Datum::string("x")),
+            (3, Datum::string("a"), Datum::string("a")),
+        ]),
+        partitioned_oracle_file("test/file2.parquet", 0, vec![Some(bucket(7))], 1, &[
+            (1, Datum::int(7), Datum::int(7)),
+            (2, Datum::string("g"), Datum::string("g")),
+            (3, Datum::string("x"), Datum::string("x")),
+        ]),
     ])
     .await;
 
@@ -647,9 +636,11 @@ async fn can_delete_using_metadata_prior_deletes_then_whole_v2() {
     let catalog = new_memory_catalog().await;
     let table = make_oracle_table_in_catalog(&catalog, FormatVersion::V2, None).await;
     let table = append_files(&catalog, &table, vec![oracle_file1(), oracle_file2()]).await;
-    let table = add_deletes(&catalog, &table, vec![
-        synthetic_position_delete("test/pos-del-1.parquet", 0, Struct::empty()),
-    ])
+    let table = add_deletes(&catalog, &table, vec![synthetic_position_delete(
+        "test/pos-del-1.parquet",
+        0,
+        Struct::empty(),
+    )])
     .await;
 
     let predicate = Reference::new("id").less_than_or_equal_to(Datum::int(3));
@@ -671,20 +662,23 @@ async fn can_delete_using_metadata_prior_deletes_then_whole_v3() {
     let catalog = new_memory_catalog().await;
     let table = make_oracle_table_in_catalog(&catalog, FormatVersion::V3, None).await;
     let table = append_files(&catalog, &table, vec![oracle_file1(), oracle_file2()]).await;
-    let table = add_deletes(&catalog, &table, vec![
-        synthetic_deletion_vector(
-            "test/dv-1.puffin",
-            0,
-            Struct::empty(),
-            "test/file1.parquet",
-        ),
-    ])
+    let table = add_deletes(&catalog, &table, vec![synthetic_deletion_vector(
+        "test/dv-1.puffin",
+        0,
+        Struct::empty(),
+        "test/file1.parquet",
+    )])
     .await;
 
     let predicate = Reference::new("id").less_than_or_equal_to(Datum::int(3));
-    assert_decision(&table, &predicate, None, true,
-        "id<=3 on a v3 table: file1 is wholly matched despite its attached deletion vector")
-        .await;
+    assert_decision(
+        &table,
+        &predicate,
+        None,
+        true,
+        "id<=3 on a v3 table: file1 is wholly matched despite its attached deletion vector",
+    )
+    .await;
 
     let (_, summary) = delete_summary(&catalog, &table, predicate).await;
     assert_delete_summary(&summary, "1", "3");
@@ -700,9 +694,11 @@ async fn can_delete_using_metadata_prior_deletes_then_rest() {
     let catalog = new_memory_catalog().await;
     let table = make_oracle_table_in_catalog(&catalog, FormatVersion::V2, None).await;
     let table = append_files(&catalog, &table, vec![oracle_file1(), oracle_file2()]).await;
-    let table = add_deletes(&catalog, &table, vec![
-        synthetic_position_delete("test/pos-del-1.parquet", 0, Struct::empty()),
-    ])
+    let table = add_deletes(&catalog, &table, vec![synthetic_position_delete(
+        "test/pos-del-1.parquet",
+        0,
+        Struct::empty(),
+    )])
     .await;
 
     assert_decision(
@@ -907,19 +903,17 @@ async fn can_delete_using_metadata_selects_partitions_requires_every_spec() {
         .expect("spec builds")
         .build();
     let table = make_oracle_table_in_catalog(&catalog, FormatVersion::V2, Some(spec)).await;
-    let table = append_files(&catalog, &table, vec![
-        partitioned_oracle_file(
-            "test/file1.parquet",
-            0,
-            vec![Some(Literal::string("x"))],
-            2,
-            &[
-                (1, Datum::int(3), Datum::int(5)),
-                (2, Datum::string("x"), Datum::string("x")),
-                (3, Datum::string("a"), Datum::string("b")),
-            ],
-        ),
-    ])
+    let table = append_files(&catalog, &table, vec![partitioned_oracle_file(
+        "test/file1.parquet",
+        0,
+        vec![Some(Literal::string("x"))],
+        2,
+        &[
+            (1, Datum::int(3), Datum::int(5)),
+            (2, Datum::string("x"), Datum::string("x")),
+            (3, Datum::string("a"), Datum::string("b")),
+        ],
+    )])
     .await;
 
     let tx = Transaction::new(&table);
@@ -929,19 +923,17 @@ async fn can_delete_using_metadata_selects_partitions_requires_every_spec() {
     let spec1 = table.metadata().default_partition_spec_id();
     assert_ne!(spec1, 0, "the spec evolved to a second spec id");
 
-    let table = append_files(&catalog, &table, vec![
-        partitioned_oracle_file(
-            "test/file2.parquet",
-            spec1,
-            vec![Some(Literal::string("g")), Some(Literal::int(7))],
-            1,
-            &[
-                (1, Datum::int(7), Datum::int(7)),
-                (2, Datum::string("g"), Datum::string("g")),
-                (3, Datum::string("x"), Datum::string("x")),
-            ],
-        ),
-    ])
+    let table = append_files(&catalog, &table, vec![partitioned_oracle_file(
+        "test/file2.parquet",
+        spec1,
+        vec![Some(Literal::string("g")), Some(Literal::int(7))],
+        1,
+        &[
+            (1, Datum::int(7), Datum::int(7)),
+            (2, Datum::string("g"), Datum::string("g")),
+            (3, Datum::string("x"), Datum::string("x")),
+        ],
+    )])
     .await;
 
     assert_decision(

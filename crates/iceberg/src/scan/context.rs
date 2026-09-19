@@ -653,12 +653,8 @@ impl PlanContext {
         let (tx_data, _rx_data) = channel(1);
         let (delete_file_idx, _delete_index_tx) = DeleteFileIndex::new();
         let (tx_delete, _rx_delete) = channel(1);
-        let manifest_file_contexts = self.build_manifest_file_contexts(
-            manifest_list,
-            tx_data,
-            delete_file_idx,
-            tx_delete,
-        )?;
+        let manifest_file_contexts =
+            self.build_manifest_file_contexts(manifest_list, tx_data, delete_file_idx, tx_delete)?;
 
         let mut data_files = Vec::new();
         for manifest_file_context in manifest_file_contexts {
