@@ -148,13 +148,14 @@ pub(crate) mod test {
     use uuid::Uuid;
 
     use super::LocationGenerator;
+    use crate::ErrorKind;
     use crate::spec::{
         FormatVersion, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
         Struct, StructType, TableMetadata, Transform, Type,
     };
     use crate::writer::file_writer::location_generator::{
-        DefaultLocationGenerator, FileNameGenerator, WRITE_DATA_LOCATION,
-        WRITE_FOLDER_STORAGE_LOCATION,
+        DefaultLocationGenerator, FileNameGenerator, TableLocationGenerator,
+        WRITE_DATA_LOCATION, WRITE_FOLDER_STORAGE_LOCATION,
     };
 
     #[test]
@@ -308,6 +309,346 @@ pub(crate) mod test {
         assert_eq!(
             location,
             "s3://data.db/table/data/id=42/name=alice/data-00000.parquet"
+        );
+    }
+
+    fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn table_metadata(location: &str, properties: HashMap<String, String>) -> TableMetadata {
+        TableMetadata {
+            format_version: FormatVersion::V2,
+            table_uuid: Uuid::parse_str("fb072c92-a02b-11e9-ae9c-1bb7bc9eca94").unwrap(),
+            location: location.to_string(),
+            last_updated_ms: 1515100955770,
+            last_column_id: 1,
+            schemas: HashMap::new(),
+            current_schema_id: 1,
+            partition_specs: HashMap::new(),
+            default_spec: PartitionSpec::unpartition_spec().into(),
+            default_partition_type: StructType::new(vec![]),
+            last_partition_id: 1000,
+            default_sort_order_id: 0,
+            sort_orders: HashMap::from_iter(vec![]),
+            snapshots: HashMap::default(),
+            current_snapshot_id: None,
+            last_sequence_number: 1,
+            properties,
+            snapshot_log: Vec::new(),
+            metadata_log: vec![],
+            refs: HashMap::new(),
+            statistics: HashMap::new(),
+            partition_statistics: HashMap::new(),
+            encryption_keys: HashMap::new(),
+            next_row_id: 0,
+        }
+    }
+
+    fn cat_partition_key(value: &str) -> PartitionKey {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "cat", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("cat", "cat", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        PartitionKey::new(
+            partition_spec,
+            schema,
+            Struct::from_iter([Some(Literal::string(value))]),
+        )
+        .expect("PartitionKey::new: valid cat value")
+    }
+
+    #[test]
+    fn table_location_generator_default_unpartitioned() {
+        let metadata = table_metadata("s3://wh/ns/t", HashMap::new());
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(None, "f.parquet"),
+            "s3://wh/ns/t/data/f.parquet"
+        );
+        assert_eq!(
+            generator.generate_location(Some(&cat_partition_key("x")), "f.parquet"),
+            "s3://wh/ns/t/data/cat=x/f.parquet"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_object_storage_unpartitioned() {
+        let metadata = table_metadata(
+            "s3://wh/ns/l_object_storage",
+            props(&[("write.object-storage.enabled", "true")]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(
+                None,
+                "00000-28-3812449f-1cb2-488c-9cc3-8f96668c44cd-0-00001.parquet"
+            ),
+            "s3://wh/ns/l_object_storage/data/1110/1011/1110/01000111/00000-28-3812449f-1cb2-488c-9cc3-8f96668c44cd-0-00001.parquet"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_object_storage_partitioned() {
+        let metadata = table_metadata(
+            "s3://wh/ns/l_object_storage_p",
+            props(&[("write.object-storage.enabled", "true")]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(
+                Some(&cat_partition_key("x")),
+                "00000-34-96eea29b-37d5-44d2-8f8e-790fbe133349-0-00001.parquet"
+            ),
+            "s3://wh/ns/l_object_storage_p/data/0001/1111/1111/10111111/cat=x/00000-34-96eea29b-37d5-44d2-8f8e-790fbe133349-0-00001.parquet"
+        );
+        assert_eq!(
+            generator.generate_location(
+                Some(&cat_partition_key("y")),
+                "00000-34-96eea29b-37d5-44d2-8f8e-790fbe133349-0-00002.parquet"
+            ),
+            "s3://wh/ns/l_object_storage_p/data/1001/1011/1111/11111010/cat=y/00000-34-96eea29b-37d5-44d2-8f8e-790fbe133349-0-00002.parquet"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_object_storage_unpartitioned_paths() {
+        let metadata = table_metadata(
+            "s3://wh/ns/l_object_storage_unpartitioned_paths",
+            props(&[
+                ("write.object-storage.enabled", "true"),
+                ("write.object-storage.partitioned-paths", "false"),
+            ]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(
+                None,
+                "00000-39-afc298d7-6274-47c4-a229-c4bd98b470f7-0-00001.parquet"
+            ),
+            "s3://wh/ns/l_object_storage_unpartitioned_paths/data/0001/1001/0110/10000001-00000-39-afc298d7-6274-47c4-a229-c4bd98b470f7-0-00001.parquet"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_object_storage_unpartitioned_paths_partitioned() {
+        let metadata = table_metadata(
+            "s3://wh/ns/l_object_storage_unpartitioned_paths_p",
+            props(&[
+                ("write.object-storage.enabled", "true"),
+                ("write.object-storage.partitioned-paths", "false"),
+            ]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(
+                Some(&cat_partition_key("x")),
+                "00000-45-9205b7af-4125-4711-912d-a933510ba235-0-00001.parquet"
+            ),
+            "s3://wh/ns/l_object_storage_unpartitioned_paths_p/data/0110/1101/0111/11111000-00000-45-9205b7af-4125-4711-912d-a933510ba235-0-00001.parquet"
+        );
+        assert_eq!(
+            generator.generate_location(
+                Some(&cat_partition_key("y")),
+                "00000-45-9205b7af-4125-4711-912d-a933510ba235-0-00002.parquet"
+            ),
+            "s3://wh/ns/l_object_storage_unpartitioned_paths_p/data/1010/0011/1100/11110001-00000-45-9205b7af-4125-4711-912d-a933510ba235-0-00002.parquet"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_object_storage_data_path_unpartitioned() {
+        let metadata = table_metadata(
+            "s3://wh/ns/l_object_storage_data_path",
+            props(&[
+                ("write.object-storage.enabled", "true"),
+                ("write.data.path", "s3://wh/alt-data"),
+            ]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(
+                None,
+                "00000-50-661c5ab6-de30-4594-858b-7f8d5fbc98e1-0-00001.parquet"
+            ),
+            "s3://wh/alt-data/1111/0011/1100/11110011/ns/l_object_storage_data_path/00000-50-661c5ab6-de30-4594-858b-7f8d5fbc98e1-0-00001.parquet"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_object_storage_data_path_partitioned() {
+        let metadata = table_metadata(
+            "s3://wh/ns/l_object_storage_data_path_p",
+            props(&[
+                ("write.object-storage.enabled", "true"),
+                ("write.data.path", "s3://wh/alt-data"),
+            ]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(
+                Some(&cat_partition_key("x")),
+                "00000-56-c7fb03ac-63e3-46aa-8da7-1608d002a1a4-0-00001.parquet"
+            ),
+            "s3://wh/alt-data/0101/1111/0100/00101010/ns/l_object_storage_data_path_p/cat=x/00000-56-c7fb03ac-63e3-46aa-8da7-1608d002a1a4-0-00001.parquet"
+        );
+        assert_eq!(
+            generator.generate_location(
+                Some(&cat_partition_key("y")),
+                "00000-56-c7fb03ac-63e3-46aa-8da7-1608d002a1a4-0-00002.parquet"
+            ),
+            "s3://wh/alt-data/0110/0010/1100/10100111/ns/l_object_storage_data_path_p/cat=y/00000-56-c7fb03ac-63e3-46aa-8da7-1608d002a1a4-0-00002.parquet"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_data_path_alone() {
+        let metadata = table_metadata(
+            "s3://wh/ns/l_data_path",
+            props(&[("write.data.path", "s3://wh/alt-data2")]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(
+                None,
+                "00000-61-d9a9dc5f-d7f2-4a5f-8240-2c8ab7e9f00c-0-00001.parquet"
+            ),
+            "s3://wh/alt-data2/00000-61-d9a9dc5f-d7f2-4a5f-8240-2c8ab7e9f00c-0-00001.parquet"
+        );
+        assert_eq!(
+            generator.generate_location(
+                Some(&cat_partition_key("x")),
+                "00000-61-d9a9dc5f-d7f2-4a5f-8240-2c8ab7e9f00c-0-00001.parquet"
+            ),
+            "s3://wh/alt-data2/cat=x/00000-61-d9a9dc5f-d7f2-4a5f-8240-2c8ab7e9f00c-0-00001.parquet"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_refuses_java_provider_impl() {
+        for enabled in ["true", "false"] {
+            let metadata = table_metadata(
+                "s3://wh/ns/t",
+                props(&[
+                    ("write.location-provider.impl", "com.example.CustomProvider"),
+                    ("write.object-storage.enabled", enabled),
+                ]),
+            );
+            let error = TableLocationGenerator::new(&metadata).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                ErrorKind::FeatureUnsupported,
+                "write.location-provider.impl must fail loudly (enabled={enabled})"
+            );
+        }
+    }
+
+    #[test]
+    fn table_location_generator_rejects_deprecated_folder_storage() {
+        let metadata = table_metadata(
+            "s3://wh/ns/t",
+            props(&[("write.folder-storage.path", "s3://wh/old")]),
+        );
+        assert!(
+            TableLocationGenerator::new(&metadata).is_err(),
+            "write.folder-storage.path alone must be rejected"
+        );
+
+        let metadata = table_metadata(
+            "s3://wh/ns/t",
+            props(&[
+                ("write.folder-storage.path", "s3://wh/old"),
+                ("write.object-storage.enabled", "true"),
+            ]),
+        );
+        assert!(
+            TableLocationGenerator::new(&metadata).is_err(),
+            "write.folder-storage.path must be rejected on the object-store path"
+        );
+
+        let metadata = table_metadata(
+            "s3://wh/ns/t",
+            props(&[
+                ("write.data.path", "s3://wh/new"),
+                ("write.folder-storage.path", "s3://wh/old"),
+            ]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(None, "f.parquet"),
+            "s3://wh/new/f.parquet",
+            "write.data.path short-circuits the deprecated check, as Java does"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_rejects_deprecated_object_storage_path() {
+        let metadata = table_metadata(
+            "s3://wh/ns/t",
+            props(&[
+                ("write.object-storage.enabled", "true"),
+                ("write.object-storage.path", "s3://wh/old"),
+            ]),
+        );
+        assert!(
+            TableLocationGenerator::new(&metadata).is_err(),
+            "write.object-storage.path must be rejected when object storage is selected"
+        );
+
+        let metadata = table_metadata(
+            "s3://wh/ns/t",
+            props(&[("write.object-storage.path", "s3://wh/old")]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(None, "f.parquet"),
+            "s3://wh/ns/t/data/f.parquet",
+            "the default provider never checks write.object-storage.path, as Java does"
+        );
+
+        let metadata = table_metadata(
+            "s3://wh/ns/t",
+            props(&[
+                ("write.object-storage.enabled", "true"),
+                ("write.data.path", "s3://wh/new"),
+                ("write.object-storage.path", "s3://wh/old"),
+            ]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(None, "f.parquet"),
+            "s3://wh/new/0111/1111/1110/11001100/ns/t/f.parquet",
+            "write.data.path short-circuits the deprecated check, as Java does"
+        );
+    }
+
+    #[test]
+    fn table_location_generator_object_storage_context_suppressed() {
+        let metadata = table_metadata(
+            "s3://wh/ns/t",
+            props(&[
+                ("write.object-storage.enabled", "true"),
+                ("write.data.path", "s3://wh/ns/t/data2/"),
+            ]),
+        );
+        let generator = TableLocationGenerator::new(&metadata).unwrap();
+        assert_eq!(
+            generator.generate_location(None, "f.parquet"),
+            "s3://wh/ns/t/data2/0111/1111/1110/11001100/f.parquet",
+            "a storage location under the table location carries no path context"
         );
     }
 }
