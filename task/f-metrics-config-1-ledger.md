@@ -113,7 +113,7 @@ The `list()/map()` null-result fallbacks are unreachable in the post-order walk
   `metricsFromFooter` returns `null` for INT96, returns counts-only when
   `truncateLength <= 0`, and returns `null` (dropping the column ENTIRELY — value
   counts, null counts and bounds) when any row-group chunk's `getStatistics()` is
-  absent or `isEmpty()`. `bounds()` applies the same statless-drop.
+  absent or `isEmpty()`. `bounds()` applies the same stat-less-drop.
 - `list()` and `map()` return EMPTY lists — every metric under a list or map is
   dropped except `column_sizes` (collected in the `message()` pass).
 - `struct()` descends; `variant()` has its own handling.
@@ -210,9 +210,9 @@ Fixture replayed through `ParquetWriterBuilder` + `DataFileWriterBuilder`
   for fields not reachable through structs — Java's `MetricsVisitor.list()/.map()`
   empty-return, measured above. `column_sizes` keeps list/map fields (Java's
   `message()` pass).
-- **Statless-chunk drop: deferred.** Java drops a column's value/null counts and
+- **Stat-less-chunk drop: deferred.** Java drops a column's value/null counts and
   bounds when ANY chunk's statistics is absent/empty; the fork gates only bounds.
-  No oracle cell exercises a statless column (Spark always writes stats); recorded
+  No oracle cell exercises a stat-less column (Spark always writes stats); recorded
   here as a known residue, not fixed this unit.
 - **`max-inferred-column-defaults` non-numeric**: Java throws; the fork warns and
   falls back to 100 (the `for_table` API is infallible; warn-and-continue is this
