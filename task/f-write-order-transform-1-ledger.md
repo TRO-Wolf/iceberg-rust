@@ -164,4 +164,13 @@ absent, so most cells are structurally inexpressible.
 
 ## Mutation table
 
-(to be filled by step 5)
+Each mutation was applied, the listed filtered run executed, the failure recorded, and the code
+restored byte-identically (`git status` clean before the step-5 commit).
+
+| mutation | site | filtered run | pins that went red |
+|---|---|---|---|
+| transform dropped to identity (action) | `PendingSortField::to_sort_field` built `.transform(Transform::Identity)` | `cargo test -p iceberg --lib sort_order` | `test_sort_by_commits_transform_fields`, `test_sort_by_commits_temporal_transforms`, `test_sort_by_binds_nested_column_source` |
+| transform dropped in the write path | `sort_group_batch` skipped `function.transform(array)` | `cargo test -p iceberg --lib binpack` | `binpack_transform_default_order_sorts_by_bucket_key_and_stamps` (identity order [None,0,1,2,…] emitted; bucket keys not non-decreasing) |
+| id reuse removed | `reuse_or_create_new_sort_id` always returned `highest+1` | `cargo test -p iceberg --lib sort_order` | `test_reapplied_equal_sort_order_reuses_its_order_id` (reapplied order got id 3 instead of 1) |
+| width/unsupported validation removed | `to_sort_field` no longer called `check_supported_transform` | `cargo test -p iceberg --lib sort_order` | `test_sort_by_rejects_bad_transform_widths`, `test_sort_by_rejects_unsupported_transforms` (commits succeeded where Java refuses) |
+| cannot-bind validation removed | `to_sort_field` dropped the `result_type` check | `cargo test -p iceberg --lib sort_order` | `test_sort_by_rejects_transform_type_mismatch`, `test_sort_by_rejects_transform_on_struct_source` — the commit still erred, but via `check_compatibility` as `ErrorKind::Unexpected`, not `DataInvalid` with Java's `Cannot bind: …` shape; the pin proves the action-level check is what produces the Java surface |
