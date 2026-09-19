@@ -395,9 +395,9 @@ split into `metadata_delete_tests/`, ceilings lowered 1918→1912 and 6845→684
 | `delete_files` | 213/213 — PROVEN |
 | `scan` | 292/292 — PROVEN |
 
-## 10. Round 3 — V-01 (S0): decimal scale-blind strict comparisons (HEAD `30ba7d6d`)
+## 10. Round 3 — V-01 (S0): decimal scale-blind strict comparisons (HEAD the round-3 fix commit)
 
-Commits: `8dc5d033` red-first pins, `30ba7d6d` fix.
+Commits: `8dc5d033` red-first pins, the round-3 fix commit fix.
 
 ### The hole
 
@@ -462,7 +462,7 @@ were already correct.
 - inclusive `not_eq` `unique_value` check removed: 4 pins red (all three `d <>`
   decision pins + the commit pin) — `uniqueValue` is load-bearing — **PROVEN**.
 
-### Gates at HEAD `30ba7d6d`
+### Gates at HEAD the round-3 fix commit
 
 | gate | result |
 |---|---|
