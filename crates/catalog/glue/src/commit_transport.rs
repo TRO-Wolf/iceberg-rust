@@ -65,6 +65,10 @@ pub(crate) trait GlueCommitTransport: Send + Sync + Debug {
     async fn send_update_table(&self, call: GlueUpdateTableCall) -> GlueCommitSend;
     #[cfg(test)]
     fn catalog_commit_attempts(&self) -> u64;
+    #[cfg(test)]
+    fn is_response_dropping_transport(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct LiveGlueCommitTransport {
@@ -254,6 +258,11 @@ impl GlueCommitTransport for DiscardingGlueCommitTransport {
     #[cfg(test)]
     fn catalog_commit_attempts(&self) -> u64 {
         self.attempts.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn is_response_dropping_transport(&self) -> bool {
+        true
     }
 }
 

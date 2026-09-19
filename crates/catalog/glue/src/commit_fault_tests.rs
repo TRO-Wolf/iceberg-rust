@@ -24,7 +24,7 @@ mod enabled {
     use iceberg::spec::FormatVersion;
     use iceberg::table::Table;
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    use iceberg::{Catalog, ErrorKind, Result};
+    use iceberg::{Catalog, CatalogBuilder, ErrorKind, Result};
 
     use crate::catalog::GlueCatalog;
     use crate::commit_outcome_tests::{data_file, dummy_glue_client, seed_table, unique_ident};
@@ -32,7 +32,11 @@ mod enabled {
         DiscardingGlueCommitTransport, GlueCommitScript, GlueCommitTransport,
         ScriptedGlueCommitTransport,
     };
-    use crate::{GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE, GLUE_COMMIT_OPERATION_ID_PROP};
+    use crate::{
+        AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY,
+        GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE, GLUE_CATALOG_PROP_WAREHOUSE,
+        GLUE_COMMIT_OPERATION_ID_PROP, GlueCatalogBuilder,
+    };
 
     async fn fault_catalog(
         scripts: impl IntoIterator<Item = GlueCommitScript>,
@@ -223,6 +227,94 @@ mod enabled {
             .expect("without the property a successful response stays success");
         assert_eq!(catalog.catalog_commit_attempts(), 1);
     }
+
+    #[tokio::test]
+    async fn public_builder_installs_the_dropping_wrapper_when_the_property_is_set() {
+        let catalog = GlueCatalogBuilder::default()
+            .load(
+                "pr5a-glue",
+                HashMap::from([
+                    (
+                        GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
+                        "memory://pr5a".to_string(),
+                    ),
+                    (AWS_REGION_NAME.to_string(), "us-east-1".to_string()),
+                    (AWS_ACCESS_KEY_ID.to_string(), "pr5a".to_string()),
+                    (AWS_SECRET_ACCESS_KEY.to_string(), "pr5a".to_string()),
+                    (
+                        GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE.to_string(),
+                        "1".to_string(),
+                    ),
+                ]),
+            )
+            .await
+            .expect("the public builder path builds the catalog when the property is set");
+        assert!(
+            catalog.commit_transport_drops_responses(),
+            "GlueCatalog::new must route the fault property through build_commit_transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_count_zero_installs_the_wrapper_but_drops_nothing() {
+        let (catalog, table, _scripted, fault) =
+            fault_catalog([GlueCommitScript::Success], drop_props(0))
+                .await
+                .expect("fault catalog builds through the property path");
+        let fault = fault.expect("n=0 still installs the wrapper");
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set("fault.zero".to_string(), "x".to_string())
+            .apply(tx)
+            .expect("apply property update");
+        tx.commit(&catalog)
+            .await
+            .expect("an empty drop budget never rewrites a response");
+        assert!(!fault.observed_accepted_response_lost());
+        assert_eq!(catalog.catalog_commit_attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_does_not_consume_the_drop_budget() {
+        let (catalog, table, _scripted, fault) = fault_catalog(
+            [
+                GlueCommitScript::ConcurrentModification,
+                GlueCommitScript::Success,
+                GlueCommitScript::Success,
+            ],
+            drop_props(1),
+        )
+        .await
+        .expect("fault catalog builds through the property path");
+        let fault = fault.expect("the property installs the response-dropping wrapper");
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set("fault.budget.0".to_string(), "x".to_string())
+            .apply(tx)
+            .expect("apply property update");
+        let error = tx
+            .commit(&catalog)
+            .await
+            .expect_err("the retried send's successful response is the one dropped");
+        assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+        assert!(fault.observed_accepted_response_lost());
+        let base = catalog
+            .load_table(table.identifier())
+            .await
+            .expect("reload the landed base");
+        let tx = Transaction::new(&base);
+        let tx = tx
+            .update_table_properties()
+            .set("fault.budget.1".to_string(), "x".to_string())
+            .apply(tx)
+            .expect("apply property update");
+        tx.commit(&catalog)
+            .await
+            .expect("the single drop credit was spent, so the next success passes");
+        assert_eq!(catalog.catalog_commit_attempts(), 3);
+    }
 }
 
 #[cfg(not(feature = "commit-fault-injection"))]
@@ -230,15 +322,19 @@ mod disabled {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use iceberg::ErrorKind;
     use iceberg::io::FileIO;
     use iceberg::spec::FormatVersion;
+    use iceberg::{CatalogBuilder, ErrorKind};
 
-    use crate::GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE;
     use crate::catalog::GlueCatalog;
     use crate::commit_outcome_tests::{dummy_glue_client, seed_table, unique_ident};
     use crate::commit_transport::{
         GlueCommitScript, GlueCommitTransport, ScriptedGlueCommitTransport,
+    };
+    use crate::{
+        AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY,
+        GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE, GLUE_CATALOG_PROP_WAREHOUSE,
+        GlueCatalogBuilder,
     };
 
     #[tokio::test]
@@ -269,6 +365,35 @@ mod disabled {
         assert!(
             rendered.contains("commit-fault-injection"),
             "the refusal names the feature: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_builder_refuses_the_fault_property_without_the_feature() {
+        let error = GlueCatalogBuilder::default()
+            .load(
+                "pr5a-glue",
+                HashMap::from([
+                    (
+                        GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
+                        "memory://pr5a".to_string(),
+                    ),
+                    (AWS_REGION_NAME.to_string(), "us-east-1".to_string()),
+                    (AWS_ACCESS_KEY_ID.to_string(), "pr5a".to_string()),
+                    (AWS_SECRET_ACCESS_KEY.to_string(), "pr5a".to_string()),
+                    (
+                        GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE.to_string(),
+                        "1".to_string(),
+                    ),
+                ]),
+            )
+            .await
+            .expect_err("the public builder path refuses the fault property without the feature");
+        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        let rendered = format!("{error}");
+        assert!(
+            rendered.contains(GLUE_CATALOG_PROP_DROP_UPDATE_TABLE_RESPONSE),
+            "the refusal names the property: {rendered}"
         );
     }
 }

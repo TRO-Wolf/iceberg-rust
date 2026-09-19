@@ -36,6 +36,10 @@ impl GlueCatalog {
         Arc::clone(&self.commit_transport)
     }
 
+    pub(crate) fn commit_transport_drops_responses(&self) -> bool {
+        self.commit_transport.is_response_dropping_transport()
+    }
+
     pub(crate) fn for_commit_outcome_tests_at_version(
         file_io: FileIO,
         commit_transport: Arc<dyn GlueCommitTransport>,

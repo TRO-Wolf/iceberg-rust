@@ -15,13 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
+use iceberg::io::FileIO;
 use iceberg::spec::{FormatVersion, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::transaction::StagedTableTransaction;
 use iceberg::{Catalog, ErrorKind, TableCreation, TableIdent};
 
-use crate::commit_outcome_tests::{catalog_with, catalog_with_version, data_file, schema};
-use crate::commit_transport::GlueCommitScript;
+use crate::GLUE_COMMIT_OPERATION_ID_PROP;
+use crate::catalog::GlueCatalog;
+use crate::commit_outcome_tests::{
+    catalog_with, catalog_with_version, data_file, dummy_glue_client, schema,
+    seed_table_with_properties, unique_ident,
+};
+use crate::commit_transport::{GlueCommitScript, GlueCommitTransport, ScriptedGlueCommitTransport};
 
 async fn begin_replace(table: &Table, ident: &TableIdent) -> StagedTableTransaction {
     StagedTableTransaction::begin_replace(
@@ -271,4 +279,75 @@ async fn replace_publish_access_denied_is_terminal() {
     assert!(!error.retryable());
     assert!(error.message().contains("Authorization denied"));
     assert_eq!(catalog.catalog_commit_attempts(), 1);
+}
+
+async fn leftover_op_id_catalog(ident: &TableIdent) -> (GlueCatalog, Table) {
+    let file_io = FileIO::new_with_memory();
+    let table = seed_table_with_properties(&file_io, ident, FormatVersion::V2, [(
+        GLUE_COMMIT_OPERATION_ID_PROP.to_string(),
+        "op-old".to_string(),
+    )])
+    .await;
+    let scripted = ScriptedGlueCommitTransport::new([GlueCommitScript::AcceptThenLose]);
+    let catalog = GlueCatalog::for_commit_outcome_tests_at_version(
+        file_io,
+        Arc::clone(&scripted) as Arc<dyn GlueCommitTransport>,
+        table.clone(),
+        dummy_glue_client().await,
+        Some("v0".to_string()),
+    );
+    (catalog, table)
+}
+
+#[tokio::test]
+async fn leftover_table_property_is_not_named_by_replace_publish() {
+    let ident = unique_ident();
+    let (catalog, table) = leftover_op_id_catalog(&ident).await;
+
+    let error = begin_replace(&table, &ident)
+        .await
+        .commit(&catalog)
+        .await
+        .expect_err("a publish whose response is lost stays unknown");
+    assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+    let rendered = format!("{error}");
+    assert!(
+        !rendered.contains("op-old"),
+        "an operation id left over from an earlier commit must not be named by this publish: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn introduced_table_property_is_named_by_replace_publish() {
+    let ident = unique_ident();
+    let (catalog, table) = leftover_op_id_catalog(&ident).await;
+
+    let staged = StagedTableTransaction::begin_replace(
+        &table,
+        TableCreation::builder()
+            .name(ident.name().to_string())
+            .schema(schema())
+            .properties([(
+                GLUE_COMMIT_OPERATION_ID_PROP.to_string(),
+                "op-new".to_string(),
+            )])
+            .build(),
+    )
+    .await
+    .expect("begin replace");
+
+    let error = staged
+        .commit(&catalog)
+        .await
+        .expect_err("a publish whose response is lost stays unknown");
+    assert_eq!(error.kind(), ErrorKind::CommitStateUnknown);
+    let rendered = format!("{error}");
+    assert!(
+        rendered.contains("op-new"),
+        "the operation id this publish introduced must be named: {rendered}"
+    );
+    assert!(
+        !rendered.contains("op-old"),
+        "the leftover id it replaced must not be named: {rendered}"
+    );
 }

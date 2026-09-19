@@ -148,37 +148,48 @@ pub(crate) async fn seed_table(
     ident: &TableIdent,
     format: FormatVersion,
 ) -> Table {
+    seed_table_with_properties(file_io, ident, format, []).await
+}
+
+pub(crate) async fn seed_table_with_properties(
+    file_io: &FileIO,
+    ident: &TableIdent,
+    format: FormatVersion,
+    extra_properties: impl IntoIterator<Item = (String, String)>,
+) -> Table {
     let location = format!(
         "memory://pr5a/{}/{}",
         ident.namespace().to_url_string(),
         ident.name()
     );
+    let mut properties = vec![
+        ("commit.retry.num-retries".to_string(), "3".to_string()),
+        ("commit.retry.min-wait-ms".to_string(), "1".to_string()),
+        ("commit.retry.max-wait-ms".to_string(), "5".to_string()),
+        (
+            "commit.status-check.num-retries".to_string(),
+            "1".to_string(),
+        ),
+        (
+            "commit.status-check.min-wait-ms".to_string(),
+            "1".to_string(),
+        ),
+        (
+            "commit.status-check.max-wait-ms".to_string(),
+            "5".to_string(),
+        ),
+        (
+            "commit.status-check.total-timeout-ms".to_string(),
+            "50".to_string(),
+        ),
+    ];
+    properties.extend(extra_properties);
     let creation = TableCreation::builder()
         .name(ident.name().to_string())
         .location(location.clone())
         .schema(schema())
         .format_version(format)
-        .properties([
-            ("commit.retry.num-retries".to_string(), "3".to_string()),
-            ("commit.retry.min-wait-ms".to_string(), "1".to_string()),
-            ("commit.retry.max-wait-ms".to_string(), "5".to_string()),
-            (
-                "commit.status-check.num-retries".to_string(),
-                "1".to_string(),
-            ),
-            (
-                "commit.status-check.min-wait-ms".to_string(),
-                "1".to_string(),
-            ),
-            (
-                "commit.status-check.max-wait-ms".to_string(),
-                "5".to_string(),
-            ),
-            (
-                "commit.status-check.total-timeout-ms".to_string(),
-                "50".to_string(),
-            ),
-        ])
+        .properties(properties)
         .build();
     let metadata = TableMetadataBuilder::from_table_creation(creation)
         .expect("metadata builder")
