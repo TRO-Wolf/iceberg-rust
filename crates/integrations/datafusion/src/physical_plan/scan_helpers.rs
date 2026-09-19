@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::error::Result as DFResult;
+use iceberg::expr::BoundPredicate;
 use iceberg::metadata_columns::is_metadata_column_name;
 use iceberg::scan::PartitionWork;
 use iceberg::table::Table;
@@ -26,30 +27,22 @@ use iceberg::table::Table;
 use super::conform::{ColumnSource, advertised_field_id};
 use crate::to_datafusion_error;
 
-pub(crate) fn exact_table_row_count(
-    table: &Table,
-    snapshot_id: i64,
-    partitions: &[PartitionWork],
-) -> Option<usize> {
-    let mut planned_any_task = false;
-    for work in partitions {
-        for task in work.tasks() {
-            planned_any_task = true;
-            if task.predicate.is_some() || !task.deletes.is_empty() {
-                return None;
-            }
+pub(crate) fn exact_table_row_count(partitions: &[PartitionWork]) -> Option<usize> {
+    let task_count: usize = partitions.iter().map(|work| work.tasks().count()).sum();
+    let mut counted_paths: HashSet<&str> = HashSet::with_capacity(task_count);
+    let mut total = 0usize;
+    for task in partitions.iter().flat_map(PartitionWork::tasks) {
+        if !task.deletes.is_empty()
+            || !matches!(task.predicate(), None | Some(BoundPredicate::AlwaysTrue))
+        {
+            return None;
+        }
+        if counted_paths.insert(task.data_file_path()) {
+            let file_records = usize::try_from(task.file_record_count?).ok()?;
+            total = total.checked_add(file_records)?;
         }
     }
-    if !planned_any_task {
-        return Some(0);
-    }
-    let summary = table.metadata().snapshot_by_id(snapshot_id)?.summary();
-    let total: u64 = summary
-        .additional_properties
-        .get("total-records")?
-        .parse()
-        .ok()?;
-    usize::try_from(total).ok()
+    Some(total)
 }
 
 pub(crate) fn resolve_bindings(

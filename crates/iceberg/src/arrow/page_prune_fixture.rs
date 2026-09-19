@@ -171,6 +171,7 @@ pub(crate) fn task(
         start: 0,
         length: 0,
         record_count: None,
+        file_record_count: None,
         data_file_path: Arc::from(path.to_string()),
         data_file_format: DataFileFormat::Parquet,
         schema,

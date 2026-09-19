@@ -1350,6 +1350,7 @@ mod tests {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(data_file.clone()),
             data_file_format: crate::spec::DataFileFormat::Parquet,
             schema: Arc::new(Schema::builder().build().expect("schema")),
@@ -1950,6 +1951,7 @@ mod tests {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(format!(
                 "{}/data-1.parquet",
                 table_location.to_str().unwrap()
@@ -2509,6 +2511,7 @@ mod tests {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(data_file_path),
             data_file_format: crate::spec::DataFileFormat::Parquet,
             schema,
@@ -3096,7 +3099,6 @@ mod tests {
             "the waiter must observe the fully populated vector"
         );
     }
-
     /// The fail-loud half of the same contract. When the claiming task dies without publishing, the
     /// waiting load must surface the typed error, not proceed as though the deletes had loaded.
     /// Swallowing the wait result returns a `DeleteFilter` with no vector, so every row it deletes
@@ -3159,7 +3161,6 @@ mod tests {
              {error}"
         );
     }
-
     /// The parquet analogue of `test_dv_waiter_does_not_return_before_the_vector_is_installed`. This
     /// call site claims under the bare delete-file path, with the same under-delete consequence.
     ///
@@ -3211,7 +3212,6 @@ mod tests {
             "the waiter must observe the fully populated position set"
         );
     }
-
     /// The parquet analogue of
     /// `test_dv_waiter_surfaces_a_dead_claimants_error_instead_of_dropping_the_deletes`. This call site
     /// must propagate the wait error too.

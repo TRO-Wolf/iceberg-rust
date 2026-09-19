@@ -267,6 +267,10 @@ pub struct FileScanTask {
     /// reading the entire data file.
     pub record_count: Option<u64>,
 
+    #[allow(missing_docs)]
+    #[serde(skip)]
+    pub file_record_count: Option<u64>,
+
     /// The data file path corresponding to the task.
     ///
     /// Arc-shared across split sub-tasks; serializes as a JSON string.
@@ -499,6 +503,7 @@ impl FileScanTask {
             start,
             length,
             record_count: None,
+            file_record_count: self.file_record_count,
             data_file_path: Arc::clone(&self.data_file_path),
             data_file_format: self.data_file_format,
             schema: Arc::clone(&self.schema),
@@ -732,6 +737,7 @@ mod tests {
             start: 0,
             length,
             record_count: Some(1000),
+            file_record_count: Some(1000),
             data_file_path: Arc::from("memory://t/data/1.parquet"),
             data_file_format: format,
             schema,
@@ -1477,7 +1483,6 @@ mod tests {
         assert_eq!(pos_delete(777).content_size_in_bytes(), 777);
         assert_eq!(dv_delete(9_000_000, 64).content_size_in_bytes(), 64);
     }
-
     // ---- serde: the flagged-additive split_offsets field ----
 
     /// Row lineage survives a split, unlike `split_offsets`, which is cleared.
@@ -1507,7 +1512,6 @@ mod tests {
             );
         }
     }
-
     /// Both fields are public on an engine-serialized struct: present when set, absent when
     /// `None` so a serialization predating them still round-trips.
     #[test]
@@ -1534,7 +1538,6 @@ mod tests {
         assert_eq!(back_none.first_row_id, None);
         assert_eq!(back_none.file_sequence_number, None);
     }
-
     /// `_row_id` suppresses splitting exactly as `_pos` does (branch 1c); without it the planner
     /// hands the reader ranged sub-tasks it then refuses one by one.
     #[test]
@@ -1557,7 +1560,6 @@ mod tests {
         splittable.start = 0;
         assert!(splittable.split(400).expect("split").len() > 1);
     }
-
     #[test]
     fn split_offsets_round_trips_and_is_absent_when_none() {
         // Present: serializes as a "split_offsets" key and round-trips.
@@ -1581,7 +1583,6 @@ mod tests {
         let back_none: FileScanTask = serde_json::from_str(&json_none).expect("deserialize none");
         assert_eq!(back_none.split_offsets, None);
     }
-
     /// FK2.1 STOP bar: Arc wrappers must not change the JSON shape of FileScanTask fields
     /// that engines serialize (path string, projection array, deletes array, residual).
     #[test]
@@ -1629,7 +1630,6 @@ mod tests {
         assert_eq!(back.deletes.as_ref(), t.deletes.as_ref());
         assert_eq!(back.predicate.as_deref(), t.predicate.as_deref());
     }
-
     /// STOP bar: frozen golden JSON (pre-Arc field shapes) must match
     /// exactly for a representative task — not just Value-level type checks.
     #[test]

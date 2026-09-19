@@ -183,6 +183,7 @@ fn parquet_task(path: &str, size: u64) -> FileScanTask {
         start: 0,
         length: size,
         record_count: None,
+        file_record_count: None,
         data_file_path: Arc::from(path),
         data_file_format: DataFileFormat::Parquet,
         schema: test_schema(),

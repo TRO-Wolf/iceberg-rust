@@ -2951,6 +2951,7 @@ message schema {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(format!("{table_location}/1.parquet")),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -3303,6 +3304,7 @@ message schema {
             start,
             length,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(path.to_string()),
             data_file_format: DataFileFormat::Parquet,
             schema,
@@ -4278,6 +4280,7 @@ message schema {
             start: rg0_start,
             length: row_group_0.compressed_size() as u64,
             record_count: Some(100),
+            file_record_count: Some(100),
             data_file_path: Arc::from(file_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -4298,6 +4301,7 @@ message schema {
             start: rg1_start,
             length: file_end - rg1_start,
             record_count: Some(200),
+            file_record_count: Some(200),
             data_file_path: Arc::from(file_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -4425,6 +4429,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/old_file.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: new_schema.clone(),
@@ -4517,6 +4522,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/data.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4638,6 +4644,7 @@ message schema {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(data_path.to_string()),
             data_file_format: DataFileFormat::Parquet,
             schema,
@@ -5547,6 +5554,7 @@ message schema {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(data_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema,
@@ -5677,6 +5685,7 @@ message schema {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(data_path),
             data_file_format: DataFileFormat::Parquet,
             schema,
@@ -5782,6 +5791,7 @@ message schema {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(data_path),
             data_file_format: DataFileFormat::Parquet,
             schema,
@@ -5852,6 +5862,7 @@ message schema {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(data_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -6000,6 +6011,7 @@ message schema {
             start: 0,
             length: 0,
             record_count: Some(200),
+            file_record_count: Some(200),
             data_file_path: Arc::from(data_file_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -6209,6 +6221,7 @@ message schema {
             start: rg1_start,
             length: rg1_length,
             record_count: Some(100), // Row group 1 has 100 rows
+            file_record_count: Some(100),
             data_file_path: Arc::from(data_file_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -6413,6 +6426,7 @@ message schema {
             start: rg1_start,
             length: rg1_length,
             record_count: Some(100), // Row group 1 has 100 rows
+            file_record_count: Some(100),
             data_file_path: Arc::from(data_file_path.clone()),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -6528,6 +6542,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -6631,6 +6646,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -6723,6 +6739,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -6827,6 +6844,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -6963,6 +6981,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -7066,6 +7085,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -7179,6 +7199,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -7271,6 +7292,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/file_0.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -7292,6 +7314,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/file_1.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -7313,6 +7336,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/file_2.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -7450,6 +7474,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!("{table_location}/data.parquet")),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -7866,6 +7891,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(file_path),
                 data_file_format: DataFileFormat::Parquet,
                 schema: iceberg_schema.clone(),
@@ -7937,6 +7963,7 @@ message schema {
             start: 0,
             length: file_size,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(file_path),
             data_file_format: DataFileFormat::Parquet,
             schema,
@@ -8652,6 +8679,7 @@ mod avro_scan_tests {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(path),
             data_file_format: DataFileFormat::Avro,
             schema,
@@ -8826,6 +8854,7 @@ mod avro_scan_tests {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(path),
             data_file_format: DataFileFormat::Orc,
             schema,
@@ -9004,7 +9033,6 @@ mod avro_scan_tests {
                 "the typed error must name the ranged AVRO task ({start}, {length}), got: {err}"
             );
         }
-
         // Both whole-file spellings must still be accepted: the legacy `length == 0` sentinel and
         // an explicit `length == file_size_in_bytes`.
         for length in [0, file_len] {
@@ -9021,7 +9049,6 @@ mod avro_scan_tests {
             );
         }
     }
-
     // -- Projection: only the projected field id materializes. ----------------------------------------
 
     #[tokio::test]
@@ -9048,7 +9075,6 @@ mod avro_scan_tests {
             .collect();
         assert_eq!(ids, vec![10, 20]);
     }
-
     // -- MoR positional deletes applied post-materialization. -----------------------------------------
 
     #[tokio::test]
@@ -9082,7 +9108,6 @@ mod avro_scan_tests {
             (50, Some("e".to_string())),
         ]);
     }
-
     // -- MoR equality deletes applied by VALUE. -------------------------------------------------------
 
     #[tokio::test]
@@ -9114,7 +9139,6 @@ mod avro_scan_tests {
             (50, Some("e".to_string())),
         ]);
     }
-
     // -- ORC dispatch now SCANS the file (U2): the golden Java-Iceberg fixture, by field-id. ---------
     //
     // The pre-U2 `orc_data_file_errors_cleanly` (which asserted the OLD FeatureUnsupported behavior)
@@ -9137,7 +9161,6 @@ mod avro_scan_tests {
             (3, Some(String::new())),
         ]);
     }
-
     /// The ORC half of the fail-closed guard, mirroring
     /// [`avro_ranged_task_is_rejected_with_a_typed_error`] one-for-one.
     /// `reject_ranged_whole_file_task` is invoked from BOTH `process_avro_file_scan_task` and
@@ -9185,7 +9208,6 @@ mod avro_scan_tests {
                 "the typed error must name the ranged ORC task ({start}, {length}), got: {err}"
             );
         }
-
         // Non-vacuity: both whole-file spellings must still stream, so this cannot pass on a reader
         // that errors on everything.
         for length in [0, file_len] {
@@ -9202,7 +9224,6 @@ mod avro_scan_tests {
             );
         }
     }
-
     // -- ORC projection: only the projected field id materializes (by field-id, not position). -------
 
     #[tokio::test]
@@ -9226,7 +9247,6 @@ mod avro_scan_tests {
             .collect();
         assert_eq!(ids, vec![1, 2, 3]);
     }
-
     // -- ORC MoR positional deletes applied post-materialization (the SAME DeleteVector path). --------
 
     #[tokio::test]
@@ -9257,7 +9277,6 @@ mod avro_scan_tests {
         // Survivors are exactly {1, 3} — position 1 (id=2) deleted via the absolute-position vector.
         assert_eq!(ids, vec![1, 3]);
     }
-
     // -- ORC MoR equality deletes applied by VALUE (the SAME shared survival evaluator). --------------
 
     #[tokio::test]
@@ -9288,7 +9307,6 @@ mod avro_scan_tests {
         // id=2 is removed by value; {1, 3} survive.
         assert_eq!(ids, vec![1, 3]);
     }
-
     // -- ORC FIELD-ID PROOF (load-bearing): read a Java-written ORC file with a RENAMED expected
     //    field (SAME field id 1, DIFFERENT name "renamed_id"). The value MUST land in the renamed
     //    column. A NAME-BASED reader would look up "id" in the file and either miss or wrongly
@@ -9323,7 +9341,6 @@ mod avro_scan_tests {
             .expect("renamed_id column (by field-id 1)");
         assert_eq!(renamed.as_primitive::<Int64Type>().values(), &[1, 2, 3]);
     }
-
     // -- MUTATION BAIT: a positional-delete keep-mask that did NOT drop the deleted rows would let
     //    id=20/id=40 survive. This pins the absolute-position membership test.
     #[tokio::test]
@@ -9355,7 +9372,6 @@ mod avro_scan_tests {
             (30, Some("c".to_string())),
         ]);
     }
-
     // -- MUTATION BAIT (ORC): a positional-delete keep-mask that did NOT drop the deleted row would
     //    let id=1 (position 0) survive. This pins the absolute-position membership test on the ORC
     //    path (the SAME `DeleteVector`/survival-mask machinery the Avro/Parquet paths use).
@@ -9387,7 +9403,6 @@ mod avro_scan_tests {
         assert_eq!(ids, vec![2, 3]);
     }
 }
-
 #[cfg(test)]
 mod parquet_eq_keyset_mor_tests {
     //! Wave B: Parquet MoR path wires [`EqDeleteKeySet`] when key columns are projected. Routing
@@ -9431,7 +9446,6 @@ mod parquet_eq_keyset_mor_tests {
                 .expect("build test schema"),
         )
     }
-
     fn write_parquet_data_file(path: &str, rows: &[(i64, Option<&str>)]) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
@@ -9457,7 +9471,6 @@ mod parquet_eq_keyset_mor_tests {
         writer.write(&batch).expect("write data");
         writer.close().expect("close data");
     }
-
     fn write_eq_delete_file(path: &str, delete_ids: &[i64]) -> FileScanTaskDeleteFile {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
@@ -9488,7 +9501,6 @@ mod parquet_eq_keyset_mor_tests {
             record_count: None,
         }
     }
-
     fn parquet_task(
         path: &str,
         schema: SchemaRef,
@@ -9500,6 +9512,7 @@ mod parquet_eq_keyset_mor_tests {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(path),
             data_file_format: DataFileFormat::Parquet,
             schema,
@@ -9527,7 +9540,6 @@ mod parquet_eq_keyset_mor_tests {
             .await
             .expect("collect scan batches")
     }
-
     fn surviving_ids(batches: &[RecordBatch]) -> Vec<i64> {
         let mut ids: Vec<i64> = batches
             .iter()
@@ -9542,7 +9554,6 @@ mod parquet_eq_keyset_mor_tests {
         ids.sort_unstable();
         ids
     }
-
     /// Unit pin: keyset routing requires every key field id to be projected.
     #[test]
     fn test_eq_delete_key_fields_projected_gate() {
@@ -9568,7 +9579,6 @@ mod parquet_eq_keyset_mor_tests {
             "empty sets are never eligible"
         );
     }
-
     /// When the eq-delete key is projected, the Parquet MoR path applies the keyset keep-mask
     /// post-decode. Survivors must match the predicate oracle (delete ids 20 and 40).
     #[tokio::test]
@@ -9603,7 +9613,6 @@ mod parquet_eq_keyset_mor_tests {
             "keyset MoR path must drop deleted ids 20 and 40"
         );
     }
-
     /// Mutation bait: a keyset path that forgot to apply deletes would keep 20/40.
     #[tokio::test]
     async fn parquet_eq_keyset_mutation_bait_drops_deleted_ids() {
@@ -9633,7 +9642,6 @@ mod parquet_eq_keyset_mor_tests {
         );
         assert_eq!(ids, vec![10, 30]);
     }
-
     /// When the eq-delete key is NOT projected, the reader falls back to the RowFilter path
     /// without error. Survivors still match the oracle (deletes applied via predicate pushdown).
     ///
@@ -9691,7 +9699,6 @@ mod parquet_eq_keyset_mor_tests {
             "key column must remain unprojected"
         );
     }
-
     /// Direct unit pin of the shared keep-mask helper: set path matches predicate oracle on a
     /// non-null long-key batch (same contract as delete_filter H6 harness, routed through
     /// `ArrowReader::eq_delete_keep_mask`).
@@ -9750,7 +9757,6 @@ mod parquet_eq_keyset_mor_tests {
         // Sanity: BooleanArray keep mask length matches the batch.
         assert_eq!(keep.len(), 3);
     }
-
     /// When keys are projected (keyset post-decode path), the scan residual
     /// must still be applied via RowFilter. Survivors = residual ∩ ¬eq-deleted.
     #[tokio::test]
@@ -9797,7 +9803,6 @@ mod parquet_eq_keyset_mor_tests {
             "keyset MoR path must AND scan residual with eq-deletes (C1-Q-001)"
         );
     }
-
     /// Nullable key column with a NULL cell forces predicate fallback
     /// under the keyset-eligible path. A value-delete must NOT drop the NULL-key row
     /// (Java nulls-first / unit A2).
@@ -9880,7 +9885,6 @@ mod parquet_eq_keyset_mor_tests {
             "NULL-key row must survive a value eq-delete; id=20 must be dropped (C1-Q-002)"
         );
     }
-
     /// Composite equality key (id + data) on the Parquet keyset path.
     /// Pins multi-column tuple membership — a sabotage that only matches the first key column
     /// would over-delete.
@@ -9974,7 +9978,6 @@ mod parquet_eq_keyset_mor_tests {
             "composite keyset must delete only the matching (id,data) tuple (C2-Q-001)"
         );
     }
-
     /// Positional RowSelection + eq keyset post-decode on one Parquet task.
     #[tokio::test]
     async fn parquet_eq_keyset_with_positional_deletes() {
@@ -10049,7 +10052,6 @@ mod parquet_eq_keyset_mor_tests {
             "pos must drop id=40 and eq-keyset must drop id=20 (C2-Q-002)"
         );
     }
-
     /// Keyset path when the projection is *only* the key column (no
     /// non-key data columns). Gate is keys ⊆ projection, not projection == full schema.
     #[tokio::test]
@@ -10081,7 +10083,6 @@ mod parquet_eq_keyset_mor_tests {
             "key-only projection keyset path (C3-Q-001)"
         );
     }
-
     /// Two eq-delete files OR-combined under the keyset path
     /// (a row matching EITHER file is deleted).
     #[tokio::test]
@@ -10110,7 +10111,6 @@ mod parquet_eq_keyset_mor_tests {
             "two eq-delete keysets must OR (drop 20 and 40) (C3-Q-002)"
         );
     }
-
     /// Keyset path that deletes every row yields empty (or no-row) output —
     /// must not error and must not resurrect rows.
     #[tokio::test]

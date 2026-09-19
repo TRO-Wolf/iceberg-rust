@@ -405,6 +405,7 @@ mod tests {
             start,
             length,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(path),
             data_file_format: DataFileFormat::Parquet,
             schema,
