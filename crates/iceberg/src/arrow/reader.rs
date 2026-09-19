@@ -63,6 +63,7 @@ use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
+use crate::expr::visitors::page_index_evaluator::predicate_can_prune_pages;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
@@ -429,8 +430,12 @@ impl ArrowReader {
         parquet_read_options: ParquetReadOptions,
         prefetched_metadata: Option<Arc<ParquetMetaData>>,
     ) -> Result<ArrowRecordBatchStream> {
+        let predicate_can_prune = task
+            .predicate
+            .as_deref()
+            .is_some_and(predicate_can_prune_pages);
         let should_load_page_index =
-            (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
+            (row_selection_enabled && predicate_can_prune) || !task.deletes.is_empty();
         let mut parquet_read_options = parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
         parquet_read_options.preload_column_index = should_load_page_index;

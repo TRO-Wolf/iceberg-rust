@@ -781,3 +781,151 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
         self.select_all_rows()
     }
 }
+
+struct PrunableLeafVisitor;
+
+impl BoundPredicateVisitor for PrunableLeafVisitor {
+    type T = bool;
+
+    fn always_true(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn always_false(&mut self) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn and(&mut self, lhs: bool, rhs: bool) -> Result<bool> {
+        Ok(lhs || rhs)
+    }
+
+    fn or(&mut self, lhs: bool, rhs: bool) -> Result<bool> {
+        Ok(lhs && rhs)
+    }
+
+    fn not(&mut self, _inner: bool) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn is_null(
+        &mut self,
+        _reference: &BoundReference,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn not_null(
+        &mut self,
+        _reference: &BoundReference,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn is_nan(&mut self, reference: &BoundReference, _predicate: &BoundPredicate) -> Result<bool> {
+        Ok(!reference.field().field_type.is_floating_type())
+    }
+
+    fn not_nan(
+        &mut self,
+        _reference: &BoundReference,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn less_than(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn less_than_or_eq(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn greater_than(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn greater_than_or_eq(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn eq(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn not_eq(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn starts_with(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn not_starts_with(
+        &mut self,
+        _reference: &BoundReference,
+        _literal: &Datum,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn r#in(
+        &mut self,
+        _reference: &BoundReference,
+        literals: &FnvHashSet<Datum>,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(literals.len() <= IN_PREDICATE_LIMIT)
+    }
+
+    fn not_in(
+        &mut self,
+        _reference: &BoundReference,
+        _literals: &FnvHashSet<Datum>,
+        _predicate: &BoundPredicate,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+pub(crate) fn predicate_can_prune_pages(predicate: &BoundPredicate) -> bool {
+    visit(&mut PrunableLeafVisitor, predicate).unwrap_or(true)
+}
