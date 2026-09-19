@@ -981,6 +981,7 @@ pub(crate) mod tests {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!(
                     "{}/1.parquet",
                     table_location.to_str().unwrap()
@@ -1003,6 +1004,7 @@ pub(crate) mod tests {
                 start: 0,
                 length: 0,
                 record_count: None,
+                file_record_count: None,
                 data_file_path: Arc::from(format!(
                     "{}/2.parquet",
                     table_location.to_str().unwrap()
@@ -1083,6 +1085,7 @@ pub(crate) mod tests {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from("data.parquet"),
             data_file_format: crate::spec::DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -1208,6 +1211,7 @@ pub(crate) mod tests {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from("data.parquet"),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -1489,6 +1493,7 @@ pub(crate) mod tests {
             start: 0,
             length: 0,
             record_count: None,
+            file_record_count: None,
             data_file_path: Arc::from(data_file_path),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -2741,7 +2746,6 @@ pub(crate) mod tests {
             "the published load must be visible to later callers as AlreadyLoaded"
         );
     }
-
     /// Risk pinned: a loader that dies WITHOUT publishing must move the entry to
     /// [`PosDelState::Failed`] and STILL wake its waiters, so each gets a typed error inside a
     /// BOUNDED await. The claiming task is the sole writer, so without that transition the entry
@@ -2770,7 +2774,6 @@ pub(crate) mod tests {
             "the error must name the delete file, got: {error}"
         );
     }
-
     /// Risk pinned: [`PosDelState::Failed`] is TERMINAL. A later caller must get neither a fresh
     /// `Load` claim, which would lie if it also died, nor an `AlreadyLoaded`, which would resurrect
     /// every row the file deletes. It gets the waiters' typed error at claim time.
@@ -2793,7 +2796,6 @@ pub(crate) mod tests {
             "the error must name the delete file, got: {error}"
         );
     }
-
     /// Risk pinned: the eq-delete waiter must ARM its notifier inside
     /// [`DeleteFilter::lookup_or_arm_eq_del`], while the read lock is held. Both eq-delete
     /// accessors go through that seam, so this pins both. The production publisher runs to
@@ -2853,7 +2855,6 @@ pub(crate) mod tests {
             "the woken waiter must read the published predicate"
         );
     }
-
     /// Risk pinned: the notifier a waiter arms on MUST be the notifier the publisher fires. The
     /// base contract minted a SECOND notifier at registration and replaced the state entry, so a
     /// waiter that armed on the claim's notifier in between was never woken.
@@ -2889,7 +2890,6 @@ pub(crate) mod tests {
             "a terminally failed eq-delete load must read as absence, so the caller errors"
         );
     }
-
     /// Risk pinned: the eq-delete publisher future can be dropped BEFORE its first poll, when a
     /// runtime is torn down between `spawn` and that poll. Such a future runs no local destructors,
     /// so a guard built inside the `async move` block would never exist and the entry would strand

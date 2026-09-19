@@ -235,6 +235,7 @@ impl ManifestEntryContext {
             start: 0,
             length: self.manifest_entry.file_size_in_bytes(),
             record_count: Some(self.manifest_entry.record_count()),
+            file_record_count: Some(self.manifest_entry.record_count()),
 
             // Arc-share path/projection/deletes so split/sub_task only pointer-clones them
             // (FK2.1). Path comes from the already-owned manifest entry string.

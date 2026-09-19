@@ -22,6 +22,8 @@ pub(crate) mod cow_affected;
 mod dangling_dv_delete_tests;
 pub(crate) mod delete;
 pub(crate) mod delete_legacy_merge;
+#[cfg(test)]
+mod exact_count_tests;
 pub(crate) mod expr_to_predicate;
 #[cfg(test)]
 mod list_null_tests;

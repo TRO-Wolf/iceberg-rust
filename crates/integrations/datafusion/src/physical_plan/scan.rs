@@ -70,6 +70,7 @@ pub struct IcebergTableScan {
     limit: Option<usize>,
     /// Empty when built by [`Self::new`] without planning, which takes the single-stream path.
     partition_work: Vec<PartitionWork>,
+    exact_row_count: Option<usize>,
     /// Per-partition data-file concurrency `P = max(1, ceil(L/N))`.
     per_partition_concurrency: usize,
     batch_size: Option<usize>,
@@ -129,6 +130,7 @@ impl IcebergTableScan {
             predicates,
             limit,
             partition_work: Vec::new(),
+            exact_row_count: None,
             per_partition_concurrency: 1,
             batch_size: None,
             row_selection_enabled: true,
@@ -197,6 +199,7 @@ impl IcebergTableScan {
             scan.limit = None;
         }
         scan.partition_work = work;
+        scan.exact_row_count = exact_table_row_count(&scan.partition_work);
         scan.per_partition_concurrency = p;
         scan.batch_size = knobs.batch_size.map(clamp_scan_knob);
         scan.row_selection_enabled = knobs.row_selection_enabled;
@@ -272,17 +275,11 @@ impl ExecutionPlan for IcebergTableScan {
                 )));
             }
         }
-        if self.partition_work.is_empty()
-            || self.predicates.is_some()
-            || self.limit.is_some()
-            || partition.is_some()
-        {
+        if self.partition_work.is_empty() || self.limit.is_some() || partition.is_some() {
             return Ok(Arc::new(Statistics::new_unknown(&self.schema())));
         }
         let mut statistics = Statistics::new_unknown(&self.schema());
-        if let Some(rows) =
-            exact_table_row_count(&self.table, self.resolved_snapshot_id, &self.partition_work)
-        {
+        if let Some(rows) = self.exact_row_count {
             statistics.num_rows = Precision::Exact(rows);
         }
         Ok(Arc::new(statistics))
@@ -632,13 +629,11 @@ mod tests {
             ]))],
         )
         .expect("the scanned batch must build");
-
         let advertised: ArrowSchemaRef = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             ArrowDataType::Int32,
             false,
         )]));
-
         let err = conform_batch(scanned, &advertised, &[ColumnSource::Scanned(
             "id".to_string(),
         )])
@@ -668,7 +663,6 @@ mod tests {
             ArrowField::new("id", ArrowDataType::Int64, false),
             ArrowField::new("required_new", ArrowDataType::Utf8, false),
         ]));
-
         let sources = vec![
             ColumnSource::Scanned("id".to_string()),
             ColumnSource::Absent,
@@ -802,7 +796,6 @@ mod tests {
             field_with_id("b", ArrowDataType::Int32, true, 4),
         ]);
         let target = ArrowField::new("s", ArrowDataType::Struct(target_children.clone()), true);
-
         let conformed = conform_column(&scanned, &target, "s").expect("the struct must conform");
         assert_eq!(conformed.data_type(), target.data_type());
         let conformed = conformed

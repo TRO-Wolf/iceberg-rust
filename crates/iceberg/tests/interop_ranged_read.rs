@@ -132,6 +132,7 @@ async fn read_window(path: &str, start: u64, length: u64) -> Vec<i64> {
         start,
         length,
         record_count: None,
+        file_record_count: None,
         data_file_path: Arc::from(path.to_string()),
         data_file_format: DataFileFormat::Parquet,
         schema: fixture_schema(),

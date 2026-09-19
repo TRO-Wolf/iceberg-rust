@@ -5493,6 +5493,7 @@ pub mod tests {
             predicate: None,
             schema: schema.clone(),
             record_count: Some(100),
+            file_record_count: Some(100),
             data_file_format: DataFileFormat::Parquet,
             deletes: Arc::from(vec![]),
             partition: None,
@@ -5515,6 +5516,7 @@ pub mod tests {
             predicate: Some(Arc::new(BoundPredicate::AlwaysTrue)),
             schema,
             record_count: None,
+            file_record_count: None,
             data_file_format: DataFileFormat::Avro,
             deletes: Arc::from(vec![]),
             partition: None,
@@ -6776,7 +6778,6 @@ pub mod tests {
             "disabled expand must be a no-op"
         );
     }
-
     /// Concurrency=1 never expands (serial path).
     #[tokio::test]
     async fn test_within_file_parallel_concurrency_one_no_expand() {
@@ -6806,7 +6807,6 @@ pub mod tests {
             .expect("collect expanded");
         assert_eq!(expanded.len(), whole.len());
     }
-
     /// Risk: the scan emit silently swallows a panicking listener (Java `SnapshotScan.planFiles`
     /// has NO guard — a throwing listener propagates). Pins that a panicking scan listener
     /// propagates out of `plan_files`.

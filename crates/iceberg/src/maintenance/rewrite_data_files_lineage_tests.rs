@@ -358,6 +358,7 @@ async fn read_file_batches(table: &Table, file: &DataFile) -> Vec<RecordBatch> {
         start: 0,
         length: file.file_size_in_bytes(),
         record_count: Some(file.record_count()),
+        file_record_count: Some(file.record_count()),
         data_file_path: Arc::from(file.file_path()),
         data_file_format: file.file_format(),
         schema: schema.clone(),

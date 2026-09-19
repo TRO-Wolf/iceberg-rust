@@ -2257,6 +2257,7 @@ pub(crate) mod tests {
             start: 0,
             length: size,
             record_count: Some(1),
+            file_record_count: Some(1),
             data_file_path: Arc::from(path),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -2415,7 +2416,6 @@ pub(crate) mod tests {
             "2 small files summing > target qualify via enoughContent"
         );
     }
-
     // The composed `remove-dangling-deletes` sub-action.
 
     /// The live delete-file paths of the current snapshot, the signal for whether a delete file was
