@@ -265,27 +265,26 @@ impl<'a> PositionDeletesTable<'a> {
                     )
                 })?;
 
-            if !transformed_evaluators.contains_key(&spec_id) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                transformed_evaluators.entry(spec_id)
+            {
                 let bound = project_partition_filter(
                     &transformed_spec,
                     metadata_schema,
                     &scan_filter,
                     CASE_SENSITIVE,
                 )?;
-                transformed_evaluators
-                    .insert(spec_id, Arc::new(ManifestEvaluator::builder(bound).build()));
+                entry.insert(Arc::new(ManifestEvaluator::builder(bound).build()));
             }
-            if !base_evaluators.contains_key(&spec_id) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = base_evaluators.entry(spec_id)
+            {
                 let bound = project_partition_filter(
                     &own_spec,
                     &table_schema,
                     &base_filter,
                     CASE_SENSITIVE,
                 )?;
-                base_evaluators.insert(
-                    spec_id,
-                    Arc::new(ManifestEvaluator::builder(bound.clone()).build()),
-                );
+                entry.insert(Arc::new(ManifestEvaluator::builder(bound.clone()).build()));
                 partition_evaluators.insert(spec_id, Arc::new(ExpressionEvaluator::new(bound)));
             }
             if !transformed_evaluators[&spec_id].eval(manifest_file)? {
@@ -311,7 +310,9 @@ impl<'a> PositionDeletesTable<'a> {
                     continue;
                 }
                 let file_spec_id = data_file.partition_spec_id();
-                if !residual_evaluators.contains_key(&file_spec_id) {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    residual_evaluators.entry(file_spec_id)
+                {
                     let file_transformed_spec = transformed_specs
                         .get(&file_spec_id)
                         .cloned()
@@ -321,15 +322,12 @@ impl<'a> PositionDeletesTable<'a> {
                                 format!("no transformed partition spec for spec id {file_spec_id}"),
                             )
                         })?;
-                    residual_evaluators.insert(
-                        file_spec_id,
-                        Arc::new(ResidualEvaluator::of(
-                            file_transformed_spec,
-                            metadata_schema,
-                            scan_filter.clone(),
-                            CASE_SENSITIVE,
-                        )?),
-                    );
+                    entry.insert(Arc::new(ResidualEvaluator::of(
+                        file_transformed_spec,
+                        metadata_schema,
+                        scan_filter.clone(),
+                        CASE_SENSITIVE,
+                    )?));
                 }
                 let residual =
                     residual_evaluators[&file_spec_id].residual_for(data_file.partition())?;
@@ -560,7 +558,7 @@ impl<'a> PositionDeletesTable<'a> {
             data_file.file_path(),
         )?;
         let row_count = positions.len();
-        let rows = extract_row_column(&batches, &row_fields, data_file.file_path())?;
+        let rows = extract_row_column(&batches, row_fields, data_file.file_path())?;
         Ok((row_count, file_paths, positions, rows))
     }
 }

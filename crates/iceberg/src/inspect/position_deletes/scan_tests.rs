@@ -288,7 +288,7 @@ fn single_batch(batches: Vec<RecordBatch>) -> RecordBatch {
     merged
 }
 
-fn partition_struct<'a>(batch: &'a RecordBatch) -> &'a arrow_array::StructArray {
+fn partition_struct(batch: &RecordBatch) -> &arrow_array::StructArray {
     batch
         .column_by_name("partition")
         .expect("partition column")
@@ -712,7 +712,7 @@ async fn scan_evolved_two_specs_null_fills_unified_partition() {
     let delete_file_paths = string_column(&batch, "delete_file_path");
     let positions = int64_column(&batch, "pos");
 
-    let mut seen: Vec<(String, i64, i32, Option<i64>, Option<i32>)> = (0..2)
+    let mut seen = (0..2)
         .map(|index| {
             (
                 delete_file_paths.value(index).to_string(),
@@ -722,7 +722,7 @@ async fn scan_evolved_two_specs_null_fills_unified_partition() {
                 partition_i32(partition, "y_bucket_8", index),
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
     seen.sort();
     assert_eq!(seen, vec![
         (del_a.clone(), 1, 0, Some(5), None),
