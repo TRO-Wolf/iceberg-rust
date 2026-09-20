@@ -323,7 +323,7 @@ async fn changelog_reader_refuses_deleted_rows_tasks() {
         .unwrap()
         .try_collect::<Vec<RecordBatch>>()
         .await;
-    let error = result.err().expect("a DeletedRows task must error");
+    let error = result.expect_err("a DeletedRows task must error");
     assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
     assert_eq!(
         error.message(),
