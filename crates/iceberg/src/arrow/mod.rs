@@ -25,6 +25,10 @@ pub(crate) mod avro_reader;
 mod nan_val_cnt_visitor;
 mod nested_projection;
 pub(crate) use nan_val_cnt_visitor::{NanValueCountVisitor, schema_needs_nan_value_counts};
+#[allow(missing_docs)]
+pub mod changelog_reader;
+pub use changelog_reader::{ChangelogReader, changelog_arrow_fields, changelog_arrow_schema};
+
 pub(crate) mod caching_delete_file_loader;
 /// Delete File loader
 pub mod delete_file_loader;
@@ -70,5 +74,7 @@ pub mod record_batch_partition_splitter;
 mod spark_fixture_tests;
 pub use record_batch_partition_splitter::*;
 
+#[cfg(test)]
+mod changelog_reader_tests;
 #[cfg(test)]
 mod f_transform_arrow_types_1_tests;

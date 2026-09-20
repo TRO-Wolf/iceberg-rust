@@ -2024,3 +2024,17 @@ fix is the column name the bound reference already carries; the pin is
 `a_nested_residual_keeps_its_full_column_name`, red on the old line ("category IS NULL" against "st.category IS NULL").
 
 - [x] Fix + red-first pin.
+
+## F-CHANGELOG-READER-1 — an Arrow reader for `ChangelogScanTask` (RePark IPI-22, run 26c)
+
+The planner half has been here since 2026-06-08 (GAP_MATRIX R123) but nothing read a
+`ChangelogScanTask`, so the three reserved change columns were defined and never emitted.
+
+- [x] `arrow/changelog_reader.rs` — `ChangelogReader` over the ordinary `ArrowReader`, plus the
+      public `changelog_arrow_schema` / `changelog_arrow_fields`.
+- [x] Red-first pins in `arrow/changelog_reader_tests.rs`: the per-task commit snapshot id (NOT
+      the scan's `to` id), a deleted data file reading as DELETE rows, and the reserved field ids.
+- [x] Ledger `task/f-changelog-reader-1-ledger.md`; GAP_MATRIX R123 amended.
+- [ ] Not in scope: reading `ChangelogTaskKind::DeletedRows` (still opt-in, still unread — Iceberg
+      1.11.0's `ChangelogRowReader` has no such path), and UPDATE_BEFORE/UPDATE_AFTER pairing
+      (Spark-side, `ChangelogIterator`).
