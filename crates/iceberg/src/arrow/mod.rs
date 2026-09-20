@@ -74,6 +74,8 @@ pub mod record_batch_partition_splitter;
 #[cfg(test)]
 mod record_batch_predicate_container_tests;
 #[cfg(test)]
+mod row_filter_nested_tests;
+#[cfg(test)]
 mod spark_fixture_tests;
 pub use record_batch_partition_splitter::*;
 
