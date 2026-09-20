@@ -34,7 +34,8 @@
 | 3-4 | 8417b8b3 | `feat: F-POSDEL-SCAN-1 — delete-manifest planning walk + delete-file reading` |
 | 5 | af6dabf1 | `docs: F-POSDEL-SCAN-1 — un-refuse position_deletes scan in module doc, map.md, GAP_MATRIX R142` |
 | 6 | d26d49ff | `test: F-POSDEL-SCAN-1 — mutation records, all seven sabotages redden pins` |
-| 7 | this commit | `chore: F-POSDEL-SCAN-1 — split partition.rs test modules for the size gate; clauses PROVEN` |
+| 7 | abee6a99 | `chore: F-POSDEL-SCAN-1 — split partition.rs test modules for the size gate; clauses PROVEN` |
+| 8 | 6aaa15bd | `chore: F-POSDEL-SCAN-1 — shed comments in moved code, drop added doc comments` |
 
 ## 1. The gap
 
@@ -424,7 +425,7 @@ Every mutation reddened at least one pin; none stayed green. No pin gaps found.
 | `cargo check -q -p iceberg-datafusion --all-targets` (call-site touched) | clean |
 | `python3 scripts/check_rust_file_size.py` | 604 files clean (90 legacy ceilings) |
 | `python3 scripts/check_ledger_grammar.py` (if exists — it does not) | n/a |
-| `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/rd-posdel origin/main` | pending |
+| `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/rd-posdel origin/main` | `comment-ban hits=0` |
 
 ### 8.1 The partition.rs split the size gate forced
 
@@ -443,7 +444,10 @@ its three `#[cfg(test)]` modules into sibling files wired with the repo's own
 | `spec/partition_path_escaping_tests.rs` | 800 | under default — no row |
 
 The moved bodies are verbatim (83 partition tests still green); only the license header
-and the `#[path]` declarations were added.
+and the `#[path]` declarations were added. The comment ban then stripped the moved
+comments (relocated code sheds its comments) and the added doc comments — `scan()` keeps
+`missing_docs` satisfied via `#[allow(missing_docs)]`, and `partition_tests.rs`'s legacy
+row ratcheted down to its post-strip size (1337).
 
 ## 9. Coverage attestation
 
