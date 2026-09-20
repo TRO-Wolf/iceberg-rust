@@ -206,7 +206,8 @@ Test module `crates/iceberg/src/inspect/position_deletes/scan_tests.rs` builds r
 fixture tables (`TableTestFixture` + hand-written v2/v3 manifest lists, real parquet
 position-delete files written with `ArrowWriter` + `PARQUET_FIELD_ID_META_KEY`, real
 puffin DVs written with the `PuffinWriter`) and calls `table.inspect().position_deletes()
-.scan()`. Seven pins, one per measured fact group:
+.scan()`. Seven pins, one per measured fact group, plus the round-2 scope pin
+at the end of the table (mutation (h) in §7):
 
 | Pin | Fact covered |
 |---|---|
@@ -217,6 +218,7 @@ puffin DVs written with the `PuffinWriter`) and calls `table.inspect().position_
 | `scan_row_column_is_read_when_the_file_carries_it` | R-4 upper half — a file that stores `row` surfaces it |
 | `scan_v2_output_has_no_dv_columns` | v2 schema has no `content_offset`/`content_size_in_bytes` |
 | `scan_empty_table_emits_no_rows` | no delete manifests → zero rows, no error |
+| `scan_ignores_parent_snapshot_delete_manifests` | R-2 second half — a live posdel file reachable only from the parent snapshot's manifest list contributes zero rows |
 
 Red run (`cargo test -q -p iceberg --lib position_deletes`, this commit):
 
@@ -352,17 +354,26 @@ LEDGER:
     verdict: PROVEN
     pins: f-posdel-scan-1/C-009 — the data-manifest decoy in
       scan_partitioned_v2_rows_match_oracle contributes no row; mutation (b) (data
-      manifests read) yields zero rows across five pins.
+      manifests read) yields zero rows across five pins; round 2 adds
+      scan_ignores_parent_snapshot_delete_manifests, which pins the current-snapshot
+      half (parent-snapshot decoy contributes no row; mutation (h) leaks it).
   - id: C-010
     proposition: >
       planning runs both manifest evaluators keyed on manifest.partitionSpecId()
       (transformed-spec evaluator + own-spec evaluator), the live filter and the content
       filter, and produces one task per delete file carrying its spec and its residual
       (2.1.2-2.1.5).
-    verdict: PROVEN
-    pins: f-posdel-scan-1/C-010 — plan_position_delete_tasks implements all of it (the
-      whole green suite runs through both evaluators, the live filter, the content
-      filter and per-file tasks); mutations (a),(b),(c) prove each filter load-bearing.
+    verdict: OPEN
+    pins: f-posdel-scan-1/C-010 — the dual-evaluator keying is implemented but
+      unpinned. scan_filter and base_filter are both Predicate::AlwaysTrue, and
+      ManifestEvaluator::eval short-circuits always_true to Ok(true), so every
+      fixture manifest passes whether or not the two eval continues run. Skipping
+      both was verified to leave scan_tests green. Mutations (a),(b),(c) prove only
+      the content filter, the DELETE-manifest filter and is_alive — not the
+      evaluators. The live filter, content filter and per-file tasks stay PROVEN via
+      C-004, C-005, C-006 and (a),(b),(c). A real prune pin needs a filter parameter
+      on scan(); scan() has none, and this unit declared filter plumbing out of
+      scope.
   - id: C-011
     proposition: >
       format routing is ContentFileUtil.isDV-equivalent: Puffin + PositionDeletes takes the
@@ -383,23 +394,29 @@ LEDGER:
       a loud Utf8-vs-Int64 DataInvalid.
   - id: C-013
     proposition: >
-      every mutation (a)-(g) turns at least one pin red with the same test population —
+      every mutation (a)-(h) turns at least one pin red with the same test population —
       a green mutation is a pin gap and is fixed, not rationalised.
     verdict: PROVEN
-    pins: f-posdel-scan-1/C-013 — ledger §7: all seven mutations reddened pins; none
+    pins: f-posdel-scan-1/C-013 — ledger §7, all eight mutations reddened pins; none
       stayed green.
   - id: C-014
     proposition: >
-      module doc, inspect/map.md position_deletes row and GAP_MATRIX R142 no longer claim
-      schema-only / scan-refused; the refusal text is deleted.
+      no shipped doc still claims schema-only / scan-refused for position_deletes.
     verdict: PROVEN
-    pins: f-posdel-scan-1/C-014 — commit af6dabf1 rewrites the module doc, the map.md row
-      and R142's residual list; the FeatureUnsupported scan refusal is deleted (the only
-      remaining FeatureUnsupported paths are wrong-format routing and a hypothetical
+    pins: f-posdel-scan-1/C-014 — step 5 rewrote the inspect/map.md row and R142's
+      residual list; step 8 deleted the module doc under the comment ban; round 2
+      deletes the three remaining stale doc lines — the PositionDeletesTable struct
+      doc (position_deletes.rs), the MetadataTableType::PositionDeletes variant doc
+      and the position_deletes() accessor doc (metadata_table.rs) — with
+      missing_docs allows per the scan() precedent (the rewrite attempt tripped the
+      ban at hits=3, so deletion was required). Grep for schema-only / scan-refused
+      / refused-loud over both files and map.md returns nothing; the
+      FeatureUnsupported scan refusal is deleted (the only remaining
+      FeatureUnsupported paths are wrong-format routing and a hypothetical
       non-vacuous residual, both loud-by-design).
 ```
 
-## 7. Mutation records (step 6 — each sabotage run + reverted; all 13 pins green after revert)
+## 7. Mutation records (step 6 + round 2 — each sabotage run + reverted; all pins green after revert)
 
 | Mutation | Pins reddened | Arithmetic |
 |---|---|---|
@@ -410,8 +427,10 @@ LEDGER:
 | (e) DV branch for v2 file and vice versa (`!= Puffin`) | 6 pins: v2 files hit `load_delete_vector`'s "carries no referenced_data_file" `DataInvalid`; the v3 puffin hit the parquet branch's `FeatureUnsupported` | 7 passed / 6 failed |
 | (f) `content_offset` / `content_size_in_bytes` emitted as 0 | `scan_partitioned_v3_dv_rows_match_oracle` (`(pos,offset,size)` tuples (1,0,0)/(7,0,0), expected (1,4,42)/(7,46,42)) | 12 passed / 1 failed |
 | (g) `pos` read from the `file_path` column | 5 v2-path pins (`column 'file_path' is Utf8, expected Int64` `DataInvalid`); v3 unaffected — its pos comes from the DV, correctly | 8 passed / 5 failed |
+| (h) `MetadataScope::CurrentSnapshot` → `AllSnapshots` in `plan_position_delete_tasks` | `scan_ignores_parent_snapshot_delete_manifests` (1 row — the parent decoy leaked — expected 0); the other seven scan pins fail on the parent manifest list their fixtures never wrote (`manifests_list_1.avro` missing), the six schema pins stay green | 6 passed / 8 failed |
 
 Every mutation reddened at least one pin; none stayed green. No pin gaps found.
+Mutation (h) reverted → 14 passed / 0 failed.
 
 ## 8. Gates (step 7 — run on this commit)
 
