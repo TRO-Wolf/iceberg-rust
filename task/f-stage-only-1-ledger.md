@@ -121,8 +121,47 @@ just before publish and differs from the staged snapshot's own `first_row_id`.
 
 ## Mutation evidence (executed)
 
-_Pending — recorded with `<N> red out of <M>` per run._
+Baseline: `cargo test -p iceberg --lib stage_only_tests` — 14 passed; 0 failed.
+
+Mutation 1 — stage flag ignored in `merge_append.rs` (`.with_stage_only(self.stage_only)`
+→ `.with_stage_only(self.stage_only && false)`): **1 red out of 14** —
+`merge_append_stage_only_adds_snapshot_without_moving_main`, failing assertion:
+
+```text
+assertion `left == right` failed: stage_only must not advance current-snapshot-id
+  left: Some(4951073193712195810)
+ right: Some(3567619747308661495)
+```
+
+Restored; rerun 14 passed; 0 failed.
+
+Mutation 2 — duplicate-publish check bypassed in `publish_changes.rs`
+(`if is_wap_id_published(metadata, wap_id)` → `if false && is_wap_id_published(metadata, wap_id)`):
+**1 red out of 14** — `staged_snapshot_for_wap_id_already_published_has_java_message`,
+failing assertion:
+
+```text
+an already-published wap id must fail: Snapshot { snapshot_id: 5436803876107560008, ... }
+```
+
+(the helper returned `Ok(staged)` for an already-published wap id). Restored; rerun
+14 passed; 0 failed.
+
+Notable: `publish_changes_twice_has_java_message` stayed GREEN under mutation 2 —
+`CherryPickAction::validate`'s own `validate_wap_publish` catches the duplicate on the
+replay path independently. That is Java's shape too (`WapUtil.validateWapPublish` is
+invoked by both `PublishChangesProcedure`'s resolved cherry-pick and the direct
+`CherrypickOperation`), so the lookup's check is the procedure-level duplicate guard
+while cherry-pick's is the action-level one; the helper pin is the load-bearing test
+for the former.
 
 ## Gates
 
-_Pending._
+- `cargo fmt --all` — clean
+- `cargo clippy -p iceberg --all-targets -- -D warnings` — clean
+- `cargo test -p iceberg --lib stage_only_tests` — 14 passed; 0 failed
+- `bash scripts/check_rust_file_size.sh` — 593 files clean (90 legacy ceilings);
+  ceilings LOWERED for `replace_partitions.rs` (2783 → 2782) and `mod.rs`
+  (1937 → 1936) after blank-line reclamation
+- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/qb-fork2 origin/main` —
+  `comment-ban hits=0`
