@@ -62,6 +62,10 @@ fn floating_point_matches_javas_ordered_bytes_including_its_shift_quirk() {
         (f64::INFINITY, "fff00000ffe00000"),
         (f64::NEG_INFINITY, "000fffffffe00000"),
         (f64::NAN, "fff80000fff00000"),
+        (f64::from_bits(0xfff8_0000_0000_0000), "fff80000fff00000"),
+        (f64::from_bits(0x7ff8_0000_0000_0001), "fff80000fff00000"),
+        (f64::from_bits(0xfff8_0000_0000_abcd), "fff80000fff00000"),
+        (f64::from_bits(0x7ff0_0000_0000_0001), "fff80000fff00000"),
     ] {
         assert_eq!(
             hex(&floating_point_ordered_bytes(value)),
@@ -69,6 +73,80 @@ fn floating_point_matches_javas_ordered_bytes_including_its_shift_quirk() {
             "{value}"
         );
     }
+}
+
+#[test]
+fn every_nan_collapses_to_javas_canonical_nan_in_the_z_value() {
+    let nans = [
+        f64::NAN,
+        f64::from_bits(0xfff8_0000_0000_0000),
+        f64::from_bits(0x7ff8_0000_0000_0001),
+        f64::from_bits(0xfff8_0000_0000_abcd),
+        f64::from_bits(0x7ff0_0000_0000_0001),
+    ];
+    let canonical = floating_point_ordered_bytes(f64::NAN);
+    for value in nans {
+        assert_eq!(
+            floating_point_ordered_bytes(value),
+            canonical,
+            "NaN bits {:016x} must encode as Java's canonical NaN",
+            value.to_bits()
+        );
+    }
+    let smallest = floating_point_ordered_bytes(f64::NEG_INFINITY);
+    let largest = floating_point_ordered_bytes(f64::INFINITY);
+    assert!(
+        canonical > largest && canonical > smallest,
+        "a NaN must sort above every number, not below them"
+    );
+}
+
+#[tokio::test]
+async fn a_float_column_canonicalises_its_nans_like_javas_widening_encoder() {
+    use arrow_array::{Float32Array, RecordBatch};
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![Arc::new(NestedField::optional(
+            1,
+            "f",
+            Type::Primitive(PrimitiveType::Float),
+        ))])
+        .build()
+        .expect("build the float schema");
+    let arrow_schema =
+        Arc::new(crate::arrow::schema_to_arrow_schema(&schema).expect("arrow schema"));
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+        Arc::new(Float32Array::from(vec![
+            f32::from_bits(0x7fc0_0000),
+            f32::from_bits(0xffc0_0000),
+            f32::from_bits(0xffc0_abcd),
+            f32::from_bits(0x7f80_0001),
+            1.5f32,
+        ])) as arrow_array::ArrayRef,
+    ])
+    .expect("float batch");
+
+    let encoder = crate::maintenance::rewrite_data_files_zorder::ZOrderEncoder::build(
+        &["f".to_string()],
+        &schema,
+        &arrow_schema,
+        8,
+        i32::MAX as usize,
+    )
+    .expect("z encoder");
+    let mut keys = vec![Vec::new(); batch.num_rows()];
+    encoder.encode(&batch, &mut keys).expect("encode");
+
+    for (row, key) in keys.iter().take(4).enumerate() {
+        assert_eq!(
+            hex(key),
+            "fff80000fff00000",
+            "float NaN row {row} must widen to Java's canonical NaN"
+        );
+    }
+    assert_eq!(hex(&keys[4]), "bff800007ff00000");
+    assert!(keys[4] < keys[0], "1.5 must sort below a NaN, as in Java");
 }
 
 #[test]

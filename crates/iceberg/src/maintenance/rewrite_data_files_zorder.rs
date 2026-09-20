@@ -28,6 +28,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::spec::{PrimitiveType, Schema as IcebergSchema, Type};
 
 pub(super) const PRIMITIVE_BUFFER_SIZE: usize = 8;
+pub(super) const JAVA_CANONICAL_NAN_BITS: i64 = 0x7ff8_0000_0000_0000;
 
 pub(super) enum ZColumnKind {
     WholeNumber,
@@ -270,7 +271,11 @@ pub(super) fn whole_number_ordered_bytes(value: i64) -> [u8; PRIMITIVE_BUFFER_SI
 }
 
 pub(super) fn floating_point_ordered_bytes(value: f64) -> [u8; PRIMITIVE_BUFFER_SIZE] {
-    let bits = value.to_bits() as i64;
+    let bits = if value.is_nan() {
+        JAVA_CANONICAL_NAN_BITS
+    } else {
+        value.to_bits() as i64
+    };
     let mask = (bits >> 31) | i64::MIN;
     (bits ^ mask).to_be_bytes()
 }
