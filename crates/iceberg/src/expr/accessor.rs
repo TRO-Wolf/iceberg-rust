@@ -26,11 +26,18 @@ fn default_is_optional() -> bool {
     true
 }
 
+fn is_default_optional(optional: &bool) -> bool {
+    *optional == default_is_optional()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct StructAccessor {
     position: usize,
     r#type: Type,
-    #[serde(default = "default_is_optional")]
+    #[serde(
+        default = "default_is_optional",
+        skip_serializing_if = "is_default_optional"
+    )]
     is_optional: bool,
     inner: Option<Box<StructAccessor>>,
 }

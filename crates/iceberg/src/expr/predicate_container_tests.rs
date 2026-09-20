@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use super::predicate::tests::test_bound_predicate_serialize_diserialize;
 use crate::ErrorKind;
-use crate::expr::{Bind, Reference};
+use crate::expr::{Bind, BoundPredicate, Reference};
 use crate::spec::{
     Datum, ListType, MapType, NestedField, PrimitiveType, Schema, SchemaRef, StructType, Type,
 };
@@ -149,4 +149,32 @@ fn test_bind_is_not_null_required_leaf_under_optional_parent_does_not_fold() {
         .bind(schema, true)
         .expect("`person.age IS NOT NULL` must bind");
     assert_eq!(&format!("{bound}"), "person.age IS NOT NULL");
+}
+
+#[test]
+fn test_optional_primitive_bound_predicate_json_omits_default_is_optional() {
+    let schema = table_schema_with_containers();
+    let bound = Reference::new("person.name")
+        .is_null()
+        .bind(schema, true)
+        .expect("`person.name IS NULL` must bind");
+    let json = serde_json::to_string(&bound).expect("serialize the bound predicate");
+    assert_eq!(
+        json,
+        r#"{"Unary":{"op":"IsNull","term":{"column_name":"person.name","field":{"id":8,"name":"name","required":false,"type":"string"},"accessor":{"position":3,"type":"string","inner":{"position":0,"type":"string","inner":null}}}}}"#
+    );
+    let decoded: BoundPredicate =
+        serde_json::from_str(&json).expect("the payload must deserialize");
+    assert_eq!(decoded, bound);
+}
+
+#[test]
+fn test_required_primitive_bound_predicate_json_carries_explicit_is_optional() {
+    let schema = table_schema_with_containers();
+    let bound = Reference::new("id")
+        .greater_than(Datum::long(1))
+        .bind(schema, true)
+        .expect("`id > 1` must bind");
+    let json = serde_json::to_string(&bound).expect("serialize the bound predicate");
+    assert_eq!(json.matches("\"is_optional\":false").count(), 1);
 }
