@@ -260,24 +260,26 @@ null exactly in rows 2–3), not from a fresh Spark run — §3 stays the measur
   `parquet::arrow::ProjectionMask::without_nested_types` (extend its exclusion to
   single-leaf non-LIST group roots) would retire the fork's
   `with_max_predicate_cache_size(0)` workaround entirely; dependency changes are out
-  of scope for this slice. The workaround is conservative (it also covers list
-  readers) and costs only page sharing, never correctness. Root cause and
-  measurements: `docs/findings/round-2c-predicate-cache-struct-panic.md`.
+  of scope for this slice. The workaround is conservative and costs only page
+  sharing, never correctness. Root cause and measurements:
+  `docs/findings/round-2c-predicate-cache-struct-panic.md`.
 
 ## 9. Round-2 findings dispositions
 
 The critic reports are not in the repo; the mapping below is reconstructed from the
-round-2a/2b commits, one row per finding id named in the round-2 brief.
+round-2a/2b commits, one row per finding id named in the round-2 brief, plus one
+round-1 red kept as its own row.
 
 | finding | disposition | where |
 |---|---|---|
-| V-01 (page-index group ids used `CantMatch`, dropping matching rows under row selection) | CLOSED | `page_index_evaluator.rs::field_id_names_a_group` fail-open (`4b85af4a`) + `test_container_null_predicates_match_spark_oracle_under_page_index_row_selection` (§7 M9) |
+| V-01 (id-less files answer container/nested null tests wrong; §8 parked it) | CLOSED | mapping/positional stamping + unmapped→Residual (`ec6da3c9`), §8 parking withdrawn above (§7 M6/M7/M10) |
 | V-02 (element/key/value accessor absence + `xs.element` bind failure unpinned) | CLOSED | `test_build_accessors_omits_element_key_value_and_container_nested_ids` + `test_bind_is_null_on_element_key_and_value_paths_fails_at_accessor_lookup` (round 2b step 5, §7 M13) |
 | V-03 (`is_present` pinned only through `table.scan()`, never directly) | CLOSED | `test_is_present_treats_empty_containers_and_all_null_struct_as_present` + `test_is_present_propagates_null_parent_and_rejects_wrong_shape` (round 2b step 5, §7 M14/M15) |
-| V-04 (id-less files answer container/nested null tests wrong; §8 parked it) | CLOSED | mapping/positional stamping + unmapped→Residual (`ec6da3c9`), §8 parking withdrawn above (§7 M6/M7/M10) |
+| V-04 (`schema_accessor_charge` pin red on this head — charge not yet updated for the new accessor tree) | CLOSED | close-out lives under C-010 (§11): `schema_accessor_charge` rewalks the accessor map `Schema` builds (§5 item 8) + `test_schema_accessor_charge_*` pins (§7 M12) |
 | V-05 / Q-26d-7 (JSON "byte-identical" claim false: `is_optional` always serialized) | CLOSED | `skip_serializing_if` on the default + frozen 220-byte string pin + `cmp` proof vs `main` (round 2b step 6, §7 M16/M17) |
-| L-01 (stale `is_optional=true` expectation in term bind tests, red since round 1) | CLOSED | `term.rs` bind tests expect `false` for required `bar` (`40bcf119`) |
+| L-01 (page-index group ids used `CantMatch`, dropping matching rows under row selection) | CLOSED | `page_index_evaluator.rs::field_id_names_a_group` fail-open (`4b85af4a`) + `test_container_null_predicates_match_spark_oracle_under_page_index_row_selection` (§7 M9) |
 | L-02 (row-3 fixture `{a:NULL,b:3}`, not the oracle's all-NULL struct; no `st.a IS NOT NULL` pin) | CLOSED | all-NULL row 3 + `st.a IS NOT NULL` cell (`1a586446`); `st.b` cell added round 2b to kill M11 (§7 M11) |
+| round-1 red (stale `is_optional=true` expectation in term bind tests) | CLOSED | `term.rs` bind tests expect `false` for required `bar` (`40bcf119`) |
 
 V-note (out of scope, for the `list_null` clerk): the RULE-5 red test
 `physical_plan::list_null_tests::select_where_xs_is_null_returns_the_null_row` flips
@@ -297,9 +299,9 @@ file being pruned. "Fail open" = keep the file/row (never drop a match).
 | inclusive/strict metrics | bounds/counts absent | might-match | existing suite |
 | row-group metrics | field id unmapped | might-match | existing suite |
 | page index | leaf id unmapped, `IsNull`/`NotNull` | `MightMatch` select-all / `CantMatch` skip-all by op | existing suite |
-| page index | **group** id unmapped (list/map/struct) | select-all (`field_id_names_a_group`, V-01 fix) | `..._under_page_index_row_selection` |
+| page index | **group** id unmapped (list/map/struct) | select-all (`field_id_names_a_group`, L-01 fix) | `..._under_page_index_row_selection` |
 | RowFilter leaf map | field id unmapped, ids present | id ignored (schema evolution) | existing suite |
-| id-less RowFilter plan | predicate id present-but-unmapped | `Residual`, never a partial Push (V-04 fix) | id-less oracle cases |
+| id-less RowFilter plan | predicate id present-but-unmapped | `Residual`, never a partial Push (V-01 fix) | id-less oracle cases |
 | record-batch evaluator | column absent from batch | NULL semantics (`is_null`→true) | `record_batch_predicate` suite |
 | DataFusion push gate | no accessor for the term | not pushed (`term_binds_soundly`) | `*_is_not_pushed` pins |
 
