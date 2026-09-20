@@ -134,9 +134,9 @@ impl SnapshotProducer<'_> {
         removed_data_files: &[DataFile],
         removed_delete_files: &[DataFile],
         drops_old_delete_files: bool,
-    ) -> Result<(Vec<ManifestFile>, Vec<DataFile>)> {
+    ) -> Result<(Vec<ManifestFile>, Vec<DataFile>, usize)> {
         if removed_data_files.is_empty() && removed_delete_files.is_empty() {
-            return Ok((existing_manifests, vec![]));
+            return Ok((existing_manifests, vec![], 0));
         }
 
         let targets = RemovalTargets::new(removed_data_files, removed_delete_files);
@@ -212,14 +212,22 @@ impl SnapshotProducer<'_> {
             ));
         }
 
+        let mut replaced_manifests = 0usize;
         let result_manifests = filtered
             .into_iter()
             .filter(|(manifest_file, rewritten)| {
+                if *rewritten {
+                    replaced_manifests += 1;
+                }
                 *rewritten || manifest_file.has_added_files() || manifest_file.has_existing_files()
             })
             .map(|(manifest_file, _)| manifest_file)
             .collect();
-        Ok((result_manifests, hits.into_expired_delete_files()))
+        Ok((
+            result_manifests,
+            hits.into_expired_delete_files(),
+            replaced_manifests,
+        ))
     }
 
     async fn filter_manifest(
