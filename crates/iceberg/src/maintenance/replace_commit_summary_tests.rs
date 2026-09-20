@@ -646,6 +646,32 @@ async fn merge_append_stamps_merge_side_replaced_count() {
     assert_manifest_counts(&props_of(&snapshot), (1, 0, 2), "merge append");
 }
 
+#[tokio::test]
+async fn user_set_manifest_counts_are_overwritten_by_computed() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let table = create_partitioned_table(&catalog, FormatVersion::V2).await;
+
+    let file = write_data_file(&table, "usr.parquet", PARTITION, &rows(PARTITION, 0, 100)).await;
+    let mut props = HashMap::new();
+    props.insert("manifests-created".to_string(), "999".to_string());
+    props.insert("manifests-kept".to_string(), "999".to_string());
+    props.insert("manifests-replaced".to_string(), "999".to_string());
+    let tx = Transaction::new(&table);
+    let action = tx
+        .fast_append()
+        .set_snapshot_properties(props)
+        .add_data_files(vec![file]);
+    let tx = action.apply(tx).expect("apply append");
+    let table = tx.commit(&catalog).await.expect("commit append");
+
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("snapshot")
+        .clone();
+    assert_manifest_counts(&props_of(&snapshot), (1, 0, 0), "user-set overridden");
+}
+
 async fn rewrite_and_reload(
     catalog: &impl Catalog,
     action: RewriteDataFiles,
@@ -671,7 +697,14 @@ async fn rdf_replace_summary_counts_added_files_and_live_totals() {
         .clone();
 
     assert_replace_totals_match_live_files(&table, &snapshot).await;
-    assert_rdf_key_set(&props_of(&snapshot), true, "rdf default");
+    let props = props_of(&snapshot);
+    assert_rdf_key_set(&props, true, "rdf default");
+    assert_eq!(
+        prop_u64(&props, "removed-delete-files"),
+        2,
+        "the seq-GC expired two of the three accumulated position deletes"
+    );
+    assert_manifest_counts(&props, (7, 1, 6), "rdf default (oracle merges_rdf_only shape)");
 }
 
 #[tokio::test]
@@ -1019,6 +1052,7 @@ async fn rdf_v3_dv_replace_summary_reports_removed_dvs() {
     assert_eq!(prop_u64(&props, "total-records"), 900);
     assert_eq!(prop_u64(&props, "total-delete-files"), 0);
     assert_eq!(prop_u64(&props, "total-position-deletes"), 0);
+    assert_manifest_counts(&props, (3, 0, 2), "rdf v3 dv (oracle v3_dv_rdf)");
 }
 
 #[tokio::test]
