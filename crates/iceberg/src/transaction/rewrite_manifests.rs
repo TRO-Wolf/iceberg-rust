@@ -319,26 +319,21 @@ impl TransactionAction for RewriteManifestsAction {
 
         // Summary counts (Java `summary()`, L98-112). These also satisfy the empty-commit precondition in
         // `SnapshotProducer::manifest_file` (this action adds no data files), so they MUST be set.
-        let created_count = rewrite_outcome.new_manifest_count + self.added_manifests.len();
+        let created_count =
+            (rewrite_outcome.new_manifest_count + self.added_manifests.len()) as u64;
+        let kept_count = rewrite_outcome.kept_count as u64;
         let replaced_count =
-            rewrite_outcome.rewritten_manifests.len() + self.deleted_manifests.len();
-        snapshot_producer.extend_snapshot_properties([
-            ("manifests-created".to_string(), created_count.to_string()),
-            (
-                "manifests-kept".to_string(),
-                rewrite_outcome.kept_count.to_string(),
-            ),
-            ("manifests-replaced".to_string(), replaced_count.to_string()),
-            (
-                "entries-processed".to_string(),
-                rewrite_outcome.entries_processed.to_string(),
-            ),
-        ]);
+            (rewrite_outcome.rewritten_manifests.len() + self.deleted_manifests.len()) as u64;
+        snapshot_producer.extend_snapshot_properties([(
+            "entries-processed".to_string(),
+            rewrite_outcome.entries_processed.to_string(),
+        )]);
 
         snapshot_producer
             .commit(
                 RewriteManifestsOperation {
                     existing_manifests: final_manifests,
+                    manifest_counts: (created_count, kept_count, replaced_count),
                 },
                 DefaultManifestProcess,
             )
@@ -636,11 +631,16 @@ fn estimate_per_entry_size(manifest_file: &ManifestFile) -> u64 {
 /// manifest list IS the precomputed list.
 struct RewriteManifestsOperation {
     existing_manifests: Vec<ManifestFile>,
+    manifest_counts: (u64, u64, u64),
 }
 
 impl SnapshotProduceOperation for RewriteManifestsOperation {
     fn operation(&self) -> Operation {
         Operation::Replace
+    }
+
+    fn manifest_counts(&self) -> Option<(u64, u64, u64)> {
+        Some(self.manifest_counts)
     }
 
     async fn delete_entries(
