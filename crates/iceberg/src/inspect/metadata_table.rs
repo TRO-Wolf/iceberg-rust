@@ -65,8 +65,7 @@ pub enum MetadataTableType {
     /// [`AllManifestsTable`] — one row per (manifest × referencing snapshot) across ALL snapshots,
     /// NOT deduplicated (Java `all_manifests`).
     AllManifests,
-    /// [`PositionDeletesTable`] — SCHEMA ONLY (Java `position_deletes`; scan not ported, refused
-    /// loud — see the module doc).
+    #[allow(missing_docs)]
     PositionDeletes,
 }
 
@@ -215,8 +214,7 @@ impl<'a> MetadataTable<'a> {
         AllManifestsTable::new(self.0)
     }
 
-    /// Get the `position_deletes` table — SCHEMA ONLY (scan refused loud; Java
-    /// `PositionDeletesTable`, whose `PositionDeletesBatchScan` has no Rust analogue yet).
+    #[allow(missing_docs)]
     pub fn position_deletes(&self) -> PositionDeletesTable<'_> {
         PositionDeletesTable::new(self.0)
     }

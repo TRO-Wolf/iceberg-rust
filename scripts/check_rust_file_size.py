@@ -80,7 +80,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/spec/manifest/mod.rs": 1237,
     "crates/iceberg/src/spec/manifest/writer.rs": 1056,
     "crates/iceberg/src/spec/manifest_list.rs": 2327,
-    "crates/iceberg/src/spec/partition.rs": 3501,
+    "crates/iceberg/src/spec/partition_tests.rs": 1337,
     "crates/iceberg/src/spec/partitioning.rs": 1055,
     "crates/iceberg/src/spec/schema/id_reassigner.rs": 1669,
     "crates/iceberg/src/spec/schema/mod.rs": 2048,

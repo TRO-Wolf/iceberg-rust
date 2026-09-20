@@ -132,8 +132,7 @@ impl IcebergMetadataTableProvider {
             }
             MetadataTableType::Partitions => metadata_table.partitions().scan().await,
             MetadataTableType::AllManifests => metadata_table.all_manifests().scan().await,
-            // Schema-only table: refused loud in `inspect` (no async work to await).
-            MetadataTableType::PositionDeletes => metadata_table.position_deletes().scan(),
+            MetadataTableType::PositionDeletes => metadata_table.position_deletes().scan().await,
         }
         .map_err(to_datafusion_error)?;
         let stream = stream.map_err(to_datafusion_error);
