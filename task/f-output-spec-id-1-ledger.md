@@ -101,20 +101,90 @@ merge_append + 7 output_spec_id tests pass.
 
 ## API changes
 
-(to fill)
+- `iceberg::writer::resolve_output_spec(&Table, Option<i32>) -> Result<PartitionSpecRef>`
+  (pub, `#[allow(missing_docs)]` per the comment ban). `None` → the table's default spec;
+  `Some(id)` → that existing spec; unknown id → `ErrorKind::DataInvalid` with Java's write-path
+  message `Output spec id <n> is not a valid spec id for table`.
+- `IcebergTableProvider::with_output_spec_id(i32) -> Self` (pub, `output_spec_id: Option<i32>`
+  field, preserved by `try_new`'s refresh path and `loaded.rs::from_planning_load` initializes
+  `None`). `insert_into` resolves once via `resolve_output_spec` and threads the selected spec
+  through `project_with_partition` (new `partition_spec` param), `repartition` (now takes
+  `&PartitionSpec` instead of `TableMetadataRef`), `IcebergWriteExec::new` (new
+  `partition_spec` param — input requirements, task writer, partition type), and
+  `IcebergCommitExec::new` (new `output_spec` param — commit-side data-file deserialization
+  uses the selected spec's id + partition type). `sort_for_write` needs no spec: it keys off
+  the projected `_partition` column plus the table sort order.
+- `repartition` is now `pub(crate)` (was `pub`); its doc block was stale after the signature
+  change and was deleted, not reworded (comment ban: moved code sheds its comments).
+- Parsing of the option string stays the caller's job (RePark): `with_output_spec_id` takes a
+  typed `i32`, so a non-integer is unrepresentable at this layer (`OS-NOT-INT` is a
+  caller-layer error by construction).
 
 ## Pins (v2 + v3)
 
-(to fill)
+Commit door — `crates/iceberg/src/transaction/tests/output_spec_id_tests.rs`
+(`transaction::tests::output_spec_id_tests`; moved under `tests/` because `transaction/mod.rs`
+sits at its 1937-line legacy ceiling — the `#[cfg(test)] mod` wiring lives inside the existing
+`mod tests` block):
+
+| cell (Spark `OS-*`) | pin | assertion |
+|---|---|---|
+| `OS-ADD-FIELD-NEW-1-{V2,V3}` | `pin_fast_append_mixed_specs_v{2,3}` | `files` = `[(0,(),2),(1,(w),1)]`, one manifest per spec, manifest `partition_spec_id` == entries' `partition_spec_id` |
+| (merge-append door, same shape) | `pin_merge_append_mixed_specs_v{2,3}` | same files answer through `merge_append` |
+| `OS-PART-TO-UNPART-0-{V2,V3}` | `pin_older_partitioned_spec_retains_tuple_v{2,3}` | spec-0 file keeps `cat=w` tuple after `DROP PARTITION FIELD` leaves an empty default |
+| `OS-OVERWRITE-PARTS-0-{V2,V3}` | `pin_overwrite_parts_0_v{2,3}` | `replace_partitions` under spec 0 deletes the `(0,())`-keyed seed file → live files `[(0,(),2)]` |
+| `OS-TWO-FIELDS-1-{V2,V3}` | `pin_two_fields_1_v{2,3}` | spec-1 file keeps arity-2 tuple `(cat, id_bucket_2)`; spec-0 file keeps `()` |
+| `OS-BAD-ID-{V2,V3}` (commit door) | `measure_added_file_unknown_spec_id_fails` (v2), `pin_added_file_unknown_spec_id_fails_v3` | `DataInvalid` "Cannot find partition spec 9 for data file" |
+
+DataFusion `INSERT INTO` door — `crates/integrations/datafusion/src/table/output_spec_id_tests.rs`
+(`table::output_spec_id_tests`; real parquet writes + `SELECT` reads back through the provider):
+
+| cell | pin | assertion |
+|---|---|---|
+| `OS-ADD-FIELD-OLD-0` / `OS-INSERTINTO-0` / `OS-V1-SAVEASTABLE` (same oracle shape: two spec-0 files, rows 1,2,7,8) | `pin_insert_into_targets_older_spec_v{2,3}` | `with_output_spec_id(0)`: `files` = `[(0,(),2),(0,(),2)]`; rows = `{1a x, 2b y, 7g x, 8h w}` |
+| `OS-ADD-FIELD-NEW-1-{V2,V3}` | `pin_insert_into_targets_new_spec_v{2,3}` | `files` = `[(0,(),2),(1,(w),1),(1,(x),1)]`; rows = all four |
+| `OS-PART-TO-UNPART-0-{V2,V3}` | `pin_insert_into_partitioned_older_spec_v{2,3}` | `files` = four spec-0 files with cat tuples `{w,x,x,y}`; rows = all four |
+| `OS-TWO-FIELDS-1-{V2,V3}` | `pin_insert_into_two_field_spec_v{2,3}` | spec-1 tuples arity 2, `cat ∈ {w,x}`, `id_bucket_2 ∈ [0,2)`; spec-0 tuple `()` |
+| `OS-BAD-ID-{V2,V3}` (writer door) | `pin_insert_into_bad_spec_id_v{2,3}` | `with_output_spec_id(9)` insert fails with "Output spec id 9 is not a valid spec id for table" |
+| resolver unit pins | `resolve_output_spec_{none_resolves_table_default,returns_older_spec,unknown_id_is_data_invalid}` | default/older/error contract |
+
+Spark `files`-table rendering note: the cells render each file's partition tuple through spec
+field names (e.g. `[["cat", null]]` for a spec-0 file under the ADD-FIELD fixture). The fork pins
+assert the stored tuple itself (`Struct::empty()` / `cat=w`), which is the on-disk ground truth
+the inspect answer is derived from.
 
 ## Mutations
 
-(to fill)
+Run against committed state `e0c7c988`, tree restored between mutations (`git checkout`).
+
+| mutation | site | pin(s) run | result |
+|---|---|---|---|
+| M1: default spec forced in the manifest writer | `snapshot.rs::write_added_manifests` — `new_cluster_manifest_writer(partition_spec_id, …)` → `new_cluster_manifest_writer(default_partition_spec_id(), …)` | `pin_fast_append_mixed_specs_v{2,3}` | RED: `mixed-spec commit: DataInvalid => Partition value has 0 fields but partition type has 1` |
+| | | `pin_insert_into_targets_older_spec_v{2,3}` (`ADD-FIELD-OLD-0` shape) | RED: `External(DataInvalid => Partition value has 0 fields but partition type has 1)` |
+| M2a: output-spec validation removed (writer door) | `writer/mod.rs::resolve_output_spec` — `Some(id)` → `unwrap_or_else(default)` | `resolve_output_spec_unknown_id_is_data_invalid` | RED: returned `PartitionSpec { spec_id: 1, … }` instead of erroring |
+| | | `pin_insert_into_bad_spec_id_v{2,3}` | RED: `an unknown output spec id must fail: ()` — the insert committed under the default spec |
+| M2b: unknown-spec validation removed (commit door) | `snapshot.rs::partition_type_for_added_file` — `ok_or_else(DataInvalid)` → `unwrap_or_else(default)` | `measure_added_file_unknown_spec_id_fails` + `pin_added_file_unknown_spec_id_fails_v3` | RED — but on a changed message: `Cannot rewrite manifests: unknown partition spec id 9` (the backstop in `cluster_partition_spec` still rejects the unknown id at manifest-writer construction). The pins assert the exact Java message, so the mutation is caught; note the commit door has TWO unknown-spec layers — removing both is needed to reach disk |
 
 ## Gates
 
-(to fill)
+(recorded after the final commit; see below)
 
 ## Residuals / ambiguity
 
-(to fill)
+- `OS-NOT-INT`: the fork's writer API takes a typed `i32`, so the non-integer case is
+  unrepresentable here — RePark's option parsing owns `NumberFormatException`-equivalent
+  behavior. No fork-level pin is possible; the typed API is the pin.
+- `OS-V1-SAVEASTABLE` / `OS-INSERTINTO-0` share the `ADD-FIELD-OLD-0` oracle shape
+  (`files = [[0,(),2],[0,(),2]]`, rows `{1,2,7,8}`); `pin_insert_into_targets_older_spec` covers
+  all three through the provider's `INSERT INTO` door — the fork has no distinct
+  saveAsTable door.
+- The `IcebergCommitExec` node now deserializes commit output under the SELECTED spec. On a
+  mixed-spec write (spec-0 files + spec-1 files in one commit — not producible through the
+  provider's single `output_spec_id`, only through hand-built plans) the node would need
+  per-file spec resolution; out of scope for the single-target option.
+- `merge_append` ordering: new-added manifests are sorted ascending by `partition_spec_id` so
+  the bin-packer stream head is the lowest-spec manifest, matching Java's HashMap-ascending
+  `prepareNewDataManifests` order; the manifest list compares as a set downstream.
+- The `#[allow(missing_docs)]` on `resolve_output_spec` is the sanctioned substitute for a doc
+  comment under the comment ban (doc comments the compiler demands are allowed only as the
+  minimum that compiles, and the ban script counts any added `///` line).
