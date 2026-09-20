@@ -31,7 +31,7 @@ use crate::metadata_columns::{
 };
 use crate::scan::{
     ArrowRecordBatchStream, ChangelogOperation, ChangelogScanTask, ChangelogScanTaskStream,
-    FileScanTaskStream,
+    ChangelogTaskKind, FileScanTaskStream,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -97,6 +97,12 @@ fn reserved_field(name: &str, data_type: DataType, field_id: i32) -> FieldRef {
 }
 
 fn read_one_task(reader: ArrowReader, task: ChangelogScanTask) -> Result<ArrowRecordBatchStream> {
+    if task.kind == ChangelogTaskKind::DeletedRows {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "DeletedRows tasks are currently not supported in changelog scans",
+        ));
+    }
     let operation = task.operation();
     let change_ordinal = task.change_ordinal;
     let commit_snapshot_id = task.commit_snapshot_id;

@@ -64,3 +64,9 @@ stays behind the existing opt-in flag and is NOT read here: Iceberg 1.11.0's `Ch
 implements `openAddedRowsScanTask` / `openDeletedDataFileScanTask` only, so exceeding it is an
 owner ruling, not this unit's. `UPDATE_BEFORE` / `UPDATE_AFTER` pairing stays engine-side, as the
 planner's own documentation says.
+
+## Mutations (round 2, critic remediation 2026-09-20)
+
+| # | Mutation | Expected | Observed |
+|---|---|---|---|
+| M-001 (V-001) | Delete the `DeletedRows` refusal at the top of `read_one_task` | `changelog_reader_refuses_deleted_rows_tasks` goes RED | RED, `cargo test -p iceberg --lib changelog_reader_refuses_deleted_rows` exit 101; restored, green again |

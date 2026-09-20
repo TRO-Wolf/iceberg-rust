@@ -34,13 +34,14 @@ use crate::metadata_columns::{
     RESERVED_FIELD_ID_CHANGE_ORDINAL, RESERVED_FIELD_ID_CHANGE_TYPE,
     RESERVED_FIELD_ID_COMMIT_SNAPSHOT_ID,
 };
+use crate::scan::{ChangelogScanTask, ChangelogScanTaskStream, ChangelogTaskKind};
 use crate::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Literal, Struct,
     TableMetadata,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
-use crate::{Catalog, TableCreation, TableIdent};
+use crate::{Catalog, ErrorKind, TableCreation, TableIdent};
 
 async fn minimal_table(catalog: &impl Catalog) -> Table {
     let table_ident =
@@ -263,6 +264,47 @@ async fn a_deleted_data_file_reads_as_delete_rows_of_its_commit_snapshot() {
         (3, "INSERT".to_string(), 0, s1),
         (9, "INSERT".to_string(), 1, s2),
     ]);
+}
+
+#[tokio::test]
+async fn changelog_reader_refuses_deleted_rows_tasks() {
+    let catalog = new_memory_catalog().await;
+    let table = minimal_table(&catalog).await;
+    let base = write_rows(&table, "base.parquet", &[2]).await;
+    let table = append(&catalog, &table, base).await;
+    let s0 = table.metadata().current_snapshot_id().unwrap();
+    let first = write_rows(&table, "a.parquet", &[3]).await;
+    let table = append(&catalog, &table, first).await;
+    let s1 = table.metadata().current_snapshot_id().unwrap();
+
+    let scan = table
+        .incremental_changelog_scan()
+        .from_snapshot_id_exclusive(s0)
+        .to_snapshot_id(s1)
+        .build()
+        .unwrap();
+    let mut tasks: Vec<ChangelogScanTask> = scan
+        .plan_files()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1, "one added file plans one changelog task");
+    tasks[0].kind = ChangelogTaskKind::DeletedRows;
+    let task_stream: ChangelogScanTaskStream =
+        Box::pin(futures::stream::iter(tasks.into_iter().map(Ok)));
+    let result = ChangelogReader::new(ArrowReaderBuilder::new(table.file_io().clone()).build())
+        .read(task_stream)
+        .unwrap()
+        .try_collect::<Vec<RecordBatch>>()
+        .await;
+    let error = result.err().expect("a DeletedRows task must error");
+    assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+    assert_eq!(
+        error.message(),
+        "DeletedRows tasks are currently not supported in changelog scans"
+    );
 }
 
 #[test]
