@@ -210,6 +210,30 @@ async fn changelog_rows_carry_the_window_snapshot_of_their_own_ordinal() {
         (5, "INSERT".to_string(), 1, s2),
     ]);
     assert_ne!(s1, s2, "the two ordinals must be different snapshots");
+    let published = changelog_arrow_fields();
+    assert!(
+        !batches.is_empty(),
+        "the scan must serve at least one batch"
+    );
+    for batch in &batches {
+        let schema = batch.schema();
+        let fields = schema.fields();
+        let served = &fields[fields.len() - 3..];
+        assert_eq!(served.len(), 3);
+        for (got, want) in served.iter().zip(published.iter()) {
+            assert_eq!(got.name(), want.name());
+            assert_eq!(got.data_type(), want.data_type());
+            assert!(
+                !got.is_nullable(),
+                "served change column {} must be non-nullable",
+                got.name()
+            );
+            assert_eq!(
+                got.metadata()[PARQUET_FIELD_ID_META_KEY],
+                want.metadata()[PARQUET_FIELD_ID_META_KEY]
+            );
+        }
+    }
 }
 
 #[tokio::test]

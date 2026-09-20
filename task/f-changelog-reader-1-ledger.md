@@ -70,3 +70,4 @@ planner's own documentation says.
 | # | Mutation | Expected | Observed |
 |---|---|---|---|
 | M-001 (V-001) | Delete the `DeletedRows` refusal at the top of `read_one_task` | `changelog_reader_refuses_deleted_rows_tasks` goes RED | RED, `cargo test -p iceberg --lib changelog_reader_refuses_deleted_rows` exit 101; restored, green again |
+| M-002 (V-002) | Flip `reserved_field`'s `Field::new(…, false)` to `true` | the served-schema pin in `changelog_rows_carry_the_window_snapshot_of_their_own_ordinal` goes RED | RED, `cargo test -p iceberg --lib changelog_rows_carry_the_window_snapshot` exit 101 (panics at the new non-nullable assertion); restored, green again |
