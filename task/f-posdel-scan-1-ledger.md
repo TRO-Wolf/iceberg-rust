@@ -29,7 +29,8 @@
 
 | Step | Commit | Subject |
 |---|---|---|
-| 1 | this commit | `docs: F-POSDEL-SCAN-1 — ledger skeleton, reuse map` |
+| 1 | 3a4fa056 | `docs: F-POSDEL-SCAN-1 — ledger skeleton, reuse map, Java evidence, clause rows OPEN` |
+| 2 | this commit | `test: F-POSDEL-SCAN-1 — red-first scan pins over oracle fixture shapes` |
 
 ## 1. The gap
 
@@ -122,14 +123,23 @@ Measured facts the pins encode:
 7. Filters: `WHERE pos = 0` → empty; `WHERE spec_id = 0` → 2; `WHERE partition.cat='y'` → 1.
 8. `pd_eqdel_v2`: `delete_files` reports `content = 1` for Spark's DELETE.
 
-### 3.1 Oracle open question — `pd_evolved_v2` shows only ONE row (spec_id 0)
+### 3.1 Oracle open question — `pd_evolved_v2` shows only ONE row (spec_id 0) — ANSWERED
 
 The recording captured one `position_deletes` row for `pd_evolved_v2` — the second DELETE
-(after spec evolution to `bucket(4,id)`) produced no row. Measured answer: **PENDING**
-(step 2/3 work inspects the recorded warehouse's delete manifests to settle whether Spark
-copy-on-write rewrote the delete, the second delete file is an equality delete, or the
-spec-1 manifest entry is non-live). To be resolved by reading the delete manifest list in
-`/tmp/oc-worker/rd-oracle/posdel/wh/` directly; outcome recorded here and in the hand-back.
+(after spec evolution to `bucket(4,id)`) produced no row. Measured answer, read directly
+from the recorded warehouse manifests in `/tmp/oc-worker/rd-oracle/posdel/wh/`:
+
+**The second DELETE ran copy-on-write.** The current snapshot's manifest list carries
+exactly ONE delete manifest, and it is spec-0 with a single live `POSITION_DELETES` entry
+(the pre-evolution delete). The post-evolution DELETE produced a DATA manifest entry pair
+— status 2 (deleted) on the old data file plus status 0 (added) on its replacement —
+i.e. Spark rewrote the affected data file rather than writing a position-delete file. No
+spec-1 delete file exists in the warehouse, so no spec-1 `position_deletes` row can
+exist; the recorded truth is correct and there is no hidden multi-spec row to pin. The
+multi-spec case is therefore exercised by the fixture-built evolved test
+(`scan_evolved_two_specs_null_fills_unified_partition`), which writes live
+position-delete files under BOTH spec 0 and spec 1 — the shape the oracle table would
+have produced had the second delete been MoR.
 
 ## 4. Reuse map — existing fork functions named (brief step 1 deliverable)
 
@@ -180,6 +190,45 @@ spec-1 manifest entry is non-live). To be resolved by reading the delete manifes
 - **Row ordering.** Emit rows in manifest-entry order per delete file, positions in file
   order (DV iter is ascending). Java does not sort; the oracle's observed order follows
   manifest order. Tests assert content, not incidental ordering.
+
+## 5.1 Step 2 — red-first record
+
+Test module `crates/iceberg/src/inspect/position_deletes/scan_tests.rs` builds real
+fixture tables (`TableTestFixture` + hand-written v2/v3 manifest lists, real parquet
+position-delete files written with `ArrowWriter` + `PARQUET_FIELD_ID_META_KEY`, real
+puffin DVs written with the `PuffinWriter`) and calls `table.inspect().position_deletes()
+.scan()`. Seven pins, one per measured fact group:
+
+| Pin | Fact covered |
+|---|---|
+| `scan_partitioned_v2_rows_match_oracle` | facts 1, 5, 7-ish; live-only, position-delete-only, delete-manifests-only (data manifest + deleted entry + equality delete all present as decoys) |
+| `scan_partitioned_v3_dv_rows_match_oracle` | facts 2, 6 — puffin DV rows, `content_offset`/`content_size_in_bytes`, `file_path` = referenced data file |
+| `scan_unpartitioned_v2_drops_partition_column` | fact 3 |
+| `scan_evolved_two_specs_null_fills_unified_partition` | fact 4 — live posdel files under spec 0 AND spec 1, unified partition struct, null fill |
+| `scan_row_column_is_read_when_the_file_carries_it` | R-4 upper half — a file that stores `row` surfaces it |
+| `scan_v2_output_has_no_dv_columns` | v2 schema has no `content_offset`/`content_size_in_bytes` |
+| `scan_empty_table_emits_no_rows` | no delete manifests → zero rows, no error |
+
+Red run (`cargo test -q -p iceberg --lib position_deletes`, this commit):
+
+```
+failures:
+    inspect::position_deletes::scan_tests::scan_empty_table_emits_no_rows
+    inspect::position_deletes::scan_tests::scan_evolved_two_specs_null_fills_unified_partition
+    inspect::position_deletes::scan_tests::scan_partitioned_v2_rows_match_oracle
+    inspect::position_deletes::scan_tests::scan_partitioned_v3_dv_rows_match_oracle
+    inspect::position_deletes::scan_tests::scan_row_column_is_read_when_the_file_carries_it
+    inspect::position_deletes::scan_tests::scan_unpartitioned_v2_drops_partition_column
+    inspect::position_deletes::scan_tests::scan_v2_output_has_no_dv_columns
+test result: FAILED. 19 passed; 7 failed
+```
+
+Every pin fails at `scan()` with the stated reason — `FeatureUnsupported: position_deletes
+metadata table scan is not yet ported` — not a fixture defect. (One fixture defect was
+found and fixed during the red run: a position-delete `DataFile` may not be placed in a
+DATA manifest — `add_entry` enforces `ManifestContent::Data` ⇒ `DataContentType::Data`.
+The data-manifest decoy is a real `Data` file; mutation (b) is still pinned because
+reading data manifests yields zero rows where two are required.)
 
 ## 6. Clauses
 
