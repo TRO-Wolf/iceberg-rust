@@ -692,68 +692,6 @@ mod tests {
         )
     }
 
-    fn nested_name_schema() -> SchemaRef {
-        Arc::new(
-            Schema::builder()
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        1,
-                        "category",
-                        Type::Primitive(PrimitiveType::Int),
-                    )),
-                    Arc::new(NestedField::optional(
-                        2,
-                        "st",
-                        Type::Struct(crate::spec::StructType::new(vec![Arc::new(
-                            NestedField::optional(
-                                3,
-                                "category",
-                                Type::Primitive(PrimitiveType::String),
-                            ),
-                        )])),
-                    )),
-                ])
-                .build()
-                .expect("schema builds"),
-        )
-    }
-
-    #[test]
-    fn a_nested_residual_keeps_its_full_column_name() {
-        let schema = nested_name_schema();
-        let spec = identity_spec(schema.clone());
-        let filter = Reference::new("st.category")
-            .is_null()
-            .bind(schema.clone(), true)
-            .expect("binds the nested field");
-        let evaluator = ResidualEvaluator::of(spec, &schema, filter, true).expect("evaluator");
-
-        let residual = evaluator
-            .residual_for(&Struct::from_iter([Some(Literal::int(5))]))
-            .expect("residual");
-        assert_eq!(
-            residual.to_string(),
-            "st.category IS NULL",
-            "the residual must carry the nested column's full path, not its leaf name"
-        );
-        let rebound = residual
-            .bind(schema.clone(), true)
-            .expect("the residual rebinds");
-        assert_ne!(
-            rebound,
-            BoundPredicate::AlwaysFalse,
-            "the rebound residual must still be able to match rows"
-        );
-        assert_eq!(
-            Reference::new("category")
-                .is_null()
-                .bind(schema, true)
-                .expect("the leaf name binds to the top-level column"),
-            BoundPredicate::AlwaysFalse,
-            "the leaf name alone binds to the required top-level column and loses every row"
-        );
-    }
-
     #[test]
     fn test_identity_partition_eq_matching_value_reduces_to_always_true() {
         let schema = identity_schema();

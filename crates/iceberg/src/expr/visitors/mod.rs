@@ -37,6 +37,8 @@ mod page_index_evaluator_tests;
 pub(crate) mod predicate_visitor;
 pub(crate) mod residual_evaluator;
 #[cfg(test)]
+mod residual_nested_name_tests;
+#[cfg(test)]
 pub(crate) mod rewrite_not;
 pub(crate) mod row_group_metrics_evaluator;
 pub(crate) mod strict_metrics_evaluator;
