@@ -25,7 +25,9 @@ use crate::memory::tests::new_memory_catalog;
 use crate::spec::{MAIN_BRANCH, ManifestContentType};
 use crate::transaction::action::TransactionAction;
 use crate::transaction::tests::make_v3_minimal_table_in_catalog;
-use crate::transaction::{ApplyTransactionAction, PublishChangesAction, Transaction};
+use crate::transaction::{
+    ApplyTransactionAction, PublishChangesAction, Transaction, staged_snapshot_for_wap_id,
+};
 use crate::{ErrorKind, TableUpdate};
 
 #[tokio::test]
@@ -146,6 +148,47 @@ async fn publish_changes_twice_has_java_message() {
     assert_eq!(
         error.message(),
         "Duplicate request to cherry pick wap id that was published already: wap-twice",
+        "Java's DuplicateWAPCommitException text, verbatim"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_replay_publish_blocks_the_wap_id_via_published_wap_id() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_fast_append(&catalog, &table, "test/staged.parquet", 0, "wap-pw").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+    let table = append_main(&catalog, &table, vec![data_file("test/head.parquet", 9)]).await;
+
+    let table = publish_changes(&catalog, &table, "wap-pw").await;
+
+    let published = table
+        .metadata()
+        .current_snapshot()
+        .expect("the publish left a current snapshot");
+    let props = &published.summary().additional_properties;
+    assert_eq!(
+        props.get("published-wap-id").map(String::as_str),
+        Some("wap-pw"),
+        "a replay publish stamps published-wap-id"
+    );
+    assert!(
+        props.get(STAGED_WAP_ID_PROP).is_none(),
+        "the replayed snapshot does NOT carry wap.id — only the published-wap-id arm of \
+         is_wap_id_published can see this publish"
+    );
+
+    let found = staged_snapshot_for_wap_id(table.metadata(), "wap-pw")
+        .expect("the staged snapshot still resolves by its wap.id");
+    assert_eq!(found.snapshot_id(), staged_id);
+
+    let error = publish_changes_err(&catalog, &table, "wap-pw").await;
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "Duplicate request to cherry pick wap id that was published already: wap-pw",
         "Java's DuplicateWAPCommitException text, verbatim"
     );
 }
