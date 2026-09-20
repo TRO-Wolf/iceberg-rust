@@ -32,6 +32,18 @@ fn test_build_accessors_includes_container_and_struct_fields() {
 }
 
 #[test]
+fn test_build_accessors_omits_element_key_value_and_container_nested_ids() {
+    let schema = table_schema_nested();
+
+    for field_id in [5, 7, 8, 9, 10, 12, 13, 14] {
+        assert!(
+            schema.accessor_by_field_id(field_id).is_none(),
+            "field id {field_id} inside a list or map must have no accessor"
+        );
+    }
+}
+
+#[test]
 fn test_build_accessors() {
     let schema = table_schema_nested();
 

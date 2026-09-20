@@ -167,7 +167,10 @@ impl StructAccessor {
 mod tests {
     use crate::ErrorKind;
     use crate::expr::accessor::StructAccessor;
-    use crate::spec::{Datum, Literal, PrimitiveType, Struct};
+    use crate::spec::{
+        Datum, ListType, Literal, Map, MapType, NestedField, PrimitiveType, Struct, StructType,
+        Type,
+    };
 
     #[test]
     fn test_single_level_accessor() {
@@ -390,6 +393,95 @@ mod tests {
                     .contains(&format!("accessor type {accessor_type}"))
             );
         }
+    }
+
+    #[test]
+    fn test_is_present_treats_empty_containers_and_all_null_struct_as_present() {
+        let list_accessor = StructAccessor::new(
+            0,
+            Type::List(ListType::new(
+                NestedField::list_element(1, Type::Primitive(PrimitiveType::Int), false).into(),
+            )),
+            true,
+        );
+        let empty_list = Struct::from_iter([Some(Literal::List(vec![]))]);
+        assert!(
+            list_accessor
+                .is_present(&empty_list)
+                .expect("an empty list must answer"),
+            "an empty list is present"
+        );
+        let null_list = Struct::from_iter([None]);
+        assert!(
+            !list_accessor
+                .is_present(&null_list)
+                .expect("a null list must answer"),
+            "a null list is absent"
+        );
+
+        let map_accessor = StructAccessor::new(
+            0,
+            Type::Map(MapType::new(
+                NestedField::map_key_element(2, Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::map_value_element(3, Type::Primitive(PrimitiveType::Int), false)
+                    .into(),
+            )),
+            true,
+        );
+        let empty_map = Struct::from_iter([Some(Literal::Map(Map::new()))]);
+        assert!(
+            map_accessor
+                .is_present(&empty_map)
+                .expect("an empty map must answer"),
+            "an empty map is present"
+        );
+
+        let struct_accessor = StructAccessor::new(
+            0,
+            Type::Struct(StructType::new(vec![
+                NestedField::optional(4, "a", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(5, "b", Type::Primitive(PrimitiveType::Int)).into(),
+            ])),
+            true,
+        );
+        let all_null_struct =
+            Struct::from_iter([Some(Literal::Struct(Struct::from_iter([None, None])))]);
+        assert!(
+            struct_accessor
+                .is_present(&all_null_struct)
+                .expect("an all-null struct must answer"),
+            "a struct whose fields are all null is present"
+        );
+    }
+
+    #[test]
+    fn test_is_present_propagates_null_parent_and_rejects_wrong_shape() {
+        let nested_accessor = StructAccessor::wrap(
+            0,
+            Box::new(StructAccessor::new(0, PrimitiveType::String, true)),
+        );
+
+        let null_parent = Struct::from_iter([None]);
+        assert!(
+            !nested_accessor
+                .is_present(&null_parent)
+                .expect("a null parent must answer"),
+            "a null parent is absent"
+        );
+
+        let wrong_shape = Struct::from_iter([Some(Literal::int(1))]);
+        let error = nested_accessor
+            .is_present(&wrong_shape)
+            .expect_err("a non-struct literal under a nested accessor must fail");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+
+        let live_parent = Struct::from_iter([Some(Literal::Struct(Struct::from_iter([None])))]);
+        assert!(
+            !nested_accessor
+                .is_present(&live_parent)
+                .expect("a null nested leaf must answer"),
+            "a null nested leaf is absent"
+        );
     }
 
     #[test]

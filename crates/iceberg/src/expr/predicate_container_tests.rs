@@ -114,6 +114,24 @@ fn test_bind_comparison_on_container_column_fails_at_bind() {
 }
 
 #[test]
+fn test_bind_is_null_on_element_key_and_value_paths_fails_at_accessor_lookup() {
+    let schema = table_schema_with_containers();
+
+    for column in ["xs.element", "mp.key", "mp.value"] {
+        let error = Reference::new(column)
+            .is_null()
+            .bind(schema.clone(), true)
+            .expect_err(&format!("`{column} IS NULL` must fail to bind"));
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("Accessor for Field"),
+            "`{column} IS NULL` must fail at the accessor lookup, got: {}",
+            error.message()
+        );
+    }
+}
+
+#[test]
 fn test_bind_is_null_required_leaf_under_optional_parent_does_not_fold() {
     let schema = table_schema_with_containers();
     let bound = Reference::new("person.age")
