@@ -325,6 +325,7 @@ async fn plan_snapshot(
     IcebergTableScan::plan(
         table.clone(),
         snapshot_id,
+        false,
         Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema")),
         None,
         filters,

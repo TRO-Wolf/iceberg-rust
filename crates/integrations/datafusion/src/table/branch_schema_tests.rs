@@ -101,13 +101,10 @@ async fn seed_two(
     name: &str,
     branch: Option<&str>,
 ) {
-    let mut provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        name.to_string(),
-    )
-    .await
-    .expect("provider for the seed write");
+    let mut provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), name.to_string())
+            .await
+            .expect("provider for the seed write");
     if let Some(branch) = branch {
         provider = provider.with_commit_branch(branch);
     }
@@ -153,14 +150,9 @@ async fn add_z(catalog: &Arc<dyn Catalog>, ident: &TableIdent) {
 }
 
 async fn provider_for_ref(table: &Table, ref_name: &str) -> IcebergStaticTableProvider {
-    let snapshot_id = table
-        .metadata()
-        .snapshot_for_ref(ref_name)
-        .unwrap_or_else(|| panic!("the test ref '{ref_name}' must exist"))
-        .snapshot_id();
-    IcebergStaticTableProvider::try_new_from_table_snapshot(table.clone(), snapshot_id)
+    IcebergStaticTableProvider::try_new_from_table_ref(table.clone(), ref_name)
         .await
-        .expect("snapshot-schema provider")
+        .expect("ref provider")
 }
 
 async fn provider_for_snapshot(table: &Table, snapshot_id: i64) -> IcebergStaticTableProvider {
@@ -196,7 +188,10 @@ fn cell_to_string(array: &dyn Array, row: usize) -> String {
     if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
         return array.value(row).to_string();
     }
-    panic!("unsupported column type in cell_to_string: {}", array.data_type())
+    panic!(
+        "unsupported column type in cell_to_string: {}",
+        array.data_type()
+    )
 }
 
 async fn run_query(provider: Arc<dyn TableProvider>, sql: &str) -> (Vec<String>, Vec<String>) {
@@ -239,12 +234,8 @@ fn find_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&IcebergTableScan> {
 }
 
 async fn branch_add_setup(version: FormatVersion) -> (Arc<dyn Catalog>, TableIdent, TempDir, i64) {
-    let (catalog, namespace, ident, temp_dir) = setup_table(
-        version,
-        cell_schema(PrimitiveType::Long),
-        HashMap::new(),
-    )
-    .await;
+    let (catalog, namespace, ident, temp_dir) =
+        setup_table(version, cell_schema(PrimitiveType::Long), HashMap::new()).await;
     seed_two(&catalog, &namespace, ident.name(), None).await;
     let table = load(&catalog, &ident).await;
     let snapshot_id = current_snapshot_id(&table);
@@ -341,12 +332,8 @@ async fn bs_drop_v3() {
 }
 
 async fn bs_drop(version: FormatVersion) {
-    let (catalog, namespace, ident, _tmp) = setup_table(
-        version,
-        cell_schema(PrimitiveType::Long),
-        HashMap::new(),
-    )
-    .await;
+    let (catalog, namespace, ident, _tmp) =
+        setup_table(version, cell_schema(PrimitiveType::Long), HashMap::new()).await;
     seed_two(&catalog, &namespace, ident.name(), None).await;
     let table = load(&catalog, &ident).await;
     create_ref(&catalog, &ident, "b0", current_snapshot_id(&table), true).await;
@@ -369,12 +356,8 @@ async fn bs_rename_v3() {
 }
 
 async fn bs_rename(version: FormatVersion) {
-    let (catalog, namespace, ident, _tmp) = setup_table(
-        version,
-        cell_schema(PrimitiveType::Long),
-        HashMap::new(),
-    )
-    .await;
+    let (catalog, namespace, ident, _tmp) =
+        setup_table(version, cell_schema(PrimitiveType::Long), HashMap::new()).await;
     seed_two(&catalog, &namespace, ident.name(), None).await;
     let table = load(&catalog, &ident).await;
     create_ref(&catalog, &ident, "b0", current_snapshot_id(&table), true).await;
@@ -397,12 +380,8 @@ async fn bs_widen_v3() {
 }
 
 async fn bs_widen(version: FormatVersion) {
-    let (catalog, namespace, ident, _tmp) = setup_table(
-        version,
-        cell_schema(PrimitiveType::Int),
-        HashMap::new(),
-    )
-    .await;
+    let (catalog, namespace, ident, _tmp) =
+        setup_table(version, cell_schema(PrimitiveType::Int), HashMap::new()).await;
     seed_two(&catalog, &namespace, ident.name(), None).await;
     let table = load(&catalog, &ident).await;
     create_ref(&catalog, &ident, "b0", current_snapshot_id(&table), true).await;
@@ -425,25 +404,21 @@ async fn bs_write_then_add_v3() {
 }
 
 async fn bs_write_then_add(version: FormatVersion) {
-    let (catalog, namespace, ident, _tmp) = setup_table(
-        version,
-        cell_schema(PrimitiveType::Long),
-        HashMap::new(),
-    )
-    .await;
+    let (catalog, namespace, ident, _tmp) =
+        setup_table(version, cell_schema(PrimitiveType::Long), HashMap::new()).await;
     seed_two(&catalog, &namespace, ident.name(), None).await;
     let table = load(&catalog, &ident).await;
     create_ref(&catalog, &ident, "b0", current_snapshot_id(&table), true).await;
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        ident.name().to_string(),
-    )
-    .await
-    .expect("provider for the branch write")
-    .with_commit_branch("b0");
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), ident.name().to_string())
+            .await
+            .expect("provider for the branch write")
+            .with_commit_branch("b0");
     let batches = sql_exec(Arc::new(provider), "INSERT INTO t VALUES (5, 'e', 'z')").await;
-    assert!(!batches.is_empty(), "the branch write must report a row count");
+    assert!(
+        !batches.is_empty(),
+        "the branch write must report a row count"
+    );
     add_z(&catalog, &ident).await;
 
     let table = load(&catalog, &ident).await;
@@ -471,26 +446,22 @@ async fn bs_add_then_write_branch_v3() {
 }
 
 async fn bs_add_then_write_branch(version: FormatVersion) {
-    let (catalog, namespace, ident, _tmp) = setup_table(
-        version,
-        cell_schema(PrimitiveType::Long),
-        HashMap::new(),
-    )
-    .await;
+    let (catalog, namespace, ident, _tmp) =
+        setup_table(version, cell_schema(PrimitiveType::Long), HashMap::new()).await;
     seed_two(&catalog, &namespace, ident.name(), None).await;
     let table = load(&catalog, &ident).await;
     create_ref(&catalog, &ident, "b0", current_snapshot_id(&table), true).await;
     add_z(&catalog, &ident).await;
-    let provider = IcebergTableProvider::try_new(
-        catalog.clone(),
-        namespace.clone(),
-        ident.name().to_string(),
-    )
-    .await
-    .expect("provider for the branch write")
-    .with_commit_branch("b0");
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), ident.name().to_string())
+            .await
+            .expect("provider for the branch write")
+            .with_commit_branch("b0");
     let batches = sql_exec(Arc::new(provider), "INSERT INTO t VALUES (5, 'e', 'z', 9)").await;
-    assert!(!batches.is_empty(), "the branch write must report a row count");
+    assert!(
+        !batches.is_empty(),
+        "the branch write must report a row count"
+    );
 
     let table = load(&catalog, &ident).await;
     let provider = provider_for_ref(&table, "b0").await;

@@ -33,7 +33,7 @@ use crate::io::object_cache::ObjectCache;
 use crate::scan::{
     BatchScan, IncrementalAppendScanBuilder, IncrementalChangelogScanBuilder, TableScanBuilder,
 };
-use crate::spec::{Schema, SchemaRef, TableMetadata, TableMetadataRef};
+use crate::spec::{Schema, SchemaRef, SnapshotReference, TableMetadata, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
@@ -240,6 +240,11 @@ impl Table {
     /// Returns current metadata ref.
     pub fn metadata_ref(&self) -> TableMetadataRef {
         self.metadata.clone()
+    }
+
+    #[allow(missing_docs)]
+    pub fn snapshot_ref(&self, ref_name: &str) -> Option<&SnapshotReference> {
+        self.metadata.refs.get(ref_name)
     }
 
     /// Returns current metadata location.

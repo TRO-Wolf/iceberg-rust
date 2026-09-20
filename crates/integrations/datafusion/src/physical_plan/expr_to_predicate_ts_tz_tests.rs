@@ -383,7 +383,7 @@ async fn single_stream_scan_reads_rows_behind_a_zoned_literal() {
             .expect("arrow schema"),
     );
     let filter = col("ts").gt_eq(lit(us(V2_MICROS, Some("UTC"))));
-    let scan = IcebergTableScan::new(table, None, scan_schema, None, &[filter], None)
+    let scan = IcebergTableScan::new(table, None, false, scan_schema, None, &[filter], None)
         .expect("scan builds");
     assert_eq!(
         scan.predicates(),

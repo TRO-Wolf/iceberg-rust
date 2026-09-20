@@ -653,12 +653,17 @@ pub(crate) fn scan_predicates(
     snapshot_id: Option<i64>,
     filters: &[Expr],
     bindings: &HashMap<String, Option<String>>,
+    project_current_schema: bool,
 ) -> DFResult<Option<Predicate>> {
-    let schema = match snapshot_id.and_then(|id| table.metadata().snapshot_by_id(id)) {
-        Some(snapshot) => snapshot
-            .schema(table.metadata())
-            .map_err(to_datafusion_error)?,
-        None => table.metadata().current_schema().clone(),
+    let schema = if project_current_schema {
+        table.metadata().current_schema().clone()
+    } else {
+        match snapshot_id.and_then(|id| table.metadata().snapshot_by_id(id)) {
+            Some(snapshot) => snapshot
+                .schema(table.metadata())
+                .map_err(to_datafusion_error)?,
+            None => table.metadata().current_schema().clone(),
+        }
     };
     Ok(convert_filters_to_predicate(
         &rebind_filters(filters, bindings),

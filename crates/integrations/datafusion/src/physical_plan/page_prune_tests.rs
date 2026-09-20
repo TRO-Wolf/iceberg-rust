@@ -41,8 +41,10 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use crate::IcebergCatalogProvider;
-use crate::physical_plan::scan::{IcebergTableScan, ScanKnobs, build_table_scan};
-use crate::physical_plan::scan_knobs::{ensure_iceberg_scan_options, scan_knobs_from_context};
+use crate::physical_plan::scan::{IcebergTableScan, ScanKnobs};
+use crate::physical_plan::scan_knobs::{
+    build_table_scan, ensure_iceberg_scan_options, scan_knobs_from_context,
+};
 
 const ROWS: i32 = 512;
 
@@ -199,6 +201,7 @@ async fn single_stream_filtered_scan_row_selection_on_matches_off() {
         let scan = IcebergTableScan::new(
             table.clone(),
             None,
+            false,
             arrow_schema.clone(),
             None,
             filters,
@@ -249,6 +252,7 @@ async fn single_stream_scan_builder_receives_row_selection_knob() {
     let scan_on = build_table_scan(
         &table,
         None,
+        false,
         vec!["id".to_string(), "data".to_string()],
         None,
         ScanKnobs {
@@ -262,6 +266,7 @@ async fn single_stream_scan_builder_receives_row_selection_knob() {
     let scan_off = build_table_scan(
         &table,
         None,
+        false,
         vec!["id".to_string(), "data".to_string()],
         None,
         ScanKnobs {
@@ -313,6 +318,7 @@ async fn plan_carries_row_selection_enabled_to_multi_partition_path() {
     let scan_on = IcebergTableScan::plan(
         table.clone(),
         None,
+        false,
         arrow_schema.clone(),
         None,
         &[],
@@ -326,10 +332,19 @@ async fn plan_carries_row_selection_enabled_to_multi_partition_path() {
     .expect("plan on");
     assert!(scan_on.row_selection_enabled);
 
-    let scan_off = IcebergTableScan::plan(table, None, arrow_schema, None, &[], None, ScanKnobs {
-        row_selection_enabled: false,
-        ..Default::default()
-    })
+    let scan_off = IcebergTableScan::plan(
+        table,
+        None,
+        false,
+        arrow_schema,
+        None,
+        &[],
+        None,
+        ScanKnobs {
+            row_selection_enabled: false,
+            ..Default::default()
+        },
+    )
     .await
     .expect("plan off");
     assert!(!scan_off.row_selection_enabled);
