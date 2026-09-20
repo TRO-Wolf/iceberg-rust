@@ -700,9 +700,9 @@ impl ArrowReader {
                 record_batch_stream_builder.schema(),
                 &iceberg_field_ids,
             )? {
-                RowFilterPlan::Push(row_filter) => {
+                RowFilterPlan::Push(pushed) => {
                     record_batch_stream_builder =
-                        record_batch_stream_builder.with_row_filter(row_filter);
+                        pushed.apply_to_stream(record_batch_stream_builder);
                 }
                 RowFilterPlan::Residual => {
                     for field_id in &iceberg_field_ids {

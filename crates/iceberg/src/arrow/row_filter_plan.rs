@@ -21,7 +21,9 @@ use std::str::FromStr;
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
-use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
+use parquet::arrow::async_reader::AsyncFileReader;
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
+use parquet::basic::{ConvertedType, LogicalType};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
@@ -29,8 +31,27 @@ use crate::error::Result;
 use crate::expr::BoundPredicate;
 use crate::spec::{NestedField, Schema, Type};
 
+pub(crate) struct PushedRowFilter {
+    pub(crate) filter: RowFilter,
+    pub(crate) disable_predicate_cache: bool,
+}
+
+impl PushedRowFilter {
+    pub(crate) fn apply_to_stream<T: AsyncFileReader + Send + 'static>(
+        self,
+        builder: ParquetRecordBatchStreamBuilder<T>,
+    ) -> ParquetRecordBatchStreamBuilder<T> {
+        let builder = builder.with_row_filter(self.filter);
+        if self.disable_predicate_cache {
+            builder.with_max_predicate_cache_size(0)
+        } else {
+            builder
+        }
+    }
+}
+
 pub(crate) enum RowFilterPlan {
-    Push(RowFilter),
+    Push(PushedRowFilter),
     Residual,
 }
 
@@ -64,16 +85,19 @@ pub(crate) fn plan_row_filter(
     column_indices.sort_unstable();
     column_indices.dedup();
 
-    let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices);
+    let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices.clone());
+    let disable_predicate_cache =
+        pushed_mask_disables_predicate_cache(parquet_schema, &column_indices);
     let predicate = predicates.clone();
     let predicate_func = move |batch: RecordBatch| {
         evaluate_predicate_to_mask(&predicate, &batch)
             .map_err(|e| ArrowError::ExternalError(Box::new(e)))
     };
     let arrow_predicate = ArrowPredicateFn::new(projection_mask, predicate_func);
-    Ok(RowFilterPlan::Push(RowFilter::new(vec![Box::new(
-        arrow_predicate,
-    )])))
+    Ok(RowFilterPlan::Push(PushedRowFilter {
+        filter: RowFilter::new(vec![Box::new(arrow_predicate)]),
+        disable_predicate_cache,
+    }))
 }
 
 pub(crate) fn top_level_ancestor_id(schema: &Schema, field_id: i32) -> Option<i32> {
@@ -203,6 +227,35 @@ fn stamped_top_level_leaf_lists(
         leaf_idx += count;
     }
     map
+}
+
+pub(crate) fn pushed_mask_disables_predicate_cache(
+    parquet_schema: &SchemaDescriptor,
+    column_indices: &[usize],
+) -> bool {
+    let wanted: HashSet<usize> = column_indices.iter().copied().collect();
+    let mut leaf_idx = 0;
+    parquet_schema
+        .root_schema()
+        .get_fields()
+        .iter()
+        .any(|root| {
+            let start = leaf_idx;
+            let count = leaf_count(root);
+            leaf_idx += count;
+            root.is_group() && count == 1 && !group_is_list(root) && wanted.contains(&start)
+        })
+}
+
+fn group_is_list(ty: &ParquetType) -> bool {
+    if !ty.is_group() {
+        return false;
+    }
+    let basic_info = ty.get_basic_info();
+    if let Some(logical) = basic_info.logical_type_ref() {
+        return *logical == LogicalType::List;
+    }
+    basic_info.converted_type() == ConvertedType::LIST
 }
 
 pub(crate) fn leaf_count(ty: &ParquetType) -> usize {
