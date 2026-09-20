@@ -406,6 +406,9 @@ which is the composition of the two Java filters.
 | an all-VOID spec is `isUnpartitioned`, and matches no source | `a_partition_filter_over_an_all_void_spec_is_refused_as_unpartitioned`, `a_table_whose_only_matching_spec_is_void_is_refused` | PROVEN |
 | an explicit file list keeps each file's values under `parallelism` | `an_explicit_file_list_keeps_each_file_s_partition_values_under_parallelism` | PROVEN |
 | conflicting source directory structures refuse | `conflicting_source_directory_structures_are_refused` | PROVEN |
+| the duplicate check compares the WHOLE path, not the basename | `a_source_sharing_only_its_basename_with_a_live_file_is_not_a_duplicate` | PROVEN |
+| the partition tuple looks its values up by the spec field's NAME | `a_partition_value_map_out_of_spec_order_still_builds_the_spec_s_tuple` (direct), `a_file_list_whose_values_are_out_of_spec_order_is_refused_by_the_spec_match` | PROVEN |
+| an embedded field id beats the column's position | `embedded_field_ids_bind_by_id_even_when_they_run_against_position` | PROVEN |
 
 ## 6. Mutation proof
 
@@ -476,6 +479,74 @@ then proven RED under the same mutation:
 - M14 was green because every partitioned fixture had ONE partition field. The new pin uses a
   two-field `(cat, dept)` spec.
 - M15 was green because the size pin only asserted `> 0`. It now asserts the listing's exact size.
+
+### 6b. Round 3 (the three rules with no pin that catches their mutation)
+
+The final verification critic of round 2 found no silent wrong answer, but three rules had a
+mutation every pin survived. Each one now has a pin, and each pin was then proven RED under that
+mutation. The numbering continues the table; the brief's "M18/M19/M20" collides with round 2's
+rows, so these are M31, M32 and M33.
+
+| # | Mutation | Pins that went RED |
+|---|---|---|
+| M31 | the duplicate check compares BASENAMES, not whole paths | `a_source_sharing_only_its_basename_with_a_live_file_is_not_a_duplicate` |
+| M32 | the partition tuple takes its values by VECTOR INDEX, not by the spec field's name | `a_partition_value_map_out_of_spec_order_still_builds_the_spec_s_tuple` |
+| M33 | an embedded field id is ignored and the column's POSITION is used instead | `embedded_field_ids_bind_by_id_even_when_they_run_against_position` |
+
+Each mutation turned exactly ONE test red — its own new pin — which is the measurement that the
+gap was real and that no round-1 or round-2 pin already covered it.
+
+**M31.** `refuse_duplicates` rebuilt as a basename set on both sides
+(`path.rsplit('/').next()`). The new pin adopts `<root-first>/part-00000.parquet`, then imports
+`<root-second>/part-00000.parquet` — a different directory, the same basename — and the import must
+SUCCEED, because Java joins `ENTRIES` on `data_file.file_path`, the whole path. Under the mutant:
+
+> a_source_sharing_only_its_basename_with_a_live_file_is_not_a_duplicate: Java joins on
+> data_file.file_path, which is the WHOLE path: DataInvalid => Cannot complete import because data
+> files to be imported already exist within the target table:
+> `<temp dir>/source-basename-second/part-00000.parquet`.
+
+`test result: FAILED. 51 passed; 1 failed`. The two round-2 duplicate pins
+(`check_duplicate_files_refuses_the_second_import`, `a_path_already_referenced_by_a_delete_file_is_a_duplicate`)
+both stayed GREEN, because both re-import the SAME path.
+
+**M32 — pinned DIRECTLY, because the end-to-end route is closed.** The mutation is
+`partition_values.get(index)` in `partition_struct`. It cannot be reached through `execute`, and
+that was measured rather than argued: a `Files` entry's value vector is also the source's declared
+partition-column list (`partition_names_of` reads its names in order), and `find_compatible_spec`
+compares those names against the spec's IN ORDER (D-7). So an entry supplied as
+`[(dept, hr), (cat, x)]` against a `(cat, dept)` spec never reaches `partition_struct` at all:
+
+> DataInvalid => Cannot find a partition spec in Iceberg table `ns-….t` that matches the partition
+> columns ([dept, cat]) in input table
+
+That refusal is now itself a pin
+(`a_file_list_whose_values_are_out_of_spec_order_is_refused_by_the_spec_match`), so the claim
+"unreachable" cannot rot silently. The rule that the LOOKUP is by name — Java's
+`partitionValues.get(field.name())` over a `Map`, which has no order — is pinned by a DIRECT call
+to `partition_struct`, the same shape as M27's direct pin. Under the mutant:
+
+> assertion `left == right` failed
+>   left: `[Some(Primitive(String("hr"))), Some(Primitive(String("x"))))]`
+>  right: `[Some(Primitive(String("x"))), Some(Primitive(String("hr"))))]`
+
+`test result: FAILED. 51 passed; 1 failed`. The spec-order pin
+`a_two_column_partition_tuple_follows_the_spec_field_order` (M14) stayed GREEN, because its hive
+directories are already in spec order.
+
+**M33.** `resolve_field_id`'s embedded branch replaced by `i32::try_from(position + 1)`. The
+round-2 pin `a_source_that_carries_field_ids_is_resolved_by_those_ids` was green under it because
+its columns carry ids 1 and 2 in that order — positional and embedded agree. The new pin writes a
+source whose FIRST column (`x`, a string) carries id 2 and whose SECOND (`y`, a long) carries id 1,
+so positional resolution binds field 1 (long) to the string column. Under the mutant:
+
+> a source whose embedded ids are not its positional ids: Unexpected => `Statistics {min: [112],
+> max: [113], …} is not match with field type long`
+
+`test result: FAILED. 51 passed; 1 failed`. That failure is also the measurement of what this rule
+costs: a positional bind does not degrade to a wrong bound, it takes the adoption down with an
+internal error — and it would silently write the wrong column's bounds for any two columns of the
+SAME type.
 
 ## 7. Gates
 
