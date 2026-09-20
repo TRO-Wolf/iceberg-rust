@@ -15,27 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! WG3-L2 pins: [`PartitionSpec::partition_to_path`] is TOTAL. An inconsistent
-//! `(spec, schema, tuple)` triple renders `name=null` for the offending field and warns, and it
-//! never aborts. Four abort vectors were reachable before this change:
-//!
-//! | # | input | pre-change abort |
-//! |---|---|---|
-//! | V1 | tuple shorter than the spec | `data[i]` index out of bounds |
-//! | V2 | source column absent from the schema | `partition_type(..).unwrap()` |
-//! | V3 | non-primitive partition-field type + a primitive value | `as_primitive_type().unwrap()` |
-//! | V4 | value literal kind incompatible with the field type | `Display for Datum`'s `unreachable!()` |
-//!
-//! Java is LENIENT for V1: `PartitionData.get(pos)` returns `null` past the end of the tuple and
-//! `Transform.toHumanString(type, null)` renders `"null"`. Java throws for the other three.
-//! [`PartitionSpec::try_partition_to_path`] surfaces all four as typed errors.
-
 use std::sync::Arc;
 
 use super::*;
 use crate::spec::{Datum, Literal, PrimitiveLiteral, PrimitiveType, Type};
 
-/// `identity(x: long)` + `identity(y: long)` over a two-column schema.
 fn two_field_spec() -> (SchemaRef, PartitionSpec) {
     let schema: SchemaRef = Arc::new(
         Schema::builder()
@@ -56,10 +40,6 @@ fn two_field_spec() -> (SchemaRef, PartitionSpec) {
     (schema, spec)
 }
 
-// NULL partition values stay legal: a NULL tuple slot is a first-class Iceberg value.
-
-/// A `PartitionKey` carrying a NULL value renders `name=null` on both paths. Java renders a
-/// null partition value as the literal `"null"` (`Transform.toHumanString(type, null)`).
 #[test]
 fn partition_key_new_accepts_null_value() {
     let (schema, spec) = two_field_spec();
@@ -75,17 +55,15 @@ fn partition_key_new_accepts_null_value() {
     );
 }
 
-/// `PartitionKey::new` rejects an invalid triple (a short non-void tuple) with a typed error.
 #[test]
 fn partition_key_new_rejects_short_non_void_tuple() {
     let (schema, spec) = two_field_spec();
-    let data = Struct::from_iter([Some(Literal::long(5))]); // missing y
+    let data = Struct::from_iter([Some(Literal::long(5))]);
     let err = PartitionKey::new(spec, schema, data)
         .expect_err("a short non-void tuple must not construct a PartitionKey");
     assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
 }
 
-/// Unit 3: `PartitionKey::new` rejects an incompatible literal kind.
 #[test]
 fn partition_key_new_rejects_incompatible_literal() {
     let (schema, spec) = two_field_spec();
@@ -95,7 +73,6 @@ fn partition_key_new_rejects_incompatible_literal() {
     assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
 }
 
-/// Unit 3: all-void + empty tuple remains constructible (the void trap).
 #[test]
 fn partition_key_new_accepts_all_void_empty_tuple() {
     let schema: SchemaRef = Arc::new(
@@ -116,10 +93,6 @@ fn partition_key_new_accepts_all_void_empty_tuple() {
     assert_eq!(key.to_path(), "x_void=null");
 }
 
-// V1 — tuple shorter than the spec.
-
-/// V1: a tuple shorter than the spec renders the missing fields as `null` (Java's past-end
-/// `PartitionData.get` leniency) instead of indexing out of bounds.
 #[test]
 fn test_partition_to_path_short_tuple_renders_null_instead_of_aborting() {
     let (schema, spec) = two_field_spec();
@@ -128,7 +101,6 @@ fn test_partition_to_path_short_tuple_renders_null_instead_of_aborting() {
     assert_eq!(spec.partition_to_path(&data, schema), "x=5/y=null");
 }
 
-/// The same short tuple is a typed `DataInvalid` on the fallible path.
 #[test]
 fn test_try_partition_to_path_short_tuple_errors() {
     let (schema, spec) = two_field_spec();
@@ -145,14 +117,9 @@ fn test_try_partition_to_path_short_tuple_errors() {
     );
 }
 
-// V2 — source column absent from the schema (the spec-evolved commit-path shape).
-
-/// Rendering a spec against a schema that dropped one of its source columns renders THAT field
-/// as `null` and still renders the others. Java's `partitionType()` substitutes `UnknownType`.
 #[test]
 fn test_partition_to_path_missing_source_column_renders_null_per_field() {
     let (_schema, spec) = two_field_spec();
-    // The evolved schema dropped `x` (source id 1) and kept `y` (source id 2).
     let evolved: SchemaRef = Arc::new(
         Schema::builder()
             .with_fields(vec![
@@ -174,10 +141,6 @@ fn test_partition_to_path_missing_source_column_renders_null_per_field() {
     assert_eq!(err.kind(), crate::ErrorKind::Unexpected);
 }
 
-// V3 — non-primitive partition-field type (a legal `void` over a non-primitive source).
-
-/// `void` over a STRUCT source is a legal partition field, so the partition type can be
-/// non-primitive. A primitive value in that slot renders `null` instead of aborting.
 #[test]
 fn test_partition_to_path_non_primitive_field_type_renders_null() {
     let schema: SchemaRef = Arc::new(
@@ -210,10 +173,6 @@ fn test_partition_to_path_non_primitive_field_type_renders_null() {
     assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
 }
 
-// V4 — value literal kind incompatible with the partition-field type.
-
-/// An `Int` literal in a `Long`-typed partition slot renders `null`. `PrimitiveType::compatible`
-/// decides, the same predicate the commit-path `validate_partition_value` uses.
 #[test]
 fn test_partition_to_path_incompatible_literal_renders_null() {
     let (schema, spec) = two_field_spec();
@@ -231,8 +190,6 @@ fn test_partition_to_path_incompatible_literal_renders_null() {
     );
 }
 
-/// A NON-primitive literal in a primitive slot already rendered `null` (never aborted); the
-/// fallible path surfaces it, matching `SnapshotProducer::validate_partition_value`'s posture.
 #[test]
 fn test_partition_to_path_non_primitive_literal_renders_null() {
     let (schema, spec) = two_field_spec();
@@ -251,15 +208,6 @@ fn test_partition_to_path_non_primitive_literal_renders_null() {
     );
 }
 
-// The void trap: an all-`void` spec is `is_unpartitioned() == true`, so `(void_spec,
-// Struct::empty())` is a LEGITIMATE pair that a naive arity rule would reject.
-
-/// TRAP: an all-`void` spec reports `is_unpartitioned() == true`, and callers legitimately hand
-/// it an EMPTY tuple. A missing value for a `void` field carries no information, so neither path
-/// treats it as an anomaly.
-///
-/// MUTATION (drop the `void` carve-out): this test and the mixed-void test go RED while
-/// `test_try_partition_to_path_short_tuple_errors` stays GREEN.
 #[test]
 fn test_all_void_spec_with_empty_tuple_is_not_an_anomaly() {
     let schema: SchemaRef = Arc::new(
@@ -289,8 +237,6 @@ fn test_all_void_spec_with_empty_tuple_is_not_an_anomaly() {
     );
 }
 
-/// The MIXED shape (`identity(x)` + `void(y)`) with a tuple covering only `x`: the identity
-/// field renders its value, the past-the-end `void` field renders `null`, and neither path errors.
 #[test]
 fn test_partition_to_path_mixed_void_short_tuple_is_not_an_anomaly() {
     let schema: SchemaRef = Arc::new(
@@ -326,10 +272,6 @@ fn test_partition_to_path_mixed_void_short_tuple_is_not_an_anomaly() {
     );
 }
 
-// The two paths agree on well-formed input.
-
-/// On a self-consistent triple the fallible path returns EXACTLY the string the total path
-/// renders — the total path's leniency is confined to the anomaly branches.
 #[test]
 fn test_try_partition_to_path_matches_partition_to_path_when_well_formed() {
     let (schema, spec) = two_field_spec();
@@ -343,12 +285,6 @@ fn test_try_partition_to_path_matches_partition_to_path_when_well_formed() {
     assert_eq!(total, "x=5/y=7");
 }
 
-// Drift alarm: every pair `PrimitiveType::compatible` accepts must RENDER.
-
-/// The anomaly guard admits exactly the pairs `PrimitiveType::compatible` accepts, and every
-/// admitted pair must survive `Datum`'s `Display`, whose `(_, _)` arm is `unreachable!()`. This
-/// test runs the whole accepted matrix, so a dropped `Display` arm PANICS here. The converse is
-/// safe: `compatible` is narrower, so a rejected pair renders `null`.
 #[test]
 fn test_every_compatible_type_literal_pair_renders() {
     let types = [
@@ -390,7 +326,6 @@ fn test_every_compatible_type_literal_pair_renders() {
     for ty in &types {
         for literal in &literals {
             if ty.compatible(literal) {
-                // Panics loudly (and names the pair) if `Display for Datum` cannot render it.
                 let _ = Datum::new(ty.clone(), literal.clone()).to_human_string();
                 rendered += 1;
             }

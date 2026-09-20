@@ -15,25 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `position_deletes` metadata table — schema and scan.
-//!
-//! Mirrors Java `PositionDeletesTable` (`core/.../PositionDeletesTable.java`): the schema is
-//! `calculateSchema` — the fixed metadata columns (`MetadataColumns.DELETE_FILE_PATH` /
-//! `DELETE_FILE_POS` / `DELETE_FILE_ROW_*` / `PARTITION_COLUMN_ID` / `SPEC_ID_COLUMN_ID` /
-//! `FILE_PATH_COLUMN_ID`, plus the v3 DV columns `CONTENT_OFFSET_COLUMN_ID` /
-//! `CONTENT_SIZE_IN_BYTES_COLUMN_ID`), the partition-field id reassignment (smallest positive
-//! ids not used by ANY table schema nor the metadata columns), and the empty-partition
-//! `TypeUtil.selectNot(PARTITION_COLUMN_ID)` drop. The scan is `PositionDeletesBatchScan`:
-//! the current snapshot's DELETE manifests filtered by both manifest evaluators
-//! (transformed-spec + own-spec, keyed on `manifest.partitionSpecId()`), live
-//! `POSITION_DELETES` entries only, one task per delete file carrying its spec and residual;
-//! Puffin delete files read as deletion vectors, Parquet files as positional-delete rows.
-//!
-//! One deliberate bound, tracked in GAP_MATRIX R142:
-//! - **Partition type** is [`TableMetadata::unified_partition_type`] (Java
-//!   `Partitioning.partitionType`). That automatically corrects the remapped-child-id set
-//!   and the empty-partition drop predicate.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -207,7 +188,7 @@ impl<'a> PositionDeletesTable<'a> {
             .expect("position_deletes metadata table schema is structurally valid")
     }
 
-    /// Scans the `position_deletes` metadata table (Java `PositionDeletesBatchScan`).
+    #[allow(missing_docs)]
     pub async fn scan(&self) -> Result<ArrowRecordBatchStream> {
         let metadata_schema = self.schema();
         let arrow_schema = Arc::new(schema_to_arrow_schema(&metadata_schema)?);
@@ -750,9 +731,6 @@ fn extract_row_column(
     }
 }
 
-/// Java `calculateSchema` id reassignment: partition child ids move to the smallest positive
-/// ids not used by any table schema (all schema versions) nor by the metadata columns / the
-/// embedded `row` struct.
 fn remap_partition_field_ids(table: &Table, partition_type: &StructType) -> StructType {
     let reassigned = partition_id_reassignment(table, partition_type);
     StructType::new(

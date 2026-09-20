@@ -59,10 +59,6 @@ fn test_partition_spec() {
     assert_eq!(Transform::Truncate(4), partition_spec.fields[2].transform);
 }
 
-// RISK (crown jewel): table-metadata JSON carrying bucket[0] used to deserialize fine and abort
-// later with a divide-by-zero at partition-value computation. Any hostile or corrupt metadata
-// file triggers it. It must fail AT DESERIALIZATION with DataInvalid, like Java's
-// `TableMetadataParser` -> `Transforms.fromString` -> `Bucket.get`.
 #[test]
 fn test_table_metadata_with_invalid_transform_parameter_fails_deserialization() {
     fn metadata_json(transform: &str) -> String {
@@ -122,8 +118,6 @@ fn test_table_metadata_with_invalid_transform_parameter_fails_deserialization() 
         )
     }
 
-    // CONTROL first (docs/testing.md sabotage discipline): the same metadata with a legal
-    // transform parses, so the sabotaged variants below fail on the transform bound.
     let control = serde_json::from_str::<crate::spec::TableMetadata>(&metadata_json("bucket[16]"))
         .expect("control metadata with bucket[16] must deserialize");
     assert_eq!(
@@ -135,14 +129,10 @@ fn test_table_metadata_with_invalid_transform_parameter_fails_deserialization() 
         let serde_error =
             serde_json::from_str::<crate::spec::TableMetadata>(&metadata_json(sabotaged))
                 .unwrap_err();
-        // Mirror the production conversion in TableMetadata::read_from
-        // (`serde_json::from_slice(...)?` routes through `Error::from`).
         let error = Error::from(serde_error);
         assert_eq!(error.kind(), ErrorKind::DataInvalid, "{sabotaged}");
     }
 
-    // The untagged TableMetadataEnum swallows the Java precondition text, so pin the message at
-    // the partition-spec JSON door — the same bytes-on-disk shape the metadata carries.
     let serde_error = serde_json::from_str::<PartitionSpec>(
         r#"{
                 "spec-id": 0,
@@ -165,8 +155,6 @@ fn test_table_metadata_with_invalid_transform_parameter_fails_deserialization() 
     );
 }
 
-// RISK: the bound builder is the programmatic route into a PartitionSpec. Java can never hold a
-// Bucket(0) or Truncate(0), so admitting one builds a spec that aborts the process at apply time.
 #[test]
 fn test_partition_spec_builder_rejects_zero_parameter_transforms() {
     let schema = Schema::builder()
@@ -193,7 +181,6 @@ fn test_partition_spec_builder_rejects_zero_parameter_transforms() {
         .expect_err("truncate[0] must be rejected by the bound builder");
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
 
-    // Over-broadened-guard pin: a legal parameter still passes every builder check.
     PartitionSpec::builder(schema)
         .add_partition_field("id", "id_bucket", Transform::Bucket(16))
         .expect("bucket[16] is legal")
@@ -201,8 +188,6 @@ fn test_partition_spec_builder_rejects_zero_parameter_transforms() {
         .expect("legal spec must build");
 }
 
-// RISK: the unbound builder feeds catalog create-table requests, under the same
-// reject-at-construction contract as the bound builder.
 #[test]
 fn test_unbound_partition_spec_builder_rejects_zero_parameter_transforms() {
     let error = UnboundPartitionSpec::builder()
@@ -215,7 +200,6 @@ fn test_unbound_partition_spec_builder_rejects_zero_parameter_transforms() {
         .expect_err("truncate[0] must be rejected by the unbound builder");
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
 
-    // Over-broadened-guard pin: a legal parameter is still accepted.
     UnboundPartitionSpec::builder()
         .add_partition_field(1, "id_bucket", Transform::Bucket(16))
         .expect("bucket[16] is legal");
@@ -565,8 +549,6 @@ fn test_builder_disallow_duplicate_names() {
         .unwrap_err();
 }
 
-/// A two-column schema whose second column `v` (id 2) is variant — input for the variant
-/// partition-source rejection pins.
 fn schema_with_variant_column() -> Schema {
     Schema::builder()
         .with_fields(vec![
@@ -577,10 +559,6 @@ fn schema_with_variant_column() -> Schema {
         .unwrap()
 }
 
-// RISK: a variant column must NOT be a partition source for any value-producing transform. Java
-// `PartitionSpec.checkCompatibility` rejects it at the non-primitive door, before canTransform,
-// and `Identity.UNSUPPORTED_TYPES` lists VARIANT. Partitioning by variant writes tuples with no
-// single-value representation, which is silent layout corruption.
 #[test]
 fn test_variant_rejected_as_partition_source_for_identity_and_bucket() {
     for transform in [
@@ -612,8 +590,6 @@ fn test_variant_rejected_as_partition_source_for_identity_and_bucket() {
     }
 }
 
-// RISK: the VOID transform must still ACCEPT a variant source. Java's checkCompatibility skips
-// `alwaysNull()` fields, and over-firing breaks partition-field removal on a variant schema.
 #[test]
 fn test_variant_accepted_as_void_partition_source() {
     let spec = PartitionSpec::builder(schema_with_variant_column())
@@ -697,7 +673,6 @@ fn test_builder_auto_assign_field_ids() {
             field_id: None,
         })
         .unwrap()
-        // Should keep its ID even if its lower
         .add_unbound_field(UnboundPartitionField {
             source_id: 3,
             name: "year".to_string(),
@@ -816,7 +791,6 @@ fn test_builder_collision_is_ok_for_identity_transforms() {
         .build()
         .unwrap();
 
-    // Not OK for different source id
     PartitionSpec::builder(schema)
         .with_spec_id(1)
         .add_unbound_field(UnboundPartitionField {
@@ -828,10 +802,6 @@ fn test_builder_collision_is_ok_for_identity_transforms() {
         .unwrap_err();
 }
 
-// RISK (Java parity): a `void` partition named after its OWN source column must be accepted (the
-// V1 removed-field replacement), while a `void` named after a DIFFERENT column stays rejected.
-// Java's `checkAndAddPartitionName(name, sourceId)` rules on the name to source-id
-// correspondence, not on the transform.
 #[test]
 fn test_builder_collision_is_ok_for_void_named_after_its_own_source() {
     let schema = Schema::builder()
@@ -847,7 +817,6 @@ fn test_builder_collision_is_ok_for_void_named_after_its_own_source() {
         .build()
         .unwrap();
 
-    // OK: void("id") sourced from id 1 (== the colliding schema field's id).
     PartitionSpec::builder(schema.clone())
         .with_spec_id(1)
         .add_unbound_field(UnboundPartitionField {
@@ -860,7 +829,6 @@ fn test_builder_collision_is_ok_for_void_named_after_its_own_source() {
         .build()
         .unwrap();
 
-    // Not OK: void("id") sourced from a DIFFERENT column (id 2).
     PartitionSpec::builder(schema)
         .with_spec_id(1)
         .add_unbound_field(UnboundPartitionField {
@@ -893,7 +861,6 @@ fn test_builder_all_source_ids_must_exist() {
         .build()
         .unwrap();
 
-    // Valid
     PartitionSpec::builder(schema.clone())
         .with_spec_id(1)
         .add_unbound_fields(vec![
@@ -914,7 +881,6 @@ fn test_builder_all_source_ids_must_exist() {
         .build()
         .unwrap();
 
-    // Invalid
     PartitionSpec::builder(schema)
         .with_spec_id(1)
         .add_unbound_fields(vec![

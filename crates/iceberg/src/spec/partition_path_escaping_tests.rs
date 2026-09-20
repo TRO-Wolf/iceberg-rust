@@ -15,19 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! R161 pins: BOTH sides of every `name=value` pair are escaped, exactly as Java does.
-//!
-//! Java `partitionToPath` appends `escape(name)`, `"="`, `escape(humanString)` per field and
-//! joins the pairs with a raw `"/"`; those two separators are STRUCTURE and stay raw. `escape`
-//! is `java.net.URLEncoder.encode(s, "UTF-8")`. Every expectation below is a verbatim jar-oracle
-//! result against `iceberg-api-1.10.0` (`dev/java-interop/run-interop-partition-path.sh`).
-
 use std::sync::Arc;
 
 use super::*;
 use crate::spec::{Literal, PrimitiveType, Type};
 
-/// A one-column `s: string` schema — the binding target for every one-field spec below.
 fn string_schema() -> SchemaRef {
     Arc::new(
         Schema::builder()
@@ -39,7 +31,6 @@ fn string_schema() -> SchemaRef {
     )
 }
 
-/// `identity(s)` exposed under `field_name`.
 fn string_spec(field_name: &str) -> PartitionSpec {
     PartitionSpec::builder(string_schema())
         .add_partition_field("s", field_name, Transform::Identity)
@@ -48,8 +39,6 @@ fn string_spec(field_name: &str) -> PartitionSpec {
         .expect("the one-field spec must build")
 }
 
-/// Render `field_name=value` through EVERY public entry point and assert they agree — the
-/// total path, the fallible path, and `PartitionKey::to_path`.
 fn render(field_name: &str, value: Option<&str>) -> String {
     let schema = string_schema();
     let spec = string_spec(field_name);
@@ -74,14 +63,8 @@ fn render(field_name: &str, value: Option<&str>) -> String {
     total
 }
 
-// The escaper itself — a full printable-ASCII sweep against Java's `URLEncoder`.
-
-/// The printable-ASCII characters `URLEncoder.encode(s, "UTF-8")` leaves untouched, verbatim
-/// from the jar sweep over `0x20..=0x7E` (note: a space is NOT here — it maps to `+`).
 const JAVA_SAFE_ASCII: &str = "*-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
 
-/// Every printable-ASCII partition value renders exactly as Java's `URLEncoder` renders it: the
-/// 66 safe characters pass through, a space becomes `+`, and the remaining 28 become `%XX`.
 #[test]
 fn printable_ascii_sweep_matches_java_url_encoder() {
     let mut passed_through = 0usize;
@@ -113,9 +96,6 @@ fn printable_ascii_sweep_matches_java_url_encoder() {
     );
 }
 
-// The VALUE side — jar-oracle table.
-
-/// `identity(s: string)` named `s`: (partition value, Java `partitionToPath`).
 const JAVA_IDENTITY_STRING_PATHS: &[(&str, &str)] = &[
     ("plain", "s=plain"),
     ("AZaz09", "s=AZaz09"),
@@ -150,8 +130,6 @@ const JAVA_IDENTITY_STRING_PATHS: &[(&str, &str)] = &[
     ("null", "s=null"),
 ];
 
-/// Every value in the jar-oracle table renders byte-identically to Java, including multi-byte
-/// UTF-8: one `%XX` group per UTF-8 byte, never per `char`.
 #[test]
 fn identity_string_values_match_java() {
     for (value, expected) in JAVA_IDENTITY_STRING_PATHS {
@@ -168,9 +146,6 @@ fn identity_string_values_match_java() {
     );
 }
 
-// The NAME side — Java escapes it too.
-
-/// `identity(s)` under a tricky partition-field NAME, value `"v"`: (field name, Java path).
 const JAVA_FIELD_NAME_PATHS: &[(&str, &str)] = &[
     ("weird name", "weird+name=v"),
     ("a/b", "a%2Fb=v"),
@@ -182,8 +157,6 @@ const JAVA_FIELD_NAME_PATHS: &[(&str, &str)] = &[
     ("*star*", "*star*=v"),
 ];
 
-/// The partition-field NAME goes through the same escaper as the value (Java escapes both
-/// sides; escaping only the value would still let a `/` in a field name forge a directory).
 #[test]
 fn field_names_match_java() {
     for (field_name, expected) in JAVA_FIELD_NAME_PATHS {
@@ -200,8 +173,6 @@ fn field_names_match_java() {
     );
 }
 
-/// A NULL partition value stays the literal `null`, and the NAME is still escaped on that
-/// branch. The `name=null` fallbacks are a separate code path and need their own pin.
 #[test]
 fn null_values_keep_rendering_null_with_an_escaped_name() {
     const JAVA_FIELD_NAME_NULL_PATHS: &[(&str, &str)] = &[
@@ -216,22 +187,12 @@ fn null_values_keep_rendering_null_with_an_escaped_name() {
             "a NULL value under field name {field_name:?} must render exactly as Java does"
         );
     }
-    // A string value that literally reads "null" is indistinguishable from a NULL value — the
-    // same ambiguity Java has, pinned so nobody "fixes" it into a divergence.
     assert_eq!(render("s", Some("null")), render("s", None));
 }
 
-/// `name=null` is emitted from THREE sites, and each needs its own pin: a mutation of one is
-/// invisible to the others. Java `Transform.toHumanString` returns the literal `"null"` before
-/// it switches on the type.
-///
-/// Site 1 is the lenient fallback in `partition_to_path`. The commit path pairs a file's older
-/// spec with the current schema, so an unescaped name puts a raw `/` into a `partitions.` key.
 #[test]
 fn the_lenient_fallback_null_still_escapes_the_field_name() {
     let spec = string_spec("a/b");
-    // A schema without source id 1: the field's partition type is not derivable, so the total
-    // path falls back to `null` for it.
     let evolved: SchemaRef = Arc::new(
         Schema::builder()
             .with_fields(vec![
@@ -240,7 +201,6 @@ fn the_lenient_fallback_null_still_escapes_the_field_name() {
             .build()
             .expect("the evolved schema must build"),
     );
-    // A value that WOULD have rendered, to prove the fallback is what emits the pair.
     let data = Struct::from_iter([Some(Literal::string("x/y"))]);
 
     let path = spec.partition_to_path(&data, evolved.clone());
@@ -253,15 +213,12 @@ fn the_lenient_fallback_null_still_escapes_the_field_name() {
         0,
         "a `/` in the field name must not forge a directory level on the fallback branch"
     );
-    // Fixture sanity: this branch is reached only because the triple is inconsistent.
     let err = spec
         .try_partition_to_path(&data, evolved)
         .expect_err("a dropped source column must be a typed error on the fallible path");
     assert_eq!(err.kind(), crate::ErrorKind::Unexpected);
 }
 
-/// Site 2 of three: the `void`-past-the-end-of-tuple branch in `render_partition_field`. An
-/// all-`void` spec reports `is_unpartitioned()`, so an empty tuple reaches `name=null` here.
 #[test]
 fn the_void_past_end_null_still_escapes_the_field_name() {
     let schema: SchemaRef = Arc::new(
@@ -302,10 +259,6 @@ fn the_void_past_end_null_still_escapes_the_field_name() {
     );
 }
 
-// Structure vs. content.
-
-/// The `/` between pairs and the `=` inside a pair are STRUCTURE — they stay raw — while a `/`
-/// or `=` inside a name or a value is CONTENT and is escaped.
 #[test]
 fn pair_and_field_separators_stay_raw() {
     let schema: SchemaRef = Arc::new(
@@ -326,7 +279,6 @@ fn pair_and_field_separators_stay_raw() {
         .expect("the two-field spec must build");
     let data = Struct::from_iter([Some(Literal::string("x/y")), Some(Literal::int(5))]);
 
-    // Jar oracle: `a+b=x%2Fy/c%2Fd=5`.
     let path = spec.partition_to_path(&data, schema);
     assert_eq!(path, "a+b=x%2Fy/c%2Fd=5");
     assert_eq!(
@@ -341,8 +293,6 @@ fn pair_and_field_separators_stay_raw() {
     );
 }
 
-/// The headline safety property: a `/` inside a partition VALUE can no longer forge an extra
-/// directory level in a data file's location (nor a bogus `partitions.` summary key).
 #[test]
 fn a_slash_in_a_value_cannot_forge_a_directory_level() {
     let path = render("s", Some("a/b/c"));
@@ -354,8 +304,6 @@ fn a_slash_in_a_value_cannot_forge_a_directory_level() {
     );
 }
 
-/// A space and a `+` must not collide: Java maps space to `+` and `+` to `%2B`, so the two
-/// values keep distinct paths (a naive "escape `/` only" fix would collapse them).
 #[test]
 fn space_and_plus_stay_distinct() {
     assert_eq!(render("s", Some("a b")), "s=a+b");
@@ -363,11 +311,6 @@ fn space_and_plus_stay_distinct() {
     assert_ne!(render("s", Some("a b")), render("s", Some("a+b")));
 }
 
-// The no-churn invariant — the overwhelmingly common case must be BYTE-IDENTICAL to pre-R161.
-
-/// Every partition value inside the URLEncoder safe set renders EXACTLY as it did before R161:
-/// no `%XX`, no `+`. This keeps ordinary table layouts unchanged, and it fails loudly under an
-/// over-eager escaper such as RFC-3986 `NON_ALPHANUMERIC`, which mangles `-`, `_`, `.` and `*`.
 #[test]
 fn safe_partition_values_are_byte_identical_to_the_unescaped_rendering() {
     const COMMON: &[(&str, &str)] = &[
@@ -390,8 +333,6 @@ fn safe_partition_values_are_byte_identical_to_the_unescaped_rendering() {
     }
 }
 
-/// The pre-R161 fixture from `tests::test_partition_to_path` is byte-stable: a realistic
-/// four-field path over plain values is untouched by the escaper.
 #[test]
 fn the_pre_r161_multi_field_fixture_is_byte_stable() {
     let schema = Schema::builder()
@@ -427,12 +368,6 @@ fn the_pre_r161_multi_field_fixture_is_byte_stable() {
     );
 }
 
-/// Which value CLASSES move under R161. FIVE fork-supported column types render a human string
-/// containing `:`, four of them a space too, so their path changes for EVERY value, the V3
-/// nanosecond pair included. `date` is the byte-stable control in the same tuple.
-///
-/// The four `assert_ne!`s ALARM on the named human-string residue: when one becomes equal, that
-/// residue is closed and row R161 must change in the same commit.
 #[test]
 fn the_five_always_moving_temporal_types_move_for_every_value() {
     let schema: SchemaRef = Arc::new(
@@ -464,8 +399,6 @@ fn the_five_always_moving_temporal_types_move_for_every_value() {
         .expect("identity(dt) is legal")
         .build()
         .expect("the six-field temporal spec must build");
-    // 2017-11-16T22:31:08 in micros (and the same instant in nanos); 22:31:08 in micros;
-    // 2022-01-08 in days.
     let data = Struct::from_iter([
         Some(Literal::timestamp(1_510_871_468_000_000)),
         Some(Literal::timestamptz(1_510_871_468_000_000)),
@@ -491,18 +424,14 @@ fn the_five_always_moving_temporal_types_move_for_every_value() {
              `date` does not"
     );
 
-    // `time` MATCHES Java post-R161: this change closes that divergence.
     assert_eq!(
         pairs[2], "tm=22%3A31%3A08",
         "Java: `22:31:08` escapes to `22%3A31%3A08`"
     );
-    // `date` is byte-stable: its human string holds no character outside the safe set.
     assert_eq!(
         pairs[5], "dt=2022-01-08",
         "Java: `2022-01-08`, untouched by the escaper"
     );
-    // The four remaining divergences, pinned as an alarm. Each expected form is Java's own,
-    // measured on the JVM, so none is a dead comparison.
     assert_ne!(
         pairs[0], "ts=2017-11-16T22%3A31%3A08",
         "residue R161: Java renders ISO `T`, the fork renders a space (escaped `+`)"
@@ -521,7 +450,6 @@ fn the_five_always_moving_temporal_types_move_for_every_value() {
     );
 }
 
-/// Render a one-field `transform(column)` spec over `column: ty` holding `value`.
 fn render_one(
     column: &str,
     field_name: &str,
@@ -545,12 +473,6 @@ fn render_one(
     spec.partition_to_path(&Struct::from_iter([Some(value)]), schema)
 }
 
-/// Byte-stability is a property of the OUTPUT type, not of the transform name.
-/// `Transform::result_type` returns the input type for `Truncate`, so `truncate(string, N)`
-/// renders a STRING and is as escaper-sensitive as `identity(string)`. Over int, long, decimal
-/// and binary it stays in the safe set: binary and fixed render as Java's standard Base64
-/// (`TransformUtil.base64encode`, no `Truncate` override), so a source byte such as `0x2F` never
-/// reaches the path. Base64's `+`, `/` and `=` are then escaped like any other character.
 #[test]
 fn truncate_is_byte_stable_except_over_string() {
     let moving = [
@@ -582,7 +504,6 @@ fn truncate_is_byte_stable_except_over_string() {
         );
     }
 
-    // CLOSED 2026-07-31 (QC / R161): Java base64 for binary partition values.
     let truncated_binary = render_one(
         "bn",
         "tb",
@@ -640,7 +561,6 @@ fn truncate_is_byte_stable_except_over_string() {
             ),
             "td=123.45",
         ),
-        // Base64 `YS9i` is inside the URLEncoder safe set — no further escaping.
         (truncated_binary.clone(), "tb=YS9i"),
     ];
     for (rendered, expected) in &stable {
@@ -652,11 +572,9 @@ fn truncate_is_byte_stable_except_over_string() {
     }
 }
 
-/// `identity(binary)` and `identity(fixed[N])` use the same Base64 human string as Java, not
-/// UPPERCASE hex. `Display for Datum` still renders hex; only the partition-path seam is base64.
 #[test]
 fn identity_binary_and_fixed_render_java_base64() {
-    let bytes = vec![0x61, 0x2F, 0x62]; // ASCII "a/b" → base64 "YS9i"
+    let bytes = vec![0x61, 0x2F, 0x62];
     assert_eq!(
         render_one(
             "bn",
@@ -680,8 +598,6 @@ fn identity_binary_and_fixed_render_java_base64() {
         "identity(fixed[3]) must match Java TransformUtil.base64encode"
     );
 
-    // Standard Base64, NOT URL-safe: bytes that produce `+`, `/` or `=` are then URL-escaped.
-    // 0xFB 0xFF -> base64 "+/8=" -> escaped "%2B%2F8%3D".
     assert_eq!(
         render_one(
             "bn",
@@ -694,7 +610,6 @@ fn identity_binary_and_fixed_render_java_base64() {
         "base64 alphabet chars outside the URLEncoder safe set must be escaped"
     );
 
-    // Display stays hex (orthogonal surface).
     let datum = crate::spec::Datum::new(
         PrimitiveType::Binary,
         crate::spec::PrimitiveLiteral::Binary(vec![0x61, 0x2F, 0x62]),
@@ -706,7 +621,6 @@ fn identity_binary_and_fixed_render_java_base64() {
     );
     assert_eq!(datum.to_human_string(), "YS9i");
 
-    // Empty binary → empty human string (Java: `toHumanString(Binary, empty ByteBuffer)` → "").
     assert_eq!(
         render_one(
             "bn",
@@ -719,7 +633,6 @@ fn identity_binary_and_fixed_render_java_base64() {
         "empty binary human string is empty (Java jar-oracle)"
     );
 
-    // UUID is NOT base64 — Java uses UUID.toString(); fork uses Display for UInt128.
     assert_eq!(
         render_one(
             "u",
@@ -733,12 +646,6 @@ fn identity_binary_and_fixed_render_java_base64() {
     );
 }
 
-/// R161 restores INJECTIVITY of partition tuple to directory, the data-trust half of the defect.
-///
-/// Before R161 the pair was `format!("{name}={value}")` with both sides raw, so a `/` or an `=`
-/// inside a VALUE made two DISTINCT tuples render the SAME path. Colliding paths put two
-/// partitions' data files in one directory and merge their `partitions.<path>` summary entries,
-/// so the per-partition record counts are silently summed.
 #[test]
 fn two_distinct_tuples_can_no_longer_collide_on_one_directory() {
     let schema: SchemaRef = Arc::new(
@@ -758,7 +665,6 @@ fn two_distinct_tuples_can_no_longer_collide_on_one_directory() {
         .build()
         .expect("the two-field spec must build");
 
-    // Same spec, two distinct tuples — both rendered `a=1/b=2/b=3` before R161.
     let x = two_field.partition_to_path(
         &Struct::from_iter([Some(Literal::string("1/b=2")), Some(Literal::string("3"))]),
         schema.clone(),
@@ -767,8 +673,6 @@ fn two_distinct_tuples_can_no_longer_collide_on_one_directory() {
         &Struct::from_iter([Some(Literal::string("1")), Some(Literal::string("2/b=3"))]),
         schema.clone(),
     );
-    // Injectivity FIRST, so a regression's failure message displays the collision itself
-    // rather than a byte mismatch on one side of it.
     assert_ne!(
         x, y,
         "two distinct partition tuples of ONE spec must never share a directory"
@@ -776,8 +680,6 @@ fn two_distinct_tuples_can_no_longer_collide_on_one_directory() {
     assert_eq!(x, "a=1%2Fb%3D2/b=3");
     assert_eq!(y, "a=1/b=2%2Fb%3D3");
 
-    // Cross-arity: a 1-field spec and a 2-field spec of the same evolving table — both
-    // rendered `a=1/b=2` before R161.
     let one_field = PartitionSpec::builder(schema.clone())
         .add_partition_field("a", "a", Transform::Identity)
         .expect("identity(a) is legal")
