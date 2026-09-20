@@ -249,3 +249,19 @@ serialized `truncate[3]` JSON assertion that was already there.
 | `./scripts/check_rust_file_size.sh` | 572 files clean (92 legacy ceilings) |
 | `typos` on touched files | clean |
 | `python3 comment_ban.py` vs `origin/main` | `comment-ban hits=0` before every commit |
+
+### Q-25d-2 — the width bound, measured (orchestrator)
+
+The logic critic's L-001 and the verification critic's V-02 both claimed Spark refuses a bucket width at or above
+`Integer.MAX_VALUE`. Measured instead of recalled (`check_width_bound.py` in the run-25d Spark write-order oracle,
+Spark 4.1.2 + Iceberg 1.11.0):
+
+| width | Spark |
+|---|---|
+| `bucket(0, id)` | refused, "Unsupported width for transform: bucket(0, id)" |
+| `bucket(1, id)` | accepted |
+| `bucket(2147483647, id)` | **accepted**, order `bucket[2147483647]` |
+| `bucket(2147483648, id)` | refused, "Unsupported width for transform: bucket(2147483648, id)" |
+
+The action's boundary (refuse 0 and anything above `i32::MAX`) is already Java's, so the finding is REFUTED and no
+code changed; the round-2 pins carry the measured boundary.
