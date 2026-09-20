@@ -51,7 +51,7 @@ impl IcebergStaticTableProvider {
         Ok(IcebergStaticTableProvider {
             table,
             snapshot_id: None,
-            project_current_schema: false,
+            project_current_schema: true,
             schema,
         })
     }

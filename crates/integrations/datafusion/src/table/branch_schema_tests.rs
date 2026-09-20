@@ -19,9 +19,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use datafusion::catalog::TableProviderFactory;
+use datafusion::common::{Constraints, DFSchema};
 use datafusion::datasource::TableProvider;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::logical_expr::CreateExternalTable;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
+use datafusion::sql::TableReference;
+use futures::TryStreamExt;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
     FormatVersion, NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
@@ -31,6 +37,7 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
 use tempfile::TempDir;
 
+use super::table_provider_factory::IcebergTableProviderFactory;
 use super::tests::{SchemaOp, evolve_schema};
 use super::{IcebergStaticTableProvider, IcebergTableProvider};
 use crate::physical_plan::scan::IcebergTableScan;
@@ -52,7 +59,7 @@ async fn setup_table(
     schema: Schema,
     properties: HashMap<String, String>,
 ) -> (Arc<dyn Catalog>, NamespaceIdent, TableIdent, TempDir) {
-    setup_table_partitioned(version, schema, properties, None).await
+    setup_table_partitioned(version, schema, properties, None, false).await
 }
 
 async fn setup_table_partitioned(
@@ -60,10 +67,16 @@ async fn setup_table_partitioned(
     schema: Schema,
     properties: HashMap<String, String>,
     partition_spec: Option<UnboundPartitionSpec>,
+    local_fs: bool,
 ) -> (Arc<dyn Catalog>, NamespaceIdent, TableIdent, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
-    let catalog = MemoryCatalogBuilder::default()
+    let mut catalog_builder = MemoryCatalogBuilder::default();
+    if local_fs {
+        catalog_builder =
+            catalog_builder.with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory));
+    }
+    let catalog = catalog_builder
         .load(
             "memory",
             HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
@@ -289,10 +302,28 @@ async fn bs_add_version_v3() {
 async fn bs_add_version(version: FormatVersion) {
     let (catalog, ident, _tmp, _seed_snap) = branch_add_setup(version).await;
     let table = load(&catalog, &ident).await;
-    let provider = provider_for_ref(&table, "b0").await;
-    let (cols, rows) = run_query(Arc::new(provider), "SELECT * FROM t").await;
+    let batches: Vec<RecordBatch> = table
+        .scan()
+        .use_ref("b0")
+        .project_current_schema()
+        .build()
+        .expect("the core use_ref branch scan builds")
+        .to_arrow()
+        .await
+        .expect("the branch ref scan streams")
+        .try_collect()
+        .await
+        .expect("collect the branch ref batches");
+    let cols: Vec<String> = batches
+        .first()
+        .expect("a seeded branch scan emits a batch")
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| format!("{}:{:?}", field.name(), field.data_type()))
+        .collect();
     assert_shape(&cols, &["id:Int64", "data:Utf8", "cat:Utf8", "z:Int32"]);
-    assert_rows(rows, &["1|a|x|NULL", "2|b|y|NULL"]);
+    assert_rows(rows_as_strings(&batches), &["1|a|x|NULL", "2|b|y|NULL"]);
 }
 
 #[tokio::test]
@@ -634,6 +665,7 @@ async fn bs_partitioned_branch(version: FormatVersion) {
         cell_schema(PrimitiveType::Long),
         HashMap::new(),
         Some(partition_spec),
+        false,
     )
     .await;
     seed_two(&catalog, &namespace, ident.name(), None).await;
@@ -674,4 +706,153 @@ async fn bs_writable_provider_branch(version: FormatVersion) {
     let (cols, rows) = run_query(Arc::new(provider), "SELECT * FROM t").await;
     assert_shape(&cols, &["id:Int64", "data:Utf8", "cat:Utf8", "z:Int32"]);
     assert_rows(rows, &["1|a|x|NULL", "2|b|y|NULL"]);
+}
+
+async fn rename_current_table(
+    version: FormatVersion,
+    local_fs: bool,
+) -> (Arc<dyn Catalog>, NamespaceIdent, TableIdent, TempDir) {
+    let (catalog, namespace, ident, temp_dir) = setup_table_partitioned(
+        version,
+        cell_schema(PrimitiveType::Long),
+        HashMap::new(),
+        None,
+        local_fs,
+    )
+    .await;
+    seed_two(&catalog, &namespace, ident.name(), None).await;
+    evolve_schema(&catalog, &ident, SchemaOp::Rename("data", "payload")).await;
+    (catalog, namespace, ident, temp_dir)
+}
+
+#[tokio::test]
+async fn bs_current_rename_static_v2() {
+    bs_current_rename_static(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn bs_current_rename_static_v3() {
+    bs_current_rename_static(FormatVersion::V3).await;
+}
+
+async fn bs_current_rename_static(version: FormatVersion) {
+    let (catalog, _ns, ident, _tmp) = rename_current_table(version, false).await;
+    let table = load(&catalog, &ident).await;
+    let provider = IcebergStaticTableProvider::try_new_from_table(table)
+        .await
+        .expect("current-table provider");
+    let (cols, rows) = run_query(Arc::new(provider), "SELECT * FROM t").await;
+    assert_shape(&cols, &["id:Int64", "payload:Utf8", "cat:Utf8"]);
+    assert_rows(rows, &["1|a|x", "2|b|y"]);
+}
+
+#[tokio::test]
+async fn bs_current_rename_factory_v2() {
+    bs_current_rename_factory(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn bs_current_rename_factory_v3() {
+    bs_current_rename_factory(FormatVersion::V3).await;
+}
+
+async fn bs_current_rename_factory(version: FormatVersion) {
+    let (catalog, _ns, ident, _tmp) = rename_current_table(version, true).await;
+    let table = load(&catalog, &ident).await;
+    let metadata_location = table
+        .metadata_location()
+        .expect("the loaded table knows its metadata file");
+    let cmd = CreateExternalTable {
+        name: TableReference::partial(ident.namespace().to_string(), ident.name()),
+        location: metadata_location.to_string(),
+        schema: Arc::new(DFSchema::empty()),
+        file_type: "iceberg".to_string(),
+        options: Default::default(),
+        table_partition_cols: Default::default(),
+        order_exprs: Default::default(),
+        constraints: Constraints::default(),
+        column_defaults: Default::default(),
+        if_not_exists: Default::default(),
+        or_replace: false,
+        temporary: false,
+        definition: Default::default(),
+        unbounded: Default::default(),
+    };
+    let state = SessionStateBuilder::new().build();
+    let provider = IcebergTableProviderFactory::new()
+        .create(&state, &cmd)
+        .await
+        .expect("the factory creates the external-table provider");
+    let (cols, rows) = run_query(provider, "SELECT * FROM t").await;
+    assert_shape(&cols, &["id:Int64", "payload:Utf8", "cat:Utf8"]);
+    assert_rows(rows, &["1|a|x", "2|b|y"]);
+}
+
+#[tokio::test]
+async fn bs_current_rename_writable_v2() {
+    bs_current_rename_writable(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn bs_current_rename_writable_v3() {
+    bs_current_rename_writable(FormatVersion::V3).await;
+}
+
+async fn bs_current_rename_writable(version: FormatVersion) {
+    let (catalog, namespace, ident, _tmp) = rename_current_table(version, false).await;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), ident.name().to_string())
+            .await
+            .expect("writable provider on the renamed table");
+    let (cols, rows) = run_query(Arc::new(provider), "SELECT * FROM t").await;
+    assert_shape(&cols, &["id:Int64", "payload:Utf8", "cat:Utf8"]);
+    assert_rows(rows, &["1|a|x", "2|b|y"]);
+}
+
+#[tokio::test]
+async fn bs_current_drop_static_v2() {
+    bs_current_drop_static(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn bs_current_drop_static_v3() {
+    bs_current_drop_static(FormatVersion::V3).await;
+}
+
+async fn bs_current_drop_static(version: FormatVersion) {
+    let (catalog, namespace, ident, _tmp) =
+        setup_table(version, cell_schema(PrimitiveType::Long), HashMap::new()).await;
+    seed_two(&catalog, &namespace, ident.name(), None).await;
+    evolve_schema(&catalog, &ident, SchemaOp::Drop("data")).await;
+    let table = load(&catalog, &ident).await;
+    let provider = IcebergStaticTableProvider::try_new_from_table(table)
+        .await
+        .expect("current-table provider");
+    let (cols, rows) = run_query(Arc::new(provider), "SELECT * FROM t").await;
+    assert_shape(&cols, &["id:Int64", "cat:Utf8"]);
+    assert_rows(rows, &["1|x", "2|y"]);
+}
+
+#[tokio::test]
+async fn bs_current_widen_static_v2() {
+    bs_current_widen_static(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn bs_current_widen_static_v3() {
+    bs_current_widen_static(FormatVersion::V3).await;
+}
+
+async fn bs_current_widen_static(version: FormatVersion) {
+    let (catalog, namespace, ident, _tmp) =
+        setup_table(version, cell_schema(PrimitiveType::Int), HashMap::new()).await;
+    seed_two(&catalog, &namespace, ident.name(), None).await;
+    evolve_schema(&catalog, &ident, SchemaOp::PromoteToLong("id")).await;
+    let table = load(&catalog, &ident).await;
+    let provider = IcebergStaticTableProvider::try_new_from_table(table)
+        .await
+        .expect("current-table provider");
+    let (cols, rows) = run_query(Arc::new(provider), "SELECT * FROM t").await;
+    assert_shape(&cols, &["id:Int64", "data:Utf8", "cat:Utf8"]);
+    assert_rows(rows, &["1|a|x", "2|b|y"]);
 }
