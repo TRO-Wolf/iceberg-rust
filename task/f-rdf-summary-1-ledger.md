@@ -197,18 +197,30 @@ Round-2 mutations (run on `b03bdab2`):
   `append_commits_stamp_manifest_counts` red — `missing summary key 'manifests-created'` on the
   append summary. Both restored after the run; the suite re-verified 16/16 green.
 
+## Round 3 — review findings (Grok logic + Rust-perf critic, PASS with four P3s)
+
+| ID | Finding | Disposition | Evidence |
+|---|---|---|---|
+| R-01 | `write_added_manifests`/`write_added_delete_manifests` deep-cloned `Vec<DataFile>` every commit; the post-`manifest_file` summary recompute was redundant because `process_deletes` finishes growing `removed_delete_files` before the added manifests are written | FIXED in `7af11bb1` | `manifest_file` split into `filter_existing_manifests` (existing manifests + `process_deletes`; extends `removed_delete_files`) and `write_and_process_manifests` (writes added manifests, assembles order, merge pass). `commit` computes `summary()` ONCE between them — added vectors full, removed set final — and the writers `mem::take` the added vectors. Follow-up `392c7e7e`: the record-count validation runs on a pre-filter summary because a refused commit must write zero objects (the `replace_record_count` no-orphan pin); `added-records`/`deleted-records` derive only from the added data files and resolved removed data files, which `process_deletes` cannot change, so the early check is identical to Java's post-`apply()` check. Mutation: sliced the added loops out of `summary()` (`added_data_files[0..0]`, `added_delete_files[0..0]`) → `rdf_replace_summary_counts_added_files_and_live_totals` red, `missing summary key 'added-data-files'`; restored, 17/17 green. The step-1 repro pin doubles as the GC-growth pin: it asserts `removed-delete-files=2` (the seq-GC grew the removed set during the filter phase) AND the full added-*/total-* invariants |
+| L-01 | Pins asserted the key set for RDF/RPD but not the count values | FIXED in `cea08f3b` | `rdf_replace_summary_counts_added_files_and_live_totals` now asserts `manifests-created=7, manifests-kept=1, manifests-replaced=6` (measured; oracle `merges_rdf_only` shows Spark `6/1/5` — divergence is in the SEED: the fork's `RowDelta` commits do not `removeDeletes`, so three accumulated position-delete manifests ride into the rewrite where Spark's MoR seed carries two — a seed divergence, not a counting divergence). `rdf_v3_dv_replace_summary_reports_removed_dvs` asserts `3/0/2`, matching oracle `v3_dv_rdf` |
+| L-02 | Two pins stay green under the clone-revert mutation because their removals resolve before `manifest_file` | ACCEPTED | Recorded as expected: `rdf_v3_dv` DVs are removed via the targeted `plan_dv_removal` set resolved BEFORE `summary()`, so the post-manifest GC path is not what makes them visible |
+| L-03 | `manifests-created`/`-kept` used `insert` while `manifests-replaced` used `or_insert` — a caller's `set_snapshot_properties("manifests-created", …)` was overwritten while `manifests-replaced` survived | FIXED in `7af11bb1` | One rule: computed counters always win — all three keys stamped with `insert`. This IS what Java does: `set()` writes user props into `SnapshotSummary.Builder.properties`, then `summaryBuilder.merge(buildManifestCountSummary(...))` does `properties.putAll`, overwriting them; for `BaseRewriteManifests` the action's own `set()` calls during `apply` are the last writes to that map, so action-computed wins there too. Fork mechanics: `RewriteManifestsOperation` carries `(created, kept, replaced)` through the new `SnapshotProduceOperation::manifest_counts()` hook — its action-level `replaced` (rewritten+deleted) is authoritative and would be clobbered by the generic `filter+merge` count (0 for RM); `entries-processed` stays on the properties channel. Pin: `user_set_manifest_counts_are_overwritten_by_computed` — a `fast_append` seeded with `manifests-*=999` commits `1/0/0` |
+
 ## Gates
+
+Round 3 (on the round-3 head):
 
 - `cargo fmt --all` — clean
 - `cargo clippy -p iceberg --all-targets -- -D warnings` — clean
-- `cargo test -p iceberg --lib replace_commit_summary` — 16 passed
+- `cargo test -p iceberg --lib replace_commit_summary` — 17 passed
 - `cargo test -p iceberg --lib snapshot_summary` — 16 passed
-- `cargo test -p iceberg --lib rewrite_` — 319 passed
-- `cargo test -p iceberg --lib replace_record_count` — 5 passed
+- `cargo test -p iceberg --lib rewrite_` — 322 passed
 - `cargo test -p iceberg --lib append` — 116 passed
 - `cargo test -p iceberg --lib row_delta` — 123 passed
 - `cargo test -p iceberg --lib overwrite` — 76 passed
-- `cargo test -p iceberg --lib delete_files` — 222 passed
+- `cargo test -p iceberg --lib delete_files` — 224 passed
+- `cargo test -p iceberg --lib merge_append` — 24 passed
+- `cargo test -p iceberg --lib replace_record_count` — 5 passed
 - the lane's comment-ban gate against `origin/main` — `comment-ban hits=0` after every commit
 
 Key-set tests updated for the universal stamping (round-2 brief step 4):
@@ -226,7 +238,10 @@ Key-set tests updated for the universal stamping (round-2 brief step 4):
   merge/filter operations was refuted by `rdf_summary_truth.json` (`appends_rm_rdf`,
   `merges_rdf_only`).
 - `entries-processed` remains a `RewriteManifests`-only key, matching Java.
-- `manifests-replaced` for `RewriteManifests` counts action-level rewritten+deleted manifests
-  (its own `extend_snapshot_properties` values win via `or_insert`); for all other commits it is
-  the Java `filter + merge` sum — filter-rewritten manifests from `process_deletes` plus
+- `manifests-replaced` for `RewriteManifests` counts action-level rewritten+deleted manifests,
+  reported through `SnapshotProduceOperation::manifest_counts()` (round 3); for all other commits
+  it is the Java `filter + merge` sum — filter-rewritten manifests from `process_deletes` plus
   carried-source manifests consumed by `MergeManifestProcess` bins.
+- The computed `manifests-*` counters overwrite any earlier-set snapshot property of the same name
+  (`insert` for all three — Java `Builder.merge` `properties.putAll` semantics); a user `set()` on
+  those keys never survives, matching Java.
