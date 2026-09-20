@@ -274,11 +274,11 @@ fn partition_literal(
         return Err(unsupported_partition_type(field_type, field_name));
     };
     let literal = match primitive {
-        PrimitiveType::Boolean => Literal::bool_from_str(raw)?,
+        PrimitiveType::Boolean => Literal::bool(raw.eq_ignore_ascii_case("true")),
         PrimitiveType::Int => Literal::int(parse_partition_value::<i32>(raw, field_name)?),
         PrimitiveType::Long => Literal::long(parse_partition_value::<i64>(raw, field_name)?),
-        PrimitiveType::Float => Literal::float(parse_partition_value::<f32>(raw, field_name)?),
-        PrimitiveType::Double => Literal::double(parse_partition_value::<f64>(raw, field_name)?),
+        PrimitiveType::Float => Literal::float(parse_java_floating::<f32>(raw, field_name)?),
+        PrimitiveType::Double => Literal::double(parse_java_floating::<f64>(raw, field_name)?),
         PrimitiveType::String => Literal::string(raw),
         PrimitiveType::Uuid => Literal::uuid_from_str(raw)?,
         PrimitiveType::Fixed(length) => {
@@ -294,13 +294,42 @@ fn partition_literal(
     Ok(Some(literal))
 }
 
+fn parse_java_floating<T: std::str::FromStr>(raw: &str, field_name: &str) -> Result<T> {
+    let trimmed = raw.trim_matches(|character: char| character <= ' ');
+    let body = trimmed
+        .strip_suffix(['f', 'F', 'd', 'D'].as_slice())
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(trimmed);
+    let (sign, magnitude) = match body.strip_prefix(['+', '-'].as_slice()) {
+        Some(rest) => (&body[..1], rest),
+        None => ("", body),
+    };
+    let candidate = match magnitude {
+        "NaN" => format!("{sign}NaN"),
+        "Infinity" => format!("{sign}inf"),
+        _ if magnitude
+            .bytes()
+            .any(|byte| byte.is_ascii_alphabetic() && byte != b'e' && byte != b'E') =>
+        {
+            return Err(unparsable_partition_value(raw, field_name));
+        }
+        _ => body.to_string(),
+    };
+    candidate
+        .parse::<T>()
+        .map_err(|_| unparsable_partition_value(raw, field_name))
+}
+
 fn parse_partition_value<T: std::str::FromStr>(raw: &str, field_name: &str) -> Result<T> {
-    raw.parse::<T>().map_err(|_| {
-        Error::new(
-            ErrorKind::DataInvalid,
-            format!("Cannot parse the partition value '{raw}' of column {field_name}"),
-        )
-    })
+    raw.parse::<T>()
+        .map_err(|_| unparsable_partition_value(raw, field_name))
+}
+
+fn unparsable_partition_value(raw: &str, field_name: &str) -> Error {
+    Error::new(
+        ErrorKind::DataInvalid,
+        format!("Cannot parse the partition value '{raw}' of column {field_name}"),
+    )
 }
 
 fn unsupported_partition_type(field_type: &Type, field_name: &str) -> Error {

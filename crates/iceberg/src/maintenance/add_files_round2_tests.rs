@@ -24,14 +24,22 @@ use bytes::Bytes;
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use tempfile::TempDir;
 
-use super::add_files::{AddFiles, AddFilesResult, AddFilesSource};
+use super::add_files::{
+    AddFiles, AddFilesEntry, AddFilesResult, AddFilesSource, find_compatible_spec,
+    validate_partition_filter,
+};
 use super::add_files_datafile::unescape_hive_path_name;
 use super::add_files_tests::{
-    create_table, id_v_cat_schema, id_v_schema, live_data_files, local_fs_catalog, long_column,
-    scan_id_v, source_root, string_column, write_source_file,
+    create_table, flat_source, id_v_cat_schema, id_v_schema, live_data_files, local_fs_catalog,
+    long_column, scan_id_v, source_root, string_column, write_source_file,
 };
-use crate::spec::{Datum, FormatVersion, Literal};
+use crate::spec::{
+    DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal, NestedField,
+    PartitionSpec, PartitionSpecRef, PrimitiveLiteral, PrimitiveType, Schema, Struct,
+    TableMetadataBuilder, Transform, Type, UnboundPartitionSpec,
+};
 use crate::table::Table;
+use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::{Catalog, ErrorKind, Result};
 
 #[test]
@@ -318,4 +326,361 @@ async fn an_id_less_source_adopts_and_scans_back_its_rows() {
     let files = live_data_files(&table).await;
     assert_eq!(files[0].lower_bounds().get(&1), Some(&Datum::long(10)));
     assert_eq!(files[0].lower_bounds().get(&2), Some(&Datum::string("p")));
+}
+
+fn id_typed_schema(column: &str, column_type: PrimitiveType) -> Schema {
+    Schema::builder()
+        .with_fields(vec![
+            Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                column,
+                Type::Primitive(column_type),
+            )),
+        ])
+        .build()
+        .expect("build a typed partition schema")
+}
+
+async fn adopt_typed_dirs(
+    name: &str,
+    column: &str,
+    column_type: PrimitiveType,
+    dirs: &[&str],
+) -> (TempDir, Result<Vec<(String, Option<Literal>)>>) {
+    let (catalog, temp_dir) = local_fs_catalog().await;
+    let table = create_table(
+        &catalog,
+        id_typed_schema(column, column_type),
+        Some(column),
+        FormatVersion::V2,
+    )
+    .await;
+    let root = source_root(&temp_dir, name);
+    for (index, dir) in dirs.iter().enumerate() {
+        write_source_file(&table, &format!("{root}/{dir}/part-00000.parquet"), &[(
+            "id",
+            long_column(&[index as i64]),
+        )])
+        .await;
+    }
+    let outcome = AddFiles::new(table.clone(), AddFilesSource::Directory(root.clone()))
+        .execute(&catalog)
+        .await;
+    let adopted = match outcome {
+        Err(error) => return (temp_dir, Err(error)),
+        Ok(_) => {
+            let table = catalog
+                .load_table(table.identifier())
+                .await
+                .expect("reload table");
+            live_data_files(&table)
+                .await
+                .into_iter()
+                .map(|file| {
+                    let directory = file
+                        .file_path()
+                        .strip_prefix(&format!("{root}/"))
+                        .and_then(|rest| rest.split('/').next())
+                        .expect("the adopted path stays under the source root")
+                        .to_string();
+                    (directory, file.partition().iter().next().flatten().cloned())
+                })
+                .collect()
+        }
+    };
+    (temp_dir, Ok(adopted))
+}
+
+#[tokio::test]
+async fn a_boolean_hive_value_follows_java_s_boolean_value_of() {
+    let (_temp_dir, adopted) =
+        adopt_typed_dirs("boolean-values", "flag", PrimitiveType::Boolean, &[
+            "flag=true",
+            "flag=TRUE",
+            "flag=True",
+            "flag=tRuE",
+            "flag=false",
+            "flag=FALSE",
+            "flag=yes",
+            "flag=1",
+            "flag= true",
+        ])
+        .await;
+    let adopted: HashMap<String, Option<Literal>> = adopted
+        .expect("Boolean.valueOf never refuses a string")
+        .into_iter()
+        .collect();
+    for (directory, expected) in [
+        ("flag=true", true),
+        ("flag=TRUE", true),
+        ("flag=True", true),
+        ("flag=tRuE", true),
+        ("flag=false", false),
+        ("flag=FALSE", false),
+        ("flag=yes", false),
+        ("flag=1", false),
+        ("flag= true", false),
+    ] {
+        assert_eq!(
+            adopted.get(directory),
+            Some(&Some(Literal::bool(expected))),
+            "Conversions.fromPartitionString(BooleanType, ...) is Boolean.valueOf: {directory}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_float_hive_value_follows_java_s_float_value_of() {
+    let (_temp_dir, adopted) = adopt_typed_dirs("float-values", "f", PrimitiveType::Float, &[
+        "f=1.5", "f=1.5f", "f=1.5D", "f=+1.5", "f= 1.5", "f=1.", "f=.5", "f=1e5",
+    ])
+    .await;
+    let adopted: HashMap<String, Option<Literal>> = adopted
+        .expect("every form Java accepts")
+        .into_iter()
+        .collect();
+    for (directory, expected) in [
+        ("f=1.5", 1.5f32),
+        ("f=1.5f", 1.5),
+        ("f=1.5D", 1.5),
+        ("f=+1.5", 1.5),
+        ("f= 1.5", 1.5),
+        ("f=1.", 1.0),
+        ("f=.5", 0.5),
+        ("f=1e5", 100000.0),
+    ] {
+        assert_eq!(
+            adopted.get(directory),
+            Some(&Some(Literal::float(expected))),
+            "Float.valueOf trims, takes an f/F/d/D suffix, and parses the rest: {directory}"
+        );
+    }
+
+    let (_temp_dir, adopted) = adopt_typed_dirs("float-nan", "f", PrimitiveType::Float, &[
+        "f=NaN",
+        "f=Infinity",
+        "f=-Infinity",
+    ])
+    .await;
+    let adopted: HashMap<String, Option<Literal>> = adopted
+        .expect("Java's exact NaN/Infinity spellings")
+        .into_iter()
+        .collect();
+    assert_eq!(
+        adopted.get("f=Infinity"),
+        Some(&Some(Literal::float(f32::INFINITY)))
+    );
+    assert_eq!(
+        adopted.get("f=-Infinity"),
+        Some(&Some(Literal::float(f32::NEG_INFINITY)))
+    );
+    assert!(
+        matches!(
+            adopted.get("f=NaN"),
+            Some(Some(Literal::Primitive(PrimitiveLiteral::Float(value)))) if value.is_nan()
+        ),
+        "NaN is the only spelling Float.valueOf accepts"
+    );
+
+    for spelling in [
+        "f=nan",
+        "f=NAN",
+        "f=inf",
+        "f=infinity",
+        "f=INFINITY",
+        "f=0x1p3",
+    ] {
+        let (_temp_dir, adopted) =
+            adopt_typed_dirs("float-refused", "f", PrimitiveType::Float, &[spelling]).await;
+        let error = adopted.expect_err("a spelling Float.valueOf rejects");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("Cannot parse the partition value"),
+            "{spelling}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_path_already_referenced_by_a_delete_file_is_a_duplicate() {
+    let (catalog, temp_dir) = local_fs_catalog().await;
+    let table = create_table(&catalog, id_v_schema(), None, FormatVersion::V2).await;
+    let root = source_root(&temp_dir, "delete-duplicate");
+    flat_source(&table, &root).await;
+    AddFiles::new(table.clone(), AddFilesSource::Directory(root.clone()))
+        .execute(&catalog)
+        .await
+        .expect("seed the target with one adopted file");
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload table");
+
+    let delete_path = format!("{root}/deletes-00000.parquet");
+    write_source_file(&table, &delete_path, &[("id", long_column(&[0]))]).await;
+    let mut builder = DataFileBuilder::default();
+    builder
+        .content(DataContentType::PositionDeletes)
+        .file_path(delete_path.clone())
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(64)
+        .record_count(1)
+        .partition_spec_id(0)
+        .partition(Struct::empty());
+    let delete_file = builder.build().expect("build a position delete entry");
+    let transaction = Transaction::new(&table);
+    let action = transaction.row_delta().add_deletes(vec![delete_file]);
+    let transaction = action.apply(transaction).expect("apply the row delta");
+    let table = transaction
+        .commit(&catalog)
+        .await
+        .expect("commit the delete file");
+
+    let error = AddFiles::new(
+        table,
+        AddFilesSource::Files(vec![AddFilesEntry::new(delete_path.clone())]),
+    )
+    .execute(&catalog)
+    .await
+    .expect_err("Java joins against ENTRIES, which spans the DELETE manifests too");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert!(
+        error
+            .message()
+            .contains("Cannot complete import because data files to be imported already exist"),
+        "{error}"
+    );
+    assert!(error.message().contains(&delete_path), "{error}");
+}
+
+fn all_identity_spec(spec_id: i32, field_name: &str) -> UnboundPartitionSpec {
+    UnboundPartitionSpec::builder()
+        .with_spec_id(spec_id)
+        .add_partition_field(3, field_name, Transform::Identity)
+        .expect("add an identity partition field")
+        .build()
+}
+
+fn with_extra_specs(table: &Table, specs: Vec<UnboundPartitionSpec>) -> Table {
+    let mut builder = TableMetadataBuilder::new_from_metadata(
+        table.metadata().clone(),
+        table.metadata_location().map(str::to_string),
+    );
+    for spec in specs {
+        builder = builder
+            .add_partition_spec(spec)
+            .expect("add a partition spec");
+    }
+    let metadata = builder
+        .build()
+        .expect("rebuild the table metadata")
+        .metadata;
+    Table::builder()
+        .metadata(metadata)
+        .identifier(table.identifier().clone())
+        .file_io(table.file_io().clone())
+        .build()
+        .expect("rebuild the table")
+}
+
+#[tokio::test]
+async fn the_lowest_spec_id_wins_when_several_specs_match() {
+    let (catalog, _temp_dir) = local_fs_catalog().await;
+    let table = create_table(&catalog, id_v_cat_schema(), Some("cat"), FormatVersion::V2).await;
+    let equivalents: Vec<UnboundPartitionSpec> = ["cAt", "caT", "cAT", "Cat", "CAt", "CaT", "CAT"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| all_identity_spec(7 + index as i32, name))
+        .collect();
+    let table = with_extra_specs(&table, equivalents);
+    assert_eq!(
+        table.metadata().partition_specs_iter().len(),
+        8,
+        "eight distinct specs whose field names all lowercase to 'cat'"
+    );
+    let chosen = find_compatible_spec(&["cat".to_string()], &table).expect("a matching spec");
+    let lowest = table
+        .metadata()
+        .partition_specs_iter()
+        .filter(|spec| {
+            spec.fields()
+                .iter()
+                .all(|field| field.transform == Transform::Identity)
+                && spec
+                    .fields()
+                    .iter()
+                    .map(|field| field.name.to_lowercase())
+                    .eq(["cat".to_string()])
+        })
+        .map(|spec| spec.spec_id())
+        .min()
+        .expect("at least one matching spec");
+    assert_eq!(
+        chosen.spec_id(),
+        lowest,
+        "Java walks table.specs() in metadata list order; the fork walks it by ascending spec id"
+    );
+}
+
+#[tokio::test]
+async fn a_table_whose_only_matching_spec_is_void_is_refused() {
+    let (catalog, temp_dir) = local_fs_catalog().await;
+    let table = create_table(&catalog, id_v_cat_schema(), Some("cat"), FormatVersion::V2).await;
+    let void = UnboundPartitionSpec::builder()
+        .with_spec_id(7)
+        .add_partition_field(3, "cat_void", Transform::Void)
+        .expect("add a void partition field")
+        .build();
+    let table = with_extra_specs(&table, vec![void]);
+    let root = source_root(&temp_dir, "void-spec");
+    write_source_file(&table, &format!("{root}/part-00000.parquet"), &[
+        ("id", long_column(&[1])),
+        ("v", string_column(&["a"])),
+    ])
+    .await;
+
+    let error = AddFiles::new(table, AddFilesSource::Directory(root))
+        .execute(&catalog)
+        .await
+        .expect_err("oracle cell F: a void spec is not an identity spec");
+    assert!(
+        error
+            .message()
+            .contains("that matches the partition columns ([]) in input table"),
+        "Java's message for an unpartitioned source over a void-spec table: {error}"
+    );
+}
+
+#[test]
+fn a_partition_filter_over_an_all_void_spec_is_refused_as_unpartitioned() {
+    let schema = id_v_cat_schema();
+    let spec: PartitionSpecRef = Arc::new(
+        PartitionSpec::builder(schema)
+            .with_spec_id(7)
+            .add_partition_field("cat", "cat_void", Transform::Void)
+            .expect("add a void partition field")
+            .build()
+            .expect("build the void spec"),
+    );
+    assert!(
+        spec.is_unpartitioned(),
+        "Java PartitionSpec.isUnpartitioned(): every field is void"
+    );
+    let error = validate_partition_filter(
+        &spec,
+        &HashMap::from([("cat".to_string(), "x".to_string())]),
+        "ns.t",
+    )
+    .expect_err("oracle cell E: a void spec takes the unpartitioned refusal");
+    assert_eq!(
+        error.message(),
+        "Cannot use partition filter with an unpartitioned table ns.t"
+    );
+    validate_partition_filter(&spec, &HashMap::new(), "ns.t")
+        .expect("an empty filter over a void spec is accepted");
 }

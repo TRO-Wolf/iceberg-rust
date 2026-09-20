@@ -842,7 +842,7 @@ async fn a_source_whose_partition_columns_match_no_spec_is_refused() {
     assert!(
         error
             .to_string()
-            .contains("that matches the partition columns (dept) in input table"),
+            .contains("that matches the partition columns ([dept]) in input table"),
         "Java SparkTableUtil.findCompatibleSpec: {error}"
     );
 }

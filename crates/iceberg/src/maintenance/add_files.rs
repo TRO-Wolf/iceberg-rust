@@ -23,8 +23,8 @@ use futures::{StreamExt, TryStreamExt, stream};
 use super::add_files_datafile::{AdoptionContext, adopt_parquet_file, unescape_hive_path_name};
 use crate::scan::context::parse_name_mapping;
 use crate::spec::{
-    DEFAULT_SCHEMA_NAME_MAPPING, DataFile, ManifestContentType, MetricsConfig, PartitionSpecRef,
-    Transform, create_name_mapping,
+    DEFAULT_SCHEMA_NAME_MAPPING, DataFile, MetricsConfig, PartitionSpecRef, Transform,
+    create_name_mapping,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -349,12 +349,17 @@ fn partition_names_of(files: &[SourceFile]) -> Result<Vec<String>> {
     Ok(names.unwrap_or_default())
 }
 
-fn find_compatible_spec(partition_names: &[String], table: &Table) -> Result<PartitionSpecRef> {
+pub(super) fn find_compatible_spec(
+    partition_names: &[String],
+    table: &Table,
+) -> Result<PartitionSpecRef> {
     let wanted: Vec<String> = partition_names
         .iter()
         .map(|name| name.to_lowercase())
         .collect();
-    for spec in table.metadata().partition_specs_iter() {
+    let mut specs: Vec<&PartitionSpecRef> = table.metadata().partition_specs_iter().collect();
+    specs.sort_by_key(|spec| spec.spec_id());
+    for spec in specs {
         if !spec
             .fields()
             .iter()
@@ -374,20 +379,19 @@ fn find_compatible_spec(partition_names: &[String], table: &Table) -> Result<Par
     Err(Error::new(
         ErrorKind::DataInvalid,
         format!(
-            "Cannot find a partition spec in Iceberg table {} that matches the partition columns ({}) in input table",
+            "Cannot find a partition spec in Iceberg table {} that matches the partition columns ([{}]) in input table",
             table.identifier(),
             partition_names.join(", ")
         ),
     ))
 }
 
-fn validate_partition_filter(
+pub(super) fn validate_partition_filter(
     spec: &PartitionSpecRef,
     partition_filter: &HashMap<String, String>,
     table_name: &str,
 ) -> Result<()> {
-    let partitioned = !spec.fields().is_empty();
-    if !partitioned {
+    if spec.is_unpartitioned() {
         if partition_filter.is_empty() {
             return Ok(());
         }
@@ -455,7 +459,7 @@ fn filter_partitions(
 }
 
 async fn refuse_duplicates(table: &Table, files: &[SourceFile]) -> Result<()> {
-    let live = live_data_file_paths(table).await?;
+    let live = live_entry_paths(table).await?;
     let mut duplicates: Vec<&str> = files
         .iter()
         .map(|file| file.path.as_str())
@@ -475,7 +479,7 @@ async fn refuse_duplicates(table: &Table, files: &[SourceFile]) -> Result<()> {
     ))
 }
 
-async fn live_data_file_paths(table: &Table) -> Result<HashSet<String>> {
+async fn live_entry_paths(table: &Table) -> Result<HashSet<String>> {
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
         return Ok(HashSet::new());
@@ -485,9 +489,6 @@ async fn live_data_file_paths(table: &Table) -> Result<HashSet<String>> {
         .await?;
     let mut paths = HashSet::new();
     for manifest_file in manifest_list.entries() {
-        if manifest_file.content != ManifestContentType::Data {
-            continue;
-        }
         let manifest = manifest_file.load_manifest(table.file_io()).await?;
         for entry in manifest.entries() {
             if entry.is_alive() {
