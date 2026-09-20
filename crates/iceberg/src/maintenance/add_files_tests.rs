@@ -99,6 +99,23 @@ async fn create_table(
     partition_by: Option<&str>,
     format_version: FormatVersion,
 ) -> Table {
+    create_table_with_properties(
+        catalog,
+        schema,
+        partition_by,
+        format_version,
+        HashMap::new(),
+    )
+    .await
+}
+
+async fn create_table_with_properties(
+    catalog: &impl Catalog,
+    schema: Schema,
+    partition_by: Option<&str>,
+    format_version: FormatVersion,
+    properties: HashMap<String, String>,
+) -> Table {
     let spec = match partition_by {
         Some(column) => PartitionSpec::builder(schema.clone())
             .with_spec_id(0)
@@ -121,6 +138,7 @@ async fn create_table(
         .name(ident.name().to_string())
         .schema(schema)
         .partition_spec(spec)
+        .properties(properties)
         .format_version(format_version)
         .build();
     catalog
@@ -813,5 +831,63 @@ async fn a_source_whose_partition_columns_match_no_spec_is_refused() {
             .to_string()
             .contains("that matches the partition columns (dept) in input table"),
         "Java SparkTableUtil.findCompatibleSpec: {error}"
+    );
+}
+
+#[tokio::test]
+async fn the_table_metrics_config_decides_the_adopted_bounds() {
+    let (catalog, temp_dir) = local_fs_catalog().await;
+    let counted = create_table(&catalog, id_v_schema(), None, FormatVersion::V2).await;
+    let counted_root = source_root(&temp_dir, "metrics-default");
+    flat_source(&counted, &counted_root).await;
+    AddFiles::new(counted.clone(), AddFilesSource::Directory(counted_root))
+        .execute(&catalog)
+        .await
+        .expect("adopt under the default metrics config");
+    let counted = catalog
+        .load_table(counted.identifier())
+        .await
+        .expect("reload table");
+    let adopted = live_data_files(&counted).await;
+    assert!(
+        !adopted[0].lower_bounds().is_empty(),
+        "the default truncate(16) mode keeps bounds"
+    );
+    assert!(!adopted[0].column_sizes().is_empty());
+
+    let none = create_table_with_properties(
+        &catalog,
+        id_v_schema(),
+        None,
+        FormatVersion::V2,
+        HashMap::from([(
+            "write.metadata.metrics.default".to_string(),
+            "none".to_string(),
+        )]),
+    )
+    .await;
+    let none_root = source_root(&temp_dir, "metrics-none");
+    flat_source(&none, &none_root).await;
+    AddFiles::new(none.clone(), AddFilesSource::Directory(none_root))
+        .execute(&catalog)
+        .await
+        .expect("adopt under metrics mode none");
+    let none = catalog
+        .load_table(none.identifier())
+        .await
+        .expect("reload table");
+    let adopted = live_data_files(&none).await;
+    assert!(
+        adopted[0].lower_bounds().is_empty() && adopted[0].upper_bounds().is_empty(),
+        "MetricsConfig::for_table reads write.metadata.metrics.default"
+    );
+    assert!(
+        adopted[0].column_sizes().is_empty() && adopted[0].value_counts().is_empty(),
+        "mode none persists nothing for the column"
+    );
+    assert_eq!(
+        adopted[0].record_count(),
+        2,
+        "the record count comes from the footer, not the metrics config"
     );
 }
