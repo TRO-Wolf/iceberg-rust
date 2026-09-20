@@ -1726,6 +1726,8 @@ pub(crate) mod tests {
 }
 
 #[cfg(test)]
+mod output_spec_id_tests;
+#[cfg(test)]
 mod transaction_row_lineage_tests;
 
 #[cfg(test)]
