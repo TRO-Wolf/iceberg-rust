@@ -363,7 +363,7 @@ fn container_test_columns(with_ids: bool) -> Vec<(arrow_schema::Field, ArrayRef)
         arrow_schema::Fields::from([a_field, b_field]),
         vec![
             Arc::new(StringArray::from(vec![Some("a1"), None, None, Some("a4")])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![Some(1), None, Some(3), Some(4)])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![Some(1), None, None, Some(4)])) as ArrayRef,
         ],
         Some(arrow_buffer::NullBuffer::from(vec![
             true, false, true, true,
@@ -549,6 +549,11 @@ fn container_oracle_cases() -> Vec<(&'static str, Predicate, Vec<i64>)> {
             1, 3, 4,
         ]),
         ("st.a IS NULL", Reference::new("st.a").is_null(), vec![2, 3]),
+        (
+            "st.a IS NOT NULL",
+            Reference::new("st.a").is_not_null(),
+            vec![1, 4],
+        ),
         (
             "deep.inner IS NULL",
             Reference::new("deep.inner").is_null(),

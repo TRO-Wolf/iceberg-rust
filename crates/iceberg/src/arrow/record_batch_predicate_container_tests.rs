@@ -111,7 +111,7 @@ fn container_truth_batch() -> RecordBatch {
             Arc::new(arrow_array::Int32Array::from(vec![
                 Some(1),
                 None,
-                Some(3),
+                None,
                 Some(4),
             ])) as ArrayRef,
         ],
