@@ -565,17 +565,24 @@ async fn pin_two_fields_1(format_version: FormatVersion) {
     assert_eq!(table.metadata().default_partition_spec().fields().len(), 2);
 
     let spec0 = oracle_file(&table, "os-spec0.parquet", 0, Struct::empty(), 2);
-    let spec1 = oracle_file(
+    let spec1_w = oracle_file(
         &table,
-        "os-spec1.parquet",
+        "os-spec1-w.parquet",
         1,
-        cat_bucket_partition("w", 1),
+        cat_bucket_partition("w", 0),
+        1,
+    );
+    let spec1_x = oracle_file(
+        &table,
+        "os-spec1-x.parquet",
+        1,
+        cat_bucket_partition("x", 1),
         1,
     );
     let tx = Transaction::new(&table);
     let tx = tx
         .fast_append()
-        .add_data_files(vec![spec0, spec1])
+        .add_data_files(vec![spec0, spec1_w, spec1_x])
         .apply(tx)
         .unwrap();
     let table = tx.commit(&catalog).await.unwrap();
@@ -586,8 +593,14 @@ async fn pin_two_fields_1(format_version: FormatVersion) {
     files.sort_by_key(|(spec_id, _, _)| *spec_id);
     assert_eq!(files, vec![
         (0, Struct::empty(), 2),
-        (1, cat_bucket_partition("w", 1), 1),
+        (1, cat_bucket_partition("w", 0), 1),
+        (1, cat_bucket_partition("x", 1), 1),
     ]);
+    let per_spec = files.iter().fold([0u64; 2], |mut counts, (spec_id, _, _)| {
+        counts[*spec_id as usize] += 1;
+        counts
+    });
+    assert_eq!(per_spec, [1, 2]);
 }
 
 #[tokio::test]

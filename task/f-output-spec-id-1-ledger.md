@@ -133,7 +133,7 @@ sits at its 1937-line legacy ceiling — the `#[cfg(test)] mod` wiring lives ins
 | (merge-append door, same shape) | `pin_merge_append_mixed_specs_v{2,3}` | same files answer through `merge_append` |
 | `OS-PART-TO-UNPART-0-{V2,V3}` | `pin_older_partitioned_spec_retains_tuple_v{2,3}` | spec-0 file keeps `cat=w` tuple after `DROP PARTITION FIELD` leaves an empty default |
 | `OS-OVERWRITE-PARTS-0-{V2,V3}` | `pin_overwrite_parts_0_v{2,3}` | `replace_partitions` under spec 0 deletes the `(0,())`-keyed seed file → live files `[(0,(),2)]` |
-| `OS-TWO-FIELDS-1-{V2,V3}` | `pin_two_fields_1_v{2,3}` | spec-1 file keeps arity-2 tuple `(cat, id_bucket_2)`; spec-0 file keeps `()` |
+| `OS-TWO-FIELDS-1-{V2,V3}` | `pin_two_fields_1_v{2,3}` | cell shape (round-3 V-03 reshape): two spec-1 files `cat ∈ {w,x}` with arity-2 tuples + one spec-0 `()` file; `specs` = `{0→1, 1→2}` |
 | `OS-BAD-ID-{V2,V3}` (commit door) | `measure_added_file_unknown_spec_id_fails` (v2), `pin_added_file_unknown_spec_id_fails_v3` | `DataInvalid` "Cannot find partition spec 9 for data file" |
 
 DataFusion `INSERT INTO` door — `crates/integrations/datafusion/src/table/output_spec_id_tests.rs`
@@ -146,6 +146,8 @@ DataFusion `INSERT INTO` door — `crates/integrations/datafusion/src/table/outp
 | `OS-PART-TO-UNPART-0-{V2,V3}` | `pin_insert_into_partitioned_older_spec_v{2,3}` | `files` = four spec-0 files with cat tuples `{w,x,x,y}`; rows = all four |
 | `OS-TWO-FIELDS-1-{V2,V3}` | `pin_insert_into_two_field_spec_v{2,3}` | spec-1 tuples arity 2, `cat ∈ {w,x}`, `id_bucket_2 ∈ [0,2)`; spec-0 tuple `()` |
 | `OS-BAD-ID-{V2,V3}` (writer door) | `pin_insert_into_bad_spec_id_v{2,3}` | `with_output_spec_id(9)` insert fails with "Output spec id 9 is not a valid spec id for table" |
+| CoW DELETE under `output-spec-id=0` (round-3 V-01) | `pin_delete_copy_on_write_targets_older_spec_v{2,3}` | `DELETE WHERE id=1` → survivor file `spec_id=0`, empty tuple, count 1; rows = `{2b y}` |
+| CoW UPDATE under `output-spec-id=0` (round-3 V-01) | `pin_update_copy_on_write_targets_older_spec_v{2,3}` | `UPDATE SET data='z' WHERE id=1` → rewritten file `spec_id=0`, empty tuple, count 2; rows = `{1z x, 2b y}` |
 | resolver unit pins | `resolve_output_spec_{none_resolves_table_default,returns_older_spec,unknown_id_is_data_invalid}` | default/older/error contract |
 
 Spark `files`-table rendering note: the cells render each file's partition tuple through spec
@@ -164,10 +166,36 @@ Run against committed state `e0c7c988`, tree restored between mutations (`git ch
 | M2a: output-spec validation removed (writer door) | `writer/mod.rs::resolve_output_spec` — `Some(id)` → `unwrap_or_else(default)` | `resolve_output_spec_unknown_id_is_data_invalid` | RED: returned `PartitionSpec { spec_id: 1, … }` instead of erroring |
 | | | `pin_insert_into_bad_spec_id_v{2,3}` | RED: `an unknown output spec id must fail: ()` — the insert committed under the default spec |
 | M2b: unknown-spec validation removed (commit door) | `snapshot.rs::partition_type_for_added_file` — `ok_or_else(DataInvalid)` → `unwrap_or_else(default)` | `measure_added_file_unknown_spec_id_fails` + `pin_added_file_unknown_spec_id_fails_v3` | RED — but on a changed message: `Cannot rewrite manifests: unknown partition spec id 9` (the backstop in `cluster_partition_spec` still rejects the unknown id at manifest-writer construction). The pins assert the exact Java message, so the mutation is caught; note the commit door has TWO unknown-spec layers — removing both is needed to reach disk |
+| M3: default spec forced in the CoW rewrite writer (round 3, run at `d4457038`) | `row_lineage.rs::StreamingDataFileWriter::try_new` — the `partition_spec` argument shadowed by `table.metadata().default_partition_spec().clone()` | `pin_delete_copy_on_write_targets_older_spec_v{2,3}` | RED: `files` = `[(1,(y),1)]` — the survivor was restamped under the default spec — expected `[(0,(),1)]` |
+| | | `pin_update_copy_on_write_targets_older_spec_v{2,3}` | RED: `files` = `[(1,(x),1),(1,(y),1)]`, expected `[(0,(),2)]` |
+| merge_append reverted alone (V-02 verification, round 3) | `git checkout 9c755bd8~1 -- merge_append.rs` | `cargo test -p iceberg --lib output_spec` (25 tests) | RED: `measure_merge_append_mixed_specs_groups_manifests_per_spec`, `pin_merge_append_mixed_specs_v{2,3}` — `merge_append expects at most one new added data manifest (got 2)`. GREEN (unchanged): `pin_fast_append_mixed_specs`, `pin_older_partitioned_spec_retains_tuple`, `pin_overwrite_parts_0`, `pin_two_fields_1` on v2+v3 — they measure pre-existing per-spec manifest grouping, not this unit's change |
+
+## Round 3 — verification findings (PR #328)
+
+| finding | severity | disposition | evidence | mutation |
+|---|---|---|---|---|
+| V-01: CoW DELETE/UPDATE restamps survivors under the DEFAULT spec, ignoring `with_output_spec_id(0)` | S2 behavioural | FIXED: `delete_from`/`update` resolve `resolve_output_spec(&table, self.output_spec_id)` exactly like `insert_into`; the resolved `PartitionSpecRef` rides `IcebergDeleteExec`/`IcebergUpdateExec` → `copy_on_write_delete`/`copy_on_write_update`/`merge_on_read_update` → `StreamingDataFileWriter::try_new(table, spec)` (was `default_partition_spec()` hard-wired). MoR DELETE writes no data files — no spec needed. `StreamingDataFileWriter` keeps one field used by `ensure_writer`, so CoW, MoR-UPDATE new rows and the INSERT-free DML doors all stamp the resolved spec | RED first: `pin_{delete,update}_copy_on_write_targets_older_spec_v{2,3}` failed as `[(1,(y),1)]`/`[(1,(x),1),(1,(y),1)]` vs expected `[(0,(),1)]`/`[(0,(),2)]` — byte-for-byte the critic's observation; after the fix all four pass | M3 (above): default spec forced back in `try_new` → all four pins red on exactly those tuples |
+| V-02: four commit-door pins stay green when merge_append alone is reverted — they measure pre-existing behaviour | S3 coverage | ACCEPTED + documented: verified by reverting `merge_append.rs` to `9c755bd8~1` — only the merge-append pins redden (`expects at most one new added data manifest (got 2)`); `pin_fast_append_mixed_specs`, `pin_older_partitioned_spec_retains_tuple`, `pin_overwrite_parts_0`, `pin_two_fields_1` stay green on v2+v3. They are kept as the fork-main measurement record. Per-door red coverage of THIS unit's change: merge_append → `pin_merge_append_mixed_specs` (revert); every commit door's per-spec manifest write → M1 (`write_added_manifests` forces default spec → fast_append + DF INSERT pins red; the same shared path serves overwrite/replace_partitions); writer door → M2a; commit validation → M2b; CoW door → M3 | revert run above | each named mutation in the Mutations table |
+| V-03: `pin_two_fields_1` asserted a hand-built one-file spec-1 tuple, not the `OS-TWO-FIELDS-1` cell | S3 oracle fidelity | FIXED: pin reshaped to the cell — two spec-1 files (`cat ∈ {w,x}`, one row each, arity-2 tuples) + one spec-0 `()` two-row file; per-spec counts `{0→1, 1→2}` match the cell's `specs` answer. Spark renders `id_bucket_2` as `null` in the `files` inspect answer; the pin asserts the stored tuple (bucket ints in `[0,2)`), consistent with `pin_insert_into_two_field_spec` on the DataFusion door | `pin_two_fields_1_v{2,3}` green after reshape | covered by M1-class revert like every per-spec commit-door pin |
 
 ## Gates
 
-(recorded after the final commit; see below)
+Round 3 (final tree, at the head commit):
+
+- `cargo fmt --all -- --check` → clean
+- `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings` → clean
+- `cargo test -p iceberg --lib output_spec` → 25 passed, 0 failed
+- `cargo test -p iceberg --lib merge_append` → 27 passed, 0 failed
+- `cargo test -p iceberg-datafusion --lib output_spec` → 14 passed, 0 failed
+- `cargo test -p iceberg-datafusion --lib table::` → 95 passed, 0 failed
+- `cargo test -p iceberg-datafusion --lib delete` → 51 passed, 0 failed, 1 ignored (touched-path regression filter)
+- `bash scripts/check_rust_file_size.sh` → 602 files clean (90 legacy ceilings); `delete.rs` split
+  (`delete_decode.rs` — the `_file`/`_pos` decoders) lowered its ceiling 1145 → 1047
+- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/qb-fork origin/main` → `comment-ban hits=0`
+
+Round-2 gate runs (same commands at `254398a2`, pre-rebase) all passed; the list above is the
+authoritative re-run after the round-3 rebase (`254398a2` → `19dbe013`, replayed as
+`5dc19f6c…b95785be`) and the V-01/V-03 changes.
 
 ## Residuals / ambiguity
 
