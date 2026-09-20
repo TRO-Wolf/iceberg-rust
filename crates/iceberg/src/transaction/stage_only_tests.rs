@@ -683,6 +683,40 @@ async fn staged_row_delta_conflict_validation_still_rejects_a_concurrent_delete(
 }
 
 #[tokio::test]
+async fn stage_only_consumes_a_sequence_number_at_stage_time() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let base_last_seq = table.metadata().last_sequence_number();
+    let base_current = table.metadata().current_snapshot_id();
+
+    let table = stage_fast_append(&catalog, &table, "test/staged.parquet", 0, "wap-seq").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+    let staged = table
+        .metadata()
+        .snapshot_by_id(staged_id)
+        .expect("staged snapshot readable by id");
+
+    assert_eq!(
+        staged.sequence_number(),
+        base_last_seq + 1,
+        "a staged snapshot consumes a sequence number at stage time, as Java's \
+         TableMetadata.Builder.addSnapshot does on the stageOnly path"
+    );
+    assert_eq!(
+        table.metadata().last_sequence_number(),
+        base_last_seq + 1,
+        "metadata.last-sequence-number advances on the staged commit"
+    );
+    assert_eq!(
+        table.metadata().current_snapshot_id(),
+        base_current,
+        "current-snapshot-id is unchanged"
+    );
+}
+
+#[tokio::test]
 async fn staged_snapshot_for_wap_id_finds_the_staged_snapshot() {
     let catalog = new_memory_catalog().await;
     let table = staged_base(&catalog).await;

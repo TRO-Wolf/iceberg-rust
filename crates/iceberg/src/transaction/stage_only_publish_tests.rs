@@ -327,6 +327,7 @@ async fn publish_changes_replay_assigns_fresh_row_ids_on_v3() {
         .first_row_id()
         .expect("a v3 staged snapshot carries a first row id");
     let table = append_main(&catalog, &table, vec![data_file("test/head.parquet", 9)]).await;
+    let next_row_id_before_publish = table.metadata().next_row_id();
 
     let table = publish_changes(&catalog, &table, "wap-rowid").await;
 
@@ -337,8 +338,12 @@ async fn publish_changes_replay_assigns_fresh_row_ids_on_v3() {
     let published_first_row_id = published
         .first_row_id()
         .expect("a v3 published snapshot carries a first row id");
-    assert!(
-        published_first_row_id > staged_first_row_id,
+    assert_eq!(
+        published_first_row_id, next_row_id_before_publish,
+        "the publish assigns first_row_id from the refreshed base's next-row-id, exactly"
+    );
+    assert_ne!(
+        published_first_row_id, staged_first_row_id,
         "the publish assigned a FRESH row range ({published_first_row_id}) rather than copying \
          the staged snapshot's ({staged_first_row_id})"
     );
