@@ -179,6 +179,8 @@ mod rewrite_data_files_sort_bound_tests;
 #[cfg(test)]
 mod rewrite_data_files_sort_harness;
 mod rewrite_data_files_sort_key;
+#[cfg(test)]
+mod rewrite_data_files_sort_key_tests;
 mod rewrite_data_files_sort_run;
 #[cfg(test)]
 mod rewrite_data_files_sort_tests;
