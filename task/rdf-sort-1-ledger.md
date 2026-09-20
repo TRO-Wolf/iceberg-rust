@@ -400,3 +400,19 @@ is red without it), or REFUTED / DEFERRED with the reason. Nothing is left impli
 
 Bin-pack, the default path, is untouched by all of it: every change is inside the sort key encoder,
 the z encoder or the external sorter, none of which a bin-pack rewrite constructs.
+
+## 9. Round 3 of the review — the final verification critic's two pin gaps
+
+The final verification critic re-ran M7–M13 and confirmed each. Two S2 gaps survived: two pins that
+stay GREEN under a mutation of the clause they are cited for. Both are closed below; nothing else
+changed in round 3.
+
+| finding | disposition |
+|---|---|
+| **V-01 S2** `a_single_spilled_run_is_forwarded_whole_and_stays_ordered` proves the ORDER, not the forward | **FIXED.** Deleting the single-run forward left the pin green, because the k-way merge emits the same rows in the same order — the forward is a cost clause, and order cannot see it. `SortRunStats` now carries `heap_merged_runs`, incremented by `runs.len()` on the k-way branch of `merge_into` only, i.e. after the forward has returned. The pin asserts `heap_merged_runs == 0`: no key was re-encoded and no heap was built. `more_runs_than_the_merge_fan_in_merge_in_passes` asserts `heap_merged_runs >= spilled_runs`, so the counter cannot be vacuously zero (M14) |
+
+**Round 3 mutations.** Same method: break the clause, run the filtered suites, revert.
+
+| mutation | what it breaks | result |
+|---|---|---|
+| M14 the `if let [only] = runs { return self.forward_run(only, sink).await; }` guard deleted from `merge_into` (V-01) | the single-run forward — a lone run pays a key re-encode and a heap it does not need | `a_single_spilled_run_is_forwarded_whole_and_stays_ordered` RED — `23 passed; 1 failed`: `a single run must be forwarded whole: no key was re-encoded and no merge heap was built, got 1 run(s) pushed through the heap / left: 1 right: 0`. Before this round the same mutation was GREEN |

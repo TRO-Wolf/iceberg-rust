@@ -302,6 +302,11 @@ async fn a_single_spilled_run_is_forwarded_whole_and_stays_ordered() {
         written.sort_stats.spilled_runs
     );
     assert_eq!(written.sort_stats.merge_passes, 1);
+    assert_eq!(
+        written.sort_stats.heap_merged_runs, 0,
+        "a single run must be forwarded whole: no key was re-encoded and no merge heap was built, got {} run(s) pushed through the heap",
+        written.sort_stats.heap_merged_runs
+    );
     assert_eq!(spill_files(&table), Vec::<String>::new());
 
     let mut ids = Vec::new();
@@ -337,6 +342,12 @@ async fn more_runs_than_the_merge_fan_in_merge_in_passes() {
         written.sort_stats.merge_passes > 1,
         "more runs than the fan-in must merge in passes, got {}",
         written.sort_stats.merge_passes
+    );
+    assert!(
+        written.sort_stats.heap_merged_runs >= written.sort_stats.spilled_runs,
+        "every one of the {} runs must reach the merge heap, only {} did",
+        written.sort_stats.spilled_runs,
+        written.sort_stats.heap_merged_runs
     );
     assert_eq!(spill_files(&table), Vec::<String>::new());
 

@@ -49,6 +49,7 @@ pub(super) trait SortedBatchSink {
 pub(crate) struct SortRunStats {
     pub(crate) spilled_runs: usize,
     pub(crate) merge_passes: usize,
+    pub(crate) heap_merged_runs: usize,
     pub(crate) peak_sort_bytes: u64,
 }
 
@@ -168,10 +169,15 @@ impl ExternalSorter {
         result
     }
 
-    async fn merge_into<S: SortedBatchSink>(&self, runs: &[SpillRun], sink: &mut S) -> Result<()> {
+    async fn merge_into<S: SortedBatchSink>(
+        &mut self,
+        runs: &[SpillRun],
+        sink: &mut S,
+    ) -> Result<()> {
         if let [only] = runs {
             return self.forward_run(only, sink).await;
         }
+        self.stats.heap_merged_runs += runs.len();
         let mut readers = Vec::with_capacity(runs.len());
         for run in runs {
             readers.push(SpillReader::open(&self.file_io, run, &self.plan).await?);
