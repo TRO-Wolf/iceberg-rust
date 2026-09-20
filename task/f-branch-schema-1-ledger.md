@@ -68,20 +68,20 @@ advertised columns and pushed filters through the snapshot schema only. The core
 
 | # | Proposition | Evidence | Status |
 |---|---|---|---|
-| P1 | branch ref → ref's snapshot + table current schema | `bs_add_ident_v{2,3}`, `bs_main_ident_v{2,3}` | pending |
-| P2 | `VERSION AS OF 'b0'` shape → same branch rule | `bs_add_version_v{2,3}` | pending |
-| P3 | tag ref → tagged snapshot's schema | `bs_add_tag_v{2,3}` | pending |
-| P4 | snapshot-id read → snapshot schema (unchanged) | `bs_add_snapid_v{2,3}` | pending |
-| P5 | dropped column absent on branch read | `bs_drop_v{2,3}` | pending |
-| P6 | renamed column appears under current name | `bs_rename_v{2,3}` | pending |
-| P7 | promoted type surfaces at current type | `bs_widen_v{2,3}` | pending |
-| P8 | branch write before ADD still projects current schema | `bs_write_then_add_v{2,3}` | pending |
-| P9 | branch write after ADD carries the new column | `bs_add_then_write_branch_v{2,3}` | pending |
-| P10 | `WHERE z IS NULL` on the new column binds and is pushed | `bs_where_newcol_v{2,3}` | pending |
-| P11 | unknown ref → typed error naming the ref | `bs_unknown_ref_v{2,3}` | pending |
-| P12 | position delete committed on a branch applies to the branch read | `bs_branch_delete_v{2,3}` | pending |
-| P13 | partitioned table branch read projects current schema | `bs_partitioned_v{2,3}` | pending |
-| P14 | `with_commit_branch` read follows the same rule | `bs_writable_provider_branch_v{2,3}` | pending |
+| P1 | branch ref → ref's snapshot + table current schema | `bs_add_ident_v{2,3}`, `bs_main_ident_v{2,3}` | verified |
+| P2 | `VERSION AS OF 'b0'` shape → same branch rule | `bs_add_version_v{2,3}` | verified |
+| P3 | tag ref → tagged snapshot's schema | `bs_add_tag_v{2,3}` | verified |
+| P4 | snapshot-id read → snapshot schema (unchanged) | `bs_add_snapid_v{2,3}` | verified |
+| P5 | dropped column absent on branch read | `bs_drop_v{2,3}` | verified |
+| P6 | renamed column appears under current name | `bs_rename_v{2,3}` | verified |
+| P7 | promoted type surfaces at current type | `bs_widen_v{2,3}` | verified |
+| P8 | branch write before ADD still projects current schema | `bs_write_then_add_v{2,3}` | verified |
+| P9 | branch write after ADD carries the new column | `bs_add_then_write_branch_v{2,3}` | verified |
+| P10 | `WHERE z IS NULL` on the new column binds and is pushed | `bs_where_newcol_v{2,3}` | verified |
+| P11 | unknown ref → typed error naming the ref | `bs_unknown_ref_v{2,3}` | verified |
+| P12 | position delete committed on a branch applies to the branch read | `bs_delete_branch_v{2,3}` | verified |
+| P13 | partitioned table branch read projects current schema | `bs_partitioned_branch_v{2,3}` | verified |
+| P14 | `with_commit_branch` read follows the same rule | `bs_writable_provider_branch_v{2,3}` | verified |
 
 ## Red evidence
 
@@ -103,8 +103,39 @@ the Spark cells' columns and rows. `cargo test -p iceberg-datafusion --lib bs_`:
 
 ## Mutation evidence
 
-(pending)
+Each leg was applied, the filtered suite run, then the mutation reverted and the suite re-run
+green (`30 passed / 0 failed`).
+
+- **branch → snapshot schema**: `try_new_from_table_ref` mutated so `is_branch` reads `false`
+  (branch resolves its snapshot but advertises the snapshot schema, flag off). Result: the 20
+  branch projections red — `bs_add_ident`, `bs_add_version`, `bs_main_ident`, `bs_drop`,
+  `bs_rename`, `bs_widen`, `bs_write_then_add`, `bs_delete_branch`, `bs_partitioned_branch`,
+  `bs_where_newcol` (v2+v3 each); tags, snapshot ids, unknown refs, and
+  `bs_add_then_write_branch` stay green (that branch snapshot's own schema IS the current one).
+  10 passed / 20 failed.
+- **tag → current schema**: `is_branch` inverted (`!is_branch()`): a tag now advertises and
+  projects the current schema. `bs_add_tag_v{2,3}` red on the extra `z:Int32` column (the leg
+  also flips branch handling, so the branch pins redden too). 8 passed / 22 failed.
+- **drop the scan-binding change**: `resolve_bindings` mutated to ignore
+  `project_current_schema` and always bind through the snapshot schema.
+  `bs_where_newcol_v{2,3}` red — advertised `z` has no field id in the snapshot schema, so the
+  filter cannot bind and the pushed predicate the pin inspects is gone. `bs_rename_v{2,3}`
+  also red: the binding resolves `payload` to the snapshot name `data`, which the
+  current-schema core `select` then cannot resolve. 26 passed / 4 failed.
 
 ## Gates
 
-(pending)
+- `cargo test -p iceberg-datafusion --lib branch_schema` — 30 passed / 0 failed.
+- `cargo test -p iceberg-datafusion --lib "physical_plan::scan"` — 29 passed / 0 failed.
+- `cargo test -p iceberg-datafusion --lib table::` — 71 passed / 0 failed.
+- `cargo test -p iceberg-datafusion --lib physical_plan` — 243 passed / 0 failed (pre-split run).
+- `cargo test -p iceberg --lib snapshot` — 249 passed / 0 failed.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings` — clean.
+- `python3 scripts/check_rust_file_size.py` — 577 files clean (the `scan.rs` legacy ceiling row
+  removed: the file is 462 lines after its test module moved to `scan_tests.rs` +
+  `scan_pin_tests.rs` siblings; moved test comments were deleted in the move per the comment
+  ban).
+- `typos` — clean.
+- `python3 /tmp/oc-worker/_lib/comment_ban.py <clone> origin/main` — `comment-ban hits=0`
+  after every commit.

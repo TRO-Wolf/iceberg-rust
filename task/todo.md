@@ -1965,10 +1965,11 @@ schema.
 
 - [x] Step 1 ledger + RED: `table/branch_schema_tests.rs` against the snapshot-schema path
       (16 red showing wrong columns, 11 control pins green). Commit.
-- [ ] Step 2 fix: `Table::snapshot_ref`, `try_new_from_table_ref`, `project_current_schema`
+- [x] Step 2 fix: `Table::snapshot_ref`, `try_new_from_table_ref`, `project_current_schema`
       threaded through plan/bindings/predicates/build_table_scan; writable provider's
-      `with_commit_branch` read follows the same rule. Commit.
-- [ ] Step 3 pins: unknown ref, position-delete branch, partitioned table, writable-provider
-      branch read; mutation legs (branch→snapshot schema, tag→current schema, drop predicate
-      binding). Commit.
-- [ ] Step 4 gates + ledger complete + final commit; handback.json; echo.
+      `with_commit_branch` read follows the same rule. Commit 970cff9f.
+- [x] Step 3 pins: unknown ref, position-delete branch, partitioned table, writable-provider
+      branch read (commit 52355f49); mutation legs (branch→snapshot schema, tag→current
+      schema, drop predicate binding) all reddened the right pins and reverted green.
+- [ ] Step 4 gates green (fmt, clippy, filtered tests, size checker, typos, comment-ban);
+      ledger complete + final commit; handback.json; echo.

@@ -147,6 +147,7 @@ impl IcebergTableScan {
     }
 
     /// Eager multi-partition plan, on when `T > 1` and the post-strip group count is above 1.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn plan(
         table: Table,
         snapshot_id: Option<i64>,
