@@ -64,7 +64,7 @@ a format is chosen only by which concrete builder is instantiated.
 So the writer is in-tree and adds **no dependency**: `flate2` (already used by the ORC footer reader)
 covers Java's default `zlib` codec, and the protobuf is hand-written exactly as the reader's is. The
 full evidence and the rejected alternatives are clause C-001 of
-[task/ledgers/staging/f-orc-avro-write-1-ledger.md](../../../../../task/ledgers/staging/f-orc-avro-write-1-ledger.md).
+[task/f-orc-avro-write-1-ledger.md](../../../../../task/f-orc-avro-write-1-ledger.md).
 
 Defaults that match Iceberg 1.11.0: stripe size 67108864 (`write.orc.stripe-size-bytes`),
 compression `zlib`, file version [0, 12], and the `iceberg.*` type attribute names and encodings.
