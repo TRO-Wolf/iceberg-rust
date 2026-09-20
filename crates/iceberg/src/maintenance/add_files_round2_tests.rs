@@ -50,8 +50,10 @@ fn the_hive_path_unescape_is_spark_s_unescape_path_name() {
         ("a%20b", "a b"),
         ("a%2Fb", "a/b"),
         ("a%25b", "a%b"),
-        ("caf%C3%A9", "caf\u{c3}\u{a9}"),
-        ("caf\u{e9}", "caf\u{e9}"),
+        ("ab%C3%A9", "ab\u{c3}\u{a9}"),
+        ("ab\u{e9}", "ab\u{e9}"),
+        ("%C3%A9", "\u{c3}\u{a9}"),
+        ("ab%E2%82%AC", "ab\u{e2}\u{82}\u{ac}"),
         ("a%zzb", "a%zzb"),
         ("a%2", "a%2"),
         ("a%", "a%"),
@@ -62,6 +64,12 @@ fn the_hive_path_unescape_is_spark_s_unescape_path_name() {
         ("a%2520b", "a%20b"),
         ("%2f", "/"),
         ("%00", "\u{0}"),
+        ("a+b%20c", "a+b c"),
+        ("%20a+b", " a+b"),
+        ("%2Ba", "+a"),
+        ("a%2Bb", "a+b"),
+        ("+%20+", "+ +"),
+        ("%20+", " +"),
     ] {
         assert_eq!(
             unescape_hive_path_name(raw),
@@ -110,23 +118,25 @@ async fn adopt_escaped_dirs(name: &str, dirs: &[&str]) -> Vec<(String, Option<Li
 async fn a_percent_escaped_hive_directory_adopts_spark_s_unescaped_value() {
     let adopted = adopt_escaped_dirs("escaped", &[
         "cat=a%20b",
-        "cat=caf%C3%A9",
+        "cat=ab%C3%A9",
         "cat=a%2Fb",
         "cat=a+b",
         "cat=a%25b",
         "cat=a%zzb",
         "cat=a%2",
+        "cat=a+b%20c",
     ])
     .await;
     let by_directory: HashMap<String, Option<Literal>> = adopted.into_iter().collect();
     for (directory, expected) in [
         ("cat=a%20b", "a b"),
-        ("cat=caf%C3%A9", "caf\u{c3}\u{a9}"),
+        ("cat=ab%C3%A9", "ab\u{c3}\u{a9}"),
         ("cat=a%2Fb", "a/b"),
         ("cat=a+b", "a+b"),
         ("cat=a%25b", "a%b"),
         ("cat=a%zzb", "a%zzb"),
         ("cat=a%2", "a%2"),
+        ("cat=a+b%20c", "a+b c"),
     ] {
         assert_eq!(
             by_directory.get(directory),

@@ -1980,3 +1980,24 @@ schema.
 - [x] Round 2 L-02 — `bs_add_version` repointed at the core `use_ref("b0") +
       project_current_schema()` entry point so the branch-ref surface has an independent pin.
       Commit 587bbbb9; ledger findings table e7e28ab7.
+
+## BUG: the Arrow reader decides `hasIds` from the FIRST field only (found 2026-09-20)
+
+Found while closing F-ADD-FILES-1 round 2 (logic critic L-002); NOT fixed there.
+
+`crates/iceberg/src/arrow/reader.rs:476-481` computes `missing_field_ids` from
+`fields().iter().next()` alone. Java `ParquetSchemaUtil.hasIds` is a recursive ANY over every field
+at every depth (`javap` on `ParquetSchemaUtil$HasIds`, recorded in
+`task/f-add-files-1-ledger.md` §9 L-002). The two disagree for a parquet file whose FIRST top-level
+column carries no field id while some later (or nested) field does: Java takes the file's own ids
+and prunes the rest, the fork applies the name mapping ON TOP of the embedded ids and the scan
+fails with `DataInvalid => Found duplicate 'field.id' N. Field ids must be unique.` — the table
+becomes unreadable, measured end to end.
+
+`add_files` now REFUSES such a source (ledger D-17), so this action cannot create one. A table
+migrated by another writer still can.
+
+- [ ] Red-first pin in the scan tests: a mixed-id parquet file registered by hand, scanned.
+- [ ] Fix: `missing_field_ids` = NO field at any depth carries an id (Java `hasIds` negated),
+      and check the Branch-1 path prunes the id-less columns as `convertAndPrune` does.
+- [ ] Mutation + gates + GAP_MATRIX row if one owns the read path's id resolution.

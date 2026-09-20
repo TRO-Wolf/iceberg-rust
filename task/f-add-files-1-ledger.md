@@ -349,6 +349,20 @@ unpartitioned table" at bytecode 107–117, AFTER `validatePartitionFilter` at 6
 "Cannot use partition filter with an unpartitioned table %s" for exactly that state. The fork keeps
 only the reachable one, so no branch in this action looks live and is not.
 
+**D-17 — a source whose columns carry field ids UNEVENLY is REFUSED (a named divergence).**
+Java's `hasIds` is a file-level recursive ANY, so Java adopts such a file by its own ids and
+`convertAndPrune` silently drops every id-less column. The fork refuses instead, because its own
+reader resolves ids by a different rule (`arrow/reader.rs` looks at the FIRST top-level field) and
+the two answers disagree on exactly that shape — measured in §9 L-002, where the pre-fix action
+produced a table whose scan failed with `Found duplicate 'field.id' 2`. The rule: when ANY field at
+any depth carries an id, EVERY TOP-LEVEL column must carry one. This also covers a file whose ids
+live only below the top level, which the fork's top-level resolution (D-3) would adopt with no
+metrics at all.
+
+**D-18 — hive path values unescape through Spark's `unescapePathName`, not a URL decoder.**
+The two escapes are different schemes and disagree on `+`; see §9 L-001. The decode is per code
+unit, matching Java's `(char) code`.
+
 **D-13 — hidden paths are skipped at EVERY segment.** Java's `HIDDEN_PATH_FILTER` filters the LEAF
 name only, because Spark's partition discovery already dropped `_`/`.` DIRECTORIES upstream. With
 one recursive listing the fork applies the same `_`/`.` rule to every segment below the source root,
@@ -381,6 +395,16 @@ which is the composition of the two Java filters.
 | a partition value that does not parse refuses | `a_partition_value_that_does_not_parse_for_its_type_is_refused` | PROVEN |
 | a partition type with no hive-string parse refuses | `a_partition_type_java_cannot_parse_from_a_string_is_refused` | PROVEN |
 | a non-`name=value` source directory refuses | `a_source_directory_that_is_not_a_partition_directory_is_refused` | PROVEN |
+| a hive directory value is UNESCAPED the way Spark's discovery unescapes | `the_hive_path_unescape_is_spark_s_unescape_path_name`, `a_percent_escaped_hive_directory_adopts_spark_s_unescaped_value` | PROVEN |
+| `partition_filter` matches the UNESCAPED value | `a_partition_filter_matches_the_unescaped_hive_value` | PROVEN |
+| a source whose columns carry field ids unevenly is REFUSED | `a_source_carrying_field_ids_on_only_some_columns_is_refused`, `a_source_whose_field_ids_are_only_nested_is_refused` | PROVEN |
+| an all-ids and an id-less source each adopt and scan back their rows | `an_all_ids_source_adopts_and_scans_back_its_rows`, `an_id_less_source_adopts_and_scans_back_its_rows` | PROVEN |
+| a BOOLEAN hive value follows `Boolean.valueOf` (never refused) | `a_boolean_hive_value_follows_java_s_boolean_value_of` | PROVEN |
+| a FLOAT/DOUBLE hive value follows `Float.valueOf` | `a_float_hive_value_follows_java_s_float_value_of` | PROVEN |
+| the duplicate set spans the DELETE manifests | `a_path_already_referenced_by_a_delete_file_is_a_duplicate` | PROVEN |
+| the spec choice is deterministic (lowest matching spec id) | `the_lowest_spec_id_wins_when_several_specs_match` | PROVEN |
+| an all-VOID spec is `isUnpartitioned`, and matches no source | `a_partition_filter_over_an_all_void_spec_is_refused_as_unpartitioned`, `a_table_whose_only_matching_spec_is_void_is_refused` | PROVEN |
+| an explicit file list keeps each file's values under `parallelism` | `an_explicit_file_list_keeps_each_file_s_partition_values_under_parallelism` | PROVEN |
 | conflicting source directory structures refuse | `conflicting_source_directory_structures_are_refused` | PROVEN |
 
 ## 6. Mutation proof
@@ -409,6 +433,38 @@ when the rule is broken.
 | M16 | the adopted file is stamped with the wrong spec id | 19 pins |
 | M17 | `record_count` is not the footer's | `unpartitioned_source_is_adopted_in_place_in_one_append_snapshot`, `partitioned_source_adopts_one_file_per_hive_directory`, `the_table_metrics_config_decides_the_adopted_bounds` |
 
+### 6a. Round 2 (the reviewers' findings)
+
+| # | Mutation | Pins that went RED |
+|---|---|---|
+| M18 | the hive directory name and value are not unescaped | `a_percent_escaped_hive_directory_adopts_spark_s_unescaped_value`, `a_partition_filter_matches_the_unescaped_hive_value` |
+| M19 | the unescape turns `+` into a space (URL decoding, not Spark's) | `the_hive_path_unescape_is_spark_s_unescape_path_name` |
+| M20 | a `%XX` pair decodes as a UTF-8 BYTE instead of Java's `char` | `a_percent_escaped_hive_directory_adopts_spark_s_unescaped_value`, `the_hive_path_unescape_is_spark_s_unescape_path_name` |
+| M21 | a source whose columns carry field ids unevenly is accepted | `a_source_carrying_field_ids_on_only_some_columns_is_refused`, `a_source_whose_field_ids_are_only_nested_is_refused` |
+| M22 | a BOOLEAN hive value parses with Rust's strict `bool` | `a_boolean_hive_value_follows_java_s_boolean_value_of` |
+| M23 | every non-empty BOOLEAN hive value becomes `true` | `a_boolean_hive_value_follows_java_s_boolean_value_of` |
+| M24 | a FLOAT hive value parses with Rust's `FromStr` | `a_float_hive_value_follows_java_s_float_value_of` |
+| M25 | the duplicate check skips the DELETE manifests | `a_path_already_referenced_by_a_delete_file_is_a_duplicate` |
+| M26 | `find_compatible_spec` walks the spec map unordered | `the_lowest_spec_id_wins_when_several_specs_match` |
+| M27 | `validate_partition_filter` tests `fields().is_empty()`, not `is_unpartitioned()` | `a_partition_filter_over_an_all_void_spec_is_refused_as_unpartitioned` |
+| M28 | the no-matching-spec refusal drops Java's list brackets | `a_table_whose_only_matching_spec_is_void_is_refused`, `a_source_whose_partition_columns_match_no_spec_is_refused` |
+| M29 | the footer read is handed size `0` instead of the listing's size | 8 pins, incl. `the_table_metrics_config_decides_the_adopted_bounds`, `a_source_that_carries_field_ids_is_resolved_by_those_ids` |
+| M30 | the `Files` arm's stats run `buffer_unordered` instead of `buffered` | **GREEN — recorded, not a gap.** See below. |
+
+Two mutations needed a note:
+
+- **M19 was GREEN on the first attempt.** `unescape_hive_path_name` copies the prefix before the
+  FIRST `%` verbatim and only loops after it, so a `+` that sits before any `%` never reaches the
+  mutated branch. Every `+` case in the pin (`a+b`, `cat=a+b`) sat in that prefix. The pin now
+  carries the MEASURED cases where a `+` follows a `%` — `+%20+` → `+ +`, `%20+` → ` +`,
+  `a+b%20c` → `a+b c`, `%20a+b` → ` a+b`, `%2Ba` → `+a`, `a%2Bb` → `a+b` — and M19 is RED.
+- **M30 is GREEN because the order is not observable, and cannot be.** Each `SourceFile` carries
+  its own path AND its own partition values as one value, and `partition_names_of` compares every
+  file against the first, so reordering the stat completions cannot mismatch a file with another
+  file's values. The pin proves the parallel path adopts all four files with their own values; it
+  does not — and no pin could — prove that `buffered` rather than `buffer_unordered` is what holds
+  the order. Recorded as unpinnable rather than claimed as covered.
+
 M4, M12, M13, M14 and M15 were GREEN on the first round. Each one added a pin, and each pin was
 then proven RED under the same mutation:
 
@@ -424,6 +480,22 @@ then proven RED under the same mutation:
 ## 7. Gates
 
 Run on the final tree (`CARGO_BUILD_JOBS=6 RUST_TEST_THREADS=6`, filtered tests only).
+
+Round 2 re-ran every one on the final tree (head `a2ea1100` plus the ledger commit).
+
+| Gate | Round 1 | Round 2 |
+|---|---|---|
+| `cargo test -p iceberg --lib add_files` | ok. 34 passed | ok. 48 passed; 0 failed |
+| `cargo test -p iceberg --lib maintenance::` | ok. 499 passed | ok. 513 passed; 0 failed |
+| `cargo test -p iceberg --lib scan::` | ok. 250 passed | ok. 250 passed; 0 failed |
+| `cargo test -p iceberg --lib spec::name_mapping` | ok. 5 passed | ok. 5 passed; 0 failed |
+| `cargo fmt --all -- --check` | clean | clean |
+| `cargo clippy -p iceberg --all-targets -- -D warnings` | clean | clean |
+| `python3 scripts/check_rust_file_size.py` | 590 files clean | rust-file-size: 591 files clean (92 legacy ceilings) |
+| `typos .` | clean | clean |
+| comment gate | `comment-ban hits=0` | `comment-ban hits=0` |
+
+The round-1 table, for the record:
 
 | Gate | Result |
 |---|---|
@@ -467,12 +539,226 @@ Two things the router owns, not the action:
    real count. A router that must be byte-identical to Spark's result row suppresses it for a
    partitioned target; one that wants the honest number passes it through. See D-9.
 
-## 9. Open
+## 9. Round 2 — the reviewers' findings
 
-- **Hive value escaping.** Spark's partition discovery URL-decodes a directory value
-  (`PartitioningUtils.unescapePathName`), so `cat=a%20b` becomes `a b`. The action passes the raw
-  segment through. A source with escaped values needs the router to decode first, or this unit to
-  grow the decoder. No oracle cell covers it.
+Round 1 was accepted; a logic critic and a Rust perf reviewer then ran. Every claim below is
+MEASURED — three new Spark oracle scripts in the run-25d Spark add_files oracle directory
+(`record_add_files_round2.py` cells A/A2/B/C/D/E, `record_add_files_round2b.py` cells F/G/H/I, and
+`record_jvm_probe{,2,3}.py`, which call the Java methods directly through the pyspark JVM gateway)
+plus `javap -c -p` on the 1.11.0 runtime jar.
+
+### L-001 — the hive directory value is not URL-unescaped — FIXED, and the suggested home REFUTED
+
+Measured (cells A, G, `unescapePathName` probe). Spark writes a partition value through
+`ExternalCatalogUtils.escapePathName` and add_files reads it back through `unescapePathName`:
+
+| value | directory Spark writes | what add_files adopts |
+|---|---|---|
+| `a b` | `cat=a b` | `a b` |
+| `a/b` | `cat=a%2Fb` | `a/b` |
+| `a%b` | `cat=a%25b` | `a%b` |
+| `a=b` | `cat=a%3Db` | `a=b` |
+| `a+b` | `cat=a+b` | `a+b` |
+| `a:b` / `a?b` / `a#b` / `a*b` | `cat=a%3Ab` / `%3Fb` / `%23b` / `%2Ab` | the raw value |
+| `abé` | `cat=abé` | `abé` |
+| `` (empty) | `cat=__HIVE_DEFAULT_PARTITION__` | NULL |
+| `a%20b` | `cat=a%2520b` | `a%20b` |
+
+**The brief's suggestion — "add the inverse of `escape_partition_path_component`" — is REFUTED.**
+That function is Iceberg's `PartitionSpec.escape`, which is `java.net.URLEncoder.encode` (a space
+becomes `+`); Spark's hive layout uses a DIFFERENT scheme, and the two disagree on exactly the
+character that matters. Measured: `escapePathName("a b")` = `a b` and `escapePathName("a+b")` =
+`a+b`, and `unescapePathName("a+b")` = `a+b` — a URL decoder would have returned `a b` and adopted
+the wrong value for every Spark-written partition containing a literal `+`. The inverse therefore
+does NOT belong beside `escape_partition_path_component`; `unescape_hive_path_name` lives in
+`add_files_datafile.rs`, the module that already owns the hive VALUE parsing.
+
+The algorithm, measured pair by pair (`unescapePathName` probe): scan for `%`; when at least two
+characters follow, parse them as hex (either case) and append **the character with that code
+point**; otherwise append the `%` literally and advance one. Bad hex and a truncated escape are
+left verbatim (`a%zzb` → `a%zzb`, `a%2` → `a%2`, `100%` → `100%`), `%%20` → `% `, `%2f` → `/`.
+
+**The decode is per CODE UNIT, not per UTF-8 byte.** Measured (round-2c cell): `%C3%A9` →
+`Ã©`, `ab%C3%A9` → `abÃ©`, and the three-byte `ab%E2%82%AC` → `abâ¬` — one character per
+escape, never one character per UTF-8 sequence. Confirmed end to end through the
+`` `parquet`.`path` `` form: directories `cat=ab%C3%A9` and `cat=abé` adopt as `abÃ©` and `abé`.
+The fork matches with `char::from(byte)`, which is Java's `(char) code`. A UTF-8-byte decoder
+would have been "more correct" and WRONG.
+
+Both the directory NAME and the VALUE unescape, as Spark's `parsePartitionColumn` does. The
+`partition_filter` compares against the unescaped value, measured in cell B:
+`map('cat','a b')` selects `cat=a%20b`, `map('cat','a%20b')` selects `cat=a%2520b`, and
+`map('cat','a/b')` selects `cat=a%2Fb`. The fork unescapes at discovery, so `filter_partitions`
+compares unescaped for free. `AddFilesSource::Files` is untouched — a router's values arrive from a
+metastore already decoded.
+
+### L-002 — a source with field ids on SOME columns — FIXED by a loud refusal, and the fork's READER is wrong
+
+Measured, three ways.
+
+1. **Java is all-or-nothing per FILE, recursively.** `ParquetSchemaUtil$HasIds.struct` returns true
+   if ANY child returned true, else `getId() != null`; `list`, `map` and `primitive` do the same.
+   `ParquetUtil.getParquetTypeWithIds` branches on it once for the whole file, and
+   `convertAndPrune` then DROPS every column that came out without an id. So Java adopts a mixed-id
+   file using the file's own ids and silently loses the id-less columns.
+2. **The fork's READER does NOT implement that.** `crates/iceberg/src/arrow/reader.rs:476-481`
+   decides `missing_field_ids` from the FIRST top-level field alone
+   (`.fields().iter().next().is_some_and(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none())`).
+   Java's `hasIds` is a recursive ANY. The two disagree on exactly one shape: a file whose first
+   column has no id and some later column does.
+3. **What that costs, measured end to end.** Table `(id:1 long, v:2 string)`; a source file with
+   columns `v` (no id) and `w` (id 2). Before the fix the action adopted it: the manifest carried
+   `lower_bounds/upper_bounds {2: "z"}` from column `w`, while the reader — taking the first-field
+   branch — applied the name mapping ON TOP of `w`'s embedded id and then failed the scan outright:
+
+   > `DataInvalid => Found duplicate 'field.id' 2. Field ids must be unique.`
+
+   The whole table became unreadable, not merely wrong. (A second shape, `id` with no id and `v`
+   with id 1, failed inside the action with a leaked `Unexpected => Statistics {...} is not match
+   with field type long` — an internal error, not a refusal.)
+
+**The fix: the action REFUSES a mixed-id source**, with a typed `DataInvalid` naming the columns
+that carry no id. The rule is stricter than Java's `hasIds` in the one direction that matters: when
+ANY field at any depth carries an id, EVERY top-level column must carry one. That also catches the
+nested-only file (ids below the top level, none above), which the fork's top-level resolution (D-3)
+would otherwise adopt with no metrics at all.
+
+This is a NAMED DIVERGENCE (D-17). Java accepts such a file and drops columns; the fork refuses.
+It is the safe direction: the fork cannot produce an entry that its own reader misreads, and no
+Spark or Hive writer emits a partially-id'd file — Iceberg writes ids everywhere, a migration
+writes none.
+
+**The reader is a separate fork bug and is NOT fixed here** (the brief's instruction, and it is a
+scan-path change that wants its own unit and its own pins). Logged in `task/todo.md`.
+
+### L-003 — a BOOLEAN hive value — FIXED, and the finding UNDERSTATED the divergence
+
+Measured directly (`Conversions.fromPartitionString(Types.BooleanType.get(), s)` over the JVM
+gateway). Java's BOOLEAN branch is `Boolean.valueOf`, which **never throws**:
+
+| input | Java | fork before | fork now |
+|---|---|---|---|
+| `true`, `TRUE`, `True`, `tRuE` | `true` | `true` only for `true` | `true` |
+| `false`, `FALSE`, `False` | `false` | `false` only for `false` | `false` |
+| `yes`, `no`, `1`, `0`, `` , ` true`, `true ` | **`false`** | **REFUSED** | `false` |
+
+So the critic's "`TRUE`/`FALSE` is refused where Java accepts it" was right but narrow: Java also
+turns every unparsable string into `false`. The fork is now
+`raw.eq_ignore_ascii_case("true")` — `"true"` has no character whose Unicode case folding differs
+from ASCII, so `equalsIgnoreCase` and `eq_ignore_ascii_case` agree on every input.
+
+**FLOAT/DOUBLE diverged too, and are fixed in the same pass** (measured, same probe). Java's
+`Float.valueOf`/`Double.valueOf` TRIM whitespace, accept a trailing `f|F|d|D`, and accept exactly
+`NaN` / `Infinity` (with an optional sign):
+
+| input | Java | Rust `parse::<f32>` |
+|---|---|---|
+| `1.5f`, `1.5D`, ` 1.5`, `\t1.5\n` | 1.5 | REFUSED |
+| `NaN`, `Infinity`, `-Infinity` | NaN, ±∞ | accepted |
+| `nan`, `NAN`, `inf`, `infinity`, `INFINITY` | **REFUSED** | **accepted** |
+| `1.`, `.5`, `1e5`, `+1.5` | accepted | accepted |
+| `""`, `" "` | REFUSED | REFUSED |
+
+`parse_java_floating` now trims Java's `String.trim()` set, strips one trailing `f/F/d/D`, maps a
+signed `NaN`/`Infinity` onto Rust's spelling, and refuses any remaining string carrying an ASCII
+letter other than `e`/`E`. That closes `inf`/`nan`/`infinity` (which the fork used to accept and
+Java refuses) and opens `1.5f`/`1.5d` (which Java accepts and the fork used to refuse).
+
+INTEGER, LONG, DATE and DECIMAL were measured in the same probe and already AGREE: Java refuses a
+leading or trailing space on all four (` 1` → `For input string: " 1"`), accepts `+1` and `007`,
+and refuses `2020-1-1`. No change.
+
+### L-004 — the duplicate check skipped the DELETE manifests — FIXED
+
+Measured (cell H). A v2 table with one merge-on-read `DELETE` over one data file:
+`SELECT status, data_file.content, data_file.file_path FROM tbl.entries` returns TWO rows —
+`(1, 0, <data file>)` and `(1, 1, <position delete file>)`. Java's duplicate check joins the
+candidate paths against exactly that set (`ENTRIES` filtered `status != 2`), so a candidate whose
+path is already a DELETE file's path is a duplicate for Java. The fork walked only
+`ManifestContentType::Data`. The content filter is gone; the function is now `live_entry_paths`.
+`entry.is_alive()` is the `status != 2` half and was already right.
+
+### L-005 — `find_compatible_spec` walked a `HashMap` — FIXED
+
+Measured (`javap` on `TableMetadata` → `PartitionUtil.indexSpecs`): `specsById` is an
+`ImmutableMap` built by iterating the metadata's partition-spec LIST, so `table.specs().values()`
+iterates in metadata list order — the order the specs were added, i.e. ascending spec id for every
+spec list Java writes. The fork's `TableMetadata` keeps a `HashMap<i32, PartitionSpecRef>` and lost
+that order at parse time, so two equivalent identity specs gave a non-deterministic `spec_id`.
+`find_compatible_spec` now sorts by `spec_id` before walking, which reproduces Java's order for
+every spec list Java can produce.
+
+While matching the refusal the message was corrected too: Java formats the source names with
+`String.format("...(%s)...", List<String>)`, so the list prints WITH brackets. Measured in cell F:
+`Cannot find a partition spec in Iceberg table sc.ns.v1_void that matches the partition columns
+([]) in input table`. The fork printed `()` / `(dept)`; it now prints `([])` / `([dept])`.
+
+### The void-spec item — REFUTED as unreachable, and the inconsistency fixed anyway
+
+The critic reported that `is_unpartitioned` and `validate_partition_filter` disagree for a spec
+whose fields are all `Void`. Both halves were measured.
+
+1. **`is_unpartitioned()` is right.** `PartitionSpec.isPartitioned()` is
+   `fields.length > 0 && fields.stream().anyMatch(<not void>)`, so `isUnpartitioned()` is
+   "empty OR all void" — the fork's definition exactly. Cell E confirms it end to end: a
+   partition_filter over a table whose default spec has no live field takes the
+   `Cannot use partition filter with an unpartitioned table sc.ns.void_filter` refusal.
+2. **The disagreement is unreachable — in Java too.** An all-Void spec is not all-Identity, so
+   `findCompatibleSpec` skips it, and `findCompatibleSpec` runs BEFORE `validatePartitionFilter`
+   (`importSparkTable` bytecode 94 then 109). Measured in cell F on a **v1** table (v2's
+   `DROP PARTITION FIELD` removes the field outright and leaves an EMPTY spec — only v1 leaves a
+   `void` field, confirmed in the on-disk metadata): both `add_files` and
+   `add_files + partition_filter` fail with `Cannot find a partition spec ... ([]) ...`, never with
+   the unpartitioned-filter message. The fork's `validate_partition_filter` can only ever see the
+   all-identity spec `find_compatible_spec` returned.
+
+`validate_partition_filter` now tests `spec.is_unpartitioned()` anyway, so the two functions state
+one rule instead of two. Because the branch is unreachable through `execute`, it is pinned by a
+DIRECT unit test on the function (`a_partition_filter_over_an_all_void_spec_is_refused_as_unpartitioned`)
+rather than by an end-to-end pin that would be vacuous — and the reachable half (an all-Void spec
+matches no source) is pinned end to end against cell F's message.
+
+### R-01 / R-02 / R-03 — FIXED. R-04 — DEFERRED
+
+- **R-01.** `adopt_parquet_file` no longer stats the file it is about to read; it builds
+  `FileMetadata { size: file_size_in_bytes }` from the size the listing (or the `Files` arm's own
+  stat) already carries, as `rewrite_data_files_write::input_parquet_metadata` does. One RPC per
+  file, gone.
+- **R-02.** The footer read now runs with `preload_column_index(false)`,
+  `preload_offset_index(false)` and `preload_page_index(false)`. Only row-group statistics are
+  used and the split offsets are cleared afterwards, so the indexes were pure waste. The 512 KiB
+  `metadata_size_hint` is KEPT — the rewrite path's 8-byte footer hint is not copied, per the
+  brief.
+- **R-03.** The `Files` arm's stats run through the same bounded `buffered` stream at the caller's
+  `parallelism` instead of a serial `for`-await.
+- **R-04 — DEFERRED, with the reason.** `Schema::build` and `MetricsByFieldId::new` are per file
+  because the resolved schema is a function of THAT file's own top-level columns, which the action
+  cannot know until it has read that file's footer. Hoisting them means a cache keyed on the file's
+  `(name, id)` column list, shared across a `buffered` stream — a lock or a per-task clone — to
+  save O(columns) allocations per file against one object-store round trip per file. The trade is
+  not obviously positive and the change is not contained; it is recorded here rather than taken.
+
+None of R-01…R-03 is directly pinnable: the workspace has no request-counting `FileIO`, so "one
+fewer HEAD" has no observable. What IS pinned is the correctness coupling R-01 introduces — the
+footer read now TRUSTS the listing's size — and M29 (hand the reader size `0`) turns eight pins
+RED. R-03's pin proves the parallel path adopts every file with its own values; see M30 for what it
+cannot prove.
+
+## 10. Open
+
+
+- **CLOSED (round 2): hive value escaping.** See §9 L-001. The decoder is
+  `unescape_hive_path_name`, measured against `ExternalCatalogUtils.unescapePathName`.
+- **A hex float literal is still refused.** Measured: `Float.valueOf("0x1p3")` = 8.0; the fork
+  refuses it. Java's hex-significand grammar is the one form of `Float.valueOf` the fork does not
+  implement. A hive directory named `f=0x1p3` is the only way to reach it.
+- **DECIMAL scale is not re-scaled.** Measured: `fromPartitionString(decimal(9,2), "1.234")`
+  returns `1.234` — Java does NOT rescale to the declared scale. Whether the fork's
+  `Literal::decimal_from_str` agrees was not measured in this unit.
+- **The fork's READER decides `hasIds` from the first top-level field only**
+  (`arrow/reader.rs:476-481`), where Java's `ParquetSchemaUtil.hasIds` is a recursive ANY. This
+  unit refuses to FEED the reader such a file (§9 L-002) but does not fix the reader; a migrated
+  table can still hold one from another writer. Its own unit — logged in `task/todo.md`.
 - **Nested-column resolution is TOP LEVEL**, matching the fork's read path
   (`arrow/reader.rs`). A struct/list/map column takes its nested ids from the table's own field
   under the resolved top-level id, so a file whose NESTED names differ from the table's carries no
