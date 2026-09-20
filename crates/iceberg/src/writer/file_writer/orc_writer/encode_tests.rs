@@ -117,6 +117,10 @@ fn test_unbounded_varint_round_trips_i128_decimal_range() {
         -9_999_999_999,
         i128::from(i64::MAX) * 1_000,
         -(i128::from(i64::MAX) * 1_000),
+        i128::MIN,
+        i128::MAX,
+        99_999_999_999_999_999_999_999_999_999_999_999_999i128,
+        -99_999_999_999_999_999_999_999_999_999_999_999_999i128,
     ] {
         let mut out = Vec::new();
         put_unbounded_varint_i128(&mut out, value);

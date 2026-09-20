@@ -72,7 +72,7 @@ pub(crate) fn put_svarint(out: &mut Vec<u8>, value: i64) {
 }
 
 pub(crate) fn put_unbounded_varint_i128(out: &mut Vec<u8>, value: i128) {
-    let mut zigzag = ((value << 1) ^ (value >> 127)) as u128;
+    let mut zigzag = (value.wrapping_shl(1) ^ (value >> 127)) as u128;
     loop {
         if zigzag < 0x80 {
             out.push(zigzag as u8);

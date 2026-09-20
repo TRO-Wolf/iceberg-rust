@@ -213,6 +213,61 @@ async fn test_orc_writer_round_trips_every_primitive_through_the_fork_reader() {
 }
 
 #[tokio::test]
+async fn test_orc_writer_round_trips_decimal_38_extremes() {
+    let (_temp, file_io, location_gen) = make_temp();
+    let schema = Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::optional(
+                    1,
+                    "c_dec38",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 38,
+                        scale: 9,
+                    }),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("build the decimal(38,9) schema"),
+    );
+    let arrow_schema: ArrowSchemaRef = Arc::new(
+        crate::arrow::schema_to_arrow_schema(&schema).expect("iceberg schema to arrow schema"),
+    );
+    let written = RecordBatch::try_new(arrow_schema, vec![Arc::new(
+        Decimal128Array::from(vec![
+            Some(99_999_999_999_999_999_999_999_999_999_999_999_999i128),
+            Some(-99_999_999_999_999_999_999_999_999_999_999_999_999i128),
+            None,
+        ])
+        .with_precision_and_scale(38, 9)
+        .expect("decimal(38,9)"),
+    ) as ArrayRef])
+    .expect("build the decimal batch");
+
+    let (path, files) = write_orc(
+        OrcWriterBuilder::new(schema.clone()),
+        &file_io,
+        &location_gen,
+        "dec38",
+        std::slice::from_ref(&written),
+    )
+    .await;
+    assert_eq!(files.len(), 1, "one ORC data file must be produced");
+
+    let bytes = read_back_bytes(&file_io, &path).await;
+    let batches = read_orc_data_bytes(bytes, &schema, 1024).expect("read the decimal file back");
+    let read = arrow_select::concat::concat_batches(&written.schema(), &batches)
+        .expect("concatenate the decoded batches");
+    assert_eq!(
+        read.column(0).as_ref(),
+        written.column(0).as_ref(),
+        "the decimal(38,9) extremes must round trip exactly"
+    );
+}
+
+#[tokio::test]
 async fn test_the_written_footer_carries_the_iceberg_id_attributes_the_reader_requires() {
     let (_temp, file_io, location_gen) = make_temp();
     let schema = Arc::new(schema_all_primitives());
