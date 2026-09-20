@@ -72,6 +72,10 @@ impl StructAccessor {
         self.inner.is_some()
     }
 
+    pub(crate) fn inner(&self) -> Option<&StructAccessor> {
+        self.inner.as_deref()
+    }
+
     pub(crate) fn is_present<'a>(&'a self, container: &'a Struct) -> Result<bool> {
         let value = container.fields().get(self.position).ok_or_else(|| {
             Error::new(

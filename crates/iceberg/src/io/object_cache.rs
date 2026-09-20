@@ -154,32 +154,28 @@ fn schema_type_graph_charge(struct_type: &StructType) -> u64 {
     charge
 }
 
+fn accessor_type_payload_charge(r#type: &Type) -> u64 {
+    match r#type {
+        Type::Struct(value) => sequence_charge::<Arc<NestedField>>(value.fields().len()),
+        Type::Primitive(_) | Type::List(_) | Type::Map(_) | Type::Variant => 0,
+    }
+}
+
 fn schema_accessor_charge(schema: &Schema) -> u64 {
-    let mut box_count = 0u64;
-    let mut pending: Vec<_> = schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|field| (field.as_ref(), 0u64))
-        .collect();
-    while let Some((field, depth)) = pending.pop() {
-        match field.field_type.as_ref() {
-            Type::Primitive(_) => box_count = box_count.saturating_add(depth),
-            Type::Struct(value) => {
-                let child_depth = depth.saturating_add(1);
-                pending.extend(
-                    value
-                        .fields()
-                        .iter()
-                        .map(|field| (field.as_ref(), child_depth)),
-                );
-            }
-            Type::List(_) | Type::Map(_) | Type::Variant => {}
+    let mut charge = 0u64;
+    for accessor in schema.accessor_entries() {
+        charge = charge
+            .saturating_add(arc_allocation_charge::<StructAccessor>())
+            .saturating_add(accessor_type_payload_charge(accessor.r#type()));
+        let mut wrapped = accessor.inner();
+        while let Some(node) = wrapped {
+            charge = charge
+                .saturating_add(shallow_charge::<StructAccessor>())
+                .saturating_add(accessor_type_payload_charge(node.r#type()));
+            wrapped = node.inner();
         }
     }
-    usize_charge(schema.accessor_count())
-        .saturating_mul(arc_allocation_charge::<StructAccessor>())
-        .saturating_add(box_count.saturating_mul(shallow_charge::<StructAccessor>()))
+    charge
 }
 
 fn schema_charge(schema: &Schema) -> u64 {
