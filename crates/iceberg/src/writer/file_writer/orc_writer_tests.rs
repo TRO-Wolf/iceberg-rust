@@ -438,9 +438,20 @@ async fn test_orc_writer_round_trips_list_map_and_struct_through_orc_rust() {
         .downcast_ref::<ListArray>()
         .expect("a list array");
     assert!(!list.is_null(0));
+    assert!(!list.is_null(1), "the second list row is empty, not null");
+    assert!(list.is_null(2), "the third list row is null");
     assert_eq!(list.value_length(0), 3);
     assert_eq!(list.value_length(1), 0);
-    assert!(list.is_null(2), "the third list row is null");
+    let row0 = list
+        .value(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("int list elements")
+        .clone();
+    assert_eq!(row0.len(), 3);
+    assert_eq!(row0.value(0), 1);
+    assert_eq!(row0.value(1), 2);
+    assert_eq!(row0.value(2), 3);
 
     let map = decoded
         .column_by_name("c_map")
@@ -448,8 +459,26 @@ async fn test_orc_writer_round_trips_list_map_and_struct_through_orc_rust() {
         .as_any()
         .downcast_ref::<MapArray>()
         .expect("a map array");
-    assert_eq!(map.value_length(0), 1);
+    assert!(!map.is_null(0));
     assert!(map.is_null(2), "the third map row is null");
+    assert_eq!(map.value_length(0), 1);
+    let entries = map.value(0);
+    let entries = entries
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("map entries");
+    let keys = entries
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("string map keys");
+    let values = entries
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("int map values");
+    assert_eq!(keys.value(0), "k");
+    assert_eq!(values.value(0), 1);
 
     let nested = decoded
         .column_by_name("c_struct")
@@ -464,8 +493,15 @@ async fn test_orc_writer_round_trips_list_map_and_struct_through_orc_rust() {
         .as_any()
         .downcast_ref::<Int32Array>()
         .expect("an int child");
+    let y = nested
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("a string child");
     assert_eq!(x.value(0), 1);
+    assert_eq!(y.value(0), "z");
     assert!(x.is_null(1), "the second row's struct child is null");
+    assert!(y.is_null(1), "the second row's string child is null");
 }
 
 #[tokio::test]
