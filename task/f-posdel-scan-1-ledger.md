@@ -30,7 +30,8 @@
 | Step | Commit | Subject |
 |---|---|---|
 | 1 | 3a4fa056 | `docs: F-POSDEL-SCAN-1 — ledger skeleton, reuse map, Java evidence, clause rows OPEN` |
-| 2 | this commit | `test: F-POSDEL-SCAN-1 — red-first scan pins over oracle fixture shapes` |
+| 2 | 27caca1f | `test: F-POSDEL-SCAN-1 — red-first scan pins over oracle fixture shapes` |
+| 3-4 | this commit | `feat: F-POSDEL-SCAN-1 — delete-manifest planning walk + delete-file reading` |
 
 ## 1. The gap
 
@@ -146,7 +147,7 @@ have produced had the second delete been MoR.
 | Need | Reused function |
 |---|---|
 | (a) reading a delete manifest | `ManifestFile::load_manifest(&file_io)` + `manifest.consume_entries()` — same call the `files`/`entries` tables use in `crates/iceberg/src/inspect/files.rs`; delete manifests of the current snapshot come from `ManifestSource::current(&table).collect()` filtered to `content == ManifestContent::Deletes` (the `snapshot().deleteManifests(io)` equivalent) |
-| (b) reading a v2 positional delete file | `BasicDeleteFileLoader::create_basic_read` + `project_positional_deletes`/`position_delete_field_ids` in `crates/iceberg/src/arrow/delete_file_loader.rs` — full parquet read + field-id projection with name fallback (`file_path`/`pos`) |
+| (b) reading a v2 positional delete file | `BasicDeleteFileLoader::parquet_to_batch_stream_with_projection` in `crates/iceberg/src/arrow/delete_file_loader.rs` — the same full-parquet-read primitive the MoR path uses (`None` projection = all columns; the positional-delete `file_path`/`pos` columns are then located by reserved field id with a name fallback) |
 | (c) reading a v3 puffin DV into positions | `crate::delete_vector::load_delete_vector(&data_file, file_io)` → `DeleteVector::iter()` — performs the puffin validation, coordinate bounds check, ranged blob read, `deletion-vector-v1` decode and the record-count cross-check |
 | manifest-level filter | `ManifestEvaluator::builder(bound_predicate).build()` + `InclusiveProjection::new(spec).project(...)` — same pair the data scan uses via `PartitionFilterCache`/`ManifestEvaluatorCache` (`crates/iceberg/src/scan/cache.rs`) |
 | per-task residual | `ResidualEvaluator::of(spec, schema, bound_filter, case_sensitive)` + `residual_for(partition)` (`crates/iceberg/src/expr/visitors/residual_evaluator.rs`) |
@@ -166,10 +167,14 @@ have produced had the second delete been MoR.
 - **`transformSpecs` port.** Java's transformed spec needs conflict checking OFF (it is
   `checkConflicts(false)`); `PartitionSpecBuilder::add_unbound_field` always checks. The
   port adds a `pub(crate)` unchecked constructor on `PartitionSpec`
-  (`new_unchecked(spec_id, fields)`) — the faithful analogue of `builderFor(...).
-  checkConflicts(false)...build(true)` — used only by `inspect::position_deletes`'s
-  `transform_specs`. `PartitionSpec` fields are private, so this is the only way to build
-  it without the checks.
+  (`from_fields_unchecked(spec_id, fields)` in `crates/iceberg/src/spec/partition.rs`) —
+  the faithful analogue of `builderFor(...).checkConflicts(false)...build(true)` — used
+  only by `inspect::position_deletes`'s `transform_spec`. `PartitionSpec` fields are
+  private, so this is the only way to build it without the checks. The original→reassigned
+  partition-field-id map (`partition_id_reassignment`) is shared with
+  `remap_partition_field_ids`, so the transformed spec's source ids are exactly the
+  metadata schema's partition child ids — the same single assignment Java's
+  `Schema.idsToReassigned()` produces.
 - **Residual pushdown.** The per-task residual is computed per 2.1.5. Java then pushes
   `ExpressionUtil.extractByIdInclusive(residual, expectedSchema, ..., nonConstantFieldIds)`
   into the file read; the fork has no `extractByIdInclusive`, and the only residual this
@@ -229,6 +234,44 @@ found and fixed during the red run: a position-delete `DataFile` may not be plac
 DATA manifest — `add_entry` enforces `ManifestContent::Data` ⇒ `DataContentType::Data`.
 The data-manifest decoy is a real `Data` file; mutation (b) is still pinned because
 reading data manifests yields zero rows where two are required.)
+
+## 5.2 Steps 3–4 — implementation record
+
+`scan()` is now async (mirroring `FilesTable::scan`) and returns one `RecordBatch`.
+
+- **Planning (`plan_position_delete_tasks`).** `collect_manifest_files(table,
+  MetadataScope::CurrentSnapshot)` — the `snapshot().deleteManifests(io)` equivalent —
+  filtered to `content == ManifestContentType::Deletes`. Per `manifest.partition_spec_id`
+  both manifest evaluators run: `transform_spec` (Java `transformSpecs`, identity
+  transforms over the reassigned partition-child ids) + `scan_filter` for the
+  deletes-table evaluator, and the table's own spec + `base_filter` for the
+  base-table evaluator; a manifest must pass both. `ManifestEvaluator` and the
+  `filterPartitions` `ExpressionEvaluator` share one
+  `InclusiveProjection::project(base_filter)` → `rewrite_not()` → bind-to-partition-schema
+  seed — the same pair the data scan builds in `scan/cache.rs`. Entries: `is_alive()`
+  then `content_type() == DataContentType::PositionDeletes`, then the partition
+  evaluator, then `ResidualEvaluator::residual_for(partition)` — one
+  `PlannedPositionDelete` per file carrying its own `spec_id` and residual.
+- **Reading (`read_delete_file_rows`).** `file_format() == Puffin` →
+  `load_delete_vector` (`crate::delete_vector`) + `DeleteVector::iter()` — Java
+  `ContentFileUtil.isDV` branch. Otherwise `BasicDeleteFileLoader::
+  parquet_to_batch_stream_with_projection(path, size, None)` — Java `newIterable`
+  branch; non-Parquet non-Puffin formats refuse `FeatureUnsupported` loud.
+- **Constants map.** `partition` via `append_partition` over the unified partition type
+  with `partition_field_ids_by_spec(file.spec_id)` source ids (null fill for fields the
+  file's spec lacks); `spec_id` = `data_file.partition_spec_id()`; `delete_file_path` =
+  `data_file.file_path()`; v3 `content_offset`/`content_size_in_bytes` from the DataFile
+  metadata. `file_path`/`pos` located in each delete-file batch by reserved field id
+  (`PARQUET_FIELD_ID_META_KEY`) with a name fallback; `row` surfaced verbatim when the
+  file's `row` column structurally equals the expected Arrow type, all-null otherwise,
+  `FeatureUnsupported` on a real mismatch. A non-`AlwaysTrue` residual is unreachable
+  today and would refuse `FeatureUnsupported` loud rather than be silently dropped.
+- **Callers.** `scan()` went async: the DataFusion provider
+  (`MetadataTableType::PositionDeletes`) now awaits it; the two stale refusal pins
+  (`scan_is_refused_loud`, `scan_still_refused_after_unified_schema`) are removed.
+
+Green run (`cargo test -q -p iceberg --lib inspect::position_deletes`, this commit):
+`test result: ok. 13 passed; 0 failed` — all seven scan pins and the six schema pins.
 
 ## 6. Clauses
 

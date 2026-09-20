@@ -95,6 +95,10 @@ impl PartitionSpec {
         }
     }
 
+    pub(crate) fn from_fields_unchecked(spec_id: i32, fields: Vec<PartitionField>) -> Self {
+        Self { spec_id, fields }
+    }
+
     /// Returns if the partition spec is unpartitioned.
     ///
     /// A [`PartitionSpec`] is unpartitioned if it has no fields or all fields are [`Transform::Void`] transform.
