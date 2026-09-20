@@ -2012,3 +2012,15 @@ lost a 27-minute CI cycle to exactly that (fork PR #309's first attempt). The re
 which is what the listing contract it pins is about.
 
 - [x] Restrict the two sets to the test's own prefix.
+
+## F-RESIDUAL-NESTED-NAME-1 — the residual of a nested predicate kept only the leaf name (2026-09-20)
+
+Found while measuring `IS NULL` on container columns (run 25d, fork #326). `unbound_reference` in
+`expr/visitors/residual_evaluator.rs` rebuilt the unbound reference from `reference.field().name` — the LEAF name —
+instead of the bound reference's full column name. On a table holding both a top-level `category` and a nested
+`st.category`, the residual of `st.category IS NULL` came back as `category IS NULL`, which rebinds to the top-level
+required column and folds to `AlwaysFalse`: the scan then returns no rows where Spark returns the matching ones. The
+fix is the column name the bound reference already carries; the pin is
+`a_nested_residual_keeps_its_full_column_name`, red on the old line ("category IS NULL" against "st.category IS NULL").
+
+- [x] Fix + red-first pin.

@@ -482,7 +482,7 @@ fn bound_to_unbound(predicate: &BoundPredicate) -> Result<Predicate> {
 
 /// Builds an unbound [`Reference`] from a bound reference's field name.
 fn unbound_reference(reference: &BoundReference) -> Reference {
-    Reference::new(reference.field().name.clone())
+    Reference::new(reference.to_string())
 }
 
 /// Negates a residual like Java `Expressions.not`, folding constants and double
