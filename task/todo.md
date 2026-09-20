@@ -1955,3 +1955,20 @@ BinaryView/Utf8View; transform code handles only Binary/Utf8 in places.
 - [ ] Step 4 mutation (one knob at a time, arithmetic recorded) + gates (comment-ban, fmt,
       clippy -p iceberg and -p iceberg-datafusion, size checker, typos, filtered tests only);
       ledger PROVEN/OPEN; handback.json; echo.
+
+## F-BRANCH-SCHEMA-1 — a branch read projects the table's current schema (2026-10-XX)
+
+Branch `fix/f-branch-schema-1`, ledger `task/f-branch-schema-1-ledger.md`.
+RePark IPI-07: Spark reads a branch with the table's current schema; a tag or snapshot id keeps
+the snapshot's. The static provider had no ref constructor and bound everything to the snapshot
+schema.
+
+- [x] Step 1 ledger + RED: `table/branch_schema_tests.rs` against the snapshot-schema path
+      (16 red showing wrong columns, 11 control pins green). Commit.
+- [ ] Step 2 fix: `Table::snapshot_ref`, `try_new_from_table_ref`, `project_current_schema`
+      threaded through plan/bindings/predicates/build_table_scan; writable provider's
+      `with_commit_branch` read follows the same rule. Commit.
+- [ ] Step 3 pins: unknown ref, position-delete branch, partitioned table, writable-provider
+      branch read; mutation legs (branch→snapshot schema, tag→current schema, drop predicate
+      binding). Commit.
+- [ ] Step 4 gates + ledger complete + final commit; handback.json; echo.

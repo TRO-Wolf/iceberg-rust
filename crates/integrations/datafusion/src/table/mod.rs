@@ -302,6 +302,8 @@ impl TableProvider for IcebergTableProvider {
     }
 }
 #[cfg(test)]
+mod branch_schema_tests;
+#[cfg(test)]
 mod schema_evo_tests;
 #[cfg(test)]
 mod tests;
