@@ -25,6 +25,37 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-20): F-STAGE-ONLY-1 — staged (WAP) commits on every write action + the publish primitive
+
+Ledger: [`f-stage-only-1-ledger.md`](f-stage-only-1-ledger.md). Branch
+`feat/f-stage-only-1` off fork `main`. RePark IPI-05: Java `stageOnly()` on the
+write's snapshot producer adds a snapshot with `wap.id` and moves no ref;
+`cherrypick_snapshot` / `publish_changes` publish it. `FastAppendAction` and
+`DeleteFilesAction` already stage; `CherryPickAction` already publishes.
+
+- [ ] SLICE 1 — `stage_only()` on merge_append / overwrite_files / replace_partitions /
+      row_delta (field + ctor + `.with_stage_only` producer chain; builders live in
+      `publish_changes.rs`, the `to_branch.rs` pattern, because the three capped
+      files only get field/ctor/chain lines back-filled by blank-line reclamation);
+      `stage_only_tests.rs` pins (staged snapshot exists with `wap.id`, `main` ref
+      unmoved, main read unchanged, staged snapshot readable by id)
+- [ ] SLICE 2 — `staged_snapshot_for_wap_id(&TableMetadata, &str) -> Result<SnapshotRef>`:
+      Java `PublishChangesProcedure` lookup (unknown → "Cannot apply unknown WAP ID
+      '<id>'", >1 → "Cannot apply non-unique WAP ID. Found multiple snapshots with WAP
+      ID '<id>'") + the already-published check (Java `DuplicateWAPCommitException`
+      message via `is_wap_id_published`); pins found / unknown / non-unique / duplicate
+- [ ] SLICE 3 — `PublishChangesAction` + `Transaction::publish_changes(wap_id)` =
+      lookup + `CherryPickAction` delegation; pins: FF publish moves main keeping
+      `wap.id`, replay publish stamps `source-snapshot-id` + `published-wap-id` with
+      the staged data, unknown id error, double-publish error, V3 first-row-id
+      reassigned at publish (Java `MergingSnapshotProducer` suppress + fresh range)
+- [ ] SLICE 4 — mutations (ignore stage flag in one action → pin red; drop the
+      duplicate check → pin red), recorded `<N> red out of <M>` each
+- [ ] SLICE 5 — gates (`cargo fmt --all`, `cargo clippy -p iceberg --all-targets --
+      -D warnings`, filtered tests, `bash scripts/check_rust_file_size.sh`,
+      comment-ban), ledger complete, `map.md` updated
+
+
 ## ACTIVE (2026-09-19): F-METRICS-CONFIG-1 — Java's table metrics config, everywhere the fork writes
 
 Ledger: [`f-metrics-config-1-ledger.md`](f-metrics-config-1-ledger.md). Branch

@@ -121,6 +121,7 @@ pub struct ReplacePartitionsAction {
     /// is a SAME-COMMIT guard on this action's own resolved partition deletes, NOT a concurrent-commit check
     /// (it is independent of and orthogonal to the two `validate_no_conflicting_*` flags above).
     validate_append_only: bool,
+    pub(crate) stage_only: bool,
     pub(crate) target_branch: String,
 }
 
@@ -135,6 +136,7 @@ impl ReplacePartitionsAction {
             validate_no_conflicting_deletes: false,
             validate_from_snapshot: None,
             validate_append_only: false,
+            stage_only: false,
             target_branch: MAIN_BRANCH.to_string(),
         }
     }
@@ -146,25 +148,21 @@ impl ReplacePartitionsAction {
         self.added_data_files.push(data_file);
         self
     }
-
     /// Add multiple [`DataFile`]s to the table. Every partition they belong to is replaced.
     pub fn add_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
         self.added_data_files.extend(data_files);
         self
     }
-
     /// Set the commit UUID for the snapshot (otherwise a fresh v7 UUID is generated).
     pub fn set_commit_uuid(mut self, commit_uuid: Uuid) -> Self {
         self.commit_uuid = Some(commit_uuid);
         self
     }
-
     /// Set key metadata for manifest files.
     pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
         self.key_metadata = Some(key_metadata);
         self
     }
-
     #[allow(missing_docs)]
     pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
         self.snapshot_properties = snapshot_properties;
@@ -350,6 +348,7 @@ impl TransactionAction for ReplacePartitionsAction {
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
         )?
+        .with_stage_only(self.stage_only)
         .with_target_branch(self.target_branch.clone())?;
 
         // Validate the added files like fast append: data content type, partition-spec match, and

@@ -92,6 +92,7 @@ pub struct MergeAppendAction {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    pub(crate) stage_only: bool,
     pub(crate) target_branch: String,
 }
 
@@ -104,6 +105,7 @@ impl MergeAppendAction {
             key_metadata: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
+            stage_only: false,
             target_branch: MAIN_BRANCH.to_string(),
         }
     }
@@ -159,6 +161,7 @@ impl TransactionAction for MergeAppendAction {
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
         )?
+        .with_stage_only(self.stage_only)
         .with_target_branch(self.target_branch.clone())?;
 
         // Validate added files (identical to fast append — only DATA content, matching spec, valid

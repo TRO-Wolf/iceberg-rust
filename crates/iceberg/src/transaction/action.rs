@@ -31,12 +31,17 @@ mod occ_scoped_projection_tests;
 #[cfg(test)]
 #[path = "occ_scoped_tests.rs"]
 pub(crate) mod occ_scoped_tests;
+#[path = "publish_changes.rs"]
+mod publish_changes;
 #[cfg(test)]
 #[path = "rewrite_manifests_cluster_tests.rs"]
 mod rewrite_manifests_cluster_tests;
 #[cfg(test)]
 #[path = "rewrite_manifests_deletes_tests.rs"]
 mod rewrite_manifests_deletes_tests;
+#[cfg(test)]
+#[path = "stage_only_tests.rs"]
+mod stage_only_tests;
 
 /// A boxed, thread-safe reference to a `TransactionAction`.
 pub(crate) type BoxedTransactionAction = Arc<dyn TransactionAction>;
