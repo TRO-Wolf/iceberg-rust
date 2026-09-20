@@ -1351,6 +1351,14 @@ impl<'a> SnapshotProducer<'a> {
             self.removed_delete_files = self.resolve_removed_delete_files(&requested).await?;
         }
 
+        let summary_error = |err: Error| {
+            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
+        };
+        let validation_summary = self
+            .summary(&snapshot_produce_operation)
+            .map_err(summary_error)?;
+        replace_record_count::validate_replace_record_counts(&validation_summary)?;
+
         let (processed_manifests, filter_replaced_manifests) = self
             .filter_existing_manifests(&snapshot_produce_operation)
             .await?;
@@ -1359,13 +1367,9 @@ impl<'a> SnapshotProducer<'a> {
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
         let parent_snapshot_id = self.parent_snapshot_id();
-        let summary_error = |err: Error| {
-            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
-        };
         let mut summary = self
             .summary(&snapshot_produce_operation)
             .map_err(summary_error)?;
-        replace_record_count::validate_replace_record_counts(&summary)?;
 
         let mut manifest_list_writer = match self.table.metadata().format_version() {
             FormatVersion::V1 => ManifestListWriter::v1(
