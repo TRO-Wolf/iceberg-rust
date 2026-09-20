@@ -194,7 +194,7 @@ Round 3 (final tree, at the head commit):
 - `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/qb-fork origin/main` → `comment-ban hits=0`
 
 Round-2 gate runs (same commands at `254398a2`, pre-rebase) all passed; the list above is the
-authoritative re-run after the round-3 rebase (`254398a2` → `19dbe013`, replayed as
+authoritative re-run after the round-3 rebase (`254398a2` → fork main at #325, replayed as
 `5dc19f6c…b95785be`) and the V-01/V-03 changes.
 
 ## Residuals / ambiguity
