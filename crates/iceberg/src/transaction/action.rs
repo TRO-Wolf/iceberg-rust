@@ -40,8 +40,11 @@ mod rewrite_manifests_cluster_tests;
 #[path = "rewrite_manifests_deletes_tests.rs"]
 mod rewrite_manifests_deletes_tests;
 #[cfg(test)]
+#[path = "stage_only_publish_tests.rs"]
+mod stage_only_publish_tests;
+#[cfg(test)]
 #[path = "stage_only_tests.rs"]
-mod stage_only_tests;
+pub(crate) mod stage_only_tests;
 
 pub use publish_changes::{PublishChangesAction, staged_snapshot_for_wap_id};
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -66,21 +66,55 @@ pub fn staged_snapshot_for_wap_id(metadata: &TableMetadata, wap_id: &str) -> Res
     Ok(staged.clone())
 }
 
+struct PublishBinding {
+    snapshot_id: i64,
+    cherry_pick: Arc<CherryPickAction>,
+}
+
 #[allow(missing_docs)]
 pub struct PublishChangesAction {
     wap_id: String,
+    binding: Mutex<Option<PublishBinding>>,
 }
 
 impl PublishChangesAction {
     pub(crate) fn new(wap_id: &str) -> Self {
         Self {
             wap_id: wap_id.to_string(),
+            binding: Mutex::new(None),
         }
     }
 
-    fn cherry_pick_for(&self, metadata: &TableMetadata) -> Result<CherryPickAction> {
-        staged_snapshot_for_wap_id(metadata, &self.wap_id)
-            .map(|staged| CherryPickAction::new(staged.snapshot_id()))
+    fn bound_cherry_pick(&self, metadata: &TableMetadata) -> Result<Arc<CherryPickAction>> {
+        let mut binding = self.binding.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(bound) = binding.as_ref() {
+            return match metadata.snapshot_by_id(bound.snapshot_id) {
+                Some(snapshot)
+                    if snapshot
+                        .summary()
+                        .additional_properties
+                        .get(STAGED_WAP_ID_PROP)
+                        .is_some_and(|value| value == &self.wap_id) =>
+                {
+                    Ok(bound.cherry_pick.clone())
+                }
+                Some(_) => Err(data_invalid(format!(
+                    "Cannot apply unknown WAP ID '{}'",
+                    self.wap_id
+                ))),
+                None => Err(data_invalid(format!(
+                    "Cannot cherry-pick unknown snapshot ID: {}",
+                    bound.snapshot_id
+                ))),
+            };
+        }
+        let staged = staged_snapshot_for_wap_id(metadata, &self.wap_id)?;
+        let cherry_pick = Arc::new(CherryPickAction::new(staged.snapshot_id()));
+        *binding = Some(PublishBinding {
+            snapshot_id: staged.snapshot_id(),
+            cherry_pick: cherry_pick.clone(),
+        });
+        Ok(cherry_pick)
     }
 }
 
@@ -91,13 +125,13 @@ impl TransactionAction for PublishChangesAction {
         starting_snapshot_id: Option<i64>,
         current: &Table,
     ) -> Result<()> {
-        Arc::new(self.cherry_pick_for(current.metadata())?)
+        self.bound_cherry_pick(current.metadata())?
             .validate(starting_snapshot_id, current)
             .await
     }
 
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        Arc::new(self.cherry_pick_for(table.metadata())?)
+        self.bound_cherry_pick(table.metadata())?
             .commit(table)
             .await
     }
