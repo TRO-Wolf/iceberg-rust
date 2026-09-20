@@ -138,6 +138,8 @@ mod add_files_field_id_tests;
 #[cfg(test)]
 mod add_files_refusal_tests;
 #[cfg(test)]
+mod add_files_round2_tests;
+#[cfg(test)]
 mod add_files_tests;
 mod compute_partition_stats;
 mod compute_table_stats;

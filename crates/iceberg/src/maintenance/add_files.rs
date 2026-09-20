@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt, stream};
 
-use super::add_files_datafile::{AdoptionContext, adopt_parquet_file};
+use super::add_files_datafile::{AdoptionContext, adopt_parquet_file, unescape_hive_path_name};
 use crate::scan::context::parse_name_mapping;
 use crate::spec::{
     DEFAULT_SCHEMA_NAME_MAPPING, DataFile, ManifestContentType, MetricsConfig, PartitionSpecRef,
@@ -304,7 +304,10 @@ async fn discover_directory(table: &Table, root: &str) -> Result<(Vec<SourceFile
                     ),
                 ));
             };
-            partition.push((name.to_string(), value.to_string()));
+            partition.push((
+                unescape_hive_path_name(name),
+                unescape_hive_path_name(value),
+            ));
         }
         files.push(SourceFile {
             path: info.location.clone(),

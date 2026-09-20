@@ -33,6 +33,50 @@ use crate::{Error, ErrorKind, Result};
 
 pub(super) const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
+pub(super) fn unescape_hive_path_name(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let Some(first) = segment.find('%') else {
+        return segment.to_string();
+    };
+    let mut out = String::with_capacity(segment.len());
+    out.push_str(&segment[..first]);
+    let mut index = first;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            match hex_pair(bytes[index + 1], bytes[index + 2]) {
+                Some(code) => {
+                    out.push(char::from(code));
+                    index += 3;
+                    continue;
+                }
+                None => {
+                    out.push('%');
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+        let rest = &segment[index..];
+        let character = rest.chars().next().unwrap_or('\u{0}');
+        out.push(character);
+        index += character.len_utf8();
+    }
+    out
+}
+
+fn hex_pair(high: u8, low: u8) -> Option<u8> {
+    Some((hex_digit(high)? << 4) | hex_digit(low)?)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub(super) struct AdoptionContext {
     pub(super) schema: SchemaRef,
     pub(super) metrics_config: MetricsConfig,
