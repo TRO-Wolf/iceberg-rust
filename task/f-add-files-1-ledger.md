@@ -420,3 +420,63 @@ then proven RED under the same mutation:
 - M14 was green because every partitioned fixture had ONE partition field. The new pin uses a
   two-field `(cat, dept)` spec.
 - M15 was green because the size pin only asserted `> 0`. It now asserts the listing's exact size.
+
+## 7. Gates
+
+Run on the final tree (`CARGO_BUILD_JOBS=6 RUST_TEST_THREADS=6`, filtered tests only).
+
+| Gate | Result |
+|---|---|
+| `cargo test -p iceberg --lib add_files` | ok. 34 passed; 0 failed |
+| `cargo test -p iceberg --lib maintenance::` | ok. 499 passed; 0 failed |
+| `cargo test -p iceberg --lib scan::` | ok. 250 passed; 0 failed |
+| `cargo test -p iceberg --lib spec::name_mapping` | ok. 5 passed; 0 failed |
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy -p iceberg --all-targets -- -D warnings` | clean |
+| `python3 scripts/check_rust_file_size.py` | rust-file-size: 590 files clean (92 legacy ceilings) |
+| `typos .` | clean |
+| comment gate | `comment-ban hits=0` |
+
+`scan::` and `spec::name_mapping` are in the list because this unit touched
+`crates/iceberg/src/scan/mod.rs` (the `context` module is now `pub(crate)` so the action reuses
+`parse_name_mapping`) and added `spec/name_mapping/create.rs`.
+
+## 8. What the RePark CALL router needs
+
+`CALL system.add_files(table, source_table, partition_filter, check_duplicate_files, parallelism)`
+maps onto the action with no reshaping:
+
+| CALL argument | Action |
+|---|---|
+| `table` | the `Table` handed to `AddFiles::new` |
+| `source_table` as `` `parquet`.`<path>` `` | `AddFilesSource::Directory(path)` |
+| `source_table` as a catalog table | resolve the table's location (and, for a partitioned source, its metastore partitions) and pass either `AddFilesSource::Directory(location)` or `AddFilesSource::Files(entries)` with the metastore's values |
+| `partition_filter => map(...)` | `.partition_filter(HashMap<String, String>)` |
+| `check_duplicate_files => bool` | `.check_duplicate_files(bool)` (default true, as Java) |
+| `parallelism => int` | `.parallelism(usize)` (default 1, as Java; `0` is refused with Java's message) |
+| the result row | `AddFilesResult { added_files_count, changed_partition_count }` — the same two columns, the second nullable |
+
+Two things the router owns, not the action:
+
+1. **A missing SOURCE TABLE.** Java raises `NoSuchTableException("Table %s does not exist")` from
+   the Spark session catalog before any Iceberg code runs. The action only sees paths, so a
+   missing catalog table must be refused by the router's own lookup. A missing PATH lands on the
+   action's "Cannot find any file to import under <source>".
+2. **`changed_partition_count` on a PARTITIONED target.** Java returns NULL there only because its
+   Spark path commits `appendManifest` (§1a). The fork commits the files, so the summary carries a
+   real count. A router that must be byte-identical to Spark's result row suppresses it for a
+   partitioned target; one that wants the honest number passes it through. See D-9.
+
+## 9. Open
+
+- **Hive value escaping.** Spark's partition discovery URL-decodes a directory value
+  (`PartitioningUtils.unescapePathName`), so `cat=a%20b` becomes `a b`. The action passes the raw
+  segment through. A source with escaped values needs the router to decode first, or this unit to
+  grow the decoder. No oracle cell covers it.
+- **Nested-column resolution is TOP LEVEL**, matching the fork's read path
+  (`arrow/reader.rs`). A struct/list/map column takes its nested ids from the table's own field
+  under the resolved top-level id, so a file whose NESTED names differ from the table's carries no
+  metrics for those leaves. No oracle cell covers it.
+- **ORC and Avro sources.** Java's `TableMigrationUtil.listPartition` dispatches on
+  `format.contains("avro"|"parquet"|"orc")`. This unit is parquet only; a non-parquet file is
+  refused by the footer read.
