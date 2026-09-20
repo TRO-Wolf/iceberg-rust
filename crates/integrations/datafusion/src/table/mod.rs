@@ -321,6 +321,10 @@ impl TableProvider for IcebergTableProvider {
 }
 #[cfg(test)]
 mod branch_schema_tests;
+
+#[cfg(test)]
+#[path = "output_spec_id_tests.rs"]
+mod output_spec_id_tests;
 #[cfg(test)]
 mod schema_evo_tests;
 #[cfg(test)]

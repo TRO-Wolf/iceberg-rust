@@ -419,3 +419,210 @@ async fn resolve_output_spec_unknown_id_is_data_invalid() {
         "Output spec id 9 is not a valid spec id for table"
     );
 }
+
+async fn pin_fast_append_mixed_specs(format_version: FormatVersion) {
+    let manifests = measure_mixed_spec_commit(format_version, |tx, files| {
+        tx.fast_append().add_data_files(files).apply(tx)
+    })
+    .await;
+    assert_manifest_specs(&manifests);
+    let mut files = live_files(&manifests);
+    files.sort_by_key(|(spec_id, _, _)| *spec_id);
+    assert_eq!(files, vec![
+        (0, Struct::empty(), 2),
+        (1, cat_partition("w"), 1),
+    ]);
+}
+
+#[tokio::test]
+async fn pin_fast_append_mixed_specs_v2() {
+    pin_fast_append_mixed_specs(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn pin_fast_append_mixed_specs_v3() {
+    pin_fast_append_mixed_specs(FormatVersion::V3).await;
+}
+
+async fn pin_merge_append_mixed_specs(format_version: FormatVersion) {
+    let manifests = measure_mixed_spec_commit(format_version, |tx, files| {
+        tx.merge_append().add_data_files(files).apply(tx)
+    })
+    .await;
+    assert_manifest_specs(&manifests);
+    let mut files = live_files(&manifests);
+    files.sort_by_key(|(spec_id, _, _)| *spec_id);
+    assert_eq!(files, vec![
+        (0, Struct::empty(), 2),
+        (1, cat_partition("w"), 1),
+    ]);
+}
+
+#[tokio::test]
+async fn pin_merge_append_mixed_specs_v2() {
+    pin_merge_append_mixed_specs(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn pin_merge_append_mixed_specs_v3() {
+    pin_merge_append_mixed_specs(FormatVersion::V3).await;
+}
+
+async fn pin_older_partitioned_spec_retains_tuple(format_version: FormatVersion) {
+    let (catalog, _guard) = local_catalog().await;
+    let table = create_oracle_table(&catalog, cat_spec(&oracle_schema()), format_version).await;
+    let table = evolve_spec(&catalog, &table, |action| action.remove_field("cat")).await;
+    assert_eq!(table.metadata().default_partition_spec_id(), 1);
+    assert!(table.metadata().default_partition_spec().is_unpartitioned());
+
+    let spec0 = oracle_file(&table, "os-spec0.parquet", 0, cat_partition("w"), 1);
+    let spec1 = oracle_file(&table, "os-spec1.parquet", 1, Struct::empty(), 1);
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![spec0, spec1])
+        .apply(tx)
+        .unwrap();
+    let table = tx.commit(&catalog).await.unwrap();
+
+    let manifests = snapshot_manifests(&table).await;
+    assert_manifest_specs(&manifests);
+    let mut files = live_files(&manifests);
+    files.sort_by_key(|(spec_id, _, _)| *spec_id);
+    assert_eq!(files, vec![
+        (0, cat_partition("w"), 1),
+        (1, Struct::empty(), 1),
+    ]);
+}
+
+#[tokio::test]
+async fn pin_older_partitioned_spec_retains_tuple_v2() {
+    pin_older_partitioned_spec_retains_tuple(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn pin_older_partitioned_spec_retains_tuple_v3() {
+    pin_older_partitioned_spec_retains_tuple(FormatVersion::V3).await;
+}
+
+async fn pin_overwrite_parts_0(format_version: FormatVersion) {
+    let (catalog, _guard, table) = mixed_spec_table(format_version).await;
+    let seed = oracle_file(&table, "seed.parquet", 0, Struct::empty(), 2);
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![seed])
+        .apply(tx)
+        .unwrap();
+    let table = tx.commit(&catalog).await.unwrap();
+
+    let replacement = oracle_file(&table, "os-overwrite.parquet", 0, Struct::empty(), 2);
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .replace_partitions()
+        .add_files(vec![replacement])
+        .apply(tx)
+        .unwrap();
+    let table = tx.commit(&catalog).await.unwrap();
+
+    let manifests = snapshot_manifests(&table).await;
+    assert_manifest_specs(&manifests);
+    assert_eq!(live_files(&manifests), vec![(0, Struct::empty(), 2)]);
+}
+
+#[tokio::test]
+async fn pin_overwrite_parts_0_v2() {
+    pin_overwrite_parts_0(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn pin_overwrite_parts_0_v3() {
+    pin_overwrite_parts_0(FormatVersion::V3).await;
+}
+
+fn cat_bucket_partition(cat: &str, bucket: i32) -> Struct {
+    Struct::from_iter([
+        Some(Literal::string(cat.to_string())),
+        Some(Literal::int(bucket)),
+    ])
+}
+
+async fn pin_two_fields_1(format_version: FormatVersion) {
+    let (catalog, _guard) = local_catalog().await;
+    let table = create_oracle_table(
+        &catalog,
+        unpartitioned_spec(&oracle_schema()),
+        format_version,
+    )
+    .await;
+    let table = evolve_spec(&catalog, &table, |action| {
+        action
+            .add_field("cat")
+            .add_field_with_transform(None, "id", Transform::Bucket(2))
+    })
+    .await;
+    assert_eq!(table.metadata().default_partition_spec_id(), 1);
+    assert_eq!(table.metadata().default_partition_spec().fields().len(), 2);
+
+    let spec0 = oracle_file(&table, "os-spec0.parquet", 0, Struct::empty(), 2);
+    let spec1 = oracle_file(
+        &table,
+        "os-spec1.parquet",
+        1,
+        cat_bucket_partition("w", 1),
+        1,
+    );
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![spec0, spec1])
+        .apply(tx)
+        .unwrap();
+    let table = tx.commit(&catalog).await.unwrap();
+
+    let manifests = snapshot_manifests(&table).await;
+    assert_manifest_specs(&manifests);
+    let mut files = live_files(&manifests);
+    files.sort_by_key(|(spec_id, _, _)| *spec_id);
+    assert_eq!(files, vec![
+        (0, Struct::empty(), 2),
+        (1, cat_bucket_partition("w", 1), 1),
+    ]);
+}
+
+#[tokio::test]
+async fn pin_two_fields_1_v2() {
+    pin_two_fields_1(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn pin_two_fields_1_v3() {
+    pin_two_fields_1(FormatVersion::V3).await;
+}
+
+async fn pin_added_file_unknown_spec_id_fails(format_version: FormatVersion) {
+    let (catalog, _guard, table) = mixed_spec_table(format_version).await;
+    let file = oracle_file(&table, "bad-spec.parquet", 9, cat_partition("w"), 1);
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file])
+        .apply(tx)
+        .unwrap();
+    let err = tx
+        .commit(&catalog)
+        .await
+        .expect_err("a file stamped with a spec id the table does not have must fail");
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(
+        err.message()
+            .contains("Cannot find partition spec 9 for data file"),
+        "unexpected message: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn pin_added_file_unknown_spec_id_fails_v3() {
+    pin_added_file_unknown_spec_id_fails(FormatVersion::V3).await;
+}

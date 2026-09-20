@@ -270,6 +270,9 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, StructType, Transform, Type};
 
     use super::*;
+    fn default_spec(table: &Table) -> PartitionSpecRef {
+        table.metadata().default_partition_spec().clone()
+    }
 
     #[test]
     fn test_partition_calculator_basic() {
@@ -740,11 +743,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = project_with_partition(
-            input,
-            &table,
-            table.metadata().default_partition_spec().clone(),
-        );
+        let result = project_with_partition(input, &table, default_spec(&table));
         assert!(result.is_ok(), "Schema validation should pass");
     }
 
@@ -802,11 +801,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = project_with_partition(
-            input,
-            &table,
-            table.metadata().default_partition_spec().clone(),
-        );
+        let result = project_with_partition(input, &table, default_spec(&table));
         assert!(
             result.is_err(),
             "Schema validation should fail for mismatched schemas"
@@ -924,12 +919,8 @@ mod tests {
         );
 
         // Outer projection: passthroughs + the `_partition` expression.
-        let plan = project_with_partition(
-            inner,
-            &table,
-            table.metadata().default_partition_spec().clone(),
-        )
-        .expect("project_with_partition");
+        let plan = project_with_partition(inner, &table, default_spec(&table))
+            .expect("project_with_partition");
 
         // The optimizer pass that fuses adjacent projections (runs twice for real plans).
         let optimized = ProjectionPushdown::new()
@@ -1051,7 +1042,7 @@ mod tests {
         project_with_partition(
             Arc::new(EmptyExec::new(arrow_schema)),
             table,
-            table.metadata().default_partition_spec().clone(),
+            default_spec(table),
         )
     }
 
@@ -1471,11 +1462,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = project_with_partition(
-            input,
-            &table,
-            table.metadata().default_partition_spec().clone(),
-        );
+        let result = project_with_partition(input, &table, default_spec(&table));
         assert!(
             result.is_ok(),
             "Schema validation should pass even with metadata differences"

@@ -656,7 +656,7 @@ pub(crate) mod tests {
     use crate::table::Table;
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent};
-
+    pub(crate) mod output_spec_id_tests;
     pub fn make_v1_table() -> Table {
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
@@ -1725,8 +1725,6 @@ pub(crate) mod tests {
     }
 }
 
-#[cfg(test)]
-mod output_spec_id_tests;
 #[cfg(test)]
 mod transaction_row_lineage_tests;
 
