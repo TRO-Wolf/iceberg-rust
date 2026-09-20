@@ -74,7 +74,6 @@ pub(crate) enum ColumnShape {
 #[derive(Debug, Clone)]
 pub(crate) struct OrcColumn {
     pub(crate) shape: ColumnShape,
-    pub(crate) field_id: Option<i32>,
     pub(crate) children: Vec<usize>,
     pub(crate) iceberg_type: Option<Type>,
 }
@@ -100,7 +99,7 @@ fn push_struct(
     field_id: Option<i32>,
     required: Option<bool>,
 ) -> Result<usize> {
-    let index = reserve(out, ColumnShape::Struct, field_id, None);
+    let index = reserve(out, ColumnShape::Struct, None);
     out.types[index].kind = Some(OrcKind::Struct);
     out.types[index].attributes = base_attributes(field_id, required);
     let mut children = Vec::with_capacity(struct_type.fields().len());
@@ -122,7 +121,7 @@ fn push_field(out: &mut OrcSchema, field: &NestedField) -> Result<usize> {
         Type::Primitive(primitive) => push_primitive(out, primitive, field, id, required),
         Type::Struct(inner) => push_struct(out, inner, id, required),
         Type::List(list) => {
-            let index = reserve(out, ColumnShape::List, id, None);
+            let index = reserve(out, ColumnShape::List, None);
             out.types[index].kind = Some(OrcKind::List);
             out.types[index].attributes = base_attributes(id, required);
             let element = push_field(out, &list.element_field)?;
@@ -131,7 +130,7 @@ fn push_field(out: &mut OrcSchema, field: &NestedField) -> Result<usize> {
             Ok(index)
         }
         Type::Map(map) => {
-            let index = reserve(out, ColumnShape::Map, id, None);
+            let index = reserve(out, ColumnShape::Map, None);
             out.types[index].kind = Some(OrcKind::Map);
             out.types[index].attributes = base_attributes(id, required);
             let key = push_field(out, &map.key_field)?;
@@ -209,7 +208,7 @@ fn push_primitive(
         PrimitiveType::Unknown => return Err(unsupported(field, "unknown")),
     };
 
-    let index = reserve(out, shape, id, Some(field.field_type.as_ref().clone()));
+    let index = reserve(out, shape, Some(field.field_type.as_ref().clone()));
     out.types[index].kind = Some(kind);
     if let PrimitiveType::Decimal { precision, scale } = primitive {
         out.types[index].precision = Some(*precision);
@@ -221,16 +220,10 @@ fn push_primitive(
     Ok(index)
 }
 
-fn reserve(
-    out: &mut OrcSchema,
-    shape: ColumnShape,
-    field_id: Option<i32>,
-    iceberg_type: Option<Type>,
-) -> usize {
+fn reserve(out: &mut OrcSchema, shape: ColumnShape, iceberg_type: Option<Type>) -> usize {
     out.types.push(OrcType::default());
     out.columns.push(OrcColumn {
         shape,
-        field_id,
         children: Vec::new(),
         iceberg_type,
     });
