@@ -256,6 +256,13 @@ null exactly in rows 2–3), not from a fresh Spark run — §3 stays the measur
   production; the direct pin guards the contract, not a reachable path.
 - Recursive name-mapping application (`ApplyNameMapping` descends; the fork maps
   top-level only) — see divergence (ii) in §13.
+- UPSTREAM note (round 2c): a parquet-side fix to
+  `parquet::arrow::ProjectionMask::without_nested_types` (extend its exclusion to
+  single-leaf non-LIST group roots) would retire the fork's
+  `with_max_predicate_cache_size(0)` workaround entirely; dependency changes are out
+  of scope for this slice. The workaround is conservative (it also covers list
+  readers) and costs only page sharing, never correctness. Root cause and
+  measurements: `docs/findings/round-2c-predicate-cache-struct-panic.md`.
 
 ## 9. Round-2 findings dispositions
 
