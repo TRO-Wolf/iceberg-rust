@@ -704,7 +704,11 @@ async fn rdf_replace_summary_counts_added_files_and_live_totals() {
         2,
         "the seq-GC expired two of the three accumulated position deletes"
     );
-    assert_manifest_counts(&props, (7, 1, 6), "rdf default (oracle merges_rdf_only shape)");
+    assert_manifest_counts(
+        &props,
+        (7, 1, 6),
+        "rdf default (oracle merges_rdf_only shape)",
+    );
 }
 
 #[tokio::test]
