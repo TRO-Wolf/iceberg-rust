@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::maintenance::rewrite_data_files::RewriteDataFiles;
-use crate::maintenance::rewrite_data_files::tests::local_fs_catalog;
+use crate::maintenance::rewrite_data_files::tests::{append_files, local_fs_catalog};
 use crate::maintenance::rewrite_data_files_sort_harness::{
-    OracleRow, concatenated_rows, oracle_table, output_files,
+    OracleRow, concatenated_rows, live_output_paths, oracle_table, output_files,
 };
 use crate::maintenance::rewrite_data_files_sort_vectors::{
     SPARK_ZORDER_1, SPARK_ZORDER_2, SPARK_ZORDER_3_TYPES, SPARK_ZORDER_MAX_OUTPUT,
@@ -33,7 +33,10 @@ use crate::maintenance::rewrite_data_files_zorder::{
     whole_number_ordered_bytes,
 };
 use crate::maintenance::{RewriteStrategy, ZOrderSpec};
-use crate::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
+use crate::spec::{
+    DataContentType, DataFile, FormatVersion, NestedField, PrimitiveType, Schema, StructType, Type,
+};
+use crate::table::Table;
 use crate::{Catalog, NamespaceIdent, TableCreation};
 
 fn hex(bytes: &[u8]) -> String {
@@ -416,12 +419,8 @@ async fn zorder_over_an_unsupported_type_is_refused_like_spark() {
     );
 }
 
-#[tokio::test]
-async fn a_nested_z_order_column_is_refused_and_never_binds_its_top_level_namesake() {
-    use crate::spec::StructType;
-
-    let (catalog, _guard) = local_fs_catalog().await;
-    let schema = Schema::builder()
+fn nested_namesake_schema() -> Schema {
+    Schema::builder()
         .with_schema_id(0)
         .with_fields(vec![
             Arc::new(NestedField::optional(
@@ -455,13 +454,136 @@ async fn a_nested_z_order_column_is_refused_and_never_binds_its_top_level_namesa
             )),
         ])
         .build()
-        .expect("build the nested schema");
+        .expect("build the nested schema")
+}
+
+async fn write_nested_namesake_file(
+    table: &Table,
+    file_name: &str,
+    rows: &[(Option<i64>, i64)],
+) -> DataFile {
+    use arrow_array::{Decimal128Array, Float64Array, Int64Array, RecordBatch, StructArray};
+    use arrow_schema::DataType;
+
+    use crate::spec::Struct;
+    use crate::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
+
+    let schema = table.metadata().current_schema();
+    let arrow_schema =
+        Arc::new(crate::arrow::schema_to_arrow_schema(schema).expect("arrow schema"));
+    let DataType::Struct(nested_fields) = arrow_schema
+        .field_with_name("st")
+        .expect("the st column")
+        .data_type()
+        .clone()
+    else {
+        panic!("st must be an arrow struct");
+    };
+    let nested = StructArray::new(
+        nested_fields,
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, nested)| *nested).collect::<Vec<i64>>(),
+            )) as arrow_array::ArrayRef,
+            Arc::new(
+                Decimal128Array::from(
+                    rows.iter()
+                        .map(|(_, nested)| i128::from(*nested) * 100)
+                        .collect::<Vec<i128>>(),
+                )
+                .with_precision_and_scale(10, 2)
+                .expect("decimal precision"),
+            ) as arrow_array::ArrayRef,
+        ],
+        None,
+    );
+    let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+        Arc::new(Int64Array::from(
+            rows.iter().map(|(id, _)| *id).collect::<Vec<Option<i64>>>(),
+        )) as arrow_array::ArrayRef,
+        Arc::new(nested) as arrow_array::ArrayRef,
+        Arc::new(Float64Array::from(
+            rows.iter()
+                .map(|(_, nested)| *nested as f64)
+                .collect::<Vec<f64>>(),
+        )) as arrow_array::ArrayRef,
+    ])
+    .expect("nested batch");
+
+    let file_path = format!("{}/data/{file_name}", table.metadata().location());
+    let output = table.file_io().new_output(file_path).expect("output file");
+    let parquet_builder = ParquetWriterBuilder::new(
+        parquet::file::properties::WriterProperties::builder().build(),
+        schema.clone(),
+    );
+    let mut writer = parquet_builder.build(output).await.expect("parquet writer");
+    writer.write(&batch).await.expect("write nested rows");
+    let mut builder = writer
+        .close()
+        .await
+        .expect("close nested writer")
+        .into_iter()
+        .next()
+        .expect("one data file builder");
+    builder.content(DataContentType::Data);
+    builder.partition_spec_id(0).partition(Struct::empty());
+    builder.build().expect("build the nested data file")
+}
+
+async fn nested_namesake_output(table: &Table) -> Vec<(Option<i64>, i64)> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    use futures::TryStreamExt;
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+
+    use crate::arrow::ArrowFileReader;
+    use crate::io::FileMetadata;
+
+    let mut rows = Vec::new();
+    for (path, _) in live_output_paths(table).await {
+        let input = table.file_io().new_input(&path).expect("input file");
+        let size = input.metadata().await.expect("file metadata").size;
+        let reader = ArrowFileReader::new(
+            FileMetadata { size },
+            input.reader().await.expect("file reader"),
+        );
+        let stream = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .expect("parquet stream builder")
+            .build()
+            .expect("parquet stream");
+        let batches: Vec<arrow_array::RecordBatch> =
+            stream.try_collect().await.expect("read output batches");
+        for batch in batches {
+            let ids = batch.column_by_name("id").expect("id column").clone();
+            let nested = batch
+                .column_by_name("st")
+                .expect("st column")
+                .as_struct()
+                .column_by_name("id")
+                .expect("st.id column")
+                .clone();
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    (!ids.is_null(row)).then(|| ids.as_primitive::<Int64Type>().value(row)),
+                    nested.as_primitive::<Int64Type>().value(row),
+                ));
+            }
+        }
+    }
+    rows
+}
+
+#[tokio::test]
+async fn a_nested_z_order_column_is_refused_and_never_binds_its_top_level_namesake() {
+    let (catalog, _guard) = local_fs_catalog().await;
+    let schema = nested_namesake_schema();
     let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
     catalog
         .create_namespace(&namespace, HashMap::new())
         .await
         .expect("create namespace");
-    let table = catalog
+    let mut table = catalog
         .create_table(&namespace, TableCreation {
             name: "t".to_string(),
             location: None,
@@ -488,6 +610,50 @@ async fn a_nested_z_order_column_is_refused_and_never_binds_its_top_level_namesa
             .expect_err("a z-order column that is not a top-level column must be refused");
         assert_eq!(error.message(), expected, "zorder({column})");
     }
+
+    let first = write_nested_namesake_file(&table, "in-0.parquet", &[
+        (Some(30), 5),
+        (Some(10), 7),
+        (None, 6),
+        (Some(20), 8),
+    ])
+    .await;
+    let second = write_nested_namesake_file(&table, "in-1.parquet", &[
+        (Some(70), 1),
+        (Some(50), 3),
+        (Some(60), 2),
+        (Some(40), 4),
+    ])
+    .await;
+    table = append_files(&catalog, &table, vec![first]).await;
+    table = append_files(&catalog, &table, vec![second]).await;
+
+    RewriteDataFiles::new(table.clone())
+        .strategy(RewriteStrategy::ZOrder(ZOrderSpec::new(["id"])))
+        .rewrite_all(true)
+        .execute(&catalog)
+        .await
+        .expect("zorder(id) must bind the top-level column and rewrite the table");
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload");
+
+    let rewritten = nested_namesake_output(&table).await;
+    assert_eq!(
+        rewritten,
+        vec![
+            (None, 6),
+            (Some(10), 7),
+            (Some(20), 8),
+            (Some(30), 5),
+            (Some(40), 4),
+            (Some(50), 3),
+            (Some(60), 2),
+            (Some(70), 1)
+        ],
+        "zorder(id) must z-order the TOP-LEVEL id; the nested st.id order is its reverse and must not appear"
+    );
 }
 
 #[test]

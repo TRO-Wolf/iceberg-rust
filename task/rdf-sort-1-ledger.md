@@ -416,3 +416,13 @@ changed in round 3.
 | mutation | what it breaks | result |
 |---|---|---|
 | M14 the `if let [only] = runs { return self.forward_run(only, sink).await; }` guard deleted from `merge_into` (V-01) | the single-run forward — a lone run pays a key re-encode and a heap it does not need | `a_single_spilled_run_is_forwarded_whole_and_stays_ordered` RED — `23 passed; 1 failed`: `a single run must be forwarded whole: no key was re-encoded and no merge heap was built, got 1 run(s) pushed through the heap / left: 1 right: 0`. Before this round the same mutation was GREEN |
+
+**V-02, the second gap.**
+
+| finding | disposition |
+|---|---|
+| **V-02 S2** `a_nested_z_order_column_is_refused_and_never_binds_its_top_level_namesake` only asserts the refusals | **FIXED.** A mutation that refuses a top-level `id` whenever a nested namesake exists kept every `expect_err` green, because refusing more is still refusing. The pin now carries the positive half on the SAME schema: eight rows across two files whose top-level `id` order is deliberately the reverse of their `st.id` order, rewritten with `zorder(id)`, which must succeed and emit `[(NULL, 6), (10, 7), (20, 8), (30, 5), (40, 4), (50, 3), (60, 2), (70, 1)]` — the top-level column's z order, with the nested namesake carried along out of its own order (M15) |
+
+| mutation | what it breaks | result |
+|---|---|---|
+| M15 `valid_z_order_columns` requires `namesakes < 2`, refusing a top-level column whenever a nested field shares its name (V-02) | the top-level bind, while keeping every nested refusal intact | `a_nested_z_order_column_is_refused_and_never_binds_its_top_level_namesake` RED — `16 passed; 1 failed`: `zorder(id) must bind the top-level column and rewrite the table: DataInvalid => No such struct field `id` in `id`, `st`, `v``. The three `expect_err` cases stayed green under the mutation, which is why the round-2 pin did not catch it |
