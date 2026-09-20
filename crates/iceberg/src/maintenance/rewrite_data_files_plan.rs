@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use crate::error::{Error, ErrorKind, Result};
+use crate::maintenance::rewrite_data_files_sort::ResolvedStrategy;
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
 use crate::spec::{DataContentType, Struct, TableProperties};
 
@@ -59,6 +60,8 @@ pub(super) struct ResolvedConfig {
     pub(super) max_open_partition_writers: usize,
     pub(super) rewrite_all: bool,
     pub(super) file_scoped_delete_paths: HashSet<String>,
+    pub(super) strategy: ResolvedStrategy,
+    pub(super) sort_memory_budget_bytes: u64,
 }
 
 /// Rewrite group order (Java `RewriteDataFilesSparkAction.RewriteJobOrder`).
