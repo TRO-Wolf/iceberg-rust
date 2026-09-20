@@ -229,6 +229,14 @@ fn container_null_predicates_match_spark_oracle_on_materialized_batch() {
         ("st.a IS NULL", Reference::new("st.a").is_null(), vec![
             false, true, true, false,
         ]),
+        ("st.b IS NULL", Reference::new("st.b").is_null(), vec![
+            false, true, true, false,
+        ]),
+        (
+            "st.b IS NOT NULL",
+            Reference::new("st.b").is_not_null(),
+            vec![true, false, false, true],
+        ),
         (
             "deep.inner IS NULL",
             Reference::new("deep.inner").is_null(),

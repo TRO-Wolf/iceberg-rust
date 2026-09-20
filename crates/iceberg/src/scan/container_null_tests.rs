@@ -554,6 +554,12 @@ fn container_oracle_cases() -> Vec<(&'static str, Predicate, Vec<i64>)> {
             Reference::new("st.a").is_not_null(),
             vec![1, 4],
         ),
+        ("st.b IS NULL", Reference::new("st.b").is_null(), vec![2, 3]),
+        (
+            "st.b IS NOT NULL",
+            Reference::new("st.b").is_not_null(),
+            vec![1, 4],
+        ),
         (
             "deep.inner IS NULL",
             Reference::new("deep.inner").is_null(),

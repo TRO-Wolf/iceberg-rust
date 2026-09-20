@@ -18,10 +18,13 @@
 use std::sync::Arc;
 
 use super::predicate::tests::test_bound_predicate_serialize_diserialize;
+use super::visitors::bound_predicate_visitor::visit;
+use super::visitors::expression_evaluator::ExpressionEvaluatorVisitor;
 use crate::ErrorKind;
 use crate::expr::{Bind, BoundPredicate, Reference};
 use crate::spec::{
-    Datum, ListType, MapType, NestedField, PrimitiveType, Schema, SchemaRef, StructType, Type,
+    Datum, ListType, Literal, MapType, NestedField, PrimitiveType, Schema, SchemaRef, Struct,
+    StructType, Type,
 };
 
 fn table_schema_with_containers() -> SchemaRef {
@@ -177,4 +180,46 @@ fn test_required_primitive_bound_predicate_json_carries_explicit_is_optional() {
         .expect("`id > 1` must bind");
     let json = serde_json::to_string(&bound).expect("serialize the bound predicate");
     assert_eq!(json.matches("\"is_optional\":false").count(), 1);
+}
+
+#[test]
+fn test_partition_evaluator_answers_container_null_tests_through_presence() {
+    let schema = table_schema_with_containers();
+    let is_null = Reference::new("xs")
+        .is_null()
+        .bind(schema.clone(), true)
+        .expect("`xs IS NULL` must bind");
+    let is_not_null = Reference::new("xs")
+        .is_not_null()
+        .bind(schema, true)
+        .expect("`xs IS NOT NULL` must bind");
+
+    let present_list = Struct::from_iter([
+        Some(Literal::long(1)),
+        Some(Literal::List(vec![Some(Literal::int(1))])),
+        None,
+        None,
+    ]);
+    let null_list = Struct::from_iter([Some(Literal::long(2)), None, None, None]);
+
+    let mut present_visitor = ExpressionEvaluatorVisitor::new(&present_list);
+    assert!(
+        !visit(&mut present_visitor, &is_null).expect("a present list must evaluate"),
+        "a present list is not null"
+    );
+    let mut present_visitor = ExpressionEvaluatorVisitor::new(&present_list);
+    assert!(
+        visit(&mut present_visitor, &is_not_null).expect("a present list must evaluate"),
+        "a present list is not-null"
+    );
+    let mut null_visitor = ExpressionEvaluatorVisitor::new(&null_list);
+    assert!(
+        visit(&mut null_visitor, &is_null).expect("a null list must evaluate"),
+        "a null list is null"
+    );
+    let mut null_visitor = ExpressionEvaluatorVisitor::new(&null_list);
+    assert!(
+        !visit(&mut null_visitor, &is_not_null).expect("a null list must evaluate"),
+        "a null list is not not-null"
+    );
 }

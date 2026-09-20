@@ -146,9 +146,13 @@ st.a IS NULL -> binds today (nested primitive leaf accessor exists)
    **every** struct field (primitive, struct, list, map, variant) at its position and
    full `Type`, wrapping nested accessors for struct descendants — the Java shape above.
    List element / map key / map value field ids still get **no** accessor (Java parity).
-2. **`StructAccessor`** — `r#type` widens `PrimitiveType` → `Type`. For primitive types
-   the serialized form is byte-identical (`SerdeType::Primitive` renders the same bare
-   type-name string), so `BoundPredicate` JSON round-trips unchanged. `get()` keeps its
+2. **`StructAccessor`** — `r#type` widens `PrimitiveType` → `Type`. For
+   **optional** primitives the serialized form is byte-identical to `main`
+   (`SerdeType::Primitive` renders the same bare type-name string, and the new
+   `is_optional` key is skipped when it holds the default `true` — proven by
+   `cmp` against a `main` probe, 220 bytes, §7 M16); a **required** primitive
+   carries one explicit `"is_optional":false` key, and wire JSON without the key
+   still deserializes via the `true` default. `get()` keeps its
    exact behavior on primitive leaves; on a non-primitive leaf it fails `DataInvalid`
    (it is unreachable through bound predicates — comparisons fail at bind, null tests go
    through `is_present`). New `is_present(&Struct) -> Result<bool>`: presence semantics —
@@ -195,17 +199,135 @@ st.a IS NULL -> binds today (nested primitive leaf accessor exists)
 
 ## 7. Mutation evidence
 
-(filled in during step 5 — one sabotage at a time, red-count recorded)
+Protocol: one mutation at a time, applied to a clean tree (only this ledger
+uncommitted), restored by file copy afterwards; restore confirmed by
+`git diff --name-only` plus a green re-run of the reddened tests. Each entry names
+the command, the population `M` that run reported, and the tests that went red.
+Baselines this session: `cargo test -q -p iceberg --lib` → 4285 passed, 0 failed,
+9 ignored; `cargo test -q -p iceberg-datafusion --lib` → 376 passed, 1 failed (the
+RULE-5 out-of-scope `list_null_tests::select_where_xs_is_null_returns_the_null_row`),
+1 ignored. The verification critic's list was not in the repo, so M1–M8 below are the
+round-2b worker's own one-per-knob set, each actually executed.
+
+| # | mutation (file) | command / population | red |
+|---|---|---|---|
+| M1 | `build_accessors` primitive-only (`spec/schema/mod.rs`) | iceberg `--lib` / 4294 | 11: `record_batch_predicate_container_tests::container_null_predicates_match_spark_oracle_on_materialized_batch`, `predicate_container_tests::test_bind_comparison_on_container_column_fails_at_bind`, `predicate_container_tests::test_bind_is_null_on_container_columns`, 3× `object_cache::charge_tests::test_schema_accessor_charge_*`, 4× `scan::container_null_tests::*spark_oracle*`, `accessor_tests::test_build_accessors_includes_container_and_struct_fields` |
+| M1 | same | datafusion `--lib` / 378 | 4: `is_null_on_a_list/map/struct_column_is_pushed`, `is_null_on_a_container_column_composes_with_its_neighbours`. NOTE: the out-of-scope `list_null` test flips red→green here (see §9 V-note) |
+| M2 | ancestor-optional dropped, leaf required-ness only (`spec/schema/mod.rs`) | iceberg `--lib expr::` / 416 | 2: both `*_required_leaf_under_optional_parent_does_not_fold` |
+| M3a | partition evaluator `is_present`→`get` (`expression_evaluator.rs`) | iceberg `--lib expr::` / 416 + `scan::` / 254 | 0 — PIN GAP, closed by the direct pin below |
+| M3b | M3 re-run after the pin | iceberg `--lib expr::` / 417 | 1: `predicate_container_tests::test_partition_evaluator_answers_container_null_tests_through_presence` |
+| M4 | group leaf-lists dropped from `RowFilter` plan (`row_filter_plan.rs`) | iceberg `--lib arrow::` / 504 + `scan::` / 254 | 2 (scan only): `test_filter_on_arrow_container_null_predicates_match_spark_oracle`, `..._under_page_index_row_selection` |
+| M5 | parent-validity propagation dropped (`record_batch_predicate.rs`) | iceberg `--lib arrow::` / 504 + `scan::` / 254 | 1 (arrow only): `..._on_materialized_batch` (row 2's valid-but-empty `ys` under NULL parents) |
+| M6 | post-decode residual never applied (`arrow/reader.rs`) | iceberg `--lib scan::` / 254 + `arrow::` / 504 | 2 (scan only): `..._without_field_ids`, `..._with_name_mapping` |
+| M7 | `Residual` fallback forced to Push (`row_filter_plan.rs`) | iceberg `--lib scan::` / 254 + `arrow::` / 504 | 2 (scan only): `..._without_field_ids`, `..._with_name_mapping` |
+| M8 | push gate requires primitive (`expr_to_predicate.rs`) | datafusion `--lib` / 378 | 4: the same push pins as M1. NOTE: out-of-scope `list_null` flips red→green here too |
+| M9 | page-index group fail-open removed (`page_index_evaluator.rs`) | iceberg `--lib page_index` / 18 + `scan::` / 254 | 1 in each pop, same test: `..._under_page_index_row_selection` |
+| M10 | fallback stamping positional-only, name match dropped (`arrow/reader.rs`) | iceberg `--lib scan::` / 254 + `arrow::` / 504 | 1 (scan only): `..._without_field_ids` (mapping case greens: that branch stamps real ids) |
+| M11a | row-3 fixture back to `{a:NULL,b:3}` (both oracle fixtures) | iceberg `--lib container` / 49 | 0 — PIN GAP, closed by the `st.b` cells below |
+| M11b | M11 re-run after the pins | `scan::container` / 4 + `record_batch_predicate_container` / 1 | 5: all four scan oracle tests + `..._on_materialized_batch` |
+| M12 | charge skips non-primitive accessors (`io/object_cache.rs`) | iceberg `--lib object_cache` / 25 | 3: `test_schema_accessor_charge_counts_actual_arc_and_box_nodes`, `..._grows_with_every_accessor_map_entry`, `..._matches_the_accessor_map_schema_builds` |
+| M13 | `accessor_by_field_id` falls back to any accessor (`spec/schema/mod.rs`) | iceberg `--lib` / 4295 | 2: `test_build_accessors_omits_element_key_value_and_container_nested_ids`, `test_bind_is_null_on_element_key_and_value_paths_fails_at_accessor_lookup` |
+| M13 | same | datafusion `--lib` / 378 | 5: `binary_on_an_accessorless_leaf_is_not_pushed`, `in_list_on_an_accessorless_leaf_is_not_pushed`, `is_null_on_a_list_element_name_is_not_pushed`, `is_null_on_an_accessorless_leaf_still_drops_only_its_own_conjunction`, + baseline-red `list_null` (stays red) |
+| M14 | `is_present` `None` arm → `true` (`expr/accessor.rs`) | iceberg `--lib expr::` / 417 + `scan::` / 254 | 4 (expr only): both `accessor::tests::test_is_present_*`, `test_partition_evaluator_answers_container_null_tests_through_presence`, pre-existing `expression_evaluator::tests::test_null_partition_value_truth_table_nulls_first` |
+| M15 | `is_present` wrong-shape arm → `true` (`expr/accessor.rs`) | iceberg `--lib expr::` / 417 + `scan::` / 254 | 1 (expr only): `test_is_present_propagates_null_parent_and_rejects_wrong_shape` |
+| M16 | `skip_serializing_if` removed (`expr/accessor.rs`) | iceberg `--lib expr::` / 417 | 1: `test_optional_primitive_bound_predicate_json_omits_default_is_optional` |
+| M17 | `is_optional` forced `true` (`spec/schema/mod.rs`) | iceberg `--lib` / 4295 | 15: `test_required_primitive_bound_predicate_json_carries_explicit_is_optional`, 9× `predicate::tests::*` (8 `test_bind_*` + `test_bound_predicate_rewrite_not_always_true_false`), 2× `term::tests::test_bind_reference*`, `bound_predicate_visitor::tests::test_not_null`, `inclusive_metrics_evaluator::test::test_required_column`, `residual_nested_name_tests::tests::a_nested_residual_keeps_its_full_column_name` |
+
+Gap-closure pins written during this step (in the step-7 commit): M3 →
+`test_partition_evaluator_answers_container_null_tests_through_presence`
+(`predicate_container_tests.rs`); M11 → `st.b IS NULL` / `st.b IS NOT NULL` cells in
+`container_oracle_cases()` (all four scan oracle tests) and in
+`container_null_predicates_match_spark_oracle_on_materialized_batch`. The `st.b`
+expectations derive from the fixture's row-3 definition (`{a:NULL,b:NULL}` → `st.b`
+null exactly in rows 2–3), not from a fresh Spark run — §3 stays the measured oracle.
 
 ## 8. Residual gaps observed (out of scope for this slice)
 
-- Parquet files **without** embedded field ids: the `RowFilter` resolves leaf predicates
-  by the position fallback map, but non-leaf field ids have no leaf to map to, so a
-  container-column filter keeps every row at the RowFilter (always-`true`); the scan's
-  normal path applies no post-decode residual, so such a file answers a container null
-  test incorrectly. Pre-existing class of gap (same shape as nested-leaf predicates on
-  id-less files); fixing it needs name-mapping-aware reference resolution in the
-  RowFilter.
-- `ExpressionEvaluatorVisitor` (partition evaluation) is the only `is_present` consumer
-  today; partition specs cannot legally contain non-primitive source fields, so the
-  container arm is defensive consistency, not a reachable production path.
+- ~~Parquet files **without** embedded field ids ...~~ **WITHDRAWN 2026-09-20 (round
+  2a, `ec6da3c9`):** id-less files now stamp top-level ids by table-schema name match
+  with a Java-counter fallback (`add_fallback_field_ids_to_arrow_schema`), project
+  unmapped groups by id (`unmapped_group_leaf_indices`), and route
+  present-but-unmapped predicates to a post-decode residual (`RowFilterPlan::Residual`)
+  instead of a wrong Push. Pinned by the id-less oracle cases in
+  `scan/container_null_tests.rs` (§7 M6/M7/M10).
+- `ExpressionEvaluatorVisitor` (partition evaluation) answers null tests through
+  `is_present`, pinned directly at the visitor (§7 M3). Partition specs cannot legally
+  contain non-primitive source fields, so the container arm stays unreachable in
+  production; the direct pin guards the contract, not a reachable path.
+- Recursive name-mapping application (`ApplyNameMapping` descends; the fork maps
+  top-level only) — see divergence (ii) in §13.
+
+## 9. Round-2 findings dispositions
+
+The critic reports are not in the repo; the mapping below is reconstructed from the
+round-2a/2b commits, one row per finding id named in the round-2 brief.
+
+| finding | disposition | where |
+|---|---|---|
+| V-01 (page-index group ids used `CantMatch`, dropping matching rows under row selection) | CLOSED | `page_index_evaluator.rs::field_id_names_a_group` fail-open (`4b85af4a`) + `test_container_null_predicates_match_spark_oracle_under_page_index_row_selection` (§7 M9) |
+| V-02 (element/key/value accessor absence + `xs.element` bind failure unpinned) | CLOSED | `test_build_accessors_omits_element_key_value_and_container_nested_ids` + `test_bind_is_null_on_element_key_and_value_paths_fails_at_accessor_lookup` (round 2b step 5, §7 M13) |
+| V-03 (`is_present` pinned only through `table.scan()`, never directly) | CLOSED | `test_is_present_treats_empty_containers_and_all_null_struct_as_present` + `test_is_present_propagates_null_parent_and_rejects_wrong_shape` (round 2b step 5, §7 M14/M15) |
+| V-04 (id-less files answer container/nested null tests wrong; §8 parked it) | CLOSED | mapping/positional stamping + unmapped→Residual (`ec6da3c9`), §8 parking withdrawn above (§7 M6/M7/M10) |
+| V-05 / Q-26d-7 (JSON "byte-identical" claim false: `is_optional` always serialized) | CLOSED | `skip_serializing_if` on the default + frozen 220-byte string pin + `cmp` proof vs `main` (round 2b step 6, §7 M16/M17) |
+| L-01 (stale `is_optional=true` expectation in term bind tests, red since round 1) | CLOSED | `term.rs` bind tests expect `false` for required `bar` (`40bcf119`) |
+| L-02 (row-3 fixture `{a:NULL,b:3}`, not the oracle's all-NULL struct; no `st.a IS NOT NULL` pin) | CLOSED | all-NULL row 3 + `st.a IS NOT NULL` cell (`1a586446`); `st.b` cell added round 2b to kill M11 (§7 M11) |
+
+V-note (out of scope, for the `list_null` clerk): the RULE-5 red test
+`physical_plan::list_null_tests::select_where_xs_is_null_returns_the_null_row` flips
+red→green under both M1 (primitive-only accessors) and M8 (primitive-only push gate),
+and stays red under M13 (accessor fallback). Its red state on this branch depends on
+container accessors existing and pushing — evidence it is branch-caused, not red on
+`main`. Untouched here per RULE 5.
+
+## 10. Q-26d-4 missing-column audit
+
+What each layer answers when the predicate's column (or its stats) is absent from the
+file being pruned. "Fail open" = keep the file/row (never drop a match).
+
+| layer | absent input | answer | fail-open pin |
+|---|---|---|---|
+| manifest evaluator | partition summary absent | might-match | existing suite |
+| inclusive/strict metrics | bounds/counts absent | might-match | existing suite |
+| row-group metrics | field id unmapped | might-match | existing suite |
+| page index | leaf id unmapped, `IsNull`/`NotNull` | `MightMatch` select-all / `CantMatch` skip-all by op | existing suite |
+| page index | **group** id unmapped (list/map/struct) | select-all (`field_id_names_a_group`, V-01 fix) | `..._under_page_index_row_selection` |
+| RowFilter leaf map | field id unmapped, ids present | id ignored (schema evolution) | existing suite |
+| id-less RowFilter plan | predicate id present-but-unmapped | `Residual`, never a partial Push (V-04 fix) | id-less oracle cases |
+| record-batch evaluator | column absent from batch | NULL semantics (`is_null`→true) | `record_batch_predicate` suite |
+| DataFusion push gate | no accessor for the term | not pushed (`term_binds_soundly`) | `*_is_not_pushed` pins |
+
+## 11. Clause close-out
+
+| clause | status | pin |
+|---|---|---|
+| C-001 container/struct/nested-container ids own an accessor | PROVEN | pins: f-container-accessor-1/C-001 (`spec::schema::accessor_tests::test_build_accessors_includes_container_and_struct_fields`) |
+| C-002 element/key/value/container-nested ids own none; `xs.element`/`mp.key`/`mp.value` bind fails `DataInvalid` at the accessor lookup | PROVEN | pins: f-container-accessor-1/C-002 (`test_build_accessors_omits_element_key_value_and_container_nested_ids`, `test_bind_is_null_on_element_key_and_value_paths_fails_at_accessor_lookup`) |
+| C-003 `IS NULL`/`NOT NULL` fold only when the leaf and all ancestors are required | PROVEN | pins: f-container-accessor-1/C-003 (`test_bind_is_null_required_leaf_under_optional_parent_does_not_fold`, `test_bind_is_not_null_required_leaf_under_optional_parent_does_not_fold`) |
+| C-004 `is_present`: empty list/map present, all-NULL struct present, `None` absent, wrong shape `DataInvalid` | PROVEN | pins: f-container-accessor-1/C-004 (`test_is_present_treats_empty_containers_and_all_null_struct_as_present`, `test_is_present_propagates_null_parent_and_rejects_wrong_shape`) |
+| C-005 partition evaluator answers container null tests through presence | PROVEN | pins: f-container-accessor-1/C-005 (`test_partition_evaluator_answers_container_null_tests_through_presence`) |
+| C-006 `RowFilter` + batch evaluator match the Spark oracle (15 scan cells + 12 batch cells, incl. `st.b` both parities) | PROVEN | pins: f-container-accessor-1/C-006 (`test_filter_on_arrow_container_null_predicates_match_spark_oracle`, `container_null_predicates_match_spark_oracle_on_materialized_batch`) |
+| C-007 id-less files answer container/nested null tests via stamping + post-decode residual | PROVEN | pins: f-container-accessor-1/C-007 (id-less oracle cases in `scan/container_null_tests.rs`) |
+| C-008 pruning never drops a matching row (manifest/metrics/row-group/page-index fail open) | PROVEN | pins: f-container-accessor-1/C-008 (`test_container_null_predicates_match_spark_oracle_under_page_index_row_selection`) |
+| C-009 optional-primitive `BoundPredicate` JSON byte-identical to `main`; required carries explicit `false`; keyless wire JSON reads | PROVEN | pins: f-container-accessor-1/C-009 (`test_optional_primitive_bound_predicate_json_omits_default_is_optional`, `test_required_primitive_bound_predicate_json_carries_explicit_is_optional`) |
+| C-010 container comparisons fail at bind; charge covers the new tree; DF pushes container null tests | PROVEN | pins: f-container-accessor-1/C-010 (`test_bind_comparison_on_container_column_fails_at_bind`, `object_cache_charge_tests`, `is_null_on_a_*_column_is_pushed`) |
+
+## 12. Coverage attestation
+
+COVERAGE_ATTESTATION:
+AT-1 covers C-001 via the container-accessor existence pin;
+AT-2 covers C-002 via the element/key/value absence and bind-failure pins;
+AT-3 covers C-003 via the required-under-optional no-fold pins;
+AT-4 covers C-004 via the direct `is_present` pins;
+AT-5 covers C-005 via the direct partition-evaluator pin;
+AT-6 covers C-006 via the Spark-oracle scan and batch pins;
+AT-7 covers C-007 via the id-less oracle pins;
+AT-8 covers C-008 via the page-index row-selection oracle pin;
+AT-9 covers C-009 via the frozen-JSON and explicit-false pins;
+AT-10 covers C-010 via the bind-rejection, charge, and pushdown pins.
+
+## 13. Declared divergences
+
+| # | divergence | evidence |
+|---|---|---|
+| (i) | DIVERGENCE-DECLARED — Branch-3 (no field ids, no name mapping) on NON-DENSE top-level ids: the fork stamps by table position with a Java-counter fallback and projects by id; Java's `pruneColumnsFallback` misaligns and returns unusable answers (bytecode-proven against iceberg-parquet 1.10.0). Flat/dense stays Java-identical. | round-2a bytecode evidence; id-less oracle pins §7 M10 |
+| (ii) | DIVERGENCE-DECLARED — Branch-2 nested predicates go to a post-decode residual instead of a pushed RowFilter, because the fork applies name mappings top-level-only while Java's `ApplyNameMapping` recurses. Same answers, less pushdown; recursive mapping is a declared future gap (§8). | id-less nested oracle pins §7 M6/M7 |
