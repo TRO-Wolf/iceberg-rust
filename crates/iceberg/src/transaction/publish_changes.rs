@@ -15,9 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::error::Result;
+use crate::spec::{SnapshotRef, TableMetadata};
+use crate::transaction::cherry_pick::is_wap_id_published;
 use crate::transaction::{
     MergeAppendAction, OverwriteFilesAction, ReplacePartitionsAction, RowDeltaAction,
 };
+use crate::{Error, ErrorKind};
+
+const STAGED_WAP_ID_PROP: &str = "wap.id";
+
+fn data_invalid(message: String) -> Error {
+    Error::new(ErrorKind::DataInvalid, message)
+}
+
+#[allow(missing_docs)]
+pub fn staged_snapshot_for_wap_id(metadata: &TableMetadata, wap_id: &str) -> Result<SnapshotRef> {
+    let mut staged = None;
+    for snapshot in metadata.snapshots() {
+        if snapshot
+            .summary()
+            .additional_properties
+            .get(STAGED_WAP_ID_PROP)
+            .is_some_and(|value| value == wap_id)
+        {
+            if staged.is_some() {
+                return Err(data_invalid(format!(
+                    "Cannot apply non-unique WAP ID. Found multiple snapshots with WAP ID '{wap_id}'"
+                )));
+            }
+            staged = Some(snapshot);
+        }
+    }
+    let Some(staged) = staged else {
+        return Err(data_invalid(format!(
+            "Cannot apply unknown WAP ID '{wap_id}'"
+        )));
+    };
+    if is_wap_id_published(metadata, wap_id) {
+        return Err(data_invalid(format!(
+            "Duplicate request to cherry pick wap id that was published already: {wap_id}"
+        )));
+    }
+    Ok(staged.clone())
+}
 
 impl MergeAppendAction {
     #[allow(missing_docs)]

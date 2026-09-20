@@ -17,7 +17,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::Catalog;
 use crate::memory::tests::new_memory_catalog;
 use crate::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
@@ -25,7 +24,8 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::tests::make_v2_minimal_table_in_catalog;
-use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::transaction::{ApplyTransactionAction, Transaction, staged_snapshot_for_wap_id};
+use crate::{Catalog, ErrorKind};
 
 const STAGED_WAP_ID_PROP: &str = "wap.id";
 
@@ -170,6 +170,33 @@ fn assert_staged_invariants(
 async fn staged_base(catalog: &impl Catalog) -> Table {
     let table = make_v2_minimal_table_in_catalog(catalog).await;
     append_main(catalog, &table, vec![data_file("test/base.parquet", 9)]).await
+}
+
+async fn stage_fast_append(
+    catalog: &impl Catalog,
+    table: &Table,
+    path: &str,
+    part_value: i64,
+    wap_id: &str,
+) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .fast_append()
+        .set_snapshot_properties(wap_properties(wap_id))
+        .add_data_files(vec![data_file(path, part_value)])
+        .stage_only()
+        .apply(tx)
+        .expect("apply staged append");
+    tx.commit(catalog).await.expect("commit staged append")
+}
+
+async fn cherry_pick(catalog: &impl Catalog, table: &Table, snapshot_id: i64) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .cherry_pick(snapshot_id)
+        .apply(tx)
+        .expect("apply cherry-pick");
+    tx.commit(catalog).await.expect("commit cherry-pick")
 }
 
 #[tokio::test]
@@ -368,5 +395,90 @@ async fn delete_files_stage_only_adds_snapshot_without_moving_main() {
         live_file_paths(&staged_table, ManifestContentType::Data).await,
         base_live,
         "a read of main must be unchanged by the staged delete"
+    );
+}
+
+#[tokio::test]
+async fn staged_snapshot_for_wap_id_finds_the_staged_snapshot() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_fast_append(&catalog, &table, "test/staged.parquet", 0, "wap-find").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+
+    let found = staged_snapshot_for_wap_id(table.metadata(), "wap-find")
+        .expect("the staged snapshot resolves by wap id");
+    assert_eq!(found.snapshot_id(), staged_id);
+    assert_eq!(
+        found
+            .summary()
+            .additional_properties
+            .get(STAGED_WAP_ID_PROP)
+            .map(String::as_str),
+        Some("wap-find"),
+    );
+}
+
+#[tokio::test]
+async fn staged_snapshot_for_wap_id_unknown_id_has_java_message() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+
+    let error = staged_snapshot_for_wap_id(table.metadata(), "nope")
+        .expect_err("an unknown wap id must fail");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "Cannot apply unknown WAP ID 'nope'",
+        "Java's unknown-WAP-id text, verbatim"
+    );
+}
+
+#[tokio::test]
+async fn staged_snapshot_for_wap_id_non_unique_has_java_message() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_fast_append(&catalog, &table, "test/s1.parquet", 0, "wap-multi").await;
+    let table = stage_fast_append(&catalog, &table, "test/s2.parquet", 1, "wap-multi").await;
+    assert_eq!(
+        non_current_snapshot_ids(&table).len(),
+        2,
+        "the fixture holds two staged snapshots sharing one wap id"
+    );
+
+    let error = staged_snapshot_for_wap_id(table.metadata(), "wap-multi")
+        .expect_err("a non-unique wap id must fail");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "Cannot apply non-unique WAP ID. Found multiple snapshots with WAP ID 'wap-multi'",
+        "Java's non-unique-WAP-id text, verbatim"
+    );
+}
+
+#[tokio::test]
+async fn staged_snapshot_for_wap_id_already_published_has_java_message() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_fast_append(&catalog, &table, "test/staged.parquet", 0, "wap-dup").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+
+    let table = cherry_pick(&catalog, &table, staged_id).await;
+    assert_eq!(
+        table.metadata().current_snapshot_id(),
+        Some(staged_id),
+        "the staged snapshot fast-forwarded onto main"
+    );
+
+    let error = staged_snapshot_for_wap_id(table.metadata(), "wap-dup")
+        .expect_err("an already-published wap id must fail");
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "Duplicate request to cherry pick wap id that was published already: wap-dup",
+        "Java's DuplicateWAPCommitException text, verbatim"
     );
 }
