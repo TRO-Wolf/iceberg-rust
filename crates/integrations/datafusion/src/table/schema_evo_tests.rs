@@ -867,6 +867,7 @@ async fn test_scan_reads_only_the_projected_column() {
     let batches: Vec<_> = get_batch_stream(
         table,
         None,
+        false,
         vec!["name".to_string()],
         None,
         crate::physical_plan::scan::ScanKnobs::default(),

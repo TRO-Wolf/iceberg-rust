@@ -40,6 +40,7 @@ pub struct IcebergStaticTableProvider {
     /// Never refreshed.
     table: Table,
     snapshot_id: Option<i64>,
+    project_current_schema: bool,
     schema: ArrowSchemaRef,
 }
 
@@ -50,6 +51,7 @@ impl IcebergStaticTableProvider {
         Ok(IcebergStaticTableProvider {
             table,
             snapshot_id: None,
+            project_current_schema: true,
             schema,
         })
     }
@@ -73,6 +75,46 @@ impl IcebergStaticTableProvider {
         Ok(IcebergStaticTableProvider {
             table,
             snapshot_id: Some(snapshot_id),
+            project_current_schema: false,
+            schema,
+        })
+    }
+
+    pub async fn try_new_from_table_ref(table: Table, ref_name: &str) -> Result<Self> {
+        let (snapshot_id, is_branch) = table
+            .snapshot_ref(ref_name)
+            .map(|reference| (reference.snapshot_id, reference.is_branch()))
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "reference {ref_name} not found in table {}",
+                        table.identifier().name()
+                    ),
+                )
+            })?;
+        let table_schema = if is_branch {
+            table.metadata().current_schema().clone()
+        } else {
+            table
+                .metadata()
+                .snapshot_by_id(snapshot_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "snapshot id {snapshot_id} for reference {ref_name} not found in table {}",
+                            table.identifier().name()
+                        ),
+                    )
+                })?
+                .schema(table.metadata())?
+        };
+        let schema = Arc::new(schema_to_arrow_schema(&table_schema)?);
+        Ok(IcebergStaticTableProvider {
+            table,
+            snapshot_id: Some(snapshot_id),
+            project_current_schema: is_branch,
             schema,
         })
     }
@@ -100,6 +142,7 @@ impl TableProvider for IcebergStaticTableProvider {
             IcebergTableScan::plan(
                 self.table.clone(),
                 self.snapshot_id,
+                self.project_current_schema,
                 self.schema.clone(),
                 projection,
                 filters,

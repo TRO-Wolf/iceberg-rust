@@ -1955,3 +1955,28 @@ BinaryView/Utf8View; transform code handles only Binary/Utf8 in places.
 - [ ] Step 4 mutation (one knob at a time, arithmetic recorded) + gates (comment-ban, fmt,
       clippy -p iceberg and -p iceberg-datafusion, size checker, typos, filtered tests only);
       ledger PROVEN/OPEN; handback.json; echo.
+
+## F-BRANCH-SCHEMA-1 — a branch read projects the table's current schema (2026-10-XX)
+
+Branch `fix/f-branch-schema-1`, ledger `task/f-branch-schema-1-ledger.md`.
+RePark IPI-07: Spark reads a branch with the table's current schema; a tag or snapshot id keeps
+the snapshot's. The static provider had no ref constructor and bound everything to the snapshot
+schema.
+
+- [x] Step 1 ledger + RED: `table/branch_schema_tests.rs` against the snapshot-schema path
+      (16 red showing wrong columns, 11 control pins green). Commit.
+- [x] Step 2 fix: `Table::snapshot_ref`, `try_new_from_table_ref`, `project_current_schema`
+      threaded through plan/bindings/predicates/build_table_scan; writable provider's
+      `with_commit_branch` read follows the same rule. Commit 970cff9f.
+- [x] Step 3 pins: unknown ref, position-delete branch, partitioned table, writable-provider
+      branch read (commit 52355f49); mutation legs (branch→snapshot schema, tag→current
+      schema, drop predicate binding) all reddened the right pins and reverted green.
+- [x] Step 4 gates green (fmt, clippy, filtered tests, size checker, typos, comment-ban);
+      ledger complete + final commit; handback.json; echo.
+- [x] Round 2 (PR #324 critic): L-01 fixed — `try_new_from_table` and the writable provider's
+      non-branch read set `project_current_schema: true`; RED pins first
+      (`bs_current_rename_{static,factory}`), mutation re-proved (`bs_current_rename_writable`,
+      `bs_current_drop_static`, `bs_current_widen_static` audited). Commit 587bbbb9.
+- [x] Round 2 L-02 — `bs_add_version` repointed at the core `use_ref("b0") +
+      project_current_schema()` entry point so the branch-ref surface has an independent pin.
+      Commit 587bbbb9; ledger findings table e7e28ab7.

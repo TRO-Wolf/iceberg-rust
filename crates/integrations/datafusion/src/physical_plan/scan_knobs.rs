@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::pin::Pin;
+
+use datafusion::arrow::array::RecordBatch;
 use datafusion::common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
-use datafusion::error::DataFusionError;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
+use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::scan::TableScan;
 use iceberg::table::Table;
@@ -201,17 +205,46 @@ pub fn ensure_iceberg_scan_options(config: &mut datafusion::prelude::SessionConf
     }
 }
 
+pub(crate) async fn get_batch_stream(
+    table: Table,
+    snapshot_id: Option<i64>,
+    project_current_schema: bool,
+    column_names: Vec<String>,
+    predicates: Option<Predicate>,
+    knobs: ScanKnobs,
+) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+    let table_scan = build_table_scan(
+        &table,
+        snapshot_id,
+        project_current_schema,
+        column_names,
+        predicates,
+        knobs,
+    )?;
+
+    let stream = table_scan
+        .to_arrow()
+        .await
+        .map_err(to_datafusion_error)?
+        .map_err(to_datafusion_error);
+    Ok(Box::pin(stream))
+}
+
 pub(crate) fn build_table_scan(
     table: &Table,
     snapshot_id: Option<i64>,
+    project_current_schema: bool,
     column_names: Vec<String>,
     predicates: Option<Predicate>,
     knobs: ScanKnobs,
 ) -> datafusion::error::Result<TableScan> {
-    let scan_builder = match snapshot_id {
+    let mut scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
         None => table.scan(),
     };
+    if project_current_schema {
+        scan_builder = scan_builder.project_current_schema();
+    }
     let mut scan_builder = scan_builder.select(column_names);
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);

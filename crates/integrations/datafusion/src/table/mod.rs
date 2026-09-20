@@ -146,11 +146,18 @@ impl TableProvider for IcebergTableProvider {
             self.commit_branch.as_deref(),
         )
         .map_err(to_datafusion_error)?;
+        let project_current_schema = match self.commit_branch.as_deref() {
+            None => true,
+            Some(name) => table
+                .snapshot_ref(name)
+                .is_some_and(|reference| reference.is_branch()),
+        };
         let knobs = crate::physical_plan::scan::scan_knobs_from_context(&state.task_ctx());
         Ok(Arc::new(
             IcebergTableScan::plan(
                 table,
                 snapshot_id,
+                project_current_schema,
                 self.schema.clone(),
                 projection,
                 filters,
@@ -301,6 +308,8 @@ impl TableProvider for IcebergTableProvider {
         )))
     }
 }
+#[cfg(test)]
+mod branch_schema_tests;
 #[cfg(test)]
 mod schema_evo_tests;
 #[cfg(test)]

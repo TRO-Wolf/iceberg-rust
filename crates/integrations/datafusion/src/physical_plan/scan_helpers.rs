@@ -49,6 +49,7 @@ pub(crate) fn resolve_bindings(
     table: &Table,
     snapshot_id: Option<i64>,
     schema: &ArrowSchemaRef,
+    project_current_schema: bool,
 ) -> DFResult<HashMap<String, Option<String>>> {
     let metadata = table.metadata();
     let snapshot = match snapshot_id {
@@ -62,7 +63,11 @@ pub(crate) fn resolve_bindings(
             .map(|field| (field.name().clone(), Some(field.name().clone())))
             .collect());
     };
-    let snapshot_schema = snapshot.schema(metadata).map_err(to_datafusion_error)?;
+    let binding_schema = if project_current_schema {
+        metadata.current_schema().clone()
+    } else {
+        snapshot.schema(metadata).map_err(to_datafusion_error)?
+    };
 
     let mut bindings = HashMap::with_capacity(schema.fields().len());
     for field in schema.fields() {
@@ -73,7 +78,7 @@ pub(crate) fn resolve_bindings(
         let field_id = advertised_field_id(field)?;
         bindings.insert(
             field.name().clone(),
-            snapshot_schema
+            binding_schema
                 .name_by_field_id(field_id)
                 .map(str::to_string),
         );
