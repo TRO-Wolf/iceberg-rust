@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, Float32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Float32Array, Int32Array, Int64Array, RecordBatch};
 use futures::TryStreamExt;
 
 use crate::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
@@ -38,6 +38,7 @@ use crate::spec::{
     PrimitiveType, Schema, SortDirection, SortField, SortOrder, Struct, Transform, Type,
 };
 use crate::table::Table;
+use crate::transform::create_transform_function;
 use crate::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
 use crate::{Catalog, NamespaceIdent, TableCreation};
 
@@ -630,4 +631,90 @@ async fn binpack_unsorted_table_stamps_zero_and_keeps_row_union() {
         );
     }
     assert_eq!(scan_rows(&table).await, rows_before);
+}
+
+#[tokio::test]
+async fn binpack_transform_default_order_sorts_by_bucket_key_and_stamps() {
+    let (catalog, _temp) = local_fs_catalog().await;
+    let order = SortOrder::builder()
+        .with_sort_field(
+            SortField::builder()
+                .source_id(2)
+                .transform(Transform::Bucket(4))
+                .direction(SortDirection::Ascending)
+                .null_order(NullOrder::First)
+                .build(),
+        )
+        .build(&nullable_yz_schema())
+        .expect("sort order");
+    let table = create_sort_table(&catalog, nullable_yz_schema(), order).await;
+    let order_id = i32::try_from(table.metadata().default_sort_order_id()).unwrap();
+
+    let file_a = write_nullable_y_file(&table, "tb-a.parquet", 0, &[
+        Some(15),
+        Some(0),
+        Some(8),
+        None,
+        Some(3),
+    ])
+    .await;
+    let file_b = write_nullable_y_file(&table, "tb-b.parquet", 0, &[
+        Some(12),
+        Some(5),
+        Some(9),
+        Some(1),
+    ])
+    .await;
+    let file_c = write_nullable_y_file(&table, "tb-c.parquet", 0, &[
+        Some(7),
+        Some(14),
+        Some(2),
+        Some(11),
+    ])
+    .await;
+    let table = append_files(&catalog, &table, vec![file_a, file_b, file_c]).await;
+
+    let result = RewriteDataFiles::new(table.clone())
+        .rewrite_all(true)
+        .execute(&catalog)
+        .await
+        .expect("binpack rewrite");
+    assert_eq!(result.rewritten_data_files_count, 3);
+
+    let table = catalog.load_table(table.identifier()).await.unwrap();
+    let files = live_data_files(&table).await;
+    assert!(!files.is_empty());
+    let bucket = create_transform_function(&Transform::Bucket(4)).expect("bucket function");
+    let mut all = Vec::new();
+    let mut differs_from_identity_sort = false;
+    for file in &files {
+        assert_eq!(
+            file.sort_order_id(),
+            Some(order_id),
+            "output file stamps the transformed default sort order id"
+        );
+        let ys = file_i64_column(&table, file, "y").await;
+        let keys = bucket
+            .transform(Arc::new(Int64Array::from(ys.clone())))
+            .expect("bucket keys");
+        let keys: Vec<Option<i32>> = keys
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int keys")
+            .iter()
+            .collect();
+        assert!(
+            keys.windows(2).all(|pair| pair[0] <= pair[1]),
+            "output rows ascending by bucket[4](y) nulls-first: {keys:?} for {ys:?}"
+        );
+        let mut identity_sorted = ys.clone();
+        identity_sorted.sort();
+        differs_from_identity_sort |= ys != identity_sorted;
+        all.extend(ys);
+    }
+    assert!(
+        differs_from_identity_sort,
+        "the fixture must prove a transform sort: bucket-key order differs from identity order"
+    );
+    assert_eq!(all.len(), 13);
 }
