@@ -309,7 +309,7 @@ file being pruned. "Fail open" = keep the file/row (never drop a match).
 | C-007 id-less files answer container/nested null tests via stamping + post-decode residual | PROVEN | pins: f-container-accessor-1/C-007 (id-less oracle cases in `scan/container_null_tests.rs`) |
 | C-008 pruning never drops a matching row (manifest/metrics/row-group/page-index fail open) | PROVEN | pins: f-container-accessor-1/C-008 (`test_container_null_predicates_match_spark_oracle_under_page_index_row_selection`) |
 | C-009 optional-primitive `BoundPredicate` JSON byte-identical to `main`; required carries explicit `false`; keyless wire JSON reads | PROVEN | pins: f-container-accessor-1/C-009 (`test_optional_primitive_bound_predicate_json_omits_default_is_optional`, `test_required_primitive_bound_predicate_json_carries_explicit_is_optional`) |
-| C-010 container comparisons fail at bind; charge covers the new tree; DF pushes container null tests | PROVEN | pins: f-container-accessor-1/C-010 (`test_bind_comparison_on_container_column_fails_at_bind`, `object_cache_charge_tests`, `is_null_on_a_*_column_is_pushed`) |
+| C-010 container comparisons fail at bind; charge covers the new tree; DF pushes container null tests | PROVEN | pins: f-container-accessor-1/C-010 (`test_bind_comparison_on_container_column_fails_at_bind`, `io::object_cache::charge_tests::test_schema_accessor_charge_*`, `is_null_on_a_list/map/struct_column_is_pushed`) |
 
 ## 12. Coverage attestation
 
