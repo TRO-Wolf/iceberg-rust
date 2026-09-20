@@ -343,6 +343,12 @@ checks duplicates after. The refusal and its message are identical; checking fir
 every footer of an import that cannot commit. The only observable difference is which error a
 caller sees when a source is BOTH a duplicate and unreadable — the fork reports the duplicate.
 
+**D-16 — Java's second unpartitioned-filter check is DEAD, in Java too, and is not ported.**
+`AddFilesProcedure.importFileTable` asserts "Cannot use a partition filter when importingto an
+unpartitioned table" at bytecode 107–117, AFTER `validatePartitionFilter` at 64 has already thrown
+"Cannot use partition filter with an unpartitioned table %s" for exactly that state. The fork keeps
+only the reachable one, so no branch in this action looks live and is not.
+
 **D-13 — hidden paths are skipped at EVERY segment.** Java's `HIDDEN_PATH_FILTER` filters the LEAF
 name only, because Spark's partition discovery already dropped `_`/`.` DIRECTORIES upstream. With
 one recursive listing the fork applies the same `_`/`.` rule to every segment below the source root,
@@ -376,3 +382,41 @@ which is the composition of the two Java filters.
 | a partition type with no hive-string parse refuses | `a_partition_type_java_cannot_parse_from_a_string_is_refused` | PROVEN |
 | a non-`name=value` source directory refuses | `a_source_directory_that_is_not_a_partition_directory_is_refused` | PROVEN |
 | conflicting source directory structures refuse | `conflicting_source_directory_structures_are_refused` | PROVEN |
+
+## 6. Mutation proof
+
+Each mutation was applied to the product code alone, `cargo test -p iceberg --lib add_files` was
+run, and the tree was restored. Every rule the action enforces has at least one pin that turns RED
+when the rule is broken.
+
+| # | Mutation | Pins that went RED |
+|---|---|---|
+| M1 | `__HIVE_DEFAULT_PARTITION__` is treated as an ordinary string | `the_hive_default_partition_directory_becomes_a_null_partition_value` |
+| M2 | every partition value becomes NULL | `partitioned_source_adopts_one_file_per_hive_directory`, `partition_filter_adopts_only_the_named_partition`, `an_explicit_file_list_carries_its_own_partition_values`, `a_partition_value_that_does_not_parse_for_its_type_is_refused`, `a_partition_type_java_cannot_parse_from_a_string_is_refused` |
+| M3 | the duplicate check never fires | `check_duplicate_files_refuses_the_second_import` |
+| M4 | the name mapping is ignored (positional fallback) | `an_id_less_source_resolves_its_columns_by_name_not_by_position` |
+| M5 | `MetricsConfig::default()` instead of `for_table` | `the_table_metrics_config_decides_the_adopted_bounds` |
+| M6 | `sort_order_id` left unset | `an_adopted_file_carries_sort_order_id_zero_and_no_split_offsets` |
+| M7 | the footer's split offsets are kept | `an_adopted_file_carries_sort_order_id_zero_and_no_split_offsets` |
+| M8 | hidden `_`/`.` paths are not skipped | `a_hidden_directory_or_file_is_skipped` |
+| M9 | `find_compatible_spec` accepts any spec | `a_source_whose_partition_columns_match_no_spec_is_refused` |
+| M10 | the name-mapping property is never created | `the_default_name_mapping_is_created_when_absent`, `a_source_column_the_target_lacks_is_dropped_and_reads_back_null` |
+| M11 | the partition filter is ignored | `partition_filter_adopts_only_the_named_partition`, `a_partition_filter_matching_no_partition_is_refused` |
+| M12 | the file's embedded field ids are ignored | `a_source_that_carries_field_ids_is_resolved_by_those_ids` |
+| M13 | a resolved id the table schema lacks is kept, not dropped | `a_field_id_the_table_schema_lacks_is_dropped_from_the_adopted_file` |
+| M14 | the partition lookup ignores the spec field name | `a_two_column_partition_tuple_follows_the_spec_field_order` |
+| M15 | `file_size_in_bytes` is not the listing's size | `an_adopted_file_carries_sort_order_id_zero_and_no_split_offsets` |
+| M16 | the adopted file is stamped with the wrong spec id | 19 pins |
+| M17 | `record_count` is not the footer's | `unpartitioned_source_is_adopted_in_place_in_one_append_snapshot`, `partitioned_source_adopts_one_file_per_hive_directory`, `the_table_metrics_config_decides_the_adopted_bounds` |
+
+M4, M12, M13, M14 and M15 were GREEN on the first round. Each one added a pin, and each pin was
+then proven RED under the same mutation:
+
+- M4 was green because every fixture table's column ORDER matched its field-id order, so the
+  positional fallback and the name mapping agreed. The new pin writes the source columns REVERSED.
+- M12 was green because no fixture carried embedded field ids. The new pin writes a source whose
+  columns are named `x`/`y` (which the name mapping cannot find) and carry ids 1/2.
+- M13 was green because no fixture carried an id the table schema lacks. The new pin writes id 9.
+- M14 was green because every partitioned fixture had ONE partition field. The new pin uses a
+  two-field `(cat, dept)` spec.
+- M15 was green because the size pin only asserted `> 0`. It now asserts the listing's exact size.

@@ -93,7 +93,7 @@ fn id_other_schema() -> Schema {
         .expect("build id/other schema")
 }
 
-async fn create_table(
+pub(super) async fn create_table(
     catalog: &impl Catalog,
     schema: Schema,
     partition_by: Option<&str>,
@@ -109,7 +109,7 @@ async fn create_table(
     .await
 }
 
-async fn create_table_with_properties(
+pub(super) async fn create_table_with_properties(
     catalog: &impl Catalog,
     schema: Schema,
     partition_by: Option<&str>,
@@ -217,7 +217,7 @@ pub(super) fn source_root(temp_dir: &TempDir, name: &str) -> String {
     )
 }
 
-async fn live_data_files(table: &Table) -> Vec<DataFile> {
+pub(super) async fn live_data_files(table: &Table) -> Vec<DataFile> {
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
         return Vec::new();
@@ -245,7 +245,7 @@ async fn live_data_files(table: &Table) -> Vec<DataFile> {
     files
 }
 
-async fn scan_id_v(table: &Table) -> Vec<(Option<i64>, Option<String>)> {
+pub(super) async fn scan_id_v(table: &Table) -> Vec<(Option<i64>, Option<String>)> {
     scan_two(table, "id", "v").await
 }
 
@@ -684,7 +684,20 @@ async fn an_adopted_file_carries_sort_order_id_zero_and_no_split_offsets() {
             .is_none_or(|offsets| offsets.is_empty()),
         "Java TableMigrationUtil.buildDataFile never calls withSplitOffsets"
     );
-    assert!(files[0].file_size_in_bytes() > 0);
+    let on_disk = table
+        .file_io()
+        .new_input(files[0].file_path())
+        .expect("input file")
+        .metadata()
+        .await
+        .expect("source file metadata")
+        .size;
+    assert_eq!(
+        files[0].file_size_in_bytes(),
+        on_disk,
+        "Java takes withFileSizeInBytes from FileStatus.getLen(), not from the footer"
+    );
+    assert!(on_disk > 0);
 }
 
 #[tokio::test]
@@ -831,63 +844,5 @@ async fn a_source_whose_partition_columns_match_no_spec_is_refused() {
             .to_string()
             .contains("that matches the partition columns (dept) in input table"),
         "Java SparkTableUtil.findCompatibleSpec: {error}"
-    );
-}
-
-#[tokio::test]
-async fn the_table_metrics_config_decides_the_adopted_bounds() {
-    let (catalog, temp_dir) = local_fs_catalog().await;
-    let counted = create_table(&catalog, id_v_schema(), None, FormatVersion::V2).await;
-    let counted_root = source_root(&temp_dir, "metrics-default");
-    flat_source(&counted, &counted_root).await;
-    AddFiles::new(counted.clone(), AddFilesSource::Directory(counted_root))
-        .execute(&catalog)
-        .await
-        .expect("adopt under the default metrics config");
-    let counted = catalog
-        .load_table(counted.identifier())
-        .await
-        .expect("reload table");
-    let adopted = live_data_files(&counted).await;
-    assert!(
-        !adopted[0].lower_bounds().is_empty(),
-        "the default truncate(16) mode keeps bounds"
-    );
-    assert!(!adopted[0].column_sizes().is_empty());
-
-    let none = create_table_with_properties(
-        &catalog,
-        id_v_schema(),
-        None,
-        FormatVersion::V2,
-        HashMap::from([(
-            "write.metadata.metrics.default".to_string(),
-            "none".to_string(),
-        )]),
-    )
-    .await;
-    let none_root = source_root(&temp_dir, "metrics-none");
-    flat_source(&none, &none_root).await;
-    AddFiles::new(none.clone(), AddFilesSource::Directory(none_root))
-        .execute(&catalog)
-        .await
-        .expect("adopt under metrics mode none");
-    let none = catalog
-        .load_table(none.identifier())
-        .await
-        .expect("reload table");
-    let adopted = live_data_files(&none).await;
-    assert!(
-        adopted[0].lower_bounds().is_empty() && adopted[0].upper_bounds().is_empty(),
-        "MetricsConfig::for_table reads write.metadata.metrics.default"
-    );
-    assert!(
-        adopted[0].column_sizes().is_empty() && adopted[0].value_counts().is_empty(),
-        "mode none persists nothing for the column"
-    );
-    assert_eq!(
-        adopted[0].record_count(),
-        2,
-        "the record count comes from the footer, not the metrics config"
     );
 }

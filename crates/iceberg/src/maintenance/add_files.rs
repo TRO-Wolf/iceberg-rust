@@ -146,16 +146,7 @@ impl AddFiles {
         validate_partition_filter(&spec, &self.partition_filter, &table_name)?;
 
         let files = filter_partitions(files, &self.partition_filter);
-        if spec.is_unpartitioned() {
-            if !self.partition_filter.is_empty() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Cannot use a partition filter when importing to an unpartitioned table {table_name}"
-                    ),
-                ));
-            }
-        } else if files.is_empty() {
+        if !spec.is_unpartitioned() && files.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!("Cannot find any matching partitions in table {table_name}"),
