@@ -48,6 +48,7 @@ pub(crate) mod record_batch_predicate;
 /// RecordBatch projection utilities
 pub mod record_batch_projector;
 pub(crate) mod record_batch_transformer;
+pub(crate) mod row_filter_plan;
 mod value;
 
 pub use reader::*;

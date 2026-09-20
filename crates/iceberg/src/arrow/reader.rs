@@ -34,7 +34,7 @@ use fnv::FnvHashSet;
 use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{
-    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
+    ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector,
 };
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
@@ -57,6 +57,9 @@ use crate::arrow::ranges::merge_ranges;
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::arrow::record_batch_transformer::{
     RecordBatchTransformer, RecordBatchTransformerBuilder,
+};
+use crate::arrow::row_filter_plan::{
+    RowFilterPlan, leaf_count, plan_row_filter, top_level_ancestor_id, unmapped_group_leaf_indices,
 };
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
@@ -494,8 +497,10 @@ impl ArrowReader {
                     name_mapping,
                 )?
             } else {
-                // Branch 3: Java `ParquetSchemaUtil.addFallbackIds()`, position-based.
-                add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
+                add_fallback_field_ids_to_arrow_schema(
+                    arrow_metadata.schema(),
+                    task.schema.as_ref(),
+                )
             };
 
             let options = ArrowReaderOptions::new().with_schema(arrow_schema);
@@ -512,11 +517,6 @@ impl ArrowReader {
             // Branch 1: the file carries field ids.
             arrow_metadata
         };
-
-        // Position-based projection applies to Branch 3 only. Branch 2 stamps real field ids, so
-        // it must project by field id. A positional projection there ignores the mapping and reads
-        // the wrong columns.
-        let use_position_fallback = missing_field_ids && task.name_mapping.is_none();
 
         // Coerce INT96 timestamps before the stream reader is built, or arrow-rs overflows i64.
         let arrow_metadata = if let Some(coerced_schema) =
@@ -576,13 +576,12 @@ impl ArrowReader {
             project_field_ids_without_metadata.dedup();
         }
 
-        // Only fallback ids project by position. Both other branches project by field id.
         let projection_mask = Self::get_arrow_projection_mask(
             &project_field_ids_without_metadata,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
-            use_position_fallback, // position-based (true) only for id-less files with NO name mapping
+            missing_field_ids,
         )?;
 
         record_batch_stream_builder =
@@ -630,27 +629,6 @@ impl ArrowReader {
             return Self::stream_pos_projection_scan_task(task, parquet_stream, delete_filter_rx)
                 .await;
         }
-
-        // RecordBatchTransformer applies type promotion, defaults, reordering, partition
-        // constants, and virtual fields such as `_file`.
-        let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
-                .with_row_lineage(task.first_row_id, task.file_sequence_number);
-
-        if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
-            let file_datum = Datum::string(task.data_file_path.clone());
-            record_batch_transformer_builder =
-                record_batch_transformer_builder.with_constant(RESERVED_FIELD_ID_FILE, file_datum);
-        }
-
-        if let (Some(partition_spec), Some(partition_data)) =
-            (task.partition_spec.clone(), task.partition.clone())
-        {
-            record_batch_transformer_builder =
-                record_batch_transformer_builder.with_partition(partition_spec, partition_data)?;
-        }
-
-        let mut record_batch_transformer = record_batch_transformer_builder.build();
 
         if let Some(batch_size) = batch_size {
             record_batch_stream_builder = record_batch_stream_builder.with_batch_size(batch_size);
@@ -706,18 +684,49 @@ impl ArrowReader {
             selected_row_group_indices = Some(byte_range_filtered_row_groups);
         }
 
+        let mut post_decode_residual: Option<BoundPredicate> = None;
+        let mut transformer_field_ids: Vec<i32> = task.project_field_ids().to_vec();
+
         if let Some(predicate) = final_predicate {
             let (iceberg_field_ids, field_id_map) = Self::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
                 &predicate,
             )?;
 
-            let row_filter = Self::get_row_filter(
+            match plan_row_filter(
                 &predicate,
+                &task.schema,
                 record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema(),
                 &iceberg_field_ids,
-            )?;
-            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
+            )? {
+                RowFilterPlan::Push(row_filter) => {
+                    record_batch_stream_builder =
+                        record_batch_stream_builder.with_row_filter(row_filter);
+                }
+                RowFilterPlan::Residual => {
+                    for field_id in &iceberg_field_ids {
+                        if let Some(top_id) = top_level_ancestor_id(&task.schema, *field_id)
+                            && !transformer_field_ids.contains(&top_id)
+                        {
+                            transformer_field_ids.push(top_id);
+                            if !project_field_ids_without_metadata.contains(&top_id) {
+                                project_field_ids_without_metadata.push(top_id);
+                            }
+                        }
+                    }
+                    let projection_mask = Self::get_arrow_projection_mask(
+                        &project_field_ids_without_metadata,
+                        &task.schema,
+                        record_batch_stream_builder.parquet_schema(),
+                        record_batch_stream_builder.schema(),
+                        missing_field_ids,
+                    )?;
+                    record_batch_stream_builder =
+                        record_batch_stream_builder.with_projection(projection_mask);
+                    post_decode_residual = Some(predicate.clone());
+                }
+            }
 
             if row_group_filtering_enabled && row_selection.is_none() {
                 let predicate_filtered_row_groups = Self::get_selected_row_group_indices(
@@ -778,34 +787,69 @@ impl ArrowReader {
                 record_batch_stream_builder.with_row_groups(selected_row_group_indices);
         }
 
-        // With `keyset_post_decode` set, eq-deletes apply here, after the transform, rather than
-        // through the RowFilter residual above.
+        let mut record_batch_transformer_builder =
+            RecordBatchTransformerBuilder::new(task.schema_ref(), &transformer_field_ids)
+                .with_row_lineage(task.first_row_id, task.file_sequence_number);
+
+        if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
+            let file_datum = Datum::string(task.data_file_path.clone());
+            record_batch_transformer_builder =
+                record_batch_transformer_builder.with_constant(RESERVED_FIELD_ID_FILE, file_datum);
+        }
+
+        if let (Some(partition_spec), Some(partition_data)) =
+            (task.partition_spec.clone(), task.partition.clone())
+        {
+            record_batch_transformer_builder =
+                record_batch_transformer_builder.with_partition(partition_spec, partition_data)?;
+        }
+
+        let mut record_batch_transformer = record_batch_transformer_builder.build();
+        let prune_extra_columns = transformer_field_ids.len() > task.project_field_ids().len();
+        let projected_column_indices: Vec<usize> = (0..task.project_field_ids().len()).collect();
+
         let record_batch_stream =
             record_batch_stream_builder
                 .build()?
                 .map(move |batch| match batch {
                     Ok(batch) => {
-                        let transformed = record_batch_transformer.process_record_batch(batch)?;
-                        if post_decode_eq_sets.is_none() && post_decode_eq_predicate.is_none() {
-                            return Ok(transformed);
-                        }
-                        // Same routing as `survival_mask`: keysets first, the bound predicate on
-                        // a NULL-key batch.
-                        match Self::eq_delete_keep_mask(
-                            &transformed,
-                            transformed.num_rows(),
+                        let mut batch = record_batch_transformer.process_record_batch(batch)?;
+                        if let Some(mask) = Self::eq_delete_keep_mask(
+                            &batch,
+                            batch.num_rows(),
                             post_decode_eq_predicate.as_ref(),
                             post_decode_eq_sets.as_deref(),
                         )? {
-                            None => Ok(transformed),
-                            Some(mask) => filter_record_batch(&transformed, &mask).map_err(|e| {
+                            batch = filter_record_batch(&batch, &mask).map_err(|e| {
                                 Error::new(
                                     ErrorKind::Unexpected,
                                     "Failed to apply equality-delete keyset keep-mask to a Parquet data batch",
                                 )
                                 .with_source(e)
-                            }),
+                            })?;
                         }
+                        if let Some(residual) = post_decode_residual.as_ref() {
+                            let mask = coerce_nulls_to_false(&evaluate_predicate_to_mask(
+                                residual, &batch,
+                            )?);
+                            batch = filter_record_batch(&batch, &mask).map_err(|e| {
+                                Error::new(
+                                    ErrorKind::Unexpected,
+                                    "Failed to apply post-decode residual predicate to a Parquet data batch",
+                                )
+                                .with_source(e)
+                            })?;
+                        }
+                        if prune_extra_columns {
+                            batch = batch.project(&projected_column_indices).map_err(|e| {
+                                Error::new(
+                                    ErrorKind::Unexpected,
+                                    "Failed to prune residual predicate columns from a Parquet data batch",
+                                )
+                                .with_source(e)
+                            })?;
+                        }
+                        Ok(batch)
                     }
                     Err(err) => Err(err.into()),
                 });
@@ -1348,7 +1392,7 @@ impl ArrowReader {
         iceberg_schema_of_task: &Schema,
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
-        use_fallback: bool, // Whether file lacks embedded field IDs (e.g., migrated from Hive/Spark)
+        missing_field_ids: bool,
     ) -> Result<ProjectionMask> {
         fn type_promotion_is_valid(
             file_type: Option<&PrimitiveType>,
@@ -1378,42 +1422,34 @@ impl ArrowReader {
             return Ok(ProjectionMask::leaves(parquet_schema, []));
         }
 
-        if use_fallback {
-            // Position-based projection necessary because file lacks embedded field IDs
-            Self::get_arrow_projection_mask_fallback(field_ids, parquet_schema)
-        } else {
-            // Parquet's columnar format requires leaf-level (not top-level struct/list/map) projection
-            let mut leaf_field_ids = vec![];
-            for field_id in field_ids {
-                // The row-lineage ids are not in the table schema but can be in the file. They
-                // are scalars, so the leaf id is the id.
-                let field = iceberg_schema_of_task
-                    .field_by_id(*field_id)
-                    .cloned()
-                    .or_else(|| get_metadata_field(*field_id).ok().cloned());
-                if let Some(field) = field {
-                    Self::include_leaf_field_id(&field, &mut leaf_field_ids);
-                }
+        let mut leaf_field_ids = vec![];
+        for field_id in field_ids {
+            let field = iceberg_schema_of_task
+                .field_by_id(*field_id)
+                .cloned()
+                .or_else(|| get_metadata_field(*field_id).ok().cloned());
+            if let Some(field) = field {
+                Self::include_leaf_field_id(&field, &mut leaf_field_ids);
             }
-
-            Self::get_arrow_projection_mask_with_field_ids(
-                &leaf_field_ids,
-                iceberg_schema_of_task,
-                parquet_schema,
-                arrow_schema,
-                type_promotion_is_valid,
-            )
         }
+
+        Self::get_arrow_projection_mask_with_field_ids(
+            &leaf_field_ids,
+            iceberg_schema_of_task,
+            parquet_schema,
+            arrow_schema,
+            type_promotion_is_valid,
+            missing_field_ids,
+        )
     }
 
-    /// Standard projection using embedded field IDs from Parquet metadata.
-    /// For iceberg-java compatibility with ParquetSchemaUtil.pruneColumns().
     fn get_arrow_projection_mask_with_field_ids(
         leaf_field_ids: &[i32],
         iceberg_schema_of_task: &Schema,
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
         type_promotion_is_valid: fn(Option<&PrimitiveType>, Option<&PrimitiveType>) -> bool,
+        missing_field_ids: bool,
     ) -> Result<ProjectionMask> {
         let mut column_map = HashMap::new();
         let fields = arrow_schema.fields();
@@ -1463,74 +1499,26 @@ impl ArrowReader {
             true
         });
 
-        // Schema evolution: New columns may not exist in old Parquet files.
-        // We only project existing columns; RecordBatchTransformer adds default/NULL values.
         let mut indices = vec![];
         for field_id in leaf_field_ids {
             if let Some(col_idx) = column_map.get(field_id) {
                 indices.push(*col_idx);
             }
         }
+        if missing_field_ids {
+            indices.extend(unmapped_group_leaf_indices(
+                leaf_field_ids,
+                iceberg_schema_of_task,
+                parquet_schema,
+                arrow_schema,
+            ));
+        }
 
         if indices.is_empty() {
-            // Edge case: All requested columns are new (don't exist in file).
-            // Project all columns so RecordBatchTransformer has a batch to transform.
             Ok(ProjectionMask::all())
         } else {
             Ok(ProjectionMask::leaves(parquet_schema, indices))
         }
-    }
-
-    /// Fallback projection for Parquet files without field IDs.
-    /// Uses position-based matching: field ID N → column position N-1.
-    /// Projects entire top-level columns (including nested content) for iceberg-java compatibility.
-    fn get_arrow_projection_mask_fallback(
-        field_ids: &[i32],
-        parquet_schema: &SchemaDescriptor,
-    ) -> Result<ProjectionMask> {
-        let parquet_root_fields = parquet_schema.root_schema().get_fields();
-        let mut root_indices = vec![];
-
-        for field_id in field_ids.iter() {
-            let parquet_pos = (*field_id - 1) as usize;
-
-            if parquet_pos < parquet_root_fields.len() {
-                root_indices.push(parquet_pos);
-            }
-            // RecordBatchTransformer adds missing columns with NULL values
-        }
-
-        if root_indices.is_empty() {
-            Ok(ProjectionMask::all())
-        } else {
-            Ok(ProjectionMask::roots(parquet_schema, root_indices))
-        }
-    }
-
-    fn get_row_filter(
-        predicates: &BoundPredicate,
-        parquet_schema: &SchemaDescriptor,
-        iceberg_field_ids: &HashSet<i32>,
-    ) -> Result<RowFilter> {
-        let leaf_lists = build_field_id_leaf_lists(parquet_schema)?
-            .unwrap_or_else(|| build_fallback_field_id_leaf_lists(parquet_schema));
-
-        // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
-        let mut column_indices = iceberg_field_ids
-            .iter()
-            .flat_map(|field_id| leaf_lists.get(field_id).into_iter().flatten().copied())
-            .collect::<Vec<_>>();
-        column_indices.sort_unstable();
-        column_indices.dedup();
-
-        let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices);
-        let predicate = predicates.clone();
-        let predicate_func = move |batch: RecordBatch| {
-            evaluate_predicate_to_mask(&predicate, &batch)
-                .map_err(|e| ArrowError::ExternalError(Box::new(e)))
-        };
-        let arrow_predicate = ArrowPredicateFn::new(projection_mask, predicate_func);
-        Ok(RowFilter::new(vec![Box::new(arrow_predicate)]))
     }
 
     pub(crate) fn get_selected_row_group_indices(
@@ -1698,17 +1686,6 @@ pub(crate) fn build_field_id_map(
     Ok(Some(column_map))
 }
 
-/// Build a fallback field ID map for Parquet files without embedded field IDs.
-///
-/// Returns the number of primitive (leaf) columns in a Parquet type, recursing into groups.
-fn leaf_count(ty: &parquet::schema::types::Type) -> usize {
-    if ty.is_primitive() {
-        1
-    } else {
-        ty.get_fields().iter().map(|f| leaf_count(f)).sum()
-    }
-}
-
 /// Maps fallback field ids to leaf column indices, for primitive top-level fields only. Java
 /// `ParquetSchemaUtil.addFallbackIds()`. # Notes Use top-level field positions, not leaf positions,
 /// to match `add_fallback_field_ids_to_arrow_schema`.
@@ -1724,63 +1701,6 @@ pub(crate) fn build_fallback_field_id_map(
             column_map.insert(field_id, leaf_idx);
         }
         leaf_idx += leaf_count(field);
-    }
-
-    column_map
-}
-
-fn build_field_id_leaf_lists(
-    parquet_schema: &SchemaDescriptor,
-) -> Result<Option<HashMap<i32, Vec<usize>>>> {
-    fn walk(
-        ty: &ParquetType,
-        leaf_idx: &mut usize,
-        map: &mut HashMap<i32, Vec<usize>>,
-    ) -> Result<bool> {
-        let start = *leaf_idx;
-        match ty {
-            ParquetType::PrimitiveType { basic_info, .. } => {
-                if !basic_info.has_id() {
-                    return Ok(false);
-                }
-                map.insert(basic_info.id(), vec![*leaf_idx]);
-                *leaf_idx += 1;
-            }
-            ParquetType::GroupType { basic_info, .. } => {
-                for field in ty.get_fields() {
-                    if !walk(field, leaf_idx, map)? {
-                        return Ok(false);
-                    }
-                }
-                if basic_info.has_id() {
-                    map.insert(basic_info.id(), (start..*leaf_idx).collect());
-                }
-            }
-        }
-        Ok(true)
-    }
-
-    let mut map = HashMap::new();
-    let mut leaf_idx = 0;
-    for field in parquet_schema.root_schema().get_fields() {
-        if !walk(field, &mut leaf_idx, &mut map)? {
-            return Ok(None);
-        }
-    }
-    Ok(Some(map))
-}
-
-fn build_fallback_field_id_leaf_lists(
-    parquet_schema: &SchemaDescriptor,
-) -> HashMap<i32, Vec<usize>> {
-    let mut column_map = HashMap::new();
-    let mut leaf_idx = 0;
-
-    for (top_pos, field) in parquet_schema.root_schema().get_fields().iter().enumerate() {
-        let field_id = (top_pos + 1) as i32;
-        let count = leaf_count(field);
-        column_map.insert(field_id, (leaf_idx..leaf_idx + count).collect());
-        leaf_idx += count;
     }
 
     column_map
@@ -1840,13 +1760,10 @@ fn apply_name_mapping_to_arrow_schema(
     )))
 }
 
-/// Adds position-based fallback field ids to an Arrow schema, so a migrated file projects.
-///
-/// # Notes
-///
-/// Ids are 1-indexed, to match Java `ParquetSchemaUtil.addFallbackIds()`. Only top-level fields
-/// get one, because nested projection uses leaf column indices.
-fn add_fallback_field_ids_to_arrow_schema(arrow_schema: &ArrowSchemaRef) -> Arc<ArrowSchema> {
+fn add_fallback_field_ids_to_arrow_schema(
+    arrow_schema: &ArrowSchemaRef,
+    table_schema: &Schema,
+) -> Arc<ArrowSchema> {
     debug_assert!(
         arrow_schema
             .fields()
@@ -1858,14 +1775,32 @@ fn add_fallback_field_ids_to_arrow_schema(arrow_schema: &ArrowSchemaRef) -> Arc<
 
     use arrow_schema::Field;
 
+    let table_top_level_fields = table_schema.as_struct().fields();
+    let mut positional: Vec<Option<i32>> = vec![None; arrow_schema.fields().len()];
+    let mut claimed = HashSet::new();
+    for (pos, field) in arrow_schema.fields().iter().enumerate() {
+        if let Some(table_field) = table_top_level_fields.get(pos)
+            && field.name() == table_field.name.as_str()
+        {
+            positional[pos] = Some(table_field.id);
+            claimed.insert(table_field.id);
+        }
+    }
     let fields_with_fallback_ids: Vec<_> = arrow_schema
         .fields()
         .iter()
         .enumerate()
         .map(|(pos, field)| {
             let mut metadata = field.metadata().clone();
-            let field_id = (pos + 1) as i32; // 1-indexed for Java compatibility
-            metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+            let counter = (pos + 1) as i32;
+            let stamped = positional[pos].or(if claimed.contains(&counter) {
+                None
+            } else {
+                Some(counter)
+            });
+            if let Some(field_id) = stamped {
+                metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+            }
 
             Field::new(field.name(), field.data_type().clone(), field.is_nullable())
                 .with_metadata(metadata)
