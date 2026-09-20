@@ -24,68 +24,15 @@ use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use iceberg::arrow::PROJECTED_PARTITION_VALUE_COLUMN;
-use iceberg::spec::{TableMetadata, TableMetadataRef};
-/// Creates an Iceberg-aware repartition execution plan that optimizes data distribution
-/// for parallel processing while respecting Iceberg table partitioning semantics.
-///
-/// Automatically determines the optimal partitioning strategy based on the table's
-/// partition specification.
-///
-/// ## Partitioning Strategies
-///
-/// - **Unpartitioned tables** – Uses round-robin distribution to balance load evenly across workers.
-///
-/// ## Requirements
-///
-/// - **For partitioned tables**: The input MUST include the `_partition` column.
-///   Add it by calling [`project_with_partition`](crate::physical_plan::project_with_partition) before [`repartition`].
-/// - **For unpartitioned tables**: No special preparation needed.
-/// - Returns an error if a partitioned table is missing the `_partition` column.
-///
-/// ## Performance Notes
-///
-/// - Only adds repartitioning when the input partitioning differs from the target.
-/// - Requires an explicit target partition count for deterministic behavior.
-///
-/// # Arguments
-///
-/// * `input` - The input [`ExecutionPlan`]. For partitioned tables, must include the `_partition`
-///   column (added via [`project_with_partition`](crate::physical_plan::project_with_partition)).
-/// * `table_metadata` - Iceberg table metadata containing partition spec.
-/// * `target_partitions` - Target number of partitions for parallel processing (must be > 0).
-///
-/// # Returns
-///
-/// An [`ExecutionPlan`] that applies the optimal partitioning strategy, or the original input plan
-/// if repartitioning is not needed.
-///
-/// # Errors
-///
-/// Returns [`DataFusionError::Plan`] if a partitioned table input is missing the `_partition` column.
-///
-/// # Examples
-///
-/// For partitioned tables, first add the `_partition` column:
-///
-/// ```ignore
-/// use std::num::NonZeroUsize;
-/// use iceberg_datafusion::physical_plan::project_with_partition;
-///
-/// let plan_with_partition = project_with_partition(input_plan, &table)?;
-///
-/// let repartitioned_plan = repartition(
-///     plan_with_partition,
-///     table.metadata_ref(),
-///     NonZeroUsize::new(4).unwrap(),
-/// )?;
-/// ```
+use iceberg::spec::PartitionSpec;
+
 pub(crate) fn repartition(
     input: Arc<dyn ExecutionPlan>,
-    table_metadata: TableMetadataRef,
+    partition_spec: &PartitionSpec,
     target_partitions: NonZeroUsize,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     let partitioning_strategy =
-        determine_partitioning_strategy(&input, &table_metadata, target_partitions)?;
+        determine_partitioning_strategy(&input, partition_spec, target_partitions)?;
 
     Ok(Arc::new(RepartitionExec::try_new(
         input,
@@ -111,10 +58,9 @@ pub(crate) fn repartition(
 /// - Returns an error if a partitioned table is missing the `_partition` column.
 fn determine_partitioning_strategy(
     input: &Arc<dyn ExecutionPlan>,
-    table_metadata: &TableMetadata,
+    partition_spec: &PartitionSpec,
     target_partitions: NonZeroUsize,
 ) -> DFResult<Partitioning> {
-    let partition_spec = table_metadata.default_partition_spec();
     let input_schema = input.schema();
     let target_partition_count = target_partitions.get();
 
@@ -219,7 +165,7 @@ mod tests {
 
         let repartitioned_plan = repartition(
             input.clone(),
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(4).unwrap(),
         )
         .unwrap();
@@ -235,7 +181,7 @@ mod tests {
 
         let repartitioned_plan = repartition(
             input,
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(8).unwrap(),
         )
         .unwrap();
@@ -270,7 +216,7 @@ mod tests {
         let target_partitions = 16;
         let repartitioned_plan = repartition(
             input,
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(target_partitions).unwrap(),
         )
         .unwrap();
@@ -291,7 +237,7 @@ mod tests {
 
         let repartitioned_plan = repartition(
             input,
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(3).unwrap(),
         )
         .unwrap();
@@ -360,7 +306,7 @@ mod tests {
         let input = Arc::new(EmptyExec::new(arrow_schema));
         let error = repartition(
             input,
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(4).unwrap(),
         )
         .expect_err("partitioned input without _partition must fail");
@@ -445,7 +391,7 @@ mod tests {
         let input = Arc::new(EmptyExec::new(arrow_schema));
         let repartitioned_plan = repartition(
             input,
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(4).unwrap(),
         )
         .unwrap();
@@ -518,7 +464,7 @@ mod tests {
         let input = Arc::new(EmptyExec::new(create_test_arrow_schema()));
         let repartitioned_plan = repartition(
             input,
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(4).unwrap(),
         )
         .unwrap();
@@ -599,7 +545,7 @@ mod tests {
         let input = Arc::new(EmptyExec::new(arrow_schema));
         let repartitioned_plan = repartition(
             input,
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(4).unwrap(),
         )
         .unwrap();
@@ -682,7 +628,7 @@ mod tests {
         let input = Arc::new(EmptyExec::new(arrow_schema));
         let repartitioned_plan = repartition(
             input,
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(4).unwrap(),
         )
         .unwrap();
@@ -768,7 +714,7 @@ mod tests {
 
         let repartitioned_plan = repartition(
             input,
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(4).unwrap(),
         )
         .unwrap();
@@ -837,7 +783,7 @@ mod tests {
 
         let repartitioned_plan = repartition(
             input,
-            table.metadata_ref(),
+            table.metadata().default_partition_spec().as_ref(),
             std::num::NonZeroUsize::new(4).unwrap(),
         )
         .unwrap();

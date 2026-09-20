@@ -33,7 +33,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::StreamExt;
 use iceberg::Catalog;
 use iceberg::expr::Predicate;
-use iceberg::spec::{DataFile, deserialize_data_file_from_json};
+use iceberg::spec::{DataFile, PartitionSpecRef, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::partitioning::fanout_writer::ascending_partition_order;
@@ -94,6 +94,7 @@ pub(crate) struct IcebergCommitExec {
     count_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
     commit_branch: Option<String>,
+    output_spec: PartitionSpecRef,
 }
 
 impl IcebergCommitExec {
@@ -103,6 +104,7 @@ impl IcebergCommitExec {
         input: Arc<dyn ExecutionPlan>,
         schema: ArrowSchemaRef,
         insert_op: InsertOp,
+        output_spec: PartitionSpecRef,
     ) -> Self {
         let count_schema = Self::make_count_schema();
 
@@ -117,6 +119,7 @@ impl IcebergCommitExec {
             count_schema,
             plan_properties,
             commit_branch: None,
+            output_spec,
         }
     }
 
@@ -217,6 +220,7 @@ impl ExecutionPlan for IcebergCommitExec {
                 children[0].clone(),
                 self.schema.clone(),
                 self.insert_op,
+                self.output_spec.clone(),
             )
             .with_commit_branch(self.commit_branch.clone()),
         ))
@@ -237,10 +241,12 @@ impl ExecutionPlan for IcebergCommitExec {
         let table = self.table.clone();
         let input_plan = self.input.clone();
 
-        // todo revisit this
-        let spec_id = self.table.metadata().default_partition_spec_id();
-        let partition_type = self.table.metadata().default_partition_type().clone();
+        let spec_id = self.output_spec.spec_id();
         let current_schema = self.table.metadata().current_schema().clone();
+        let partition_type = self
+            .output_spec
+            .partition_type(&current_schema)
+            .map_err(to_datafusion_error)?;
 
         let catalog = Arc::clone(&self.catalog);
         let insert_op = self.insert_op;

@@ -72,6 +72,7 @@ pub struct IcebergTableProvider {
     pub(crate) schema: ArrowSchemaRef,
     pub(crate) commit_branch: Option<String>,
     pub(crate) planning_table: Option<Table>,
+    pub(crate) output_spec_id: Option<i32>,
 }
 
 impl IcebergTableProvider {
@@ -91,6 +92,7 @@ impl IcebergTableProvider {
             schema,
             commit_branch: None,
             planning_table: None,
+            output_spec_id: None,
         })
     }
 
@@ -105,12 +107,18 @@ impl IcebergTableProvider {
             schema: Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?),
             commit_branch: self.commit_branch.clone(),
             planning_table: None,
+            output_spec_id: self.output_spec_id,
         })
     }
 
     /// Scan and commit snapshot-producing DML against `branch` instead of `main`. Java `SnapshotUpdate.toBranch`.
     pub fn with_commit_branch(mut self, branch: impl Into<String>) -> Self {
         self.commit_branch = Some(branch.into());
+        self
+    }
+
+    pub fn with_output_spec_id(mut self, spec_id: i32) -> Self {
+        self.output_spec_id = Some(spec_id);
         self
     }
 
@@ -188,10 +196,11 @@ impl TableProvider for IcebergTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
-        let partition_spec = table.metadata().default_partition_spec();
+        let output_spec = iceberg::writer::resolve_output_spec(&table, self.output_spec_id)
+            .map_err(to_datafusion_error)?;
 
-        let plan_with_partition = if !partition_spec.is_unpartitioned() {
-            project_with_partition(input, &table)?
+        let plan_with_partition = if !output_spec.is_unpartitioned() {
+            project_with_partition(input, &table, output_spec.clone())?
         } else {
             input
         };
@@ -204,13 +213,14 @@ impl TableProvider for IcebergTableProvider {
             })?;
 
         let repartitioned_plan =
-            repartition(plan_with_partition, table.metadata_ref(), target_partitions)?;
+            repartition(plan_with_partition, output_spec.as_ref(), target_partitions)?;
 
         let (write_input, sort_order_id) = sort_for_write(repartitioned_plan, &table)?;
 
         let write_plan = Arc::new(IcebergWriteExec::new(
             table.clone(),
             write_input,
+            output_spec.clone(),
             sort_order_id,
         ));
 
@@ -224,6 +234,7 @@ impl TableProvider for IcebergTableProvider {
                 coalesce_partitions,
                 current_schema,
                 insert_op,
+                output_spec,
             )
             .with_commit_branch(self.commit_branch.clone()),
         ))

@@ -366,8 +366,7 @@ async fn measure_added_file_partition_validated_against_its_own_spec() {
     let err = tx
         .commit(&catalog)
         .await
-        .err()
-        .expect("a spec-0 file with a spec-1 tuple must fail its own spec's arity");
+        .expect_err("a spec-0 file with a spec-1 tuple must fail its own spec's arity");
     assert_eq!(err.kind(), ErrorKind::DataInvalid);
 }
 
@@ -384,13 +383,39 @@ async fn measure_added_file_unknown_spec_id_fails() {
     let err = tx
         .commit(&catalog)
         .await
-        .err()
-        .expect("a file stamped with a spec id the table does not have must fail");
+        .expect_err("a file stamped with a spec id the table does not have must fail");
     assert_eq!(err.kind(), ErrorKind::DataInvalid);
     assert!(
         err.message()
             .contains("Cannot find partition spec 9 for data file"),
         "unexpected message: {}",
         err.message()
+    );
+}
+
+#[tokio::test]
+async fn resolve_output_spec_none_resolves_table_default() {
+    let (_catalog, _guard, table) = mixed_spec_table(FormatVersion::V2).await;
+    let spec = crate::writer::resolve_output_spec(&table, None).expect("default resolves");
+    assert_eq!(spec.spec_id(), table.metadata().default_partition_spec_id());
+}
+
+#[tokio::test]
+async fn resolve_output_spec_returns_older_spec() {
+    let (_catalog, _guard, table) = mixed_spec_table(FormatVersion::V2).await;
+    let spec = crate::writer::resolve_output_spec(&table, Some(0)).expect("spec 0 resolves");
+    assert_eq!(spec.spec_id(), 0);
+    assert!(spec.is_unpartitioned());
+}
+
+#[tokio::test]
+async fn resolve_output_spec_unknown_id_is_data_invalid() {
+    let (_catalog, _guard, table) = mixed_spec_table(FormatVersion::V2).await;
+    let err =
+        crate::writer::resolve_output_spec(&table, Some(9)).expect_err("an unknown spec id fails");
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        err.message(),
+        "Output spec id 9 is not a valid spec id for table"
     );
 }

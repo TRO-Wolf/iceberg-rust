@@ -35,6 +35,7 @@ impl IcebergTableProvider {
             schema,
             commit_branch: None,
             planning_table: Some(table),
+            output_spec_id: None,
         })
     }
 
