@@ -272,22 +272,21 @@ impl SchemaBuilder {
         let mut map = HashMap::new();
 
         for (pos, field) in self.fields.iter().enumerate() {
-            match field.field_type.as_ref() {
-                Type::Primitive(prim_type) => {
-                    // add an accessor for this field
-                    let accessor = Arc::new(StructAccessor::new(pos, prim_type.clone()));
-                    map.insert(field.id, accessor.clone());
-                }
+            let field_optional = !field.required;
+            map.insert(
+                field.id,
+                Arc::new(StructAccessor::new(
+                    pos,
+                    field.field_type.as_ref().clone(),
+                    field_optional,
+                )),
+            );
 
-                Type::Struct(nested) => {
-                    // add accessors for nested fields
-                    for (field_id, accessor) in Self::build_accessors_nested(nested.fields()) {
-                        let new_accessor = Arc::new(StructAccessor::wrap(pos, accessor));
-                        map.insert(field_id, new_accessor.clone());
-                    }
-                }
-                _ => {
-                    // Accessors don't get built for Map or List types
+            if let Type::Struct(nested) = field.field_type.as_ref() {
+                for (field_id, accessor) in
+                    Self::build_accessors_nested(nested.fields(), field_optional)
+                {
+                    map.insert(field_id, Arc::new(StructAccessor::wrap(pos, accessor)));
                 }
             }
         }
@@ -295,27 +294,27 @@ impl SchemaBuilder {
         map
     }
 
-    fn build_accessors_nested(fields: &[NestedFieldRef]) -> Vec<(i32, Box<StructAccessor>)> {
+    fn build_accessors_nested(
+        fields: &[NestedFieldRef],
+        ancestors_optional: bool,
+    ) -> Vec<(i32, Box<StructAccessor>)> {
         let mut results = vec![];
         for (pos, field) in fields.iter().enumerate() {
-            match field.field_type.as_ref() {
-                Type::Primitive(prim_type) => {
-                    let accessor = Box::new(StructAccessor::new(pos, prim_type.clone()));
-                    results.push((field.id, accessor));
-                }
-                Type::Struct(nested) => {
-                    let nested_accessors = Self::build_accessors_nested(nested.fields());
+            let field_optional = ancestors_optional || !field.required;
+            results.push((
+                field.id,
+                Box::new(StructAccessor::new(
+                    pos,
+                    field.field_type.as_ref().clone(),
+                    field_optional,
+                )),
+            ));
 
-                    let wrapped_nested_accessors =
-                        nested_accessors.into_iter().map(|(id, accessor)| {
-                            let new_accessor = Box::new(StructAccessor::wrap(pos, accessor));
-                            (id, new_accessor.clone())
-                        });
-
-                    results.extend(wrapped_nested_accessors);
-                }
-                _ => {
-                    // Accessors don't get built for Map or List types
+            if let Type::Struct(nested) = field.field_type.as_ref() {
+                for (field_id, accessor) in
+                    Self::build_accessors_nested(nested.fields(), field_optional)
+                {
+                    results.push((field_id, Box::new(StructAccessor::wrap(pos, accessor))));
                 }
             }
         }
@@ -1260,11 +1259,6 @@ table {
         );
     }
 
-    /// Java `Accessors$BuildPositionAccessors.struct()` calls `Accessors.newAccessor(pos,
-    /// field.type())` for EVERY struct field — list, map and struct fields included. The fork
-    /// must therefore expose an accessor for the container field ids of `table_schema_nested`
-    /// (`qux` 4, `quux` 6, `location` 11, `person` 15) alongside the nested primitive ids it
-    /// already covers (16, 17).
     #[test]
     fn test_build_accessors_includes_container_and_struct_fields() {
         let schema = table_schema_nested();

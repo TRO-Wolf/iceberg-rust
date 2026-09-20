@@ -2579,10 +2579,6 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
-        /// An unpartitioned fixture whose schema adds the run-25d Spark container-null oracle's
-        /// columns: `id` (9), `st` STRUCT<a STRING, b INT> (10/11/12), `xs` ARRAY<INT> (13/14),
-        /// `mp` MAP<STRING, INT> (15/16/17) and `deep` STRUCT<inner STRUCT<x STRING,
-        /// ys ARRAY<INT>>> (18/19/20/21/22). Pair with [`Self::setup_container_manifest_files`].
         pub fn new_container_columns() -> Self {
             let tmp_dir = TempDir::new().unwrap();
             let table_location = tmp_dir.path().join("table1");
@@ -2734,10 +2730,6 @@ pub mod tests {
             }
         }
 
-        /// Writes `containers.parquet` holding the run-25d Spark oracle's four rows: row 1 fully
-        /// populated, row 2 NULL in `st`, `xs`, `mp` and `deep`, row 3 present-but-empty
-        /// containers (empty `xs`/`mp`, `st.a` NULL, `deep.inner` present with `x`/`ys` NULL) and
-        /// row 4 populated with `deep.inner` NULL. Returns the file size for the manifest entry.
         fn write_container_parquet_file(&self) -> u64 {
             std::fs::create_dir_all(&self.table_location).unwrap();
 
@@ -2935,8 +2927,6 @@ pub mod tests {
                 .len()
         }
 
-        /// Declares `containers.parquet` (4 rows) as the single live data file of the current
-        /// snapshot (unpartitioned V2 manifest).
         pub async fn setup_container_manifest_files(&mut self) {
             let current_snapshot = self.table.metadata().current_snapshot().unwrap();
             let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
@@ -4740,11 +4730,6 @@ pub mod tests {
         }
     }
 
-    /// The run-25d Spark container-null oracle, driven through `table.scan().with_filter`. Every
-    /// cell Spark answered is pinned by `id` set: `IS NULL`/`IS NOT NULL` on top-level list, map
-    /// and struct columns, nested struct paths (`st.a`, `deep.inner`, `deep.inner.x`,
-    /// `deep.inner.ys`), and two boolean compositions. An empty `xs`/`mp` is NOT NULL (row 3) and
-    /// a struct whose fields are all NULL is NOT NULL (row 3).
     #[tokio::test]
     async fn test_filter_on_arrow_container_null_predicates_match_spark_oracle() {
         let mut fixture = TableTestFixture::new_container_columns();

@@ -410,7 +410,7 @@ mod tests {
         let schema = table_schema_simple();
         let reference = Reference::new("bar").bind(schema, true).unwrap();
 
-        let accessor_ref = Arc::new(StructAccessor::new(1, PrimitiveType::Int));
+        let accessor_ref = Arc::new(StructAccessor::new(1, PrimitiveType::Int, true));
         let expected_ref = BoundReference::new(
             "bar",
             NestedField::required(2, "bar", Type::Primitive(PrimitiveType::Int)).into(),
@@ -425,7 +425,7 @@ mod tests {
         let schema = table_schema_simple();
         let reference = Reference::new("BAR").bind(schema, false).unwrap();
 
-        let accessor_ref = Arc::new(StructAccessor::new(1, PrimitiveType::Int));
+        let accessor_ref = Arc::new(StructAccessor::new(1, PrimitiveType::Int, true));
         let expected_ref = BoundReference::new(
             "BAR",
             NestedField::required(2, "bar", Type::Primitive(PrimitiveType::Int)).into(),

@@ -128,7 +128,7 @@ mod test {
                 BoundReference::new(
                     self.name.clone(),
                     self.field.clone(),
-                    Arc::new(StructAccessor::new(1, PrimitiveType::Boolean)),
+                    Arc::new(StructAccessor::new(1, PrimitiveType::Boolean, true)),
                 ),
                 literal,
             ))
@@ -143,7 +143,7 @@ mod test {
                 BoundReference::new(
                     self.name.clone(),
                     self.field.clone(),
-                    Arc::new(StructAccessor::new(1, PrimitiveType::Boolean)),
+                    Arc::new(StructAccessor::new(1, PrimitiveType::Boolean, true)),
                 ),
                 HashSet::from_iter(literals),
             ))

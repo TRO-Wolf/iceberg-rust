@@ -22,15 +22,15 @@ use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
-use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
+use arrow_arith::boolean::and;
+use arrow_array::{Array, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
 use arrow_cast::cast::cast;
-use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
+
 use arrow_schema::{
     ArrowError, DataType, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use arrow_select::filter::filter_record_batch;
-use arrow_string::like::starts_with;
+
 use bytes::Bytes;
 use fnv::FnvHashSet;
 use futures::future::BoxFuture;
@@ -55,13 +55,11 @@ use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::open_parquet::{effective_row_selection, page_index_policy};
 use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::ranges::merge_ranges;
-use crate::arrow::record_batch_predicate::{
-    evaluate_predicate_to_mask, is_nan_row_mask, not_nan_row_mask, null_filled,
-};
+use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::arrow::record_batch_transformer::{
     RecordBatchTransformer, RecordBatchTransformerBuilder,
 };
-use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
+use crate::arrow::arrow_schema_to_schema;
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
@@ -720,7 +718,6 @@ impl ArrowReader {
                 &predicate,
                 record_batch_stream_builder.parquet_schema(),
                 &iceberg_field_ids,
-                &field_id_map,
             )?;
             record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
 
@@ -1516,23 +1513,30 @@ impl ArrowReader {
         predicates: &BoundPredicate,
         parquet_schema: &SchemaDescriptor,
         iceberg_field_ids: &HashSet<i32>,
-        field_id_map: &HashMap<i32, usize>,
     ) -> Result<RowFilter> {
+        let leaf_lists = build_field_id_leaf_lists(parquet_schema)?
+            .unwrap_or_else(|| build_fallback_field_id_leaf_lists(parquet_schema));
+
         // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
         let mut column_indices = iceberg_field_ids
             .iter()
-            .filter_map(|field_id| field_id_map.get(field_id).cloned())
+            .flat_map(|field_id| {
+                leaf_lists
+                    .get(field_id)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
             .collect::<Vec<_>>();
-        column_indices.sort();
+        column_indices.sort_unstable();
+        column_indices.dedup();
 
-        let mut converter = PredicateConverter {
-            parquet_schema,
-            column_map: field_id_map,
-            column_indices: &column_indices,
+        let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices);
+        let predicate = predicates.clone();
+        let predicate_func = move |batch: RecordBatch| {
+            evaluate_predicate_to_mask(&predicate, &batch)
+                .map_err(|e| ArrowError::ExternalError(Box::new(e)))
         };
-
-        let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices.clone());
-        let predicate_func = visit(&mut converter, predicates)?;
         let arrow_predicate = ArrowPredicateFn::new(projection_mask, predicate_func);
         Ok(RowFilter::new(vec![Box::new(arrow_predicate)]))
     }
@@ -1728,6 +1732,63 @@ pub(crate) fn build_fallback_field_id_map(
             column_map.insert(field_id, leaf_idx);
         }
         leaf_idx += leaf_count(field);
+    }
+
+    column_map
+}
+
+fn build_field_id_leaf_lists(
+    parquet_schema: &SchemaDescriptor,
+) -> Result<Option<HashMap<i32, Vec<usize>>>> {
+    fn walk(
+        ty: &ParquetType,
+        leaf_idx: &mut usize,
+        map: &mut HashMap<i32, Vec<usize>>,
+    ) -> Result<bool> {
+        let start = *leaf_idx;
+        match ty {
+            ParquetType::PrimitiveType { basic_info, .. } => {
+                if !basic_info.has_id() {
+                    return Ok(false);
+                }
+                map.insert(basic_info.id(), vec![*leaf_idx]);
+                *leaf_idx += 1;
+            }
+            ParquetType::GroupType { basic_info, .. } => {
+                for field in ty.get_fields() {
+                    if !walk(field, leaf_idx, map)? {
+                        return Ok(false);
+                    }
+                }
+                if basic_info.has_id() {
+                    map.insert(basic_info.id(), (start..*leaf_idx).collect());
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    let mut map = HashMap::new();
+    let mut leaf_idx = 0;
+    for field in parquet_schema.root_schema().get_fields() {
+        if !walk(field, &mut leaf_idx, &mut map)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(map))
+}
+
+fn build_fallback_field_id_leaf_lists(
+    parquet_schema: &SchemaDescriptor,
+) -> HashMap<i32, Vec<usize>> {
+    let mut column_map = HashMap::new();
+    let mut leaf_idx = 0;
+
+    for (top_pos, field) in parquet_schema.root_schema().get_fields().iter().enumerate() {
+        let field_id = (top_pos + 1) as i32;
+        let count = leaf_count(field);
+        column_map.insert(field_id, (leaf_idx..leaf_idx + count).collect());
+        leaf_idx += count;
     }
 
     column_map
@@ -1981,65 +2042,6 @@ impl BoundPredicateVisitor for CollectFieldIdVisitor {
     }
 }
 
-/// A visitor to convert Iceberg bound predicates to Arrow predicates.
-struct PredicateConverter<'a> {
-    /// The Parquet schema descriptor.
-    pub parquet_schema: &'a SchemaDescriptor,
-    /// The map between field id and leaf column index in Parquet schema.
-    pub column_map: &'a HashMap<i32, usize>,
-    /// The required column indices in Parquet schema for the predicates.
-    pub column_indices: &'a Vec<usize>,
-}
-
-impl PredicateConverter<'_> {
-    /// When visiting a bound reference, we return index of the leaf column in the
-    /// required column indices which is used to project the column in the record batch.
-    /// Return None if the field id is not found in the column map, which is possible
-    /// due to schema evolution.
-    fn bound_reference(&mut self, reference: &BoundReference) -> Result<Option<usize>> {
-        if let Some(column_idx) = self.column_map.get(&reference.field().id) {
-            if self.parquet_schema.get_column_root(*column_idx).is_group() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Leaf column `{}` in predicates isn't a root column in Parquet schema.",
-                        reference.field().name
-                    ),
-                ));
-            }
-
-            let index = self
-                .column_indices
-                .iter()
-                .position(|&idx| idx == *column_idx)
-                .ok_or(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                "Leaf column `{}` in predicates cannot be found in the required column indices.",
-                reference.field().name
-            ),
-                ))?;
-
-            Ok(Some(index))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Build an Arrow predicate that always returns true.
-    fn build_always_true(&self) -> Result<Box<PredicateResult>> {
-        Ok(Box::new(|batch| {
-            Ok(BooleanArray::from(vec![true; batch.num_rows()]))
-        }))
-    }
-
-    /// Build an Arrow predicate that always returns false.
-    fn build_always_false(&self) -> Result<Box<PredicateResult>> {
-        Ok(Box::new(|batch| {
-            Ok(BooleanArray::from(vec![false; batch.num_rows()]))
-        }))
-    }
-}
 
 /// Coerces a three-valued keep-mask to two values, turning NULL into `false`, as the Parquet
 /// `RowFilter` does. [`evaluate_predicate_to_mask`] already returns a two-valued mask, so this is
@@ -2068,378 +2070,6 @@ pub(crate) fn eq_delete_key_fields_projected(
         .all(|id| projected.contains(id))
 }
 
-/// Gets the leaf column from the record batch for the required column index. Only
-/// supports top-level columns for now.
-fn project_column(
-    batch: &RecordBatch,
-    column_idx: usize,
-) -> std::result::Result<ArrayRef, ArrowError> {
-    let column = batch.column(column_idx);
-
-    match column.data_type() {
-        DataType::Struct(_) => Err(ArrowError::SchemaError(
-            "Does not support struct column yet.".to_string(),
-        )),
-        _ => Ok(column.clone()),
-    }
-}
-
-type PredicateResult =
-    dyn FnMut(RecordBatch) -> std::result::Result<BooleanArray, ArrowError> + Send + 'static;
-
-impl BoundPredicateVisitor for PredicateConverter<'_> {
-    type T = Box<PredicateResult>;
-
-    fn always_true(&mut self) -> Result<Box<PredicateResult>> {
-        self.build_always_true()
-    }
-
-    fn always_false(&mut self) -> Result<Box<PredicateResult>> {
-        self.build_always_false()
-    }
-
-    fn and(
-        &mut self,
-        mut lhs: Box<PredicateResult>,
-        mut rhs: Box<PredicateResult>,
-    ) -> Result<Box<PredicateResult>> {
-        Ok(Box::new(move |batch| {
-            let left = lhs(batch.clone())?;
-            let right = rhs(batch)?;
-            and_kleene(&left, &right)
-        }))
-    }
-
-    fn or(
-        &mut self,
-        mut lhs: Box<PredicateResult>,
-        mut rhs: Box<PredicateResult>,
-    ) -> Result<Box<PredicateResult>> {
-        Ok(Box::new(move |batch| {
-            let left = lhs(batch.clone())?;
-            let right = rhs(batch)?;
-            or_kleene(&left, &right)
-        }))
-    }
-
-    fn not(&mut self, mut inner: Box<PredicateResult>) -> Result<Box<PredicateResult>> {
-        Ok(Box::new(move |batch| {
-            let pred_ret = inner(batch)?;
-            not(&pred_ret)
-        }))
-    }
-
-    fn is_null(
-        &mut self,
-        reference: &BoundReference,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
-                is_null(&column)
-            }))
-        } else {
-            // A missing column, treating it as null.
-            self.build_always_true()
-        }
-    }
-
-    fn not_null(
-        &mut self,
-        reference: &BoundReference,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
-                is_not_null(&column)
-            }))
-        } else {
-            // A missing column, treating it as null.
-            self.build_always_false()
-        }
-    }
-
-    fn is_nan(
-        &mut self,
-        reference: &BoundReference,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
-                // Java `NaNUtil.isNaN`. A NULL cell gives false, and the mask stays two-valued.
-                Ok(is_nan_row_mask(&column))
-            }))
-        } else {
-            // A missing column, treating it as null: Java `NaNUtil.isNaN(null)` == false.
-            self.build_always_false()
-        }
-    }
-
-    fn not_nan(
-        &mut self,
-        reference: &BoundReference,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
-                // A NULL cell is not NaN, so the row stays. Java `EvalVisitor.notNaN`.
-                Ok(not_nan_row_mask(&column))
-            }))
-        } else {
-            // A missing column, treating it as null: `!NaNUtil.isNaN(null)` == true.
-            self.build_always_true()
-        }
-    }
-
-    fn less_than(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
-
-            Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                // A NULL cell keeps the row. Java's nulls-first comparator gives
-                // `compare(null, lit) == -1`, and `EvalVisitor.lt` tests `< 0`. A
-                // three-valued-logic NULL slot would make the `RowFilter` drop the row.
-                Ok(null_filled(lt(&left, literal.as_ref())?, true))
-            }))
-        } else {
-            // A missing column is a NULL column ⇒ TRUE (nulls-first: null < lit).
-            self.build_always_true()
-        }
-    }
-
-    fn less_than_or_eq(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
-
-            Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                // A NULL cell keeps the row. Java `ltEq` tests `<= 0` over -1.
-                Ok(null_filled(lt_eq(&left, literal.as_ref())?, true))
-            }))
-        } else {
-            // A missing column is a NULL column ⇒ TRUE (nulls-first: null <= lit).
-            self.build_always_true()
-        }
-    }
-
-    fn greater_than(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
-
-            Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                // A NULL cell drops the row. Java `gt` tests `> 0`. Stating it keeps `not`,
-                // `and`, and `or` composition plain boolean.
-                Ok(null_filled(gt(&left, literal.as_ref())?, false))
-            }))
-        } else {
-            // A missing column is a NULL column ⇒ FALSE (nulls-first: null > lit is false).
-            self.build_always_false()
-        }
-    }
-
-    fn greater_than_or_eq(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
-
-            Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                // A NULL cell drops the row. Java `gtEq` tests `>= 0`.
-                Ok(null_filled(gt_eq(&left, literal.as_ref())?, false))
-            }))
-        } else {
-            // A missing column is a NULL column ⇒ FALSE (nulls-first: null >= lit is false).
-            self.build_always_false()
-        }
-    }
-
-    fn eq(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
-
-            Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                // A NULL cell drops the row. Java `eq` tests `== 0` over -1.
-                Ok(null_filled(eq(&left, literal.as_ref())?, false))
-            }))
-        } else {
-            // A missing column is a NULL column ⇒ FALSE (null == lit is false under
-            // nulls-first).
-            self.build_always_false()
-        }
-    }
-
-    fn not_eq(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
-
-            Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                // A NULL cell keeps the row. Java `notEq` is `!eq`. The kernel's three-valued
-                // NULL made the `RowFilter` drop every NULL cell under `!=`.
-                Ok(null_filled(neq(&left, literal.as_ref())?, true))
-            }))
-        } else {
-            // A missing column is NULL, and Java `notEq(null, lit)` is true. An always-false
-            // build made a schema-evolved file return zero rows under `!=`.
-            self.build_always_true()
-        }
-    }
-
-    fn starts_with(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
-
-            Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                // A NULL cell drops the row. Java `startsWith` null-guards to false.
-                Ok(null_filled(starts_with(&left, literal.as_ref())?, false))
-            }))
-        } else {
-            // A missing column is a NULL column ⇒ FALSE (Java's explicit null guard).
-            self.build_always_false()
-        }
-    }
-
-    fn not_starts_with(
-        &mut self,
-        reference: &BoundReference,
-        literal: &Datum,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            let literal = get_arrow_datum(literal)?;
-
-            Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
-                let literal = try_cast_literal(&literal, left.data_type())?;
-                // Update this if arrow adds a native not_starts_with.
-                // A NULL cell keeps the row. Java `notStartsWith` negates the null guard.
-                Ok(null_filled(
-                    not(&starts_with(&left, literal.as_ref())?)?,
-                    true,
-                ))
-            }))
-        } else {
-            // A missing column is a NULL column ⇒ TRUE (`notStartsWith` negates the null
-            // guard's false).
-            self.build_always_true()
-        }
-    }
-
-    fn r#in(
-        &mut self,
-        reference: &BoundReference,
-        literals: &FnvHashSet<Datum>,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            // `get_arrow_datum` fails on a decimal literal past Arrow's Decimal128 precision, and
-            // on an unsupported type. Propagate a typed error, never panic the predicate build.
-            let literals = literals
-                .iter()
-                .map(get_arrow_datum)
-                .collect::<Result<Vec<_>>>()?;
-
-            Ok(Box::new(move |batch| {
-                // update this if arrow ever adds a native is_in kernel
-                let left = project_column(&batch, idx)?;
-
-                let mut acc = BooleanArray::from(vec![false; batch.num_rows()]);
-                for literal in &literals {
-                    let literal = try_cast_literal(literal, left.data_type())?;
-                    acc = or(&acc, &eq(&left, literal.as_ref())?)?
-                }
-
-                // A NULL cell drops the row. Java `in` is `literalSet.contains(null)`, false in
-                // both set implementations.
-                Ok(null_filled(acc, false))
-            }))
-        } else {
-            // A missing column is a NULL column ⇒ FALSE (`contains(null)` is false).
-            self.build_always_false()
-        }
-    }
-
-    fn not_in(
-        &mut self,
-        reference: &BoundReference,
-        literals: &FnvHashSet<Datum>,
-        _predicate: &BoundPredicate,
-    ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
-            // Fallible like `r#in` above, so propagate a typed error.
-            let literals = literals
-                .iter()
-                .map(get_arrow_datum)
-                .collect::<Result<Vec<_>>>()?;
-
-            Ok(Box::new(move |batch| {
-                // update this if arrow ever adds a native not_in kernel
-                let left = project_column(&batch, idx)?;
-                let mut acc = BooleanArray::from(vec![true; batch.num_rows()]);
-                for literal in &literals {
-                    let literal = try_cast_literal(literal, left.data_type())?;
-                    acc = and(&acc, &neq(&left, literal.as_ref())?)?
-                }
-
-                // A NULL cell keeps the row. Java `notIn` negates `contains(null)`. An
-                // accumulated three-valued NULL made the `RowFilter` drop NULL cells.
-                Ok(null_filled(acc, true))
-            }))
-        } else {
-            // A missing column is a NULL column ⇒ TRUE (`notIn` negates contains(null)).
-            self.build_always_true()
-        }
-    }
-}
 
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 pub struct ArrowFileReader {
@@ -2572,7 +2202,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::{ArrayRef, LargeStringArray, RecordBatch, StringArray};
+    use arrow_array::{ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use fnv::FnvHashSet;
     use futures::TryStreamExt;
@@ -2589,9 +2219,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::ErrorKind;
-    use crate::arrow::reader::{
-        CollectFieldIdVisitor, PARQUET_FIELD_ID_META_KEY, PredicateConverter,
-    };
+    use crate::arrow::reader::{CollectFieldIdVisitor, PARQUET_FIELD_ID_META_KEY};
+    use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::delete_vector::DeleteVector;
     use crate::expr::accessor::StructAccessor;
@@ -2644,17 +2273,6 @@ mod tests {
     /// Precision above 38 is reachable: neither the `decimal(P,S)` deserializer nor
     /// `Datum::try_from_bytes` bound-checks it, so corrupt catalog metadata can supply one.
     fn assert_set_predicate_over_max_decimal_is_typed_error(op: PredicateOperator) {
-        // One leaf decimal column carrying field id 1.
-        let message_type = "
-message schema {
-  optional fixed_len_byte_array(16) d (DECIMAL(38,0)) = 1;
-}
-        ";
-        let parquet_type = parse_message_type(message_type).expect("should parse schema");
-        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
-        let column_map = HashMap::from([(1_i32, 0_usize)]);
-        let column_indices = vec![0_usize];
-
         let field = NestedField::optional(
             1,
             "d",
@@ -2664,10 +2282,14 @@ message schema {
             }),
         )
         .into();
-        let accessor = Arc::new(StructAccessor::new(0, PrimitiveType::Decimal {
-            precision: 38,
-            scale: 0,
-        }));
+        let accessor = Arc::new(StructAccessor::new(
+            0,
+            PrimitiveType::Decimal {
+                precision: 38,
+                scale: 0,
+            },
+            true,
+        ));
         let bound_ref = BoundReference::new("d", field, accessor);
 
         // precision 50 > 38: get_arrow_datum returns Err for this literal.
@@ -2683,13 +2305,19 @@ message schema {
 
         let predicate = BoundPredicate::Set(SetExpression::new(op, bound_ref, literals));
 
-        let mut converter = PredicateConverter {
-            parquet_schema: &parquet_schema,
-            column_map: &column_map,
-            column_indices: &column_indices,
-        };
+        let arrow_field = Field::new("d", DataType::Decimal128(38, 0), true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+        );
+        let decimal_col = Decimal128Array::from(vec![Some(1_i128)])
+            .with_precision_and_scale(38, 0)
+            .expect("a decimal(38,0) array");
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![arrow_field])),
+            vec![Arc::new(decimal_col)],
+        )
+        .expect("batch");
 
-        match visit(&mut converter, &predicate) {
+        match evaluate_predicate_to_mask(&predicate, &batch) {
             Ok(_) => panic!(
                 "{op:?} with a decimal literal of precision 50 must return a typed error, not panic"
             ),

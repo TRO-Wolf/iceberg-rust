@@ -547,12 +547,12 @@ impl Predicate {
 
                 match &bound_expr.op {
                     &PredicateOperator::IsNull => {
-                        if bound_expr.term.field().required {
+                        if !bound_expr.term.accessor().is_optional() {
                             return Ok(BoundPredicate::AlwaysFalse);
                         }
                     }
                     &PredicateOperator::NotNull => {
-                        if bound_expr.term.field().required {
+                        if !bound_expr.term.accessor().is_optional() {
                             return Ok(BoundPredicate::AlwaysTrue);
                         }
                     }
@@ -1835,8 +1835,6 @@ mod tests {
         test_bound_predicate_serialize_diserialize(bound_expr);
     }
 
-    /// The run-25d oracle column shapes: optional list, map and struct columns plus a required
-    /// leaf (`person.age`, required under the optional `person` struct).
     fn table_schema_with_containers() -> SchemaRef {
         Arc::new(
             Schema::builder()
@@ -1900,8 +1898,6 @@ mod tests {
         )
     }
 
-    /// Java builds a position accessor for every struct field type, so `IS NULL`/`IS NOT NULL`
-    /// bind on list, map and struct columns.
     #[test]
     fn test_bind_is_null_on_container_columns() {
         let schema = table_schema_with_containers();
@@ -1927,9 +1923,6 @@ mod tests {
         }
     }
 
-    /// Java `Literal.to(listType|mapType|structType)` returns null and `UnboundPredicate.bind`
-    /// throws, so a comparison against a container column must fail at BIND with the typed
-    /// conversion error — never silently evaluate.
     #[test]
     fn test_bind_comparison_on_container_column_fails_at_bind() {
         let schema = table_schema_with_containers();
@@ -1952,9 +1945,6 @@ mod tests {
         }
     }
 
-    /// `person.age` is REQUIRED but nested inside the OPTIONAL `person` struct: a NULL parent
-    /// makes `age` NULL, so `person.age IS NULL` must NOT fold to `False` (Java folds only when
-    /// the field AND every ancestor are required).
     #[test]
     fn test_bind_is_null_required_leaf_under_optional_parent_does_not_fold() {
         let schema = table_schema_with_containers();
@@ -1965,7 +1955,6 @@ mod tests {
         assert_eq!(&format!("{bound}"), "person.age IS NULL");
     }
 
-    /// The `IS NOT NULL` side of the ancestor-required fold: required leaf, optional parent.
     #[test]
     fn test_bind_is_not_null_required_leaf_under_optional_parent_does_not_fold() {
         let schema = table_schema_with_containers();
