@@ -44,7 +44,6 @@ a format is chosen only by which concrete builder is instantiated.
 | `orc_writer/column.rs` | the per-column stream builders. One recursive walk over the `Literal` row fills each column's PRESENT / DATA / LENGTH / SECONDARY buffers; a child only receives a value for the rows where its parent is present, which is ORC's nesting rule |
 | `orc_writer/footer_write.rs` | the hand-rolled protobuf writer for `StripeFooter`, `Footer` and `PostScript` — the mirror image of `../../arrow/orc_reader/footer.rs`, which hand-parses them. `orc-rust` keeps its `writer` and `encoding` modules private and stamps `attributes: vec![]` on every type, so neither its writer nor its encoders can produce an Iceberg ORC file |
 | `orc_writer_tests.rs`, `orc_writer/*_tests.rs` | the `#[cfg(test)]` cells for the ORC writer |
-| `any_writer.rs` | `AnyFileWriterBuilder` / `AnyFileWriter`: one enum over the three formats so a caller can pick a format at run time from `write.format.default`. `Puffin` is refused — a sidecar is never a data file |
 | `rolling_writer.rs` | size-based rolling over any `FileWriterBuilder` |
 | `location_generator.rs` | file naming and placement; the extension comes from `DataFileFormat`'s `Display` |
 
@@ -75,8 +74,7 @@ encoding kind, so the values are identical; only the byte layout differs.
 
 | I want to... | go to |
 |---|---|
-| Add a physical format | implement `FileWriterBuilder` / `FileWriter`, then add an `AnyFileWriter` arm |
-| Choose a format at run time | `any_writer.rs` — `AnyFileWriterBuilder::for_format` |
+| Add a physical format | implement `FileWriterBuilder` / `FileWriter` |
 | Change what statistics a data file carries | `parquet_writer.rs` (parquet); ORC and Avro carry row count + file size only |
 | Change an ORC byte encoding | `orc_writer/encode.rs`, then re-run the round-trip tests — they decode with `orc-rust`, not with this crate's encoder |
 | Understand how a nested ORC column is laid out | `orc_writer/column.rs` — the present/length/child recursion |
