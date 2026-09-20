@@ -1971,5 +1971,12 @@ schema.
 - [x] Step 3 pins: unknown ref, position-delete branch, partitioned table, writable-provider
       branch read (commit 52355f49); mutation legs (branch→snapshot schema, tag→current
       schema, drop predicate binding) all reddened the right pins and reverted green.
-- [ ] Step 4 gates green (fmt, clippy, filtered tests, size checker, typos, comment-ban);
+- [x] Step 4 gates green (fmt, clippy, filtered tests, size checker, typos, comment-ban);
       ledger complete + final commit; handback.json; echo.
+- [x] Round 2 (PR #324 critic): L-01 fixed — `try_new_from_table` and the writable provider's
+      non-branch read set `project_current_schema: true`; RED pins first
+      (`bs_current_rename_{static,factory}`), mutation re-proved (`bs_current_rename_writable`,
+      `bs_current_drop_static`, `bs_current_widen_static` audited). Commit 587bbbb9.
+- [x] Round 2 L-02 — `bs_add_version` repointed at the core `use_ref("b0") +
+      project_current_schema()` entry point so the branch-ref surface has an independent pin.
+      Commit 587bbbb9; ledger findings table e7e28ab7.

@@ -82,6 +82,10 @@ advertised columns and pushed filters through the snapshot schema only. The core
 | P12 | position delete committed on a branch applies to the branch read | `bs_delete_branch_v{2,3}` | verified |
 | P13 | partitioned table branch read projects current schema | `bs_partitioned_branch_v{2,3}` | verified |
 | P14 | `with_commit_branch` read follows the same rule | `bs_writable_provider_branch_v{2,3}` | verified |
+| P15 | unpinned current-table read binds the current schema (rename w/o snapshot) | `bs_current_rename_static_v{2,3}` | verified |
+| P16 | factory (CREATE EXTERNAL TABLE) read binds the current schema | `bs_current_rename_factory_v{2,3}` | verified |
+| P17 | writable provider non-branch read is consistent under rename | `bs_current_rename_writable_v{2,3}` | verified (control: green pre-fix) |
+| P18 | current-table read is consistent under drop and promotion | `bs_current_drop_static_v{2,3}`, `bs_current_widen_static_v{2,3}` | verified (control: green pre-fix) |
 
 ## Red evidence
 
@@ -123,7 +127,33 @@ green (`30 passed / 0 failed`).
   also red: the binding resolves `payload` to the snapshot name `data`, which the
   current-schema core `select` then cannot resolve. 26 passed / 4 failed.
 
+## Round 2 — critic findings (PR #324, NEEDS_REMEDIATION)
+
+| Finding | Disposition | Evidence | Mutation |
+|---|---|---|---|
+| L-01 (P2): `try_new_from_table` advertised the current schema but bound through the snapshot schema while the unpinned core `select` resolved names against the current schema → `Column data not found` after a snapshot-less rename; same reach through `IcebergTableProviderFactory` (CREATE EXTERNAL TABLE) | FIXED — `project_current_schema: true` on `try_new_from_table` (the current table ≡ main ≡ current schema); the writable provider's `commit_branch: None` arm also set true (a `main` read is a branch read). Audited the other constructors: `try_new_from_table_snapshot` (snapshot schema + pinned snapshot) is consistent at flag false; `try_new_from_table_ref` carries the ref kind | RED pins first: `bs_current_rename_static_v{2,3}` and `bs_current_rename_factory_v{2,3}` failed pre-fix with the critic's exact `DataInvalid: Column data not found … 2: payload`; `bs_current_rename_writable_v{2,3}` stayed green — the writable provider pins `current_snapshot_id`, so binding and `select` share the snapshot schema and conform renames to the advertised name (behavior-equivalent; the flag is set for semantic correctness). Class check: `bs_current_drop_static` and `bs_current_widen_static` green pre-fix — a drop/promotion keeps advertised names resolvable in both schemas; pinned anyway | `project_current_schema` flipped back to `false` on `try_new_from_table` → the 4 rename pins (static + factory, v2+v3) red; restored, 40/40 green |
+| L-02 (P3): `bs_add_version` duplicated `bs_add_ident` (same `provider_for_ref("b0")` + `SELECT *`), so `VERSION AS OF 'b0'` had no independent pin | FIXED — `bs_add_version` now exercises a genuinely different fork entry point: the core `table.scan().use_ref("b0").project_current_schema().to_arrow()` read (the lower-level "VERSION AS OF '<branch>'" surface; `use_ref("main")` pins nothing — `(ref_name != MAIN_BRANCH).then_some` — so it is already current-schema by construction, matching Java `schemaFor`) | `bs_add_version_v{2,3}` green post-change on the core entry point; `bs_add_ident` keeps the DataFusion `try_new_from_table_ref` surface | The core entry point was already correct; the L-01 flag mutation does not touch it |
+
+Note for the ledger of record: in this fork `VERSION AS OF '<branch>'` has no DataFusion SQL
+surface; the named-ref read resolves through `try_new_from_table_ref` (static provider) and
+`use_ref` + `project_current_schema` (core). Both surfaces are now pinned by distinct tests.
+
 ## Gates
+
+Round 2 gate results (post-fix head):
+
+- `cargo test -p iceberg-datafusion --lib branch_schema` — 40 passed / 0 failed.
+- `cargo test -p iceberg-datafusion --lib table::` — 81 passed / 0 failed.
+- `cargo test -p iceberg-datafusion --lib physical_plan` — 243 passed / 0 failed.
+- `cargo test -p iceberg --lib snapshot` — 249 passed / 0 failed.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings` — clean.
+- `python3 scripts/check_rust_file_size.py` — 577 files clean (91 legacy ceilings).
+- `typos` — clean.
+- `python3 /tmp/oc-worker/_lib/comment_ban.py <clone> origin/main` — `comment-ban hits=0`
+  after every commit.
+
+Round 1 gate results:
 
 - `cargo test -p iceberg-datafusion --lib branch_schema` — 30 passed / 0 failed.
 - `cargo test -p iceberg-datafusion --lib "physical_plan::scan"` — 29 passed / 0 failed.
