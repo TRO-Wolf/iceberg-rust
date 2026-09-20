@@ -209,6 +209,84 @@ pub(crate) async fn stage_fast_append(
     tx.commit(catalog).await.expect("commit staged append")
 }
 
+pub(crate) async fn stage_merge_append(
+    catalog: &impl Catalog,
+    table: &Table,
+    path: &str,
+    part_value: i64,
+    wap_id: &str,
+) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .merge_append()
+        .set_snapshot_properties(wap_properties(wap_id))
+        .add_data_files(vec![data_file(path, part_value)])
+        .stage_only()
+        .apply(tx)
+        .expect("apply staged merge append");
+    tx.commit(catalog)
+        .await
+        .expect("commit staged merge append")
+}
+
+pub(crate) async fn stage_overwrite_files(
+    catalog: &impl Catalog,
+    table: &Table,
+    added: DataFile,
+    delete_path: &str,
+    wap_id: &str,
+) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .overwrite_files()
+        .set_snapshot_properties(wap_properties(wap_id))
+        .add_file(added)
+        .delete_file(delete_path)
+        .stage_only()
+        .apply(tx)
+        .expect("apply staged overwrite");
+    tx.commit(catalog).await.expect("commit staged overwrite")
+}
+
+pub(crate) async fn stage_replace_partitions(
+    catalog: &impl Catalog,
+    table: &Table,
+    path: &str,
+    part_value: i64,
+    wap_id: &str,
+) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .replace_partitions()
+        .set_snapshot_properties(wap_properties(wap_id))
+        .add_file(data_file(path, part_value))
+        .stage_only()
+        .apply(tx)
+        .expect("apply staged replace partitions");
+    tx.commit(catalog)
+        .await
+        .expect("commit staged replace partitions")
+}
+
+pub(crate) async fn stage_row_delta(
+    catalog: &impl Catalog,
+    table: &Table,
+    data: Vec<DataFile>,
+    deletes: Vec<DataFile>,
+    wap_id: &str,
+) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .row_delta()
+        .set_snapshot_properties(wap_properties(wap_id))
+        .add_data_files(data)
+        .add_deletes(deletes)
+        .stage_only()
+        .apply(tx)
+        .expect("apply staged row delta");
+    tx.commit(catalog).await.expect("commit staged row delta")
+}
+
 pub(crate) async fn stage_delete_files(
     catalog: &impl Catalog,
     table: &Table,
@@ -269,18 +347,8 @@ async fn merge_append_stage_only_adds_snapshot_without_moving_main() {
     let base_count = snapshot_count(&table);
     let base_live = live_file_paths(&table, ManifestContentType::Data).await;
 
-    let tx = Transaction::new(&table);
-    let tx = tx
-        .merge_append()
-        .set_snapshot_properties(wap_properties("wap-merge"))
-        .add_data_files(vec![data_file("test/staged.parquet", 0)])
-        .stage_only()
-        .apply(tx)
-        .expect("apply staged merge append");
-    let staged_table = tx
-        .commit(&catalog)
-        .await
-        .expect("commit staged merge append");
+    let staged_table =
+        stage_merge_append(&catalog, &table, "test/staged.parquet", 0, "wap-merge").await;
 
     let staged_id = assert_staged_invariants(
         &staged_table,
@@ -295,15 +363,26 @@ async fn merge_append_stage_only_adds_snapshot_without_moving_main() {
         base_live,
         "a read of main must be unchanged by the staged merge append"
     );
+    let staged = staged_table
+        .metadata()
+        .snapshot_by_id(staged_id)
+        .expect("staged snapshot readable by id");
     assert_eq!(
-        staged_table
-            .metadata()
-            .snapshot_by_id(staged_id)
-            .expect("staged snapshot readable by id")
-            .summary()
-            .operation,
+        staged.summary().operation,
         Operation::Append,
         "a staged merge append records an append snapshot"
+    );
+    assert_eq!(
+        staged.parent_snapshot_id(),
+        base_current,
+        "the staged snapshot is parented on the base head"
+    );
+    let mut expected = base_live.clone();
+    expected.insert("test/staged.parquet".to_string());
+    assert_eq!(
+        snapshot_live_file_paths(&staged_table, staged_id, ManifestContentType::Data).await,
+        expected,
+        "the staged snapshot's own live set holds the base file plus the staged file"
     );
 }
 
@@ -317,18 +396,16 @@ async fn overwrite_files_stage_only_adds_snapshot_without_moving_main() {
     let base_count = snapshot_count(&table);
     let base_live = live_file_paths(&table, ManifestContentType::Data).await;
 
-    let tx = Transaction::new(&table);
-    let tx = tx
-        .overwrite_files()
-        .set_snapshot_properties(wap_properties("wap-ow"))
-        .add_file(data_file("test/new.parquet", 0))
-        .delete_file("test/base.parquet")
-        .stage_only()
-        .apply(tx)
-        .expect("apply staged overwrite");
-    let staged_table = tx.commit(&catalog).await.expect("commit staged overwrite");
+    let staged_table = stage_overwrite_files(
+        &catalog,
+        &table,
+        data_file("test/new.parquet", 0),
+        "test/base.parquet",
+        "wap-ow",
+    )
+    .await;
 
-    assert_staged_invariants(
+    let staged_id = assert_staged_invariants(
         &staged_table,
         base_current,
         base_main,
@@ -340,6 +417,25 @@ async fn overwrite_files_stage_only_adds_snapshot_without_moving_main() {
         live_file_paths(&staged_table, ManifestContentType::Data).await,
         base_live,
         "a read of main must be unchanged by the staged overwrite"
+    );
+    let staged = staged_table
+        .metadata()
+        .snapshot_by_id(staged_id)
+        .expect("staged snapshot readable by id");
+    assert_eq!(
+        staged.summary().operation,
+        Operation::Overwrite,
+        "a staged overwrite records an overwrite snapshot"
+    );
+    assert_eq!(
+        staged.parent_snapshot_id(),
+        base_current,
+        "the staged snapshot is parented on the base head"
+    );
+    assert_eq!(
+        snapshot_live_file_paths(&staged_table, staged_id, ManifestContentType::Data).await,
+        HashSet::from(["test/new.parquet".to_string()]),
+        "the staged snapshot's own live set drops the removed base file"
     );
 }
 
@@ -353,20 +449,10 @@ async fn replace_partitions_stage_only_adds_snapshot_without_moving_main() {
     let base_count = snapshot_count(&table);
     let base_live = live_file_paths(&table, ManifestContentType::Data).await;
 
-    let tx = Transaction::new(&table);
-    let tx = tx
-        .replace_partitions()
-        .set_snapshot_properties(wap_properties("wap-rp"))
-        .add_file(data_file("test/new.parquet", 9))
-        .stage_only()
-        .apply(tx)
-        .expect("apply staged replace partitions");
-    let staged_table = tx
-        .commit(&catalog)
-        .await
-        .expect("commit staged replace partitions");
+    let staged_table =
+        stage_replace_partitions(&catalog, &table, "test/new.parquet", 9, "wap-rp").await;
 
-    assert_staged_invariants(
+    let staged_id = assert_staged_invariants(
         &staged_table,
         base_current,
         base_main,
@@ -378,6 +464,34 @@ async fn replace_partitions_stage_only_adds_snapshot_without_moving_main() {
         live_file_paths(&staged_table, ManifestContentType::Data).await,
         base_live,
         "a read of main must be unchanged by the staged replace"
+    );
+    let staged = staged_table
+        .metadata()
+        .snapshot_by_id(staged_id)
+        .expect("staged snapshot readable by id");
+    assert_eq!(
+        staged.summary().operation,
+        Operation::Overwrite,
+        "a staged replace partitions records an overwrite snapshot"
+    );
+    assert_eq!(
+        staged
+            .summary()
+            .additional_properties
+            .get("replace-partitions")
+            .map(String::as_str),
+        Some("true"),
+        "the staged snapshot carries the replace-partitions marker the replay arm reads"
+    );
+    assert_eq!(
+        staged.parent_snapshot_id(),
+        base_current,
+        "the staged snapshot is parented on the base head"
+    );
+    assert_eq!(
+        snapshot_live_file_paths(&staged_table, staged_id, ManifestContentType::Data).await,
+        HashSet::from(["test/new.parquet".to_string()]),
+        "the staged snapshot's own live set already shows the replaced partition's old file gone"
     );
 }
 
@@ -391,18 +505,16 @@ async fn row_delta_stage_only_adds_snapshot_without_moving_main() {
     let base_count = snapshot_count(&table);
     let base_live = live_file_paths(&table, ManifestContentType::Data).await;
 
-    let tx = Transaction::new(&table);
-    let tx = tx
-        .row_delta()
-        .set_snapshot_properties(wap_properties("wap-rd"))
-        .add_data_files(vec![data_file("test/new.parquet", 0)])
-        .add_deletes(vec![pos_delete_file("test/del.parquet", 9)])
-        .stage_only()
-        .apply(tx)
-        .expect("apply staged row delta");
-    let staged_table = tx.commit(&catalog).await.expect("commit staged row delta");
+    let staged_table = stage_row_delta(
+        &catalog,
+        &table,
+        vec![data_file("test/new.parquet", 0)],
+        vec![pos_delete_file("test/del.parquet", 9)],
+        "wap-rd",
+    )
+    .await;
 
-    assert_staged_invariants(
+    let staged_id = assert_staged_invariants(
         &staged_table,
         base_current,
         base_main,
@@ -421,6 +533,32 @@ async fn row_delta_stage_only_adds_snapshot_without_moving_main() {
             .is_empty(),
         "a read of main must not see the staged delete file"
     );
+    let staged = staged_table
+        .metadata()
+        .snapshot_by_id(staged_id)
+        .expect("staged snapshot readable by id");
+    assert_eq!(
+        staged.summary().operation,
+        Operation::Overwrite,
+        "a data+deletes staged row delta records an overwrite snapshot"
+    );
+    assert_eq!(
+        staged.parent_snapshot_id(),
+        base_current,
+        "the staged snapshot is parented on the base head"
+    );
+    let mut expected = base_live.clone();
+    expected.insert("test/new.parquet".to_string());
+    assert_eq!(
+        snapshot_live_file_paths(&staged_table, staged_id, ManifestContentType::Data).await,
+        expected,
+        "the staged snapshot's own data set holds the base file plus the staged file"
+    );
+    assert_eq!(
+        snapshot_live_file_paths(&staged_table, staged_id, ManifestContentType::Deletes).await,
+        HashSet::from(["test/del.parquet".to_string()]),
+        "the staged snapshot's own delete manifest holds the staged position delete"
+    );
 }
 
 #[tokio::test]
@@ -433,17 +571,9 @@ async fn delete_files_stage_only_adds_snapshot_without_moving_main() {
     let base_count = snapshot_count(&table);
     let base_live = live_file_paths(&table, ManifestContentType::Data).await;
 
-    let tx = Transaction::new(&table);
-    let tx = tx
-        .delete_files()
-        .set_snapshot_properties(wap_properties("wap-del"))
-        .delete_file("test/base.parquet")
-        .stage_only()
-        .apply(tx)
-        .expect("apply staged delete");
-    let staged_table = tx.commit(&catalog).await.expect("commit staged delete");
+    let staged_table = stage_delete_files(&catalog, &table, "test/base.parquet", "wap-del").await;
 
-    assert_staged_invariants(
+    let staged_id = assert_staged_invariants(
         &staged_table,
         base_current,
         base_main,
@@ -455,6 +585,26 @@ async fn delete_files_stage_only_adds_snapshot_without_moving_main() {
         live_file_paths(&staged_table, ManifestContentType::Data).await,
         base_live,
         "a read of main must be unchanged by the staged delete"
+    );
+    let staged = staged_table
+        .metadata()
+        .snapshot_by_id(staged_id)
+        .expect("staged snapshot readable by id");
+    assert_eq!(
+        staged.summary().operation,
+        Operation::Delete,
+        "a staged delete files records a delete snapshot"
+    );
+    assert_eq!(
+        staged.parent_snapshot_id(),
+        base_current,
+        "the staged snapshot is parented on the base head"
+    );
+    assert!(
+        snapshot_live_file_paths(&staged_table, staged_id, ManifestContentType::Data)
+            .await
+            .is_empty(),
+        "the staged snapshot's own live set drops the deleted base file"
     );
 }
 

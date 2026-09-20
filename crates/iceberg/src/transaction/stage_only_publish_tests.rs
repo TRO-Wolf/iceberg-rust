@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::stage_only_tests::{
     STAGED_WAP_ID_PROP, append_main, data_file, live_file_paths, non_current_snapshot_ids,
-    publish_changes, publish_changes_err, stage_delete_files, stage_fast_append, staged_base,
+    pos_delete_file, publish_changes, publish_changes_err, stage_delete_files, stage_fast_append,
+    stage_merge_append, stage_overwrite_files, stage_replace_partitions, stage_row_delta,
+    staged_base,
 };
 use crate::memory::tests::new_memory_catalog;
-use crate::spec::{MAIN_BRANCH, ManifestContentType};
+use crate::spec::{MAIN_BRANCH, ManifestContentType, Operation};
 use crate::transaction::action::TransactionAction;
 use crate::transaction::tests::make_v3_minimal_table_in_catalog;
 use crate::transaction::{
@@ -364,4 +367,274 @@ async fn publish_changes_replay_assigns_fresh_row_ids_on_v3() {
         vec![None],
         "the replayed file is stored with no first_row_id, so a fresh one is assigned"
     );
+}
+
+#[tokio::test]
+async fn publish_changes_merge_append_fast_forwards() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_merge_append(&catalog, &table, "test/staged.parquet", 0, "wap-mff").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+
+    let table = publish_changes(&catalog, &table, "wap-mff").await;
+
+    assert_eq!(
+        table.metadata().current_snapshot_id(),
+        Some(staged_id),
+        "a head-parented staged merge append publishes by fast-forward"
+    );
+    let live = live_file_paths(&table, ManifestContentType::Data).await;
+    assert!(
+        live.contains("test/staged.parquet") && live.contains("test/base.parquet"),
+        "a read of main sees the staged merge-append data: {live:?}"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_merge_append_replays() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_merge_append(&catalog, &table, "test/staged.parquet", 0, "wap-mr").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+    let table = append_main(&catalog, &table, vec![data_file("test/head.parquet", 9)]).await;
+
+    let table = publish_changes(&catalog, &table, "wap-mr").await;
+
+    let published = table
+        .metadata()
+        .current_snapshot()
+        .expect("the publish left a current snapshot");
+    assert_ne!(published.snapshot_id(), staged_id);
+    assert_eq!(
+        published.summary().operation,
+        Operation::Append,
+        "a merge-append replay records an append snapshot"
+    );
+    let props = &published.summary().additional_properties;
+    assert_eq!(
+        props.get("source-snapshot-id"),
+        Some(&staged_id.to_string())
+    );
+    assert_eq!(
+        props.get("published-wap-id").map(String::as_str),
+        Some("wap-mr")
+    );
+    let live = live_file_paths(&table, ManifestContentType::Data).await;
+    assert!(
+        live.contains("test/staged.parquet")
+            && live.contains("test/head.parquet")
+            && live.contains("test/base.parquet"),
+        "the merge-append replay adds the staged data on top of the head: {live:?}"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_replace_partitions_replays() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_replace_partitions(&catalog, &table, "test/new.parquet", 9, "wap-rpp").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+    let table = append_main(&catalog, &table, vec![data_file("test/head.parquet", 5)]).await;
+
+    let table = publish_changes(&catalog, &table, "wap-rpp").await;
+
+    let published = table
+        .metadata()
+        .current_snapshot()
+        .expect("the publish left a current snapshot");
+    assert_ne!(published.snapshot_id(), staged_id);
+    assert_eq!(
+        published.summary().operation,
+        Operation::Overwrite,
+        "a replace-partitions replay records an overwrite snapshot"
+    );
+    let props = &published.summary().additional_properties;
+    assert_eq!(
+        props.get("source-snapshot-id"),
+        Some(&staged_id.to_string())
+    );
+    assert_eq!(
+        props.get("published-wap-id").map(String::as_str),
+        Some("wap-rpp")
+    );
+    let live = live_file_paths(&table, ManifestContentType::Data).await;
+    assert!(
+        live.contains("test/new.parquet") && live.contains("test/head.parquet"),
+        "the replay adds the new partition file and keeps the head append: {live:?}"
+    );
+    assert!(
+        !live.contains("test/base.parquet"),
+        "the replay removes the replaced partition's old file: {live:?}"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_overwrite_files_fast_forwards() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_overwrite_files(
+        &catalog,
+        &table,
+        data_file("test/new.parquet", 0),
+        "test/base.parquet",
+        "wap-off",
+    )
+    .await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+
+    let table = publish_changes(&catalog, &table, "wap-off").await;
+
+    assert_eq!(
+        table.metadata().current_snapshot_id(),
+        Some(staged_id),
+        "a head-parented staged overwrite publishes by fast-forward"
+    );
+    assert_eq!(
+        live_file_paths(&table, ManifestContentType::Data).await,
+        HashSet::from(["test/new.parquet".to_string()]),
+        "a read of main sees the staged overwrite's live set"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_overwrite_files_replay_refuses_with_java_message() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_overwrite_files(
+        &catalog,
+        &table,
+        data_file("test/new.parquet", 0),
+        "test/base.parquet",
+        "wap-orr",
+    )
+    .await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+    let table = append_main(&catalog, &table, vec![data_file("test/head.parquet", 9)]).await;
+
+    let error = publish_changes_err(&catalog, &table, "wap-orr").await;
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        format!(
+            "Cannot cherry-pick snapshot {staged_id}: not append, dynamic overwrite, or \
+             fast-forward"
+        ),
+        "a non-replace overwrite cannot replay, matching CherryPickOperation's dispatch"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_row_delta_fast_forwards() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_row_delta(
+        &catalog,
+        &table,
+        vec![data_file("test/new.parquet", 0)],
+        vec![pos_delete_file("test/del.parquet", 9)],
+        "wap-rdf",
+    )
+    .await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+
+    let table = publish_changes(&catalog, &table, "wap-rdf").await;
+
+    assert_eq!(
+        table.metadata().current_snapshot_id(),
+        Some(staged_id),
+        "a head-parented staged row delta publishes by fast-forward"
+    );
+    assert!(
+        live_file_paths(&table, ManifestContentType::Data)
+            .await
+            .contains("test/new.parquet"),
+        "a read of main sees the staged row-delta data"
+    );
+    assert_eq!(
+        live_file_paths(&table, ManifestContentType::Deletes).await,
+        HashSet::from(["test/del.parquet".to_string()]),
+        "a read of main sees the staged position delete"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_delete_files_fast_forwards() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_delete_files(&catalog, &table, "test/base.parquet", "wap-df").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+
+    let table = publish_changes(&catalog, &table, "wap-df").await;
+
+    assert_eq!(
+        table.metadata().current_snapshot_id(),
+        Some(staged_id),
+        "a head-parented staged delete publishes by fast-forward"
+    );
+    assert!(
+        live_file_paths(&table, ManifestContentType::Data)
+            .await
+            .is_empty(),
+        "a read of main sees the staged delete's live set"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_data_only_row_delta_records_overwrite_and_refuses_replay() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_row_delta(
+        &catalog,
+        &table,
+        vec![data_file("test/new.parquet", 0)],
+        vec![],
+        "wap-rdo",
+    )
+    .await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+    assert_eq!(
+        staged_table_operation(&table, staged_id),
+        Operation::Overwrite,
+        "named divergence: a data-only staged row delta records Overwrite (1.10.0 \
+         freeze), not Java 1.11.0's Append — F-ROWDELTA-OP-1 owns that change"
+    );
+    let table = append_main(&catalog, &table, vec![data_file("test/head.parquet", 9)]).await;
+
+    let error = publish_changes_err(&catalog, &table, "wap-rdo").await;
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        format!(
+            "Cannot cherry-pick snapshot {staged_id}: not append, dynamic overwrite, or \
+             fast-forward"
+        ),
+        "the staged Overwrite cannot replay after the head moves, so the Spark \
+         MoR-INSERT-under-spark.wap.id path refuses publish as Java's Overwrite arm does"
+    );
+}
+
+fn staged_table_operation(table: &crate::table::Table, snapshot_id: i64) -> Operation {
+    table
+        .metadata()
+        .snapshot_by_id(snapshot_id)
+        .expect("snapshot readable by id")
+        .summary()
+        .operation
+        .clone()
 }
