@@ -17,7 +17,7 @@
 
 use std::io::Write;
 
-use flate2::Compression as FlateLevel;
+use flate2::Compression as DeflateLevel;
 use flate2::write::DeflateEncoder;
 
 use crate::{Error, ErrorKind, Result};
@@ -236,7 +236,7 @@ fn chunk_too_large() -> Error {
 }
 
 fn deflate_raw(block: &[u8]) -> Result<Vec<u8>> {
-    let mut encoder = DeflateEncoder::new(Vec::new(), FlateLevel::default());
+    let mut encoder = DeflateEncoder::new(Vec::new(), DeflateLevel::default());
     encoder.write_all(block).map_err(deflate_failed)?;
     encoder.finish().map_err(deflate_failed)
 }

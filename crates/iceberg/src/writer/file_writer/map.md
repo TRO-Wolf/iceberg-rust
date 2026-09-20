@@ -61,7 +61,7 @@ a format is chosen only by which concrete builder is instantiated.
 - 0.9.0 needs arrow 59; this workspace is on arrow 58.4. `datafusion-orc` 0.10.0 is a DataFusion
   integration **over** `orc-rust` 0.9, not a second ORC implementation.
 
-So the writer is in-tree and adds **no dependency**: `flate2` (already used by the ORC footer reader)
+So the writer is in-tree and adds **no dependency**: the DEFLATE encoder (already used by the ORC footer reader)
 covers Java's default `zlib` codec, and the protobuf is hand-written exactly as the reader's is. The
 full evidence and the rejected alternatives are clause C-001 of
 [task/f-orc-avro-write-1-ledger.md](../../../../../task/f-orc-avro-write-1-ledger.md).

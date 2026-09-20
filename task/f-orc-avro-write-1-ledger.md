@@ -46,7 +46,7 @@ vendored sources (`~/.cargo/registry/src/*/orc-rust-0.8.0` and `-0.9.0`):
    while this workspace is on arrow 58.4. `datafusion-orc` 0.10.0 is a
    DataFusion integration over `orc-rust` 0.9, not a second ORC implementation.
 
-So the writer is in-tree and adds no dependency: `flate2` covers the `zlib`
+So the writer is in-tree and adds no dependency: the DEFLATE encoder covers the `zlib`
 codec and the protobuf is hand-written. `orc-rust` keeps the READ path and the
 independent write oracle (the nested round-trip test decodes with its
 `ArrowReader`, not with this crate's encoder).
