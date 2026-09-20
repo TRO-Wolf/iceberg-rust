@@ -625,7 +625,7 @@ fn lookup_ancestor_by_source_snapshot(metadata: &TableMetadata, snapshot_id: i64
 /// Whether `wap_id` is already staged or published among the current ancestors (Java
 /// `WapUtil.isWapIdPublished` L62-70): some ancestor's summary has `wap.id == wap_id` or
 /// `published-wap-id == wap_id`.
-pub(crate) fn is_wap_id_published(metadata: &TableMetadata, wap_id: &str) -> bool {
+fn is_wap_id_published(metadata: &TableMetadata, wap_id: &str) -> bool {
     let mut current = metadata.current_snapshot_id();
     while let Some(id) = current {
         let Some(snapshot) = metadata.snapshot_by_id(id) else {

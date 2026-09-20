@@ -209,6 +209,23 @@ pub(crate) async fn stage_fast_append(
     tx.commit(catalog).await.expect("commit staged append")
 }
 
+pub(crate) async fn stage_delete_files(
+    catalog: &impl Catalog,
+    table: &Table,
+    delete_path: &str,
+    wap_id: &str,
+) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .delete_files()
+        .set_snapshot_properties(wap_properties(wap_id))
+        .delete_file(delete_path)
+        .stage_only()
+        .apply(tx)
+        .expect("apply staged delete");
+    tx.commit(catalog).await.expect("commit staged delete")
+}
+
 pub(crate) async fn cherry_pick(catalog: &impl Catalog, table: &Table, snapshot_id: i64) -> Table {
     let tx = Transaction::new(table);
     let tx = tx
@@ -501,7 +518,7 @@ async fn staged_snapshot_for_wap_id_non_unique_has_java_message() {
 }
 
 #[tokio::test]
-async fn staged_snapshot_for_wap_id_already_published_has_java_message() {
+async fn staged_snapshot_for_wap_id_already_published_returns_the_staged_snapshot() {
     let catalog = new_memory_catalog().await;
     let table = staged_base(&catalog).await;
     let table = stage_fast_append(&catalog, &table, "test/staged.parquet", 0, "wap-dup").await;
@@ -516,12 +533,12 @@ async fn staged_snapshot_for_wap_id_already_published_has_java_message() {
         "the staged snapshot fast-forwarded onto main"
     );
 
-    let error = staged_snapshot_for_wap_id(table.metadata(), "wap-dup")
-        .expect_err("an already-published wap id must fail");
-    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    let found = staged_snapshot_for_wap_id(table.metadata(), "wap-dup")
+        .expect("the lookup resolves the unique wap.id match even when it is already published");
     assert_eq!(
-        error.message(),
-        "Duplicate request to cherry pick wap id that was published already: wap-dup",
-        "Java's DuplicateWAPCommitException text, verbatim"
+        found.snapshot_id(),
+        staged_id,
+        "Java's PublishChangesProcedure lookup checks unique/unknown only; the \
+         duplicate-WAP refusal lives in CherryPickOperation"
     );
 }

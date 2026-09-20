@@ -23,7 +23,7 @@ use crate::error::Result;
 use crate::spec::{SnapshotRef, TableMetadata};
 use crate::table::Table;
 use crate::transaction::action::{ActionCommit, TransactionAction};
-use crate::transaction::cherry_pick::{CherryPickAction, is_wap_id_published};
+use crate::transaction::cherry_pick::CherryPickAction;
 use crate::transaction::{
     MergeAppendAction, OverwriteFilesAction, ReplacePartitionsAction, RowDeltaAction,
 };
@@ -58,11 +58,6 @@ pub fn staged_snapshot_for_wap_id(metadata: &TableMetadata, wap_id: &str) -> Res
             "Cannot apply unknown WAP ID '{wap_id}'"
         )));
     };
-    if is_wap_id_published(metadata, wap_id) {
-        return Err(data_invalid(format!(
-            "Duplicate request to cherry pick wap id that was published already: {wap_id}"
-        )));
-    }
     Ok(staged.clone())
 }
 

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use super::stage_only_tests::{
     STAGED_WAP_ID_PROP, append_main, data_file, live_file_paths, non_current_snapshot_ids,
-    publish_changes, publish_changes_err, stage_fast_append, staged_base,
+    publish_changes, publish_changes_err, stage_delete_files, stage_fast_append, staged_base,
 };
 use crate::memory::tests::new_memory_catalog;
 use crate::spec::{MAIN_BRANCH, ManifestContentType};
@@ -147,6 +147,36 @@ async fn publish_changes_twice_has_java_message() {
         error.message(),
         "Duplicate request to cherry pick wap id that was published already: wap-twice",
         "Java's DuplicateWAPCommitException text, verbatim"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_twice_of_a_published_delete_has_ff_only_message() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_delete_files(&catalog, &table, "test/base.parquet", "wap-dd").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+
+    let table = publish_changes(&catalog, &table, "wap-dd").await;
+    assert_eq!(
+        table.metadata().current_snapshot_id(),
+        Some(staged_id),
+        "a head-parented staged delete publishes by fast-forward"
+    );
+
+    let error = publish_changes_err(&catalog, &table, "wap-dd").await;
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        format!(
+            "Cannot cherry-pick snapshot {staged_id}: not append, dynamic overwrite, or \
+             fast-forward"
+        ),
+        "a second publish of an FF-published delete fails inside CherryPickOperation's \
+         dispatch, not with the duplicate-WAP text — WapUtil.validateWapPublish runs only \
+         on the append and replace-partitions arms"
     );
 }
 
