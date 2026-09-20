@@ -23,10 +23,12 @@ use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-use iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{
+    FormatVersion, NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
+};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
 use tempfile::TempDir;
 
 use super::tests::{SchemaOp, evolve_schema};
@@ -50,6 +52,15 @@ async fn setup_table(
     schema: Schema,
     properties: HashMap<String, String>,
 ) -> (Arc<dyn Catalog>, NamespaceIdent, TableIdent, TempDir) {
+    setup_table_partitioned(version, schema, properties, None).await
+}
+
+async fn setup_table_partitioned(
+    version: FormatVersion,
+    schema: Schema,
+    properties: HashMap<String, String>,
+    partition_spec: Option<UnboundPartitionSpec>,
+) -> (Arc<dyn Catalog>, NamespaceIdent, TableIdent, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
     let catalog = MemoryCatalogBuilder::default()
@@ -70,6 +81,7 @@ async fn setup_table(
         .schema(schema)
         .properties(properties)
         .format_version(version)
+        .partition_spec_opt(partition_spec)
         .build();
     catalog
         .create_table(&namespace, creation)
@@ -534,4 +546,132 @@ async fn bs_where_newcol(version: FormatVersion) {
     let (cols, rows) = run_query(provider, "SELECT id FROM t WHERE z IS NULL").await;
     assert_shape(&cols, &["id:Int64"]);
     assert_rows(rows, &["1", "2"]);
+}
+
+#[tokio::test]
+async fn bs_unknown_ref_v2() {
+    bs_unknown_ref(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn bs_unknown_ref_v3() {
+    bs_unknown_ref(FormatVersion::V3).await;
+}
+
+async fn bs_unknown_ref(version: FormatVersion) {
+    let (catalog, ident, _tmp, _seed_snap) = branch_add_setup(version).await;
+    let table = load(&catalog, &ident).await;
+    let err = IcebergStaticTableProvider::try_new_from_table_ref(table, "not_a_ref")
+        .await
+        .expect_err("an unknown ref must fail");
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(
+        err.to_string().contains("not_a_ref"),
+        "the error must name the missing ref: {err}"
+    );
+}
+
+#[tokio::test]
+async fn bs_delete_branch_v2() {
+    bs_delete_branch(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn bs_delete_branch_v3() {
+    bs_delete_branch(FormatVersion::V3).await;
+}
+
+async fn bs_delete_branch(version: FormatVersion) {
+    let (catalog, namespace, ident, _tmp) = setup_table(
+        version,
+        cell_schema(PrimitiveType::Long),
+        HashMap::from([("write.delete.mode".to_string(), "merge-on-read".to_string())]),
+    )
+    .await;
+    seed_two(&catalog, &namespace, ident.name(), None).await;
+    let table = load(&catalog, &ident).await;
+    create_ref(&catalog, &ident, "b0", current_snapshot_id(&table), true).await;
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), ident.name().to_string())
+            .await
+            .expect("provider for the branch delete")
+            .with_commit_branch("b0");
+    let batches = sql_exec(Arc::new(provider), "DELETE FROM t WHERE id = 1").await;
+    assert!(!batches.is_empty(), "the branch delete must report a count");
+    add_z(&catalog, &ident).await;
+
+    let table = load(&catalog, &ident).await;
+    let provider = provider_for_ref(&table, "b0").await;
+    let (cols, rows) = run_query(Arc::new(provider), "SELECT * FROM t").await;
+    assert_shape(&cols, &["id:Int64", "data:Utf8", "cat:Utf8", "z:Int32"]);
+    assert_rows(rows, &["2|b|y|NULL"]);
+
+    let provider = IcebergStaticTableProvider::try_new_from_table(table)
+        .await
+        .expect("main provider");
+    let (_cols, rows) = run_query(Arc::new(provider), "SELECT * FROM t").await;
+    assert_rows(rows, &["1|a|x|NULL", "2|b|y|NULL"]);
+}
+
+#[tokio::test]
+async fn bs_partitioned_branch_v2() {
+    bs_partitioned_branch(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn bs_partitioned_branch_v3() {
+    bs_partitioned_branch(FormatVersion::V3).await;
+}
+
+async fn bs_partitioned_branch(version: FormatVersion) {
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(3, "cat", Transform::Identity)
+        .expect("partition field on cat")
+        .build();
+    let (catalog, namespace, ident, _tmp) = setup_table_partitioned(
+        version,
+        cell_schema(PrimitiveType::Long),
+        HashMap::new(),
+        Some(partition_spec),
+    )
+    .await;
+    seed_two(&catalog, &namespace, ident.name(), None).await;
+    let table = load(&catalog, &ident).await;
+    create_ref(&catalog, &ident, "b0", current_snapshot_id(&table), true).await;
+    add_z(&catalog, &ident).await;
+
+    let table = load(&catalog, &ident).await;
+    let provider = provider_for_ref(&table, "b0").await;
+    let (cols, rows) = run_query(Arc::new(provider), "SELECT * FROM t").await;
+    assert_shape(&cols, &["id:Int64", "data:Utf8", "cat:Utf8", "z:Int32"]);
+    assert_rows(rows, &["1|a|x|NULL", "2|b|y|NULL"]);
+}
+
+#[tokio::test]
+async fn bs_writable_provider_branch_v2() {
+    bs_writable_provider_branch(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn bs_writable_provider_branch_v3() {
+    bs_writable_provider_branch(FormatVersion::V3).await;
+}
+
+async fn bs_writable_provider_branch(version: FormatVersion) {
+    let (catalog, namespace, ident, _tmp) =
+        setup_table(version, cell_schema(PrimitiveType::Long), HashMap::new()).await;
+    seed_two(&catalog, &namespace, ident.name(), None).await;
+    let table = load(&catalog, &ident).await;
+    create_ref(&catalog, &ident, "b0", current_snapshot_id(&table), true).await;
+    add_z(&catalog, &ident).await;
+
+    let provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), ident.name().to_string())
+            .await
+            .expect("provider for the branch read")
+            .with_commit_branch("b0");
+    let (cols, rows) = run_query(Arc::new(provider), "SELECT * FROM t").await;
+    assert_shape(&cols, &["id:Int64", "data:Utf8", "cat:Utf8", "z:Int32"]);
+    assert_rows(rows, &["1|a|x|NULL", "2|b|y|NULL"]);
 }
