@@ -132,7 +132,7 @@ impl AddFiles {
         let table = ensure_name_mapping_present(&self.table, catalog).await?;
         let table_name = table.identifier().to_string();
 
-        let (files, partition_names) = discover(&table, &self.source).await?;
+        let (files, partition_names) = discover(&table, &self.source, self.parallelism).await?;
         if files.is_empty() {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -251,24 +251,27 @@ async fn ensure_name_mapping_present(table: &Table, catalog: &dyn Catalog) -> Re
 async fn discover(
     table: &Table,
     source: &AddFilesSource,
+    parallelism: usize,
 ) -> Result<(Vec<SourceFile>, Vec<String>)> {
     match source {
         AddFilesSource::Directory(root) => discover_directory(table, root).await,
         AddFilesSource::Files(entries) => {
-            let mut files = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let size = table
-                    .file_io()
-                    .new_input(&entry.path)?
-                    .metadata()
-                    .await?
-                    .size;
-                files.push(SourceFile {
-                    path: entry.path.clone(),
-                    size,
-                    partition: entry.partition.clone(),
-                });
-            }
+            let file_io = table.file_io().clone();
+            let files: Vec<SourceFile> = stream::iter(entries.iter())
+                .map(|entry| {
+                    let file_io = file_io.clone();
+                    async move {
+                        let size = file_io.new_input(&entry.path)?.metadata().await?.size;
+                        Ok::<SourceFile, Error>(SourceFile {
+                            path: entry.path.clone(),
+                            size,
+                            partition: entry.partition.clone(),
+                        })
+                    }
+                })
+                .buffered(parallelism)
+                .try_collect()
+                .await?;
             let names = partition_names_of(&files)?;
             Ok((files, names))
         }

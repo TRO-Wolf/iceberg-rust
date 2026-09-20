@@ -684,3 +684,53 @@ fn a_partition_filter_over_an_all_void_spec_is_refused_as_unpartitioned() {
     validate_partition_filter(&spec, &HashMap::new(), "ns.t")
         .expect("an empty filter over a void spec is accepted");
 }
+
+#[tokio::test]
+async fn an_explicit_file_list_keeps_each_file_s_partition_values_under_parallelism() {
+    let (catalog, temp_dir) = local_fs_catalog().await;
+    let table = create_table(&catalog, id_v_cat_schema(), Some("cat"), FormatVersion::V2).await;
+    let root = source_root(&temp_dir, "parallel-list");
+    let mut entries = Vec::new();
+    for (index, value) in ["x", "y", "z", "w"].into_iter().enumerate() {
+        let path = format!("{root}/file-{index}.parquet");
+        write_source_file(&table, &path, &[
+            ("id", long_column(&[index as i64])),
+            ("v", string_column(&["a"])),
+        ])
+        .await;
+        entries.push(
+            AddFilesEntry::new(path).with_partition(vec![("cat".to_string(), value.to_string())]),
+        );
+    }
+
+    AddFiles::new(table.clone(), AddFilesSource::Files(entries))
+        .parallelism(4)
+        .execute(&catalog)
+        .await
+        .expect("adopt an explicit file list with four stats in flight");
+
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload table");
+    let adopted: Vec<(String, Option<Literal>)> = live_data_files(&table)
+        .await
+        .into_iter()
+        .map(|file| {
+            (
+                file.file_path()
+                    .rsplit('/')
+                    .next()
+                    .expect("a file name")
+                    .to_string(),
+                file.partition().iter().next().flatten().cloned(),
+            )
+        })
+        .collect();
+    assert_eq!(adopted, vec![
+        ("file-0.parquet".to_string(), Some(Literal::string("x"))),
+        ("file-1.parquet".to_string(), Some(Literal::string("y"))),
+        ("file-2.parquet".to_string(), Some(Literal::string("z"))),
+        ("file-3.parquet".to_string(), Some(Literal::string("w"))),
+    ]);
+}

@@ -22,8 +22,8 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::Type as ParquetType;
 
-use crate::arrow::ArrowFileReader;
-use crate::io::FileIO;
+use crate::arrow::{ArrowFileReader, ParquetReadOptions};
+use crate::io::{FileIO, FileMetadata};
 use crate::spec::{
     DataContentType, DataFile, Literal, MetricsByFieldId, MetricsConfig, NameMapping, NestedField,
     PartitionSpecRef, PrimitiveType, Schema, SchemaRef, Struct, StructType, Type,
@@ -95,9 +95,20 @@ pub(super) async fn adopt_parquet_file(
     let partition = partition_struct(context, partition_values)?;
 
     let input_file = file_io.new_input(path)?;
-    let file_metadata = input_file.metadata().await?;
     let reader = input_file.reader().await?;
-    let mut parquet_reader = ArrowFileReader::new(file_metadata, reader);
+    let mut parquet_reader = ArrowFileReader::new(
+        FileMetadata {
+            size: file_size_in_bytes,
+        },
+        reader,
+    )
+    .with_parquet_read_options(
+        ParquetReadOptions::builder()
+            .with_preload_column_index(false)
+            .with_preload_offset_index(false)
+            .with_preload_page_index(false)
+            .build(),
+    );
     let parquet_metadata = parquet_reader.get_metadata(None).await.map_err(|err| {
         Error::new(
             ErrorKind::DataInvalid,
