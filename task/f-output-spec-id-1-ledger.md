@@ -86,7 +86,18 @@ not at `apply` — `apply` only registers the action.
 
 ## Implementation decisions
 
-(to fill)
+### merge_append fix
+
+`split_and_reorder` no longer asserts ≤1 new added data manifest: every manifest whose
+`added_snapshot_id == this snapshot` is this commit's new work and is carried ahead of the
+existing manifests, preserving input order within each group. Java's
+`Iterables.concat(prepareNewDataManifests(), filtered)` puts ALL new data manifests (one per
+spec, HashMap spec order ≈ ascending for realistic spec ids) first; the new-added prefix is
+sorted by `partition_spec_id` ascending so `first` (the stream head the bin-packer's
+min-count rule protects, Java `ManifestFile first = manifestIter.next()`) is the lowest-spec
+new manifest, matching Java's HashMap-ascending `prepareNewDataManifests` order.
+Post-fix: `measure_merge_append_mixed_specs_groups_manifests_per_spec` GREEN; all 24
+merge_append + 7 output_spec_id tests pass.
 
 ## API changes
 
