@@ -31,7 +31,9 @@
 |---|---|---|
 | 1 | 3a4fa056 | `docs: F-POSDEL-SCAN-1 — ledger skeleton, reuse map, Java evidence, clause rows OPEN` |
 | 2 | 27caca1f | `test: F-POSDEL-SCAN-1 — red-first scan pins over oracle fixture shapes` |
-| 3-4 | this commit | `feat: F-POSDEL-SCAN-1 — delete-manifest planning walk + delete-file reading` |
+| 3-4 | 8417b8b3 | `feat: F-POSDEL-SCAN-1 — delete-manifest planning walk + delete-file reading` |
+| 5 | af6dabf1 | `docs: F-POSDEL-SCAN-1 — un-refuse position_deletes scan in module doc, map.md, GAP_MATRIX R142` |
+| 6 | this commit | `test: F-POSDEL-SCAN-1 — mutation records, all seven sabotages redden pins` |
 
 ## 1. The gap
 
@@ -355,17 +357,19 @@ LEDGER:
     verdict: OPEN
 ```
 
-## 7. Mutation records (step 6 — filled as each sabotage runs)
+## 7. Mutation records (step 6 — each sabotage run + reverted; all 13 pins green after revert)
 
 | Mutation | Pins reddened | Arithmetic |
 |---|---|---|
-| (a) drop POSITION_DELETES content filter | — pending — | — |
-| (b) data manifests instead of delete manifests | — pending — | — |
-| (c) include status-2 (deleted) entries | — pending — | — |
-| (d) partition from file's own spec, not unified type | — pending — | — |
-| (e) DV branch for v2 file and vice versa | — pending — | — |
-| (f) drop content_offset / content_size_in_bytes | — pending — | — |
-| (g) pos from the wrong column | — pending — | — |
+| (a) drop POSITION_DELETES content filter (equality deletes admitted) | `scan_partitioned_v2_rows_match_oracle` (3 rows, expected 2 — the equality-delete decoy leaked) | 12 passed / 1 failed |
+| (b) `ManifestContentType::Data` instead of `Deletes` | `scan_partitioned_v2_rows_match_oracle`, `scan_partitioned_v3_dv_rows_match_oracle`, `scan_unpartitioned_v2_drops_partition_column`, `scan_evolved_two_specs_null_fills_unified_partition`, `scan_row_column_is_read_when_the_file_carries_it` (all got 0 rows) | 8 passed / 5 failed |
+| (c) include status-2 (deleted) entries (`is_alive` check removed) | `scan_partitioned_v2_rows_match_oracle` (3 rows, expected 2 — the deleted decoy leaked) | 12 passed / 1 failed |
+| (d) partition appended through the file's OWN spec's partition type, not the unified type | `scan_evolved_two_specs_null_fills_unified_partition` (StructBuilder unequal-lengths panic — the null fill is gone) | 12 passed / 1 failed |
+| (e) DV branch for v2 file and vice versa (`!= Puffin`) | 6 pins: v2 files hit `load_delete_vector`'s "carries no referenced_data_file" `DataInvalid`; the v3 puffin hit the parquet branch's `FeatureUnsupported` | 7 passed / 6 failed |
+| (f) `content_offset` / `content_size_in_bytes` emitted as 0 | `scan_partitioned_v3_dv_rows_match_oracle` (`(pos,offset,size)` tuples (1,0,0)/(7,0,0), expected (1,4,42)/(7,46,42)) | 12 passed / 1 failed |
+| (g) `pos` read from the `file_path` column | 5 v2-path pins (`column 'file_path' is Utf8, expected Int64` `DataInvalid`); v3 unaffected — its pos comes from the DV, correctly | 8 passed / 5 failed |
+
+Every mutation reddened at least one pin; none stayed green. No pin gaps found.
 
 ## 8. Gates (step 7 — filled as they run)
 
