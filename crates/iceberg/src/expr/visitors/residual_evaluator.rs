@@ -736,9 +736,22 @@ mod tests {
             "st.category IS NULL",
             "the residual must carry the nested column's full path, not its leaf name"
         );
-        residual
-            .bind(schema, true)
-            .expect("the residual rebinds to the same nested field");
+        let rebound = residual
+            .bind(schema.clone(), true)
+            .expect("the residual rebinds");
+        assert_ne!(
+            rebound,
+            BoundPredicate::AlwaysFalse,
+            "the rebound residual must still be able to match rows"
+        );
+        assert_eq!(
+            Reference::new("category")
+                .is_null()
+                .bind(schema, true)
+                .expect("the leaf name binds to the top-level column"),
+            BoundPredicate::AlwaysFalse,
+            "the leaf name alone binds to the required top-level column and loses every row"
+        );
     }
 
     #[test]
