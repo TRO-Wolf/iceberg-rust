@@ -133,6 +133,15 @@ impl AddFiles {
         let table_name = table.identifier().to_string();
 
         let (files, partition_names) = discover(&table, &self.source).await?;
+        if files.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot find any file to import under {}",
+                    describe(&self.source)
+                ),
+            ));
+        }
         let spec = find_compatible_spec(&partition_names, &table)?;
         validate_partition_filter(&spec, &self.partition_filter, &table_name)?;
 
@@ -198,6 +207,13 @@ impl AddFiles {
             .buffered(self.parallelism)
             .try_collect()
             .await
+    }
+}
+
+fn describe(source: &AddFilesSource) -> String {
+    match source {
+        AddFilesSource::Directory(root) => root.clone(),
+        AddFilesSource::Files(entries) => format!("the given list of {} files", entries.len()),
     }
 }
 

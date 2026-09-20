@@ -328,6 +328,21 @@ every footer read complete BEFORE the append transaction is built, so any refusa
 commit. The only ordering exception is D-10's name-mapping property commit, which is Java's order
 too.
 
+**D-14 — a source with no importable file is REFUSED, not committed as an empty snapshot.**
+Java's catalog-table path reaches `table.newAppend().commit()` with an empty file list and writes
+an EMPTY append snapshot (`importSparkTable` at 148–162), while its `` `parquet`.`<path>` `` path
+refuses ("Cannot find any matching partitions in table %s"). The fork refuses, with
+"Cannot find any file to import under <source>": the fork's snapshot producer already refuses a
+no-op manifest write (`PreconditionFailed`), an empty append snapshot carries no information while
+consuming a sequence number, and a caller that meant to import files and imported none must learn
+so. A missing source directory reaches the same refusal, because `FileIO::list` over a
+directory-semantics backend returns an EMPTY list for an absent prefix rather than an error.
+
+**D-15 — the duplicate check runs BEFORE the footer reads.** Java builds every `DataFile` first and
+checks duplicates after. The refusal and its message are identical; checking first avoids reading
+every footer of an import that cannot commit. The only observable difference is which error a
+caller sees when a source is BOTH a duplicate and unreadable — the fork reports the duplicate.
+
 **D-13 — hidden paths are skipped at EVERY segment.** Java's `HIDDEN_PATH_FILTER` filters the LEAF
 name only, because Spark's partition discovery already dropped `_`/`.` DIRECTORIES upstream. With
 one recursive listing the fork applies the same `_`/`.` rule to every segment below the source root,
@@ -335,16 +350,29 @@ which is the composition of the two Java filters.
 
 ## 5. Clause coverage
 
-| Clause | Status |
-|---|---|
-| in-place adoption, one append snapshot | pending |
-| hive-layout partitioned source, one file per dir | pending |
-| `partition_filter` selects one partition | pending |
-| `partition_filter` on an unpartitioned table refuses | pending |
-| `check_duplicate_files` true refuses the second import | pending |
-| `check_duplicate_files` false adopts twice | pending |
-| missing source refuses | pending |
-| silent column drop (name mapping) | pending |
-| name mapping created when absent | pending |
-| `parallelism` bound | pending |
-| v3 target | pending |
+| Clause | Pin | Status |
+|---|---|---|
+| in-place adoption, one `append` snapshot | `unpartitioned_source_is_adopted_in_place_in_one_append_snapshot` | PROVEN |
+| hive-layout partitioned source, one file per dir, values parsed | `partitioned_source_adopts_one_file_per_hive_directory` | PROVEN |
+| `partition_filter` selects one partition | `partition_filter_adopts_only_the_named_partition` | PROVEN |
+| `partition_filter` on an unpartitioned table refuses | `partition_filter_on_an_unpartitioned_table_is_refused` | PROVEN |
+| `partition_filter` wider than the spec refuses | `a_partition_filter_wider_than_the_spec_is_refused` | PROVEN |
+| `partition_filter` naming a non-partition column refuses | `a_partition_filter_naming_a_non_partition_column_is_refused` | PROVEN |
+| `partition_filter` matching nothing refuses | `a_partition_filter_matching_no_partition_is_refused` | PROVEN |
+| `check_duplicate_files` true refuses the second import | `check_duplicate_files_refuses_the_second_import`, `the_duplicate_refusal_is_a_typed_error_naming_every_duplicate` | PROVEN |
+| `check_duplicate_files` false adopts twice | `check_duplicate_files_false_adopts_the_same_files_twice` | PROVEN |
+| a missing source refuses | `a_missing_source_is_refused`, `a_missing_source_file_is_a_typed_error_naming_the_path` | PROVEN |
+| a file that is not parquet refuses | `a_file_that_is_not_parquet_is_refused`, `a_non_parquet_file_refusal_names_the_file` | PROVEN |
+| silent column drop (name mapping) | `a_source_column_the_target_lacks_is_dropped_and_reads_back_null` | PROVEN |
+| name mapping created when absent | `the_default_name_mapping_is_created_when_absent` | PROVEN |
+| `parallelism` bound, and `0` refused | `parallelism_two_adopts_the_same_files`, `parallelism_zero_is_refused` | PROVEN |
+| v3 target | `a_v3_target_adopts_the_file` | PROVEN |
+| `sort_order_id = 0`, no split offsets | `an_adopted_file_carries_sort_order_id_zero_and_no_split_offsets` | PROVEN |
+| `__HIVE_DEFAULT_PARTITION__` is a NULL partition value | `the_hive_default_partition_directory_becomes_a_null_partition_value` | PROVEN |
+| hidden `_`/`.` paths skipped | `a_hidden_directory_or_file_is_skipped` | PROVEN |
+| `findCompatibleSpec` refusal | `a_source_whose_partition_columns_match_no_spec_is_refused` | PROVEN |
+| an explicit file list carries its own values | `an_explicit_file_list_carries_its_own_partition_values` | PROVEN |
+| a partition value that does not parse refuses | `a_partition_value_that_does_not_parse_for_its_type_is_refused` | PROVEN |
+| a partition type with no hive-string parse refuses | `a_partition_type_java_cannot_parse_from_a_string_is_refused` | PROVEN |
+| a non-`name=value` source directory refuses | `a_source_directory_that_is_not_a_partition_directory_is_refused` | PROVEN |
+| conflicting source directory structures refuse | `conflicting_source_directory_structures_are_refused` | PROVEN |

@@ -134,6 +134,8 @@ mod actions_provider;
 mod add_files;
 mod add_files_datafile;
 #[cfg(test)]
+mod add_files_refusal_tests;
+#[cfg(test)]
 mod add_files_tests;
 mod compute_partition_stats;
 mod compute_table_stats;

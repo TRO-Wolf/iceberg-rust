@@ -26,7 +26,7 @@ use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
 use crate::maintenance::add_files::{AddFiles, AddFilesEntry, AddFilesSource};
-use crate::maintenance::rewrite_data_files::tests::local_fs_catalog;
+pub(super) use crate::maintenance::rewrite_data_files::tests::local_fs_catalog;
 use crate::spec::{
     DEFAULT_SCHEMA_NAME_MAPPING, DataFile, FormatVersion, ManifestContentType, NestedField,
     PartitionSpec, PrimitiveType, Schema, Transform, Type,
@@ -34,7 +34,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
-fn id_v_schema() -> Schema {
+pub(super) fn id_v_schema() -> Schema {
     Schema::builder()
         .with_fields(vec![
             Arc::new(NestedField::optional(
@@ -52,7 +52,7 @@ fn id_v_schema() -> Schema {
         .expect("build id/v schema")
 }
 
-fn id_v_cat_schema() -> Schema {
+pub(super) fn id_v_cat_schema() -> Schema {
     Schema::builder()
         .with_fields(vec![
             Arc::new(NestedField::optional(
@@ -148,7 +148,7 @@ fn id_less_parquet_bytes(columns: &[(&str, ArrayRef)]) -> Bytes {
     Bytes::from(buffer)
 }
 
-async fn write_source_file(table: &Table, path: &str, columns: &[(&str, ArrayRef)]) {
+pub(super) async fn write_source_file(table: &Table, path: &str, columns: &[(&str, ArrayRef)]) {
     table
         .file_io()
         .new_output(path)
@@ -158,15 +158,15 @@ async fn write_source_file(table: &Table, path: &str, columns: &[(&str, ArrayRef
         .expect("write source file");
 }
 
-fn long_column(values: &[i64]) -> ArrayRef {
+pub(super) fn long_column(values: &[i64]) -> ArrayRef {
     Arc::new(Int64Array::from(values.to_vec())) as ArrayRef
 }
 
-fn string_column(values: &[&str]) -> ArrayRef {
+pub(super) fn string_column(values: &[&str]) -> ArrayRef {
     Arc::new(StringArray::from(values.to_vec())) as ArrayRef
 }
 
-async fn flat_source(table: &Table, root: &str) {
+pub(super) async fn flat_source(table: &Table, root: &str) {
     write_source_file(table, &format!("{root}/part-00000.parquet"), &[
         ("id", long_column(&[10, 11])),
         ("v", string_column(&["p", "q"])),
@@ -174,7 +174,7 @@ async fn flat_source(table: &Table, root: &str) {
     .await;
 }
 
-async fn hive_source(table: &Table, root: &str) {
+pub(super) async fn hive_source(table: &Table, root: &str) {
     write_source_file(table, &format!("{root}/cat=x/part-00000.parquet"), &[
         ("id", long_column(&[1, 2])),
         ("v", string_column(&["a", "b"])),
@@ -192,7 +192,7 @@ async fn hive_source(table: &Table, root: &str) {
     .await;
 }
 
-fn source_root(temp_dir: &TempDir, name: &str) -> String {
+pub(super) fn source_root(temp_dir: &TempDir, name: &str) -> String {
     format!(
         "{}/source-{name}",
         temp_dir.path().to_str().expect("utf8 temp path")
