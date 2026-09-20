@@ -251,6 +251,8 @@ impl TableProvider for IcebergTableProvider {
             .map_err(to_datafusion_error)?;
         let mode = WriteMode::from_property(&table, WRITE_DELETE_MODE);
         let isolation = IsolationLevel::for_row_level_op(&table, WRITE_DELETE_ISOLATION_LEVEL)?;
+        let output_spec = iceberg::writer::resolve_output_spec(&table, self.output_spec_id)
+            .map_err(to_datafusion_error)?;
 
         // Exact PhysicalExpr is the row contract. Iceberg gets prune-only.
         let prune = convert_filters_to_predicate(&filters, table.metadata().current_schema());
@@ -271,6 +273,7 @@ impl TableProvider for IcebergTableProvider {
             isolation,
             current_schema,
             self.commit_branch.clone(),
+            output_spec,
         )))
     }
 
@@ -286,6 +289,8 @@ impl TableProvider for IcebergTableProvider {
             .map_err(to_datafusion_error)?;
         let mode = WriteMode::from_property(&table, WRITE_UPDATE_MODE);
         let isolation = IsolationLevel::for_row_level_op(&table, WRITE_UPDATE_ISOLATION_LEVEL)?;
+        let output_spec = iceberg::writer::resolve_output_spec(&table, self.output_spec_id)
+            .map_err(to_datafusion_error)?;
 
         let df_schema = DFSchema::try_from(current_schema.as_ref().clone())?;
 
@@ -316,6 +321,7 @@ impl TableProvider for IcebergTableProvider {
             isolation,
             current_schema,
             self.commit_branch.clone(),
+            output_spec,
         )))
     }
 }

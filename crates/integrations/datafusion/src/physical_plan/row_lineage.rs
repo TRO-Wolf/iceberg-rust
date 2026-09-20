@@ -32,8 +32,8 @@ use iceberg::metadata_columns::{
     RESERVED_FIELD_ID_ROW_ID, format_supports_row_lineage, schema_with_row_lineage,
 };
 use iceberg::spec::{
-    DataFile, DataFileFormat, FormatVersion, MetricsConfig, SchemaRef as IcebergSchemaRef,
-    TableProperties,
+    DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionSpecRef,
+    SchemaRef as IcebergSchemaRef, TableProperties,
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -232,11 +232,10 @@ pub(super) struct StreamingDataFileWriter {
 }
 
 impl StreamingDataFileWriter {
-    pub(super) fn try_new(table: &Table) -> DFResult<Self> {
+    pub(super) fn try_new(table: &Table, partition_spec: PartitionSpecRef) -> DFResult<Self> {
         let table_schema = table.metadata().current_schema().clone();
         let table_field_count = table_schema.as_struct().fields().len();
         let schema = table_write_schema(table)?;
-        let partition_spec = table.metadata().default_partition_spec().clone();
 
         let compression = parquet_compression_from_properties(table.metadata().properties())
             .map_err(to_datafusion_error)?;

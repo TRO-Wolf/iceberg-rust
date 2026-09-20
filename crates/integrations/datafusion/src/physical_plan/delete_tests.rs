@@ -905,6 +905,7 @@ async fn mor_update_threads_scan_partitions_to_the_close() {
         &table_schema,
         IsolationLevel::Serializable,
         None,
+        table.metadata().default_partition_spec().clone(),
     )
     .await
     .expect("update");

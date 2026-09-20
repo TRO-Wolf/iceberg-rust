@@ -52,7 +52,9 @@ use iceberg::Catalog;
 use iceberg::delete_vector_container::DvContainerClose;
 use iceberg::expr::Predicate;
 use iceberg::metadata_columns::{RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_POS};
-use iceberg::spec::{DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionKey, Struct};
+use iceberg::spec::{
+    DataFile, DataFileFormat, FormatVersion, MetricsConfig, PartitionKey, PartitionSpecRef, Struct,
+};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::position_delete_writer::{
@@ -75,6 +77,10 @@ use super::snapshot_target::{
 };
 use crate::physical_plan::delete_legacy_merge::write_deletion_vectors;
 use crate::to_datafusion_error;
+
+#[path = "delete_decode.rs"]
+mod delete_decode;
+use delete_decode::{decode_file_path, decode_file_paths_batch, decode_position};
 
 #[path = "delete_position_deletes.rs"]
 mod delete_position_deletes;
@@ -165,6 +171,7 @@ pub(crate) struct IcebergDeleteExec {
     count_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
     commit_branch: Option<String>,
+    partition_spec: PartitionSpecRef,
 }
 
 impl IcebergDeleteExec {
@@ -178,6 +185,7 @@ impl IcebergDeleteExec {
         isolation: IsolationLevel,
         table_schema: SchemaRef,
         commit_branch: Option<String>,
+        partition_spec: PartitionSpecRef,
     ) -> Self {
         let count_schema = Self::make_count_schema();
         let plan_properties = Self::compute_properties(Arc::clone(&count_schema));
@@ -192,6 +200,7 @@ impl IcebergDeleteExec {
             count_schema,
             plan_properties,
             commit_branch,
+            partition_spec,
         }
     }
 
@@ -285,6 +294,7 @@ impl ExecutionPlan for IcebergDeleteExec {
         let table_schema = Arc::clone(&self.table_schema);
         let count_schema = Arc::clone(&self.count_schema);
         let commit_branch = self.commit_branch.clone();
+        let partition_spec = self.partition_spec.clone();
 
         let stream = futures::stream::once(async move {
             let deleted = match mode {
@@ -308,6 +318,7 @@ impl ExecutionPlan for IcebergDeleteExec {
                         &table_schema,
                         isolation,
                         commit_branch.as_deref(),
+                        partition_spec,
                     )
                     .await?
                 }
@@ -555,6 +566,7 @@ async fn merge_on_read_delete(
 /// row, rewrites only those files' survivors, and commits an `OverwriteFiles`. Unaffected files stay
 /// untouched. The survivors span many partitions and one batch may interleave files, so the
 /// [`TaskWriter`] runs with `fanout_enabled = true` and routes each row without pre-sorting.
+#[allow(clippy::too_many_arguments)]
 async fn copy_on_write_delete(
     table: &Table,
     catalog: &dyn Catalog,
@@ -563,6 +575,7 @@ async fn copy_on_write_delete(
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
     commit_branch: Option<&str>,
+    partition_spec: PartitionSpecRef,
 ) -> DFResult<u64> {
     let scan_snapshot_id =
         resolve_scan_snapshot_id(table, commit_branch).map_err(to_datafusion_error)?;
@@ -640,7 +653,10 @@ async fn copy_on_write_delete(
                 surviving = attach_lineage(surviving, row_id, last_updated)?;
             }
             if data_writer.is_none() {
-                data_writer = Some(StreamingDataFileWriter::try_new(table)?);
+                data_writer = Some(StreamingDataFileWriter::try_new(
+                    table,
+                    partition_spec.clone(),
+                )?);
             }
             let Some(writer) = data_writer.as_mut() else {
                 return Err(DataFusionError::Internal(
@@ -686,122 +702,6 @@ async fn copy_on_write_delete(
         .map_err(to_datafusion_error)?;
 
     Ok(deleted)
-}
-
-/// Decodes the reserved `_file` column at `row`, tolerating run-end-encoded and plain `Utf8`. A NULL
-/// slot is an error, not a value: arrow's `value()` returns `""` there, and an empty path becomes a
-/// position delete against a file that does not exist.
-fn decode_file_path(col: &ArrayRef, row: usize) -> DFResult<String> {
-    use datafusion::arrow::array::RunArray;
-    use datafusion::arrow::datatypes::Int32Type;
-
-    if let Some(plain) = col.as_any().downcast_ref::<StringArray>() {
-        if plain.is_null(row) {
-            return Err(null_file_path_error(row));
-        }
-        return Ok(plain.value(row).to_string());
-    }
-    if let Some(run) = col.as_any().downcast_ref::<RunArray<Int32Type>>() {
-        let physical = run.get_physical_index(row);
-        let values = run
-            .values()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                DataFusionError::Internal("_file REE values are not Utf8".to_string())
-            })?;
-        if values.is_null(physical) {
-            return Err(null_file_path_error(row));
-        }
-        return Ok(values.value(physical).to_string());
-    }
-    Err(DataFusionError::Internal(format!(
-        "unexpected _file column type: {:?}",
-        col.data_type()
-    )))
-}
-
-/// The one error raised for a NULL reserved `_file` slot, in both decode paths.
-fn null_file_path_error(row: usize) -> DataFusionError {
-    DataFusionError::Internal(format!(
-        "reserved _file column is NULL at row {row}; a position delete cannot be keyed by an \
-         unknown data file"
-    ))
-}
-
-/// Decodes the reserved `_pos` column at `row`. A NULL slot is an error for the same reason as
-/// [`decode_file_path`]: arrow returns `0`, which would position-delete row 0 of a real data file.
-fn decode_position(col: &Int64Array, row: usize) -> DFResult<i64> {
-    if col.is_null(row) {
-        return Err(DataFusionError::Internal(format!(
-            "reserved _pos column is NULL at row {row}; a position delete cannot be keyed by an \
-             unknown row position"
-        )));
-    }
-    Ok(col.value(row))
-}
-
-/// Decodes the `_file` column for a whole batch in one pass (row `i` → `out[i]`). Equivalent to
-/// [`decode_file_path`] per row, but it allocates no `String`: each run's value of a run-end-encoded
-/// column is resolved once and reused. The strings are byte-identical, and in the same order.
-fn decode_file_paths_batch(col: &ArrayRef) -> DFResult<Vec<&str>> {
-    use datafusion::arrow::array::RunArray;
-    use datafusion::arrow::datatypes::Int32Type;
-
-    if let Some(plain) = col.as_any().downcast_ref::<StringArray>() {
-        return (0..plain.len())
-            .map(|row| {
-                if plain.is_null(row) {
-                    return Err(null_file_path_error(row));
-                }
-                Ok(plain.value(row))
-            })
-            .collect();
-    }
-    if let Some(run) = col.as_any().downcast_ref::<RunArray<Int32Type>>() {
-        let values = run
-            .values()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                DataFusionError::Internal("_file REE values are not Utf8".to_string())
-            })?;
-        let mut out = Vec::with_capacity(run.len());
-        if run.offset() == 0 {
-            // Unsliced REE, the only shape the COW scan produces: the logical index equals the
-            // physical run-end offset, so one walk gives the same `&str` per row as the form below.
-            let run_ends = run.run_ends().values();
-            let mut start = 0usize;
-            for (physical, &end) in run_ends.iter().enumerate() {
-                let end = usize::try_from(end).map_err(|_| {
-                    DataFusionError::Internal("_file REE run-end is negative".to_string())
-                })?;
-                if start < end && values.is_null(physical) {
-                    return Err(null_file_path_error(start));
-                }
-                let value = values.value(physical);
-                for _ in start..end {
-                    out.push(value);
-                }
-                start = end;
-            }
-        } else {
-            // Sliced REE: the logical-to-physical map is offset-relative, so defer per row. A
-            // sliced run-ends walk is easy to get subtly wrong.
-            for row in 0..run.len() {
-                let physical = run.get_physical_index(row);
-                if values.is_null(physical) {
-                    return Err(null_file_path_error(row));
-                }
-                out.push(values.value(physical));
-            }
-        }
-        return Ok(out);
-    }
-    Err(DataFusionError::Internal(format!(
-        "unexpected _file column type: {:?}",
-        col.data_type()
-    )))
 }
 
 /// Evaluate the `WHERE` predicate (or all-true when `None`) over `table_batch` to a NULL-free keep mask
@@ -895,6 +795,7 @@ pub(crate) async fn merge_on_read_update(
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
     commit_branch: Option<&str>,
+    partition_spec: PartitionSpecRef,
 ) -> DFResult<(u64, DvContainerClose)> {
     let delete_kind = merge_on_read_delete_kind(table)?;
     let scan_snapshot_id =
@@ -915,7 +816,7 @@ pub(crate) async fn merge_on_read_update(
     // The delete side buffers the matched pairs, because `write_position_deletes` must group and
     // sort them. The new-row side streams into the writer per batch.
     let mut pairs: Vec<(String, i64)> = Vec::new();
-    let mut data_writer = StreamingDataFileWriter::try_new(table)?;
+    let mut data_writer = StreamingDataFileWriter::try_new(table, partition_spec)?;
     while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
         let table_batch = table_column_batch(&batch, table_schema)?;
         let mask = match_mask(&predicate, &table_batch)?;
@@ -1021,6 +922,7 @@ pub(crate) async fn copy_on_write_update(
     table_schema: &SchemaRef,
     isolation: IsolationLevel,
     commit_branch: Option<&str>,
+    partition_spec: PartitionSpecRef,
 ) -> DFResult<u64> {
     let scan_snapshot_id =
         resolve_scan_snapshot_id(table, commit_branch).map_err(to_datafusion_error)?;
@@ -1063,7 +965,7 @@ pub(crate) async fn copy_on_write_update(
     let mut stream = cow_scan_stream(table, table_schema, scan_snapshot_id, prune.clone()).await?;
     // Eager construction is safe here, unlike the DELETE path: `updated > 0` means at least one file
     // is affected, and every row of an affected file is rewritten.
-    let mut data_writer = StreamingDataFileWriter::try_new(table)?;
+    let mut data_writer = StreamingDataFileWriter::try_new(table, partition_spec)?;
 
     while let Some(batch) = stream.try_next().await.map_err(to_datafusion_error)? {
         let num_rows = batch.num_rows();

@@ -431,6 +431,114 @@ async fn pin_insert_into_two_field_spec_v3() {
     pin_insert_into_two_field_spec(FormatVersion::V3).await;
 }
 
+async fn dml_values(
+    catalog: &Arc<dyn Catalog>,
+    namespace: &NamespaceIdent,
+    output_spec_id: Option<i32>,
+    sql: &str,
+) -> DFResult<()> {
+    let mut provider =
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "t".to_string())
+            .await
+            .unwrap();
+    if let Some(spec_id) = output_spec_id {
+        provider = provider.with_output_spec_id(spec_id);
+    }
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+    let df = ctx.sql(sql).await?;
+    df.collect().await?;
+    Ok(())
+}
+
+async fn pin_delete_copy_on_write_targets_older_spec(format_version: FormatVersion) {
+    let (catalog, namespace, _guard) =
+        catalog_with_table(format_version, unpartitioned_spec()).await;
+    evolve_spec(&catalog, &namespace, &[("cat", Transform::Identity)], &[]).await;
+    let table = load_table(&catalog, &namespace).await;
+    assert_eq!(table.metadata().default_partition_spec_id(), 1);
+
+    insert_values(
+        &catalog,
+        &namespace,
+        Some(0),
+        "(1, 'a', 'x'), (2, 'b', 'y')",
+    )
+    .await
+    .unwrap();
+
+    dml_values(&catalog, &namespace, Some(0), "DELETE FROM t WHERE id = 1")
+        .await
+        .unwrap();
+
+    assert_eq!(files_answer(&catalog, &namespace).await, vec![(
+        0,
+        vec![],
+        1
+    )]);
+    assert_eq!(rows_answer(&catalog, &namespace).await, vec![(
+        2,
+        "b".to_string(),
+        "y".to_string()
+    )]);
+}
+
+#[tokio::test]
+async fn pin_delete_copy_on_write_targets_older_spec_v2() {
+    pin_delete_copy_on_write_targets_older_spec(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn pin_delete_copy_on_write_targets_older_spec_v3() {
+    pin_delete_copy_on_write_targets_older_spec(FormatVersion::V3).await;
+}
+
+async fn pin_update_copy_on_write_targets_older_spec(format_version: FormatVersion) {
+    let (catalog, namespace, _guard) =
+        catalog_with_table(format_version, unpartitioned_spec()).await;
+    evolve_spec(&catalog, &namespace, &[("cat", Transform::Identity)], &[]).await;
+    let table = load_table(&catalog, &namespace).await;
+    assert_eq!(table.metadata().default_partition_spec_id(), 1);
+
+    insert_values(
+        &catalog,
+        &namespace,
+        Some(0),
+        "(1, 'a', 'x'), (2, 'b', 'y')",
+    )
+    .await
+    .unwrap();
+
+    dml_values(
+        &catalog,
+        &namespace,
+        Some(0),
+        "UPDATE t SET data = 'z' WHERE id = 1",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(files_answer(&catalog, &namespace).await, vec![(
+        0,
+        vec![],
+        2
+    )]);
+    assert_eq!(rows_answer(&catalog, &namespace).await, vec![
+        (1, "z".to_string(), "x".to_string()),
+        (2, "b".to_string(), "y".to_string()),
+    ]);
+}
+
+#[tokio::test]
+async fn pin_update_copy_on_write_targets_older_spec_v2() {
+    pin_update_copy_on_write_targets_older_spec(FormatVersion::V2).await;
+}
+
+#[tokio::test]
+async fn pin_update_copy_on_write_targets_older_spec_v3() {
+    pin_update_copy_on_write_targets_older_spec(FormatVersion::V3).await;
+}
+
 async fn pin_insert_into_bad_spec_id(format_version: FormatVersion) {
     let (catalog, namespace, _guard) =
         catalog_with_table(format_version, unpartitioned_spec()).await;
