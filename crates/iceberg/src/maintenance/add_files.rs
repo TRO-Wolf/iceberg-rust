@@ -15,10 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt, stream};
+
+use super::add_files_datafile::{AdoptionContext, adopt_parquet_file};
+use crate::scan::context::parse_name_mapping;
+use crate::spec::{
+    DEFAULT_SCHEMA_NAME_MAPPING, DataFile, ManifestContentType, MetricsConfig, PartitionSpecRef,
+    Transform, create_name_mapping,
+};
 use crate::table::Table;
+use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::{Catalog, Error, ErrorKind, Result};
+
+const DUPLICATE_FILE_SAMPLE: usize = 10;
 
 #[allow(missing_docs)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -72,6 +84,12 @@ pub struct AddFiles {
     parallelism: usize,
 }
 
+struct SourceFile {
+    path: String,
+    size: u64,
+    partition: Vec<(String, String)>,
+}
+
 impl AddFiles {
     #[allow(missing_docs)]
     pub fn new(table: Table, source: AddFilesSource) -> Self {
@@ -103,17 +121,369 @@ impl AddFiles {
     }
 
     #[allow(missing_docs)]
-    pub async fn execute(self, _catalog: &dyn Catalog) -> Result<AddFilesResult> {
-        let _ = (
-            &self.table,
-            &self.source,
-            &self.partition_filter,
-            self.check_duplicate_files,
-            self.parallelism,
-        );
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "add_files is not implemented yet",
-        ))
+    pub async fn execute(self, catalog: &dyn Catalog) -> Result<AddFilesResult> {
+        if self.parallelism == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Parallelism should be larger than 0",
+            ));
+        }
+
+        let table = ensure_name_mapping_present(&self.table, catalog).await?;
+        let table_name = table.identifier().to_string();
+
+        let (files, partition_names) = discover(&table, &self.source).await?;
+        let spec = find_compatible_spec(&partition_names, &table)?;
+        validate_partition_filter(&spec, &self.partition_filter, &table_name)?;
+
+        let files = filter_partitions(files, &self.partition_filter);
+        if spec.is_unpartitioned() {
+            if !self.partition_filter.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot use a partition filter when importing to an unpartitioned table {table_name}"
+                    ),
+                ));
+            }
+        } else if files.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Cannot find any matching partitions in table {table_name}"),
+            ));
+        }
+
+        if self.check_duplicate_files {
+            refuse_duplicates(&table, &files).await?;
+        }
+
+        let data_files = self.build_data_files(&table, spec, &files).await?;
+
+        let transaction = Transaction::new(&table);
+        let action = transaction
+            .merge_append()
+            .with_check_duplicate(self.check_duplicate_files)
+            .add_data_files(data_files);
+        let transaction = action.apply(transaction)?;
+        let committed = transaction.commit(catalog).await?;
+
+        Ok(result_of(&committed))
     }
+
+    async fn build_data_files(
+        &self,
+        table: &Table,
+        spec: PartitionSpecRef,
+        files: &[SourceFile],
+    ) -> Result<Vec<DataFile>> {
+        let metadata = table.metadata();
+        let context = Arc::new(AdoptionContext {
+            schema: metadata.current_schema().clone(),
+            metrics_config: MetricsConfig::for_table(metadata)?,
+            name_mapping: parse_name_mapping(metadata)?,
+            partition_type: spec.partition_type(metadata.current_schema())?,
+            spec,
+        });
+        let file_io = table.file_io().clone();
+
+        stream::iter(files.iter())
+            .map(|file| {
+                let context = Arc::clone(&context);
+                let file_io = file_io.clone();
+                async move {
+                    adopt_parquet_file(&file_io, &context, &file.path, file.size, &file.partition)
+                        .await
+                }
+            })
+            .buffered(self.parallelism)
+            .try_collect()
+            .await
+    }
+}
+
+fn result_of(table: &Table) -> AddFilesResult {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return AddFilesResult::default();
+    };
+    let summary = &snapshot.summary().additional_properties;
+    AddFilesResult {
+        added_files_count: summary
+            .get("added-data-files")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0),
+        changed_partition_count: summary
+            .get("changed-partition-count")
+            .and_then(|value| value.parse::<u64>().ok()),
+    }
+}
+
+async fn ensure_name_mapping_present(table: &Table, catalog: &dyn Catalog) -> Result<Table> {
+    if table
+        .metadata()
+        .properties()
+        .contains_key(DEFAULT_SCHEMA_NAME_MAPPING)
+    {
+        return Ok(table.clone());
+    }
+    let mapping = create_name_mapping(table.metadata().current_schema())?;
+    let json = serde_json::to_string(&mapping).map_err(|err| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "Cannot serialize the default name mapping",
+        )
+        .with_source(err)
+    })?;
+    let transaction = Transaction::new(table);
+    let action = transaction
+        .update_table_properties()
+        .set(DEFAULT_SCHEMA_NAME_MAPPING.to_string(), json);
+    let transaction = action.apply(transaction)?;
+    transaction.commit(catalog).await
+}
+
+async fn discover(
+    table: &Table,
+    source: &AddFilesSource,
+) -> Result<(Vec<SourceFile>, Vec<String>)> {
+    match source {
+        AddFilesSource::Directory(root) => discover_directory(table, root).await,
+        AddFilesSource::Files(entries) => {
+            let mut files = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let size = table
+                    .file_io()
+                    .new_input(&entry.path)?
+                    .metadata()
+                    .await?
+                    .size;
+                files.push(SourceFile {
+                    path: entry.path.clone(),
+                    size,
+                    partition: entry.partition.clone(),
+                });
+            }
+            let names = partition_names_of(&files)?;
+            Ok((files, names))
+        }
+    }
+}
+
+async fn discover_directory(table: &Table, root: &str) -> Result<(Vec<SourceFile>, Vec<String>)> {
+    let prefix = format!("{}/", root.trim_end_matches('/'));
+    let listed = table.file_io().list(&prefix).await.map_err(|err| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("Cannot list the source location {root} to import"),
+        )
+        .with_source(err)
+    })?;
+
+    let mut files = Vec::new();
+    for info in listed {
+        let Some(relative) = info.location.strip_prefix(&prefix) else {
+            continue;
+        };
+        let segments: Vec<&str> = relative.split('/').collect();
+        if segments.iter().any(|segment| is_hidden(segment)) {
+            continue;
+        }
+        let mut partition = Vec::with_capacity(segments.len().saturating_sub(1));
+        for segment in &segments[..segments.len().saturating_sub(1)] {
+            let Some((name, value)) = segment.split_once('=') else {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot infer the partition columns of {root}: the directory '{segment}' is not a 'name=value' partition directory"
+                    ),
+                ));
+            };
+            partition.push((name.to_string(), value.to_string()));
+        }
+        files.push(SourceFile {
+            path: info.location.clone(),
+            size: info.size,
+            partition,
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let names = partition_names_of(&files)?;
+    Ok((files, names))
+}
+
+fn is_hidden(segment: &str) -> bool {
+    segment.starts_with('_') || segment.starts_with('.')
+}
+
+fn partition_names_of(files: &[SourceFile]) -> Result<Vec<String>> {
+    let mut names: Option<Vec<String>> = None;
+    for file in files {
+        let own: Vec<String> = file
+            .partition
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        match &names {
+            None => names = Some(own),
+            Some(known) if known == &own => {}
+            Some(known) => {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Conflicting directory structures in the source to import: {known:?} and {own:?}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(names.unwrap_or_default())
+}
+
+fn find_compatible_spec(partition_names: &[String], table: &Table) -> Result<PartitionSpecRef> {
+    let wanted: Vec<String> = partition_names
+        .iter()
+        .map(|name| name.to_lowercase())
+        .collect();
+    for spec in table.metadata().partition_specs_iter() {
+        if !spec
+            .fields()
+            .iter()
+            .all(|field| field.transform == Transform::Identity)
+        {
+            continue;
+        }
+        let names: Vec<String> = spec
+            .fields()
+            .iter()
+            .map(|field| field.name.to_lowercase())
+            .collect();
+        if names == wanted {
+            return Ok(spec.clone());
+        }
+    }
+    Err(Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "Cannot find a partition spec in Iceberg table {} that matches the partition columns ({}) in input table",
+            table.identifier(),
+            partition_names.join(", ")
+        ),
+    ))
+}
+
+fn validate_partition_filter(
+    spec: &PartitionSpecRef,
+    partition_filter: &HashMap<String, String>,
+    table_name: &str,
+) -> Result<()> {
+    let partitioned = !spec.fields().is_empty();
+    if !partitioned {
+        if partition_filter.is_empty() {
+            return Ok(());
+        }
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Cannot use partition filter with an unpartitioned table {table_name}"),
+        ));
+    }
+    if partition_filter.is_empty() {
+        return Ok(());
+    }
+    if spec.fields().len() < partition_filter.len() {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot add data files to target table {table_name} because that table is partitioned, but the number of columns in the provided partition filter ({}) is greater than the number of partitioned columns in table ({})",
+                partition_filter.len(),
+                spec.fields().len()
+            ),
+        ));
+    }
+    let names: HashSet<&str> = spec
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    let mut unknown: Vec<&str> = partition_filter
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !names.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let mut valid: Vec<&str> = names.into_iter().collect();
+    valid.sort_unstable();
+    Err(Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "Cannot add files to target table {table_name}. {table_name} is partitioned but the specified partition filter refers to columns that are not partitioned: {} . Valid partition columns: [{}]",
+            unknown.join(", "),
+            valid.join(",")
+        ),
+    ))
+}
+
+fn filter_partitions(
+    files: Vec<SourceFile>,
+    partition_filter: &HashMap<String, String>,
+) -> Vec<SourceFile> {
+    if partition_filter.is_empty() {
+        return files;
+    }
+    files
+        .into_iter()
+        .filter(|file| {
+            partition_filter.iter().all(|(key, value)| {
+                file.partition
+                    .iter()
+                    .any(|(name, own)| name == key && own == value)
+            })
+        })
+        .collect()
+}
+
+async fn refuse_duplicates(table: &Table, files: &[SourceFile]) -> Result<()> {
+    let live = live_data_file_paths(table).await?;
+    let mut duplicates: Vec<&str> = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .filter(|path| live.contains(*path))
+        .collect();
+    if duplicates.is_empty() {
+        return Ok(());
+    }
+    duplicates.sort_unstable();
+    duplicates.truncate(DUPLICATE_FILE_SAMPLE);
+    Err(Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "Cannot complete import because data files to be imported already exist within the target table: {}.  This is disabled by default as Iceberg is not designed for multiple references to the same file within the same table.  If you are sure, you may set 'check_duplicate_files' to false to force the import.",
+            duplicates.join(",")
+        ),
+    ))
+}
+
+async fn live_data_file_paths(table: &Table) -> Result<HashSet<String>> {
+    let metadata = table.metadata();
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return Ok(HashSet::new());
+    };
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), metadata)
+        .await?;
+    let mut paths = HashSet::new();
+    for manifest_file in manifest_list.entries() {
+        if manifest_file.content != ManifestContentType::Data {
+            continue;
+        }
+        let manifest = manifest_file.load_manifest(table.file_io()).await?;
+        for entry in manifest.entries() {
+            if entry.is_alive() {
+                paths.insert(entry.data_file().file_path().to_string());
+            }
+        }
+    }
+    Ok(paths)
 }
