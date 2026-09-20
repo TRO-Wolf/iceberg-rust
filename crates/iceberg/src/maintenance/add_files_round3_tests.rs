@@ -27,8 +27,8 @@ use super::add_files_tests::{
 };
 use crate::scan::context::parse_name_mapping;
 use crate::spec::{
-    Datum, FormatVersion, Literal, MetricsConfig, NestedField, PartitionSpec, PrimitiveType, Schema,
-    Transform, Type,
+    Datum, FormatVersion, Literal, MetricsConfig, NestedField, PartitionSpec, PrimitiveType,
+    Schema, Transform, Type,
 };
 use crate::table::Table;
 use crate::{Catalog, ErrorKind, NamespaceIdent, TableCreation};
@@ -51,10 +51,13 @@ async fn a_source_sharing_only_its_basename_with_a_live_file_is_not_a_duplicate(
     let second_root = source_root(&temp_dir, "basename-second");
     flat_source(&table, &second_root).await;
 
-    let result = AddFiles::new(table.clone(), AddFilesSource::Directory(second_root.clone()))
-        .execute(&catalog)
-        .await
-        .expect("Java joins on data_file.file_path, which is the WHOLE path");
+    let result = AddFiles::new(
+        table.clone(),
+        AddFilesSource::Directory(second_root.clone()),
+    )
+    .execute(&catalog)
+    .await
+    .expect("Java joins on data_file.file_path, which is the WHOLE path");
 
     assert_eq!(result.added_files_count, 1);
     let table = catalog
@@ -174,9 +177,9 @@ async fn a_file_list_whose_values_are_out_of_spec_order_is_refused_by_the_spec_m
 
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
     assert!(
-        error.message().contains(
-            "that matches the partition columns ([dept, cat]) in input table"
-        ),
+        error
+            .message()
+            .contains("that matches the partition columns ([dept, cat]) in input table"),
         "{error}"
     );
 }

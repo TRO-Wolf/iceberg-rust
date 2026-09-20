@@ -564,19 +564,21 @@ SAME type.
 
 Run on the final tree (`CARGO_BUILD_JOBS=6 RUST_TEST_THREADS=6`, filtered tests only).
 
-Round 2 re-ran every one on the final tree (head `a2ea1100` plus the ledger commit).
+Round 2 re-ran every one on the final tree (head `a2ea1100` plus the ledger commit). Round 3 re-ran
+the ones its change can reach, on the final tree rebased onto fork main `ec30b2fd`; the file-count
+move (591 → 599, 92 → 90 legacy ceilings) is that rebase, not this round.
 
-| Gate | Round 1 | Round 2 |
-|---|---|---|
-| `cargo test -p iceberg --lib add_files` | ok. 34 passed | ok. 48 passed; 0 failed |
-| `cargo test -p iceberg --lib maintenance::` | ok. 499 passed | ok. 513 passed; 0 failed |
-| `cargo test -p iceberg --lib scan::` | ok. 250 passed | ok. 250 passed; 0 failed |
-| `cargo test -p iceberg --lib spec::name_mapping` | ok. 5 passed | ok. 5 passed; 0 failed |
-| `cargo fmt --all -- --check` | clean | clean |
-| `cargo clippy -p iceberg --all-targets -- -D warnings` | clean | clean |
-| `python3 scripts/check_rust_file_size.py` | 590 files clean | rust-file-size: 591 files clean (92 legacy ceilings) |
-| `typos .` | clean | clean |
-| comment gate | `comment-ban hits=0` | `comment-ban hits=0` |
+| Gate | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|
+| `cargo test -p iceberg --lib add_files` | ok. 34 passed | ok. 48 passed; 0 failed | ok. 52 passed; 0 failed |
+| `cargo test -p iceberg --lib maintenance::` | ok. 499 passed | ok. 513 passed; 0 failed | ok. 534 passed; 0 failed |
+| `cargo test -p iceberg --lib scan::` | ok. 250 passed | ok. 250 passed; 0 failed | not re-run (untouched) |
+| `cargo test -p iceberg --lib spec::name_mapping` | ok. 5 passed | ok. 5 passed; 0 failed | not re-run (untouched) |
+| `cargo fmt --all -- --check` | clean | clean | clean |
+| `cargo clippy -p iceberg --all-targets -- -D warnings` | clean | clean | clean |
+| `scripts/check_rust_file_size.sh` | 590 files clean | rust-file-size: 591 files clean (92 legacy ceilings) | rust-file-size: 599 files clean (90 legacy ceilings) |
+| `typos .` | clean | clean | clean |
+| comment gate | `comment-ban hits=0` | `comment-ban hits=0` | `comment-ban hits=0` |
 
 The round-1 table, for the record:
 
