@@ -85,9 +85,9 @@ pub(crate) fn plan_row_filter(
     column_indices.sort_unstable();
     column_indices.dedup();
 
-    let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices.clone());
     let disable_predicate_cache =
         pushed_mask_disables_predicate_cache(parquet_schema, &column_indices);
+    let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices);
     let predicate = predicates.clone();
     let predicate_func = move |batch: RecordBatch| {
         evaluate_predicate_to_mask(&predicate, &batch)
