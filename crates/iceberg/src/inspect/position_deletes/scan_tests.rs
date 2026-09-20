@@ -36,7 +36,8 @@ use crate::puffin::{Blob, CompressionCodec, DELETION_VECTOR_V1, PuffinWriter};
 use crate::scan::tests::TableTestFixture;
 use crate::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriterBuilder, PartitionSpec, Struct,
+    ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriterBuilder, PartitionSpec,
+    Snapshot, Struct,
 };
 
 fn field_id_meta(id: i32) -> HashMap<String, String> {
@@ -142,13 +143,25 @@ async fn write_manifest(
         .table
         .metadata()
         .current_snapshot()
-        .expect("current snapshot");
-    let current_schema = current_snapshot
+        .expect("current snapshot")
+        .clone();
+    write_snapshot_manifest(fixture, &current_snapshot, spec, v3, entries, deletes).await
+}
+
+async fn write_snapshot_manifest(
+    fixture: &TableTestFixture,
+    snapshot: &Snapshot,
+    spec: &PartitionSpec,
+    v3: bool,
+    entries: Vec<ManifestEntry>,
+    deletes: bool,
+) -> ManifestFile {
+    let current_schema = snapshot
         .schema(fixture.table.metadata())
         .expect("snapshot schema");
     let builder = ManifestWriterBuilder::new(
         next_manifest_file(fixture),
-        Some(current_snapshot.snapshot_id()),
+        Some(snapshot.snapshot_id()),
         None,
         current_schema,
         spec.clone(),
@@ -178,25 +191,34 @@ async fn write_manifest_list(fixture: &TableTestFixture, manifests: Vec<Manifest
         .current_snapshot()
         .expect("current snapshot")
         .clone();
+    write_snapshot_manifest_list(fixture, &current_snapshot, manifests, v3).await;
+}
+
+async fn write_snapshot_manifest_list(
+    fixture: &TableTestFixture,
+    snapshot: &Snapshot,
+    manifests: Vec<ManifestFile>,
+    v3: bool,
+) {
     let output = fixture
         .table
         .file_io()
-        .new_output(current_snapshot.manifest_list())
+        .new_output(snapshot.manifest_list())
         .expect("manifest list output");
     let mut writer = if v3 {
         ManifestListWriter::v3(
             output,
-            current_snapshot.snapshot_id(),
-            current_snapshot.parent_snapshot_id(),
-            current_snapshot.sequence_number(),
+            snapshot.snapshot_id(),
+            snapshot.parent_snapshot_id(),
+            snapshot.sequence_number(),
             None,
         )
     } else {
         ManifestListWriter::v2(
             output,
-            current_snapshot.snapshot_id(),
-            current_snapshot.parent_snapshot_id(),
-            current_snapshot.sequence_number(),
+            snapshot.snapshot_id(),
+            snapshot.parent_snapshot_id(),
+            snapshot.sequence_number(),
         )
     };
     writer
@@ -853,6 +875,75 @@ async fn scan_empty_table_emits_no_rows() {
     std::fs::create_dir_all(format!("{}/metadata", fixture.table_location)).expect("metadata dir");
 
     let spec = default_spec(&fixture);
+    let data_manifest = write_manifest(
+        &fixture,
+        &spec,
+        false,
+        vec![added_entry(
+            DataFileBuilder::default()
+                .partition_spec_id(0)
+                .content(DataContentType::Data)
+                .file_path(format!("{}/data/a.parquet", fixture.table_location))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition(Struct::from_iter([Some(Literal::long(1))]))
+                .key_metadata(None)
+                .build()
+                .expect("data file"),
+        )],
+        false,
+    )
+    .await;
+    write_manifest_list(&fixture, vec![data_manifest], false).await;
+
+    let total: usize = collect_posdel_batches(&fixture)
+        .await
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(total, 0);
+}
+
+#[tokio::test]
+async fn scan_ignores_parent_snapshot_delete_manifests() {
+    let fixture = TableTestFixture::new();
+    std::fs::create_dir_all(format!("{}/metadata", fixture.table_location)).expect("metadata dir");
+
+    let data_decoy = format!("{}/data/x=1/decoy.parquet", fixture.table_location);
+    let del_decoy = format!("{}/del_parent_decoy.parquet", fixture.table_location);
+    let size_decoy = write_posdel_parquet(&del_decoy, &[(data_decoy.clone(), 9)], None);
+
+    let spec = default_spec(&fixture);
+    let metadata = fixture.table.metadata();
+    let parent_snapshot = metadata
+        .current_snapshot()
+        .expect("current snapshot")
+        .parent_snapshot(metadata)
+        .expect("parent snapshot");
+    let parent_decoy_manifest = write_snapshot_manifest(
+        &fixture,
+        &parent_snapshot,
+        &spec,
+        false,
+        vec![added_entry(posdel_data_file(
+            &del_decoy,
+            size_decoy,
+            1,
+            0,
+            Struct::from_iter([Some(Literal::long(1))]),
+        ))],
+        true,
+    )
+    .await;
+    write_snapshot_manifest_list(
+        &fixture,
+        &parent_snapshot,
+        vec![parent_decoy_manifest],
+        false,
+    )
+    .await;
+
     let data_manifest = write_manifest(
         &fixture,
         &spec,
