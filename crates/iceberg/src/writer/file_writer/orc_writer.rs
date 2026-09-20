@@ -83,7 +83,10 @@ impl OrcWriterBuilder {
             Some(raw) => raw.trim().parse::<u64>().map_err(|error| {
                 Error::new(
                     ErrorKind::DataInvalid,
-                    format!("Invalid value for {}: {raw}", PROPERTY_ORC_STRIPE_SIZE_BYTES),
+                    format!(
+                        "Invalid value for {}: {raw}",
+                        PROPERTY_ORC_STRIPE_SIZE_BYTES
+                    ),
                 )
                 .with_source(error)
             })?,
