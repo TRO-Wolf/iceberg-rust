@@ -61,7 +61,7 @@ Two facts hold across EVERY successful cell:
   (`in_table_location=false`). Nothing is copied, rewritten or moved.
 - **One `append` snapshot per call.** Every cell's snapshot `operation` is `append`.
 
-### 1a. Why `changed_partition_count` is NULL on the partitioned cells
+### 1a. Which cells return a `changed_partition_count`, and why
 
 Measured, not guessed. `AddFilesProcedure.changedPartitionCount(Map)` is
 
@@ -73,7 +73,12 @@ Measured, not guessed. `AddFilesProcedure.changedPartitionCount(Map)` is
 — it simply reads the snapshot summary key `changed-partition-count`, and returns `null` when the
 key is absent. `addedFilesCount` reads `added-data-files` with default `0`.
 
-The key is absent on the partitioned cells because the two import paths COMMIT DIFFERENTLY:
+Read off the cells, the key is present in exactly FOUR of the thirteen — 2, 10, 11 and 13, every
+one of them an UNPARTITIONED source named as a catalog table, each returning
+`changed_partition_count = 1`. It is absent in 1, 3, 4, 5, 6 and 8 (partitioned sources) and ALSO
+in 7, which is an unpartitioned source named through the `` `parquet`.`<path>` `` form. So the
+dividing line is not "is the target partitioned" — it is WHICH IMPORT PATH runs, because the two
+COMMIT DIFFERENTLY:
 
 | Path | Java | Commit shape | Summary |
 |---|---|---|---|
@@ -82,8 +87,10 @@ The key is absent on the partitioned cells because the two import paths COMMIT D
 
 `importSparkPartitions` bytecode at 428–457: `Table.newAppend()` → `List<ManifestFile>.forEach(append::appendManifest)` → `commit()`. Appending a MANIFEST (rather than files) makes Java's
 snapshot summary distrust the size/partition metrics, so those keys never reach the summary and the
-procedure's second output column is `null`. This is a **Spark-layer artifact of `appendManifest`,
-not a core-library rule** — see D-9.
+procedure's second output column is `null`. Cell 7 takes that path with an unpartitioned source
+because `importFileTable` wraps even an unpartitioned source in ONE
+`SparkPartition(emptyMap, path, format)` and hands it to `importSparkPartitions` (§2a). This is a
+**Spark-layer artifact of `appendManifest`, not a core-library rule** — see D-9.
 
 ## 2. The Java evidence (`javap -c -p`, iceberg-spark-runtime-4.1_2.13-1.11.0.jar)
 
@@ -304,12 +311,17 @@ Same set, no engine. Default ON, Java's message, at most ten paths listed.
 **D-9 — one `append` snapshot, with an HONEST summary (a named divergence).** The fork appends the
 `DataFile`s themselves through `Transaction::merge_append` (Java `Table.newAppend()` is
 `MergeAppend`), so the snapshot summary carries `added-files-size` and `changed-partition-count` on
-the PARTITIONED path too. Java's partitioned path loses those keys only because it appends
-executor-written MANIFESTS (§1a) — a Spark distribution artifact, not a format rule. The fork has no
-executors and no manifest-staging step, so reproducing the missing keys would mean writing a
+EVERY path. Java carries them on exactly one: `importUnpartitionedSparkTable`, which is why cells
+2, 10, 11 and 13 all return `changed_partition_count = 1`. Every other cell commits
+`appendManifest` and returns NULL — the partitioned cells 1, 3, 4, 5, 6 and 8, and cell 7 too,
+whose source is UNPARTITIONED but reaches `importSparkPartitions` through the
+`` `parquet`.`<path>` `` form (§1a). So the divergence is not "the fork keeps the keys where Java's
+partitioned path loses them": it is that the fork keeps them wherever Java's COMMIT SHAPE drops
+them, partitioned or not. That shape is a Spark distribution artifact, not a format rule — the fork
+has no executors and no manifest-staging step, so reproducing the missing keys would mean writing a
 manifest solely to degrade the summary. `added_files_count` is identical; a RePark router that must
-return Spark's exact NULL for `changed_partition_count` on a partitioned target does so at the
-router, from the same summary.
+return Spark's exact NULL does so at the router, from the same summary, keying on the same two
+things Java keys on — a partitioned source, or the `` `parquet`.`<path>` `` form.
 
 **D-10 — `ensure_name_mapping_present` mirrors Java, in its own commit.** When
 `schema.name-mapping.default` is absent the action builds it with the Rust port of
@@ -605,10 +617,13 @@ Two things the router owns, not the action:
    the Spark session catalog before any Iceberg code runs. The action only sees paths, so a
    missing catalog table must be refused by the router's own lookup. A missing PATH lands on the
    action's "Cannot find any file to import under <source>".
-2. **`changed_partition_count` on a PARTITIONED target.** Java returns NULL there only because its
-   Spark path commits `appendManifest` (§1a). The fork commits the files, so the summary carries a
-   real count. A router that must be byte-identical to Spark's result row suppresses it for a
-   partitioned target; one that wants the honest number passes it through. See D-9.
+2. **`changed_partition_count`.** Java returns a count on exactly one path — an unpartitioned
+   source named as a catalog table (cells 2, 10, 11, 13, all `1`) — and NULL on every path that
+   commits `appendManifest`: a partitioned source (cells 1, 3, 4, 5, 6, 8) and the
+   `` `parquet`.`<path>` `` form even over an unpartitioned source (cell 7). The fork commits the
+   files on all of them, so its summary always carries a real count. A router that must be
+   byte-identical to Spark's result row suppresses it for those two cases; one that wants the
+   honest number passes it through. See D-9.
 
 ## 9. Round 2 — the reviewers' findings
 
