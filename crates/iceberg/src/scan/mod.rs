@@ -21,7 +21,7 @@ mod batch;
 pub(crate) mod bin_pack;
 mod cache;
 use cache::*;
-mod context;
+pub(crate) mod context;
 use context::*;
 mod incremental;
 pub use batch::*;

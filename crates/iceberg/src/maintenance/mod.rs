@@ -131,6 +131,18 @@
 //! reusing `expire_cleanup`'s delta machinery).
 
 mod actions_provider;
+mod add_files;
+mod add_files_datafile;
+#[cfg(test)]
+mod add_files_field_id_tests;
+#[cfg(test)]
+mod add_files_refusal_tests;
+#[cfg(test)]
+mod add_files_round2_tests;
+#[cfg(test)]
+mod add_files_round3_tests;
+#[cfg(test)]
+mod add_files_tests;
 mod compute_partition_stats;
 mod compute_table_stats;
 mod convert_equality_delete_files;
@@ -199,6 +211,7 @@ mod rewrite_table_path;
 mod tests;
 
 pub use actions_provider::{Actions, ActionsProvider, NoAction};
+pub use add_files::{AddFiles, AddFilesEntry, AddFilesResult, AddFilesSource};
 pub use compute_partition_stats::{ComputePartitionStats, ComputePartitionStatsResult};
 pub use compute_table_stats::{ComputeTableStats, ComputeTableStatsResult};
 pub use convert_equality_delete_files::{
