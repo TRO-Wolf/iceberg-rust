@@ -257,7 +257,6 @@ fn encode_value(array: &ArrayRef, row: usize, out: &mut Vec<u8>) -> Result<()> {
         DataType::Decimal256(_, _) => {
             let value = array.as_primitive::<Decimal256Type>().value(row);
             let mut bytes = value.to_be_bytes();
-            bytes.reverse();
             bytes[0] ^= 0x80;
             out.extend_from_slice(&bytes);
         }
