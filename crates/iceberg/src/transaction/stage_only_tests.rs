@@ -609,6 +609,80 @@ async fn delete_files_stage_only_adds_snapshot_without_moving_main() {
 }
 
 #[tokio::test]
+async fn staged_overwrite_conflict_validation_still_rejects_a_concurrent_append() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .overwrite_files()
+        .set_snapshot_properties(wap_properties("wap-vc"))
+        .add_file(data_file("test/new.parquet", 0))
+        .delete_file("test/base.parquet")
+        .validate_no_conflicting_data()
+        .stage_only()
+        .apply(tx)
+        .expect("apply staged overwrite");
+    append_main(&catalog, &table, vec![data_file(
+        "test/concurrent.parquet",
+        5,
+    )])
+    .await;
+
+    let error = tx.commit(&catalog).await.expect_err(
+        "a staged commit must still run conflict validation against the refreshed head",
+    );
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "Found conflicting files that can contain records matching true: \
+         test/concurrent.parquet",
+        "Java runs the same validations on the stageOnly path — SnapshotProducer.apply has \
+         no stageOnly branch in validation"
+    );
+}
+
+#[tokio::test]
+async fn staged_row_delta_conflict_validation_still_rejects_a_concurrent_delete() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .row_delta()
+        .set_snapshot_properties(wap_properties("wap-vd"))
+        .add_data_files(vec![data_file("test/new.parquet", 0)])
+        .add_deletes(vec![pos_delete_file("test/del2.parquet", 9)])
+        .validate_no_conflicting_delete_files()
+        .stage_only()
+        .apply(tx)
+        .expect("apply staged row delta");
+
+    let concurrent = Transaction::new(&table);
+    let concurrent = concurrent
+        .row_delta()
+        .add_deletes(vec![pos_delete_file("test/del1.parquet", 9)])
+        .apply(concurrent)
+        .expect("apply concurrent delete");
+    concurrent
+        .commit(&catalog)
+        .await
+        .expect("commit concurrent delete");
+
+    let error = tx.commit(&catalog).await.expect_err(
+        "a staged commit must still run conflict validation against the refreshed head",
+    );
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "Found new conflicting delete files that can apply to records matching true: \
+         test/del1.parquet",
+        "Java runs the same validations on the stageOnly path — SnapshotProducer.apply has \
+         no stageOnly branch in validation"
+    );
+}
+
+#[tokio::test]
 async fn staged_snapshot_for_wap_id_finds_the_staged_snapshot() {
     let catalog = new_memory_catalog().await;
     let table = staged_base(&catalog).await;
