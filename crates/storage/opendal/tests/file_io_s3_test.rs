@@ -109,11 +109,20 @@ mod tests {
         assert!(bare.iter().any(|f| f.location == file_path));
         assert!(slash.iter().any(|f| f.location == file_path));
 
-        let bare_set: HashSet<&str> = bare.iter().map(|f| f.location.as_str()).collect();
-        let slash_set: HashSet<&str> = slash.iter().map(|f| f.location.as_str()).collect();
+        let own = format!("s3://bucket1/{tag}");
+        let bare_set: HashSet<&str> = bare
+            .iter()
+            .map(|f| f.location.as_str())
+            .filter(|l| l.starts_with(&own))
+            .collect();
+        let slash_set: HashSet<&str> = slash
+            .iter()
+            .map(|f| f.location.as_str())
+            .filter(|l| l.starts_with(&own))
+            .collect();
         assert_eq!(
             bare_set, slash_set,
-            "bare and slash bucket roots must list the same set"
+            "bare and slash bucket roots must list this test's own entries identically"
         );
     }
 

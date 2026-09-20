@@ -2001,3 +2001,14 @@ migrated by another writer still can.
 - [ ] Fix: `missing_field_ids` = NO field at any depth carries an id (Java `hasIds` negated),
       and check the Branch-1 path prunes the id-less columns as `convertAndPrune` does.
 - [ ] Mutation + gates + GAP_MATRIX row if one owns the read path's id resolution.
+
+## F-S3-FIXTURE-RACE-1 — the bucket-root listing test no longer races its neighbours (2026-09-20)
+
+`crates/storage/opendal/tests/file_io_s3_test.rs::test_file_io_s3_list_bucket_root` asserted that a listing of
+`s3://bucket1` and a listing of `s3://bucket1/` hold the SAME set. The two listings are two round trips against a
+bucket every other test in the file writes into, so a neighbour's write between them makes the sets differ; run 24d
+lost a 27-minute CI cycle to exactly that (fork PR #309's first attempt). The re-prefix assertion and both
+"contains my own file" assertions are unchanged; only the set equality is now restricted to this test's own tag,
+which is what the listing contract it pins is about.
+
+- [x] Restrict the two sets to the test's own prefix.
