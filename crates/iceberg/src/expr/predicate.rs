@@ -1193,7 +1193,9 @@ mod tests {
     use crate::expr::{
         Bind, BoundPredicate, BoundReference, LogicalExpression, Predicate, Reference,
     };
-    use crate::spec::{Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::spec::{
+        Datum, ListType, MapType, NestedField, PrimitiveType, Schema, SchemaRef, StructType, Type,
+    };
     use crate::{ErrorKind, Result};
 
     #[test]
@@ -1831,6 +1833,147 @@ mod tests {
         let bound_expr = expr.bind(schema, true).unwrap();
         assert_eq!(&format!("{bound_expr}"), "True");
         test_bound_predicate_serialize_diserialize(bound_expr);
+    }
+
+    /// The run-25d oracle column shapes: optional list, map and struct columns plus a required
+    /// leaf (`person.age`, required under the optional `person` struct).
+    fn table_schema_with_containers() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        2,
+                        "xs",
+                        Type::List(ListType::new(
+                            NestedField::optional(
+                                3,
+                                "element",
+                                Type::Primitive(PrimitiveType::Int),
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        4,
+                        "mp",
+                        Type::Map(MapType::new(
+                            NestedField::required(
+                                5,
+                                "key",
+                                Type::Primitive(PrimitiveType::String),
+                            )
+                            .into(),
+                            NestedField::optional(
+                                6,
+                                "value",
+                                Type::Primitive(PrimitiveType::Int),
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        7,
+                        "person",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(
+                                8,
+                                "name",
+                                Type::Primitive(PrimitiveType::String),
+                            )
+                            .into(),
+                            NestedField::required(
+                                9,
+                                "age",
+                                Type::Primitive(PrimitiveType::Int),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Java builds a position accessor for every struct field type, so `IS NULL`/`IS NOT NULL`
+    /// bind on list, map and struct columns.
+    #[test]
+    fn test_bind_is_null_on_container_columns() {
+        let schema = table_schema_with_containers();
+
+        for (column, expected) in [
+            ("xs", "xs IS NULL"),
+            ("mp", "mp IS NULL"),
+            ("person", "person IS NULL"),
+        ] {
+            let bound = Reference::new(column)
+                .is_null()
+                .bind(schema.clone(), true)
+                .unwrap_or_else(|e| panic!("`{column} IS NULL` must bind: {e}"));
+            assert_eq!(&format!("{bound}"), expected);
+            test_bound_predicate_serialize_diserialize(bound);
+
+            let bound_not = Reference::new(column)
+                .is_not_null()
+                .bind(schema.clone(), true)
+                .unwrap_or_else(|e| panic!("`{column} IS NOT NULL` must bind: {e}"));
+            assert_eq!(format!("{bound_not}"), format!("{column} IS NOT NULL"));
+            test_bound_predicate_serialize_diserialize(bound_not);
+        }
+    }
+
+    /// Java `Literal.to(listType|mapType|structType)` returns null and `UnboundPredicate.bind`
+    /// throws, so a comparison against a container column must fail at BIND with the typed
+    /// conversion error — never silently evaluate.
+    #[test]
+    fn test_bind_comparison_on_container_column_fails_at_bind() {
+        let schema = table_schema_with_containers();
+
+        for (column, datum) in [
+            ("xs", Datum::int(1)),
+            ("mp", Datum::int(1)),
+            ("person", Datum::int(1)),
+        ] {
+            let error = Reference::new(column)
+                .equal_to(datum)
+                .bind(schema.clone(), true)
+                .expect_err(&format!("`{column} = <literal>` must fail to bind"));
+            assert_eq!(error.kind(), ErrorKind::DataInvalid);
+            assert!(
+                error.message().contains("Can't convert"),
+                "`{column} = <literal>` must fail in literal conversion, got: {}",
+                error.message()
+            );
+        }
+    }
+
+    /// `person.age` is REQUIRED but nested inside the OPTIONAL `person` struct: a NULL parent
+    /// makes `age` NULL, so `person.age IS NULL` must NOT fold to `False` (Java folds only when
+    /// the field AND every ancestor are required).
+    #[test]
+    fn test_bind_is_null_required_leaf_under_optional_parent_does_not_fold() {
+        let schema = table_schema_with_containers();
+        let bound = Reference::new("person.age")
+            .is_null()
+            .bind(schema, true)
+            .expect("`person.age IS NULL` must bind");
+        assert_eq!(&format!("{bound}"), "person.age IS NULL");
+    }
+
+    /// The `IS NOT NULL` side of the ancestor-required fold: required leaf, optional parent.
+    #[test]
+    fn test_bind_is_not_null_required_leaf_under_optional_parent_does_not_fold() {
+        let schema = table_schema_with_containers();
+        let bound = Reference::new("person.age")
+            .is_not_null()
+            .bind(schema, true)
+            .expect("`person.age IS NOT NULL` must bind");
+        assert_eq!(&format!("{bound}"), "person.age IS NOT NULL");
     }
 
     #[test]

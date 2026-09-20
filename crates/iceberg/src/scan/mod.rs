@@ -2579,6 +2579,421 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
+        /// An unpartitioned fixture whose schema adds the run-25d Spark container-null oracle's
+        /// columns: `id` (9), `st` STRUCT<a STRING, b INT> (10/11/12), `xs` ARRAY<INT> (13/14),
+        /// `mp` MAP<STRING, INT> (15/16/17) and `deep` STRUCT<inner STRUCT<x STRING,
+        /// ys ARRAY<INT>>> (18/19/20/21/22). Pair with [`Self::setup_container_manifest_files`].
+        pub fn new_container_columns() -> Self {
+            let tmp_dir = TempDir::new().unwrap();
+            let table_location = tmp_dir.path().join("table1");
+            let manifest_list1_location = table_location.join("metadata/manifests_list_1.avro");
+            let manifest_list2_location = table_location.join("metadata/manifests_list_2.avro");
+            let table_metadata1_location = table_location.join("metadata/v1.json");
+
+            let file_io = FileIO::new_with_fs();
+
+            let mut table_metadata = {
+                let template_json_str = fs::read_to_string(format!(
+                    "{}/testdata/example_table_metadata_v2.json",
+                    env!("CARGO_MANIFEST_DIR")
+                ))
+                .unwrap();
+                let metadata_json = render_template(&template_json_str, context! {
+                    table_location => &table_location,
+                    manifest_list_1_location => &manifest_list1_location,
+                    manifest_list_2_location => &manifest_list2_location,
+                    table_metadata_1_location => &table_metadata1_location,
+                });
+                serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
+            };
+
+            table_metadata.default_spec = Arc::new(PartitionSpec::unpartition_spec());
+            table_metadata.partition_specs.clear();
+            table_metadata.default_partition_type = StructType::new(vec![]);
+            table_metadata
+                .partition_specs
+                .insert(0, table_metadata.default_spec.clone());
+
+            let extended_fields: Vec<_> = table_metadata
+                .schemas
+                .get(&1)
+                .expect("template carries schema id 1")
+                .as_struct()
+                .fields()
+                .iter()
+                .cloned()
+                .chain([
+                    NestedField::required(9, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        10,
+                        "st",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(
+                                11,
+                                "a",
+                                Type::Primitive(PrimitiveType::String),
+                            )
+                            .into(),
+                            NestedField::optional(
+                                12,
+                                "b",
+                                Type::Primitive(PrimitiveType::Int),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        13,
+                        "xs",
+                        Type::List(crate::spec::ListType::new(
+                            NestedField::optional(
+                                14,
+                                "element",
+                                Type::Primitive(PrimitiveType::Int),
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        15,
+                        "mp",
+                        Type::Map(crate::spec::MapType::new(
+                            NestedField::required(
+                                16,
+                                "key",
+                                Type::Primitive(PrimitiveType::String),
+                            )
+                            .into(),
+                            NestedField::optional(
+                                17,
+                                "value",
+                                Type::Primitive(PrimitiveType::Int),
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        18,
+                        "deep",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(
+                                19,
+                                "inner",
+                                Type::Struct(StructType::new(vec![
+                                    NestedField::optional(
+                                        20,
+                                        "x",
+                                        Type::Primitive(PrimitiveType::String),
+                                    )
+                                    .into(),
+                                    NestedField::optional(
+                                        21,
+                                        "ys",
+                                        Type::List(crate::spec::ListType::new(
+                                            NestedField::optional(
+                                                22,
+                                                "element",
+                                                Type::Primitive(PrimitiveType::Int),
+                                            )
+                                            .into(),
+                                        )),
+                                    )
+                                    .into(),
+                                ])),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .collect();
+            let extended_schema = Arc::new(
+                Schema::builder()
+                    .with_schema_id(1)
+                    .with_fields(extended_fields)
+                    .build()
+                    .expect("extend fixture schema with container columns"),
+            );
+            table_metadata.schemas.insert(1, extended_schema);
+            table_metadata.last_column_id = 22;
+
+            let table = Table::builder()
+                .metadata(table_metadata)
+                .identifier(TableIdent::from_strs(["db", "table1"]).unwrap())
+                .file_io(file_io.clone())
+                .metadata_location(table_metadata1_location.to_str().unwrap())
+                .build()
+                .unwrap();
+
+            Self {
+                table_location: table_location.to_str().unwrap().to_string(),
+                table,
+            }
+        }
+
+        /// Writes `containers.parquet` holding the run-25d Spark oracle's four rows: row 1 fully
+        /// populated, row 2 NULL in `st`, `xs`, `mp` and `deep`, row 3 present-but-empty
+        /// containers (empty `xs`/`mp`, `st.a` NULL, `deep.inner` present with `x`/`ys` NULL) and
+        /// row 4 populated with `deep.inner` NULL. Returns the file size for the manifest entry.
+        fn write_container_parquet_file(&self) -> u64 {
+            std::fs::create_dir_all(&self.table_location).unwrap();
+
+            let field_id_metadata =
+                |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+            let fid = |id: i32| field_id_metadata(&id.to_string());
+
+            let id_field = arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false)
+                .with_metadata(fid(9));
+
+            let a_field = Arc::new(
+                arrow_schema::Field::new("a", arrow_schema::DataType::Utf8, true)
+                    .with_metadata(fid(11)),
+            );
+            let b_field = Arc::new(
+                arrow_schema::Field::new("b", arrow_schema::DataType::Int32, true)
+                    .with_metadata(fid(12)),
+            );
+            let st_field = arrow_schema::Field::new(
+                "st",
+                arrow_schema::DataType::Struct(arrow_schema::Fields::from([
+                    a_field.clone(),
+                    b_field.clone(),
+                ])),
+                true,
+            )
+            .with_metadata(fid(10));
+
+            let xs_element_field = Arc::new(
+                arrow_schema::Field::new("element", arrow_schema::DataType::Int32, true)
+                    .with_metadata(fid(14)),
+            );
+            let xs_field = arrow_schema::Field::new(
+                "xs",
+                arrow_schema::DataType::List(xs_element_field.clone()),
+                true,
+            )
+            .with_metadata(fid(13));
+
+            let key_field = Arc::new(
+                arrow_schema::Field::new("key", arrow_schema::DataType::Utf8, false)
+                    .with_metadata(fid(16)),
+            );
+            let value_field = Arc::new(
+                arrow_schema::Field::new("value", arrow_schema::DataType::Int32, true)
+                    .with_metadata(fid(17)),
+            );
+            let entries_field = Arc::new(arrow_schema::Field::new(
+                "entries",
+                arrow_schema::DataType::Struct(arrow_schema::Fields::from([
+                    key_field.clone(),
+                    value_field.clone(),
+                ])),
+                false,
+            ));
+            let mp_field = arrow_schema::Field::new(
+                "mp",
+                arrow_schema::DataType::Map(entries_field.clone(), false),
+                true,
+            )
+            .with_metadata(fid(15));
+
+            let x_field = Arc::new(
+                arrow_schema::Field::new("x", arrow_schema::DataType::Utf8, true)
+                    .with_metadata(fid(20)),
+            );
+            let ys_element_field = Arc::new(
+                arrow_schema::Field::new("element", arrow_schema::DataType::Int32, true)
+                    .with_metadata(fid(22)),
+            );
+            let ys_field = Arc::new(
+                arrow_schema::Field::new(
+                    "ys",
+                    arrow_schema::DataType::List(ys_element_field.clone()),
+                    true,
+                )
+                .with_metadata(fid(21)),
+            );
+            let inner_field = Arc::new(
+                arrow_schema::Field::new(
+                    "inner",
+                    arrow_schema::DataType::Struct(arrow_schema::Fields::from([
+                        x_field.clone(),
+                        ys_field.clone(),
+                    ])),
+                    true,
+                )
+                .with_metadata(fid(19)),
+            );
+            let deep_field = arrow_schema::Field::new(
+                "deep",
+                arrow_schema::DataType::Struct(arrow_schema::Fields::from([inner_field.clone()])),
+                true,
+            )
+            .with_metadata(fid(18));
+
+            let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+                id_field, st_field, xs_field, mp_field, deep_field,
+            ]));
+
+            let id_col = Arc::new(Int64Array::from_iter_values([1, 2, 3, 4])) as ArrayRef;
+
+            let st_col = Arc::new(arrow_array::StructArray::new(
+                arrow_schema::Fields::from([a_field, b_field]),
+                vec![
+                    Arc::new(StringArray::from(vec![
+                        Some("a1"),
+                        None,
+                        None,
+                        Some("a4"),
+                    ])) as ArrayRef,
+                    Arc::new(Int32Array::from(vec![Some(1), None, Some(3), Some(4)])) as ArrayRef,
+                ],
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    true, false, true, true,
+                ])),
+            )) as ArrayRef;
+
+            let xs_col = Arc::new(arrow_array::ListArray::new(
+                xs_element_field,
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
+                    0i32, 2, 2, 2, 4,
+                ])),
+                Arc::new(Int32Array::from(vec![1, 2, 4, 5])),
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    true, false, true, true,
+                ])),
+            )) as ArrayRef;
+
+            let mp_entries = arrow_array::StructArray::new(
+                arrow_schema::Fields::from([key_field, value_field]),
+                vec![
+                    Arc::new(StringArray::from(vec!["k", "k2"])) as ArrayRef,
+                    Arc::new(Int32Array::from(vec![1, 4])) as ArrayRef,
+                ],
+                None,
+            );
+            let mp_col = Arc::new(arrow_array::MapArray::new(
+                entries_field,
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
+                    0i32, 1, 1, 1, 2,
+                ])),
+                mp_entries,
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    true, false, true, true,
+                ])),
+                false,
+            )) as ArrayRef;
+
+            let ys_col = Arc::new(arrow_array::ListArray::new(
+                ys_element_field,
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
+                    0i32, 1, 1, 1, 1,
+                ])),
+                Arc::new(Int32Array::from(vec![1])),
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    true, true, false, true,
+                ])),
+            )) as ArrayRef;
+            let inner_col = Arc::new(arrow_array::StructArray::new(
+                arrow_schema::Fields::from([x_field, ys_field]),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("x1"), None, None, None])) as ArrayRef,
+                    ys_col,
+                ],
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    true, false, true, false,
+                ])),
+            )) as ArrayRef;
+            let deep_col = Arc::new(arrow_array::StructArray::new(
+                arrow_schema::Fields::from([inner_field]),
+                vec![inner_col],
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    true, false, true, true,
+                ])),
+            )) as ArrayRef;
+
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![id_col, st_col, xs_col, mp_col, deep_col],
+            )
+            .unwrap();
+            let file = File::create(format!("{}/containers.parquet", &self.table_location)).unwrap();
+            let mut writer = ArrowWriter::try_new(
+                file,
+                arrow_schema,
+                Some(WriterProperties::builder().build()),
+            )
+            .unwrap();
+            writer.write(&batch).expect("Writing batch");
+            writer.close().unwrap();
+
+            std::fs::metadata(format!("{}/containers.parquet", &self.table_location))
+                .unwrap()
+                .len()
+        }
+
+        /// Declares `containers.parquet` (4 rows) as the single live data file of the current
+        /// snapshot (unpartitioned V2 manifest).
+        pub async fn setup_container_manifest_files(&mut self) {
+            let current_snapshot = self.table.metadata().current_snapshot().unwrap();
+            let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
+            let current_partition_spec = Arc::new(PartitionSpec::unpartition_spec());
+
+            let size = self.write_container_parquet_file();
+
+            let mut writer = ManifestWriterBuilder::new(
+                self.next_manifest_file(),
+                Some(current_snapshot.snapshot_id()),
+                None,
+                current_schema.clone(),
+                current_partition_spec.as_ref().clone(),
+            )
+            .build_v2_data();
+
+            writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(
+                            DataFileBuilder::default()
+                                .partition_spec_id(0)
+                                .content(DataContentType::Data)
+                                .file_path(format!(
+                                    "{}/containers.parquet",
+                                    &self.table_location
+                                ))
+                                .file_format(DataFileFormat::Parquet)
+                                .file_size_in_bytes(size)
+                                .record_count(4)
+                                .partition(Struct::empty())
+                                .key_metadata(None)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .unwrap();
+
+            let data_file_manifest = writer.write_manifest_file().await.unwrap();
+
+            let mut manifest_list_write = ManifestListWriter::v2(
+                self.table
+                    .file_io()
+                    .new_output(current_snapshot.manifest_list())
+                    .unwrap(),
+                current_snapshot.snapshot_id(),
+                current_snapshot.parent_snapshot_id(),
+                current_snapshot.sequence_number(),
+            );
+            manifest_list_write
+                .add_manifests(vec![data_file_manifest].into_iter())
+                .unwrap();
+            manifest_list_write.close().await.unwrap();
+        }
+
         /// Writes `1.parquet` with no field-id metadata, the `add_files` migration shape, and
         /// with the physical column order reversed against the table schema.
         ///
@@ -4322,6 +4737,100 @@ pub mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The run-25d Spark container-null oracle, driven through `table.scan().with_filter`. Every
+    /// cell Spark answered is pinned by `id` set: `IS NULL`/`IS NOT NULL` on top-level list, map
+    /// and struct columns, nested struct paths (`st.a`, `deep.inner`, `deep.inner.x`,
+    /// `deep.inner.ys`), and two boolean compositions. An empty `xs`/`mp` is NOT NULL (row 3) and
+    /// a struct whose fields are all NULL is NOT NULL (row 3).
+    #[tokio::test]
+    async fn test_filter_on_arrow_container_null_predicates_match_spark_oracle() {
+        let mut fixture = TableTestFixture::new_container_columns();
+        fixture.setup_container_manifest_files().await;
+
+        let cases: Vec<(&str, Predicate, Vec<i64>)> = vec![
+            ("st IS NULL", Reference::new("st").is_null(), vec![2]),
+            (
+                "st IS NOT NULL",
+                Reference::new("st").is_not_null(),
+                vec![1, 3, 4],
+            ),
+            ("xs IS NULL", Reference::new("xs").is_null(), vec![2]),
+            (
+                "xs IS NOT NULL",
+                Reference::new("xs").is_not_null(),
+                vec![1, 3, 4],
+            ),
+            ("mp IS NULL", Reference::new("mp").is_null(), vec![2]),
+            (
+                "mp IS NOT NULL",
+                Reference::new("mp").is_not_null(),
+                vec![1, 3, 4],
+            ),
+            ("st.a IS NULL", Reference::new("st.a").is_null(), vec![2, 3]),
+            (
+                "deep.inner IS NULL",
+                Reference::new("deep.inner").is_null(),
+                vec![2, 4],
+            ),
+            (
+                "deep.inner.x IS NULL",
+                Reference::new("deep.inner.x").is_null(),
+                vec![2, 3, 4],
+            ),
+            (
+                "deep.inner.ys IS NULL",
+                Reference::new("deep.inner.ys").is_null(),
+                vec![2, 3, 4],
+            ),
+            (
+                "st IS NULL OR id = 1",
+                Reference::new("st")
+                    .is_null()
+                    .or(Reference::new("id").equal_to(Datum::long(1))),
+                vec![1, 2],
+            ),
+            (
+                "st IS NOT NULL AND id > 2",
+                Reference::new("st")
+                    .is_not_null()
+                    .and(Reference::new("id").greater_than(Datum::long(2))),
+                vec![3, 4],
+            ),
+        ];
+
+        for (predicate_display, predicate, expected_ids) in cases {
+            let table_scan = fixture
+                .table
+                .scan()
+                .select(["id"])
+                .with_filter(predicate)
+                .build()
+                .unwrap_or_else(|e| panic!("build the scan for `{predicate_display}`: {e}"));
+            let batches: Vec<_> = table_scan
+                .to_arrow()
+                .await
+                .expect("open the arrow stream")
+                .try_collect()
+                .await
+                .unwrap_or_else(|e| panic!("collect the filtered batches for `{predicate_display}`: {e}"));
+
+            let mut ids: Vec<i64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let col = batch
+                        .column_by_name("id")
+                        .expect("scan output carries the id column");
+                    decode_int64_column(col)
+                        .iter()
+                        .map(|value| value.expect("id is a required column"))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(ids, expected_ids, "filter `{predicate_display}`");
         }
     }
 

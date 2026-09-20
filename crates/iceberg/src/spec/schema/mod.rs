@@ -1260,6 +1260,23 @@ table {
         );
     }
 
+    /// Java `Accessors$BuildPositionAccessors.struct()` calls `Accessors.newAccessor(pos,
+    /// field.type())` for EVERY struct field — list, map and struct fields included. The fork
+    /// must therefore expose an accessor for the container field ids of `table_schema_nested`
+    /// (`qux` 4, `quux` 6, `location` 11, `person` 15) alongside the nested primitive ids it
+    /// already covers (16, 17).
+    #[test]
+    fn test_build_accessors_includes_container_and_struct_fields() {
+        let schema = table_schema_nested();
+
+        for field_id in [4, 6, 11, 15] {
+            assert!(
+                schema.accessor_by_field_id(field_id).is_some(),
+                "accessor for container field id {field_id} must exist"
+            );
+        }
+    }
+
     #[test]
     fn test_highest_field_id() {
         let schema = table_schema_nested();
