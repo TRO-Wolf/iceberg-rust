@@ -110,6 +110,9 @@ impl StructAccessor {
         match &self.inner {
             None => match (value, self.r#type.as_primitive_type()) {
                 (None, _) => Ok(None),
+                // PrimitiveLiteral records the physical representation, not a separate semantic
+                // type tag. Compatibility therefore intentionally accepts representation-sharing
+                // families such as int/date, long/time/timestamps, and binary/fixed.
                 (Some(Literal::Primitive(literal)), Some(prim_type))
                     if prim_type.compatible(literal) =>
                 {
