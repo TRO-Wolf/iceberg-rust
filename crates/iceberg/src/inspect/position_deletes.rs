@@ -67,7 +67,7 @@ const CONTENT_OFFSET_COLUMN_ID: i32 = JAVA_INT_MAX - 6;
 /// `MetadataColumns.CONTENT_SIZE_IN_BYTES_COLUMN_ID` (`content_size_in_bytes`, optional long, v3+).
 const CONTENT_SIZE_IN_BYTES_COLUMN_ID: i32 = JAVA_INT_MAX - 7;
 
-/// PositionDeletes table.
+#[allow(missing_docs)]
 pub struct PositionDeletesTable<'a> {
     table: &'a Table,
     /// Java `Partitioning.partitionType(table)` — stored so [`Self::schema`] stays infallible.

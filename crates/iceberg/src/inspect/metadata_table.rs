@@ -65,7 +65,7 @@ pub enum MetadataTableType {
     /// [`AllManifestsTable`] — one row per (manifest × referencing snapshot) across ALL snapshots,
     /// NOT deduplicated (Java `all_manifests`).
     AllManifests,
-    /// [`PositionDeletesTable`] (Java `position_deletes`).
+    #[allow(missing_docs)]
     PositionDeletes,
 }
 
@@ -214,7 +214,7 @@ impl<'a> MetadataTable<'a> {
         AllManifestsTable::new(self.0)
     }
 
-    /// Get the `position_deletes` table (Java `PositionDeletesTable`).
+    #[allow(missing_docs)]
     pub fn position_deletes(&self) -> PositionDeletesTable<'_> {
         PositionDeletesTable::new(self.0)
     }
