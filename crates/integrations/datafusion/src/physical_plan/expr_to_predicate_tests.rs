@@ -778,21 +778,39 @@ fn push_nested(exprs: &[Expr]) -> Option<Predicate> {
 }
 
 #[test]
-fn is_null_on_a_list_column_is_not_pushed() {
-    assert_eq!(push_nested(&[Expr::IsNull(Box::new(col("xs")))]), None);
-    assert_eq!(push_nested(&[Expr::IsNotNull(Box::new(col("xs")))]), None);
+fn is_null_on_a_list_column_is_pushed() {
+    assert_eq!(
+        push_nested(&[Expr::IsNull(Box::new(col("xs")))]),
+        Some(Reference::new("xs").is_null())
+    );
+    assert_eq!(
+        push_nested(&[Expr::IsNotNull(Box::new(col("xs")))]),
+        Some(Reference::new("xs").is_not_null())
+    );
 }
 
 #[test]
-fn is_null_on_a_map_column_is_not_pushed() {
-    assert_eq!(push_nested(&[Expr::IsNull(Box::new(col("m")))]), None);
-    assert_eq!(push_nested(&[Expr::IsNotNull(Box::new(col("m")))]), None);
+fn is_null_on_a_map_column_is_pushed() {
+    assert_eq!(
+        push_nested(&[Expr::IsNull(Box::new(col("m")))]),
+        Some(Reference::new("m").is_null())
+    );
+    assert_eq!(
+        push_nested(&[Expr::IsNotNull(Box::new(col("m")))]),
+        Some(Reference::new("m").is_not_null())
+    );
 }
 
 #[test]
-fn is_null_on_a_struct_column_is_not_pushed() {
-    assert_eq!(push_nested(&[Expr::IsNull(Box::new(col("s")))]), None);
-    assert_eq!(push_nested(&[Expr::IsNotNull(Box::new(col("s")))]), None);
+fn is_null_on_a_struct_column_is_pushed() {
+    assert_eq!(
+        push_nested(&[Expr::IsNull(Box::new(col("s")))]),
+        Some(Reference::new("s").is_null())
+    );
+    assert_eq!(
+        push_nested(&[Expr::IsNotNull(Box::new(col("s")))]),
+        Some(Reference::new("s").is_not_null())
+    );
 }
 
 #[test]
@@ -837,23 +855,54 @@ fn in_list_on_an_accessorless_leaf_is_not_pushed() {
 }
 
 #[test]
-fn is_null_on_a_nested_column_drops_only_its_own_conjunction() {
+fn is_null_on_a_container_column_composes_with_its_neighbours() {
     assert_eq!(
         push_nested(&[col("id").gt(lit(1_i64)), Expr::IsNull(Box::new(col("xs")))]),
-        Some(Reference::new("id").greater_than(Datum::long(1)))
+        Some(
+            Reference::new("id")
+                .greater_than(Datum::long(1))
+                .and(Reference::new("xs").is_null())
+        )
     );
     assert_eq!(
         push_nested(&[col("id")
             .gt(lit(1_i64))
             .and(Expr::IsNull(Box::new(col("xs"))))]),
-        None
+        Some(
+            Reference::new("id")
+                .greater_than(Datum::long(1))
+                .and(Reference::new("xs").is_null())
+        )
     );
     assert_eq!(
         push_nested(&[Expr::IsNull(Box::new(col("xs"))).or(col("id").eq(lit(1_i64)))]),
-        None
+        Some(
+            Reference::new("xs")
+                .is_null()
+                .or(Reference::new("id").equal_to(Datum::long(1)))
+        )
     );
     assert_eq!(
         push_nested(&[Expr::Not(Box::new(Expr::IsNull(Box::new(col("xs")))))]),
+        Some(!Reference::new("xs").is_null())
+    );
+}
+
+#[test]
+fn is_null_on_an_accessorless_leaf_still_drops_only_its_own_conjunction() {
+    let element = || Expr::Column(Column::new_unqualified("xs.element"));
+    assert_eq!(
+        push_nested(&[col("id").gt(lit(1_i64)), Expr::IsNull(Box::new(element()))]),
+        Some(Reference::new("id").greater_than(Datum::long(1)))
+    );
+    assert_eq!(
+        push_nested(&[col("id")
+            .gt(lit(1_i64))
+            .and(Expr::IsNull(Box::new(element())))]),
+        None
+    );
+    assert_eq!(
+        push_nested(&[Expr::IsNull(Box::new(element())).or(col("id").eq(lit(1_i64)))]),
         None
     );
 }

@@ -135,6 +135,12 @@ impl<'a> PageIndexEvaluator<'a> {
         .into())
     }
 
+    fn field_id_names_a_group(&self, field_id: i32) -> bool {
+        self.snapshot_schema
+            .field_by_id(field_id)
+            .is_some_and(|field| field.field_type.as_primitive_type().is_none())
+    }
+
     fn calc_row_selection<F>(
         &mut self,
         field_id: i32,
@@ -149,6 +155,9 @@ impl<'a> PageIndexEvaluator<'a> {
         else {
             // if the snapshot's column is not present in the row group,
             // exit early
+            if self.field_id_names_a_group(field_id) {
+                return self.select_all_rows();
+            }
             return match missing_col_behavior {
                 MissingColBehavior::CantMatch => self.skip_all_rows(),
                 MissingColBehavior::MightMatch => self.select_all_rows(),

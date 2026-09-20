@@ -418,12 +418,8 @@ impl TableTestFixture {
     }
 }
 
-#[tokio::test]
-async fn test_filter_on_arrow_container_null_predicates_match_spark_oracle() {
-    let mut fixture = TableTestFixture::new_container_columns();
-    fixture.setup_container_manifest_files().await;
-
-    let cases: Vec<(&str, Predicate, Vec<i64>)> = vec![
+fn container_oracle_cases() -> Vec<(&'static str, Predicate, Vec<i64>)> {
+    vec![
         ("st IS NULL", Reference::new("st").is_null(), vec![2]),
         ("st IS NOT NULL", Reference::new("st").is_not_null(), vec![
             1, 3, 4,
@@ -466,39 +462,68 @@ async fn test_filter_on_arrow_container_null_predicates_match_spark_oracle() {
                 .and(Reference::new("id").greater_than(Datum::long(2))),
             vec![3, 4],
         ),
-    ];
+    ]
+}
 
-    for (predicate_display, predicate, expected_ids) in cases {
-        let table_scan = fixture
-            .table
-            .scan()
-            .select(["id"])
-            .with_filter(predicate)
-            .build()
-            .unwrap_or_else(|e| panic!("build the scan for `{predicate_display}`: {e}"));
-        let batches: Vec<_> = table_scan
-            .to_arrow()
-            .await
-            .expect("open the arrow stream")
-            .try_collect()
-            .await
-            .unwrap_or_else(|e| {
-                panic!("collect the filtered batches for `{predicate_display}`: {e}")
-            });
+async fn scanned_container_ids(
+    fixture: &TableTestFixture,
+    predicate: Predicate,
+    display: &str,
+    row_selection_enabled: bool,
+) -> Vec<i64> {
+    let table_scan = fixture
+        .table
+        .scan()
+        .select(["id"])
+        .with_row_selection_enabled(row_selection_enabled)
+        .with_filter(predicate)
+        .build()
+        .unwrap_or_else(|e| panic!("build the scan for `{display}`: {e}"));
+    let batches: Vec<_> = table_scan
+        .to_arrow()
+        .await
+        .expect("open the arrow stream")
+        .try_collect()
+        .await
+        .unwrap_or_else(|e| panic!("collect the filtered batches for `{display}`: {e}"));
 
-        let mut ids: Vec<i64> = batches
-            .iter()
-            .flat_map(|batch| {
-                let col = batch
-                    .column_by_name("id")
-                    .expect("scan output carries the id column");
-                decode_int64_column(col)
-                    .iter()
-                    .map(|value| value.expect("id is a required column"))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        ids.sort_unstable();
-        assert_eq!(ids, expected_ids, "filter `{predicate_display}`");
+    let mut ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            let col = batch
+                .column_by_name("id")
+                .expect("scan output carries the id column");
+            decode_int64_column(col)
+                .iter()
+                .map(|value| value.expect("id is a required column"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test]
+async fn test_filter_on_arrow_container_null_predicates_match_spark_oracle() {
+    let mut fixture = TableTestFixture::new_container_columns();
+    fixture.setup_container_manifest_files().await;
+
+    for (display, predicate, expected_ids) in container_oracle_cases() {
+        let ids = scanned_container_ids(&fixture, predicate, display, false).await;
+        assert_eq!(ids, expected_ids, "filter `{display}`");
+    }
+}
+
+#[tokio::test]
+async fn test_container_null_predicates_match_spark_oracle_under_page_index_row_selection() {
+    let mut fixture = TableTestFixture::new_container_columns();
+    fixture.setup_container_manifest_files().await;
+
+    for (display, predicate, expected_ids) in container_oracle_cases() {
+        let ids = scanned_container_ids(&fixture, predicate, display, true).await;
+        assert_eq!(
+            ids, expected_ids,
+            "filter `{display}` under page-index row selection"
+        );
     }
 }
