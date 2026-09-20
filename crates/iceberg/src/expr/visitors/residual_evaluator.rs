@@ -482,7 +482,7 @@ fn bound_to_unbound(predicate: &BoundPredicate) -> Result<Predicate> {
 
 /// Builds an unbound [`Reference`] from a bound reference's field name.
 fn unbound_reference(reference: &BoundReference) -> Reference {
-    Reference::new(reference.field().name.clone())
+    Reference::new(reference.to_string())
 }
 
 /// Negates a residual like Java `Expressions.not`, folding constants and double
@@ -690,6 +690,55 @@ mod tests {
                 .build()
                 .expect("spec builds"),
         )
+    }
+
+    fn nested_name_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        "category",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(NestedField::optional(
+                        2,
+                        "st",
+                        Type::Struct(crate::spec::StructType::new(vec![Arc::new(
+                            NestedField::optional(
+                                3,
+                                "category",
+                                Type::Primitive(PrimitiveType::String),
+                            ),
+                        )])),
+                    )),
+                ])
+                .build()
+                .expect("schema builds"),
+        )
+    }
+
+    #[test]
+    fn a_nested_residual_keeps_its_full_column_name() {
+        let schema = nested_name_schema();
+        let spec = identity_spec(schema.clone());
+        let filter = Reference::new("st.category")
+            .is_null()
+            .bind(schema.clone(), true)
+            .expect("binds the nested field");
+        let evaluator = ResidualEvaluator::of(spec, &schema, filter, true).expect("evaluator");
+
+        let residual = evaluator
+            .residual_for(&Struct::from_iter([Some(Literal::int(5))]))
+            .expect("residual");
+        assert_eq!(
+            residual.to_string(),
+            "st.category IS NULL",
+            "the residual must carry the nested column's full path, not its leaf name"
+        );
+        residual
+            .bind(schema, true)
+            .expect("the residual rebinds to the same nested field");
     }
 
     #[test]
