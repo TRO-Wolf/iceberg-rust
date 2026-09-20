@@ -103,29 +103,26 @@ async fn scan_ids(
                 .expect("predicate binds")
         })
         .map(Arc::new);
-    let tasks = Box::pin(futures::stream::iter(
-        vec![Ok(FileScanTask {
-            file_size_in_bytes: std::fs::metadata(path).expect("stat").len(),
-            start: 0,
-            length: 0,
-            record_count: None,
-            file_record_count: None,
-            data_file_path: Arc::from(path.to_string()),
-            data_file_format: DataFileFormat::Parquet,
-            schema,
-            project_field_ids: Arc::from(project),
-            predicate: bound,
-            deletes: Arc::from(vec![]),
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: false,
-            split_offsets: None,
-            first_row_id: None,
-            file_sequence_number: None,
-        })]
-        .into_iter(),
-    )) as FileScanTaskStream;
+    let tasks = Box::pin(futures::stream::iter(vec![Ok(FileScanTask {
+        file_size_in_bytes: std::fs::metadata(path).expect("stat").len(),
+        start: 0,
+        length: 0,
+        record_count: None,
+        file_record_count: None,
+        data_file_path: Arc::from(path.to_string()),
+        data_file_format: DataFileFormat::Parquet,
+        schema,
+        project_field_ids: Arc::from(project),
+        predicate: bound,
+        deletes: Arc::from(vec![]),
+        partition: None,
+        partition_spec: None,
+        name_mapping: None,
+        case_sensitive: false,
+        split_offsets: None,
+        first_row_id: None,
+        file_sequence_number: None,
+    })])) as FileScanTaskStream;
     let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
     reader
         .read(tasks)
