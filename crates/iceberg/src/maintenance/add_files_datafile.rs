@@ -245,7 +245,7 @@ fn has_embedded_field_ids(node: &ParquetType) -> bool {
             .any(|child| has_embedded_field_ids(child))
 }
 
-fn partition_struct(
+pub(super) fn partition_struct(
     context: &AdoptionContext,
     partition_values: &[(String, String)],
 ) -> Result<Struct> {

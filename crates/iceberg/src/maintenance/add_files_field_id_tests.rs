@@ -91,7 +91,7 @@ async fn the_table_metrics_config_decides_the_adopted_bounds() {
     );
 }
 
-fn field_id_parquet_bytes(columns: &[(&str, i32, ArrayRef)]) -> Bytes {
+pub(super) fn field_id_parquet_bytes(columns: &[(&str, i32, ArrayRef)]) -> Bytes {
     let fields: Vec<Field> = columns
         .iter()
         .map(|(name, field_id, array)| {
