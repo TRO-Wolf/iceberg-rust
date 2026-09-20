@@ -262,6 +262,57 @@ async fn a_small_sort_budget_spills_runs_and_still_writes_one_global_order() {
 }
 
 #[tokio::test]
+async fn a_single_spilled_run_is_forwarded_whole_and_stays_ordered() {
+    let (catalog, _guard) = local_fs_catalog().await;
+    let schema = wide_schema();
+    let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+    let mut table = catalog
+        .create_table(&namespace, TableCreation {
+            name: "t".to_string(),
+            location: None,
+            schema: schema.clone(),
+            partition_spec: None,
+            sort_order: None,
+            properties: HashMap::new(),
+            format_version: FormatVersion::V2,
+        })
+        .await
+        .expect("create the single-run table");
+    let rows: Vec<i64> = (0..300i64).map(|row| (row * 7919) % 300).collect();
+    let data_file = write_scattered_file(&table, "in-single.parquet", &rows).await;
+    table = append_files(&catalog, &table, vec![data_file]).await;
+
+    let action = RewriteDataFiles::new(table.clone())
+        .strategy(RewriteStrategy::Sort(id_asc()))
+        .sort_memory_budget_bytes(1)
+        .rewrite_all(true);
+    let group = planned_group(&table).await;
+    let written = action
+        .write_group_for_test(&table, &group)
+        .await
+        .expect("single-run write");
+
+    assert_eq!(
+        written.sort_stats.spilled_runs, 1,
+        "the pin needs exactly one spilled run, got {}",
+        written.sort_stats.spilled_runs
+    );
+    assert_eq!(written.sort_stats.merge_passes, 1);
+    assert_eq!(spill_files(&table), Vec::<String>::new());
+
+    let mut ids = Vec::new();
+    for file in &written.files {
+        ids.extend(file_ids(&table, file.file_path()).await);
+    }
+    assert_ascending("the forwarded run", &ids);
+    assert_eq!(ids.len(), rows.len());
+}
+
+#[tokio::test]
 async fn more_runs_than_the_merge_fan_in_merge_in_passes() {
     let (catalog, _guard) = local_fs_catalog().await;
     let table = scattered_table(&catalog).await;

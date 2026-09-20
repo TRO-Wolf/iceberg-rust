@@ -19,7 +19,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::future::Future;
 
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef as ArrowSchemaRef};
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -169,13 +169,16 @@ impl ExternalSorter {
     }
 
     async fn merge_into<S: SortedBatchSink>(&self, runs: &[SpillRun], sink: &mut S) -> Result<()> {
+        if let [only] = runs {
+            return self.forward_run(only, sink).await;
+        }
         let mut readers = Vec::with_capacity(runs.len());
         for run in runs {
             readers.push(SpillReader::open(&self.file_io, run, &self.plan).await?);
         }
         let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
         for (index, reader) in readers.iter_mut().enumerate() {
-            if let Some(key) = reader.peek_key() {
+            if let Some(key) = reader.take_key() {
                 heap.push(Reverse((key, index)));
             }
         }
@@ -185,16 +188,15 @@ impl ExternalSorter {
         while let Some(Reverse((_, index))) = heap.pop() {
             let reader = &mut readers[index];
             let epoch = reader.epoch;
-            let (batch, row) = reader.take_row()?;
             let slot = match slots[index] {
                 Some((slot, held)) if held == epoch => slot,
                 _ => {
-                    sources.push(batch);
+                    sources.push(reader.current_batch()?.clone());
                     slots[index] = Some((sources.len() - 1, epoch));
                     sources.len() - 1
                 }
             };
-            indices.push((slot, row));
+            indices.push((slot, reader.advance_row()?));
             if indices.len() >= MERGE_OUTPUT_ROWS {
                 flush_merged(&sources, &indices, sink).await?;
                 indices.clear();
@@ -205,7 +207,7 @@ impl ExternalSorter {
             if reader.exhausted_batch() {
                 reader.load_next(&self.plan).await?;
             }
-            if let Some(key) = reader.peek_key() {
+            if let Some(key) = reader.take_key() {
                 heap.push(Reverse((key, index)));
             }
         }
@@ -215,24 +217,39 @@ impl ExternalSorter {
         Ok(())
     }
 
+    async fn forward_run<S: SortedBatchSink>(&self, run: &SpillRun, sink: &mut S) -> Result<()> {
+        let mut stream = spill_stream(&self.file_io, run).await?;
+        while let Some(batch) = stream.try_next().await.map_err(sort_spill_err)? {
+            if batch.num_rows() > 0 {
+                sink.write_sorted(batch).await?;
+            }
+        }
+        Ok(())
+    }
+
     fn sort_current_run(&mut self) -> Result<Option<RecordBatch>> {
         if self.run.is_empty() {
             return Ok(None);
         }
         let batches = std::mem::take(&mut self.run);
+        let rows = self.run_rows;
         self.run_bytes = 0;
         self.run_rows = 0;
-        let batch = arrow_select::concat::concat_batches(&self.arrow_schema, &batches)
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(rows);
+        let mut positions: Vec<(usize, usize)> = Vec::with_capacity(rows);
+        for (source, batch) in batches.iter().enumerate() {
+            for (row, key) in self.plan.encode(batch)?.into_iter().enumerate() {
+                keys.push(key);
+                positions.push((source, row));
+            }
+        }
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by(|left, right| keys[*left].cmp(&keys[*right]));
+        let indices: Vec<(usize, usize)> = order.into_iter().map(|row| positions[row]).collect();
+        drop(keys);
+        let sources: Vec<&RecordBatch> = batches.iter().collect();
+        let sorted = arrow_select::interleave::interleave_record_batch(&sources, &indices)
             .map_err(sort_run_err)?;
-        drop(batches);
-        let keys = self.plan.encode(&batch)?;
-        let mut order: Vec<u32> = (0..keys.len())
-            .map(|row| u32::try_from(row).unwrap_or(u32::MAX))
-            .collect();
-        order.sort_by(|left, right| keys[*left as usize].cmp(&keys[*right as usize]));
-        let indices = UInt32Array::from(order);
-        let sorted =
-            arrow_select::take::take_record_batch(&batch, &indices).map_err(sort_run_err)?;
         Ok(Some(sorted))
     }
 
@@ -368,17 +385,8 @@ struct SpillReader {
 
 impl SpillReader {
     async fn open(file_io: &FileIO, run: &SpillRun, plan: &KeyPlan) -> Result<SpillReader> {
-        let input = file_io.new_input(&run.path)?;
-        let size = input.metadata().await?.size;
-        let reader = ArrowFileReader::new(FileMetadata { size }, input.reader().await?);
-        let stream = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(sort_spill_err)?
-            .with_batch_size(run.batch_rows)
-            .build()
-            .map_err(sort_spill_err)?;
         let mut reader = SpillReader {
-            stream,
+            stream: spill_stream(file_io, run).await?,
             batch: None,
             keys: Vec::new(),
             row: 0,
@@ -410,12 +418,12 @@ impl SpillReader {
         }
     }
 
-    fn peek_key(&self) -> Option<Vec<u8>> {
+    fn take_key(&mut self) -> Option<Vec<u8>> {
         let batch = self.batch.as_ref()?;
         if self.row >= batch.num_rows() {
             return None;
         }
-        Some(self.keys[self.row].clone())
+        Some(std::mem::take(&mut self.keys[self.row]))
     }
 
     fn exhausted_batch(&self) -> bool {
@@ -425,17 +433,36 @@ impl SpillReader {
         }
     }
 
-    fn take_row(&mut self) -> Result<(RecordBatch, usize)> {
-        let batch = self.batch.clone().ok_or_else(|| {
+    fn current_batch(&self) -> Result<&RecordBatch> {
+        self.batch.as_ref().ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,
                 "A merged sort run reported a row after its last batch",
             )
-        })?;
+        })
+    }
+
+    fn advance_row(&mut self) -> Result<usize> {
+        self.current_batch()?;
         let row = self.row;
         self.row += 1;
-        Ok((batch, row))
+        Ok(row)
     }
+}
+
+async fn spill_stream(
+    file_io: &FileIO,
+    run: &SpillRun,
+) -> Result<ParquetRecordBatchStream<ArrowFileReader>> {
+    let input = file_io.new_input(&run.path)?;
+    let size = input.metadata().await?.size;
+    let reader = ArrowFileReader::new(FileMetadata { size }, input.reader().await?);
+    ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(sort_spill_err)?
+        .with_batch_size(run.batch_rows)
+        .build()
+        .map_err(sort_spill_err)
 }
 
 fn sort_run_err(error: ArrowError) -> Error {
