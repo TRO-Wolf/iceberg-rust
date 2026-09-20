@@ -29,7 +29,7 @@ The file-writing layer (Java `data/` writers): Arrow batches in → data / delet
 
 | Path | What it does |
 |---|---|
-| `mod.rs` | the `IcebergWriter` / `IcebergWriterBuilder` traits + layering docs |
+| `mod.rs` | the `IcebergWriter` / `IcebergWriterBuilder` traits + layering docs; `resolve_output_spec(table, Option<i32>)` resolves a write's target partition spec (Java `output-spec-id`), `DataInvalid` on an unknown id |
 | `base_writer/data_file_writer.rs` | plain data files. `CurrentFileStatus` is empty/zero before the first write and after `close` |
 | `base_writer/equality_delete_writer.rs` | equality-delete files (equality ids → projected schema) |
 | `base_writer/position_delete_writer.rs` | position-delete files: `file_path` (id 2147483546) + `pos` (id 2147483545), `content(PositionDeletes)`, **write-as-given** (no sorting/merging — Java-faithful). Both property builders disable dictionary encoding on `pos` — Spark's delete files carry INT64 columns PLAIN while INT32/BINARY stay dictionary-encoded (F-RPD-TARGET-SMALL-1) |

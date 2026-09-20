@@ -29,6 +29,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use iceberg::Catalog;
 use iceberg::expr::Predicate;
+use iceberg::spec::PartitionSpecRef;
 use iceberg::table::Table;
 
 use super::delete::{
@@ -52,6 +53,7 @@ pub(crate) struct IcebergUpdateExec {
     count_schema: SchemaRef,
     plan_properties: Arc<PlanProperties>,
     commit_branch: Option<String>,
+    partition_spec: PartitionSpecRef,
 }
 
 impl IcebergUpdateExec {
@@ -66,6 +68,7 @@ impl IcebergUpdateExec {
         isolation: IsolationLevel,
         table_schema: SchemaRef,
         commit_branch: Option<String>,
+        partition_spec: PartitionSpecRef,
     ) -> Self {
         let count_schema = IcebergDeleteExec::make_count_schema();
         let plan_properties = IcebergDeleteExec::compute_properties(Arc::clone(&count_schema));
@@ -81,6 +84,7 @@ impl IcebergUpdateExec {
             count_schema,
             plan_properties,
             commit_branch,
+            partition_spec,
         }
     }
 }
@@ -148,6 +152,7 @@ impl ExecutionPlan for IcebergUpdateExec {
         let table_schema = Arc::clone(&self.table_schema);
         let count_schema = Arc::clone(&self.count_schema);
         let commit_branch = self.commit_branch.clone();
+        let partition_spec = self.partition_spec.clone();
 
         let stream = futures::stream::once(async move {
             let updated = match mode {
@@ -160,6 +165,7 @@ impl ExecutionPlan for IcebergUpdateExec {
                     &table_schema,
                     isolation,
                     commit_branch.as_deref(),
+                    partition_spec,
                 )
                 .await
                 .map(|(updated, _)| updated)?,
@@ -173,6 +179,7 @@ impl ExecutionPlan for IcebergUpdateExec {
                         &table_schema,
                         isolation,
                         commit_branch.as_deref(),
+                        partition_spec,
                     )
                     .await?
                 }

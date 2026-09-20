@@ -289,11 +289,29 @@ pub(crate) mod write_defaults_tests;
 
 use arrow_array::RecordBatch;
 
-use crate::Result;
-use crate::spec::{DataFile, PartitionKey};
+use crate::spec::{DataFile, PartitionKey, PartitionSpecRef};
+use crate::table::Table;
+use crate::{Error, ErrorKind, Result};
 
 type DefaultInput = RecordBatch;
 type DefaultOutput = Vec<DataFile>;
+
+#[allow(missing_docs)]
+pub fn resolve_output_spec(table: &Table, output_spec_id: Option<i32>) -> Result<PartitionSpecRef> {
+    match output_spec_id {
+        None => Ok(table.metadata().default_partition_spec().clone()),
+        Some(spec_id) => table
+            .metadata()
+            .partition_spec_by_id(spec_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Output spec id {spec_id} is not a valid spec id for table"),
+                )
+            }),
+    }
+}
 
 /// The builder for iceberg writer.
 #[async_trait::async_trait]

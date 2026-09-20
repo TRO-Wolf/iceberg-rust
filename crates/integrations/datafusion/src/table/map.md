@@ -28,7 +28,7 @@ DataFusion `TableProvider` implementations. Metadata-table `scan` honors `projec
 
 | File | Role |
 |---|---|
-| `mod.rs` | `IcebergTableProvider` (catalog-backed, writes). `schema()` advertises the metadata-free Arrow schema (`strip_metadata_from_schema`) because DataFusion's `insert_to_plan`/`Values` exec type literals against it and reject stamped nested field ids (F-LIST-INSERT-1 r2); the internal stamped schema still feeds `scan` and the write path |
+| `mod.rs` | `IcebergTableProvider` (catalog-backed, writes). `schema()` advertises the metadata-free Arrow schema (`strip_metadata_from_schema`) because DataFusion's `insert_to_plan`/`Values` exec type literals against it and reject stamped nested field ids (F-LIST-INSERT-1 r2); the internal stamped schema still feeds `scan` and the write path. `with_output_spec_id(i32)` targets writes at any existing partition spec (Java `output-spec-id`); `insert_into` resolves it via `iceberg::writer::resolve_output_spec` and threads the spec through `project_with_partition` / `repartition` / `IcebergWriteExec` / `IcebergCommitExec` (F-OUTPUT-SPEC-ID-1) |
 | `loaded.rs` | `IcebergTableProvider` loaded-Table paths (`from_planning_load`, planning fast path) |
 | `static_provider.rs` | `IcebergStaticTableProvider` (one snapshot, read-only). `schema()` also advertises the metadata-free schema for the same `insert_to_plan`/`Values` reason (F-LIST-INSERT-1 r3); the stamped schema still feeds `scan` |
 | `metadata_table.rs` | `IcebergMetadataTableProvider` — inspect tables as DataFusion tables |

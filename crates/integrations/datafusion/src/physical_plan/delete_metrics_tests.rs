@@ -75,8 +75,11 @@ async fn test_streaming_data_file_writer_honors_metrics_default_none() {
     ])
     .expect("batch");
 
-    let mut writer = crate::physical_plan::row_lineage::StreamingDataFileWriter::try_new(&table)
-        .expect("streaming writer");
+    let mut writer = crate::physical_plan::row_lineage::StreamingDataFileWriter::try_new(
+        &table,
+        table.metadata().default_partition_spec().clone(),
+    )
+    .expect("streaming writer");
     writer.write_batch(batch).await.expect("write batch");
     let files = writer.finish().await.expect("finish");
     assert_eq!(files.len(), 1);

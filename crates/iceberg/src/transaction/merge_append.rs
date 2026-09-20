@@ -286,16 +286,6 @@ impl MergeManifestProcess {
         }
     }
 
-    /// Split the input manifest list into (data, deletes), reorder the DATA manifests so this commit's
-    /// new added manifest is FIRST (Java `Iterables.concat(prepareNewDataManifests(), filtered)`), and
-    /// return them alongside the delete manifests (carried forward unchanged).
-    ///
-    /// The producer's `manifest_file` builds the list as `[carried existing..., new added data manifest]`
-    /// (the added manifest is PUSHED last). Java puts the new data manifest FIRST, which the bin-packer's
-    /// "bin containing `first`" min-count rule depends on. For merge_append the new added manifest is the
-    /// UNIQUE data manifest whose `added_snapshot_id == this snapshot` (no rewritten manifests exist — the
-    /// delete set is always empty, so no manifest was rewritten with this snapshot id). We assert that
-    /// uniqueness rather than trust it.
     fn split_and_reorder(
         &self,
         manifests: Vec<ManifestFile>,
@@ -317,18 +307,7 @@ impl MergeManifestProcess {
             }
         }
 
-        // For merge_append the new added manifest is unambiguous: the producer writes at most one added
-        // DATA manifest and rewrites NONE (the delete set is always empty). A future merging caller with
-        // rewritten manifests would need a richer "first" identification; flag it loudly here instead of
-        // silently producing the wrong order.
-        debug_assert!(
-            new_added_data.len() <= 1,
-            "merge_append expects at most one new added data manifest (got {})",
-            new_added_data.len()
-        );
-
-        // New added data manifest FIRST, then existing data manifests in their current order (Java
-        // `concat(prepareNewDataManifests(), filtered)`).
+        new_added_data.sort_by_key(|manifest| manifest.partition_spec_id);
         let mut data_manifests = new_added_data;
         data_manifests.extend(existing_data);
 

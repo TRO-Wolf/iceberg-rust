@@ -39,7 +39,9 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN};
-use iceberg::spec::{DataFileFormat, MetricsConfig, TableProperties, serialize_data_file_to_json};
+use iceberg::spec::{
+    DataFileFormat, MetricsConfig, PartitionSpecRef, TableProperties, serialize_data_file_to_json,
+};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -66,6 +68,7 @@ pub(crate) struct IcebergWriteExec {
     input: Arc<dyn ExecutionPlan>,
     input_distribution: Distribution,
     input_ordering: Option<OrderingRequirements>,
+    partition_spec: PartitionSpecRef,
     sort_order_id: Option<i32>,
     result_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
@@ -78,13 +81,20 @@ impl IcebergWriteExec {
     /// table's: `execute` emits result batches, and a node whose parents are planned against a
     /// schema it never emits is the BUG-011 skew in the write path. It also removes the last
     /// consumer of the provider's cached table schema from this branch of the plan.
-    pub fn new(table: Table, input: Arc<dyn ExecutionPlan>, sort_order_id: Option<i32>) -> Self {
-        let (input_distribution, input_ordering) = Self::input_requirements(&table, &input);
+    pub fn new(
+        table: Table,
+        input: Arc<dyn ExecutionPlan>,
+        partition_spec: PartitionSpecRef,
+        sort_order_id: Option<i32>,
+    ) -> Self {
+        let (input_distribution, input_ordering) =
+            Self::input_requirements(&table, &input, &partition_spec);
         Self::new_with_requirements(
             table,
             input,
             input_distribution,
             input_ordering,
+            partition_spec,
             sort_order_id,
         )
     }
@@ -94,6 +104,7 @@ impl IcebergWriteExec {
         input: Arc<dyn ExecutionPlan>,
         input_distribution: Distribution,
         input_ordering: Option<OrderingRequirements>,
+        partition_spec: PartitionSpecRef,
         sort_order_id: Option<i32>,
     ) -> Self {
         let result_schema = Self::make_result_schema();
@@ -104,6 +115,7 @@ impl IcebergWriteExec {
             input,
             input_distribution,
             input_ordering,
+            partition_spec,
             sort_order_id,
             result_schema,
             plan_properties,
@@ -113,12 +125,13 @@ impl IcebergWriteExec {
     fn input_requirements(
         table: &Table,
         input: &Arc<dyn ExecutionPlan>,
+        partition_spec: &PartitionSpecRef,
     ) -> (Distribution, Option<OrderingRequirements>) {
         let sort = write_sort_plan(table, input.schema().as_ref());
         let sort_ordering = sort
             .exprs
             .and_then(|exprs| LexOrdering::new(exprs).map(OrderingRequirements::from));
-        if table.metadata().default_partition_spec().is_unpartitioned() {
+        if partition_spec.is_unpartitioned() {
             return (Distribution::UnspecifiedDistribution, sort_ordering);
         }
 
@@ -257,6 +270,7 @@ impl ExecutionPlan for IcebergWriteExec {
             Arc::clone(&children[0]),
             self.input_distribution.clone(),
             self.input_ordering.clone(),
+            self.partition_spec.clone(),
             self.sort_order_id,
         )))
     }
@@ -273,7 +287,6 @@ impl ExecutionPlan for IcebergWriteExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let partition_type = self.table.metadata().default_partition_type().clone();
         let format_version = self.table.metadata().format_version();
 
         // Get typed table properties
@@ -328,12 +341,12 @@ impl ExecutionPlan for IcebergWriteExec {
             location_generator,
             file_name_generator,
         );
-        // Create TaskWriter
         let fanout_enabled = table_props.write_datafusion_fanout_enabled;
         let schema = self.table.metadata().current_schema().clone();
-        let partition_spec = self.table.metadata().default_partition_spec().clone();
-        // Stamp the real default_spec_id when built without a PartitionKey (post–DROP empty
-        // default may be non-zero; bare new() would fabricate 0 — C5-L-001 / C6-L-001).
+        let partition_spec = self.partition_spec.clone();
+        let partition_type = partition_spec
+            .partition_type(&schema)
+            .map_err(to_datafusion_error)?;
         let mut data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder)
             .with_partition_spec(partition_spec.as_ref().clone());
         if let Some(sort_order_id) = self.sort_order_id {
@@ -584,7 +597,12 @@ mod tests {
         ]));
 
         // 4. Create IcebergWriteExec
-        let write_exec = IcebergWriteExec::new(table.clone(), input_plan, None);
+        let write_exec = IcebergWriteExec::new(
+            table.clone(),
+            input_plan,
+            table.metadata().default_partition_spec().clone(),
+            None,
+        );
 
         // The node must advertise the schema it actually emits — the serialized data files, not the
         // table's schema (which is what it used to advertise while emitting result batches).
@@ -748,7 +766,12 @@ mod tests {
         })?;
 
         let input_plan = Arc::new(MockExecutionPlan::new(arrow_schema, vec![batch]));
-        let write_exec = IcebergWriteExec::new(table.clone(), input_plan, None);
+        let write_exec = IcebergWriteExec::new(
+            table.clone(),
+            input_plan,
+            table.metadata().default_partition_spec().clone(),
+            None,
+        );
         let mut stream = write_exec
             .execute(0, Arc::new(TaskContext::default()))
             .map_err(|e| {

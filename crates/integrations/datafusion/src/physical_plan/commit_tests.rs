@@ -217,6 +217,7 @@ async fn test_iceberg_commit_exec() -> Result<(), Box<dyn std::error::Error>> {
         input_exec,
         arrow_schema,
         InsertOp::Append,
+        table.metadata().default_partition_spec().clone(),
     );
 
     // Verify Execution Plan schema matches the count schema
@@ -467,6 +468,7 @@ async fn run_commit_exec(
         input,
         arrow_schema,
         insert_op,
+        table.metadata().default_partition_spec().clone(),
     );
     let stream = exec.execute(0, Arc::new(TaskContext::default()))?;
     collect(stream).await

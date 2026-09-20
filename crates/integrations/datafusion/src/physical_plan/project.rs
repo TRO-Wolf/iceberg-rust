@@ -30,7 +30,7 @@ use iceberg::arrow::{
     PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator, schema_to_arrow_schema,
     strip_metadata_from_schema,
 };
-use iceberg::spec::PartitionSpec;
+use iceberg::spec::{PartitionSpec, PartitionSpecRef};
 use iceberg::table::Table;
 
 use crate::to_datafusion_error;
@@ -46,20 +46,12 @@ use write_compatibility::{canonical_layout_input, field_is_write_compatible};
 /// This function takes an input ExecutionPlan and extends it with an additional column
 /// containing calculated partition values based on the table's partition specification.
 /// For unpartitioned tables, returns the original plan unchanged.
-///
-/// # Arguments
-/// * `input` - The input ExecutionPlan to extend
-/// * `table` - The Iceberg table with partition specification
-///
-/// # Returns
-/// * `Ok(Arc<dyn ExecutionPlan>)` - Extended plan with partition values column
-/// * `Err` - If partition spec is not found or transformation fails
 pub fn project_with_partition(
     input: Arc<dyn ExecutionPlan>,
     table: &Table,
+    partition_spec: PartitionSpecRef,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     let metadata = table.metadata();
-    let partition_spec = metadata.default_partition_spec();
     let table_schema = metadata.current_schema();
 
     if partition_spec.is_unpartitioned() {
@@ -278,6 +270,9 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, StructType, Transform, Type};
 
     use super::*;
+    fn default_spec(table: &Table) -> PartitionSpecRef {
+        table.metadata().default_partition_spec().clone()
+    }
 
     #[test]
     fn test_partition_calculator_basic() {
@@ -748,7 +743,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = project_with_partition(input, &table);
+        let result = project_with_partition(input, &table, default_spec(&table));
         assert!(result.is_ok(), "Schema validation should pass");
     }
 
@@ -806,7 +801,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = project_with_partition(input, &table);
+        let result = project_with_partition(input, &table, default_spec(&table));
         assert!(
             result.is_err(),
             "Schema validation should fail for mismatched schemas"
@@ -924,7 +919,8 @@ mod tests {
         );
 
         // Outer projection: passthroughs + the `_partition` expression.
-        let plan = project_with_partition(inner, &table).expect("project_with_partition");
+        let plan = project_with_partition(inner, &table, default_spec(&table))
+            .expect("project_with_partition");
 
         // The optimizer pass that fuses adjacent projections (runs twice for real plans).
         let optimized = ProjectionPushdown::new()
@@ -1043,7 +1039,11 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             payload_field,
         ]));
-        project_with_partition(Arc::new(EmptyExec::new(arrow_schema)), table)
+        project_with_partition(
+            Arc::new(EmptyExec::new(arrow_schema)),
+            table,
+            default_spec(table),
+        )
     }
 
     /// G0: a NON-nullable input column is accepted into an OPTIONAL (nullable)
@@ -1462,7 +1462,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = project_with_partition(input, &table);
+        let result = project_with_partition(input, &table, default_spec(&table));
         assert!(
             result.is_ok(),
             "Schema validation should pass even with metadata differences"
