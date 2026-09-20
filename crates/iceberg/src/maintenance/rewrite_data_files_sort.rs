@@ -331,7 +331,7 @@ fn valid_z_order_columns(table: &Table, spec: &ZOrderSpec) -> Result<Vec<String>
 
     let mut kept = Vec::with_capacity(spec.columns.len());
     for name in &spec.columns {
-        let field = schema.field_by_name(name).ok_or_else(|| {
+        let field = schema.field_by_name_case_insensitive(name).ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -340,15 +340,30 @@ fn valid_z_order_columns(table: &Table, spec: &ZOrderSpec) -> Result<Vec<String>
                 ),
             )
         })?;
+        if identity_sources.contains(&field.id) {
+            continue;
+        }
+        let top_level = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .any(|candidate| candidate.name == *name && candidate.id == field.id);
+        if !top_level {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "No such struct field {} in {}",
+                    spark_identifier(name),
+                    top_level_names(schema)
+                ),
+            ));
+        }
         column_kind(
             name,
             field.field_type.as_ref(),
             spec.var_length_contribution.max(1) as usize,
         )?;
-        if identity_sources.contains(&field.id) {
-            continue;
-        }
-        kept.push(field.name.clone());
+        kept.push(name.clone());
     }
     if kept.is_empty() {
         return Err(Error::new(
@@ -357,6 +372,23 @@ fn valid_z_order_columns(table: &Table, spec: &ZOrderSpec) -> Result<Vec<String>
         ));
     }
     Ok(kept)
+}
+
+fn spark_identifier(name: &str) -> String {
+    name.split('.')
+        .map(|part| format!("`{part}`"))
+        .collect::<Vec<String>>()
+        .join(".")
+}
+
+fn top_level_names(schema: &Schema) -> String {
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| format!("`{}`", field.name))
+        .collect::<Vec<String>>()
+        .join(", ")
 }
 
 fn java_struct_display(schema: &Schema) -> String {

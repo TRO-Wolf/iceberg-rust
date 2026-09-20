@@ -416,6 +416,80 @@ async fn zorder_over_an_unsupported_type_is_refused_like_spark() {
     );
 }
 
+#[tokio::test]
+async fn a_nested_z_order_column_is_refused_and_never_binds_its_top_level_namesake() {
+    use crate::spec::StructType;
+
+    let (catalog, _guard) = local_fs_catalog().await;
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "st",
+                Type::Struct(StructType::new(vec![
+                    Arc::new(NestedField::optional(
+                        4,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        5,
+                        "d",
+                        Type::Primitive(PrimitiveType::Decimal {
+                            precision: 10,
+                            scale: 2,
+                        }),
+                    )),
+                ])),
+            )),
+            Arc::new(NestedField::optional(
+                3,
+                "v",
+                Type::Primitive(PrimitiveType::Double),
+            )),
+        ])
+        .build()
+        .expect("build the nested schema");
+    let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+    let table = catalog
+        .create_table(&namespace, TableCreation {
+            name: "t".to_string(),
+            location: None,
+            schema,
+            partition_spec: None,
+            sort_order: None,
+            properties: HashMap::new(),
+            format_version: FormatVersion::V2,
+        })
+        .await
+        .expect("create the nested table");
+
+    let cases = [
+        ("st.id", "No such struct field `st`.`id` in `id`, `st`, `v`"),
+        ("st.d", "No such struct field `st`.`d` in `id`, `st`, `v`"),
+        ("ID", "No such struct field `ID` in `id`, `st`, `v`"),
+    ];
+    for (column, expected) in cases {
+        let error = RewriteDataFiles::new(table.clone())
+            .strategy(RewriteStrategy::ZOrder(ZOrderSpec::new([column])))
+            .rewrite_all(true)
+            .execute(&catalog)
+            .await
+            .expect_err("a z-order column that is not a top-level column must be refused");
+        assert_eq!(error.message(), expected, "zorder({column})");
+    }
+}
+
 #[test]
 fn zorder_encodes_a_boolean_like_javas_udf_and_a_null_boolean_as_zero_bytes() {
     use arrow_array::{BooleanArray, Int64Array, RecordBatch};
