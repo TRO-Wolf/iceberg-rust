@@ -66,9 +66,14 @@ covers Java's default `zlib` codec, and the protobuf is hand-written exactly as 
 full evidence and the rejected alternatives are clause C-001 of
 [task/ledgers/staging/f-orc-avro-write-1-ledger.md](../../../../../task/ledgers/staging/f-orc-avro-write-1-ledger.md).
 
-Integer streams are written with RLE **v1** (`ColumnEncoding.DIRECT`), where Java writes RLE v2
-(`DIRECT_V2`). Both are ORC-spec encodings and every reader selects the decoder from the declared
-encoding kind, so the values are identical; only the byte layout differs.
+Defaults that match Iceberg 1.11.0: stripe size 67108864 (`write.orc.stripe-size-bytes`),
+compression `zlib`, file version [0, 12], and the `iceberg.*` type attribute names and encodings.
+The 256 KiB compression block is the Apache ORC `bufferSize` default, not
+`write.orc.block-size-bytes` (the 268435456 HDFS block). Two divergences stay: integer streams use
+RLE **v1** (`ColumnEncoding.DIRECT`) where Java writes RLE v2 (`DIRECT_V2`), and the footer sets
+`rowIndexStride = 0` with no `ROW_INDEX` streams where Java uses stride 10000. Both are ORC-spec
+shapes and every reader selects the decoder from the declared encoding kind, so the values are
+identical; only the byte layout differs. Clause C-002 of the ledger records the comparison.
 
 ## I want to...
 
