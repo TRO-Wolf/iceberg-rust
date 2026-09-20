@@ -42,7 +42,7 @@ This unit ports the middle piece only.
 | C-002 | Every row of a task carries **that task's** commit snapshot id — the window snapshot at its own `_change_ordinal`, never the scan's `to` id. | PROVEN | same test: the ordinal-0 rows carry `s1` while the scan's `to` is `s2`, and the test asserts `s1 != s2`. A reader filling the column with the scan's `to` id (or `0`) fails it. |
 | C-003 | A `DeletedDataFile` task reads as `DELETE` rows of the snapshot that removed the file, beside the `INSERT` rows of the snapshot that added it. | PROVEN | `a_deleted_data_file_reads_as_delete_rows_of_its_commit_snapshot` |
 | C-004 | The three appended fields carry the RESERVED field ids already defined in `metadata_columns.rs` — no second definition. | PROVEN | `the_three_reserved_columns_keep_their_reserved_field_ids` (asserts the `PARQUET:field_id` metadata equals the three `RESERVED_FIELD_ID_*` constants) |
-| C-005 | The default (Java-parity) mode is unchanged: the reader never enables `with_row_level_deletes`, so a range holding delete manifests still refuses with the planner's `Delete files are currently not supported in changelog scans` — the same string Iceberg 1.11.0's `BaseIncrementalChangelogScan` carries. | PROVEN | untouched planner guard (`scan/incremental.rs`), pinned by the existing `test_changelog_rejects_range_with_delete_manifest`; the reader adds no flag |
+| C-005 | The default (Java-parity) mode is unchanged: the reader never enables `with_row_level_deletes`, so a range holding delete manifests still refuses with the planner's `FeatureUnsupported` guard — the same KIND Iceberg 1.11.0's `BaseIncrementalChangelogScan` carries. A `DeletedRows` task handed to the reader is explicitly REFUSED with a pinned kind and message. | PROVEN | untouched planner guard (`scan/incremental.rs`), pinned KIND-only by the existing `test_changelog_rejects_range_with_delete_manifest` (owned outside this branch, not edited here); the reader adds no flag; message-level evidence is `changelog_reader_refuses_deleted_rows_tasks`, which pins both `ErrorKind::FeatureUnsupported` and the refusal string |
 
 ## Design notes
 
@@ -60,7 +60,7 @@ This unit ports the middle piece only.
 ## Not in this unit
 
 Row-level changelog (`ChangelogTaskKind::DeletedRows`, applying `added_deletes` as a selector)
-stays behind the existing opt-in flag and is NOT read here: Iceberg 1.11.0's `ChangelogRowReader`
+stays behind the existing opt-in flag and the reader explicitly refuses it: Iceberg 1.11.0's `ChangelogRowReader`
 implements `openAddedRowsScanTask` / `openDeletedDataFileScanTask` only, so exceeding it is an
 owner ruling, not this unit's. `UPDATE_BEFORE` / `UPDATE_AFTER` pairing stays engine-side, as the
 planner's own documentation says.
