@@ -19,9 +19,11 @@ fn attribute<'a>(orc_type: &'a OrcType, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+type PrimitiveCase = (PrimitiveType, OrcKind, Vec<(&'static str, &'static str)>);
+
 #[test]
 fn test_every_iceberg_primitive_maps_to_java_s_orc_kind_and_attributes() {
-    let cases: Vec<(PrimitiveType, OrcKind, Vec<(&str, &str)>)> = vec![
+    let cases: Vec<PrimitiveCase> = vec![
         (PrimitiveType::Boolean, OrcKind::Boolean, vec![]),
         (PrimitiveType::Int, OrcKind::Int, vec![]),
         (PrimitiveType::Long, OrcKind::Long, vec![(
