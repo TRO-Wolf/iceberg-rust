@@ -31,7 +31,8 @@ application. Scan planning lives in `../scan/`; this directory runs the plan.
 | File | What it does |
 |---|---|
 | `reader.rs` | `ArrowReader`: Parquet/Avro/ORC task execution — projection masks, `RowFilter` planning via `row_filter_plan`, row-group + page-index pruning, the post-decode residual (`RowFilterPlan::Residual` → `evaluate_predicate_to_mask` → prune extra columns), fallback field-id stamping for id-less files (`add_fallback_field_ids_to_arrow_schema`: table-name match, Java-counter fallback) |
-| `row_filter_plan.rs` | `plan_row_filter`: `Push` (leaf-index map incl. group ids) vs `Residual` (present-but-unmapped ids on id-less files); `top_level_ancestor_id`, `unmapped_group_leaf_indices`, `leaf_count` |
+| `row_filter_plan.rs` | `plan_row_filter`: `Push` (leaf-index map incl. group ids) vs `Residual` (present-but-unmapped ids on id-less files); `top_level_ancestor_id`, `unmapped_group_leaf_indices`, `leaf_count`; `PushedRowFilter { filter, disable_predicate_cache }` + `apply_to_stream` (`pushed_mask_disables_predicate_cache`, `group_is_list`) turns the predicate cache off when the pushed mask selects the leaf of a single-leaf non-LIST group root, which would otherwise panic in parquet's cached array reader |
+| `row_filter_nested_tests.rs` | **test-only** red-first pin: `IS NULL` on an optional single-leaf struct with the struct projected returns only the null-struct row (parquet predicate-cache panic guard) |
 | `record_batch_predicate.rs` | `evaluate_predicate_to_mask`: `BoundPredicate` → `BooleanArray` over one batch, resolving references by field-id path with parent-validity propagation (`column_at_path` + `null_propagation`) |
 | `record_batch_predicate_container_tests.rs` | **test-only** Spark container-null oracle over a materialized batch (incl. `st.b` both parities) |
 | `null_propagation.rs` | `array_with_parent_validity`: union a struct parent's nulls into a child column (Arrow never propagates validity downward) |
