@@ -85,6 +85,36 @@ Every cell carries `rewrite-all` except `SORT-EXPLICIT-DEFAULT-OPTS`.
 | ZORDER-CASE | `zorder(ID, s)` fails `FIELD_NOT_FOUND` — validation is case-insensitive, but the Spark column lookup that follows is not |
 | ZORDER-NESTED | `zorder(st.x, id)` fails `FIELD_NOT_FOUND` — a nested column passes validation and then fails the Spark lookup |
 
+### Round 3 cells (`record_rdf_sort_nan.py`, added by round 2 of the review)
+
+Table `(id BIGINT, st STRUCT<id: BIGINT, x: BIGINT>, v DOUBLE)`, five INSERT statements of 10 rows, so a
+nested `st.id` collides with the top-level `id`.
+
+| cell | call | Spark answer |
+|---|---|---|
+| ZORDER-NESTED-COLLISION | `zorder(st.id)` | `IllegalArgumentException` ``[FIELD_NOT_FOUND] No such struct field `st`.`id` in `id`, `st`, `v`. SQLSTATE: 42704`` — Spark REFUSES; it does not silently z-order the top-level `id` |
+| ZORDER-NESTED-PLAIN | `zorder(st.x)` | the same refusal for ``` `st`.`x` ``` |
+| ZORDER-CASE-COLLISION | `zorder(ID)` | the same refusal for ``` `ID` ``` — validation is case-insensitive, the bind is not |
+| ZORDER-TOP-LEVEL | `zorder(id)` | 5 → 1 file, the 50 rows in ascending `id`, the nested `st.id` descending beside them |
+
+### Java's own z bytes for every NaN (`java -cp <runtime jar> ZBytes.java`)
+
+`ZOrderByteUtils.doubleToOrderedBytes` / `.floatToOrderedBytes`, measured bit pattern in, bytes out:
+
+| input bits | `Double.doubleToLongBits` | ordered bytes |
+|---|---|---|
+| `0000000000000000` (+0.0) | `0000000000000000` | `8000000000000000` |
+| `8000000000000000` (-0.0) | `8000000000000000` | `7fffffff00000000` |
+| `7ff8000000000000` (canonical NaN) | `7ff8000000000000` | `fff80000fff00000` |
+| `fff8000000000000` (sign-bit NaN) | `7ff8000000000000` | `fff80000fff00000` |
+| `7ff8000000000001` (payload NaN) | `7ff8000000000000` | `fff80000fff00000` |
+| `fff800000000abcd` (sign + payload) | `7ff8000000000000` | `fff80000fff00000` |
+| `7ff0000000000001` (signalling NaN) | `7ff8000000000000` | `fff80000fff00000` |
+| float `ffc0abcd` | widens to raw `fff81579a0000000` | `fff80000fff00000` |
+
+Every NaN — sign bit, payload, signalling, float or double — collapses to one z value, and it is
+ABOVE `+Infinity` (`fff00000ffe00000`). `-0.0` and `+0.0` stay distinct and ordered.
+
 ## 2. The Java evidence (`javap` on `iceberg-spark-runtime-4.1_2.13-1.11.0.jar`)
 
 `org.apache.iceberg.util.ZOrderByteUtils`:
@@ -97,8 +127,9 @@ Every cell carries `rewrite-all` except `SORT-EXPLICIT-DEFAULT-OPTS`.
   negative value that flips the sign bit and bits 63..31 only; the low 31 bits are NOT flipped.
   This is a quirk of Java's implementation, and the encoding is only weakly order preserving for
   negatives. It is reproduced exactly. `floatToOrderedBytes` widens `f2d` first, so a FLOAT is the
-  8-byte encoding of its double value. `Double.doubleToLongBits` canonicalises every NaN to
-  `0x7ff8000000000000`.
+  8-byte encoding of its double value — `f2d` KEEPS the sign and payload of a NaN, and
+  `Double.doubleToLongBits` (not `doubleToRawLongBits`) then canonicalises every NaN to
+  `0x7ff8000000000000`, so float and double NaNs share one z value. Measured above.
 - `stringToOrderedBytes(s, len, buf, encoder)`: zero-fill `len` bytes, then UTF-8 encode with
   `endOfInput = true`. On OVERFLOW the encoder stops at a character boundary, so a multi-byte
   character that does not fit contributes NOTHING and the tail stays zero. A null string is `len`
@@ -149,7 +180,11 @@ Every cell carries `rewrite-all` except `SORT-EXPLICIT-DEFAULT-OPTS`.
 - `SparkZOrderFileRewriteRunner.validZOrderColNames` refuses an empty column list, refuses a table
   that already has an `ICEZVALUE` column, resolves each name (case-insensitively by default),
   DROPS every name that is an identity partition source of the table's current spec, and refuses
-  the call when nothing is left.
+  the call when nothing is left. The list it returns holds the CALLER'S OWN name (bytecode offset
+  216-220 loads the loop variable, not `NestedField.name()`), and `zValue` then binds each name
+  with `df.schema().apply(name)` — an exact, top-level, case-sensitive lookup against the
+  dataframe. That pair is the whole story behind ZORDER-CASE, ZORDER-NESTED and the round-3 cells:
+  a dotted or differently-cased name passes validation and dies at the bind.
 
 ## 3. Design decisions
 
@@ -215,9 +250,10 @@ alone, ascending, which is unsigned-lexicographic by construction. A single enco
 both the in-run sort and the merge, so the two can never disagree.
 
 **D-7 — the z encoding is a byte-for-byte port of `ZOrderByteUtils` including its quirks.** The
-arithmetic-shift float mask (§2), the widening of every whole number to 8 bytes, the
-`min(sum, max-output-size)` output width, the UTF-8 encoder's character-boundary truncation, the
-zero fill for nulls, `0x81` for a true boolean. One deliberate divergence: a NULL boolean encodes
+arithmetic-shift float mask (§2), the CANONICALISATION of every NaN before that mask
+(`Double.doubleToLongBits`, not the raw bits — §2's measured table), the widening of every whole
+number to 8 bytes, the `min(sum, max-output-size)` output width, the UTF-8 encoder's
+character-boundary truncation, the zero fill for nulls, `0x81` for a true boolean. One deliberate divergence: a NULL boolean encodes
 as 8 zero bytes, the rule every other type follows, where Java crashes the job on an unboxing NPE
 (ZORDER-BOOL-NULL). Java's crash is a missing null check, not a contract, and an action that
 destroys a rewrite on a null boolean is not a behaviour worth porting.
@@ -228,6 +264,17 @@ fork extension, not a parity claim); `timestamptz` → SECONDS (Spark's `cast(ts
 lowercase text, which is what Spark z-orders (Iceberg `uuid` reads as a Spark STRING);
 fixed/binary → `var-length-contribution` bytes; boolean → the `0x81`/`0x00` byte in an 8-byte buffer; decimal and
 the v3 nanosecond timestamps are REFUSED with Java's "the type is unsupported" message.
+
+**D-11 — a z-order column binds the caller's own name, against the TOP-LEVEL schema only.**
+Java keeps the caller's string in `validZOrderColNames` and binds it with `df.schema().apply(name)`
+(§2), so a dotted or differently-cased name is a hard error even when the case-insensitive
+validation resolved it. The fork does the same: resolve case-insensitively for the "Cannot find
+column" refusal and the identity-partition drop, then require a top-level field of that exact name
+and that exact field id, else refuse. Measured: on a table holding BOTH `id` and `st.id`,
+`zorder(st.id)` is refused by Spark (ZORDER-NESTED-COLLISION) — it does not silently z-order the
+top-level `id`, and neither does the fork. The order of the three steps is Java's: find, drop the
+identity partition columns, bind, then type-check, so an identity partition column of an
+unsupported type is dropped rather than refused.
 
 **D-8 — the layout-only options.** `shuffle-partitions-per-file` and `compression-factor` are
 accepted and validated (both must be > 0, with Java's messages) and are recorded as no-ops for a
@@ -260,7 +307,7 @@ multiset for conservation.
 | null boolean in a z-order tuple | the fork encodes 8 zero bytes; Spark fails the job with an unboxing NPE (D-7) |
 | output file split points | the fork rolls on written bytes, Spark cuts on sampled ranges (D-9) |
 | `shuffle-partitions-per-file`, `compression-factor` | accepted, validated, no effect (D-8) |
-| a z-order over a nested or differently-cased column | the fork refuses it; Spark passes validation and then fails the Spark column lookup (`FIELD_NOT_FOUND`). Both are errors |
+| a z-order over a nested or differently-cased column | the fork refuses it at `resolve_strategy` with ``No such struct field `st`.`id` in `id`, `st`, `v` ``; Spark passes validation and then fails the same bind with the same sentence, wrapped in its `[FIELD_NOT_FOUND] … SQLSTATE: 42704` error class. Both refuse, neither binds a different column (D-11) |
 | Iceberg `time` in a z tuple | the fork encodes micros as a whole number; Spark has no mapping for it |
 
 ## 5. Red-first evidence and the mutation proof
@@ -282,15 +329,30 @@ the mutation reverted. Every clause has at least one pin that fails when it brea
 | M4 z-order encodes `timestamptz` in micros, not seconds | the z type mapping | `zorder_over_a_string_a_timestamp_and_a_long_matches_the_spark_row_order` |
 | M5 the float mask uses a LOGICAL shift (`>>>`) instead of Java's arithmetic `>>` | the float encoding quirk | `floating_point_matches_javas_ordered_bytes_including_its_shift_quirk` |
 
+**Round 2 mutations (the review's findings).** Same method: break the clause, run
+`cargo test -p iceberg --lib rewrite_data_files`, revert. The count after each result is the whole
+filtered suite, so "1 failed" means the new pin is the only thing standing between the clause and a
+silent regression.
+
+| mutation | what it breaks | result |
+|---|---|---|
+| M7 `total = total.saturating_add(width)` — the `.min(max_output_size)` cap dropped (L-01's neighbour, V-01) | the z output width | `the_max_output_size_cap_bounds_the_interleaved_z_value` RED — `149 passed; 1 failed`. The round-1 cell pin stayed green, which is exactly the hollowness the reviewer found |
+| M8 `push_int` writes `value.to_be_bytes()` — no sign flip (V-02) | negatives above positives in every sort key | `whole_number_keys_place_every_negative_below_every_positive` RED — `149 passed; 1 failed` |
+| M9 `push_escaped` stops escaping `0x00` (V-03) | a key with an embedded NUL | `variable_length_keys_escape_their_zero_bytes_and_terminate` RED. With the byte assertions removed the ORDER assertion still fails on its own: `'a\0'` sorts before `'a'` — `left: [3, 0, 1, 2] right: [0, 3, 1, 2]` |
+| M10 `push_escaped` stops writing its `0x00 0x00` terminator (V-03) | the field boundary | the same pin RED. With the byte assertions removed: a DESCENDING string key puts `'a'` above `'ab'` — `left: [0, 2, 3, 1] right: [2, 1, 3, 0]` |
+| M11 the 256-bit decimal key reverses its bytes again (L-03) | the wide-decimal order | `wide_decimal_keys_sort_big_endian_with_a_flipped_sign` RED — the five pinned values come out `[4, 1, 2, 0, 3]` |
+| M12 `floating_point_ordered_bytes` reads raw bits (L-01) | NaN canonicalisation | `every_nan_collapses_to_javas_canonical_nan_in_the_z_value`, `a_float_column_canonicalises_its_nans_like_javas_widening_encoder` and `floating_point_matches_javas_ordered_bytes_including_its_shift_quirk` RED — `13 passed; 3 failed` of the z suite |
+| M13 `valid_z_order_columns` keeps `field.name` and drops the top-level check (L-02) | the z column bind | `a_nested_z_order_column_is_refused_and_never_binds_its_top_level_namesake` RED at its `expect_err` — the rewrite SUCCEEDS on `zorder(st.id)`, silently z-ordering the top-level `id`, which is the defect itself |
+
 ## 6. Gates
 
 | gate | command | result |
 |---|---|---|
-| unit pins (every `rewrite_data_files` module) | `cargo test -p iceberg --lib rewrite_data_files` | `ok. 143 passed; 0 failed; 0 ignored; 0 measured; 3981 filtered out` |
-| the neighbouring delete-rewrite suites | `cargo test -p iceberg --lib rewrite_position_delete` | `ok. 101 passed; 0 failed; 0 ignored; 0 measured; 4023 filtered out` |
+| unit pins (every `rewrite_data_files` module) | `cargo test -p iceberg --lib rewrite_data_files` | `ok. 152 passed; 0 failed; 0 ignored; 0 measured; 4010 filtered out` |
+| the neighbouring delete-rewrite suites | `cargo test -p iceberg --lib rewrite_position_delete` | `ok. 103 passed; 0 failed; 0 ignored; 0 measured; 4059 filtered out` |
 | format | `cargo fmt --all -- --check` | clean |
 | lints | `cargo clippy -p iceberg --all-targets -- -D warnings` | `Finished dev profile` — no warning |
-| file size | `python3 scripts/check_rust_file_size.py` | `581 files clean (92 legacy ceilings)`; the `rewrite_data_files.rs` ceiling moved DOWN 2440 → 2418 |
+| file size | `python3 scripts/check_rust_file_size.py` | `583 files clean (92 legacy ceilings)`; the `rewrite_data_files.rs` ceiling moved DOWN 2440 → 2418 |
 | prose | `typos crates/iceberg/src/maintenance/ task/rdf-sort-1-ledger.md` | clean |
 | comment ban | `comment_ban.py <clone> origin/main` | `comment-ban hits=0` |
 
@@ -316,3 +378,25 @@ sortOrder: <text>` (a transform inside `zorder(...)`). For an unknown option it 
 `Cannot use options [<names>], they are not supported by the action or the rewriter <NAME>` from
 `RewriteStrategy::valid_option_names()` and `RewriteStrategy::description()`, which exist for it.
 Every other refusal in §1 comes out of `execute` as a typed `Error` with Java's message text.
+
+## 8. Round 2 of the review — every finding and its disposition
+
+Three reviewers ran against round 1. Each finding below is FIXED (with the commit and the pin that
+is red without it), or REFUTED / DEFERRED with the reason. Nothing is left implicit.
+
+| finding | disposition |
+|---|---|
+| **L-01 P1** z-order NaN is not canonicalised | **FIXED.** `floating_point_ordered_bytes` now reads `0x7ff8000000000000` for every NaN before Java's shift mask, which is what `Double.doubleToLongBits` does. Java's own bytes for a sign-bit, payload, signalling, float and double NaN are in §2's table — all `fff80000fff00000`. Pins: `every_nan_collapses_to_javas_canonical_nan_in_the_z_value`, `a_float_column_canonicalises_its_nans_like_javas_widening_encoder`, four new rows in `floating_point_matches_javas_ordered_bytes_including_its_shift_quirk`. The f32 path needs no separate fix: it widens to f64 first, exactly as Java's `f2d` does, and the canonicalisation happens after the widening in both |
+| **L-02 P1** a dotted z-order column binds the wrong column | **FIXED, by refusing.** Measured first: on a table holding both `id` and `st.id`, Spark refuses `zorder(st.id)` (ZORDER-NESTED-COLLISION) rather than binding either. The rule and its Java provenance are D-11. Pin: `a_nested_z_order_column_is_refused_and_never_binds_its_top_level_namesake`, which without the fix does not merely report a different message — the rewrite succeeds and z-orders the wrong column |
+| **L-03 P3** Decimal256 encoding | **FIXED.** `arrow_buffer::i256::to_be_bytes` is already big-endian, so the extra `reverse()` produced a little-endian key. Removed. The branch stays unreachable from an Iceberg table (decimal precision ≤ 38 maps to `Decimal128`, and `arrow_schema_to_schema` refuses a `Decimal256` column), so the pin drives the encoder directly with a `Decimal256` batch: `wide_decimal_keys_sort_big_endian_with_a_flipped_sign` |
+| **V-01 S2** the `max-output-size` pin is hollow | **FIXED.** The cell pin only compared a row order, and truncating a z value rarely changes one. The new pin asserts the encoded WIDTH and that two rows differing only below the cap collapse to one key: `the_max_output_size_cap_bounds_the_interleaved_z_value` (M7) |
+| **V-02 S2** the `push_int` sign flip survives mutation | **FIXED.** The oracle table's ids are all ≥ 0, so no cell could see the flip. The new pin encodes `i64::MIN, -1, 0, 1, i64::MAX` and `i32` beside them, in bytes and in order (M8) |
+| **V-03 S2** `push_escaped` survives mutation | **FIXED.** Two mutations, two independent assertions: dropping the `0x00` escape puts `'a\0'` before `'a'`, and dropping the terminator puts `'a'` above `'ab'` under a DESCENDING key (M9, M10) |
+| **R-01 P1** the merge clones a `RecordBatch` and a key `Vec` per row | **FIXED.** The key is now MOVED out of the reader — each row's key is pushed onto the heap exactly once and consumed exactly once, so the clone had no reader-side use — and the batch is cloned once per (batch, epoch) when its slot opens, i.e. once per merge output block rather than once per row. `take_row` became `current_batch` + `advance_row` |
+| **R-02** a `Vec<u8>` per row for the in-memory run | **REFUTED — deliberate (D-6).** One encoding serves both the in-run sort and the k-way merge, and the merge's heap must own its keys across batch reloads and spill boundaries. A flat arena with `(offset, len)` handles cannot back the heap without either pinning every run's arena for the whole merge or copying the key back out per row, which is the allocation it set out to remove. The allocation is one `Vec<u8>` per row of one run, freed when the run is written |
+| **R-03** `concat_batches` + `take` copies the whole run | **FIXED.** `sort_current_run` now encodes each batch in place and hands the sorted `(batch, row)` pairs to `interleave_record_batch` over the run's own batches. The concat copy is gone; peak resident bytes are unchanged at ~2× budget (the run plus its sorted image), which is what D-4 claims |
+| **R-04** keys re-encoded when a spill is read back | **DEFERRED — deliberate (D-5/D-6), and narrowed.** A spill file holds rows, not keys: writing the key as a column would grow every spill by the key width, and the merge would still have to decode it. The one case where the re-encode bought nothing at all — a merge of a single run — no longer happens (R-05) |
+| **R-05** a single spilled run still pays the k-way merge | **FIXED.** `merge_into` forwards a lone run's batches straight to the sink: no key encoding, no heap, no per-row interleave. Pin: `a_single_spilled_run_is_forwarded_whole_and_stays_ordered` |
+
+Bin-pack, the default path, is untouched by all of it: every change is inside the sort key encoder,
+the z encoder or the external sorter, none of which a bin-pack rewrite constructs.
