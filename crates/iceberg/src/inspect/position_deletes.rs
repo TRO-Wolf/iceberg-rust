@@ -15,22 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `position_deletes` metadata table — SCHEMA ONLY (scan is not ported).
+//! `position_deletes` metadata table — schema and scan.
 //!
-//! Mirrors Java `PositionDeletesTable.calculateSchema` (`core/.../PositionDeletesTable.java`):
-//! the fixed metadata columns (`MetadataColumns.DELETE_FILE_PATH` / `DELETE_FILE_POS` /
-//! `DELETE_FILE_ROW_*` / `PARTITION_COLUMN_ID` / `SPEC_ID_COLUMN_ID` / `FILE_PATH_COLUMN_ID`,
-//! plus the v3 DV columns `CONTENT_OFFSET_COLUMN_ID` / `CONTENT_SIZE_IN_BYTES_COLUMN_ID`), the
-//! partition-field id reassignment (smallest positive ids not used by ANY table schema nor the
-//! metadata columns), and the empty-partition `TypeUtil.selectNot(PARTITION_COLUMN_ID)` drop.
+//! Mirrors Java `PositionDeletesTable` (`core/.../PositionDeletesTable.java`): the schema is
+//! `calculateSchema` — the fixed metadata columns (`MetadataColumns.DELETE_FILE_PATH` /
+//! `DELETE_FILE_POS` / `DELETE_FILE_ROW_*` / `PARTITION_COLUMN_ID` / `SPEC_ID_COLUMN_ID` /
+//! `FILE_PATH_COLUMN_ID`, plus the v3 DV columns `CONTENT_OFFSET_COLUMN_ID` /
+//! `CONTENT_SIZE_IN_BYTES_COLUMN_ID`), the partition-field id reassignment (smallest positive
+//! ids not used by ANY table schema nor the metadata columns), and the empty-partition
+//! `TypeUtil.selectNot(PARTITION_COLUMN_ID)` drop. The scan is `PositionDeletesBatchScan`:
+//! the current snapshot's DELETE manifests filtered by both manifest evaluators
+//! (transformed-spec + own-spec, keyed on `manifest.partitionSpecId()`), live
+//! `POSITION_DELETES` entries only, one task per delete file carrying its spec and residual;
+//! Puffin delete files read as deletion vectors, Parquet files as positional-delete rows.
 //!
-//! Two deliberate bounds, both tracked in GAP_MATRIX R142:
-//! - **Scan is refused loud** (`FeatureUnsupported`): Java backs this table with a dedicated
-//!   `PositionDeletesBatchScan` over delete manifests; that port is a separate campaign.
-//!   Increment D does **not** un-refuse the scan.
+//! One deliberate bound, tracked in GAP_MATRIX R142:
 //! - **Partition type** is [`TableMetadata::unified_partition_type`] (Java
-//!   `Partitioning.partitionType`) — increment D. That automatically corrects the
-//!   remapped-child-id set and the empty-partition drop predicate.
+//!   `Partitioning.partitionType`). That automatically corrects the remapped-child-id set
+//!   and the empty-partition drop predicate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
