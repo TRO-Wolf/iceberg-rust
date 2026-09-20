@@ -173,7 +173,10 @@ mod tests {
     fn test_single_level_accessor() {
         let accessor = StructAccessor::new(1, PrimitiveType::Boolean, true);
 
-        assert_eq!(accessor.r#type().as_primitive_type(), Some(&PrimitiveType::Boolean));
+        assert_eq!(
+            accessor.r#type().as_primitive_type(),
+            Some(&PrimitiveType::Boolean)
+        );
         assert_eq!(accessor.position(), 1);
 
         let test_struct =
@@ -186,7 +189,10 @@ mod tests {
     fn test_single_level_accessor_null() {
         let accessor = StructAccessor::new(1, PrimitiveType::Boolean, true);
 
-        assert_eq!(accessor.r#type().as_primitive_type(), Some(&PrimitiveType::Boolean));
+        assert_eq!(
+            accessor.r#type().as_primitive_type(),
+            Some(&PrimitiveType::Boolean)
+        );
         assert_eq!(accessor.position(), 1);
 
         let test_struct = Struct::from_iter(vec![Some(Literal::bool(false)), None]);
@@ -199,7 +205,10 @@ mod tests {
         let nested_accessor = StructAccessor::new(1, PrimitiveType::Boolean, true);
         let accessor = StructAccessor::wrap(2, Box::new(nested_accessor));
 
-        assert_eq!(accessor.r#type().as_primitive_type(), Some(&PrimitiveType::Boolean));
+        assert_eq!(
+            accessor.r#type().as_primitive_type(),
+            Some(&PrimitiveType::Boolean)
+        );
         //assert_eq!(accessor.position(), 1);
 
         let nested_test_struct =
@@ -219,7 +228,10 @@ mod tests {
         let nested_accessor = StructAccessor::new(0, PrimitiveType::Boolean, true);
         let accessor = StructAccessor::wrap(2, Box::new(nested_accessor));
 
-        assert_eq!(accessor.r#type().as_primitive_type(), Some(&PrimitiveType::Boolean));
+        assert_eq!(
+            accessor.r#type().as_primitive_type(),
+            Some(&PrimitiveType::Boolean)
+        );
         //assert_eq!(accessor.position(), 1);
 
         let nested_test_struct = Struct::from_iter(vec![None, Some(Literal::bool(true))]);
@@ -251,8 +263,10 @@ mod tests {
 
     #[test]
     fn test_nested_accessor_rejects_short_inner_struct() {
-        let accessor =
-            StructAccessor::wrap(0, Box::new(StructAccessor::new(0, PrimitiveType::Boolean, true)));
+        let accessor = StructAccessor::wrap(
+            0,
+            Box::new(StructAccessor::new(0, PrimitiveType::Boolean, true)),
+        );
         let test_struct = Struct::from_iter([Some(Literal::Struct(Struct::empty()))]);
 
         let error = accessor
@@ -301,8 +315,10 @@ mod tests {
         assert_eq!(outer_error.kind(), ErrorKind::DataInvalid);
         assert!(outer_error.message().contains("accessor type boolean"));
 
-        let nested_accessor =
-            StructAccessor::wrap(0, Box::new(StructAccessor::new(0, PrimitiveType::Boolean, true)));
+        let nested_accessor = StructAccessor::wrap(
+            0,
+            Box::new(StructAccessor::new(0, PrimitiveType::Boolean, true)),
+        );
         let nested_error = nested_accessor
             .get(&Struct::from_iter([Some(Literal::Struct(
                 Struct::from_iter([Some(Literal::int(7))]),
@@ -383,8 +399,10 @@ mod tests {
             .expect_err("a leaf accessor must reject a struct literal");
         assert_eq!(primitive_leaf_error.kind(), ErrorKind::DataInvalid);
 
-        let nested_accessor =
-            StructAccessor::wrap(0, Box::new(StructAccessor::new(0, PrimitiveType::Boolean, true)));
+        let nested_accessor = StructAccessor::wrap(
+            0,
+            Box::new(StructAccessor::new(0, PrimitiveType::Boolean, true)),
+        );
         let nested_shape_error = nested_accessor
             .get(&Struct::from_iter([Some(Literal::bool(true))]))
             .expect_err("a nested accessor must reject a primitive outer literal");

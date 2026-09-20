@@ -23,6 +23,8 @@ pub use term::*;
 pub(crate) mod accessor;
 pub mod expression_parser;
 mod predicate;
+#[cfg(test)]
+mod predicate_container_tests;
 pub(crate) mod visitors;
 use std::fmt::{Display, Formatter};
 

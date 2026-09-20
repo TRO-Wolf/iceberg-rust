@@ -25,12 +25,10 @@ use std::sync::Arc;
 use arrow_arith::boolean::and;
 use arrow_array::{Array, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
 use arrow_cast::cast::cast;
-
 use arrow_schema::{
     ArrowError, DataType, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use arrow_select::filter::filter_record_batch;
-
 use bytes::Bytes;
 use fnv::FnvHashSet;
 use futures::future::BoxFuture;
@@ -46,6 +44,7 @@ use parquet::file::metadata::{
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 use typed_builder::TypedBuilder;
 
+use crate::arrow::arrow_schema_to_schema;
 use crate::arrow::avro_reader::read_avro_data_file;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::delete_filter::positional_delete_keep_mask;
@@ -59,7 +58,6 @@ use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::arrow::record_batch_transformer::{
     RecordBatchTransformer, RecordBatchTransformerBuilder,
 };
-use crate::arrow::arrow_schema_to_schema;
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
@@ -1520,13 +1518,7 @@ impl ArrowReader {
         // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
         let mut column_indices = iceberg_field_ids
             .iter()
-            .flat_map(|field_id| {
-                leaf_lists
-                    .get(field_id)
-                    .into_iter()
-                    .flatten()
-                    .copied()
-            })
+            .flat_map(|field_id| leaf_lists.get(field_id).into_iter().flatten().copied())
             .collect::<Vec<_>>();
         column_indices.sort_unstable();
         column_indices.dedup();
@@ -2042,7 +2034,6 @@ impl BoundPredicateVisitor for CollectFieldIdVisitor {
     }
 }
 
-
 /// Coerces a three-valued keep-mask to two values, turning NULL into `false`, as the Parquet
 /// `RowFilter` does. [`evaluate_predicate_to_mask`] already returns a two-valued mask, so this is
 /// defense in depth against a future three-valued-logic leak.
@@ -2069,7 +2060,6 @@ pub(crate) fn eq_delete_key_fields_projected(
         .iter()
         .all(|id| projected.contains(id))
 }
-
 
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 pub struct ArrowFileReader {
@@ -2311,10 +2301,9 @@ mod tests {
         let decimal_col = Decimal128Array::from(vec![Some(1_i128)])
             .with_precision_and_scale(38, 0)
             .expect("a decimal(38,0) array");
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![arrow_field])),
-            vec![Arc::new(decimal_col)],
-        )
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![arrow_field])), vec![
+            Arc::new(decimal_col),
+        ])
         .expect("batch");
 
         match evaluate_predicate_to_mask(&predicate, &batch) {

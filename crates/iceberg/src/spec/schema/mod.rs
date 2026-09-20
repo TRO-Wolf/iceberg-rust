@@ -21,6 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+#[cfg(test)]
+mod accessor_tests;
 mod cache_charge;
 mod utils;
 mod visitor;
@@ -627,13 +629,12 @@ mod tests {
 
     use bimap::BiHashMap;
 
+    use crate::spec::Literal;
     use crate::spec::datatypes::Type::{List, Map, Primitive, Struct};
     use crate::spec::datatypes::{
         ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, StructType, Type,
     };
     use crate::spec::schema::Schema;
-    use crate::spec::values::Map as MapValue;
-    use crate::spec::{Datum, Literal};
 
     #[test]
     fn test_construct_schema() {
@@ -1182,91 +1183,6 @@ table {
                 Some(&field),
                 schema.field_by_id(id).map(|f| f.as_ref()),
                 "Field for {id} not match."
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_accessors() {
-        let schema = table_schema_nested();
-
-        let test_struct = crate::spec::Struct::from_iter(vec![
-            Some(Literal::string("foo value")),
-            Some(Literal::int(1002)),
-            Some(Literal::bool(true)),
-            Some(Literal::List(vec![
-                Some(Literal::string("qux item 1")),
-                Some(Literal::string("qux item 2")),
-            ])),
-            Some(Literal::Map(MapValue::from([(
-                Literal::string("quux key 1"),
-                Some(Literal::Map(MapValue::from([(
-                    Literal::string("quux nested key 1"),
-                    Some(Literal::int(1000)),
-                )]))),
-            )]))),
-            Some(Literal::List(vec![Some(Literal::Struct(
-                crate::spec::Struct::from_iter(vec![
-                    Some(Literal::float(52.509_09)),
-                    Some(Literal::float(-1.885_249)),
-                ]),
-            ))])),
-            Some(Literal::Struct(crate::spec::Struct::from_iter(vec![
-                Some(Literal::string("Testy McTest")),
-                Some(Literal::int(33)),
-            ]))),
-        ]);
-
-        assert_eq!(
-            schema
-                .accessor_by_field_id(1)
-                .unwrap()
-                .get(&test_struct)
-                .unwrap(),
-            Some(Datum::string("foo value"))
-        );
-        assert_eq!(
-            schema
-                .accessor_by_field_id(2)
-                .unwrap()
-                .get(&test_struct)
-                .unwrap(),
-            Some(Datum::int(1002))
-        );
-        assert_eq!(
-            schema
-                .accessor_by_field_id(3)
-                .unwrap()
-                .get(&test_struct)
-                .unwrap(),
-            Some(Datum::bool(true))
-        );
-        assert_eq!(
-            schema
-                .accessor_by_field_id(16)
-                .unwrap()
-                .get(&test_struct)
-                .unwrap(),
-            Some(Datum::string("Testy McTest"))
-        );
-        assert_eq!(
-            schema
-                .accessor_by_field_id(17)
-                .unwrap()
-                .get(&test_struct)
-                .unwrap(),
-            Some(Datum::int(33))
-        );
-    }
-
-    #[test]
-    fn test_build_accessors_includes_container_and_struct_fields() {
-        let schema = table_schema_nested();
-
-        for field_id in [4, 6, 11, 15] {
-            assert!(
-                schema.accessor_by_field_id(field_id).is_some(),
-                "accessor for container field id {field_id} must exist"
             );
         }
     }

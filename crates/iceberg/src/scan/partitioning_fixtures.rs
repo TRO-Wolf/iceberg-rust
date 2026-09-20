@@ -43,7 +43,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 
-fn render_template(template: &str, ctx: Value) -> String {
+pub(crate) fn render_template(template: &str, ctx: Value) -> String {
     let mut env = Environment::new();
     env.set_auto_escape_callback(|_| AutoEscape::None);
     env.render_str(template, ctx).unwrap()
