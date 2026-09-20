@@ -106,7 +106,7 @@ pub(super) async fn adopt_parquet_file(
         .with_source(err)
     })?;
 
-    let resolved = resolved_file_schema(context, &parquet_metadata)?;
+    let resolved = resolved_file_schema(context, &parquet_metadata, path)?;
     let metrics = MetricsByFieldId::new(&resolved, &context.metrics_config);
     let mut builder = ParquetWriter::parquet_to_data_file_builder(
         Arc::new(resolved),
@@ -140,6 +140,7 @@ pub(super) async fn adopt_parquet_file(
 fn resolved_file_schema(
     context: &AdoptionContext,
     parquet_metadata: &ParquetMetaData,
+    path: &str,
 ) -> Result<Schema> {
     let root = parquet_metadata
         .file_metadata()
@@ -147,6 +148,9 @@ fn resolved_file_schema(
         .root_schema();
     let columns = root.get_fields();
     let embedded = has_embedded_field_ids(root);
+    if embedded {
+        refuse_partial_field_ids(columns, path)?;
+    }
 
     let mut fields: Vec<Arc<NestedField>> = Vec::with_capacity(columns.len());
     for (position, column) in columns.iter().enumerate() {
@@ -199,6 +203,24 @@ fn resolve_field_id(
             .and_then(|field| field.field_id()),
         None => i32::try_from(position + 1).ok(),
     }
+}
+
+fn refuse_partial_field_ids(columns: &[Arc<ParquetType>], path: &str) -> Result<()> {
+    let without: Vec<&str> = columns
+        .iter()
+        .filter(|column| !column.get_basic_info().has_id())
+        .map(|column| column.name())
+        .collect();
+    if without.is_empty() {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "Cannot import the parquet file {path} because only some of its columns carry Iceberg field ids. These columns carry none: {}. Rewrite the file with a field id on every column, or with none at all.",
+            without.join(", ")
+        ),
+    ))
 }
 
 fn has_embedded_field_ids(node: &ParquetType) -> bool {
