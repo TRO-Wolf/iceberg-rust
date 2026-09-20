@@ -23,9 +23,11 @@ use crate::spec::{
     ManifestContentType, Operation, Struct,
 };
 use crate::table::Table;
-use crate::transaction::tests::make_v2_minimal_table_in_catalog;
+use crate::transaction::tests::{
+    make_v2_minimal_table_in_catalog, make_v3_minimal_table_in_catalog,
+};
 use crate::transaction::{ApplyTransactionAction, Transaction, staged_snapshot_for_wap_id};
-use crate::{Catalog, ErrorKind};
+use crate::{Catalog, Error, ErrorKind};
 
 const STAGED_WAP_ID_PROP: &str = "wap.id";
 
@@ -197,6 +199,26 @@ async fn cherry_pick(catalog: &impl Catalog, table: &Table, snapshot_id: i64) ->
         .apply(tx)
         .expect("apply cherry-pick");
     tx.commit(catalog).await.expect("commit cherry-pick")
+}
+
+async fn publish_changes(catalog: &impl Catalog, table: &Table, wap_id: &str) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .publish_changes(wap_id)
+        .apply(tx)
+        .expect("apply publish-changes");
+    tx.commit(catalog).await.expect("commit publish-changes")
+}
+
+async fn publish_changes_err(catalog: &impl Catalog, table: &Table, wap_id: &str) -> Error {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .publish_changes(wap_id)
+        .apply(tx)
+        .expect("apply publish-changes");
+    tx.commit(catalog)
+        .await
+        .expect_err("publish-changes should fail")
 }
 
 #[tokio::test]
@@ -480,5 +502,184 @@ async fn staged_snapshot_for_wap_id_already_published_has_java_message() {
         error.message(),
         "Duplicate request to cherry pick wap id that was published already: wap-dup",
         "Java's DuplicateWAPCommitException text, verbatim"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_fast_forwards_the_staged_snapshot() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_fast_append(&catalog, &table, "test/staged.parquet", 0, "wap-ff").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+    let snapshot_count_before = table.metadata().snapshots().count();
+    let base_live = live_file_paths(&table, ManifestContentType::Data).await;
+
+    let table = publish_changes(&catalog, &table, "wap-ff").await;
+
+    assert_eq!(
+        table.metadata().current_snapshot_id(),
+        Some(staged_id),
+        "a head-parented staged snapshot publishes by fast-forwarding main"
+    );
+    assert_eq!(
+        table.metadata().snapshots().count(),
+        snapshot_count_before,
+        "a fast-forward produces no new snapshot"
+    );
+    let published = table
+        .metadata()
+        .current_snapshot()
+        .expect("the publish left a current snapshot");
+    assert_eq!(
+        published
+            .summary()
+            .additional_properties
+            .get(STAGED_WAP_ID_PROP)
+            .map(String::as_str),
+        Some("wap-ff"),
+        "the fast-forwarded snapshot keeps its wap.id, as Java does"
+    );
+    let live = live_file_paths(&table, ManifestContentType::Data).await;
+    assert!(
+        live.contains("test/staged.parquet"),
+        "a read of main sees the staged data: {live:?}"
+    );
+    assert!(
+        base_live.is_subset(&live),
+        "the base files survive the publish: {live:?}"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_replays_and_sets_source_and_published_wap_id() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_fast_append(&catalog, &table, "test/staged.parquet", 0, "wap-replay").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+    let table = append_main(&catalog, &table, vec![data_file("test/head.parquet", 9)]).await;
+    let snapshot_count_before = table.metadata().snapshots().count();
+
+    let table = publish_changes(&catalog, &table, "wap-replay").await;
+
+    assert_eq!(
+        table.metadata().snapshots().count(),
+        snapshot_count_before + 1,
+        "a staged snapshot whose parent is not the head replays into a NEW snapshot"
+    );
+    let published = table
+        .metadata()
+        .current_snapshot()
+        .expect("the publish left a current snapshot");
+    assert_ne!(
+        published.snapshot_id(),
+        staged_id,
+        "the published snapshot is new, not the staged one"
+    );
+    let props = &published.summary().additional_properties;
+    assert_eq!(
+        props.get("source-snapshot-id"),
+        Some(&staged_id.to_string()),
+        "Java tags the replayed snapshot with the staged snapshot id"
+    );
+    assert_eq!(
+        props.get("published-wap-id").map(String::as_str),
+        Some("wap-replay"),
+        "Java tags the replayed snapshot with the published wap id"
+    );
+    let live = live_file_paths(&table, ManifestContentType::Data).await;
+    assert!(
+        live.contains("test/staged.parquet") && live.contains("test/head.parquet"),
+        "a read of main sees both the staged and the head data: {live:?}"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_unknown_wap_id_has_java_message() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+
+    let error = publish_changes_err(&catalog, &table, "nope").await;
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "Cannot apply unknown WAP ID 'nope'",
+        "Java's unknown-WAP-id text, verbatim"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_twice_has_java_message() {
+    let catalog = new_memory_catalog().await;
+    let table = staged_base(&catalog).await;
+    let table = stage_fast_append(&catalog, &table, "test/staged.parquet", 0, "wap-twice").await;
+    let table = publish_changes(&catalog, &table, "wap-twice").await;
+
+    let error = publish_changes_err(&catalog, &table, "wap-twice").await;
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        error.message(),
+        "Duplicate request to cherry pick wap id that was published already: wap-twice",
+        "Java's DuplicateWAPCommitException text, verbatim"
+    );
+}
+
+#[tokio::test]
+async fn publish_changes_replay_assigns_fresh_row_ids_on_v3() {
+    let catalog = new_memory_catalog().await;
+    let table = make_v3_minimal_table_in_catalog(&catalog).await;
+    let table = stage_fast_append(&catalog, &table, "test/staged.parquet", 0, "wap-rowid").await;
+    let staged_id = *non_current_snapshot_ids(&table)
+        .first()
+        .expect("a staged snapshot exists");
+    let staged_first_row_id = table
+        .metadata()
+        .snapshot_by_id(staged_id)
+        .expect("the staged snapshot is in metadata")
+        .first_row_id()
+        .expect("a v3 staged snapshot carries a first row id");
+    let table = append_main(&catalog, &table, vec![data_file("test/head.parquet", 9)]).await;
+
+    let table = publish_changes(&catalog, &table, "wap-rowid").await;
+
+    let published = table
+        .metadata()
+        .current_snapshot()
+        .expect("the publish left a current snapshot");
+    let published_first_row_id = published
+        .first_row_id()
+        .expect("a v3 published snapshot carries a first row id");
+    assert!(
+        published_first_row_id > staged_first_row_id,
+        "the publish assigned a FRESH row range ({published_first_row_id}) rather than copying \
+         the staged snapshot's ({staged_first_row_id})"
+    );
+    let manifest_list = published
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("load the published manifest list");
+    let mut stored = Vec::new();
+    for manifest_file in manifest_list.entries() {
+        let bytes = table
+            .file_io()
+            .new_input(&manifest_file.manifest_path)
+            .expect("open the manifest")
+            .read()
+            .await
+            .expect("read the manifest bytes");
+        let manifest = crate::spec::Manifest::parse_avro(&bytes).expect("parse the manifest avro");
+        for entry in manifest.entries() {
+            if entry.file_path() == "test/staged.parquet" {
+                stored.push(entry.data_file().first_row_id());
+            }
+        }
+    }
+    assert_eq!(
+        stored,
+        vec![None],
+        "the replayed file is stored with no first_row_id, so a fresh one is assigned"
     );
 }

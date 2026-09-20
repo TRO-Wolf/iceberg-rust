@@ -43,7 +43,7 @@ mod rewrite_manifests_deletes_tests;
 #[path = "stage_only_tests.rs"]
 mod stage_only_tests;
 
-pub use publish_changes::staged_snapshot_for_wap_id;
+pub use publish_changes::{PublishChangesAction, staged_snapshot_for_wap_id};
 
 /// A boxed, thread-safe reference to a `TransactionAction`.
 pub(crate) type BoxedTransactionAction = Arc<dyn TransactionAction>;

@@ -15,9 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
 use crate::error::Result;
 use crate::spec::{SnapshotRef, TableMetadata};
-use crate::transaction::cherry_pick::is_wap_id_published;
+use crate::table::Table;
+use crate::transaction::action::{ActionCommit, TransactionAction};
+use crate::transaction::cherry_pick::{CherryPickAction, is_wap_id_published};
 use crate::transaction::{
     MergeAppendAction, OverwriteFilesAction, ReplacePartitionsAction, RowDeltaAction,
 };
@@ -58,6 +64,43 @@ pub fn staged_snapshot_for_wap_id(metadata: &TableMetadata, wap_id: &str) -> Res
         )));
     }
     Ok(staged.clone())
+}
+
+#[allow(missing_docs)]
+pub struct PublishChangesAction {
+    wap_id: String,
+}
+
+impl PublishChangesAction {
+    pub(crate) fn new(wap_id: &str) -> Self {
+        Self {
+            wap_id: wap_id.to_string(),
+        }
+    }
+
+    fn cherry_pick_for(&self, metadata: &TableMetadata) -> Result<CherryPickAction> {
+        staged_snapshot_for_wap_id(metadata, &self.wap_id)
+            .map(|staged| CherryPickAction::new(staged.snapshot_id()))
+    }
+}
+
+#[async_trait]
+impl TransactionAction for PublishChangesAction {
+    async fn validate(
+        self: Arc<Self>,
+        starting_snapshot_id: Option<i64>,
+        current: &Table,
+    ) -> Result<()> {
+        Arc::new(self.cherry_pick_for(current.metadata())?)
+            .validate(starting_snapshot_id, current)
+            .await
+    }
+
+    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        Arc::new(self.cherry_pick_for(table.metadata())?)
+            .commit(table)
+            .await
+    }
 }
 
 impl MergeAppendAction {
