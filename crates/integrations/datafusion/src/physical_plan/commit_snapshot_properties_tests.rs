@@ -22,7 +22,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use iceberg::transaction::staged_snapshot_for_wap_id;
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use iceberg::{NamespaceIdent, TableIdent};
 
 use super::tests::{
     BoxResult, TestResult, append_files_direct, assert_count, data_file_json, make_data_file,

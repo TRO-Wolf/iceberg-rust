@@ -25,7 +25,7 @@ use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{MAIN_BRANCH, NestedField, Operation, PrimitiveType, Schema, Type};
 use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::transaction::{ApplyTransactionAction, Transaction, staged_snapshot_for_wap_id};
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation, TableIdent,
 };
@@ -95,6 +95,7 @@ async fn provider(
     name: &str,
     branch: Option<&str>,
     stage_only: bool,
+    properties: HashMap<String, String>,
 ) -> IcebergTableProvider {
     let base = IcebergTableProvider::try_new(catalog, namespace, name.to_string())
         .await
@@ -103,7 +104,9 @@ async fn provider(
         Some(name) => base.with_commit_branch(name),
         None => base,
     };
-    branched.with_stage_only(stage_only)
+    branched
+        .with_stage_only(stage_only)
+        .with_snapshot_properties(properties)
 }
 
 async fn register(provider: IcebergTableProvider) -> SessionContext {
@@ -179,7 +182,18 @@ async fn query_ids(ctx: &SessionContext, sql: &str) -> Vec<i32> {
 }
 
 async fn seed(catalog: &Arc<dyn Catalog>, namespace: &NamespaceIdent) -> i64 {
-    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None, false).await).await;
+    let ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            false,
+            HashMap::new(),
+        )
+        .await,
+    )
+    .await;
     run_sql(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
     load(catalog.as_ref(), namespace, "t")
         .await
@@ -195,8 +209,18 @@ async fn insert_stage_only_adds_snapshot_without_moving_main() -> Result<()> {
     let catalog: Arc<dyn Catalog> = Arc::new(catalog);
     let main_id = seed(&catalog, &namespace).await;
 
-    let staged_ctx =
-        register(provider(catalog.clone(), namespace.clone(), "t", None, true).await).await;
+    let staged_ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            true,
+            HashMap::new(),
+        )
+        .await,
+    )
+    .await;
     run_sql(&staged_ctx, "INSERT INTO t VALUES (2, 'b')").await;
 
     let table = load(catalog.as_ref(), &namespace, "t").await;
@@ -211,7 +235,18 @@ async fn insert_stage_only_adds_snapshot_without_moving_main() -> Result<()> {
     assert_eq!(staged.parent_snapshot_id(), Some(main_id));
     assert_eq!(staged.summary().operation, Operation::Append);
 
-    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None, false).await).await;
+    let ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            false,
+            HashMap::new(),
+        )
+        .await,
+    )
+    .await;
     assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1]);
     Ok(())
 }
@@ -223,8 +258,18 @@ async fn insert_overwrite_stage_only_adds_snapshot_without_moving_main() -> Resu
     let catalog: Arc<dyn Catalog> = Arc::new(catalog);
     let main_id = seed(&catalog, &namespace).await;
 
-    let staged_ctx =
-        register(provider(catalog.clone(), namespace.clone(), "t", None, true).await).await;
+    let staged_ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            true,
+            HashMap::new(),
+        )
+        .await,
+    )
+    .await;
     run_sql(&staged_ctx, "INSERT OVERWRITE t VALUES (9, 'z')").await;
 
     let table = load(catalog.as_ref(), &namespace, "t").await;
@@ -239,7 +284,18 @@ async fn insert_overwrite_stage_only_adds_snapshot_without_moving_main() -> Resu
     assert_eq!(staged.parent_snapshot_id(), Some(main_id));
     assert_eq!(staged.summary().operation, Operation::Overwrite);
 
-    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None, false).await).await;
+    let ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            false,
+            HashMap::new(),
+        )
+        .await,
+    )
+    .await;
     assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1]);
     Ok(())
 }
@@ -254,9 +310,18 @@ async fn stage_only_with_commit_branch_leaves_branch_unmoved() -> Result<()> {
     let table = create_named_branch(catalog.as_ref(), &table, "audit").await;
     assert_eq!(ref_id(&table, "audit"), Some(main_id));
 
-    let staged_ctx =
-        register(provider(catalog.clone(), namespace.clone(), "t", Some("audit"), true).await)
-            .await;
+    let staged_ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            Some("audit"),
+            true,
+            HashMap::new(),
+        )
+        .await,
+    )
+    .await;
     run_sql(&staged_ctx, "INSERT INTO t VALUES (2, 'b')").await;
 
     let table = load(catalog.as_ref(), &namespace, "t").await;
@@ -271,7 +336,18 @@ async fn insert_without_stage_only_advances_main() -> Result<()> {
     let catalog = memory_catalog().await;
     let namespace = create_table(&catalog, "ns_plain_append", "t", HashMap::new()).await;
     let catalog: Arc<dyn Catalog> = Arc::new(catalog);
-    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None, false).await).await;
+    let ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            false,
+            HashMap::new(),
+        )
+        .await,
+    )
+    .await;
     run_sql(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
 
     let table = load(catalog.as_ref(), &namespace, "t").await;
@@ -289,7 +365,18 @@ async fn insert_overwrite_without_stage_only_advances_main() -> Result<()> {
     let catalog: Arc<dyn Catalog> = Arc::new(catalog);
     let main_id = seed(&catalog, &namespace).await;
 
-    let ctx = register(provider(catalog.clone(), namespace.clone(), "t", None, false).await).await;
+    let ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            false,
+            HashMap::new(),
+        )
+        .await,
+    )
+    .await;
     run_sql(&ctx, "INSERT OVERWRITE t VALUES (9, 'z')").await;
 
     let table = load(catalog.as_ref(), &namespace, "t").await;
@@ -326,6 +413,7 @@ async fn commit_branch_without_stage_only_still_targets_branch() -> Result<()> {
             "t",
             Some("audit"),
             false,
+            HashMap::new(),
         )
         .await,
     )
@@ -336,5 +424,187 @@ async fn commit_branch_without_stage_only_still_targets_branch() -> Result<()> {
     assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
     let branch_id = ref_id(&table, "audit").expect("audit");
     assert_ne!(branch_id, main_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_with_snapshot_properties_stamps_current_summary() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_props_append", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            false,
+            HashMap::from([
+                ("wap.id".to_string(), "append-wap".to_string()),
+                ("custom.key".to_string(), "custom-value".to_string()),
+            ]),
+        )
+        .await,
+    )
+    .await;
+    run_sql(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    let summary = table.metadata().current_snapshot().expect("head").summary();
+    assert_eq!(
+        summary.additional_properties.get("wap.id"),
+        Some(&"append-wap".to_string())
+    );
+    assert_eq!(
+        summary.additional_properties.get("custom.key"),
+        Some(&"custom-value".to_string())
+    );
+    assert!(
+        !summary
+            .additional_properties
+            .get("engine.operation-id")
+            .expect("operation id stamp")
+            .is_empty()
+    );
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_overwrite_with_snapshot_properties_stamps_current_summary() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_props_overwrite", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let main_id = seed(&catalog, &namespace).await;
+
+    let ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            false,
+            HashMap::from([
+                ("wap.id".to_string(), "overwrite-wap".to_string()),
+                ("custom.key".to_string(), "custom-value".to_string()),
+            ]),
+        )
+        .await,
+    )
+    .await;
+    run_sql(&ctx, "INSERT OVERWRITE t VALUES (9, 'z')").await;
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    let moved = table.metadata().current_snapshot_id().expect("moved");
+    assert_ne!(moved, main_id);
+    let summary = table.metadata().current_snapshot().expect("head").summary();
+    assert_eq!(
+        summary.additional_properties.get("wap.id"),
+        Some(&"overwrite-wap".to_string())
+    );
+    assert_eq!(
+        summary.additional_properties.get("custom.key"),
+        Some(&"custom-value".to_string())
+    );
+    assert!(
+        !summary
+            .additional_properties
+            .get("engine.operation-id")
+            .expect("operation id stamp")
+            .is_empty()
+    );
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![9]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_properties_caller_operation_id_does_not_win() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_props_precedence", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            false,
+            HashMap::from([
+                ("engine.operation-id".to_string(), "forged".to_string()),
+                ("k".to_string(), "v".to_string()),
+            ]),
+        )
+        .await,
+    )
+    .await;
+    run_sql(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    let summary = table.metadata().current_snapshot().expect("head").summary();
+    let operation_id = summary
+        .additional_properties
+        .get("engine.operation-id")
+        .expect("operation id stamp");
+    assert_ne!(operation_id, "forged");
+    assert!(!operation_id.is_empty());
+    assert_eq!(
+        summary.additional_properties.get("k"),
+        Some(&"v".to_string())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_only_with_snapshot_properties_stamps_staged_snapshot() -> Result<()> {
+    let catalog = memory_catalog().await;
+    let namespace = create_table(&catalog, "ns_props_staged", "t", HashMap::new()).await;
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let main_id = seed(&catalog, &namespace).await;
+
+    let staged_ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            true,
+            HashMap::from([("wap.id".to_string(), "staged-wap".to_string())]),
+        )
+        .await,
+    )
+    .await;
+    run_sql(&staged_ctx, "INSERT INTO t VALUES (2, 'b')").await;
+
+    let table = load(catalog.as_ref(), &namespace, "t").await;
+    assert_eq!(table.metadata().current_snapshot_id(), Some(main_id));
+    assert_eq!(ref_id(&table, MAIN_BRANCH), Some(main_id));
+    let staged = staged_snapshot_for_wap_id(table.metadata(), "staged-wap")?;
+    assert_ne!(staged.snapshot_id(), main_id);
+    assert_eq!(
+        staged.summary().additional_properties.get("wap.id"),
+        Some(&"staged-wap".to_string())
+    );
+    assert!(
+        !staged
+            .summary()
+            .additional_properties
+            .get("engine.operation-id")
+            .expect("operation id stamp")
+            .is_empty()
+    );
+
+    let ctx = register(
+        provider(
+            catalog.clone(),
+            namespace.clone(),
+            "t",
+            None,
+            false,
+            HashMap::new(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(query_ids(&ctx, "SELECT id FROM t").await, vec![1]);
     Ok(())
 }
