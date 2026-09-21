@@ -136,6 +136,7 @@ pub struct RowDeltaAction {
     /// `MergingSnapshotProducer.caseSensitive`). `true` by default, as in Java. `false` switches every
     /// filter binding this action's `validate` performs. See [`RowDeltaAction::case_sensitive`].
     case_sensitive: bool,
+    pub(crate) stage_only: bool,
     pub(crate) target_branch: String,
 }
 
@@ -157,6 +158,7 @@ impl RowDeltaAction {
             removed_delete_files: vec![],
             // Java `MergingSnapshotProducer` defaults this to true.
             case_sensitive: true,
+            stage_only: false,
             target_branch: MAIN_BRANCH.to_string(),
         }
     }
@@ -166,7 +168,6 @@ impl RowDeltaAction {
         self.added_data_files.extend(data_files);
         self
     }
-
     /// Add row-level DELETE files (Java `RowDelta.addDeletes`).
     ///
     /// Java has a separate `DeleteFile` type. Here both kinds are [`DataFile`] and the content type
@@ -176,7 +177,6 @@ impl RowDeltaAction {
             .extend(delete_files.into_iter().map(|file| (file, None)));
         self
     }
-
     /// Add a DELETE file with an explicit data sequence number (Java `addFile(DeleteFile, long)`).
     ///
     /// A rewritten sibling DV keeps the original data seq so its applicability window is unchanged.
@@ -189,7 +189,6 @@ impl RowDeltaAction {
             .push((delete_file, Some(sequence_number)));
         self
     }
-
     /// Record DATA files this row delta removes (Java `RowDelta.removeRows(DataFile)`). The files drop
     /// from the table in this same snapshot, and they drive the `validateNoNewDeletesForDataFiles`
     /// check. Repeated calls accumulate.
@@ -570,6 +569,7 @@ impl TransactionAction for RowDeltaAction {
             FirstRowIdPolicy::Suppress,
         )?
         .with_removed_delete_files(self.removed_delete_files.clone())
+        .with_stage_only(self.stage_only)
         .with_target_branch(self.target_branch.clone())?;
         let snapshot_producer = if self
             .added_delete_files

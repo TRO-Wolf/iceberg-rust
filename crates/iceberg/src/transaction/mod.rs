@@ -317,7 +317,6 @@ impl Transaction {
     pub fn manage_snapshots(&self) -> ManageSnapshotsAction {
         ManageSnapshotsAction::new()
     }
-
     /// Creates an expire-snapshots action: the METADATA retention semantics of Java
     /// `ExpireSnapshots`. It covers per-branch age and count retention, ref expiry where `main`
     /// never expires, unreferenced-snapshot retention, and explicit
@@ -342,27 +341,27 @@ impl Transaction {
         CherryPickAction::new(snapshot_id)
     }
 
+    #[allow(missing_docs)]
+    pub fn publish_changes(&self, wap_id: &str) -> PublishChangesAction {
+        PublishChangesAction::new(wap_id)
+    }
     /// Creates an update-partition-spec action (partition evolution: add/remove/rename fields).
     pub fn update_partition_spec(&self) -> UpdatePartitionSpecAction {
         UpdatePartitionSpecAction::new()
     }
-
     /// Creates an update-schema action (schema evolution: add/rename/update/delete/move columns,
     /// identifier fields, union-by-name).
     pub fn update_schema(&self) -> UpdateSchemaAction {
         UpdateSchemaAction::new()
     }
-
     /// Set the location of table
     pub fn update_location(&self) -> UpdateLocationAction {
         UpdateLocationAction::new()
     }
-
     /// Update the statistics of table
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
     }
-
     /// Update the PARTITION statistics of the table (Java `Table.updatePartitionStatistics()` →
     /// `UpdatePartitionStatistics`). Set/remove [`PartitionStatisticsFile`](crate::spec::PartitionStatisticsFile)
     /// entries keyed by snapshot id; the commit attaches the table-UUID requirement (a non-snapshot

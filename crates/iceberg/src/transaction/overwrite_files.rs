@@ -117,6 +117,7 @@ pub struct OverwriteFilesAction {
     /// Defaults to `true`, the Java default. `false` switches EVERY filter binding this action performs to
     /// case-insensitive column resolution. See [`OverwriteFilesAction::case_sensitive`].
     case_sensitive: bool,
+    pub(crate) stage_only: bool,
     pub(crate) target_branch: String,
 }
 
@@ -138,6 +139,7 @@ impl OverwriteFilesAction {
             allow_empty_commit: false,
             // Java `MergingSnapshotProducer` defaults `caseSensitive` to true.
             case_sensitive: true,
+            stage_only: false,
             target_branch: MAIN_BRANCH.to_string(),
         }
     }
@@ -147,13 +149,11 @@ impl OverwriteFilesAction {
         self.added_data_files.push(data_file);
         self
     }
-
     /// Add multiple [`DataFile`]s to the table.
     pub fn add_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
         self.added_data_files.extend(data_files);
         self
     }
-
     /// Delete a single file by its fully-qualified path.
     ///
     /// To remove a file from the table, this path must equal a path in the table's metadata (mirrors
@@ -168,7 +168,6 @@ impl OverwriteFilesAction {
         self.delete_paths.extend(paths.into_iter().map(Into::into));
         self
     }
-
     /// Delete multiple files supplied as full [`DataFile`]s (Java `OverwriteFiles.deleteFile(DataFile)`).
     ///
     /// Each path joins the delete set that drives the manifest rewrite, like [`Self::delete_file`]. The full
@@ -400,6 +399,7 @@ impl TransactionAction for OverwriteFilesAction {
             self.added_data_files.clone(),
             FirstRowIdPolicy::Suppress,
         )?
+        .with_stage_only(self.stage_only)
         .with_target_branch(self.target_branch.clone())?;
 
         // Validate the added files like fast append: content type, spec match, partition values. The
