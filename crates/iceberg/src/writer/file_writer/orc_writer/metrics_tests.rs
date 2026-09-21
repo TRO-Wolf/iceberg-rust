@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::spec::{
-    ListType, MapType, NestedField, PrimitiveLiteral, PrimitiveType, Schema, Type,
+    ListType, MapType, MetricsMode, NestedField, PrimitiveLiteral, PrimitiveType, Schema, Type,
     METRICS_MODE_COLUMN_CONF_PREFIX, METRICS_MODE_DEFAULT_KEY,
 };
 
@@ -262,12 +262,20 @@ fn test_string_bounds_are_truncated_by_the_configured_mode() {
     let lower = metrics.lower_bounds.get(&3).expect("a string lower bound");
     match lower.literal() {
         PrimitiveLiteral::String(value) => assert_eq!(
-            value.len(),
-            16,
-            "the default metrics mode truncates string bounds to 16"
+            value.as_str(),
+            &long[..16],
+            "the default metrics mode truncates the lower bound to the first 16 characters"
         ),
         other => panic!("expected a string bound, got {other:?}"),
     }
+    let expected_upper = MetricsMode::Truncate(16)
+        .truncate_upper_bound(&Datum::string(long.clone()))
+        .expect("a forty-character max has a valid truncated upper bound");
+    assert_eq!(
+        metrics.upper_bounds.get(&3),
+        Some(&expected_upper),
+        "the default metrics mode truncates the upper bound up"
+    );
 }
 
 fn renumbered_schema() -> Schema {
@@ -363,4 +371,46 @@ fn test_column_sizes_map_orc_column_indices_back_to_field_ids() {
         Some(&15),
         "stripe sizes accumulate per field id"
     );
+}
+
+#[test]
+fn test_column_sizes_key_nested_structs_by_field_id_not_orc_index() {
+    let schema = Schema::builder()
+        .with_schema_id(1)
+        .with_fields(vec![Arc::new(NestedField::optional(
+            20,
+            "st",
+            Type::Struct(StructType::new(vec![
+                NestedField::required(21, "x", Type::Primitive(PrimitiveType::Int)).into(),
+            ])),
+        ))])
+        .build()
+        .expect("build the nested schema");
+    let orc_schema = crate::writer::file_writer::orc_writer::orc_type::build_orc_schema(&schema)
+        .expect("map the schema");
+    assert_eq!(orc_schema.columns[1].field_id, Some(20));
+    assert_eq!(orc_schema.columns[2].field_id, Some(21));
+    let mut collector = OrcMetricsCollector::new(&schema, &MetricsConfig::default());
+    collector.observe_stripe_column_sizes(
+        &orc_schema,
+        &HashMap::from([(1usize, 11u64), (2usize, 7u64)]),
+    );
+    let metrics = collector.build();
+
+    assert_eq!(
+        metrics.column_sizes.get(&20),
+        Some(&11),
+        "ORC index 1 maps to struct field id 20, not to key 1"
+    );
+    assert_eq!(
+        metrics.column_sizes.get(&21),
+        Some(&7),
+        "ORC index 2 maps to child field id 21, not to key 2"
+    );
+    for orc_index in [0i32, 1, 2] {
+        assert!(
+            !metrics.column_sizes.contains_key(&orc_index),
+            "ORC index {orc_index} must not appear as a field id key"
+        );
+    }
 }
