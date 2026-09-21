@@ -709,6 +709,36 @@ mod tests {
     }
 
     #[test]
+    fn orc_bad_properties_fail_loud() {
+        let schema = Arc::new(schema_simple());
+        for (key, value, kind, message) in [
+            (
+                "write.orc.stripe-size-bytes",
+                "abc",
+                ErrorKind::DataInvalid,
+                "Invalid value for write.orc.stripe-size-bytes: abc",
+            ),
+            (
+                "write.orc.compression-codec",
+                "brotli",
+                ErrorKind::FeatureUnsupported,
+                "ORC compression codec 'brotli' is not supported by the Rust ORC writer (supported: none, zlib)",
+            ),
+        ] {
+            let err = AnyFileWriterBuilder::for_format(
+                DataFileFormat::Orc,
+                schema.clone(),
+                &HashMap::from([(key.to_string(), value.to_string())]),
+                MetricsConfig::default(),
+                FieldMatchMode::Id,
+            )
+            .expect_err("a bogus ORC property must fail");
+            assert_eq!(err.kind(), kind);
+            assert_eq!(err.message(), message);
+        }
+    }
+
+    #[test]
     fn puffin_arm_errors_naming_format() {
         let schema = Arc::new(schema_simple());
         let err = AnyFileWriterBuilder::for_format(
