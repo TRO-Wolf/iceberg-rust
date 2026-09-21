@@ -196,7 +196,10 @@ impl IcebergMetadataTableProvider {
                 None => metadata_table.metadata_log_entries().scan().await,
             },
             MetadataTableType::Partitions => match snapshot_id {
-                Some(_) => Err(snapshot_scope_refused(&table_name)),
+                Some(id) => match PartitionsTable::try_at_snapshot(&self.table, id) {
+                    Ok(scoped) => scoped.scan().await,
+                    Err(err) => Err(err),
+                },
                 None => metadata_table.partitions().scan().await,
             },
             MetadataTableType::AllManifests => match snapshot_id {
@@ -204,7 +207,10 @@ impl IcebergMetadataTableProvider {
                 None => metadata_table.all_manifests().scan().await,
             },
             MetadataTableType::PositionDeletes => match snapshot_id {
-                Some(_) => Err(snapshot_scope_refused(&table_name)),
+                Some(id) => match PositionDeletesTable::try_at_snapshot(&self.table, id) {
+                    Ok(scoped) => scoped.scan().await,
+                    Err(err) => Err(err),
+                },
                 None => metadata_table.position_deletes().scan().await,
             },
         }
@@ -409,13 +415,11 @@ mod tests {
         );
     }
 
-    const SNAPSHOT_UNSCOPED_TYPES: [MetadataTableType; 11] = [
+    const SNAPSHOT_UNSCOPED_TYPES: [MetadataTableType; 9] = [
         MetadataTableType::Snapshots,
         MetadataTableType::History,
         MetadataTableType::Refs,
         MetadataTableType::MetadataLogEntries,
-        MetadataTableType::Partitions,
-        MetadataTableType::PositionDeletes,
         MetadataTableType::AllFiles,
         MetadataTableType::AllDataFiles,
         MetadataTableType::AllDeleteFiles,
@@ -423,12 +427,14 @@ mod tests {
         MetadataTableType::AllManifests,
     ];
 
-    const SNAPSHOT_SCOPED_TYPES: [MetadataTableType; 5] = [
+    const SNAPSHOT_SCOPED_TYPES: [MetadataTableType; 7] = [
         MetadataTableType::Files,
         MetadataTableType::DataFiles,
         MetadataTableType::DeleteFiles,
         MetadataTableType::Entries,
         MetadataTableType::Manifests,
+        MetadataTableType::Partitions,
+        MetadataTableType::PositionDeletes,
     ];
 
     const UNKNOWN_SNAPSHOT_ID: i64 = 999_999_999_999;
@@ -555,7 +561,7 @@ mod tests {
             );
             refused += 1;
         }
-        assert_eq!(refused, 11);
+        assert_eq!(refused, 9);
     }
 
     #[tokio::test]
@@ -586,7 +592,7 @@ mod tests {
             );
             failed += 1;
         }
-        assert_eq!(failed, 5);
+        assert_eq!(failed, 7);
     }
 
     #[tokio::test]
@@ -604,6 +610,73 @@ mod tests {
             assert_eq!(actual, expected, "Some(current) must match None for {name}");
             matched += 1;
         }
-        assert_eq!(matched, 5);
+        assert_eq!(matched, 7);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_scope_some_serves_partitions_and_position_deletes() {
+        let table = test_table().await;
+        let snapshot_id = table
+            .metadata()
+            .current_snapshot_id()
+            .expect("fixture has a current snapshot");
+        for r#type in [
+            MetadataTableType::Partitions,
+            MetadataTableType::PositionDeletes,
+        ] {
+            let name = r#type.as_str().to_owned();
+            let expected = provider_scan_outcome(&table, r#type.clone(), None).await;
+            let actual = provider_scan_outcome(&table, r#type, Some(snapshot_id)).await;
+            match &actual {
+                Ok(_) => {}
+                Err(message) => assert!(
+                    !message.contains("snapshot scope not yet served"),
+                    "Some must serve rows for {name}, got refusal: {message}"
+                ),
+            }
+            assert_eq!(actual, expected, "Some(current) must match None for {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_scope_some_refuses_all_star_tables() {
+        let table = test_table().await;
+        let snapshot_id = table
+            .metadata()
+            .current_snapshot_id()
+            .expect("fixture has a current snapshot");
+        let mut refused = 0u32;
+        for r#type in [
+            MetadataTableType::AllFiles,
+            MetadataTableType::AllDataFiles,
+            MetadataTableType::AllDeleteFiles,
+            MetadataTableType::AllEntries,
+            MetadataTableType::AllManifests,
+        ] {
+            let name = r#type.as_str().to_owned();
+            let provider =
+                IcebergMetadataTableProvider::try_new(table.clone(), r#type, Some(snapshot_id))
+                    .unwrap_or_else(|e| panic!("try_new failed for {name}: {e}"));
+            let err = match provider.scan().await {
+                Ok(_) => panic!("scan with Some must refuse for {name}"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                iceberg_kind(&err),
+                iceberg::ErrorKind::FeatureUnsupported,
+                "refusal kind for {name}"
+            );
+            let message = datafusion_message(err);
+            assert!(
+                message.contains(&name),
+                "refusal must name the table {name}, got: {message}"
+            );
+            assert!(
+                message.contains("snapshot scope not yet served"),
+                "refusal must state snapshot scope is unserved, got: {message}"
+            );
+            refused += 1;
+        }
+        assert_eq!(refused, 5);
     }
 }
