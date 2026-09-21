@@ -271,7 +271,9 @@ mod tests {
         let mut shift = 0u32;
         let mut raw = 0u64;
         loop {
-            let byte = *rest.first().expect("the codec value must be length-prefixed");
+            let byte = *rest
+                .first()
+                .expect("the codec value must be length-prefixed");
             rest = &rest[1..];
             raw |= u64::from(byte & 0x7f) << shift;
             shift += 7;
@@ -281,6 +283,41 @@ mod tests {
         }
         let len = (raw >> 1) as usize ^ 0usize.wrapping_sub((raw & 1) as usize);
         String::from_utf8(rest[..len].to_vec()).expect("the codec name must be utf-8")
+    }
+
+    async fn avro_codec_name_and_rows_for_property(value: &str) -> (String, usize) {
+        let (_temp, file_io, location_gen) = make_temp();
+        let schema = Arc::new(schema_simple());
+        let properties = HashMap::from([(
+            "write.avro.compression-codec".to_string(),
+            value.to_string(),
+        )]);
+        let builder = AnyFileWriterBuilder::for_format(
+            DataFileFormat::Avro,
+            schema.clone(),
+            &properties,
+            MetricsConfig::default(),
+            FieldMatchMode::Id,
+        )
+        .expect("route the avro arm");
+        let batch = simple_batch(&schema);
+        let (path, builders) = write_single_batch(
+            &builder,
+            &file_io,
+            &location_gen,
+            "any-avro-alias",
+            DataFileFormat::Avro,
+            &batch,
+        )
+        .await;
+        assert_eq!(builders.len(), 1);
+        let bytes = read_back_bytes(&file_io, &path).await;
+        let codec = ocf_codec_name(&bytes);
+        let rows = AvroReader::new(&bytes[..])
+            .expect("open the OCF")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("decode the OCF rows");
+        (codec, rows.len())
     }
 
     fn repeated_batch(schema: &Schema) -> RecordBatch {
@@ -379,10 +416,8 @@ mod tests {
             &batch,
         )
         .await;
-        let enabled_properties = HashMap::from([(
-            "parquet.enable.dictionary".to_string(),
-            "true".to_string(),
-        )]);
+        let enabled_properties =
+            HashMap::from([("parquet.enable.dictionary".to_string(), "true".to_string())]);
         let enabled_builder = AnyFileWriterBuilder::for_format(
             DataFileFormat::Parquet,
             schema.clone(),
@@ -579,27 +614,56 @@ mod tests {
         assert_eq!(rows.len(), 3);
     }
 
+    #[tokio::test]
+    async fn avro_java_alias_gzip_writes_deflate() {
+        let (codec, rows) = avro_codec_name_and_rows_for_property("gzip").await;
+        assert_eq!(codec, "deflate");
+        assert_eq!(rows, 3);
+    }
+
+    #[tokio::test]
+    async fn avro_java_alias_zstd_writes_zstandard() {
+        let (codec, rows) = avro_codec_name_and_rows_for_property("zstd").await;
+        assert_eq!(codec, "zstandard");
+        assert_eq!(rows, 3);
+    }
+
+    #[tokio::test]
+    async fn avro_java_alias_uncompressed_writes_null() {
+        let (codec, rows) = avro_codec_name_and_rows_for_property("uncompressed").await;
+        assert_eq!(codec, "null");
+        assert_eq!(rows, 3);
+    }
+
+    #[tokio::test]
+    async fn avro_codec_name_folds_case_and_whitespace() {
+        let (codec, rows) = avro_codec_name_and_rows_for_property("  GZip  ").await;
+        assert_eq!(codec, "deflate");
+        assert_eq!(rows, 3);
+    }
+
     #[test]
     fn avro_bogus_codec_errors_naming_value() {
-        let schema = Arc::new(schema_simple());
-        let properties = HashMap::from([(
-            "write.avro.compression-codec".to_string(),
-            "broccoli".to_string(),
-        )]);
-        let err = AnyFileWriterBuilder::for_format(
-            DataFileFormat::Avro,
-            schema,
-            &properties,
-            MetricsConfig::default(),
-            FieldMatchMode::Id,
-        )
-        .expect_err("a bogus codec must fail");
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.message().contains("broccoli"),
-            "error must name the bad value, got {}",
-            err.message()
-        );
+        for value in ["broccoli", "snappy", "bzip2", "xz"] {
+            let schema = Arc::new(schema_simple());
+            let properties = HashMap::from([(
+                "write.avro.compression-codec".to_string(),
+                value.to_string(),
+            )]);
+            let err = AnyFileWriterBuilder::for_format(
+                DataFileFormat::Avro,
+                schema,
+                &properties,
+                MetricsConfig::default(),
+                FieldMatchMode::Id,
+            )
+            .expect_err("an unsupported codec must fail");
+            assert_eq!(err.kind(), ErrorKind::DataInvalid);
+            assert_eq!(
+                err.message(),
+                format!("Invalid value for write.avro.compression-codec: {value}")
+            );
+        }
     }
 
     #[tokio::test]
