@@ -246,7 +246,58 @@ fn test_inflate_chunks(mut raw: &[u8]) -> Vec<u8> {
     out
 }
 
-fn test_footer_row_counts(file: &[u8]) -> (u64, Vec<u64>) {
+struct TestFileLayout {
+    footer_rows: u64,
+    stripe_rows: Vec<u64>,
+    stripe_offsets: Vec<u64>,
+    header_length: u64,
+    content_length: u64,
+    row_index_stride: u64,
+    footer_start: u64,
+    postscript_length: u64,
+    postscript_footer_length: u64,
+    postscript_compression: u64,
+    postscript_block_size: Option<u64>,
+    postscript_version: Vec<u64>,
+    postscript_magic: Vec<u8>,
+    stripe_timezones: Vec<Vec<u8>>,
+}
+
+fn test_read_stripe_record(body: &[u8]) -> (u64, u64, u64, u64) {
+    let mut inner = 0;
+    let mut offset = 0;
+    let mut data_length = 0;
+    let mut footer_length = 0;
+    let mut rows = 0;
+    while inner < body.len() {
+        let sub = test_read_varint(body, &mut inner);
+        match (sub >> 3, sub & 7) {
+            (1, 0) => offset = test_read_varint(body, &mut inner),
+            (3, 0) => data_length = test_read_varint(body, &mut inner),
+            (4, 0) => footer_length = test_read_varint(body, &mut inner),
+            (5, 0) => rows = test_read_varint(body, &mut inner),
+            (_, wire) => test_skip_field(body, &mut inner, wire),
+        }
+    }
+    (offset, data_length, footer_length, rows)
+}
+
+fn test_read_timezone(stripe_footer: &[u8]) -> Vec<u8> {
+    let mut at = 0;
+    while at < stripe_footer.len() {
+        let key = test_read_varint(stripe_footer, &mut at);
+        match (key >> 3, key & 7) {
+            (3, 2) => {
+                let len = test_read_varint(stripe_footer, &mut at) as usize;
+                return stripe_footer[at..at + len].to_vec();
+            }
+            (_, wire) => test_skip_field(stripe_footer, &mut at, wire),
+        }
+    }
+    Vec::new()
+}
+
+fn test_file_layout(file: &[u8]) -> TestFileLayout {
     let ps_len = usize::from(*file.last().expect("a non-empty ORC file"));
     let ps_end = file.len() - 1;
     let ps_start = ps_end - ps_len;
@@ -254,11 +305,29 @@ fn test_footer_row_counts(file: &[u8]) -> (u64, Vec<u64>) {
     let mut at = 0;
     let mut footer_length = 0usize;
     let mut compression = 0u64;
+    let mut block_size = None;
+    let mut version = Vec::new();
+    let mut magic = Vec::new();
     while at < ps.len() {
         let key = test_read_varint(ps, &mut at);
         match (key >> 3, key & 7) {
             (1, 0) => footer_length = test_read_varint(ps, &mut at) as usize,
             (2, 0) => compression = test_read_varint(ps, &mut at),
+            (3, 0) => block_size = Some(test_read_varint(ps, &mut at)),
+            (4, 2) => {
+                let len = test_read_varint(ps, &mut at) as usize;
+                let packed = &ps[at..at + len];
+                at += len;
+                let mut inner = 0;
+                while inner < packed.len() {
+                    version.push(test_read_varint(packed, &mut inner));
+                }
+            }
+            (8000, 2) => {
+                let len = test_read_varint(ps, &mut at) as usize;
+                magic = ps[at..at + len].to_vec();
+                at += len;
+            }
             (_, wire) => test_skip_field(ps, &mut at, wire),
         }
     }
@@ -271,32 +340,58 @@ fn test_footer_row_counts(file: &[u8]) -> (u64, Vec<u64>) {
     };
     let mut at = 0;
     let mut number_of_rows = None;
-    let mut stripe_rows = Vec::new();
+    let mut header_length = 0;
+    let mut content_length = 0;
+    let mut row_index_stride = 0;
+    let mut stripes = Vec::new();
     while at < footer.len() {
         let key = test_read_varint(&footer, &mut at);
         match (key >> 3, key & 7) {
+            (1, 0) => header_length = test_read_varint(&footer, &mut at),
+            (2, 0) => content_length = test_read_varint(&footer, &mut at),
             (6, 0) => number_of_rows = Some(test_read_varint(&footer, &mut at)),
+            (8, 0) => row_index_stride = test_read_varint(&footer, &mut at),
             (3, 2) => {
                 let len = test_read_varint(&footer, &mut at) as usize;
-                let body = &footer[at..at + len];
+                stripes.push(test_read_stripe_record(&footer[at..at + len]));
                 at += len;
-                let mut inner = 0;
-                while inner < body.len() {
-                    let sub = test_read_varint(body, &mut inner);
-                    if (sub >> 3, sub & 7) == (5, 0) {
-                        stripe_rows.push(test_read_varint(body, &mut inner));
-                    } else {
-                        test_skip_field(body, &mut inner, sub & 7);
-                    }
-                }
             }
             (_, wire) => test_skip_field(&footer, &mut at, wire),
         }
     }
-    (
-        number_of_rows.expect("Footer.numberOfRows must be present"),
+    let mut stripe_rows = Vec::with_capacity(stripes.len());
+    let mut stripe_offsets = Vec::with_capacity(stripes.len());
+    let mut stripe_timezones = Vec::with_capacity(stripes.len());
+    for (offset, data_length, stripe_footer_length, rows) in &stripes {
+        stripe_rows.push(*rows);
+        stripe_offsets.push(*offset);
+        let start = (*offset + *data_length) as usize;
+        let end = start + *stripe_footer_length as usize;
+        let raw_stripe_footer = &file[start..end];
+        let stripe_footer = match compression {
+            0 => raw_stripe_footer.to_vec(),
+            1 => test_inflate_chunks(raw_stripe_footer),
+            other => panic!("unexpected test stripe compression {other}"),
+        };
+        stripe_timezones.push(test_read_timezone(&stripe_footer));
+    }
+    TestFileLayout {
+        footer_rows: number_of_rows.expect("Footer.numberOfRows must be present"),
         stripe_rows,
-    )
+        stripe_offsets,
+        header_length,
+        content_length,
+        row_index_stride,
+        footer_start: u64::try_from(footer_start).expect("the test file fits in a u64"),
+        postscript_length: u64::try_from(ps_len).expect("the test file fits in a u64"),
+        postscript_footer_length: u64::try_from(footer_length)
+            .expect("the test footer fits in a u64"),
+        postscript_compression: compression,
+        postscript_block_size: block_size,
+        postscript_version: version,
+        postscript_magic: magic,
+        stripe_timezones,
+    }
 }
 
 #[tokio::test]
@@ -733,33 +828,95 @@ async fn test_a_small_stripe_size_produces_several_stripes_that_still_round_trip
         .build()
         .expect("build the data file");
     assert_eq!(data_file.record_count(), 9);
-    assert_eq!(
-        data_file.split_offsets().map(<[i64]>::len),
-        Some(3),
-        "one split offset per stripe"
-    );
+    let split_offsets = data_file
+        .split_offsets()
+        .expect("split offsets are set")
+        .to_vec();
+    assert_eq!(split_offsets.len(), 3, "one split offset per stripe");
 
     let bytes = read_back_bytes(&file_io, &path).await;
-    let (footer_rows, stripe_rows) = test_footer_row_counts(&bytes);
+    let layout = test_file_layout(&bytes);
     assert_eq!(
-        stripe_rows,
+        layout.stripe_rows,
         vec![3, 3, 3],
         "one 3-row batch per stripe in the emitted footer"
     );
     assert_eq!(
-        footer_rows,
+        layout.footer_rows,
         data_file.record_count(),
         "Footer.numberOfRows must equal the committed record count"
     );
     assert_eq!(
-        footer_rows,
-        stripe_rows.iter().sum::<u64>(),
+        layout.footer_rows,
+        layout.stripe_rows.iter().sum::<u64>(),
         "Footer.numberOfRows must equal the sum of stripe row counts"
     );
     assert_eq!(
         data_file.file_size_in_bytes(),
         u64::try_from(bytes.len()).expect("the test file fits in a u64"),
         "file_size_in_bytes must equal the exact on-disk byte count"
+    );
+    assert_eq!(
+        layout.header_length,
+        u64::try_from(ORC_MAGIC.len()).expect("the test magic fits in a u64"),
+        "the footer header length must cover the ORC magic"
+    );
+    assert_eq!(
+        layout.content_length, layout.footer_start,
+        "the footer content length must land on the real footer bytes"
+    );
+    assert_eq!(
+        layout.row_index_stride, 0,
+        "no row-index streams are written, so the emitted stride is 0"
+    );
+    assert_eq!(
+        split_offsets[0],
+        i64::try_from(ORC_MAGIC.len()).expect("the test magic fits in an i64"),
+        "the first stripe starts right after the ORC magic"
+    );
+    let footer_offsets: Vec<i64> = layout
+        .stripe_offsets
+        .iter()
+        .map(|offset| i64::try_from(*offset).expect("the test offsets fit in an i64"))
+        .collect();
+    assert_eq!(
+        split_offsets, footer_offsets,
+        "split offsets must match the footer stripe offsets"
+    );
+    assert_eq!(
+        layout.footer_start
+            + layout.postscript_footer_length
+            + layout.postscript_length
+            + 1,
+        u64::try_from(bytes.len()).expect("the test file fits in a u64"),
+        "the PostScript footer length must land on the real footer bytes"
+    );
+    assert_eq!(
+        layout.postscript_compression, 1,
+        "the default codec is zlib"
+    );
+    assert_eq!(
+        layout.postscript_block_size,
+        Some(
+            u64::try_from(DEFAULT_COMPRESSION_BLOCK_SIZE)
+                .expect("the test block size fits in a u64")
+        ),
+        "the PostScript must declare the compression block size"
+    );
+    assert_eq!(
+        layout.postscript_version,
+        vec![0, 12],
+        "the PostScript must declare file version 0.12"
+    );
+    assert_eq!(
+        layout.postscript_magic,
+        b"ORC".to_vec(),
+        "the PostScript must carry the ORC magic"
+    );
+    assert_eq!(
+        layout.stripe_timezones,
+        vec![b"UTC".to_vec(), b"UTC".to_vec(), b"UTC".to_vec()],
+        "every stripe footer must declare the UTC writer timezone"
     );
     let decoded = read_orc_data_bytes(bytes, &schema, 1024).expect("read the multi-stripe file");
     let expected = arrow_select::concat::concat_batches(&batch.schema(), &batches)
@@ -800,6 +957,17 @@ async fn test_uncompressed_orc_round_trips_too() {
     )
     .await;
     let bytes = read_back_bytes(&file_io, &path).await;
+    let layout = test_file_layout(&bytes);
+    assert_eq!(
+        layout.postscript_compression, 0,
+        "the file must actually be uncompressed"
+    );
+    assert_eq!(
+        layout.postscript_block_size, None,
+        "an uncompressed file declares no compression block size"
+    );
+    assert_eq!(layout.footer_rows, 3, "all three rows reach the footer");
+    assert_eq!(layout.stripe_rows, vec![3], "one stripe holds all rows");
     let decoded = read_orc_data_bytes(bytes, &schema, 1024).expect("read the uncompressed file");
     let read = arrow_select::concat::concat_batches(&written.schema(), &decoded)
         .expect("concatenate the decoded batches");
