@@ -478,13 +478,7 @@ mod tests {
             &batch,
         )
         .await;
-        assert_eq!(builders.len(), 1);
-        let data_file = builders
-            .into_iter()
-            .next()
-            .expect("one builder")
-            .build()
-            .expect("build the data file");
+        let data_file = only_data_file(builders);
         assert_eq!(data_file.file_format(), DataFileFormat::Parquet);
         assert_eq!(data_file.record_count(), 3);
         assert!(data_file.file_size_in_bytes() > 0);
@@ -612,13 +606,7 @@ mod tests {
             &batch,
         )
         .await;
-        assert_eq!(builders.len(), 1);
-        let data_file = builders
-            .into_iter()
-            .next()
-            .expect("one builder")
-            .build()
-            .expect("build the data file");
+        let data_file = only_data_file(builders);
         assert_eq!(data_file.record_count(), 3);
         assert_eq!(data_file.nan_value_counts().get(&2), Some(&1));
         let name_builder = AnyFileWriterBuilder::for_format(
@@ -663,13 +651,7 @@ mod tests {
             &batch,
         )
         .await;
-        assert_eq!(builders.len(), 1);
-        let data_file = builders
-            .into_iter()
-            .next()
-            .expect("one builder")
-            .build()
-            .expect("build the data file");
+        let data_file = only_data_file(builders);
         assert_eq!(data_file.file_format(), DataFileFormat::Avro);
         assert_eq!(data_file.record_count(), 3);
         assert!(data_file.file_size_in_bytes() > 0);
@@ -707,13 +689,7 @@ mod tests {
             &batch,
         )
         .await;
-        assert_eq!(builders.len(), 1);
-        let data_file = builders
-            .into_iter()
-            .next()
-            .expect("one builder")
-            .build()
-            .expect("build the data file");
+        let data_file = only_data_file(builders);
         assert_eq!(data_file.file_format(), DataFileFormat::Orc);
         assert_eq!(data_file.record_count(), 3);
         assert!(data_file.file_size_in_bytes() > 0);
@@ -901,8 +877,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn orc_metrics_restrictive_config_drops_bounds() {
+    fn only_data_file(builders: Vec<DataFileBuilder>) -> crate::writer::DataFile {
+        assert_eq!(builders.len(), 1);
+        builders
+            .into_iter()
+            .next()
+            .expect("one builder")
+            .build()
+            .expect("build the data file")
+    }
+
+    async fn metrics_bounds_pair(
+        format: DataFileFormat,
+        prefix: &str,
+    ) -> (crate::writer::DataFile, crate::writer::DataFile) {
         let (_temp, file_io, location_gen) = make_temp();
         let schema = Arc::new(schema_simple());
         let batch = simple_batch(&schema);
@@ -912,51 +900,49 @@ mod tests {
         )]))
         .expect("parse the restrictive config");
         let default_builder = AnyFileWriterBuilder::for_format(
-            DataFileFormat::Orc,
+            format,
             schema.clone(),
             &HashMap::new(),
             MetricsConfig::default(),
             FieldMatchMode::Id,
         )
-        .expect("route the default ORC arm");
+        .expect("route the default arm");
         let restrictive_builder = AnyFileWriterBuilder::for_format(
-            DataFileFormat::Orc,
+            format,
             schema.clone(),
             &HashMap::new(),
             restrictive,
             FieldMatchMode::Id,
         )
-        .expect("route the restrictive ORC arm");
-        let (_path, default_builders) = write_single_batch(
+        .expect("route the restrictive arm");
+        let (_, default_builders) = write_single_batch(
             &default_builder,
             &file_io,
             &location_gen,
-            "any-orc-default",
-            DataFileFormat::Orc,
+            &format!("{prefix}-default"),
+            format,
             &batch,
         )
         .await;
-        let (_path, restrictive_builders) = write_single_batch(
+        let (_, restrictive_builders) = write_single_batch(
             &restrictive_builder,
             &file_io,
             &location_gen,
-            "any-orc-none",
-            DataFileFormat::Orc,
+            &format!("{prefix}-none"),
+            format,
             &batch,
         )
         .await;
-        let default_file = default_builders
-            .into_iter()
-            .next()
-            .expect("one builder")
-            .build()
-            .expect("build the default data file");
-        let restrictive_file = restrictive_builders
-            .into_iter()
-            .next()
-            .expect("one builder")
-            .build()
-            .expect("build the restrictive data file");
+        (
+            only_data_file(default_builders),
+            only_data_file(restrictive_builders),
+        )
+    }
+
+    fn assert_none_drops_int_bounds(
+        default_file: &crate::writer::DataFile,
+        none_file: &crate::writer::DataFile,
+    ) {
         assert!(
             default_file.lower_bounds().contains_key(&1),
             "the default config must keep the int lower bound"
@@ -966,12 +952,25 @@ mod tests {
             "the default config must keep the int upper bound"
         );
         assert!(
-            restrictive_file.lower_bounds().is_empty(),
+            none_file.lower_bounds().is_empty(),
             "the none config must drop every lower bound"
         );
         assert!(
-            restrictive_file.upper_bounds().is_empty(),
+            none_file.upper_bounds().is_empty(),
             "the none config must drop every upper bound"
         );
+    }
+
+    #[tokio::test]
+    async fn orc_metrics_restrictive_config_drops_bounds() {
+        let (default_file, none_file) = metrics_bounds_pair(DataFileFormat::Orc, "any-orc").await;
+        assert_none_drops_int_bounds(&default_file, &none_file);
+    }
+
+    #[tokio::test]
+    async fn parquet_metrics_restrictive_config_drops_bounds() {
+        let (default_file, none_file) =
+            metrics_bounds_pair(DataFileFormat::Parquet, "any-parquet").await;
+        assert_none_drops_int_bounds(&default_file, &none_file);
     }
 }
