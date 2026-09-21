@@ -23,11 +23,11 @@ use arrow_array::builder::{BooleanBuilder, PrimitiveBuilder};
 use arrow_array::types::{Int64Type, TimestampMicrosecondType};
 use futures::{StreamExt, stream};
 
-use crate::Result;
 use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{NestedField, PrimitiveType, Type};
 use crate::table::Table;
+use crate::{Error, ErrorKind, Result};
 
 /// History table.
 ///
@@ -35,12 +35,30 @@ use crate::table::Table;
 /// update to the table's current snapshot). Mirrors Java `HistoryTable`.
 pub struct HistoryTable<'a> {
     table: &'a Table,
+    snapshot_id: Option<i64>,
 }
 
 impl<'a> HistoryTable<'a> {
     /// Create a new History table instance.
     pub fn new(table: &'a Table) -> Self {
-        Self { table }
+        Self {
+            table,
+            snapshot_id: None,
+        }
+    }
+
+    #[allow(missing_docs)]
+    pub fn try_at_snapshot(table: &'a Table, snapshot_id: i64) -> Result<Self> {
+        if table.metadata().snapshot_by_id(snapshot_id).is_none() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Cannot find snapshot: {snapshot_id}"),
+            ));
+        }
+        Ok(Self {
+            table,
+            snapshot_id: Some(snapshot_id),
+        })
     }
 
     /// Returns the iceberg schema of the history table.
@@ -72,9 +90,21 @@ impl<'a> HistoryTable<'a> {
         let schema = schema_to_arrow_schema(&self.schema())?;
         let metadata = self.table.metadata();
 
-        // The set of snapshot ids that are ancestors of (or are) the current snapshot — i.e. the
-        // parent chain walked from `current_snapshot_id`. Mirrors Java `SnapshotUtil.currentAncestorIds`.
-        let current_ancestors = current_ancestor_ids(metadata);
+        let (cutoff, ancestors) = match self.snapshot_id {
+            Some(snapshot_id) => {
+                let target = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Cannot find snapshot: {snapshot_id}"),
+                    )
+                })?;
+                (
+                    Some(target.timestamp_ms()),
+                    ancestor_ids_from(metadata, Some(snapshot_id)),
+                )
+            }
+            None => (None, current_ancestor_ids(metadata)),
+        };
 
         let mut made_current_at =
             PrimitiveBuilder::<TimestampMicrosecondType>::new().with_timezone(UTC_TIME_ZONE);
@@ -83,6 +113,9 @@ impl<'a> HistoryTable<'a> {
         let mut is_current_ancestor = BooleanBuilder::new();
 
         for entry in metadata.history() {
+            if cutoff.is_some_and(|cutoff| entry.timestamp_ms > cutoff) {
+                continue;
+            }
             made_current_at.append_value(entry.timestamp_ms * 1000);
             snapshot_id.append_value(entry.snapshot_id);
             // `parent_id` is the SNAPSHOT's parent (nullable), not the previous log entry.
@@ -91,7 +124,7 @@ impl<'a> HistoryTable<'a> {
                     .snapshot_by_id(entry.snapshot_id)
                     .and_then(|s| s.parent_snapshot_id()),
             );
-            is_current_ancestor.append_value(current_ancestors.contains(&entry.snapshot_id));
+            is_current_ancestor.append_value(ancestors.contains(&entry.snapshot_id));
         }
 
         let batch = RecordBatch::try_new(Arc::new(schema), vec![
@@ -109,11 +142,14 @@ impl<'a> HistoryTable<'a> {
 /// `parent_snapshot_id` (inclusive of the current snapshot). Mirrors Java
 /// `SnapshotUtil.currentAncestorIds(table)`.
 fn current_ancestor_ids(metadata: &crate::spec::TableMetadata) -> HashSet<i64> {
+    ancestor_ids_from(metadata, metadata.current_snapshot_id())
+}
+
+fn ancestor_ids_from(metadata: &crate::spec::TableMetadata, start: Option<i64>) -> HashSet<i64> {
     let mut ids = HashSet::new();
-    let mut current = metadata.current_snapshot_id();
+    let mut current = start;
     while let Some(id) = current {
         if !ids.insert(id) {
-            // Defensive: a malformed parent cycle would otherwise loop forever.
             break;
         }
         current = metadata
