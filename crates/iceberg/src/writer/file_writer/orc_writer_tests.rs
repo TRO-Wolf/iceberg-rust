@@ -319,6 +319,17 @@ async fn test_the_written_footer_carries_the_iceberg_id_attributes_the_reader_re
     );
 
     let layout = test_file_layout(&bytes);
+    assert!(
+        layout.type_attributes[0].is_empty(),
+        "the emitted root type must carry no iceberg attributes"
+    );
+    for attributes in layout.type_attributes.iter().skip(1) {
+        assert!(
+            attributes.contains_key("iceberg.id")
+                && attributes.contains_key("iceberg.required"),
+            "every emitted non-root type must carry iceberg.id and iceberg.required"
+        );
+    }
     for (id, key, expected) in [
         ("3", "iceberg.long-type", "LONG"),
         ("9", "iceberg.long-type", "TIME"),
@@ -712,6 +723,15 @@ async fn test_a_small_stripe_size_produces_several_stripes_that_still_round_trip
     assert_eq!(
         split_offsets, footer_offsets,
         "split offsets must match the footer stripe offsets"
+    );
+    assert!(
+        data_file.column_sizes().is_empty()
+            && data_file.value_counts().is_empty()
+            && data_file.null_value_counts().is_empty()
+            && data_file.nan_value_counts().is_empty()
+            && data_file.lower_bounds().is_empty()
+            && data_file.upper_bounds().is_empty(),
+        "an ORC data file must carry no column metrics"
     );
     assert_eq!(
         layout.footer_start
