@@ -489,49 +489,41 @@ mod tests {
         let (_temp, file_io, location_gen) = make_temp();
         let schema = Arc::new(schema_simple());
         let batch = repeated_batch(&schema);
-        let unset_builder = for_format_default(DataFileFormat::Parquet, schema.clone());
-        let (unset_path, _) = write_single_batch(
-            &unset_builder,
-            &file_io,
-            &location_gen,
-            "any-parquet-dict-unset",
-            DataFileFormat::Parquet,
-            &batch,
-        )
-        .await;
-        let enabled_properties =
-            HashMap::from([("parquet.enable.dictionary".to_string(), "true".to_string())]);
-        let enabled_builder = AnyFileWriterBuilder::for_format(
-            DataFileFormat::Parquet,
-            schema.clone(),
-            &enabled_properties,
-            MetricsConfig::default(),
-            FieldMatchMode::Id,
-        )
-        .expect("route the parquet arm");
-        let (enabled_path, _) = write_single_batch(
-            &enabled_builder,
-            &file_io,
-            &location_gen,
-            "any-parquet-dict-on",
-            DataFileFormat::Parquet,
-            &batch,
-        )
-        .await;
-        let unset_flags =
-            parquet_columns_use_dictionary(read_back_bytes(&file_io, &unset_path).await);
-        let enabled_flags =
-            parquet_columns_use_dictionary(read_back_bytes(&file_io, &enabled_path).await);
-        assert!(!unset_flags.is_empty(), "the file must hold columns");
-        assert!(
-            unset_flags.iter().all(|flag| !flag),
-            "an unset property must leave dictionary encoding off"
-        );
-        assert!(!enabled_flags.is_empty(), "the file must hold columns");
-        assert!(
-            enabled_flags.iter().all(|flag| *flag),
-            "parquet.enable.dictionary=true must turn dictionary encoding on"
-        );
+        for (prefix, value, expect_on) in [
+            ("any-parquet-dict-unset", None, false),
+            ("any-parquet-dict-on", Some("true"), true),
+            ("any-parquet-dict-upper", Some("TRUE"), true),
+            ("any-parquet-dict-off", Some("false"), false),
+        ] {
+            let properties = value
+                .map(|text| {
+                    HashMap::from([("parquet.enable.dictionary".to_string(), text.to_string())])
+                })
+                .unwrap_or_default();
+            let builder = AnyFileWriterBuilder::for_format(
+                DataFileFormat::Parquet,
+                schema.clone(),
+                &properties,
+                MetricsConfig::default(),
+                FieldMatchMode::Id,
+            )
+            .expect("route the parquet arm");
+            let (path, _) = write_single_batch(
+                &builder,
+                &file_io,
+                &location_gen,
+                prefix,
+                DataFileFormat::Parquet,
+                &batch,
+            )
+            .await;
+            let flags = parquet_columns_use_dictionary(read_back_bytes(&file_io, &path).await);
+            assert!(!flags.is_empty(), "the file must hold columns");
+            assert!(
+                flags.iter().all(|flag| *flag == expect_on),
+                "case {prefix} must leave dictionary encoding {expect_on}"
+            );
+        }
     }
 
     #[tokio::test]
