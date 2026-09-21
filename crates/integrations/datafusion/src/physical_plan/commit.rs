@@ -94,6 +94,7 @@ pub(crate) struct IcebergCommitExec {
     count_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
     commit_branch: Option<String>,
+    stage_only: bool,
     output_spec: PartitionSpecRef,
 }
 
@@ -119,12 +120,18 @@ impl IcebergCommitExec {
             count_schema,
             plan_properties,
             commit_branch: None,
+            stage_only: false,
             output_spec,
         }
     }
 
     pub(crate) fn with_commit_branch(mut self, branch: Option<String>) -> Self {
         self.commit_branch = branch;
+        self
+    }
+
+    pub(crate) fn with_stage_only(mut self, stage_only: bool) -> Self {
+        self.stage_only = stage_only;
         self
     }
 
@@ -222,7 +229,8 @@ impl ExecutionPlan for IcebergCommitExec {
                 self.insert_op,
                 self.output_spec.clone(),
             )
-            .with_commit_branch(self.commit_branch.clone()),
+            .with_commit_branch(self.commit_branch.clone())
+            .with_stage_only(self.stage_only),
         ))
     }
 
@@ -251,6 +259,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let catalog = Arc::clone(&self.catalog);
         let insert_op = self.insert_op;
         let commit_branch = self.commit_branch.clone();
+        let stage_only = self.stage_only;
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
@@ -364,10 +373,13 @@ impl ExecutionPlan for IcebergCommitExec {
                 // reads table state nor removes files, so nothing can conflict (Java
                 // `SparkWrite.BatchAppend.commit` runs none).
                 InsertOp::Append => {
+                    let base = tx
+                        .fast_append()
+                        .add_data_files(data_files)
+                        .set_snapshot_properties(snapshot_properties);
+                    let base = if stage_only { base.stage_only() } else { base };
                     let action = crate::physical_plan::snapshot_target::maybe_to_branch(
-                        tx.fast_append()
-                            .add_data_files(data_files)
-                            .set_snapshot_properties(snapshot_properties),
+                        base,
                         commit_branch.as_deref(),
                         |action, branch| action.to_branch(branch),
                     );
@@ -390,6 +402,9 @@ impl ExecutionPlan for IcebergCommitExec {
                         .overwrite_by_row_filter(Predicate::AlwaysTrue)
                         .add_files(data_files)
                         .set_snapshot_properties(snapshot_properties);
+                    if stage_only {
+                        action = action.stage_only();
+                    }
                     if let Some(isolation) = overwrite_isolation_level(&table)? {
                         action = action.validate_no_conflicting_deletes();
                         if isolation == IsolationLevel::Serializable {

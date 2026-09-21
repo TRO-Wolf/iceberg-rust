@@ -34,6 +34,7 @@ impl IcebergTableProvider {
             table_ident: table.identifier().clone(),
             schema,
             commit_branch: None,
+            stage_only: false,
             planning_table: Some(table),
             output_spec_id: None,
         })
