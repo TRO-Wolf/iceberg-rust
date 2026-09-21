@@ -79,7 +79,7 @@ asserts structural equality with Java's result. All run **offline** in plain `ca
 
 | `interop_spec_partition_scan.rs` | `_spec_id` / `_partition` scan columns (OFFLINE — always runs, no Java/env): per-file spec ids, union-struct partition values with NULL where a file's spec lacks the field (ADD and REMOVE evolutions), NULL (never empty) struct on unpartitioned tables and missing-spec files, plus the `_pos` read-path leg | landed 2026-09-21 (WO-fork-3) |
 | `interop_deleted_scan.rs` | `_deleted` scan column (OFFLINE — always runs, no Java/env): projecting `_deleted` marks MoR-masked rows true and live rows false, unprojected scans keep filter semantics, CoW tables read all false, select-all omits the column | landed 2026-09-21 |
-| `interop_snapshot_scope_scan.rs` | Snapshot-scoped inspection tables (OFFLINE — always runs, no Java/env): `files` / `data_files` / `delete_files` / `entries` / `manifests` at an older snapshot read that snapshot's manifests (A-live-then-replaced fixture), unknown snapshot ids fail loud `DataInvalid`, snapshot-less tables scan empty | landed 2026-09-21 (WO-fork-4) |
+| `interop_snapshot_scope_scan.rs` | Snapshot-scoped inspection tables (OFFLINE — always runs, no Java/env): `files` / `data_files` / `delete_files` / `entries` / `manifests` / `partitions` / `position_deletes` at an older snapshot read that snapshot's manifests (A-live-then-replaced fixture; partitions uses a partition-A/B swap fixture, position_deletes a snap2-adds-deletes fixture), unknown snapshot ids fail loud `DataInvalid`, snapshot-less tables scan empty while scoped scans on them fail loud | landed 2026-09-21 (WO-fork-4); partitions + position_deletes 2026-09-21 (WO-fork-5) |
 
 ## I want to...
 
