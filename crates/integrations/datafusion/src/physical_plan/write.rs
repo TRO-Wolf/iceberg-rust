@@ -44,13 +44,11 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::AnyFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, TableLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
-use iceberg::{Error, ErrorKind};
-use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use crate::physical_plan::sort::write_sort_plan;
@@ -299,32 +297,14 @@ impl ExecutionPlan for IcebergWriteExec {
         // Check data file format
         let file_format = DataFileFormat::from_str(&table_props.write_format_default)
             .map_err(to_datafusion_error)?;
-        if file_format != DataFileFormat::Parquet {
-            return Err(to_datafusion_error(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!("File format {file_format} is not supported for insert_into yet!"),
-            )));
-        }
-
-        let compression = parquet_compression_from_properties(self.table.metadata().properties())
-            .map_err(to_datafusion_error)?;
-        let dictionary_enabled = self
-            .table
-            .metadata()
-            .properties()
-            .get("parquet.enable.dictionary")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-        let parquet_file_writer_builder = ParquetWriterBuilder::new_with_match_mode(
-            WriterProperties::builder()
-                .set_compression(compression)
-                .set_dictionary_enabled(dictionary_enabled)
-                .build(),
+        let file_writer_builder = AnyFileWriterBuilder::for_format(
+            file_format,
             self.table.metadata().current_schema().clone(),
+            self.table.metadata().properties(),
+            MetricsConfig::for_table(self.table.metadata()).map_err(to_datafusion_error)?,
             FieldMatchMode::Name,
         )
-        .with_metrics_config(
-            MetricsConfig::for_table(self.table.metadata()).map_err(to_datafusion_error)?,
-        );
+        .map_err(to_datafusion_error)?;
         let target_file_size = table_props.write_target_file_size_bytes;
 
         let file_io = self.table.file_io().clone();
@@ -335,7 +315,7 @@ impl ExecutionPlan for IcebergWriteExec {
         let file_name_generator =
             DefaultFileNameGenerator::new(Uuid::now_v7().to_string(), None, file_format);
         let rolling_writer_builder = RollingFileWriterBuilder::new(
-            parquet_file_writer_builder,
+            file_writer_builder,
             target_file_size,
             file_io,
             location_generator,
@@ -424,7 +404,10 @@ mod tests {
     use iceberg::spec::{
         DataFileFormat, NestedField, PrimitiveType, Schema, Type, deserialize_data_file_from_json,
     };
-    use iceberg::{Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation};
+    use iceberg::{
+        Catalog, CatalogBuilder, Error, ErrorKind, MemoryCatalog, NamespaceIdent, Result,
+        TableCreation,
+    };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use tempfile::TempDir;
 
