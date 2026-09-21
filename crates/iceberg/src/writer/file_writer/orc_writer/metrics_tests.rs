@@ -270,6 +270,83 @@ fn test_string_bounds_are_truncated_by_the_configured_mode() {
     }
 }
 
+fn renumbered_schema() -> Schema {
+    Schema::builder()
+        .with_schema_id(1)
+        .with_fields(vec![
+            Arc::new(NestedField::required(
+                100,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(
+                7,
+                "v",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+        ])
+        .build()
+        .expect("build the renumbered schema")
+}
+
+#[test]
+fn test_column_sizes_key_by_field_id_when_ids_differ_from_orc_indices() {
+    let schema = renumbered_schema();
+    let orc_schema = crate::writer::file_writer::orc_writer::orc_type::build_orc_schema(&schema)
+        .expect("map the schema");
+    let mut collector = OrcMetricsCollector::new(&schema, &MetricsConfig::default());
+    collector.observe_row(
+        &schema,
+        Some(&Literal::Struct(Struct::from_iter(vec![
+            primitive(PrimitiveLiteral::Int(1)),
+            primitive(PrimitiveLiteral::Int(2)),
+        ]))),
+    );
+    collector.observe_stripe_column_sizes(&orc_schema, &HashMap::from([(1usize, 11u64)]));
+    collector.observe_stripe_column_sizes(&orc_schema, &HashMap::from([(1usize, 4u64)]));
+    let metrics = collector.build();
+
+    assert_eq!(
+        metrics.column_sizes.get(&100),
+        Some(&15),
+        "ORC index 1 maps to field id 100, not to key 1"
+    );
+    assert!(
+        !metrics.column_sizes.contains_key(&1),
+        "sizes keyed by ORC index would land on key 1"
+    );
+}
+
+#[test]
+fn test_required_child_under_a_null_parent_counts_as_null() {
+    let schema = Schema::builder()
+        .with_schema_id(1)
+        .with_fields(vec![Arc::new(NestedField::optional(
+            20,
+            "st",
+            Type::Struct(StructType::new(vec![
+                NestedField::required(21, "x", Type::Primitive(PrimitiveType::Int)).into(),
+            ])),
+        ))])
+        .build()
+        .expect("build the required-child schema");
+    let present = Literal::Struct(Struct::from_iter(vec![Some(Literal::Struct(
+        Struct::from_iter(vec![primitive(PrimitiveLiteral::Int(7))]),
+    ))]));
+    let parent_null = Literal::Struct(Struct::from_iter(vec![None]));
+    let mut collector = OrcMetricsCollector::new(&schema, &MetricsConfig::default());
+    collector.observe_row(&schema, Some(&present));
+    collector.observe_row(&schema, Some(&parent_null));
+    let metrics = collector.build();
+
+    assert_eq!(metrics.value_counts.get(&21), Some(&2));
+    assert_eq!(
+        metrics.null_value_counts.get(&21),
+        Some(&1),
+        "Java ORC reports 0 nulls here because required children have no PRESENT stream; this collector follows Java Parquet where a null parent makes the child null"
+    );
+}
+
 #[test]
 fn test_column_sizes_map_orc_column_indices_back_to_field_ids() {
     let schema = wide_schema();
