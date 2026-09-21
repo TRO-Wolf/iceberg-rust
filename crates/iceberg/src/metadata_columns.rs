@@ -393,7 +393,7 @@ pub fn partition_field(partition_fields: Vec<NestedFieldRef>) -> NestedFieldRef 
     use crate::spec::StructType;
 
     Arc::new(
-        NestedField::required(
+        NestedField::optional(
             RESERVED_FIELD_ID_PARTITION,
             RESERVED_COL_NAME_PARTITION,
             Type::Struct(StructType::new(partition_fields)),
@@ -550,7 +550,7 @@ mod tests {
         // Verify field properties
         assert_eq!(partition.id, RESERVED_FIELD_ID_PARTITION);
         assert_eq!(partition.name, RESERVED_COL_NAME_PARTITION);
-        assert!(partition.required);
+        assert!(!partition.required);
 
         // Verify it's a struct type with correct fields
         if let Type::Struct(struct_type) = partition.field_type.as_ref() {
